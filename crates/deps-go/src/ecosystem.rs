@@ -330,7 +330,7 @@ mod tests {
     // placeholder text as `version` instead of truncating it to the first whitespace-delimited
     // fragment, so it stays a normal registry-sourced `Some(version_requirement)` and reaches
     // `deps_core::edit::plan_vulnerability_fix` directly — depends on
-    // `RequirementResolution::requirement_is_placeholder`'s shared default (`GoFormatter` has
+    // `RequirementResolution::bounded_requirement_is_placeholder`'s shared default (`GoFormatter` has
     // no override). Supersedes the pre-#1377 `no_placeholder_syntax:` marker here, which
     // predated the discovery that external templating can still leave one of these shapes in
     // a `require` line's version field even though `go.mod`'s own grammar has no such syntax.

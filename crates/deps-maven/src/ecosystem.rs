@@ -608,7 +608,7 @@ mod tests {
     // placeholder, a malformed range with one embedded (e.g. `[1.0,${hi}`), and an unexpanded
     // `@property@` resource-filtering placeholder (e.g. `@project.version@`) as
     // `Some(version_requirement)` — all three reach `deps_core::edit::plan_vulnerability_fix`
-    // directly, so `RequirementResolution::requirement_is_placeholder`'s central gate
+    // directly, so `RequirementResolution::bounded_requirement_is_placeholder`'s central gate
     // (`MavenFormatter` has no override; the shared default's own `is_unresolved`-equivalent
     // detector covers both grammars) must actually hold for both placeholder grammars.
     deps_core::unresolved_requirement_conformance! {

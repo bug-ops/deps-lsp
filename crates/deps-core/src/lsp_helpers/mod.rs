@@ -3446,9 +3446,9 @@ impl RequirementMatcher for SemverReqMatcher {
 /// the analogous `node_semver::Range` case into `deps_npm::compile_node_semver_range`.
 ///
 /// Unlike that npm/JSR case, this function has no built-in unresolved-placeholder guard: Cargo
-/// and Swift's [`formatter::RequirementResolution::requirement_is_unresolved`] overrides
+/// and Swift's [`formatter::RequirementResolution::bounded_requirement_is_unresolved`] overrides
 /// diverge (Swift additionally rejects its own native `\(...)` string-interpolation syntax), so
-/// each formatter must run its own `self.requirement_is_unresolved(requirement)` guard before
+/// each formatter must run its own `self.bounded_requirement_is_unresolved(requirement)` guard before
 /// calling this function, rather than the guard being hardcoded here.
 ///
 /// # Examples
@@ -5908,16 +5908,39 @@ mod tests {
     fn test_ecosystem_formatter_version_satisfies() {
         let formatter = MOCK_FORMATTER;
 
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2.3"));
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.3"),
+            &VersionReq::new("1.2.3")
+        ));
 
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "^1.2"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "~1.2"));
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.3"),
+            &VersionReq::new("^1.2")
+        ));
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.3"),
+            &VersionReq::new("~1.2")
+        ));
 
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2"));
+        assert!(
+            formatter.version_satisfies_requirement(
+                &ConcreteVersion::new("1.2.3"),
+                &VersionReq::new("1")
+            )
+        );
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.3"),
+            &VersionReq::new("1.2")
+        ));
 
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "2.0.0"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.3"));
+        assert!(!formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.3"),
+            &VersionReq::new("2.0.0")
+        ));
+        assert!(!formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.3"),
+            &VersionReq::new("1.3")
+        ));
     }
 
     #[test]

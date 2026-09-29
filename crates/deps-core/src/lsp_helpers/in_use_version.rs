@@ -312,7 +312,7 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// Picks the lock-file-resolved candidate that best matches one dependency occurrence's own
 /// version requirement (FR-001/FR-002), among a name's multiple retained lock-file entries.
 ///
-/// Filters `candidates` down to those [`crate::lsp_helpers::RequirementResolution::version_satisfies_requirement`]
+/// Filters `candidates` down to those [`crate::lsp_helpers::RequirementResolution::version_satisfies_bounded_requirement`]
 /// accepts, then returns the highest-semver entry among that satisfying subset — falling back
 /// to [`crate::lockfile`]'s lexicographic tiebreak for non-parseable versions
 /// ([`crate::lockfile::compare_lockfile_versions`]), the same ordering a single-candidate
@@ -321,7 +321,7 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// non-matching entry.
 /// Prefers [`crate::lsp_helpers::RequirementResolution::compile_bounded_requirement`]'s precise, ecosystem-native
 /// comparator (e.g. `deps-cargo`'s real `semver::VersionReq` range semantics) over
-/// [`crate::lsp_helpers::RequirementResolution::version_satisfies_requirement`]'s looser heuristic — critical
+/// [`crate::lsp_helpers::RequirementResolution::version_satisfies_bounded_requirement`]'s looser heuristic — critical
 /// here specifically because that heuristic's plain/partial-requirement branch requires
 /// *minor-version equality* (`is_same_major_minor`), so a caret-range requirement like
 /// Cargo's `"2.4"` (meaning `>=2.4.0, <3.0.0`) would wrongly reject a `2.9.4` candidate,
@@ -336,7 +336,7 @@ fn version_matches_requirement(
     if let Some(matcher) = formatter.compile_bounded_requirement(requirement) {
         matcher.matches(version) == Some(true)
     } else {
-        formatter.version_satisfies_requirement(version, requirement.as_str())
+        formatter.version_satisfies_bounded_requirement(version, requirement)
     }
 }
 

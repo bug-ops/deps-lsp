@@ -3,7 +3,6 @@ use deps_core::Dependency;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::StabilityFloor;
-use deps_core::VersionReq;
 use deps_core::interval::{VersionRange, range_from_edges, tighter_lower, tighter_upper};
 use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
@@ -78,7 +77,7 @@ struct ComposerMatcher(String);
 
 impl RequirementMatcher for ComposerMatcher {
     fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-        Some(ComposerFormatter.version_satisfies_requirement(version, &self.0))
+        Some(walk_requirement(&AdmitLeaf, version.as_str(), &self.0))
     }
 
     /// Composer's requirement grammar is not strict SemVer 2.0.0 (#299) — must not opt in.
@@ -783,8 +782,7 @@ fn intersect_clause_bounds<'a>(
 /// stripping; a real Packagist tag left un-stripped here (e.g. `v1.5.0`, common for
 /// `symfony/*`) would silently defeat every gap comparison.
 fn composer_or_gap_excludes(version: &str, requirement: &str) -> bool {
-    if ComposerFormatter.version_satisfies_requirement(&ConcreteVersion::new(version), requirement)
-    {
+    if walk_requirement(&AdmitLeaf, version, requirement) {
         return false;
     }
     let Some(stripped_requirement) = strip_branch_affixes(requirement) else {
@@ -946,8 +944,12 @@ impl RequirementResolution for ComposerFormatter {
     /// Delegates the OR/AND-splitting and `v`-prefix/`@stability`-flag normalization to the
     /// shared `walk_requirement` tree-walker (see `AdmitLeaf` for this method's leaf
     /// semantics).
-    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
-        walk_requirement(&AdmitLeaf, version.as_str(), requirement)
+    fn version_satisfies_bounded_requirement(
+        &self,
+        version: &ConcreteVersion,
+        requirement: BoundedVersionReq<'_>,
+    ) -> bool {
+        walk_requirement(&AdmitLeaf, version.as_str(), requirement.as_str())
     }
 
     /// Compiles `requirement` into a `ComposerMatcher` using the same
@@ -991,7 +993,7 @@ impl RequirementResolution for ComposerFormatter {
     /// non-rewritable — Composer has no "concrete but undecidable, safe-to-rewrite" ref
     /// concept (unlike a SHA/branch pin) for `requirement_is_unresolved` to stay broader
     /// than this for, so its default delegates here rather than duplicating the detector.
-    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+    fn bounded_requirement_is_placeholder(&self, requirement: BoundedVersionReq<'_>) -> bool {
         requirement_is_composer_unresolved(requirement.as_str())
     }
 }
@@ -1329,6 +1331,7 @@ fn compare_versions(a: &str, b: &str) -> Ordering {
 mod tests {
     use super::*;
     use crate::types::{ComposerDependency, ComposerSection};
+    use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
     use deps_core::position::{Position as DomainPosition, Range};
     #[cfg(feature = "lsp-responses")]
@@ -1400,8 +1403,12 @@ mod tests {
     #[test]
     fn test_wildcard() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "*"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("99.0.0"), "*"));
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), &VersionReq::new("*"))
+        );
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("99.0.0"), &VersionReq::new("*"))
+        );
     }
 
     /// `RequirementLeaf::on_wildcard` is the one branch of the #1591 tree-walker extraction
@@ -1418,10 +1425,22 @@ mod tests {
     #[test]
     fn test_caret_operator() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "^1.2"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "^1.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^1.2"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.3.0"), "^1.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.3"),
+            &VersionReq::new("^1.2")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new("^1.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("^1.2")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.3.0"),
+            &VersionReq::new("^1.0")
+        ));
     }
 
     /// #1617: `satisfies_caret` enforced only the major-version upper cutoff, silently
@@ -1431,14 +1450,38 @@ mod tests {
     fn test_caret_enforces_minor_lower_bound() {
         let f = ComposerFormatter;
         // ^1.5 == >=1.5.0 <2.0.0
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "^1.5"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.9"), "^1.5"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.9.0"), "^1.5"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), "^1.5"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "^1.5"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.4.0"), "^1.5"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^1.5"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), "^1.5"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new("^1.5")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.9"),
+            &VersionReq::new("^1.5")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.9.0"),
+            &VersionReq::new("^1.5")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.1.0"),
+            &VersionReq::new("^1.5")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.0"),
+            &VersionReq::new("^1.5")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.4.0"),
+            &VersionReq::new("^1.5")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("^1.5")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.9.0"),
+            &VersionReq::new("^1.5")
+        ));
     }
 
     /// 0.x caret locks tighter (Composer follows npm semantics here): `^0.3.2` ==
@@ -1446,15 +1489,36 @@ mod tests {
     #[test]
     fn test_caret_zero_major_locks_to_first_nonzero_component() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("0.3.2"), "^0.3.2"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("0.3.9"), "^0.3.2"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.3.1"), "^0.3.2"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.4.0"), "^0.3.2"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.3.2"),
+            &VersionReq::new("^0.3.2")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.3.9"),
+            &VersionReq::new("^0.3.2")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.3.1"),
+            &VersionReq::new("^0.3.2")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.4.0"),
+            &VersionReq::new("^0.3.2")
+        ));
 
         // ^0.0.3 == >=0.0.3 <0.0.4 — locks all the way to patch.
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("0.0.3"), "^0.0.3"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.0.2"), "^0.0.3"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.0.4"), "^0.0.3"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.0.3"),
+            &VersionReq::new("^0.0.3")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.0.2"),
+            &VersionReq::new("^0.0.3")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.0.4"),
+            &VersionReq::new("^0.0.3")
+        ));
     }
 
     /// impl-critic S1: the upper bound must exclude every prerelease of the next boundary
@@ -1463,10 +1527,22 @@ mod tests {
     #[test]
     fn test_caret_upper_bound_excludes_prerelease_of_next_boundary() {
         let f = ComposerFormatter;
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0-beta1"), "^1.5"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0-dev"), "^1.5"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.4.0-RC1"), "^0.3.2"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.0.4-alpha"), "^0.0.3"));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0-beta1"),
+            &VersionReq::new("^1.5")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0-dev"),
+            &VersionReq::new("^1.5")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.4.0-RC1"),
+            &VersionReq::new("^0.3.2")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.0.4-alpha"),
+            &VersionReq::new("^0.0.3")
+        ));
     }
 
     /// impl-critic M1: the lower bound must still admit a prerelease *of the requirement
@@ -1474,8 +1550,14 @@ mod tests {
     #[test]
     fn test_caret_lower_bound_admits_prerelease_of_requirement_itself() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0-RC1"), "^1.5"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.4.9-RC1"), "^1.5"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0-RC1"),
+            &VersionReq::new("^1.5")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.4.9-RC1"),
+            &VersionReq::new("^1.5")
+        ));
     }
 
     /// impl-critic M2 / tester gap: a stability suffix on the requirement's own last segment
@@ -1485,22 +1567,41 @@ mod tests {
     #[test]
     fn test_caret_requirement_suffix_attaches_to_zero_padded_core() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0-beta"), "^1.0-beta"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("0.3.0-beta"), "^0.3-beta"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("0.3.5"), "^0.3-beta"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.4.0"), "^0.3-beta"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.0-beta"),
+            &VersionReq::new("^1.0-beta")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.3.0-beta"),
+            &VersionReq::new("^0.3-beta")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.3.5"),
+            &VersionReq::new("^0.3-beta")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.4.0"),
+            &VersionReq::new("^0.3-beta")
+        ));
 
         // Referenced in `satisfies_caret`'s own doc comment: `^1.0.0-a1` must admit itself.
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0-a1"), "^1.0.0-a1"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.0-a1"),
+            &VersionReq::new("^1.0.0-a1")
+        ));
 
         // Tester gap: a fused, separator-optional suffix directly after the locking digit
         // (real Composer syntax, see `test_is_prerelease_marker_separatorless_suffix`) must
         // not corrupt the upper-bound's numeric parse and produce an inverted/unsatisfiable
         // range — `^0.0.3-alpha1` must admit its own exact version.
-        assert!(
-            f.version_satisfies_requirement(&ConcreteVersion::new("0.0.3-alpha1"), "^0.0.3-alpha1")
-        );
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.0.4"), "^0.0.3-alpha1"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.0.3-alpha1"),
+            &VersionReq::new("^0.0.3-alpha1")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.0.4"),
+            &VersionReq::new("^0.0.3-alpha1")
+        ));
     }
 
     /// impl-critic M3: a fully non-numeric requirement (typo/malformed) must be rejected, not
@@ -1508,8 +1609,14 @@ mod tests {
     #[test]
     fn test_caret_malformed_requirement_rejected() {
         let f = ComposerFormatter;
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), "^abc"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "^abc"));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.5.0"),
+            &VersionReq::new("^abc")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.0"),
+            &VersionReq::new("^abc")
+        ));
     }
 
     /// impl-critic S2: an overflowing requirement segment must not panic (debug) or silently
@@ -1520,7 +1627,7 @@ mod tests {
         let f = ComposerFormatter;
         assert!(!f.version_satisfies_requirement(
             &ConcreteVersion::new("18446744073709551615.0.0"),
-            "^18446744073709551615"
+            &VersionReq::new("^18446744073709551615")
         ));
     }
 
@@ -1528,52 +1635,112 @@ mod tests {
     fn test_tilde_with_three_segments() {
         let f = ComposerFormatter;
         // ~1.2.3 means >=1.2.3 <1.3.0 (same as npm)
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "~1.2.3"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.9"), "~1.2.3"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.3.0"), "~1.2.3"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.2"), "~1.2.3"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.3"),
+            &VersionReq::new("~1.2.3")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.9"),
+            &VersionReq::new("~1.2.3")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.3.0"),
+            &VersionReq::new("~1.2.3")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.2"),
+            &VersionReq::new("~1.2.3")
+        ));
     }
 
     #[test]
     fn test_tilde_with_two_segments_composer_specific() {
         let f = ComposerFormatter;
         // ~1.2 means >=1.2.0 <2.0.0 (DIFFERENT from npm ~1.2 = >=1.2.0 <1.3.0)
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "~1.2"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.9.9"), "~1.2"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "~1.2")); // upper bound is <2.0.0
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.1.9"), "~1.2")); // minor too low
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), "~1.2")); // major too low
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.0"),
+            &VersionReq::new("~1.2")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.9.9"),
+            &VersionReq::new("~1.2")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("~1.2")
+        )); // upper bound is <2.0.0
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.1.9"),
+            &VersionReq::new("~1.2")
+        )); // minor too low
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.9.0"),
+            &VersionReq::new("~1.2")
+        )); // major too low
     }
 
     #[test]
     fn test_wildcard_version() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.5"), "1.0.*"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), "1.0.*"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.5"),
+            &VersionReq::new("1.0.*")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.1.0"),
+            &VersionReq::new("1.0.*")
+        ));
     }
 
     #[test]
     fn test_or_combinator() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "1.0.0 || 2.0.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "1.0.0 || 2.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("3.0.0"), "1.0.0 || 2.0.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.0"),
+            &VersionReq::new("1.0.0 || 2.0.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("1.0.0 || 2.0.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("3.0.0"),
+            &VersionReq::new("1.0.0 || 2.0.0")
+        ));
     }
 
     #[test]
     fn test_range_constraint() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), ">=1.0 <2.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), ">=1.0 <2.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), ">=1.0 <2.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new(">=1.0 <2.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new(">=1.0 <2.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.9.0"),
+            &VersionReq::new(">=1.0 <2.0")
+        ));
     }
 
     #[test]
     fn test_range_constraint_spaced_operators() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), ">= 1.0 < 2.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), ">= 1.0 < 2.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), ">= 1.0 < 2.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new(">= 1.0 < 2.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new(">= 1.0 < 2.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.9.0"),
+            &VersionReq::new(">= 1.0 < 2.0")
+        ));
     }
 
     /// #1603: a comma is Composer's other AND separator, equivalent to whitespace — before
@@ -1583,29 +1750,71 @@ mod tests {
     fn test_comma_and_separator_equivalent_to_whitespace() {
         let f = ComposerFormatter;
         // Control: a plain caret requirement, unaffected by the comma fix.
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "^1.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^1.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new("^1.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("^1.0")
+        ));
 
         // The comma-joined compound requirement must gate on BOTH bounds, not just the first.
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), ">=1.0.0,<2.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.5.0"), ">=1.0.0,<2.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), ">=1.0.0,<2.0.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new(">=1.0.0,<2.0.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.5.0"),
+            &VersionReq::new(">=1.0.0,<2.0.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.5.0"),
+            &VersionReq::new(">=1.0.0,<2.0.0")
+        ));
 
         // A lone `!=` clause, comma-adjacent syntax aside.
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), "!=1.1.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "!=1.1.0"));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.1.0"),
+            &VersionReq::new("!=1.1.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.0"),
+            &VersionReq::new("!=1.1.0")
+        ));
 
         // Compound: all three comma-separated clauses must hold.
         let compound = ">=1.0.0,<2.0.0,!=1.1.0";
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), compound));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), compound));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), compound));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), compound));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), compound));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.0"),
+            &VersionReq::new(compound)
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new(compound)
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.1.0"),
+            &VersionReq::new(compound)
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new(compound)
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.9.0"),
+            &VersionReq::new(compound)
+        ));
 
         // Control: a plain lower bound alone stays unaffected.
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("5.0.0"), ">=1.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), ">=1.0.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("5.0.0"),
+            &VersionReq::new(">=1.0.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.5.0"),
+            &VersionReq::new(">=1.0.0")
+        ));
     }
 
     /// #1603 impl-critic follow-up: the cooldown-fallback safety net
@@ -1721,7 +1930,10 @@ mod tests {
         let f = ComposerFormatter;
         let req = "<1.0 || ^1.5 || >=3.0";
         for candidate in ["1.5.0", "1.5", "1.9.9"] {
-            let admitted = f.version_satisfies_requirement(&ConcreteVersion::new(candidate), req);
+            let admitted = f.version_satisfies_requirement(
+                &ConcreteVersion::new(candidate),
+                &VersionReq::new(req),
+            );
             let excluded = composer_explicitly_excludes(candidate, req);
             assert!(
                 !(admitted && excluded),
@@ -1805,7 +2017,9 @@ mod tests {
     fn test_composer_explicitly_excludes_or_gap_ignores_non_numeric_wildcard_prefix() {
         let f = ComposerFormatter;
         let req = "abc.* || >=2.0";
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), req));
+        assert!(
+            !f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), &VersionReq::new(req))
+        );
         assert!(!composer_explicitly_excludes("1.0.0", req));
     }
 
@@ -1816,15 +2030,24 @@ mod tests {
         let f = ComposerFormatter;
         for req in [">=1.0,<2.0", ">=1.0, <2.0", ">=1.0 ,<2.0", ">=1.0 , <2.0"] {
             assert!(
-                f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), req),
+                f.version_satisfies_requirement(
+                    &ConcreteVersion::new("1.5.0"),
+                    &VersionReq::new(req)
+                ),
                 "{req}"
             );
             assert!(
-                !f.version_satisfies_requirement(&ConcreteVersion::new("2.5.0"), req),
+                !f.version_satisfies_requirement(
+                    &ConcreteVersion::new("2.5.0"),
+                    &VersionReq::new(req)
+                ),
                 "{req}"
             );
             assert!(
-                !f.version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), req),
+                !f.version_satisfies_requirement(
+                    &ConcreteVersion::new("0.5.0"),
+                    &VersionReq::new(req)
+                ),
                 "{req}"
             );
         }
@@ -1836,9 +2059,15 @@ mod tests {
     fn test_and_inside_or_with_commas() {
         let f = ComposerFormatter;
         let req = "^0.9 || >=1.0,<2.0,!=1.5.0";
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.6.0"), req));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), req));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), req));
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("1.6.0"), &VersionReq::new(req))
+        );
+        assert!(
+            !f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), &VersionReq::new(req))
+        );
+        assert!(
+            !f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), &VersionReq::new(req))
+        );
     }
 
     /// impl-critic S3: a whitespace-AND clause list must combine every clause regardless of
@@ -1848,13 +2077,28 @@ mod tests {
     #[test]
     fn test_and_split_handles_non_range_operator_tokens() {
         let f = ComposerFormatter;
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "^1.0 !=1.2.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.3.0"), "^1.0 !=1.2.0"));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.0"),
+            &VersionReq::new("^1.0 !=1.2.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.3.0"),
+            &VersionReq::new("^1.0 !=1.2.0")
+        ));
         // Parity with the comma form, which already worked.
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "^1.0,!=1.2.0"));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.0"),
+            &VersionReq::new("^1.0,!=1.2.0")
+        ));
 
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.5"), "~1.0 !=1.0.5"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.6"), "~1.0 !=1.0.5"));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.5"),
+            &VersionReq::new("~1.0 !=1.0.5")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.6"),
+            &VersionReq::new("~1.0 !=1.0.5")
+        ));
     }
 
     /// #1608: composer/semver's Hyphenated Version Range grammar, `"1.0 - 2.0"` ==
@@ -1866,14 +2110,20 @@ mod tests {
         let f = ComposerFormatter;
         for v in ["1.0.0", "1.5.0", "2.0.0", "2.0.9"] {
             assert!(
-                f.version_satisfies_requirement(&ConcreteVersion::new(v), "1.0 - 2.0"),
+                f.version_satisfies_requirement(
+                    &ConcreteVersion::new(v),
+                    &VersionReq::new("1.0 - 2.0")
+                ),
                 "{v} should be admitted by \"1.0 - 2.0\""
             );
         }
         // Below the lower bound, or at/above the exclusive upper bound (`2.1`, not `2.0`).
         for v in ["0.5.0", "2.1.0", "3.0.0"] {
             assert!(
-                !f.version_satisfies_requirement(&ConcreteVersion::new(v), "1.0 - 2.0"),
+                !f.version_satisfies_requirement(
+                    &ConcreteVersion::new(v),
+                    &VersionReq::new("1.0 - 2.0")
+                ),
                 "{v} should not be admitted by \"1.0 - 2.0\""
             );
         }
@@ -1887,11 +2137,12 @@ mod tests {
         let f = ComposerFormatter;
         assert!(f.version_satisfies_requirement(
             &ConcreteVersion::new("1.0.0-alpha"),
-            "1.0.0-alpha - 2.0.0"
+            &VersionReq::new("1.0.0-alpha - 2.0.0")
         ));
-        assert!(
-            !f.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), "1.0.0-alpha - 2.0.0")
-        );
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.9.0"),
+            &VersionReq::new("1.0.0-alpha - 2.0.0")
+        ));
     }
 
     /// #1608: a plain (non-OR, non-`!=`) hyphen range never itself explicitly excludes a
@@ -1923,7 +2174,10 @@ mod tests {
     fn test_hyphen_range_malformed_shape_fails_closed() {
         let f = ComposerFormatter;
         for v in ["1.0.0", "1.5.0", "2.0.0", "3.0.0"] {
-            assert!(!f.version_satisfies_requirement(&ConcreteVersion::new(v), "1.0 - 2.0 - 3.0"));
+            assert!(!f.version_satisfies_requirement(
+                &ConcreteVersion::new(v),
+                &VersionReq::new("1.0 - 2.0 - 3.0")
+            ));
         }
     }
 
@@ -1938,14 +2192,14 @@ mod tests {
         // Within the range and not the excluded point: admitted.
         for v in ["1.0.0", "1.3.0", "1.5.0", "2.0.9"] {
             assert!(
-                f.version_satisfies_requirement(&ConcreteVersion::new(v), req),
+                f.version_satisfies_requirement(&ConcreteVersion::new(v), &VersionReq::new(req)),
                 "{v} should be admitted by {req:?}"
             );
         }
         // Outside the range, or exactly the excluded point: not admitted.
         for v in ["0.9.0", "1.4.0", "2.1.0", "3.0.0"] {
             assert!(
-                !f.version_satisfies_requirement(&ConcreteVersion::new(v), req),
+                !f.version_satisfies_requirement(&ConcreteVersion::new(v), &VersionReq::new(req)),
                 "{v} should not be admitted by {req:?}"
             );
         }
@@ -1961,15 +2215,33 @@ mod tests {
     fn test_hyphen_range_and_combined_with_multiple_clauses_and_or() {
         let f = ComposerFormatter;
         let req = "1.0 - 2.0 !=1.4.0 !=1.6.0";
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), req));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.4.0"), req));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.6.0"), req));
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), &VersionReq::new(req))
+        );
+        assert!(
+            !f.version_satisfies_requirement(&ConcreteVersion::new("1.4.0"), &VersionReq::new(req))
+        );
+        assert!(
+            !f.version_satisfies_requirement(&ConcreteVersion::new("1.6.0"), &VersionReq::new(req))
+        );
 
         let or_req = "1.0 - 2.0 !=1.4.0 || 3.0 - 4.0";
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), or_req));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.4.0"), or_req));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("3.5.0"), or_req));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.5.0"), or_req));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new(or_req)
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.4.0"),
+            &VersionReq::new(or_req)
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("3.5.0"),
+            &VersionReq::new(or_req)
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.5.0"),
+            &VersionReq::new(or_req)
+        ));
     }
 
     /// impl-critic S1 regression: a spaced operator in a hyphen range's trailing AND-clause
@@ -1984,25 +2256,43 @@ mod tests {
         let unspaced = "1.0 - 2.0 !=1.4.0";
         for v in ["1.0.0", "1.3.0", "1.5.0", "2.0.9"] {
             assert_eq!(
-                f.version_satisfies_requirement(&ConcreteVersion::new(v), spaced),
-                f.version_satisfies_requirement(&ConcreteVersion::new(v), unspaced),
+                f.version_satisfies_requirement(&ConcreteVersion::new(v), &VersionReq::new(spaced)),
+                f.version_satisfies_requirement(
+                    &ConcreteVersion::new(v),
+                    &VersionReq::new(unspaced)
+                ),
                 "{v} should agree between spaced/unspaced `!=`"
             );
             assert!(
-                f.version_satisfies_requirement(&ConcreteVersion::new(v), spaced),
+                f.version_satisfies_requirement(&ConcreteVersion::new(v), &VersionReq::new(spaced)),
                 "{v} should be admitted by {spaced:?}"
             );
         }
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.4.0"), spaced));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.4.0"),
+            &VersionReq::new(spaced)
+        ));
         assert!(composer_explicitly_excludes("1.4.0", spaced));
 
         // A spaced `>=` trailing clause must also tighten the lower bound, not just admit
         // itself in isolation.
         let spaced_ge = "1.0 - 2.0 >= 1.2";
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), spaced_ge));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), spaced_ge));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.9"), spaced_ge));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.1.0"), spaced_ge));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.1.0"),
+            &VersionReq::new(spaced_ge)
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new(spaced_ge)
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.9"),
+            &VersionReq::new(spaced_ge)
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.1.0"),
+            &VersionReq::new(spaced_ge)
+        ));
     }
 
     /// impl-critic S2 regression: a comma-joined trailing AND-group after a hyphen range
@@ -2043,14 +2333,17 @@ mod tests {
         let spaced = "1.0 - 2.0 !=1.4.0";
         for v in ["1.5.0", "2.0.5", "1.4.0"] {
             assert_eq!(
-                f.version_satisfies_requirement(&ConcreteVersion::new(v), comma),
-                f.version_satisfies_requirement(&ConcreteVersion::new(v), spaced),
+                f.version_satisfies_requirement(&ConcreteVersion::new(v), &VersionReq::new(comma)),
+                f.version_satisfies_requirement(&ConcreteVersion::new(v), &VersionReq::new(spaced)),
                 "{v} should agree between comma/space-separated forms"
             );
         }
         // A bare trailing comma (nothing follows) must not glue to `hi` either — `2.0.5` stays
         // admitted, the same as the exact `"1.0 - 2.0"` case (widened partial upper bound).
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.5"), "1.0 - 2.0,"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.5"),
+            &VersionReq::new("1.0 - 2.0,")
+        ));
     }
 
     /// #1609: composer/semver's `VersionParser::parseConstraints` splits OR-branches on
@@ -2059,9 +2352,18 @@ mod tests {
     #[test]
     fn test_single_pipe_or_separator_equivalent_to_double() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "1.0.0 | 2.0.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "1.0.0 | 2.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("3.0.0"), "1.0.0 | 2.0.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.0"),
+            &VersionReq::new("1.0.0 | 2.0.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("1.0.0 | 2.0.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("3.0.0"),
+            &VersionReq::new("1.0.0 | 2.0.0")
+        ));
     }
 
     /// #1609: the OR-alternation-gap check must reach a single-pipe-separated union exactly
@@ -2105,15 +2407,19 @@ mod tests {
         let f = ComposerFormatter;
         for req in ["^1.0 ||", "^1.0 || || ^2.0", "|| ^1.0"] {
             assert!(
-                !f.version_satisfies_requirement(&ConcreteVersion::new("9.9.9"), req),
+                !f.version_satisfies_requirement(
+                    &ConcreteVersion::new("9.9.9"),
+                    &VersionReq::new(req)
+                ),
                 "{req}"
             );
             assert!(!composer_explicitly_excludes("9.9.9", req), "{req}");
         }
         // A single run of 3+ pipes is not itself a blank-branch shape — still a normal OR.
-        assert!(
-            f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "1.0.0 |||| 2.0.0")
-        );
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.0"),
+            &VersionReq::new("1.0.0 |||| 2.0.0")
+        ));
     }
 
     /// `hyphen_range_edges` expects text already run through `normalize_and_separators` (see its
@@ -2234,7 +2540,10 @@ mod tests {
         ];
         for (clause, version, admitted) in cases {
             assert_eq!(
-                f.version_satisfies_requirement(&ConcreteVersion::new(*version), clause),
+                f.version_satisfies_requirement(
+                    &ConcreteVersion::new(*version),
+                    &VersionReq::new(*clause)
+                ),
                 *admitted,
                 "{clause} vs {version}"
             );
@@ -2292,11 +2601,17 @@ mod tests {
         let f = ComposerFormatter;
         for req in ["^1.0 - 2.0", ">=1.0 - 2.0", "abc - 2.0"] {
             assert!(
-                !f.version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), req),
+                !f.version_satisfies_requirement(
+                    &ConcreteVersion::new("0.5.0"),
+                    &VersionReq::new(req)
+                ),
                 "{req}"
             );
             assert!(
-                !f.version_satisfies_requirement(&ConcreteVersion::new("1.9.0"), req),
+                !f.version_satisfies_requirement(
+                    &ConcreteVersion::new("1.9.0"),
+                    &VersionReq::new(req)
+                ),
                 "{req}"
             );
         }
@@ -2309,13 +2624,21 @@ mod tests {
     fn test_hyphen_range_full_upper_bound_is_inclusive() {
         let f = ComposerFormatter;
         let req = "1.0.0 - 2.1.0";
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.1.0"), req));
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("2.1.0"), &VersionReq::new(req))
+        );
         // A prerelease/finer-grained version at the same numeric core sorts above a bare
         // `<=2.1.0` boundary under `compare_versions`' own qualifier precedence, so it is
         // correctly excluded (this was the exact bug impl-critic S2 found: the old
         // always-exclusive `<2.2` implementation incorrectly admitted both of these).
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.1.1-RC1"), req));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.1.0.1"), req));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.1.1-RC1"),
+            &VersionReq::new(req)
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.1.0.1"),
+            &VersionReq::new(req)
+        ));
     }
 
     /// impl-critic S2: a "partial" (fewer than 3 numeric segments, no suffix) `hi` widens to a
@@ -2326,9 +2649,16 @@ mod tests {
     fn test_hyphen_range_partial_upper_bound_excludes_same_core_prerelease() {
         let f = ComposerFormatter;
         let req = "1.0 - 2.0";
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.9"), req));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.1.0-beta"), req));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.1.0"), req));
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("2.0.9"), &VersionReq::new(req))
+        );
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.1.0-beta"),
+            &VersionReq::new(req)
+        ));
+        assert!(
+            !f.version_satisfies_requirement(&ConcreteVersion::new("2.1.0"), &VersionReq::new(req))
+        );
     }
 
     /// impl-critic S2: a `hi` that already carries its own stability suffix is treated as
@@ -2337,11 +2667,20 @@ mod tests {
     fn test_hyphen_range_qualified_upper_bound_is_inclusive() {
         let f = ComposerFormatter;
         let req = "1.0.0 - 2.0.0-beta";
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0-beta"), req));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), req));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0-beta"),
+            &VersionReq::new(req)
+        ));
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), &VersionReq::new(req))
+        );
         // A stable release at the same core outranks the `-beta` boundary, so it's excluded.
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), req));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.1"), req));
+        assert!(
+            !f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), &VersionReq::new(req))
+        );
+        assert!(
+            !f.version_satisfies_requirement(&ConcreteVersion::new("2.0.1"), &VersionReq::new(req))
+        );
     }
 
     #[test]
@@ -2363,16 +2702,28 @@ mod tests {
     #[test]
     fn test_comma_with_trailing_garbage_does_not_panic() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "1.0.0,"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.1"), "1.0.0,"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), ","));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.0"),
+            &VersionReq::new("1.0.0,")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.1"),
+            &VersionReq::new("1.0.0,")
+        ));
+        assert!(
+            !f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), &VersionReq::new(","))
+        );
     }
 
     #[test]
     fn test_bare_v_requirement_does_not_match_everything() {
         let f = ComposerFormatter;
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "v"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.0.0"), "v"));
+        assert!(
+            !f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), &VersionReq::new("v"))
+        );
+        assert!(
+            !f.version_satisfies_requirement(&ConcreteVersion::new("0.0.0"), &VersionReq::new("v"))
+        );
     }
 
     /// Regression test for #418: a stability qualifier suffix must not be silently
@@ -2507,15 +2858,36 @@ mod tests {
     #[test]
     fn test_comparison_operators() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), ">=2.0.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.1"), ">=2.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.9.9"), ">=2.0.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new(">=2.0.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.1"),
+            &VersionReq::new(">=2.0.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.9.9"),
+            &VersionReq::new(">=2.0.0")
+        ));
 
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.9.9"), "<2.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "<2.0.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.9.9"),
+            &VersionReq::new("<2.0.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("<2.0.0")
+        ));
 
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "=1.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.1"), "=1.0.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.0"),
+            &VersionReq::new("=1.0.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.1"),
+            &VersionReq::new("=1.0.0")
+        ));
     }
 
     /// impl-critic M5 regression: a spaced bare `=` (`"= 1.0.0"`) must still match exactly like
@@ -2527,23 +2899,43 @@ mod tests {
     #[test]
     fn test_spaced_bare_equals_operator() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "= 1.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.1"), "= 1.0.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.0"),
+            &VersionReq::new("= 1.0.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.1"),
+            &VersionReq::new("= 1.0.0")
+        ));
     }
 
     #[test]
     fn test_exact_version() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2.3"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.4"), "1.2.3"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.3"),
+            &VersionReq::new("1.2.3")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.4"),
+            &VersionReq::new("1.2.3")
+        ));
     }
 
     #[test]
     fn test_partial_version() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "1.2"));
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), &VersionReq::new("1"))
+        );
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.3"),
+            &VersionReq::new("1.2")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("1.2")
+        ));
     }
 
     #[test]
@@ -2580,12 +2972,30 @@ mod tests {
     #[test]
     fn test_v_prefix_stripped() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("v1.24.1"), "^1.24"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3"), "~1.2.3"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("v2.0.0"), ">=2.0.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("v1.0.5"), "1.0.*"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3"), "1.2.3"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("v2.0.0"), "^1.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("v1.24.1"),
+            &VersionReq::new("^1.24")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("v1.2.3"),
+            &VersionReq::new("~1.2.3")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("v2.0.0"),
+            &VersionReq::new(">=2.0.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("v1.0.5"),
+            &VersionReq::new("1.0.*")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("v1.2.3"),
+            &VersionReq::new("1.2.3")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("v2.0.0"),
+            &VersionReq::new("^1.0")
+        ));
     }
 
     /// #534: an uppercase-`V`-prefixed candidate version (real Packagist tags, e.g.
@@ -2595,13 +3005,34 @@ mod tests {
     #[test]
     fn test_uppercase_v_prefix_stripped() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V3.1.0"), "^3.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V1.24.1"), "^1.24"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V1.2.3"), "~1.2.3"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V4.0.0"), ">=3.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V1.0.5"), "1.0.*"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V3.1.0"), "3.1.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("V2.0.0"), "^1.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("V3.1.0"),
+            &VersionReq::new("^3.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("V1.24.1"),
+            &VersionReq::new("^1.24")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("V1.2.3"),
+            &VersionReq::new("~1.2.3")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("V4.0.0"),
+            &VersionReq::new(">=3.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("V1.0.5"),
+            &VersionReq::new("1.0.*")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("V3.1.0"),
+            &VersionReq::new("3.1.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("V2.0.0"),
+            &VersionReq::new("^1.0")
+        ));
     }
 
     /// #534: the requirement side may itself carry an uppercase `V` prefix (bare, or right
@@ -2609,14 +3040,38 @@ mod tests {
     #[test]
     fn test_uppercase_v_prefix_symmetric_on_requirement_side() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "V1.2.3"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V1.2.3"), "V1.2.3"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V1.2.3"), "v1.2.3"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3"), "V1.2.3"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "^V1.2.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.9"), "~V1.2.3"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^V1.2.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.5"), "V1.0.*"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.3"),
+            &VersionReq::new("V1.2.3")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("V1.2.3"),
+            &VersionReq::new("V1.2.3")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("V1.2.3"),
+            &VersionReq::new("v1.2.3")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("v1.2.3"),
+            &VersionReq::new("V1.2.3")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new("^V1.2.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.9"),
+            &VersionReq::new("~V1.2.3")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("^V1.2.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.5"),
+            &VersionReq::new("V1.0.*")
+        ));
     }
 
     /// #534: the wildcard branch with BOTH the candidate version and the requirement
@@ -2625,7 +3080,10 @@ mod tests {
     #[test]
     fn test_uppercase_v_prefix_wildcard_both_sides() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V1.0.5"), "V1.0.*"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("V1.0.5"),
+            &VersionReq::new("V1.0.*")
+        ));
     }
 
     /// #534: uppercase-`V` on the plain comparison-operator branches (`>=`, `<=`, `>`, `<`,
@@ -2633,13 +3091,34 @@ mod tests {
     #[test]
     fn test_uppercase_v_prefix_on_comparison_operators() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), ">=V1.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), ">=V1.0.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "<=V2.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.5.0"), "<V2.0.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.1"), ">V2.0.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "=V2.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "!=V2.0.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new(">=V1.0.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.9.0"),
+            &VersionReq::new(">=V1.0.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new("<=V2.0.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.5.0"),
+            &VersionReq::new("<V2.0.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.1"),
+            &VersionReq::new(">V2.0.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("=V2.0.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("!=V2.0.0")
+        ));
     }
 
     /// #534: a bare uppercase `"V"` requirement must fall through to exact/partial match
@@ -2648,8 +3127,12 @@ mod tests {
     #[test]
     fn test_bare_uppercase_v_requirement_does_not_match_everything() {
         let f = ComposerFormatter;
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "V"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.0.0"), "V"));
+        assert!(
+            !f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), &VersionReq::new("V"))
+        );
+        assert!(
+            !f.version_satisfies_requirement(&ConcreteVersion::new("0.0.0"), &VersionReq::new("V"))
+        );
     }
 
     #[test]
@@ -2657,15 +3140,33 @@ mod tests {
         let f = ComposerFormatter;
         // Exact pin with a `v`-prefixed requirement, matched against an un-prefixed
         // candidate (the common case: registry candidates already had `v` stripped).
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "v1.2.3"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.3"),
+            &VersionReq::new("v1.2.3")
+        ));
         // Both sides `v`-prefixed.
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3"), "v1.2.3"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("v1.2.3"),
+            &VersionReq::new("v1.2.3")
+        ));
         // Operator-prefixed requirement with a `v`-prefixed version literal.
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "^v1.2.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.9"), "~v1.2.3"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^v1.2.0"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new("^v1.2.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.9"),
+            &VersionReq::new("~v1.2.3")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("^v1.2.0")
+        ));
         // Wildcard with a `v`-prefixed requirement.
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.5"), "v1.0.*"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.5"),
+            &VersionReq::new("v1.0.*")
+        ));
     }
 
     /// #424 S2: `strip_stability_flag` recognizes every Composer stability flag word
@@ -2720,9 +3221,18 @@ mod tests {
     #[test]
     fn test_version_satisfies_requirement_at_flag_tilde_range() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.5"), "~1.2.3@beta"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.3.0"), "~1.2.3@beta"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.2"), "~1.2.3@beta"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.5"),
+            &VersionReq::new("~1.2.3@beta")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.3.0"),
+            &VersionReq::new("~1.2.3@beta")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.2"),
+            &VersionReq::new("~1.2.3@beta")
+        ));
     }
 
     /// #424: `composer_version_stability` classifies a version's own qualifier on the same
@@ -2791,16 +3301,38 @@ mod tests {
     #[test]
     fn test_v_prefix_on_comparison_operators() {
         let f = ComposerFormatter;
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), ">=v1.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), ">=v1.0.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "<=v2.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.5.0"), "<v2.0.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.1"), ">v2.0.0"));
-        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "=v2.0.0"));
-        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "!=v2.0.0"));
-        assert!(
-            f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), ">=v1.0.0 <v2.0.0")
-        );
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new(">=v1.0.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("0.9.0"),
+            &VersionReq::new(">=v1.0.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new("<=v2.0.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.5.0"),
+            &VersionReq::new("<v2.0.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.1"),
+            &VersionReq::new(">v2.0.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("=v2.0.0")
+        ));
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("!=v2.0.0")
+        ));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new(">=v1.0.0 <v2.0.0")
+        ));
     }
 
     #[test]

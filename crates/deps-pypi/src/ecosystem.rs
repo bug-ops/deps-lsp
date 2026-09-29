@@ -710,7 +710,7 @@ mod tests {
     // directly) — an unresolved external-templating placeholder there (`$VAR`/`${VAR}`,
     // `{{ }}`, `@VAR@`, `%VAR%`, `<%= %>`) stays a normal `Some(version_requirement)` and
     // reaches `deps_core::edit::plan_vulnerability_fix` directly, depending entirely on
-    // `RequirementResolution::requirement_is_placeholder`'s shared default (`PypiFormatter`
+    // `RequirementResolution::bounded_requirement_is_placeholder`'s shared default (`PypiFormatter`
     // has no override).
     deps_core::unresolved_requirement_conformance! {
         mod pypi_poetry_dollar_placeholder_conformance;

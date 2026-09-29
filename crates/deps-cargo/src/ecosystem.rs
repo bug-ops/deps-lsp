@@ -219,7 +219,7 @@ mod tests {
     // `@VAR@`/`%VAR%`/`<%= %>`-shaped literal in the version slot; the TOML parser has no way
     // to distinguish that from an ordinary string, so it stays a normal
     // `Some(version_requirement)` and reaches `deps_core::edit::plan_vulnerability_fix`
-    // directly — guarded by `RequirementResolution::requirement_is_placeholder`'s shared
+    // directly — guarded by `RequirementResolution::bounded_requirement_is_placeholder`'s shared
     // default (`CargoFormatter` has no override), consulted via
     // `deps_core::edit::requirement_is_placeholder_for`.
     deps_core::unresolved_requirement_conformance! {

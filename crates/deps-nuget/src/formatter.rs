@@ -6,7 +6,7 @@ use deps_core::lsp_helpers::{
     compile_requirement_unless, format_version_replacing_by_shape,
     requirement_contains_template_placeholder,
 };
-use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName, VersionReq};
+use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName};
 
 /// Maximum package ID length NuGet's client-side `PackageIdValidator` accepts.
 const MAX_PACKAGE_ID_LENGTH: usize = 100;
@@ -136,17 +136,22 @@ impl RequirementResolution for NuGetFormatter {
     /// interval-notation ranges (`[1.0,2.0)`) and floating patterns (`1.1.*`).
     ///
     /// Issue #1347 hardening: an unresolved requirement (see
-    /// [`Self::requirement_is_unresolved`]) returns `true` (treated as satisfied) rather than
+    /// [`Self::bounded_requirement_is_unresolved`]) returns `true` (treated as satisfied) rather than
     /// falling into `crate::version::satisfies`, which would otherwise coerce it to a
     /// `0.0.0`-shaped floor matching almost any version — mirrors `MavenFormatter`'s identical
     /// "skip comparison" precedent for its own unresolved-property case, and is what
     /// `deps_core::lsp_helpers::in_use_version`'s `version_matches_requirement` (its
     /// `compile_bounded_requirement`-`None` fallback) calls this method for.
-    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
-        if self.requirement_is_unresolved(&VersionReq::new(requirement)) {
+    fn version_satisfies_bounded_requirement(
+        &self,
+        version: &ConcreteVersion,
+        requirement: BoundedVersionReq<'_>,
+    ) -> bool {
+        if self.bounded_requirement_is_unresolved(requirement) {
             return true;
         }
         let version = version.as_str();
+        let requirement = requirement.as_str();
         if requirement.contains('*') {
             let versions = [version.to_string()];
             return crate::version::resolve_float(&versions, requirement).is_some();
@@ -165,27 +170,25 @@ impl RequirementResolution for NuGetFormatter {
     /// window, so those keep the general satisfies check.
     ///
     /// Issue #1347 hardening: an unresolved requirement (see
-    /// [`Self::requirement_is_unresolved`]) returns `true` (treated as up to date) before
+    /// [`Self::bounded_requirement_is_unresolved`]) returns `true` (treated as up to date) before
     /// reaching `crate::version::compare_minimum_floor`, which would otherwise coerce it to a
     /// `0.0.0`-shaped floor that every `latest` compares `>=` against — the same
-    /// false-"satisfied" coercion [`Self::version_satisfies_requirement`]'s guard above
+    /// false-"satisfied" coercion [`Self::version_satisfies_bounded_requirement`]'s guard above
     /// prevents, needed separately here since this floor branch never calls that method.
     fn is_bounded_requirement_up_to_date(
         &self,
         requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> bool {
-        let requirement = requirement.get();
-        if self.requirement_is_unresolved(requirement) {
+        if self.bounded_requirement_is_unresolved(requirement) {
             return true;
         }
-        let requirement = requirement.as_str();
-        if requirement.contains('*') {
-            return self.version_satisfies_requirement(latest, requirement);
+        if requirement.as_str().contains('*') {
+            return self.version_satisfies_bounded_requirement(latest, requirement);
         }
-        match crate::version::compare_minimum_floor(requirement, latest.as_str()) {
+        match crate::version::compare_minimum_floor(requirement.as_str(), latest.as_str()) {
             Some(ordering) => ordering != std::cmp::Ordering::Less,
-            None => self.version_satisfies_requirement(latest, requirement),
+            None => self.version_satisfies_bounded_requirement(latest, requirement),
         }
     }
 
@@ -205,7 +208,7 @@ impl RequirementResolution for NuGetFormatter {
     /// Mirrors Maven's `${property}` / Gradle's `$var`/`${var}` unresolved-variable guards.
     ///
     /// #1370/#1380: NuGet has no separate "concrete but undecidable ref" case
-    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
+    /// [`Self::bounded_requirement_is_unresolved`] would need to stay broader than this — an
     /// unexpanded MSBuild reference is the only *native* unresolved shape NuGet has, so both
     /// predicates key off the same composed detector, and `requirement_is_unresolved`'s
     /// default delegates here rather than duplicating it.
@@ -215,7 +218,7 @@ impl RequirementResolution for NuGetFormatter {
     /// `{{ }}`/`<%= %>`/`@VAR@`/`%VAR%`/`${VAR}`/`$VAR` forms (NuGet's own `$(` always needs the
     /// paren), so both must be checked — a manifest carrying a generic templating placeholder
     /// from some external tool (`envsubst`, CI templating) is not on its own MSBuild syntax.
-    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+    fn bounded_requirement_is_placeholder(&self, requirement: BoundedVersionReq<'_>) -> bool {
         let requirement = requirement.as_str();
         requirement_contains_template_placeholder(requirement)
             || crate::parser::is_msbuild_reference(requirement)
@@ -232,7 +235,7 @@ impl RequirementResolution for NuGetFormatter {
     /// Issue #1347 hardening: a bare (unbracketed) `$(SomeProperty)` reference is rejected
     /// outright first, before the undecidable-predicate dispatch below — unlike the bracketed
     /// `[$(Min),$(Max))` form, it has no nested-bracket shape for `parse_range` to trip on
-    /// (see [`Self::requirement_is_unresolved`]'s doc), so without this explicit check it
+    /// (see [`Self::bounded_requirement_is_unresolved`]'s doc), so without this explicit check it
     /// would parse as an ordinary lower-bound-only floor and this method would
     /// decisively (and wrongly) report every version as satisfying it. Not a fix for a
     /// reproducible defect, though: `crate::parser` already degrades this input to
@@ -247,8 +250,7 @@ impl RequirementResolution for NuGetFormatter {
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        let requirement = requirement.get();
-        if self.requirement_is_unresolved(requirement) {
+        if self.bounded_requirement_is_unresolved(requirement) {
             return None;
         }
         let requirement = requirement.as_str();
@@ -322,6 +324,7 @@ impl OsvNaming for NuGetFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
 
     #[test]
@@ -546,7 +549,7 @@ mod tests {
         let f = NuGetFormatter;
         assert!(f.version_satisfies_requirement(
             &ConcreteVersion::new("13.0.3"),
-            "$(SomePackageVersion)"
+            &VersionReq::new("$(SomePackageVersion)")
         ));
     }
 
@@ -602,7 +605,7 @@ mod tests {
         let native = f.osv_version_to_native(&osv_version);
         assert_eq!(native, osv_version.as_str());
         let edit_text = f.format_version_for_text_edit(&native);
-        assert!(f.version_satisfies_requirement(&native, &edit_text));
+        assert!(f.version_satisfies_requirement(&native, &VersionReq::new(&edit_text)));
     }
 
     #[test]

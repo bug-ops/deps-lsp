@@ -988,7 +988,7 @@ mod tests {
 
     /// Whether `formatter`'s own comparator (preferring
     /// [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`], falling back to
-    /// [`deps_core::lsp_helpers::RequirementResolution::version_satisfies_requirement`] when it
+    /// [`deps_core::lsp_helpers::RequirementResolution::version_satisfies_bounded_requirement`] when it
     /// declines to compile) treats a bare `requirement` as an exact pin: it must match
     /// `requirement` itself but reject both a higher patch (`"1.2.9"`) and a higher
     /// minor/major (`"9.9.9"`) — the same "matches only this one version" shape
@@ -1024,7 +1024,7 @@ mod tests {
             if let Some(matcher) = formatter.compile_requirement(&requirement) {
                 matcher.matches(&version) == Some(true)
             } else {
-                formatter.version_satisfies_requirement(&version, bare)
+                formatter.version_satisfies_requirement(&version, &VersionReq::new(bare))
             }
         };
 

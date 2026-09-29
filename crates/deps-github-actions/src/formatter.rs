@@ -261,7 +261,7 @@ impl RequirementResolution for GithubActionsFormatter {
     /// corresponding leading components match; a full version is compared component-for-
     /// component. `v`/`V` is normalized off both sides first. An unparseable requirement
     /// (a bare SHA or branch name — neither is dot-separated all-digit) returns `true`,
-    /// never a false "outdated": [`Self::requirement_is_unresolved`] is what actually
+    /// never a false "outdated": [`Self::bounded_requirement_is_unresolved`] is what actually
     /// gates those out of the diagnostic/inlay-hint path; this is only the fallback for a
     /// caller that does not consult that hook first.
     fn is_bounded_requirement_up_to_date(
@@ -299,7 +299,7 @@ impl RequirementResolution for GithubActionsFormatter {
     /// `v`/`V` followed by a digit) is treated as a branch — the "honest unknown" side,
     /// since neither can be resolved to a concrete version without a `TagIndex` lookup
     /// this pure predicate has no access to.
-    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+    fn bounded_requirement_is_unresolved(&self, requirement: BoundedVersionReq<'_>) -> bool {
         let req = requirement.as_str();
         is_full_sha(req) || !is_tag_shaped(req)
     }
@@ -308,7 +308,7 @@ impl RequirementResolution for GithubActionsFormatter {
     /// ref — e.g. `actions/checkout@v4-${{ env.CHECKOUT_REF }}`. Unlike a bare SHA or branch
     /// name, this can sit inside an otherwise [`is_tag_shaped`] ref (`is_tag_shaped` only
     /// inspects the leading characters: an optional `v`/`V` followed by a digit), so it is
-    /// not always caught by [`Self::requirement_is_unresolved`]'s `PinStyle`-free shape check
+    /// not always caught by [`Self::bounded_requirement_is_unresolved`]'s `PinStyle`-free shape check
     /// — the same embedded-placeholder gap `deps-gitlab-ci`'s
     /// `contains_unresolved_gitlab_variable` closes for its own `$VAR`/`${VAR}`/`%VAR%`
     /// syntax. `${{` alone is sufficient: it cannot appear in a SHA (hex-only) or a genuine
@@ -319,7 +319,7 @@ impl RequirementResolution for GithubActionsFormatter {
     /// detector already matches `${{ env.X }}` via its generic `{{ ... }}` rule, so the native
     /// `${{`-prefix check here is kept only to also catch the empty `${{}}`/`${{ }}` form the
     /// shared detector's non-empty-content requirement misses.
-    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+    fn bounded_requirement_is_placeholder(&self, requirement: BoundedVersionReq<'_>) -> bool {
         let requirement = requirement.as_str();
         requirement_contains_template_placeholder(requirement) || requirement.contains("${{")
     }

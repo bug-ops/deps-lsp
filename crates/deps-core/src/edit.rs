@@ -11,8 +11,9 @@
 
 use crate::lsp_helpers::{
     EcosystemFormatter, LineOffsetTable, RequirementGate, RequirementStatus, VersionData,
-    is_safe_version_string, literal_span_matches, resolve_in_use_version, slice_for_range,
-    strip_whitespace, warn_rejected_value,
+    is_safe_version_string, literal_span_matches, requirement_is_oversized,
+    requirement_len_exceeds_cap, resolve_in_use_version, slice_for_range, strip_whitespace,
+    warn_rejected_value,
 };
 use crate::{ConcreteVersion, Dependency, ParseResult, VersionReq};
 
@@ -735,7 +736,7 @@ pub enum UpdateCandidate {
 /// the registry, no declared requirement, an empty requirement, or genuinely up to date) is
 /// not a candidate and produces no entry here — reporting those would be noise, not signal
 /// (most manifest dependencies are exactly this case on any given run). An unexpanded
-/// placeholder ([`crate::lsp_helpers::RequirementResolution::requirement_is_placeholder`],
+/// placeholder ([`crate::lsp_helpers::RequirementResolution::bounded_requirement_is_placeholder`],
 /// #1370) is checked and skipped the same way, independent of whatever status an ecosystem's
 /// own classification logic reports for it — this is one of the four central edit-planning
 /// gates that predicate consults.
@@ -946,11 +947,15 @@ pub enum VulnFixSkip {
     /// to make.
     NoOpRewrite,
     /// `current` is an unexpanded placeholder/interpolation
-    /// ([`crate::lsp_helpers::RequirementResolution::requirement_is_placeholder`]) — there is
+    /// ([`crate::lsp_helpers::RequirementResolution::bounded_requirement_is_placeholder`]) — there is
     /// no concrete version text to replace, so the requirement is never rewritten regardless
     /// of what any other resolution predicate or the formatter's own rewrite logic would do
     /// with it (#1370).
     UnresolvedPlaceholder,
+    /// `current`, the dependency's requirement, or its version literal exceeds
+    /// [`crate::lsp_helpers::MAX_REQUIREMENT_LEN`] — unmodellable text is never rewritten,
+    /// fail-closed and distinct from a placeholder so a caller can report the size cause.
+    OversizedRequirement,
 }
 
 /// Resolves and validates the OSV-recommended fix for `dv`.
@@ -1304,9 +1309,9 @@ pub fn plan_vulnerability_fix(
 ///
 /// # Errors
 ///
-/// Returns [`VulnFixSkip::UnresolvedPlaceholder`], [`VulnFixSkip::RequirementAlreadyResolves`],
-/// or [`VulnFixSkip::NoOpRewrite`] — the three causes that can still make an edit unnecessary
-/// once the fix is already known resolved and verified.
+/// Returns [`VulnFixSkip::OversizedRequirement`], [`VulnFixSkip::UnresolvedPlaceholder`],
+/// [`VulnFixSkip::RequirementAlreadyResolves`], or [`VulnFixSkip::NoOpRewrite`] — the causes
+/// that can still make an edit unnecessary once the fix is already known resolved and verified.
 pub fn plan_verified_fix(
     dep: &dyn Dependency,
     version_range: crate::position::Range,
@@ -1314,6 +1319,19 @@ pub fn plan_verified_fix(
     version_native: &str,
     formatter: &dyn EcosystemFormatter,
 ) -> Result<PlannedUpdate, VulnFixSkip> {
+    // Checked before the placeholder gate: that gate reports oversized text as a placeholder,
+    // which would misattribute a size-based skip to `UnresolvedPlaceholder`.
+    if requirement_len_exceeds_cap(current)
+        || dep
+            .version_requirement()
+            .is_some_and(requirement_is_oversized)
+        || dep
+            .version_literal()
+            .is_some_and(requirement_len_exceeds_cap)
+    {
+        return Err(VulnFixSkip::OversizedRequirement);
+    }
+
     // #1370: central placeholder gate, checked first — an unexpanded placeholder has no
     // concrete version text to replace, independent of whether `bounded_requirement_already_resolves_to`
     // or the formatter's own rewrite logic would coincidentally treat it as safe. Checked
@@ -1946,7 +1964,10 @@ mod tests {
             }
         }
         impl RequirementResolution for ShaPinFormatter {
-            fn requirement_is_unresolved(&self, _requirement: &VersionReq) -> bool {
+            fn bounded_requirement_is_unresolved(
+                &self,
+                _requirement: crate::lsp_helpers::BoundedVersionReq<'_>,
+            ) -> bool {
                 true
             }
         }
@@ -1972,13 +1993,27 @@ mod tests {
         /// `RequirementAlreadyResolves`, even when `bounded_requirement_already_resolves_to` would
         /// otherwise report `true` — proven via `ExactMatchFormatter`'s exact string-equality
         /// matcher, so an oversized requirement identical to the fix target trivially "already
-        /// resolves" without the gate. With the gate, planning proceeds past that check and
-        /// correctly lands on the plain textual no-op guard instead.
+        /// resolves" without the gate. With the gate, planning stops earlier with the distinct
+        /// `OversizedRequirement` skip (#1665) — not `UnresolvedPlaceholder`, which the
+        /// placeholder gate's fail-closed `true` for oversized text would otherwise report; the
+        /// at-cap control proves the size check is a strict `>`, not `>=`.
         #[test]
         fn test_oversized_requirement_does_not_report_already_resolves() {
+            use crate::lsp_helpers::MAX_REQUIREMENT_LEN;
             use crate::lsp_helpers::test_support::ExactMatchFormatter;
 
-            let oversized = "1".repeat(300);
+            let at_cap = "1".repeat(MAX_REQUIREMENT_LEN);
+            let d = dep(
+                "serde",
+                &at_cap,
+                range(0, 8, 0, 8 + u32::try_from(at_cap.len()).unwrap()),
+            );
+            assert_eq!(
+                plan_verified_fix(&d, d.version_range, &at_cap, &at_cap, &ExactMatchFormatter),
+                Err(VulnFixSkip::RequirementAlreadyResolves)
+            );
+
+            let oversized = "1".repeat(MAX_REQUIREMENT_LEN + 1);
             let d = dep(
                 "serde",
                 &oversized,
@@ -1993,7 +2028,73 @@ mod tests {
                 &ExactMatchFormatter,
             );
 
-            assert_eq!(planned, Err(VulnFixSkip::NoOpRewrite));
+            assert_eq!(planned, Err(VulnFixSkip::OversizedRequirement));
+        }
+
+        /// #1665: the oversized check also covers the dependency's own requirement and version
+        /// literal, not only the `current` text a caller passes in — each arm alone must yield
+        /// `OversizedRequirement` rather than a placeholder or rewrite verdict.
+        #[test]
+        fn test_oversized_dependency_requirement_or_literal_is_oversized_skip() {
+            use crate::lsp_helpers::MAX_REQUIREMENT_LEN;
+            use crate::lsp_helpers::test_support::ExactMatchFormatter;
+
+            struct LiteralDep {
+                inner: MockDep,
+                literal: String,
+            }
+            impl Dependency for LiteralDep {
+                fn name(&self) -> &PackageName {
+                    self.inner.name()
+                }
+                fn name_range(&self) -> crate::position::Range {
+                    self.inner.name_range()
+                }
+                fn version_requirement(&self) -> Option<&VersionReq> {
+                    self.inner.version_requirement()
+                }
+                fn version_range(&self) -> Option<crate::position::Range> {
+                    self.inner.version_range()
+                }
+                fn version_literal(&self) -> Option<&str> {
+                    Some(&self.literal)
+                }
+                fn source(&self) -> crate::parser::DependencySource {
+                    self.inner.source()
+                }
+                fn as_any(&self) -> &dyn std::any::Any {
+                    self
+                }
+            }
+
+            let oversized = "1".repeat(MAX_REQUIREMENT_LEN + 1);
+
+            let oversized_requirement = dep("serde", &oversized, range(0, 8, 0, 9));
+            assert_eq!(
+                plan_verified_fix(
+                    &oversized_requirement,
+                    oversized_requirement.version_range,
+                    "1",
+                    "2",
+                    &ExactMatchFormatter,
+                ),
+                Err(VulnFixSkip::OversizedRequirement)
+            );
+
+            let oversized_literal = LiteralDep {
+                inner: dep("serde", "1", range(0, 8, 0, 9)),
+                literal: oversized,
+            };
+            assert_eq!(
+                plan_verified_fix(
+                    &oversized_literal,
+                    range(0, 8, 0, 9),
+                    "1",
+                    "2",
+                    &ExactMatchFormatter,
+                ),
+                Err(VulnFixSkip::OversizedRequirement)
+            );
         }
 
         /// A requirement the comparator confirms does NOT admit the fix target must still

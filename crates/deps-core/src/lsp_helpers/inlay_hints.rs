@@ -919,29 +919,77 @@ mod tests {
         let formatter = MOCK_FORMATTER;
 
         // ^0.2 should only allow 0.2.x
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.2.0"), "^0.2"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.2.5"), "^0.2"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.2.99"), "^0.2"));
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("0.2.0"),
+            &VersionReq::new("^0.2")
+        ));
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("0.2.5"),
+            &VersionReq::new("^0.2")
+        ));
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("0.2.99"),
+            &VersionReq::new("^0.2")
+        ));
 
         // ^0.2 should NOT allow 0.3.x or 0.1.x
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("0.3.0"), "^0.2"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("0.1.0"), "^0.2"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "^0.2"));
+        assert!(!formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("0.3.0"),
+            &VersionReq::new("^0.2")
+        ));
+        assert!(!formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("0.1.0"),
+            &VersionReq::new("^0.2")
+        ));
+        assert!(!formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.0"),
+            &VersionReq::new("^0.2")
+        ));
 
         // ^0.0.3 should only allow 0.0.3 (left-most non-zero is patch)
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.0.3"), "^0.0.3"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.0.3"), "^0.0"));
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("0.0.3"),
+            &VersionReq::new("^0.0.3")
+        ));
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("0.0.3"),
+            &VersionReq::new("^0.0")
+        ));
         // ^0.0.3 should NOT allow 0.0.2 (below the floor) or 0.0.4 (past the ceiling).
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("0.0.2"), "^0.0.3"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("0.0.4"), "^0.0.3"));
+        assert!(!formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("0.0.2"),
+            &VersionReq::new("^0.0.3")
+        ));
+        assert!(!formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("0.0.4"),
+            &VersionReq::new("^0.0.3")
+        ));
 
         // ^0 should only allow 0.x.y (major is 0)
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.0.0"), "^0"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), "^0"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "^0"));
+        assert!(
+            formatter.version_satisfies_requirement(
+                &ConcreteVersion::new("0.0.0"),
+                &VersionReq::new("^0")
+            )
+        );
+        assert!(
+            formatter.version_satisfies_requirement(
+                &ConcreteVersion::new("0.5.0"),
+                &VersionReq::new("^0")
+            )
+        );
+        assert!(
+            !formatter.version_satisfies_requirement(
+                &ConcreteVersion::new("1.0.0"),
+                &VersionReq::new("^0")
+            )
+        );
 
         // ^0.0 should NOT allow 0.1.0 (past the ceiling).
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("0.1.0"), "^0.0"));
+        assert!(!formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("0.1.0"),
+            &VersionReq::new("^0.0")
+        ));
     }
 
     #[test]
@@ -950,14 +998,32 @@ mod tests {
 
         // ^1.2 allows [1.2.0, 2.0.0) — same major, but never below the requirement's own
         // minor floor (#1622).
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "^1.2"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.9.9"), "^1.2"));
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.0"),
+            &VersionReq::new("^1.2")
+        ));
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("1.9.9"),
+            &VersionReq::new("^1.2")
+        ));
 
         // ^1.2 should NOT allow 2.x.x, nor a same-major version below the minor floor.
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^1.2"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), "^1.2"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "^1.2"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.1.9"), "^1.2"));
+        assert!(!formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("^1.2")
+        ));
+        assert!(!formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("0.9.0"),
+            &VersionReq::new("^1.2")
+        ));
+        assert!(!formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.0"),
+            &VersionReq::new("^1.2")
+        ));
+        assert!(!formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("1.1.9"),
+            &VersionReq::new("^1.2")
+        ));
     }
 
     /// #1622 regression: `^X.Y` must enforce its own minor/patch lower bound, not just the
@@ -966,10 +1032,22 @@ mod tests {
     fn test_caret_requirement_enforces_minor_lower_bound() {
         let formatter = MOCK_FORMATTER;
 
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), "^1.5"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "^1.5"));
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.9.0"), "^1.5"));
-        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^1.5"));
+        assert!(!formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("1.1.0"),
+            &VersionReq::new("^1.5")
+        ));
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new("^1.5")
+        ));
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("1.9.0"),
+            &VersionReq::new("^1.5")
+        ));
+        assert!(!formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("^1.5")
+        ));
     }
 
     #[test]
