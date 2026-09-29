@@ -77,7 +77,8 @@ pub use formatter::{
     BareMeaning, DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming,
     PackageNaming, PackageRendering, RequirementGate, RequirementResolution,
     RequirementRewriteShape, SourcePolicy, bare_meaning, classify_requirement_rewrite_shape,
-    format_version_replacing_by_shape, requirement_is_compound, up_to_date_via_compiled_matcher,
+    format_version_replacing_by_shape, requirement_is_compound,
+    up_to_date_for_comparators_via_compiled_matcher, up_to_date_via_compiled_matcher,
 };
 pub use git_ref::{
     CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, TagIndex, byte_span_to_range, is_full_sha,
