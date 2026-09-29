@@ -2,13 +2,14 @@
 
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNameAvailability, OsvNaming,
-    PackageNaming, PackageRendering, RequirementResolution, RequirementStatus, ResolvedPin,
-    SourcePolicy, TagIndex, match_v_prefix_style, requirement_contains_template_placeholder,
+    BoundedVersionReq, CommitSha, DiagnosticMessages, DiagnosticPolicy, OsvNameAvailability,
+    OsvNaming, PackageNaming, PackageRendering, RequirementResolution, RequirementStatus,
+    ResolvedPin, SourcePolicy, TagIndex, concrete_pin_version, extends_tag,
+    is_partial_semver_shaped, match_v_prefix_style, requirement_contains_template_placeholder,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
-    ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq,
+    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName, VersionReq,
     lsp_helpers::warn_rejected_value,
 };
 use std::sync::Arc;
@@ -357,16 +358,28 @@ impl RequirementResolution for GithubActionsFormatter {
     /// its own `version_req`) is just as eligible. `None` on any `TagIndex` miss (cold
     /// cache, or a SHA no currently-fetched tag points at) — the honest "unknown", not a
     /// fabricated version.
+    ///
+    /// #1684: a floating tag pin (`@v4`) resolves the same way through the commit its tag
+    /// points at, see `Self::pinned_commit`, but only to a release that extends (or equals)
+    /// the written tag (candidates are filtered before the most specific is picked): a commit
+    /// that also carries an unrelated `v5.0.0` must not be scanned as that version.
     fn resolved_pin_version(&self, dep: &dyn Dependency) -> Option<ResolvedPin> {
         let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-        if !matches!(gha_dep.pin, Some(PinStyle::Sha { .. })) {
-            return None;
+        let commit = self.pinned_commit(gha_dep)?;
+        let index = self.tag_index.get(dep.name())?;
+        if gha_dep.pin != Some(PinStyle::Tag) {
+            return index.resolved_pin(commit.as_str());
         }
-        let sha = crate::types::sha_pin_raw_sha(gha_dep)?;
-        if !is_full_sha(sha) {
-            return None;
-        }
-        self.tag_index.get(dep.name())?.resolved_pin(sha)
+        let written = gha_dep.version_req.as_ref()?.as_str();
+        let candidates: Vec<(&str, &CommitSha)> = index
+            .tag_to_sha
+            .iter()
+            .filter(|(tag, sha)| {
+                **sha == commit && (tag.as_str() == written || extends_tag(tag, written))
+            })
+            .map(|(tag, sha)| (tag.as_str(), sha))
+            .collect();
+        TagIndex::from_tags(candidates).resolved_pin(commit.as_str())
     }
 
     /// `tag_index` is populated as a side effect of [`GithubActionsRegistry`]'s own tags
@@ -379,6 +392,34 @@ impl RequirementResolution for GithubActionsFormatter {
 }
 
 impl GithubActionsFormatter {
+    /// The commit `gha_dep` is pinned to: the raw SHA of a full-SHA pin, or the commit a
+    /// *floating* tag pin (`@v4`, `@v4.1` — partial-semver-shaped but not a concrete
+    /// version) currently points at per the `TagIndex` (#1684).
+    ///
+    /// Commit-based rather than "highest semver under `v4`": the commit is the release the
+    /// runner actually executes, which differs when a major tag lags behind. Exact tags
+    /// (`@v4.1.2`), branches and any `TagIndex` miss (cold cache, exact-text key absent)
+    /// yield `None`, keeping exact tags on the text path.
+    pub(crate) fn pinned_commit(&self, gha_dep: &GithubActionsDependency) -> Option<CommitSha> {
+        match &gha_dep.pin {
+            Some(PinStyle::Sha { .. }) => CommitSha::parse(crate::types::sha_pin_raw_sha(gha_dep)?),
+            Some(PinStyle::Tag) => {
+                let tag = gha_dep.version_req.as_ref()?.as_str();
+                let floating = is_partial_semver_shaped(tag)
+                    && concrete_pin_version(tag, EcosystemId::GithubActions).is_none();
+                if !floating {
+                    return None;
+                }
+                self.tag_index
+                    .get(&gha_dep.name)?
+                    .tag_to_sha
+                    .get(tag)
+                    .cloned()
+            }
+            Some(PinStyle::Branch) | None => None,
+        }
+    }
+
     /// Ground-truth status for a comment-annotated SHA pin whose commit is indexed in
     /// `tag_index` — see [`RequirementResolution::classify_requirement_status_for`]. `None`
     /// when `dep` isn't such a pin, or the SHA has no `TagIndex` entry yet.
@@ -430,12 +471,15 @@ impl DiagnosticPolicy for GithubActionsFormatter {}
 impl SourcePolicy for GithubActionsFormatter {}
 
 impl OsvNaming for GithubActionsFormatter {
-    /// Awaiting until the repository's tags response confirmed its canonical casing.
+    /// Awaiting until the repository's tags response confirmed its canonical casing; the
+    /// written name is offered meanwhile as a provisional query name (#1694).
     fn osv_name_availability(&self, dep: &dyn Dependency) -> OsvNameAvailability {
         if self.osv_package_name(dep).is_some() {
             OsvNameAvailability::Ready
         } else {
-            OsvNameAvailability::AwaitingRegistryData
+            OsvNameAvailability::AwaitingRegistryData {
+                written_fallback: deps_core::osv::OsvPackageName::new_or_skip(dep.name().as_str()),
+            }
         }
     }
 
@@ -1235,6 +1279,115 @@ mod tests {
         );
     }
 
+    fn floating_tag_pin_for(tag: &str, indexed: &[(&str, &str)]) -> Option<ResolvedPin> {
+        let fmt = formatter();
+        let commits: Vec<(&str, CommitSha)> = indexed
+            .iter()
+            .map(|(name, sha)| (*name, CommitSha::parse(sha).unwrap()))
+            .collect();
+        let index = TagIndex::from_tags(commits.iter().map(|(name, sha)| (*name, sha)));
+        fmt.tag_index
+            .insert(PackageName::new("actions/checkout"), Arc::new(index));
+        let mut d = dep(Some(PinStyle::Tag), "actions/checkout", None);
+        d.version_req = Some(tag.into());
+        fmt.resolved_pin_version(&d)
+    }
+
+    /// #1684: a floating tag pin resolves through the commit its tag points at.
+    #[test]
+    fn test_resolved_pin_version_floating_tag_resolves_via_commit() {
+        let sha = "a".repeat(40);
+        let warm = [("v4", sha.as_str()), ("v4.2.2", sha.as_str())];
+        assert_eq!(
+            floating_tag_pin_for("v4", &warm),
+            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v4.2.2")))
+        );
+        assert_eq!(
+            floating_tag_pin_for("v4", &[("v4", sha.as_str())]),
+            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v4")))
+        );
+    }
+
+    /// #1684: the commit, not the highest semver under `v4`, decides — a lagging major tag
+    /// resolves to the release it really points at.
+    #[test]
+    fn test_resolved_pin_version_floating_tag_lagging_major_uses_commit() {
+        let old = "a".repeat(40);
+        let new = "b".repeat(40);
+        let tags = [
+            ("v4", old.as_str()),
+            ("v4.1.0", old.as_str()),
+            ("v4.2.0", new.as_str()),
+        ];
+        assert_eq!(
+            floating_tag_pin_for("v4", &tags),
+            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v4.1.0")))
+        );
+    }
+
+    /// #1684 (security): a release on the commit that does not extend the written floating tag
+    /// is never adopted as the pin's version.
+    #[test]
+    fn test_resolved_pin_version_floating_tag_ignores_unrelated_release() {
+        let sha = "a".repeat(40);
+        for other in ["v5.0.0", "v99.0.0"] {
+            let tags = [("v4", sha.as_str()), (other, sha.as_str())];
+            assert_eq!(
+                floating_tag_pin_for("v4", &tags),
+                Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v4"))),
+                "{other}: only the written tag itself remains, which is not a full version"
+            );
+        }
+        let tags = [("v4", sha.as_str()), ("v4.2.2", sha.as_str())];
+        assert_eq!(
+            floating_tag_pin_for("v4", &tags),
+            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v4.2.2")))
+        );
+        let tags = [
+            ("v4", sha.as_str()),
+            ("v4.2.2", sha.as_str()),
+            ("v5.0.0", sha.as_str()),
+        ];
+        assert_eq!(
+            floating_tag_pin_for("v4", &tags),
+            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v4.2.2")))
+        );
+    }
+
+    /// #1684 (critic N3): exact tags, missing tags and a cold index stay on the text path.
+    #[test]
+    fn test_resolved_pin_version_exact_or_unindexed_tag_returns_none() {
+        let sha = "a".repeat(40);
+        let warm = [("v4", sha.as_str()), ("v4.1.2", sha.as_str())];
+        assert_eq!(floating_tag_pin_for("v4.1.2", &warm), None);
+        assert_eq!(floating_tag_pin_for("v5", &warm), None);
+        assert_eq!(floating_tag_pin_for("V4", &warm), None);
+        assert_eq!(floating_tag_pin_for("v4", &[]), None);
+    }
+
+    /// #1684: the shared `pinned_commit` helper returns `None` for an exact tag even when
+    /// the index carries it (hover and `resolved_pin_version` both rely on this).
+    #[test]
+    fn test_pinned_commit_exact_tag_is_none_floating_is_some() {
+        let sha = "c".repeat(40);
+        let fmt = formatter();
+        let mut index = TagIndex::default();
+        for tag in ["v4", "v4.1.2"] {
+            index
+                .tag_to_sha
+                .insert(tag.to_string(), CommitSha::parse(&sha).unwrap());
+        }
+        fmt.tag_index
+            .insert(PackageName::new("actions/checkout"), Arc::new(index));
+        let mut d = dep(Some(PinStyle::Tag), "actions/checkout", None);
+        assert_eq!(
+            fmt.pinned_commit(&d).map(|c| c.as_str().to_string()),
+            Some(sha)
+        );
+        d.version_req = Some("v4.1.2".into());
+        assert_eq!(fmt.pinned_commit(&d), None);
+    }
+
     fn resolved_pin_for_tags(tags: &[&str]) -> Option<ResolvedPin> {
         let sha = "a".repeat(40);
         let commit = CommitSha::parse(&sha).unwrap();
@@ -1850,7 +2003,11 @@ mod tests {
         assert_eq!(formatter.osv_package_name(dep), None, "cold index");
         assert_eq!(
             formatter.osv_name_availability(dep),
-            OsvNameAvailability::AwaitingRegistryData
+            OsvNameAvailability::AwaitingRegistryData {
+                written_fallback: deps_core::osv::OsvPackageName::new_or_skip(
+                    "azure/setup-kubectl"
+                ),
+            }
         );
 
         formatter

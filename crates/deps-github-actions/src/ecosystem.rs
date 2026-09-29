@@ -285,13 +285,13 @@ impl Ecosystem for GithubActionsEcosystem {
     /// makes a stale or hand-edited `# vX.Y.Z` comment visible for free (M4): the tag
     /// shown here comes from `TagIndex.sha_to_tag`, not from trusting the comment text.
     ///
-    /// Scoped to [`PinStyle::Sha`] only — the SHA is the one pin form GitHub itself does
-    /// not render as a readable version, so it is the only form where naming the tag it
-    /// resolves to adds information; a `PinStyle::Tag` pin already shows the tag text
-    /// directly. Guarded on `dep.version_range().is_some()` (N3): a non-resolvable
-    /// dependency (a reusable-workflow call, `./local`, `docker://…`) still matches the
-    /// shared helper's own hover-target predicate and must not have a `**Resolved**` line
-    /// spliced onto it.
+    /// Scoped to [`PinStyle::Sha`] and floating [`PinStyle::Tag`] pins (`@v4`, #1684) —
+    /// the two forms where the pinned commit names a more specific release than the
+    /// written text; an exact tag already shows its own version, and a floating tag whose
+    /// commit only carries that same tag is not spliced (the line would be a tautology).
+    /// Guarded on `dep.version_range().is_some()` (N3): a non-resolvable dependency (a
+    /// reusable-workflow call, `./local`, `docker://…`) still matches the shared helper's
+    /// own hover-target predicate and must not have a `**Resolved**` line spliced onto it.
     #[cfg(feature = "lsp-responses")]
     fn generate_hover<'a>(
         &'a self,
@@ -342,21 +342,29 @@ impl Ecosystem for GithubActionsEcosystem {
                 hover.push_markdown(deps_core::lsp_helpers::CMD_DOT_FOOTER);
             }
 
-            let Some(sha) = crate::types::sha_pin_raw_sha(gha_dep) else {
+            let Some(sha) = self.formatter.pinned_commit(gha_dep) else {
                 return Some(hover);
             };
 
+            use deps_core::lsp_helpers::RequirementResolution;
             let Some(resolved_tag) = self
                 .formatter
-                .tag_index
-                .get(dep.name())
-                .and_then(|index| index.tag_for_sha(sha).map(str::to_string))
+                .resolved_pin_version(dep)
+                .map(|pin| pin.version().as_str().to_string())
             else {
                 return Some(hover);
             };
 
+            let written_tag = gha_dep
+                .version_req
+                .as_ref()
+                .map(deps_core::VersionReq::as_str);
+            if gha_dep.pin == Some(PinStyle::Tag) && written_tag == Some(resolved_tag.as_str()) {
+                return Some(hover);
+            }
+
             hover.rewrite_markdown(|md| {
-                deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, sha)
+                deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, sha.as_str())
             });
 
             Some(hover)
@@ -1567,6 +1575,120 @@ mod tests {
              got: {}",
                 content
             );
+        }
+
+        /// A SHA pin's `Resolved` line names the tag `TagIndex` ranks most specific for the
+        /// commit, even when the commit carries several (including unrelated) tags.
+        #[tokio::test]
+        async fn test_generate_hover_sha_pin_resolved_uses_most_specific_tag() {
+            let sha = "a".repeat(40);
+            let cache = Arc::new(deps_core::HttpCache::new());
+            cache.set_offline(deps_core::NetworkMode::Offline);
+            let eco = GithubActionsEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = format!("steps:\n  - uses: actions/checkout@{sha} # v4\n");
+            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let commit = deps_core::lsp_helpers::CommitSha::parse(&sha).unwrap();
+            let index =
+                TagIndex::from_tags(["v4", "v4.2.2", "v5.0.0"].into_iter().map(|t| (t, &commit)));
+            eco.formatter.tag_index.insert(
+                deps_core::PackageName::new("actions/checkout"),
+                Arc::new(index),
+            );
+            let expected = index_most_specific(&sha);
+
+            let position = parse_result.dependencies()[0].name_range().start.into();
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            let md = eco
+                .generate_hover(
+                    parse_result.as_ref(),
+                    position,
+                    deps_core::VersionData::new(&cached, &resolved)
+                        .with_network(deps_core::NetworkMode::Offline),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await
+                .expect("hover")
+                .markdown()
+                .to_string();
+            assert!(
+                md.contains(&format!("**Resolved**: `{expected}`")),
+                "got: {md}"
+            );
+        }
+
+        fn index_most_specific(sha: &str) -> String {
+            let commit = deps_core::lsp_helpers::CommitSha::parse(sha).unwrap();
+            TagIndex::from_tags(["v4", "v4.2.2", "v5.0.0"].into_iter().map(|t| (t, &commit)))
+                .tag_for_sha(sha)
+                .unwrap()
+                .to_string()
+        }
+
+        async fn floating_tag_hover(uses_ref: &str, tags: &[(&str, char)]) -> String {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            cache.set_offline(deps_core::NetworkMode::Offline);
+            let eco = GithubActionsEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = format!("steps:\n  - uses: actions/checkout@{uses_ref}\n");
+            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+
+            let commits: Vec<(&str, deps_core::lsp_helpers::CommitSha)> = tags
+                .iter()
+                .map(|(tag, c)| {
+                    (
+                        *tag,
+                        deps_core::lsp_helpers::CommitSha::parse(&c.to_string().repeat(40))
+                            .unwrap(),
+                    )
+                })
+                .collect();
+            let index = TagIndex::from_tags(commits.iter().map(|(t, c)| (*t, c)));
+            eco.formatter.tag_index.insert(
+                deps_core::PackageName::new("actions/checkout"),
+                Arc::new(index),
+            );
+
+            let position = parse_result.dependencies()[0].name_range().start.into();
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            eco.generate_hover(
+                parse_result.as_ref(),
+                position,
+                deps_core::VersionData::new(&cached, &resolved)
+                    .with_network(deps_core::NetworkMode::Offline),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover")
+            .markdown()
+            .to_string()
+        }
+
+        /// #1684: a floating `@v4` with a warm index names the release its commit carries.
+        #[tokio::test]
+        async fn test_generate_hover_floating_tag_shows_resolved_release() {
+            let md = floating_tag_hover("v4", &[("v4", 'a'), ("v4.2.2", 'a')]).await;
+            assert!(
+                md.contains("**Resolved**: `v4.2.2` (`aaaaaaa…`)"),
+                "got: {md}"
+            );
+        }
+
+        /// #1684 (critic N4): a commit carrying only the written tag would yield a
+        /// tautological `Resolved v4` line.
+        #[tokio::test]
+        async fn test_generate_hover_floating_tag_without_specific_release_omits_resolved() {
+            let md = floating_tag_hover("v4", &[("v4", 'a')]).await;
+            assert!(!md.contains("**Resolved**"), "got: {md}");
+        }
+
+        /// #1684: an exact tag keeps showing only its own text.
+        #[tokio::test]
+        async fn test_generate_hover_exact_tag_omits_resolved() {
+            let md = floating_tag_hover("v4.2.2", &[("v4", 'a'), ("v4.2.2", 'a')]).await;
+            assert!(!md.contains("**Resolved**"), "got: {md}");
         }
 
         /// A `PinStyle::Tag` step with no `TagIndex` entry (true cold start, nothing ever

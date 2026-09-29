@@ -74,8 +74,14 @@ without a version and matches their affected ranges locally against the pinned v
 
 - A full SemVer pin (`@v4.1.2`, or a SHA pin whose tag resolves to one) is checked; an advisory
   whose range contains it produces the usual vulnerability hover and diagnostic.
-- A floating tag (`@v4`), a SHA pin with no resolvable tag, or any other non-SemVer pin is shown
-  as "not checked" in the hover footer (`UnmatchableVersion`), never as clean.
+- A floating tag (`@v4`, `@v4.1`) is resolved through the commit the tag currently points at, using
+  the same tags fetch as SHA pins: the most specific release tag on that commit that extends the
+  written tag (`v4.2.2` for `@v4`) is the version that is checked, and hover shows it as
+  `Resolved`. This is a snapshot taken at scan time: if the tag later moves to another commit,
+  the result is refreshed only when the tags are next fetched. If the commit carries no such
+  release (for example only `v4`, or an unrelated `v5.0.0`), the tag index is not loaded yet, or
+  the pin is a bare major (`@4`), a SHA pin with no resolvable tag, or any other non-SemVer pin,
+  it is shown as "not checked", never as clean.
 - An advisory exists for the package but its affected range cannot be evaluated: a diagnostic
   notes that vulnerability data was not checked (`UnevaluableAdvisoryRange`).
 - A package with more than 50 advisories is reported as truncated rather than partially matched.
@@ -83,9 +89,16 @@ without a version and matches their affected ranges locally against the pinned v
 OSV.dev package names are case-sensitive, so the queried name is the repository's canonical
 `owner/repo` casing taken from the GitHub tags response (a lowercase `uses:` value still
 matches). Vulnerability checking therefore depends on the GitHub tags fetch and its API quota
-(60 requests/hour unauthenticated; set `GITHUB_TOKEN` to raise it): until the casing is
-confirmed, or when the fetch fails, the dependency is shown as "not checked", never as clean.
+(60 requests/hour unauthenticated; set `GITHUB_TOKEN` to raise it).
 
-**Known limitations**: floating tags are not resolved to a precise release (#1684), and a
-renamed or transferred repository is queried only under its current GitHub name, so an advisory
-OSV.dev still files under the old name is not matched.
+Until the casing is confirmed (or when the tags fetch fails or the repository is private), the
+name as written in the manifest is queried instead, and only a positive result is trusted: an
+advisory found under the written name is reported, while an empty or non-matching answer stays
+"not checked" (`CanonicalNameUnconfirmed`), never clean. Such a result is re-checked under the
+canonical casing once the tags arrive, and a recommended fix is not offered as verified for it.
+Because of this fallback, the written `owner/repo` of a private repository is sent to osv.dev
+whenever its canonical name cannot be confirmed, as it was before canonical-name resolution.
+
+**Known limitations**: a renamed or transferred repository is queried only under its current
+GitHub name once confirmed, so an advisory OSV.dev still files under the old name is not
+matched.

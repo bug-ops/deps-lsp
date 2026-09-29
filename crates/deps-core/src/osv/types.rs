@@ -404,6 +404,57 @@ mod osv_package_name_tests {
     }
 }
 
+/// The package name a [`ScanTarget`] is queried under, tagged with how far a *negative* answer
+/// for it can be trusted.
+///
+/// OSV's `GitHub Actions` names are exact-case, so a name that is not confirmed canonical may
+/// simply be the wrong spelling: a hit on it is real (OSV matched that exact name), but an empty
+/// result proves nothing. Carrying the distinction in the type — with no `AsRef<str>` and no
+/// default — forces every producer to state it and every consumer to match on it.
+///
+/// `Debug` prints the variant and the redacted name.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::{OsvPackageName, OsvQueryName};
+///
+/// let name = OsvPackageName::new("actions/checkout").unwrap();
+/// assert_eq!(OsvQueryName::Confirmed(name.clone()).name(), &name);
+/// assert_eq!(OsvQueryName::Provisional(name.clone()).name(), &name);
+/// ```
+#[derive(Clone, PartialEq, Eq)]
+pub enum OsvQueryName {
+    /// The canonical name; both positive and negative results are authoritative.
+    Confirmed(OsvPackageName),
+    /// The name as written in the manifest; only a positive result is authoritative, a clean
+    /// result stays unchecked.
+    Provisional(OsvPackageName),
+}
+
+impl OsvQueryName {
+    /// The wrapped name, regardless of trust — for the wire, cache keys and advisory matching,
+    /// where the result for an exact name is objective.
+    #[must_use]
+    pub const fn name(&self) -> &OsvPackageName {
+        match self {
+            Self::Confirmed(name) | Self::Provisional(name) => name,
+        }
+    }
+}
+
+impl fmt::Debug for OsvQueryName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (variant, name) = match self {
+            Self::Confirmed(name) => ("Confirmed", name),
+            Self::Provisional(name) => ("Provisional", name),
+        };
+        f.debug_tuple(variant)
+            .field(&crate::redact::redact_declaration_key(name.as_str()))
+            .finish()
+    }
+}
+
 /// One dependency to query against OSV.
 ///
 /// Four distinct strings, deliberately: `key` is this project's internal
@@ -426,16 +477,16 @@ mod osv_package_name_tests {
 ///
 /// ```
 /// use deps_core::ConcreteVersion;
-/// use deps_core::osv::{OsvPackageName, OsvVersion, ScanTarget};
+/// use deps_core::osv::{OsvPackageName, OsvQueryName, OsvVersion, ScanTarget};
 /// use deps_core::test_util::vuln_key;
 ///
 /// let target = ScanTarget::new(
 ///     vuln_key("time"),
-///     OsvPackageName::new("time").unwrap(),
+///     OsvQueryName::Confirmed(OsvPackageName::new("time").unwrap()),
 ///     OsvVersion::new("0.1.43"),
 ///     ConcreteVersion::new("0.1.43"),
 /// );
-/// assert!(target.osv_name == target.key.as_str());
+/// assert!(*target.osv_name.name() == target.key.as_str());
 /// ```
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, crate::redact_debug::RedactingDebug)]
@@ -443,9 +494,9 @@ pub struct ScanTarget {
     /// This project's internal lookup key — used to key [`VulnerabilityMap`].
     #[redact(key)]
     pub key: VulnKey,
-    /// OSV's canonical package name for this ecosystem — sent on the wire.
-    #[redact(key)]
-    pub osv_name: OsvPackageName,
+    /// The package name to send on the wire, with the trust its negative answer deserves.
+    #[raw]
+    pub osv_name: OsvQueryName,
     /// Concrete version to query, resolved per the version-selection policy
     /// and rewritten to OSV's wire spelling via
     /// `EcosystemFormatter::osv_version`. Never surface this to the user —
@@ -473,8 +524,9 @@ impl ScanTarget {
     ///
     /// * `key` - This project's internal lookup key — used to key [`VulnerabilityMap`],
     ///   **not** what gets sent to OSV
-    /// * `osv_name` - OSV's canonical package name for this ecosystem — sent on the wire,
-    ///   distinct from `key` because the two do not always round-trip (see [`Self::key`]'s docs)
+    /// * `osv_name` - OSV's package name for this ecosystem — sent on the wire, distinct from
+    ///   `key` because the two do not always round-trip (see [`Self::key`]'s docs) — with its
+    ///   trust level
     /// * `version` - Concrete version rewritten to OSV's wire spelling
     ///   (`EcosystemFormatter::osv_version`) — sent to OSV, never shown to the user
     /// * `display_version` - The same version in the ecosystem's native spelling, for
@@ -482,7 +534,7 @@ impl ScanTarget {
     #[must_use]
     pub fn new(
         key: VulnKey,
-        osv_name: OsvPackageName,
+        osv_name: OsvQueryName,
         version: OsvVersion,
         display_version: ConcreteVersion,
     ) -> Self {
@@ -503,7 +555,7 @@ impl ScanTarget {
     /// ```
     /// use deps_core::ConcreteVersion;
     /// use deps_core::lsp_helpers::OsvNaming;
-    /// use deps_core::osv::{OsvPackageName, ScanTarget};
+    /// use deps_core::osv::{OsvPackageName, OsvQueryName, ScanTarget};
     /// use deps_core::test_util::vuln_key;
     ///
     /// struct DefaultFormatter;
@@ -511,7 +563,7 @@ impl ScanTarget {
     ///
     /// let target = ScanTarget::from_native(
     ///     vuln_key("time"),
-    ///     OsvPackageName::new("time").unwrap(),
+    ///     OsvQueryName::Confirmed(OsvPackageName::new("time").unwrap()),
     ///     ConcreteVersion::new("0.1.43"),
     ///     &DefaultFormatter,
     /// );
@@ -521,7 +573,7 @@ impl ScanTarget {
     #[must_use]
     pub fn from_native(
         key: VulnKey,
-        osv_name: OsvPackageName,
+        osv_name: OsvQueryName,
         native: ConcreteVersion,
         naming: &dyn crate::lsp_helpers::OsvNaming,
     ) -> Self {
@@ -532,7 +584,7 @@ impl ScanTarget {
 
 #[cfg(test)]
 mod scan_target_debug_redaction_tests {
-    use super::{OsvPackageName, OsvVersion, ScanTarget, VulnKey};
+    use super::{OsvPackageName, OsvQueryName, OsvVersion, ScanTarget, VulnKey};
     use crate::ConcreteVersion;
 
     crate::debug_redaction_conformance!(
@@ -540,7 +592,9 @@ mod scan_target_debug_redaction_tests {
         2,
         ScanTarget {
             key: VulnKey(crate::conformance::CREDENTIAL_PROBE_KEY.into()),
-            osv_name: OsvPackageName::new(crate::conformance::CREDENTIAL_PROBE_KEY).unwrap(),
+            osv_name: OsvQueryName::Confirmed(
+                OsvPackageName::new(crate::conformance::CREDENTIAL_PROBE_KEY).unwrap()
+            ),
             version: OsvVersion::new("1.0.0"),
             display_version: ConcreteVersion::new("1.0.0"),
         },
@@ -2033,7 +2087,7 @@ impl OsvQuery {
     pub(super) fn new(target: &ScanTarget, osv_eco: OsvEcosystem) -> Self {
         Self {
             package: OsvPackage {
-                name: target.osv_name.clone().into_string(),
+                name: target.osv_name.name().clone().into_string(),
                 ecosystem: osv_eco.as_str().to_owned(),
             },
             version: match osv_eco.version_matching() {

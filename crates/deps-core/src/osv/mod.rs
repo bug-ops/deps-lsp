@@ -30,9 +30,9 @@ use types::worst_severity;
 pub use types::{
     Advisory, CandidateStatusMap, CandidateStatuses, Capped, DependencyVulnerabilities,
     EmptyOsvPackageName, FixRecommendation, LatestStatusMap, OsvEcosystem, OsvPackageName,
-    OsvVersion, ScanOutcome, ScanTarget, SkipReason, StructuralSkipReason, UpgradeStatus,
-    VersionMatching, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap, is_valid_osv_id,
-    validated_osv_url, vuln_key_for, vulnerability_keys,
+    OsvQueryName, OsvVersion, ScanOutcome, ScanTarget, SkipReason, StructuralSkipReason,
+    UpgradeStatus, VersionMatching, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap,
+    is_valid_osv_id, validated_osv_url, vuln_key_for, vulnerability_keys,
 };
 use types::{OsvBatchRequest, OsvBatchResponse, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord};
 
@@ -173,11 +173,13 @@ enum QueryCacheKey {
 impl QueryCacheKey {
     fn for_target(osv_eco: OsvEcosystem, target: &ScanTarget) -> Self {
         match osv_eco.version_matching() {
-            VersionMatching::ServerSide => {
-                Self::Versioned(osv_eco, target.osv_name.clone(), target.version.clone())
-            }
+            VersionMatching::ServerSide => Self::Versioned(
+                osv_eco,
+                target.osv_name.name().clone(),
+                target.version.clone(),
+            ),
             VersionMatching::LocalUnversioned => {
-                Self::Unversioned(osv_eco, target.osv_name.clone())
+                Self::Unversioned(osv_eco, target.osv_name.name().clone())
             }
         }
     }
@@ -441,7 +443,35 @@ impl OsvClient {
     /// whole future in `tokio::time::timeout`, which would drop
     /// already-accumulated `outcomes` along with whatever was still running
     /// (critique S5).
+    ///
+    /// A clean answer for an [`OsvQueryName::Provisional`] target is downgraded to
+    /// [`SkipReason::CanonicalNameUnconfirmed`]: only a hit under an unconfirmed name is
+    /// authoritative.
     async fn resolve(
+        &self,
+        ecosystem: crate::EcosystemId,
+        targets: &[ScanTarget],
+        timeout: Duration,
+    ) -> VulnerabilityMap {
+        let mut outcomes = self.resolve_by_name(ecosystem, targets, timeout).await;
+        let mut seen: HashSet<&VulnKey> = HashSet::with_capacity(targets.len());
+        for t in targets {
+            if !seen.insert(&t.key) {
+                continue;
+            }
+            match &t.osv_name {
+                OsvQueryName::Confirmed(_) => {}
+                OsvQueryName::Provisional(_) => {
+                    if let Some(outcome @ ScanOutcome::Clean) = outcomes.get_mut(&t.key) {
+                        *outcome = ScanOutcome::Skipped(SkipReason::CanonicalNameUnconfirmed);
+                    }
+                }
+            }
+        }
+        outcomes
+    }
+
+    async fn resolve_by_name(
         &self,
         ecosystem: crate::EcosystemId,
         targets: &[ScanTarget],
@@ -487,7 +517,7 @@ impl OsvClient {
                 (Some(vuln_ids), VersionMatching::ServerSide) => {
                     outcomes.insert(
                         t.key.clone(),
-                        self.build_outcome(osv_eco, &t.osv_name, &vuln_ids, deadline)
+                        self.build_outcome(osv_eco, t.osv_name.name(), &vuln_ids, deadline)
                             .await,
                     );
                 }
@@ -619,7 +649,7 @@ impl OsvClient {
             match osv_eco.version_matching() {
                 VersionMatching::ServerSide => {
                     let outcome = self
-                        .build_outcome(osv_eco, &target.osv_name, &vuln_ids, deadline)
+                        .build_outcome(osv_eco, target.osv_name.name(), &vuln_ids, deadline)
                         .await;
                     outcomes.insert(target.key.clone(), outcome);
                 }
@@ -710,7 +740,10 @@ impl OsvClient {
         let mut affected = Vec::new();
         let mut undeterminable = 0usize;
         for record in records {
-            let verdict = match_affected(&record.affected_for(&target.osv_name, osv_eco), &version);
+            let verdict = match_affected(
+                &record.affected_for(target.osv_name.name(), osv_eco),
+                &version,
+            );
             match verdict {
                 Verdict::Affected => affected.push(record),
                 Verdict::NotAffected => {}
@@ -829,7 +862,7 @@ impl OsvClient {
         let mut vuln_ids = Vec::with_capacity(total);
 
         for record in records {
-            let Some(advisory) = record.into_advisory(&target.osv_name, osv_eco) else {
+            let Some(advisory) = record.into_advisory(target.osv_name.name(), osv_eco) else {
                 continue;
             };
             let advisory = Arc::new(advisory);
@@ -1208,7 +1241,7 @@ mod tests {
     fn osv_query_wire_json_carries_plain_package_name() {
         let t = ScanTarget::new(
             crate::test_util::vuln_key("apple/swift-nio"),
-            OsvPackageName::new("github.com/apple/swift-nio").unwrap(),
+            OsvQueryName::Confirmed(OsvPackageName::new("github.com/apple/swift-nio").unwrap()),
             OsvVersion::new("2.0.0"),
             ConcreteVersion::new("2.0.0"),
         );
@@ -1237,7 +1270,7 @@ mod tests {
     fn target(name: &str, version: &str) -> ScanTarget {
         ScanTarget {
             key: crate::test_util::vuln_key(name),
-            osv_name: OsvPackageName::new(name).unwrap(),
+            osv_name: OsvQueryName::Confirmed(OsvPackageName::new(name).unwrap()),
             version: OsvVersion::new(version),
             display_version: ConcreteVersion::new(version),
         }
@@ -1627,6 +1660,192 @@ mod tests {
     #[tokio::test]
     async fn gha_unversioned_query_is_clean_for_out_of_range_version() {
         assert_matches!(scan_gha("4.1.3").await, ScanOutcome::Clean);
+    }
+
+    fn provisional_target(name: &str, version: &str) -> ScanTarget {
+        ScanTarget {
+            osv_name: OsvQueryName::Provisional(OsvPackageName::new(name).unwrap()),
+            ..target(name, version)
+        }
+    }
+
+    async fn scan_gha_provisional(version: &str, batch_body: &str) -> ScanOutcome {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(batch_body)
+            .create_async()
+            .await;
+        let _record = server
+            .mock("GET", "/v1/vulns/GHSA-cxww-7g56-2vh6")
+            .with_status(200)
+            .with_body(GHA_RECORD_BODY)
+            .create_async()
+            .await;
+        let targets = vec![provisional_target("actions/download-artifact", version)];
+        let mut outcomes = client
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        outcomes
+            .remove(&crate::test_util::vuln_key("actions/download-artifact"))
+            .expect("one outcome per target")
+    }
+
+    /// #1694: a hit under an unconfirmed name is authoritative.
+    #[tokio::test]
+    async fn provisional_name_positive_hit_stays_vulnerable() {
+        assert_matches!(
+            scan_gha_provisional("4.1.2", GHA_UNVERSIONED_BODY).await,
+            ScanOutcome::Vulnerable(_)
+        );
+    }
+
+    /// #1694: an empty answer, or one whose records do not affect the version, is never clean.
+    #[tokio::test]
+    async fn provisional_name_clean_result_is_downgraded_to_unconfirmed() {
+        for body in [GHA_UNVERSIONED_BODY, r#"{"results":[{}]}"#] {
+            let version = if body == GHA_UNVERSIONED_BODY {
+                "4.1.3"
+            } else {
+                "4.1.2"
+            };
+            assert_matches!(
+                scan_gha_provisional(version, body).await,
+                ScanOutcome::Skipped(SkipReason::CanonicalNameUnconfirmed),
+                "body={body}"
+            );
+        }
+    }
+
+    /// #1694: a failed query stays `QueryFailed`, and the cached second scan downgrades the
+    /// same way as the first.
+    #[tokio::test]
+    async fn provisional_name_query_failure_and_cached_rescan() {
+        let (mut server, client) = mock_client().await;
+        let failing = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(500)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let targets = [provisional_target("actions/download-artifact", "4.1.2")];
+        let key = crate::test_util::vuln_key("actions/download-artifact");
+        let outcomes = client
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        assert_matches!(
+            outcomes.get(&key),
+            Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
+        );
+        failing.remove_async().await;
+
+        let batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(r#"{"results":[{}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        for _ in 0..2 {
+            let outcomes = client
+                .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+                .await;
+            assert_matches!(
+                outcomes.get(&key),
+                Some(ScanOutcome::Skipped(SkipReason::CanonicalNameUnconfirmed))
+            );
+        }
+        batch.assert_async().await;
+    }
+
+    /// #1694: a record filed under a different casing than the provisional written name does
+    /// not describe it, so the answer is unconfirmed, not vulnerable and not clean.
+    #[tokio::test]
+    async fn provisional_name_record_for_other_casing_is_skipped() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(GHA_UNVERSIONED_BODY)
+            .create_async()
+            .await;
+        let _record = server
+            .mock("GET", "/v1/vulns/GHSA-cxww-7g56-2vh6")
+            .with_status(200)
+            .with_body(
+                GHA_RECORD_BODY.replace("actions/download-artifact", "Actions/Download-Artifact"),
+            )
+            .create_async()
+            .await;
+        let targets = [provisional_target("actions/download-artifact", "4.1.2")];
+        let outcomes = client
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("actions/download-artifact")),
+            Some(ScanOutcome::Skipped(SkipReason::UnevaluableAdvisoryRange))
+        );
+    }
+
+    /// #1694: `check_candidates` shares `resolve`, so a provisional candidate is never
+    /// reported clean either.
+    #[tokio::test]
+    async fn provisional_name_candidate_check_is_unverified_not_clean() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(r#"{"results":[{}]}"#)
+            .create_async()
+            .await;
+        let statuses = client
+            .check_candidates(
+                EcosystemId::GithubActions,
+                &[provisional_target("actions/download-artifact", "4.1.2")],
+                TEST_TIMEOUT,
+            )
+            .await;
+        assert_matches!(
+            statuses.get(&crate::test_util::vuln_key("actions/download-artifact")),
+            Some(UpgradeStatus::CandidateUnverified {
+                reason: SkipReason::CanonicalNameUnconfirmed,
+                ..
+            })
+        );
+    }
+
+    /// #1694: with duplicate keys the first-seen target decides, matching which one is queried.
+    #[tokio::test]
+    async fn provisional_downgrade_follows_first_seen_duplicate_key() {
+        for (first_provisional, expected_clean) in [(false, true), (true, false)] {
+            let (mut server, client) = mock_client().await;
+            let _batch = server
+                .mock("POST", "/v1/querybatch")
+                .with_status(200)
+                .with_body(r#"{"results":[{}]}"#)
+                .create_async()
+                .await;
+            let confirmed = target("actions/download-artifact", "4.1.2");
+            let provisional = provisional_target("actions/download-artifact", "4.1.2");
+            let targets = if first_provisional {
+                [provisional, confirmed]
+            } else {
+                [confirmed, provisional]
+            };
+            let outcomes = client
+                .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+                .await;
+            let outcome = outcomes.get(&crate::test_util::vuln_key("actions/download-artifact"));
+            if expected_clean {
+                assert_matches!(outcome, Some(ScanOutcome::Clean));
+            } else {
+                assert_matches!(
+                    outcome,
+                    Some(ScanOutcome::Skipped(SkipReason::CanonicalNameUnconfirmed))
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -2652,7 +2871,7 @@ mod tests {
 
         let candidate = ScanTarget {
             key: crate::test_util::vuln_key("golang.org/x/text"),
-            osv_name: OsvPackageName::new("golang.org/x/text").unwrap(),
+            osv_name: OsvQueryName::Confirmed(OsvPackageName::new("golang.org/x/text").unwrap()),
             version: OsvVersion::new("0.4.0"),
             display_version: ConcreteVersion::new("v0.4.0"),
         };

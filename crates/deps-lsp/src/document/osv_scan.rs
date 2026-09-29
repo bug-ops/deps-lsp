@@ -7,7 +7,7 @@ use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower_lsp_server::ls_types::Uri;
@@ -53,7 +53,9 @@ pub(crate) struct OsvScanResult {
     resolved_generation: ResolvedGeneration,
     vulnerabilities: deps_core::osv::VulnerabilityMap,
     /// `key -> osv_name`, needed to build phase B candidates.
-    osv_name_by_key: HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvPackageName>,
+    osv_name_by_key: HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvQueryName>,
+    /// Keys queried under a provisional name, committed next to `vulnerabilities`.
+    provisional_keys: HashSet<deps_core::osv::VulnKey>,
 }
 
 /// Phase A: builds scan targets, runs [`deps_core::osv::OsvClient::scan`], and
@@ -97,8 +99,12 @@ pub(crate) async fn run_osv_scan_phase_a(
         return None;
     }
 
-    let osv_name_by_key: HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvPackageName> =
-        deps_engine::classify::osv::osv_name_by_key(&targets);
+    let osv_name_by_key = deps_engine::classify::osv::osv_name_by_key(&targets);
+    let provisional_keys = osv_name_by_key
+        .iter()
+        .filter(|(_, name)| matches!(name, deps_core::osv::OsvQueryName::Provisional(_)))
+        .map(|(key, _)| key.clone())
+        .collect();
 
     if !targets.is_empty() {
         let timeout_duration =
@@ -117,6 +123,7 @@ pub(crate) async fn run_osv_scan_phase_a(
         resolved_generation,
         vulnerabilities,
         osv_name_by_key,
+        provisional_keys,
     })
 }
 
@@ -165,6 +172,35 @@ pub(crate) async fn rescan_after_resolved_version_change(
     .await;
 }
 
+/// Whether any dependency whose last scan used a provisional package name can now be queried
+/// under its confirmed one (#1694) — a dependency that stays unconfirmed (private repository,
+/// no tags) must not trigger a rescan on every open/edit.
+fn provisional_name_now_confirmed(
+    doc: &super::state::DocumentState,
+    ecosystem: &Arc<dyn Ecosystem>,
+) -> bool {
+    let Some(parse_result) = doc.parse_result() else {
+        return false;
+    };
+    let formatter = ecosystem.formatter();
+    let keys = deps_core::osv::vulnerability_keys(
+        parse_result,
+        &doc.signals.resolved_versions,
+        Some(&doc.signals.resolved_version_candidates),
+        formatter,
+        ecosystem.ecosystem_id(),
+    );
+    parse_result.dependencies().into_iter().any(|dep| {
+        doc.signals
+            .provisional_osv_keys
+            .contains(&deps_core::osv::vuln_key_for(dep, Some(&keys), formatter))
+            && matches!(
+                formatter.osv_name_availability(dep),
+                deps_core::lsp_helpers::OsvNameAvailability::Ready
+            )
+    })
+}
+
 /// Re-runs the OSV phase A/B pipeline once more and commits its result, when needed, right
 /// after a registry fetch this document just awaited (#1556 critic S2).
 ///
@@ -180,7 +216,8 @@ pub(crate) async fn rescan_after_resolved_version_change(
 /// Cheap no-op in the overwhelmingly common case: returns immediately unless both (a) this
 /// ecosystem's formatter opts into
 /// `resolved_pin_version_depends_on_registry_fetch` and (b) the document's just-committed
-/// vulnerability map actually left something skipped as `NoConcreteVersion` — most
+/// vulnerability map actually left something skipped on the tag index, or a result queried
+/// under a provisional package name whose confirmed name is now available (#1694) — most
 /// ecosystems and most documents hit neither. When it does run, it mirrors
 /// [`rescan_after_resolved_version_change`]'s "run phase A, then phase B, then commit" shape
 /// exactly, plus the same hint/code-lens republish
@@ -201,12 +238,15 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
     }
 
     let left_unresolved = state.get_document(uri).is_some_and(|doc| {
-        doc.signals.vulnerabilities.values().any(|outcome| {
+        let provisional = &doc.signals.provisional_osv_keys;
+        let skipped_on_tag_index = doc.signals.vulnerabilities.iter().any(|(key, outcome)| {
             matches!(
                 outcome,
                 deps_core::osv::ScanOutcome::Skipped(reason) if reason.depends_on_tag_index()
-            )
-        })
+            ) && !provisional.contains(key)
+        });
+        skipped_on_tag_index
+            || (!provisional.is_empty() && provisional_name_now_confirmed(&doc, ecosystem))
     });
     if !left_unresolved {
         return;
@@ -510,6 +550,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
             true
         } else {
             doc.update_vulnerabilities(result.vulnerabilities);
+            doc.signals.provisional_osv_keys = result.provisional_keys;
             doc.update_latest_status(latest_status);
             false
         }
@@ -654,7 +695,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
 async fn run_osv_fix_target_verification(
     vulnerabilities: &mut deps_core::osv::VulnerabilityMap,
     vulnerable_keys: &[deps_core::osv::VulnKey],
-    osv_name_by_key: &HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvPackageName>,
+    osv_name_by_key: &HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvQueryName>,
     latest_status: &deps_core::osv::LatestStatusMap,
     ecosystem_id: EcosystemId,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
@@ -1968,6 +2009,331 @@ mod tests {
                     .get(&key),
                 Some(deps_core::osv::ScanOutcome::Clean)
             );
+        }
+
+        async fn open_gha_document(
+            osv_base_url: String,
+            content: &str,
+        ) -> (Arc<ServerState>, Uri, Arc<dyn Ecosystem>) {
+            let mut state = ServerState::new();
+            state.osv = Arc::new(OsvClient::for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                osv_base_url,
+            ));
+            let state = Arc::new(state);
+            let url = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let ecosystem: Arc<dyn Ecosystem> = Arc::new(GithubActionsEcosystem::new(Arc::new(
+                deps_core::HttpCache::new(),
+            )));
+            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            state.update_document(
+                uri.clone(),
+                DocumentState::new_from_parse_result(
+                    EcosystemId::GithubActions,
+                    content.to_string(),
+                    parse_result,
+                ),
+            );
+            (state, uri, ecosystem)
+        }
+
+        async fn scan_and_commit(
+            state: &Arc<ServerState>,
+            uri: &Uri,
+            ecosystem: &Arc<dyn Ecosystem>,
+        ) {
+            let phase_a =
+                run_osv_scan_phase_a(uri.clone(), Arc::clone(state), Arc::clone(ecosystem), 5)
+                    .await
+                    .expect("a workflow step must produce a phase-A result");
+            run_osv_phase_b_and_commit(
+                uri,
+                state,
+                ecosystem.ecosystem_id(),
+                ecosystem.formatter(),
+                5,
+                phase_a,
+            )
+            .await;
+        }
+
+        fn land_tags(
+            ecosystem: &Arc<dyn Ecosystem>,
+            name: &str,
+            tags: &[(&str, &CommitSha)],
+            canonical_commit_url: &str,
+        ) {
+            let registry = ecosystem.registry();
+            registry
+                .as_any()
+                .downcast_ref::<GithubActionsRegistry>()
+                .expect("GithubActionsEcosystem::registry() must return a GithubActionsRegistry")
+                .tag_index()
+                .insert(
+                    PackageName::new(name),
+                    Arc::new(
+                        TagIndex::from_tags(tags.iter().map(|(t, c)| (*t, *c)))
+                            .with_canonical_repo_name(
+                                deps_core::github::CanonicalRepoName::from_commit_url(
+                                    canonical_commit_url,
+                                ),
+                            ),
+                    ),
+                );
+        }
+
+        /// #1694: a hit under the written name lands before any tags do, and is re-queried
+        /// under the canonical casing once it is confirmed (clearing the provisional mark).
+        #[tokio::test]
+        async fn provisional_positive_hit_is_requeried_under_canonical_name_once_tags_land() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let written = server
+                .mock("POST", "/v1/querybatch")
+                .match_body(mockito::Matcher::Regex("azure/setup-kubectl".into()))
+                .with_status(200)
+                .with_body(r#"{"results":[{"vulns":[{"id":"GHSA-cxww-7g56-2vh6","modified":"2025-01-22T17:31:55Z"}]}]}"#)
+                .expect(1)
+                .create_async()
+                .await;
+            let _record = server
+                .mock("GET", "/v1/vulns/GHSA-cxww-7g56-2vh6")
+                .with_status(200)
+                .with_body(
+                    r#"{"id":"GHSA-cxww-7g56-2vh6","modified":"2025-01-22T17:31:55Z",
+                    "affected":[{"package":{"name":"azure/setup-kubectl","ecosystem":"GitHub Actions"},
+                    "ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"9.0.0"}]}]}]}"#,
+                )
+                .create_async()
+                .await;
+            let canonical = server
+                .mock("POST", "/v1/querybatch")
+                .match_body(mockito::Matcher::Regex("Azure/setup-kubectl".into()))
+                .with_status(200)
+                .with_body(r#"{"results":[{}]}"#)
+                .expect(1)
+                .create_async()
+                .await;
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+            let (state, uri, ecosystem) = open_gha_document(
+                server.url(),
+                "steps:\n  - uses: azure/setup-kubectl@v4.1.2\n",
+            )
+            .await;
+
+            scan_and_commit(&state, &uri, &ecosystem).await;
+
+            let key = deps_core::test_util::vuln_key("azure/setup-kubectl");
+            {
+                let doc = state.get_document(&uri).unwrap();
+                assert_matches!(
+                    doc.signals.vulnerabilities.get(&key),
+                    Some(deps_core::osv::ScanOutcome::Vulnerable(_)),
+                    "{:?}",
+                    doc.signals.vulnerabilities
+                );
+                assert!(doc.signals.provisional_osv_keys.contains(&key));
+            }
+            written.assert_async().await;
+
+            let commit = CommitSha::parse(&"a".repeat(40)).unwrap();
+            land_tags(
+                &ecosystem,
+                "azure/setup-kubectl",
+                &[("v4.1.2", &commit)],
+                "https://api.github.com/repos/Azure/setup-kubectl/commits/abc",
+            );
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+            {
+                let doc = state.get_document(&uri).unwrap();
+                assert_matches!(
+                    doc.signals.vulnerabilities.get(&key),
+                    Some(deps_core::osv::ScanOutcome::Clean),
+                    "{:?}",
+                    doc.signals.vulnerabilities
+                );
+                assert!(doc.signals.provisional_osv_keys.is_empty());
+            }
+            canonical.assert_async().await;
+        }
+
+        /// #1694: an empty answer under the written name is unconfirmed, and the rescan under the
+        /// canonical casing can still end in a real vulnerability.
+        #[tokio::test]
+        async fn provisional_clean_rescan_under_canonical_name_can_end_vulnerable() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let _written = server
+                .mock("POST", "/v1/querybatch")
+                .match_body(mockito::Matcher::Regex("azure/setup-kubectl".into()))
+                .with_status(200)
+                .with_body(r#"{"results":[{}]}"#)
+                .create_async()
+                .await;
+            let _canonical = server
+                .mock("POST", "/v1/querybatch")
+                .match_body(mockito::Matcher::Regex("Azure/setup-kubectl".into()))
+                .with_status(200)
+                .with_body(r#"{"results":[{"vulns":[{"id":"GHSA-cxww-7g56-2vh6","modified":"2025-01-22T17:31:55Z"}]}]}"#)
+                .create_async()
+                .await;
+            let _record = server
+                .mock("GET", "/v1/vulns/GHSA-cxww-7g56-2vh6")
+                .with_status(200)
+                .with_body(
+                    r#"{"id":"GHSA-cxww-7g56-2vh6","modified":"2025-01-22T17:31:55Z",
+                    "affected":[{"package":{"name":"Azure/setup-kubectl","ecosystem":"GitHub Actions"},
+                    "ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"9.0.0"}]}]}]}"#,
+                )
+                .create_async()
+                .await;
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+            let (state, uri, ecosystem) = open_gha_document(
+                server.url(),
+                "steps:\n  - uses: azure/setup-kubectl@v4.1.2\n",
+            )
+            .await;
+
+            scan_and_commit(&state, &uri, &ecosystem).await;
+
+            let key = deps_core::test_util::vuln_key("azure/setup-kubectl");
+            assert_matches!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .signals
+                    .vulnerabilities
+                    .get(&key),
+                Some(deps_core::osv::ScanOutcome::Skipped(
+                    deps_core::osv::SkipReason::CanonicalNameUnconfirmed
+                ))
+            );
+
+            let commit = CommitSha::parse(&"a".repeat(40)).unwrap();
+            land_tags(
+                &ecosystem,
+                "azure/setup-kubectl",
+                &[("v4.1.2", &commit)],
+                "https://api.github.com/repos/Azure/setup-kubectl/commits/abc",
+            );
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_matches!(
+                doc.signals.vulnerabilities.get(&key),
+                Some(deps_core::osv::ScanOutcome::Vulnerable(_)),
+                "{:?}",
+                doc.signals.vulnerabilities
+            );
+            assert!(doc.signals.provisional_osv_keys.is_empty());
+        }
+
+        /// #1694 (critic N2): a dependency whose canonical name never arrives (private
+        /// repository, no tags) must not re-run the pipeline on every open/edit. A sentinel
+        /// entry survives only if the full-replace commit of a rescan never happened.
+        #[tokio::test]
+        async fn permanently_provisional_dependency_does_not_trigger_rescan() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let _batch = server
+                .mock("POST", "/v1/querybatch")
+                .with_status(200)
+                .with_body(r#"{"results":[{}]}"#)
+                .create_async()
+                .await;
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+            let (state, uri, ecosystem) =
+                open_gha_document(server.url(), "steps:\n  - uses: actions/checkout@v4.1.2\n")
+                    .await;
+
+            scan_and_commit(&state, &uri, &ecosystem).await;
+
+            let key = deps_core::test_util::vuln_key("actions/checkout");
+            let sentinel = deps_core::test_util::vuln_key("sentinel");
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                assert!(doc.signals.provisional_osv_keys.contains(&key));
+                assert_matches!(
+                    doc.signals.vulnerabilities.get(&key),
+                    Some(deps_core::osv::ScanOutcome::Skipped(
+                        deps_core::osv::SkipReason::CanonicalNameUnconfirmed
+                    ))
+                );
+                doc.signals
+                    .vulnerabilities
+                    .insert(sentinel.clone(), deps_core::osv::ScanOutcome::Clean);
+            }
+
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+            assert!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .signals
+                    .vulnerabilities
+                    .contains_key(&sentinel),
+                "an unconfirmed name with no new registry data must not rescan"
+            );
+        }
+
+        /// #1684: a floating `@v4` is a cold skip until the tags land, then resolves to the
+        /// release its commit carries and gets a real result.
+        #[tokio::test]
+        async fn rescan_resolves_floating_tag_once_index_lands() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let batch = server
+                .mock("POST", "/v1/querybatch")
+                .with_status(200)
+                .with_body(r#"{"results":[{}]}"#)
+                .expect(1)
+                .create_async()
+                .await;
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+            let (state, uri, ecosystem) =
+                open_gha_document(server.url(), "steps:\n  - uses: actions/checkout@v4\n").await;
+
+            scan_and_commit(&state, &uri, &ecosystem).await;
+
+            let key = deps_core::test_util::vuln_key("actions/checkout");
+            assert_matches!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .signals
+                    .vulnerabilities
+                    .get(&key),
+                Some(deps_core::osv::ScanOutcome::Skipped(
+                    deps_core::osv::SkipReason::NoConcreteVersion
+                ))
+            );
+
+            let commit = CommitSha::parse(&"b".repeat(40)).unwrap();
+            land_tags(
+                &ecosystem,
+                "actions/checkout",
+                &[("v4", &commit), ("v4.2.2", &commit)],
+                "https://api.github.com/repos/actions/checkout/commits/abc",
+            );
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+            assert_matches!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .signals
+                    .vulnerabilities
+                    .get(&key),
+                Some(deps_core::osv::ScanOutcome::Clean)
+            );
+            batch.assert_async().await;
         }
 
         /// No-op guard: an ecosystem that doesn't override

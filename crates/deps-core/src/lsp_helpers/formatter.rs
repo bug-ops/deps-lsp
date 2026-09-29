@@ -2238,12 +2238,17 @@ pub trait SourcePolicy: Send + Sync {
 /// Separates a transient gap (registry data the name depends on has not landed) from a
 /// structural one (`osv_package_name` returning `None` for good), so the former is never
 /// recorded as permanently unmappable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OsvNameAvailability {
     /// [`OsvNaming::osv_package_name`]'s answer is final for the data currently held.
     Ready,
     /// The name depends on registry data that has not been fetched yet; retry after it lands.
-    AwaitingRegistryData,
+    AwaitingRegistryData {
+        /// The name as written in the manifest, when it is a valid OSV name: queried as a
+        /// provisional name (positive results only) until the confirmed one is available.
+        /// `None` keeps the dependency skipped.
+        written_fallback: Option<crate::osv::OsvPackageName>,
+    },
 }
 
 /// Native <-> OSV.dev namespace bridging for package names and version strings.
