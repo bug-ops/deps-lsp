@@ -27,6 +27,31 @@ mod lsp;
 #[cfg(feature = "lsp-responses")]
 use lsp::{build_url_completion, strip_github_prefix};
 
+/// Whether `source` is written as a URL literal that a package URL completion may replace.
+///
+/// `id:` (`CustomRegistry`) and `path:` literals are not URLs; replacing them would corrupt them.
+#[cfg(feature = "lsp-responses")]
+fn is_url_source(source: &deps_core::parser::DependencySource) -> bool {
+    matches!(
+        source,
+        deps_core::parser::DependencySource::Registry
+            | deps_core::parser::DependencySource::Git { .. }
+    )
+}
+
+/// Whether `position` lies in the name literal of a dependency whose source is a URL.
+#[cfg(feature = "lsp-responses")]
+fn name_completion_targets_url(
+    parse_result: &dyn ParseResultTrait,
+    position: tower_lsp_server::ls_types::Position,
+) -> bool {
+    parse_result
+        .dependencies()
+        .into_iter()
+        .find(|d| deps_core::position_in_range(position.into(), d.name_range()))
+        .is_some_and(|d| is_url_source(&d.source()))
+}
+
 /// Swift/SPM ecosystem implementation.
 ///
 /// Provides LSP functionality for Package.swift files, including:
@@ -136,15 +161,17 @@ impl Ecosystem for SwiftEcosystem {
     #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
-        _request: deps_core::completion::CompletionRequest<'a>,
+        request: deps_core::completion::CompletionRequest<'a>,
         prefix: String,
         range: LspRange,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        // The completion context only fires with the cursor inside an existing
-        // dependency's url: "..." literal (see module docs), so `range` (the
-        // dependency's `name_range()`, computed by `detect_completion_context`)
+        let is_url_literal = name_completion_targets_url(request.parse_result, request.position);
+        // `range` (the dependency's `name_range()`, computed by `detect_completion_context`)
         // is already the exact span the completion must replace.
         Box::pin(async move {
+            if !is_url_literal {
+                return Completions::default();
+            }
             self.complete_package_urls(strip_github_prefix(&prefix), Some(range))
                 .await
                 .into()
@@ -718,6 +745,81 @@ mod tests {
                 Completions::default()
                     .with_origin(deps_core::completion::CompletionOrigin::PackageName)
             );
+        }
+
+        async fn complete_at(content: &str, needle: &str) -> Completions {
+            let parse_result = crate::parser::parse_package_swift(
+                content,
+                &deps_core::test_util::test_uri("/test/Package.swift"),
+            )
+            .unwrap();
+            let offset = content.find(needle).unwrap() + 1;
+            let eco = SwiftEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+            eco.generate_completions(
+                &parse_result,
+                Position::new(0, u32::try_from(offset).unwrap()),
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+        }
+
+        #[test]
+        fn test_is_url_source_only_registry_and_git() {
+            use deps_core::parser::DependencySource as S;
+            assert!(is_url_source(&S::Registry));
+            assert!(is_url_source(&S::Git {
+                url: "u".into(),
+                rev: None
+            }));
+            assert!(!is_url_source(&S::CustomRegistry { url: "mona".into() }));
+            assert!(!is_url_source(&S::Path {
+                path: "../p".into()
+            }));
+        }
+
+        #[test]
+        fn test_name_completion_targets_url_by_position() {
+            let content = "\
+.package(id: \"mona.LinkedList\", from: \"1.0.0\"),
+.package(url: \"https://github.com/apple/swift-nio.git\", from: \"1.0.0\"),
+.package(path: \"../Local\"),";
+            let parsed = crate::parser::parse_package_swift(
+                content,
+                &deps_core::test_util::test_uri("/test/Package.swift"),
+            )
+            .unwrap();
+            let at = |line: u32, character: u32| {
+                name_completion_targets_url(&parsed, Position::new(line, character))
+            };
+            assert!(!at(0, 20));
+            assert!(at(1, 25));
+            assert!(!at(2, 18));
+        }
+
+        /// #1679 critic M5: an `id:` literal is not a URL — name completion must not offer a
+        /// GitHub URL replacement (offline: the gate returns before any registry search).
+        #[tokio::test]
+        async fn test_name_completion_at_id_literal_is_empty() {
+            let content = r#".package(id: "mona.LinkedList", from: "1.0.0")"#;
+            let result = complete_at(content, "mona.LinkedList").await;
+            assert!(result.items.is_empty());
+        }
+
+        /// Same corruption class for `path:` literals (pre-existing before #1679).
+        #[tokio::test]
+        async fn test_name_completion_at_path_literal_is_empty() {
+            let content = r#".package(path: "../LocalPackage")"#;
+            let result = complete_at(content, "LocalPackage").await;
+            assert!(result.items.is_empty());
+        }
+
+        /// #1679 critic M5: version completion on an unresolvable `id:` dependency stays empty.
+        #[tokio::test]
+        async fn test_version_completion_at_id_literal_is_empty() {
+            let content = r#".package(id: "mona.LinkedList", from: "1.0.0")"#;
+            let result = complete_at(content, "1.0.0").await;
+            assert!(result.items.is_empty());
         }
 
         /// #793 S1: the `Feature` and `None` contexts (swift has no feature-flag syntax) must

@@ -96,6 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-swift**: labelled `exact:`, `branch:`, `revision:` requirements and the legacy `name:` label before `url:`/`path:` are now parsed; branch/revision stay non-version-pinned Git deps (resolves #1672) (#1681)
 - **deps-swift**: `.package(url:, ..., traits: [...])` calls are no longer dropped by the parser (#1686)
 - **deps-core**: inlay hints treat a resolved version differing from latest only by build metadata as up to date (#1686)
+- **deps-swift**: a `traits:` argument of any shape (deep nesting, variable, unclosed `[`) no longer drops the dependency or swallows the entries after it (resolves #1688) (#1697)
+- **deps-swift**: `.package(id: "scope.name", ...)` dependencies, previously not parsed, are now parsed as unresolved registry deps (no version lookup), and name completion no longer splices a GitHub URL over `path:`/`id:` literals (resolves #1679) (#1697)
 - **deps-core, deps-github-actions, deps-gitlab-ci, deps-engine**: a SHA pin resolving to a most-specific two-component release tag (`v2.9`) is now scanned by OSV, and a resolved-but-partial tag is no longer reported as "no resolved or exact version" (resolves #1668) (#1677)
 - **deps-swift**: labelled `.package(url:, exact: "1.2.3")` dependencies are now parsed instead of skipped (#1671)
 - **deps-core**: a bare or `=` pin is no longer reported outdated when `latest` differs only by semver build metadata (#1671)

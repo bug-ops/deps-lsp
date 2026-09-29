@@ -503,6 +503,22 @@ mod tests {
         assert_eq!(fmt.osv_package_name(&dep), None);
     }
 
+    /// #1679 critic M4: an `id:` dependency has an empty `url`, which must never be attributed
+    /// to a GitHub `SwiftURL` advisory.
+    #[test]
+    fn test_osv_package_name_registry_id_dependency_returns_none() {
+        let parsed = crate::parser::parse_package_swift(
+            r#".package(id: "mona.LinkedList", from: "1.0.0")"#,
+            &deps_core::test_util::test_uri("/test/Package.swift"),
+        )
+        .unwrap();
+        assert_eq!(parsed.dependencies[0].url, "");
+        assert_eq!(
+            SwiftFormatter.osv_package_name(&parsed.dependencies[0]),
+            None
+        );
+    }
+
     #[test]
     fn test_osv_package_name_unparseable_url_returns_none() {
         let fmt = SwiftFormatter;

@@ -10,7 +10,7 @@ use deps_core::position::Range;
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, deps_core::redact_debug::RedactingDebug)]
 pub struct SwiftDependency {
-    /// Package identity: owner/repo (e.g. "apple/swift-nio")
+    /// Package identity: owner/repo (e.g. "apple/swift-nio"); `scope.name` for `id:` deps
     #[raw]
     pub name: deps_core::PackageName,
     /// LSP range of the URL string content (excluding quotes)
@@ -29,7 +29,7 @@ pub struct SwiftDependency {
     /// `None` for branch/revision/path deps, which have no `version_range` to guard.
     #[raw]
     pub version_literal: Option<String>,
-    /// Original Git URL from Package.swift
+    /// Original Git URL from Package.swift; empty for `id:` and `path:` deps
     #[redact(url)]
     pub url: String,
     /// Dependency source (registry, git, or path)

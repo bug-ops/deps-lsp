@@ -427,6 +427,38 @@ mod tests {
         assert_eq!(resolved.version("FallbackName"), Some("1.0.0"));
     }
 
+    /// #1679 critic M1: a registry pin (empty `location`, lowercased identity) resolves for an
+    /// `id:` dependency through the formatter's normalized name, as for Cargo alt-registries.
+    #[tokio::test]
+    async fn test_registry_pin_resolves_for_id_dependency() {
+        let content = r#"{
+  "pins": [
+    {
+      "identity": "mona.linkedlist",
+      "kind": "registry",
+      "location": "",
+      "state": { "version": "1.2.0" }
+    }
+  ],
+  "version": 3
+}"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Package.resolved");
+        tokio::fs::write(&path, content).await.unwrap();
+        let resolved = SwiftLockParser.parse_lockfile(&path).await.unwrap();
+
+        let manifest = crate::parser::parse_package_swift(
+            r#".package(id: "mona.LinkedList", from: "1.0.0")"#,
+            &deps_core::test_util::test_uri("/test/Package.swift"),
+        )
+        .unwrap();
+        let key = deps_core::lsp_helpers::PackageNaming::normalize_package_name(
+            &crate::formatter::SwiftFormatter,
+            &manifest.dependencies[0].name,
+        );
+        assert_eq!(resolved.version(&key), Some("1.2.0"));
+    }
+
     /// Regression for #979: a v2/v3 pin on a non-GitHub host (`location`) must never be
     /// resolved into an `owner/repo` identity by naively slicing the URL path — it must
     /// fall back to the pin's own `identity` field, exactly like the existing
