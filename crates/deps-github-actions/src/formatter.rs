@@ -3,12 +3,14 @@
 use dashmap::DashMap;
 #[cfg(any(test, feature = "lsp-responses"))]
 use deps_core::VersionReq;
+use deps_core::github::normalize_tag;
 use deps_core::lsp_helpers::{
     BoundedVersionReq, CommitSha, DiagnosticMessages, DiagnosticPolicy, OsvNameAvailability,
     OsvNaming, PackageNaming, PackageRendering, RequirementResolution, RequirementStatus,
     ResolvedPin, ShaPinLookup, SourcePolicy, TagIndex, concrete_pin_version, extends_tag,
     is_partial_semver_shaped, match_v_prefix_style, requirement_contains_template_placeholder,
 };
+use deps_core::pagination::ListCoverage;
 use deps_core::parser::DependencySource;
 use deps_core::{
     ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName,
@@ -97,11 +99,15 @@ impl GithubActionsFormatter {
     /// ```
     #[must_use]
     pub fn sha_pin_replacement_for(&self, name: &PackageName, tag: &str) -> Option<String> {
-        let sha = self
-            .tag_index
-            .get(name)
-            .and_then(|index| index.tag_to_sha.get(tag).cloned())?;
+        let sha = self.commit_for_tag(name, tag)?;
         Some(format!("{sha} # {tag}"))
+    }
+
+    /// The commit `tag` points at per the shared [`TagIndex`], `None` on a cache miss.
+    fn commit_for_tag(&self, name: &PackageName, tag: &str) -> Option<CommitSha> {
+        self.tag_index
+            .get(name)
+            .and_then(|index| index.tag_to_sha.get(tag).cloned())
     }
 }
 
@@ -192,9 +198,12 @@ impl PackageRendering for GithubActionsFormatter {
     }
 
     /// Tag → the latest tag, preserving `current`'s `v`-prefix style. SHA → looks up the
-    /// new SHA for `version`'s tag in the shared [`TagIndex`]; on a miss, returns
-    /// `dep.version_literal().unwrap_or(current)` — byte-identical to the raw declared
-    /// span, so every shared no-op guard (comparing against exactly that text)
+    /// new SHA for `version`'s tag in the shared [`TagIndex`]: `{sha} # {tag}` for a plain,
+    /// last-on-line scalar, the bare SHA for a quoted/flow-style pin without a comment
+    /// (`version_range` is then exactly the 40 hex, so no `#` may be injected, #1724).
+    /// Otherwise (index miss, or a comment-annotated quoted/flow pin the parser never
+    /// produces) returns `dep.version_literal().unwrap_or(current)` — byte-identical to the
+    /// raw declared span, so every shared no-op guard (comparing against exactly that text)
     /// suppresses the action instead of emitting a destructive downgrade-to-tag edit
     /// (B1). Branch → `current` unchanged, for the same reason.
     fn format_version_replacing_for(
@@ -208,20 +217,21 @@ impl PackageRendering for GithubActionsFormatter {
         };
         match &gha_dep.pin {
             Some(PinStyle::Tag) => match_v_prefix_style(current, version.as_str()),
-            // is_plain_scalar: a quoted value has version_range inside quotes, so appending
-            // `# {tag}` would break the string, not start a comment (#473). is_last_on_line:
-            // a flow-style step has real YAML after the ref, which would get commented out
-            // too (#633/#898). Both guards fall to the no-op fallback.
-            Some(PinStyle::Sha { .. }) if gha_dep.is_plain_scalar && gha_dep.is_last_on_line => {
-                self.tag_index
-                    .get(dep.name())
-                    .and_then(|index| index.tag_to_sha.get(version.as_str()).cloned())
-                    .map(|sha| format!("{sha} # {}", version.as_str()))
-                    .unwrap_or_else(|| dep.version_literal().unwrap_or(current).to_string())
+            Some(PinStyle::Sha { comment_tag }) => {
+                let literal = || dep.version_literal().unwrap_or(current).to_string();
+                match self.commit_for_tag(dep.name(), version.as_str()) {
+                    // is_plain_scalar: a quoted value has version_range inside quotes, so
+                    // appending `# {tag}` would break the string (#473). is_last_on_line: a
+                    // flow-style step has real YAML after the ref, which would get commented
+                    // out too (#633/#898).
+                    Some(sha) if gha_dep.is_plain_scalar && gha_dep.is_last_on_line => {
+                        format!("{sha} # {}", version.as_str())
+                    }
+                    Some(sha) if comment_tag.is_none() => sha.to_string(),
+                    Some(_) | None => literal(),
+                }
             }
-            Some(PinStyle::Sha { .. } | PinStyle::Branch) | None => {
-                dep.version_literal().unwrap_or(current).to_string()
-            }
+            Some(PinStyle::Branch) | None => dep.version_literal().unwrap_or(current).to_string(),
         }
     }
 
@@ -410,11 +420,7 @@ impl GithubActionsFormatter {
                 if !floating {
                     return None;
                 }
-                self.tag_index
-                    .get(&gha_dep.name)?
-                    .tag_to_sha
-                    .get(tag)
-                    .cloned()
+                self.commit_for_tag(&gha_dep.name, tag)
             }
             Some(PinStyle::Branch) | None => None,
         }
@@ -422,8 +428,8 @@ impl GithubActionsFormatter {
 
     /// Ground-truth status for a full-SHA pin against the repository's `TagIndex` — see
     /// [`RequirementResolution::classify_requirement_status_for`]. `None` when `dep` isn't a
-    /// full-SHA pin, or the repository's index is not populated yet (cold cache), or a
-    /// comment-annotated pin's SHA is absent from it (the comment is then trusted).
+    /// full-SHA pin, or the index cannot vouch for the SHA's absence (cold cache, or a
+    /// `Truncated` index); the comment, if any, is then trusted.
     ///
     /// #1648: no longer gates on `requirement_is_oversized` itself — this method is only ever
     /// reached through
@@ -432,8 +438,9 @@ impl GithubActionsFormatter {
     /// [`Self::classify_requirement_status_for`], so an oversized requirement never reaches
     /// here at all.
     ///
-    /// #1720: a commentless SHA absent from a populated index is `Outdated` (`latest` comes
-    /// from the same tags fetch, so the pin is provably not `latest`'s commit). An indexed
+    /// #1720/#1722: a SHA absent from a `Complete` index is `Outdated`, comment or not
+    /// (`latest` comes from the same tags fetch, so the pin is provably not `latest`'s commit,
+    /// and a comment naming a tag must not override that). An indexed
     /// SHA is up to date when it is `latest`'s commit, or its tag is a version tag that is
     /// itself up to date; a non-version tag (`cargo-deny`) never counts as up to date by text.
     fn sha_pin_status_from_tag_index(
@@ -442,20 +449,95 @@ impl GithubActionsFormatter {
         latest: &ConcreteVersion,
     ) -> Option<RequirementStatus> {
         let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-        let Some(PinStyle::Sha { comment_tag }) = &gha_dep.pin else {
+        let Some(PinStyle::Sha { .. }) = &gha_dep.pin else {
             return None;
         };
         let sha = crate::types::sha_pin_raw_sha(gha_dep)?;
         let index = self.tag_index.get(dep.name());
-        let not_indexed = match comment_tag {
-            None => Some(RequirementStatus::Outdated),
-            Some(_) => None,
-        };
         ShaPinLookup::resolve(index.as_deref().map(AsRef::as_ref), sha, latest)?
-            .into_status(not_indexed, |tag| {
-                self.is_bounded_requirement_up_to_date(tag, latest)
-            })
+            .into_status(|tag| self.is_bounded_requirement_up_to_date(tag, latest))
     }
+
+    /// Whether a SHA pin's trailing `# tag` comment agrees with the repository's `TagIndex`
+    /// (#1722). `None` when `gha_dep` is not a full-SHA pin.
+    ///
+    /// Partial-precision comments (`# v4` over `v4.3.1`) agree when the SHA's most specific
+    /// tag extends the comment; `tag_to_sha["v4"]` is not compared for that case since moving
+    /// majors legitimately drift.
+    pub(crate) fn sha_comment_check(
+        &self,
+        gha_dep: &GithubActionsDependency,
+    ) -> Option<CommentCheck> {
+        let Some(PinStyle::Sha { comment_tag }) = &gha_dep.pin else {
+            return None;
+        };
+        let sha = crate::types::sha_pin_raw_sha(gha_dep)?;
+        if !is_full_sha(sha) {
+            return None;
+        }
+        let Some(comment) = comment_tag else {
+            return Some(CommentCheck::NoComment);
+        };
+        let sha = sha.to_ascii_lowercase();
+        let Some(index) = self
+            .tag_index
+            .get(&gha_dep.name)
+            .filter(|index| !index.is_empty())
+        else {
+            return Some(CommentCheck::Unverifiable);
+        };
+        if index
+            .tag_to_sha
+            .get(comment.as_str())
+            .is_some_and(|commit| commit.as_str() == sha)
+        {
+            return Some(CommentCheck::Confirmed);
+        }
+        Some(match (index.tag_for_sha(&sha), index.coverage()) {
+            (Some(actual), _) if comment_names_tag(comment, actual) => CommentCheck::Confirmed,
+            (Some(actual), _) => CommentCheck::Mismatch(CommentMismatch::ShaIsOtherTag {
+                actual: ConcreteVersion::new(actual),
+            }),
+            (None, ListCoverage::Complete) => {
+                CommentCheck::Mismatch(CommentMismatch::ShaNotInIndex)
+            }
+            (None, ListCoverage::Truncated) => CommentCheck::Unverifiable,
+        })
+    }
+}
+
+/// Whether a `# comment` names `actual`: equal ignoring the `v`/`V` prefix, or a shorter
+/// prefix of a release tag (`# v4` over `v4.3.1`). A prerelease tag (`v4.3.1-rc.1`) is only
+/// named by a comment that itself carries the prerelease part.
+fn comment_names_tag(comment: &str, actual: &str) -> bool {
+    let is_prerelease = |tag: &str| normalize_tag(tag).contains(['-', '+']);
+    normalize_tag(comment) == normalize_tag(actual)
+        || (extends_tag(actual, comment) && (!is_prerelease(actual) || is_prerelease(comment)))
+}
+
+/// Verdict on whether a SHA pin's trailing `# tag` comment matches the pinned commit (#1722).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommentCheck {
+    /// The pin has no version comment to check.
+    NoComment,
+    /// The index cannot vouch either way (cold cache, or the SHA is absent from a truncated index).
+    Unverifiable,
+    /// The comment names the pinned commit's tag.
+    Confirmed,
+    /// The comment provably does not name the pinned commit's tag.
+    Mismatch(CommentMismatch),
+}
+
+/// Why a SHA pin's comment does not match its commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommentMismatch {
+    /// No release tag of the repository points at the SHA.
+    ShaNotInIndex,
+    /// A different tag names the SHA.
+    ShaIsOtherTag {
+        /// The tag that does point at the SHA.
+        actual: ConcreteVersion,
+    },
 }
 
 impl DiagnosticMessages for GithubActionsFormatter {}
@@ -497,6 +579,7 @@ impl OsvNaming for GithubActionsFormatter {
 mod tests {
     use super::*;
     use deps_core::lsp_helpers::{CommitSha, RequirementGate};
+    use deps_core::pagination::ListCoverage;
     use deps_core::parser::DependencySource;
     use deps_core::{Position, Range};
 
@@ -1243,11 +1326,11 @@ mod tests {
     }
 
     #[test]
-    fn test_sha_pin_version_comment_missing_from_index_trusts_comment() {
+    fn test_sha_pin_version_comment_missing_from_index_is_outdated() {
         let fmt = fmt_with_release_index_1720(&[]);
         assert_eq!(
             status_1720(&fmt, &sha_pin_1720(MISSING_SHA_1720, Some("v2.87.22"))),
-            RequirementStatus::UpToDate
+            RequirementStatus::Outdated
         );
         assert_eq!(
             status_1720(&fmt, &sha_pin_1720(MISSING_SHA_1720, Some("v2.87.20"))),
@@ -1357,6 +1440,208 @@ mod tests {
         let fmt = formatter();
         let d = sha_pin_1720(MISSING_SHA_1720, None);
         assert_eq!(status_1720(&fmt, &d), RequirementStatus::Unresolved);
+    }
+
+    // --- #1722: comment-vs-SHA verdict ---
+
+    fn check_1722(fmt: &GithubActionsFormatter, d: &GithubActionsDependency) -> CommentCheck {
+        fmt.sha_comment_check(d).expect("full-SHA pin")
+    }
+
+    fn fmt_with_coverage_1722(coverage: ListCoverage) -> GithubActionsFormatter {
+        let fmt = formatter();
+        let latest = CommitSha::parse(LATEST_SHA_1720).unwrap();
+        let old = CommitSha::parse(OLD_SHA_1720).unwrap();
+        let index = TagIndex::from_tags([("v2.87.22", &latest), ("v2.87.21", &old)])
+            .with_coverage(coverage);
+        fmt.tag_index.insert(
+            PackageName::new("EmbarkStudios/cargo-deny-action"),
+            Arc::new(index),
+        );
+        fmt
+    }
+
+    #[test]
+    fn test_comment_check_no_comment() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        let d = sha_pin_1720(MISSING_SHA_1720, None);
+        assert_eq!(check_1722(&fmt, &d), CommentCheck::NoComment);
+    }
+
+    #[test]
+    fn test_comment_check_non_sha_pin_is_none() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        let d = dep(Some(PinStyle::Tag), "EmbarkStudios/cargo-deny-action", None);
+        assert_eq!(fmt.sha_comment_check(&d), None);
+    }
+
+    #[test]
+    fn test_comment_check_confirmed_exact_and_uppercase() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        let d = sha_pin_1720(OLD_SHA_1720, Some("v2.87.21"));
+        assert_eq!(check_1722(&fmt, &d), CommentCheck::Confirmed);
+
+        let fmt = formatter();
+        let sha = CommitSha::parse("abcdefabcdefabcdefabcdefabcdefabcdefabcd").unwrap();
+        fmt.tag_index.insert(
+            PackageName::new("EmbarkStudios/cargo-deny-action"),
+            Arc::new(TagIndex::from_tags([("v2.87.22", &sha)])),
+        );
+        let d = sha_pin_1720("ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD", Some("v2.87.22"));
+        assert_eq!(check_1722(&fmt, &d), CommentCheck::Confirmed);
+    }
+
+    #[test]
+    fn test_comment_check_partial_precision_comment_is_confirmed() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        for comment in ["v2", "v2.87"] {
+            let d = sha_pin_1720(LATEST_SHA_1720, Some(comment));
+            assert_eq!(check_1722(&fmt, &d), CommentCheck::Confirmed, "{comment}");
+        }
+    }
+
+    #[test]
+    fn test_comment_check_other_tag_is_mismatch() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        let d = sha_pin_1720(LATEST_SHA_1720, Some("v2.87.20"));
+        assert_eq!(
+            check_1722(&fmt, &d),
+            CommentCheck::Mismatch(CommentMismatch::ShaIsOtherTag {
+                actual: ConcreteVersion::new("v2.87.22")
+            })
+        );
+    }
+
+    #[test]
+    fn test_comment_check_v_prefix_and_case_do_not_cause_mismatch() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        for comment in ["2.87.22", "V2.87.22", "v2.87.22"] {
+            let d = sha_pin_1720(LATEST_SHA_1720, Some(comment));
+            assert_eq!(check_1722(&fmt, &d), CommentCheck::Confirmed, "{comment}");
+        }
+
+        let unprefixed = formatter();
+        let sha = CommitSha::parse(OLD_SHA_1720).unwrap();
+        unprefixed.tag_index.insert(
+            PackageName::new("EmbarkStudios/cargo-deny-action"),
+            Arc::new(TagIndex::from_tags([("4.1.0", &sha)])),
+        );
+        for comment in ["v4.1.0", "V4.1.0", "4.1.0"] {
+            let d = sha_pin_1720(OLD_SHA_1720, Some(comment));
+            assert_eq!(
+                check_1722(&unprefixed, &d),
+                CommentCheck::Confirmed,
+                "{comment}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_comment_check_prerelease_tag_is_not_named_by_a_prefix_comment() {
+        let fmt = formatter();
+        let sha = CommitSha::parse(OLD_SHA_1720).unwrap();
+        fmt.tag_index.insert(
+            PackageName::new("EmbarkStudios/cargo-deny-action"),
+            Arc::new(TagIndex::from_tags([("v4.3.1-rc.1", &sha)])),
+        );
+        let prefix = sha_pin_1720(OLD_SHA_1720, Some("v4.3"));
+        assert_eq!(
+            check_1722(&fmt, &prefix),
+            CommentCheck::Mismatch(CommentMismatch::ShaIsOtherTag {
+                actual: ConcreteVersion::new("v4.3.1-rc.1")
+            })
+        );
+        let exact = sha_pin_1720(OLD_SHA_1720, Some("v4.3.1-rc.1"));
+        assert_eq!(check_1722(&fmt, &exact), CommentCheck::Confirmed);
+    }
+
+    #[test]
+    fn test_comment_check_moving_major_drift_is_confirmed() {
+        let fmt = formatter();
+        let latest = CommitSha::parse(LATEST_SHA_1720).unwrap();
+        let other = CommitSha::parse(OLD_SHA_1720).unwrap();
+        fmt.tag_index.insert(
+            PackageName::new("EmbarkStudios/cargo-deny-action"),
+            Arc::new(TagIndex::from_tags([("v2", &other), ("v2.87.22", &latest)])),
+        );
+        let d = sha_pin_1720(LATEST_SHA_1720, Some("v2"));
+        assert_eq!(check_1722(&fmt, &d), CommentCheck::Confirmed);
+    }
+
+    #[test]
+    fn test_comment_check_partial_comment_of_other_line_is_mismatch() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        for comment in ["v3", "v2.86"] {
+            let d = sha_pin_1720(LATEST_SHA_1720, Some(comment));
+            assert_eq!(
+                check_1722(&fmt, &d),
+                CommentCheck::Mismatch(CommentMismatch::ShaIsOtherTag {
+                    actual: ConcreteVersion::new("v2.87.22")
+                }),
+                "{comment}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_comment_check_sha_absent_from_complete_index_is_mismatch() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        for comment in ["v2.87.22", "v2.87.20"] {
+            let d = sha_pin_1720(MISSING_SHA_1720, Some(comment));
+            assert_eq!(
+                check_1722(&fmt, &d),
+                CommentCheck::Mismatch(CommentMismatch::ShaNotInIndex),
+                "{comment}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_comment_check_cold_and_empty_index_are_unverifiable() {
+        let fmt = formatter();
+        let d = sha_pin_1720(MISSING_SHA_1720, Some("v2.87.22"));
+        assert_eq!(check_1722(&fmt, &d), CommentCheck::Unverifiable);
+        assert_eq!(status_1720(&fmt, &d), RequirementStatus::UpToDate);
+
+        fmt.tag_index.insert(
+            PackageName::new("EmbarkStudios/cargo-deny-action"),
+            Arc::new(TagIndex::default()),
+        );
+        assert_eq!(check_1722(&fmt, &d), CommentCheck::Unverifiable);
+        assert_eq!(status_1720(&fmt, &d), RequirementStatus::UpToDate);
+    }
+
+    #[test]
+    fn test_truncated_index_absent_sha_is_unverifiable_not_outdated() {
+        let fmt = fmt_with_coverage_1722(ListCoverage::Truncated);
+
+        let commentless = sha_pin_1720(MISSING_SHA_1720, None);
+        assert_eq!(
+            status_1720(&fmt, &commentless),
+            RequirementStatus::Unresolved
+        );
+        assert_eq!(check_1722(&fmt, &commentless), CommentCheck::NoComment);
+
+        let commented = sha_pin_1720(MISSING_SHA_1720, Some("v2.87.22"));
+        assert_eq!(status_1720(&fmt, &commented), RequirementStatus::UpToDate);
+        assert_eq!(check_1722(&fmt, &commented), CommentCheck::Unverifiable);
+    }
+
+    #[test]
+    fn test_truncated_index_present_sha_is_still_verified() {
+        let fmt = fmt_with_coverage_1722(ListCoverage::Truncated);
+
+        let ok = sha_pin_1720(OLD_SHA_1720, Some("v2.87.21"));
+        assert_eq!(check_1722(&fmt, &ok), CommentCheck::Confirmed);
+        assert_eq!(status_1720(&fmt, &ok), RequirementStatus::Outdated);
+
+        let wrong = sha_pin_1720(OLD_SHA_1720, Some("v2.87.22"));
+        assert_eq!(
+            check_1722(&fmt, &wrong),
+            CommentCheck::Mismatch(CommentMismatch::ShaIsOtherTag {
+                actual: ConcreteVersion::new("v2.87.21")
+            })
+        );
     }
 
     // --- #1556: resolved_pin_version ---
@@ -1906,7 +2191,7 @@ mod tests {
     /// unterminated flow mapping. Manifest shape from the issue's exact repro:
     /// `- {uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683, with: {node-version: 20}}`.
     #[test]
-    fn test_format_version_replacing_for_sha_flow_style_not_last_on_line_falls_back_to_literal() {
+    fn test_format_version_replacing_for_sha_flow_style_commentless_rewrites_only_the_sha() {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
         let mut index = TagIndex::default();
@@ -1924,13 +2209,45 @@ mod tests {
         );
         d.is_last_on_line = false;
 
-        // Commentless flow-style SHA ref: `current` is the raw SHA since `version_literal` is `None`.
+        // #1724: only the 40 hex is rewritten; `version_range` never covers the flow siblings.
         let new_text = fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v5.0.0"), sha);
         assert_eq!(
-            new_text, sha,
+            new_text,
+            "deadbeef".repeat(5),
             "a flow-style SHA ref with sibling content must never gain a `# {{tag}}` suffix"
         );
         assert!(!new_text.contains('#'));
+    }
+
+    /// #1724: a quoted commentless SHA pin is rewritten to the bare new SHA.
+    #[test]
+    fn test_format_version_replacing_for_sha_quoted_commentless_rewrites_only_the_sha() {
+        let fmt = formatter();
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert(
+            "v5.0.0".to_string(),
+            CommitSha::parse(&"deadbeef".repeat(5)).unwrap(),
+        );
+        fmt.tag_index
+            .insert(PackageName::new("actions/checkout"), Arc::new(index));
+
+        let mut d = dep(
+            Some(PinStyle::Sha { comment_tag: None }),
+            "actions/checkout",
+            None,
+        );
+        d.is_plain_scalar = false;
+
+        let sha = "11bd71901bbe5b1630ceea73d27597364c9af683";
+        assert_eq!(
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v5.0.0"), sha),
+            "deadbeef".repeat(5)
+        );
+        assert_eq!(
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v9.9.9"), sha),
+            sha,
+            "an index miss keeps the no-op literal fallback"
+        );
     }
 
     /// Positive-control companion to the withhold test above: an ordinary,

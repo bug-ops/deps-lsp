@@ -8,9 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
+- **deps-core**: `github::paginate_tags` and `pagination::paginate_pages` now return `Paginated<T>` (items plus a `ListCoverage`), and `TagIndex` records it via `with_coverage`/`coverage` (#1731)
 - **deps-core**: removed `SkipReason::depends_on_tag_index`; `deps-lsp` now decides rescans by comparing scan plans (#1715)
 
 ### Added
+- **deps-github-actions, deps-core**: new `sha-comment-mismatch` diagnostic and hover warning (severity `diagnostics.sha_comment_mismatch_severity`); a SHA absent from a complete tag index is now outdated (resolves #1722) (#1731)
 - **ci**: new `ecosystem-crate-test` job runs each of the 14 ecosystem crates' own test suite scoped to itself with default (non-`lsp-responses`) features, closing a CI blind spot that let a mis-gated trait override ship silently (resolves #1549) (#1552)
 - **deps-core**: new shared `secret::ApiToken`/`secret::token_from_env` and `rate_limit::DEFAULT_COOLDOWN_SECS`, replacing GitHub Actions' and GitLab CI's independently duplicated auth-token and rate-limit-cooldown code (part of #1480) (#1510)
 - **deps-core, deps-lsp**: new opt-in deps.dev GOSSIP signals (`gossip.enabled`, disabled by default) source hover's/diagnostics' outdated-cooldown callout from deps.dev's authoritative Dynamic Cooldown data (falling back to the existing local heuristic when unavailable), add a live hover low-usage/slopsquatting-risk callout for the pinned version, and give completion a new default-on local per-candidate cooldown badge, across the seven deps.dev-covered ecosystems (Cargo, npm, PyPI, Go, Bundler, Maven, NuGet) (resolves #1456) (#1473)
@@ -33,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-composer**: an unrecognized `composer.json` `minimum-stability` value now surfaces a warning diagnostic instead of silently resolving as `stable` (resolves #1444) (#1450)
 - **deps-cli, deps-engine**: `check`/`update` now honor `[gossip].enabled`, floor-protected against ever excluding an already-in-use version, plus an `ignored_sections`/`[typosquat]` warning-parity fix for explicit `--config` files (resolves #1474) (#1520)
 - **deps-core**: new `lsp_helpers::{FallbackEditVerdict, FallbackEditRejection, fallback_edit_excludes_newer}`, `edit::{ManifestReparse, EcosystemReparse}`, and `ecosystem::parse_manifest_now` — a two-phase, re-parse-based guard deciding whether a cooldown-fallback edit is safe to write, applied uniformly across all 14 ecosystems (part of #1544) (#1581)
+
+### Fixed
+- **deps-github-actions**: update-all and the update quickfix now rewrite a quoted or flow-style SHA pin to the new SHA instead of silently dropping the edit (resolves #1724) (#1731)
 
 ### Security
 - **deps-core, deps-nuget**: `RequirementResolution::is_requirement_up_to_date`/`requirement_already_resolves_to`'s shared defaults, NuGet's own overrides of both, and `in_use_version`'s best-candidate matcher now gate on `requirement_is_oversized` before reaching any ecosystem's matcher — defense-in-depth: every production caller was already gated before this change, so this closes the last CWE-400 call sites reachable only via a direct/test/future caller of the shared defaults or NuGet's overrides (part of #1472's remediation, resolves #1627) (#1632)

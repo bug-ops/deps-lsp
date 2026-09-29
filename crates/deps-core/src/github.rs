@@ -533,6 +533,11 @@ pub fn warn_if_pagination_truncated(
 /// out-of-order processing (not just fetching) would change which tag is picked as
 /// canonical for a shared SHA — hence ordered `buffered`, not `buffer_unordered`.
 ///
+/// Returns the tags as [`Paginated`](crate::pagination::Paginated) so callers can tell a
+/// complete list from one cut off at [`MAX_TAG_PAGES`]
+/// ([`ListCoverage::Truncated`](crate::pagination::ListCoverage::Truncated)); only a
+/// `Complete` list proves that a tag or SHA does not exist.
+///
 /// `ecosystem` is forwarded to [`warn_if_pagination_truncated`] to name the caller in the
 /// truncation warning. Extracted so ecosystem crates' tests can inject a fake `fetch_page`
 /// and exercise the real loop — including that warning's call site — without a live
@@ -548,7 +553,7 @@ pub async fn paginate_tags<F, Fut>(
     ecosystem: EcosystemId,
     name: &str,
     fetch_page: F,
-) -> Result<Vec<GithubTag>>
+) -> Result<crate::pagination::Paginated<GithubTag>>
 where
     F: FnMut(u32) -> Fut,
     Fut: Future<Output = Result<Bytes>>,
@@ -1136,7 +1141,8 @@ mod tests {
             1,
             "the common single-page-repo case must not pay for batching"
         );
-        assert_eq!(result.len(), 42);
+        assert_eq!(result.items.len(), 42);
+        assert_eq!(result.coverage, crate::pagination::ListCoverage::Complete);
     }
 
     #[cfg(feature = "test-util")]
@@ -1166,7 +1172,8 @@ mod tests {
             })
             .await
             .unwrap();
-            tags = result;
+            assert_eq!(result.coverage, crate::pagination::ListCoverage::Complete);
+            tags = result.items;
         })
         .await;
 
@@ -1227,7 +1234,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result.len(), 501);
+        assert_eq!(result.items.len(), 501);
         for (expected_prefix, start, len) in [
             ("page1", 0, 100),
             ("page2", 100, 100),
@@ -1238,10 +1245,10 @@ mod tests {
         ] {
             for i in 0..len {
                 assert!(
-                    result[start + i].name.starts_with(expected_prefix),
+                    result.items[start + i].name.starts_with(expected_prefix),
                     "expected {expected_prefix} at index {}, got {}",
                     start + i,
-                    result[start + i].name
+                    result.items[start + i].name
                 );
             }
         }
@@ -1285,7 +1292,8 @@ mod tests {
             })
             .await
             .unwrap();
-            assert_eq!(result.len(), 100 * MAX_TAG_PAGES as usize);
+            assert_eq!(result.items.len(), 100 * MAX_TAG_PAGES as usize);
+            assert_eq!(result.coverage, crate::pagination::ListCoverage::Truncated);
         })
         .await;
 

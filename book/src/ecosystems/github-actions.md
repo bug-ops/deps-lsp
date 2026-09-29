@@ -61,6 +61,29 @@ non-release commit is therefore offered the latest release. This includes a comm
 non-release commit newer than the latest release: it is reported outdated and update-all re-pins
 it to the latest release (effectively a downgrade).
 
+A pin whose SHA is absent from the loaded tag index is reported outdated even when it carries a
+version comment, since the comment cannot make a non-release commit the latest release. The
+"absent" verdict is only drawn from a complete tag list: a repository with more tags than the
+fetch cap (30 pages of 100) yields a truncated index, and a SHA missing from it stays
+unverifiable (comment trusted, no mismatch diagnostic) instead of being called outdated.
+
+### Comment mismatch diagnostic (issue #1722)
+
+When the trailing comment names a tag that is provably not the pinned commit's tag, the
+`sha-comment-mismatch` diagnostic flags the step (an imposter-commit or stale-comment signal) and
+hover adds a `**Warning**` line, either `comment says v2.87.20, but SHA is v2.87.22` or
+`SHA is not the commit of any release tag`. A partial-precision comment (`# v4`) agrees with a
+SHA whose most specific tag extends it. Nothing is reported while the tag index is cold or when
+the SHA is absent from a truncated index. Severity defaults to warning and is set with
+`diagnostics.sha_comment_mismatch_severity`; there is no on/off toggle.
+
+### Updating quoted and flow-style pins (issue #1724)
+
+Update-all and the update quickfix rewrite a plain scalar SHA pin to `<new sha> # <tag>`. For a
+quoted or flow-style pin (`uses: 'owner/repo@<sha>'`, `{uses: owner/repo@<sha>, with: {...}}`)
+only the 40-hex SHA is replaced, so the quoting and flow structure stay intact. A trailing
+`# vX` comment outside the quotes is not touched and may be left stale.
+
 ## Mutable-Ref Pinning
 
 GitHub Actions shares its mutable-ref-pin diagnostic and bulk "Pin All to SHA" code lens with

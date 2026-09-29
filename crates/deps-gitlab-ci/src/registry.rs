@@ -8,6 +8,7 @@ use dashmap::DashMap;
 use deps_core::error::{DepsError, RateLimitEvidence, Result};
 use deps_core::github::{normalize_tag, semver_tags_newest_first};
 use deps_core::lsp_helpers::{CommitSha, TagIndex};
+use deps_core::pagination::ListCoverage;
 use deps_core::rate_limit::{DEFAULT_COOLDOWN_SECS, RateLimitGate};
 use deps_core::registry::{CapResult, KeyShape, register_capped};
 use deps_core::{EcosystemId, PackageName, PublishTime};
@@ -44,11 +45,13 @@ pub(crate) fn populate_tag_index_entries<'a>(
     index: &DashMap<(EndpointKind, PackageName), Arc<TagIndex>>,
     key: (EndpointKind, PackageName),
     entries: impl Iterator<Item = (&'a str, &'a str)>,
+    coverage: ListCoverage,
 ) {
     let valid: Vec<(&str, CommitSha)> = entries
         .filter_map(|(name, sha)| Some((name, CommitSha::parse(sha)?)))
         .collect();
-    let built = TagIndex::from_tags(valid.iter().map(|(name, sha)| (*name, sha)));
+    let built =
+        TagIndex::from_tags(valid.iter().map(|(name, sha)| (*name, sha))).with_coverage(coverage);
     if !index.contains_key(&key) {
         deps_core::cache_policy::evict_arbitrary_if_full(index, MAX_TAG_INDEX_ENTRIES);
     }
@@ -321,9 +324,12 @@ impl GitlabCiRegistry {
                 populate_tag_index_entries(
                     &self.tag_index,
                     (EndpointKind::Tags, name.clone()),
-                    tags.iter().map(|t| (t.name.as_str(), t.commit.id.as_str())),
+                    tags.items
+                        .iter()
+                        .map(|t| (t.name.as_str(), t.commit.id.as_str())),
+                    tags.coverage,
                 );
-                tags_to_versions(tags)
+                tags_to_versions(tags.items)
             }
             EndpointKind::Releases => {
                 let client = &self.client;
@@ -346,10 +352,12 @@ impl GitlabCiRegistry {
                     &self.tag_index,
                     (EndpointKind::Releases, name.clone()),
                     releases
+                        .items
                         .iter()
                         .map(|r| (r.tag_name.as_str(), r.commit.id.as_str())),
+                    releases.coverage,
                 );
-                releases_to_versions(releases)
+                releases_to_versions(releases.items)
             }
         };
 
@@ -843,6 +851,40 @@ mod tests {
             index.tag_to_sha.get("cargo-deny"),
             Some(&CommitSha::parse(&sha).unwrap())
         );
+    }
+
+    /// #1722: a fetch that hits the page cap must mark the index `Truncated`.
+    #[tokio::test]
+    async fn test_fetch_route_tags_records_truncated_coverage_at_page_cap() {
+        let mut server = mockito::Server::new_async().await;
+        let sha = "a".repeat(40);
+        let full_page = format!(
+            "[{}]",
+            (0..100)
+                .map(|i| format!(r#"{{"name":"{i}.0.0","commit":{{"id":"{sha}"}}}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let _tags_mock = server
+            .mock("GET", "/api/v4/projects/org%2Fproj/repository/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(full_page)
+            .create_async()
+            .await;
+
+        let registry = GitlabCiRegistry::new(test_client());
+        let host_bare = server.url();
+        let gitlab_route = route(&host_bare, EndpointKind::Tags);
+        let name = PackageName::new(format!(
+            "{}/org/proj",
+            crate::host::GitlabHost::for_test(&host_bare).host()
+        ));
+
+        registry.fetch_route(&name, &gitlab_route).await.unwrap();
+
+        let index = registry.tag_index.get(&(EndpointKind::Tags, name)).unwrap();
+        assert_eq!(index.coverage(), ListCoverage::Truncated);
     }
 
     /// #1480 item 3 regression: when a bare-moving tag (`v1`) and the precise semver release

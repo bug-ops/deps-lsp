@@ -172,6 +172,7 @@ impl PolicyConfig {
             deprecated_severity: _,
             mutable_ref_pin_severity: _,
             mutable_ref_pin_enabled: _,
+            sha_comment_mismatch_severity: _,
             vulnerabilities_enabled: _,
         } = new_diagnostics;
         let CacheConfig {
@@ -224,6 +225,7 @@ impl PolicyConfig {
 /// - `deprecated_severity`: `WARNING` - Dependencies on a package the registry reports as deprecated/abandoned
 /// - `mutable_ref_pin_severity`: `HINT` - Dependencies pinned to a mutable ref (tag/branch) instead of a commit SHA (GitHub Actions `uses:` steps, GitLab CI `project:`/`component:` includes)
 /// - `mutable_ref_pin_enabled`: `true` - Whether the mutable-ref-pin diagnostic runs at all
+/// - `sha_comment_mismatch_severity`: `WARNING` - SHA-pinned GitHub Actions steps whose trailing version comment names a tag that is not the pinned commit's tag
 ///
 /// # Examples
 ///
@@ -239,6 +241,7 @@ impl PolicyConfig {
 ///     .with_deprecated_severity(Severity::Error)
 ///     .with_mutable_ref_pin_severity(Severity::Error)
 ///     .with_mutable_ref_pin_enabled(true)
+///     .with_sha_comment_mismatch_severity(Severity::Error)
 ///     .with_vulnerabilities_enabled(true);
 ///
 /// assert_eq!(config.unknown_severity, Severity::Error);
@@ -283,6 +286,11 @@ pub struct DiagnosticsConfig {
     /// SHA-pinning. Mirrors `vulnerabilities_enabled`'s exact shape.
     #[serde(default = "default_true")]
     pub mutable_ref_pin_enabled: bool,
+    /// Severity for a SHA-pinned GitHub Actions `uses:` step whose trailing version comment
+    /// names a tag that is provably not the pinned commit's tag. Severity only; there is no
+    /// toggle because only a provable mismatch is reported.
+    #[serde(default = "default_sha_comment_mismatch_severity")]
+    pub sha_comment_mismatch_severity: Severity,
     /// Whether to run the OSV.dev vulnerability scan and render its
     /// diagnostics/hover content. Default `true` (opt-out): `cargo audit`/
     /// `npm audit` run by default, and an opt-in gate would undercut the
@@ -319,6 +327,7 @@ impl DiagnosticsConfig {
             deprecated_severity: default_deprecated_severity(),
             mutable_ref_pin_severity: default_mutable_ref_pin_severity(),
             mutable_ref_pin_enabled: true,
+            sha_comment_mismatch_severity: default_sha_comment_mismatch_severity(),
             vulnerabilities_enabled: true,
         }
     }
@@ -375,6 +384,16 @@ impl DiagnosticsConfig {
         self
     }
 
+    /// Overrides [`Self::sha_comment_mismatch_severity`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_sha_comment_mismatch_severity(
+        mut self,
+        sha_comment_mismatch_severity: Severity,
+    ) -> Self {
+        self.sha_comment_mismatch_severity = sha_comment_mismatch_severity;
+        self
+    }
+
     /// Overrides [`Self::vulnerabilities_enabled`]. See [`Self::new`].
     #[must_use]
     pub const fn with_vulnerabilities_enabled(mut self, vulnerabilities_enabled: bool) -> Self {
@@ -399,6 +418,7 @@ impl DiagnosticsConfig {
     /// assert_eq!(severities.deprecated, config.deprecated_severity);
     /// assert_eq!(severities.mutable_ref_pin, config.mutable_ref_pin_severity);
     /// assert_eq!(severities.mutable_ref_pin_enabled, config.mutable_ref_pin_enabled);
+    /// assert_eq!(severities.sha_comment_mismatch, config.sha_comment_mismatch_severity);
     /// ```
     #[must_use]
     pub const fn to_severities(&self) -> crate::DiagnosticSeverities {
@@ -410,6 +430,7 @@ impl DiagnosticsConfig {
             .with_deprecated(self.deprecated_severity)
             .with_mutable_ref_pin(self.mutable_ref_pin_severity)
             .with_mutable_ref_pin_enabled(self.mutable_ref_pin_enabled)
+            .with_sha_comment_mismatch(self.sha_comment_mismatch_severity)
             .with_vulnerabilities_enabled(self.vulnerabilities_enabled)
     }
 }
@@ -569,6 +590,10 @@ const fn default_deprecated_severity() -> Severity {
 
 const fn default_mutable_ref_pin_severity() -> Severity {
     Severity::Hint
+}
+
+const fn default_sha_comment_mismatch_severity() -> Severity {
+    Severity::Warning
 }
 
 const fn default_fetch_timeout_secs() -> u64 {
@@ -1489,6 +1514,21 @@ mod tests {
             resolved.gitlab_instance_host.as_deref(),
             Some("gitlab.corp")
         );
+    }
+
+    #[test]
+    fn test_diagnostics_config_sha_comment_mismatch_severity_default_and_override() {
+        let default: DiagnosticsConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.sha_comment_mismatch_severity, Severity::Warning);
+        assert_eq!(
+            default.to_severities().sha_comment_mismatch,
+            Severity::Warning
+        );
+
+        let config: DiagnosticsConfig =
+            serde_json::from_str(r#"{ "sha_comment_mismatch_severity": 1 }"#).unwrap();
+        assert_eq!(config.sha_comment_mismatch_severity, Severity::Error);
+        assert_eq!(config.to_severities().sha_comment_mismatch, Severity::Error);
     }
 
     #[test]
