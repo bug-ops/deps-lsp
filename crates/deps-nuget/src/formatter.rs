@@ -587,7 +587,7 @@ mod tests {
         let f = NuGetFormatter;
         assert_eq!(
             f.osv_package_name(&dep),
-            Some(deps_core::osv::OsvPackageName::new("Newtonsoft.Json"))
+            Some(deps_core::osv::OsvPackageName::new("Newtonsoft.Json").unwrap())
         );
         assert_ne!(
             f.osv_package_name(&dep).unwrap().as_str(),

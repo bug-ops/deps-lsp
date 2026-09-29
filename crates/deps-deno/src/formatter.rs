@@ -207,7 +207,7 @@ impl OsvNaming for DenoFormatter {
     /// cross-registry name collision.
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<OsvPackageName> {
         match split_scheme(dep.name().as_str()) {
-            Some((Scheme::Npm, rest)) => Some(OsvPackageName::new(rest)),
+            Some((Scheme::Npm, rest)) => OsvPackageName::new_or_skip(rest),
             _ => None,
         }
     }
@@ -490,7 +490,7 @@ mod tests {
         let npm_dep = FakeDep(PackageName::new("npm:react"));
         assert_eq!(
             formatter.osv_package_name(&npm_dep),
-            Some(OsvPackageName::new("react"))
+            Some(OsvPackageName::new("react").unwrap())
         );
 
         let jsr_dep = FakeDep(PackageName::new("jsr:@std/fs"));
@@ -576,6 +576,36 @@ mod tests {
         let _ = DenoFormatter.is_requirement_up_to_date(
             &VersionReq::new("workspace:*"),
             &ConcreteVersion::new("1.0.0"),
+        );
+    }
+
+    #[test]
+    fn test_osv_package_name_empty_npm_specifier_is_skipped() {
+        struct FakeDep(deps_core::PackageName);
+        impl Dependency for FakeDep {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.0
+            }
+            fn name_range(&self) -> deps_core::position::Range {
+                deps_core::position::Range::default()
+            }
+            fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+                None
+            }
+            fn version_range(&self) -> Option<deps_core::position::Range> {
+                None
+            }
+            fn source(&self) -> deps_core::parser::DependencySource {
+                deps_core::parser::DependencySource::Registry
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        assert_eq!(
+            DenoFormatter.osv_package_name(&FakeDep(deps_core::PackageName::new("npm:"))),
+            None
         );
     }
 }

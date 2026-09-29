@@ -1039,7 +1039,7 @@ impl OsvNaming for ComposerFormatter {
     ///
     /// Must stay ungated: this is plain OSV-classification logic reachable from `deps-cli`, not LSP-response code (#1545).
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<OsvPackageName> {
-        Some(OsvPackageName::new(self.normalize_package_name(dep.name())))
+        OsvPackageName::new_or_skip(self.normalize_package_name(dep.name()))
     }
 }
 
@@ -2955,7 +2955,7 @@ mod tests {
 
         assert_eq!(
             f.osv_package_name(&dep),
-            Some(OsvPackageName::new("symfony/http-kernel"))
+            Some(OsvPackageName::new("symfony/http-kernel").unwrap())
         );
         // Regression guard: a future "tidy-up" that routes osv_package_name
         // through normalize_package_name directly instead of calling it
@@ -3987,5 +3987,19 @@ mod tests {
             assert!(up_to_date(requirement, "1.4.9"), "{requirement:?}");
         }
         assert!(!up_to_date("^1.5 <1.9", "1.9.5"));
+    }
+
+    #[test]
+    fn test_osv_package_name_empty_name_is_skipped() {
+        let f = ComposerFormatter;
+        let dep = ComposerDependency {
+            name: "".into(),
+            name_range: Range::new(DomainPosition::new(0, 0), DomainPosition::new(0, 1)),
+            version_req: Some("^1.0".into()),
+            version_range: None,
+            section: ComposerSection::Require,
+            source: deps_core::parser::DependencySource::Registry,
+        };
+        assert_eq!(f.osv_package_name(&dep), None);
     }
 }

@@ -200,7 +200,7 @@ mod tests {
     const PKG_NAME: &str = "yaml-rust";
 
     fn pkg_name() -> OsvPackageName {
-        OsvPackageName::new(PKG_NAME)
+        OsvPackageName::new(PKG_NAME).unwrap()
     }
     const PKG_ECO: &str = "crates.io";
     const PKG_OSV_ECO: OsvEcosystem = OsvEcosystem::CratesIo;
@@ -240,6 +240,7 @@ mod tests {
     #[test]
     fn falls_back_to_ecosystem_specific_severity() {
         let affected = OsvAffected {
+            versions: vec![],
             package: None,
             ecosystem_specific: Some(serde_json::json!({ "severity": "LOW" })),
             database_specific: None,
@@ -412,6 +413,7 @@ mod tests {
     /// pass treats as a genuine match (FR-002b/M2).
     fn informational_affected(value: &str) -> OsvAffected {
         OsvAffected {
+            versions: vec![],
             package: Some(OsvPackage {
                 name: PKG_NAME.to_string(),
                 ecosystem: PKG_ECO.to_string(),
@@ -521,6 +523,7 @@ mod tests {
         // first, since classify() runs a full graded-severity pass before
         // ever considering the informational pass.
         let graded = OsvAffected {
+            versions: vec![],
             package: None,
             ecosystem_specific: Some(serde_json::json!({ "severity": "HIGH" })),
             database_specific: None,
@@ -575,6 +578,7 @@ mod tests {
         // `package` never equals the queried osv_name/osv_eco by construction — a stranger
         // entry's `informational` value must not downgrade this record's classification.
         let stranger = OsvAffected {
+            versions: vec![],
             package: Some(OsvPackage {
                 name: "some-other-crate".to_string(),
                 ecosystem: PKG_ECO.to_string(),
@@ -603,6 +607,7 @@ mod tests {
         // count as a genuine match for the informational check specifically
         // — it is not confirmed to actually describe the queried package.
         let affected = OsvAffected {
+            versions: vec![],
             package: None,
             ecosystem_specific: None,
             database_specific: Some(serde_json::json!({ "informational": "unmaintained" })),
@@ -630,6 +635,7 @@ mod tests {
             serde_json::json!({}),
         ] {
             let affected = OsvAffected {
+                versions: vec![],
                 package: Some(OsvPackage {
                     name: PKG_NAME.to_string(),
                     ecosystem: PKG_ECO.to_string(),

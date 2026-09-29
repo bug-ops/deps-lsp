@@ -2215,7 +2215,7 @@ pub trait OsvNaming: Send + Sync {
     /// OSV's canonical spelling. PyPI (PEP 503 normalization) and Composer
     /// (lowercase) override it.
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<crate::osv::OsvPackageName> {
-        Some(crate::osv::OsvPackageName::new(dep.name().as_str()))
+        crate::osv::OsvPackageName::new_or_skip(dep.name().as_str())
     }
 
     /// Converts a version string as it appears in an OSV advisory record
@@ -3710,5 +3710,20 @@ mod tests {
         );
         assert_eq!(relax_caret_floors("^x", " "), None);
         assert_eq!(relax_caret_floors(">=1 <2", " "), None);
+    }
+
+    #[test]
+    fn test_default_osv_package_name_skips_empty_name() {
+        use crate::lsp_helpers::test_support::MockDep;
+        use crate::position::Range;
+
+        let dep = |name: &str| MockDep {
+            name: name.into(),
+            version_req: "1.0".into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+        assert_eq!(MOCK_FORMATTER.osv_package_name(&dep("")), None);
+        assert!(MOCK_FORMATTER.osv_package_name(&dep("serde")).is_some());
     }
 }
