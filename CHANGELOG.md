@@ -89,6 +89,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-pypi**: `PypiFormatter::osv_package_name` now PEP 503-normalizes the package name, so a verbatim Poetry key (`Werkzeug`, `Flask_Cors`) matches OSV's normalized `affected[].package.name` and no longer leaks fixes from sibling packages in multi-package records; a separator-only key is skipped as unmappable instead of poisoning the OSV batch (resolves #1663) (#1676)
+- **deps-core, deps-cargo**: Cargo comparator requirements (`=1.2.3`, `<2`, `>=1.2, <2`) are no longer reported outdated when `latest` satisfies them; bare pins keep the pin heuristic (resolves #1660) (#1667)
 - **deps-github-actions, deps-gitlab-ci**: `is_requirement_up_to_date` no longer reports an oversized requirement as outdated; it is treated as up to date, consistent with `Unresolved` (#1664)
 - **deps-npm, deps-deno, deps-core, deps-composer**: comparator, `||`, hyphen, and wildcard tilde/equals npm requirements are no longer reported outdated when `latest` satisfies them, and compound `^` requirements no longer hit the single-caret shortcut (#1656) (#1659)
 - **deps-core, deps-engine**: repeated dependencies with the same in-use signature no longer get a false "OSV.dev query failed" hint (resolves #1655) (#1658)
@@ -270,6 +271,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **deps-core, deps-cli**: a requirement over the length cap no longer gets vulnerability-fix quickfixes, "Update to X" actions or hover footers; `deps-cli update --security-only` reports it `Unfixable(OversizedRequirement)` instead of rewriting it (#1676)
+- **deps-core**: `up_to_date_via_compiled_matcher` retries a prerelease `latest`'s numeric core only for matchers with `strict_prerelease_exclusion()`, hardening the public helper (resolves #1661) (#1667)
 - **deps-cli**: `update --security-only` unfixable rows for a yanked, confirmed-unsupported-requirement-shape, or oversized-requirement fix target now report that rejected version in the table's target column and the JSON `target` field instead of leaving it empty; the `UnsupportedRequirementShape` reason text also now says "fix target" instead of "fix version", matching the column name (resolves #1614) (#1621)
 - **deps-core, deps-composer, deps-maven**: Composer's OR-gap bound derivation now builds `deps_core::interval::VersionRange` (with new shared `upper_edge`/`lower_edge`/`range_from_edges` helpers) instead of a bespoke `BranchBound` type; `deps-maven`'s own edge extraction now delegates to the same accessors (resolves #1610) (#1612)
 - **deps-cli, deps-core, deps-engine**: amends #1550 — the cooldown-fallback guard now re-parses the actual written edit instead of compiling the declared requirement's text, so Cargo/Dart/PyPI-default/Swift `from:` fail closed (no fallback written) when a known newer version falls inside the edit's auto-following range, on both the lockfile and no-lockfile paths (part of #1544) (#1581)
