@@ -198,14 +198,14 @@ impl PackageRendering for GithubActionsFormatter {
     }
 
     /// Tag → the latest tag, preserving `current`'s `v`-prefix style. SHA → looks up the
-    /// new SHA for `version`'s tag in the shared [`TagIndex`]: `{sha} # {tag}` for a plain,
+    /// new SHA for `version`'s tag in the shared [`TagIndex`]: `{sha}{closers} # {tag}` for
+    /// a comment-annotated pin (the closing quote/`}` are re-emitted, #1732) or a plain,
     /// last-on-line scalar, the bare SHA for a quoted/flow-style pin without a comment
     /// (`version_range` is then exactly the 40 hex, so no `#` may be injected, #1724).
-    /// Otherwise (index miss, or a comment-annotated quoted/flow pin the parser never
-    /// produces) returns `dep.version_literal().unwrap_or(current)` — byte-identical to the
-    /// raw declared span, so every shared no-op guard (comparing against exactly that text)
-    /// suppresses the action instead of emitting a destructive downgrade-to-tag edit
-    /// (B1). Branch → `current` unchanged, for the same reason.
+    /// Otherwise (index miss) returns `dep.version_literal().unwrap_or(current)`,
+    /// byte-identical to the raw declared span, so every shared no-op guard (comparing
+    /// against exactly that text) suppresses the action instead of emitting a destructive
+    /// downgrade-to-tag edit (B1). Branch → `current` unchanged, for the same reason.
     fn format_version_replacing_for(
         &self,
         dep: &dyn Dependency,
@@ -220,12 +220,15 @@ impl PackageRendering for GithubActionsFormatter {
             Some(PinStyle::Sha { comment_tag }) => {
                 let literal = || dep.version_literal().unwrap_or(current).to_string();
                 match self.commit_for_tag(dep.name(), version.as_str()) {
-                    // is_plain_scalar: a quoted value has version_range inside quotes, so
-                    // appending `# {tag}` would break the string (#473). is_last_on_line: a
-                    // flow-style step has real YAML after the ref, which would get commented
-                    // out too (#633/#898).
-                    Some(sha) if gha_dep.is_plain_scalar && gha_dep.is_last_on_line => {
-                        format!("{sha} # {}", version.as_str())
+                    // A parsed comment already proves the tail is safe to rewrite (its
+                    // closers are re-emitted); a commentless pin needs a plain, last-on-line
+                    // scalar, since `# {tag}` inside quotes breaks the string (#473) and
+                    // after a flow ref comments out real YAML (#633/#898).
+                    Some(sha)
+                        if comment_tag.is_some()
+                            || (gha_dep.is_plain_scalar && gha_dep.is_last_on_line) =>
+                    {
+                        format!("{sha}{} # {}", gha_dep.closing_delimiters, version.as_str())
                     }
                     Some(sha) if comment_tag.is_none() => sha.to_string(),
                     Some(_) | None => literal(),
@@ -987,6 +990,7 @@ mod tests {
             source: DependencySource::Registry,
             is_plain_scalar: true,
             is_last_on_line: true,
+            closing_delimiters: crate::types::ClosingDelimiters::default(),
         }
     }
 
@@ -2222,11 +2226,11 @@ mod tests {
         );
     }
 
-    /// FR-010 sibling fix (security audit finding): a quoted-scalar SHA pin must fall
-    /// back to the no-op literal even on a `TagIndex` hit — never append `# {tag}` inside
-    /// the quotes.
+    /// FR-010 sibling fix (security audit finding): a quoted-scalar SHA pin must never get
+    /// `# {tag}` appended inside the quotes — the comment is written after the closing
+    /// delimiters (#1732).
     #[test]
-    fn test_format_version_replacing_for_sha_quoted_scalar_falls_back_to_literal() {
+    fn test_format_version_replacing_for_sha_quoted_scalar_keeps_closing_quote() {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
         let mut index = TagIndex::default();
@@ -2241,13 +2245,17 @@ mod tests {
                 comment_tag: Some("v4.2.0".to_string()),
             }),
             "actions/checkout",
-            Some("oldsha # v4.2.0"),
+            Some("oldsha\" # v4.2.0"),
         );
         d.is_plain_scalar = false;
+        d.closing_delimiters = crate::types::ClosingDelimiters::parse(
+            "\" # v4.2.0",
+            yaml_rust2::scanner::TScalarStyle::DoubleQuoted,
+        );
 
         let new_text =
             fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v5.0.0"), "v4.2.0");
-        assert_eq!(new_text, "oldsha # v4.2.0");
+        assert_eq!(new_text, format!("{}\" # v5.0.0", "deadbeef".repeat(5)));
     }
 
     /// Issue #898 critic follow-up (S1): a flow-style SHA ref with sibling YAML content

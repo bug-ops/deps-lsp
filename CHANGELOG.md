@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: bump `taiki-e/install-action` to v2.87.22 in all workflows (#1736)
 
 ### Fixed
+- **deps-github-actions**: the trailing `# tag` comment of a quoted or flow-mapping SHA pin is now read, checked for mismatch and rewritten with the closing quote/brace preserved (resolves #1732) (#1738)
+- **deps-gitlab-ci**: a branch `ref:` pin is no longer offered an update that rewrites the branch name into a version (resolves #1729) (#1738)
 - **deps-github-actions**: update-all and the update quickfix now rewrite a quoted or flow-style SHA pin to the new SHA instead of silently dropping the edit (resolves #1724) (#1731)
 
 ### Security

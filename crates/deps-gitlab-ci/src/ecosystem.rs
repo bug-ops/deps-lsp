@@ -3149,6 +3149,48 @@ mod tests {
             assert!(edits.is_empty());
         }
 
+        /// #1729: update-all rewrites only a `Tag` pin; a branch (like `~latest`/partial
+        /// component pins) is never rewritten into a (v-stripped) version.
+        #[tokio::test]
+        async fn test_update_all_rewrites_tag_pin_but_not_branch_latest_or_partial() {
+            let eco = GitlabCiEcosystem::with_context(
+                Arc::new(HttpCache::new()),
+                Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+                Arc::new(RwLock::new(Some("gitlab.com".to_string()))),
+            );
+            let content = "include:\n\
+                 \x20 - project: org/tagged\n\
+                 \x20   ref: v1.0.0\n\
+                 \x20 - project: org/branched\n\
+                 \x20   ref: main\n\
+                 \x20 - component: gitlab.com/org/latest/comp@~latest\n\
+                 \x20 - component: gitlab.com/org/partial/comp@1.0\n";
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let deps = deps_core::ParseResult::dependencies(parse_result.as_ref());
+            assert_eq!(deps.len(), 4);
+
+            let mut cached = std::collections::HashMap::new();
+            for dep in &deps {
+                cached.insert(
+                    dep.name().clone(),
+                    deps_core::PackageVersions::latest_only("v1.1.0"),
+                );
+            }
+            let resolved = std::collections::HashMap::new();
+            let edits = deps_core::lsp_helpers::collect_update_all_edits(
+                parse_result.as_ref(),
+                content,
+                deps_core::VersionData::new(&cached, &resolved),
+                &eco.formatter,
+            );
+            let planned: Vec<(u32, &str)> = edits
+                .iter()
+                .map(|e| (e.range.start.line, e.new_text.as_str()))
+                .collect();
+            assert_eq!(planned, [(2, "v1.1.0")], "{edits:?}");
+        }
+
         /// #1723: SHA pins absent from the populated index must be reported consistently by
         /// diagnostics, inlay hints, update-all and hover (`component:` and `project:`
         /// includes alike), and the rewrite is the latest tag's full SHA, never a bare tag. A

@@ -39,7 +39,8 @@ pub use formatter::GithubActionsFormatter;
 pub use parser::parse_workflow_yaml;
 pub use registry::GithubActionsRegistry;
 pub use types::{
-    GithubActionsDependency, GithubActionsParseResult, GithubActionsVersion, PinStyle,
+    ClosingDelimiters, GithubActionsDependency, GithubActionsParseResult, GithubActionsVersion,
+    PinStyle,
 };
 
 /// Stable [`tower_lsp_server::ls_types::Diagnostic::code`] for the mutable-ref-pin
