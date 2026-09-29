@@ -262,7 +262,7 @@ impl OsvNaming for PypiFormatter {
     /// the whole batch with it, silently dropping every sibling dependency's advisories.
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<OsvPackageName> {
         self.validate_package_name(dep.name().as_str()).ok()?;
-        Some(OsvPackageName::new(self.normalize_package_name(dep.name())))
+        OsvPackageName::new_or_skip(self.normalize_package_name(dep.name()))
     }
 }
 
@@ -770,7 +770,7 @@ mod tests {
         ] {
             assert_eq!(
                 PypiFormatter.osv_package_name(&dep(manifest)),
-                Some(OsvPackageName::new(osv)),
+                OsvPackageName::new(osv).ok(),
                 "{manifest}"
             );
         }

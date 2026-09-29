@@ -2795,6 +2795,7 @@ mod osv_version_validation_tests {
     #[test]
     fn into_advisory_pypi_multi_package_record_keeps_only_queried_package_fix() {
         let affected = |name: &str, fixed: &str| OsvAffected {
+            versions: vec![],
             package: Some(OsvPackage {
                 name: name.to_string(),
                 ecosystem: "PyPI".to_string(),
@@ -2804,6 +2805,8 @@ mod osv_version_validation_tests {
             ranges: vec![OsvRange {
                 range_type: OsvRangeType::Ecosystem,
                 events: vec![OsvEvent {
+                    introduced: None,
+                    last_affected: None,
                     fixed: Some(fixed.to_string()),
                 }],
             }],
@@ -2819,7 +2822,10 @@ mod osv_version_validation_tests {
         };
 
         let advisory = record
-            .into_advisory(&OsvPackageName::new("werkzeug"), OsvEcosystem::PyPI)
+            .into_advisory(
+                &OsvPackageName::new("werkzeug").unwrap(),
+                OsvEcosystem::PyPI,
+            )
             .expect("valid id");
         assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("3.0.1")]);
     }
