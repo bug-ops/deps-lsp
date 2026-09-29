@@ -10,7 +10,8 @@
 use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, warn_rejected_value,
+    RequirementMatcher, RequirementResolution, SourcePolicy, up_to_date_via_compiled_matcher,
+    warn_rejected_value,
 };
 use deps_core::osv::OsvPackageName;
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
@@ -113,6 +114,15 @@ impl RequirementResolution for DenoFormatter {
     /// `jsr:` specifiers with no separate flag to declare on this formatter.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
         deps_npm::compile_node_semver_range(requirement)
+    }
+
+    /// Same compiled-matcher verdict as `deps-npm` (#1656), for both `npm:` and `jsr:`.
+    fn is_requirement_up_to_date(
+        &self,
+        requirement: &VersionReq,
+        latest: &ConcreteVersion,
+    ) -> bool {
+        up_to_date_via_compiled_matcher(self, requirement, latest)
     }
 
     // #1370/#1377/#1380/#1391: `deno.json`/`deno.jsonc`'s own import-specifier grammar has no
@@ -508,5 +518,59 @@ mod tests {
         assert!(matcher.explicitly_excludes(&ConcreteVersion::new("1.5.0")));
         assert!(!matcher.explicitly_excludes(&ConcreteVersion::new("1.2.0")));
         assert!(!matcher.explicitly_excludes(&ConcreteVersion::new("1.8.0")));
+    }
+
+    #[test]
+    fn test_is_requirement_up_to_date_npm_and_jsr_shapes() {
+        for requirement in ["=4.18.1", "<5", "^3 || ^4", "~*", ">=4.0.0 <4.20.0"] {
+            assert!(
+                DenoFormatter.is_requirement_up_to_date(
+                    &VersionReq::new(requirement),
+                    &ConcreteVersion::new("4.18.1")
+                ),
+                "{requirement:?} must be up to date"
+            );
+        }
+        for requirement in [">=5", "^5 || ^6", "^4.5 <4.7"] {
+            assert!(
+                !DenoFormatter.is_requirement_up_to_date(
+                    &VersionReq::new(requirement),
+                    &ConcreteVersion::new("4.18.1")
+                ),
+                "{requirement:?} must be outdated"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_requirement_up_to_date_prerelease_latest_and_floor_above_latest() {
+        for (requirement, latest) in [
+            ("*", "1.0.0-beta.3"),
+            ("1.x", "1.0.0-beta.3"),
+            ("~1.0", "1.0.0-beta.3"),
+            ("^4 || ^5", "5.0.0-beta.1"),
+            ("^1.5 || ^2", "1.4.9"),
+        ] {
+            assert!(
+                DenoFormatter.is_requirement_up_to_date(
+                    &VersionReq::new(requirement),
+                    &ConcreteVersion::new(latest)
+                ),
+                "{requirement:?} vs {latest}"
+            );
+        }
+        assert!(!DenoFormatter.is_requirement_up_to_date(
+            &VersionReq::new(">=4 <5"),
+            &ConcreteVersion::new("5.0.0-beta.1")
+        ));
+    }
+
+    /// A non-semver specifier value must not be misjudged as up to date by the matcher path.
+    #[test]
+    fn test_is_requirement_up_to_date_workspace_specifier_does_not_panic() {
+        let _ = DenoFormatter.is_requirement_up_to_date(
+            &VersionReq::new("workspace:*"),
+            &ConcreteVersion::new("1.0.0"),
+        );
     }
 }

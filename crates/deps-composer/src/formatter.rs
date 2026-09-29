@@ -3427,4 +3427,29 @@ mod tests {
             self
         }
     }
+
+    /// #1656: a compound caret no longer gets hijacked by the single-caret shortcut.
+    #[test]
+    fn test_is_requirement_up_to_date_compound_caret_default_path() {
+        assert!(ComposerFormatter.is_requirement_up_to_date(
+            &VersionReq::new("^3.0 || ^4.0"),
+            &ConcreteVersion::new("4.1.0")
+        ));
+    }
+
+    /// S2 for compound requirements: a floor above `latest` never suggests a downgrade, while
+    /// a `latest` past the upper bound is genuinely outdated.
+    #[test]
+    fn test_is_requirement_up_to_date_compound_caret_floor_above_latest() {
+        let up_to_date = |requirement: &str, latest: &str| {
+            ComposerFormatter.is_requirement_up_to_date(
+                &VersionReq::new(requirement),
+                &ConcreteVersion::new(latest),
+            )
+        };
+        for requirement in ["^1.5 <1.9", "^1.5,<1.9", "^1.5 || ^2.0"] {
+            assert!(up_to_date(requirement, "1.4.9"), "{requirement:?}");
+        }
+        assert!(!up_to_date("^1.5 <1.9", "1.9.5"));
+    }
 }
