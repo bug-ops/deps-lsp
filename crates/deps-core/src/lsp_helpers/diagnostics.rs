@@ -1338,7 +1338,8 @@ fn offline_notice(
 
 /// Whether `reason` is transient/environment-dependent enough to warrant the persistent,
 /// document-level [`skip_reason_notice`] (issue #1392 M1) — as opposed to
-/// `NonRegistrySource`/`UnmappableName`/`UnmappableEcosystem`, which are structurally
+/// `NonRegistrySource`/`UnmappableName`/`UnmappableEcosystem`/`UnmatchableVersion` (a floating
+/// `@v4` tag is the norm for GitHub Actions, not a transient state), which are structurally
 /// permanent for as long as the dependency is declared the way it is (every `deno.json`
 /// `jsr:` dependency is `UnmappableName` forever, for example) and would otherwise leave a
 /// standing, unresolvable Problems-panel entry. [`push_skip_reason_footer_hover_section`]
@@ -1350,10 +1351,12 @@ const fn should_notify_in_diagnostics(reason: SkipReason) -> bool {
         SkipReason::NoConcreteVersion
         | SkipReason::ResolvedTagNotFullVersion
         | SkipReason::QueryFailed
-        | SkipReason::Truncated => true,
+        | SkipReason::Truncated
+        | SkipReason::UnevaluableAdvisoryRange => true,
         SkipReason::NonRegistrySource
         | SkipReason::UnmappableName
-        | SkipReason::UnmappableEcosystem => false,
+        | SkipReason::UnmappableEcosystem
+        | SkipReason::UnmatchableVersion => false,
     }
 }
 
@@ -5436,6 +5439,52 @@ mod tests {
             "UnmappableName/UnmappableEcosystem must never contribute to the notice; \
              got: {diagnostics:?}"
         );
+    }
+
+    fn skip_notice_present(reason: crate::osv::SkipReason) -> bool {
+        use crate::osv::{ScanOutcome, VulnerabilityMap};
+        use crate::position::{Position, Range};
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "pkg".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 3)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            crate::test_util::vuln_key("pkg"),
+            ScanOutcome::Skipped(reason),
+        );
+        generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &MOCK_FORMATTER,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        )
+        .iter()
+        .any(|d| {
+            d.message()
+                .contains("vulnerability data was not checked for")
+        })
+    }
+
+    /// #1675: an advisory whose range could not be evaluated must be visible outside the hover
+    /// footer, while a non-SemVer pin (a permanent, benign state) must not leave a standing notice.
+    #[test]
+    fn test_skip_reason_notice_for_local_matching_reasons() {
+        use crate::osv::SkipReason;
+
+        assert!(skip_notice_present(SkipReason::UnevaluableAdvisoryRange));
+        assert!(!skip_notice_present(SkipReason::UnmatchableVersion));
     }
 
     /// Issue #1392 (critic S2, M4): two dependencies skipped for the *same* reason must

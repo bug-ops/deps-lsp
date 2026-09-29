@@ -86,6 +86,49 @@ impl OsvEcosystem {
             Self::GitHubActions => "GitHub Actions",
         }
     }
+
+    /// How OSV.dev evaluates a queried version for this ecosystem — the single place a new
+    /// ecosystem is forced (by exhaustiveness) to declare whether the server can be trusted to
+    /// version-match, or whether affected ranges must be matched locally (issue #1675).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::{OsvEcosystem, VersionMatching};
+    ///
+    /// assert_eq!(OsvEcosystem::CratesIo.version_matching(), VersionMatching::ServerSide);
+    /// assert_eq!(OsvEcosystem::GitHubActions.version_matching(), VersionMatching::LocalUnversioned);
+    /// ```
+    #[must_use]
+    pub const fn version_matching(self) -> VersionMatching {
+        match self {
+            Self::CratesIo
+            | Self::Npm
+            | Self::PyPI
+            | Self::Go
+            | Self::RubyGems
+            | Self::Pub
+            | Self::Maven
+            | Self::Packagist
+            | Self::SwiftURL
+            | Self::NuGet => VersionMatching::ServerSide,
+            Self::GitHubActions => VersionMatching::LocalUnversioned,
+        }
+    }
+}
+
+/// Where an [`OsvEcosystem`]'s queried version is matched against advisory ranges.
+///
+/// OSV.dev returns `{}` for a `version`-carrying query in the `GitHub Actions` ecosystem even
+/// when the version is inside an advisory's affected range (issue #1675), so a versioned query
+/// there reads as a false "clean". [`Self::LocalUnversioned`] ecosystems are queried without
+/// `version` and matched locally against each record's `affected[].ranges`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionMatching {
+    /// OSV.dev matches `version` server-side; the query carries it.
+    ServerSide,
+    /// The query omits `version`; advisory ranges are matched locally against the in-use version.
+    LocalUnversioned,
 }
 
 /// A version string in OSV.dev's own wire spelling — distinct from [`ConcreteVersion`], the
@@ -216,16 +259,19 @@ impl PartialEq<&str> for OsvVersion {
 /// (`PackageName`): the transform between them is not round-trippable (Swift `owner/repo` ->
 /// `github.com/owner/repo`; Composer lowercased), so a bare `String` would let a native name be
 /// passed where the wire name is required. Deliberately has no `From<String>`/`From<&str>`:
-/// construction goes through [`OsvPackageName::new`] only, so every wrap is greppable.
+/// construction goes through [`OsvPackageName::new`] only, so every wrap is greppable, and it
+/// rejects an empty name: OSV answers a `querybatch` containing one empty package name with
+/// HTTP 400 for the *whole* batch, dropping every sibling's advisories (issue #1678).
 ///
 /// # Examples
 ///
 /// ```
 /// use deps_core::osv::OsvPackageName;
 ///
-/// let name = OsvPackageName::new("github.com/apple/swift-nio");
+/// let name = OsvPackageName::new("github.com/apple/swift-nio").unwrap();
 /// assert_eq!(name.as_str(), "github.com/apple/swift-nio");
 /// assert_eq!(name, "github.com/apple/swift-nio");
+/// assert!(OsvPackageName::new("").is_err());
 /// ```
 ///
 /// `PartialOrd`/`Ord` are derived (raw byte-string order) only because
@@ -234,19 +280,52 @@ impl PartialEq<&str> for OsvVersion {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OsvPackageName(String);
 
+/// Error returned by [`OsvPackageName::new`] for an empty package name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("OSV package name must not be empty")]
+pub struct EmptyOsvPackageName;
+
 impl OsvPackageName {
     /// Wraps `value` as an `OsvPackageName`, unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EmptyOsvPackageName`] if `value` is empty.
     ///
     /// # Examples
     ///
     /// ```
     /// use deps_core::osv::OsvPackageName;
     ///
-    /// let name = OsvPackageName::new(String::from("serde"));
+    /// let name = OsvPackageName::new(String::from("serde")).unwrap();
     /// assert_eq!(name.as_str(), "serde");
+    /// assert!(OsvPackageName::new("").is_err());
     /// ```
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    pub fn new(value: impl Into<String>) -> Result<Self, EmptyOsvPackageName> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(EmptyOsvPackageName);
+        }
+        Ok(Self(value))
+    }
+
+    /// Like [`Self::new`], but maps an empty name to `None` after logging that the dependency
+    /// is skipped — the shared handling for `OsvNaming::osv_package_name` implementations,
+    /// so one empty key never poisons a whole batch (issue #1678).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::OsvPackageName;
+    ///
+    /// assert!(OsvPackageName::new_or_skip("serde").is_some());
+    /// assert!(OsvPackageName::new_or_skip("").is_none());
+    /// ```
+    #[must_use]
+    pub fn new_or_skip(value: impl Into<String>) -> Option<Self> {
+        Self::new(value)
+            .inspect_err(|e| tracing::warn!(error = %e, "skipping dependency from OSV scan"))
+            .ok()
     }
 
     /// Returns the OSV wire package name as a string slice.
@@ -256,7 +335,7 @@ impl OsvPackageName {
     /// ```
     /// use deps_core::osv::OsvPackageName;
     ///
-    /// assert_eq!(OsvPackageName::new("tokio").as_str(), "tokio");
+    /// assert_eq!(OsvPackageName::new("tokio").unwrap().as_str(), "tokio");
     /// ```
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -270,7 +349,7 @@ impl OsvPackageName {
     /// ```
     /// use deps_core::osv::OsvPackageName;
     ///
-    /// let owned: String = OsvPackageName::new("tokio").into_string();
+    /// let owned: String = OsvPackageName::new("tokio").unwrap().into_string();
     /// assert_eq!(owned, "tokio");
     /// ```
     #[must_use]
@@ -308,8 +387,15 @@ mod osv_package_name_tests {
     use super::OsvPackageName;
 
     #[test]
+    fn new_rejects_empty_name_and_new_or_skip_maps_it_to_none() {
+        assert_eq!(OsvPackageName::new(""), Err(super::EmptyOsvPackageName));
+        assert_eq!(OsvPackageName::new_or_skip(""), None);
+        assert!(OsvPackageName::new_or_skip("serde").is_some());
+    }
+
+    #[test]
     fn test_display_as_ref_and_str_equality() {
-        let name = OsvPackageName::new("github.com/apple/swift-nio");
+        let name = OsvPackageName::new("github.com/apple/swift-nio").unwrap();
         assert_eq!(name.to_string(), "github.com/apple/swift-nio");
         assert_eq!(AsRef::<str>::as_ref(&name), "github.com/apple/swift-nio");
         assert_eq!(name, *"github.com/apple/swift-nio");
@@ -345,7 +431,7 @@ mod osv_package_name_tests {
 ///
 /// let target = ScanTarget::new(
 ///     vuln_key("time"),
-///     OsvPackageName::new("time"),
+///     OsvPackageName::new("time").unwrap(),
 ///     OsvVersion::new("0.1.43"),
 ///     ConcreteVersion::new("0.1.43"),
 /// );
@@ -425,7 +511,7 @@ impl ScanTarget {
     ///
     /// let target = ScanTarget::from_native(
     ///     vuln_key("time"),
-    ///     OsvPackageName::new("time"),
+    ///     OsvPackageName::new("time").unwrap(),
     ///     ConcreteVersion::new("0.1.43"),
     ///     &DefaultFormatter,
     /// );
@@ -454,7 +540,7 @@ mod scan_target_debug_redaction_tests {
         2,
         ScanTarget {
             key: VulnKey(crate::conformance::CREDENTIAL_PROBE_KEY.into()),
-            osv_name: OsvPackageName::new(crate::conformance::CREDENTIAL_PROBE_KEY),
+            osv_name: OsvPackageName::new(crate::conformance::CREDENTIAL_PROBE_KEY).unwrap(),
             version: OsvVersion::new("1.0.0"),
             display_version: ConcreteVersion::new("1.0.0"),
         },
@@ -1167,6 +1253,12 @@ pub enum SkipReason {
     /// bounded individual-requery budget was exhausted before this entry
     /// could be recovered (§8 invariant 2).
     Truncated,
+    /// The ecosystem is matched locally ([`OsvEcosystem::version_matching`]) and the in-use
+    /// version is not a full SemVer version (a floating `v4` tag, a SHA pin, a branch).
+    UnmatchableVersion,
+    /// The ecosystem is matched locally and an advisory exists for the package, but its
+    /// affected ranges could not be evaluated against the in-use version — possibly vulnerable.
+    UnevaluableAdvisoryRange,
 }
 
 impl SkipReason {
@@ -1180,6 +1272,8 @@ impl SkipReason {
             Self::UnmappableEcosystem => "unmappable-ecosystem",
             Self::QueryFailed => "query-failed",
             Self::Truncated => "truncated",
+            Self::UnmatchableVersion => "unmatchable-version",
+            Self::UnevaluableAdvisoryRange => "unevaluable-advisory-range",
         }
     }
 
@@ -1235,6 +1329,12 @@ impl SkipReason {
             Self::UnmappableEcosystem => Some("this ecosystem is not supported by OSV.dev"),
             Self::QueryFailed => Some("the OSV.dev query failed"),
             Self::Truncated => Some("the OSV.dev result set was truncated"),
+            Self::UnmatchableVersion => {
+                Some("the version could not be matched against advisory ranges")
+            }
+            Self::UnevaluableAdvisoryRange => Some(
+                "an advisory exists for this package but its affected range could not be evaluated",
+            ),
         }
     }
 
@@ -1258,7 +1358,9 @@ impl SkipReason {
             | Self::UnmappableName
             | Self::UnmappableEcosystem
             | Self::QueryFailed
-            | Self::Truncated => false,
+            | Self::Truncated
+            | Self::UnmatchableVersion
+            | Self::UnevaluableAdvisoryRange => false,
         }
     }
 
@@ -1373,6 +1475,16 @@ mod skip_reason_unchecked_reason_tests {
             (
                 SkipReason::Truncated,
                 Some("the OSV.dev result set was truncated"),
+            ),
+            (
+                SkipReason::UnmatchableVersion,
+                Some("the version could not be matched against advisory ranges"),
+            ),
+            (
+                SkipReason::UnevaluableAdvisoryRange,
+                Some(
+                    "an advisory exists for this package but its affected range could not be evaluated",
+                ),
             ),
         ];
         for (reason, expected) in cases {
@@ -1888,7 +2000,8 @@ pub(super) struct OsvBatchRequest {
 #[derive(Debug, Serialize)]
 pub(super) struct OsvQuery {
     pub(super) package: OsvPackage,
-    pub(super) version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) version: Option<String>,
 }
 
 impl OsvQuery {
@@ -1898,7 +2011,10 @@ impl OsvQuery {
                 name: target.osv_name.clone().into_string(),
                 ecosystem: osv_eco.as_str().to_owned(),
             },
-            version: target.version.clone().into_string(),
+            version: match osv_eco.version_matching() {
+                VersionMatching::ServerSide => Some(target.version.clone().into_string()),
+                VersionMatching::LocalUnversioned => None,
+            },
         }
     }
 }
@@ -1994,6 +2110,8 @@ pub(super) struct OsvAffected {
     pub(super) database_specific: Option<serde_json::Value>,
     #[serde(default)]
     pub(super) ranges: Vec<OsvRange>,
+    #[serde(default)]
+    pub(super) versions: Vec<String>,
 }
 
 /// OSV's `affected[].ranges[].type` discriminator (issue #1482).
@@ -2037,7 +2155,11 @@ pub(super) struct OsvRange {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub(super) struct OsvEvent {
     #[serde(default)]
+    pub(super) introduced: Option<String>,
+    #[serde(default)]
     pub(super) fixed: Option<String>,
+    #[serde(default)]
+    pub(super) last_affected: Option<String>,
 }
 
 /// Returns `true` if `id` matches OSV's advisory id grammar
@@ -2086,6 +2208,23 @@ pub fn validated_osv_url(id: &str) -> Option<String> {
 }
 
 impl OsvVulnRecord {
+    /// The `affected[]` entries describing `osv_name`/`osv_eco` (or omitting `package`) — one
+    /// record can cover several unrelated packages sharing an advisory id.
+    pub(super) fn affected_for(
+        &self,
+        osv_name: &OsvPackageName,
+        osv_eco: OsvEcosystem,
+    ) -> Vec<&OsvAffected> {
+        self.affected
+            .iter()
+            .filter(|a| {
+                a.package
+                    .as_ref()
+                    .is_none_or(|p| osv_name == p.name.as_str() && p.ecosystem == osv_eco.as_str())
+            })
+            .collect()
+    }
+
     /// Converts a raw wire record into the `deps-lsp`-facing [`Advisory`],
     /// or `None` if the record's id fails [`is_valid_osv_id`] (dropped, same
     /// as a 404 on `/v1/vulns/{id}` — the dependency renders with whichever
@@ -2110,15 +2249,7 @@ impl OsvVulnRecord {
             return None;
         }
 
-        let relevant: Vec<&OsvAffected> = self
-            .affected
-            .iter()
-            .filter(|a| {
-                a.package
-                    .as_ref()
-                    .is_none_or(|p| osv_name == p.name.as_str() && p.ecosystem == osv_eco.as_str())
-            })
-            .collect();
+        let relevant = self.affected_for(osv_name, osv_eco);
         // Every `affected[]` entry named a different package: OSV returned
         // this record in response to our exact query, so that should not
         // happen in practice. Fall back to using every entry rather than
@@ -2475,6 +2606,7 @@ mod osv_version_validation_tests {
             severity: vec![],
             database_specific: None,
             affected: vec![OsvAffected {
+                versions: vec![],
                 package: None,
                 ecosystem_specific: None,
                 database_specific: None,
@@ -2483,6 +2615,8 @@ mod osv_version_validation_tests {
                     events: fixed
                         .iter()
                         .map(|f| OsvEvent {
+                            introduced: None,
+                            last_affected: None,
                             fixed: Some((*f).to_string()),
                         })
                         .collect(),
@@ -2587,7 +2721,7 @@ mod osv_version_validation_tests {
         };
         assert!(
             record
-                .into_advisory(&OsvPackageName::new("pkg"), OsvEcosystem::CratesIo)
+                .into_advisory(&OsvPackageName::new("pkg").unwrap(), OsvEcosystem::CratesIo)
                 .is_none()
         );
     }
@@ -2613,7 +2747,7 @@ mod osv_version_validation_tests {
         let log = crate::test_util::capture_tracing_output(|| {
             assert!(
                 record
-                    .into_advisory(&OsvPackageName::new("pkg"), OsvEcosystem::CratesIo)
+                    .into_advisory(&OsvPackageName::new("pkg").unwrap(), OsvEcosystem::CratesIo)
                     .is_none()
             );
         });
@@ -2638,7 +2772,7 @@ mod osv_version_validation_tests {
         // verbatim into a `TextEdit`.
         let record = record_with_fixed(&["1.0.0", "1.0.0\", git = \"https://evil/x"]);
         let advisory = record
-            .into_advisory(&OsvPackageName::new("pkg"), OsvEcosystem::CratesIo)
+            .into_advisory(&OsvPackageName::new("pkg").unwrap(), OsvEcosystem::CratesIo)
             .expect("valid id, should still resolve");
 
         assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("1.0.0")]);
@@ -2649,7 +2783,7 @@ mod osv_version_validation_tests {
         let long_version = format!("1.0.0-{}", "a".repeat(64));
         let record = record_with_fixed(&["1.0.0", &long_version]);
         let advisory = record
-            .into_advisory(&OsvPackageName::new("pkg"), OsvEcosystem::CratesIo)
+            .into_advisory(&OsvPackageName::new("pkg").unwrap(), OsvEcosystem::CratesIo)
             .unwrap();
 
         assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("1.0.0")]);
@@ -2669,6 +2803,7 @@ mod osv_version_validation_tests {
             severity: vec![],
             database_specific: None,
             affected: vec![OsvAffected {
+                versions: vec![],
                 package: None,
                 ecosystem_specific: None,
                 database_specific: None,
@@ -2676,12 +2811,16 @@ mod osv_version_validation_tests {
                     OsvRange {
                         range_type: OsvRangeType::Git,
                         events: vec![OsvEvent {
+                            introduced: None,
+                            last_affected: None,
                             fixed: Some("74ea7cf7b6a3e2ff56cd76ce0d7bfa7ddd7bcaba".to_string()),
                         }],
                     },
                     OsvRange {
                         range_type: OsvRangeType::Ecosystem,
                         events: vec![OsvEvent {
+                            introduced: None,
+                            last_affected: None,
                             fixed: Some("2.31.0".to_string()),
                         }],
                     },
@@ -2690,7 +2829,10 @@ mod osv_version_validation_tests {
         };
 
         let advisory = record
-            .into_advisory(&OsvPackageName::new("requests"), OsvEcosystem::PyPI)
+            .into_advisory(
+                &OsvPackageName::new("requests").unwrap(),
+                OsvEcosystem::PyPI,
+            )
             .expect("valid id, should resolve");
 
         assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("2.31.0")]);
@@ -2710,6 +2852,7 @@ mod osv_version_validation_tests {
             severity: vec![],
             database_specific: None,
             affected: vec![OsvAffected {
+                versions: vec![],
                 package: None,
                 ecosystem_specific: None,
                 database_specific: None,
@@ -2717,12 +2860,16 @@ mod osv_version_validation_tests {
                     OsvRange {
                         range_type: OsvRangeType::Git,
                         events: vec![OsvEvent {
+                            introduced: None,
+                            last_affected: None,
                             fixed: Some("74ea7cf7b6a3e2ff56cd76ce0d7bfa7ddd7bcaba".to_string()),
                         }],
                     },
                     OsvRange {
                         range_type: OsvRangeType::Ecosystem,
                         events: vec![OsvEvent {
+                            introduced: None,
+                            last_affected: None,
                             fixed: Some("2.31.0".to_string()),
                         }],
                     },
@@ -2731,7 +2878,10 @@ mod osv_version_validation_tests {
         };
         let advisory = Arc::new(
             record
-                .into_advisory(&OsvPackageName::new("requests"), OsvEcosystem::PyPI)
+                .into_advisory(
+                    &OsvPackageName::new("requests").unwrap(),
+                    OsvEcosystem::PyPI,
+                )
                 .expect("valid id, should resolve"),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1));
@@ -2754,19 +2904,22 @@ mod osv_version_validation_tests {
             severity: vec![],
             database_specific: None,
             affected: vec![OsvAffected {
+                versions: vec![],
                 package: None,
                 ecosystem_specific: None,
                 database_specific: None,
                 ranges: vec![OsvRange {
                     range_type: OsvRangeType::Git,
                     events: vec![OsvEvent {
+                        introduced: None,
+                        last_affected: None,
                         fixed: Some("74ea7cf7b6a3e2ff56cd76ce0d7bfa7ddd7bcaba".to_string()),
                     }],
                 }],
             }],
         };
         let advisory = record
-            .into_advisory(&OsvPackageName::new("pkg"), OsvEcosystem::CratesIo)
+            .into_advisory(&OsvPackageName::new("pkg").unwrap(), OsvEcosystem::CratesIo)
             .expect("valid id, should resolve");
         assert!(
             advisory.fixed_versions.is_empty(),
@@ -2792,12 +2945,15 @@ mod osv_version_validation_tests {
             severity: vec![],
             database_specific: None,
             affected: vec![OsvAffected {
+                versions: vec![],
                 package: None,
                 ecosystem_specific: None,
                 database_specific: None,
                 ranges: vec![OsvRange {
                     range_type: OsvRangeType::Unknown,
                     events: vec![OsvEvent {
+                        introduced: None,
+                        last_affected: None,
                         fixed: Some("1.2.3".to_string()),
                     }],
                 }],
@@ -2805,7 +2961,7 @@ mod osv_version_validation_tests {
         };
 
         let advisory = record
-            .into_advisory(&OsvPackageName::new("pkg"), OsvEcosystem::CratesIo)
+            .into_advisory(&OsvPackageName::new("pkg").unwrap(), OsvEcosystem::CratesIo)
             .expect("valid id, should resolve");
 
         assert!(advisory.fixed_versions.is_empty());
@@ -2837,7 +2993,7 @@ mod osv_version_validation_tests {
     fn every_fixed_version_malformed_yields_empty_fixed_versions_not_a_dropped_advisory() {
         let record = record_with_fixed(&["1.0.0\nEvil"]);
         let advisory = record
-            .into_advisory(&OsvPackageName::new("pkg"), OsvEcosystem::CratesIo)
+            .into_advisory(&OsvPackageName::new("pkg").unwrap(), OsvEcosystem::CratesIo)
             .expect("the advisory itself is still valid, just with no usable fix");
 
         assert!(advisory.fixed_versions.is_empty());
@@ -2907,7 +3063,10 @@ mod informational_record_tests {
     fn live_yaml_rust_unmaintained_record_classifies_as_informational() {
         let record: OsvVulnRecord = serde_json::from_str(YAML_RUST_RUSTSEC_2024_0320).unwrap();
         let advisory = record
-            .into_advisory(&OsvPackageName::new("yaml-rust"), OsvEcosystem::CratesIo)
+            .into_advisory(
+                &OsvPackageName::new("yaml-rust").unwrap(),
+                OsvEcosystem::CratesIo,
+            )
             .expect("valid id, should resolve");
 
         assert_eq!(advisory.severity, VulnSeverity::Informational);
@@ -2933,7 +3092,7 @@ mod informational_record_tests {
         let record: OsvVulnRecord = serde_json::from_str(YAML_RUST_RUSTSEC_2024_0320).unwrap();
         let advisory = record
             .into_advisory(
-                &OsvPackageName::new("some-other-crate"),
+                &OsvPackageName::new("some-other-crate").unwrap(),
                 OsvEcosystem::CratesIo,
             )
             .expect("valid id, should resolve");
@@ -2957,7 +3116,10 @@ mod informational_record_tests {
         }"#;
         let record: OsvVulnRecord = serde_json::from_str(json).unwrap();
         let advisory = record
-            .into_advisory(&OsvPackageName::new("yaml-rust"), OsvEcosystem::CratesIo)
+            .into_advisory(
+                &OsvPackageName::new("yaml-rust").unwrap(),
+                OsvEcosystem::CratesIo,
+            )
             .expect("valid id, should resolve");
 
         assert_ne!(advisory.severity, VulnSeverity::Informational);
@@ -2981,7 +3143,10 @@ mod informational_record_tests {
         }"#;
         let record: OsvVulnRecord = serde_json::from_str(json).unwrap();
         let advisory = record
-            .into_advisory(&OsvPackageName::new("atty"), OsvEcosystem::CratesIo)
+            .into_advisory(
+                &OsvPackageName::new("atty").unwrap(),
+                OsvEcosystem::CratesIo,
+            )
             .expect("valid id, should resolve");
 
         assert_ne!(
@@ -3013,7 +3178,10 @@ mod informational_record_tests {
         }"#;
         let record: OsvVulnRecord = serde_json::from_str(json).unwrap();
         let advisory = record
-            .into_advisory(&OsvPackageName::new("yaml-rust"), OsvEcosystem::CratesIo)
+            .into_advisory(
+                &OsvPackageName::new("yaml-rust").unwrap(),
+                OsvEcosystem::CratesIo,
+            )
             .expect("valid id, should resolve");
 
         assert_eq!(advisory.severity, VulnSeverity::Unknown);

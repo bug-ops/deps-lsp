@@ -65,3 +65,21 @@ GitLab CI/CD — see [CI/CD Pinning](../cross-ecosystem/ci-pinning.md) for the f
 GitHub Actions sources release dates from the same `deps_core::github::ReleaseDatesCache` Swift
 uses — see [Swift](swift.md#release-freshness-coverage-shared-with-github-actions) for the full
 detail, including the four ways this coverage is partial and the `GITHUB_TOKEN` requirement.
+
+## Vulnerability Scanning
+
+OSV.dev does not version-match the `GitHub Actions` ecosystem server-side (a versioned query
+returns nothing even for an affected version), so deps-lsp fetches a package's advisories
+without a version and matches their affected ranges locally against the pinned version.
+
+- A full SemVer pin (`@v4.1.2`, or a SHA pin whose tag resolves to one) is checked; an advisory
+  whose range contains it produces the usual vulnerability hover and diagnostic.
+- A floating tag (`@v4`), a SHA pin with no resolvable tag, or any other non-SemVer pin is shown
+  as "not checked" in the hover footer (`UnmatchableVersion`), never as clean.
+- An advisory exists for the package but its affected range cannot be evaluated: a diagnostic
+  notes that vulnerability data was not checked (`UnevaluableAdvisoryRange`).
+- A package with more than 50 advisories is reported as truncated rather than partially matched.
+
+**Known limitations**: OSV package names are case-sensitive (#1683), floating tags are not
+resolved to a precise release (#1684), and unversioned advisory records are re-fetched on each
+cache miss (#1682).

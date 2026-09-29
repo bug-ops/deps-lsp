@@ -14,6 +14,7 @@
 //! one [`ScanOutcome`] back, so an OSV outage degrades to an empty-ish map
 //! rather than propagating an error into the LSP response (FR-007).
 
+mod local_match;
 mod severity;
 mod types;
 
@@ -23,15 +24,19 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
+use local_match::{LocalVersion, Verdict, match_affected};
 pub use severity::to_diagnostic_severity as diagnostic_severity_for;
 use types::worst_severity;
 pub use types::{
     Advisory, CandidateStatusMap, CandidateStatuses, Capped, DependencyVulnerabilities,
-    FixRecommendation, LatestStatusMap, OsvEcosystem, OsvPackageName, OsvVersion, ScanOutcome,
-    ScanTarget, SkipReason, StructuralSkipReason, UpgradeStatus, VulnKey, VulnKeys, VulnSeverity,
-    VulnerabilityMap, is_valid_osv_id, validated_osv_url, vuln_key_for, vulnerability_keys,
+    EmptyOsvPackageName, FixRecommendation, LatestStatusMap, OsvEcosystem, OsvPackageName,
+    OsvVersion, ScanOutcome, ScanTarget, SkipReason, StructuralSkipReason, UpgradeStatus,
+    VersionMatching, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap, is_valid_osv_id,
+    validated_osv_url, vuln_key_for, vulnerability_keys,
 };
-use types::{OsvBatchRequest, OsvBatchResponse, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord};
+use types::{
+    OsvBatchRequest, OsvBatchResponse, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord, OsvVulnStub,
+};
 
 use crate::cache::HttpCache;
 
@@ -432,6 +437,15 @@ impl OsvClient {
             if !seen.insert(&t.key) {
                 continue;
             }
+            if osv_eco.version_matching() == VersionMatching::LocalUnversioned
+                && LocalVersion::parse(&t.version).is_none()
+            {
+                outcomes.insert(
+                    t.key.clone(),
+                    ScanOutcome::Skipped(SkipReason::UnmatchableVersion),
+                );
+                continue;
+            }
             let cache_key = (osv_eco, t.osv_name.clone(), t.version.clone());
             let cached_ids = self.query_cache.get(&cache_key).and_then(|entry| {
                 (entry.fetched_at.elapsed() < QUERY_CACHE_TTL).then(|| entry.vuln_ids.clone())
@@ -555,18 +569,96 @@ impl OsvClient {
                 truncated.push(target.clone());
                 continue;
             }
-            let vuln_ids: Vec<(String, String)> = result
-                .vulns
-                .into_iter()
-                .map(|v| (v.id, v.modified))
-                .collect();
-            self.store_query_cache(osv_eco, target, &vuln_ids);
-            outcomes.insert(
-                target.key.clone(),
-                self.build_outcome(osv_eco, &target.osv_name, &vuln_ids, deadline)
-                    .await,
-            );
+            let outcome = match osv_eco.version_matching() {
+                VersionMatching::ServerSide => {
+                    let vuln_ids: Vec<(String, String)> = result
+                        .vulns
+                        .into_iter()
+                        .map(|v| (v.id, v.modified))
+                        .collect();
+                    self.store_query_cache(osv_eco, target, &vuln_ids);
+                    self.build_outcome(osv_eco, &target.osv_name, &vuln_ids, deadline)
+                        .await
+                }
+                VersionMatching::LocalUnversioned => {
+                    self.outcome_from_local_stubs(osv_eco, target, result.vulns, deadline)
+                        .await
+                }
+            };
+            outcomes.insert(target.key.clone(), outcome);
         }
+    }
+
+    /// Resolves an unversioned result set for a [`VersionMatching::LocalUnversioned`] target:
+    /// fetches every record and matches its ranges against the in-use version locally.
+    ///
+    /// Fails closed: more stubs than [`MAX_ADVISORY_RECORDS`] is [`SkipReason::Truncated`] (a
+    /// cap applied before matching could drop the one record that applies), and any record that
+    /// fails to fetch is [`SkipReason::QueryFailed`].
+    async fn outcome_from_local_stubs(
+        &self,
+        osv_eco: OsvEcosystem,
+        target: &ScanTarget,
+        stubs: Vec<OsvVulnStub>,
+        deadline: Instant,
+    ) -> ScanOutcome {
+        use futures::stream::{self, StreamExt};
+
+        if stubs.is_empty() {
+            self.store_query_cache(osv_eco, target, &[]);
+            return ScanOutcome::Clean;
+        }
+        if stubs.len() > MAX_ADVISORY_RECORDS {
+            return ScanOutcome::Skipped(SkipReason::Truncated);
+        }
+
+        let fetched: Vec<Option<Arc<OsvVulnRecord>>> =
+            stream::iter(stubs.into_iter().map(|s| s.id))
+                .map(|id| async move { self.fetch_record_single_flight(&id, deadline).await })
+                .buffer_unordered(RECORD_FETCH_CONCURRENCY)
+                .collect()
+                .await;
+        let Some(records) = fetched
+            .into_iter()
+            .map(|r| r.map(|r| (*r).clone()))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return ScanOutcome::Skipped(SkipReason::QueryFailed);
+        };
+        self.outcome_from_local_records(osv_eco, target, records)
+    }
+
+    /// Filters full `records` to those whose ranges apply to `target`'s version, then resolves
+    /// them like [`Self::outcome_from_full_records`]. A record whose ranges cannot be evaluated
+    /// never counts as clean: with no confirmed match the outcome is
+    /// [`SkipReason::UnevaluableAdvisoryRange`].
+    fn outcome_from_local_records(
+        &self,
+        osv_eco: OsvEcosystem,
+        target: &ScanTarget,
+        records: Vec<OsvVulnRecord>,
+    ) -> ScanOutcome {
+        let Some(version) = LocalVersion::parse(&target.version) else {
+            return ScanOutcome::Skipped(SkipReason::UnmatchableVersion);
+        };
+        let mut affected = Vec::new();
+        let mut undeterminable = 0usize;
+        for record in records {
+            let verdict = match_affected(&record.affected_for(&target.osv_name, osv_eco), &version);
+            match verdict {
+                Verdict::Affected => affected.push(record),
+                Verdict::NotAffected => {}
+                Verdict::Undeterminable => {
+                    tracing::warn!(id = %record.id, "OSV record ranges could not be matched locally");
+                    undeterminable += 1;
+                }
+            }
+        }
+        // A confirmed match outranks unevaluable siblings: the dependency is already flagged.
+        if affected.is_empty() && undeterminable > 0 {
+            return ScanOutcome::Skipped(SkipReason::UnevaluableAdvisoryRange);
+        }
+        self.outcome_from_full_records(osv_eco, target, affected)
     }
 
     /// Recovers batch-truncated entries via individual `POST /v1/query`
@@ -626,7 +718,14 @@ impl OsvClient {
                         );
                         ScanOutcome::Skipped(SkipReason::Truncated)
                     }
-                    Some(resp) => self.outcome_from_full_records(osv_eco, &target, resp.vulns),
+                    Some(resp) => match osv_eco.version_matching() {
+                        VersionMatching::ServerSide => {
+                            self.outcome_from_full_records(osv_eco, &target, resp.vulns)
+                        }
+                        VersionMatching::LocalUnversioned => {
+                            self.outcome_from_local_records(osv_eco, &target, resp.vulns)
+                        }
+                    },
                     None => ScanOutcome::Skipped(SkipReason::QueryFailed),
                 };
                 (target.key.clone(), outcome)
@@ -1003,7 +1102,7 @@ mod tests {
     fn osv_query_wire_json_carries_plain_package_name() {
         let t = ScanTarget::new(
             crate::test_util::vuln_key("apple/swift-nio"),
-            OsvPackageName::new("github.com/apple/swift-nio"),
+            OsvPackageName::new("github.com/apple/swift-nio").unwrap(),
             OsvVersion::new("2.0.0"),
             ConcreteVersion::new("2.0.0"),
         );
@@ -1032,7 +1131,7 @@ mod tests {
     fn target(name: &str, version: &str) -> ScanTarget {
         ScanTarget {
             key: crate::test_util::vuln_key(name),
-            osv_name: OsvPackageName::new(name),
+            osv_name: OsvPackageName::new(name).unwrap(),
             version: OsvVersion::new(version),
             display_version: ConcreteVersion::new(version),
         }
@@ -1376,6 +1475,334 @@ mod tests {
         assert_eq!(
             dv.advisories.items()[0].fixed_versions,
             vec![OsvVersion::new("2.17.1")]
+        );
+    }
+
+    const GHA_UNVERSIONED_BODY: &str = r#"{"results":[{"vulns":[{"id":"GHSA-cxww-7g56-2vh6","modified":"2025-01-22T17:31:55Z"}]}]}"#;
+    const GHA_RECORD_BODY: &str = r#"{"id":"GHSA-cxww-7g56-2vh6","modified":"2025-01-22T17:31:55Z",
+        "affected":[{"package":{"name":"actions/download-artifact","ecosystem":"GitHub Actions"},
+        "ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"4.0.0"},{"fixed":"4.1.3"}]}]}]}"#;
+
+    async fn scan_gha(version: &str) -> ScanOutcome {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .match_request(|req| {
+                !req.utf8_lossy_body()
+                    .is_ok_and(|b| b.contains("\"version\""))
+            })
+            .with_status(200)
+            .with_body(GHA_UNVERSIONED_BODY)
+            .create_async()
+            .await;
+        let _record = server
+            .mock("GET", "/v1/vulns/GHSA-cxww-7g56-2vh6")
+            .with_status(200)
+            .with_body(GHA_RECORD_BODY)
+            .create_async()
+            .await;
+        let targets = vec![target("actions/download-artifact", version)];
+        let mut outcomes = client
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        outcomes
+            .remove(&crate::test_util::vuln_key("actions/download-artifact"))
+            .expect("one outcome per target")
+    }
+
+    #[tokio::test]
+    async fn gha_unversioned_query_matches_in_range_version_locally() {
+        let ScanOutcome::Vulnerable(dv) = scan_gha("4.1.2").await else {
+            panic!("expected Vulnerable");
+        };
+        assert_eq!(dv.advisories.items()[0].id, "GHSA-cxww-7g56-2vh6");
+    }
+
+    #[tokio::test]
+    async fn gha_unversioned_query_is_clean_for_out_of_range_version() {
+        assert_matches!(scan_gha("4.1.3").await, ScanOutcome::Clean);
+    }
+
+    #[tokio::test]
+    async fn gha_non_semver_version_is_skipped_without_querying() {
+        let (_server, client) = mock_client().await;
+        for version in ["4", "main", "1234567890abcdef1234567890abcdef12345678"] {
+            let targets = vec![target("actions/download-artifact", version)];
+            let outcomes = client
+                .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+                .await;
+            assert_matches!(
+                outcomes.get(&crate::test_util::vuln_key("actions/download-artifact")),
+                Some(ScanOutcome::Skipped(SkipReason::UnmatchableVersion))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gha_unevaluable_range_is_skipped_not_clean() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(GHA_UNVERSIONED_BODY)
+            .create_async()
+            .await;
+        let _record = server
+            .mock("GET", "/v1/vulns/GHSA-cxww-7g56-2vh6")
+            .with_status(200)
+            .with_body(
+                r#"{"id":"GHSA-cxww-7g56-2vh6","modified":"2025-01-22T17:31:55Z",
+                "affected":[{"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"not-a-version"}]}]}]}"#,
+            )
+            .create_async()
+            .await;
+        let targets = vec![target("actions/download-artifact", "4.1.2")];
+        let outcomes = client
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("actions/download-artifact")),
+            Some(ScanOutcome::Skipped(SkipReason::UnevaluableAdvisoryRange))
+        );
+    }
+
+    fn gha_record(id: &str, affected_events: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","modified":"2025-01-01T00:00:00Z","affected":[{{"package":{{"name":"actions/download-artifact","ecosystem":"GitHub Actions"}},"ranges":[{{"type":"ECOSYSTEM","events":{affected_events}}}]}}]}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn gha_bare_major_fixed_bound_is_matched() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(GHA_UNVERSIONED_BODY)
+            .create_async()
+            .await;
+        let _record = server
+            .mock("GET", "/v1/vulns/GHSA-cxww-7g56-2vh6")
+            .with_status(200)
+            .with_body(gha_record(
+                "GHSA-cxww-7g56-2vh6",
+                r#"[{"introduced":"0"},{"fixed":"2"}]"#,
+            ))
+            .create_async()
+            .await;
+        let targets = vec![target("actions/download-artifact", "1.0.0")];
+        let outcomes = client
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("actions/download-artifact")),
+            Some(ScanOutcome::Vulnerable(_))
+        );
+    }
+
+    #[tokio::test]
+    async fn gha_mixed_batch_queries_only_matchable_targets() {
+        let (mut server, client) = mock_client().await;
+        let batch = server
+            .mock("POST", "/v1/querybatch")
+            .match_request(|req| {
+                req.utf8_lossy_body().is_ok_and(|b| {
+                    b.contains("actions/download-artifact") && !b.contains("floating-pin")
+                })
+            })
+            .with_status(200)
+            .with_body(r#"{"results":[{}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let targets = vec![
+            target("floating-pin", "v4"),
+            target("actions/download-artifact", "4.1.2"),
+        ];
+        let outcomes = client
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        batch.assert_async().await;
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("floating-pin")),
+            Some(ScanOutcome::Skipped(SkipReason::UnmatchableVersion))
+        );
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("actions/download-artifact")),
+            Some(ScanOutcome::Clean)
+        );
+    }
+
+    #[tokio::test]
+    async fn gha_confirmed_match_outranks_an_unevaluable_sibling() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(
+                r#"{"results":[{"vulns":[{"id":"GHSA-good","modified":"2025-01-01T00:00:00Z"},{"id":"GHSA-bad","modified":"2025-01-01T00:00:00Z"}]}]}"#,
+            )
+            .create_async()
+            .await;
+        let _good = server
+            .mock("GET", "/v1/vulns/GHSA-good")
+            .with_status(200)
+            .with_body(gha_record(
+                "GHSA-good",
+                r#"[{"introduced":"0"},{"fixed":"5.0.0"}]"#,
+            ))
+            .create_async()
+            .await;
+        let _bad = server
+            .mock("GET", "/v1/vulns/GHSA-bad")
+            .with_status(200)
+            .with_body(gha_record(
+                "GHSA-bad",
+                r#"[{"introduced":"0"},{"fixed":"not-a-version"}]"#,
+            ))
+            .create_async()
+            .await;
+        let targets = vec![target("actions/download-artifact", "4.1.2")];
+        let outcomes = client
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        let Some(ScanOutcome::Vulnerable(dv)) =
+            outcomes.get(&crate::test_util::vuln_key("actions/download-artifact"))
+        else {
+            panic!("expected Vulnerable");
+        };
+        assert_eq!(dv.advisories.total(), 1);
+    }
+
+    #[tokio::test]
+    async fn gha_more_than_the_record_cap_is_truncated_not_clean() {
+        let (mut server, client) = mock_client().await;
+        let vulns: Vec<String> = (0..=MAX_ADVISORY_RECORDS)
+            .map(|i| format!(r#"{{"id":"GHSA-{i}","modified":"2025-01-01T00:00:00Z"}}"#))
+            .collect();
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"results":[{{"vulns":[{}]}}]}}"#,
+                vulns.join(",")
+            ))
+            .create_async()
+            .await;
+        let targets = vec![target("actions/download-artifact", "4.1.2")];
+        let outcomes = client
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("actions/download-artifact")),
+            Some(ScanOutcome::Skipped(SkipReason::Truncated))
+        );
+    }
+
+    #[tokio::test]
+    async fn gha_record_fetch_failure_is_query_failed() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(GHA_UNVERSIONED_BODY)
+            .create_async()
+            .await;
+        let _record = server
+            .mock("GET", "/v1/vulns/GHSA-cxww-7g56-2vh6")
+            .with_status(500)
+            .create_async()
+            .await;
+        let targets = vec![target("actions/download-artifact", "4.1.2")];
+        let outcomes = client
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("actions/download-artifact")),
+            Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
+        );
+    }
+
+    #[tokio::test]
+    async fn gha_truncation_recovery_matches_locally() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(r#"{"results":[{"vulns":[],"next_page_token":"t"},{}]}"#)
+            .create_async()
+            .await;
+        let _single = server
+            .mock("POST", "/v1/query")
+            .match_request(|req| {
+                !req.utf8_lossy_body()
+                    .is_ok_and(|b| b.contains("\"version\""))
+            })
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"vulns":[{}]}}"#,
+                gha_record(
+                    "GHSA-cxww-7g56-2vh6",
+                    r#"[{"introduced":"4.0.0"},{"fixed":"4.1.3"}]"#
+                )
+            ))
+            .create_async()
+            .await;
+        let targets = vec![
+            target("actions/download-artifact", "4.1.2"),
+            target("actions/other", "9.9.9"),
+        ];
+        let outcomes = client
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("actions/download-artifact")),
+            Some(ScanOutcome::Vulnerable(_))
+        );
+    }
+
+    #[test]
+    fn version_matching_table_and_wire_json() {
+        assert_eq!(
+            OsvEcosystem::CratesIo.version_matching(),
+            VersionMatching::ServerSide
+        );
+        assert_eq!(
+            OsvEcosystem::GitHubActions.version_matching(),
+            VersionMatching::LocalUnversioned
+        );
+        let t = target("actions/download-artifact", "4.1.2");
+        let local = serde_json::to_value(OsvQuery::new(&t, OsvEcosystem::GitHubActions)).unwrap();
+        assert!(local.get("version").is_none());
+        let server_side = serde_json::to_value(OsvQuery::new(&t, OsvEcosystem::Npm)).unwrap();
+        assert_eq!(server_side["version"], "4.1.2");
+    }
+
+    /// Live gate for GHA advisories with bare-major bounds (`fixed: "2"`).
+    #[tokio::test]
+    #[ignore = "requires network access"]
+    async fn live_gha_bare_major_bound_is_vulnerable() {
+        let targets = vec![target("embano1/wip", "1.0.0")];
+        let outcomes = client()
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("embano1/wip")),
+            Some(ScanOutcome::Vulnerable(_))
+        );
+    }
+
+    /// Live registry gate for issue #1675: run on demand, never in CI.
+    #[tokio::test]
+    #[ignore = "requires network access"]
+    async fn live_gha_in_range_version_is_vulnerable() {
+        let targets = vec![target("actions/download-artifact", "4.1.2")];
+        let outcomes = client()
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("actions/download-artifact")),
+            Some(ScanOutcome::Vulnerable(_))
         );
     }
 
@@ -2119,7 +2546,7 @@ mod tests {
 
         let candidate = ScanTarget {
             key: crate::test_util::vuln_key("golang.org/x/text"),
-            osv_name: OsvPackageName::new("golang.org/x/text"),
+            osv_name: OsvPackageName::new("golang.org/x/text").unwrap(),
             version: OsvVersion::new("0.4.0"),
             display_version: ConcreteVersion::new("v0.4.0"),
         };

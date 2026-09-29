@@ -758,12 +758,12 @@ pub fn apply_live_fix_target_statuses(
 ///
 /// let targets = vec![ScanTarget::new(
 ///     vuln_key("serde"),
-///     OsvPackageName::new("serde"),
+///     OsvPackageName::new("serde").unwrap(),
 ///     OsvVersion::new("1.0.0"),
 ///     ConcreteVersion::new("1.0.0"),
 /// )];
 /// let map = osv_name_by_key(&targets);
-/// assert_eq!(map.get(&vuln_key("serde")), Some(&OsvPackageName::new("serde")));
+/// assert_eq!(map.get(&vuln_key("serde")), Some(&OsvPackageName::new("serde").unwrap()));
 /// ```
 #[must_use]
 pub fn osv_name_by_key(
@@ -2124,7 +2124,7 @@ mod tests {
             let mut osv_name_by_key = HashMap::new();
             osv_name_by_key.insert(
                 deps_core::test_util::vuln_key("pkg"),
-                deps_core::osv::OsvPackageName::new("pkg"),
+                deps_core::osv::OsvPackageName::new("pkg").unwrap(),
             );
 
             let resolution = resolve_fix_target(
@@ -2138,7 +2138,7 @@ mod tests {
                 resolution,
                 FixTargetResolution::NeedsLiveCheck(deps_core::osv::ScanTarget::new(
                     deps_core::test_util::vuln_key("pkg"),
-                    deps_core::osv::OsvPackageName::new("pkg"),
+                    deps_core::osv::OsvPackageName::new("pkg").unwrap(),
                     OsvVersion::new("1.2.0"),
                     ConcreteVersion::new("1.2.0"),
                 ))
@@ -2159,7 +2159,7 @@ mod tests {
             let mut osv_name_by_key = HashMap::new();
             osv_name_by_key.insert(
                 deps_core::test_util::vuln_key("pkg"),
-                deps_core::osv::OsvPackageName::new("pkg"),
+                deps_core::osv::OsvPackageName::new("pkg").unwrap(),
             );
 
             let resolution = resolve_fix_target(
@@ -2173,7 +2173,7 @@ mod tests {
                 resolution,
                 FixTargetResolution::NeedsLiveCheck(deps_core::osv::ScanTarget::new(
                     deps_core::test_util::vuln_key("pkg"),
-                    deps_core::osv::OsvPackageName::new("pkg"),
+                    deps_core::osv::OsvPackageName::new("pkg").unwrap(),
                     OsvVersion::new("1.2.0"),
                     ConcreteVersion::new("1.2.0"),
                 ))
@@ -2262,15 +2262,15 @@ mod tests {
             let mut osv_name_by_key = HashMap::new();
             osv_name_by_key.insert(
                 deps_core::test_util::vuln_key("reused"),
-                deps_core::osv::OsvPackageName::new("reused"),
+                deps_core::osv::OsvPackageName::new("reused").unwrap(),
             );
             osv_name_by_key.insert(
                 deps_core::test_util::vuln_key("live-a"),
-                deps_core::osv::OsvPackageName::new("live-a"),
+                deps_core::osv::OsvPackageName::new("live-a").unwrap(),
             );
             osv_name_by_key.insert(
                 deps_core::test_util::vuln_key("live-b"),
-                deps_core::osv::OsvPackageName::new("live-b"),
+                deps_core::osv::OsvPackageName::new("live-b").unwrap(),
             );
 
             let (resolved, live_check_candidates) = collect_fix_target_resolutions(

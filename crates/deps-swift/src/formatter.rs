@@ -226,7 +226,8 @@ impl OsvNaming for SwiftFormatter {
         let host = reqwest::Url::parse(&swift_dep.url).ok()?;
         host.host_str()
             .is_some_and(crate::is_github_host)
-            .then(|| OsvPackageName::new(format!("github.com/{}", dep.name().as_str())))
+            .then(|| format!("github.com/{}", dep.name().as_str()))
+            .and_then(OsvPackageName::new_or_skip)
     }
 }
 
@@ -460,7 +461,7 @@ mod tests {
         let dep = dep_with_url("apple/swift-nio", "https://github.com/apple/swift-nio.git");
         assert_eq!(
             fmt.osv_package_name(&dep),
-            Some(OsvPackageName::new("github.com/apple/swift-nio"))
+            Some(OsvPackageName::new("github.com/apple/swift-nio").unwrap())
         );
     }
 
@@ -473,7 +474,7 @@ mod tests {
         );
         assert_eq!(
             fmt.osv_package_name(&dep),
-            Some(OsvPackageName::new("github.com/apple/swift-nio"))
+            Some(OsvPackageName::new("github.com/apple/swift-nio").unwrap())
         );
     }
 
@@ -507,7 +508,7 @@ mod tests {
         let dep = dep_with_url("Apple/Swift-NIO", "https://github.com/Apple/Swift-NIO.git");
         assert_eq!(
             fmt.osv_package_name(&dep),
-            Some(OsvPackageName::new("github.com/Apple/Swift-NIO"))
+            Some(OsvPackageName::new("github.com/Apple/Swift-NIO").unwrap())
         );
         assert_eq!(
             fmt.normalize_package_name(&dep.name),
