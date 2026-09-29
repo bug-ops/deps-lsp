@@ -7,6 +7,9 @@
 
 #![no_main]
 
+#[path = "../shared/panic_guard.rs"]
+mod panic_guard;
+
 use deps_pypi::parser::PypiParser;
 use libfuzzer_sys::fuzz_target;
 use std::sync::LazyLock;
@@ -20,5 +23,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let parser = PypiParser::new();
-    let _ = parser.parse_requirements(content, &FUZZ_URI, false);
+    let _ = panic_guard::run_aborting_on_escape(|| {
+        parser.parse_requirements(content, &FUZZ_URI, false)
+    });
 });
