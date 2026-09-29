@@ -124,7 +124,7 @@ fuzz_target!(|data: &[u8]| {
                 });
             }
             let _ = timed("version_satisfies_requirement", bound_duration, || {
-                formatter.version_satisfies_requirement(&version, requirement_str)
+                formatter.version_satisfies_requirement(&version, &requirement)
             });
             let _ = timed("is_requirement_up_to_date", bound_duration, || {
                 formatter.is_requirement_up_to_date(&requirement, &version)

@@ -3,8 +3,8 @@
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementResolution, RequirementStatus, SourcePolicy, TagIndex,
-    match_v_prefix_style, requirement_contains_template_placeholder, warn_rejected_value,
+    PackageRendering, RequirementResolution, RequirementStatus, ResolvedPin, SourcePolicy,
+    TagIndex, match_v_prefix_style, requirement_contains_template_placeholder, warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
@@ -52,7 +52,7 @@ impl GitlabCiFormatter {
     ) -> Option<String> {
         self.tag_index
             .get(&(endpoint, name.clone()))
-            .and_then(|index| index.sha_to_tag.get(sha).cloned())
+            .and_then(|index| index.tag_for_sha(sha).map(str::to_string))
     }
 
     /// Looks up `tag`'s commit SHA for `name` under `endpoint` in the shared tag index —
@@ -299,19 +299,15 @@ impl RequirementResolution for GitlabCiFormatter {
     /// Keyed by `(endpoint, name)`, not `name` alone (validation finding S2) — same
     /// disambiguation `Self::resolved_tag_for_sha` applies, since a `project:` and
     /// `component:` include can textually collide on name across endpoints.
-    fn resolved_pin_version(&self, dep: &dyn Dependency) -> Option<ConcreteVersion> {
+    fn resolved_pin_version(&self, dep: &dyn Dependency) -> Option<ResolvedPin> {
         let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
         if gl_dep.pin != Some(PinStyle::Sha) {
             return None;
         }
         let sha = gl_dep.version_req.as_ref().map(VersionReq::as_str)?;
-        let tag = self
-            .tag_index
+        self.tag_index
             .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()))?
-            .sha_to_tag
-            .get(sha)?
-            .clone();
-        Some(ConcreteVersion::new(tag))
+            .resolved_pin(sha)
     }
 
     /// `tag_index` is populated as a side effect of [`GitlabCiRegistry`]'s own tags fetch,
@@ -826,9 +822,12 @@ mod tests {
         let sha = "a".repeat(40);
         let fmt = formatter();
         let mut index = TagIndex::default();
-        index
-            .sha_to_tag
-            .insert(CommitSha::parse(&sha).unwrap(), "v1.2.3".to_string());
+        index.insert_sha_pin(
+            CommitSha::parse(&sha).unwrap(),
+            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+                "v1.2.3",
+            )),
+        );
         fmt.tag_index.insert(
             (EndpointKind::Tags, PackageName::new("gitlab.com/org/proj")),
             Arc::new(index),
@@ -846,8 +845,44 @@ mod tests {
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            Some(ConcreteVersion::new("v1.2.3"))
+            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v1.2.3")))
         );
+    }
+
+    /// #1668 parity with GitHub Actions: the shared `TagIndex` classification flows through
+    /// GitLab's `(endpoint, name)`-keyed lookup.
+    #[test]
+    fn test_resolved_pin_version_classifies_two_component_release_and_alias() {
+        use deps_core::lsp_helpers::CommitSha;
+
+        let most_specific = |tag: &str| Some(ResolvedPin::MostSpecific(ConcreteVersion::new(tag)));
+        let sha = "a".repeat(40);
+        let commit = CommitSha::parse(&sha).unwrap();
+        for (tags, expected) in [
+            (vec!["v2", "v2.9"], most_specific("v2.9")),
+            (vec!["v2"], most_specific("v2")),
+            (vec!["v2", "v2.9.1"], most_specific("v2.9.1")),
+            (
+                vec!["v2.9", "v2.9.1.4"],
+                Some(ResolvedPin::Alias(ConcreteVersion::new("v2.9"))),
+            ),
+        ] {
+            let fmt = formatter();
+            fmt.tag_index.insert(
+                (EndpointKind::Tags, PackageName::new("gitlab.com/org/proj")),
+                Arc::new(TagIndex::from_tags(tags.iter().map(|t| (*t, &commit)))),
+            );
+            let mut d = dep(
+                Some(PinStyle::Sha),
+                "gitlab.com/org/proj",
+                DependencySource::AlternateRegistry {
+                    index: "gitlab:abc".into(),
+                    mirrors_crates_io: false,
+                },
+            );
+            d.version_req = Some(sha.clone().into());
+            assert_eq!(fmt.resolved_pin_version(&d), expected, "{tags:?}");
+        }
     }
 
     /// Keyed by `(endpoint, name)`, not `name` alone (validation finding S2): a
@@ -860,9 +895,12 @@ mod tests {
         let sha = "b".repeat(40);
         let fmt = formatter();
         let mut index = TagIndex::default();
-        index
-            .sha_to_tag
-            .insert(CommitSha::parse(&sha).unwrap(), "v1.0.0".to_string());
+        index.insert_sha_pin(
+            CommitSha::parse(&sha).unwrap(),
+            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+                "v1.0.0",
+            )),
+        );
         // Only the Releases (component:) endpoint has an entry for this name.
         fmt.tag_index.insert(
             (

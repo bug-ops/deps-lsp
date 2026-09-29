@@ -1543,7 +1543,7 @@ pub trait RequirementResolution: Send + Sync {
     /// [`crate::lsp_helpers::concrete_pin_version`] must.
     ///
     /// GitHub Actions is the motivating case (#1556): a SHA-pinned `uses:` step's exact
-    /// version is knowable from [`crate::lsp_helpers::TagIndex::sha_to_tag`] — resolved via
+    /// version is knowable from [`crate::lsp_helpers::TagIndex::resolved_pin`] — resolved via
     /// the same live tags fetch that already backs hover's `**Resolved**` line and the "Pin
     /// to commit SHA" quickfix — even when the pin's trailing `# comment` fails
     /// `concrete_pin_version`'s text-shape check (a moving-major-tag comment, a literal
@@ -1558,13 +1558,16 @@ pub trait RequirementResolution: Send + Sync {
     /// open, never silently supersede a stronger existing resolution source), but a `Some`
     /// here wins over the blind manifest-text guess below it, since it is still strictly
     /// more trustworthy than text alone. Its own output is not trusted verbatim either: the
-    /// caller re-applies the identical full-version shape gate manifest text goes through
-    /// (`concrete_pin_version`), since this hook can itself resolve to a
-    /// moving/partial name (#1556 impl-critic S1).
+    /// caller re-applies a shape gate (`concrete_pin_version`, plus a two-component allowance
+    /// for a [`crate::lsp_helpers::ResolvedPin::MostSpecific`] tag), since this hook can itself
+    /// resolve to a moving/partial name (#1556 impl-critic S1, #1668).
     ///
     /// Default: `None` — every ecosystem's manifest requirement text is authoritative until
     /// it opts in.
-    fn resolved_pin_version(&self, dep: &dyn Dependency) -> Option<ConcreteVersion> {
+    fn resolved_pin_version(
+        &self,
+        dep: &dyn Dependency,
+    ) -> Option<crate::lsp_helpers::ResolvedPin> {
         let _ = dep;
         None
     }

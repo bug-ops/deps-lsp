@@ -1848,8 +1848,13 @@ mod tests {
                 ) -> bool {
                     false
                 }
-                fn resolved_pin_version(&self, _dep: &dyn Dependency) -> Option<ConcreteVersion> {
-                    Some(ConcreteVersion::new("v1.3.0"))
+                fn resolved_pin_version(
+                    &self,
+                    _dep: &dyn Dependency,
+                ) -> Option<crate::lsp_helpers::ResolvedPin> {
+                    Some(crate::lsp_helpers::ResolvedPin::MostSpecific(
+                        ConcreteVersion::new("v1.3.0"),
+                    ))
                 }
             }
             impl crate::lsp_helpers::DiagnosticMessages for ShaPinResolvedFormatter {}

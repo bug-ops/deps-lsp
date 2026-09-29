@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::lsp_helpers::{BoundedVersionReq, EcosystemFormatter};
+use crate::lsp_helpers::{BoundedVersionReq, EcosystemFormatter, ResolvedPin};
 use crate::{ConcreteVersion, Dependency, EcosystemId, PackageName};
 
 /// How a *bare* (no explicit pin marker) version requirement should be treated when
@@ -200,15 +200,17 @@ pub fn is_full_semver_shape(s: &str) -> bool {
         Some(idx) => &s[..idx],
         None => s,
     };
+    is_dotted_numeric::<3>(core)
+}
+
+/// Whether `core` is exactly `N` non-empty, all-digit, dot-separated components.
+fn is_dotted_numeric<const N: usize>(core: &str) -> bool {
     let mut parts = core.split('.');
-    let (Some(major), Some(minor), Some(patch), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    [major, minor, patch]
-        .iter()
-        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    let components: [Option<&str>; N] = std::array::from_fn(|_| parts.next());
+    parts.next().is_none()
+        && components
+            .iter()
+            .all(|p| p.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())))
 }
 
 /// Returns `true` if `s` (already stripped of any pin marker) has the shape
@@ -512,12 +514,11 @@ pub fn resolve_in_use_version(
     // #1556: an ecosystem's own out-of-band resolution (e.g. GitHub Actions' `TagIndex`)
     // wins over the manifest-text fallback below — but never over a lock-file-resolved
     // version above (impl-critic M2: a stronger existing resolution source must not be
-    // silently superseded) — and still must pass the same full-version shape gate as
-    // manifest text, since `TagIndex` can resolve a SHA to a moving/partial tag name
-    // (`v1`, `v2.9`) that is not itself a queryable version (#503).
+    // silently superseded) — and still must pass a shape gate, since `TagIndex` can resolve a
+    // SHA to a moving alias (`v1`, `v2` next to `v2.9`) that is not a queryable version (#503).
     if let Some(resolved) = formatter
         .resolved_pin_version(dep)
-        .and_then(|v| concrete_pin_version(v.as_str(), ecosystem).map(ConcreteVersion::from))
+        .and_then(|pin| queryable_pin_version(&pin, ecosystem))
     {
         return Some(resolved);
     }
@@ -525,6 +526,44 @@ pub fn resolve_in_use_version(
     dep.version_requirement()
         .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
         .map(ConcreteVersion::from)
+}
+
+/// The version a [`ResolvedPin`] may be queried with: a full `major.minor.patch` tag, or a
+/// two-component tag that is the most specific name published for the pinned commit (#1668).
+fn queryable_pin_version(pin: &ResolvedPin, ecosystem: EcosystemId) -> Option<ConcreteVersion> {
+    let version = pin.version();
+    match pin {
+        ResolvedPin::MostSpecific(_) if is_major_minor_shape(version.as_str()) => {
+            Some(version.clone())
+        }
+        ResolvedPin::MostSpecific(_) | ResolvedPin::Alias(_) => {
+            concrete_pin_version(version.as_str(), ecosystem).map(ConcreteVersion::from)
+        }
+    }
+}
+
+/// Whether `s` is exactly `major.minor` (optional `v`/`V` prefix), all-digit, no suffix.
+fn is_major_minor_shape(s: &str) -> bool {
+    is_dotted_numeric::<2>(crate::github::normalize_tag(s))
+}
+
+/// Whether `dep` resolved to a tag too imprecise to query with (a moving alias or a
+/// non-version name).
+///
+/// "Resolved" means [`RequirementResolution::resolved_pin_version`](crate::lsp_helpers::RequirementResolution::resolved_pin_version)
+/// returned `Some`.
+///
+/// Lets a caller that got `None` from [`resolve_in_use_version`] tell "a tag was resolved but
+/// is not a full version" apart from "nothing was resolved at all" (#1668).
+#[must_use]
+pub fn has_unqueryable_resolved_pin(
+    dep: &dyn Dependency,
+    formatter: &dyn EcosystemFormatter,
+    ecosystem: EcosystemId,
+) -> bool {
+    formatter
+        .resolved_pin_version(dep)
+        .is_some_and(|pin| queryable_pin_version(&pin, ecosystem).is_none())
 }
 
 #[cfg(test)]
@@ -566,7 +605,17 @@ mod tests {
     /// A formatter whose `resolved_pin_version` always returns a fixed value regardless of
     /// `dep` — exercises `resolve_in_use_version`'s own full-semver-shape gate on the hook's
     /// output (#1556 critic S1), independent of any ecosystem's own `TagIndex` plumbing.
-    struct FixedResolvedPinFormatter(&'static str);
+    struct FixedResolvedPinFormatter(ResolvedPin);
+
+    impl FixedResolvedPinFormatter {
+        fn most_specific(tag: &str) -> Self {
+            Self(ResolvedPin::MostSpecific(ConcreteVersion::new(tag)))
+        }
+
+        fn alias(tag: &str) -> Self {
+            Self(ResolvedPin::Alias(ConcreteVersion::new(tag)))
+        }
+    }
 
     impl crate::lsp_helpers::PackageNaming for FixedResolvedPinFormatter {}
     impl crate::lsp_helpers::PackageRendering for FixedResolvedPinFormatter {
@@ -578,8 +627,8 @@ mod tests {
         }
     }
     impl crate::lsp_helpers::RequirementResolution for FixedResolvedPinFormatter {
-        fn resolved_pin_version(&self, _dep: &dyn Dependency) -> Option<ConcreteVersion> {
-            Some(ConcreteVersion::new(self.0))
+        fn resolved_pin_version(&self, _dep: &dyn Dependency) -> Option<ResolvedPin> {
+            Some(self.0.clone())
         }
     }
     impl crate::lsp_helpers::DiagnosticMessages for FixedResolvedPinFormatter {}
@@ -604,16 +653,65 @@ mod tests {
             name_range: Range::default(),
         };
 
-        for partial in ["v1", "2.9", "cargo-deny"] {
+        let unqueryable = [
+            FixedResolvedPinFormatter::most_specific("v1"),
+            FixedResolvedPinFormatter::most_specific("cargo-deny"),
+            FixedResolvedPinFormatter::alias("v1"),
+            FixedResolvedPinFormatter::alias("2.9"),
+        ];
+        for formatter in &unqueryable {
             let result = resolve_in_use_version(
                 &dep,
                 "actions/checkout",
                 &HashMap::new(),
                 None,
-                &FixedResolvedPinFormatter(partial),
+                formatter,
                 EcosystemId::GithubActions,
             );
-            assert_eq!(result, None, "{partial:?} must not resolve as concrete");
+            assert_eq!(
+                result, None,
+                "{:?} must not resolve as concrete",
+                formatter.0
+            );
+            assert!(has_unqueryable_resolved_pin(
+                &dep,
+                formatter,
+                EcosystemId::GithubActions
+            ));
+        }
+    }
+
+    /// #1668: a two-component tag that no other tag on the commit extends is the most
+    /// specific release name published, so it is queryable; the same text as a moving alias
+    /// is not.
+    #[test]
+    fn resolve_in_use_version_accepts_most_specific_two_component_tag() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let dep = MockDep {
+            name: PackageName::new("obi1kenobi/cargo-semver-checks-action"),
+            version_req: VersionReq::new("deadbeef"),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+
+        for (formatter, expected) in [
+            (
+                FixedResolvedPinFormatter::most_specific("v2.9"),
+                Some(ConcreteVersion::from("v2.9")),
+            ),
+            (FixedResolvedPinFormatter::alias("v2.9"), None),
+        ] {
+            let result = resolve_in_use_version(
+                &dep,
+                "obi1kenobi/cargo-semver-checks-action",
+                &HashMap::new(),
+                None,
+                &formatter,
+                EcosystemId::GithubActions,
+            );
+            assert_eq!(result, expected, "{:?}", formatter.0);
         }
     }
 
@@ -643,7 +741,7 @@ mod tests {
             "actions/checkout",
             &resolved_versions,
             None,
-            &FixedResolvedPinFormatter("v1.3.0"),
+            &FixedResolvedPinFormatter::most_specific("v1.3.0"),
             EcosystemId::GithubActions,
         );
         assert_eq!(
@@ -673,10 +771,54 @@ mod tests {
             "actions/checkout",
             &HashMap::new(),
             None,
-            &FixedResolvedPinFormatter("v1.3.0"),
+            &FixedResolvedPinFormatter::most_specific("v1.3.0"),
             EcosystemId::GithubActions,
         );
         assert_eq!(result, Some(ConcreteVersion::from("v1.3.0")));
+    }
+
+    #[test]
+    fn is_major_minor_shape_accepts_only_bare_two_component_versions() {
+        for accepted in ["v2.9", "V2.9", "2.9", "v10.0"] {
+            assert!(is_major_minor_shape(accepted), "{accepted:?}");
+        }
+        for rejected in ["v2.9-rc1", "v2.", "v.9", "v2.9.0", "v2", "", "v2.x", "main"] {
+            assert!(!is_major_minor_shape(rejected), "{rejected:?}");
+        }
+    }
+
+    /// #1668: the hook-resolved tag is unqueryable exactly when `queryable_pin_version`
+    /// rejects it; no hook output at all is not "unqueryable".
+    #[test]
+    fn has_unqueryable_resolved_pin_distinguishes_partial_tag_from_no_resolution() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let dep = MockDep {
+            name: PackageName::new("actions/checkout"),
+            version_req: VersionReq::new("deadbeef"),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+        for (formatter, expected) in [
+            (FixedResolvedPinFormatter::most_specific("v2.9-rc1"), true),
+            (FixedResolvedPinFormatter::most_specific("v2"), true),
+            (FixedResolvedPinFormatter::alias("v2.9"), true),
+            (FixedResolvedPinFormatter::most_specific("v2.9"), false),
+            (FixedResolvedPinFormatter::most_specific("v1.3.0"), false),
+        ] {
+            assert_eq!(
+                has_unqueryable_resolved_pin(&dep, &formatter, EcosystemId::GithubActions),
+                expected,
+                "{:?}",
+                formatter.0
+            );
+        }
+        assert!(!has_unqueryable_resolved_pin(
+            &dep,
+            &CaretFormatter,
+            EcosystemId::GithubActions
+        ));
     }
 
     #[test]
