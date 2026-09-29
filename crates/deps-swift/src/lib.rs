@@ -18,6 +18,7 @@
 pub mod ecosystem;
 pub mod formatter;
 pub mod lockfile;
+mod package_location;
 pub mod parser;
 pub mod registry;
 pub mod types;

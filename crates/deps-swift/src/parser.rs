@@ -4,6 +4,7 @@
 //! comments to avoid false positives. Byte offsets are preserved during
 //! comment stripping for accurate LSP position tracking.
 
+use crate::package_location::{PackageLocation, RegistryIdentity};
 use crate::types::SwiftDependency;
 use deps_core::Result;
 use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
@@ -42,54 +43,65 @@ const LEGACY_LABEL: &str = r#"(?:name\s*:\s*"[^"]*"\s*,\s*)?"#;
 /// Closes a `.package(...)` call, tolerating a trailing comma after the last argument (#1673).
 const CALL_END: &str = r"\s*,?\s*\)";
 
-/// Optional trailing SwiftPM 6.1 `traits: [...]` argument; tolerates strings and one level of
-/// nested brackets (e.g. `.trait(name: "A", condition: .when(traits: ["B"]))`).
-const TRAITS_TAIL: &str =
-    r#"(?:\s*,\s*traits\s*:\s*\[(?:[^\[\]"]|"[^"]*"|\[(?:[^\[\]"]|"[^"]*")*\])*\])?"#;
+/// Ends a `.package(...)` match at the `traits:` label or the closing parenthesis.
+///
+/// `traits:` is the last argument of every SwiftPM `.package` overload, so its value is never
+/// scanned: any nesting depth, a variable, or an unclosed `[` cannot swallow later entries (#1688).
+const ARGS_END: &str = r"(?:\s*,\s*traits\s*:|\s*,?\s*\))";
 
 /// Compiles a `.package(url: "<capture 1>", <requirement>)` pattern.
 ///
-/// Every URL-form regex is built here so the legacy-label prefix and the trailing-comma
-/// tolerance are defined once; `requirement` is the pattern between the URL and the closing
-/// parenthesis and must end without its own `\s*,?\s*\)`; the optional `traits:` tail is appended here.
+/// Used by the forms that only exist for Git URLs (`branch`, `revision`); `requirement` is the
+/// pattern between the URL and [`ARGS_END`].
 // Compile-time-constant patterns; a malformed literal is a build-visible programmer error,
 // not attacker-influenceable input.
 #[allow(clippy::expect_used)]
 fn url_package_regex(requirement: &str) -> Regex {
     Regex::new(&format!(
-        r#"(?s)\.package\s*\(\s*{LEGACY_LABEL}url\s*:\s*"([^"]+)"\s*,\s*{requirement}{TRAITS_TAIL}{CALL_END}"#
+        r#"(?s)\.package\s*\(\s*{LEGACY_LABEL}url\s*:\s*"([^"]+)"\s*,\s*{requirement}{ARGS_END}"#
     ))
     .expect("url package regex")
 }
 
+/// Compiles a `.package(url: "<url>" | id: "<id>", <requirement>)` pattern for the forms valid
+/// with a registry requirement; the head is captured as named group `url` or `id`.
+#[allow(clippy::expect_used)]
+fn registry_package_regex(requirement: &str) -> Regex {
+    Regex::new(&format!(
+        r#"(?s)\.package\s*\(\s*(?:{LEGACY_LABEL}url\s*:\s*"(?P<url>[^"]+)"|id\s*:\s*"(?P<id>[^"]+)")\s*,\s*{requirement}{ARGS_END}"#
+    ))
+    .expect("registry package regex")
+}
+
 // `from: "x"`.
-static RE_URL_FROM: LazyLock<Regex> =
-    LazyLock::new(|| url_package_regex(r#"from\s*:\s*"([^"]+)""#));
+static RE_FROM: LazyLock<Regex> =
+    LazyLock::new(|| registry_package_regex(r#"from\s*:\s*"(?P<ver>[^"]+)""#));
 
-static RE_URL_UP_TO_NEXT_MAJOR: LazyLock<Regex> = LazyLock::new(|| {
-    url_package_regex(&format!(
-        r#"\.upToNextMajor\s*\(\s*from\s*:\s*"([^"]+)"{CALL_END}"#
+static RE_UP_TO_NEXT_MAJOR: LazyLock<Regex> = LazyLock::new(|| {
+    registry_package_regex(&format!(
+        r#"\.upToNextMajor\s*\(\s*from\s*:\s*"(?P<ver>[^"]+)"{CALL_END}"#
     ))
 });
 
-static RE_URL_UP_TO_NEXT_MINOR: LazyLock<Regex> = LazyLock::new(|| {
-    url_package_regex(&format!(
-        r#"\.upToNextMinor\s*\(\s*from\s*:\s*"([^"]+)"{CALL_END}"#
+static RE_UP_TO_NEXT_MINOR: LazyLock<Regex> = LazyLock::new(|| {
+    registry_package_regex(&format!(
+        r#"\.upToNextMinor\s*\(\s*from\s*:\s*"(?P<ver>[^"]+)"{CALL_END}"#
     ))
 });
 
-static RE_URL_EXACT: LazyLock<Regex> =
-    LazyLock::new(|| url_package_regex(&format!(r#"\.exact\s*\(\s*"([^"]+)"{CALL_END}"#)));
+static RE_EXACT: LazyLock<Regex> = LazyLock::new(|| {
+    registry_package_regex(&format!(r#"\.exact\s*\(\s*"(?P<ver>[^"]+)"{CALL_END}"#))
+});
 
 // `exact: "x"`.
-static RE_URL_EXACT_LABELLED: LazyLock<Regex> =
-    LazyLock::new(|| url_package_regex(r#"exact\s*:\s*"([^"]+)""#));
+static RE_EXACT_LABELLED: LazyLock<Regex> =
+    LazyLock::new(|| registry_package_regex(r#"exact\s*:\s*"(?P<ver>[^"]+)""#));
 
-static RE_URL_RANGE_HALF_OPEN: LazyLock<Regex> =
-    LazyLock::new(|| url_package_regex(r#""([^"]+)"\s*\.\.<\s*"([^"]+)""#));
+static RE_RANGE_HALF_OPEN: LazyLock<Regex> =
+    LazyLock::new(|| registry_package_regex(r#""(?P<lower>[^"]+)"\s*\.\.<\s*"(?P<upper>[^"]+)""#));
 
-static RE_URL_RANGE_CLOSED: LazyLock<Regex> =
-    LazyLock::new(|| url_package_regex(r#""([^"]+)"\s*\.\.\.\s*"([^"]+)""#));
+static RE_RANGE_CLOSED: LazyLock<Regex> =
+    LazyLock::new(|| registry_package_regex(r#""(?P<lower>[^"]+)"\s*\.\.\.\s*"(?P<upper>[^"]+)""#));
 
 static RE_URL_BRANCH: LazyLock<Regex> =
     LazyLock::new(|| url_package_regex(&format!(r#"\.branch\s*\(\s*"([^"]+)"{CALL_END}"#)));
@@ -109,7 +121,7 @@ static RE_URL_REVISION_LABELLED: LazyLock<Regex> =
 #[allow(clippy::expect_used)]
 static RE_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"(?s)\.package\s*\(\s*{LEGACY_LABEL}path\s*:\s*"([^"]+)"{TRAITS_TAIL}{CALL_END}"#
+        r#"(?s)\.package\s*\(\s*{LEGACY_LABEL}path\s*:\s*"([^"]+)"{ARGS_END}"#
     ))
     .expect("RE_PATH")
 });
@@ -175,17 +187,46 @@ pub(crate) fn parse_git_url(url: &str) -> Option<reqwest::Url> {
 /// instead of silently vanishing, while never being queried against GitHub
 /// (`EcosystemFormatter::can_resolve_source` defaults to `Registry`-only, which this crate
 /// does not override).
-fn resolve_registry_source(url_str: &str) -> (String, DependencySource) {
-    match url_to_identity(url_str) {
-        Some(identity) => (identity, DependencySource::Registry),
-        None => (
-            url_str.to_string(),
-            DependencySource::Git {
-                url: url_str.to_string(),
-                rev: None,
+///
+/// An `id:` dependency (SE-0292) resolves to [`DependencySource::CustomRegistry`] keyed by its
+/// scope: shown in hover/inlay output but never queried, as no Swift registry client exists.
+fn resolve_registry_source(location: PackageLocation<'_>) -> (String, DependencySource) {
+    match location {
+        PackageLocation::Url(url_str) => match url_to_identity(url_str) {
+            Some(identity) => (identity, DependencySource::Registry),
+            None => (
+                url_str.to_string(),
+                DependencySource::Git {
+                    url: url_str.to_string(),
+                    rev: None,
+                },
+            ),
+        },
+        // TODO(#1691): resolve `.package(id:)` via an SE-0292 registry client.
+        PackageLocation::Id(id) => (
+            id.to_string(),
+            DependencySource::CustomRegistry {
+                url: id.scope().to_string(),
             },
         ),
     }
+}
+
+/// Extracts the `url`/`id` head capture of a registry-form match; `None` for an invalid `id:`.
+fn locate<'c>(
+    cap: &regex::Captures<'_>,
+    content: &'c str,
+) -> Option<(std::ops::Range<usize>, PackageLocation<'c>)> {
+    if let Some(url) = cap.name("url") {
+        return Some((url.range(), PackageLocation::Url(content.get(url.range())?)));
+    }
+    let id = cap.name("id")?;
+    let id_str = content.get(id.range())?;
+    let Some(identity) = RegistryIdentity::parse(id_str) else {
+        tracing::debug!(len = id_str.len(), "skipping invalid registry id");
+        return None;
+    };
+    Some((id.range(), PackageLocation::Id(identity)))
 }
 
 /// Strips comments from Package.swift content, replacing comment characters
@@ -227,8 +268,9 @@ fn next_minor(major: &str, minor: &str) -> String {
 // Every capture-group slice below (`url.start()..url.end()`, etc.) uses regex match offsets,
 // always char boundaries; offsets taken on `stripped` are valid in `content` too because
 // `strip_comments` overwrites byte-for-byte (length- and boundary-preserving). Group 0
-// always exists on a successful match and every numbered group in these patterns is
-// mandatory (never `?`-optional), so `cap.get(N).unwrap()` is always `Some`.
+// always exists on a successful match; the `ver`/`lower`/`upper` and numbered groups are
+// mandatory (never `?`-optional), so their `unwrap()` is always `Some`. The alternative `url`/`id`
+// head is optional per group and goes through `locate` instead.
 #[allow(clippy::string_slice, clippy::unwrap_used)]
 pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult> {
     let stripped = strip_comments(content);
@@ -253,16 +295,18 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         matched.iter().any(|r| r.start <= start && end <= r.end)
     };
 
-    // 1. .package(url: "...", .upToNextMajor(from: "..."))
-    for cap in RE_URL_UP_TO_NEXT_MAJOR.captures_iter(&stripped) {
+    // 1. .package(url:|id: "...", .upToNextMajor(from: "..."))
+    for cap in RE_UP_TO_NEXT_MAJOR.captures_iter(&stripped) {
         let full = cap.get(0).unwrap();
         if is_already_matched(full.start(), full.end(), &matched_ranges) {
             continue;
         }
-        let url = cap.get(1).unwrap();
-        let ver = cap.get(2).unwrap();
+        let Some((url_span, location)) = locate(&cap, content) else {
+            matched_ranges.push(full.start()..full.end());
+            continue;
+        };
+        let ver = cap.name("ver").unwrap();
 
-        let url_str = &content[url.start()..url.end()];
         let ver_str = &content[ver.start()..ver.end()];
 
         let parts: Vec<&str> = ver_str.splitn(3, '.').collect();
@@ -273,29 +317,31 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             matched_ranges.push(full.start()..full.end());
             continue;
         }
-        let (name, source) = resolve_registry_source(url_str);
+        let (name, source) = resolve_registry_source(location);
         dependencies.push(SwiftDependency {
             name: name.into(),
-            name_range: make_range(url.start(), url.end()),
+            name_range: make_range(url_span.start, url_span.end),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             version_literal: Some(ver_str.to_string()),
-            url: url_str.to_string(),
+            url: location.url().to_string(),
             source,
         });
         matched_ranges.push(full.start()..full.end());
     }
 
-    // 2. .package(url: "...", .upToNextMinor(from: "..."))
-    for cap in RE_URL_UP_TO_NEXT_MINOR.captures_iter(&stripped) {
+    // 2. .package(url:|id: "...", .upToNextMinor(from: "..."))
+    for cap in RE_UP_TO_NEXT_MINOR.captures_iter(&stripped) {
         let full = cap.get(0).unwrap();
         if is_already_matched(full.start(), full.end(), &matched_ranges) {
             continue;
         }
-        let url = cap.get(1).unwrap();
-        let ver = cap.get(2).unwrap();
+        let Some((url_span, location)) = locate(&cap, content) else {
+            matched_ranges.push(full.start()..full.end());
+            continue;
+        };
+        let ver = cap.name("ver").unwrap();
 
-        let url_str = &content[url.start()..url.end()];
         let ver_str = &content[ver.start()..ver.end()];
 
         let parts: Vec<&str> = ver_str.splitn(3, '.').collect();
@@ -307,32 +353,34 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             matched_ranges.push(full.start()..full.end());
             continue;
         }
-        let (name, source) = resolve_registry_source(url_str);
+        let (name, source) = resolve_registry_source(location);
         dependencies.push(SwiftDependency {
             name: name.into(),
-            name_range: make_range(url.start(), url.end()),
+            name_range: make_range(url_span.start, url_span.end),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             version_literal: Some(ver_str.to_string()),
-            url: url_str.to_string(),
+            url: location.url().to_string(),
             source,
         });
         matched_ranges.push(full.start()..full.end());
     }
 
     // 3. .package(url: "...", .exact("...")) / exact: "..."
-    for cap in RE_URL_EXACT
+    for cap in RE_EXACT
         .captures_iter(&stripped)
-        .chain(RE_URL_EXACT_LABELLED.captures_iter(&stripped))
+        .chain(RE_EXACT_LABELLED.captures_iter(&stripped))
     {
         let full = cap.get(0).unwrap();
         if is_already_matched(full.start(), full.end(), &matched_ranges) {
             continue;
         }
-        let url = cap.get(1).unwrap();
-        let ver = cap.get(2).unwrap();
+        let Some((url_span, location)) = locate(&cap, content) else {
+            matched_ranges.push(full.start()..full.end());
+            continue;
+        };
+        let ver = cap.name("ver").unwrap();
 
-        let url_str = &content[url.start()..url.end()];
         let ver_str = &content[ver.start()..ver.end()];
 
         let version_req = format!("={ver_str}");
@@ -341,30 +389,32 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             matched_ranges.push(full.start()..full.end());
             continue;
         }
-        let (name, source) = resolve_registry_source(url_str);
+        let (name, source) = resolve_registry_source(location);
         dependencies.push(SwiftDependency {
             name: name.into(),
-            name_range: make_range(url.start(), url.end()),
+            name_range: make_range(url_span.start, url_span.end),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             version_literal: Some(ver_str.to_string()),
-            url: url_str.to_string(),
+            url: location.url().to_string(),
             source,
         });
         matched_ranges.push(full.start()..full.end());
     }
 
     // 4. .package(url: "...", "lower"..<"upper")
-    for cap in RE_URL_RANGE_HALF_OPEN.captures_iter(&stripped) {
+    for cap in RE_RANGE_HALF_OPEN.captures_iter(&stripped) {
         let full = cap.get(0).unwrap();
         if is_already_matched(full.start(), full.end(), &matched_ranges) {
             continue;
         }
-        let url = cap.get(1).unwrap();
-        let lower = cap.get(2).unwrap();
-        let upper = cap.get(3).unwrap();
+        let Some((url_span, location)) = locate(&cap, content) else {
+            matched_ranges.push(full.start()..full.end());
+            continue;
+        };
+        let lower = cap.name("lower").unwrap();
+        let upper = cap.name("upper").unwrap();
 
-        let url_str = &content[url.start()..url.end()];
         let lower_str = &content[lower.start()..lower.end()];
         let upper_str = &content[upper.start()..upper.end()];
 
@@ -374,10 +424,10 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             matched_ranges.push(full.start()..full.end());
             continue;
         }
-        let (name, source) = resolve_registry_source(url_str);
+        let (name, source) = resolve_registry_source(location);
         dependencies.push(SwiftDependency {
             name: name.into(),
-            name_range: make_range(url.start(), url.end()),
+            name_range: make_range(url_span.start, url_span.end),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(lower.start(), lower.end())),
             // Deliberately `None`, unlike every other registry form: `version_range` spans
@@ -387,23 +437,25 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             // traps on `lowerBound > upperBound`, corrupting the whole manifest (#367 C1).
             // `None` keeps this form fail-closed, matching pre-fix behavior.
             version_literal: None,
-            url: url_str.to_string(),
+            url: location.url().to_string(),
             source,
         });
         matched_ranges.push(full.start()..full.end());
     }
 
     // 5. .package(url: "...", "lower"..."upper")
-    for cap in RE_URL_RANGE_CLOSED.captures_iter(&stripped) {
+    for cap in RE_RANGE_CLOSED.captures_iter(&stripped) {
         let full = cap.get(0).unwrap();
         if is_already_matched(full.start(), full.end(), &matched_ranges) {
             continue;
         }
-        let url = cap.get(1).unwrap();
-        let lower = cap.get(2).unwrap();
-        let upper = cap.get(3).unwrap();
+        let Some((url_span, location)) = locate(&cap, content) else {
+            matched_ranges.push(full.start()..full.end());
+            continue;
+        };
+        let lower = cap.name("lower").unwrap();
+        let upper = cap.name("upper").unwrap();
 
-        let url_str = &content[url.start()..url.end()];
         let lower_str = &content[lower.start()..lower.end()];
         let upper_str = &content[upper.start()..upper.end()];
 
@@ -413,32 +465,34 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             matched_ranges.push(full.start()..full.end());
             continue;
         }
-        let (name, source) = resolve_registry_source(url_str);
+        let (name, source) = resolve_registry_source(location);
         dependencies.push(SwiftDependency {
             name: name.into(),
-            name_range: make_range(url.start(), url.end()),
+            name_range: make_range(url_span.start, url_span.end),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(lower.start(), lower.end())),
             // See the half-open range form above (#367 C1): `version_range` spans only
             // the lower bound, so reporting it as the literal would let the guard rewrite
             // the lower bound alone and invert the range.
             version_literal: None,
-            url: url_str.to_string(),
+            url: location.url().to_string(),
             source,
         });
         matched_ranges.push(full.start()..full.end());
     }
 
     // 6. .package(url: "...", from: "...")
-    for cap in RE_URL_FROM.captures_iter(&stripped) {
+    for cap in RE_FROM.captures_iter(&stripped) {
         let full = cap.get(0).unwrap();
         if is_already_matched(full.start(), full.end(), &matched_ranges) {
             continue;
         }
-        let url = cap.get(1).unwrap();
-        let ver = cap.get(2).unwrap();
+        let Some((url_span, location)) = locate(&cap, content) else {
+            matched_ranges.push(full.start()..full.end());
+            continue;
+        };
+        let ver = cap.name("ver").unwrap();
 
-        let url_str = &content[url.start()..url.end()];
         let ver_str = &content[ver.start()..ver.end()];
 
         let version_req = format!(">={ver_str}, <{}.0.0", next_major(ver_str));
@@ -447,14 +501,14 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             matched_ranges.push(full.start()..full.end());
             continue;
         }
-        let (name, source) = resolve_registry_source(url_str);
+        let (name, source) = resolve_registry_source(location);
         dependencies.push(SwiftDependency {
             name: name.into(),
-            name_range: make_range(url.start(), url.end()),
+            name_range: make_range(url_span.start, url_span.end),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             version_literal: Some(ver_str.to_string()),
-            url: url_str.to_string(),
+            url: location.url().to_string(),
             source,
         });
         matched_ranges.push(full.start()..full.end());
@@ -1595,24 +1649,192 @@ let package = Package(
     }
 
     #[test]
-    fn test_traits_deeper_nesting_is_skipped_without_panic() {
+    fn test_traits_arbitrary_nesting_and_non_literal_values() {
         let content = r#"
         .package(url: "https://github.com/a/deep", from: "1.0.0", traits: [[["X"]]]),
-        .package(url: "https://github.com/a/ok", from: "2.0.0", traits: ["X"]),
+        .package(url: "https://github.com/a/cond", from: "2.0.0", traits: [.trait(name: "T", condition: .when(traits: [.trait(name: "U", condition: .when(traits: ["V"]))]))]),
+        .package(url: "https://github.com/a/var", from: "3.0.0", traits: myTraits),
+        .package(url: "https://github.com/a/set", from: "4.0.0", traits: Set(["A"])),
+        .package(path: "../Local", traits: myTraits),
 "#;
         let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 5);
+        for (name, ver) in [
+            ("a/deep", "1.0.0"),
+            ("a/cond", "2.0.0"),
+            ("a/var", "3.0.0"),
+            ("a/set", "4.0.0"),
+        ] {
+            assert_eq!(dep(&result, name).version_literal.as_deref(), Some(ver));
+        }
         assert!(
             result
                 .dependencies
                 .iter()
-                .any(|d| d.name.as_str() == "a/ok")
+                .any(|d| d.name.as_str() == "Local")
         );
-        assert!(
-            result
+    }
+
+    #[test]
+    fn test_unclosed_traits_does_not_swallow_following_entries() {
+        let content = r#"
+        .package(url: "https://github.com/a/one", from: "1.0.0", traits: [
+        .package(url: "https://github.com/a/two", from: "2.0.0"),
+        .package(url: "https://github.com/a/three", .upToNextMajor(from: "3.0.0")),
+    ]
+)
+"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+        let lines: Vec<&str> = content.lines().collect();
+        for (name, literal) in [("a/one", "1.0.0"), ("a/two", "2.0.0"), ("a/three", "3.0.0")] {
+            let range = dep(&result, name).version_range.unwrap();
+            let line = lines[range.start.line as usize];
+            assert_eq!(
+                line.get(range.start.character as usize..range.end.character as usize),
+                Some(literal),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unclosed_traits_as_last_entry_and_at_eof() {
+        let last = "        .package(url: \"https://github.com/a/one\", from: \"1.0.0\", traits: [\n    ]\n)\n";
+        assert_eq!(
+            parse_package_swift(last, &test_uri())
+                .unwrap()
                 .dependencies
-                .iter()
-                .all(|d| d.name.as_str() != "a/deep")
+                .len(),
+            1
         );
+        let eof = ".package(url: \"https://github.com/a/one\", from: \"1.0.0\", traits:";
+        assert_eq!(
+            parse_package_swift(eof, &test_uri())
+                .unwrap()
+                .dependencies
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_traits_terminator_inside_strings_and_multiline() {
+        let content = r#"
+        .package(
+            url: "https://github.com/a/one",
+            from: "1.0.0"
+            ,
+            traits
+            : ["a)b", ", traits: [", "]"]
+        ),
+        .package(url: "https://github.com/a/two", from: "2.0.0"),
+"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        assert_eq!(
+            dep(&result, "a/one").version_literal.as_deref(),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            dep(&result, "a/two").version_literal.as_deref(),
+            Some("2.0.0")
+        );
+    }
+
+    #[test]
+    fn test_registry_id_forms() {
+        let content = r#"
+        .package(id: "mona.from", from: "1.0.0"),
+        .package(id: "mona.major", .upToNextMajor(from: "2.1.0")),
+        .package(id: "mona.minor", .upToNextMinor(from: "3.1.0"), traits: ["X"]),
+        .package(id: "mona.exact", exact: "4.0.0",),
+        .package(id: "mona.half", "1.0.0"..<"2.0.0"),
+        .package(
+            id: "mona.closed",
+            "1.0.0"..."2.0.0",
+            traits: [.defaults]
+        ),
+"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 6);
+        let lines: Vec<&str> = content.lines().collect();
+        for d in &result.dependencies {
+            assert_eq!(
+                d.source,
+                DependencySource::CustomRegistry { url: "mona".into() }
+            );
+            assert!(d.url.is_empty());
+        }
+        assert_eq!(
+            dep(&result, "mona.minor")
+                .version_req
+                .as_ref()
+                .map(deps_core::VersionReq::as_str),
+            Some(">=3.1.0, <3.2.0")
+        );
+        for (name, literal, slice) in [
+            ("mona.from", Some("1.0.0"), "1.0.0"),
+            ("mona.exact", Some("4.0.0"), "4.0.0"),
+            ("mona.half", None, "1.0.0"),
+            ("mona.closed", None, "1.0.0"),
+        ] {
+            let d = dep(&result, name);
+            assert_eq!(d.version_literal.as_deref(), literal, "{name}");
+            let range = d.version_range.unwrap();
+            let line = lines[range.start.line as usize];
+            assert_eq!(
+                line.get(range.start.character as usize..range.end.character as usize),
+                Some(slice),
+                "{name}"
+            );
+        }
+        let id_range = dep(&result, "mona.from").name_range;
+        assert_eq!(
+            lines[id_range.start.line as usize]
+                .get(id_range.start.character as usize..id_range.end.character as usize),
+            Some("mona.from")
+        );
+    }
+
+    #[test]
+    fn test_registry_id_invalid_or_unsupported_is_skipped() {
+        for id_call in [
+            r#".package(id: "noscope", from: "1.0.0")"#,
+            r#".package(id: ".name", from: "1.0.0")"#,
+            r#".package(id: "sc--ope.n", from: "1.0.0")"#,
+            r#".package(id: "-a.b", from: "1.0.0")"#,
+            r#".package(id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.n", from: "1.0.0")"#,
+            r#".package(id: "mona.x", branch: "main")"#,
+            r#".package(id: "mona.x", .branch("main"))"#,
+            r#".package(name: "N", id: "mona.x", from: "1.0.0")"#,
+            r#".package(name: "N", id: "mona.x", from: "1.0.0", traits: ["X"])"#,
+        ] {
+            let result = parse_package_swift(id_call, &test_uri()).unwrap();
+            assert!(result.dependencies.is_empty(), "{id_call}");
+        }
+    }
+
+    /// Pins current behavior: ids are compared case-sensitively (SwiftPM lowercases them); see #1691.
+    #[test]
+    fn test_registry_id_case_variants_are_distinct_dependencies() {
+        let content = r#"
+        .package(id: "mona.x", from: "1.0.0"),
+        .package(id: "Mona.X", from: "1.0.0"),
+"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+    }
+
+    #[test]
+    fn test_registry_id_does_not_swallow_neighbours() {
+        let content = r#"
+        .package(id: "bad", from: "1.0.0"),
+        .package(url: "https://github.com/a/ok", from: "2.0.0"),
+"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name.as_str(), "a/ok");
     }
 
     #[test]

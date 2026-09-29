@@ -24,6 +24,11 @@ are resolved from the same host the `url:` points at: **GitHub's tags API**, via
 source with no hover version data. When a `Package.resolved` lock file is present alongside
 the manifest, it is read to show each dependency's actual pinned (in-use) revision/version.
 
+A `traits:` argument (SwiftPM 6.1) of any shape is accepted after the requirement; its value is
+never parsed. A `.package(id: "scope.name", from: "1.0.0")` registry dependency (SE-0292) is
+parsed and shown in hover/inlay hints (in-use version from `Package.resolved`), but is not
+version-resolved: `deps-swift` has no Swift package registry client.
+
 ## Non-GitHub Package Hosts (issues #979, #983, #924)
 
 A registry-form `.package(url: "...")` dependency is only ever resolved against
