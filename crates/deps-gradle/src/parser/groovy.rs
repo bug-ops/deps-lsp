@@ -3,7 +3,8 @@
 //! Regex-based extraction of dependency declarations from dependencies { } blocks.
 
 use crate::parser::{
-    GradleParseResult, build_dependency, is_dependency_configuration, opens_dependencies_block,
+    GradleParseResult, LineOffsetTable, SourceLine, build_dependency, is_dependency_configuration,
+    opens_dependencies_block,
 };
 use crate::types::GradleDependency;
 use deps_core::Result;
@@ -82,14 +83,13 @@ static RE_PLATFORM_NO_VERSION_WITHOUT_PARENS: LazyLock<Regex> = LazyLock::new(||
 /// so `has_version` alone distinguishes the two capture shapes.
 fn extract_matches(
     re: &Regex,
-    line: &str,
-    line_u32: u32,
+    line: &SourceLine<'_>,
     has_version: bool,
     matched_positions: &mut deps_core::MatchedSpans,
     dependencies: &mut Vec<GradleDependency>,
     budget: &mut deps_core::DependencyBudget,
 ) {
-    for caps in re.captures_iter(line) {
+    for caps in re.captures_iter(line.text()) {
         let config = caps.get(1).map_or("", |m| m.as_str());
         if !is_dependency_configuration(config) {
             continue;
@@ -102,7 +102,7 @@ fn extract_matches(
         if !budget.allow() {
             continue;
         }
-        dependencies.push(build_dependency(&caps, line, line_u32, has_version, config));
+        dependencies.push(build_dependency(&caps, line, has_version, config));
     }
 }
 
@@ -116,6 +116,7 @@ fn extract_matches(
 /// Infallible by construction: this function never returns `Err`.
 pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
     let mut dependencies = Vec::new();
+    let line_table = LineOffsetTable::new(content);
 
     let mut brace_depth: i32 = 0;
     let mut in_dependencies_block = false;
@@ -147,13 +148,12 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
             continue;
         }
 
-        let line_u32 = line_idx as u32;
+        let src = SourceLine::new(&line_table, content, line_idx, line);
         let mut matched_positions = deps_core::MatchedSpans::default();
 
         extract_matches(
             &RE_WITH_PARENS,
-            line,
-            line_u32,
+            &src,
             true,
             &mut matched_positions,
             &mut dependencies,
@@ -162,8 +162,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
 
         extract_matches(
             &RE_WITHOUT_PARENS,
-            line,
-            line_u32,
+            &src,
             true,
             &mut matched_positions,
             &mut dependencies,
@@ -172,8 +171,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
 
         extract_matches(
             &RE_NO_VERSION_WITH_PARENS,
-            line,
-            line_u32,
+            &src,
             false,
             &mut matched_positions,
             &mut dependencies,
@@ -182,8 +180,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
 
         extract_matches(
             &RE_NO_VERSION_WITHOUT_PARENS,
-            line,
-            line_u32,
+            &src,
             false,
             &mut matched_positions,
             &mut dependencies,
@@ -192,8 +189,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
 
         extract_matches(
             &RE_PLATFORM_WITH_PARENS,
-            line,
-            line_u32,
+            &src,
             true,
             &mut matched_positions,
             &mut dependencies,
@@ -202,8 +198,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
 
         extract_matches(
             &RE_PLATFORM_WITHOUT_PARENS,
-            line,
-            line_u32,
+            &src,
             true,
             &mut matched_positions,
             &mut dependencies,
@@ -212,8 +207,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
 
         extract_matches(
             &RE_PLATFORM_NO_VERSION_WITH_PARENS,
-            line,
-            line_u32,
+            &src,
             false,
             &mut matched_positions,
             &mut dependencies,
@@ -222,8 +216,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
 
         extract_matches(
             &RE_PLATFORM_NO_VERSION_WITHOUT_PARENS,
-            line,
-            line_u32,
+            &src,
             false,
             &mut matched_positions,
             &mut dependencies,
@@ -570,5 +563,35 @@ mod tests {
             result.dependencies.len(),
             deps_core::MAX_DEPENDENCIES_PER_DOCUMENT
         );
+    }
+
+    /// #1701: same single-long-line shape as the Kotlin test, for the Groovy DSL.
+    #[test]
+    fn test_single_long_line_utf16_columns() {
+        const N: usize = 5000;
+        let filler = "/*\u{1F600}\u{65E5}*/ ";
+        let head = "implementation '";
+        let units = |s: &str| u32::try_from(s.encode_utf16().count()).unwrap();
+        let mut line = String::from("dependencies { ");
+        let mut expected = Vec::with_capacity(N);
+        let mut col = units(&line);
+        for i in 0..N {
+            let name = format!("g{i}:a{i}");
+            col += units(filler) + units(head);
+            expected.push((col, col + units(&name)));
+            col += units(&name) + 1;
+            line.push_str(&format!("{filler}{head}{name}'"));
+        }
+        line.push_str(" }\n");
+
+        let result = parse_groovy_dsl(&line, &make_uri()).unwrap();
+
+        assert_eq!(result.dependencies.len(), N);
+        let got: Vec<_> = result
+            .dependencies
+            .iter()
+            .map(|d| (d.name_range.start.character, d.name_range.end.character))
+            .collect();
+        assert_eq!(got, expected);
     }
 }
