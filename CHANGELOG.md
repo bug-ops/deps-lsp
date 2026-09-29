@@ -91,6 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle, deps-nuget, deps-swift, deps-bundler, deps-github-actions**: `requirement_is_placeholder` now also composes the shared `requirement_contains_template_placeholder` detector (previously native-syntax-only), so `{{ VAR }}`/`@VAR@`/`%VAR%`/`${VAR}`/`<%= VAR %>` external-templating placeholders are no longer destructively rewritten to a literal version by `deps-cli update` or vulnerability-fix code actions in these five ecosystems (resolves #1390) (#1393)
 
 ### Fixed
+- **deps-github-actions**: a full-SHA pin absent from the release tag index is now reported outdated by diagnostics, inlay hints, and the update-all lens instead of unresolved (resolves #1720) (#1721)
 - **deps-core**: an explicit OSV `versions` hit above an open-ended range's `last_known_affected_version_range` cap is no longer reported as affected (resolves #1714) (#1717)
 - **deps-gradle**: build script and settings parsers no longer take quadratic time on a single long line with many dependencies, and settings plugin ranges no longer point at an earlier same-prefix plugin (resolves #1701) (#1713)
 - **deps-core**: open-ended OSV ranges are now capped by `database_specific.last_known_affected_version_range`, so fixed and latest `github/codeql-action` versions are no longer flagged by GHSA-vqf5-2xx6-9wfm (resolves #1707) (#1712)

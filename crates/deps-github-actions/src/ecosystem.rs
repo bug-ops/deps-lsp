@@ -2024,6 +2024,165 @@ mod tests {
             );
         }
 
+        /// #1720: full-SHA pins absent from the populated release index must be reported
+        /// consistently by diagnostics, inlay hints, the update-all lens and hover, while a
+        /// control pin on latest's commit gets none of them. Code actions are not driven here:
+        /// the shared default fetches the live registry, overwriting the seeded `TagIndex`.
+        #[cfg(feature = "lsp-responses")]
+        #[tokio::test]
+        async fn test_sha_pin_missing_from_index_surfaces_agree() {
+            use tower_lsp_server::ls_types::InlayHintLabel;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+            let name = "EmbarkStudios/cargo-deny-action";
+            let latest_sha = "3".repeat(40);
+            let (missing_a, missing_b) = ("5".repeat(40), "6".repeat(40));
+            let index = TagIndex::from_tags([(
+                "v2.87.22",
+                &deps_core::lsp_helpers::CommitSha::parse(&latest_sha).unwrap(),
+            )]);
+            eco.formatter
+                .tag_index
+                .insert(deps_core::PackageName::new(name), Arc::new(index));
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = format!(
+                "steps:\n\
+                 \x20 - uses: {name}@{missing_a}\n\
+                 \x20 - uses: {name}@{missing_a} # cargo-deny\n\
+                 \x20 - uses: {name}@{missing_b}\n\
+                 \x20 - uses: {name}@{missing_b} # cargo-deny\n\
+                 \x20 - uses: {name}@{latest_sha} # cargo-deny\n"
+            );
+            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let mut cached = HashMap::new();
+            cached.insert(
+                deps_core::PackageName::new(name),
+                deps_core::PackageVersions::latest_only("v2.87.22"),
+            );
+            let resolved = HashMap::new();
+            let versions = || deps_core::VersionData::new(&cached, &resolved);
+            let outdated_lines = [1_u32, 2, 3, 4];
+            let control_line = 5_u32;
+
+            let diagnostics = eco
+                .generate_diagnostics(
+                    parse_result.as_ref(),
+                    versions(),
+                    &uri,
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::lsp_helpers::DiagnosticSeverities::default(),
+                )
+                .await;
+            let mut diagnostic_lines: Vec<u32> = diagnostics
+                .iter()
+                .filter(|d| d.message().contains("Newer version available"))
+                .map(|d| d.range.start.line)
+                .collect();
+            diagnostic_lines.sort_unstable();
+            assert_eq!(diagnostic_lines, outdated_lines, "{diagnostics:?}");
+
+            let edits = deps_core::lsp_helpers::collect_update_all_edits(
+                parse_result.as_ref(),
+                &content,
+                versions(),
+                &eco.formatter,
+            );
+            let mut edit_lines: Vec<u32> = edits.iter().map(|e| e.range.start.line).collect();
+            edit_lines.sort_unstable();
+            assert_eq!(edit_lines, outdated_lines, "{edits:?}");
+            assert!(edits.iter().all(|e| e.new_text.starts_with(&latest_sha)));
+
+            let hints = eco
+                .generate_inlay_hints(
+                    parse_result.as_ref(),
+                    versions(),
+                    deps_core::LoadingState::Loaded,
+                    &deps_core::EcosystemConfig::default(),
+                )
+                .await;
+            let names_latest = |line: u32| {
+                hints.iter().any(|h| {
+                    h.position.line == line
+                        && matches!(&h.label, InlayHintLabel::String(t) if t.contains("v2.87.22"))
+                })
+            };
+            for line in outdated_lines {
+                assert!(names_latest(line), "line {line}: {hints:?}");
+            }
+            assert!(!names_latest(control_line), "control: {hints:?}");
+
+            for line in outdated_lines {
+                let hover = eco
+                    .generate_hover(
+                        parse_result.as_ref(),
+                        Position::new(line, 40),
+                        versions().with_network(deps_core::NetworkMode::Offline),
+                        deps_core::FreshnessSettings::default(),
+                    )
+                    .await
+                    .expect("hover");
+                assert!(
+                    hover
+                        .markdown()
+                        .contains(deps_core::lsp_helpers::CMD_DOT_FOOTER),
+                    "line {line}: {}",
+                    hover.markdown()
+                );
+            }
+        }
+
+        /// #1720: non-repo and reusable-workflow `uses:` are outside the SHA-pin status path.
+        #[tokio::test]
+        async fn test_sha_pin_status_does_not_touch_non_repo_uses() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+            let index = TagIndex::from_tags([(
+                "v1.0.0",
+                &deps_core::lsp_helpers::CommitSha::parse(&"3".repeat(40)).unwrap(),
+            )]);
+            eco.formatter.tag_index.insert(
+                deps_core::PackageName::new("octo-org/repo"),
+                Arc::new(index),
+            );
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = format!(
+                "jobs:\n  call:\n    uses: octo-org/repo/.github/workflows/x.yml@{}\n  build:\n    steps:\n      - uses: docker://alpine:3.18\n      - uses: ./local\n",
+                "5".repeat(40)
+            );
+            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let mut cached = HashMap::new();
+            cached.insert(
+                deps_core::PackageName::new("octo-org/repo"),
+                deps_core::PackageVersions::latest_only("v1.0.0"),
+            );
+            let resolved = HashMap::new();
+
+            let diagnostics = eco
+                .generate_diagnostics(
+                    parse_result.as_ref(),
+                    deps_core::VersionData::new(&cached, &resolved),
+                    &uri,
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::lsp_helpers::DiagnosticSeverities::default(),
+                )
+                .await;
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|d| !d.message().contains("Newer version available")),
+                "{diagnostics:?}"
+            );
+            let edits = deps_core::lsp_helpers::collect_update_all_edits(
+                parse_result.as_ref(),
+                &content,
+                deps_core::VersionData::new(&cached, &resolved),
+                &eco.formatter,
+            );
+            assert!(edits.is_empty(), "{edits:?}");
+        }
+
         #[tokio::test]
         async fn test_collect_pin_all_to_sha_edits_empty_when_no_tag_pins() {
             let cache = Arc::new(deps_core::HttpCache::new());
