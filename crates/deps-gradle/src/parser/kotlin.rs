@@ -3,7 +3,8 @@
 //! Regex-based extraction of dependency declarations from dependencies { } blocks.
 
 use crate::parser::{
-    GradleParseResult, build_dependency, is_dependency_configuration, opens_dependencies_block,
+    GradleParseResult, LineOffsetTable, SourceLine, build_dependency, is_dependency_configuration,
+    opens_dependencies_block,
 };
 use deps_core::Result;
 use regex::Regex;
@@ -66,6 +67,7 @@ fn claimed_starts(re: &Regex, line: &str) -> deps_core::MatchedSpans {
 /// Infallible by construction: this function never returns `Err`.
 pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
     let mut dependencies = Vec::new();
+    let line_table = LineOffsetTable::new(content);
 
     let mut brace_depth: i32 = 0;
     let mut in_dependencies_block = false;
@@ -97,7 +99,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
             continue;
         }
 
-        let line_u32 = line_idx as u32;
+        let src = SourceLine::new(&line_table, content, line_idx, line);
 
         for caps in RE_WITH_VERSION.captures_iter(line) {
             let config = caps.get(1).map_or("", |m| m.as_str());
@@ -107,7 +109,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
             if !budget.allow() {
                 continue;
             }
-            dependencies.push(build_dependency(&caps, line, line_u32, true, config));
+            dependencies.push(build_dependency(&caps, &src, true, config));
         }
 
         // Only match a versionless coordinate if this line has no versioned match already.
@@ -125,7 +127,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
             if !budget.allow() {
                 continue;
             }
-            dependencies.push(build_dependency(&caps, line, line_u32, false, config));
+            dependencies.push(build_dependency(&caps, &src, false, config));
         }
 
         // Same as above, for platform()/enforcedPlatform()-wrapped BOM coordinates
@@ -139,7 +141,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
             if !budget.allow() {
                 continue;
             }
-            dependencies.push(build_dependency(&caps, line, line_u32, true, config));
+            dependencies.push(build_dependency(&caps, &src, true, config));
         }
 
         for caps in RE_PLATFORM_NO_VERSION.captures_iter(line) {
@@ -154,7 +156,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
             if !budget.allow() {
                 continue;
             }
-            dependencies.push(build_dependency(&caps, line, line_u32, false, config));
+            dependencies.push(build_dependency(&caps, &src, false, config));
         }
     }
 
@@ -555,5 +557,62 @@ mod tests {
         let byte = line.find("g:a").unwrap();
         let expected = u32::try_from(line.get(..byte).unwrap().encode_utf16().count()).unwrap();
         assert_eq!(result.dependencies[0].name_range.start.character, expected);
+    }
+
+    /// #1701: one huge non-ASCII line with thousands of matches must report exact UTF-16
+    /// columns (an astral char counts as 2 units, a CJK char as 1).
+    #[test]
+    fn test_single_long_line_utf16_columns() {
+        const N: usize = 5000;
+        let filler = "/*\u{1F600}\u{65E5}*/ ";
+        let head = "implementation(\"";
+        let units = |s: &str| u32::try_from(s.encode_utf16().count()).unwrap();
+        let mut line = String::from("dependencies { ");
+        let mut expected = Vec::with_capacity(N);
+        let mut col = units(&line);
+        for i in 0..N {
+            let name = format!("g{i}:a{i}");
+            let coord = if i % 2 == 0 {
+                name.clone()
+            } else {
+                format!("{name}:1.{i}")
+            };
+            col += units(filler) + units(head);
+            expected.push((col, col + units(&name)));
+            col += units(&coord) + 2;
+            line.push_str(&format!("{filler}{head}{coord}\")"));
+        }
+        line.push_str(" }\n");
+
+        let result = parse_kotlin_dsl(&line, &make_uri()).unwrap();
+
+        assert_eq!(result.dependencies.len(), N);
+        let mut got: Vec<_> = result
+            .dependencies
+            .iter()
+            .map(|d| (d.name_range.start.character, d.name_range.end.character))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, expected);
+    }
+
+    /// Mixed ASCII / non-ASCII / CRLF lines each get columns relative to their own line.
+    #[test]
+    fn test_mixed_ascii_and_non_ascii_lines() {
+        let content = "dependencies {\r\n    implementation(\"a:b:1\")\r\n    /*\u{1F600}*/ implementation(\"c:d:2\")\r\n    implementation(\"e:f:3\")\r\n}\r\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        let got: Vec<_> = result
+            .dependencies
+            .iter()
+            .map(|d| {
+                let v = d.version_range.unwrap();
+                (
+                    d.name_range.start.line,
+                    d.name_range.start.character,
+                    v.start.character,
+                )
+            })
+            .collect();
+        assert_eq!(got, [(1, 20, 24), (2, 27, 31), (3, 20, 24)]);
     }
 }

@@ -88,6 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle, deps-nuget, deps-swift, deps-bundler, deps-github-actions**: `requirement_is_placeholder` now also composes the shared `requirement_contains_template_placeholder` detector (previously native-syntax-only), so `{{ VAR }}`/`@VAR@`/`%VAR%`/`${VAR}`/`<%= VAR %>` external-templating placeholders are no longer destructively rewritten to a literal version by `deps-cli update` or vulnerability-fix code actions in these five ecosystems (resolves #1390) (#1393)
 
 ### Fixed
+- **deps-gradle**: build script and settings parsers no longer take quadratic time on a single long line with many dependencies, and settings plugin ranges no longer point at an earlier same-prefix plugin (resolves #1701) (#1701)
 - **deps-core**: Dart `+N` build-number pins (e.g. `0.8.13+1`) without a lock file are now treated as concrete versions, restoring the OSV scan and retracted-version probe (resolves #1689) (#1695)
 - **deps-swift**: `Package.swift` parser no longer takes quadratic time on large manifests; already-matched span lookup is now O(log n) (resolves #1692) (#1698)
 - **deps-gradle, deps-swift, deps-core**: Kotlin/Groovy parsers now use the shared `deps_core::MatchedSpans` (also adopted by Swift, replacing its private copy) instead of quadratic `Vec` scans on long lines (resolves #1699) (#1700)

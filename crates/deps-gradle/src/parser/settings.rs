@@ -2,10 +2,9 @@
 //!
 //! Extracts plugin declarations from `pluginManagement { plugins { } }` blocks.
 
-use crate::parser::{GradleParseResult, saturating_utf16_len};
+use crate::parser::{GradleParseResult, LineOffsetTable, SourceLine};
 use crate::types::GradleDependency;
 use deps_core::Result;
-use deps_core::position::{Position, Range};
 use regex::Regex;
 use std::sync::LazyLock;
 use url::Url;
@@ -19,43 +18,6 @@ static RE_PLUGIN: LazyLock<Regex> = LazyLock::new(|| {
         .expect("RE_PLUGIN")
 });
 
-/// Finds the LSP range of `plugin_id` within `line`.
-// `col` comes from `find(plugin_id)`; `plugin_id` is a name string, so this slice bound is
-// always a char boundary.
-#[allow(clippy::string_slice)]
-fn find_plugin_name_range(line: &str, line_idx: u32, plugin_id: &str) -> Range {
-    if let Some(col) = line.find(plugin_id) {
-        let col_u32 = deps_core::lsp_helpers::byte_to_utf16_offset(line, col);
-        let end_u32 = col_u32 + saturating_utf16_len(plugin_id);
-        Range::new(
-            Position::new(line_idx, col_u32),
-            Position::new(line_idx, end_u32),
-        )
-    } else {
-        Range::default()
-    }
-}
-
-/// Finds the LSP range of `version` in `line` after the `version` keyword.
-// `kw_pos` comes from `find("version")`, an ASCII token; `abs_start` derives from a further
-// ASCII `find`. Every slice bound is always a char boundary.
-#[allow(clippy::string_slice)]
-fn find_plugin_version_range(line: &str, line_idx: u32, version: &str) -> Range {
-    if let Some(kw_pos) = line.find("version") {
-        let after_kw = &line[kw_pos + "version".len()..];
-        if let Some(rel) = after_kw.find(version) {
-            let abs_start = kw_pos + "version".len() + rel;
-            let col_start = deps_core::lsp_helpers::byte_to_utf16_offset(line, abs_start);
-            let col_end = col_start + saturating_utf16_len(version);
-            return Range::new(
-                Position::new(line_idx, col_start),
-                Position::new(line_idx, col_end),
-            );
-        }
-    }
-    Range::default()
-}
-
 /// Parses `pluginManagement { plugins { ... } }` blocks from settings.gradle / settings.gradle.kts.
 ///
 /// # Errors
@@ -64,6 +26,7 @@ fn find_plugin_version_range(line: &str, line_idx: u32, version: &str) -> Range 
 /// Returns [`Result`] only to match the shared parser signature every ecosystem implements.
 pub fn parse_settings(content: &str, uri: &Url) -> Result<GradleParseResult> {
     let mut dependencies = Vec::new();
+    let line_table = LineOffsetTable::new(content);
     let mut brace_depth: i32 = 0;
     let mut in_plugin_management = false;
     let mut pm_depth: i32 = 0;
@@ -109,28 +72,31 @@ pub fn parse_settings(content: &str, uri: &Url) -> Result<GradleParseResult> {
             continue;
         }
 
-        let line_u32 = line_idx as u32;
+        let src = SourceLine::new(&line_table, content, line_idx, line);
 
         for caps in RE_PLUGIN.captures_iter(line) {
             if !budget.allow() {
                 continue;
             }
-            let plugin_id = caps.get(1).map_or("", |m| m.as_str()).to_string();
-            let version = caps.get(2).map_or("", |m| m.as_str()).trim().to_string();
+            let (id_start, plugin_id) = caps.get(1).map_or((0, ""), |m| (m.start(), m.as_str()));
+            let (version_start, raw_version) =
+                caps.get(2).map_or((0, ""), |m| (m.start(), m.as_str()));
+            let version = raw_version.trim();
+            let leading_ws = raw_version.len() - raw_version.trim_start().len();
 
             // Convention: pluginId -> group = pluginId, artifact = pluginId.gradle.plugin
             let artifact_id = format!("{plugin_id}.gradle.plugin");
             let name = format!("{plugin_id}:{artifact_id}");
 
-            let name_range = find_plugin_name_range(line, line_u32, &plugin_id);
-            let version_range = find_plugin_version_range(line, line_u32, &version);
+            let name_range = src.range_of(id_start, plugin_id);
+            let version_range = src.range_of(version_start + leading_ws, version);
 
             dependencies.push(GradleDependency {
-                group_id: plugin_id,
+                group_id: plugin_id.to_string(),
                 artifact_id,
                 name: name.into(),
                 name_range,
-                version_req: Some(version.into()),
+                version_req: Some(version.to_string().into()),
                 version_range: Some(version_range),
                 configuration: "plugin".to_string(),
                 source: deps_core::parser::DependencySource::Registry,
@@ -234,5 +200,62 @@ mod tests {
     fn test_empty_content() {
         let result = parse_settings("", &make_uri("settings.gradle")).unwrap();
         assert!(result.dependencies.is_empty());
+    }
+
+    /// #1701: one huge non-ASCII line with thousands of plugins must report exact UTF-16
+    /// columns for both the plugin id and the version.
+    #[test]
+    fn test_single_long_line_utf16_columns() {
+        const N: usize = 5000;
+        let filler = "/*\u{1F600}\u{65E5}*/ ";
+        let units = |s: &str| u32::try_from(s.encode_utf16().count()).unwrap();
+        let mut body = String::from("        ");
+        let mut expected = Vec::with_capacity(N);
+        let mut col = units(&body);
+        for i in 0..N {
+            let id = format!("org.p{i}");
+            let version = format!("1.{i}");
+            let before_id = format!("{filler}id(\"");
+            let between = "\") version \"";
+            col += units(&before_id);
+            let id_range = (col, col + units(&id));
+            col += units(&id) + units(between);
+            expected.push((id_range, (col, col + units(&version))));
+            col += units(&version) + 1;
+            body.push_str(&format!("{before_id}{id}{between}{version}\""));
+        }
+        let content = format!("pluginManagement {{\n    plugins {{\n{body}\n    }}\n}}\n");
+
+        let result = parse_settings(&content, &make_uri("settings.gradle.kts")).unwrap();
+
+        assert_eq!(result.dependencies.len(), N);
+        let got: Vec<_> = result
+            .dependencies
+            .iter()
+            .map(|d| {
+                let v = d.version_range.unwrap();
+                (
+                    (d.name_range.start.character, d.name_range.end.character),
+                    (v.start.character, v.end.character),
+                )
+            })
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    /// A shorter id sharing a prefix with an earlier one, and an identical version, must map
+    /// to its own span rather than the first plugin's.
+    #[test]
+    fn test_prefix_sharing_ids_get_own_ranges() {
+        let line = r#"        id("org.a.b") version "1.0"; id("org.a") version "1.0""#;
+        let content = format!("pluginManagement {{\n    plugins {{\n{line}\n    }}\n}}\n");
+        let result = parse_settings(&content, &make_uri("settings.gradle.kts")).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        let second = &result.dependencies[1];
+        let id_col = u32::try_from(line.rfind("org.a\"").unwrap()).unwrap();
+        assert_eq!(second.name_range.start.character, id_col);
+        assert_eq!(second.name_range.end.character, id_col + 5);
+        let ver_col = u32::try_from(line.rfind("1.0").unwrap()).unwrap();
+        assert_eq!(second.version_range.unwrap().start.character, ver_col);
     }
 }
