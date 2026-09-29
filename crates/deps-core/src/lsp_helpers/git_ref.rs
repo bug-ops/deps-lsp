@@ -158,7 +158,18 @@ fn tag_components(name: &str) -> impl Iterator<Item = &str> {
 }
 
 /// Whether `longer` extends `shorter` by at least one more dot-separated component.
-fn extends_tag(longer: &str, shorter: &str) -> bool {
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::extends_tag;
+///
+/// assert!(extends_tag("v4.2.2", "v4"));
+/// assert!(!extends_tag("v5.0.0", "v4"));
+/// assert!(!extends_tag("v4", "v4"));
+/// ```
+#[must_use]
+pub fn extends_tag(longer: &str, shorter: &str) -> bool {
     let mut longer = tag_components(longer);
     tag_components(shorter).all(|c| longer.next() == Some(c)) && longer.next().is_some()
 }

@@ -116,9 +116,11 @@ pub fn build_scan_targets(
     Vec<deps_core::osv::ScanTarget>,
     deps_core::osv::VulnerabilityMap,
 ) {
-    use deps_core::osv::{ScanOutcome, SkipReason};
+    use deps_core::osv::{OsvQueryName, ScanOutcome, SkipReason};
+    use std::collections::hash_map::Entry;
 
-    let mut targets = Vec::new();
+    let mut targets: Vec<deps_core::osv::ScanTarget> = Vec::new();
+    let mut target_index: HashMap<deps_core::osv::VulnKey, usize> = HashMap::new();
     let mut skipped = deps_core::osv::VulnerabilityMap::new();
     let keys = deps_core::osv::vulnerability_keys(
         parse_result,
@@ -160,22 +162,43 @@ pub fn build_scan_targets(
             continue;
         };
 
-        if formatter.osv_name_availability(dep) == OsvNameAvailability::AwaitingRegistryData {
-            skipped.insert(
-                key,
-                ScanOutcome::Skipped(SkipReason::CanonicalNameUnconfirmed),
-            );
-            continue;
-        }
-
-        let Some(osv_name) = formatter.osv_package_name(dep) else {
-            skipped.insert(key, ScanOutcome::Skipped(SkipReason::UnmappableName));
-            continue;
+        let osv_name = match formatter.osv_name_availability(dep) {
+            OsvNameAvailability::Ready => match formatter.osv_package_name(dep) {
+                Some(name) => OsvQueryName::Confirmed(name),
+                None => {
+                    skipped.insert(key, ScanOutcome::Skipped(SkipReason::UnmappableName));
+                    continue;
+                }
+            },
+            OsvNameAvailability::AwaitingRegistryData {
+                written_fallback: Some(name),
+            } => OsvQueryName::Provisional(name),
+            OsvNameAvailability::AwaitingRegistryData {
+                written_fallback: None,
+            } => {
+                skipped.insert(
+                    key,
+                    ScanOutcome::Skipped(SkipReason::CanonicalNameUnconfirmed),
+                );
+                continue;
+            }
         };
 
-        targets.push(deps_core::osv::ScanTarget::from_native(
-            key, osv_name, version, formatter,
-        ));
+        let target = deps_core::osv::ScanTarget::from_native(key, osv_name, version, formatter);
+        match target_index.entry(target.key.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(targets.len());
+                targets.push(target);
+            }
+            Entry::Occupied(slot) => {
+                if let Some(existing) = targets.get_mut(*slot.get())
+                    && matches!(existing.osv_name, OsvQueryName::Provisional(_))
+                    && matches!(target.osv_name, OsvQueryName::Confirmed(_))
+                {
+                    *existing = target;
+                }
+            }
+        }
     }
 
     (targets, skipped)
@@ -232,7 +255,10 @@ fn classify_dep_for_check_targets<'a>(
         return DepCheckClassification::NoCachedVersions;
     };
 
-    if formatter.osv_name_availability(dep) == OsvNameAvailability::AwaitingRegistryData {
+    if matches!(
+        formatter.osv_name_availability(dep),
+        OsvNameAvailability::AwaitingRegistryData { .. }
+    ) {
         return DepCheckClassification::AwaitingOsvName { cached };
     }
 
@@ -374,7 +400,7 @@ pub fn build_latest_check_targets(
                 }
                 targets.push(deps_core::osv::ScanTarget::from_native(
                     key,
-                    osv_name,
+                    deps_core::osv::OsvQueryName::Confirmed(osv_name),
                     cached.latest.clone(),
                     formatter,
                 ));
@@ -487,7 +513,7 @@ pub fn build_candidate_check_targets(
             };
             bucket.push(deps_core::osv::ScanTarget::from_native(
                 key.clone(),
-                osv_name.clone(),
+                deps_core::osv::OsvQueryName::Confirmed(osv_name.clone()),
                 version.clone(),
                 formatter,
             ));
@@ -501,7 +527,8 @@ pub fn build_candidate_check_targets(
 #[derive(Debug, PartialEq, Eq)]
 enum FixTargetResolution {
     /// No fix recommended, F failed [`deps_core::lsp_helpers::is_safe_version_string`], or no
-    /// `osv_name` is on record for this key — nothing to verify or record; `fix_target_status`
+    /// `osv_name` is on record for this key, or that name is only provisional (#1694) — nothing to
+    /// verify or record; `fix_target_status`
     /// stays untouched (left at `NotChecked`).
     Skip,
     /// F's status was resolved without a network call by reusing the already-checked
@@ -522,11 +549,11 @@ fn resolve_fix_target(
     dv: &deps_core::osv::DependencyVulnerabilities,
     key: &deps_core::osv::VulnKey,
     latest_status: &deps_core::osv::LatestStatusMap,
-    osv_name_by_key: &HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvPackageName>,
+    osv_name_by_key: &HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvQueryName>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> FixTargetResolution {
     use deps_core::edit::{VulnFixSkip, resolve_recommended_fix};
-    use deps_core::osv::{ScanTarget, UpgradeStatus};
+    use deps_core::osv::{OsvQueryName, ScanTarget, UpgradeStatus};
 
     let latest = latest_status.get(key);
 
@@ -585,16 +612,26 @@ fn resolve_fix_target(
         return FixTargetResolution::Resolved(latest.cloned().unwrap_or(UpgradeStatus::NotChecked));
     }
 
-    let Some(osv_name) = osv_name_by_key.get(key).cloned() else {
+    let Some(osv_name) = osv_name_by_key.get(key) else {
         tracing::debug!(
             key = %key,
             "OSV #462: no osv_name on record for fix-target verification, skipping"
         );
         return FixTargetResolution::Skip;
     };
+    let osv_name = match osv_name {
+        OsvQueryName::Confirmed(name) => name.clone(),
+        OsvQueryName::Provisional(_) => {
+            tracing::debug!(
+                key = %key,
+                "OSV #1694: unconfirmed package name, fix target stays unverified"
+            );
+            return FixTargetResolution::Skip;
+        }
+    };
     FixTargetResolution::NeedsLiveCheck(ScanTarget::new(
         key.clone(),
-        osv_name,
+        OsvQueryName::Confirmed(osv_name),
         fix.version,
         ConcreteVersion::new(version_native),
     ))
@@ -678,7 +715,7 @@ fn resolve_fix_target(
 pub fn collect_fix_target_resolutions(
     vulnerabilities: &deps_core::osv::VulnerabilityMap,
     vulnerable_keys: &[deps_core::osv::VulnKey],
-    osv_name_by_key: &HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvPackageName>,
+    osv_name_by_key: &HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvQueryName>,
     latest_status: &deps_core::osv::LatestStatusMap,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> (
@@ -784,23 +821,24 @@ pub fn apply_live_fix_target_statuses(
 ///
 /// ```
 /// use deps_core::ConcreteVersion;
-/// use deps_core::osv::{OsvPackageName, OsvVersion, ScanTarget};
+/// use deps_core::osv::{OsvPackageName, OsvQueryName, OsvVersion, ScanTarget};
 /// use deps_core::test_util::vuln_key;
 /// use deps_engine::classify::osv::osv_name_by_key;
 ///
+/// let name = OsvQueryName::Confirmed(OsvPackageName::new("serde").unwrap());
 /// let targets = vec![ScanTarget::new(
 ///     vuln_key("serde"),
-///     OsvPackageName::new("serde").unwrap(),
+///     name.clone(),
 ///     OsvVersion::new("1.0.0"),
 ///     ConcreteVersion::new("1.0.0"),
 /// )];
 /// let map = osv_name_by_key(&targets);
-/// assert_eq!(map.get(&vuln_key("serde")), Some(&OsvPackageName::new("serde").unwrap()));
+/// assert_eq!(map.get(&vuln_key("serde")), Some(&name));
 /// ```
 #[must_use]
 pub fn osv_name_by_key(
     targets: &[deps_core::osv::ScanTarget],
-) -> HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvPackageName> {
+) -> HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvQueryName> {
     targets
         .iter()
         .map(|t| (t.key.clone(), t.osv_name.clone()))
@@ -1138,7 +1176,7 @@ mod tests {
             );
 
             assert_eq!(targets.len(), 1);
-            assert_eq!(targets[0].osv_name, "symfony/http-kernel");
+            assert_eq!(targets[0].osv_name.name(), "symfony/http-kernel");
             assert!(skipped.is_empty());
         }
 
@@ -1166,7 +1204,7 @@ mod tests {
             );
 
             assert_eq!(targets.len(), 1);
-            assert_eq!(targets[0].osv_name, "werkzeug");
+            assert_eq!(targets[0].osv_name.name(), "werkzeug");
             assert_eq!(skipped.len(), 1);
             // The skip is keyed by the normalized name, which is empty for `---`.
             assert_matches!(
@@ -1847,8 +1885,12 @@ mod tests {
             }
         }
 
-        /// A formatter whose OSV name is derived from registry data that has not landed yet.
-        struct AwaitingNameFormatter;
+        /// A formatter whose OSV name is derived from registry data that has not landed yet;
+        /// `with_fallback` offers the written name as a provisional query name (#1694).
+        #[derive(Default)]
+        struct AwaitingNameFormatter {
+            with_fallback: bool,
+        }
         impl PackageNaming for AwaitingNameFormatter {}
         impl PackageRendering for AwaitingNameFormatter {
             fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
@@ -1865,9 +1907,14 @@ mod tests {
         impl OsvNaming for AwaitingNameFormatter {
             fn osv_name_availability(
                 &self,
-                _dep: &dyn Dependency,
+                dep: &dyn Dependency,
             ) -> deps_core::lsp_helpers::OsvNameAvailability {
-                deps_core::lsp_helpers::OsvNameAvailability::AwaitingRegistryData
+                deps_core::lsp_helpers::OsvNameAvailability::AwaitingRegistryData {
+                    written_fallback: self
+                        .with_fallback
+                        .then(|| deps_core::osv::OsvPackageName::new_or_skip(dep.name().as_str()))
+                        .flatten(),
+                }
             }
         }
 
@@ -1882,7 +1929,7 @@ mod tests {
                     source: DependencySource::Registry,
                 }],
             };
-            let vuln_keys = vuln_keys_for(&parse_result, &AwaitingNameFormatter);
+            let vuln_keys = vuln_keys_for(&parse_result, &AwaitingNameFormatter::default());
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
                 PackageName::new("gha-action"),
@@ -1899,7 +1946,7 @@ mod tests {
                 &parse_result,
                 &cached_versions,
                 &vuln_keys,
-                &AwaitingNameFormatter,
+                &AwaitingNameFormatter::default(),
             );
 
             assert!(targets.is_empty());
@@ -1920,7 +1967,7 @@ mod tests {
                 &parse_result,
                 &cached_versions,
                 &vuln_keys,
-                &AwaitingNameFormatter,
+                &AwaitingNameFormatter::default(),
             );
 
             assert!(rounds.iter().all(Vec::is_empty));
@@ -1930,30 +1977,32 @@ mod tests {
             );
         }
 
-        /// #1683: a tag-pinned action whose repository casing is not yet confirmed is a
-        /// transient skip, never `UnmappableName`.
+        /// #1694: an unconfirmed casing queries the written name as a provisional target
+        /// (only a positive answer is trusted); a confirmed one is the authoritative target.
         #[cfg(feature = "github-actions")]
         #[test]
-        fn build_scan_targets_github_actions_without_canonical_name_is_unconfirmed() {
+        fn build_scan_targets_github_actions_unconfirmed_name_is_provisional() {
             use deps_core::lsp_helpers::TagIndex;
-            use deps_core::osv::{ScanOutcome, SkipReason};
+            use deps_core::osv::OsvQueryName;
             use deps_github_actions::{GithubActionsFormatter, GithubActionsRegistry};
             use std::sync::Arc;
 
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let parse_result = deps_github_actions::parse_workflow_yaml(
-                "steps:\n  - uses: actions/checkout@v4.1.2\n",
+                "steps:\n  - uses: azure/setup-kubectl@v4.1.2\n",
                 &uri,
             )
             .expect("valid yaml");
             let registry = GithubActionsRegistry::new(Arc::new(deps_core::HttpCache::new()));
+            let written = deps_core::osv::OsvPackageName::new("azure/setup-kubectl").unwrap();
+            let canonical = deps_core::osv::OsvPackageName::new("Azure/setup-kubectl").unwrap();
 
             for warm_without_canonical in [false, true] {
                 let tag_index = registry.tag_index();
                 tag_index.clear();
                 if warm_without_canonical {
                     tag_index.insert(
-                        PackageName::new("actions/checkout"),
+                        PackageName::new("azure/setup-kubectl"),
                         Arc::new(TagIndex::default()),
                     );
                 }
@@ -1967,12 +2016,201 @@ mod tests {
                     EcosystemId::GithubActions,
                 );
 
-                assert!(targets.is_empty());
-                assert_matches!(
-                    skipped.get(&deps_core::test_util::vuln_key("actions/checkout")),
-                    Some(ScanOutcome::Skipped(SkipReason::CanonicalNameUnconfirmed)),
-                    "warm_without_canonical={warm_without_canonical}: {skipped:?}"
+                assert!(skipped.is_empty(), "{skipped:?}");
+                assert_eq!(targets.len(), 1);
+                assert_eq!(
+                    targets[0].osv_name,
+                    OsvQueryName::Provisional(written.clone()),
+                    "warm_without_canonical={warm_without_canonical}"
                 );
+            }
+
+            let tag_index = registry.tag_index();
+            tag_index.insert(
+                PackageName::new("azure/setup-kubectl"),
+                Arc::new(TagIndex::default().with_canonical_repo_name(
+                    deps_core::github::CanonicalRepoName::from_commit_url(
+                        "https://api.github.com/repos/Azure/setup-kubectl/commits/abc",
+                    ),
+                )),
+            );
+            let formatter = GithubActionsFormatter::new(tag_index);
+            let (targets, _) = build_scan_targets(
+                &parse_result,
+                &HashMap::new(),
+                &HashMap::new(),
+                &formatter,
+                EcosystemId::GithubActions,
+            );
+            assert_eq!(targets[0].osv_name, OsvQueryName::Confirmed(canonical));
+        }
+
+        /// #1684: a floating `@v4` scans the release its tag's commit carries, and stays an
+        /// honest skip while the index is cold or the commit only carries the floating tag.
+        #[cfg(feature = "github-actions")]
+        #[test]
+        fn build_scan_targets_github_actions_floating_tag_resolves_via_commit() {
+            use deps_core::lsp_helpers::{CommitSha, TagIndex};
+            use deps_core::osv::{OsvQueryName, ScanOutcome, SkipReason};
+            use deps_github_actions::{GithubActionsFormatter, GithubActionsRegistry};
+            use std::sync::Arc;
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let parse_result = deps_github_actions::parse_workflow_yaml(
+                "steps:\n  - uses: actions/checkout@v4\n",
+                &uri,
+            )
+            .expect("valid yaml");
+            let registry = GithubActionsRegistry::new(Arc::new(deps_core::HttpCache::new()));
+            let key = deps_core::test_util::vuln_key("actions/checkout");
+            let commit = CommitSha::parse(&"a".repeat(40)).unwrap();
+            let scan = |tags: &[&str]| {
+                let tag_index = registry.tag_index();
+                tag_index.clear();
+                if !tags.is_empty() {
+                    let index = TagIndex::from_tags(tags.iter().map(|t| (*t, &commit)))
+                        .with_canonical_repo_name(
+                            deps_core::github::CanonicalRepoName::from_commit_url(
+                                "https://api.github.com/repos/actions/checkout/commits/abc",
+                            ),
+                        );
+                    tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
+                }
+                build_scan_targets(
+                    &parse_result,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &GithubActionsFormatter::new(tag_index),
+                    EcosystemId::GithubActions,
+                )
+            };
+
+            let (targets, skipped) = scan(&["v4", "v4.2.2"]);
+            assert!(skipped.is_empty(), "{skipped:?}");
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].version, "4.2.2");
+            assert_matches!(targets[0].osv_name, OsvQueryName::Confirmed(_));
+
+            let (targets, skipped) = scan(&[]);
+            assert!(targets.is_empty());
+            assert_matches!(
+                skipped.get(&key),
+                Some(ScanOutcome::Skipped(SkipReason::NoConcreteVersion))
+            );
+
+            let (targets, skipped) = scan(&["v4"]);
+            assert!(targets.is_empty());
+            assert_matches!(
+                skipped.get(&key),
+                Some(ScanOutcome::Skipped(SkipReason::ResolvedTagNotFullVersion))
+            );
+        }
+
+        /// #1694: a written name that is not a valid OSV name stays a fail-closed skip.
+        #[test]
+        fn build_scan_targets_awaiting_name_without_fallback_is_unconfirmed_skip() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("gha-action"),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let mut resolved = HashMap::new();
+            resolved.insert(
+                PackageName::new("gha-action"),
+                ConcreteVersion::new("1.0.0"),
+            );
+
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &resolved,
+                &HashMap::new(),
+                &AwaitingNameFormatter::default(),
+                EcosystemId::Cargo,
+            );
+
+            assert!(targets.is_empty());
+            assert_matches!(
+                skipped.get(&deps_core::test_util::vuln_key("gha-action")),
+                Some(deps_core::osv::ScanOutcome::Skipped(
+                    deps_core::osv::SkipReason::CanonicalNameUnconfirmed
+                ))
+            );
+        }
+
+        /// A formatter reporting a different name availability per successive dependency.
+        struct SequencedNameFormatter {
+            ready: [bool; 2],
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl PackageNaming for SequencedNameFormatter {}
+        impl PackageRendering for SequencedNameFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl RequirementResolution for SequencedNameFormatter {}
+        impl DiagnosticMessages for SequencedNameFormatter {}
+        impl DiagnosticPolicy for SequencedNameFormatter {}
+        impl SourcePolicy for SequencedNameFormatter {}
+        impl OsvNaming for SequencedNameFormatter {
+            fn osv_name_availability(
+                &self,
+                dep: &dyn Dependency,
+            ) -> deps_core::lsp_helpers::OsvNameAvailability {
+                let idx = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.ready[idx] {
+                    deps_core::lsp_helpers::OsvNameAvailability::Ready
+                } else {
+                    deps_core::lsp_helpers::OsvNameAvailability::AwaitingRegistryData {
+                        written_fallback: deps_core::osv::OsvPackageName::new_or_skip(
+                            dep.name().as_str(),
+                        ),
+                    }
+                }
+            }
+        }
+
+        /// #1694 (critic M1): occurrences sharing a key collapse to one target, and a
+        /// confirmed name wins over a provisional one whichever comes first.
+        #[test]
+        fn build_scan_targets_dedups_per_key_preferring_confirmed_name() {
+            use deps_core::osv::OsvQueryName;
+
+            let mut resolved = HashMap::new();
+            resolved.insert(PackageName::new("dup"), ConcreteVersion::new("1.0.0"));
+            let name = deps_core::osv::OsvPackageName::new("dup").unwrap();
+
+            for (ready, expected) in [
+                ([false, true], OsvQueryName::Confirmed(name.clone())),
+                ([true, false], OsvQueryName::Confirmed(name.clone())),
+                ([false, false], OsvQueryName::Provisional(name)),
+            ] {
+                let parse_result = MockParseResult {
+                    deps: ["dup", "dup"]
+                        .into_iter()
+                        .map(|n| MockDep {
+                            name: PackageName::new(n),
+                            source: DependencySource::Registry,
+                        })
+                        .collect(),
+                };
+                let formatter = SequencedNameFormatter {
+                    ready,
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                };
+                let (targets, _) = build_scan_targets(
+                    &parse_result,
+                    &resolved,
+                    &HashMap::new(),
+                    &formatter,
+                    EcosystemId::Cargo,
+                );
+                assert_eq!(targets.len(), 1, "ready={ready:?}");
+                assert_eq!(targets[0].osv_name, expected, "ready={ready:?}");
             }
         }
 
@@ -2358,7 +2596,9 @@ mod tests {
             let mut osv_name_by_key = HashMap::new();
             osv_name_by_key.insert(
                 deps_core::test_util::vuln_key("pkg"),
-                deps_core::osv::OsvPackageName::new("pkg").unwrap(),
+                deps_core::osv::OsvQueryName::Confirmed(
+                    deps_core::osv::OsvPackageName::new("pkg").unwrap(),
+                ),
             );
 
             let resolution = resolve_fix_target(
@@ -2372,7 +2612,9 @@ mod tests {
                 resolution,
                 FixTargetResolution::NeedsLiveCheck(deps_core::osv::ScanTarget::new(
                     deps_core::test_util::vuln_key("pkg"),
-                    deps_core::osv::OsvPackageName::new("pkg").unwrap(),
+                    deps_core::osv::OsvQueryName::Confirmed(
+                        deps_core::osv::OsvPackageName::new("pkg").unwrap()
+                    ),
                     OsvVersion::new("1.2.0"),
                     ConcreteVersion::new("1.2.0"),
                 ))
@@ -2393,7 +2635,9 @@ mod tests {
             let mut osv_name_by_key = HashMap::new();
             osv_name_by_key.insert(
                 deps_core::test_util::vuln_key("pkg"),
-                deps_core::osv::OsvPackageName::new("pkg").unwrap(),
+                deps_core::osv::OsvQueryName::Confirmed(
+                    deps_core::osv::OsvPackageName::new("pkg").unwrap(),
+                ),
             );
 
             let resolution = resolve_fix_target(
@@ -2407,10 +2651,56 @@ mod tests {
                 resolution,
                 FixTargetResolution::NeedsLiveCheck(deps_core::osv::ScanTarget::new(
                     deps_core::test_util::vuln_key("pkg"),
-                    deps_core::osv::OsvPackageName::new("pkg").unwrap(),
+                    deps_core::osv::OsvQueryName::Confirmed(
+                        deps_core::osv::OsvPackageName::new("pkg").unwrap()
+                    ),
                     OsvVersion::new("1.2.0"),
                     ConcreteVersion::new("1.2.0"),
                 ))
+            );
+        }
+
+        /// #1694: a fix target can never be verified through an unconfirmed name — a clean
+        /// answer there is not evidence, so the fix stays unverified and no query is queued.
+        #[test]
+        fn resolve_fix_target_skips_provisional_name_and_queues_no_live_check() {
+            let dv = dv(vec![advisory("A1", &["1.2.0"])]);
+            let key = deps_core::test_util::vuln_key("pkg");
+            let latest_status_map = latest_status_map(UpgradeStatus::CandidateClean {
+                version: ConcreteVersion::new("3.0.0"),
+            });
+            let mut osv_name_by_key = HashMap::new();
+            osv_name_by_key.insert(
+                key.clone(),
+                deps_core::osv::OsvQueryName::Provisional(
+                    deps_core::osv::OsvPackageName::new("pkg").unwrap(),
+                ),
+            );
+
+            assert_eq!(
+                resolve_fix_target(
+                    &dv,
+                    &key,
+                    &latest_status_map,
+                    &osv_name_by_key,
+                    &StubFormatter::DEFAULT,
+                ),
+                FixTargetResolution::Skip
+            );
+
+            let mut vulnerabilities = VulnerabilityMap::new();
+            vulnerabilities.insert(key.clone(), ScanOutcome::Vulnerable(dv));
+            let (resolved, live_check_candidates) = collect_fix_target_resolutions(
+                &vulnerabilities,
+                &[key],
+                &osv_name_by_key,
+                &latest_status_map,
+                &StubFormatter::DEFAULT,
+            );
+            assert!(resolved.is_empty(), "{resolved:?}");
+            assert!(
+                live_check_candidates.is_empty(),
+                "{live_check_candidates:?}"
             );
         }
 
@@ -2496,15 +2786,21 @@ mod tests {
             let mut osv_name_by_key = HashMap::new();
             osv_name_by_key.insert(
                 deps_core::test_util::vuln_key("reused"),
-                deps_core::osv::OsvPackageName::new("reused").unwrap(),
+                deps_core::osv::OsvQueryName::Confirmed(
+                    deps_core::osv::OsvPackageName::new("reused").unwrap(),
+                ),
             );
             osv_name_by_key.insert(
                 deps_core::test_util::vuln_key("live-a"),
-                deps_core::osv::OsvPackageName::new("live-a").unwrap(),
+                deps_core::osv::OsvQueryName::Confirmed(
+                    deps_core::osv::OsvPackageName::new("live-a").unwrap(),
+                ),
             );
             osv_name_by_key.insert(
                 deps_core::test_util::vuln_key("live-b"),
-                deps_core::osv::OsvPackageName::new("live-b").unwrap(),
+                deps_core::osv::OsvQueryName::Confirmed(
+                    deps_core::osv::OsvPackageName::new("live-b").unwrap(),
+                ),
             );
 
             let (resolved, live_check_candidates) = collect_fix_target_resolutions(

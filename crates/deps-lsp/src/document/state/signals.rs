@@ -9,12 +9,12 @@
 //! items are visible to descendant modules, and `signals` is a descendant of `state`.
 
 use deps_core::lsp_helpers::EcosystemFormatter;
-use deps_core::osv::{CandidateStatusMap, LatestStatusMap, VulnerabilityMap};
+use deps_core::osv::{CandidateStatusMap, LatestStatusMap, VulnKey, VulnerabilityMap};
 use deps_core::{
     ConcreteVersion, DependencyOutcomes, GossipFindings, PackageName, PackageVersions,
     TyposquatSignal, VersionData,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::super::typosquat::TyposquatGate;
 use super::ResolvedGeneration;
@@ -56,6 +56,11 @@ pub struct PackageSignals {
     /// the first background scan completes; carried across document edits
     /// by `preserve_cache` so it is not wiped on every keystroke.
     pub vulnerabilities: VulnerabilityMap,
+    /// Keys of [`Self::vulnerabilities`] whose scan target was queried under an unconfirmed
+    /// (provisional) package name (#1694): their clean result is not evidence, so the scan is
+    /// repeated once the confirmed name becomes available. Committed with, and carried across
+    /// edits like, [`Self::vulnerabilities`].
+    pub provisional_osv_keys: HashSet<VulnKey>,
     /// Phase B's per-key "latest" check result (issue #1517), keyed the same way as
     /// [`Self::vulnerabilities`] — see [`deps_core::osv::LatestStatusMap`]. Populated for
     /// every dependency with a registry-cached latest, not only ones already flagged
@@ -187,6 +192,7 @@ impl std::fmt::Debug for PackageSignals {
             resolved_version_candidates,
             resolved_versions_generation,
             vulnerabilities,
+            provisional_osv_keys,
             latest_status,
             candidate_status,
             outcomes,
@@ -204,6 +210,7 @@ impl std::fmt::Debug for PackageSignals {
             )
             .field("resolved_versions_generation", resolved_versions_generation)
             .field("vulnerabilities_count", &vulnerabilities.len())
+            .field("provisional_osv_keys_count", &provisional_osv_keys.len())
             .field("latest_status_count", &latest_status.len())
             .field("candidate_status_count", &candidate_status.len())
             .field("licenses_count", &licenses.len())
@@ -235,6 +242,7 @@ impl Default for PackageSignals {
             resolved_version_candidates: HashMap::new(),
             resolved_versions_generation: ResolvedGeneration::INITIAL,
             vulnerabilities: VulnerabilityMap::new(),
+            provisional_osv_keys: HashSet::new(),
             latest_status: LatestStatusMap::new(),
             candidate_status: CandidateStatusMap::new(),
             outcomes: DependencyOutcomes::new(),
@@ -274,6 +282,7 @@ impl PackageSignals {
             resolved_version_candidates,
             resolved_versions_generation: _,
             vulnerabilities,
+            provisional_osv_keys,
             latest_status,
             candidate_status,
             outcomes,
@@ -291,6 +300,7 @@ impl PackageSignals {
             gossip_findings.remove(removed_dep);
             let normalized = formatter.normalize_package_name(removed_dep);
             vulnerabilities.retain(|key, _| key.as_str() != normalized);
+            provisional_osv_keys.retain(|key| key.as_str() != normalized);
             latest_status.retain(|key, _| key.as_str() != normalized);
             candidate_status.retain(|key, _| key.as_str() != normalized);
             outcomes.remove(&normalized);
