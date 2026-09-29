@@ -1,6 +1,8 @@
 //! GitHub Actions ecosystem formatter.
 
 use dashmap::DashMap;
+#[cfg(any(test, feature = "lsp-responses"))]
+use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
     BoundedVersionReq, CommitSha, DiagnosticMessages, DiagnosticPolicy, OsvNameAvailability,
     OsvNaming, PackageNaming, PackageRendering, RequirementResolution, RequirementStatus,
@@ -9,7 +11,7 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
-    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName, VersionReq,
+    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName,
     lsp_helpers::warn_rejected_value,
 };
 use std::sync::Arc;
