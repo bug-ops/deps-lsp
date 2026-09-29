@@ -3147,5 +3147,120 @@ mod tests {
             );
             assert!(edits.is_empty());
         }
+
+        /// #1723: SHA pins absent from the populated index must be reported consistently by
+        /// diagnostics, inlay hints, update-all and hover (`component:` and `project:`
+        /// includes alike), and the rewrite is the latest tag's full SHA, never a bare tag. A
+        /// control pin on latest's commit gets none of them.
+        #[tokio::test]
+        async fn test_sha_pin_surfaces_agree() {
+            use tower_lsp_server::ls_types::InlayHintLabel;
+
+            let eco = GitlabCiEcosystem::with_context(
+                Arc::new(HttpCache::new()),
+                Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+                Arc::new(RwLock::new(Some("gitlab.com".to_string()))),
+            );
+            let latest_sha = "3".repeat(40);
+            let missing = "5".repeat(40);
+            let content = format!(
+                "include:\n\
+                 \x20 - component: gitlab.com/org/proj/comp@{missing}\n\
+                 \x20 - project: org/proj\n\
+                 \x20   ref: {missing}\n\
+                 \x20 - component: gitlab.com/org/other/comp@{latest_sha}\n"
+            );
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let deps = deps_core::ParseResult::dependencies(parse_result.as_ref());
+            assert_eq!(deps.len(), 3);
+
+            let mut cached = std::collections::HashMap::new();
+            for (dep, endpoint) in deps.iter().zip([
+                EndpointKind::Releases,
+                EndpointKind::Tags,
+                EndpointKind::Releases,
+            ]) {
+                let index =
+                    TagIndex::from_tags([("v1.1.0", &CommitSha::parse(&latest_sha).unwrap())]);
+                eco.formatter
+                    .tag_index
+                    .insert((endpoint, dep.name().clone()), Arc::new(index));
+                cached.insert(
+                    dep.name().clone(),
+                    deps_core::PackageVersions::latest_only("v1.1.0"),
+                );
+            }
+            let resolved = std::collections::HashMap::new();
+            let versions = || deps_core::VersionData::new(&cached, &resolved);
+            let outdated_lines = [1_u32, 3];
+            let control_line = 4_u32;
+
+            let diagnostics = eco
+                .generate_diagnostics(
+                    parse_result.as_ref(),
+                    versions(),
+                    &uri,
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::lsp_helpers::DiagnosticSeverities::default(),
+                )
+                .await;
+            let mut diagnostic_lines: Vec<u32> = diagnostics
+                .iter()
+                .filter(|d| d.message().contains("Newer version available"))
+                .map(|d| d.range.start.line)
+                .collect();
+            diagnostic_lines.sort_unstable();
+            assert_eq!(diagnostic_lines, outdated_lines, "{diagnostics:?}");
+
+            let edits = deps_core::lsp_helpers::collect_update_all_edits(
+                parse_result.as_ref(),
+                &content,
+                versions(),
+                &eco.formatter,
+            );
+            let mut edit_lines: Vec<u32> = edits.iter().map(|e| e.range.start.line).collect();
+            edit_lines.sort_unstable();
+            assert_eq!(edit_lines, outdated_lines, "{edits:?}");
+            assert!(edits.iter().all(|e| e.new_text == latest_sha), "{edits:?}");
+
+            let hints = eco
+                .generate_inlay_hints(
+                    parse_result.as_ref(),
+                    versions(),
+                    deps_core::LoadingState::Loaded,
+                    &deps_core::EcosystemConfig::default(),
+                )
+                .await;
+            let names_latest = |line: u32| {
+                hints.iter().any(|h| {
+                    h.position.line == line
+                        && matches!(&h.label, InlayHintLabel::String(t) if t.contains("v1.1.0"))
+                })
+            };
+            for line in outdated_lines {
+                assert!(names_latest(line), "line {line}: {hints:?}");
+            }
+            assert!(!names_latest(control_line), "control: {hints:?}");
+
+            for line in outdated_lines {
+                let hover = eco
+                    .generate_hover(
+                        parse_result.as_ref(),
+                        Position::new(line, 30),
+                        versions().with_network(deps_core::NetworkMode::Offline),
+                        deps_core::FreshnessSettings::default(),
+                    )
+                    .await
+                    .expect("hover");
+                assert!(
+                    hover
+                        .markdown()
+                        .contains(deps_core::lsp_helpers::CMD_DOT_FOOTER),
+                    "line {line}: {}",
+                    hover.markdown()
+                );
+            }
+        }
     }
 }
