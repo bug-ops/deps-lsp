@@ -369,7 +369,7 @@ fn classify_vulnerable_dependency(
             None,
         ),
         // #1344/#1350: `RequirementAlreadyResolves` (the declared requirement already resolves
-        // forward to the fix target — see `requirement_already_resolves_to`'s and
+        // forward to the fix target — see `bounded_requirement_already_resolves_to`'s and
         // `NuGetFormatter`'s doc for why this is not simply "the requirement admits the fix")
         // reads as "nothing to rewrite here" — note this runs after the FR-012 yanked filter
         // above, so a requirement that already resolves forward but whose fix target is yanked
@@ -382,17 +382,17 @@ fn classify_vulnerable_dependency(
             ignore_rule_overridden,
         ),
         // #1566 S1: `NoOpRewrite` here no longer safely implies "the literal already reads as
-        // the fix." `plan_verified_fix` only reaches `NoOpRewrite` after `requirement_already_resolves_to`
+        // the fix." `plan_verified_fix` only reaches `NoOpRewrite` after `bounded_requirement_already_resolves_to`
         // has already returned `false` above (a `true` answer would have hit
         // `RequirementAlreadyResolves` instead), so the historical assumption — no
-        // `compile_requirement` comparator exists (e.g. GitHub Actions/GitLab CI tag pins), and
+        // `compile_bounded_requirement` comparator exists (e.g. GitHub Actions/GitLab CI tag pins), and
         // the declared literal happens to already spell the fix text verbatim — no longer holds
         // once an ecosystem's formatter can deliberately echo `current` back unchanged for a
         // requirement shape it has no safe single-value rewrite for (Cargo's compound
         // comma-separated requirements, #1566).
         //
-        // Code review regression: checking only `compile_requirement(..).is_some()` (a matcher
-        // *exists*) is not enough, because `requirement_already_resolves_to` can diverge from
+        // Code review regression: checking only `compile_bounded_requirement(..).is_some()` (a matcher
+        // *exists*) is not enough, because `bounded_requirement_already_resolves_to` can diverge from
         // the raw matcher's verdict — `NuGetFormatter` overrides it to always report `false`
         // for a bare/open-ended-minimum floor requirement regardless of what the matcher itself
         // says (floor semantics: leaving the manifest unedited restores the floor version, even
@@ -400,21 +400,21 @@ fn classify_vulnerable_dependency(
         // return `None` (indeterminate — the compared version failed to parse) rather than a
         // confirmed `Some(false)`. Neither case means the requirement was *confirmed* to
         // exclude the fix, so re-deriving the verdict from the underlying matcher directly —
-        // not `requirement_already_resolves_to`, which those two overrides deliberately bend
+        // not `bounded_requirement_already_resolves_to`, which those two overrides deliberately bend
         // away from the matcher's plain answer — and requiring exactly `Some(false)` is the
         // only way to tell "confirmed excluded" apart from "unknown"/"overridden for other
         // reasons". Only a confirmed exclusion is a real gap; anything else falls back to the
         // legacy "assume already fixed" reading, preserving pre-#1566 behavior.
         Err(VulnFixSkip::NoOpRewrite) => {
             // #1578 S1: an oversized requirement is a size-based fail-closed guard, never a
-            // confirmed exclusion — `compile_requirement` (the CWE-400 resource-exhaustion
+            // confirmed exclusion — `compile_bounded_requirement` (the CWE-400 resource-exhaustion
             // vector deps-core's own #1472 gate bounds, e.g. `requirement_status`,
             // `best_candidate_for_requirement`) is never called for it, so it must not be
             // folded into the same boolean/reason as an actually-confirmed `Some(false)`
             // matcher verdict below; kept as its own branch reporting
             // `UnfixableReason::OversizedRequirement` rather than
             // `UnsupportedRequirementShape`, whose doc/message both assert confirmation.
-            if deps_core::lsp_helpers::requirement_is_oversized(version_req) {
+            let Some(bounded) = deps_core::lsp_helpers::BoundedVersionReq::new(version_req) else {
                 return unfixable_item(
                     dep,
                     current,
@@ -423,11 +423,11 @@ fn classify_vulnerable_dependency(
                     },
                     ignore_rule_overridden,
                 );
-            }
+            };
 
             let fix_concrete = deps_core::ConcreteVersion::new(version_native.as_str());
             let confirmed_excluded = formatter
-                .compile_requirement(version_req)
+                .compile_bounded_requirement(bounded)
                 .is_some_and(|matcher| matcher.matches(&fix_concrete) == Some(false));
             if confirmed_excluded {
                 unfixable_item(
@@ -614,7 +614,7 @@ mod tests {
         }
     }
 
-    /// A fixed-answer [`RequirementMatcher`] — the test controls whether `compile_requirement`
+    /// A fixed-answer [`RequirementMatcher`] — the test controls whether `compile_bounded_requirement`
     /// reports the declared requirement as already admitting the fix target, independent of
     /// real semver semantics (deps-cli has no `semver` dependency of its own to build a real
     /// one with).
@@ -629,7 +629,7 @@ mod tests {
         }
     }
 
-    /// A formatter with a `compile_requirement` override (like 12 of the 14 real ecosystems),
+    /// A formatter with a `compile_bounded_requirement` override (like 12 of the 14 real ecosystems),
     /// whose verdict is fixed per test rather than computed from a real requirement grammar.
     struct TestFormatter {
         requirement_already_admits_fix: bool,
@@ -645,9 +645,9 @@ mod tests {
         }
     }
     impl RequirementResolution for TestFormatter {
-        fn compile_requirement(
+        fn compile_bounded_requirement(
             &self,
-            _requirement: &VersionReq,
+            _requirement: deps_core::lsp_helpers::BoundedVersionReq<'_>,
         ) -> Option<Box<dyn RequirementMatcher>> {
             Some(Box::new(FixedMatcher(self.requirement_already_admits_fix)))
         }
@@ -673,7 +673,7 @@ mod tests {
     }
 
     /// #1566 S1: simulates an ecosystem formatter (like Cargo's compound comma-separated
-    /// requirement handling) whose `compile_requirement` comparator has already confirmed the
+    /// requirement handling) whose `compile_bounded_requirement` comparator has already confirmed the
     /// fix target is NOT admitted, yet whose `format_version_replacing` deliberately echoes
     /// `current` back unchanged because no single-value rewrite preserves the requirement
     /// shape's semantics.
@@ -695,9 +695,9 @@ mod tests {
         }
     }
     impl RequirementResolution for UnsupportedShapeFormatter {
-        fn compile_requirement(
+        fn compile_bounded_requirement(
             &self,
-            _requirement: &VersionReq,
+            _requirement: deps_core::lsp_helpers::BoundedVersionReq<'_>,
         ) -> Option<Box<dyn RequirementMatcher>> {
             Some(Box::new(FixedMatcher(false)))
         }
@@ -707,9 +707,9 @@ mod tests {
     impl SourcePolicy for UnsupportedShapeFormatter {}
     impl OsvNaming for UnsupportedShapeFormatter {}
 
-    /// Code review regression (S1 fix): mirrors `NuGetFormatter::requirement_already_resolves_to`'s
+    /// Code review regression (S1 fix): mirrors `NuGetFormatter::bounded_requirement_already_resolves_to`'s
     /// real bare-floor override — the raw matcher mathematically admits the fix (`Some(true)`),
-    /// but the ecosystem overrides `requirement_already_resolves_to` to always report `false`
+    /// but the ecosystem overrides `bounded_requirement_already_resolves_to` to always report `false`
     /// for a floor shape (floor semantics: leaving the manifest unedited keeps restoring the
     /// declared floor). `format_version_replacing` echoes `current` back unchanged, so
     /// `plan_verified_fix` reaches `NoOpRewrite` — but the raw matcher's `Some(true)` must never
@@ -732,15 +732,15 @@ mod tests {
         }
     }
     impl RequirementResolution for FloorLikeFormatter {
-        fn compile_requirement(
+        fn compile_bounded_requirement(
             &self,
-            _requirement: &VersionReq,
+            _requirement: deps_core::lsp_helpers::BoundedVersionReq<'_>,
         ) -> Option<Box<dyn RequirementMatcher>> {
             Some(Box::new(FixedMatcher(true)))
         }
-        fn requirement_already_resolves_to(
+        fn bounded_requirement_already_resolves_to(
             &self,
-            _requirement: &VersionReq,
+            _requirement: deps_core::lsp_helpers::BoundedVersionReq<'_>,
             _target: &deps_core::ConcreteVersion,
         ) -> bool {
             false
@@ -785,9 +785,9 @@ mod tests {
         }
     }
     impl RequirementResolution for IndeterminateFormatter {
-        fn compile_requirement(
+        fn compile_bounded_requirement(
             &self,
-            _requirement: &VersionReq,
+            _requirement: deps_core::lsp_helpers::BoundedVersionReq<'_>,
         ) -> Option<Box<dyn RequirementMatcher>> {
             Some(Box::new(IndeterminateMatcher))
         }
@@ -798,7 +798,7 @@ mod tests {
     impl OsvNaming for IndeterminateFormatter {}
 
     /// Issue #1578: echoes `current` back unchanged (so `plan_verified_fix` reaches
-    /// `NoOpRewrite`) but panics if `compile_requirement` is ever called — proves the
+    /// `NoOpRewrite`) but panics if `compile_bounded_requirement` is ever called — proves the
     /// oversized-requirement gate in `classify_vulnerable_dependency`'s `NoOpRewrite` arm
     /// short-circuits before reaching it, rather than merely happening to also produce the
     /// right outcome.
@@ -820,11 +820,13 @@ mod tests {
         }
     }
     impl RequirementResolution for PanicsIfCompiledFormatter {
-        fn compile_requirement(
+        fn compile_bounded_requirement(
             &self,
-            _requirement: &VersionReq,
+            _requirement: deps_core::lsp_helpers::BoundedVersionReq<'_>,
         ) -> Option<Box<dyn RequirementMatcher>> {
-            panic!("compile_requirement must not be called for an oversized requirement (#1578)");
+            panic!(
+                "compile_bounded_requirement must not be called for an oversized requirement (#1578)"
+            );
         }
     }
     impl DiagnosticMessages for PanicsIfCompiledFormatter {}
@@ -832,7 +834,7 @@ mod tests {
     impl SourcePolicy for PanicsIfCompiledFormatter {}
     impl OsvNaming for PanicsIfCompiledFormatter {}
 
-    /// A formatter with no `compile_requirement` override (like GitHub Actions/GitLab CI) —
+    /// A formatter with no `compile_bounded_requirement` override (like GitHub Actions/GitLab CI) —
     /// `plan_vulnerability_fix`'s own textual no-op guard is the only available signal.
     const NO_COMPILE_REQUIREMENT_FORMATTER: deps_core::test_util::StubFormatter =
         deps_core::test_util::StubFormatter::new().with_package_url_prefix("");
@@ -1010,7 +1012,7 @@ mod tests {
         );
     }
 
-    /// Fallback path (GitHub Actions/GitLab CI — no `compile_requirement`): the declared
+    /// Fallback path (GitHub Actions/GitLab CI — no `compile_bounded_requirement`): the declared
     /// literal already spelling the fix text verbatim still resolves to
     /// `RequiresLockfileUpdate` via `plan_vulnerability_fix`'s own no-op guard.
     #[test]
@@ -1076,7 +1078,7 @@ mod tests {
 
     /// Code review regression (S1 fix): a bare/open-ended-minimum floor requirement (like
     /// NuGet's), whose raw matcher mathematically admits the fix (`Some(true)`) but whose
-    /// `requirement_already_resolves_to` override always reports `false` for floor shapes, must
+    /// `bounded_requirement_already_resolves_to` override always reports `false` for floor shapes, must
     /// still be `RequiresLockfileUpdate` — the matcher's `Some(true)` is not a confirmed
     /// exclusion, so `NoOpRewrite` here means the declared floor already spells the fix
     /// version, not that the shape is unsupported.
@@ -1627,7 +1629,7 @@ mod tests {
     /// `deps_cargo::CargoFormatter`, reached through deps-engine's ecosystem registry rather
     /// than linking deps-cargo directly) end to end: its own
     /// `format_version_replacing` echoes a compound requirement back unchanged (reaching
-    /// `NoOpRewrite`), and its `compile_requirement` (real `semver::VersionReq`) must confirm
+    /// `NoOpRewrite`), and its `compile_bounded_requirement` (real `semver::VersionReq`) must confirm
     /// `1.5.2` is excluded by `">=1.2, <1.5"`.
     #[test]
     fn test_classify_real_cargo_formatter_compound_requirement_confirms_exclusion() {
@@ -1655,9 +1657,9 @@ mod tests {
     }
 
     /// Issue #1578 gap 2: an oversized requirement must be rejected as `Unfixable` before ever
-    /// reaching `compile_requirement` — `PanicsIfCompiledFormatter` panics if that call is
+    /// reaching `compile_bounded_requirement` — `PanicsIfCompiledFormatter` panics if that call is
     /// made, so this fails loudly (not just with the wrong outcome) if the gate is removed or
-    /// reordered after the `compile_requirement` call.
+    /// reordered after the `compile_bounded_requirement` call.
     #[test]
     fn test_classify_oversized_requirement_never_reaches_compile_requirement() {
         let oversized_req = "1".repeat(MAX_REQUIREMENT_LEN + 1);

@@ -7,9 +7,9 @@ use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
-    requirement_contains_template_placeholder, requirement_is_compound,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
+    compile_requirement_unless, requirement_contains_template_placeholder, requirement_is_compound,
 };
 
 /// Whether every character of `name` is in RubyGems' gem-name charset
@@ -64,7 +64,7 @@ fn any_constraint_fails_closed_and_invalid(requirement: &str) -> bool {
 }
 
 /// Rubygems requirement matcher, compiled once per dependency by
-/// [`BundlerFormatter::compile_requirement`]. `version_matches_requirement` is a hand-rolled
+/// [`BundlerFormatter::compile_bounded_requirement`]. `version_matches_requirement` is a hand-rolled
 /// comparator with no external parser to fail on, so this always decides (`Some`).
 struct RubygemsMatcher(String);
 
@@ -90,7 +90,7 @@ impl RequirementMatcher for RubygemsMatcher {
 /// "~> #{RAILS_VERSION}"` or `gem 'rails', "~> #@rails_version"`. Bundler's parser does not
 /// degrade any of these shapes to `version_requirement: None` (unlike NuGet's `$(Property)`),
 /// so they reach [`RequirementResolution`] and [`PackageRendering`] directly — issue #1354
-/// security audit: `compile_requirement` previously returned `None` for `"~> #{V}"` only by
+/// security audit: `compile_bounded_requirement` previously returned `None` for `"~> #{V}"` only by
 /// coincidence (its operand fails `is_valid_rubygems_version`), while `">= #{V}"` compiled to
 /// `Some(true)` for every candidate (`fail_closed_operand` excludes `>=`), and neither path
 /// stopped `format_version_replacing` from planning a destructive `"9.9.9"`-literal rewrite
@@ -322,13 +322,17 @@ impl RequirementResolution for BundlerFormatter {
     /// open: with no up-front validation, that would produce a misleading "no version satisfies
     /// requirement" diagnostic instead of flagging the requirement itself as invalid, so this
     /// returns `None` for it instead, matching the `is_valid_range`/`is_valid_requirement`
-    /// precedent in Maven/Gradle/NuGet's `compile_requirement` (#332). The "could this
+    /// precedent in Maven/Gradle/NuGet's `compile_bounded_requirement` (#332). The "could this
     /// requirement be satisfied by a version
     /// RubyGems hid" ambiguity is handled separately in
     /// [`Self::requirement_is_undecidable_given_available`], which sees `available` and can
     /// therefore decide it precisely instead of this method having to guess from
     /// `requirement` alone.
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    fn compile_bounded_requirement(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+    ) -> Option<Box<dyn RequirementMatcher>> {
+        let requirement = requirement.get();
         if self.requirement_is_unresolved(requirement) {
             return None;
         }
@@ -351,7 +355,7 @@ impl RequirementResolution for BundlerFormatter {
     /// #1354: an unexpanded Ruby string-interpolation placeholder (`#{...}`) inside a
     /// requirement — see `requirement_contains_unresolved_interpolation`. Previously, only
     /// the fail-closed operator shapes (`~>`, `<`, `<=`, `=`, bare) happened to make
-    /// `compile_requirement` undecidable for it; a fail-open operator (`>=`, `>`, `!=`)
+    /// `compile_bounded_requirement` undecidable for it; a fail-open operator (`>=`, `>`, `!=`)
     /// compiled to a matcher that accepted every candidate instead. This explicit predicate
     /// makes every operator shape decide identically, mirroring Maven/Gradle/NuGet's
     /// unresolved-variable precedent.
@@ -384,6 +388,7 @@ impl OsvNaming for BundlerFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::lsp_helpers::RequirementGate;
 
     #[test]
     fn test_format_version() {
@@ -1078,7 +1083,7 @@ mod tests {
         );
     }
 
-    /// #1366: `compile_requirement` must reject a multi-constraint requirement when *any* of its
+    /// #1366: `compile_bounded_requirement` must reject a multi-constraint requirement when *any* of its
     /// constraints has an invalid operand for a fail-closed operator, not just the first.
     #[test]
     fn test_compile_requirement_multi_constraint_invalid_later_constraint_suppressed() {

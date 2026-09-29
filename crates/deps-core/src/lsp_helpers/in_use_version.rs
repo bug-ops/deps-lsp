@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::lsp_helpers::EcosystemFormatter;
+use crate::lsp_helpers::{BoundedVersionReq, EcosystemFormatter};
 use crate::{ConcreteVersion, Dependency, EcosystemId, PackageName};
 
 /// How a *bare* (no explicit pin marker) version requirement should be treated when
@@ -73,7 +73,7 @@ enum BareRequirementPolicy {
 ///   ecosystems were grouped with Cargo under `AlwaysRange`, which silently
 ///   dropped `in_use_version` resolution (and therefore hover License/OSV
 ///   sections) for any bare-pinned npm/Composer manifest with no lock file.
-/// - Deno (#667): `DenoFormatter::compile_requirement`
+/// - Deno (#667): `DenoFormatter::compile_bounded_requirement`
 ///   (`crates/deps-deno/src/formatter.rs`) compiles both its `jsr:` and
 ///   `npm:` specifiers through the identical `node_semver::Range` grammar
 ///   npm itself uses, so the same full-vs-partial distinction applies
@@ -106,7 +106,7 @@ enum BareRequirementPolicy {
 /// under `AlwaysRange` (Cargo's group) by the same reasoning that moved
 /// npm/Composer/Deno to `ConcreteIfFullVersion`. It is deliberately kept
 /// under `Concrete` anyway, as a documented approximation rather than an
-/// oversight: `NuGetFormatter::is_requirement_up_to_date` (this crate's
+/// oversight: `NuGetFormatter::is_bounded_requirement_up_to_date` (this crate's
 /// sibling `deps-nuget`) already treats a bare floor as a pin for the
 /// identical reason — restore resolves a direct `PackageReference` to
 /// *exactly* its floor version unless something else forces a higher one,
@@ -319,28 +319,21 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// collapse already uses, so this never diverges from it. Returns `None` when nothing
 /// satisfies the requirement (FR-003) — the caller must not then substitute an arbitrary
 /// non-matching entry.
-/// Prefers [`crate::lsp_helpers::RequirementResolution::compile_requirement`]'s precise, ecosystem-native
+/// Prefers [`crate::lsp_helpers::RequirementResolution::compile_bounded_requirement`]'s precise, ecosystem-native
 /// comparator (e.g. `deps-cargo`'s real `semver::VersionReq` range semantics) over
 /// [`crate::lsp_helpers::RequirementResolution::version_satisfies_requirement`]'s looser heuristic — critical
 /// here specifically because that heuristic's plain/partial-requirement branch requires
 /// *minor-version equality* (`is_same_major_minor`), so a caret-range requirement like
 /// Cargo's `"2.4"` (meaning `>=2.4.0, <3.0.0`) would wrongly reject a `2.9.4` candidate,
-/// turning a real match into a false FR-003 skip. `compile_requirement` is only used when
+/// turning a real match into a false FR-003 skip. `compile_bounded_requirement` is only used when
 /// it succeeds; an ecosystem that returns `None` (requirement fails to parse under its own
 /// comparator) falls back to the heuristic exactly as it did before this existed.
 fn version_matches_requirement(
     formatter: &dyn EcosystemFormatter,
     version: &ConcreteVersion,
-    requirement: &crate::VersionReq,
+    requirement: BoundedVersionReq<'_>,
 ) -> bool {
-    // #1627 defense-in-depth: `best_candidate_for_requirement` already bails out before ever
-    // calling this per candidate (its own `requirement_is_oversized` gate above), but this
-    // repeats the check here too so this function stays safe on its own if a future caller is
-    // added without that outer gate.
-    if super::requirement_is_oversized(requirement) {
-        return false;
-    }
-    if let Some(matcher) = formatter.compile_requirement(requirement) {
+    if let Some(matcher) = formatter.compile_bounded_requirement(requirement) {
         matcher.matches(version) == Some(true)
     } else {
         formatter.version_satisfies_requirement(version, requirement.as_str())
@@ -352,12 +345,8 @@ fn best_candidate_for_requirement<'a>(
     requirement: &crate::VersionReq,
     formatter: &dyn EcosystemFormatter,
 ) -> Option<&'a ConcreteVersion> {
-    // #1472 defense-in-depth: this calls into `compile_requirement` once per candidate, so an
-    // oversized requirement's one-time parse cost multiplies by `candidates.len()` — bail out
-    // before that rather than offering a substitution built from an unmodellable requirement.
-    if super::requirement_is_oversized(requirement) {
-        return None;
-    }
+    // #1472: an oversized requirement's parse cost would multiply by `candidates.len()`.
+    let requirement = BoundedVersionReq::new(requirement)?;
     candidates
         .iter()
         .filter(|v| version_matches_requirement(formatter, v, requirement))
@@ -543,9 +532,9 @@ mod tests {
     use super::*;
     use crate::position::Range;
 
-    /// Minimal formatter with a real `compile_requirement` (Cargo-style `semver::VersionReq`
+    /// Minimal formatter with a real `compile_bounded_requirement` (Cargo-style `semver::VersionReq`
     /// semantics), for tests that must distinguish `best_candidate_for_requirement`'s
-    /// precise `compile_requirement` path from `MOCK_FORMATTER`'s heuristic-only fallback
+    /// precise `compile_bounded_requirement` path from `MOCK_FORMATTER`'s heuristic-only fallback
     /// (issue #649 critic finding C1).
     struct CaretFormatter;
 
@@ -559,10 +548,11 @@ mod tests {
         }
     }
     impl crate::lsp_helpers::RequirementResolution for CaretFormatter {
-        fn compile_requirement(
+        fn compile_bounded_requirement(
             &self,
-            requirement: &crate::VersionReq,
+            requirement: BoundedVersionReq<'_>,
         ) -> Option<Box<dyn crate::lsp_helpers::RequirementMatcher>> {
+            let requirement = requirement.get();
             // Flips strict_prerelease_exclusion() from this module's old local matcher's
             // `false` to `true` — inert here, since nothing in this test module reads that flag.
             crate::lsp_helpers::compile_semver_requirement(requirement)
@@ -727,7 +717,7 @@ mod tests {
     #[test]
     fn is_concrete_version_nuget_bare_version_is_a_deliberate_pin_approximation() {
         // #669: a bare NuGet `Version="1.0.0"` is really a minimum-only floor, but treated
-        // as concrete anyway (mirrors `NuGetFormatter::is_requirement_up_to_date`) —
+        // as concrete anyway (mirrors `NuGetFormatter::is_bounded_requirement_up_to_date`) —
         // reclassifying to always-range was tried and reverted since it dropped OSV/hover/
         // license resolution for the dominant bare-version spelling. See `Concrete`'s doc.
         assert!(is_concrete_version("1.0.0", EcosystemId::NuGet));
@@ -986,7 +976,7 @@ mod tests {
 
     #[test]
     fn concrete_pin_version_deno_partial_bare_version_is_a_range() {
-        // `DenoFormatter::compile_requirement` compiles `jsr:`/`npm:` requirements
+        // `DenoFormatter::compile_bounded_requirement` compiles `jsr:`/`npm:` requirements
         // through the same `node_semver::Range` npm uses, so a bare partial version
         // expands to an implicit X-range, not a single version.
         assert_eq!(concrete_pin_version("4.17", EcosystemId::Deno), None);
@@ -1203,7 +1193,7 @@ mod tests {
     }
 
     /// C1 fix regression guard: `best_candidate_for_requirement` must prefer
-    /// `compile_requirement`'s precise comparator over `version_satisfies_requirement`'s
+    /// `compile_bounded_requirement`'s precise comparator over `version_satisfies_requirement`'s
     /// heuristic. The heuristic's partial-requirement branch requires *minor-version
     /// equality*, so a Cargo-style caret requirement `"2.4"` (meaning `>=2.4.0, <3.0.0`)
     /// would wrongly reject `2.9.4` under the heuristic alone — this is the exact
@@ -1248,7 +1238,7 @@ mod tests {
     }
 
     /// #1472 defense-in-depth: an oversized requirement must short-circuit to `None` before
-    /// ever calling into `compile_requirement`/`version_satisfies_requirement` per candidate —
+    /// ever calling into `compile_bounded_requirement`/`version_satisfies_requirement` per candidate —
     /// not just fail to match. The candidate here is built to trivially satisfy the heuristic's
     /// exact-equality branch if the gate were bypassed, proving the gate itself is what decides.
     #[test]

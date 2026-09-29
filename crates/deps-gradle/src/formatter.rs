@@ -1,8 +1,8 @@
 //! Version formatting for Gradle ecosystem.
 
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
     compile_requirement_unless, format_version_replacing_by_shape,
     requirement_contains_template_placeholder,
 };
@@ -37,7 +37,7 @@ fn is_placeholder(requirement: &str) -> bool {
 /// satisfy it — a version inside the strict range/pin satisfies the requirement
 /// regardless of whether it matches the preferred pointer, so every "does this version
 /// satisfy the requirement" comparison in [`gradle_version_matches`] and
-/// [`GradleFormatter::compile_requirement`] must operate on the `strictlyVersion`
+/// [`GradleFormatter::compile_bounded_requirement`] must operate on the `strictlyVersion`
 /// constraint alone, never the preference. `requirement` is `trim_end`ed before the
 /// marker check: `libs.versions.toml` catalog values reach here un-trimmed
 /// (`catalog::extract_version` returns the raw string verbatim), unlike the DSL
@@ -59,20 +59,20 @@ fn is_snapshot(requirement: &str) -> bool {
 }
 
 /// Decides whether `version` satisfies a Gradle `requirement` — shared by
-/// `version_satisfies_requirement` and [`GradleFormatter::compile_requirement`]'s matcher,
+/// `version_satisfies_requirement` and [`GradleFormatter::compile_bounded_requirement`]'s matcher,
 /// since Gradle has no separate "loose" vs. "precise" comparator to distinguish (mirrors
 /// `deps-maven`'s formatter, which shares the same shape for the same reason).
 ///
 /// #249 review (M4, root cause of S1): this function's branch order is a separate copy from
-/// `compile_requirement`'s below — the malformed-range guard that function adds ahead of its
+/// `compile_bounded_requirement`'s below — the malformed-range guard that function adds ahead of its
 /// own copy of this order has no equivalent here (this function has none; a malformed range
 /// simply falls through to `crate::range::satisfies`'s fail-closed `false`, which is correct
 /// for the "loose satisfies" question this function answers). Reordering the branches here
-/// must be checked against `compile_requirement`'s branch order and guard placement too.
+/// must be checked against `compile_bounded_requirement`'s branch order and guard placement too.
 fn gradle_version_matches(version: &str, requirement: &str) -> bool {
     // Checked on the raw string before stripping `!!`: an unresolved variable can appear in the
     // strictlyVersion half (e.g. `${r}!!1.7.25`), and stripping first would discard the `$`.
-    // Deliberate, harmless asymmetry with `compile_requirement`, which has no equivalent
+    // Deliberate, harmless asymmetry with `compile_bounded_requirement`, which has no equivalent
     // raw-string check and relies on the post-strip check below instead: this makes the loose
     // matcher over-permissive (never under-permissive) when the *preferred* half alone is
     // unresolved, which never produces a false "outdated" badge — don't remove this without
@@ -105,10 +105,10 @@ fn gradle_version_matches(version: &str, requirement: &str) -> bool {
 }
 
 /// Precise Gradle version/range matcher, compiled once per dependency by
-/// [`GradleFormatter::compile_requirement`] — a bracket-interval range is parsed once into a
+/// [`GradleFormatter::compile_bounded_requirement`] — a bracket-interval range is parsed once into a
 /// [`deps_maven::interval::VersionRange`] here rather than being re-parsed for every
 /// candidate version scanned. `requirement_is_unsatisfiable` already gates on
-/// `requirement_is_unresolved` before calling `compile_requirement`, so the unresolved and
+/// `requirement_is_unresolved` before calling `compile_bounded_requirement`, so the unresolved and
 /// `latest.*` short-circuits are unreachable from that caller in practice; they stay so this
 /// matcher is correct if used standalone.
 enum GradleMatcher {
@@ -271,7 +271,7 @@ impl RequirementResolution for GradleFormatter {
     }
 
     /// Uses [`compile_requirement_unless`] (see that function and
-    /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`] for the shared "undecidable" contract).
+    /// [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`] for the shared "undecidable" contract).
     ///
     /// The undecidable predicate rejects a malformed range (leading `[`/`(`/`]` but
     /// `crate::range::parse_range` fails) — checked unconditionally, first, before any
@@ -282,7 +282,11 @@ impl RequirementResolution for GradleFormatter {
     ///
     /// #249 review (M4): this is a separate branch-order copy from `gradle_version_matches`
     /// above — see the note on that function before reordering either one.
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    fn compile_bounded_requirement(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+    ) -> Option<Box<dyn RequirementMatcher>> {
+        let requirement = requirement.get();
         // Stripped once here so every branch below operates on the strictlyVersion spelling —
         // unlike `gradle_version_matches`, this matcher is pre-parsed once, so the stripped
         // spelling must be what's stored in `GradleMatcher` (e.g. `Exact` must not compare
@@ -327,7 +331,7 @@ impl OsvNaming for GradleFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::lsp_helpers::{RequirementStatus, RequirementStatusGate};
+    use deps_core::lsp_helpers::{RequirementGate, RequirementStatus};
 
     /// A minimal [`deps_core::Dependency`] for probing
     /// [`deps_core::edit::replacement_text`] directly — its identity is irrelevant to the
@@ -517,7 +521,7 @@ mod tests {
     }
 
     // #758: exact-value `EcosystemFormatter` conformance, replacing the individual hand-written
-    // package-name/version tests. The other version_satisfies_requirement/compile_requirement
+    // package-name/version tests. The other version_satisfies_requirement/compile_bounded_requirement
     // tests below stay hand-written: Gradle's rich-version semantics are regression-driven
     // behavior, not simple redundant literal lists.
     deps_core::formatter_conformance! {
@@ -628,7 +632,7 @@ mod tests {
     }
 
     /// M3: the discriminating case for the raw-string pre-check's documented
-    /// asymmetry with `compile_requirement` — `1.7.25` above is inside the strict
+    /// asymmetry with `compile_bounded_requirement` — `1.7.25` above is inside the strict
     /// range regardless of the pre-check, so it doesn't prove anything on its own.
     /// `1.8.0` is genuinely outside `[1.7,1.8[`; the loose matcher still reports it
     /// as satisfied only because the raw-string pre-check short-circuits before the
@@ -843,7 +847,7 @@ mod tests {
         assert_eq!(matcher.matches(&ConcreteVersion::new("1.2.4")), Some(false));
     }
 
-    /// M6: `compile_requirement`'s range-validity guard must strip `!!` the same way
+    /// M6: `compile_bounded_requirement`'s range-validity guard must strip `!!` the same way
     /// `gradle_version_matches` does — otherwise a valid strict range like
     /// `"[1.0,2.0)!!"` fails `parse_range` (the suffix isn't range grammar) and the
     /// guard wrongly suppresses the diagnostic instead of compiling the matcher.
@@ -859,8 +863,8 @@ mod tests {
 
     /// #1353: mirrors `deps-maven`'s equivalent test — an unresolved `$var`/`${var}`
     /// reference must be classified as unresolved directly, the predicate
-    /// `requirement_status`, `requirement_is_unsatisfiable`, and (via `compile_requirement`)
-    /// `requirement_already_resolves_to` all key off.
+    /// `requirement_status`, `requirement_is_unsatisfiable`, and (via `compile_bounded_requirement`)
+    /// `bounded_requirement_already_resolves_to` all key off.
     #[test]
     fn test_requirement_is_unresolved_variable_reference() {
         let f = GradleFormatter;
@@ -894,9 +898,9 @@ mod tests {
     }
 
     /// #1353/#1391 S1: `[1.0,$hi` and `[$lo,` are classified placeholders (`is_placeholder`
-    /// matches `$`), but both are *also* malformed ranges — `compile_requirement`'s
+    /// matches `$`), but both are *also* malformed ranges — `compile_bounded_requirement`'s
     /// malformed-range guard returns `None` for them (not `GradleMatcher::AlwaysSatisfied`),
-    /// making the default `requirement_already_resolves_to` inert.
+    /// making the default `bounded_requirement_already_resolves_to` inert.
     /// `RequirementResolution::requirement_is_placeholder`'s direct `is_placeholder` check —
     /// consulted by `deps_core::edit::replacement_text` before ever calling
     /// `format_version_replacing` — is what actually closes this gap.
