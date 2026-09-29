@@ -10,6 +10,61 @@ use crate::error::Result;
 use bytes::Bytes;
 use std::future::Future;
 
+/// Whether a paginated list reached its true end or was cut off at the page cap.
+///
+/// Absence-driven consumers (e.g. "this SHA is not any release tag") must only trust a
+/// [`ListCoverage::Complete`] list; presence-driven consumers may use either.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::pagination::ListCoverage;
+///
+/// assert_eq!(ListCoverage::default(), ListCoverage::Complete);
+/// assert_ne!(ListCoverage::Truncated, ListCoverage::Complete);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ListCoverage {
+    /// The last fetched page was partial, so no entries are missing.
+    #[default]
+    Complete,
+    /// Fetching stopped at the page cap while more pages may exist.
+    Truncated,
+}
+
+/// Items collected by [`paginate_pages`] together with how completely they cover the list.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::pagination::{ListCoverage, Paginated};
+///
+/// fn absent_means_missing(tags: &Paginated<String>, wanted: &str) -> bool {
+///     tags.coverage == ListCoverage::Complete && !tags.items.iter().any(|t| t == wanted)
+/// }
+///
+/// let page = Paginated::new(vec!["v1".to_string()], ListCoverage::Complete);
+/// assert!(absent_means_missing(&page, "v2"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Paginated<T> {
+    /// Items in page order.
+    pub items: Vec<T>,
+    /// Whether `items` is the whole list.
+    pub coverage: ListCoverage,
+}
+
+impl<T> Paginated<T> {
+    /// Bundles `items` with the `coverage` of the list they were taken from.
+    ///
+    /// Needed because the struct is `#[non_exhaustive]`: other crates cannot use a literal.
+    #[must_use]
+    pub const fn new(items: Vec<T>, coverage: ListCoverage) -> Self {
+        Self { items, coverage }
+    }
+}
+
 /// Number of pages fetched concurrently per batch, once page 1 is confirmed full.
 ///
 /// See [`paginate_pages`]'s doc comment for why page 1 is always fetched alone first.
@@ -85,6 +140,9 @@ pub fn warn_if_pagination_truncated(
 /// Propagates the first error seen among `fetch_page`'s results (page 1's own error, or the
 /// first in page order within a batch — any other in-flight futures in that batch are
 /// dropped), or the error from `parse_page` when a page's body cannot be parsed.
+///
+/// The result is [`ListCoverage::Truncated`] when `max_pages` is exhausted without seeing a
+/// partial page (conservatively including a list of exactly `max_pages * 100` entries).
 pub async fn paginate_pages<T, F, Fut, P>(
     provider: &str,
     ecosystem: EcosystemId,
@@ -93,7 +151,7 @@ pub async fn paginate_pages<T, F, Fut, P>(
     max_pages: u32,
     mut fetch_page: F,
     mut parse_page: P,
-) -> Result<Vec<T>>
+) -> Result<Paginated<T>>
 where
     F: FnMut(u32) -> Fut,
     Fut: Future<Output = Result<Bytes>>,
@@ -110,9 +168,13 @@ where
     if !page_has_more(first_page_len) {
         // No call to `warn_if_pagination_truncated` here: it only fires at
         // `page == max_pages`, which page 1 can never equal since `max_pages > 1`.
-        return Ok(items);
+        return Ok(Paginated {
+            items,
+            coverage: ListCoverage::Complete,
+        });
     }
 
+    let mut coverage = ListCoverage::Truncated;
     let mut page = 2u32;
     #[expect(
         clippy::cast_possible_truncation,
@@ -130,6 +192,7 @@ where
             let page_len = page_items.len();
             items.extend(page_items);
             if !page_has_more(page_len) {
+                coverage = ListCoverage::Complete;
                 break 'batches;
             }
             warn_if_pagination_truncated(
@@ -145,7 +208,7 @@ where
         }
         page = batch_end + 1;
     }
-    Ok(items)
+    Ok(Paginated { items, coverage })
 }
 
 #[cfg(test)]
@@ -249,7 +312,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(result.len(), 42);
+        assert_eq!(result.items.len(), 42);
     }
 
     #[tokio::test]
@@ -272,6 +335,71 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result.len(), 110);
+        assert_eq!(result.items.len(), 110);
+        assert_eq!(result.coverage, ListCoverage::Complete);
+    }
+
+    #[tokio::test]
+    async fn test_paginate_pages_single_partial_page_is_complete() {
+        let result = paginate_pages(
+            "GitLab",
+            EcosystemId::GitlabCi,
+            "tags",
+            "org/repo",
+            5,
+            |_page| async move { Ok(page_json(3)) },
+            parse_page,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.coverage, ListCoverage::Complete);
+    }
+
+    #[tokio::test]
+    async fn test_paginate_pages_cap_reached_with_full_last_page_is_truncated() {
+        let result = paginate_pages(
+            "GitLab",
+            EcosystemId::GitlabCi,
+            "tags",
+            "org/repo",
+            3,
+            |_page| async move { Ok(page_json(100)) },
+            parse_page,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.items.len(), 300);
+        assert_eq!(result.coverage, ListCoverage::Truncated);
+    }
+
+    #[tokio::test]
+    async fn test_paginate_pages_partial_page_exactly_at_cap_is_complete() {
+        let result = paginate_pages(
+            "GitLab",
+            EcosystemId::GitlabCi,
+            "tags",
+            "org/repo",
+            3,
+            |page| async move {
+                match page {
+                    1 | 2 => Ok(page_json(100)),
+                    3 => Ok(page_json(7)),
+                    _ => panic!("page {page} must not be fetched beyond the 3-page cap"),
+                }
+            },
+            parse_page,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.items.len(), 207);
+        assert_eq!(result.coverage, ListCoverage::Complete);
+    }
+
+    #[test]
+    fn test_list_coverage_default_is_complete() {
+        assert_eq!(ListCoverage::default(), ListCoverage::Complete);
     }
 }

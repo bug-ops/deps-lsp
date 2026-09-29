@@ -31,6 +31,9 @@ or `.github/actions/<name>/`, issue #706), and implements `deps_core::Ecosystem`
   `@v4`) gets an additive, independent diagnostic recommending SHA pinning, plus a "Pin to
   commit SHA" quick fix rewriting it to `@<sha> # <tag>` when the tag's commit is already
   known; on by default, configurable via `mutable_ref_pin_severity`/`mutable_ref_pin_enabled`
+- **SHA-comment-mismatch diagnostic** (issue #1722) — a `@<sha> # vX` pin whose comment is
+  provably not that commit's tag gets a warning diagnostic and hover note; severity via
+  `sha_comment_mismatch_severity`
 - **Bulk "Pin all to SHA" code lens** (issue #633) — a "Pin N actions to commit SHA" lens
   applies the per-step quick fix above to every resolvable mutable-tag step in one edit,
   reusing the same `TagIndex` lookup at zero additional network cost

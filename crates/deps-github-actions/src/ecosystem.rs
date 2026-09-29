@@ -18,9 +18,9 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
 use url::Url;
 
-use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
+use crate::{MUTABLE_REF_PIN_DIAGNOSTIC_CODE, SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE};
 
-use crate::formatter::GithubActionsFormatter;
+use crate::formatter::{CommentCheck, CommentMismatch, GithubActionsFormatter};
 use crate::registry::GithubActionsRegistry;
 use crate::types::{GithubActionsDependency, PinStyle};
 use deps_core::lsp_helpers::TagIndex;
@@ -211,6 +211,9 @@ impl Ecosystem for GithubActionsEcosystem {
     /// Gated on `severities.mutable_ref_pin_enabled` (spec 031 FR-009, corrected during
     /// implementation review): `severities.mutable_ref_pin` alone cannot silence this
     /// diagnostic, since `DiagnosticSeverity` has no suppression value.
+    ///
+    /// Also appends the SHA-comment-mismatch diagnostic (issue #1722), which is not gated on
+    /// `mutable_ref_pin_enabled`: it only fires for a provable mismatch.
     fn generate_diagnostics<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -236,6 +239,11 @@ impl Ecosystem for GithubActionsEcosystem {
                     &self.formatter.tag_index,
                 ));
             }
+            diagnostics.extend(sha_comment_mismatch_diagnostics(
+                parse_result,
+                severities.sha_comment_mismatch,
+                &self.formatter,
+            ));
             diagnostics
         })
     }
@@ -347,25 +355,32 @@ impl Ecosystem for GithubActionsEcosystem {
             };
 
             use deps_core::lsp_helpers::RequirementResolution;
-            let Some(resolved_tag) = self
+            let resolved_tag = self
                 .formatter
                 .resolved_pin_version(dep)
-                .map(|pin| pin.version().as_str().to_string())
-            else {
-                return Some(hover);
-            };
+                .map(|pin| pin.version().as_str().to_string());
 
             let written_tag = gha_dep
                 .version_req
                 .as_ref()
                 .map(deps_core::VersionReq::as_str);
-            if gha_dep.pin == Some(PinStyle::Tag) && written_tag == Some(resolved_tag.as_str()) {
-                return Some(hover);
+            if let Some(resolved_tag) = resolved_tag.filter(|resolved| {
+                !(gha_dep.pin == Some(PinStyle::Tag) && written_tag == Some(resolved.as_str()))
+            }) {
+                hover.rewrite_markdown(|md| {
+                    deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, sha.as_str())
+                });
             }
 
-            hover.rewrite_markdown(|md| {
-                deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, sha.as_str())
-            });
+            if let Some(CommentCheck::Mismatch(mismatch)) =
+                self.formatter.sha_comment_check(gha_dep)
+                && let Some(PinStyle::Sha {
+                    comment_tag: Some(comment),
+                }) = &gha_dep.pin
+            {
+                let line = sha_comment_mismatch_hover_line(sha.as_str(), comment, &mismatch);
+                hover.rewrite_markdown(|md| deps_core::lsp_helpers::splice_hover_line(md, &line));
+            }
 
             Some(hover)
         })
@@ -531,6 +546,78 @@ fn mutable_ref_pin_diagnostics(
             )
         })
         .collect()
+}
+
+fn sanitize_for_message(value: &str) -> String {
+    deps_core::lsp_helpers::sanitize_and_truncate_for_diagnostic(
+        value,
+        deps_core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS,
+    )
+}
+
+/// Builds one SHA-comment-mismatch [`Diagnostic`] (issue #1722) per SHA-pinned step whose
+/// trailing `# tag` comment provably names a different commit than the pinned SHA.
+///
+/// Emits nothing for a confirmed comment, a commentless pin, or an unverifiable one (cold
+/// cache, or a SHA absent from a truncated tag list).
+fn sha_comment_mismatch_diagnostics(
+    parse_result: &dyn ParseResultTrait,
+    severity: Severity,
+    formatter: &GithubActionsFormatter,
+) -> Vec<Diagnostic> {
+    parse_result
+        .dependencies()
+        .into_iter()
+        .filter_map(|dep| {
+            let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+            let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gha_dep)? else {
+                return None;
+            };
+            let PinStyle::Sha {
+                comment_tag: Some(comment),
+            } = gha_dep.pin.as_ref()?
+            else {
+                return None;
+            };
+            let range = gha_dep.version_range?;
+            let sha = deps_core::lsp_helpers::short_sha(crate::types::sha_pin_raw_sha(gha_dep)?);
+            let name = deps_core::lsp_helpers::redact_name_for_diagnostic(&gha_dep.name);
+            let comment = sanitize_for_message(comment);
+            let message = match mismatch {
+                CommentMismatch::ShaIsOtherTag { actual } => format!(
+                    "{name}: SHA {sha} is not the commit of `{comment}` named in the comment \
+                     (it is `{}`)",
+                    sanitize_for_message(actual.as_str())
+                ),
+                CommentMismatch::ShaNotInIndex => format!(
+                    "{name}: SHA {sha} is not the commit of any release tag; the comment \
+                     names `{comment}`"
+                ),
+            };
+            Some(
+                Diagnostic::new(range, message)
+                    .with_severity(severity)
+                    .with_code(SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE),
+            )
+        })
+        .collect()
+}
+
+/// The hover warning line for a SHA-comment mismatch (issue #1722).
+#[cfg(feature = "lsp-responses")]
+fn sha_comment_mismatch_hover_line(sha: &str, comment: &str, mismatch: &CommentMismatch) -> String {
+    use deps_core::lsp_helpers::markdown_code_span;
+    let sha = markdown_code_span(&format!("{}…", deps_core::lsp_helpers::short_sha(sha)));
+    let comment = markdown_code_span(&sanitize_for_message(comment));
+    match mismatch {
+        CommentMismatch::ShaIsOtherTag { actual } => format!(
+            "**Warning**: comment says {comment}, but SHA {sha} is {}",
+            markdown_code_span(&sanitize_for_message(actual.as_str()))
+        ),
+        CommentMismatch::ShaNotInIndex => format!(
+            "**Warning**: SHA {sha} is not the commit of any release tag; comment says {comment}"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -2128,6 +2215,356 @@ mod tests {
                         .markdown()
                         .contains(deps_core::lsp_helpers::CMD_DOT_FOOTER),
                     "line {line}: {}",
+                    hover.markdown()
+                );
+            }
+        }
+
+        /// #1724: for every YAML scalar style, "Newer version available" diagnostics and the
+        /// planned update-all edits must agree, and applying the edit must re-parse as up to
+        /// date with the quoting/flow structure intact.
+        #[tokio::test]
+        async fn test_sha_pin_update_edit_agrees_with_diagnostic_for_every_scalar_style() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+            let (old, new) = ("a".repeat(40), "b".repeat(40));
+            let name = "actions/checkout";
+            let index = TagIndex::from_tags([
+                (
+                    "v4.0.0",
+                    &deps_core::lsp_helpers::CommitSha::parse(&old).unwrap(),
+                ),
+                (
+                    "v4.3.1",
+                    &deps_core::lsp_helpers::CommitSha::parse(&new).unwrap(),
+                ),
+            ]);
+            eco.formatter
+                .tag_index
+                .insert(deps_core::PackageName::new(name), Arc::new(index));
+
+            let mut cached = HashMap::new();
+            cached.insert(
+                deps_core::PackageName::new(name),
+                deps_core::PackageVersions::latest_only("v4.3.1"),
+            );
+            let resolved = HashMap::new();
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+
+            let cases = [
+                (
+                    format!("  - uses: {name}@{old}"),
+                    format!("  - uses: {name}@{new} # v4.3.1"),
+                ),
+                (
+                    format!("  - uses: {name}@{old} # v4.0.0"),
+                    format!("  - uses: {name}@{new} # v4.3.1"),
+                ),
+                (
+                    format!("  - uses: '{name}@{old}'"),
+                    format!("  - uses: '{name}@{new}'"),
+                ),
+                (
+                    format!("  - uses: \"{name}@{old}\""),
+                    format!("  - uses: \"{name}@{new}\""),
+                ),
+                (
+                    format!("  - {{uses: {name}@{old}, with: {{x: 1}}}}"),
+                    format!("  - {{uses: {name}@{new}, with: {{x: 1}}}}"),
+                ),
+                (
+                    format!("  - {{uses: {name}@{old}}}"),
+                    format!("  - {{uses: {name}@{new}}}"),
+                ),
+                (
+                    format!("  - uses: '{name}@{old}' # v4.0.0"),
+                    format!("  - uses: '{name}@{new}' # v4.0.0"),
+                ),
+                (
+                    format!("  - uses: \"{name}@{old}\" # v4.0.0"),
+                    format!("  - uses: \"{name}@{new}\" # v4.0.0"),
+                ),
+                (
+                    format!("  - {{uses: {name}@{old}}} # v4.0.0"),
+                    format!("  - {{uses: {name}@{new}}} # v4.0.0"),
+                ),
+                (
+                    format!("  - {{uses: {name}@{old}, with: {{x: 1}}}} # v4.0.0"),
+                    format!("  - {{uses: {name}@{new}, with: {{x: 1}}}} # v4.0.0"),
+                ),
+            ];
+
+            let newer_count = |diagnostics: &[Diagnostic]| {
+                diagnostics
+                    .iter()
+                    .filter(|d| d.message().contains("Newer version available"))
+                    .count()
+            };
+            for (line, expected_line) in cases {
+                let content = format!("steps:\n{line}\n");
+                let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+                let versions = deps_core::VersionData::new(&cached, &resolved);
+                let diagnostics = eco
+                    .generate_diagnostics(
+                        parse_result.as_ref(),
+                        versions,
+                        &uri,
+                        deps_core::FreshnessSettings::default(),
+                        deps_core::lsp_helpers::DiagnosticSeverities::default(),
+                    )
+                    .await;
+                let planned = deps_core::edit::collect_update_edits(
+                    parse_result.as_ref(),
+                    &content,
+                    versions,
+                    &eco.formatter,
+                );
+                assert_eq!(newer_count(&diagnostics), 1, "{line}: {diagnostics:?}");
+                assert_eq!(
+                    planned.len(),
+                    1,
+                    "{line}: diagnostic without a planned edit"
+                );
+
+                let edits: Vec<_> = planned.into_iter().map(|p| p.edit).collect();
+                let applied = deps_core::edit::apply_edits(&content, &edits);
+                assert_eq!(applied, format!("steps:\n{expected_line}\n"), "{line}");
+
+                let reparsed = eco.parse_manifest(&applied, &uri).await.unwrap();
+                let after = eco
+                    .generate_diagnostics(
+                        reparsed.as_ref(),
+                        versions,
+                        &uri,
+                        deps_core::FreshnessSettings::default(),
+                        deps_core::lsp_helpers::DiagnosticSeverities::default(),
+                    )
+                    .await;
+                assert_eq!(newer_count(&after), 0, "{line}: not idempotent: {after:?}");
+                // A trailing comment outside the quotes/flow end is invisible to the parser,
+                // so the stale `# v4.0.0` left behind is not flagged either.
+                assert!(
+                    after
+                        .iter()
+                        .all(|d| d.code() != Some(SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE)),
+                    "{line}: {after:?}"
+                );
+            }
+        }
+
+        fn mismatch_fixture() -> (GithubActionsEcosystem, String, [String; 3]) {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+            let (a, b, missing) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+            let index = TagIndex::from_tags([
+                (
+                    "v2.87.20",
+                    &deps_core::lsp_helpers::CommitSha::parse(&a).unwrap(),
+                ),
+                (
+                    "v2.87.22",
+                    &deps_core::lsp_helpers::CommitSha::parse(&b).unwrap(),
+                ),
+            ]);
+            eco.formatter
+                .tag_index
+                .insert(deps_core::PackageName::new("owner/action"), Arc::new(index));
+            (eco, "owner/action".to_string(), [a, b, missing])
+        }
+
+        async fn sha_comment_diagnostics(
+            eco: &GithubActionsEcosystem,
+            content: &str,
+            severities: deps_core::lsp_helpers::DiagnosticSeverities,
+        ) -> Vec<Diagnostic> {
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let mut cached = HashMap::new();
+            cached.insert(
+                deps_core::PackageName::new("owner/action"),
+                deps_core::PackageVersions::latest_only("v2.87.22"),
+            );
+            let resolved = HashMap::new();
+            eco.generate_diagnostics(
+                parse_result.as_ref(),
+                deps_core::VersionData::new(&cached, &resolved),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                severities,
+            )
+            .await
+            .into_iter()
+            .filter(|d| d.code() == Some(SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE))
+            .collect()
+        }
+
+        /// #1722: exactly the provable mismatches are reported, at the configured severity,
+        /// independent of `mutable_ref_pin_enabled`.
+        #[tokio::test]
+        async fn test_sha_comment_mismatch_diagnostic_only_for_provable_mismatch() {
+            let (eco, name, [a, b, missing]) = mismatch_fixture();
+            let content = format!(
+                "steps:\n\
+                 \x20 - uses: {name}@{a} # v2.87.22\n\
+                 \x20 - uses: {name}@{missing} # v2.87.22\n\
+                 \x20 - uses: {name}@{b} # v2.87.22\n\
+                 \x20 - uses: {name}@{a} # v2.87\n\
+                 \x20 - uses: {name}@{a}\n\
+                 \x20 - uses: '{name}@{missing}'\n"
+            );
+
+            let default = sha_comment_diagnostics(
+                &eco,
+                &content,
+                deps_core::lsp_helpers::DiagnosticSeverities::default()
+                    .with_mutable_ref_pin_enabled(false),
+            )
+            .await;
+            let lines: Vec<u32> = default.iter().map(|d| d.range.start.line).collect();
+            assert_eq!(lines, [1, 2], "{default:?}");
+            let expected_end = 23 + 40 + " # v2.87.22".len() as u32;
+            for d in &default {
+                assert_eq!(d.range.start.character, 23, "{d:?}");
+                assert_eq!(d.range.end.character, expected_end, "{d:?}");
+            }
+            assert!(
+                default
+                    .iter()
+                    .all(|d| d.severity == Some(Severity::Warning))
+            );
+            assert!(
+                default[0].message().contains("it is `v2.87.20`"),
+                "{default:?}"
+            );
+            assert!(
+                default[1]
+                    .message()
+                    .contains("not the commit of any release tag"),
+                "{default:?}"
+            );
+
+            let loud = sha_comment_diagnostics(
+                &eco,
+                &content,
+                deps_core::lsp_helpers::DiagnosticSeverities::default()
+                    .with_sha_comment_mismatch(Severity::Error),
+            )
+            .await;
+            assert_eq!(loud.len(), 2);
+            assert!(loud.iter().all(|d| d.severity == Some(Severity::Error)));
+        }
+
+        /// #1722: a cold cache must produce no mismatch diagnostic.
+        #[tokio::test]
+        async fn test_sha_comment_mismatch_diagnostic_silent_on_cold_cache() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+            let content = format!(
+                "steps:\n  - uses: owner/action@{} # v2.87.22\n",
+                "c".repeat(40)
+            );
+            let found = sha_comment_diagnostics(
+                &eco,
+                &content,
+                deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            )
+            .await;
+            assert!(found.is_empty(), "{found:?}");
+        }
+
+        /// #1722: hover carries a warning line for both mismatch kinds.
+        #[cfg(feature = "lsp-responses")]
+        #[tokio::test]
+        async fn test_sha_comment_mismatch_hover_warning() {
+            let (eco, name, [a, _b, missing]) = mismatch_fixture();
+            let content = format!(
+                "steps:\n  - uses: {name}@{a} # v2.87.22\n  - uses: {name}@{missing} # v2.87.22\n"
+            );
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let mut cached = HashMap::new();
+            cached.insert(
+                deps_core::PackageName::new(&name),
+                deps_core::PackageVersions::latest_only("v2.87.22"),
+            );
+            let resolved = HashMap::new();
+
+            let hover_at = |line: u32| {
+                let versions = deps_core::VersionData::new(&cached, &resolved)
+                    .with_network(deps_core::NetworkMode::Offline);
+                let parse_result = &parse_result;
+                let eco = &eco;
+                async move {
+                    eco.generate_hover(
+                        parse_result.as_ref(),
+                        Position::new(line, 40),
+                        versions,
+                        deps_core::FreshnessSettings::default(),
+                    )
+                    .await
+                    .expect("hover")
+                    .markdown()
+                    .to_string()
+                }
+            };
+
+            let other = hover_at(1).await;
+            assert!(
+                other.contains(
+                    "**Warning**: comment says `v2.87.22`, but SHA `aaaaaaa…` is `v2.87.20`"
+                ),
+                "{other}"
+            );
+            let resolved_at = other.find("**Resolved**").expect("resolved line");
+            let warning_at = other.find("**Warning**").expect("warning line");
+            assert!(resolved_at < warning_at, "{other}");
+            let absent = hover_at(2).await;
+            assert!(
+                absent.contains("not the commit of any release tag"),
+                "{absent}"
+            );
+            assert!(!absent.contains("**Resolved**"), "{absent}");
+        }
+
+        /// #1722: no warning for a confirmed comment, a commentless pin, or a cold cache.
+        #[cfg(feature = "lsp-responses")]
+        #[tokio::test]
+        async fn test_sha_comment_hover_has_no_warning_when_not_mismatched() {
+            let (eco, name, [a, b, _missing]) = mismatch_fixture();
+            let content =
+                format!("steps:\n  - uses: {name}@{b} # v2.87.22\n  - uses: {name}@{a}\n");
+            let cold = GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let mut cached = HashMap::new();
+            cached.insert(
+                deps_core::PackageName::new(&name),
+                deps_core::PackageVersions::latest_only("v2.87.22"),
+            );
+            let resolved = HashMap::new();
+
+            for (ecosystem, line, text) in [
+                (&eco, 1_u32, content.clone()),
+                (&eco, 2, content.clone()),
+                (
+                    &cold,
+                    1,
+                    format!("steps:\n  - uses: {name}@{a} # v2.87.22\n"),
+                ),
+            ] {
+                let parse_result = ecosystem.parse_manifest(&text, &uri).await.unwrap();
+                let hover = ecosystem
+                    .generate_hover(
+                        parse_result.as_ref(),
+                        Position::new(line, 40),
+                        deps_core::VersionData::new(&cached, &resolved)
+                            .with_network(deps_core::NetworkMode::Offline),
+                        deps_core::FreshnessSettings::default(),
+                    )
+                    .await
+                    .expect("hover");
+                assert!(
+                    !hover.markdown().contains("**Warning**"),
+                    "{}",
                     hover.markdown()
                 );
             }

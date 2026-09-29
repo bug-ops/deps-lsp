@@ -54,6 +54,14 @@ pub use types::{
 /// Open Questions), so generalizing into `deps-core` would be premature.
 pub const MUTABLE_REF_PIN_DIAGNOSTIC_CODE: &str = "mutable-ref-pin";
 
+/// Stable [`tower_lsp_server::ls_types::Diagnostic::code`] for the SHA-comment-mismatch
+/// diagnostic (issue #1722).
+///
+/// Flags a SHA-pinned `uses:` step whose trailing `# vX.Y.Z` comment names a tag that is
+/// provably not the pinned commit's tag (the pin points at a commit that is either another
+/// release or no release at all), a supply-chain signal distinct from the outdated check.
+pub const SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE: &str = "sha-comment-mismatch";
+
 /// Whether `name` matches the `owner/repo` GitHub identifier shape this crate accepts:
 /// `[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+`, with neither segment being exactly `.`/`..` (see
 /// [`deps_core::is_dot_segment`]).

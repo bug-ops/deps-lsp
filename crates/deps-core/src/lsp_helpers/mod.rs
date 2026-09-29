@@ -83,11 +83,12 @@ pub use formatter::{
 pub use git_ref::{
     CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, ResolvedPin, TagIndex, byte_span_to_range,
     extends_tag, is_full_sha, is_null_tag, is_partial_semver_shaped, is_plain_null, is_tag_shaped,
-    locate_value_span, marker_byte_offset, match_v_prefix_style,
+    locate_value_span, marker_byte_offset, match_v_prefix_style, short_sha,
 };
 #[cfg(feature = "lsp-responses")]
 pub use git_ref::{
-    ResolvedShaPin, ShaPinning, build_sha_pin_action, sha_pin_text_edit, splice_resolved_line,
+    ResolvedShaPin, ShaPinning, build_sha_pin_action, sha_pin_text_edit, splice_hover_line,
+    splice_resolved_line,
 };
 #[cfg(feature = "lsp-responses")]
 pub use hover::{CMD_DOT_FOOTER, generate_hover};
