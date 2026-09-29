@@ -11,7 +11,7 @@ The composition root for the [deps-lsp](https://github.com/bug-ops/deps-lsp) wor
 This crate exists only because Cargo forbids a cycle: `deps-core` cannot depend on any
 `deps-<ecosystem>` crate, since all 14 already depend on `deps-core`. `deps-engine` sits one
 layer above `deps-core` and depends on every feature-gated `deps-<ecosystem>` crate instead,
-so every driving adapter (`deps-lsp`, and future `deps-cli`/`deps-mcp`) shares one
+so every driving adapter (`deps-lsp` and `deps-cli`) shares one
 registration instead of each reimplementing it independently.
 
 Not a user-facing crate — nothing here is meant to be consumed directly outside this
@@ -23,6 +23,8 @@ workspace's own adapter crates.
   threads into the ecosystems that need them
 - `setup::register_ecosystems` — wires every feature-enabled `deps-<ecosystem>` crate into a
   `deps_core::EcosystemRegistry`
+- `deps-cli`'s shared check/update pipeline — per-package OSV verification, freshness-cooldown
+  fallback selection, and gossip handling, so `check` and `update` agree with the LSP
 - `setup::EcosystemRuntime::from_policy` — builds a runtime from a
   `deps_core::policy_config::PolicyConfig` snapshot
 
@@ -30,7 +32,7 @@ workspace's own adapter crates.
 
 ```toml
 [dependencies]
-deps-engine = { version = "1.2", default-features = false, features = ["cargo", "npm"] }
+deps-engine = { version = "1.3", default-features = false, features = ["cargo", "npm"] }
 ```
 
 > [!IMPORTANT]

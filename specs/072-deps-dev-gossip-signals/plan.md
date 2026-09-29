@@ -7,7 +7,7 @@ tags:
   - deps-dev
   - security
 created: 2026-09-25
-status: draft
+status: shipped
 related:
   - "[[spec]]"
   - "[[constitution]]"

@@ -127,6 +127,11 @@ without a version and matches their affected ranges locally against the pinned v
   for a floating tag (`@v4`) only the releases that extend the written tag. Pre-release tags are
   never checked as siblings. A sibling-only advisory whose fix is not newer than the pinned
   version is not offered as a fix.
+- An affected range that has only an `introduced` event and no `fixed` event is treated as open-ended
+  unless the advisory's `database_specific.last_known_affected_version_range` gives a parsable
+  upper bound (`< X` or `<= X`); versions above that bound are not reported as affected, whether
+  the range or an explicit versions list matched them. An unparsable bound makes the range
+  unevaluable rather than affecting every later version.
 - An advisory exists for the package but its affected range cannot be evaluated: a diagnostic
   notes that vulnerability data was not checked (`UnevaluableAdvisoryRange`).
 - A package with more than 50 advisories is reported as truncated rather than partially matched.

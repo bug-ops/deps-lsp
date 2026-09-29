@@ -15,7 +15,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **JSON parsing** — Parse `composer.json` with position tracking for `require` and `require-dev` sections
 - **Lock file parsing** — Extract resolved versions from `composer.lock`
 - **Packagist registry** — Client for Packagist v2 API with metadata de-minification
-- **Version resolution** — Composer-specific version matching (`^`, `~`, `*`, `||`, ranges)
+- **Version resolution** — Composer-specific version matching (`^`, `~`, `*`, `||` and single-`|` OR, hyphen ranges, comma/space AND); caret requirements enforce their minor/patch lower bound
 - **Platform filtering** — Excludes `php`, `ext-*`, and `lib-*` pseudo-packages from registry lookups
 - **Case-insensitive names** — Package names normalized to lowercase (`vendor/package`)
 - **Stability-aware version selection** — "Latest version" excludes alpha/beta/RC releases by default (matching Composer's `minimum-stability: stable`), unless overridden by `composer.json`'s `minimum-stability` field or a per-dependency `@stability` flag (`^1.0@beta`); a wildcard requirement still resolves a prerelease-only package
@@ -29,7 +29,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-composer = "1.2"
+deps-composer = "1.3"
 ```
 
 > [!IMPORTANT]

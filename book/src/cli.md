@@ -173,8 +173,8 @@ than read in full (the same cap `deps-lsp` applies via `fs_probe::read_to_string
 ## Configuration (`deps.toml`)
 
 `deps-cli` reuses `deps-lsp`'s own `PolicyConfig` schema — the same `diagnostics`, `cache`,
-`freshness`, `supply_chain`, `registries`, `network`, and `license_policy` sections
-documented in [Configuration](configuration.md) — loaded from a `deps.toml` file instead of
+`freshness`, `supply_chain`, `registries`, `network`, `license_policy`, `typosquat`, and
+`gossip` sections documented in [Configuration](configuration.md) — loaded from a `deps.toml` file instead of
 LSP `initializationOptions`:
 
 ```toml
@@ -202,10 +202,16 @@ whole file; an unrecognized key nested inside a known section like `[cache]` is 
 forward compatibility). `--offline` and `--cooldown` override the loaded config for that run
 only.
 
+`[gossip] enabled = true` is honored by `check` and `update` when loaded from an explicit
+`--config` (see [deps.dev GOSSIP signals](cross-ecosystem/gossip-signals.md)); an auto-discovered
+`deps.toml` has it reset to `false`. `[typosquat]` has no effect in `deps-cli` at all: the
+typosquat diagnostic is `deps-lsp` only, and a non-default `[typosquat]` section prints a
+"has no effect" warning even for an explicit `--config`.
+
 > **Warning:** An auto-discovered `deps.toml` — found by the default lookup, not passed
 > explicitly via `--config` — has its `registries`, `network`, and
 > `diagnostics.*_enabled` sections (and cache/freshness/license_policy/supply_chain) reset
-> to their safe defaults before use; only the six `*_severity` display values are kept
+> to their safe defaults before use; only the seven `*_severity` display values are kept
 > (they're cosmetic and can never suppress a `--fail-on` match). This is deliberate: the
 > repository a CI job is checking is not a trusted source for the policy that judges it. A
 > checked-in `deps.toml` on an attacker-controlled branch must not be able to disable the

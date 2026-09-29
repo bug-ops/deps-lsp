@@ -17,9 +17,13 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Hover info** — Package descriptions with resolved version from lock file
 - **License hover & policy** — SPDX license for the resolved and latest version in hover, plus an optional `license_policy` allow/deny-list diagnostic
 - **Diagnostics** — Warnings for outdated, unknown, yanked, or unsatisfiable-requirement dependencies
-- **Vulnerability scanning** — OSV.dev-backed advisories in diagnostics and hover, across all supported ecosystems
+- **Vulnerability scanning** — OSV.dev-backed advisories in diagnostics and hover, across all supported ecosystems; every version offered as an "update to X" action or completion item is OSV-checked too, so a flagged or unverified release is never suggested as a safe upgrade
+- **Typosquat detection (opt-in)** — `typosquat.enabled` flags a declared dependency whose name deps.dev reports as suspiciously similar to a much more popular package, for Cargo, npm, PyPI, Go, Bundler, Maven, and NuGet
+- **deps.dev GOSSIP signals (opt-in)** — `gossip.enabled` sources the outdated-cooldown callout from deps.dev's Dynamic Cooldown data and adds a low-usage / slopsquatting-risk hover warning; completion gains a per-candidate cooldown badge
+- **CI SHA-pin awareness** — GitHub Actions and GitLab CI/CD SHA pins are classified through the tag index, with a `sha-comment-mismatch` diagnostic (`diagnostics.sha_comment_mismatch_severity`) for a `# vX` comment that does not match the pinned commit
 - **Supply-chain trust signal** — OpenSSF Scorecard score and SLSA/attestation provenance status in hover, via deps.dev, for npm, Cargo, Go, Maven, PyPI, Bundler, and NuGet
 - **Release-freshness signal** — Flags a "latest" version still within a cooldown window in hover and completion, mirroring GitHub Dependabot's default 3-day package cooldown
+- **Safe edits** — Fixes never overwrite an unresolved version placeholder (`${VAR}`, `$(VAR)`, `%VAR%`, string interpolation), and tracing output neutralizes control characters and masks token-shaped URL segments
 - **Code actions** — Quick fixes to update dependencies, resolve unsatisfiable version requirements, and upgrade to a patched version for known vulnerabilities
 - **Code lens** — "Update N outdated dependencies" batch update on every open manifest
 - **Lock file support** — Reads resolved versions without network requests
@@ -46,7 +50,7 @@ All ecosystems are enabled by default. Disable unused ones to reduce binary size
 
 ```toml
 [dependencies]
-deps-lsp = { version = "1.2", default-features = false, features = ["cargo", "npm"] }
+deps-lsp = { version = "1.3", default-features = false, features = ["cargo", "npm"] }
 ```
 
 | Feature | Ecosystem | Default |

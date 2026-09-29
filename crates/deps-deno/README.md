@@ -14,7 +14,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 - **JSONC parsing** — Parse `deno.json`/`deno.jsonc` (comments tolerated) with exact position tracking for every `imports` entry, via `jsonc-parser`'s AST rather than text search
 - **Dual registry routing** — `jsr:` specifiers resolve against the keyless JSR API; `npm:` specifiers reuse the existing `deps-npm` registry client, including its `.npmrc`-scoped custom/private registry resolution, through one dispatching `Registry` facade
-- **Node semver resolution** — Full `^`, `~`, `>=`, `<`, range support for both `jsr:` and `npm:` requirements (JSR mandates strict semver)
+- **Node semver resolution** — Full `^`, `~`, `>=`, `<`, range and `x`/`*` wildcard support for both `jsr:` and `npm:` requirements (JSR mandates strict semver)
 - **Scoped packages** — `@scope/pkg` names for both registries
 - **Freshness at zero extra cost** — JSR's `meta.json` carries per-version publish dates in the same response `get_versions` already fetches
 - **License hover** — SPDX license for the resolved and latest version via background pre-fetch, flagging a "License changed" when they differ
@@ -23,7 +23,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-deno = "1.2"
+deps-deno = "1.3"
 ```
 
 > [!IMPORTANT]

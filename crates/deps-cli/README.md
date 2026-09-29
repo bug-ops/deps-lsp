@@ -13,7 +13,8 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 check` walks a workspace, routes every manifest it finds through the same 14-ecosystem
 classification pipeline (`deps-engine`) that powers `deps-lsp`'s hover and diagnostics, and
 reports outdated/yanked/vulnerable/unsatisfiable/deprecated/license/mutable-ref-pin findings as
-a table, as JSON, or as SARIF 2.1.0, with a CI-friendly exit code.
+a table, as JSON, or as SARIF 2.1.0, with a CI-friendly exit code. `deps-cli update` is the
+write-back counterpart: it plans and applies version-requirement edits to one manifest.
 
 > [!IMPORTANT]
 > `deps-cli` implements no classification logic of its own — every verdict comes from the exact
@@ -46,6 +47,16 @@ a table, as JSON, or as SARIF 2.1.0, with a CI-friendly exit code.
   itself can never weaken what `--fail-on` observes or redirect credentials to an attacker
   host; only an explicitly-passed `--config` is trusted with the full policy (see
   [Configuration](#configuration))
+- **`update` subcommand** — plans and atomically writes version-requirement edits for one
+  manifest's outdated or OSV-vulnerable dependencies, with `--dry-run`, `--package`
+  selection, and `table`/`json` output (see [`update` subcommand](#update-subcommand))
+- **OSV-checked upgrade targets** — an upgrade target (including a cooldown fallback) is
+  independently OSV-verified before `update` writes it, and a flagged or unverified one is
+  refused rather than silently substituted
+- **Freshness cooldown** — `update` skips a version published within `freshness.cooldown_secs`
+  (default 3 days) and targets the newest already-cooled-down, verified candidate instead
+- **Safe rewrites** — an unresolved version placeholder (`${VAR}`, `$(VAR)`, `%VAR%`,
+  `self.version`, string interpolation) is never overwritten by a rewrite
 - **Offline mode** — `--offline` serves only already-cached registry data, useful for
   air-gapped CI runners or fast local iteration
 
@@ -120,7 +131,7 @@ To drive the `check` pipeline programmatically:
 
 ```toml
 [dependencies]
-deps-cli = "1.2"
+deps-cli = "1.3"
 ```
 
 > [!IMPORTANT]
@@ -192,18 +203,39 @@ code lens and vulnerability-fix quick action:
 # Update every outdated dependency
 deps-cli update Cargo.toml
 
+# Only the named dependencies (repeatable)
+deps-cli update --package serde --package tokio Cargo.toml
+
 # Only OSV-vulnerable dependencies, targeting each advisory's own recommended fix
 deps-cli update --security-only Cargo.toml
 
 # Plan without writing, inspecting the machine-readable result
 deps-cli update --dry-run --format json Cargo.toml
+
+# Honor [update].ignore rules from an explicit config, using cached registry data only
+deps-cli update --config ./ci/deps-strict.toml --offline Cargo.toml
 ```
 
-`[update].ignore` rules (skip specific dependencies, optionally scoped by update kind) are
-honored only from an explicit `--config <path>` — `update` never auto-discovers a `deps.toml`.
+Flags: `--package <NAME>` (repeatable), `--security-only`, `--dry-run`, `--format
+table|json`, `--config <PATH>`, `--offline`, and `--cooldown <DURATION>` (`--cooldown` has no
+effect under `--security-only`).
+
+- **Default mode** honors the freshness cooldown (default 3 days) even with no flags: a
+  version published inside the window is replaced by the newest already-cooled-down, OSV-verified
+  candidate that does not drop below the in-use version (or, with no lock file, the declared
+  requirement), or the dependency is skipped when none exists. A flagged or unverified
+  candidate is refused and the run exits non-zero.
+- **`--security-only`** rewrites to each advisory's recommended fix, independently re-verified
+  against OSV, and classifies every vulnerable dependency as `applied`,
+  `requires-lockfile-update`, or `unfixable`. It overrides every `[update].ignore` rule.
+- **`[update].ignore`** (`{ name = "tokio", update_types = ["major"] }`) is honored only from
+  an explicit `--config <path>` — `update` never auto-discovers a `deps.toml`.
+- **Exit codes**: `0` all selected updates applied or deliberately skipped, `1` at least one
+  wanted fix could not be applied, `2` execution error. A non-zero exit does not imply the
+  manifest is unmodified; inspect each item's `outcome` in `--format json`.
+
 See the [`update` usage](https://bug-ops.github.io/deps-lsp/cli.html#update-usage) mdBook
-section for the full flag reference, the three-outcome `--security-only` classification, and
-the exit-code contract.
+section for the full reference.
 
 ## Pre-commit hook
 
@@ -236,7 +268,7 @@ a Docker-based action. It writes a SARIF file but does not upload it — wire
 tag rather than `@main` — see the action's own README for why:
 
 ```yaml
-- uses: bug-ops/deps-lsp/crates/github-action@v1.2.0
+- uses: bug-ops/deps-lsp/crates/github-action@v1.3.0
   id: deps-check
   with:
     fail-on: vulnerable,yanked,unsatisfiable
@@ -279,6 +311,12 @@ mutable_ref_pin_enabled = true
 [freshness]
 cooldown_secs = 259200 # 3 days, Dependabot's default
 
+[gossip]
+enabled = false # opt-in deps.dev cooldown signals; explicit --config only
+
+[update]
+ignore = [{ name = "tokio", update_types = ["major"] }] # honored only via --config
+
 [network]
 offline = false
 
@@ -290,7 +328,7 @@ allow = ["MIT", "Apache-2.0", "BSD-3-Clause"]
 
 > [!WARNING]
 > An auto-discovered `deps.toml` — one found by this default lookup, not passed explicitly via
-> `--config` — has its `registries`, `network`, and `diagnostics.*_enabled` sections (and a few
+> `--config` — has its `registries`, `network`, `gossip`, and `diagnostics.*_enabled` sections (and a few
 > other gate-relevant fields) reset to their safe defaults before use. This is deliberate: the
 > repository a CI job is checking is not a trusted source for the policy that judges it, and a
 > checked-in `deps.toml` on an attacker-controlled branch must not be able to disable the check

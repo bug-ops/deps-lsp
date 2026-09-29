@@ -10,7 +10,7 @@ tags:
   - deps-dev
   - priority/p3
 created: 2026-09-25
-status: draft
+status: shipped
 related:
   - "[[MOC-specs]]"
   - "[[010-license-hover-policy/spec]]"

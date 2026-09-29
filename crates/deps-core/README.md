@@ -17,19 +17,25 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 - **`PackageName`/`VersionReq` newtypes** — Distinguish a manifest package name from a version requirement string at the type level, threaded through `Registry`, `Ecosystem`, and `EcosystemFormatter` so the two cannot be swapped at a call site
 - **`Registry` trait** — Abstraction over package registries with version lookup
 - **`freshness` module** — Release-freshness signal (`PublishTime`, `FreshnessSettings`, `is_within_cooldown`) flagging a "latest" version still inside its cooldown window, mirroring GitHub Dependabot's default 3-day package cooldown
+- **`edit` module** — `ManifestEdit`, `PlannedUpdate`, `UpdateKind`/`classify_update`, `collect_update_edits`, and `plan_vulnerability_fix`: the edit planning shared by `deps-lsp`'s code actions/lenses and `deps-cli update`, including the cooldown-fallback guard (`lsp_helpers::fallback_edit_excludes_newer`) that decides whether a fallback edit is safe to write
+- **`fs_probe::write_atomic`** — symlink-refusing, permission-preserving atomic file write
+- **`config_trust` module** — shared `ConfigTier`/`expand_env_vars` config-trust-tier and `${VAR}`/`%VAR%` interpolation logic
+- **`interval::VersionRange`, `lsp_helpers::BoundedVersionReq` and `MatchedSpans`** — shared bounded-interval requirement matching and oversized-requirement gating, so every ecosystem rejects unsatisfiable or pathological ranges the same way
+- **`policy_config::{GossipConfig, TyposquatConfig}`** — opt-in deps.dev GOSSIP-signal and typosquat-similarity settings (both default off)
 - **`LockFileProvider` trait** — Abstract lock file parsing for resolved versions
 - **Generic LSP handlers** — `generate_inlay_hints`, `generate_hover`, `generate_code_actions`, `generate_diagnostics_from_cache`, `generate_code_lenses`, taking a bundled `VersionData` (cached + resolved version maps) to avoid swapping same-typed arguments at call sites
 - **`collect_update_all_edits`** — batch `TextEdit`s bringing every safely-editable outdated dependency to latest, shared across all ecosystems; guards against rewriting a `version_range` that isn't actually the version literal (property references, DSL variables, catalog aliases, synthesized range bounds)
 - **`HttpCache`** — ETag/Last-Modified caching for registry HTTP requests, with a streaming 32 MiB response-size cap
-- **`osv::OsvClient`** — batches dependency versions against the [OSV.dev](https://osv.dev) vulnerability database (`POST /v1/querybatch`), resolves matching advisories, and caches both queries and records independently of `HttpCache` (OSV sends no cache validators). `EcosystemId::osv_ecosystem()` and `EcosystemFormatter::osv_package_name()` provide the per-ecosystem mapping
+- **`osv::OsvClient`** — batches dependency versions against the [OSV.dev](https://osv.dev) vulnerability database (`POST /v1/querybatch`), resolves matching advisories (bounded record-fetch concurrency, in-flight dedup, GitHub Actions advisories matched locally by canonical name), and caches both queries and records independently of `HttpCache` (OSV sends no cache validators). `EcosystemId::osv_ecosystem()` and `EcosystemFormatter::osv_package_name()` provide the per-ecosystem mapping
 - **`check_toml_nesting_depth`** — single-pass structural guard rejecting pathologically nested TOML (bracket depth and dotted-key/header segment count) before it reaches the recursive-descent `toml_span` parser
 - **`parse_toml_checked`** — the single shared entry point combining `check_toml_nesting_depth` with `toml_span::parse`, returning a `CheckedTomlError` (`NestingTooDeep`/`Syntax`) callers can branch on
 - **`check_yaml_nesting_depth`** — single-pass structural guard rejecting pathologically nested YAML (flow bracket depth and block-style indentation/dash-chain nesting) before it reaches the recursive-descent `yaml-rust2` parser
 - **`check_yaml_expansion`** — streaming pre-pass over `yaml-rust2`'s own parser event stream rejecting YAML whose anchor/alias references would expand to an excessive number of allocated bytes (billion-laughs-style), independent of nesting depth
 - **`lockfile::read_lockfile_content`** — shared read-and-error-wrap helper for lock file parsers
-- **`deps_dev::DepsDevClient`** — supply-chain trust signal client for the [deps.dev](https://deps.dev) API, resolving a dependency's linked source repository, OpenSSF Scorecard score, and SLSA/attestation provenance status (`SupplyChainTrustSignal`, `ScorecardSummary`, `ProvenanceStatus`)
+- **`deps_dev::DepsDevClient`** — deps.dev client for typosquat-similarity and GOSSIP cooldown/low-usage findings, plus the supply-chain trust signal, resolving a dependency's linked source repository, OpenSSF Scorecard score, and SLSA/attestation provenance status (`SupplyChainTrustSignal`, `ScorecardSummary`, `ProvenanceStatus`)
 - **`licenses::LicensePolicy`** — SPDX allow/deny-list evaluation shared by every ecosystem's `license_policy` diagnostic, plus `Ecosystem::fetch_license`/`license_source()` sealed-trait hooks for tier-3 ecosystems whose license isn't already present in the hot-path registry response
 - **`diagnostic::Diagnostic`/`RelatedInformation`** — sanitize and cap their message/code text at construction (control characters, bidi/invisible-character overrides, unbounded length), exposed only through `message()`/`code()` getters so no caller can bypass the sanitization after the fact
+- **`redact::url_for_tracing`/`RedactedUrl`** — masks credentials and token-shaped host/path segments (GitLab job tokens, base64url and marker-gated hex tokens) in tracing output; `PackageName::for_tracing()` sweeps control characters (CWE-117)
 - **`redact::redact_parse_error_for_log`** — redacts credential-shaped substrings from a parser error before it reaches logs or an LSP-visible diagnostic
 - **`rate_limit::RateLimitGate`** — process-lifetime cooldown gate shared by ecosystem registry clients to stop hammering an upstream once it has rate-limited or auth-rejected a request
 - **Error types** — Unified error handling with `thiserror`
@@ -38,7 +44,7 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 
 ```toml
 [dependencies]
-deps-core = "1.2"
+deps-core = "1.3"
 ```
 
 > [!IMPORTANT]

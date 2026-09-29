@@ -17,6 +17,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Groovy DSL** — Parse `build.gradle` dependency declarations
 - **Multi-registry** — Resolves from Maven Central, Google Maven, and Gradle Plugin Portal
 - **Maven version comparison** — Full qualifier-aware comparison (`alpha`, `beta`, `RC`, `SNAPSHOT`)
+- **Property/`version.ref` resolution** — Resolves `$name`/`${name}` and catalog `version.ref` values, each bounded to 1 KiB; columns are computed as UTF-16 offsets
 - **Configuration awareness** — Recognises `implementation`, `api`, `testImplementation`, and other Gradle configurations
 - **License hover** — SPDX license for the resolved and latest version via background pre-fetch; Maven Central POM free-text license names (e.g. "The Apache Software License, Version 2.0") are normalized to SPDX identifiers before comparison and `license_policy` evaluation
 - **Release-freshness signal (partial)** — Per-version ages in hover/completion for Maven Central-resolved dependencies; unavailable for Google Maven and Gradle Plugin Portal artifacts, which have no date column (see the [deps-lsp book](https://bug-ops.github.io/deps-lsp/ecosystems/maven-gradle.html#release-freshness-coverage))
@@ -28,7 +29,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-gradle = "1.2"
+deps-gradle = "1.3"
 ```
 
 > [!IMPORTANT]

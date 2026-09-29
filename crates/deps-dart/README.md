@@ -16,7 +16,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Lock file parsing** — Extract resolved versions from `pubspec.lock`
 - **pub.dev registry** — Client for the pub.dev API with version lookups and package metadata
 - **Dependency sources** — Support for hosted, git, path, and SDK sources
-- **Caret semantics** — Dart-specific `^X.Y.Z` version constraint matching
+- **Caret semantics** — Dart-specific `^X.Y.Z` version constraint matching; a `+N` build revision (`1.2.3+4`) is significant, so a `+N` pin compares as a concrete version
 - **Git sub-path** — Handle `path:` inside git repositories
 - **License hover** — SPDX license for the resolved and latest version via background pre-fetch, with a "(detected)" qualifier for pana-scored results, flagging a "License changed" when they differ
 
@@ -24,7 +24,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-dart = "1.2"
+deps-dart = "1.3"
 ```
 
 > [!IMPORTANT]

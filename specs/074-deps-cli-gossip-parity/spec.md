@@ -9,7 +9,7 @@ tags:
   - deps-dev
   - priority/p4
 created: 2026-09-26
-status: ready
+status: shipped
 related:
   - "[[MOC-specs]]"
   - "[[072-deps-dev-gossip-signals/spec]]"

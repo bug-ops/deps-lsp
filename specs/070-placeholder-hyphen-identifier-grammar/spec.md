@@ -11,7 +11,7 @@ tags:
   - lsp-diagnostics
   - lsp-code-actions
 created: 2026-09-24
-status: draft
+status: shipped
 related:
   - "[[constitution]]"
   - "[[069-template-placeholder-dollar-paren-guard/spec]]"
