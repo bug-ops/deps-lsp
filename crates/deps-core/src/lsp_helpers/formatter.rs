@@ -2232,6 +2232,20 @@ pub trait SourcePolicy: Send + Sync {
     }
 }
 
+/// Whether a dependency's OSV package name can be produced yet, as reported by
+/// [`OsvNaming::osv_name_availability`].
+///
+/// Separates a transient gap (registry data the name depends on has not landed) from a
+/// structural one (`osv_package_name` returning `None` for good), so the former is never
+/// recorded as permanently unmappable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsvNameAvailability {
+    /// [`OsvNaming::osv_package_name`]'s answer is final for the data currently held.
+    Ready,
+    /// The name depends on registry data that has not been fetched yet; retry after it lands.
+    AwaitingRegistryData,
+}
+
 /// Native <-> OSV.dev namespace bridging for package names and version strings.
 ///
 /// Implementors guarantee every method is the identity transform unless this ecosystem's
@@ -2259,6 +2273,16 @@ pub trait OsvNaming: Send + Sync {
     /// (lowercase) override it.
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<crate::osv::OsvPackageName> {
         crate::osv::OsvPackageName::new_or_skip(dep.name().as_str())
+    }
+
+    /// Whether [`Self::osv_package_name`] can already answer for `dep`.
+    ///
+    /// Callers check this first: [`OsvNameAvailability::AwaitingRegistryData`] is a transient
+    /// skip, not an unmappable name. Default: always [`OsvNameAvailability::Ready`]; override
+    /// only when the OSV name is derived from registry data (GitHub Actions' canonical casing).
+    fn osv_name_availability(&self, dep: &dyn Dependency) -> OsvNameAvailability {
+        let _ = dep;
+        OsvNameAvailability::Ready
     }
 
     /// Converts a version string as it appears in an OSV advisory record

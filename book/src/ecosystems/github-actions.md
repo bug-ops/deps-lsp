@@ -80,6 +80,12 @@ without a version and matches their affected ranges locally against the pinned v
   notes that vulnerability data was not checked (`UnevaluableAdvisoryRange`).
 - A package with more than 50 advisories is reported as truncated rather than partially matched.
 
-**Known limitations**: OSV package names are case-sensitive (#1683), floating tags are not
-resolved to a precise release (#1684), and unversioned advisory records are re-fetched on each
-cache miss (#1682).
+OSV.dev package names are case-sensitive, so the queried name is the repository's canonical
+`owner/repo` casing taken from the GitHub tags response (a lowercase `uses:` value still
+matches). Vulnerability checking therefore depends on the GitHub tags fetch and its API quota
+(60 requests/hour unauthenticated; set `GITHUB_TOKEN` to raise it): until the casing is
+confirmed, or when the fetch fails, the dependency is shown as "not checked", never as clean.
+
+**Known limitations**: floating tags are not resolved to a precise release (#1684), and a
+renamed or transferred repository is queried only under its current GitHub name, so an advisory
+OSV.dev still files under the old name is not matched.

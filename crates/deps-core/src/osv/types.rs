@@ -1244,6 +1244,10 @@ pub enum SkipReason {
     ResolvedTagNotFullVersion,
     /// `EcosystemFormatter::osv_package_name` returned `None`.
     UnmappableName,
+    /// The OSV package name depends on registry data (a repository's canonical casing) that
+    /// has not been fetched yet, or could not be; retried once the ecosystem's `TagIndex`
+    /// is populated.
+    CanonicalNameUnconfirmed,
     /// `EcosystemId::osv_ecosystem` returned `None`.
     UnmappableEcosystem,
     /// The batch or single-package query failed (network error, non-2xx, malformed JSON,
@@ -1269,6 +1273,7 @@ impl SkipReason {
             Self::NoConcreteVersion => "no-concrete-version",
             Self::ResolvedTagNotFullVersion => "resolved-tag-not-full-version",
             Self::UnmappableName => "unmappable-name",
+            Self::CanonicalNameUnconfirmed => "canonical-name-unconfirmed",
             Self::UnmappableEcosystem => "unmappable-ecosystem",
             Self::QueryFailed => "query-failed",
             Self::Truncated => "truncated",
@@ -1326,6 +1331,9 @@ impl SkipReason {
             Self::UnmappableName => {
                 Some("the package name could not be mapped to an OSV.dev ecosystem")
             }
+            Self::CanonicalNameUnconfirmed => {
+                Some("the repository's canonical name has not been confirmed by GitHub")
+            }
             Self::UnmappableEcosystem => Some("this ecosystem is not supported by OSV.dev"),
             Self::QueryFailed => Some("the OSV.dev query failed"),
             Self::Truncated => Some("the OSV.dev result set was truncated"),
@@ -1353,7 +1361,9 @@ impl SkipReason {
     #[must_use]
     pub const fn depends_on_tag_index(self) -> bool {
         match self {
-            Self::NoConcreteVersion | Self::ResolvedTagNotFullVersion => true,
+            Self::NoConcreteVersion
+            | Self::ResolvedTagNotFullVersion
+            | Self::CanonicalNameUnconfirmed => true,
             Self::NonRegistrySource
             | Self::UnmappableName
             | Self::UnmappableEcosystem
@@ -1471,6 +1481,10 @@ mod skip_reason_unchecked_reason_tests {
                 SkipReason::ResolvedTagNotFullVersion,
                 Some("the resolved tag is not a full version, so it was not queried"),
             ),
+            (
+                SkipReason::CanonicalNameUnconfirmed,
+                Some("the repository's canonical name has not been confirmed by GitHub"),
+            ),
             (SkipReason::QueryFailed, Some("the OSV.dev query failed")),
             (
                 SkipReason::Truncated,
@@ -1496,6 +1510,16 @@ mod skip_reason_unchecked_reason_tests {
         }
     }
 
+    /// #1683: the unconfirmed-name skip is transient — it triggers the tag-index rescan and is
+    /// never storable as structural.
+    #[test]
+    fn canonical_name_unconfirmed_is_transient_and_rescan_triggering() {
+        let reason = SkipReason::CanonicalNameUnconfirmed;
+        assert!(reason.depends_on_tag_index());
+        assert!(!reason.is_structural());
+        assert_eq!(reason.as_str(), "canonical-name-unconfirmed");
+    }
+
     /// None of the wordings promise an immediate remedy (issue #1392 S1: resolving a
     /// version does not itself re-run the OSV scan for an already-open document, so
     /// claiming a fix would overclaim).
@@ -1506,6 +1530,7 @@ mod skip_reason_unchecked_reason_tests {
             SkipReason::ResolvedTagNotFullVersion,
             SkipReason::UnmappableName,
             SkipReason::UnmappableEcosystem,
+            SkipReason::CanonicalNameUnconfirmed,
             SkipReason::QueryFailed,
             SkipReason::Truncated,
         ] {

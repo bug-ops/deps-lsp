@@ -34,9 +34,7 @@ pub use types::{
     VersionMatching, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap, is_valid_osv_id,
     validated_osv_url, vuln_key_for, vulnerability_keys,
 };
-use types::{
-    OsvBatchRequest, OsvBatchResponse, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord, OsvVulnStub,
-};
+use types::{OsvBatchRequest, OsvBatchResponse, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord};
 
 use crate::cache::HttpCache;
 
@@ -84,7 +82,7 @@ const MAX_TRUNCATED_REQUERY_BUDGET: usize = 20;
 /// well past this constant's intended bound.
 const RECORD_FETCH_CONCURRENCY: usize = 10;
 
-/// Entry-count bound shared by `query_cache` and `record_cache`.
+/// Entry-count bound shared by `query_cache`, `record_cache` and `raw_record_cache`.
 const MAX_CACHE_ENTRIES: usize = 10_000;
 
 const OSV_API_BASE: &str = "https://api.osv.dev";
@@ -164,6 +162,27 @@ fn compare_version_strings(a: &str, b: &str) -> std::cmp::Ordering {
         .then_with(|| a.cmp(b))
 }
 
+/// Key of [`OsvClient::query_cache`]: only [`VersionMatching::ServerSide`] queries carry a
+/// version, so an unversioned result set is shared by every version of the same package.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum QueryCacheKey {
+    Versioned(OsvEcosystem, OsvPackageName, OsvVersion),
+    Unversioned(OsvEcosystem, OsvPackageName),
+}
+
+impl QueryCacheKey {
+    fn for_target(osv_eco: OsvEcosystem, target: &ScanTarget) -> Self {
+        match osv_eco.version_matching() {
+            VersionMatching::ServerSide => {
+                Self::Versioned(osv_eco, target.osv_name.clone(), target.version.clone())
+            }
+            VersionMatching::LocalUnversioned => {
+                Self::Unversioned(osv_eco, target.osv_name.clone())
+            }
+        }
+    }
+}
+
 struct QueryCacheEntry {
     vuln_ids: Vec<(String, String)>,
     fetched_at: Instant,
@@ -172,6 +191,11 @@ struct QueryCacheEntry {
 struct RecordCacheEntry {
     advisory: Arc<Advisory>,
     modified: String,
+    fetched_at: Instant,
+}
+
+struct RawRecordCacheEntry {
+    record: Arc<OsvVulnRecord>,
     fetched_at: Instant,
 }
 
@@ -209,8 +233,12 @@ impl InFlightRecord {
 /// every open document's scan benefits from the same query/record cache.
 pub struct OsvClient {
     cache: Arc<HttpCache>,
-    query_cache: DashMap<(OsvEcosystem, OsvPackageName, OsvVersion), QueryCacheEntry>,
+    query_cache: DashMap<QueryCacheKey, QueryCacheEntry>,
     record_cache: DashMap<String, RecordCacheEntry>,
+    /// Raw records keyed by advisory id, validated by `modified` — lets a
+    /// [`VersionMatching::LocalUnversioned`] scan of another version of the same package match
+    /// locally without refetching.
+    raw_record_cache: DashMap<String, RawRecordCacheEntry>,
     /// Client-wide bound (permits = [`RECORD_FETCH_CONCURRENCY`]) on concurrent
     /// `/v1/vulns/{id}`/`/v1/query` requests — see [`RECORD_FETCH_CONCURRENCY`]'s doc for why
     /// this must be a field shared via `Arc` rather than a per-call `buffer_unordered` bound
@@ -243,6 +271,7 @@ impl OsvClient {
             cache,
             query_cache: DashMap::new(),
             record_cache: DashMap::new(),
+            raw_record_cache: DashMap::new(),
             record_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(RECORD_FETCH_CONCURRENCY)),
             record_in_flight: DashMap::new(),
             #[cfg(any(test, feature = "test-util"))]
@@ -267,6 +296,7 @@ impl OsvClient {
             cache,
             query_cache: DashMap::new(),
             record_cache: DashMap::new(),
+            raw_record_cache: DashMap::new(),
             record_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(RECORD_FETCH_CONCURRENCY)),
             record_in_flight: DashMap::new(),
             base_url,
@@ -431,6 +461,7 @@ impl OsvClient {
         };
 
         let mut to_query: Vec<ScanTarget> = Vec::new();
+        let mut cached_stubs: Vec<(ScanTarget, Vec<(String, String)>)> = Vec::new();
         let mut seen: HashSet<&VulnKey> = HashSet::with_capacity(targets.len());
         for t in targets {
             // Duplicate keys share one result; querying them twice would only waste requests.
@@ -446,20 +477,29 @@ impl OsvClient {
                 );
                 continue;
             }
-            let cache_key = (osv_eco, t.osv_name.clone(), t.version.clone());
-            let cached_ids = self.query_cache.get(&cache_key).and_then(|entry| {
-                (entry.fetched_at.elapsed() < QUERY_CACHE_TTL).then(|| entry.vuln_ids.clone())
-            });
-            if let Some(vuln_ids) = cached_ids {
-                outcomes.insert(
-                    t.key.clone(),
-                    self.build_outcome(osv_eco, &t.osv_name, &vuln_ids, deadline)
-                        .await,
-                );
-            } else {
-                to_query.push(t.clone());
+            let cached_ids = self
+                .query_cache
+                .get(&QueryCacheKey::for_target(osv_eco, t))
+                .and_then(|entry| {
+                    (entry.fetched_at.elapsed() < QUERY_CACHE_TTL).then(|| entry.vuln_ids.clone())
+                });
+            match (cached_ids, osv_eco.version_matching()) {
+                (Some(vuln_ids), VersionMatching::ServerSide) => {
+                    outcomes.insert(
+                        t.key.clone(),
+                        self.build_outcome(osv_eco, &t.osv_name, &vuln_ids, deadline)
+                            .await,
+                    );
+                }
+                (Some(vuln_ids), VersionMatching::LocalUnversioned) => {
+                    cached_stubs.push((t.clone(), vuln_ids));
+                }
+                (None, _) => to_query.push(t.clone()),
             }
         }
+
+        self.resolve_local_stubs(osv_eco, cached_stubs, &mut outcomes, deadline)
+            .await;
 
         if to_query.is_empty() {
             return outcomes;
@@ -564,29 +604,54 @@ impl OsvClient {
             return;
         }
 
+        let mut local_stubs: Vec<(ScanTarget, Vec<(String, String)>)> = Vec::new();
         for (target, result) in chunk.iter().zip(parsed.results) {
             if result.next_page_token.is_some() {
                 truncated.push(target.clone());
                 continue;
             }
-            let outcome = match osv_eco.version_matching() {
+            let vuln_ids: Vec<(String, String)> = result
+                .vulns
+                .into_iter()
+                .map(|v| (v.id, v.modified))
+                .collect();
+            self.store_query_cache(osv_eco, target, &vuln_ids);
+            match osv_eco.version_matching() {
                 VersionMatching::ServerSide => {
-                    let vuln_ids: Vec<(String, String)> = result
-                        .vulns
-                        .into_iter()
-                        .map(|v| (v.id, v.modified))
-                        .collect();
-                    self.store_query_cache(osv_eco, target, &vuln_ids);
-                    self.build_outcome(osv_eco, &target.osv_name, &vuln_ids, deadline)
-                        .await
+                    let outcome = self
+                        .build_outcome(osv_eco, &target.osv_name, &vuln_ids, deadline)
+                        .await;
+                    outcomes.insert(target.key.clone(), outcome);
                 }
-                VersionMatching::LocalUnversioned => {
-                    self.outcome_from_local_stubs(osv_eco, target, result.vulns, deadline)
-                        .await
-                }
-            };
-            outcomes.insert(target.key.clone(), outcome);
+                VersionMatching::LocalUnversioned => local_stubs.push((target.clone(), vuln_ids)),
+            }
         }
+        self.resolve_local_stubs(osv_eco, local_stubs, outcomes, deadline)
+            .await;
+    }
+
+    /// Resolves every `(target, stubs)` pair of a [`VersionMatching::LocalUnversioned`]
+    /// ecosystem concurrently, bounded by [`RECORD_FETCH_CONCURRENCY`].
+    async fn resolve_local_stubs(
+        &self,
+        osv_eco: OsvEcosystem,
+        pending: Vec<(ScanTarget, Vec<(String, String)>)>,
+        outcomes: &mut VulnerabilityMap,
+        deadline: Instant,
+    ) {
+        use futures::stream::{self, StreamExt};
+
+        let resolved: Vec<(VulnKey, ScanOutcome)> = stream::iter(pending)
+            .map(|(target, stubs)| async move {
+                let outcome = self
+                    .outcome_from_local_stubs(osv_eco, &target, &stubs, deadline)
+                    .await;
+                (target.key, outcome)
+            })
+            .buffer_unordered(RECORD_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+        outcomes.extend(resolved);
     }
 
     /// Resolves an unversioned result set for a [`VersionMatching::LocalUnversioned`] target:
@@ -599,13 +664,12 @@ impl OsvClient {
         &self,
         osv_eco: OsvEcosystem,
         target: &ScanTarget,
-        stubs: Vec<OsvVulnStub>,
+        stubs: &[(String, String)],
         deadline: Instant,
     ) -> ScanOutcome {
         use futures::stream::{self, StreamExt};
 
         if stubs.is_empty() {
-            self.store_query_cache(osv_eco, target, &[]);
             return ScanOutcome::Clean;
         }
         if stubs.len() > MAX_ADVISORY_RECORDS {
@@ -613,8 +677,10 @@ impl OsvClient {
         }
 
         let fetched: Vec<Option<Arc<OsvVulnRecord>>> =
-            stream::iter(stubs.into_iter().map(|s| s.id))
-                .map(|id| async move { self.fetch_record_single_flight(&id, deadline).await })
+            stream::iter(stubs.iter().cloned())
+                .map(|(id, modified)| async move {
+                    self.fetch_raw_record(&id, &modified, deadline).await
+                })
                 .buffer_unordered(RECORD_FETCH_CONCURRENCY)
                 .collect()
                 .await;
@@ -774,7 +840,11 @@ impl OsvClient {
             }
         }
 
-        self.store_query_cache(osv_eco, target, &vuln_ids);
+        // An affected-only subset must never stand in for an unversioned package's full stub list.
+        match osv_eco.version_matching() {
+            VersionMatching::ServerSide => self.store_query_cache(osv_eco, target, &vuln_ids),
+            VersionMatching::LocalUnversioned => {}
+        }
 
         if total == 0 {
             ScanOutcome::Clean
@@ -849,6 +919,25 @@ impl OsvClient {
             .into_iter()
             .flatten()
             .collect()
+    }
+
+    /// Returns the raw record for `id`, from `raw_record_cache` when its `modified` matches the
+    /// stub's, else via [`Self::fetch_record_single_flight`]. Failed fetches are never cached.
+    async fn fetch_raw_record(
+        &self,
+        id: &str,
+        modified: &str,
+        deadline: Instant,
+    ) -> Option<Arc<OsvVulnRecord>> {
+        let cached = self.raw_record_cache.get(id).and_then(|entry| {
+            (entry.record.modified == modified).then(|| Arc::clone(&entry.record))
+        });
+        if cached.is_some() {
+            return cached;
+        }
+        let record = self.fetch_record_single_flight(id, deadline).await?;
+        self.store_raw_record_cache(&record);
+        Some(record)
     }
 
     /// Coalesces concurrent fetches of the same advisory id — across every call sharing this
@@ -1018,6 +1107,23 @@ impl OsvClient {
         }
     }
 
+    fn store_raw_record_cache(&self, record: &Arc<OsvVulnRecord>) {
+        if self.raw_record_cache.len() >= MAX_CACHE_ENTRIES {
+            crate::cache_policy::evict_oldest_batch(
+                &self.raw_record_cache,
+                MAX_CACHE_ENTRIES,
+                |e| e.fetched_at,
+            );
+        }
+        self.raw_record_cache.insert(
+            record.id.clone(),
+            RawRecordCacheEntry {
+                record: Arc::clone(record),
+                fetched_at: Instant::now(),
+            },
+        );
+    }
+
     fn store_query_cache(
         &self,
         osv_eco: OsvEcosystem,
@@ -1030,7 +1136,7 @@ impl OsvClient {
             });
         }
         self.query_cache.insert(
-            (osv_eco, target.osv_name.clone(), target.version.clone()),
+            QueryCacheKey::for_target(osv_eco, target),
             QueryCacheEntry {
                 vuln_ids: vuln_ids.to_vec(),
                 fetched_at: Instant::now(),
@@ -2621,7 +2727,7 @@ mod tests {
         let t = target("pkg", "1.0.0");
 
         client.query_cache.insert(
-            (OsvEcosystem::Npm, t.osv_name.clone(), t.version.clone()),
+            QueryCacheKey::for_target(OsvEcosystem::Npm, &t),
             QueryCacheEntry {
                 vuln_ids: vec![],
                 fetched_at: Instant::now()
@@ -2694,6 +2800,176 @@ mod tests {
             Some("updated summary")
         );
         record.assert_async().await;
+    }
+
+    /// #1682: an unversioned GHA result set is shared across versions of one action, and the
+    /// raw record is cached by id, so neither another version nor a cleared query cache
+    /// refetches `/v1/vulns/{id}`.
+    #[tokio::test]
+    async fn gha_unversioned_records_are_fetched_once_across_versions() {
+        let (mut server, client) = mock_client().await;
+        let batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(GHA_UNVERSIONED_BODY)
+            .expect(2)
+            .create_async()
+            .await;
+        let record = server
+            .mock("GET", "/v1/vulns/GHSA-cxww-7g56-2vh6")
+            .with_status(200)
+            .with_body(GHA_RECORD_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let key = crate::test_util::vuln_key("actions/download-artifact");
+        let scan = |version: &'static str| {
+            let client = &client;
+            let key = key.clone();
+            async move {
+                client
+                    .scan(
+                        EcosystemId::GithubActions,
+                        &[target("actions/download-artifact", version)],
+                        TEST_TIMEOUT,
+                    )
+                    .await
+                    .remove(&key)
+                    .expect("one outcome per target")
+            }
+        };
+
+        assert_matches!(scan("4.1.2").await, ScanOutcome::Vulnerable(_));
+        assert_matches!(scan("4.1.3").await, ScanOutcome::Clean);
+        client.query_cache.clear();
+        assert_matches!(scan("4.0.5").await, ScanOutcome::Vulnerable(_));
+
+        batch.assert_async().await;
+        record.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn gha_failed_record_fetch_is_not_cached() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(GHA_UNVERSIONED_BODY)
+            .create_async()
+            .await;
+        let failing = server
+            .mock("GET", "/v1/vulns/GHSA-cxww-7g56-2vh6")
+            .with_status(500)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let targets = [target("actions/download-artifact", "4.1.2")];
+        let key = crate::test_util::vuln_key("actions/download-artifact");
+
+        let outcomes = client
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        assert_matches!(
+            outcomes.get(&key),
+            Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
+        );
+        failing.remove_async().await;
+
+        let _ok = server
+            .mock("GET", "/v1/vulns/GHSA-cxww-7g56-2vh6")
+            .with_status(200)
+            .with_body(GHA_RECORD_BODY)
+            .expect(1)
+            .create_async()
+            .await;
+        let outcomes = client
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        assert_matches!(outcomes.get(&key), Some(ScanOutcome::Vulnerable(_)));
+    }
+
+    /// #1682: records of different dependencies are fetched concurrently, not one dependency
+    /// at a time.
+    #[tokio::test]
+    async fn resolve_local_stubs_fetches_records_across_dependencies_concurrently() {
+        let (addr, _in_flight, watermark, total) =
+            spawn_mock_vuln_server(Duration::from_millis(100)).await;
+        let client = OsvClient::with_base_url(Arc::new(HttpCache::new()), format!("http://{addr}"));
+        let pending: Vec<_> = (0..25)
+            .map(|i| {
+                (
+                    target(&format!("actions/a{i}"), "1.0.0"),
+                    vec![(format!("ADV-{i}"), "2023-01-01T00:00:00Z".to_string())],
+                )
+            })
+            .collect();
+        let mut outcomes = VulnerabilityMap::new();
+
+        client
+            .resolve_local_stubs(
+                OsvEcosystem::GitHubActions,
+                pending,
+                &mut outcomes,
+                Instant::now() + TEST_TIMEOUT,
+            )
+            .await;
+
+        assert_eq!(outcomes.len(), 25);
+        assert_eq!(total.load(Ordering::SeqCst), 25);
+        let peak = watermark.load(Ordering::SeqCst);
+        assert!(
+            peak > 1,
+            "records of separate dependencies must be in flight together"
+        );
+        assert!(
+            peak <= RECORD_FETCH_CONCURRENCY,
+            "peak in-flight ({peak}) must stay within the client-wide bound"
+        );
+    }
+
+    /// #1682: a stub whose `modified` differs from the cached record's invalidates it.
+    #[tokio::test]
+    async fn raw_record_cache_refetches_when_stub_modified_changes() {
+        let (mut server, client) = mock_client().await;
+        let record = server
+            .mock("GET", "/v1/vulns/ADV-1")
+            .with_status(200)
+            .with_body(r#"{"id":"ADV-1","modified":"2023-01-01T00:00:00Z"}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let deadline = Instant::now() + TEST_TIMEOUT;
+
+        for modified in [
+            "2023-01-01T00:00:00Z",
+            "2023-01-01T00:00:00Z",
+            "2024-01-01T00:00:00Z",
+        ] {
+            assert!(
+                client
+                    .fetch_raw_record("ADV-1", modified, deadline)
+                    .await
+                    .is_some()
+            );
+        }
+
+        record.assert_async().await;
+    }
+
+    #[test]
+    fn raw_record_cache_evicts_oldest_when_max_entries_reached() {
+        let client = OsvClient::new(Arc::new(HttpCache::new()));
+        for i in 0..=MAX_CACHE_ENTRIES {
+            client.store_raw_record_cache(&Arc::new(OsvVulnRecord {
+                id: format!("ADV-{i}"),
+                ..OsvVulnRecord::default()
+            }));
+        }
+        assert!(
+            client.raw_record_cache.len() <= MAX_CACHE_ENTRIES,
+            "raw_record_cache must stay bounded, got {}",
+            client.raw_record_cache.len()
+        );
     }
 
     /// A minimal raw-TCP `GET /v1/vulns/{id}` responder for the concurrency tests below.

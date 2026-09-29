@@ -423,6 +423,57 @@ pub struct GithubTagCommit {
     /// The full commit SHA the tag points at.
     #[serde(default)]
     pub sha: String,
+    /// The commit's API URL (`https://api.github.com/repos/{owner}/{repo}/commits/{sha}`), whose
+    /// `owner/repo` carries the repository's canonical casing. Empty when absent.
+    #[serde(default)]
+    pub url: String,
+}
+
+/// A GitHub `owner/repo` in the canonical casing GitHub reports for the repository.
+///
+/// GitHub resolves repository names case-insensitively, but OSV.dev's `GitHub Actions`
+/// package names are exact-case, so a `uses:` value written in another casing only matches
+/// advisories once mapped to this spelling. Constructible only from a GitHub API URL the
+/// server itself returned, never from user-written text.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::github::CanonicalRepoName;
+///
+/// let name = CanonicalRepoName::from_commit_url(
+///     "https://api.github.com/repos/Azure/setup-kubectl/commits/0123abcd",
+/// )
+/// .unwrap();
+/// assert_eq!(name.as_str(), "Azure/setup-kubectl");
+/// assert!(CanonicalRepoName::from_commit_url("").is_none());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CanonicalRepoName(String);
+
+impl CanonicalRepoName {
+    /// Extracts the repository from a `.../repos/{owner}/{repo}/commits/{sha}` API URL.
+    ///
+    /// Returns `None` when `url` has no such shape or the `owner/repo` fails
+    /// [`validate_owner_repo`].
+    #[must_use]
+    pub fn from_commit_url(url: &str) -> Option<Self> {
+        let (_, tail) = url.split_once("/repos/")?;
+        let mut segments = tail.split('/');
+        let (owner, repo) = (segments.next()?, segments.next()?);
+        if segments.next()? != "commits" {
+            return None;
+        }
+        let name = format!("{owner}/{repo}");
+        validate_owner_repo(&name).ok()?;
+        Some(Self(name))
+    }
+
+    /// The `owner/repo` string in canonical casing.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// GitHub API error response (rate limit, not found, etc.).
@@ -1831,5 +1882,42 @@ mod tests {
             output.contains("GITHUB_TOKEN not set"),
             "a different api_base must miss the memo and fall through: {output}"
         );
+    }
+
+    #[test]
+    fn canonical_repo_name_from_commit_url_extracts_owner_repo_casing() {
+        let name = CanonicalRepoName::from_commit_url(
+            "https://api.github.com/repos/Azure/setup-kubectl/commits/0123abcd",
+        )
+        .expect("well-formed commit url");
+        assert_eq!(name.as_str(), "Azure/setup-kubectl");
+    }
+
+    #[test]
+    fn canonical_repo_name_ignores_trailing_segments_after_commits() {
+        let name = CanonicalRepoName::from_commit_url(
+            "https://api.github.com/repos/Azure/setup-kubectl/commits/abc/extra",
+        )
+        .expect("owner/repo/commits prefix is what identifies the repository");
+        assert_eq!(name.as_str(), "Azure/setup-kubectl");
+        let bare = CanonicalRepoName::from_commit_url("https://api.github.com/repos/o/r/commits")
+            .expect("the sha is not needed to identify the repository");
+        assert_eq!(bare.as_str(), "o/r");
+    }
+
+    #[test]
+    fn canonical_repo_name_rejects_malformed_commit_urls() {
+        for url in [
+            "",
+            "https://api.github.com/repos/Azure",
+            "https://api.github.com/repos/Azure/setup-kubectl",
+            "https://api.github.com/repos/Azure/setup-kubectl/tags/abc",
+            "https://api.github.com/repos/../setup-kubectl/commits/abc",
+            "https://api.github.com/repos/Az ure/setup-kubectl/commits/abc",
+            "https://api.github.com/repos//r/commits/x",
+            "https://api.github.com/repos/o//commits/x",
+        ] {
+            assert!(CanonicalRepoName::from_commit_url(url).is_none(), "{url}");
+        }
     }
 }

@@ -109,6 +109,7 @@ pub struct TagIndex {
     /// Commit SHA -> the tag/release it corresponds to, classified at insertion time so a
     /// tag can never be read back without knowing whether it is a moving alias.
     sha_to_tag: std::collections::HashMap<CommitSha, ResolvedPin>,
+    canonical_repo_name: Option<crate::github::CanonicalRepoName>,
 }
 
 /// A tag resolved from a commit SHA, classified by whether it names a release or is a
@@ -221,6 +222,22 @@ impl TagIndex {
             index.sha_to_tag.insert(sha.clone(), pin);
         }
         index
+    }
+
+    /// Attaches the repository's canonical casing as reported by GitHub.
+    #[must_use]
+    pub fn with_canonical_repo_name(
+        mut self,
+        name: Option<crate::github::CanonicalRepoName>,
+    ) -> Self {
+        self.canonical_repo_name = name;
+        self
+    }
+
+    /// The repository's canonical `owner/repo` casing, `None` when no fetched tag confirmed it.
+    #[must_use]
+    pub const fn canonical_repo_name(&self) -> Option<&crate::github::CanonicalRepoName> {
+        self.canonical_repo_name.as_ref()
     }
 
     /// Records `pin` as the tag resolved for `sha`, replacing any previous entry.

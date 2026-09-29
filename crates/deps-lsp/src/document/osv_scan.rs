@@ -1733,6 +1733,11 @@ mod tests {
                     "v1.3.0",
                 )),
             );
+            let index = index.with_canonical_repo_name(
+                deps_core::github::CanonicalRepoName::from_commit_url(
+                    "https://api.github.com/repos/actions/checkout/commits/abc",
+                ),
+            );
             gha_registry
                 .tag_index()
                 .insert(PackageName::new("actions/checkout"), Arc::new(index));
@@ -1754,6 +1759,104 @@ mod tests {
                  behind: {:?}",
                 doc.signals.vulnerabilities
             );
+        }
+
+        /// #1683: a non-SHA pin (`@v4.1.2`) needs no tag lookup to resolve its version, but its
+        /// OSV name needs the canonical casing from the tags fetch. On a cold open the scan
+        /// must skip transiently (never as an unmappable name), and the rescan must run once
+        /// the index lands and replace it with a real result.
+        #[tokio::test]
+        async fn rescan_replaces_cold_canonical_name_skip_for_non_sha_pin() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let batch = server
+                .mock("POST", "/v1/querybatch")
+                .match_body(mockito::Matcher::Regex("actions/checkout".into()))
+                .with_status(200)
+                .with_body(r#"{"results":[{}]}"#)
+                .expect(1)
+                .create_async()
+                .await;
+
+            let mut state = ServerState::new();
+            state.osv = Arc::new(OsvClient::for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                server.url(),
+            ));
+            let state = Arc::new(state);
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+
+            let url = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let content = "steps:\n  - uses: actions/checkout@v4.1.2\n".to_string();
+
+            let ecosystem: Arc<dyn Ecosystem> = Arc::new(GithubActionsEcosystem::new(Arc::new(
+                deps_core::HttpCache::new(),
+            )));
+            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            state.update_document(
+                uri.clone(),
+                DocumentState::new_from_parse_result(
+                    EcosystemId::GithubActions,
+                    content,
+                    parse_result,
+                ),
+            );
+
+            let cold_phase_a =
+                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
+                    .await
+                    .expect("a tag-pinned step must produce a phase-A result");
+            run_osv_phase_b_and_commit(
+                &uri,
+                &state,
+                ecosystem.ecosystem_id(),
+                ecosystem.formatter(),
+                5,
+                cold_phase_a,
+            )
+            .await;
+
+            let key = deps_core::test_util::vuln_key("actions/checkout");
+            assert_matches!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .signals
+                    .vulnerabilities
+                    .get(&key),
+                Some(deps_core::osv::ScanOutcome::Skipped(
+                    deps_core::osv::SkipReason::CanonicalNameUnconfirmed
+                ))
+            );
+
+            let registry = ecosystem.registry();
+            let gha_registry = registry
+                .as_any()
+                .downcast_ref::<GithubActionsRegistry>()
+                .expect("GithubActionsEcosystem::registry() must return a GithubActionsRegistry");
+            gha_registry.tag_index().insert(
+                PackageName::new("actions/checkout"),
+                Arc::new(TagIndex::default().with_canonical_repo_name(
+                    deps_core::github::CanonicalRepoName::from_commit_url(
+                        "https://api.github.com/repos/actions/checkout/commits/abc",
+                    ),
+                )),
+            );
+
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+            assert_matches!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .signals
+                    .vulnerabilities
+                    .get(&key),
+                Some(deps_core::osv::ScanOutcome::Clean)
+            );
+            batch.assert_async().await;
         }
 
         /// #1668: a skip because the resolved tag was only a moving alias (`v2`) is just as
@@ -1807,7 +1910,13 @@ mod tests {
                 .tag_index();
             tag_index.insert(
                 PackageName::new("actions/checkout"),
-                Arc::new(TagIndex::from_tags([("v2", &commit)])),
+                Arc::new(
+                    TagIndex::from_tags([("v2", &commit)]).with_canonical_repo_name(
+                        deps_core::github::CanonicalRepoName::from_commit_url(
+                            "https://api.github.com/repos/actions/checkout/commits/abc",
+                        ),
+                    ),
+                ),
             );
 
             let phase_a =
@@ -1839,7 +1948,14 @@ mod tests {
 
             tag_index.insert(
                 PackageName::new("actions/checkout"),
-                Arc::new(TagIndex::from_tags([("v2", &commit), ("v2.9.1", &commit)])),
+                Arc::new(
+                    TagIndex::from_tags([("v2", &commit), ("v2.9.1", &commit)])
+                        .with_canonical_repo_name(
+                            deps_core::github::CanonicalRepoName::from_commit_url(
+                                "https://api.github.com/repos/actions/checkout/commits/abc",
+                            ),
+                        ),
+                ),
             );
             rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
 

@@ -5,8 +5,8 @@
 
 use dashmap::DashMap;
 use deps_core::github::{
-    GithubTag, GithubTagsClient, ReleaseDatesCache, normalize_tag, paginate_tags,
-    semver_tags_newest_first, validate_owner_repo,
+    CanonicalRepoName, GithubTag, GithubTagsClient, ReleaseDatesCache, normalize_tag,
+    paginate_tags, semver_tags_newest_first, validate_owner_repo,
 };
 use deps_core::lsp_helpers::{CommitSha, TagIndex};
 use deps_core::rate_limit::{DEFAULT_COOLDOWN_SECS, RateLimitGate};
@@ -211,7 +211,11 @@ impl GithubActionsRegistry {
             .iter()
             .filter_map(|tag| Some((tag.name.as_str(), CommitSha::parse(&tag.commit.sha)?)))
             .collect();
-        let index = TagIndex::from_tags(valid.iter().map(|(name, sha)| (*name, sha)));
+        let canonical = tags
+            .iter()
+            .find_map(|tag| CanonicalRepoName::from_commit_url(&tag.commit.url));
+        let index = TagIndex::from_tags(valid.iter().map(|(name, sha)| (*name, sha)))
+            .with_canonical_repo_name(canonical);
         if !self.tag_index.contains_key(name) {
             deps_core::cache_policy::evict_arbitrary_if_full(
                 &self.tag_index,
@@ -1383,5 +1387,96 @@ mod tests {
 
         assert_eq!(versions.len(), 1);
         assert!(versions.iter().all(|v| v.published_at().is_none()));
+    }
+
+    /// #1683: the canonical `owner/repo` casing comes from the tags response's `commit.url`.
+    #[tokio::test]
+    async fn test_get_versions_records_canonical_repo_name_from_commit_url() {
+        let sha = "a".repeat(40);
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/azure/setup-kubectl/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name": "v4.0.0", "commit": {{"sha": "{sha}", "url": "https://api.github.com/repos/Azure/setup-kubectl/commits/{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), false);
+        registry.get_versions("azure/setup-kubectl").await.unwrap();
+
+        let index = registry
+            .tag_index
+            .get(&PackageName::new("azure/setup-kubectl"))
+            .unwrap();
+        assert_eq!(
+            index.canonical_repo_name().map(CanonicalRepoName::as_str),
+            Some("Azure/setup-kubectl")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_without_commit_url_leaves_canonical_repo_name_unset() {
+        let sha = "a".repeat(40);
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/azure/setup-kubectl/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name": "v4.0.0", "commit": {{"sha": "{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), false);
+        registry.get_versions("azure/setup-kubectl").await.unwrap();
+
+        let index = registry
+            .tag_index
+            .get(&PackageName::new("azure/setup-kubectl"))
+            .unwrap();
+        assert!(index.canonical_repo_name().is_none());
+    }
+
+    /// #1683: the first parsable `commit.url` wins; an invalid earlier one is skipped, and a
+    /// repository with no tags never confirms a name.
+    #[tokio::test]
+    async fn test_get_versions_canonical_repo_name_scans_past_invalid_urls_and_needs_tags() {
+        let sha = "a".repeat(40);
+        let bad =
+            format!(r#"{{"name": "v4.1.0", "commit": {{"sha": "{sha}", "url": "not-a-url"}}}}"#);
+        let good = format!(
+            r#"{{"name": "v4.0.0", "commit": {{"sha": "{sha}", "url": "https://api.github.com/repos/Azure/setup-kubectl/commits/{sha}"}}}}"#
+        );
+        for (body, expected) in [
+            (format!("[{bad},{good}]"), Some("Azure/setup-kubectl")),
+            (format!("[{bad}]"), None),
+            ("[]".to_string(), None),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _mock = server
+                .mock("GET", "/repos/azure/setup-kubectl/tags")
+                .match_query(mockito::Matcher::Any)
+                .with_status(200)
+                .with_body(body.clone())
+                .create_async()
+                .await;
+
+            let registry = mock_registry(&server.url(), false);
+            registry.get_versions("azure/setup-kubectl").await.unwrap();
+
+            let index = registry
+                .tag_index
+                .get(&PackageName::new("azure/setup-kubectl"))
+                .unwrap();
+            assert_eq!(
+                index.canonical_repo_name().map(CanonicalRepoName::as_str),
+                expected,
+                "{body}"
+            );
+        }
     }
 }
