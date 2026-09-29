@@ -36,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli, deps-engine**: `check`/`update` now honor `[gossip].enabled`, floor-protected against ever excluding an already-in-use version, plus an `ignored_sections`/`[typosquat]` warning-parity fix for explicit `--config` files (resolves #1474) (#1520)
 - **deps-core**: new `lsp_helpers::{FallbackEditVerdict, FallbackEditRejection, fallback_edit_excludes_newer}`, `edit::{ManifestReparse, EcosystemReparse}`, and `ecosystem::parse_manifest_now` — a two-phase, re-parse-based guard deciding whether a cooldown-fallback edit is safe to write, applied uniformly across all 14 ecosystems (part of #1544) (#1581)
 
+### Changed
+- **ci**: bump `taiki-e/install-action` to v2.87.22 in all workflows (#1736)
+
 ### Fixed
 - **deps-github-actions**: update-all and the update quickfix now rewrite a quoted or flow-style SHA pin to the new SHA instead of silently dropping the edit (resolves #1724) (#1731)
 
