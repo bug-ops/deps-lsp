@@ -406,6 +406,26 @@ impl ConcreteVersion {
     pub fn into_string(self) -> String {
         self.0
     }
+
+    /// Whether `self` and `other` are the same version once semver build metadata
+    /// (`+...`, which carries no precedence) is ignored.
+    ///
+    /// Follows SemVer 2.0.0 precedence only; ecosystems where a `+N` suffix denotes a
+    /// distinct release (e.g. pub.dev build numbers) are out of scope.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::ConcreteVersion;
+    ///
+    /// let resolved = ConcreteVersion::new("1.2.3");
+    /// assert!(resolved.eq_ignoring_build_metadata(&ConcreteVersion::new("1.2.3+build.7")));
+    /// assert!(!resolved.eq_ignoring_build_metadata(&ConcreteVersion::new("1.2.4+build.7")));
+    /// ```
+    #[must_use]
+    pub fn eq_ignoring_build_metadata(&self, other: &Self) -> bool {
+        strip_build_metadata(&self.0) == strip_build_metadata(&other.0)
+    }
 }
 
 impl fmt::Display for ConcreteVersion {
@@ -442,6 +462,13 @@ impl PartialEq<&str> for ConcreteVersion {
     fn eq(&self, other: &&str) -> bool {
         self.0 == *other
     }
+}
+
+/// `version` without its semver build metadata (`+...`), which carries no precedence.
+pub(crate) fn strip_build_metadata(version: &str) -> &str {
+    version
+        .split_once('+')
+        .map_or(version, |(precedence, _)| precedence)
 }
 
 /// Length, in bytes, of an `@scope/pkg` or unscoped `pkg` name at the start of `rest`.
@@ -499,6 +526,28 @@ pub fn npm_style_name_boundary(rest: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{ConcreteVersion, PackageName, VersionReq};
+
+    #[test]
+    fn eq_ignoring_build_metadata_cases() {
+        for (a, b, expected) in [
+            ("1.2.3", "1.2.3", true),
+            ("1.2.3+a", "1.2.3+b", true),
+            ("1.2.3", "1.2.3+b", true),
+            ("1.2.3+a", "1.2.3", true),
+            ("1.2.3", "1.2.4+b", false),
+            ("1.2.3-beta.1", "1.2.3+b", false),
+            ("1.2.3-beta.1+a", "1.2.3-beta.1+b", true),
+            ("1.2.3+", "1.2.3", true),
+            ("1.2.3+a+b", "1.2.3+c", true),
+            ("1.2.3+a+b", "1.2.4+a+b", false),
+        ] {
+            assert_eq!(
+                ConcreteVersion::new(a).eq_ignoring_build_metadata(&ConcreteVersion::new(b)),
+                expected,
+                "{a} vs {b}"
+            );
+        }
+    }
 
     #[test]
     fn package_name_round_trips_empty_string() {

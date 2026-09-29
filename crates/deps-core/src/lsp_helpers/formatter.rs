@@ -8,6 +8,7 @@
 //! implementing a subset of them (e.g. in a test mock that only needs [`PackageRendering`]) is
 //! always sufficient for calling that subset's methods directly, without pulling in the rest.
 
+use crate::package::strip_build_metadata;
 use crate::position::Position;
 
 use super::{
@@ -762,13 +763,6 @@ fn caret_upper_bound(lower: [u64; 3], req_parts: &[&str]) -> Option<[u64; 3]> {
         1 => [major, minor.checked_add(1)?, 0],
         _ => [major, minor, patch.checked_add(1)?],
     })
-}
-
-/// `version` without its semver build metadata (`+...`), which carries no precedence.
-fn strip_build_metadata(version: &str) -> &str {
-    version
-        .split_once('+')
-        .map_or(version, |(precedence, _)| precedence)
 }
 
 /// Truncates `version` at its first `-` (prerelease) or `+` (build metadata) marker, so the

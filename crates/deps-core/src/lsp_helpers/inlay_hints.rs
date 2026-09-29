@@ -165,7 +165,7 @@ pub fn generate_inlay_hints(
         };
 
         let status = if let Some(resolved) = &resolved_version {
-            if resolved == latest {
+            if resolved.eq_ignoring_build_metadata(latest) {
                 RequirementStatus::UpToDate
             } else {
                 RequirementStatus::Outdated
@@ -817,6 +817,104 @@ mod tests {
                 );
             }
             _ => panic!("Expected string label"),
+        }
+    }
+
+    /// #1674: a lockfile-resolved version differing from `latest` only by build metadata is up to date.
+    #[test]
+    fn test_inlay_hint_resolved_differing_only_by_build_metadata_is_up_to_date() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            network: crate::NetworkMode::Online,
+        };
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions::latest_only("1.2.0+build.7"),
+        );
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".into(), "1.2.0+build.3".into());
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            crate::LoadingState::Loaded,
+            &config,
+            &MOCK_FORMATTER,
+        );
+
+        assert_eq!(hints.len(), 1);
+        std::assert_matches!(&hints[0].label, InlayHintLabel::String(text) if text.starts_with("✅"));
+    }
+
+    #[test]
+    fn test_inlay_hint_resolved_vs_latest_build_metadata_matrix() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            network: crate::NetworkMode::Online,
+        };
+        for (resolved, latest, up_to_date) in [
+            ("1.2.0", "1.2.0", true),
+            ("1.2.0+build.3", "1.2.0", true),
+            ("1.2.0", "1.2.0+build.7", true),
+            ("1.2.0+a", "1.2.0+b", true),
+            ("1.2.0+build.3", "1.3.0+build.3", false),
+            ("1.2.0-beta.1", "1.2.0+build.7", false),
+        ] {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: "serde".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+                }],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert("serde".into(), PackageVersions::latest_only(latest));
+            let mut resolved_versions = HashMap::new();
+            resolved_versions.insert("serde".into(), resolved.into());
+
+            let hints = generate_inlay_hints(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                crate::LoadingState::Loaded,
+                &config,
+                &MOCK_FORMATTER,
+            );
+
+            assert_eq!(hints.len(), 1, "{resolved} vs {latest}");
+            let InlayHintLabel::String(text) = &hints[0].label else {
+                panic!("expected string label");
+            };
+            if up_to_date {
+                assert!(text.starts_with("✅"), "{resolved} vs {latest}: {text}");
+            } else {
+                assert_eq!(text, &format!("❌ {latest}"), "{resolved} vs {latest}");
+            }
         }
     }
 
