@@ -89,6 +89,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-core**: Dart `+N` build-number pins (e.g. `0.8.13+1`) without a lock file are now treated as concrete versions, restoring the OSV scan and retracted-version probe (resolves #1689) (#1695)
+- **deps-swift**: `Package.swift` parser no longer takes quadratic time on large manifests; already-matched span lookup is now O(log n) (resolves #1692) (#1698)
 - **deps-pypi**: `PypiFormatter::osv_package_name` now PEP 503-normalizes the package name, so a verbatim Poetry key (`Werkzeug`, `Flask_Cors`) matches OSV's normalized `affected[].package.name` and no longer leaks fixes from sibling packages in multi-package records; a separator-only key is skipped as unmappable instead of poisoning the OSV batch (resolves #1663) (#1676)
 - **deps-dart, deps-core**: pub `+N` build revisions are now significant in version comparison and latest selection via a new `BuildMetadataPolicy` formatter hook (resolves #1687) (#1690)
 - **deps-swift**: `Package.swift` `.package(...)` calls with a trailing comma after the last argument are no longer skipped; all URL/path regexes now share one builder (resolves #1673) (#1681)
