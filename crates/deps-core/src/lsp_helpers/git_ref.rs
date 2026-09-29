@@ -137,20 +137,46 @@ impl ResolvedPin {
     }
 }
 
+/// Sort key of [`tag_specificity_rank`]: class, then numeric version order (lower wins), then name.
+type TagRank<'a> = (
+    (u8, usize, bool),
+    std::cmp::Reverse<Option<semver::Version>>,
+    std::cmp::Reverse<Vec<u64>>,
+    std::cmp::Reverse<&'a str>,
+);
+
 /// Specificity rank of a tag name when several share one commit: a full semver name beats a
 /// partial numeric one (more components wins), which beats any non-semver name; within a
-/// rank a release beats a pre-release of it, and the lexicographically smaller name wins so
-/// the choice never depends on fetch order.
-fn tag_specificity_rank(name: &str) -> ((u8, usize, bool), std::cmp::Reverse<&str>) {
-    let is_release = !crate::github::normalize_tag(name).contains(['-', '+']);
-    let class = if semver::Version::parse(crate::github::normalize_tag(name)).is_ok() {
-        (2, 0, is_release)
+/// rank a release beats a pre-release of it, the numerically lower version wins (`v4.9.0`
+/// over `v4.10.0`), and the lexicographically smaller name breaks any remaining tie so the
+/// choice never depends on fetch order.
+///
+/// Only one tag per commit is queried against OSV, so a commit carrying several equally
+/// specific releases can still miss an advisory that affects only the other ones; the lowest
+/// release is preferred because advisories typically name the version that fixed them.
+fn tag_specificity_rank(name: &str) -> TagRank<'_> {
+    let normalized = crate::github::normalize_tag(name);
+    let is_release = !normalized.contains(['-', '+']);
+    let (class, semver, numeric) = if let Ok(v) = semver::Version::parse(normalized) {
+        ((2, 0, is_release), Some(v), Vec::new())
     } else if is_partial_semver_shaped(name) {
-        (1, tag_components(name).count(), is_release)
+        let numeric = normalized
+            .split(['-', '+'])
+            .next()
+            .unwrap_or_default()
+            .split('.')
+            .map(|c| c.parse().unwrap_or(u64::MAX))
+            .collect();
+        ((1, tag_components(name).count(), is_release), None, numeric)
     } else {
-        (0, 0, false)
+        ((0, 0, false), None, Vec::new())
     };
-    (class, std::cmp::Reverse(name))
+    (
+        class,
+        std::cmp::Reverse(semver),
+        std::cmp::Reverse(numeric),
+        std::cmp::Reverse(name),
+    )
 }
 
 fn tag_components(name: &str) -> impl Iterator<Item = &str> {
@@ -1246,6 +1272,51 @@ mod tests {
         }
         for tags in [["v2.9.1-rc1", "v2.9.1"], ["v2.9.1", "v2.9.1-rc1"]] {
             assert_eq!(resolved_pin_for(&tags), most_specific("v2.9.1"), "{tags:?}");
+        }
+    }
+
+    /// #1703: equally specific releases on one commit resolve to the numerically lowest one,
+    /// not to whichever name sorts first as text (`v4.10.0` < `v4.9.0` textually).
+    #[test]
+    fn test_tag_index_lowest_semver_release_wins_in_any_order() {
+        for (tags, expected) in [
+            (["v4.9.0", "v4.10.0"], "v4.9.0"),
+            (["v4.10.0", "v4.9.0"], "v4.9.0"),
+            (["v2.9", "v2.10"], "v2.9"),
+            (["v2.10", "v2.9"], "v2.9"),
+            (["v4.8.0", "v4.9.0"], "v4.8.0"),
+            (["v4.9.0", "v4.8.0"], "v4.8.0"),
+        ] {
+            assert_eq!(resolved_pin_for(&tags), most_specific(expected), "{tags:?}");
+        }
+    }
+
+    #[test]
+    fn test_tag_index_prerelease_ordering_and_release_precedence() {
+        for tags in [
+            ["v1.0.0-rc.2", "v1.0.0-rc.10"],
+            ["v1.0.0-rc.10", "v1.0.0-rc.2"],
+        ] {
+            assert_eq!(
+                resolved_pin_for(&tags),
+                most_specific("v1.0.0-rc.2"),
+                "{tags:?}"
+            );
+        }
+        assert_eq!(
+            resolved_pin_for(&["v4.10.0-rc1", "v4.9.0"]),
+            most_specific("v4.9.0")
+        );
+    }
+
+    #[test]
+    fn test_tag_index_non_semver_and_overflowing_components_stay_deterministic() {
+        for tags in [["nightly", "edge"], ["edge", "nightly"]] {
+            assert_eq!(resolved_pin_for(&tags), most_specific("edge"), "{tags:?}");
+        }
+        let huge = "v99999999999999999999999.1";
+        for tags in [[huge, "v2.9"], ["v2.9", huge]] {
+            assert_eq!(resolved_pin_for(&tags), most_specific("v2.9"), "{tags:?}");
         }
     }
 
