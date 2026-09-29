@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+- **deps-core**: removed `SkipReason::depends_on_tag_index`; `deps-lsp` now decides rescans by comparing scan plans (#1715)
+
 ### Added
 - **ci**: new `ecosystem-crate-test` job runs each of the 14 ecosystem crates' own test suite scoped to itself with default (non-`lsp-responses`) features, closing a CI blind spot that let a mis-gated trait override ship silently (resolves #1549) (#1552)
 - **deps-core**: new shared `secret::ApiToken`/`secret::token_from_env` and `rate_limit::DEFAULT_COOLDOWN_SECS`, replacing GitHub Actions' and GitLab CI's independently duplicated auth-token and rate-limit-cooldown code (part of #1480) (#1510)
@@ -91,6 +94,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: open-ended OSV ranges are now capped by `database_specific.last_known_affected_version_range`, so fixed and latest `github/codeql-action` versions are no longer flagged by GHSA-vqf5-2xx6-9wfm (resolves #1707) (#1712)
 - **deps-core**: equally specific release tags on one commit now resolve to the numerically lowest SemVer instead of the textually smallest name (`v4.9.0` over `v4.10.0`) when picking the tag matched against OSV advisories (resolves #1703) (#1708)
 - **deps-lsp**: the post-fetch OSV tag-index rescan is now skipped when vulnerabilities are disabled or the server is offline, like the phase A launch (resolves #1704) (#1708)
+- **deps-lsp**: OSV rescan after a registry fetch runs only when the per-key scan plan changed, so floating-tag, bare-major and branch pins no longer re-scan on every fetch (resolves #1705) (#1715)
+- **deps-lsp**: a floating GitHub Actions tag pin (`@v4`) is rescanned when its tag moves to another release (resolves #1706) (#1715)
 - **deps-core**: Dart `+N` build-number pins (e.g. `0.8.13+1`) without a lock file are now treated as concrete versions, restoring the OSV scan and retracted-version probe (resolves #1689) (#1695)
 - **deps-swift**: `Package.swift` parser no longer takes quadratic time on large manifests; already-matched span lookup is now O(log n) (resolves #1692) (#1698)
 - **deps-gradle, deps-swift, deps-core**: Kotlin/Groovy parsers now use the shared `deps_core::MatchedSpans` (also adopted by Swift, replacing its private copy) instead of quadratic `Vec` scans on long lines (resolves #1699) (#1700)
