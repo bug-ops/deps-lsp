@@ -764,6 +764,13 @@ fn caret_upper_bound(lower: [u64; 3], req_parts: &[&str]) -> Option<[u64; 3]> {
     })
 }
 
+/// `version` without its semver build metadata (`+...`), which carries no precedence.
+fn strip_build_metadata(version: &str) -> &str {
+    version
+        .split_once('+')
+        .map_or(version, |(precedence, _)| precedence)
+}
+
 /// Truncates `version` at its first `-` (prerelease) or `+` (build metadata) marker, so the
 /// numeric `major.minor.patch` core can still be split and parsed by
 /// [`parse_caret_components`] even when the candidate carries a suffix that component-wise
@@ -1030,7 +1037,8 @@ pub trait RequirementResolution: Send + Sync {
         let version_core = split_patch_component(version).0;
         let ver_parts: Vec<&str> = version_core.split('.').collect();
 
-        version == requirement
+        strip_build_metadata(version)
+            == strip_build_metadata(requirement.strip_prefix('=').unwrap_or(requirement))
             || (is_partial_version && is_same_major_minor(requirement, version_core))
             || matches_wildcard_components(&req_parts, &ver_parts)
     }
@@ -2671,6 +2679,30 @@ mod tests {
             MOCK_FORMATTER.is_requirement_up_to_date(&requirement, &ConcreteVersion::new("1.4.9")),
             "latest below the caret's own lower-bound floor stays up to date (#1622 S2)"
         );
+    }
+
+    #[test]
+    fn test_is_requirement_up_to_date_pin_ignores_build_metadata() {
+        for (pin, latest, expected) in [
+            ("1.2.3", "1.2.3+build.7", true),
+            ("1.2.3+build.1", "1.2.3", true),
+            ("1.2.3+build.1", "1.2.3+build.7", true),
+            ("1.2.3", "1.2.4+build.7", false),
+            ("1.2.3-beta.1", "1.2.3+build.7", false),
+            ("=1.2.3", "1.2.3", true),
+            ("=1.2.3", "1.2.3+build.7", true),
+            ("=300.3.1+3.3.1", "300.3.1+3.3.2", true),
+            ("=1.2.3", "1.2.4", false),
+        ] {
+            assert_eq!(
+                MOCK_FORMATTER.is_requirement_up_to_date(
+                    &VersionReq::new(pin),
+                    &ConcreteVersion::new(latest)
+                ),
+                expected,
+                "pin {pin} vs latest {latest}"
+            );
+        }
     }
 
     /// Same M2 fix, exercised through the `requirement_status` wrapper end to end, mirroring
