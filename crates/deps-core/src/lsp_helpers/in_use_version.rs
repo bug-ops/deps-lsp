@@ -553,11 +553,151 @@ pub fn resolve_in_use_version(
     formatter: &dyn EcosystemFormatter,
     ecosystem: EcosystemId,
 ) -> Option<ConcreteVersion> {
+    resolve_in_use_versions(
+        dep,
+        normalized_name,
+        resolved_versions,
+        resolved_version_candidates,
+        formatter,
+        ecosystem,
+    )
+    .map(InUseVersions::into_primary)
+}
+
+/// Every version of one dependency occurrence that is in use: the primary plus any sibling
+/// release tags naming the same commit.
+///
+/// Siblings come only from a formatter-resolved tag pin (GitHub Actions SHA and exact-tag
+/// pins), each admitted through the same queryability gate as the primary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InUseVersions {
+    primary: ConcreteVersion,
+    siblings: Vec<ConcreteVersion>,
+}
+
+impl InUseVersions {
+    fn without_siblings(primary: ConcreteVersion) -> Self {
+        Self {
+            primary,
+            siblings: Vec::new(),
+        }
+    }
+
+    /// Builds a value without a formatter, for tests of consumers in other crates.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub const fn for_test(primary: ConcreteVersion, siblings: Vec<ConcreteVersion>) -> Self {
+        Self { primary, siblings }
+    }
+
+    /// The version [`resolve_in_use_version`] reports.
+    #[must_use]
+    pub const fn primary(&self) -> &ConcreteVersion {
+        &self.primary
+    }
+
+    /// Other queryable release tags on the primary's commit, lowest version first.
+    #[must_use]
+    pub fn siblings(&self) -> &[ConcreteVersion] {
+        &self.siblings
+    }
+
+    /// Discards the siblings, keeping the primary.
+    #[must_use]
+    pub fn into_primary(self) -> ConcreteVersion {
+        self.primary
+    }
+}
+
+/// Like [`resolve_in_use_version`], but also reports the sibling release tags sharing the
+/// primary's commit (see [`InUseVersions`]).
+///
+/// Siblings only come from an ecosystem's tag-pin resolution (GitHub Actions); every other
+/// source yields an empty list.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     RequirementResolution, SourcePolicy, resolve_in_use_versions,
+/// };
+/// use deps_core::position::Range;
+/// use deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageName, VersionReq};
+/// use std::any::Any;
+/// use std::collections::HashMap;
+///
+/// struct SimpleDep {
+///     name: PackageName,
+///     version_req: Option<VersionReq>,
+/// }
+///
+/// impl Dependency for SimpleDep {
+///     fn name(&self) -> &PackageName {
+///         &self.name
+///     }
+///     fn name_range(&self) -> Range {
+///         Range::default()
+///     }
+///     fn version_requirement(&self) -> Option<&VersionReq> {
+///         self.version_req.as_ref()
+///     }
+///     fn version_range(&self) -> Option<Range> {
+///         None
+///     }
+///     fn source(&self) -> deps_core::parser::DependencySource {
+///         deps_core::parser::DependencySource::Registry
+///     }
+///     fn as_any(&self) -> &dyn Any {
+///         self
+///     }
+/// }
+///
+/// struct SimpleFormatter;
+/// impl PackageNaming for SimpleFormatter {}
+/// impl PackageRendering for SimpleFormatter {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+///         version.to_string()
+///     }
+///     fn package_url(&self, name: &PackageName) -> String {
+///         name.as_str().to_string()
+///     }
+/// }
+/// impl RequirementResolution for SimpleFormatter {}
+/// impl DiagnosticMessages for SimpleFormatter {}
+/// impl DiagnosticPolicy for SimpleFormatter {}
+/// impl SourcePolicy for SimpleFormatter {}
+/// impl OsvNaming for SimpleFormatter {}
+///
+/// let dep = SimpleDep {
+///     name: PackageName::new("time"),
+///     version_req: Some(VersionReq::new("=0.1.43")),
+/// };
+/// let versions = resolve_in_use_versions(
+///     &dep,
+///     "time",
+///     &HashMap::new(),
+///     None,
+///     &SimpleFormatter,
+///     EcosystemId::Cargo,
+/// )
+/// .unwrap();
+/// assert_eq!(versions.primary().as_str(), "0.1.43");
+/// assert!(versions.siblings().is_empty());
+/// ```
+pub fn resolve_in_use_versions(
+    dep: &dyn Dependency,
+    normalized_name: &str,
+    resolved_versions: &HashMap<PackageName, ConcreteVersion>,
+    resolved_version_candidates: Option<&HashMap<PackageName, Vec<ConcreteVersion>>>,
+    formatter: &dyn EcosystemFormatter,
+    ecosystem: EcosystemId,
+) -> Option<InUseVersions> {
     if formatter.manifest_requirement_is_resolved_version(dep) {
         return dep
             .version_requirement()
             .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
-            .map(ConcreteVersion::from);
+            .map(|v| InUseVersions::without_siblings(ConcreteVersion::from(v)));
     }
 
     if let Some(version) = resolve_occurrence_version(
@@ -567,7 +707,7 @@ pub fn resolve_in_use_version(
         resolved_version_candidates,
         formatter,
     ) {
-        return Some(version.clone());
+        return Some(InUseVersions::without_siblings(version.clone()));
     }
 
     // #1556: an ecosystem's own out-of-band resolution (e.g. GitHub Actions' `TagIndex`)
@@ -575,16 +715,22 @@ pub fn resolve_in_use_version(
     // version above (impl-critic M2: a stronger existing resolution source must not be
     // silently superseded) — and still must pass a shape gate, since `TagIndex` can resolve a
     // SHA to a moving alias (`v1`, `v2` next to `v2.9`) that is not a queryable version (#503).
-    if let Some(resolved) = formatter
-        .resolved_pin_version(dep)
-        .and_then(|pin| queryable_pin_version(&pin, ecosystem))
+    if let Some(pin) = formatter.resolved_pin_version(dep)
+        && let Some(primary) = queryable_pin_version(&pin, ecosystem)
     {
-        return Some(resolved);
+        let siblings = pin
+            .siblings()
+            .iter()
+            .filter_map(|tag| {
+                queryable_pin_version(&ResolvedPin::most_specific(tag.clone()), ecosystem)
+            })
+            .collect();
+        return Some(InUseVersions { primary, siblings });
     }
 
     dep.version_requirement()
         .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
-        .map(ConcreteVersion::from)
+        .map(|v| InUseVersions::without_siblings(ConcreteVersion::from(v)))
 }
 
 /// The version a [`ResolvedPin`] may be queried with: a full `major.minor.patch` tag, or a
@@ -592,10 +738,10 @@ pub fn resolve_in_use_version(
 fn queryable_pin_version(pin: &ResolvedPin, ecosystem: EcosystemId) -> Option<ConcreteVersion> {
     let version = pin.version();
     match pin {
-        ResolvedPin::MostSpecific(_) if is_major_minor_shape(version.as_str()) => {
+        ResolvedPin::MostSpecific { .. } if is_major_minor_shape(version.as_str()) => {
             Some(version.clone())
         }
-        ResolvedPin::MostSpecific(_) | ResolvedPin::Alias(_) => {
+        ResolvedPin::MostSpecific { .. } | ResolvedPin::Alias { .. } => {
             concrete_pin_version(version.as_str(), ecosystem).map(ConcreteVersion::from)
         }
     }
@@ -668,11 +814,17 @@ mod tests {
 
     impl FixedResolvedPinFormatter {
         fn most_specific(tag: &str) -> Self {
-            Self(ResolvedPin::MostSpecific(ConcreteVersion::new(tag)))
+            Self(ResolvedPin::most_specific(ConcreteVersion::new(tag)))
         }
 
         fn alias(tag: &str) -> Self {
-            Self(ResolvedPin::Alias(ConcreteVersion::new(tag)))
+            Self(ResolvedPin::alias(ConcreteVersion::new(tag)))
+        }
+
+        fn from_index(tags: &[&str]) -> Self {
+            let sha = crate::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap();
+            let index = crate::lsp_helpers::TagIndex::from_tags(tags.iter().map(|t| (*t, &sha)));
+            Self(index.resolved_pin(sha.as_str()).unwrap())
         }
     }
 
@@ -1729,6 +1881,94 @@ mod tests {
         );
 
         assert_eq!(result, Some(ConcreteVersion::from("1.0.0")));
+    }
+
+    fn sha_pinned_dep() -> crate::lsp_helpers::test_support::MockDep {
+        crate::lsp_helpers::test_support::MockDep {
+            name: PackageName::new("actions/checkout"),
+            version_req: crate::VersionReq::new("deadbeef"),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        }
+    }
+
+    /// #1709: a pin's sibling release tags are reported next to the primary.
+    #[test]
+    fn resolve_in_use_versions_reports_pin_siblings_through_the_queryable_gate() {
+        let formatter = FixedResolvedPinFormatter::from_index(&[
+            "v4.9.0",
+            "v4.8.0",
+            "v4.10.0",
+            "v4.11.0-rc1",
+            "v4",
+        ]);
+        let versions = resolve_in_use_versions(
+            &sha_pinned_dep(),
+            "actions/checkout",
+            &HashMap::new(),
+            None,
+            &formatter,
+            EcosystemId::GithubActions,
+        )
+        .unwrap();
+        assert_eq!(versions.primary().as_str(), "v4.8.0");
+        let siblings: Vec<&str> = versions.siblings().iter().map(|s| s.as_str()).collect();
+        assert_eq!(siblings, ["v4.9.0", "v4.10.0"]);
+    }
+
+    /// #1709 (G7): a most-specific two-component primary keeps its two-component siblings.
+    #[test]
+    fn resolve_in_use_versions_two_component_primary_keeps_two_component_siblings() {
+        let formatter = FixedResolvedPinFormatter::from_index(&["v2.9", "v2.10"]);
+        let versions = resolve_in_use_versions(
+            &sha_pinned_dep(),
+            "actions/checkout",
+            &HashMap::new(),
+            None,
+            &formatter,
+            EcosystemId::GithubActions,
+        )
+        .unwrap();
+        assert_eq!(versions.primary().as_str(), "v2.9");
+        assert_eq!(versions.siblings().len(), 1);
+    }
+
+    /// #1709: a lock-file version wins and carries no siblings.
+    #[test]
+    fn resolve_in_use_versions_lockfile_version_has_no_siblings() {
+        let formatter = FixedResolvedPinFormatter::from_index(&["v4.8.0", "v4.9.0"]);
+        let resolved = HashMap::from([(
+            PackageName::new("actions/checkout"),
+            ConcreteVersion::new("4.7.0"),
+        )]);
+        let versions = resolve_in_use_versions(
+            &sha_pinned_dep(),
+            "actions/checkout",
+            &resolved,
+            None,
+            &formatter,
+            EcosystemId::GithubActions,
+        )
+        .unwrap();
+        assert_eq!(versions.primary().as_str(), "4.7.0");
+        assert!(versions.siblings().is_empty());
+    }
+
+    /// #1709: `resolve_in_use_version` stays the primary of `resolve_in_use_versions`.
+    #[test]
+    fn resolve_in_use_version_returns_the_primary_of_a_sibling_pin() {
+        let formatter = FixedResolvedPinFormatter::from_index(&["v4.8.0", "v4.9.0"]);
+        assert_eq!(
+            resolve_in_use_version(
+                &sha_pinned_dep(),
+                "actions/checkout",
+                &HashMap::new(),
+                None,
+                &formatter,
+                EcosystemId::GithubActions,
+            ),
+            Some(ConcreteVersion::new("v4.8.0"))
+        );
     }
 
     /// #1602: `bare_requirement_policy` (in-use-version resolution) and `bare_meaning`

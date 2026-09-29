@@ -363,8 +363,17 @@ impl RequirementResolution for GithubActionsFormatter {
     /// points at, see `Self::pinned_commit`, but only to a release that extends (or equals)
     /// the written tag (candidates are filtered before the most specific is picked): a commit
     /// that also carries an unrelated `v5.0.0` must not be scanned as that version.
+    ///
+    /// An exact full-semver tag pin (`@v4.8.0`) keeps itself as the primary and gains the other
+    /// releases of its major line on the same commit as siblings (#1709).
     fn resolved_pin_version(&self, dep: &dyn Dependency) -> Option<ResolvedPin> {
         let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+        if gha_dep.pin == Some(PinStyle::Tag) {
+            let written = gha_dep.version_req.as_ref()?.as_str();
+            if concrete_pin_version(written, EcosystemId::GithubActions).is_some() {
+                return self.tag_index.get(dep.name())?.resolved_exact_tag(written);
+            }
+        }
         let commit = self.pinned_commit(gha_dep)?;
         let index = self.tag_index.get(dep.name())?;
         if gha_dep.pin != Some(PinStyle::Tag) {
@@ -458,7 +467,11 @@ impl GithubActionsFormatter {
     }
 }
 
-impl DiagnosticMessages for GithubActionsFormatter {}
+impl DiagnosticMessages for GithubActionsFormatter {
+    fn sibling_match_label(&self) -> &'static str {
+        "matched release tag"
+    }
+}
 
 impl DiagnosticPolicy for GithubActionsFormatter {}
 
@@ -999,7 +1012,7 @@ mod tests {
         let mut index = TagIndex::default();
         index.insert_sha_pin(
             CommitSha::parse(&sha).unwrap(),
-            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+            deps_core::lsp_helpers::ResolvedPin::most_specific(deps_core::ConcreteVersion::new(
                 "v4.0.0",
             )),
         );
@@ -1042,7 +1055,7 @@ mod tests {
         let mut index = TagIndex::default();
         index.insert_sha_pin(
             CommitSha::parse(&sha).unwrap(),
-            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+            deps_core::lsp_helpers::ResolvedPin::most_specific(deps_core::ConcreteVersion::new(
                 "v4.0.0",
             )),
         );
@@ -1093,7 +1106,7 @@ mod tests {
         let mut index = TagIndex::default();
         index.insert_sha_pin(
             CommitSha::parse(&sha).unwrap(),
-            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+            deps_core::lsp_helpers::ResolvedPin::most_specific(deps_core::ConcreteVersion::new(
                 format!("v{}", "1".repeat(MAX_REQUIREMENT_LEN)),
             )),
         );
@@ -1128,7 +1141,7 @@ mod tests {
         let mut index = TagIndex::default();
         index.insert_sha_pin(
             CommitSha::parse(&sha).unwrap(),
-            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+            deps_core::lsp_helpers::ResolvedPin::most_specific(deps_core::ConcreteVersion::new(
                 "v4.0.0",
             )),
         );
@@ -1370,7 +1383,7 @@ mod tests {
         let mut index = TagIndex::default();
         index.insert_sha_pin(
             CommitSha::parse(&sha).unwrap(),
-            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+            deps_core::lsp_helpers::ResolvedPin::most_specific(deps_core::ConcreteVersion::new(
                 "v1",
             )),
         );
@@ -1387,7 +1400,7 @@ mod tests {
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v1")))
+            Some(ResolvedPin::most_specific(ConcreteVersion::new("v1")))
         );
     }
 
@@ -1402,7 +1415,7 @@ mod tests {
         let mut index = TagIndex::default();
         index.insert_sha_pin(
             CommitSha::parse(&sha).unwrap(),
-            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+            deps_core::lsp_helpers::ResolvedPin::most_specific(deps_core::ConcreteVersion::new(
                 "cargo-deny",
             )),
         );
@@ -1418,7 +1431,7 @@ mod tests {
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            Some(ResolvedPin::MostSpecific(ConcreteVersion::new(
+            Some(ResolvedPin::most_specific(ConcreteVersion::new(
                 "cargo-deny"
             )))
         );
@@ -1433,7 +1446,7 @@ mod tests {
         let mut index = TagIndex::default();
         index.insert_sha_pin(
             CommitSha::parse(&sha).unwrap(),
-            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+            deps_core::lsp_helpers::ResolvedPin::most_specific(deps_core::ConcreteVersion::new(
                 "v4.2.0",
             )),
         );
@@ -1449,7 +1462,7 @@ mod tests {
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v4.2.0")))
+            Some(ResolvedPin::most_specific(ConcreteVersion::new("v4.2.0")))
         );
     }
 
@@ -1474,11 +1487,11 @@ mod tests {
         let warm = [("v4", sha.as_str()), ("v4.2.2", sha.as_str())];
         assert_eq!(
             floating_tag_pin_for("v4", &warm),
-            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v4.2.2")))
+            Some(ResolvedPin::most_specific(ConcreteVersion::new("v4.2.2")))
         );
         assert_eq!(
             floating_tag_pin_for("v4", &[("v4", sha.as_str())]),
-            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v4")))
+            Some(ResolvedPin::most_specific(ConcreteVersion::new("v4")))
         );
     }
 
@@ -1495,7 +1508,7 @@ mod tests {
         ];
         assert_eq!(
             floating_tag_pin_for("v4", &tags),
-            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v4.1.0")))
+            Some(ResolvedPin::most_specific(ConcreteVersion::new("v4.1.0")))
         );
     }
 
@@ -1508,14 +1521,14 @@ mod tests {
             let tags = [("v4", sha.as_str()), (other, sha.as_str())];
             assert_eq!(
                 floating_tag_pin_for("v4", &tags),
-                Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v4"))),
+                Some(ResolvedPin::most_specific(ConcreteVersion::new("v4"))),
                 "{other}: only the written tag itself remains, which is not a full version"
             );
         }
         let tags = [("v4", sha.as_str()), ("v4.2.2", sha.as_str())];
         assert_eq!(
             floating_tag_pin_for("v4", &tags),
-            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v4.2.2")))
+            Some(ResolvedPin::most_specific(ConcreteVersion::new("v4.2.2")))
         );
         let tags = [
             ("v4", sha.as_str()),
@@ -1524,19 +1537,72 @@ mod tests {
         ];
         assert_eq!(
             floating_tag_pin_for("v4", &tags),
-            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v4.2.2")))
+            Some(ResolvedPin::most_specific(ConcreteVersion::new("v4.2.2")))
         );
     }
 
-    /// #1684 (critic N3): exact tags, missing tags and a cold index stay on the text path.
+    /// #1684 (critic N3): missing tags and a cold index stay on the text path.
     #[test]
-    fn test_resolved_pin_version_exact_or_unindexed_tag_returns_none() {
+    fn test_resolved_pin_version_unindexed_tag_returns_none() {
         let sha = "a".repeat(40);
         let warm = [("v4", sha.as_str()), ("v4.1.2", sha.as_str())];
-        assert_eq!(floating_tag_pin_for("v4.1.2", &warm), None);
         assert_eq!(floating_tag_pin_for("v5", &warm), None);
         assert_eq!(floating_tag_pin_for("V4", &warm), None);
         assert_eq!(floating_tag_pin_for("v4", &[]), None);
+    }
+
+    fn sibling_names(pin: &ResolvedPin) -> Vec<&str> {
+        pin.siblings().iter().map(|t| t.as_str()).collect()
+    }
+
+    /// #1709/#1719: an exact tag pin stays primary and gains the same-major releases on its
+    /// commit as siblings; other majors stay out.
+    #[test]
+    fn test_resolved_pin_version_exact_tag_keeps_written_primary_with_same_major_siblings() {
+        let sha = "a".repeat(40);
+        let warm = [
+            ("v4.8.0", sha.as_str()),
+            ("v4.9.0", sha.as_str()),
+            ("v5.0.0", sha.as_str()),
+        ];
+        let pin = floating_tag_pin_for("v4.8.0", &warm).unwrap();
+        assert_eq!(pin.version().as_str(), "v4.8.0");
+        assert_eq!(sibling_names(&pin), ["v4.9.0"]);
+        let pin = floating_tag_pin_for("v4.9.0", &warm).unwrap();
+        assert_eq!(pin.version().as_str(), "v4.9.0");
+        assert_eq!(sibling_names(&pin), ["v4.8.0"]);
+    }
+
+    /// #1709 (N3): a non-full-semver tag pin never takes the exact-tag path.
+    #[test]
+    fn test_resolved_pin_version_non_semver_tag_pin_is_not_resolved_as_exact() {
+        let sha = "a".repeat(40);
+        let warm = [("release-x", sha.as_str()), ("release-y", sha.as_str())];
+        assert_eq!(floating_tag_pin_for("release-x", &warm), None);
+    }
+
+    /// #1709: a SHA pin carries every release on its commit, across majors (#1719).
+    #[test]
+    fn test_resolved_pin_version_sha_pin_carries_cross_major_siblings() {
+        let pin = resolved_pin_for_tags(&["v5.0.0", "v4.8.0", "v4.9.0"]).unwrap();
+        assert_eq!(pin.version().as_str(), "v4.8.0");
+        assert_eq!(sibling_names(&pin), ["v4.9.0", "v5.0.0"]);
+    }
+
+    /// #1709 (M6): parsed GitHub Actions dependencies never carry a synthetic name range, so
+    /// their scan key is per-occurrence.
+    #[test]
+    fn test_parsed_dependencies_have_real_name_ranges() {
+        let content = format!(
+            "steps:\n  - uses: actions/checkout@{}\n  - uses: actions/checkout@v4.8.0\n",
+            "a".repeat(40)
+        );
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let parsed = crate::parser::parse_workflow_yaml(&content, &uri).unwrap();
+        assert_eq!(parsed.dependencies.len(), 2);
+        for dep in deps_core::ParseResult::dependencies(&parsed) {
+            assert!(!dep.name_range_is_synthetic());
+        }
     }
 
     /// #1684: the shared `pinned_commit` helper returns `None` for an exact tag even when
@@ -1583,7 +1649,7 @@ mod tests {
     /// tag extends it.
     #[test]
     fn test_resolved_pin_version_classifies_two_component_release_and_alias() {
-        let most_specific = |tag: &str| Some(ResolvedPin::MostSpecific(ConcreteVersion::new(tag)));
+        let most_specific = |tag: &str| Some(ResolvedPin::most_specific(ConcreteVersion::new(tag)));
         assert_eq!(
             resolved_pin_for_tags(&["v2", "v2.9"]),
             most_specific("v2.9")
@@ -1599,7 +1665,7 @@ mod tests {
         );
         assert_eq!(
             resolved_pin_for_tags(&["v2.9", "v2.9.1.4"]),
-            Some(ResolvedPin::Alias(ConcreteVersion::new("v2.9")))
+            Some(ResolvedPin::alias(ConcreteVersion::new("v2.9")))
         );
     }
 

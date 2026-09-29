@@ -508,6 +508,32 @@ pub struct ScanTarget {
     /// than send it to OSV.
     #[raw]
     pub display_version: ConcreteVersion,
+    /// Other release tags naming the same commit as [`Self::version`]; an advisory affecting any
+    /// of them affects the dependency. Set only via [`Self::with_siblings`].
+    #[raw]
+    siblings: Vec<ScanVersion>,
+}
+
+/// One sibling release tag of a [`ScanTarget`]: the same wire/native split as the target's own
+/// `version`/`display_version`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanVersion {
+    version: OsvVersion,
+    display_version: ConcreteVersion,
+}
+
+impl ScanVersion {
+    /// The version in OSV's wire spelling.
+    #[must_use]
+    pub const fn version(&self) -> &OsvVersion {
+        &self.version
+    }
+
+    /// The version in the ecosystem's native spelling, for display.
+    #[must_use]
+    pub const fn display_version(&self) -> &ConcreteVersion {
+        &self.display_version
+    }
 }
 
 impl ScanTarget {
@@ -543,7 +569,38 @@ impl ScanTarget {
             osv_name,
             version,
             display_version,
+            siblings: Vec::new(),
         }
+    }
+
+    /// Attaches the sibling release tags of `versions`, deriving each wire version via
+    /// `naming.osv_version`.
+    ///
+    /// Taking [`crate::lsp_helpers::InUseVersions`] (which only
+    /// [`crate::lsp_helpers::resolve_in_use_versions`] produces) keeps arbitrary tags from being
+    /// attached. Only [`crate::osv::OsvClient`]'s local-matching path evaluates siblings; a
+    /// server-side matched target carrying any is skipped fail-closed.
+    #[must_use]
+    pub fn with_siblings(
+        mut self,
+        versions: &crate::lsp_helpers::InUseVersions,
+        naming: &dyn crate::lsp_helpers::OsvNaming,
+    ) -> Self {
+        self.siblings = versions
+            .siblings()
+            .iter()
+            .map(|native| ScanVersion {
+                version: naming.osv_version(native),
+                display_version: native.clone(),
+            })
+            .collect();
+        self
+    }
+
+    /// The sibling release tags attached via [`Self::with_siblings`].
+    #[must_use]
+    pub fn siblings(&self) -> &[ScanVersion] {
+        &self.siblings
     }
 
     /// Constructs a `ScanTarget` from a native (ecosystem-spelled) version, deriving the wire
@@ -597,6 +654,7 @@ mod scan_target_debug_redaction_tests {
             ),
             version: OsvVersion::new("1.0.0"),
             display_version: ConcreteVersion::new("1.0.0"),
+            siblings: Vec::new(),
         },
     );
 }
@@ -1017,6 +1075,73 @@ pub struct DependencyVulnerabilities {
     /// `deps-core`'s `lsp_helpers::code_actions::fix_target_is_verified` (the actual gate
     /// `generate_code_actions` uses) for the full contract, rather than re-deriving it ad hoc.
     pub fix_target_status: UpgradeStatus,
+    /// For advisories matched only through a sibling release tag of the scanned commit, which
+    /// tags they matched; `None` when no advisory matched that way. Read through
+    /// [`Self::sibling_match`].
+    pub(crate) sibling_matches: Option<SiblingMatches>,
+}
+
+/// Sibling release tags an advisory matched, never empty by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedTags {
+    first: ConcreteVersion,
+    rest: Vec<ConcreteVersion>,
+}
+
+impl MatchedTags {
+    pub(crate) fn from_tags(tags: Vec<ConcreteVersion>) -> Option<Self> {
+        let mut tags = tags.into_iter();
+        let first = tags.next()?;
+        Some(Self {
+            first,
+            rest: tags.collect(),
+        })
+    }
+
+    /// The matched tags, lowest version first.
+    pub fn iter(&self) -> impl Iterator<Item = &ConcreteVersion> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+}
+
+/// Sibling tags matched per advisory id, bound to the scanned primary version.
+///
+/// Holds only advisories that do not match the primary itself. Built only by
+/// [`crate::osv::OsvClient`], so tags can never exist without their primary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiblingMatches {
+    primary: OsvVersion,
+    tags: HashMap<String, MatchedTags>,
+}
+
+impl SiblingMatches {
+    pub(crate) fn new(primary: OsvVersion) -> Self {
+        Self {
+            primary,
+            tags: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn insert(&mut self, id: String, tags: MatchedTags) {
+        self.tags.insert(id, tags);
+    }
+
+    /// Whether `advisory` matched only through a sibling and its fix does not lie above the
+    /// scanned primary version: following it would rewrite the pin to the same or an older release.
+    fn fix_is_not_an_upgrade(&self, advisory: &Advisory) -> bool {
+        let (Some(fixed), true) = (
+            advisory.fixed_versions.last(),
+            self.tags.contains_key(&advisory.id),
+        ) else {
+            return false;
+        };
+        super::compare_version_strings(fixed.as_str(), self.primary.as_str())
+            != std::cmp::Ordering::Greater
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.tags.is_empty()
+    }
 }
 
 impl DependencyVulnerabilities {
@@ -1037,11 +1162,43 @@ impl DependencyVulnerabilities {
     /// assert!(dv.advisories.items().is_empty());
     /// ```
     #[must_use]
-    pub const fn new(advisories: Capped<Arc<Advisory>>) -> Self {
+    pub fn new(advisories: Capped<Arc<Advisory>>) -> Self {
         Self {
             advisories,
             fix_target_status: UpgradeStatus::NotChecked,
+            sibling_matches: None,
         }
+    }
+
+    /// Attaches the sibling-tag matches. See [`Self::sibling_match`].
+    #[must_use]
+    pub(crate) fn with_sibling_matches(mut self, sibling_matches: SiblingMatches) -> Self {
+        self.sibling_matches = Some(sibling_matches);
+        self
+    }
+
+    /// The sibling release tags advisory `id` matched instead of the scanned primary version;
+    /// `None` when it matched the primary version itself.
+    #[must_use]
+    pub fn sibling_match(&self, id: &str) -> Option<&MatchedTags> {
+        self.sibling_matches.as_ref()?.tags.get(id)
+    }
+
+    /// Whether any advisory matched only through a sibling release tag.
+    #[must_use]
+    pub const fn has_sibling_matches(&self) -> bool {
+        self.sibling_matches.is_some()
+    }
+
+    /// Whether the "fixed in" version of `advisory` may be shown or followed as an upgrade: false
+    /// for an advisory matched only through a sibling whose fix is not newer than the scanned
+    /// version, since following it would keep or lower the pin.
+    #[must_use]
+    pub fn fix_is_upgrade(&self, advisory: &Advisory) -> bool {
+        !self
+            .sibling_matches
+            .as_ref()
+            .is_some_and(|m| m.fix_is_not_an_upgrade(advisory))
     }
 
     /// Attaches the independent verification of the recommended fix target. See
@@ -1251,6 +1408,7 @@ impl DependencyVulnerabilities {
             .map(Arc::as_ref)
             .filter(|a| !a.fixed_versions.is_empty())
             .filter(|a| !still_applying.contains(&a.id))
+            .filter(|a| self.fix_is_upgrade(a))
             .collect();
 
         if claimed.is_empty() {
@@ -1961,7 +2119,7 @@ pub fn vulnerability_keys(
     formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     ecosystem: crate::EcosystemId,
 ) -> VulnKeys {
-    use crate::lsp_helpers::resolve_in_use_version;
+    use crate::lsp_helpers::resolve_in_use_versions;
 
     let deps = parse_result.dependencies();
 
@@ -1977,7 +2135,7 @@ pub fn vulnerability_keys(
         .map(|dep| {
             let name = formatter.normalize_package_name(dep.name());
             let signature = if formatter.source_is_public_registry_content(&dep.source()) {
-                match resolve_in_use_version(
+                match resolve_in_use_versions(
                     *dep,
                     &name,
                     resolved,
@@ -1985,7 +2143,14 @@ pub fn vulnerability_keys(
                     formatter,
                     ecosystem,
                 ) {
-                    Some(v) => format!("v:{v}"),
+                    Some(v) => {
+                        let mut signature = format!("v:{}", v.primary());
+                        for sibling in v.siblings() {
+                            signature.push(' ');
+                            signature.push_str(sibling.as_str());
+                        }
+                        signature
+                    }
                     None => "u".to_string(),
                 }
             } else {
@@ -2435,6 +2600,7 @@ mod recommended_fix_tests {
     fn dv(advisories: Vec<Arc<Advisory>>) -> DependencyVulnerabilities {
         let total = advisories.len();
         DependencyVulnerabilities {
+            sibling_matches: None,
             advisories: Capped::new(advisories, total),
             fix_target_status: UpgradeStatus::NotChecked,
         }
@@ -2578,6 +2744,7 @@ mod advisories_for_display_tests {
 
     fn dv(advisories: Vec<Arc<Advisory>>, total: usize) -> DependencyVulnerabilities {
         DependencyVulnerabilities {
+            sibling_matches: None,
             advisories: Capped::new(advisories, total),
             fix_target_status: UpgradeStatus::NotChecked,
         }
@@ -3437,6 +3604,98 @@ mod vulnerability_keys_candidates_tests {
         assert!(
             keys.get(&deps[1].name_range()).is_some(),
             "the real dependency's own range must still be present"
+        );
+    }
+
+    /// Resolves each occurrence's `version_requirement()` text to a fixed tag set on one commit.
+    struct PinByRequirementFormatter;
+
+    impl crate::lsp_helpers::PackageNaming for PinByRequirementFormatter {}
+    impl crate::lsp_helpers::PackageRendering for PinByRequirementFormatter {
+        fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+            version.to_string()
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.as_str().to_string()
+        }
+    }
+    impl crate::lsp_helpers::RequirementResolution for PinByRequirementFormatter {
+        fn resolved_pin_version(
+            &self,
+            dep: &dyn crate::Dependency,
+        ) -> Option<crate::lsp_helpers::ResolvedPin> {
+            let tags: &[&str] = match dep.version_requirement()?.as_str() {
+                "with-sibling" => &["v4.8.0", "v4.9.0"],
+                _ => &["v4.8.0"],
+            };
+            let sha = crate::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap();
+            let index = crate::lsp_helpers::TagIndex::from_tags(tags.iter().map(|t| (*t, &sha)));
+            index.resolved_pin(sha.as_str())
+        }
+    }
+    impl crate::lsp_helpers::DiagnosticMessages for PinByRequirementFormatter {}
+    impl crate::lsp_helpers::DiagnosticPolicy for PinByRequirementFormatter {}
+    impl crate::lsp_helpers::SourcePolicy for PinByRequirementFormatter {}
+    impl crate::lsp_helpers::OsvNaming for PinByRequirementFormatter {}
+
+    /// #1709 (M6): synthetic-range occurrences of one name have no per-occurrence key, so they
+    /// share the plain normalized-name key however their sibling sets differ (known caveat).
+    #[test]
+    fn synthetic_range_occurrences_share_the_plain_key() {
+        use crate::lsp_helpers::test_support::{MockMixedParseResult, MockSyntheticRangeDep};
+
+        let parse_result = MockMixedParseResult {
+            deps: vec![
+                Box::new(MockSyntheticRangeDep {
+                    name: PackageName::new("actions/checkout"),
+                }),
+                Box::new(MockSyntheticRangeDep {
+                    name: PackageName::new("actions/checkout"),
+                }),
+            ],
+            uri: crate::test_util::test_uri("/test/workflow.yml"),
+        };
+        let keys = vulnerability_keys(
+            &parse_result,
+            &std::collections::HashMap::new(),
+            None,
+            &PinByRequirementFormatter,
+            EcosystemId::GithubActions,
+        );
+        let deps = parse_result.dependencies();
+        let key = |i: usize| vuln_key_for(deps[i], Some(&keys), &PinByRequirementFormatter);
+        assert_eq!(key(0), key(1));
+        assert_eq!(key(0).as_str(), "actions/checkout");
+    }
+
+    /// #1709: two occurrences sharing a primary tag but not their sibling sets must not share a
+    /// key, or the dedup in `build_scan_targets` would drop the one carrying siblings.
+    #[test]
+    fn vulnerability_keys_differ_when_only_the_sibling_set_differs() {
+        use crate::lsp_helpers::test_support::MockParseResult;
+
+        let dep = |requirement: &str, line: u32| MockDep {
+            name: PackageName::new("actions/checkout"),
+            version_req: VersionReq::new(requirement),
+            version_range: Range::new(Position::new(line, 10), Position::new(line, 20)),
+            name_range: Range::new(Position::new(line, 0), Position::new(line, 8)),
+        };
+        let parse_result = MockParseResult {
+            deps: vec![dep("with-sibling", 0), dep("alone", 1)],
+            uri: crate::test_util::test_uri("/test/workflow.yml"),
+        };
+
+        let keys = vulnerability_keys(
+            &parse_result,
+            &std::collections::HashMap::new(),
+            None,
+            &PinByRequirementFormatter,
+            EcosystemId::GithubActions,
+        );
+        let deps = parse_result.dependencies();
+        assert_ne!(
+            keys.get(&deps[0].name_range()),
+            keys.get(&deps[1].name_range())
         );
     }
 }

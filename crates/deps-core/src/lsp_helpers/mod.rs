@@ -81,8 +81,8 @@ pub use formatter::{
     up_to_date_for_comparators_via_compiled_matcher, up_to_date_via_compiled_matcher,
 };
 pub use git_ref::{
-    CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, ResolvedPin, ShaPinLookup, TagIndex,
-    byte_span_to_range, extends_tag, is_full_sha, is_null_tag, is_partial_semver_shaped,
+    CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, ResolvedPin, ShaPinLookup, SiblingTags,
+    TagIndex, byte_span_to_range, extends_tag, is_full_sha, is_null_tag, is_partial_semver_shaped,
     is_plain_null, is_tag_shaped, locate_value_span, marker_byte_offset, match_v_prefix_style,
 };
 #[cfg(feature = "lsp-responses")]
@@ -94,8 +94,8 @@ pub use hover::{CMD_DOT_FOOTER, generate_hover};
 #[cfg(feature = "lsp-responses")]
 pub use hover_markdown::{FieldKind, HoverMarkdown, SafeNumber};
 pub use in_use_version::{
-    concrete_pin_version, has_unqueryable_resolved_pin, is_full_semver_shape,
-    resolve_in_use_version,
+    InUseVersions, concrete_pin_version, has_unqueryable_resolved_pin, is_full_semver_shape,
+    resolve_in_use_version, resolve_in_use_versions,
 };
 #[cfg(feature = "lsp-responses")]
 pub use inlay_hints::generate_inlay_hints;

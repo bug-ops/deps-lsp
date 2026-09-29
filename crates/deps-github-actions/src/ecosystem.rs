@@ -1899,6 +1899,103 @@ mod tests {
             );
         }
 
+        /// #1709/#1718: an advisory introduced in `v4.9.0` is reported against an exact `@v4.8.0`
+        /// pin whose commit also carries `v4.9.0`, and hover/diagnostics name that release tag.
+        #[tokio::test]
+        async fn test_sibling_release_tag_match_is_named_in_hover_and_diagnostics() {
+            use deps_core::ConcreteVersion;
+            use deps_core::lsp_helpers::CommitSha;
+            use deps_core::osv::{OsvClient, OsvPackageName, OsvQueryName, ScanTarget};
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(Arc::clone(&cache));
+            let name = "actions/checkout";
+            let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+            eco.formatter.tag_index.insert(
+                deps_core::PackageName::new(name),
+                Arc::new(TagIndex::from_tags([("v4.8.0", &sha), ("v4.9.0", &sha)])),
+            );
+
+            let mut server = mockito::Server::new_async().await;
+            let _batch = server
+                .mock("POST", "/v1/querybatch")
+                .with_status(200)
+                .with_body(r#"{"results":[{"vulns":[{"id":"GHSA-aaaa-bbbb-cccc","modified":"2025-01-01T00:00:00Z"}]}]}"#)
+                .create_async()
+                .await;
+            let _record = server
+                .mock("GET", "/v1/vulns/GHSA-aaaa-bbbb-cccc")
+                .with_status(200)
+                .with_body(
+                    r#"{"id":"GHSA-aaaa-bbbb-cccc","modified":"2025-01-01T00:00:00Z","summary":"Introduced late",
+                    "affected":[{"package":{"name":"actions/checkout","ecosystem":"GitHub Actions"},
+                    "ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"4.9.0"},{"fixed":"4.9.1"}]}]}]}"#,
+                )
+                .create_async()
+                .await;
+            let osv = OsvClient::for_test(cache, server.url());
+            let target = ScanTarget::from_native(
+                deps_core::test_util::vuln_key(name),
+                OsvQueryName::Confirmed(OsvPackageName::new(name).unwrap()),
+                ConcreteVersion::new("v4.8.0"),
+                &eco.formatter,
+            )
+            .with_siblings(
+                &deps_core::lsp_helpers::InUseVersions::for_test(
+                    ConcreteVersion::new("v4.8.0"),
+                    vec![ConcreteVersion::new("v4.9.0")],
+                ),
+                &eco.formatter,
+            );
+            let vulns = osv
+                .scan(
+                    deps_core::EcosystemId::GithubActions,
+                    &[target],
+                    std::time::Duration::from_secs(30),
+                )
+                .await;
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let parse_result = eco
+                .parse_manifest("steps:\n  - uses: actions/checkout@v4.8.0\n", &uri)
+                .await
+                .unwrap();
+            let (cached, resolved) = empty_versions();
+            let versions =
+                || deps_core::VersionData::new(&cached, &resolved).with_vulnerabilities(&vulns);
+
+            let diagnostics = eco
+                .generate_diagnostics(
+                    parse_result.as_ref(),
+                    versions(),
+                    &uri,
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::lsp_helpers::DiagnosticSeverities::default(),
+                )
+                .await;
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message().contains("(matched release tag v4.9.0)")),
+                "{diagnostics:?}"
+            );
+
+            let hover = eco
+                .generate_hover(
+                    parse_result.as_ref(),
+                    Position::new(1, 30),
+                    versions().with_network(deps_core::NetworkMode::Offline),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await
+                .expect("hover");
+            assert!(
+                hover.markdown().contains(r"matched release tag v4\.9\.0"),
+                "{}",
+                hover.markdown()
+            );
+        }
+
         // --- issue #633/#640: bulk "Pin all to SHA" collector + lens ---
 
         fn seed_tag(eco: &GithubActionsEcosystem, name: &str, tag: &str, sha: &str) {
@@ -1981,9 +2078,9 @@ mod tests {
             let mut index = TagIndex::default();
             index.insert_sha_pin(
                 deps_core::lsp_helpers::CommitSha::parse(&sha).unwrap(),
-                deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
-                    "v4.0.0",
-                )),
+                deps_core::lsp_helpers::ResolvedPin::most_specific(
+                    deps_core::ConcreteVersion::new("v4.0.0"),
+                ),
             );
             // Needed so `format_version_replacing_for` produces a real replacement for `latest`,
             // or a `tag_to_sha` miss falls back to the unchanged literal and drops the edit.

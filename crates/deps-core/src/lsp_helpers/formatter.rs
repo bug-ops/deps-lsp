@@ -1989,6 +1989,12 @@ pub trait DiagnosticMessages: Send + Sync {
         "This package is deprecated"
     }
 
+    /// Label preceding the sibling release tag(s) an advisory matched instead of the scanned
+    /// primary version, e.g. `matched tag v4.9.0` (#1718).
+    fn sibling_match_label(&self) -> &'static str {
+        "matched tag"
+    }
+
     /// Label for a deprecated package in hover.
     fn deprecated_label(&self) -> &'static str {
         "*(deprecated)*"

@@ -472,6 +472,7 @@ pub async fn check_manifest(
         .await;
 
     let dep_index = DependencyIndex::build(analysis.parse_result.as_ref());
+    // TODO(#1726): mark advisories matched only through a sibling release tag in the report.
     let advisory_severities = advisory_severity_index(analysis.vulnerabilities.as_ref());
     // Same per-occurrence key `vulnerabilities` was built under, so a shared advisory id
     // across two dependencies can never resolve to the wrong one's severity (issue #1077 review #4).

@@ -862,7 +862,7 @@ mod tests {
         let mut index = TagIndex::default();
         index.insert_sha_pin(
             CommitSha::parse(&sha).unwrap(),
-            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+            deps_core::lsp_helpers::ResolvedPin::most_specific(deps_core::ConcreteVersion::new(
                 "v1.2.3",
             )),
         );
@@ -883,7 +883,7 @@ mod tests {
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v1.2.3")))
+            Some(ResolvedPin::most_specific(ConcreteVersion::new("v1.2.3")))
         );
     }
 
@@ -893,7 +893,7 @@ mod tests {
     fn test_resolved_pin_version_classifies_two_component_release_and_alias() {
         use deps_core::lsp_helpers::CommitSha;
 
-        let most_specific = |tag: &str| Some(ResolvedPin::MostSpecific(ConcreteVersion::new(tag)));
+        let most_specific = |tag: &str| Some(ResolvedPin::most_specific(ConcreteVersion::new(tag)));
         let sha = "a".repeat(40);
         let commit = CommitSha::parse(&sha).unwrap();
         for (tags, expected) in [
@@ -902,7 +902,7 @@ mod tests {
             (vec!["v2", "v2.9.1"], most_specific("v2.9.1")),
             (
                 vec!["v2.9", "v2.9.1.4"],
-                Some(ResolvedPin::Alias(ConcreteVersion::new("v2.9"))),
+                Some(ResolvedPin::alias(ConcreteVersion::new("v2.9"))),
             ),
         ] {
             let fmt = formatter();
@@ -935,7 +935,7 @@ mod tests {
         let mut index = TagIndex::default();
         index.insert_sha_pin(
             CommitSha::parse(&sha).unwrap(),
-            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+            deps_core::lsp_helpers::ResolvedPin::most_specific(deps_core::ConcreteVersion::new(
                 "v1.0.0",
             )),
         );
@@ -1162,7 +1162,7 @@ mod tests {
         let upper = HEX_SHA_1723.to_ascii_uppercase();
         assert_eq!(
             fmt.resolved_pin_version(&sha_dep_1723(&upper)),
-            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v1.0.1")))
+            Some(ResolvedPin::most_specific(ConcreteVersion::new("v1.0.1")))
         );
     }
 

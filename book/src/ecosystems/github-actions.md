@@ -88,6 +88,13 @@ without a version and matches their affected ranges locally against the pinned v
   release (for example only `v4`, or an unrelated `v5.0.0`), the tag index is not loaded yet, or
   the pin is a bare major (`@4`), a SHA pin with no resolvable tag, or any other non-SemVer pin,
   it is shown as "not checked", never as clean.
+- A commit often carries several release tags (`v4.8.0` and `v4.9.0`). Every one of them is
+  checked, so an advisory that affects only a sibling tag is still reported, and hover and the
+  diagnostic name it (`matched release tag v4.9.0`). For a SHA pin all release tags on the commit
+  count; for an exact tag pin (`@v4.8.0`) only the releases of the same major version do, and
+  for a floating tag (`@v4`) only the releases that extend the written tag. Pre-release tags are
+  never checked as siblings. A sibling-only advisory whose fix is not newer than the pinned
+  version is not offered as a fix.
 - An advisory exists for the package but its affected range cannot be evaluated: a diagnostic
   notes that vulnerability data was not checked (`UnevaluableAdvisoryRange`).
 - A package with more than 50 advisories is reported as truncated rather than partially matched.

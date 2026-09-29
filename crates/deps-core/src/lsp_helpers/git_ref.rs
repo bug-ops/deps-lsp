@@ -112,30 +112,160 @@ pub struct TagIndex {
     canonical_repo_name: Option<crate::github::CanonicalRepoName>,
 }
 
+/// Other release tags sharing a commit with a [`ResolvedPin`]'s primary tag.
+///
+/// Each has the same specificity class as the primary (a full-semver release next to a
+/// full-semver release, or a `major.minor` release that no other tag extends next to another),
+/// so each is as valid a name for the commit as the primary. Pre-release and non-semver tags
+/// are never siblings. The list is sorted deterministically (lowest version first) and
+/// excludes the primary and spelling duplicates (`4.8.0` next to `v4.8.0`). It can only be
+/// built inside `deps-core` from a [`TagIndex`]; a scan receives it only through
+/// [`crate::lsp_helpers::InUseVersions`]. [`Default`] is the empty list.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{CommitSha, SiblingTags, TagIndex};
+///
+/// assert!(SiblingTags::default().is_empty());
+///
+/// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+/// let index = TagIndex::from_tags([("v4.8.0", &sha), ("v4.9.0", &sha), ("v4.9.1-rc1", &sha)]);
+/// let pin = index.resolved_pin(sha.as_str()).unwrap();
+/// let siblings: Vec<&str> = pin.siblings().iter().map(|t| t.as_str()).collect();
+/// assert_eq!(siblings, ["v4.9.0"]);
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SiblingTags(Vec<crate::ConcreteVersion>);
+
+impl SiblingTags {
+    pub(crate) fn from_candidates<'a>(
+        primary: &str,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let class = tag_specificity_rank(primary).0;
+        let (kind, _, is_release) = class;
+        if !is_release || !matches!(kind, FULL_SEMVER_KIND | PARTIAL_SEMVER_KIND) {
+            return Self::default();
+        }
+        let primary_normalized = crate::github::normalize_tag(primary);
+        let mut ranked: Vec<(TagRank<'a>, &'a str)> = names
+            .into_iter()
+            .map(|n| (tag_specificity_rank(n), n))
+            .collect();
+        let all: Vec<&str> = ranked.iter().map(|(_, n)| *n).collect();
+        ranked.retain(|(rank, n)| {
+            rank.0 == class
+                && crate::github::normalize_tag(n) != primary_normalized
+                && (kind == FULL_SEMVER_KIND
+                    || (tag_components(n).all(|c| c.parse::<u64>().is_ok())
+                        && !all.iter().any(|other| extends_tag(other, n))))
+        });
+        ranked.sort_by(|a, b| b.0.cmp(&a.0));
+        ranked.dedup_by(|a, b| {
+            crate::github::normalize_tag(a.1) == crate::github::normalize_tag(b.1)
+        });
+        Self(
+            ranked
+                .into_iter()
+                .map(|(_, n)| crate::ConcreteVersion::new(n))
+                .collect(),
+        )
+    }
+
+    /// The sibling tags, lowest version first.
+    pub fn iter(&self) -> std::slice::Iter<'_, crate::ConcreteVersion> {
+        self.0.iter()
+    }
+
+    /// Whether the primary tag is the only release name on its commit.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The number of sibling tags.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<'a> IntoIterator for &'a SiblingTags {
+    type Item = &'a crate::ConcreteVersion;
+    type IntoIter = std::slice::Iter<'a, crate::ConcreteVersion>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// A tag resolved from a commit SHA, classified by whether it names a release or is a
 /// moving alias of a more specific tag on the same commit.
 ///
 /// Produced by [`TagIndex::resolved_pin`]; consumed by
 /// [`crate::lsp_helpers::resolve_in_use_version`], which is the only place that decides
-/// whether the tag is precise enough to query a vulnerability database with.
+/// whether the tag is precise enough to query a vulnerability database with. Both variants
+/// carry the other release tags on the same commit ([`SiblingTags`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedPin {
     /// No other tag on the same commit extends this one, so it is the most specific name the
     /// repository published for the commit (`v2.9` next to `v2`, but also a lone `v2`).
-    MostSpecific(crate::ConcreteVersion),
+    MostSpecific {
+        /// The tag text, verbatim as published.
+        tag: crate::ConcreteVersion,
+        /// Other release tags on the same commit.
+        siblings: SiblingTags,
+    },
     /// Another tag on the same commit extends this one (`v2` next to `v2.9`): a moving alias.
-    Alias(crate::ConcreteVersion),
+    Alias {
+        /// The tag text, verbatim as published.
+        tag: crate::ConcreteVersion,
+        /// Other release tags on the same commit.
+        siblings: SiblingTags,
+    },
 }
 
 impl ResolvedPin {
+    /// A [`Self::MostSpecific`] pin without siblings.
+    #[must_use]
+    pub fn most_specific(tag: crate::ConcreteVersion) -> Self {
+        Self::MostSpecific {
+            tag,
+            siblings: SiblingTags::default(),
+        }
+    }
+
+    /// An [`Self::Alias`] pin without siblings.
+    #[must_use]
+    pub fn alias(tag: crate::ConcreteVersion) -> Self {
+        Self::Alias {
+            tag,
+            siblings: SiblingTags::default(),
+        }
+    }
+
     /// The tag text, verbatim as published.
     #[must_use]
     pub const fn version(&self) -> &crate::ConcreteVersion {
         match self {
-            Self::MostSpecific(v) | Self::Alias(v) => v,
+            Self::MostSpecific { tag, .. } | Self::Alias { tag, .. } => tag,
+        }
+    }
+
+    /// Other release tags on the same commit as [`Self::version`].
+    #[must_use]
+    pub const fn siblings(&self) -> &SiblingTags {
+        match self {
+            Self::MostSpecific { siblings, .. } | Self::Alias { siblings, .. } => siblings,
         }
     }
 }
+
+/// [`tag_specificity_rank`] class kind of a full `major.minor.patch` semver name.
+const FULL_SEMVER_KIND: u8 = 2;
+/// [`tag_specificity_rank`] class kind of a partial numeric name (`v2`, `v2.9`).
+const PARTIAL_SEMVER_KIND: u8 = 1;
 
 /// Sort key of [`tag_specificity_rank`]: class, then numeric version order (lower wins), then name.
 type TagRank<'a> = (
@@ -151,14 +281,13 @@ type TagRank<'a> = (
 /// over `v4.10.0`), and the lexicographically smaller name breaks any remaining tie so the
 /// choice never depends on fetch order.
 ///
-/// Only one tag per commit is queried against OSV, so a commit carrying several equally
-/// specific releases can still miss an advisory that affects only the other ones; the lowest
-/// release is preferred because advisories typically name the version that fixed them.
+/// The winner is the commit's primary tag; the other names of its class become its
+/// [`SiblingTags`], which the OSV scan evaluates as well.
 fn tag_specificity_rank(name: &str) -> TagRank<'_> {
     let normalized = crate::github::normalize_tag(name);
     let is_release = !normalized.contains(['-', '+']);
     let (class, semver, numeric) = if let Ok(v) = semver::Version::parse(normalized) {
-        ((2, 0, is_release), Some(v), Vec::new())
+        ((FULL_SEMVER_KIND, 0, is_release), Some(v), Vec::new())
     } else if is_partial_semver_shaped(name) {
         let numeric = normalized
             .split(['-', '+'])
@@ -167,7 +296,15 @@ fn tag_specificity_rank(name: &str) -> TagRank<'_> {
             .split('.')
             .map(|c| c.parse().unwrap_or(u64::MAX))
             .collect();
-        ((1, tag_components(name).count(), is_release), None, numeric)
+        (
+            (
+                PARTIAL_SEMVER_KIND,
+                tag_components(name).count(),
+                is_release,
+            ),
+            None,
+            numeric,
+        )
     } else {
         ((0, 0, false), None, Vec::new())
     };
@@ -250,15 +387,54 @@ impl TagIndex {
             else {
                 continue;
             };
+            let siblings = SiblingTags::from_candidates(best, names.iter().copied());
             let tag = crate::ConcreteVersion::new(best);
             let pin = if names.iter().any(|other| extends_tag(other, best)) {
-                ResolvedPin::Alias(tag)
+                ResolvedPin::Alias { tag, siblings }
             } else {
-                ResolvedPin::MostSpecific(tag)
+                ResolvedPin::MostSpecific { tag, siblings }
             };
             index.sha_to_tag.insert(sha.clone(), pin);
         }
         index
+    }
+
+    /// Resolves the exact tag `written` (`v4.8.0`) to a pin whose primary is that tag itself,
+    /// with the other release tags of the same major line on its commit as siblings.
+    ///
+    /// Unlike [`Self::resolved_pin`] the primary is never re-picked: the user wrote that tag.
+    /// Tags of other majors on the same commit are not siblings. `None` when `written` is not
+    /// in the index.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{CommitSha, TagIndex};
+    ///
+    /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let index = TagIndex::from_tags([("v4.8.0", &sha), ("v4.9.0", &sha), ("v5.0.0", &sha)]);
+    /// let pin = index.resolved_exact_tag("v4.8.0").unwrap();
+    /// assert_eq!(pin.version().as_str(), "v4.8.0");
+    /// assert_eq!(pin.siblings().len(), 1);
+    /// assert!(index.resolved_exact_tag("v9.9.9").is_none());
+    /// ```
+    #[must_use]
+    pub fn resolved_exact_tag(&self, written: &str) -> Option<ResolvedPin> {
+        let sha = self.tag_to_sha.get(written)?;
+        let major = tag_components(written).next();
+        let names: Vec<&str> = self
+            .tag_to_sha
+            .iter()
+            .filter(|(name, other)| *other == sha && tag_components(name).next() == major)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let siblings = SiblingTags::from_candidates(written, names.iter().copied());
+        let tag = crate::ConcreteVersion::new(written);
+        Some(if names.iter().any(|other| extends_tag(other, written)) {
+            ResolvedPin::Alias { tag, siblings }
+        } else {
+            ResolvedPin::MostSpecific { tag, siblings }
+        })
     }
 
     /// Attaches the repository's canonical casing as reported by GitHub.
@@ -1452,7 +1628,7 @@ mod tests {
         for tags in [["v2.9", "v2"], ["v2", "v2.9"]] {
             assert_eq!(
                 resolved_pin_for(&tags),
-                Some(ResolvedPin::MostSpecific(crate::ConcreteVersion::new(
+                Some(ResolvedPin::most_specific(crate::ConcreteVersion::new(
                     "v2.9"
                 ))),
                 "{tags:?}"
@@ -1464,7 +1640,7 @@ mod tests {
     fn test_tag_index_full_semver_beats_two_component_and_major() {
         assert_eq!(
             resolved_pin_for(&["v2", "v2.9", "v2.9.1"]),
-            Some(ResolvedPin::MostSpecific(crate::ConcreteVersion::new(
+            Some(ResolvedPin::most_specific(crate::ConcreteVersion::new(
                 "v2.9.1"
             )))
         );
@@ -1474,17 +1650,112 @@ mod tests {
     fn test_tag_index_lone_major_is_most_specific_but_a_prefix_of_an_unranked_tag_is_alias() {
         assert_eq!(
             resolved_pin_for(&["v2"]),
-            Some(ResolvedPin::MostSpecific(crate::ConcreteVersion::new("v2")))
+            Some(ResolvedPin::most_specific(crate::ConcreteVersion::new(
+                "v2"
+            )))
         );
         // Four components rank below a partial-semver name but still extend it.
         assert_eq!(
             resolved_pin_for(&["v2.9", "v2.9.1.4"]),
-            Some(ResolvedPin::Alias(crate::ConcreteVersion::new("v2.9")))
+            Some(ResolvedPin::alias(crate::ConcreteVersion::new("v2.9")))
         );
     }
 
     fn most_specific(tag: &str) -> Option<ResolvedPin> {
-        Some(ResolvedPin::MostSpecific(crate::ConcreteVersion::new(tag)))
+        Some(ResolvedPin::most_specific(crate::ConcreteVersion::new(tag)))
+    }
+
+    fn sibling_names(pin: &ResolvedPin) -> Vec<&str> {
+        pin.siblings().iter().map(|t| t.as_str()).collect()
+    }
+
+    /// #1709: other release names on the commit become siblings of the primary, in any order.
+    #[test]
+    fn test_sibling_tags_collect_other_releases_in_any_order() {
+        for tags in [["v4.8.0", "v4.9.0"], ["v4.9.0", "v4.8.0"]] {
+            let pin = resolved_pin_for(&tags).unwrap();
+            assert_eq!(pin.version().as_str(), "v4.8.0", "{tags:?}");
+            assert_eq!(sibling_names(&pin), ["v4.9.0"], "{tags:?}");
+        }
+    }
+
+    #[test]
+    fn test_sibling_tags_are_sorted_lowest_first() {
+        let pin = resolved_pin_for(&["v4.10.0", "v4.8.0", "v4.9.0", "v4.11.0"]).unwrap();
+        assert_eq!(pin.version().as_str(), "v4.8.0");
+        assert_eq!(sibling_names(&pin), ["v4.9.0", "v4.10.0", "v4.11.0"]);
+    }
+
+    /// #1709 (M4): aliases, pre-releases, other classes and spelling duplicates are never siblings.
+    #[test]
+    fn test_sibling_tags_exclude_aliases_prereleases_and_duplicates() {
+        let pin = resolved_pin_for(&["v4", "v4.8", "v4.8.0", "v4.9.0-rc1", "4.8.0", "release-x"])
+            .unwrap();
+        assert_eq!(pin.version().as_str().trim_start_matches('v'), "4.8.0");
+        assert!(pin.siblings().is_empty(), "{:?}", pin.siblings());
+    }
+
+    /// #1709: spelling duplicates among siblings collapse to one entry.
+    #[test]
+    fn test_sibling_tags_dedupe_spelling_variants_among_siblings() {
+        let pin = resolved_pin_for(&["v4.8.0", "v4.9.0", "4.9.0"]).unwrap();
+        assert_eq!(pin.version().as_str(), "v4.8.0");
+        assert_eq!(pin.siblings().len(), 1);
+    }
+
+    /// #1709 (G7): two-component releases are siblings unless another tag extends them.
+    #[test]
+    fn test_sibling_tags_two_component_releases() {
+        let pin = resolved_pin_for(&["v2.9", "v2.10"]).unwrap();
+        assert_eq!(sibling_names(&pin), ["v2.10"]);
+        let pin = resolved_pin_for(&["v2.9", "v2.10", "v2.10.0.1"]).unwrap();
+        assert_eq!(pin.version().as_str(), "v2.9");
+        assert!(pin.siblings().is_empty());
+    }
+
+    /// #1709: a prerelease primary has no siblings, not even other prereleases.
+    #[test]
+    fn test_sibling_tags_prerelease_primary_has_none() {
+        let pin = resolved_pin_for(&["v4.9.0-rc1", "v4.9.0-rc2"]).unwrap();
+        assert!(pin.siblings().is_empty());
+    }
+
+    /// #1709: an alias winner (extended by a non-semver 4-component name) keeps its siblings.
+    #[test]
+    fn test_sibling_tags_alias_winner_keeps_siblings() {
+        let pin = resolved_pin_for(&["v1.2.3", "v1.2.4", "v1.2.3.1"]).unwrap();
+        assert!(matches!(pin, ResolvedPin::Alias { .. }));
+        assert_eq!(pin.version().as_str(), "v1.2.3");
+        assert_eq!(sibling_names(&pin), ["v1.2.4"]);
+    }
+
+    /// #1709/#1719: the written exact tag stays primary; only its major line's releases on the
+    /// same commit are siblings.
+    #[test]
+    fn test_resolved_exact_tag_keeps_written_primary_and_same_major_siblings() {
+        let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let other = CommitSha::parse(&"b".repeat(40)).unwrap();
+        let index = TagIndex::from_tags([
+            ("v4.9.0", &sha),
+            ("v4.8.0", &sha),
+            ("v5.0.0", &sha),
+            ("v4.7.0", &other),
+        ]);
+        let pin = index.resolved_exact_tag("v4.9.0").unwrap();
+        assert_eq!(pin.version().as_str(), "v4.9.0");
+        assert_eq!(sibling_names(&pin), ["v4.8.0"]);
+        assert_eq!(index.resolved_exact_tag("v9.9.9"), None);
+    }
+
+    /// #1709: an exact tag extended by another name on its commit is an alias primary; a
+    /// differently spelled twin on the commit is not a sibling.
+    #[test]
+    fn test_resolved_exact_tag_alias_and_spelling_twin() {
+        let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let index = TagIndex::from_tags([("v4.8.0", &sha), ("v4.8.0.1", &sha), ("4.8.0", &sha)]);
+        let pin = index.resolved_exact_tag("v4.8.0").unwrap();
+        assert!(matches!(pin, ResolvedPin::Alias { .. }));
+        assert!(pin.siblings().is_empty());
     }
 
     /// A pre-release never beats its own release, in either fetch order (#1668 critic).
@@ -1510,7 +1781,9 @@ mod tests {
             (["v4.8.0", "v4.9.0"], "v4.8.0"),
             (["v4.9.0", "v4.8.0"], "v4.8.0"),
         ] {
-            assert_eq!(resolved_pin_for(&tags), most_specific(expected), "{tags:?}");
+            let pin = resolved_pin_for(&tags).unwrap();
+            assert_eq!(pin.version().as_str(), expected, "{tags:?}");
+            assert!(matches!(pin, ResolvedPin::MostSpecific { .. }), "{tags:?}");
         }
     }
 
@@ -1591,12 +1864,12 @@ mod tests {
         let mut index = TagIndex::from_tags([("v2.9", &sha), ("v2.9.1.4", &sha)]);
         assert_eq!(
             index.resolved_pin(sha.as_str()),
-            Some(ResolvedPin::Alias(crate::ConcreteVersion::new("v2.9")))
+            Some(ResolvedPin::alias(crate::ConcreteVersion::new("v2.9")))
         );
         assert_eq!(index.tag_for_sha(sha.as_str()), Some("v2.9"));
         index.insert_sha_pin(
             sha.clone(),
-            ResolvedPin::MostSpecific(crate::ConcreteVersion::new("v3.0")),
+            ResolvedPin::most_specific(crate::ConcreteVersion::new("v3.0")),
         );
         assert_eq!(index.resolved_pin(sha.as_str()), most_specific("v3.0"));
     }
