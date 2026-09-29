@@ -19,7 +19,9 @@
 //! the correct versioning, so they stay fully resolvable. The discriminator is whether the
 //! path segments after `owner/repo` start with `.github/workflows/`.
 
-use crate::types::{GithubActionsDependency, GithubActionsParseResult, PinStyle};
+use crate::types::{
+    ClosingDelimiters, GithubActionsDependency, GithubActionsParseResult, PinStyle,
+};
 use deps_core::lsp_helpers::{
     LineOffsetTable, MarkedScalar, byte_span_to_range, is_partial_semver_shaped,
     warn_rejected_value,
@@ -424,6 +426,7 @@ fn build_dependency(
             },
             is_plain_scalar,
             is_last_on_line: true,
+            closing_delimiters: ClosingDelimiters::default(),
         }),
         ParsedUses::Docker => Some(GithubActionsDependency {
             name: trimmed_value.clone().into(),
@@ -435,6 +438,7 @@ fn build_dependency(
             source: DependencySource::Url { url: trimmed_value },
             is_plain_scalar,
             is_last_on_line: true,
+            closing_delimiters: ClosingDelimiters::default(),
         }),
         ParsedUses::NoAt { name } => {
             let name_end = span_start + name.len();
@@ -448,6 +452,7 @@ fn build_dependency(
                 source: DependencySource::Registry,
                 is_plain_scalar,
                 is_last_on_line: true,
+                closing_delimiters: ClosingDelimiters::default(),
             })
         }
         ParsedUses::Ref {
@@ -476,6 +481,7 @@ fn build_dependency(
                     },
                     is_plain_scalar,
                     is_last_on_line: true,
+                    closing_delimiters: ClosingDelimiters::default(),
                 });
             }
 
@@ -529,11 +535,20 @@ fn build_dependency(
 
             if is_full_sha(&ref_text) {
                 // `extract_comment_tag` can't tell this ref's own comment from an unrelated
-                // later token on a flow-style line (#898); gating on `is_last_on_line`
-                // prevents a flow-style continuation from being misread as the comment.
-                let comment = (is_plain_scalar && is_last_on_line)
-                    .then(|| extract_comment_tag(rest_of_line, window))
-                    .flatten();
+                // later token on a flow-style line (#898), so a comment is read only when
+                // nothing but closing delimiters (#1732) sits between the SHA and the `#`.
+                let closing_delimiters = ClosingDelimiters::parse(rest_of_line, candidate.style());
+                let comment = if closing_delimiters.is_empty() {
+                    (is_plain_scalar && is_last_on_line)
+                        .then(|| extract_comment_tag(rest_of_line, window))
+                        .flatten()
+                } else {
+                    let tail = &rest_of_line[closing_delimiters.byte_len()..];
+                    ref_is_last_token_on_line(tail, window)
+                        .then(|| extract_comment_tag(tail, window))
+                        .flatten()
+                        .map(|(tag, end)| (tag, closing_delimiters.byte_len() + end))
+                };
 
                 return Some(match comment {
                     Some((tag, token_end)) => GithubActionsDependency {
@@ -548,6 +563,7 @@ fn build_dependency(
                         source: DependencySource::Registry,
                         is_plain_scalar,
                         is_last_on_line,
+                        closing_delimiters,
                     },
                     None => GithubActionsDependency {
                         name: name.into(),
@@ -559,6 +575,7 @@ fn build_dependency(
                         source: DependencySource::Registry,
                         is_plain_scalar,
                         is_last_on_line,
+                        closing_delimiters: ClosingDelimiters::default(),
                     },
                 });
             }
@@ -578,6 +595,7 @@ fn build_dependency(
                 source: DependencySource::Registry,
                 is_plain_scalar,
                 is_last_on_line,
+                closing_delimiters: ClosingDelimiters::default(),
             })
         }
         ParsedUses::Malformed => {
@@ -893,18 +911,96 @@ mod tests {
     }
 
     #[test]
-    fn test_quoted_sha_with_real_yaml_comment_outside_quotes_degrades_to_bare_sha() {
-        // B3: the comment-tag rule applies only to plain scalars — a quoted scalar skips
-        // the comment scan entirely, even with a genuine YAML comment outside the quotes.
+    fn test_quoted_sha_with_comment_outside_quotes_reads_tag_and_keeps_quote() {
         let sha = "a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5";
-        let content = format!("steps:\n  - uses: \"actions/checkout@{sha}\" # v4.2.0\n");
+        for quote in ['"', '\''] {
+            let content =
+                format!("steps:\n  - uses: {quote}actions/checkout@{sha}{quote} # v4.2.0\n");
+            let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+            let dep = &result.dependencies[0];
+            assert_eq!(
+                dep.pin,
+                Some(PinStyle::Sha {
+                    comment_tag: Some("v4.2.0".to_string())
+                })
+            );
+            assert_eq!(
+                dep.version_literal.as_deref(),
+                Some(format!("{sha}{quote} # v4.2.0").as_str())
+            );
+            assert_eq!(
+                slice(&content, dep.version_range().unwrap()),
+                format!("{sha}{quote} # v4.2.0")
+            );
+            assert_eq!(dep.closing_delimiters.to_string(), quote.to_string());
+            assert!(!dep.is_plain_scalar);
+        }
+    }
+
+    #[test]
+    fn test_flow_sha_with_comment_after_closing_brace_reads_tag() {
+        let sha = "a".repeat(40);
+        let cases = [
+            (format!("{{uses: actions/checkout@{sha}}}"), "}"),
+            (format!("{{uses: \"actions/checkout@{sha}\"}}"), "\"}"),
+            (format!("{{uses: 'actions/checkout@{sha}'}}"), "'}"),
+            (format!("{{ uses: actions/checkout@{sha} }}"), " }"),
+            (format!("{{uses: actions/checkout@{sha}\t}}"), "\t}"),
+            (format!("{{ uses: \"actions/checkout@{sha}\" }}"), "\" }"),
+        ];
+        for (flow, closers) in cases {
+            let content = format!("steps:\n  - {flow} # v4\n");
+            let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+            let dep = &result.dependencies[0];
+            assert_eq!(
+                dep.pin,
+                Some(PinStyle::Sha {
+                    comment_tag: Some("v4".to_string())
+                }),
+                "{flow}"
+            );
+            assert_eq!(
+                slice(&content, dep.version_range().unwrap()),
+                format!("{sha}{closers} # v4"),
+                "{flow}"
+            );
+            assert_eq!(dep.closing_delimiters.to_string(), closers, "{flow}");
+        }
+    }
+
+    #[test]
+    fn test_flow_sha_with_sibling_keys_or_outer_collection_stays_commentless() {
+        let sha = "a".repeat(40);
+        for flow in [
+            format!("{{uses: actions/checkout@{sha}, name: x}}"),
+            format!("{{uses: \"actions/checkout@{sha}\", name: x}}"),
+            format!("{{a: {{uses: actions/checkout@{sha}}}}}"),
+            format!("{{a: {{uses: \"actions/checkout@{sha}\"}}}}"),
+            format!("[{{uses: actions/checkout@{sha}}}]"),
+        ] {
+            let content = format!("steps:\n  - {flow} # v4\n");
+            let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+            let dep = &result.dependencies[0];
+            assert_eq!(dep.pin, Some(PinStyle::Sha { comment_tag: None }), "{flow}");
+            assert!(dep.closing_delimiters.is_empty());
+            assert_eq!(slice(&content, dep.version_range().unwrap()), sha);
+        }
+    }
+
+    #[test]
+    fn test_quoted_sha_comment_range_is_utf16_correct_after_multibyte_prefix() {
+        let sha = "a".repeat(40);
+        let content =
+            format!("steps:\n  - {{name: \"日本\", uses: \"actions/checkout@{sha}\"}} # v4\n");
         let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
-        let dep = &result.dependencies[0];
-        assert_eq!(
-            dep.version_requirement().map(deps_core::VersionReq::as_str),
-            Some(sha)
-        );
-        assert_eq!(dep.pin, Some(PinStyle::Sha { comment_tag: None }));
+        let range = result.dependencies[0].version_range().unwrap();
+        let line = content.lines().nth(1).unwrap();
+        let units: Vec<u16> = line.encode_utf16().collect();
+        let literal = String::from_utf16(
+            &units[range.start.character as usize..range.end.character as usize],
+        )
+        .unwrap();
+        assert_eq!(literal, format!("{sha}\"}} # v4"));
     }
 
     #[test]

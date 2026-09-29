@@ -2,7 +2,9 @@
 
 use deps_core::parser::DependencySource;
 use deps_core::position::Range;
+use std::fmt;
 use url::Url;
+use yaml_rust2::scanner::TScalarStyle;
 
 /// How a `uses:` step's ref is pinned, driving requirement synthesis and edit shape.
 ///
@@ -25,6 +27,110 @@ pub enum PinStyle {
     Branch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delimiter {
+    DoubleQuote,
+    SingleQuote,
+    Space,
+    Tab,
+    CloseBrace,
+}
+
+impl Delimiter {
+    const fn as_char(self) -> char {
+        match self {
+            Self::DoubleQuote => '"',
+            Self::SingleQuote => '\'',
+            Self::Space => ' ',
+            Self::Tab => '\t',
+            Self::CloseBrace => '}',
+        }
+    }
+
+    const fn blank(c: char) -> Option<Self> {
+        match c {
+            ' ' => Some(Self::Space),
+            '\t' => Some(Self::Tab),
+            _ => None,
+        }
+    }
+}
+
+/// The closing quote and flow-mapping `}` between a full-SHA ref and its `# tag` comment.
+///
+/// For instance the closing `"` of `uses: "a/b@<sha>" # v4`, or the `}` of
+/// `{uses: a/b@<sha>} # v4`. Blanks before the `}` (`{ uses: a/b@<sha> } # v4`) are kept.
+///
+/// Non-empty only for a [`PinStyle::Sha`] whose `comment_tag` was read past those
+/// delimiters; every SHA-comment rewrite re-emits them verbatim so the surrounding quote or
+/// flow mapping stays balanced. At most one `}` is accepted: further closers end an outer
+/// collection, where a trailing comment cannot be attributed to this ref. Restricted by
+/// construction to ASCII characters, so its byte length equals its column width.
+///
+/// # Examples
+///
+/// ```
+/// use deps_github_actions::ClosingDelimiters;
+///
+/// let none = ClosingDelimiters::default();
+/// assert!(none.is_empty());
+/// assert_eq!(none.byte_len(), 0);
+/// assert_eq!(none.to_string(), "");
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClosingDelimiters(Vec<Delimiter>);
+
+impl ClosingDelimiters {
+    /// Parses the delimiters at the start of `tail` (the source text after the ref).
+    ///
+    /// A quoted scalar requires its own closing quote first; then blanks followed by one
+    /// flow-mapping `}` may follow. Blanks not followed by `}` are not consumed, and block
+    /// scalars or any other tail shape yield an empty value.
+    pub(crate) fn parse(tail: &str, style: TScalarStyle) -> Self {
+        let opening = match style {
+            TScalarStyle::Plain => None,
+            TScalarStyle::SingleQuoted => Some(Delimiter::SingleQuote),
+            TScalarStyle::DoubleQuoted => Some(Delimiter::DoubleQuote),
+            TScalarStyle::Literal | TScalarStyle::Folded => return Self::default(),
+        };
+        let mut chars = tail.chars();
+        let mut delimiters = Vec::new();
+        if let Some(quote) = opening {
+            if chars.next() != Some(quote.as_char()) {
+                return Self::default();
+            }
+            delimiters.push(quote);
+        }
+        let rest = chars.as_str();
+        let blanks: Vec<Delimiter> = rest.chars().map_while(Delimiter::blank).collect();
+        if rest.chars().nth(blanks.len()) == Some(Delimiter::CloseBrace.as_char()) {
+            delimiters.extend(blanks);
+            delimiters.push(Delimiter::CloseBrace);
+        }
+        Self(delimiters)
+    }
+
+    /// Whether no delimiter sits between the ref and its comment.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Length in bytes (equal to the column width, all delimiters being ASCII).
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl fmt::Display for ClosingDelimiters {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0
+            .iter()
+            .try_for_each(|d| fmt::Write::write_char(f, d.as_char()))
+    }
+}
+
 /// Parsed `uses:` dependency from a GitHub Actions workflow file, with position tracking.
 ///
 /// `name` is `owner/repo` — truncated at the second `/` for a subdirectory action
@@ -43,7 +149,8 @@ pub struct GithubActionsDependency {
     /// non-resolvable source.
     pub version_req: Option<deps_core::VersionReq>,
     /// LSP range of the ref text — for a [`PinStyle::Sha`] with a `comment_tag`, this
-    /// extends through the comment token (`<40hex> # v4.2.0`). `None` for a
+    /// extends through the comment token (`<40hex> # v4.2.0`), including any
+    /// [`ClosingDelimiters`] in between (`<40hex>" # v4.2.0`). `None` for a
     /// non-resolvable source or a bare `uses: owner/repo` with no `@` at all.
     pub version_range: Option<Range>,
     /// The raw literal text `version_range` spans, when it differs from `version_req` —
@@ -82,6 +189,9 @@ pub struct GithubActionsDependency {
     /// finding, issue #633) — see
     /// `crate::formatter::GithubActionsFormatter::sha_pin_replacement_for`'s caller.
     pub is_last_on_line: bool,
+    /// Closing quote/flow closers between the SHA and its `# tag` comment, when
+    /// `version_range` spans them (see [`ClosingDelimiters`]); empty for every other form.
+    pub closing_delimiters: ClosingDelimiters,
 }
 
 deps_core::impl_dependency!(GithubActionsDependency {
@@ -96,10 +206,10 @@ deps_core::impl_dependency!(GithubActionsDependency {
 /// Extracts the raw 40-hex SHA text a `PinStyle::Sha` pin's literal encodes, or `None` for
 /// any other pin style.
 ///
-/// With a comment tag, the SHA is the literal's first whitespace-delimited token — not a
-/// `split_once(" # ")` exact-space match, since the parser's comment-tag rule only
-/// requires the `#` to be *whitespace-preceded* (a tab or double-space gap is a valid
-/// literal too). Without one, `version_req` already *is* the bare SHA.
+/// With a comment tag, the SHA is the literal's leading run of hex digits — not a
+/// `split_once(" # ")` exact-space match, since the `#` only has to be
+/// *whitespace-preceded* and a closing quote/brace may directly follow the SHA. Without
+/// one, `version_req` already *is* the bare SHA.
 ///
 /// Shared by `ecosystem.rs`'s `generate_hover` `**Resolved**` splice and
 /// `formatter.rs`'s `requirement_status_for` ground-truth lookup (#907 review DRY note) so
@@ -109,7 +219,11 @@ pub(crate) fn sha_pin_raw_sha(dep: &GithubActionsDependency) -> Option<&str> {
     match &dep.pin {
         Some(PinStyle::Sha {
             comment_tag: Some(_),
-        }) => dep.version_literal.as_deref()?.split_whitespace().next(),
+        }) => dep
+            .version_literal
+            .as_deref()?
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .next(),
         Some(PinStyle::Sha { comment_tag: None }) => {
             dep.version_req.as_ref().map(deps_core::VersionReq::as_str)
         }
@@ -179,6 +293,37 @@ mod tests {
     }
 
     #[test]
+    fn test_closing_delimiters_parse() {
+        use TScalarStyle::{DoubleQuoted, Folded, Literal, Plain, SingleQuoted};
+        let cases = [
+            (" # v4", Plain, ""),
+            ("\" # v4", DoubleQuoted, "\""),
+            ("' # v4", SingleQuoted, "'"),
+            ("} # v4", Plain, "}"),
+            ("\"} # v4", DoubleQuoted, "\"}"),
+            ("}} # v4", Plain, "}"),
+            ("}}", Plain, "}"),
+            ("\"}} # v4", DoubleQuoted, "\"}"),
+            (" } # v4", Plain, " }"),
+            ("\t } # v4", Plain, "\t }"),
+            ("\" } # v4", DoubleQuoted, "\" }"),
+            ("   # v4", Plain, ""),
+            ("\"  # v4", DoubleQuoted, "\""),
+            (" # v4", DoubleQuoted, ""),
+            ("' # v4", DoubleQuoted, ""),
+            ("\"} # v4", Plain, ""),
+            ("} # v4", Literal, ""),
+            ("} # v4", Folded, ""),
+        ];
+        for (tail, style, expected) in cases {
+            let parsed = ClosingDelimiters::parse(tail, style);
+            assert_eq!(parsed.to_string(), expected, "{tail:?} as {style:?}");
+            assert_eq!(parsed.byte_len(), expected.len(), "{tail:?}");
+            assert_eq!(parsed.is_empty(), expected.is_empty(), "{tail:?}");
+        }
+    }
+
+    #[test]
     fn test_github_actions_dependency_tag_pin() {
         let dep = GithubActionsDependency {
             name: "actions/checkout".into(),
@@ -190,6 +335,7 @@ mod tests {
             source: DependencySource::Registry,
             is_plain_scalar: true,
             is_last_on_line: true,
+            closing_delimiters: ClosingDelimiters::default(),
         };
         assert_eq!(dep.name(), "actions/checkout");
         assert_eq!(
@@ -213,6 +359,7 @@ mod tests {
             source: DependencySource::Registry,
             is_plain_scalar: true,
             is_last_on_line: true,
+            closing_delimiters: ClosingDelimiters::default(),
         };
         assert_eq!(dep.version_literal(), dep.version_literal.as_deref());
         assert_ne!(
@@ -254,6 +401,7 @@ mod tests {
                 source: DependencySource::Registry,
                 is_plain_scalar: true,
                 is_last_on_line: true,
+                closing_delimiters: ClosingDelimiters::default(),
             }],
             uri,
             dependency_truncation: None,

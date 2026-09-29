@@ -776,6 +776,7 @@ mod tests {
                 source: DependencySource::Registry,
                 is_plain_scalar: true,
                 is_last_on_line: true,
+                closing_delimiters: crate::types::ClosingDelimiters::default(),
             }],
             uri: deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml"),
             dependency_truncation: None,
@@ -2375,15 +2376,39 @@ mod tests {
                 ),
                 (
                     format!("  - uses: '{name}@{old}' # v4.0.0"),
-                    format!("  - uses: '{name}@{new}' # v4.0.0"),
+                    format!("  - uses: '{name}@{new}' # v4.3.1"),
                 ),
                 (
                     format!("  - uses: \"{name}@{old}\" # v4.0.0"),
-                    format!("  - uses: \"{name}@{new}\" # v4.0.0"),
+                    format!("  - uses: \"{name}@{new}\" # v4.3.1"),
                 ),
                 (
                     format!("  - {{uses: {name}@{old}}} # v4.0.0"),
-                    format!("  - {{uses: {name}@{new}}} # v4.0.0"),
+                    format!("  - {{uses: {name}@{new}}} # v4.3.1"),
+                ),
+                (
+                    format!("  - {{uses: \"{name}@{old}\"}} # v4.0.0"),
+                    format!("  - {{uses: \"{name}@{new}\"}} # v4.3.1"),
+                ),
+                (
+                    format!("  - {{uses: '{name}@{old}'}} # v4.0.0"),
+                    format!("  - {{uses: '{name}@{new}'}} # v4.3.1"),
+                ),
+                (
+                    format!("  - {{ uses: {name}@{old} }} # v4.0.0"),
+                    format!("  - {{ uses: {name}@{new} }} # v4.3.1"),
+                ),
+                (
+                    format!("  - {{uses: {name}@{old}\t}} # v4.0.0"),
+                    format!("  - {{uses: {name}@{new}\t}} # v4.3.1"),
+                ),
+                (
+                    format!("  - {{ uses: \"{name}@{old}\" }} # v4.0.0"),
+                    format!("  - {{ uses: \"{name}@{new}\" }} # v4.3.1"),
+                ),
+                (
+                    format!("  - {{ uses: {name}@{old} }}"),
+                    format!("  - {{ uses: {name}@{new} }}"),
                 ),
                 (
                     format!("  - {{uses: {name}@{old}, with: {{x: 1}}}} # v4.0.0"),
@@ -2438,8 +2463,8 @@ mod tests {
                     )
                     .await;
                 assert_eq!(newer_count(&after), 0, "{line}: not idempotent: {after:?}");
-                // A trailing comment outside the quotes/flow end is invisible to the parser,
-                // so the stale `# v4.0.0` left behind is not flagged either.
+                // A comment after a flow mapping with sibling keys is deliberately not
+                // attributed to the ref, so the stale `# v4.0.0` left behind is not flagged.
                 assert!(
                     after
                         .iter()
@@ -2549,6 +2574,94 @@ mod tests {
             .await;
             assert_eq!(loud.len(), 2);
             assert!(loud.iter().all(|d| d.severity == Some(Severity::Error)));
+        }
+
+        /// #1732: quoted and flow-mapping SHA pins with a trailing comment are checked for a
+        /// mismatch too, with the range spanning the closing delimiters and the comment;
+        /// a flow mapping with sibling keys is not.
+        #[tokio::test]
+        async fn test_sha_comment_mismatch_diagnostic_for_quoted_and_flow_forms() {
+            let (eco, name, [a, _b, _missing]) = mismatch_fixture();
+            let content = format!(
+                "steps:\n\
+                 \x20 - uses: \"{name}@{a}\" # v2.87.22\n\
+                 \x20 - uses: '{name}@{a}' # v2.87.22\n\
+                 \x20 - {{uses: {name}@{a}}} # v2.87.22\n\
+                 \x20 - {{uses: \"{name}@{a}\"}} # v2.87.22\n\
+                 \x20 - {{uses: {name}@{a}, name: x}} # v2.87.22\n\
+                 \x20 - {{name: \"日本\", uses: \"{name}@{a}\"}} # v2.87.22\n\
+                 \x20 - {{ uses: {name}@{a} }} # v2.87.22\n\
+                 \x20 - {{uses: {name}@{a}\t}} # v2.87.22\n"
+            );
+            let found = sha_comment_diagnostics(
+                &eco,
+                &content,
+                deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            )
+            .await;
+            let lines: Vec<u32> = found.iter().map(|d| d.range.start.line).collect();
+            assert_eq!(lines, [1, 2, 3, 4, 6, 7, 8], "{found:?}");
+            let widths: Vec<u32> = found
+                .iter()
+                .map(|d| d.range.end.character - d.range.start.character)
+                .collect();
+            let tail = " # v2.87.22".len() as u32;
+            assert_eq!(
+                widths,
+                [
+                    41 + tail,
+                    41 + tail,
+                    41 + tail,
+                    42 + tail,
+                    42 + tail,
+                    42 + tail,
+                    42 + tail
+                ],
+                "{found:?}"
+            );
+        }
+
+        /// #1732: a commentless flow-mapping pin must not gain a ` # tag` that would
+        /// swallow its closing `}` (#633); the rewrite stays a bare-SHA swap.
+        #[tokio::test]
+        async fn test_commentless_flow_sha_pin_update_keeps_closing_brace() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+            let (old, new) = ("a".repeat(40), "b".repeat(40));
+            let name = "actions/checkout";
+            eco.formatter.tag_index.insert(
+                deps_core::PackageName::new(name),
+                Arc::new(TagIndex::from_tags([
+                    (
+                        "v4.0.0",
+                        &deps_core::lsp_helpers::CommitSha::parse(&old).unwrap(),
+                    ),
+                    (
+                        "v4.3.1",
+                        &deps_core::lsp_helpers::CommitSha::parse(&new).unwrap(),
+                    ),
+                ])),
+            );
+            let mut cached = HashMap::new();
+            cached.insert(
+                deps_core::PackageName::new(name),
+                deps_core::PackageVersions::latest_only("v4.3.1"),
+            );
+            let resolved = HashMap::new();
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = format!("steps:\n  - {{uses: {name}@{old}}}\n");
+            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let planned = deps_core::edit::collect_update_edits(
+                parse_result.as_ref(),
+                &content,
+                deps_core::VersionData::new(&cached, &resolved),
+                &eco.formatter,
+            );
+            let edits: Vec<_> = planned.into_iter().map(|p| p.edit).collect();
+            assert_eq!(
+                deps_core::edit::apply_edits(&content, &edits),
+                format!("steps:\n  - {{uses: {name}@{new}}}\n")
+            );
         }
 
         /// #1722: a cold cache must produce no mismatch diagnostic.
@@ -3099,6 +3212,36 @@ mod tests {
                     "expected no completion (and no fallback) at character {character} \
                  (sha_end = {sha_end})"
                 );
+            }
+        }
+
+        /// #1732: for a quoted/flow pin the SHA's own end is the closing delimiter's start,
+        /// so the column right after the SHA is not past it and the delimiter's column is.
+        #[tokio::test]
+        async fn test_position_past_sha_pin_own_ref_for_quoted_and_flow_pins() {
+            let sha = "a".repeat(40);
+            let eco = GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            for line in [
+                format!("  - uses: \"actions/checkout@{sha}\" # v4"),
+                format!("  - {{uses: actions/checkout@{sha}}} # v4"),
+                format!("  - {{uses: 'actions/checkout@{sha}'}} # v4"),
+            ] {
+                let content = format!("steps:\n{line}\n");
+                let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+                let start = parse_result.dependencies()[0]
+                    .version_range()
+                    .unwrap()
+                    .start
+                    .character;
+                let past = |character: u32| {
+                    position_past_sha_pin_own_ref(
+                        parse_result.as_ref(),
+                        Position::new(1, character),
+                    )
+                };
+                assert!(!past(start + 40), "{line}");
+                assert!(past(start + 41), "{line}");
             }
         }
 

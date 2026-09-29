@@ -81,8 +81,17 @@ the SHA is absent from a truncated index. Severity defaults to warning and is se
 
 Update-all and the update quickfix rewrite a plain scalar SHA pin to `<new sha> # <tag>`. For a
 quoted or flow-style pin (`uses: 'owner/repo@<sha>'`, `{uses: owner/repo@<sha>, with: {...}}`)
-only the 40-hex SHA is replaced, so the quoting and flow structure stay intact. A trailing
-`# vX` comment outside the quotes is not touched and may be left stale.
+without a comment only the 40-hex SHA is replaced, so the quoting and flow structure stay intact.
+
+### Comments after quotes and flow mappings (issue #1732)
+
+The trailing `# vX` comment is also read, mismatch-checked and rewritten when only the closing
+quote and/or the flow mapping's `}` sit between the SHA and the comment: `uses: "owner/repo@<sha>" # v4`,
+`uses: 'owner/repo@<sha>' # v4`, `{uses: owner/repo@<sha>} # v4`, `{uses: "owner/repo@<sha>"} # v4`.
+Blanks before the `}` (`{ uses: owner/repo@<sha> } # v4`) are accepted too. The rewrite keeps the
+delimiters (`<new sha>" # <new tag>`). A comment after a flow mapping that
+has sibling keys after `uses` (`{uses: owner/repo@<sha>, name: x} # v4`) is ambiguous and not
+attributed to the pin.
 
 ## Mutable-Ref Pinning
 

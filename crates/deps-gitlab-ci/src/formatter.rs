@@ -163,10 +163,11 @@ impl PackageRendering for GitlabCiFormatter {
         version.as_str().to_string()
     }
 
-    /// Preserves `current`'s `v`-prefix style for a normal (Sha/Tag/Branch/unpinned)
-    /// update; `Partial`/`Latest` pins are returned unchanged — bumping `1.2` to `1.3.0`
-    /// changes the pin's *kind*, not just its value, so the shared no-op guard correctly
-    /// suppresses the code action instead of writing a value-changing-but-kind-wrong edit.
+    /// Preserves `current`'s `v`-prefix style for a normal (Tag/unpinned) update;
+    /// `Partial`/`Latest`/`Branch` pins are returned unchanged — bumping `1.2` to `1.3.0`,
+    /// or `main` to a version, changes the pin's *kind*, not just its value, so the shared
+    /// no-op guard correctly suppresses the code action instead of writing a
+    /// value-changing-but-kind-wrong edit (#1729).
     ///
     /// Since #1391, `current` is never an unresolved `$VAR`/`${VAR}`/`%VAR%` GitLab CI
     /// variable reference here — the sole production caller,
@@ -184,11 +185,11 @@ impl PackageRendering for GitlabCiFormatter {
             return self.format_version_for_text_edit(version);
         };
         match &gl_dep.pin {
-            Some(PinStyle::Partial | PinStyle::Latest) => current.to_string(),
+            Some(PinStyle::Partial | PinStyle::Latest | PinStyle::Branch) => current.to_string(),
             Some(PinStyle::Sha) => self
                 .sha_pin_replacement_for(gl_dep.kind.endpoint(), &gl_dep.name, version.as_str())
                 .unwrap_or_else(|| current.to_string()),
-            _ => match_v_prefix_style(current, version.as_str()),
+            Some(PinStyle::Tag) | None => match_v_prefix_style(current, version.as_str()),
         }
     }
 
@@ -1388,20 +1389,21 @@ mod tests {
         );
     }
 
-    /// Regression: an ordinary branch name with no variable syntax must still be treated as a
-    /// normal, bumpable pin — the guard must not over-fire on every `Branch` pin.
+    /// #1729: an ordinary branch pin must never be rewritten into a (v-stripped) version.
     #[test]
-    fn test_format_version_replacing_for_ordinary_branch_still_rewritten() {
+    fn test_format_version_replacing_for_ordinary_branch_is_left_unchanged() {
         let fmt = formatter();
         let d = dep(
             Some(PinStyle::Branch),
             "org/proj",
             DependencySource::Registry,
         );
-        assert_eq!(
-            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("2.0.0"), "main"),
-            "2.0.0"
-        );
+        for version in ["2.0.0", "v2.0.0"] {
+            assert_eq!(
+                fmt.format_version_replacing_for(&d, &ConcreteVersion::new(version), "main"),
+                "main"
+            );
+        }
     }
 
     /// #1365 security audit / #1370: exercises `deps_core::edit::plan_vulnerability_fix` with
