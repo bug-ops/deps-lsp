@@ -11,7 +11,6 @@ use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use deps_core::parser::DependencySource;
 use deps_core::position::Range;
 use regex::Regex;
-use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use url::Url;
 
@@ -257,49 +256,6 @@ fn next_minor(major: &str, minor: &str) -> String {
     format!("{major}.{}.0", minor_num + 1)
 }
 
-/// Byte spans already claimed by an earlier pin-form pass.
-///
-/// Answers "is `[start, end]` contained in a single recorded span" in O(log n). Spans from
-/// different passes may nest or partially overlap, so only non-dominated spans are kept:
-/// starts and ends both strictly increase, making the predecessor by start the one with the
-/// largest end among all spans starting at or before the query.
-#[derive(Default)]
-struct MatchedSpans(BTreeMap<usize, usize>);
-
-impl MatchedSpans {
-    fn contains(&self, start: usize, end: usize) -> bool {
-        self.0
-            .range(..=start)
-            .next_back()
-            .is_some_and(|(_, &max_end)| end <= max_end)
-    }
-
-    fn insert(&mut self, start: usize, end: usize) {
-        if self.contains(start, end) {
-            return;
-        }
-        while let Some((&s, &e)) = self.0.range(start..).next() {
-            if e > end {
-                break;
-            }
-            self.0.remove(&s);
-        }
-        self.0.insert(start, end);
-        debug_assert!(
-            self.0
-                .range(..start)
-                .next_back()
-                .is_none_or(|(_, &e)| e < end)
-                && self
-                    .0
-                    .range(start + 1..)
-                    .next()
-                    .is_none_or(|(_, &e)| e > end),
-            "staircase invariant violated at {start}..{end}"
-        );
-    }
-}
-
 /// Parses a Package.swift file and returns all dependencies with LSP positions.
 ///
 /// Uses regex matching after stripping comments. Byte offsets are preserved
@@ -330,7 +286,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
     // and map back to original content for position calculation.
     // Since stripping only replaces with spaces (same byte length), offsets match.
 
-    let mut matched = MatchedSpans::default();
+    let mut matched = deps_core::MatchedSpans::default();
     // Shared across all 9 pin-form passes below (#796) — the ceiling is per-document, not
     // per-form.
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
@@ -338,11 +294,11 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
     // 1. .package(url:|id: "...", .upToNextMajor(from: "..."))
     for cap in RE_UP_TO_NEXT_MAJOR.captures_iter(&stripped) {
         let full = cap.get(0).unwrap();
-        if matched.contains(full.start(), full.end()) {
+        if matched.contains(&(full.start()..full.end())) {
             continue;
         }
         let Some((url_span, location)) = locate(&cap, content) else {
-            matched.insert(full.start(), full.end());
+            matched.insert(full.start()..full.end());
             continue;
         };
         let ver = cap.name("ver").unwrap();
@@ -354,7 +310,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         let version_req = format!(">={ver_str}, <{}.0.0", next_major(major));
 
         if !budget.allow() {
-            matched.insert(full.start(), full.end());
+            matched.insert(full.start()..full.end());
             continue;
         }
         let (name, source) = resolve_registry_source(location);
@@ -367,17 +323,17 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             url: location.url().to_string(),
             source,
         });
-        matched.insert(full.start(), full.end());
+        matched.insert(full.start()..full.end());
     }
 
     // 2. .package(url:|id: "...", .upToNextMinor(from: "..."))
     for cap in RE_UP_TO_NEXT_MINOR.captures_iter(&stripped) {
         let full = cap.get(0).unwrap();
-        if matched.contains(full.start(), full.end()) {
+        if matched.contains(&(full.start()..full.end())) {
             continue;
         }
         let Some((url_span, location)) = locate(&cap, content) else {
-            matched.insert(full.start(), full.end());
+            matched.insert(full.start()..full.end());
             continue;
         };
         let ver = cap.name("ver").unwrap();
@@ -390,7 +346,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         let version_req = format!(">={ver_str}, <{}", next_minor(major, minor));
 
         if !budget.allow() {
-            matched.insert(full.start(), full.end());
+            matched.insert(full.start()..full.end());
             continue;
         }
         let (name, source) = resolve_registry_source(location);
@@ -403,7 +359,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             url: location.url().to_string(),
             source,
         });
-        matched.insert(full.start(), full.end());
+        matched.insert(full.start()..full.end());
     }
 
     // 3. .package(url: "...", .exact("...")) / exact: "..."
@@ -412,11 +368,11 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         .chain(RE_EXACT_LABELLED.captures_iter(&stripped))
     {
         let full = cap.get(0).unwrap();
-        if matched.contains(full.start(), full.end()) {
+        if matched.contains(&(full.start()..full.end())) {
             continue;
         }
         let Some((url_span, location)) = locate(&cap, content) else {
-            matched.insert(full.start(), full.end());
+            matched.insert(full.start()..full.end());
             continue;
         };
         let ver = cap.name("ver").unwrap();
@@ -426,7 +382,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         let version_req = format!("={ver_str}");
 
         if !budget.allow() {
-            matched.insert(full.start(), full.end());
+            matched.insert(full.start()..full.end());
             continue;
         }
         let (name, source) = resolve_registry_source(location);
@@ -439,17 +395,17 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             url: location.url().to_string(),
             source,
         });
-        matched.insert(full.start(), full.end());
+        matched.insert(full.start()..full.end());
     }
 
     // 4. .package(url: "...", "lower"..<"upper")
     for cap in RE_RANGE_HALF_OPEN.captures_iter(&stripped) {
         let full = cap.get(0).unwrap();
-        if matched.contains(full.start(), full.end()) {
+        if matched.contains(&(full.start()..full.end())) {
             continue;
         }
         let Some((url_span, location)) = locate(&cap, content) else {
-            matched.insert(full.start(), full.end());
+            matched.insert(full.start()..full.end());
             continue;
         };
         let lower = cap.name("lower").unwrap();
@@ -461,7 +417,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         let version_req = format!(">={lower_str}, <{upper_str}");
 
         if !budget.allow() {
-            matched.insert(full.start(), full.end());
+            matched.insert(full.start()..full.end());
             continue;
         }
         let (name, source) = resolve_registry_source(location);
@@ -480,17 +436,17 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             url: location.url().to_string(),
             source,
         });
-        matched.insert(full.start(), full.end());
+        matched.insert(full.start()..full.end());
     }
 
     // 5. .package(url: "...", "lower"..."upper")
     for cap in RE_RANGE_CLOSED.captures_iter(&stripped) {
         let full = cap.get(0).unwrap();
-        if matched.contains(full.start(), full.end()) {
+        if matched.contains(&(full.start()..full.end())) {
             continue;
         }
         let Some((url_span, location)) = locate(&cap, content) else {
-            matched.insert(full.start(), full.end());
+            matched.insert(full.start()..full.end());
             continue;
         };
         let lower = cap.name("lower").unwrap();
@@ -502,7 +458,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         let version_req = format!(">={lower_str}, <={upper_str}");
 
         if !budget.allow() {
-            matched.insert(full.start(), full.end());
+            matched.insert(full.start()..full.end());
             continue;
         }
         let (name, source) = resolve_registry_source(location);
@@ -518,17 +474,17 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             url: location.url().to_string(),
             source,
         });
-        matched.insert(full.start(), full.end());
+        matched.insert(full.start()..full.end());
     }
 
     // 6. .package(url: "...", from: "...")
     for cap in RE_FROM.captures_iter(&stripped) {
         let full = cap.get(0).unwrap();
-        if matched.contains(full.start(), full.end()) {
+        if matched.contains(&(full.start()..full.end())) {
             continue;
         }
         let Some((url_span, location)) = locate(&cap, content) else {
-            matched.insert(full.start(), full.end());
+            matched.insert(full.start()..full.end());
             continue;
         };
         let ver = cap.name("ver").unwrap();
@@ -538,7 +494,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         let version_req = format!(">={ver_str}, <{}.0.0", next_major(ver_str));
 
         if !budget.allow() {
-            matched.insert(full.start(), full.end());
+            matched.insert(full.start()..full.end());
             continue;
         }
         let (name, source) = resolve_registry_source(location);
@@ -551,7 +507,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             url: location.url().to_string(),
             source,
         });
-        matched.insert(full.start(), full.end());
+        matched.insert(full.start()..full.end());
     }
 
     // 7. .package(url: "...", .branch("...")) / branch: "..."
@@ -560,7 +516,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         .chain(RE_URL_BRANCH_LABELLED.captures_iter(&stripped))
     {
         let full = cap.get(0).unwrap();
-        if matched.contains(full.start(), full.end()) {
+        if matched.contains(&(full.start()..full.end())) {
             continue;
         }
         let url = cap.get(1).unwrap();
@@ -572,7 +528,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         let identity = url_to_identity(url_str).unwrap_or_else(|| url_str.to_string());
 
         if !budget.allow() {
-            matched.insert(full.start(), full.end());
+            matched.insert(full.start()..full.end());
             continue;
         }
         dependencies.push(SwiftDependency {
@@ -587,7 +543,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
                 rev: Some(branch_str.to_string()),
             },
         });
-        matched.insert(full.start(), full.end());
+        matched.insert(full.start()..full.end());
     }
 
     // 8. .package(url: "...", .revision("...")) / revision: "..."
@@ -596,7 +552,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         .chain(RE_URL_REVISION_LABELLED.captures_iter(&stripped))
     {
         let full = cap.get(0).unwrap();
-        if matched.contains(full.start(), full.end()) {
+        if matched.contains(&(full.start()..full.end())) {
             continue;
         }
         let url = cap.get(1).unwrap();
@@ -608,7 +564,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         let identity = url_to_identity(url_str).unwrap_or_else(|| url_str.to_string());
 
         if !budget.allow() {
-            matched.insert(full.start(), full.end());
+            matched.insert(full.start()..full.end());
             continue;
         }
         dependencies.push(SwiftDependency {
@@ -623,13 +579,13 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
                 rev: Some(rev_str.to_string()),
             },
         });
-        matched.insert(full.start(), full.end());
+        matched.insert(full.start()..full.end());
     }
 
     // 9. .package(path: "...")
     for cap in RE_PATH.captures_iter(&stripped) {
         let full = cap.get(0).unwrap();
-        if matched.contains(full.start(), full.end()) {
+        if matched.contains(&(full.start()..full.end())) {
             continue;
         }
         let path = cap.get(1).unwrap();
@@ -642,7 +598,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             .to_string();
 
         if !budget.allow() {
-            matched.insert(full.start(), full.end());
+            matched.insert(full.start()..full.end());
             continue;
         }
         dependencies.push(SwiftDependency {
@@ -656,7 +612,7 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
                 path: path_str.to_string(),
             },
         });
-        matched.insert(full.start(), full.end());
+        matched.insert(full.start()..full.end());
     }
 
     Ok(SwiftParseResult {
@@ -1898,99 +1854,6 @@ let package = Package(
     }
 
     #[test]
-    fn test_matched_spans_agree_with_naive_containment() {
-        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
-        let mut next = move |bound: usize| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            usize::try_from(seed % bound as u64).unwrap()
-        };
-        let mut spans = MatchedSpans::default();
-        let mut naive: Vec<(usize, usize)> = Vec::new();
-        for _ in 0..3000 {
-            let start = next(200);
-            let end = start + next(40);
-            let expected = naive.iter().any(|&(s, e)| s <= start && end <= e);
-            assert_eq!(spans.contains(start, end), expected, "{start}..{end}");
-            spans.insert(start, end);
-            naive.push((start, end));
-        }
-    }
-
-    #[test]
-    fn test_matched_spans_named_cases() {
-        struct Case {
-            name: &'static str,
-            recorded: &'static [(usize, usize)],
-            query: (usize, usize),
-            contained: bool,
-        }
-        let cases = [
-            Case {
-                name: "nested inside",
-                recorded: &[(0, 10)],
-                query: (2, 5),
-                contained: true,
-            },
-            Case {
-                name: "encloses recorded",
-                recorded: &[(2, 5)],
-                query: (0, 10),
-                contained: false,
-            },
-            Case {
-                name: "partial overlap",
-                recorded: &[(0, 5)],
-                query: (3, 8),
-                contained: false,
-            },
-            Case {
-                name: "duplicate",
-                recorded: &[(3, 7), (3, 7)],
-                query: (3, 7),
-                contained: true,
-            },
-            Case {
-                name: "adjacent",
-                recorded: &[(0, 5), (5, 10)],
-                query: (3, 8),
-                contained: false,
-            },
-            Case {
-                name: "zero-length inside",
-                recorded: &[(0, 5)],
-                query: (2, 2),
-                contained: true,
-            },
-            Case {
-                name: "zero-length outside",
-                recorded: &[(0, 5)],
-                query: (6, 6),
-                contained: false,
-            },
-            Case {
-                name: "dominated then enclosing",
-                recorded: &[(2, 4), (0, 10)],
-                query: (3, 9),
-                contained: true,
-            },
-        ];
-        for case in cases {
-            let mut spans = MatchedSpans::default();
-            for &(start, end) in case.recorded {
-                spans.insert(start, end);
-            }
-            assert_eq!(
-                spans.contains(case.query.0, case.query.1),
-                case.contained,
-                "{}",
-                case.name
-            );
-        }
-    }
-
-    #[test]
     fn test_path_flood_parses_in_bounded_time() {
         let count = 200_000;
         let content = ".package(path: \"p\"),\n".repeat(count);
@@ -2002,5 +1865,35 @@ let package = Package(
             deps_core::MAX_DEPENDENCIES_PER_DOCUMENT
         );
         assert!(result.dependency_truncation.is_some());
+    }
+
+    #[test]
+    fn test_overlapping_forms_flood_on_one_line_is_linear() {
+        let unit = r#".package(url: "https://github.com/a/b.git", from: "1.0.0") .package(url: "https://github.com/a/b.git", .upToNextMajor(from: "1.0.0")) "#;
+        let content = unit.repeat(50_000);
+        let start = std::time::Instant::now();
+        let result = parse_package_swift(&content, &test_uri()).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(
+            result.dependencies.len(),
+            deps_core::MAX_DEPENDENCIES_PER_DOCUMENT
+        );
+    }
+
+    #[test]
+    fn test_multibyte_prefix_keeps_utf16_columns() {
+        let line = r#"let s = "é😀"; .package(url: "https://github.com/a/b.git", from: "1.0.0")"#;
+        let result = parse_package_swift(line, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let byte = line.find("1.0.0").unwrap();
+        let expected = u32::try_from(line.get(..byte).unwrap().encode_utf16().count()).unwrap();
+        assert_eq!(
+            result.dependencies[0]
+                .version_range
+                .unwrap()
+                .start
+                .character,
+            expected
+        );
     }
 }

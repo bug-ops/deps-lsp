@@ -268,7 +268,7 @@ fn looks_like_a_single_version(s: &str, ecosystem: EcosystemId) -> bool {
         return false;
     }
     if s.contains([
-        '^', '~', '*', '<', '>', ',', '|', '(', ')', '[', ']', ' ', '\t', ':', 'x', 'X',
+        '^', '~', '*', '<', '>', ',', '|', '(', ')', '[', ']', ' ', '\t', ':',
     ]) {
         return false;
     }
@@ -276,7 +276,20 @@ fn looks_like_a_single_version(s: &str, ecosystem: EcosystemId) -> bool {
         return false;
     }
     let core = crate::github::normalize_tag(s);
-    core.chars().next().is_some_and(|c| c.is_ascii_digit())
+    core.chars().next().is_some_and(|c| c.is_ascii_digit()) && !has_wildcard_component(core)
+}
+
+/// Whether `version` carries an `x`/`X` wildcard: any `x`/`X` in the numeric core (before the
+/// first `-`), or a later pre-release dot-component that is exactly `x`/`X`. A pre-release
+/// word merely containing the letter (`experimental`, `dev.x1`) or a leading `-x` identifier
+/// is not a wildcard.
+fn has_wildcard_component(version: &str) -> bool {
+    let (numeric, pre_release) = match version.split_once('-') {
+        Some((numeric, pre)) => (numeric, Some(pre)),
+        None => (version, None),
+    };
+    numeric.contains(['x', 'X'])
+        || pre_release.is_some_and(|pre| pre.split('.').skip(1).any(|c| matches!(c, "x" | "X")))
 }
 
 /// Returns the concrete version text `requirement` denotes, or `None` if
@@ -970,7 +983,7 @@ mod tests {
     #[test]
     fn is_concrete_version_rejects_partials_and_wildcards() {
         // Critique C2: npm/Composer "1.x"/"1.2.x" and bare partials like "1.2" are ranges
-        // (rejected by the `x` reject-char and `ConcreteIfFullVersion`'s
+        // (rejected by the wildcard-component check and `ConcreteIfFullVersion`'s
         // `is_full_semver_shape` gate respectively, #664), and Gradle's "1.+" is dynamic.
         for eco in [EcosystemId::Npm, EcosystemId::Composer] {
             assert!(!is_concrete_version("1.x", eco), "{eco:?}");
@@ -978,6 +991,50 @@ mod tests {
             assert!(!is_concrete_version("1.2", eco), "{eco:?}");
         }
         assert!(!is_concrete_version("1.+", EcosystemId::Gradle));
+    }
+
+    #[test]
+    fn is_concrete_version_accepts_pins_containing_the_letter_x() {
+        for eco in [EcosystemId::Go, EcosystemId::Dart, EcosystemId::Npm] {
+            for pin in [
+                "0.1.0-experimental",
+                "2.0.0-dev.x1",
+                "1.0.0-next",
+                "1.2.3-x",
+                "1.2.3-x.1",
+                "1.0.0-max",
+                "1.0.0-xx",
+            ] {
+                assert!(is_concrete_version(pin, eco), "{pin} {eco:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn is_concrete_version_rejects_wildcard_components() {
+        for eco in [EcosystemId::Go, EcosystemId::Dart] {
+            for wildcard in [
+                "1.x",
+                "1.2.X",
+                "1.*",
+                "x",
+                "X",
+                "x.1",
+                "v1.x",
+                "1..x",
+                "1.x.0",
+                "1.2.xx",
+                "1.x0",
+                "1.2.x-SNAPSHOT",
+                "1.2.x-beta",
+                "1.x-beta",
+                "2.x-dev",
+                "1.2.3-alpha.x",
+                "1.0.0-rc.x",
+            ] {
+                assert!(!is_concrete_version(wildcard, eco), "{wildcard} {eco:?}");
+            }
+        }
     }
 
     #[test]

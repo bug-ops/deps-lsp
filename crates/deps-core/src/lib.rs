@@ -169,6 +169,7 @@ pub mod licenses;
 pub mod lockfile;
 pub mod lsp_helpers;
 pub mod macros;
+pub mod matched_spans;
 pub mod mtime_cache;
 pub mod net_policy;
 pub mod osv;
@@ -286,6 +287,7 @@ pub use lsp_helpers::{
     generate_code_lenses as lsp_generate_code_lenses, generate_hover as lsp_generate_hover,
     generate_inlay_hints as lsp_generate_inlay_hints, single_file_edit, to_ls_uri,
 };
+pub use matched_spans::MatchedSpans;
 pub use mtime_cache::{DEFAULT_MAX_CACHED_FILES, MAX_CACHED_FILE_BYTES, MtimeFileCache};
 pub use package::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
 pub use parser::{

@@ -85,7 +85,7 @@ fn extract_matches(
     line: &str,
     line_u32: u32,
     has_version: bool,
-    matched_positions: &mut Vec<usize>,
+    matched_positions: &mut deps_core::MatchedSpans,
     dependencies: &mut Vec<GradleDependency>,
     budget: &mut deps_core::DependencyBudget,
 ) {
@@ -95,10 +95,9 @@ fn extract_matches(
             continue;
         }
         let start = caps.get(0).map_or(0, |m| m.start());
-        if matched_positions.contains(&start) {
+        if !matched_positions.insert_point(start) {
             continue;
         }
-        matched_positions.push(start);
 
         if !budget.allow() {
             continue;
@@ -149,7 +148,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
         }
 
         let line_u32 = line_idx as u32;
-        let mut matched_positions: Vec<usize> = Vec::new();
+        let mut matched_positions = deps_core::MatchedSpans::default();
 
         extract_matches(
             &RE_WITH_PARENS,
@@ -557,5 +556,19 @@ mod tests {
             "org.springframework.boot:spring-boot-dependencies"
         );
         assert_eq!(result.dependencies[0].version_req, Some("3.2.0".into()));
+    }
+
+    #[test]
+    fn test_versioned_and_versionless_flood_on_one_line_is_linear() {
+        let filler = "implementation 'g:a:1'\n".repeat(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
+        let flood = "api 'g:a:1' api 'g:a' ".repeat(100_000);
+        let content = format!("dependencies {{\n{filler}{flood}\n}}\n");
+        let start = std::time::Instant::now();
+        let result = parse_groovy_dsl(&content, &make_uri()).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(
+            result.dependencies.len(),
+            deps_core::MAX_DEPENDENCIES_PER_DOCUMENT
+        );
     }
 }
