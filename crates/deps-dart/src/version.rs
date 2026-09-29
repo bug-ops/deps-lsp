@@ -28,15 +28,21 @@ impl PrereleaseIdentifier {
     }
 }
 
-/// Splits `version` into its bare numeric-dot core and, if present, its raw prerelease
-/// suffix. Build metadata (after `+`) is discarded first; the prerelease suffix is
-/// everything after the first `-` that follows.
-fn split_core_and_prerelease(version: &str) -> (&str, Option<&str>) {
-    let without_build = version.split('+').next().unwrap_or(version);
+/// Splits `version` into its bare numeric-dot core, raw prerelease suffix (after the first
+/// `-`), and raw build suffix (after the first `+`).
+fn split_version(version: &str) -> (&str, Option<&str>, Option<&str>) {
+    let (without_build, build) = match version.split_once('+') {
+        Some((head, build)) => (head, Some(build)),
+        None => (version, None),
+    };
     match without_build.split_once('-') {
-        Some((core, pre)) => (core, Some(pre)),
-        None => (without_build, None),
+        Some((core, pre)) => (core, Some(pre), build),
+        None => (without_build, None, build),
     }
+}
+
+fn parse_identifiers(suffix: &str) -> Vec<PrereleaseIdentifier> {
+    suffix.split('.').map(PrereleaseIdentifier::parse).collect()
 }
 
 /// Parses a bare numeric-dot core string into its components, leniently taking each
@@ -59,8 +65,10 @@ fn parse_core_parts(core: &str) -> Vec<u64> {
 /// `0`, so `"1.0"` and `"1.0.0"` compare equal), then SemVer 2.0.0 prerelease precedence
 /// (spec §11) applies: a version with no prerelease outranks one with a prerelease of the
 /// same core, and two prereleases are compared identifier-by-identifier, with a longer
-/// identifier list outranking a shared-prefix shorter one. Build metadata (`+...`) is
-/// ignored.
+/// identifier list outranking a shared-prefix shorter one. Unlike SemVer 2.0.0, pub treats
+/// build metadata (`+...`) as significant: it breaks ties last, with the same identifier
+/// ordering as a prerelease, and a version without build metadata sorts below one with it
+/// (`0.8.13` < `0.8.13+1` < `0.8.13+23`).
 ///
 /// # Examples
 ///
@@ -71,10 +79,11 @@ fn parse_core_parts(core: &str) -> Vec<u64> {
 /// assert_eq!(compare_versions("2.0.0", "2.0.0-beta1"), Ordering::Greater);
 /// assert_eq!(compare_versions("2.0.0-alpha", "2.0.0-beta"), Ordering::Less);
 /// assert_eq!(compare_versions("1.0.0-alpha", "1.0.0-alpha.1"), Ordering::Less);
+/// assert_eq!(compare_versions("0.8.13+1", "0.8.13+23"), Ordering::Less);
 /// ```
 pub fn compare_versions(a: &str, b: &str) -> Ordering {
-    let (a_core, a_pre) = split_core_and_prerelease(a);
-    let (b_core, b_pre) = split_core_and_prerelease(b);
+    let (a_core, a_pre, a_build) = split_version(a);
+    let (b_core, b_pre, b_build) = split_version(b);
 
     let a_core_parts = parse_core_parts(a_core);
     let b_core_parts = parse_core_parts(b_core);
@@ -89,18 +98,17 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
         }
     }
 
-    match (a_pre, b_pre) {
+    let prerelease = match (a_pre, b_pre) {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
-        (Some(a_pre), Some(b_pre)) => {
-            let a_ids: Vec<PrereleaseIdentifier> =
-                a_pre.split('.').map(PrereleaseIdentifier::parse).collect();
-            let b_ids: Vec<PrereleaseIdentifier> =
-                b_pre.split('.').map(PrereleaseIdentifier::parse).collect();
-            a_ids.cmp(&b_ids)
-        }
-    }
+        (Some(a_pre), Some(b_pre)) => parse_identifiers(a_pre).cmp(&parse_identifiers(b_pre)),
+    };
+    prerelease.then_with(|| {
+        a_build
+            .map(parse_identifiers)
+            .cmp(&b_build.map(parse_identifiers))
+    })
 }
 
 /// Checks if a version satisfies a Dart version constraint.
@@ -208,7 +216,7 @@ fn matches_caret(version: &str, requirement: &str) -> bool {
 /// conventions not in its fixed list, e.g. Dart's `nullsafety` preview tag
 /// (`2.10.0-nullsafety.1`) (#322).
 pub fn is_prerelease(version: &str) -> bool {
-    version.split('+').next().unwrap_or(version).contains('-')
+    split_version(version).1.is_some()
 }
 
 #[cfg(test)]
@@ -258,16 +266,54 @@ mod tests {
         );
     }
 
+    /// #1687: pub orders `+N` build revisions; a bare version sorts below any build of it.
     #[test]
-    fn test_compare_versions_build_metadata_ignored() {
-        assert_eq!(
-            compare_versions("1.0.0+build1", "1.0.0+build2"),
-            Ordering::Equal
-        );
-        assert_eq!(
-            compare_versions("1.0.0-beta+build1", "1.0.0-beta+build2"),
-            Ordering::Equal
-        );
+    fn test_compare_versions_build_metadata_significant() {
+        for (a, b, expected) in [
+            ("0.8.13+1", "0.8.13+23", Ordering::Less),
+            ("0.8.13+23", "0.8.13+1", Ordering::Greater),
+            ("0.8.13+9", "0.8.13+10", Ordering::Less),
+            ("0.8.13+1", "0.8.13+1", Ordering::Equal),
+            ("0.8.13", "0.8.13+1", Ordering::Less),
+            ("1.0.0+build1", "1.0.0+build2", Ordering::Less),
+            ("1.0.0-beta+2", "1.0.0-beta+10", Ordering::Less),
+            ("1.0.0-beta+99", "1.0.0", Ordering::Less),
+            ("0.8.14", "0.8.13+23", Ordering::Greater),
+        ] {
+            assert_eq!(compare_versions(a, b), expected, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn test_compare_versions_build_identifier_shapes() {
+        for (a, b, expected) in [
+            // Numeric identifiers sort below alphanumeric ones, as in prerelease.
+            ("1.0.0+5", "1.0.0+abc", Ordering::Less),
+            ("1.0.0+1.2", "1.0.0+1.10", Ordering::Less),
+            ("1.0.0+1", "1.0.0+1.0", Ordering::Less),
+            ("1.0.0+abc.1", "1.0.0+abc.2", Ordering::Less),
+            ("1.0.0-alpha+9", "1.0.0-beta+1", Ordering::Less),
+            ("1.0.0-alpha+1", "1.0.0-alpha+2", Ordering::Less),
+            // A numeric id beyond u64 falls back to alphanumeric comparison (pinned behavior).
+            ("1.0.0+99999999999999999999", "1.0.0+2", Ordering::Greater),
+        ] {
+            assert_eq!(compare_versions(a, b), expected, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn test_is_prerelease_ignores_hyphen_in_build() {
+        assert!(!is_prerelease("1.0.0+build-x"));
+        assert!(is_prerelease("1.0.0-beta+build-x"));
+    }
+
+    #[test]
+    fn test_version_matches_constraint_build_revision() {
+        assert!(version_matches_constraint("0.8.13+1", "0.8.13+1"));
+        assert!(!version_matches_constraint("0.8.13+23", "0.8.13+1"));
+        assert!(version_matches_constraint("0.8.13+23", ">=0.8.13+1"));
+        assert!(!version_matches_constraint("0.8.13+1", ">0.8.13+1"));
+        assert!(version_matches_constraint("0.8.13+23", "^0.8.13+1"));
     }
 
     /// Regression test for #418: sorting a version list must move every prerelease

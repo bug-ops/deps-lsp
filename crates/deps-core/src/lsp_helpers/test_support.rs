@@ -54,6 +54,35 @@ impl SourcePolicy for MockUnresolvedFormatter {}
 
 impl OsvNaming for MockUnresolvedFormatter {}
 
+/// A formatter whose [`BuildMetadataPolicy`] is `Significant`, standing in for Dart/pub.
+pub(crate) struct MockBuildAwareFormatter;
+
+impl PackageNaming for MockBuildAwareFormatter {}
+
+impl PackageRendering for MockBuildAwareFormatter {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        version.to_string()
+    }
+
+    fn package_url(&self, name: &PackageName) -> String {
+        format!("https://example.com/{}", name.as_str())
+    }
+}
+
+impl RequirementResolution for MockBuildAwareFormatter {
+    fn build_metadata_policy(&self) -> BuildMetadataPolicy {
+        BuildMetadataPolicy::Significant
+    }
+}
+
+impl DiagnosticMessages for MockBuildAwareFormatter {}
+
+impl DiagnosticPolicy for MockBuildAwareFormatter {}
+
+impl SourcePolicy for MockBuildAwareFormatter {}
+
+impl OsvNaming for MockBuildAwareFormatter {}
+
 /// A formatter whose `validate_package_name` always rejects, for exercising
 /// the "Invalid package name" diagnostic path independently of "Unknown package".
 pub(crate) struct RejectingFormatter;

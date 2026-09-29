@@ -165,7 +165,10 @@ pub fn generate_inlay_hints(
         };
 
         let status = if let Some(resolved) = &resolved_version {
-            if resolved.eq_ignoring_build_metadata(latest) {
+            if formatter
+                .build_metadata_policy()
+                .versions_equal(resolved.as_str(), latest.as_str())
+            {
                 RequirementStatus::UpToDate
             } else {
                 RequirementStatus::Outdated
@@ -502,6 +505,67 @@ mod tests {
             }
             _ => panic!("Expected string label"),
         }
+    }
+
+    fn resolved_vs_latest_label(
+        formatter: &dyn EcosystemFormatter,
+        resolved: &str,
+        latest: &str,
+    ) -> String {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            network: crate::NetworkMode::Online,
+        };
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "pkg".into(),
+                version_req: "^0.8.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            }],
+            uri: crate::test_util::test_uri("/test/pubspec.yaml"),
+        };
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("pkg".into(), PackageVersions::latest_only(latest));
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("pkg".into(), resolved.into());
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            crate::LoadingState::Loaded,
+            &config,
+            formatter,
+        );
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => text.clone(),
+            _ => panic!("expected string label"),
+        }
+    }
+
+    /// #1687: a formatter whose build metadata is significant (Dart) must not render a
+    /// lock-resolved `+1` build as up to date against a newer `+23` build.
+    #[test]
+    fn test_inlay_hint_significant_build_metadata_resolved_older_build_is_outdated() {
+        let label = resolved_vs_latest_label(&MockBuildAwareFormatter, "0.8.13+1", "0.8.13+23");
+        assert_eq!(label, "❌ 0.8.13+23");
+        let label = resolved_vs_latest_label(&MockBuildAwareFormatter, "0.8.13+23", "0.8.13+23");
+        assert!(label.starts_with("✅"), "got: {label}");
+    }
+
+    /// SemVer ecosystems keep ignoring build metadata (#1671).
+    #[test]
+    fn test_inlay_hint_ignored_build_metadata_resolved_build_difference_is_up_to_date() {
+        let label = resolved_vs_latest_label(&MOCK_FORMATTER, "1.2.3+1", "1.2.3+23");
+        assert!(label.starts_with("✅"), "got: {label}");
     }
 
     /// Issue #1517 (the P0 this fix addresses): an OSV-flagged/malicious latest must render

@@ -498,6 +498,25 @@ mod tests {
         assert!(versions[3].retracted);
     }
 
+    /// #1687: the newest `+N` build revision must sort first so it is selected as latest.
+    #[test]
+    fn test_parse_versions_response_orders_build_revisions() {
+        let json = r#"{
+            "name": "image_picker_android",
+            "latest": {"version": "0.8.13+23", "pubspec": {"name": "image_picker_android"}},
+            "versions": [
+                {"version": "0.8.13+1", "retracted": false},
+                {"version": "0.8.13+23", "retracted": false},
+                {"version": "0.8.13+9", "retracted": false},
+                {"version": "0.8.13", "retracted": false}
+            ]
+        }"#;
+
+        let versions = parse_versions_response(json.as_bytes()).unwrap();
+        let order: Vec<&str> = versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(order, ["0.8.13+23", "0.8.13+9", "0.8.13+1", "0.8.13"]);
+    }
+
     #[test]
     fn test_parse_versions_response_with_published() {
         let json = r#"{

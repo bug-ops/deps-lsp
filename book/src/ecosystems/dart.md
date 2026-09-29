@@ -9,7 +9,7 @@
 | Manifest file | `pubspec.yaml` |
 | Lock file (in-use version) | `pubspec.lock` |
 | Registry | pub.dev (`pub.dev/api/packages/{name}`) |
-| Version syntax | SemVer 2.0.0, with §11 prerelease-precedence ordering (numeric identifiers compare numerically, alphanumeric compare lexically, a prerelease sorts below its base release) |
+| Version syntax | pub_semver: SemVer 2.0.0 §11 prerelease precedence (numeric identifiers compare numerically, alphanumeric compare lexically, a prerelease sorts below its base release), plus significant `+N` build revisions |
 
 ```yaml
 dependencies:
@@ -54,7 +54,13 @@ ordering: SemVer 2.0.0 §11 precedence — numeric identifiers compare numerical
 identifiers compare lexically (ASCII), and a version with a prerelease sorts below its base
 release. Applied both to "latest version" selection (pub.dev's response order) and to
 constraint matching, so hover/completion sort order and outdated diagnostics are both
-corrected. See [Composer](composer.md#version-comparison) for the equivalent fix in that
+corrected.
+
+Unlike SemVer 2.0.0 (and the other ecosystems), pub treats `+N` build revisions as distinct,
+ordered releases: `0.8.13` < `0.8.13+1` < `0.8.13+23`, with build identifiers ordered like
+prerelease identifiers and applied after prerelease. A `pubspec.lock` pin at `0.8.13+1` is
+therefore reported outdated when pub.dev's latest is `0.8.13+23`, and the newest build revision
+is selected as latest. See [Composer](composer.md#version-comparison) for the equivalent fix in that
 ecosystem, which shares the same underlying bug class.
 
 ## YAML Anchor/Alias Resolution

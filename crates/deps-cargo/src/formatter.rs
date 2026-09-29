@@ -217,6 +217,20 @@ mod tests {
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
 
+    /// #1687: only pub treats `+build` as significant; SemVer ecosystems keep ignoring it.
+    #[test]
+    fn test_build_metadata_stays_ignored_for_pins() {
+        use deps_core::lsp_helpers::{BuildMetadataPolicy, RequirementResolution};
+        assert_eq!(
+            CargoFormatter.build_metadata_policy(),
+            BuildMetadataPolicy::Ignored
+        );
+        assert!(CargoFormatter.is_requirement_up_to_date(
+            &deps_core::VersionReq::new("1.2.3+a"),
+            &deps_core::ConcreteVersion::new("1.2.3+b"),
+        ));
+    }
+
     // #758: exact-value `EcosystemFormatter` conformance, replacing several hand-written
     // tests. The remaining validate_package_name tests below stay hand-written: they assert
     // on `InvalidPackageName::reason()`'s exact text, or a computed boundary-length name —
