@@ -9,6 +9,7 @@ use deps_core::github::{
     paginate_tags, semver_tags_newest_first, validate_owner_repo,
 };
 use deps_core::lsp_helpers::{CommitSha, TagIndex};
+use deps_core::pagination::ListCoverage;
 use deps_core::rate_limit::{DEFAULT_COOLDOWN_SECS, RateLimitGate};
 use deps_core::{
     DepsError, EcosystemId, HttpCache, PackageName, PublishTime, RateLimitEvidence, Result,
@@ -206,7 +207,7 @@ impl GithubActionsRegistry {
     /// (`v0.1.15`) it was actually cut from (#503 critic S1). `tag_to_sha` has no such
     /// ambiguity — it is keyed by the workflow's own literal ref text — so it stays a
     /// plain first-wins index over the raw tags.
-    fn populate_tag_index(&self, name: &PackageName, tags: &[GithubTag]) {
+    fn populate_tag_index(&self, name: &PackageName, tags: &[GithubTag], coverage: ListCoverage) {
         let valid: Vec<(&str, CommitSha)> = tags
             .iter()
             .filter_map(|tag| Some((tag.name.as_str(), CommitSha::parse(&tag.commit.sha)?)))
@@ -215,7 +216,8 @@ impl GithubActionsRegistry {
             .iter()
             .find_map(|tag| CanonicalRepoName::from_commit_url(&tag.commit.url));
         let index = TagIndex::from_tags(valid.iter().map(|(name, sha)| (*name, sha)))
-            .with_canonical_repo_name(canonical);
+            .with_canonical_repo_name(canonical)
+            .with_coverage(coverage);
         if !self.tag_index.contains_key(name) {
             deps_core::cache_policy::evict_arbitrary_if_full(
                 &self.tag_index,
@@ -263,8 +265,8 @@ impl GithubActionsRegistry {
         .await
         .map_err(|e| self.map_tags_error(name, e))?;
 
-        self.populate_tag_index(&package_name, &tags);
-        Ok(tags_to_versions(tags))
+        self.populate_tag_index(&package_name, &tags.items, tags.coverage);
+        Ok(tags_to_versions(tags.items))
     }
 
     /// Like [`GithubActionsRegistry::get_versions`], but also attaches GitHub Release
@@ -668,6 +670,52 @@ mod tests {
         let name = PackageName::new("actions/checkout");
         let index = registry.tag_index.get(&name).unwrap();
         assert!(index.is_empty());
+    }
+
+    /// #1722: a fetch that hits the page cap must mark the index `Truncated`; a fetch that
+    /// ends on a partial page must leave it `Complete`.
+    #[tokio::test]
+    async fn test_get_versions_tag_index_records_coverage() {
+        let sha = "a".repeat(40);
+        let full_page: String = format!(
+            "[{}]",
+            (0..100)
+                .map(|i| format!(r#"{{"name":"{i}.0.0","commit":{{"sha":"{sha}"}}}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut server = mockito::Server::new_async().await;
+        let _capped = server
+            .mock("GET", "/repos/owner/capped/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(full_page)
+            .create_async()
+            .await;
+        let _short = server
+            .mock("GET", "/repos/owner/short/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name":"v1.0.0","commit":{{"sha":"{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), false);
+        registry.get_versions("owner/capped").await.unwrap();
+        registry.get_versions("owner/short").await.unwrap();
+
+        let capped = registry
+            .tag_index
+            .get(&PackageName::new("owner/capped"))
+            .unwrap();
+        assert_eq!(capped.coverage(), ListCoverage::Truncated);
+        let short = registry
+            .tag_index
+            .get(&PackageName::new("owner/short"))
+            .unwrap();
+        assert_eq!(short.coverage(), ListCoverage::Complete);
     }
 
     /// Regression for #503 critic S1: when two tags share one commit SHA — a moving

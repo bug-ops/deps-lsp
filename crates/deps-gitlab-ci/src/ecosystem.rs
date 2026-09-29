@@ -1897,6 +1897,7 @@ mod tests {
                     parse_result.dependencies[0].name.clone(),
                 ),
                 std::iter::once(("cargo-deny", sha.as_str())),
+                deps_core::pagination::ListCoverage::Complete,
             );
             let formatter = GitlabCiFormatter::new(Arc::new(DashMap::new()), tag_index);
 

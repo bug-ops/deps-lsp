@@ -61,7 +61,7 @@ impl SwiftRegistry {
                 .map_err(|e| classify_tags_fetch_error(e, name, REGISTRY, self.github.has_token()))
         })
         .await?;
-        Ok(tags_to_versions(tags))
+        Ok(tags_to_versions(tags.items))
     }
 
     /// Like [`SwiftRegistry::get_versions`], but also attaches GitHub Release publish
