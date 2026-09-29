@@ -97,8 +97,7 @@ pub(crate) fn opens_dependencies_block(trimmed: &str) -> bool {
 /// present) — so `has_version` alone distinguishes the two capture shapes.
 pub(crate) fn build_dependency(
     caps: &Captures<'_>,
-    line: &str,
-    line_idx: u32,
+    line: &SourceLine<'_>,
     has_version: bool,
     config: &str,
 ) -> GradleDependency {
@@ -112,11 +111,11 @@ pub(crate) fn build_dependency(
     let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
     let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
     let name = format!("{group_id}:{artifact_id}");
-    let name_range = find_name_range(line, line_idx, match_start, &group_id, &artifact_id);
+    let name_range = find_name_range(line, match_start, &group_id, &artifact_id);
 
     let (version_req, version_range) = if has_version {
         let version = caps.get(4).map_or("", |m| m.as_str()).trim().to_string();
-        let version_range = find_version_range(line, line_idx, match_start, &version);
+        let version_range = find_version_range(line, match_start, &version);
         (Some(version.into()), Some(version_range))
     } else {
         (None, None)
@@ -709,6 +708,58 @@ pub(crate) fn apply_repository_content_restrictions(
     }
 }
 
+/// One source line paired with the document-wide [`LineOffsetTable`], so a byte offset within
+/// the line converts to an LSP position in O(1) on an ASCII line and O(log n) on a non-ASCII
+/// one, instead of re-encoding the line's prefix per match (#1701).
+pub(crate) struct SourceLine<'a> {
+    table: &'a LineOffsetTable,
+    content: &'a str,
+    text: &'a str,
+    start: usize,
+    idx: u32,
+}
+
+impl<'a> SourceLine<'a> {
+    /// Wraps line `idx` (0-indexed) of `content`, whose text is `text`, against `table` built
+    /// from that same `content`.
+    pub(crate) fn new(
+        table: &'a LineOffsetTable,
+        content: &'a str,
+        idx: usize,
+        text: &'a str,
+    ) -> Self {
+        let start = table.line_start(idx).unwrap_or(0);
+        debug_assert_eq!(
+            content.get(start..start + text.len()),
+            Some(text),
+            "`text` must be line `idx` of `content`"
+        );
+        Self {
+            table,
+            content,
+            text,
+            start,
+            idx: u32::try_from(idx).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// The line's text, without its terminator.
+    pub(crate) const fn text(&self) -> &'a str {
+        self.text
+    }
+
+    /// LSP range of `matched`, which starts `rel_start` bytes into the line.
+    pub(crate) fn range_of(&self, rel_start: usize, matched: &str) -> Range {
+        let start = self
+            .table
+            .byte_offset_to_position(self.content, self.start + rel_start);
+        let end = start
+            .character
+            .saturating_add(saturating_utf16_len(matched));
+        Range::new(start, Position::new(self.idx, end))
+    }
+}
+
 /// The UTF-16 length of a short string (a matched substring, not a whole line), saturating
 /// like [`deps_core::lsp_helpers::byte_to_utf16_offset`] itself.
 ///
@@ -732,25 +783,16 @@ pub(crate) fn saturating_utf16_len(s: &str) -> u32 {
 // coordinate string. Every slice bound is always a char boundary.
 #[allow(clippy::string_slice)]
 pub(crate) fn find_name_range(
-    line: &str,
-    line_idx: u32,
+    line: &SourceLine<'_>,
     match_start: usize,
     group_id: &str,
     artifact_id: &str,
 ) -> Range {
-    let scoped = &line[match_start..];
+    let scoped = &line.text()[match_start..];
     let search = format!("{group_id}:{artifact_id}");
-    if let Some(rel) = scoped.find(&search) {
-        let abs_start = match_start + rel;
-        let col_u32 = deps_core::lsp_helpers::byte_to_utf16_offset(line, abs_start);
-        let end_u32 = col_u32 + saturating_utf16_len(&search);
-        Range::new(
-            Position::new(line_idx, col_u32),
-            Position::new(line_idx, end_u32),
-        )
-    } else {
-        Range::default()
-    }
+    scoped.find(&search).map_or_else(Range::default, |rel| {
+        line.range_of(match_start + rel, &search)
+    })
 }
 
 /// Finds the LSP range of `version` after the second `:` within the
@@ -765,12 +807,11 @@ pub(crate) fn find_name_range(
 // derives from `find` of the version string. Every slice bound is always a char boundary.
 #[allow(clippy::string_slice)]
 pub(crate) fn find_version_range(
-    line: &str,
-    line_idx: u32,
+    line: &SourceLine<'_>,
     match_start: usize,
     version: &str,
 ) -> Range {
-    let scoped = &line[match_start..];
+    let scoped = &line.text()[match_start..];
     let second_colon = scoped
         .char_indices()
         .filter(|(_, c)| *c == ':')
@@ -780,13 +821,7 @@ pub(crate) fn find_version_range(
     if let Some(colon_pos) = second_colon {
         let after_colon = &scoped[colon_pos + 1..];
         if let Some(rel) = after_colon.find(version) {
-            let abs_start = match_start + colon_pos + 1 + rel;
-            let col_start = deps_core::lsp_helpers::byte_to_utf16_offset(line, abs_start);
-            let col_end = col_start + saturating_utf16_len(version);
-            return Range::new(
-                Position::new(line_idx, col_start),
-                Position::new(line_idx, col_end),
-            );
+            return line.range_of(match_start + colon_pos + 1 + rel, version);
         }
     }
     Range::default()
@@ -1049,8 +1084,10 @@ mod tests {
 
     #[test]
     fn test_find_name_range() {
-        let line = "    implementation(\"com.example:lib:1.0.0\")";
-        let range = find_name_range(line, 5, 0, "com.example", "lib");
+        let content = "\n\n\n\n\n    implementation(\"com.example:lib:1.0.0\")";
+        let table = LineOffsetTable::new(content);
+        let line = SourceLine::new(&table, content, 5, content.lines().nth(5).unwrap());
+        let range = find_name_range(&line, 0, "com.example", "lib");
         assert_eq!(range.start.line, 5);
         assert!(range.start.character > 0);
     }
@@ -1060,10 +1097,12 @@ mod tests {
         // Two dependencies with an identical coordinate on one line: scoping
         // the search to the second dependency's match_start must not return
         // the first dependency's name_range.
-        let line = "implementation(\"a:b:1.0.0\"); testImplementation(\"a:b:1.0.0\")";
-        let second_match_start = line.rfind("testImplementation").unwrap();
-        let range = find_name_range(line, 0, second_match_start, "a", "b");
-        let first_range = find_name_range(line, 0, 0, "a", "b");
+        let content = "implementation(\"a:b:1.0.0\"); testImplementation(\"a:b:1.0.0\")";
+        let table = LineOffsetTable::new(content);
+        let line = SourceLine::new(&table, content, 0, content);
+        let second_match_start = content.rfind("testImplementation").unwrap();
+        let range = find_name_range(&line, second_match_start, "a", "b");
+        let first_range = find_name_range(&line, 0, "a", "b");
         assert_ne!(range.start.character, first_range.start.character);
         assert!(range.start.character > second_match_start as u32);
     }
@@ -1109,8 +1148,10 @@ mod tests {
 
     #[test]
     fn test_find_version_range() {
-        let line = "    implementation(\"com.example:lib:1.0.0\")";
-        let range = find_version_range(line, 5, 0, "1.0.0");
+        let content = "\n\n\n\n\n    implementation(\"com.example:lib:1.0.0\")";
+        let table = LineOffsetTable::new(content);
+        let line = SourceLine::new(&table, content, 5, content.lines().nth(5).unwrap());
+        let range = find_version_range(&line, 0, "1.0.0");
         assert_eq!(range.start.line, 5);
         // "1.0.0" is 5 chars, end = start + 5
         assert_eq!(range.end.character - range.start.character, 5);
@@ -1121,12 +1162,43 @@ mod tests {
         // Two dependencies sharing the same version on one line: scoping the
         // search to the second dependency's match_start must not return the
         // first dependency's colon/version position.
-        let line = "implementation(\"a:b:1.0.0\"); implementation(\"c:d:1.0.0\")";
-        let second_match_start = line.rfind("implementation").unwrap();
-        let range = find_version_range(line, 0, second_match_start, "1.0.0");
-        let first_range = find_version_range(line, 0, 0, "1.0.0");
+        let content = "implementation(\"a:b:1.0.0\"); implementation(\"c:d:1.0.0\")";
+        let table = LineOffsetTable::new(content);
+        let line = SourceLine::new(&table, content, 0, content);
+        let second_match_start = content.rfind("implementation").unwrap();
+        let range = find_version_range(&line, second_match_start, "1.0.0");
+        let first_range = find_version_range(&line, 0, "1.0.0");
         assert_ne!(range.start.character, first_range.start.character);
         assert!(range.start.character > second_match_start as u32);
+    }
+
+    /// `SourceLine::range_of` on a document mixing ASCII, non-ASCII and CRLF lines: the column
+    /// is UTF-16 units within its own line, the line index is the line's own.
+    #[test]
+    fn test_source_line_range_of_mixed_lines() {
+        let content = "ascii a:b\r\n\u{1F600}\u{65E5} a:b \u{1F600} a:b\nlast a:b";
+        let table = LineOffsetTable::new(content);
+        let lines: Vec<_> = content.lines().collect();
+        let expect = [
+            (0, "ascii a:b", vec![6]),
+            (1, "\u{1F600}\u{65E5} a:b \u{1F600} a:b", vec![4, 11]),
+            (2, "last a:b", vec![5]),
+        ];
+        for (idx, text, cols) in expect {
+            assert_eq!(lines[idx], text);
+            let line = SourceLine::new(&table, content, idx, text);
+            let found: Vec<_> = text
+                .match_indices("a:b")
+                .map(|(rel, m)| line.range_of(rel, m))
+                .collect();
+            let got: Vec<_> = found.iter().map(|r| r.start.character).collect();
+            assert_eq!(got, cols, "line {idx}");
+            for r in &found {
+                assert_eq!(r.start.line, idx as u32);
+                assert_eq!(r.end.line, idx as u32);
+                assert_eq!(r.end.character, r.start.character + 3);
+            }
+        }
     }
 
     /// #1212: `includeGroup` inside a repository's `content { }` block is a real static

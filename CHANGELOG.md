@@ -92,6 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-core**: an explicit OSV `versions` hit above an open-ended range's `last_known_affected_version_range` cap is no longer reported as affected (resolves #1714) (#1717)
+- **deps-gradle**: build script and settings parsers no longer take quadratic time on a single long line with many dependencies, and settings plugin ranges no longer point at an earlier same-prefix plugin (resolves #1701) (#1713)
 - **deps-core**: open-ended OSV ranges are now capped by `database_specific.last_known_affected_version_range`, so fixed and latest `github/codeql-action` versions are no longer flagged by GHSA-vqf5-2xx6-9wfm (resolves #1707) (#1712)
 - **deps-core**: `LineOffsetTable::position_to_byte_offset` reuses the per-line UTF-16 index instead of rescanning the line, making many edits on one long line O(1)/O(log n) each (resolves #1711) (#1717)
 - **deps-core**: equally specific release tags on one commit now resolve to the numerically lowest SemVer instead of the textually smallest name (`v4.9.0` over `v4.10.0`) when picking the tag matched against OSV advisories (resolves #1703) (#1708)
