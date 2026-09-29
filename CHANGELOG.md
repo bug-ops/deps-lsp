@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli, deps-engine**: `check`/`update` now honor `[gossip].enabled`, floor-protected against ever excluding an already-in-use version, plus an `ignored_sections`/`[typosquat]` warning-parity fix for explicit `--config` files (resolves #1474) (#1520)
 - **deps-core**: new `lsp_helpers::{FallbackEditVerdict, FallbackEditRejection, fallback_edit_excludes_newer}`, `edit::{ManifestReparse, EcosystemReparse}`, and `ecosystem::parse_manifest_now` — a two-phase, re-parse-based guard deciding whether a cooldown-fallback edit is safe to write, applied uniformly across all 14 ecosystems (part of #1544) (#1581)
 
+### Changed
+- **ci**: bump `taiki-e/install-action` to v2.87.22 in all workflows (#1736)
+
 ### Security
 - **deps-core, deps-nuget**: `RequirementResolution::is_requirement_up_to_date`/`requirement_already_resolves_to`'s shared defaults, NuGet's own overrides of both, and `in_use_version`'s best-candidate matcher now gate on `requirement_is_oversized` before reaching any ecosystem's matcher — defense-in-depth: every production caller was already gated before this change, so this closes the last CWE-400 call sites reachable only via a direct/test/future caller of the shared defaults or NuGet's overrides (part of #1472's remediation, resolves #1627) (#1632)
 - **fuzz**: new `requirement_matcher` target drives every ecosystem's `compile_requirement`/`matches`/`explicitly_excludes`/`version_satisfies_requirement`/`is_requirement_up_to_date`/`requirement_already_resolves_to` from arbitrary version/requirement pairs under a per-call time bound, closing the requirement-matcher fuzz-coverage gap (part of #1627) (#1632)
