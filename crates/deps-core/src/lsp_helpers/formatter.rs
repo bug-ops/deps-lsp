@@ -241,6 +241,41 @@ pub enum BareMeaning {
     Floor,
 }
 
+/// Whether an ecosystem's version comparison distinguishes versions that differ only by their
+/// `+build` suffix.
+///
+/// SemVer 2.0.0 gives build metadata no precedence, so most ecosystems treat `1.2.3+a` and
+/// `1.2.3+b` as the same release. Pub does not: `+N` build revisions are distinct, ordered
+/// releases (#1687), so a pin at `0.8.13+1` is outdated against `0.8.13+23`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::BuildMetadataPolicy;
+///
+/// assert!(BuildMetadataPolicy::Ignored.versions_equal("1.2.3+1", "1.2.3+23"));
+/// assert!(!BuildMetadataPolicy::Significant.versions_equal("1.2.3+1", "1.2.3+23"));
+/// assert!(!BuildMetadataPolicy::Ignored.versions_equal("1.2.3", "1.2.4+1"));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildMetadataPolicy {
+    /// SemVer 2.0.0 precedence: build metadata is discarded before comparing.
+    Ignored,
+    /// Build metadata is part of the version's identity (Dart/pub).
+    Significant,
+}
+
+impl BuildMetadataPolicy {
+    /// Whether `a` and `b` name the same version under this policy.
+    #[must_use]
+    pub fn versions_equal(self, a: &str, b: &str) -> bool {
+        match self {
+            Self::Ignored => strip_build_metadata(a) == strip_build_metadata(b),
+            Self::Significant => a == b,
+        }
+    }
+}
+
 /// The [`BareMeaning`] a bare (no-operator) version requirement carries under `ecosystem`.
 ///
 /// The single, exhaustive source [`format_version_replacing_by_shape`] callers should derive
@@ -1078,6 +1113,19 @@ pub fn up_to_date_via_compiled_matcher<F: RequirementResolution + ?Sized>(
 /// needing the tri-state distinction use
 /// [`RequirementGate::requirement_status`], not the boolean method.
 pub trait RequirementResolution: Send + Sync {
+    /// Whether `+build` suffixes distinguish versions in this ecosystem's comparisons.
+    ///
+    /// Default: [`BuildMetadataPolicy::Ignored`] (SemVer 2.0.0). `deps-dart` overrides it with
+    /// [`BuildMetadataPolicy::Significant`], since pub orders `+N` build revisions (#1687).
+    /// Consulted by the shared pin equality in [`Self::version_satisfies_bounded_requirement`] (the
+    /// path behind every requirement-vs-latest verdict: diagnostics, code lenses, code
+    /// actions, `deps-cli`) and by the inlay-hint resolved-vs-latest check. Any new
+    /// ecosystem-blind equality between an in-use or pinned version and a candidate must go
+    /// through it rather than drop build metadata itself.
+    fn build_metadata_policy(&self) -> BuildMetadataPolicy {
+        BuildMetadataPolicy::Ignored
+    }
+
     /// Check if a version satisfies a requirement string.
     ///
     /// General constraint check (e.g. for completion/candidate filtering) — not the
@@ -1155,9 +1203,10 @@ pub trait RequirementResolution: Send + Sync {
         let version_core = split_patch_component(version).0;
         let ver_parts: Vec<&str> = version_core.split('.').collect();
 
-        strip_build_metadata(version)
-            == strip_build_metadata(requirement.strip_prefix('=').unwrap_or(requirement))
-            || (is_partial_version && is_same_major_minor(requirement, version_core))
+        self.build_metadata_policy().versions_equal(
+            version,
+            requirement.strip_prefix('=').unwrap_or(requirement),
+        ) || (is_partial_version && is_same_major_minor(requirement, version_core))
             || matches_wildcard_components(&req_parts, &ver_parts)
     }
 
@@ -3028,6 +3077,38 @@ mod tests {
             MOCK_FORMATTER.is_requirement_up_to_date(&requirement, &ConcreteVersion::new("1.4.9")),
             "latest below the caret's own lower-bound floor stays up to date (#1622 S2)"
         );
+    }
+
+    #[test]
+    fn test_build_metadata_policy_defaults_to_ignored() {
+        assert_eq!(
+            MOCK_FORMATTER.build_metadata_policy(),
+            BuildMetadataPolicy::Ignored
+        );
+    }
+
+    #[test]
+    fn test_pin_build_metadata_significant_policy_distinguishes_revisions() {
+        struct BuildAware;
+        impl RequirementResolution for BuildAware {
+            fn build_metadata_policy(&self) -> BuildMetadataPolicy {
+                BuildMetadataPolicy::Significant
+            }
+        }
+        for (pin, latest, expected) in [
+            ("1.2.3+1", "1.2.3+23", false),
+            ("1.2.3+23", "1.2.3+23", true),
+            ("=1.2.3+1", "1.2.3+23", false),
+        ] {
+            assert_eq!(
+                BuildAware.is_requirement_up_to_date(
+                    &VersionReq::new(pin),
+                    &ConcreteVersion::new(latest)
+                ),
+                expected,
+                "pin {pin} vs latest {latest}"
+            );
+        }
     }
 
     #[test]

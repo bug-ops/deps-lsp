@@ -214,6 +214,47 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 mod tests {
     use super::*;
 
+    /// #1687 e2e: a `pubspec.lock`-resolved `0.8.13+1` against pub.dev latest `0.8.13+23`
+    /// must render as outdated, not up to date.
+    #[tokio::test]
+    async fn test_inlay_hint_lock_resolved_older_build_revision_is_outdated() {
+        use deps_core::lsp_helpers::VersionData;
+        use deps_core::{EcosystemConfig, PackageVersions};
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::InlayHintLabel;
+
+        let ecosystem = DartEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = "name: app\ndependencies:\n  image_picker_android: ^0.8.0\n";
+        let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+        let mut cached = HashMap::new();
+        cached.insert(
+            "image_picker_android".into(),
+            PackageVersions::latest_only("0.8.13+23"),
+        );
+        let mut resolved = HashMap::new();
+        resolved.insert("image_picker_android".into(), "0.8.13+1".into());
+
+        let hints = ecosystem
+            .generate_inlay_hints(
+                parse_result.as_ref(),
+                VersionData::new(&cached, &resolved),
+                deps_core::LoadingState::Loaded,
+                &EcosystemConfig::default(),
+            )
+            .await;
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                assert!(!text.starts_with('✅'), "expected outdated, got: {text}");
+                assert!(text.contains("0.8.13+23"), "got: {text}");
+            }
+            other => panic!("expected string label, got {other:?}"),
+        }
+    }
+
     /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against Dart's REAL
     /// formatter and a real `EcosystemReparse`. `format_version_for_text_edit` writes an
     /// explicit `^{version}` — an auto-following range like Cargo's caret — so FR-025's rule

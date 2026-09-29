@@ -74,8 +74,8 @@ pub use diagnostics::requirement_is_oversized;
 #[cfg(feature = "lsp-responses")]
 pub(crate) use diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
 pub use formatter::{
-    BareMeaning, DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming,
-    PackageNaming, PackageRendering, RequirementGate, RequirementResolution,
+    BareMeaning, BuildMetadataPolicy, DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter,
+    OsvNaming, PackageNaming, PackageRendering, RequirementGate, RequirementResolution,
     RequirementRewriteShape, SourcePolicy, bare_meaning, classify_requirement_rewrite_shape,
     format_version_replacing_by_shape, requirement_is_compound,
     up_to_date_for_comparators_via_compiled_matcher, up_to_date_via_compiled_matcher,

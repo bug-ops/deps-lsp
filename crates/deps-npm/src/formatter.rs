@@ -676,6 +676,20 @@ mod tests {
     use super::*;
     use deps_core::lsp_helpers::RequirementGate;
 
+    /// #1687: only pub treats `+build` as significant; SemVer ecosystems keep ignoring it.
+    #[test]
+    fn test_build_metadata_stays_ignored_for_pins() {
+        use deps_core::lsp_helpers::{BuildMetadataPolicy, RequirementResolution};
+        assert_eq!(
+            NpmFormatter.build_metadata_policy(),
+            BuildMetadataPolicy::Ignored
+        );
+        assert!(NpmFormatter.is_requirement_up_to_date(
+            &deps_core::VersionReq::new("1.2.3+a"),
+            &deps_core::ConcreteVersion::new("1.2.3+b"),
+        ));
+    }
+
     /// O2: npm never offers the #205 "Replace with X" rename action — its only
     /// successor signal is free text (`deprecated`'s message), and regex-extracting a
     /// package name from registry-controlled prose to rewrite a manifest is a

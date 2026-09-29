@@ -6,9 +6,9 @@ use deps_core::EcosystemId;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
-    format_version_replacing_by_shape,
+    BoundedVersionReq, BuildMetadataPolicy, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
+    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
+    bare_meaning, format_version_replacing_by_shape,
 };
 use deps_core::normalize_operator_spacing;
 
@@ -106,6 +106,11 @@ impl PackageRendering for DartFormatter {
 }
 
 impl RequirementResolution for DartFormatter {
+    /// pub orders `+N` build revisions as distinct releases (#1687).
+    fn build_metadata_policy(&self) -> BuildMetadataPolicy {
+        BuildMetadataPolicy::Significant
+    }
+
     fn version_satisfies_bounded_requirement(
         &self,
         version: &ConcreteVersion,
@@ -157,6 +162,73 @@ mod tests {
     use super::*;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
+
+    /// #1687: `+N` build revisions are distinct releases in pub.
+    #[test]
+    fn test_pin_with_older_build_revision_is_outdated() {
+        let f = DartFormatter;
+        for (pin, latest, expected) in [
+            ("0.8.13+1", "0.8.13+23", false),
+            ("0.8.13+23", "0.8.13+23", true),
+            ("0.8.13", "0.8.13+1", false),
+            ("0.8.13+1", "0.8.14", false),
+        ] {
+            assert_eq!(
+                f.is_requirement_up_to_date(&VersionReq::new(pin), &ConcreteVersion::new(latest)),
+                expected,
+                "pin {pin} vs latest {latest}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_requirement_status_pin_older_build_revision_is_outdated() {
+        use deps_core::lsp_helpers::RequirementStatus;
+        let f = DartFormatter;
+        let status = |pin: &str, latest: &str| {
+            f.requirement_status(&VersionReq::new(pin), &ConcreteVersion::new(latest))
+        };
+        assert_eq!(status("0.8.13+1", "0.8.13+23"), RequirementStatus::Outdated);
+        assert_eq!(
+            status("0.8.13+23", "0.8.13+23"),
+            RequirementStatus::UpToDate
+        );
+    }
+
+    /// #1687: constraint operators over build revisions, through the compiled matcher too.
+    #[test]
+    fn test_compiled_matcher_build_revision_constraints() {
+        let f = DartFormatter;
+        for (constraint, candidate, expected) in [
+            ("^0.8.13+1", "0.8.13+23", true),
+            ("^0.8.13+1", "0.8.13", false),
+            ("^0.8.13+1", "0.9.0", false),
+            (">=0.8.13+1", "0.8.13+23", true),
+            (">=0.8.13+23", "0.8.13+1", false),
+            ("<0.8.13+5", "0.8.13+4", true),
+            ("<0.8.13+5", "0.8.13+5", false),
+            ("<=0.8.13+5", "0.8.13+5", true),
+            (">0.8.13", "0.8.13+1", true),
+            (">0.8.13", "0.8.13", false),
+            (">=0.8.13 <0.8.13+5", "0.8.13", true),
+            (">=0.8.13 <0.8.13+5", "0.8.13+4", true),
+            (">=0.8.13 <0.8.13+5", "0.8.13+5", false),
+        ] {
+            let requirement = VersionReq::new(constraint);
+            let bounded = BoundedVersionReq::new(&requirement).unwrap();
+            let matcher = f.compile_bounded_requirement(bounded).unwrap();
+            assert_eq!(
+                matcher.matches(&ConcreteVersion::new(candidate)),
+                Some(expected),
+                "{constraint} vs {candidate}"
+            );
+            assert_eq!(
+                f.version_satisfies_bounded_requirement(&ConcreteVersion::new(candidate), bounded),
+                expected,
+                "{constraint} vs {candidate} (uncompiled)"
+            );
+        }
+    }
 
     #[test]
     fn test_format_version() {
