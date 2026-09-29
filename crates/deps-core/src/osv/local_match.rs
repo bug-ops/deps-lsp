@@ -7,6 +7,11 @@
 //! Anything that cannot be evaluated (a non-numeric bound, an unrecognized range type, an entry
 //! with only `GIT` ranges) yields [`Verdict::Undeterminable`] rather than a guess, so it can
 //! never read as clean. Build metadata is ignored on both sides, per the SemVer spec.
+//!
+//! A range that only ever `introduced` (no `fixed`/`last_affected`) is open-ended. GitHub's
+//! advisory export then puts the real ceiling in the entry's
+//! `database_specific.last_known_affected_version_range` (`< X` / `<= X`); it is honored
+//! as the upper bound, and an unparsable one makes the range undeterminable (issue #1707).
 
 use semver::{BuildMetadata, Version};
 
@@ -69,6 +74,55 @@ enum RangeVerdict {
     Irrelevant,
 }
 
+/// The entry's `database_specific.last_known_affected_version_range`, when present.
+#[derive(Debug)]
+enum LastKnownRange {
+    Below(Version),
+    AtMost(Version),
+    Unparsable,
+}
+
+impl LastKnownRange {
+    /// Reads the raw string off `entry`; `None` when the key is absent or not a string.
+    fn of(entry: &OsvAffected) -> Option<Self> {
+        let raw = entry
+            .database_specific
+            .as_ref()?
+            .get("last_known_affected_version_range")?
+            .as_str()?;
+        Some(Self::parse(raw))
+    }
+
+    fn parse(raw: &str) -> Self {
+        let raw = raw.trim();
+        let (bound, inclusive) = match raw.strip_prefix("<=") {
+            Some(rest) => (rest, true),
+            None => match raw.strip_prefix('<') {
+                Some(rest) => (rest, false),
+                None => return Self::Unparsable,
+            },
+        };
+        match parse_bound(bound.trim()) {
+            Some(v) if inclusive => Self::AtMost(v),
+            Some(v) => Self::Below(v),
+            None => Self::Unparsable,
+        }
+    }
+
+    fn verdict(&self, version: &LocalVersion) -> RangeVerdict {
+        let inside = match self {
+            Self::Below(bound) => version.0 < *bound,
+            Self::AtMost(bound) => version.0 <= *bound,
+            Self::Unparsable => return RangeVerdict::Undeterminable,
+        };
+        if inside {
+            RangeVerdict::Affected
+        } else {
+            RangeVerdict::NotAffected
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Edge {
     Introduced,
@@ -87,6 +141,7 @@ pub(super) fn match_affected(affected: &[&OsvAffected], version: &LocalVersion) 
         Verdict::NotAffected
     };
     for entry in affected {
+        let last_known = LastKnownRange::of(entry);
         if entry
             .versions
             .iter()
@@ -97,7 +152,7 @@ pub(super) fn match_affected(affected: &[&OsvAffected], version: &LocalVersion) 
         }
         let mut evaluable = !entry.versions.is_empty();
         for range in &entry.ranges {
-            match match_range(range, version) {
+            match match_range(range, version, last_known.as_ref()) {
                 RangeVerdict::Affected => return Verdict::Affected,
                 RangeVerdict::Undeterminable => verdict = Verdict::Undeterminable,
                 RangeVerdict::NotAffected => evaluable = true,
@@ -111,7 +166,11 @@ pub(super) fn match_affected(affected: &[&OsvAffected], version: &LocalVersion) 
     verdict
 }
 
-fn match_range(range: &OsvRange, version: &LocalVersion) -> RangeVerdict {
+fn match_range(
+    range: &OsvRange,
+    version: &LocalVersion,
+    last_known: Option<&LastKnownRange>,
+) -> RangeVerdict {
     match range.range_type {
         OsvRangeType::Git => RangeVerdict::Irrelevant,
         OsvRangeType::Unknown => RangeVerdict::Undeterminable,
@@ -125,6 +184,10 @@ fn match_range(range: &OsvRange, version: &LocalVersion) -> RangeVerdict {
                 }
             }
             edges.sort_by(|a, b| a.1.cmp(&b.1));
+            // Every event must be `introduced`: a mixed range's trailing `introduced` is not capped.
+            let open_ended = edges
+                .iter()
+                .all(|(edge, _)| matches!(edge, Edge::Introduced));
             let mut affected = false;
             for (edge, bound) in edges {
                 match edge {
@@ -134,7 +197,9 @@ fn match_range(range: &OsvRange, version: &LocalVersion) -> RangeVerdict {
                     Edge::Introduced | Edge::Fixed | Edge::LastAffected => {}
                 }
             }
-            if affected {
+            if affected && open_ended {
+                last_known.map_or(RangeVerdict::Affected, |r| r.verdict(version))
+            } else if affected {
                 RangeVerdict::Affected
             } else {
                 RangeVerdict::NotAffected
@@ -345,6 +410,109 @@ mod tests {
     fn empty_entry_list_is_undeterminable() {
         let version = LocalVersion::parse(&OsvVersion::new("1.0.0")).unwrap();
         assert_eq!(match_affected(&[], &version), Verdict::Undeterminable);
+    }
+
+    fn codeql_open_ended_entries() -> Vec<serde_json::Value> {
+        vec![
+            json!({
+                "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "3.26.11"}, {"fixed": "3.28.3"}]}],
+                "database_specific": {"last_known_affected_version_range": "<= 3.28.2"}
+            }),
+            json!({
+                "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "2.26.11"}]}],
+                "database_specific": {"last_known_affected_version_range": "< 3.0.0"}
+            }),
+        ]
+    }
+
+    #[test]
+    fn ghsa_vqf5_open_ended_range_is_capped_by_last_known_affected_range() {
+        let entries = codeql_open_ended_entries();
+        for affected in ["3.28.2", "3.26.11", "2.26.11", "2.30.0", "2.99.99"] {
+            assert_eq!(
+                verdict_for(&entries, affected),
+                Verdict::Affected,
+                "{affected}"
+            );
+        }
+        for clean in ["3.28.3", "4.38.2", "2.26.10", "3.0.0", "3.26.10"] {
+            assert_eq!(
+                verdict_for(&entries, clean),
+                Verdict::NotAffected,
+                "{clean}"
+            );
+        }
+    }
+
+    #[test]
+    fn last_known_affected_range_at_most_is_inclusive() {
+        let e = json!({
+            "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "1.0.0"}]}],
+            "database_specific": {"last_known_affected_version_range": "<= 2.0.0"}
+        });
+        assert_eq!(verdict(e.clone(), "2.0.0"), Verdict::Affected);
+        assert_eq!(verdict(e.clone(), "2.0.1"), Verdict::NotAffected);
+        assert_eq!(verdict(e, "0.9.0"), Verdict::NotAffected);
+    }
+
+    #[test]
+    fn unparsable_last_known_affected_range_is_undeterminable() {
+        for bad in [">= 1.0.0", "3.0.0", "< latest", "", "<"] {
+            let e = json!({
+                "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "1.0.0"}]}],
+                "database_specific": {"last_known_affected_version_range": bad}
+            });
+            assert_eq!(verdict(e, "2.0.0"), Verdict::Undeterminable, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn last_known_affected_range_ignored_without_open_ended_range_or_key() {
+        let closed = json!({
+            "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "1.0.0"}, {"fixed": "2.0.0"}]}],
+            "database_specific": {"last_known_affected_version_range": "< 1.5.0"}
+        });
+        assert_eq!(verdict(closed, "1.9.0"), Verdict::Affected);
+        let no_key = json!({
+            "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "1.0.0"}]}],
+            "database_specific": {"informational": "unmaintained"}
+        });
+        assert_eq!(verdict(no_key, "9.0.0"), Verdict::Affected);
+        let non_string = json!({
+            "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "1.0.0"}]}],
+            "database_specific": {"last_known_affected_version_range": 3}
+        });
+        assert_eq!(verdict(non_string, "9.0.0"), Verdict::Affected);
+    }
+
+    #[test]
+    fn last_known_cap_scope_is_per_entry_and_all_introduced_only() {
+        let capped = json!({
+            "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "1.0.0"}]}],
+            "database_specific": {"last_known_affected_version_range": "< 2.0.0"}
+        });
+        let uncapped = semver_range(json!([{"introduced": "1.0.0"}]));
+        assert_eq!(verdict_for(&[capped, uncapped], "9.0.0"), Verdict::Affected);
+        let mixed = json!({
+            "ranges": [{"type": "ECOSYSTEM", "events": [
+                {"introduced": "1.0.0"}, {"fixed": "2.0.0"}, {"introduced": "3.0.0"}
+            ]}],
+            "database_specific": {"last_known_affected_version_range": "< 4.0.0"}
+        });
+        assert_eq!(verdict(mixed, "9.0.0"), Verdict::Affected);
+    }
+
+    #[test]
+    fn introduced_zero_with_last_known_upper_bound() {
+        let e = || {
+            json!({
+                "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}]}],
+                "database_specific": {"last_known_affected_version_range": "< 2.0.0"}
+            })
+        };
+        assert_eq!(verdict(e(), "1.9.9"), Verdict::Affected);
+        assert_eq!(verdict(e(), "2.0.0"), Verdict::NotAffected);
+        assert_eq!(verdict(e(), "3.0.0"), Verdict::NotAffected);
     }
 
     #[test]
