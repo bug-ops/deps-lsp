@@ -11,7 +11,7 @@
 use deps_core::ConcreteVersion;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
-use deps_core::lsp_helpers::resolve_in_use_version;
+use deps_core::lsp_helpers::{has_unqueryable_resolved_pin, resolve_in_use_version};
 use std::collections::HashMap;
 
 /// Builds the OSV scan targets for one manifest's dependencies, applying the
@@ -149,7 +149,12 @@ pub fn build_scan_targets(
         );
 
         let Some(version) = version else {
-            skipped.insert(key, ScanOutcome::Skipped(SkipReason::NoConcreteVersion));
+            let reason = if has_unqueryable_resolved_pin(dep, formatter, ecosystem) {
+                SkipReason::ResolvedTagNotFullVersion
+            } else {
+                SkipReason::NoConcreteVersion
+            };
+            skipped.insert(key, ScanOutcome::Skipped(reason));
             continue;
         };
 
@@ -1132,9 +1137,12 @@ mod tests {
             let registry = GithubActionsRegistry::new(cache);
             let tag_index = registry.tag_index();
             let mut index = TagIndex::default();
-            index
-                .sha_to_tag
-                .insert(CommitSha::parse(&sha).unwrap(), "v1".to_string());
+            index.insert_sha_pin(
+                CommitSha::parse(&sha).unwrap(),
+                deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+                    "v1",
+                )),
+            );
             tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
             let formatter = GithubActionsFormatter::new(tag_index);
 
@@ -1152,8 +1160,66 @@ mod tests {
             );
             assert_matches!(
                 skipped.get(&deps_core::test_util::vuln_key("actions/checkout")),
-                Some(ScanOutcome::Skipped(SkipReason::NoConcreteVersion))
+                Some(ScanOutcome::Skipped(SkipReason::ResolvedTagNotFullVersion))
             );
+        }
+
+        /// #1668: a SHA pin whose commit carries a two-component release tag (`v2.9`) plus its
+        /// moving alias (`v2`) is scanned as `v2.9`; a commit carrying only the moving alias
+        /// (`v2`) stays skipped, with the accurate "resolved tag is not a full version" reason.
+        #[cfg(feature = "github-actions")]
+        #[test]
+        fn build_scan_targets_github_actions_sha_pin_two_component_release_tag() {
+            use deps_core::lsp_helpers::{CommitSha, TagIndex};
+            use deps_core::osv::{ScanOutcome, SkipReason};
+            use deps_github_actions::{GithubActionsFormatter, GithubActionsRegistry};
+            use std::sync::Arc;
+
+            let sha = "f".repeat(40);
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = format!("steps:\n  - uses: actions/checkout@{sha} # v2.9\n");
+            let parse_result =
+                deps_github_actions::parse_workflow_yaml(&content, &uri).expect("valid yaml");
+            let commit = CommitSha::parse(&sha).unwrap();
+
+            for (tags, expected) in [
+                (vec!["v2", "v2.9"], Some("v2.9")),
+                (vec!["v2.9", "v2.9.1"], Some("v2.9.1")),
+                (vec!["v2.9"], Some("v2.9")),
+                (vec!["v2"], None),
+            ] {
+                let cache = Arc::new(deps_core::HttpCache::new());
+                let registry = GithubActionsRegistry::new(cache);
+                let tag_index = registry.tag_index();
+                tag_index.insert(
+                    PackageName::new("actions/checkout"),
+                    Arc::new(TagIndex::from_tags(tags.iter().map(|t| (*t, &commit)))),
+                );
+                let formatter = GithubActionsFormatter::new(tag_index);
+
+                let (targets, skipped) = build_scan_targets(
+                    &parse_result,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &formatter,
+                    EcosystemId::GithubActions,
+                );
+
+                match expected {
+                    Some(version) => {
+                        assert_eq!(targets.len(), 1, "{tags:?}: {skipped:?}");
+                        assert_eq!(targets[0].display_version, version);
+                        assert!(skipped.is_empty());
+                    }
+                    None => {
+                        assert!(targets.is_empty(), "{tags:?}: {targets:?}");
+                        assert_matches!(
+                            skipped.get(&deps_core::test_util::vuln_key("actions/checkout")),
+                            Some(ScanOutcome::Skipped(SkipReason::ResolvedTagNotFullVersion))
+                        );
+                    }
+                }
+            }
         }
 
         /// #1556: the actually-intended fix — a GitHub Actions SHA pin whose `TagIndex`
@@ -1181,9 +1247,12 @@ mod tests {
             let registry = GithubActionsRegistry::new(cache);
             let tag_index = registry.tag_index();
             let mut index = TagIndex::default();
-            index
-                .sha_to_tag
-                .insert(CommitSha::parse(&sha).unwrap(), "v1.3.0".to_string());
+            index.insert_sha_pin(
+                CommitSha::parse(&sha).unwrap(),
+                deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+                    "v1.3.0",
+                )),
+            );
             tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
             let formatter = GithubActionsFormatter::new(tag_index);
 

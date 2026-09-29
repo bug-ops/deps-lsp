@@ -603,7 +603,7 @@ mod tests {
             index.tag_to_sha.get("v4.2.0"),
             Some(&CommitSha::parse(sha).unwrap())
         );
-        assert_eq!(index.sha_to_tag.get(sha), Some(&"v4.2.0".to_string()));
+        assert_eq!(index.tag_for_sha(sha), Some("v4.2.0"));
     }
 
     /// Regression for #503: a bare-major moving tag like `v4` fails
@@ -640,7 +640,7 @@ mod tests {
             Some(&CommitSha::parse(sha).unwrap()),
             "the SHA-pin index must resolve a bare-major tag even though it's not a version"
         );
-        assert_eq!(index.sha_to_tag.get(sha), Some(&"v4".to_string()));
+        assert_eq!(index.tag_for_sha(sha), Some("v4"));
     }
 
     /// Regression for #503: a tag with a non-full-SHA `commit.sha` must still be excluded
@@ -663,8 +663,7 @@ mod tests {
 
         let name = PackageName::new("actions/checkout");
         let index = registry.tag_index.get(&name).unwrap();
-        assert!(index.tag_to_sha.is_empty());
-        assert!(index.sha_to_tag.is_empty());
+        assert!(index.is_empty());
     }
 
     /// Regression for #503 critic S1: when two tags share one commit SHA — a moving
@@ -694,8 +693,8 @@ mod tests {
         let name = PackageName::new("owner/repo");
         let index = registry.tag_index.get(&name).unwrap();
         assert_eq!(
-            index.sha_to_tag.get(sha.as_str()),
-            Some(&"v0.1.15".to_string()),
+            index.tag_for_sha(sha.as_str()),
+            Some("v0.1.15"),
             "sha_to_tag must prefer the semver-parseable tag over the bare moving one"
         );
         // tag_to_sha has no such ambiguity (keyed by the workflow's own literal ref

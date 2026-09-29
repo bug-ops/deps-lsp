@@ -99,27 +99,81 @@ impl std::borrow::Borrow<str> for CommitSha {
 /// a live registry fetch — can seed a repository's entry directly.
 ///
 /// No constructor beyond [`Default`] and [`Self::from_tags`] is provided: a caller may also
-/// build one via `TagIndex::default()` and populate [`Self::tag_to_sha`]/[`Self::sha_to_tag`]
-/// directly, which `#[non_exhaustive]` does not restrict.
+/// build one via `TagIndex::default()` and populate [`Self::tag_to_sha`] directly and the
+/// SHA -> tag direction via [`Self::insert_sha_pin`].
 #[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct TagIndex {
     /// Tag/release text (as published) -> the commit SHA it points at.
     pub tag_to_sha: std::collections::HashMap<String, CommitSha>,
-    /// Commit SHA -> the tag/release text (as published) it corresponds to.
-    pub sha_to_tag: std::collections::HashMap<CommitSha, String>,
+    /// Commit SHA -> the tag/release it corresponds to, classified at insertion time so a
+    /// tag can never be read back without knowing whether it is a moving alias.
+    sha_to_tag: std::collections::HashMap<CommitSha, ResolvedPin>,
+}
+
+/// A tag resolved from a commit SHA, classified by whether it names a release or is a
+/// moving alias of a more specific tag on the same commit.
+///
+/// Produced by [`TagIndex::resolved_pin`]; consumed by
+/// [`crate::lsp_helpers::resolve_in_use_version`], which is the only place that decides
+/// whether the tag is precise enough to query a vulnerability database with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedPin {
+    /// No other tag on the same commit extends this one, so it is the most specific name the
+    /// repository published for the commit (`v2.9` next to `v2`, but also a lone `v2`).
+    MostSpecific(crate::ConcreteVersion),
+    /// Another tag on the same commit extends this one (`v2` next to `v2.9`): a moving alias.
+    Alias(crate::ConcreteVersion),
+}
+
+impl ResolvedPin {
+    /// The tag text, verbatim as published.
+    #[must_use]
+    pub const fn version(&self) -> &crate::ConcreteVersion {
+        match self {
+            Self::MostSpecific(v) | Self::Alias(v) => v,
+        }
+    }
+}
+
+/// Specificity rank of a tag name when several share one commit: a full semver name beats a
+/// partial numeric one (more components wins), which beats any non-semver name; within a
+/// rank a release beats a pre-release of it, and the lexicographically smaller name wins so
+/// the choice never depends on fetch order.
+fn tag_specificity_rank(name: &str) -> ((u8, usize, bool), std::cmp::Reverse<&str>) {
+    let is_release = !crate::github::normalize_tag(name).contains(['-', '+']);
+    let class = if semver::Version::parse(crate::github::normalize_tag(name)).is_ok() {
+        (2, 0, is_release)
+    } else if is_partial_semver_shaped(name) {
+        (1, tag_components(name).count(), is_release)
+    } else {
+        (0, 0, false)
+    };
+    (class, std::cmp::Reverse(name))
+}
+
+fn tag_components(name: &str) -> impl Iterator<Item = &str> {
+    crate::github::normalize_tag(name).split('.')
+}
+
+/// Whether `longer` extends `shorter` by at least one more dot-separated component.
+fn extends_tag(longer: &str, shorter: &str) -> bool {
+    let mut longer = tag_components(longer);
+    tag_components(shorter).all(|c| longer.next() == Some(c)) && longer.next().is_some()
 }
 
 impl TagIndex {
-    /// Builds a `TagIndex` from `(name, sha)` pairs, preferring a full-semver-parseable name
-    /// over a bare/non-semver one when several entries share one SHA.
+    /// Builds a `TagIndex` from `(name, sha)` pairs, preferring the most specific name when
+    /// several entries share one SHA.
     ///
-    /// A bare-major moving tag like `v3`/`v4` (or a non-semver release name) normalizes to
-    /// something `semver::Version::parse` rejects, so a first-wins pass over raw fetch order
-    /// can resolve a shared SHA to a less-specific name instead of the precise release it was
-    /// actually cut from — the fetch API's ordering is undocumented, so "first in the
-    /// response" is not a reliable proxy for "most specific". [`Self::sha_to_tag`] runs a
-    /// semver-preferring pass first, then fills any remaining entries first-wins;
+    /// A bare-major moving tag like `v3`/`v4` (or a non-semver release name) is a less
+    /// specific name than the precise release the SHA was actually cut from, and the fetch
+    /// API's ordering is undocumented, so "first in the response" is not a reliable proxy for
+    /// "most specific". The SHA -> tag map therefore ranks the names sharing a SHA: a full
+    /// semver name first, then a partial numeric one with more components (`v2.9` over `v2`),
+    /// then anything else; a release beats a pre-release of it, and remaining ties resolve
+    /// to the smaller name. The chosen name is stored as [`ResolvedPin::Alias`] when another
+    /// name on the same SHA still extends it, else as [`ResolvedPin::MostSpecific`].
     /// [`Self::tag_to_sha`] has no such ambiguity (keyed by the caller's own literal ref
     /// text), so it stays a plain first-wins index over `entries`' order.
     ///
@@ -130,42 +184,71 @@ impl TagIndex {
     ///
     /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
     /// // "v1" (a bare-major moving tag) is listed before "v0.1.0" (the precise release) —
-    /// // `sha_to_tag` must still prefer the semver-parseable name.
+    /// // the SHA -> tag map must still prefer the more specific name.
     /// let index = TagIndex::from_tags([("v1", &sha), ("v0.1.0", &sha)]);
-    /// assert_eq!(index.sha_to_tag.get(&sha), Some(&"v0.1.0".to_string()));
+    /// assert_eq!(index.tag_for_sha(sha.as_str()), Some("v0.1.0"));
     /// assert_eq!(index.tag_to_sha.get("v1"), Some(&sha));
     /// ```
     #[must_use]
     pub fn from_tags<'a, I>(entries: I) -> Self
     where
         I: IntoIterator<Item = (&'a str, &'a CommitSha)>,
-        I::IntoIter: Clone,
     {
-        // Two passes need the sequence twice — cloning the iterator (cheap: the call sites'
-        // iterators are all slice-backed, so this copies a pointer/index pair, not the
-        // underlying tag/SHA data) avoids collecting into an intermediate `Vec` here on top of
-        // whatever collection the caller already built to own its `CommitSha` values.
-        let iter = entries.into_iter();
         let mut index = Self::default();
-        for (name, sha) in iter.clone() {
-            if semver::Version::parse(crate::github::normalize_tag(name)).is_ok() {
-                index
-                    .sha_to_tag
-                    .entry(sha.clone())
-                    .or_insert_with(|| name.to_string());
-            }
-        }
-        for (name, sha) in iter {
-            index
-                .sha_to_tag
-                .entry(sha.clone())
-                .or_insert_with(|| name.to_string());
+        let mut names_by_sha: std::collections::HashMap<&CommitSha, Vec<&str>> =
+            std::collections::HashMap::new();
+        for (name, sha) in entries {
+            names_by_sha.entry(sha).or_default().push(name);
             index
                 .tag_to_sha
                 .entry(name.to_string())
                 .or_insert_with(|| sha.clone());
         }
+        for (sha, names) in names_by_sha {
+            let Some(best) = names
+                .iter()
+                .copied()
+                .max_by_key(|n| tag_specificity_rank(n))
+            else {
+                continue;
+            };
+            let tag = crate::ConcreteVersion::new(best);
+            let pin = if names.iter().any(|other| extends_tag(other, best)) {
+                ResolvedPin::Alias(tag)
+            } else {
+                ResolvedPin::MostSpecific(tag)
+            };
+            index.sha_to_tag.insert(sha.clone(), pin);
+        }
         index
+    }
+
+    /// Records `pin` as the tag resolved for `sha`, replacing any previous entry.
+    ///
+    /// For callers that build an index by hand (e.g. cross-crate tests) instead of via
+    /// [`Self::from_tags`], and so must state the alias classification explicitly.
+    pub fn insert_sha_pin(&mut self, sha: CommitSha, pin: ResolvedPin) {
+        self.sha_to_tag.insert(sha, pin);
+    }
+
+    /// The tag published at `sha`, classified as a release name or a moving alias.
+    ///
+    /// `None` when no tag points at `sha`.
+    #[must_use]
+    pub fn resolved_pin(&self, sha: &str) -> Option<ResolvedPin> {
+        self.sha_to_tag.get(sha).cloned()
+    }
+
+    /// The tag text published at `sha`, without its alias classification.
+    #[must_use]
+    pub fn tag_for_sha(&self, sha: &str) -> Option<&str> {
+        self.sha_to_tag.get(sha).map(|pin| pin.version().as_str())
+    }
+
+    /// Whether the index holds no tag in either direction.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tag_to_sha.is_empty() && self.sha_to_tag.is_empty()
     }
 }
 
@@ -1074,9 +1157,141 @@ mod tests {
         // The moving tag ("v1") listed before the precise release ("v0.1.15") — sha_to_tag
         // must still resolve to the semver-parseable one, regardless of iteration order.
         let index = TagIndex::from_tags([("v1", &sha), ("v0.1.15", &sha)]);
-        assert_eq!(index.sha_to_tag.get(&sha), Some(&"v0.1.15".to_string()));
+        assert_eq!(index.tag_for_sha(sha.as_str()), Some("v0.1.15"));
         assert_eq!(index.tag_to_sha.get("v1"), Some(&sha));
         assert_eq!(index.tag_to_sha.get("v0.1.15"), Some(&sha));
+    }
+
+    fn resolved_pin_for(tags: &[&str]) -> Option<ResolvedPin> {
+        let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let index = TagIndex::from_tags(tags.iter().map(|t| (*t, &sha)));
+        index.resolved_pin(sha.as_str())
+    }
+
+    /// #1668: `v2.9` next to its moving alias `v2` is the most specific name, regardless of the
+    /// order the fetch returned them in.
+    #[test]
+    fn test_tag_index_two_component_release_beats_moving_major_in_any_order() {
+        for tags in [["v2.9", "v2"], ["v2", "v2.9"]] {
+            assert_eq!(
+                resolved_pin_for(&tags),
+                Some(ResolvedPin::MostSpecific(crate::ConcreteVersion::new(
+                    "v2.9"
+                ))),
+                "{tags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tag_index_full_semver_beats_two_component_and_major() {
+        assert_eq!(
+            resolved_pin_for(&["v2", "v2.9", "v2.9.1"]),
+            Some(ResolvedPin::MostSpecific(crate::ConcreteVersion::new(
+                "v2.9.1"
+            )))
+        );
+    }
+
+    #[test]
+    fn test_tag_index_lone_major_is_most_specific_but_a_prefix_of_an_unranked_tag_is_alias() {
+        assert_eq!(
+            resolved_pin_for(&["v2"]),
+            Some(ResolvedPin::MostSpecific(crate::ConcreteVersion::new("v2")))
+        );
+        // Four components rank below a partial-semver name but still extend it.
+        assert_eq!(
+            resolved_pin_for(&["v2.9", "v2.9.1.4"]),
+            Some(ResolvedPin::Alias(crate::ConcreteVersion::new("v2.9")))
+        );
+    }
+
+    fn most_specific(tag: &str) -> Option<ResolvedPin> {
+        Some(ResolvedPin::MostSpecific(crate::ConcreteVersion::new(tag)))
+    }
+
+    /// A pre-release never beats its own release, in either fetch order (#1668 critic).
+    #[test]
+    fn test_tag_index_release_beats_prerelease_in_any_order() {
+        for tags in [["v2.9-rc1", "v2.9"], ["v2.9", "v2.9-rc1"]] {
+            assert_eq!(resolved_pin_for(&tags), most_specific("v2.9"), "{tags:?}");
+        }
+        for tags in [["v2.9.1-rc1", "v2.9.1"], ["v2.9.1", "v2.9.1-rc1"]] {
+            assert_eq!(resolved_pin_for(&tags), most_specific("v2.9.1"), "{tags:?}");
+        }
+    }
+
+    #[test]
+    fn test_tag_index_full_semver_prerelease_beats_two_component() {
+        assert_eq!(
+            resolved_pin_for(&["v2.9", "v2.9.0-beta"]),
+            most_specific("v2.9.0-beta")
+        );
+    }
+
+    #[test]
+    fn test_tag_index_unprefixed_tags_rank_like_prefixed() {
+        for tags in [["2.9", "2"], ["2", "2.9"]] {
+            assert_eq!(resolved_pin_for(&tags), most_specific("2.9"), "{tags:?}");
+        }
+        assert_eq!(resolved_pin_for(&["2"]), most_specific("2"));
+    }
+
+    #[test]
+    fn test_tag_index_numeric_tag_beats_non_numeric_and_lone_non_numeric_wins() {
+        assert_eq!(resolved_pin_for(&["cargo-deny", "v2"]), most_specific("v2"));
+        assert_eq!(
+            resolved_pin_for(&["nightly", "v2.9"]),
+            most_specific("v2.9")
+        );
+        assert_eq!(resolved_pin_for(&["nightly"]), most_specific("nightly"));
+    }
+
+    #[test]
+    fn test_tag_index_empty_input_yields_empty_index() {
+        let index = TagIndex::from_tags(std::iter::empty());
+        assert!(index.is_empty());
+        assert_eq!(index.resolved_pin(&"a".repeat(40)), None);
+    }
+
+    #[test]
+    fn test_tag_index_classifies_each_sha_independently() {
+        let a = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let b = CommitSha::parse(&"b".repeat(40)).unwrap();
+        let index = TagIndex::from_tags([("v2", &a), ("v2.9", &a), ("v3", &b)]);
+        assert_eq!(index.resolved_pin(a.as_str()), most_specific("v2.9"));
+        assert_eq!(index.resolved_pin(b.as_str()), most_specific("v3"));
+    }
+
+    #[test]
+    fn test_tag_index_alias_is_classified_and_insert_sha_pin_overrides() {
+        let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let mut index = TagIndex::from_tags([("v2.9", &sha), ("v2.9.1.4", &sha)]);
+        assert_eq!(
+            index.resolved_pin(sha.as_str()),
+            Some(ResolvedPin::Alias(crate::ConcreteVersion::new("v2.9")))
+        );
+        assert_eq!(index.tag_for_sha(sha.as_str()), Some("v2.9"));
+        index.insert_sha_pin(
+            sha.clone(),
+            ResolvedPin::MostSpecific(crate::ConcreteVersion::new("v3.0")),
+        );
+        assert_eq!(index.resolved_pin(sha.as_str()), most_specific("v3.0"));
+    }
+
+    #[test]
+    fn test_extends_tag() {
+        assert!(extends_tag("v2.9", "v2"));
+        assert!(extends_tag("2.9.1", "v2.9"));
+        assert!(!extends_tag("v2.10", "v2.1"));
+        assert!(!extends_tag("v2", "v2"));
+        assert!(!extends_tag("v2", "v2.9"));
+        assert!(!extends_tag("v3.9", "v2"));
+    }
+
+    #[test]
+    fn test_tag_index_resolved_pin_none_for_unknown_sha() {
+        assert_eq!(TagIndex::default().resolved_pin(&"b".repeat(40)), None);
     }
 
     #[test]
