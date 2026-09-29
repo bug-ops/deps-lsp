@@ -1400,34 +1400,6 @@ impl SkipReason {
         }
     }
 
-    /// Whether this skip can be turned into a real scan by a registry fetch that populates an
-    /// ecosystem's `TagIndex` (a SHA pin's tag resolves only after that fetch lands).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_core::osv::SkipReason;
-    ///
-    /// assert!(SkipReason::NoConcreteVersion.depends_on_tag_index());
-    /// assert!(SkipReason::ResolvedTagNotFullVersion.depends_on_tag_index());
-    /// assert!(!SkipReason::QueryFailed.depends_on_tag_index());
-    /// ```
-    #[must_use]
-    pub const fn depends_on_tag_index(self) -> bool {
-        match self {
-            Self::NoConcreteVersion
-            | Self::ResolvedTagNotFullVersion
-            | Self::CanonicalNameUnconfirmed => true,
-            Self::NonRegistrySource
-            | Self::UnmappableName
-            | Self::UnmappableEcosystem
-            | Self::QueryFailed
-            | Self::Truncated
-            | Self::UnmatchableVersion
-            | Self::UnevaluableAdvisoryRange => false,
-        }
-    }
-
     /// Whether this reason is structural — permanent for as long as a dependency is declared
     /// the way it is (a mapping/ecosystem-support gap) — as opposed to transient (a timeout or
     /// a temporary OSV outage, which a retry could resolve).
@@ -1564,12 +1536,10 @@ mod skip_reason_unchecked_reason_tests {
         }
     }
 
-    /// #1683: the unconfirmed-name skip is transient — it triggers the tag-index rescan and is
-    /// never storable as structural.
+    /// #1683: the unconfirmed-name skip is transient and never storable as structural.
     #[test]
-    fn canonical_name_unconfirmed_is_transient_and_rescan_triggering() {
+    fn canonical_name_unconfirmed_is_transient() {
         let reason = SkipReason::CanonicalNameUnconfirmed;
-        assert!(reason.depends_on_tag_index());
         assert!(!reason.is_structural());
         assert_eq!(reason.as_str(), "canonical-name-unconfirmed");
     }
@@ -1694,6 +1664,26 @@ impl VulnKey {
         &self.0
     }
 
+    /// Whether this key belongs to the dependency with this normalized name — either the plain
+    /// name key or a version-qualified key [`vulnerability_keys`] derives for a duplicated name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::test_util::vuln_key;
+    ///
+    /// assert!(vuln_key("serde").is_for_name("serde"));
+    /// assert!(!vuln_key("serde_json").is_for_name("serde"));
+    /// assert!(vuln_key("serde\u{0}v:1.0").is_for_name("serde"));
+    /// ```
+    #[must_use]
+    pub fn is_for_name(&self, normalized_name: &str) -> bool {
+        self.0
+            .split_once(VERSION_QUALIFIER_SEPARATOR)
+            .map_or(self.0.as_str(), |(name, _)| name)
+            == normalized_name
+    }
+
     /// Builds a key directly from an already-computed name, for `deps-core`-internal fallback
     /// construction (e.g. [`crate::lsp_helpers::resolve_scan_outcome`]'s normalized/declared-name
     /// lookups) where going through [`vuln_key_for`] would require a full [`crate::Dependency`].
@@ -1716,6 +1706,9 @@ impl std::fmt::Display for VulnKey {
         f.write_str(&crate::redact::sanitize_invisible(&self.0))
     }
 }
+
+/// Separates the normalized name from the version signature in a duplicated dependency's key.
+const VERSION_QUALIFIER_SEPARATOR: char = '\u{0}';
 
 /// Per-occurrence [`VulnKey`]s for one document, keyed by
 /// [`Dependency::name_range`](crate::Dependency::name_range) — returned by
@@ -2023,7 +2016,7 @@ pub fn vulnerability_keys(
                 .get(name.as_str())
                 .is_some_and(|s| s.len() > 1);
             let key = if ambiguous {
-                format!("{name}\u{0}{signature}")
+                format!("{name}{VERSION_QUALIFIER_SEPARATOR}{signature}")
             } else {
                 name.clone()
             };

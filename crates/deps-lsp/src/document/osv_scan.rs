@@ -7,7 +7,7 @@ use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower_lsp_server::ls_types::Uri;
@@ -40,6 +40,78 @@ fn log_osv_run_summary(vulnerabilities: &deps_core::osv::VulnerabilityMap) {
     );
 }
 
+/// What the scan does for one key: the exact query it sends, or why it sends none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlannedQuery {
+    Query {
+        name: deps_core::osv::OsvQueryName,
+        version: deps_core::osv::OsvVersion,
+    },
+    Skip(deps_core::osv::SkipReason),
+}
+
+/// The per-key inputs of one OSV scan, as [`deps_engine::classify::osv::build_scan_targets`]
+/// decided them — committed next to the scan's results so a later rebuild of the same plan
+/// tells exactly whether a rescan could produce anything different (#1705, #1706).
+///
+/// Comparing inputs rather than outcomes is what keeps a permanently skipped key (a branch
+/// pin, a bare `@4`, an unconfirmed private repository) from re-running the scan after every
+/// registry fetch, while still catching a floating tag that moved to another release.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OsvScanPlan(HashMap<deps_core::osv::VulnKey, PlannedQuery>);
+
+impl OsvScanPlan {
+    fn new(
+        targets: &[deps_core::osv::ScanTarget],
+        skipped: &deps_core::osv::VulnerabilityMap,
+    ) -> Self {
+        let queries = targets.iter().map(|target| {
+            (
+                target.key.clone(),
+                PlannedQuery::Query {
+                    name: target.osv_name.clone(),
+                    version: target.version.clone(),
+                },
+            )
+        });
+        let skips = skipped.iter().filter_map(|(key, outcome)| {
+            let deps_core::osv::ScanOutcome::Skipped(reason) = outcome else {
+                return None;
+            };
+            Some((key.clone(), PlannedQuery::Skip(*reason)))
+        });
+        Self(queries.chain(skips).collect())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Drops the entry for a removed dependency's normalized name.
+    pub(crate) fn retain_not_named(&mut self, normalized: &str) {
+        self.0.retain(|key, _| !key.is_for_name(normalized));
+    }
+}
+
+/// Builds the scan targets and pre-filter skips from whatever the document holds right now —
+/// the single input both [`run_osv_scan_phase_a`] and the rescan predicate derive from.
+fn scan_inputs(
+    doc: &super::state::DocumentState,
+    ecosystem: &dyn Ecosystem,
+) -> Option<(
+    Vec<deps_core::osv::ScanTarget>,
+    deps_core::osv::VulnerabilityMap,
+)> {
+    let parse_result = doc.parse_result()?;
+    Some(deps_engine::classify::osv::build_scan_targets(
+        parse_result,
+        &doc.signals.resolved_versions,
+        &doc.signals.resolved_version_candidates,
+        ecosystem.formatter(),
+        ecosystem.ecosystem_id(),
+    ))
+}
+
 /// Phase A output, carried from the concurrently-spawned scan task into
 /// phase B (run later, after the registry fetch resolves — critique S1).
 pub(crate) struct OsvScanResult {
@@ -54,8 +126,8 @@ pub(crate) struct OsvScanResult {
     vulnerabilities: deps_core::osv::VulnerabilityMap,
     /// `key -> osv_name`, needed to build phase B candidates.
     osv_name_by_key: HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvQueryName>,
-    /// Keys queried under a provisional name, committed next to `vulnerabilities`.
-    provisional_keys: HashSet<deps_core::osv::VulnKey>,
+    /// Inputs this scan ran with, committed next to `vulnerabilities`.
+    scan_plan: OsvScanPlan,
 }
 
 /// Phase A: builds scan targets, runs [`deps_core::osv::OsvClient::scan`], and
@@ -79,14 +151,7 @@ pub(crate) async fn run_osv_scan_phase_a(
 
     let (content_snapshot, resolved_generation, targets, mut vulnerabilities) = {
         let doc = state.get_document(&uri)?;
-        let parse_result = doc.parse_result()?;
-        let (targets, skipped) = deps_engine::classify::osv::build_scan_targets(
-            parse_result,
-            &doc.signals.resolved_versions,
-            &doc.signals.resolved_version_candidates,
-            ecosystem.formatter(),
-            ecosystem_id,
-        );
+        let (targets, skipped) = scan_inputs(&doc, ecosystem.as_ref())?;
         (
             doc.content.clone(),
             doc.signals.resolved_versions_generation,
@@ -100,11 +165,7 @@ pub(crate) async fn run_osv_scan_phase_a(
     }
 
     let osv_name_by_key = deps_engine::classify::osv::osv_name_by_key(&targets);
-    let provisional_keys = osv_name_by_key
-        .iter()
-        .filter(|(_, name)| matches!(name, deps_core::osv::OsvQueryName::Provisional(_)))
-        .map(|(key, _)| key.clone())
-        .collect();
+    let scan_plan = OsvScanPlan::new(&targets, &vulnerabilities);
 
     if !targets.is_empty() {
         let timeout_duration =
@@ -123,7 +184,7 @@ pub(crate) async fn run_osv_scan_phase_a(
         resolved_generation,
         vulnerabilities,
         osv_name_by_key,
-        provisional_keys,
+        scan_plan,
     })
 }
 
@@ -172,35 +233,6 @@ pub(crate) async fn rescan_after_resolved_version_change(
     .await;
 }
 
-/// Whether any dependency whose last scan used a provisional package name can now be queried
-/// under its confirmed one (#1694) — a dependency that stays unconfirmed (private repository,
-/// no tags) must not trigger a rescan on every open/edit.
-fn provisional_name_now_confirmed(
-    doc: &super::state::DocumentState,
-    ecosystem: &Arc<dyn Ecosystem>,
-) -> bool {
-    let Some(parse_result) = doc.parse_result() else {
-        return false;
-    };
-    let formatter = ecosystem.formatter();
-    let keys = deps_core::osv::vulnerability_keys(
-        parse_result,
-        &doc.signals.resolved_versions,
-        Some(&doc.signals.resolved_version_candidates),
-        formatter,
-        ecosystem.ecosystem_id(),
-    );
-    parse_result.dependencies().into_iter().any(|dep| {
-        doc.signals
-            .provisional_osv_keys
-            .contains(&deps_core::osv::vuln_key_for(dep, Some(&keys), formatter))
-            && matches!(
-                formatter.osv_name_availability(dep),
-                deps_core::lsp_helpers::OsvNameAvailability::Ready
-            )
-    })
-}
-
 /// Re-runs the OSV phase A/B pipeline once more and commits its result, when needed, right
 /// after a registry fetch this document just awaited (#1556 critic S2).
 ///
@@ -219,10 +251,12 @@ fn provisional_name_now_confirmed(
 ///
 /// Cheap no-op in the overwhelmingly common case: returns immediately unless both (a) this
 /// ecosystem's formatter opts into
-/// `resolved_pin_version_depends_on_registry_fetch` and (b) the document's just-committed
-/// vulnerability map actually left something skipped on the tag index, or a result queried
-/// under a provisional package name whose confirmed name is now available (#1694) — most
-/// ecosystems and most documents hit neither. When it does run, it mirrors
+/// `resolved_pin_version_depends_on_registry_fetch` and (b) the [`OsvScanPlan`] rebuilt from the
+/// document's current state differs from the one its last committed scan ran with — a
+/// cold-index skip that now resolves (#1556), a provisional name now confirmed (#1694), or a
+/// floating tag that moved to another release (#1706). A key that stays skipped for the same
+/// reason (a branch pin, a bare `@4`) leaves the plans equal and never rescans (#1705). When it
+/// does run, it mirrors
 /// [`rescan_after_resolved_version_change`]'s "run phase A, then phase B, then commit" shape
 /// exactly, plus the same hint/code-lens republish
 /// [`super::lifecycle`]'s ordinary commit path gives a phase-B commit, since this can be the
@@ -242,20 +276,15 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
         return;
     }
 
-    let left_unresolved = state.get_document(uri).is_some_and(|doc| {
-        let provisional = &doc.signals.provisional_osv_keys;
-        let skipped_on_tag_index = doc.signals.vulnerabilities.iter().any(|(key, outcome)| {
-            matches!(
-                outcome,
-                deps_core::osv::ScanOutcome::Skipped(reason) if reason.depends_on_tag_index()
-            ) && !provisional.contains(key)
-        });
-        skipped_on_tag_index
-            || (!provisional.is_empty() && provisional_name_now_confirmed(&doc, ecosystem))
+    let plan_changed = state.get_document(uri).is_some_and(|doc| {
+        scan_inputs(&doc, ecosystem.as_ref()).is_some_and(|(targets, skipped)| {
+            OsvScanPlan::new(&targets, &skipped) != doc.signals.osv_scan_plan
+        })
     });
-    if !left_unresolved {
+    if !plan_changed {
         return;
     }
+    tracing::debug!("OSV scan plan changed after registry fetch, rescanning");
 
     let Some(phase_a_result) = run_osv_scan_phase_a(
         uri.clone(),
@@ -555,7 +584,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
             true
         } else {
             doc.update_vulnerabilities(result.vulnerabilities);
-            doc.signals.provisional_osv_keys = result.provisional_keys;
+            doc.signals.osv_scan_plan = result.scan_plan;
             doc.update_latest_status(latest_status);
             false
         }
@@ -2091,6 +2120,375 @@ mod tests {
             );
         }
 
+        /// #1705: branch, bare-major and alias-only pins stay skipped for the same reason across
+        /// a warm index, so a rescan must never run — a sentinel entry survives only if the
+        /// full-replace commit never happened.
+        #[tokio::test]
+        async fn unchanged_skipped_pins_do_not_rescan() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let server = mockito::Server::new_async().await;
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+            let (state, uri, ecosystem) = open_gha_document(
+                server.url(),
+                "steps:\n  - uses: actions/checkout@main\n  - uses: actions/setup-node@4\n  - uses: actions/cache@v4\n",
+            )
+            .await;
+            let commit = CommitSha::parse(&"c".repeat(40)).unwrap();
+            for name in ["actions/checkout", "actions/setup-node", "actions/cache"] {
+                land_tags(
+                    &ecosystem,
+                    name,
+                    &[("v4", &commit)],
+                    &format!("https://api.github.com/repos/{name}/commits/abc"),
+                );
+            }
+
+            scan_and_commit(&state, &uri, &ecosystem).await;
+
+            let sentinel = deps_core::test_util::vuln_key("sentinel");
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                assert_eq!(doc.signals.osv_scan_plan.len(), 3);
+                assert!(
+                    doc.signals
+                        .osv_scan_plan
+                        .0
+                        .values()
+                        .all(|planned| matches!(planned, PlannedQuery::Skip(_))),
+                    "{:?}",
+                    doc.signals.osv_scan_plan
+                );
+                doc.signals
+                    .vulnerabilities
+                    .insert(sentinel.clone(), deps_core::osv::ScanOutcome::Clean);
+            }
+
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+            assert!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .signals
+                    .vulnerabilities
+                    .contains_key(&sentinel),
+                "skips that did not change must not rescan"
+            );
+        }
+
+        /// #1705: a failed tags fetch leaves the index untouched, so a cold-index skip stays
+        /// equal to its stored plan and does not rescan.
+        #[tokio::test]
+        async fn unchanged_cold_index_skip_does_not_rescan() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let server = mockito::Server::new_async().await;
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+            let (state, uri, ecosystem) =
+                open_gha_document(server.url(), "steps:\n  - uses: actions/checkout@v4\n").await;
+
+            scan_and_commit(&state, &uri, &ecosystem).await;
+
+            let sentinel = deps_core::test_util::vuln_key("sentinel");
+            state
+                .documents
+                .get_mut(&uri)
+                .unwrap()
+                .signals
+                .vulnerabilities
+                .insert(sentinel.clone(), deps_core::osv::ScanOutcome::Clean);
+
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+            assert!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .signals
+                    .vulnerabilities
+                    .contains_key(&sentinel),
+                "an index that stayed cold must not rescan"
+            );
+        }
+
+        /// #1706: a floating `@v4` whose tag moves to another release is re-queried under the
+        /// new version, and a further rescan with the index unchanged does nothing.
+        #[tokio::test]
+        async fn moved_floating_tag_triggers_rescan_once() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let _batch = server
+                .mock("POST", "/v1/querybatch")
+                .with_status(200)
+                .with_body(r#"{"results":[{}]}"#)
+                .create_async()
+                .await;
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+            let (state, uri, ecosystem) =
+                open_gha_document(server.url(), "steps:\n  - uses: actions/checkout@v4\n").await;
+            let canonical = "https://api.github.com/repos/actions/checkout/commits/abc";
+            let old = CommitSha::parse(&"a".repeat(40)).unwrap();
+            land_tags(
+                &ecosystem,
+                "actions/checkout",
+                &[("v4", &old), ("v4.1.0", &old)],
+                canonical,
+            );
+
+            scan_and_commit(&state, &uri, &ecosystem).await;
+            let key = deps_core::test_util::vuln_key("actions/checkout");
+            let planned_version = |state: &Arc<ServerState>| match state
+                .get_document(&uri)
+                .unwrap()
+                .signals
+                .osv_scan_plan
+                .0
+                .get(&key)
+            {
+                Some(PlannedQuery::Query { version, .. }) => version.as_str().to_string(),
+                other => panic!("expected a planned query, got {other:?}"),
+            };
+            assert!(planned_version(&state).contains("4.1.0"));
+
+            let new = CommitSha::parse(&"b".repeat(40)).unwrap();
+            land_tags(
+                &ecosystem,
+                "actions/checkout",
+                &[("v4", &new), ("v4.1.0", &old), ("v4.2.0", &new)],
+                canonical,
+            );
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            assert!(planned_version(&state).contains("4.2.0"));
+
+            let sentinel = deps_core::test_util::vuln_key("sentinel");
+            state
+                .documents
+                .get_mut(&uri)
+                .unwrap()
+                .signals
+                .vulnerabilities
+                .insert(sentinel.clone(), deps_core::osv::ScanOutcome::Clean);
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+            assert!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .signals
+                    .vulnerabilities
+                    .contains_key(&sentinel),
+                "an unchanged plan must not rescan again"
+            );
+        }
+
+        /// A dependency removed from the manifest drops its plan entry with its other
+        /// per-key state.
+        #[tokio::test]
+        async fn prune_removed_drops_the_plan_entry() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let server = mockito::Server::new_async().await;
+            let (state, uri, ecosystem) = open_gha_document(
+                server.url(),
+                "steps:\n  - uses: actions/checkout@main\n  - uses: actions/cache@main\n",
+            )
+            .await;
+            scan_and_commit(&state, &uri, &ecosystem).await;
+
+            let mut doc = state.documents.get_mut(&uri).unwrap();
+            assert_eq!(doc.signals.osv_scan_plan.len(), 2);
+            doc.signals
+                .prune_removed(&[PackageName::new("actions/cache")], ecosystem.formatter());
+
+            assert_eq!(doc.signals.osv_scan_plan.len(), 1);
+            assert!(
+                !doc.signals
+                    .osv_scan_plan
+                    .0
+                    .contains_key(&deps_core::test_util::vuln_key("actions/cache"))
+            );
+        }
+
+        /// Plan equality is decided by the query's name, trust, version, or skip reason.
+        #[test]
+        fn scan_plan_equality_tracks_query_inputs() {
+            let target = |name: &str, version: &str, confirmed: bool| {
+                let package = deps_core::osv::OsvPackageName::new(name).unwrap();
+                deps_core::osv::ScanTarget::new(
+                    deps_core::test_util::vuln_key(name),
+                    if confirmed {
+                        deps_core::osv::OsvQueryName::Confirmed(package)
+                    } else {
+                        deps_core::osv::OsvQueryName::Provisional(package)
+                    },
+                    deps_core::osv::OsvVersion::new(version.to_string()),
+                    ConcreteVersion::new(version),
+                )
+            };
+            let skipped = |reason| {
+                deps_core::osv::VulnerabilityMap::from([(
+                    deps_core::test_util::vuln_key("b"),
+                    deps_core::osv::ScanOutcome::Skipped(reason),
+                )])
+            };
+            let base = OsvScanPlan::new(
+                &[target("a", "1.0.0", true)],
+                &skipped(deps_core::osv::SkipReason::NoConcreteVersion),
+            );
+
+            assert_eq!(
+                base,
+                OsvScanPlan::new(
+                    &[target("a", "1.0.0", true)],
+                    &skipped(deps_core::osv::SkipReason::NoConcreteVersion),
+                )
+            );
+            assert_ne!(
+                base,
+                OsvScanPlan::new(
+                    &[target("a", "1.1.0", true)],
+                    &skipped(deps_core::osv::SkipReason::NoConcreteVersion),
+                )
+            );
+            assert_ne!(
+                base,
+                OsvScanPlan::new(
+                    &[target("a", "1.0.0", false)],
+                    &skipped(deps_core::osv::SkipReason::NoConcreteVersion),
+                )
+            );
+            assert_ne!(
+                base,
+                OsvScanPlan::new(
+                    &[target("a", "1.0.0", true)],
+                    &skipped(deps_core::osv::SkipReason::ResolvedTagNotFullVersion),
+                )
+            );
+        }
+
+        /// #1705: a floating `@v4` on a warm index whose tags did not move (e.g. the tags
+        /// fetch failed and left the index untouched) does not rescan.
+        #[tokio::test]
+        async fn unchanged_warm_floating_tag_does_not_rescan() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let _batch = server
+                .mock("POST", "/v1/querybatch")
+                .with_status(200)
+                .with_body(r#"{"results":[{}]}"#)
+                .create_async()
+                .await;
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+            let (state, uri, ecosystem) =
+                open_gha_document(server.url(), "steps:\n  - uses: actions/checkout@v4\n").await;
+            let commit = CommitSha::parse(&"a".repeat(40)).unwrap();
+            land_tags(
+                &ecosystem,
+                "actions/checkout",
+                &[("v4", &commit), ("v4.1.0", &commit)],
+                "https://api.github.com/repos/actions/checkout/commits/abc",
+            );
+            scan_and_commit(&state, &uri, &ecosystem).await;
+
+            let sentinel = deps_core::test_util::vuln_key("sentinel");
+            state
+                .documents
+                .get_mut(&uri)
+                .unwrap()
+                .signals
+                .vulnerabilities
+                .insert(sentinel.clone(), deps_core::osv::ScanOutcome::Clean);
+
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+            assert!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .signals
+                    .vulnerabilities
+                    .contains_key(&sentinel),
+                "a warm index that did not change must not rescan"
+            );
+        }
+
+        /// A dependency added or removed between the last scan and the predicate changes the
+        /// plan's key set, so the rescan runs both times.
+        #[tokio::test]
+        async fn added_and_removed_dependency_trigger_rescan() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let server = mockito::Server::new_async().await;
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+            let (state, uri, ecosystem) =
+                open_gha_document(server.url(), "steps:\n  - uses: actions/checkout@main\n").await;
+            scan_and_commit(&state, &uri, &ecosystem).await;
+
+            let url = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let sentinel = deps_core::test_util::vuln_key("sentinel");
+            let cache_key = deps_core::test_util::vuln_key("actions/cache");
+            for (content, cache_planned) in [
+                (
+                    "steps:\n  - uses: actions/checkout@main\n  - uses: actions/cache@main\n",
+                    true,
+                ),
+                ("steps:\n  - uses: actions/checkout@main\n", false),
+            ] {
+                let mut signals = state.get_document(&uri).unwrap().signals.clone();
+                signals
+                    .vulnerabilities
+                    .insert(sentinel.clone(), deps_core::osv::ScanOutcome::Clean);
+                let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+                let mut edited = DocumentState::new_from_parse_result(
+                    EcosystemId::GithubActions,
+                    content.to_string(),
+                    parse_result,
+                );
+                edited.signals = signals;
+                state.update_document(uri.clone(), edited);
+
+                rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+                let doc = state.get_document(&uri).unwrap();
+                assert!(
+                    !doc.signals.vulnerabilities.contains_key(&sentinel),
+                    "a changed key set must rescan"
+                );
+                assert_eq!(
+                    doc.signals.osv_scan_plan.0.contains_key(&cache_key),
+                    cache_planned
+                );
+            }
+        }
+
+        /// A version-qualified key of a duplicated dependency is pruned with its name.
+        #[test]
+        fn retain_not_named_drops_version_qualified_keys() {
+            let skipped = [
+                deps_core::test_util::vuln_key("a"),
+                deps_core::test_util::vuln_key("a\u{0}v:1.0"),
+                deps_core::test_util::vuln_key("ab"),
+            ]
+            .into_iter()
+            .map(|key| {
+                (
+                    key,
+                    deps_core::osv::ScanOutcome::Skipped(
+                        deps_core::osv::SkipReason::NoConcreteVersion,
+                    ),
+                )
+            })
+            .collect();
+            let mut plan = OsvScanPlan::new(&[], &skipped);
+
+            plan.retain_not_named("a");
+
+            assert_eq!(plan.len(), 1);
+            assert!(plan.0.contains_key(&deps_core::test_util::vuln_key("ab")));
+        }
+
         async fn open_gha_document(
             osv_base_url: String,
             content: &str,
@@ -2214,7 +2612,13 @@ mod tests {
                     "{:?}",
                     doc.signals.vulnerabilities
                 );
-                assert!(doc.signals.provisional_osv_keys.contains(&key));
+                assert_matches!(
+                    doc.signals.osv_scan_plan.0.get(&key),
+                    Some(PlannedQuery::Query {
+                        name: deps_core::osv::OsvQueryName::Provisional(_),
+                        ..
+                    })
+                );
             }
             written.assert_async().await;
 
@@ -2235,7 +2639,13 @@ mod tests {
                     "{:?}",
                     doc.signals.vulnerabilities
                 );
-                assert!(doc.signals.provisional_osv_keys.is_empty());
+                assert_matches!(
+                    doc.signals.osv_scan_plan.0.get(&key),
+                    Some(PlannedQuery::Query {
+                        name: deps_core::osv::OsvQueryName::Confirmed(_),
+                        ..
+                    })
+                );
             }
             canonical.assert_async().await;
         }
@@ -2309,7 +2719,13 @@ mod tests {
                 "{:?}",
                 doc.signals.vulnerabilities
             );
-            assert!(doc.signals.provisional_osv_keys.is_empty());
+            assert_matches!(
+                doc.signals.osv_scan_plan.0.get(&key),
+                Some(PlannedQuery::Query {
+                    name: deps_core::osv::OsvQueryName::Confirmed(_),
+                    ..
+                })
+            );
         }
 
         /// #1694 (critic N2): a dependency whose canonical name never arrives (private
@@ -2337,7 +2753,13 @@ mod tests {
             let sentinel = deps_core::test_util::vuln_key("sentinel");
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                assert!(doc.signals.provisional_osv_keys.contains(&key));
+                assert_matches!(
+                    doc.signals.osv_scan_plan.0.get(&key),
+                    Some(PlannedQuery::Query {
+                        name: deps_core::osv::OsvQueryName::Provisional(_),
+                        ..
+                    })
+                );
                 assert_matches!(
                     doc.signals.vulnerabilities.get(&key),
                     Some(deps_core::osv::ScanOutcome::Skipped(
