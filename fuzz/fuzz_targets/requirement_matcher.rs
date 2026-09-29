@@ -18,6 +18,9 @@
 
 #![no_main]
 
+#[path = "../shared/panic_guard.rs"]
+mod panic_guard;
+
 use deps_core::lsp_helpers::requirement_is_oversized;
 use deps_core::{ConcreteVersion, Ecosystem, EcosystemId, VersionReq};
 use libfuzzer_sys::fuzz_target;
@@ -109,24 +112,26 @@ fuzz_target!(|data: &[u8]| {
     let requirement = VersionReq::new(requirement_str);
     let bound_duration = !requirement_is_oversized(&requirement);
 
-    for ecosystem in ECOSYSTEMS.iter() {
-        let formatter = ecosystem.formatter();
-        if let Some(matcher) = timed("compile_requirement", bound_duration, || {
-            formatter.compile_requirement(&requirement)
-        }) {
-            let _ = timed("matches", bound_duration, || matcher.matches(&version));
-            let _ = timed("explicitly_excludes", bound_duration, || {
-                matcher.explicitly_excludes(&version)
+    panic_guard::run_aborting_on_escape(|| {
+        for ecosystem in ECOSYSTEMS.iter() {
+            let formatter = ecosystem.formatter();
+            if let Some(matcher) = timed("compile_requirement", bound_duration, || {
+                formatter.compile_requirement(&requirement)
+            }) {
+                let _ = timed("matches", bound_duration, || matcher.matches(&version));
+                let _ = timed("explicitly_excludes", bound_duration, || {
+                    matcher.explicitly_excludes(&version)
+                });
+            }
+            let _ = timed("version_satisfies_requirement", bound_duration, || {
+                formatter.version_satisfies_requirement(&version, requirement_str)
+            });
+            let _ = timed("is_requirement_up_to_date", bound_duration, || {
+                formatter.is_requirement_up_to_date(&requirement, &version)
+            });
+            let _ = timed("requirement_already_resolves_to", bound_duration, || {
+                formatter.requirement_already_resolves_to(&requirement, &version)
             });
         }
-        let _ = timed("version_satisfies_requirement", bound_duration, || {
-            formatter.version_satisfies_requirement(&version, requirement_str)
-        });
-        let _ = timed("is_requirement_up_to_date", bound_duration, || {
-            formatter.is_requirement_up_to_date(&requirement, &version)
-        });
-        let _ = timed("requirement_already_resolves_to", bound_duration, || {
-            formatter.requirement_already_resolves_to(&requirement, &version)
-        });
-    }
+    });
 });
