@@ -213,6 +213,10 @@ fn provisional_name_now_confirmed(
 /// re-checks it once the fetch actually lands, so the diagnostic stays wrong for the rest of
 /// the session.
 ///
+/// No-op while [`ServerState::is_osv_latest_check_enabled`] (vulnerabilities enabled and not
+/// offline) is `false`, read live so a setting change during the preceding fetch is honored
+/// (#1704).
+///
 /// Cheap no-op in the overwhelmingly common case: returns immediately unless both (a) this
 /// ecosystem's formatter opts into
 /// `resolved_pin_version_depends_on_registry_fetch` and (b) the document's just-committed
@@ -230,9 +234,10 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
     ecosystem: &Arc<dyn Ecosystem>,
     fetch_timeout_secs: u64,
 ) {
-    if !ecosystem
-        .formatter()
-        .resolved_pin_version_depends_on_registry_fetch()
+    if !state.is_osv_latest_check_enabled()
+        || !ecosystem
+            .formatter()
+            .resolved_pin_version_depends_on_registry_fetch()
     {
         return;
     }
@@ -1799,6 +1804,81 @@ mod tests {
                 "the rescan's full-replace commit must leave no leftover stale entry \
                  behind: {:?}",
                 doc.signals.vulnerabilities
+            );
+        }
+
+        /// #1704: with vulnerabilities disabled or the server offline (both fold into
+        /// `is_osv_latest_check_enabled`, see the `did_change_configuration` tests in
+        /// `server.rs`) a warm `TagIndex` must not trigger an OSV request or replace the stale
+        /// skip.
+        #[tokio::test]
+        async fn rescan_is_noop_when_vulnerabilities_disabled_or_offline() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let batch = server
+                .mock("POST", "/v1/querybatch")
+                .with_status(200)
+                .with_body(r#"{"results":[{}]}"#)
+                .expect(0)
+                .create_async()
+                .await;
+
+            let mut state = ServerState::new();
+            state.osv = Arc::new(OsvClient::for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                server.url(),
+            ));
+            state.set_osv_latest_check_enabled(false);
+            let state = Arc::new(state);
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+
+            let sha = "f".repeat(40);
+            let url = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let content = format!("steps:\n  - uses: actions/checkout@{sha} # v1\n");
+
+            let ecosystem: Arc<dyn Ecosystem> = Arc::new(GithubActionsEcosystem::new(Arc::new(
+                deps_core::HttpCache::new(),
+            )));
+            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let mut doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::GithubActions,
+                content,
+                parse_result,
+            );
+            let key = deps_core::test_util::vuln_key("actions/checkout");
+            doc_state.signals.vulnerabilities.insert(
+                key.clone(),
+                deps_core::osv::ScanOutcome::Skipped(deps_core::osv::SkipReason::NoConcreteVersion),
+            );
+            state.update_document(uri.clone(), doc_state);
+
+            let registry = ecosystem.registry();
+            let gha_registry = registry
+                .as_any()
+                .downcast_ref::<GithubActionsRegistry>()
+                .expect("GithubActionsEcosystem::registry() must return a GithubActionsRegistry");
+            let mut index = TagIndex::default();
+            index.insert_sha_pin(
+                CommitSha::parse(&sha).unwrap(),
+                deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+                    "v1.3.0",
+                )),
+            );
+            gha_registry
+                .tag_index()
+                .insert(PackageName::new("actions/checkout"), Arc::new(index));
+
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+            batch.assert_async().await;
+            let doc = state.get_document(&uri).unwrap();
+            assert_matches!(
+                doc.signals.vulnerabilities.get(&key),
+                Some(deps_core::osv::ScanOutcome::Skipped(
+                    deps_core::osv::SkipReason::NoConcreteVersion
+                ))
             );
         }
 
