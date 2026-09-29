@@ -268,7 +268,7 @@ pub fn load(explicit_path: Option<&Path>, default_dir: &Path) -> Result<CliConfi
 /// (safe) value here automatically, rather than silently staying attacker-controlled until
 /// someone notices and adds it to a reset list.
 ///
-/// The only fields kept from `parsed`: `policy.diagnostics`'s six `*_severity` values. These
+/// The only fields kept from `parsed`: `policy.diagnostics`'s `*_severity` values. These
 /// are purely cosmetic (`table`/`json` severity display) —
 /// [`crate::report::FailOnPolicy::matches`] checks a finding's `Category`, never its
 /// severity, so no severity value can suppress or weaken a `--fail-on` match. Everything else
@@ -294,7 +294,10 @@ pub fn safe_auto_discovered_config(parsed: CliConfig) -> CliConfig {
                 .with_yanked_severity(parsed.policy.diagnostics.yanked_severity)
                 .with_unsatisfiable_severity(parsed.policy.diagnostics.unsatisfiable_severity)
                 .with_deprecated_severity(parsed.policy.diagnostics.deprecated_severity)
-                .with_mutable_ref_pin_severity(parsed.policy.diagnostics.mutable_ref_pin_severity),
+                .with_mutable_ref_pin_severity(parsed.policy.diagnostics.mutable_ref_pin_severity)
+                .with_sha_comment_mismatch_severity(
+                    parsed.policy.diagnostics.sha_comment_mismatch_severity,
+                ),
             ..PolicyConfig::default()
         },
         ..CliConfig::default()
@@ -827,6 +830,25 @@ b = 2
         assert_eq!(
             config.policy.diagnostics.yanked_severity,
             deps_core::diagnostic::Severity::Hint
+        );
+    }
+
+    #[test]
+    fn test_load_auto_discovered_pin_severities_are_kept() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            dir.path().join(DEFAULT_CONFIG_FILENAME),
+            "[diagnostics]\nmutable_ref_pin_severity = 1\nsha_comment_mismatch_severity = 1\n",
+        )
+        .expect("write deps.toml");
+        let config = load(None, dir.path()).expect("auto-discovered file must still load");
+        assert_eq!(
+            config.policy.diagnostics.mutable_ref_pin_severity,
+            deps_core::diagnostic::Severity::Error
+        );
+        assert_eq!(
+            config.policy.diagnostics.sha_comment_mismatch_severity,
+            deps_core::diagnostic::Severity::Error
         );
     }
 

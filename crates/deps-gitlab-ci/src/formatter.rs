@@ -135,9 +135,7 @@ impl GitlabCiFormatter {
             requirement.as_str(),
             latest,
         )?
-        .into_status(Some(RequirementStatus::Outdated), |tag| {
-            self.is_bounded_requirement_up_to_date(tag, latest)
-        })
+        .into_status(|tag| self.is_bounded_requirement_up_to_date(tag, latest))
     }
 }
 

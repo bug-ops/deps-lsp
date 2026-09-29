@@ -5,6 +5,7 @@
 //! defining them locally.
 
 use super::{BoundedVersionReq, LineOffsetTable, RequirementStatus};
+use crate::pagination::ListCoverage;
 use crate::position::Range;
 use yaml_rust2::parser::Tag;
 use yaml_rust2::scanner::{Marker, TScalarStyle};
@@ -20,6 +21,21 @@ use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit,
 
 /// Length of a full, lowercase-or-not hex commit SHA (git's SHA-1 object id).
 const SHA_LEN: usize = 40;
+
+/// The conventional 7-character display prefix of a commit SHA (the whole string when shorter).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::short_sha;
+///
+/// assert_eq!(short_sha(&"a".repeat(40)), "aaaaaaa");
+/// assert_eq!(short_sha("abc"), "abc");
+/// ```
+#[must_use]
+pub fn short_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
+}
 
 /// Whether `s` is a 40-character hex string — a git commit SHA shape, shared by every
 /// ecosystem resolving refs against a git-tags-datasource API (GitHub, GitLab).
@@ -110,6 +126,7 @@ pub struct TagIndex {
     /// tag can never be read back without knowing whether it is a moving alias.
     sha_to_tag: std::collections::HashMap<CommitSha, ResolvedPin>,
     canonical_repo_name: Option<crate::github::CanonicalRepoName>,
+    coverage: ListCoverage,
 }
 
 /// Other release tags sharing a commit with a [`ResolvedPin`]'s primary tag.
@@ -447,6 +464,21 @@ impl TagIndex {
         self
     }
 
+    /// Records whether the fetch that built this index reached the end of the tag list.
+    ///
+    /// [`Self::default`] and [`Self::from_tags`] start as [`ListCoverage::Complete`].
+    #[must_use]
+    pub const fn with_coverage(mut self, coverage: ListCoverage) -> Self {
+        self.coverage = coverage;
+        self
+    }
+
+    /// Whether the index covers every tag of the repository, so absence of a SHA is meaningful.
+    #[must_use]
+    pub const fn coverage(&self) -> ListCoverage {
+        self.coverage
+    }
+
     /// The repository's canonical `owner/repo` casing, `None` when no fetched tag confirmed it.
     #[must_use]
     pub const fn canonical_repo_name(&self) -> Option<&crate::github::CanonicalRepoName> {
@@ -507,19 +539,21 @@ pub enum ShaPinLookup {
         /// The tag published at the SHA, verbatim.
         tag: crate::ConcreteVersion,
     },
-    /// The repository's index is populated and no tag points at the SHA.
+    /// The repository's index is populated, [`ListCoverage::Complete`], and no tag points at
+    /// the SHA.
     NotIndexed,
-    /// No populated index for the repository yet (cold cache).
-    IndexUnavailable,
+    /// The index cannot vouch for the SHA either way: no populated index yet (cold cache), or
+    /// the SHA is absent from a [`ListCoverage::Truncated`] index.
+    Unverifiable,
 }
 
 impl ShaPinLookup {
     /// Looks `sha` up in `index` relative to `latest`; `None` when `sha` is not a full SHA.
     ///
     /// The lookup key is lowercased: registries report lowercase hex, while a pin may be
-    /// written in uppercase. A missing or empty `index` yields
-    /// [`Self::IndexUnavailable`], never [`Self::NotIndexed`], so a cold cache is not
-    /// mistaken for proof that the pin is stale.
+    /// written in uppercase. A missing or empty `index`, or a SHA absent from a truncated one,
+    /// yields [`Self::Unverifiable`], never [`Self::NotIndexed`], so a cold cache or a
+    /// capped tag list is not mistaken for proof that the pin is stale.
     ///
     /// # Examples
     ///
@@ -536,7 +570,7 @@ impl ShaPinLookup {
     /// );
     /// assert_eq!(
     ///     ShaPinLookup::resolve(None, sha.as_str(), &latest),
-    ///     Some(ShaPinLookup::IndexUnavailable)
+    ///     Some(ShaPinLookup::Unverifiable)
     /// );
     /// ```
     #[must_use]
@@ -550,7 +584,7 @@ impl ShaPinLookup {
         }
         let sha = sha.to_ascii_lowercase();
         let Some(index) = index.filter(|index| !index.is_empty()) else {
-            return Some(Self::IndexUnavailable);
+            return Some(Self::Unverifiable);
         };
         if index
             .tag_to_sha
@@ -559,21 +593,21 @@ impl ShaPinLookup {
         {
             return Some(Self::LatestCommit);
         }
-        Some(match index.tag_version_for_sha(&sha) {
-            Some(tag) => Self::Indexed { tag: tag.clone() },
-            None => Self::NotIndexed,
+        Some(match (index.tag_version_for_sha(&sha), index.coverage()) {
+            (Some(tag), _) => Self::Indexed { tag: tag.clone() },
+            (None, ListCoverage::Complete) => Self::NotIndexed,
+            (None, ListCoverage::Truncated) => Self::Unverifiable,
         })
     }
 
     /// Maps the lookup to a [`RequirementStatus`], or `None` when the caller should fall back
-    /// to its own text-based classification.
+    /// to its own text-based classification (only for [`Self::Unverifiable`]).
     ///
     /// [`Self::LatestCommit`] is up to date. [`Self::Indexed`] is up to date only when its tag
     /// is [`is_tag_shaped`] and `tag_is_up_to_date` accepts it, so a non-version tag
     /// (`cargo-deny`) never reads as current by text; an oversized tag is `Unresolved`.
-    /// [`Self::NotIndexed`] yields `not_indexed`, the one ecosystem-specific policy (GitHub
-    /// Actions trusts a `# tag` comment, GitLab CI has none). [`Self::IndexUnavailable`] yields
-    /// `None`.
+    /// [`Self::NotIndexed`] is `Outdated`: `latest` comes from the same fetch, so the pin is
+    /// provably not `latest`'s commit, whatever a trailing `# tag` comment claims.
     ///
     /// # Examples
     ///
@@ -581,19 +615,18 @@ impl ShaPinLookup {
     /// use deps_core::lsp_helpers::{RequirementStatus, ShaPinLookup};
     ///
     /// assert_eq!(
-    ///     ShaPinLookup::LatestCommit.into_status(None, |_| false),
+    ///     ShaPinLookup::LatestCommit.into_status(|_| false),
     ///     Some(RequirementStatus::UpToDate)
     /// );
     /// assert_eq!(
-    ///     ShaPinLookup::NotIndexed.into_status(Some(RequirementStatus::Outdated), |_| true),
+    ///     ShaPinLookup::NotIndexed.into_status(|_| true),
     ///     Some(RequirementStatus::Outdated)
     /// );
-    /// assert_eq!(ShaPinLookup::IndexUnavailable.into_status(None, |_| true), None);
+    /// assert_eq!(ShaPinLookup::Unverifiable.into_status(|_| true), None);
     /// ```
     #[must_use]
     pub fn into_status(
         self,
-        not_indexed: Option<RequirementStatus>,
         tag_is_up_to_date: impl FnOnce(BoundedVersionReq<'_>) -> bool,
     ) -> Option<RequirementStatus> {
         match self {
@@ -610,8 +643,8 @@ impl ShaPinLookup {
                     }),
                 )
             }
-            Self::NotIndexed => not_indexed,
-            Self::IndexUnavailable => None,
+            Self::NotIndexed => Some(RequirementStatus::Outdated),
+            Self::Unverifiable => None,
         }
     }
 }
@@ -1431,17 +1464,10 @@ pub fn sha_pin_text_edit(pinning: &impl ShaPinning, dep: &dyn Dependency) -> Opt
 /// let out = splice_resolved_line(markdown, "v3.0.0", &sha);
 /// assert!(out.contains("**Resolved**: `v3.0.0`"));
 /// ```
-// `pos`/`rel_end`/`insert_at` come from `find` of ASCII anchors (`"**Current**: "`,
-// `"\n\n"`), so all are always char boundaries.
 #[cfg(feature = "lsp-responses")]
-#[expect(
-    clippy::string_slice,
-    reason = "sha.get(..7) already guards non-ASCII input; pos/rel_end/insert_at derive only \
-              from find() of ASCII anchors, so every slice below is a char boundary"
-)]
 #[must_use]
 pub fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String {
-    let short_sha = sha.get(..7).unwrap_or(sha);
+    let short_sha = short_sha(sha);
     // `resolved_tag` is tag-index/registry-controlled and unbounded (#1311), and — like
     // any git tag — has no legitimate use for an invisible/bidi character, so it gets
     // the same `sanitize_invisible`-then-truncate treatment `HoverMarkdown`'s
@@ -1449,27 +1475,52 @@ pub fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> St
     // `build_sha_pin_action`'s `display_name` above already uses, at
     // `MAX_VERSION_DIAGNOSTIC_CHARS` (the version-shaped sibling cap).
     let line = format!(
-        "**Resolved**: {} ({})\n\n",
+        "**Resolved**: {} ({})",
         markdown_code_span(&super::diagnostics::sanitize_and_truncate_for_diagnostic(
             resolved_tag,
             MAX_VERSION_DIAGNOSTIC_CHARS
         )),
         markdown_code_span(&format!("{short_sha}…"))
     );
+    splice_hover_line(markdown, &line)
+}
 
-    for anchor in ["**Current**: ", "**Requirement**: "] {
+/// Inserts one markdown `line` as its own paragraph after the last present hover anchor
+/// (`**Resolved**`, else `**Current**`, else `**Requirement**`), falling back to append.
+///
+/// Anchoring on `**Resolved**` first keeps a warning line below a previously spliced
+/// resolved-tag line. `line` must already be sanitized and contain no paragraph break.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::splice_hover_line;
+///
+/// let out = splice_hover_line("**Current**: `v3`\n\nBody.", "**Warning**: careful");
+/// assert_eq!(out, "**Current**: `v3`\n\n**Warning**: careful\n\nBody.");
+/// ```
+#[cfg(feature = "lsp-responses")]
+#[expect(
+    clippy::string_slice,
+    reason = "pos/rel_end/insert_at derive only from find() of ASCII anchors, so every slice \
+              below is a char boundary"
+)]
+#[must_use]
+pub fn splice_hover_line(markdown: &str, line: &str) -> String {
+    for anchor in ["**Resolved**: ", "**Current**: ", "**Requirement**: "] {
         if let Some(pos) = markdown.find(anchor)
             && let Some(rel_end) = markdown[pos..].find("\n\n")
         {
             let insert_at = pos + rel_end + 2;
-            let mut out = String::with_capacity(markdown.len() + line.len());
+            let mut out = String::with_capacity(markdown.len() + line.len() + 2);
             out.push_str(&markdown[..insert_at]);
-            out.push_str(&line);
+            out.push_str(line);
+            out.push_str("\n\n");
             out.push_str(&markdown[insert_at..]);
             return out;
         }
     }
-    format!("{markdown}{line}")
+    format!("{markdown}{line}\n\n")
 }
 
 #[cfg(test)]
@@ -1570,11 +1621,31 @@ mod tests {
         );
         assert_eq!(
             lookup(Some(&TagIndex::default()), &"a".repeat(40), "v1.1.0"),
-            Some(ShaPinLookup::IndexUnavailable)
+            Some(ShaPinLookup::Unverifiable)
         );
         assert_eq!(
             lookup(None, &"a".repeat(40), "v1.1.0"),
-            Some(ShaPinLookup::IndexUnavailable)
+            Some(ShaPinLookup::Unverifiable)
+        );
+        assert_eq!(
+            lookup(Some(&index), &"b".repeat(40), "v1.1.0"),
+            Some(ShaPinLookup::LatestCommit)
+        );
+    }
+
+    #[test]
+    fn test_sha_pin_lookup_truncated_index_only_proves_presence() {
+        let index = TagIndex::from_tags([("v1.0.0", &sha_of('a')), ("v1.1.0", &sha_of('b'))])
+            .with_coverage(ListCoverage::Truncated);
+        assert_eq!(
+            lookup(Some(&index), &"c".repeat(40), "v1.1.0"),
+            Some(ShaPinLookup::Unverifiable)
+        );
+        assert_eq!(
+            lookup(Some(&index), &"a".repeat(40), "v1.1.0"),
+            Some(ShaPinLookup::Indexed {
+                tag: crate::ConcreteVersion::new("v1.0.0")
+            })
         );
         assert_eq!(
             lookup(Some(&index), &"b".repeat(40), "v1.1.0"),
@@ -1596,23 +1667,27 @@ mod tests {
             tag: crate::ConcreteVersion::new(tag),
         };
         assert_eq!(
-            indexed("v1.0.0").into_status(None, |_| true),
+            indexed("v1.0.0").into_status(|_| true),
             Some(RequirementStatus::UpToDate)
         );
         assert_eq!(
-            indexed("v1.0.0").into_status(None, |_| false),
+            indexed("v1.0.0").into_status(|_| false),
             Some(RequirementStatus::Outdated)
         );
         assert_eq!(
-            indexed("cargo-deny").into_status(None, |_| true),
+            indexed("cargo-deny").into_status(|_| true),
             Some(RequirementStatus::Outdated)
         );
         let oversized = "v".repeat(super::super::MAX_REQUIREMENT_LEN + 1);
         assert_eq!(
-            indexed(&oversized).into_status(None, |_| true),
+            indexed(&oversized).into_status(|_| true),
             Some(RequirementStatus::Unresolved)
         );
-        assert_eq!(ShaPinLookup::NotIndexed.into_status(None, |_| true), None);
+        assert_eq!(
+            ShaPinLookup::NotIndexed.into_status(|_| true),
+            Some(RequirementStatus::Outdated)
+        );
+        assert_eq!(ShaPinLookup::Unverifiable.into_status(|_| true), None);
     }
 
     fn resolved_pin_for(tags: &[&str]) -> Option<ResolvedPin> {
@@ -2351,9 +2426,38 @@ mod tests {
         assert_eq!(marker_byte_offset(content, &table, 5, 14), content.len());
     }
 
+    #[test]
+    fn test_tag_index_coverage_defaults_to_complete() {
+        assert_eq!(TagIndex::default().coverage(), ListCoverage::Complete);
+        assert_eq!(
+            TagIndex::from_tags(std::iter::empty()).coverage(),
+            ListCoverage::Complete
+        );
+    }
+
+    #[test]
+    fn test_tag_index_with_coverage_records_truncation() {
+        let index = TagIndex::default().with_coverage(ListCoverage::Truncated);
+        assert_eq!(index.coverage(), ListCoverage::Truncated);
+    }
+
     #[cfg(feature = "lsp-responses")]
     mod lsp_tests {
         use super::*;
+
+        #[test]
+        fn splice_hover_line_anchor_priority_resolved_then_current_then_requirement() {
+            let with_resolved = "**Current**: `a`\n\n**Resolved**: `b`\n\nBody.";
+            assert_eq!(
+                splice_hover_line(with_resolved, "W"),
+                "**Current**: `a`\n\n**Resolved**: `b`\n\nW\n\nBody."
+            );
+            assert_eq!(
+                splice_hover_line("**Requirement**: `a`\n\nBody.", "W"),
+                "**Requirement**: `a`\n\nW\n\nBody."
+            );
+            assert_eq!(splice_hover_line("Body.", "W"), "Body.W\n\n");
+        }
 
         /// #1311: `resolved_tag` is tag-index/registry-controlled and unbounded — mirrors
         /// diagnostics.rs's `MAX_VERSION_DIAGNOSTIC_CHARS` truncation test pattern.

@@ -358,6 +358,7 @@ pub const DEPRECATED_DIAGNOSTIC_CODE: &str = "deprecated-package";
 /// assert_eq!(severities.deprecated, Severity::Warning);
 /// assert_eq!(severities.mutable_ref_pin, Severity::Hint);
 /// assert!(severities.mutable_ref_pin_enabled);
+/// assert_eq!(severities.sha_comment_mismatch, Severity::Warning);
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,6 +389,11 @@ pub struct DiagnosticSeverities {
     /// additionally needs a real presence toggle, mirroring
     /// `deps_lsp::config::DiagnosticsConfig::vulnerabilities_enabled`'s shape.
     pub mutable_ref_pin_enabled: bool,
+    /// Severity for a SHA-pinned `uses:` step whose trailing version comment names a tag
+    /// that is provably not the pinned commit's tag (`deps-github-actions`'s
+    /// `SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE`). No `_enabled` toggle: only a provable
+    /// mismatch is reported.
+    pub sha_comment_mismatch: Severity,
     /// Whether OSV vulnerability checking is enabled at all (issue #1517), mirroring
     /// `deps_lsp::config::DiagnosticsConfig::vulnerabilities_enabled`'s exact shape and
     /// default (`true`, opt-out). Consulted by the `deps-lsp` diagnostics handler to decide
@@ -435,6 +441,7 @@ impl DiagnosticSeverities {
             deprecated: Severity::Warning,
             mutable_ref_pin: Severity::Hint,
             mutable_ref_pin_enabled: true,
+            sha_comment_mismatch: Severity::Warning,
             vulnerabilities_enabled: true,
         }
     }
@@ -486,6 +493,13 @@ impl DiagnosticSeverities {
     #[must_use]
     pub const fn with_mutable_ref_pin_enabled(mut self, mutable_ref_pin_enabled: bool) -> Self {
         self.mutable_ref_pin_enabled = mutable_ref_pin_enabled;
+        self
+    }
+
+    /// Overrides [`Self::sha_comment_mismatch`]. See [`Self::with_outdated`].
+    #[must_use]
+    pub const fn with_sha_comment_mismatch(mut self, sha_comment_mismatch: Severity) -> Self {
+        self.sha_comment_mismatch = sha_comment_mismatch;
         self
     }
 

@@ -42,6 +42,10 @@ const GITLAB_CI_MUTABLE_REF_PIN_CODE: &str = "gitlab-ci-mutable-ref-pin";
 /// `registries.gitlab_instance_host` is unset/invalid. See
 /// [`GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE`]'s doc for why this is a literal.
 const GITLAB_CI_UNRESOLVED_HOST_CODE: &str = "unresolved-gitlab-host";
+/// `deps_github_actions::SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE` — a supply-chain hygiene
+/// warning, not a vulnerability. See [`GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE`]'s doc for why this
+/// is a literal.
+const GITHUB_ACTIONS_SHA_COMMENT_MISMATCH_CODE: &str = "sha-comment-mismatch";
 
 /// A category a [`CheckFinding`] can be classified into — the seven `--fail-on` tokens FR-009
 /// defines, plus [`Category::Other`].
@@ -685,7 +689,9 @@ fn classify(
             GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE | GITLAB_CI_MUTABLE_REF_PIN_CODE => {
                 Category::MutableRefPin
             }
-            GITLAB_CI_UNRESOLVED_HOST_CODE => Category::Other,
+            GITLAB_CI_UNRESOLVED_HOST_CODE | GITHUB_ACTIONS_SHA_COMMENT_MISMATCH_CODE => {
+                Category::Other
+            }
             _ => Category::Vulnerable,
         };
     }
@@ -869,6 +875,15 @@ mod tests {
         assert_eq!(classify(&d, &STUB_FORMATTER), Category::MutableRefPin);
         let d = diagnostic_with(Some(GITLAB_CI_MUTABLE_REF_PIN_CODE), "pinned to a tag");
         assert_eq!(classify(&d, &STUB_FORMATTER), Category::MutableRefPin);
+    }
+
+    #[test]
+    fn test_classify_sha_comment_mismatch_is_other() {
+        let d = diagnostic_with(
+            Some(GITHUB_ACTIONS_SHA_COMMENT_MISMATCH_CODE),
+            "SHA is not the commit of the tag in the comment",
+        );
+        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Other);
     }
 
     #[test]
