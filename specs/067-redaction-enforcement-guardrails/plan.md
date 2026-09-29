@@ -8,7 +8,7 @@ tags:
   - testing-infra
   - deps-core
 created: 2026-09-23
-status: draft
+status: shipped
 related:
   - "[[spec]]"
   - "[[constitution]]"

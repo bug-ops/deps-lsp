@@ -4,7 +4,7 @@
 [![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/bug-ops/deps-lsp/badge)](https://scorecard.dev/viewer/?uri=github.com/bug-ops/deps-lsp)
 [![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ)](https://codecov.io/gh/bug-ops/deps-lsp)
-[![Tests](https://img.shields.io/badge/tests-6322%20passed-brightgreen)](https://github.com/bug-ops/deps-lsp/actions)
+[![Tests](https://img.shields.io/badge/tests-8065%20passed-brightgreen)](https://github.com/bug-ops/deps-lsp/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.98-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
@@ -31,6 +31,15 @@ install and keep in sync.
 - **Typosquat detection** *(opt-in)* — flags a declared dependency whose name deps.dev reports as
   suspiciously similar to a much more popular package, across Cargo, npm, PyPI, Go, Bundler,
   Maven, and NuGet.
+- **Opt-in deps.dev signals** *(GOSSIP)* — with `gossip.enabled`, hover and diagnostics take the
+  outdated-cooldown callout from deps.dev's Dynamic Cooldown data and add a low-usage /
+  slopsquatting-risk warning for the pinned version.
+- **Safe upgrade recommendations** — every version offered as an update target is independently
+  checked against OSV, so a flagged or malicious release is never suggested as a safe upgrade;
+  an unresolved version placeholder (`${VAR}`, `$(VAR)`, `%VAR%`) is never overwritten by a fix.
+- **CI supply-chain pinning** — GitHub Actions and GitLab CI/CD SHA pins are resolved through the
+  repository's tag index, so a pin is checked, flagged as outdated, or re-pinned to the latest
+  release's SHA, and a `# vX` comment that does not match the pinned commit is reported.
 - **Lock-file aware** — Reads the version you actually have installed, not just the range you
   wrote, across every ecosystem that has a lock file.
 - **One-click fixes** — Code actions to bump a version, resolve an unsatisfiable range, or patch a
@@ -151,8 +160,9 @@ docker run --rm -v "$PWD:/workspace" -w /workspace \
 
 - **Output formats**: human-readable table (default), versioned JSON, or SARIF 2.1.0 for
   `github/codeql-action/upload-sarif`
-- **`deps-cli update <MANIFEST>`**: plans and writes back version-requirement edits for
-  outdated (default) or OSV-vulnerable (`--security-only`) dependencies — see
+- **`deps-cli update <MANIFEST>`**: plans and atomically writes back version-requirement edits
+  for outdated (default, honoring the freshness cooldown) or OSV-vulnerable (`--security-only`)
+  dependencies, with `--package`, `--dry-run`, and `--format table|json` — see
   [`crates/deps-cli/README.md`](crates/deps-cli/README.md#update-subcommand)
 - **[Pre-commit hook](.pre-commit-hooks.yaml)**: `deps-lsp-check`, runs `deps-cli check`
   against staged files
@@ -173,6 +183,8 @@ setup only touches a handful of options:
   "inlay_hints": { "enabled": true },
   "diagnostics": { "outdated_severity": "hint", "vulnerabilities_enabled": true },
   "freshness": { "enabled": true, "cooldown_secs": 259200 },
+  "gossip": { "enabled": false },
+  "typosquat": { "enabled": false },
   "network": { "offline": false },
   "license_policy": { "allow": [], "deny": [] }
 }

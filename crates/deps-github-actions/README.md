@@ -26,7 +26,14 @@ or `.github/actions/<name>/`, issue #706), and implements `deps_core::Ecosystem`
   request coalescing so N workflows referencing the same action on a cold cache issue one
   fetch, not N, and a local rate-limit gate that stops hammering GitHub once a 403 is seen
 - **SHA-pin-aware code actions** — updating a `@<sha> # vX.Y.Z` pin writes both a new SHA
-  and its matching tag comment, never silently downgrading a SHA pin to a bare tag
+  and its matching tag comment, never silently downgrading a SHA pin to a bare tag; quoted and
+  flow-style SHA pins are rewritten too, keeping their quotes/braces and trailing comment
+- **SHA-pin classification through the tag index** — a full-SHA pin is classified against the
+  repository's release tags: on the latest release's commit is up to date, at an older tag or on
+  no release tag (from a complete tag list) is outdated and re-pinned to the latest release's SHA
+- **OSV scanning** — OSV.dev does not version-match the `GitHub Actions` ecosystem, so advisories
+  are fetched by canonical name and matched locally; SHA pins and floating tags (`@v4`) resolve
+  through the tag index, and every release tag on the pinned commit is checked
 - **Mutable-ref-pin security diagnostic** (issue #473) — a tag-pinned `uses:` step (e.g.
   `@v4`) gets an additive, independent diagnostic recommending SHA pinning, plus a "Pin to
   commit SHA" quick fix rewriting it to `@<sha> # <tag>` when the tag's commit is already
@@ -48,7 +55,7 @@ or `.github/actions/<name>/`, issue #706), and implements `deps_core::Ecosystem`
 
 ```toml
 [dependencies]
-deps-github-actions = "1.2"
+deps-github-actions = "2.0"
 ```
 
 > [!IMPORTANT]
@@ -81,9 +88,11 @@ against the tag with zero SHA-to-tag network resolution.
 
 ## Known limitations
 
-- Bare SHA and branch refs have no resolvable version — no outdated diagnostic, no inlay
-  hint, matching the existing Maven `${property}`/Gradle `$var` precedent for an
-  unresolvable requirement
+- Branch refs have no resolvable version — no outdated diagnostic, no inlay hint, and no
+  rewrite (a branch pin is never turned into a version)
+- A SHA pin is classified only once the repository's tag index is loaded; while it is cold, or
+  when the index was truncated by the 30-page fetch cap, a SHA missing from it stays unverified
+  rather than being called outdated
 - Reusable-workflow calls (`owner/repo/.github/workflows/x.yml@ref`) are parsed and
   recognized but deliberately non-resolvable: the referenced workflow's version and the
   host repository's release tags are not reliably the same thing, and a wrong diagnostic
@@ -96,11 +105,11 @@ against the tag with zero SHA-to-tag network resolution.
   keystroke would burn the 60 req/hour unauthenticated budget fast
 - The unauthenticated GitHub API budget (60 req/hour) is per-IP and shared with any
   `deps-swift` traffic in the same process; set `GITHUB_TOKEN` to raise it to 5000 req/hour
-- The "Pin to commit SHA" quick fix is withheld for a quoted `uses:` value
+- The mutable-tag "Pin to commit SHA" quick fix is withheld for a quoted `uses:` value
   (`uses: "actions/checkout@v4"`) — the ref sits inside the quotes there, and appending
   `# <tag>` would corrupt the value instead of adding a YAML comment; the diagnostic still
   fires, just without the automated fix
-- Both the "Pin to commit SHA" quick fix and the bulk "Pin all to SHA" lens are withheld
+- Both the mutable-tag "Pin to commit SHA" quick fix and the bulk "Pin all to SHA" lens are withheld
   for a `uses:` step written in YAML flow style (`{uses: actions/checkout@v4, with:
   {node: 20}}`) — appending `# <tag>` would comment out the rest of the flow collection
   and produce invalid YAML; block-style steps (the common case) are unaffected

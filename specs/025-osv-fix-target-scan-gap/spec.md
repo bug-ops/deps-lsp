@@ -10,13 +10,16 @@ tags:
   - deps-lsp
   - deps-core
 created: 2026-09-02
-status: draft
+status: shipped
 related:
   - "[[constitution]]"
   - "[[002-osv-vulnerability-diagnostics/spec|OSV vulnerability diagnostics]]"
 ---
 
 # Feature: OSV Fix-Target Scan Gap — Recommended Fix Version Is Never Independently Scanned
+
+> [!success] Shipped
+> Implemented by PR #467 (issue #462): the recommended fix version is verified before `generate_code_actions` offers it. PR #1530 later extended fail-closed OSV checks to every offered upgrade candidate.
 
 > [!info] Metadata
 > **Author**: continuous-improvement cycle (research/architecture stream)

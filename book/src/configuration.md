@@ -12,6 +12,11 @@ control, see [Conventions](cross-ecosystem/conventions.md).
 
 | Section | Option | Default | Description |
 | --------- | -------- | --------- | ------------- |
+| `inlay_hints` | `enabled` | `true` | Show inline version annotations next to each dependency |
+| `inlay_hints` | `up_to_date_text` | `"✅"` | Text shown when the dependency is up to date |
+| `inlay_hints` | `needs_update_text` | `"❌ {}"` | Text shown when an update exists; `{}` is replaced with the latest version |
+| `cold_start` | `enabled` | `true` | Load previously opened files from disk at startup so features work before the editor sends `didOpen` |
+| `cold_start` | `rate_limit_ms` | `100` | Minimum delay in milliseconds between cold-start registry fetches for the same URI |
 | `cache` | `enabled` | `true` | Whether the HTTP entry-map cache is used at all; `false` fetches fresh on every request and never stores. Overridden to behave as `true` while `network.offline` is set |
 | `cache` | `fetch_timeout_secs` | `5` | Per-package fetch timeout (1-300 seconds) |
 | `cache` | `max_concurrent_fetches` | `20` | Concurrent registry requests (1-100) |

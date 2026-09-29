@@ -30,6 +30,13 @@ provides parsing and registry integration for `.gitlab-ci.yml` and `.gitlab/ci/*
   (highest published non-prerelease release), and partial semver (`1.2`, `1`) via
   `semver::VersionReq` range matching, per GitLab's own documented CI/CD Catalog resolution
   order
+- **SHA-pin classification** — a full 40-hex `ref:`/`component:` SHA pin is classified through
+  the route's tag (or release) index: up to date on the latest release's commit, otherwise
+  outdated and re-pinned to the latest release's full SHA, never to a bare tag
+- **Branch pins left alone** — a branch `ref:` is never offered an update that rewrites the
+  branch name into a version
+- **Placeholder guard** — an unresolved `$VAR`/`${VAR}`/`%VAR%` ref and `$[[ inputs.x ]]`
+  expression is never overwritten by a fix
 - **Per-host rate limiting** — one self-hosted instance rate-limiting or requiring
   authentication never disables lookups against `gitlab.com` or any other configured host
 
@@ -37,7 +44,7 @@ provides parsing and registry integration for `.gitlab-ci.yml` and `.gitlab/ci/*
 
 ```toml
 [dependencies]
-deps-gitlab-ci = "1.2"
+deps-gitlab-ci = "2.0"
 ```
 
 > [!IMPORTANT]

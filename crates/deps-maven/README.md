@@ -16,7 +16,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Dependency sections** — Handle `<dependencies>`, `<dependencyManagement>`, and `<build><plugins>` blocks
 - **Maven Central registry** — Solr API client for version lookups and artifact search
 - **Version comparison** — Maven version qualifier support (`alpha`, `beta`, `RC`, `SNAPSHOT`, `GA`)
-- **Property resolution** — Resolve `${property}` placeholders defined in `<properties>`
+- **Property resolution** — Resolve `${property}` placeholders defined in `<properties>`; each retained property value is bounded to 1 KiB, and an unresolved placeholder is never overwritten by a fix
 - **Scope handling** — Recognise `compile`, `test`, `provided`, `runtime`, and `import` scopes
 - **License hover** — SPDX license for the resolved and latest version, flagging a "License changed" when they differ
 - **Release-freshness signal (partial)** — Per-version ages in hover/completion from Maven Central's directory listing; unavailable for Google Maven and Gradle Plugin Portal artifacts, which have no date column (see the [deps-lsp book](https://bug-ops.github.io/deps-lsp/ecosystems/maven-gradle.html#release-freshness-coverage))
@@ -25,7 +25,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-maven = "1.2"
+deps-maven = "2.0"
 ```
 
 > [!IMPORTANT]

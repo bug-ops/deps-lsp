@@ -10,7 +10,7 @@ tags:
   - testing-infra
   - deps-core
 created: 2026-09-23
-status: draft
+status: shipped
 related:
   - "[[constitution]]"
   - "[[041-credential-redaction-hardening/spec|Credential Redaction Hardening]]"

@@ -7,7 +7,7 @@ tags:
   - deps-cli
   - deps-dev
 created: 2026-09-26
-status: draft
+status: shipped
 related:
   - "[[spec]]"
   - "[[constitution]]"

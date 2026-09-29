@@ -12,7 +12,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ## Features
 
-- **Regex-based parser** — Parse all 9 `.package()` call signatures without requiring a Swift toolchain
+- **Regex-based parser** — Parse all 9 `.package()` call signatures without requiring a Swift toolchain, including labelled `exact:`/`branch:`/`revision:`/`name:` forms, trailing commas, a trailing `traits:` argument, and `.package(id:)` registry dependencies
 - **GitHub API registry** — Resolve versions from repository tags via the GitHub REST API
 - **Lock file parsing** — Extract resolved versions from `Package.resolved`
 - **All version forms** — `from`, `upToNextMajor`, `upToNextMinor`, `exact`, half-open range, closed range, `branch`, `revision`, `path`
@@ -27,7 +27,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-swift = "1.2"
+deps-swift = "2.0"
 ```
 
 > [!IMPORTANT]

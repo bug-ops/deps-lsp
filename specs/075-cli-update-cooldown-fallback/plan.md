@@ -8,7 +8,7 @@ tags:
   - deps-core
   - deps-engine
 created: 2026-09-27
-status: ready
+status: shipped
 related:
   - "[[spec]]"
   - "[[constitution]]"

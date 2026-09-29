@@ -10,7 +10,7 @@ tags:
   - deps-dev
   - priority/p3
 created: 2026-09-25
-status: ready
+status: shipped
 related:
   - "[[MOC-specs]]"
   - "[[002-osv-vulnerability-diagnostics/spec]]"

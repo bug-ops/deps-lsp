@@ -8,7 +8,7 @@ tags:
   - deps-core
   - deps-engine
 created: 2026-09-27
-status: ready
+status: shipped
 related:
   - "[[spec]]"
   - "[[plan]]"
@@ -80,21 +80,21 @@ bug (round-1 critic M2): a partial match (one in-use version locatable, one not)
 at the locatable one and ignores that another in-use version could not be placed.
 **Spec reference**: [[spec#FR-016]], [[spec#FR-017]], [[spec#FR-018]]
 **Acceptance criteria**:
-- [ ] `enum InUseFloor { Absent, Located(usize), Unlocatable { newest_located: Option<usize> } }`
+- [x] `enum InUseFloor { Absent, Located(usize), Unlocatable { newest_located: Option<usize> } }`
       added, engine-private
-- [ ] `fn in_use_floor(versions: &[Box<dyn Version>], in_use_versions: &[String]) -> InUseFloor`
+- [x] `fn in_use_floor(versions: &[Box<dyn Version>], in_use_versions: &[String]) -> InUseFloor`
       replaces BOTH `protect_floor` (`:894`) and the fallback `floor` lookup (`:1241`) — no third
       copy
-- [ ] Spec 074's GOSSIP-filter call site: `Located(idx)`/`Unlocatable { newest_located: Some(idx) }`
+- [x] Spec 074's GOSSIP-filter call site: `Located(idx)`/`Unlocatable { newest_located: Some(idx) }`
       both filter at `idx`; `Absent`/`Unlocatable { newest_located: None }` both no-op — BYTE FOR
       BYTE unchanged from today's shipped behavior (verify against every existing spec 074 test in
       `fetch.rs`, none of which may change expectation)
-- [ ] Fallback-candidate call site: `Located(idx)` sets the D2 floor unchanged;
+- [x] Fallback-candidate call site: `Located(idx)` sets the D2 floor unchanged;
       `Unlocatable` (either variant) now yields `cooldown_fallback: None` — STRICTER than today's
       shipped `.min()?`, which silently ignores an unplaceable entry
-- [ ] New unit test: a partial in-use-version match (one locatable, one not) at the fallback call
+- [x] New unit test: a partial in-use-version match (one locatable, one not) at the fallback call
       site resolves `cooldown_fallback: None` (SC-010)
-- [ ] New unit test: spec 074's existing partial-match tests
+- [x] New unit test: spec 074's existing partial-match tests
       (`floor_exists_but_ecosystem_selection_rejects_the_remainder_is_a_no_op`,
       `filtered_pick_below_the_floor_is_rejected_in_favor_of_the_unfiltered_pick`) pass unchanged
       after the refactor (SC-011)
@@ -113,12 +113,12 @@ sites, and `compute_cooldown_fallback` already skips the scan when the known unf
 `Cleared` (an unknown pick still scans). No production change here.
 **Spec reference**: [[spec#FR-019]], [[spec#FR-020]], [[spec#FR-021]]
 **Acceptance criteria**:
-- [ ] NO `CooldownVerdict`/`cooldown_verdict_for` is added (spec §3 amendment callout)
-- [ ] SC-012: confirm existing #1553 tests cover "known Cleared pick → no scan" and "unknown pick →
+- [x] NO `CooldownVerdict`/`cooldown_verdict_for` is added (spec §3 amendment callout)
+- [x] SC-012: confirm existing #1553 tests cover "known Cleared pick → no scan" and "unknown pick →
       full scan" (`unknown_list_based_pick_still_runs_the_full_fallback_search`); add a test only for a gap
-- [ ] SC-013: FR-021 gate-superset tests in `deps-engine` (3 proof cases + window-narrowed case asserting a
+- [x] SC-013: FR-021 gate-superset tests in `deps-engine` (3 proof cases + window-narrowed case asserting a
       skip, never an unsafe write)
-- [ ] NFR-007/SC-021: existing precedence/disposition/hover/diagnostics/report tests unchanged
+- [x] NFR-007/SC-021: existing precedence/disposition/hover/diagnostics/report tests unchanged
 **Dependencies**: T000 (shares `fetch.rs`)
 **Files**: `crates/deps-engine/src/classify/fetch.rs` (tests only)
 **Complexity**: low
@@ -133,22 +133,22 @@ edited occurrence by a lookup key that survives every ecosystem's grammar, all f
 call site, without bypassing the existing `#796` dependency-count cap.
 **Spec reference**: [[spec#FR-024]]
 **Acceptance criteria**:
-- [ ] `pub fn parse_manifest_now(ecosystem: &dyn Ecosystem, content: &str, uri: &Url) ->
+- [x] `pub fn parse_manifest_now(ecosystem: &dyn Ecosystem, content: &str, uri: &Url) ->
       Option<Box<dyn ParseResult>>` added to `deps_core::ecosystem` — drives
       `Ecosystem::parse_manifest` via `futures::FutureExt::now_or_never()`, then applies
       `dependency_cap::cap_dependencies(parsed, MAX_DEPENDENCIES_PER_DOCUMENT)`, the SAME call
       `parse_manifest_blocking` makes — `Pending` or an `Err` from the future maps to `None`
-- [ ] New test: `parse_manifest_now` on a manifest at/over `MAX_DEPENDENCIES_PER_DOCUMENT` is
+- [x] New test: `parse_manifest_now` on a manifest at/over `MAX_DEPENDENCIES_PER_DOCUMENT` is
       capped identically to `parse_manifest_blocking`'s async path (SC-016)
-- [ ] `pub trait ManifestReparse { fn reparse(&self, content: &str) -> Option<Box<dyn
+- [x] `pub trait ManifestReparse { fn reparse(&self, content: &str) -> Option<Box<dyn
       ParseResult>>; }` added to `deps_core::edit`
-- [ ] `pub struct EcosystemReparse<'a> { ecosystem: &'a dyn Ecosystem, uri: &'a Url }` implements
+- [x] `pub struct EcosystemReparse<'a> { ecosystem: &'a dyn Ecosystem, uri: &'a Url }` implements
       `ManifestReparse` via `parse_manifest_now` — NOT a raw `now_or_never()` call (that would
       bypass the cap this task exists to enforce)
-- [ ] Occurrence lookup after re-parse is by `(formatter.normalize_package_name(dep.name()),
+- [x] Occurrence lookup after re-parse is by `(formatter.normalize_package_name(dep.name()),
       version_range.start)` — NOT `name_range` equality; exactly one match required, zero or
       multiple fails closed (`None`)
-- [ ] New test: a NuGet `<PackageReference Version="1.0" Include="X"/>` (`Version` attribute
+- [x] New test: a NuGet `<PackageReference Version="1.0" Include="X"/>` (`Version` attribute
       before `Include`) fixture resolves correctly via this lookup key — proves the fix over a
       `name_range`-based lookup, which would silently fail closed here (SC-017)
 **Dependencies**: none
@@ -164,12 +164,12 @@ call site, without bypassing the existing `#796` dependency-count cap.
 `Located` and `Absent` paths, no per-ecosystem override, no retry. Removes spec 075's Go bypass.
 **Spec reference**: [[spec#FR-022]], [[spec#FR-023]], [[spec#FR-025]]
 **Acceptance criteria**:
-- [ ] `pub enum FallbackEditVerdict { Writable, Rejected(FallbackEditRejection) }` and exhaustive
+- [x] `pub enum FallbackEditVerdict { Writable, Rejected(FallbackEditRejection) }` and exhaustive
       `pub enum FallbackEditRejection { OriginalUncompilable, OriginalAlreadyUpToDate,
       OriginalResolvesPastFallback, ReparseFailed, OccurrenceNotUnique, EditedUncompilable,
       EditedExcludesFallback, EditedAdmitsNewer }` in `deps_core::lsp_helpers` (derive `Debug, Clone,
       Copy, PartialEq, Eq`; `///` docs + doctest)
-- [ ] `pub fn fallback_edit_excludes_newer(formatter, reparse: &dyn ManifestReparse, content, dep,
+- [x] `pub fn fallback_edit_excludes_newer(formatter, reparse: &dyn ManifestReparse, content, dep,
       candidate: &ManifestEdit, fallback, available) -> FallbackEditVerdict`, checks in this order,
       first failure wins:
       - Phase 1 on R0 = `dep.version_requirement()` (no parse): a0 `compile_requirement(R0)` is `Some`;
@@ -183,18 +183,18 @@ call site, without bypassing the existing `#796` dependency-count cap.
         b1 matcher `matches(fallback) == Some(true)`; d1 no entry STRICTLY newer than `fallback` has
         `requirement_already_resolves_to(R1, v)`
       - Yanked entries are NOT filtered out of the d0/d1 scans (conservative)
-- [ ] No Go special case anywhere; `fallback_satisfies_requirement` is DELETED (the
+- [x] No Go special case anywhere; `fallback_satisfies_requirement` is DELETED (the
       `manifest_requirement_is_resolved_version` trait method itself stays — other callers use it)
-- [ ] SC-014 unit tests in `deps-core`, one per `FallbackEditRejection` variant plus `Writable`, each
+- [x] SC-014 unit tests in `deps-core`, one per `FallbackEditRejection` variant plus `Writable`, each
       asserting the EXACT variant, using stub formatters + closure `ManifestReparse` (see "Test
       location" below): d0 (R0 `^2.0`, fallback 1.9.0, 2.x available); c0 (NuGet-shaped floor stub, R0
       `2.0.0`, fallback 1.9.0); d1 (semver stub, R0 `1.0`, fallback 2.0.0, edit `2.0.0`, fresh 2.1.0);
       b1 (reparse closure yields R1 `^5`, only 1.x/2.x available); a0/a1 (stub with no
       `compile_requirement`); `ReparseFailed` (closure → `None`); `OccurrenceNotUnique` (closure yields
       two matching deps); `Writable` (semver stub, fallback 2.5.0, fresh 3.0.0)
-- [ ] SC-015: Swift `.exact(...)`/`.upToNextMinor` and Bundler multi-constraint evaluated on real
+- [x] SC-015: Swift `.exact(...)`/`.upToNextMinor` and Bundler multi-constraint evaluated on real
       re-parsed semantics — lives in `deps-swift`/`deps-bundler` tests (real formatter + `EcosystemReparse`)
-- [ ] SC-020: spec 075's Go-bypass tests inverted to prove Go's `ExactMatcher` alone yields the same
+- [x] SC-020: spec 075's Go-bypass tests inverted to prove Go's `ExactMatcher` alone yields the same
       outcome (lives in `deps-go` or `deps-cli` with the real `GoFormatter`)
 
 **Test location (decided)**: `deps-core` cannot depend on ecosystem crates, so SC-014's variant
@@ -219,20 +219,20 @@ can be planned at all, and so every occurrence's candidate edit — `Located` or
 checked through T003 before being written.
 **Spec reference**: [[spec#US-003]], [[spec#US-004]]
 **Acceptance criteria**:
-- [ ] `plan_updates`/`resolve_occurrence` gain a `reparse: &dyn ManifestReparse` parameter
-- [ ] `crates/deps-cli/src/main.rs` builds an `EcosystemReparse` from the resolved ecosystem and
+- [x] `plan_updates`/`resolve_occurrence` gain a `reparse: &dyn ManifestReparse` parameter
+- [x] `crates/deps-cli/src/main.rs` builds an `EcosystemReparse` from the resolved ecosystem and
       `analysis.uri`, passing it through to `plan_updates`
-- [ ] Every fallback-view candidate — whether it came from `InUseFloor::Located` (spec 075's
+- [x] Every fallback-view candidate — whether it came from `InUseFloor::Located` (spec 075's
       existing path) or `InUseFloor::Absent` (this spec's new path) — is checked through
       `fallback_edit_excludes_newer` before being marked `Planned`; there is no branch that skips
       the check for either origin
-- [ ] New test: a no-lockfile range dependency where no known newer version falls inside the
+- [x] New test: a no-lockfile range dependency where no known newer version falls inside the
       ecosystem's default-rendered fallback edit resolves `Applied(fallback)` (US-003 criterion 1,
       SC-009)
-- [ ] New test: a no-lockfile Cargo dependency where a known newer version DOES fall inside the
+- [x] New test: a no-lockfile Cargo dependency where a known newer version DOES fall inside the
       default-rendered `^X` edit resolves `NoneUsable` → `WithinFreshnessCooldown` (US-003
       criterion 2)
-- [ ] New test: the same Cargo scenario but with the newer version OUTSIDE the written `^X` range
+- [x] New test: the same Cargo scenario but with the newer version OUTSIDE the written `^X` range
       resolves `Applied(fallback)` — proves FR-025's rule is conditional, not a fixed per-ecosystem
       verdict (US-003 criterion 3)
 **Dependencies**: T000, T003
@@ -250,17 +250,17 @@ declared-requirement shape, pinning drift in either the formatter's default rend
 re-parse lookup.
 **Spec reference**: [[spec#FR-026]]
 **Acceptance criteria**:
-- [ ] One test per ecosystem crate (14 total: Cargo, npm, Deno, PyPI, Go, Bundler, Dart, Maven,
+- [x] One test per ecosystem crate (14 total: Cargo, npm, Deno, PyPI, Go, Bundler, Dart, Maven,
       Gradle, Swift, Composer, NuGet, GitHub Actions, GitLab CI) drives
       `fallback_edit_excludes_newer` with that ecosystem's REAL formatter and a real
       `EcosystemReparse`
-- [ ] Where FR-025's rule is conditional on the fresh version's position relative to the written
+- [x] Where FR-025's rule is conditional on the fresh version's position relative to the written
       requirement (Cargo, Dart, PyPI's `~=`/default form, Swift `.upToNextMinor`), the test pins
       BOTH sub-cases (fresh version inside the range → fails closed; outside → writes) — not a
       single assertion (round-4 critic M5)
-- [ ] `deps-cargo` and `deps-nuget` tests additionally pin the real-formatter confirmations of T003's
+- [x] `deps-cargo` and `deps-nuget` tests additionally pin the real-formatter confirmations of T003's
       SC-014 probe values (see T003 "Test location"), asserting the exact `FallbackEditVerdict`
-- [ ] GitHub Actions/GitLab CI tests assert `Rejected(OriginalUncompilable)` (a0; `compile_requirement` is
+- [x] GitHub Actions/GitLab CI tests assert `Rejected(OriginalUncompilable)` (a0; `compile_requirement` is
       `None`) — documented as unchanged, pre-existing behavior, not a new fail-closed case (SC-018)
 **Dependencies**: T004
 **Files**: `crates/deps-cargo`, `crates/deps-npm`, `crates/deps-deno`, `crates/deps-pypi`,
@@ -278,14 +278,14 @@ re-parse lookup.
 caret/range-shaped fallback for Cargo, Dart, PyPI's default form, or Swift `from:`.
 **Spec reference**: [[spec#FR-027]]
 **Acceptance criteria**:
-- [ ] `crates/deps-cli/src/update/mod.rs::test_plan_updates_real_semver_formatter_applies_fallback`
+- [x] `crates/deps-cli/src/update/mod.rs::test_plan_updates_real_semver_formatter_applies_fallback`
       (~2386) is checked against T003's guard; if its written shape no longer passes, its
       expectation is corrected (NOT reverted — spec 075's table, like this spec's, is a design aid,
       the guard's actual behavior is the oracle) and the correction is documented in the PR
       description
-- [ ] Every other spec 075 test asserting a WRITTEN fallback for a Cargo/Dart/PyPI-default/Swift
+- [x] Every other spec 075 test asserting a WRITTEN fallback for a Cargo/Dart/PyPI-default/Swift
       `from:` occurrence is likewise checked and corrected if needed (SC-019)
-- [ ] No spec 075 test for npm/Composer/Bundler/Go/Maven/Gradle/NuGet is affected (these ecosystems'
+- [x] No spec 075 test for npm/Composer/Bundler/Go/Maven/Gradle/NuGet is affected (these ecosystems'
       default renderings are already exact/floor-shaped and pass T003's guard unchanged)
 **Dependencies**: T004
 **Files**: `crates/deps-cli/src/update/mod.rs`
@@ -310,16 +310,16 @@ during this spec's spec-writing session (spec 076 §10's 4 amendment callouts ar
 spec's initial, overly narrow scope restriction).
 **Spec reference**: [[spec#10-amendments-to-other-specs]], [[spec#11-required-follow-up]]
 **Acceptance criteria**:
-- [ ] `CHANGELOG.md` gets a new `### Fixed` (or corrected existing) entry reflecting that the
+- [x] `CHANGELOG.md` gets a new `### Fixed` (or corrected existing) entry reflecting that the
       fallback no longer applies universally on either path for Cargo/Dart/PyPI-default/Swift
       `from:` — see spec 076 §10's exact wording concern about the existing `#1550` entry
-- [ ] Three follow-up GitHub issues are filed per spec 076 §11: (1) in-range-churn fail-closed
+- [x] Three follow-up GitHub issues are filed per spec 076 §11: (1) in-range-churn fail-closed
       outcome restoration research, (2) `#1551` items 3/5, (3) PyPI/Composer `!=X` exclusion
       specifiers — each with a category label plus a P0-P4 priority label per this project's issue
       convention
-- [ ] The implementation PR's description states which of #1544/#1528/#1551 it closes vs. partially
+- [x] The implementation PR's description states which of #1544/#1528/#1551 it closes vs. partially
       addresses, per §9's Rollout Plan wording
-- [ ] `specs/MOC-specs.md`'s row for 076 is updated to `tasks` phase, `shipped` status, with the PR
+- [x] `specs/MOC-specs.md`'s row for 076 is updated to `tasks` phase, `shipped` status, with the PR
       and issue numbers once merged
 **Dependencies**: T001, T005, T006
 **Files**: `CHANGELOG.md`, `specs/MOC-specs.md`

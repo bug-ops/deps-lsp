@@ -10,7 +10,7 @@ tags:
   - deps-maven
   - deps-core
 created: 2026-09-25
-status: ready
+status: shipped
 related:
   - "[[constitution]]"
   - "[[071-typosquat-similarity-diagnostic/spec]]"
