@@ -2801,24 +2801,47 @@ impl LineOffsetTable {
     /// [`byte_offset_to_position`](Self::byte_offset_to_position). Out-of-range lines or
     /// UTF-16 characters clamp to `content.len()` rather than panicking, matching the
     /// forward conversion's `.min(content.len())` guard.
+    ///
+    /// A `character` landing inside a surrogate pair rounds up to the next char boundary, and
+    /// one past the line's end (including its `\n`) resolves to the line's end — the same
+    /// results as [`utf16_to_byte_offset`] on the line, but O(1) on an ASCII line and
+    /// O(log line length) on a non-ASCII one via the cached per-line index (#1711).
     #[expect(
         clippy::string_slice,
         reason = "line_start/line_end come from line_starts (post-newline offsets, always \
                   char boundaries) or content.len()"
     )]
     pub fn position_to_byte_offset(&self, content: &str, position: Position) -> usize {
-        let Some(&line_start) = self.line_starts.get(position.line as usize) else {
+        let line0 = position.line as usize;
+        let Some(&line_start) = self.line_starts.get(line0) else {
             return content.len();
         };
         let line_end = self
             .line_starts
-            .get(position.line as usize + 1)
+            .get(line0 + 1)
             .copied()
             .unwrap_or(content.len());
-        let line = &content[line_start..line_end];
-        utf16_to_byte_offset(line, position.character)
-            .map_or(line_end, |offset| line_start + offset)
-            .min(content.len())
+        let line_len = line_end - line_start;
+        let relative = if self.line_is_ascii.get(line0).copied().unwrap_or(false) {
+            let character = position.character as usize;
+            if character <= line_len {
+                character
+            } else {
+                line_len
+            }
+        } else {
+            let line_text = &content[line_start..line_end];
+            self.with_non_ascii_line_index(line0, line_text, |index| {
+                let i = index
+                    .entries
+                    .partition_point(|&(_, units)| units < position.character);
+                index
+                    .entries
+                    .get(i)
+                    .map_or(line_len, |&(byte_offset, _)| byte_offset as usize)
+            })
+        };
+        (line_start + relative).min(content.len())
     }
 }
 
@@ -4883,6 +4906,105 @@ mod tests {
             table.byte_offset_to_position(content, 18 + 8),
             Position::new(2, 7)
         );
+    }
+
+    fn reference_position_to_byte_offset(
+        table: &LineOffsetTable,
+        content: &str,
+        position: Position,
+    ) -> usize {
+        let Some(line_start) = table.line_start(position.line as usize) else {
+            return content.len();
+        };
+        let line_end = table
+            .line_start(position.line as usize + 1)
+            .unwrap_or(content.len());
+        utf16_to_byte_offset(&content[line_start..line_end], position.character)
+            .map_or(line_end, |offset| line_start + offset)
+            .min(content.len())
+    }
+
+    /// #1711: the indexed inverse conversion must match the old per-call line scan for every
+    /// position, including out-of-range lines/characters and ones splitting a surrogate pair.
+    #[test]
+    fn test_position_to_byte_offset_matches_line_scan_reference() {
+        for content in [
+            "",
+            "abc",
+            "abc\n",
+            "a\r\nbb\r\nc",
+            "h\u{e9}llo \u{1f600}\nascii\n\u{65e5}\u{672c}\u{8a9e}x\n",
+            "\u{1f600}\u{1f600}",
+            "\n\n\u{e9}",
+        ] {
+            let table = LineOffsetTable::new(content);
+            for line in 0..6 {
+                for character in 0..24 {
+                    let position = Position::new(line, character);
+                    assert_eq!(
+                        table.position_to_byte_offset(content, position),
+                        reference_position_to_byte_offset(&table, content, position),
+                        "content {content:?} position {position:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_position_to_byte_offset_surrogate_split_rounds_up_and_overshoot_clamps() {
+        let content = "a\u{1f600}b\nzz";
+        let table = LineOffsetTable::new(content);
+        assert_eq!(
+            table.position_to_byte_offset(content, Position::new(0, 2)),
+            5
+        );
+        assert_eq!(
+            table.position_to_byte_offset(content, Position::new(0, 4)),
+            6
+        );
+        assert_eq!(
+            table.position_to_byte_offset(content, Position::new(0, 99)),
+            7
+        );
+        assert_eq!(
+            table.position_to_byte_offset(content, Position::new(1, 99)),
+            content.len()
+        );
+        assert_eq!(
+            table.position_to_byte_offset(content, Position::new(9, 0)),
+            content.len()
+        );
+    }
+
+    /// #1711: many edits on one long non-ASCII line must round-trip through the cached index.
+    #[test]
+    fn test_position_to_byte_offset_long_non_ascii_line_round_trips() {
+        let content = "\u{e9}\u{1f600}dep = \"1.0.0\", ".repeat(5000);
+        let table = LineOffsetTable::new(&content);
+        for (offset, _) in content.char_indices().step_by(7) {
+            let position = table.byte_offset_to_position(&content, offset);
+            assert_eq!(table.position_to_byte_offset(&content, position), offset);
+        }
+    }
+
+    #[test]
+    fn test_position_to_byte_offset_round_trips_across_mixed_ascii_and_non_ascii_lines() {
+        let content = "plain = 1\r\nh\u{e9}llo \u{1f600}\nascii again\n\u{65e5}\u{672c}\n\nend";
+        let table = LineOffsetTable::new(content);
+        let offsets: Vec<usize> = content
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain([content.len()])
+            .collect();
+        for &offset in offsets.iter().rev().chain(offsets.iter()) {
+            let position = table.byte_offset_to_position(content, offset);
+            assert_eq!(
+                table.position_to_byte_offset(content, position),
+                offset,
+                "offset {offset}"
+            );
+        }
     }
 
     /// Regression guard for #742: `byte_offset_to_position` on a large single-line

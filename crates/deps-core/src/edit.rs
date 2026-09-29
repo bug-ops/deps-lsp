@@ -1577,6 +1577,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_apply_edits_non_ascii_line_with_several_edits() {
+        let content = "h\u{e9}llo \u{1f600} a = \"1.0.0\", b = \"2.0.0\"\n";
+        let edit = |sc, ec, text: &str| ManifestEdit {
+            range: range(0, sc, 0, ec),
+            new_text: text.to_string(),
+        };
+        let edits = vec![
+            edit(27, 32, "2.2.2"),
+            edit(6, 8, "X"),
+            edit(14, 19, "1.1.0"),
+        ];
+        assert_eq!(
+            apply_edits(content, &edits),
+            "h\u{e9}llo X a = \"1.1.0\", b = \"2.2.2\"\n"
+        );
+    }
+
+    #[test]
+    fn test_apply_edits_many_edits_on_one_long_non_ascii_line() {
+        const UNITS: usize = 5000;
+        const UNIT_UTF16_LEN: u32 = 18;
+        const VERSION_COL: u32 = 10;
+        let unit = |version: &str| format!("\u{e9}\u{1f600}dep = \"{version}\", ");
+        let content = "\u{e9}\u{1f600}dep = \"1.0.0\", ".repeat(UNITS);
+        let edits: Vec<ManifestEdit> = (0..UNITS)
+            .filter(|i| i % 30 == 0)
+            .map(|i| {
+                let start = VERSION_COL + UNIT_UTF16_LEN * u32::try_from(i).unwrap();
+                ManifestEdit {
+                    range: range(0, start, 0, start + 5),
+                    new_text: "9.9.9".to_string(),
+                }
+            })
+            .collect();
+        assert!(edits.len() >= 100);
+        let expected: String = (0..UNITS)
+            .map(|i| unit(if i % 30 == 0 { "9.9.9" } else { "1.0.0" }))
+            .collect();
+        assert_eq!(apply_edits(&content, &edits), expected);
+    }
+
     // --- collect_update_edits / collect_update_candidates ---
 
     mod collect_update_tests {
