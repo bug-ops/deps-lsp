@@ -331,10 +331,8 @@ impl RequirementResolution for GithubActionsFormatter {
     /// but the SHA itself is immutable — a stale comment can silently read as "up to
     /// date" against `latest` even though the pinned commit is actually behind newer
     /// releases still inside the same major/minor line. Falls back to
-    /// [`Self::classify_requirement_status`] (trusting the comment) on any `TagIndex` miss — a
-    /// cold cache before the registry fetch populates it, or a commentless/tag/branch
-    /// pin, for which the comment-trusting path is already correct or already
-    /// `Unresolved`.
+    /// [`Self::classify_requirement_status`] (trusting the comment) on a cold cache, a
+    /// comment-annotated pin absent from the populated index, or a tag/branch pin.
     fn classify_requirement_status_for(
         &self,
         dep: &dyn Dependency,
@@ -420,9 +418,10 @@ impl GithubActionsFormatter {
         }
     }
 
-    /// Ground-truth status for a comment-annotated SHA pin whose commit is indexed in
-    /// `tag_index` — see [`RequirementResolution::classify_requirement_status_for`]. `None`
-    /// when `dep` isn't such a pin, or the SHA has no `TagIndex` entry yet.
+    /// Ground-truth status for a full-SHA pin against the repository's `TagIndex` — see
+    /// [`RequirementResolution::classify_requirement_status_for`]. `None` when `dep` isn't a
+    /// full-SHA pin, or the repository's index is not populated yet (cold cache), or a
+    /// comment-annotated pin's SHA is absent from it (the comment is then trusted).
     ///
     /// #1648: no longer gates on `requirement_is_oversized` itself — this method is only ever
     /// reached through
@@ -430,38 +429,88 @@ impl GithubActionsFormatter {
     /// which already constructs a [`BoundedVersionReq`] before calling
     /// [`Self::classify_requirement_status_for`], so an oversized requirement never reaches
     /// here at all.
+    ///
+    /// #1720: a commentless SHA absent from a populated index is `Outdated` (`latest` comes
+    /// from the same tags fetch, so the pin is provably not `latest`'s commit). An indexed
+    /// SHA is up to date when it is `latest`'s commit, or its tag is a version tag that is
+    /// itself up to date; a non-version tag (`cargo-deny`) never counts as up to date by text.
     fn sha_pin_status_from_tag_index(
         &self,
         dep: &dyn Dependency,
         latest: &ConcreteVersion,
     ) -> Option<RequirementStatus> {
         let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-        // Restricted to comment-annotated SHA pins: a commentless pin has no human-written
-        // text to distrust, so it stays on the ordinary path instead (#907 scope decision).
-        if !matches!(
-            gha_dep.pin,
-            Some(PinStyle::Sha {
-                comment_tag: Some(_)
-            })
-        ) {
+        let Some(PinStyle::Sha { comment_tag }) = &gha_dep.pin else {
             return None;
-        }
+        };
         let sha = crate::types::sha_pin_raw_sha(gha_dep)?;
+        match self.lookup_sha_pin(dep.name(), sha, latest)? {
+            ShaPinLookup::LatestCommit => Some(RequirementStatus::UpToDate),
+            ShaPinLookup::Indexed { tag } => {
+                // An oversized registry tag is unmodellable, not a reason to trust the comment (#907).
+                let real_tag = VersionReq::new(tag);
+                Some(BoundedVersionReq::new(&real_tag).map_or(
+                    RequirementStatus::Unresolved,
+                    |real_tag| {
+                        if is_tag_shaped(real_tag.as_str())
+                            && self.is_bounded_requirement_up_to_date(real_tag, latest)
+                        {
+                            RequirementStatus::UpToDate
+                        } else {
+                            RequirementStatus::Outdated
+                        }
+                    },
+                ))
+            }
+            ShaPinLookup::NotIndexed => match comment_tag {
+                None => Some(RequirementStatus::Outdated),
+                Some(_) => None,
+            },
+            ShaPinLookup::IndexUnavailable => None,
+        }
+    }
+
+    /// `None` when `sha` is not a full SHA. The lookup key is lowercased: the registry
+    /// reports lowercase hex, while a pin may be written in uppercase.
+    fn lookup_sha_pin(
+        &self,
+        name: &PackageName,
+        sha: &str,
+        latest: &ConcreteVersion,
+    ) -> Option<ShaPinLookup> {
         if !is_full_sha(sha) {
             return None;
         }
-        let real_tag = VersionReq::new(self.tag_index.get(dep.name())?.tag_for_sha(sha)?);
-        // An oversized registry tag is unmodellable, not a reason to trust the comment (#907).
-        Some(
-            BoundedVersionReq::new(&real_tag).map_or(RequirementStatus::Unresolved, |real_tag| {
-                if self.is_bounded_requirement_up_to_date(real_tag, latest) {
-                    RequirementStatus::UpToDate
-                } else {
-                    RequirementStatus::Outdated
-                }
-            }),
-        )
+        let sha = sha.to_ascii_lowercase();
+        let Some(index) = self.tag_index.get(name).filter(|index| !index.is_empty()) else {
+            return Some(ShaPinLookup::IndexUnavailable);
+        };
+        if index
+            .tag_to_sha
+            .get(latest.as_str())
+            .is_some_and(|commit| commit.as_str() == sha)
+        {
+            return Some(ShaPinLookup::LatestCommit);
+        }
+        Some(match index.tag_for_sha(&sha) {
+            Some(tag) => ShaPinLookup::Indexed {
+                tag: tag.to_string(),
+            },
+            None => ShaPinLookup::NotIndexed,
+        })
     }
+}
+
+/// Outcome of looking a full-SHA pin up in the repository's `TagIndex` (#1720).
+enum ShaPinLookup {
+    /// The SHA is the commit of `latest`, whatever other tags name it.
+    LatestCommit,
+    /// A tag other than `latest` names the SHA.
+    Indexed { tag: String },
+    /// The repository's index is populated and no tag points at the SHA.
+    NotIndexed,
+    /// No populated index for the repository yet (cold cache).
+    IndexUnavailable,
 }
 
 impl DiagnosticMessages for GithubActionsFormatter {}
@@ -1183,6 +1232,186 @@ mod tests {
             RequirementStatus::UpToDate,
             "no TagIndex entry: falls back to the comment-trusting path"
         );
+    }
+
+    // --- #1720: full-SHA pin absent from the release TagIndex ---
+
+    const LATEST_SHA_1720: &str = "3333333333333333333333333333333333333333";
+    const OLD_SHA_1720: &str = "4444444444444444444444444444444444444444";
+    const MISSING_SHA_1720: &str = "5555555555555555555555555555555555555555";
+
+    fn fmt_with_release_index_1720(extra: &[(&str, &str)]) -> GithubActionsFormatter {
+        let fmt = formatter();
+        let mut tags = vec![("v2.87.22", LATEST_SHA_1720), ("v2.87.21", OLD_SHA_1720)];
+        tags.extend_from_slice(extra);
+        let commits: Vec<(&str, CommitSha)> = tags
+            .iter()
+            .map(|(tag, sha)| (*tag, CommitSha::parse(sha).unwrap()))
+            .collect();
+        let index = TagIndex::from_tags(commits.iter().map(|(tag, sha)| (*tag, sha)));
+        fmt.tag_index.insert(
+            PackageName::new("EmbarkStudios/cargo-deny-action"),
+            Arc::new(index),
+        );
+        fmt
+    }
+
+    fn sha_pin_1720(sha: &str, comment_tag: Option<&str>) -> GithubActionsDependency {
+        let mut d = dep(
+            Some(PinStyle::Sha {
+                comment_tag: comment_tag.map(str::to_string),
+            }),
+            "EmbarkStudios/cargo-deny-action",
+            Some(&comment_tag.map_or_else(|| sha.to_string(), |tag| format!("{sha} # {tag}"))),
+        );
+        d.version_req = Some(comment_tag.map_or_else(|| sha.into(), Into::into));
+        d
+    }
+
+    fn status_1720(fmt: &GithubActionsFormatter, d: &GithubActionsDependency) -> RequirementStatus {
+        let req = d.version_req.clone().unwrap();
+        fmt.requirement_status_for(d, &req, &ConcreteVersion::new("v2.87.22"))
+    }
+
+    #[test]
+    fn test_sha_pin_missing_from_populated_index_commentless_is_outdated() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        let d = sha_pin_1720(MISSING_SHA_1720, None);
+        assert_eq!(status_1720(&fmt, &d), RequirementStatus::Outdated);
+    }
+
+    #[test]
+    fn test_sha_pin_non_version_comment_missing_from_index_is_outdated() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        let content = format!(
+            "steps:\n  - uses: EmbarkStudios/cargo-deny-action@{MISSING_SHA_1720} # cargo-deny\n"
+        );
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let parsed = crate::parser::parse_workflow_yaml(&content, &uri).unwrap();
+        let d = parsed.dependencies.first().expect("one dependency");
+        let d = d
+            .as_any()
+            .downcast_ref::<GithubActionsDependency>()
+            .unwrap();
+        assert_eq!(d.pin, Some(PinStyle::Sha { comment_tag: None }));
+        assert_eq!(status_1720(&fmt, d), RequirementStatus::Outdated);
+    }
+
+    #[test]
+    fn test_sha_pin_version_comment_missing_from_index_trusts_comment() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        assert_eq!(
+            status_1720(&fmt, &sha_pin_1720(MISSING_SHA_1720, Some("v2.87.22"))),
+            RequirementStatus::UpToDate
+        );
+        assert_eq!(
+            status_1720(&fmt, &sha_pin_1720(MISSING_SHA_1720, Some("v2.87.20"))),
+            RequirementStatus::Outdated
+        );
+    }
+
+    #[test]
+    fn test_sha_pin_uppercase_hex_matches_lowercase_index() {
+        let fmt =
+            fmt_with_release_index_1720(&[("v2.87.0", "abcdefabcdefabcdefabcdefabcdefabcdefabcd")]);
+        let upper_old = sha_pin_1720("ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD", None);
+        assert_eq!(status_1720(&fmt, &upper_old), RequirementStatus::Outdated);
+
+        let fmt = formatter();
+        let latest = CommitSha::parse("abcdefabcdefabcdefabcdefabcdefabcdefabcd").unwrap();
+        fmt.tag_index.insert(
+            PackageName::new("EmbarkStudios/cargo-deny-action"),
+            Arc::new(TagIndex::from_tags([("v2.87.22", &latest)])),
+        );
+        let upper_latest = sha_pin_1720("ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD", None);
+        assert_eq!(
+            status_1720(&fmt, &upper_latest),
+            RequirementStatus::UpToDate
+        );
+    }
+
+    #[test]
+    fn test_sha_pin_two_releases_on_latest_commit_is_up_to_date() {
+        let fmt = fmt_with_release_index_1720(&[("v2.87.21", LATEST_SHA_1720)]);
+        let d = sha_pin_1720(LATEST_SHA_1720, None);
+        assert_eq!(status_1720(&fmt, &d), RequirementStatus::UpToDate);
+    }
+
+    #[test]
+    fn test_sha_pin_populated_but_empty_index_stays_unresolved() {
+        let fmt = formatter();
+        fmt.tag_index.insert(
+            PackageName::new("EmbarkStudios/cargo-deny-action"),
+            Arc::new(TagIndex::default()),
+        );
+        let d = sha_pin_1720(MISSING_SHA_1720, None);
+        assert_eq!(status_1720(&fmt, &d), RequirementStatus::Unresolved);
+    }
+
+    #[test]
+    fn test_sha_pin_index_without_latest_tag_is_outdated() {
+        let fmt = formatter();
+        let old = CommitSha::parse(OLD_SHA_1720).unwrap();
+        fmt.tag_index.insert(
+            PackageName::new("EmbarkStudios/cargo-deny-action"),
+            Arc::new(TagIndex::from_tags([("v2.87.21", &old)])),
+        );
+        for sha in [MISSING_SHA_1720, OLD_SHA_1720] {
+            assert_eq!(
+                status_1720(&fmt, &sha_pin_1720(sha, None)),
+                RequirementStatus::Outdated,
+                "{sha}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_short_sha_pin_is_never_outdated() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        let content = "steps:\n  - uses: EmbarkStudios/cargo-deny-action@abcdef1\n";
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let parsed = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+        let d = parsed.dependencies.first().expect("one dependency");
+        let d = d
+            .as_any()
+            .downcast_ref::<GithubActionsDependency>()
+            .unwrap();
+        assert_eq!(status_1720(&fmt, d), RequirementStatus::Unresolved);
+    }
+
+    #[test]
+    fn test_sha_pin_commentless_on_latest_commit_is_up_to_date() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        let d = sha_pin_1720(LATEST_SHA_1720, None);
+        assert_eq!(status_1720(&fmt, &d), RequirementStatus::UpToDate);
+    }
+
+    #[test]
+    fn test_sha_pin_commentless_on_older_release_is_outdated() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        let d = sha_pin_1720(OLD_SHA_1720, None);
+        assert_eq!(status_1720(&fmt, &d), RequirementStatus::Outdated);
+    }
+
+    #[test]
+    fn test_sha_pin_only_non_version_tag_on_old_commit_is_outdated() {
+        let fmt = fmt_with_release_index_1720(&[("cargo-deny", MISSING_SHA_1720)]);
+        let d = sha_pin_1720(MISSING_SHA_1720, None);
+        assert_eq!(status_1720(&fmt, &d), RequirementStatus::Outdated);
+    }
+
+    #[test]
+    fn test_sha_pin_non_version_tag_on_latest_commit_is_up_to_date() {
+        let fmt = fmt_with_release_index_1720(&[("cargo-deny", LATEST_SHA_1720)]);
+        let d = sha_pin_1720(LATEST_SHA_1720, None);
+        assert_eq!(status_1720(&fmt, &d), RequirementStatus::UpToDate);
+    }
+
+    #[test]
+    fn test_sha_pin_commentless_cold_cache_stays_unresolved() {
+        let fmt = formatter();
+        let d = sha_pin_1720(MISSING_SHA_1720, None);
+        assert_eq!(status_1720(&fmt, &d), RequirementStatus::Unresolved);
     }
 
     // --- #1556: resolved_pin_version ---

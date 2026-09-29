@@ -55,6 +55,12 @@ freshness against `TagIndex.sha_to_tag` (which SHA the tag *really* points at
 today), so a comment that has drifted from the pinned SHA no longer produces a
 false "up to date" result just because the comment text looked current.
 
+A full-SHA pin that no release tag points at (with no comment, or a non-version one like
+`# cargo-deny`) is reported as outdated once the repository's tags are loaded; a pin to a
+non-release commit is therefore offered the latest release. This includes a commentless pin on a
+non-release commit newer than the latest release: it is reported outdated and update-all re-pins
+it to the latest release (effectively a downgrade).
+
 ## Mutable-Ref Pinning
 
 GitHub Actions shares its mutable-ref-pin diagnostic and bulk "Pin All to SHA" code lens with
