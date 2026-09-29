@@ -784,6 +784,43 @@ fn strip_version_suffix(version: &str) -> &str {
     &version[..cut]
 }
 
+/// `requirement` with every simple `^X.Y.Z` token replaced by its major-wide range
+/// (`>=X.0.0 <A.B.C`, the caret's exclusive upper bound), or `None` when no token was replaced.
+///
+/// Extends #1622 S2 (a caret's lower-bound floor must not make `latest` look outdated) to
+/// compound requirements: `^1.5 <1.9` -> `>=1.0.0 <2.0.0 <1.9`.
+/// Tokens are delimited by whitespace, `|`, and `,`; wildcard-led or unparseable carets are
+/// left untouched.
+fn relax_caret_floors(requirement: &str) -> Option<String> {
+    let is_sep = |c: char| c.is_whitespace() || matches!(c, '|' | ',');
+    let mut out = String::with_capacity(requirement.len());
+    let mut replaced = false;
+    let mut rest = requirement;
+    while !rest.is_empty() {
+        let (token, tail) = rest.split_at(rest.find(is_sep).unwrap_or(rest.len()));
+        let (sep, next) = tail.split_at(tail.find(|c: char| !is_sep(c)).unwrap_or(tail.len()));
+        let bound = token.strip_prefix('^').and_then(|body| {
+            let parts: Vec<&str> = strip_version_suffix(body).split('.').collect();
+            let effective = truncate_at_wildcard(&parts);
+            if effective.is_empty() {
+                return None;
+            }
+            let lower = parse_caret_components(effective)?;
+            Some((lower[0], caret_upper_bound(lower, effective)?))
+        });
+        match bound {
+            Some((floor_major, [major, minor, patch])) => {
+                replaced = true;
+                out.push_str(&format!(">={floor_major}.0.0 <{major}.{minor}.{patch}"));
+            }
+            None => out.push_str(token),
+        }
+        out.push_str(sep);
+        rest = next;
+    }
+    replaced.then_some(out)
+}
+
 /// Whether `latest` is still within a `^`-requirement's exclusive *upper* bound (the
 /// auto-following range's ceiling) — ignoring the requirement's own minor/patch lower-bound
 /// floor #1622 added to [`RequirementResolution::version_satisfies_requirement`]'s `^` branch.
@@ -798,10 +835,16 @@ fn strip_version_suffix(version: &str) -> &str {
 /// scoped to `version_satisfies_requirement`'s own general-purpose membership question (e.g.
 /// lock-file in-use-version checks), not leak into this one.
 ///
-/// Returns `None` when `requirement` doesn't start with `^`, or any of its components fails to
-/// parse, so the caller falls back to its own general-purpose check for every other shape.
+/// Returns `None` when `requirement` doesn't start with `^`, or what follows the `^` is not a
+/// single simple token (whitespace, `|`, or another comparator character: `^3 || ^4`,
+/// `^4.5 <4.7`) so the caller falls back to its own general-purpose check for every other shape.
 fn caret_admits_up_to_date(latest: &str, requirement: &str) -> Option<bool> {
     let req = requirement.strip_prefix('^')?;
+    if req.contains(|c: char| {
+        c.is_whitespace() || matches!(c, '|' | '<' | '>' | '=' | '~' | '^' | ',')
+    }) {
+        return None;
+    }
     let req = strip_version_suffix(req);
     let req_parts: Vec<&str> = req.split('.').collect();
     let ver_parts: Vec<&str> = strip_version_suffix(latest).split('.').collect();
@@ -826,6 +869,82 @@ fn caret_admits_up_to_date(latest: &str, requirement: &str) -> Option<bool> {
     };
 
     Some(caret_upper_bound(lower, effective_req_parts).is_none_or(|upper| candidate < upper))
+}
+
+/// Up-to-date verdict backed by the compiled requirement matcher.
+///
+/// For ecosystems whose [`RequirementResolution::compile_bounded_requirement`] matcher models
+/// the full requirement grammar (comparators, `||`, hyphen ranges, wildcards); meant to back a
+/// [`RequirementResolution::is_bounded_requirement_up_to_date`] override.
+///
+/// A single simple `^` requirement keeps the default's upper-bound-only semantics (#1622 S2);
+/// everything else is asked of the compiled matcher, also retried with caret floors relaxed to
+/// their upper bounds (S2 for compound requirements) and against `latest`'s numeric core (a
+/// prerelease `latest` is judged by its `X.Y.Z`, since npm matchers exclude prereleases). Falls
+/// back to [`RequirementResolution::version_satisfies_requirement`] when the requirement does
+/// not compile or the matcher cannot judge `latest`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{
+///     BoundedVersionReq, RequirementMatcher, RequirementResolution, up_to_date_via_compiled_matcher,
+/// };
+/// use deps_core::{ConcreteVersion, VersionReq};
+///
+/// struct AtLeastOne;
+/// impl RequirementMatcher for AtLeastOne {
+///     fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+///         Some(version.as_str().starts_with("1."))
+///     }
+///     fn strict_prerelease_exclusion(&self) -> bool {
+///         false
+///     }
+/// }
+///
+/// struct Formatter;
+/// impl RequirementResolution for Formatter {
+///     fn compile_bounded_requirement(
+///         &self,
+///         _: BoundedVersionReq<'_>,
+///     ) -> Option<Box<dyn RequirementMatcher>> {
+///         Some(Box::new(AtLeastOne))
+///     }
+/// }
+///
+/// let latest = ConcreteVersion::new("1.4.0");
+/// let requirement = VersionReq::new(">=1 <2");
+/// let bounded = BoundedVersionReq::new(&requirement).unwrap();
+/// assert!(up_to_date_via_compiled_matcher(&Formatter, bounded, &latest));
+/// ```
+pub fn up_to_date_via_compiled_matcher<F: RequirementResolution + ?Sized>(
+    formatter: &F,
+    requirement: BoundedVersionReq<'_>,
+    latest: &ConcreteVersion,
+) -> bool {
+    if let Some(admitted) = caret_admits_up_to_date(latest.as_str(), requirement.as_str()) {
+        return admitted;
+    }
+    let Some(matcher) = formatter.compile_bounded_requirement(requirement) else {
+        return formatter.version_satisfies_requirement(latest, requirement.as_str());
+    };
+    let core = ConcreteVersion::new(strip_version_suffix(latest.as_str()));
+    let admits = |m: &dyn RequirementMatcher| {
+        m.matches(latest) == Some(true) || m.matches(&core) == Some(true)
+    };
+    let relaxed = relax_caret_floors(requirement.as_str())
+        .map(VersionReq::new)
+        .and_then(|relaxed| {
+            BoundedVersionReq::new(&relaxed)
+                .and_then(|bounded| formatter.compile_bounded_requirement(bounded))
+        });
+    if admits(&*matcher) || relaxed.as_deref().is_some_and(admits) {
+        true
+    } else if matcher.matches(latest).is_none() {
+        formatter.version_satisfies_requirement(latest, requirement.as_str())
+    } else {
+        false
+    }
 }
 
 /// Requirement parsing, matching, and up-to-date status.
@@ -956,9 +1075,11 @@ pub trait RequirementResolution: Send + Sync {
         requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> bool {
-        let requirement = requirement.get();
-        caret_admits_up_to_date(latest.as_str(), requirement.as_str())
-            .unwrap_or_else(|| self.version_satisfies_requirement(latest, requirement.as_str()))
+        caret_admits_up_to_date(latest.as_str(), requirement.as_str()).unwrap_or_else(|| {
+            self.version_satisfies_requirement(latest, requirement.as_str())
+                || relax_caret_floors(requirement.as_str())
+                    .is_some_and(|relaxed| self.version_satisfies_requirement(latest, &relaxed))
+        })
     }
 
     /// Whether `requirement` could not be resolved to a concrete version constraint (e.g. an
@@ -1352,9 +1473,8 @@ pub trait RequirementResolution: Send + Sync {
 /// that override does.
 ///
 /// The oversized result is defined once, here, and is consistent across methods:
-/// [`Self::requirement_status`] is `Unresolved`, [`Self::is_requirement_up_to_date`] is `true`,
-/// [`Self::compile_requirement`] is `None`, and [`Self::requirement_already_resolves_to`] is
-/// `false`.
+/// [`Self::requirement_status`] is `Unresolved`, `is_requirement_up_to_date` is `true`,
+/// `compile_requirement` is `None`, and `requirement_already_resolves_to` is `false`.
 ///
 /// Call sites only need to bring this trait into scope (`use
 /// deps_core::lsp_helpers::RequirementGate;`) to keep using method syntax — it covers
@@ -3056,5 +3176,44 @@ mod tests {
         for &eco in EcosystemId::ALL {
             let _ = bare_meaning(eco);
         }
+    }
+
+    /// #1656: `^`-prefixed compound requirements are not single carets and must not be
+    /// mis-parsed by `caret_admits_up_to_date`.
+    #[test]
+    fn test_caret_admits_up_to_date_rejects_compound_shapes() {
+        for requirement in ["^3 || ^4", "^4.5 <4.7", "^1 ^2", "^1, <2"] {
+            assert_eq!(
+                caret_admits_up_to_date("4.1.0", requirement),
+                None,
+                "{requirement}"
+            );
+        }
+        assert_eq!(caret_admits_up_to_date("4.1.0", "^4.0"), Some(true));
+    }
+
+    #[test]
+    fn test_up_to_date_via_compiled_matcher_falls_back_without_matcher() {
+        let latest = ConcreteVersion::new("1.2.3");
+        let requirement = VersionReq::new("1.2.3");
+        assert!(up_to_date_via_compiled_matcher(
+            &MOCK_FORMATTER,
+            BoundedVersionReq::new(&requirement).unwrap(),
+            &latest
+        ));
+    }
+
+    #[test]
+    fn test_relax_caret_floors() {
+        assert_eq!(
+            relax_caret_floors("^1.5 <1.9").as_deref(),
+            Some(">=1.0.0 <2.0.0 <1.9")
+        );
+        assert_eq!(
+            relax_caret_floors("^1.5,<1.9 || ^0.2").as_deref(),
+            Some(">=1.0.0 <2.0.0,<1.9 || >=0.0.0 <0.3.0")
+        );
+        assert_eq!(relax_caret_floors("^x"), None);
+        assert_eq!(relax_caret_floors(">=1 <2"), None);
     }
 }

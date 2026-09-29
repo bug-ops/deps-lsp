@@ -510,16 +510,18 @@ fn parse_npm_alias(value: &str) -> Option<NpmAlias> {
     // and falsely report the real aliased package as up to date.
     let version_req = if version_req.is_empty() {
         "*"
-    } else if deps_core::lsp_helpers::requirement_len_exceeds_cap(version_req) {
-        tracing::debug!(
-            len = version_req.len(),
-            "npm: alias version requirement exceeds max length, keeping literal value"
-        );
-        version_req
-    } else if crate::formatter::parse_range_safe(version_req).is_err() {
-        "*"
     } else {
-        version_req
+        match crate::formatter::parse_range_safe(version_req) {
+            Ok(_) => version_req,
+            Err(crate::RangeParseError::TooLong { .. }) => {
+                tracing::debug!(
+                    len = version_req.len(),
+                    "npm: alias version requirement exceeds max length, keeping literal value"
+                );
+                version_req
+            }
+            Err(crate::RangeParseError::Malformed(_) | crate::RangeParseError::Panicked) => "*",
+        }
     };
 
     Some(NpmAlias {

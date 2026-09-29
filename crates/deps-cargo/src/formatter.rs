@@ -573,4 +573,16 @@ mod tests {
             Some(false)
         );
     }
+
+    /// #1656: the compiled-matcher path is npm/deno opt-in; Cargo's pin heuristic is unchanged.
+    #[test]
+    fn test_is_requirement_up_to_date_bare_pin_stays_outdated() {
+        let latest = ConcreteVersion::new("1.0.229");
+        for requirement in ["=1.0.228", "1.0.228"] {
+            assert!(
+                !CargoFormatter.is_requirement_up_to_date(&VersionReq::new(requirement), &latest),
+                "{requirement:?} must stay outdated against 1.0.229"
+            );
+        }
+    }
 }
