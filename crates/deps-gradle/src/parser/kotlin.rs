@@ -42,6 +42,20 @@ static RE_PLATFORM_NO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
     .expect("RE_PLATFORM_NO_VERSION")
 });
 
+/// Start offsets (as unit spans) of dependency-configuration matches of `re` on `line`.
+fn claimed_starts(re: &Regex, line: &str) -> deps_core::MatchedSpans {
+    let mut spans = deps_core::MatchedSpans::default();
+    for caps in re.captures_iter(line) {
+        let is_dependency = caps
+            .get(1)
+            .is_some_and(|config| is_dependency_configuration(config.as_str()));
+        if let (true, Some(m)) = (is_dependency, caps.get(0)) {
+            spans.insert_point(m.start());
+        }
+    }
+    spans
+}
+
 /// Parses a Kotlin-DSL `build.gradle.kts` file into a [`GradleParseResult`].
 ///
 /// Always succeeds: unrecognized lines are simply skipped. Returns [`Result`]
@@ -97,13 +111,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
         }
 
         // Only match a versionless coordinate if this line has no versioned match already.
-        let already_matched: Vec<_> = RE_WITH_VERSION
-            .captures_iter(line)
-            .filter_map(|c| {
-                let config = c.get(1)?.as_str();
-                is_dependency_configuration(config).then_some(c.get(0)?.start())
-            })
-            .collect();
+        let already_matched = claimed_starts(&RE_WITH_VERSION, line);
 
         for caps in RE_NO_VERSION.captures_iter(line) {
             let config = caps.get(1).map_or("", |m| m.as_str());
@@ -111,7 +119,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
                 continue;
             }
             let match_start = caps.get(0).map_or(0, |m| m.start());
-            if already_matched.contains(&match_start) {
+            if already_matched.contains_point(match_start) {
                 continue;
             }
             if !budget.allow() {
@@ -121,13 +129,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
         }
 
         // Same as above, for platform()/enforcedPlatform()-wrapped BOM coordinates
-        let already_matched_platform: Vec<_> = RE_PLATFORM_WITH_VERSION
-            .captures_iter(line)
-            .filter_map(|c| {
-                let config = c.get(1)?.as_str();
-                is_dependency_configuration(config).then_some(c.get(0)?.start())
-            })
-            .collect();
+        let already_matched_platform = claimed_starts(&RE_PLATFORM_WITH_VERSION, line);
 
         for caps in RE_PLATFORM_WITH_VERSION.captures_iter(line) {
             let config = caps.get(1).map_or("", |m| m.as_str());
@@ -146,7 +148,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Url) -> Result<GradleParseResult> {
                 continue;
             }
             let match_start = caps.get(0).map_or(0, |m| m.start());
-            if already_matched_platform.contains(&match_start) {
+            if already_matched_platform.contains_point(match_start) {
                 continue;
             }
             if !budget.allow() {
@@ -528,5 +530,30 @@ mod tests {
         assert_eq!(dep.name_range.start.line, 1);
         assert!(dep.version_range.is_some());
         assert_eq!(dep.version_range.unwrap().start.line, 1);
+    }
+
+    #[test]
+    fn test_versioned_and_versionless_flood_on_one_line_is_linear() {
+        let filler = "api(\"g:a:1\")\n".repeat(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
+        let flood = r#"api("g:a:1")api("g:a")"#.repeat(100_000);
+        let content = format!("dependencies {{\n{filler}{flood}\n}}\n");
+        let start = std::time::Instant::now();
+        let result = parse_kotlin_dsl(&content, &make_uri()).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(
+            result.dependencies.len(),
+            deps_core::MAX_DEPENDENCIES_PER_DOCUMENT
+        );
+    }
+
+    #[test]
+    fn test_versionless_after_multibyte_prefix_keeps_utf16_columns() {
+        let line = r#"val s = "é😀"; implementation("g:a")"#;
+        let content = format!("dependencies {{\n{line}\n}}\n");
+        let result = parse_kotlin_dsl(&content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let byte = line.find("g:a").unwrap();
+        let expected = u32::try_from(line.get(..byte).unwrap().encode_utf16().count()).unwrap();
+        assert_eq!(result.dependencies[0].name_range.start.character, expected);
     }
 }
