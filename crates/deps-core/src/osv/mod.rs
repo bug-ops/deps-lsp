@@ -29,13 +29,15 @@ pub use severity::to_diagnostic_severity as diagnostic_severity_for;
 use types::worst_severity;
 pub use types::{
     Advisory, CandidateStatusMap, CandidateStatuses, Capped, DependencyVulnerabilities,
-    EmptyOsvPackageName, FixRecommendation, LatestStatusMap, OsvEcosystem, OsvPackageName,
-    OsvQueryName, OsvVersion, ScanOutcome, ScanTarget, SkipReason, StructuralSkipReason,
-    UpgradeStatus, VersionMatching, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap,
-    is_valid_osv_id, validated_osv_url, vuln_key_for, vulnerability_keys,
+    EmptyOsvPackageName, FixRecommendation, LatestStatusMap, MatchedTags, OsvEcosystem,
+    OsvPackageName, OsvQueryName, OsvVersion, ScanOutcome, ScanTarget, ScanVersion, SiblingMatches,
+    SkipReason, StructuralSkipReason, UpgradeStatus, VersionMatching, VulnKey, VulnKeys,
+    VulnSeverity, VulnerabilityMap, is_valid_osv_id, validated_osv_url, vuln_key_for,
+    vulnerability_keys,
 };
 use types::{OsvBatchRequest, OsvBatchResponse, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord};
 
+use crate::ConcreteVersion;
 use crate::cache::HttpCache;
 
 /// Advisories rendered (§7) per dependency in hover/diagnostics/`deps-cli` output.
@@ -498,6 +500,18 @@ impl OsvClient {
             if !seen.insert(&t.key) {
                 continue;
             }
+            if osv_eco.version_matching() == VersionMatching::ServerSide && !t.siblings().is_empty()
+            {
+                tracing::warn!(
+                    dep = %t.key,
+                    "sibling release tags cannot be matched server-side, skipping"
+                );
+                outcomes.insert(
+                    t.key.clone(),
+                    ScanOutcome::Skipped(SkipReason::UnmatchableVersion),
+                );
+                continue;
+            }
             if osv_eco.version_matching() == VersionMatching::LocalUnversioned
                 && LocalVersion::parse(&t.version).is_none()
             {
@@ -737,27 +751,63 @@ impl OsvClient {
         let Some(version) = LocalVersion::parse(&target.version) else {
             return ScanOutcome::Skipped(SkipReason::UnmatchableVersion);
         };
+        let siblings: Vec<(Option<LocalVersion>, &ConcreteVersion)> = target
+            .siblings()
+            .iter()
+            .map(|s| (LocalVersion::parse(s.version()), s.display_version()))
+            .collect();
         let mut affected = Vec::new();
+        let mut sibling_only: HashMap<String, MatchedTags> = HashMap::new();
         let mut undeterminable = 0usize;
         for record in records {
-            let verdict = match_affected(
-                &record.affected_for(target.osv_name.name(), osv_eco),
-                &version,
-            );
-            match verdict {
-                Verdict::Affected => affected.push(record),
-                Verdict::NotAffected => {}
-                Verdict::Undeterminable => {
-                    tracing::warn!(id = %record.id, "OSV record ranges could not be matched locally");
-                    undeterminable += 1;
+            let ranges = record.affected_for(target.osv_name.name(), osv_eco);
+            let primary_verdict = match_affected(&ranges, &version);
+            let mut matched_siblings = Vec::new();
+            let mut sibling_undeterminable = false;
+            for (sibling, display) in &siblings {
+                match sibling
+                    .as_ref()
+                    .map_or(Verdict::Undeterminable, |v| match_affected(&ranges, v))
+                {
+                    Verdict::Affected => matched_siblings.push((*display).clone()),
+                    Verdict::NotAffected => {}
+                    Verdict::Undeterminable => sibling_undeterminable = true,
                 }
+            }
+            let is_affected = primary_verdict == Verdict::Affected || !matched_siblings.is_empty();
+            if is_affected {
+                if primary_verdict != Verdict::Affected
+                    && let Some(tags) = MatchedTags::from_tags(matched_siblings)
+                {
+                    sibling_only.insert(record.id.clone(), tags);
+                }
+                affected.push(record);
+            } else if primary_verdict == Verdict::Undeterminable || sibling_undeterminable {
+                tracing::warn!(id = %record.id, "OSV record ranges could not be matched locally");
+                undeterminable += 1;
             }
         }
         // A confirmed match outranks unevaluable siblings: the dependency is already flagged.
         if affected.is_empty() && undeterminable > 0 {
             return ScanOutcome::Skipped(SkipReason::UnevaluableAdvisoryRange);
         }
-        self.outcome_from_full_records(osv_eco, target, affected)
+        match self.outcome_from_full_records(osv_eco, target, affected) {
+            ScanOutcome::Vulnerable(dv) => {
+                let mut matches = SiblingMatches::new(target.version.clone());
+                for advisory in dv.advisories.items() {
+                    if let Some(tags) = sibling_only.remove(&advisory.id) {
+                        matches.insert(advisory.id.clone(), tags);
+                    }
+                }
+                ScanOutcome::Vulnerable(if matches.is_empty() {
+                    dv
+                } else {
+                    dv.with_sibling_matches(matches)
+                })
+            }
+            ScanOutcome::Clean => ScanOutcome::Clean,
+            ScanOutcome::Skipped(reason) => ScanOutcome::Skipped(reason),
+        }
     }
 
     /// Recovers batch-truncated entries via individual `POST /v1/query`
@@ -883,6 +933,7 @@ impl OsvClient {
             ScanOutcome::Clean
         } else {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(advisories, total),
                 fix_target_status: UpgradeStatus::NotChecked,
             })
@@ -913,6 +964,7 @@ impl OsvClient {
             .await;
 
         ScanOutcome::Vulnerable(DependencyVulnerabilities {
+            sibling_matches: None,
             advisories: Capped::new(advisories, vuln_ids.len()),
             fix_target_status: UpgradeStatus::NotChecked,
         })
@@ -1268,12 +1320,12 @@ mod tests {
     const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
     fn target(name: &str, version: &str) -> ScanTarget {
-        ScanTarget {
-            key: crate::test_util::vuln_key(name),
-            osv_name: OsvQueryName::Confirmed(OsvPackageName::new(name).unwrap()),
-            version: OsvVersion::new(version),
-            display_version: ConcreteVersion::new(version),
-        }
+        ScanTarget::new(
+            crate::test_util::vuln_key(name),
+            OsvQueryName::Confirmed(OsvPackageName::new(name).unwrap()),
+            OsvVersion::new(version),
+            ConcreteVersion::new(version),
+        )
     }
 
     #[test]
@@ -1711,10 +1763,12 @@ mod tests {
     }
 
     fn provisional_target(name: &str, version: &str) -> ScanTarget {
-        ScanTarget {
-            osv_name: OsvQueryName::Provisional(OsvPackageName::new(name).unwrap()),
-            ..target(name, version)
-        }
+        ScanTarget::new(
+            crate::test_util::vuln_key(name),
+            OsvQueryName::Provisional(OsvPackageName::new(name).unwrap()),
+            OsvVersion::new(version),
+            ConcreteVersion::new(version),
+        )
     }
 
     async fn scan_gha_provisional(version: &str, batch_body: &str) -> ScanOutcome {
@@ -2004,6 +2058,198 @@ mod tests {
             outcomes.get(&crate::test_util::vuln_key("actions/download-artifact")),
             Some(ScanOutcome::Clean)
         );
+    }
+
+    struct IdentityNaming;
+    impl crate::lsp_helpers::OsvNaming for IdentityNaming {}
+
+    fn with_sibling_tags(target: ScanTarget, primary: &str, siblings: &[&str]) -> ScanTarget {
+        let versions = crate::lsp_helpers::InUseVersions::for_test(
+            ConcreteVersion::new(primary),
+            siblings.iter().map(|s| ConcreteVersion::new(*s)).collect(),
+        );
+        target.with_siblings(&versions, &IdentityNaming)
+    }
+
+    async fn scan_gha_with_siblings(primary: &str, siblings: &[&str], events: &str) -> ScanOutcome {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(GHA_UNVERSIONED_BODY)
+            .create_async()
+            .await;
+        let _record = server
+            .mock("GET", "/v1/vulns/GHSA-cxww-7g56-2vh6")
+            .with_status(200)
+            .with_body(gha_record("GHSA-cxww-7g56-2vh6", events))
+            .create_async()
+            .await;
+        let targets = vec![with_sibling_tags(
+            target("actions/download-artifact", primary),
+            primary,
+            siblings,
+        )];
+        let mut outcomes = client
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        outcomes
+            .remove(&crate::test_util::vuln_key("actions/download-artifact"))
+            .expect("one outcome per target")
+    }
+
+    /// #1709: an advisory fixed in the sibling's release still affects the primary; nothing is
+    /// attributed to the sibling.
+    #[tokio::test]
+    async fn gha_sibling_scan_fixed_in_sibling_release_matches_primary_only() {
+        let ScanOutcome::Vulnerable(dv) = scan_gha_with_siblings(
+            "4.8.0",
+            &["4.9.0"],
+            r#"[{"introduced":"0"},{"fixed":"4.9.0"}]"#,
+        )
+        .await
+        else {
+            panic!("expected Vulnerable");
+        };
+        assert!(!dv.has_sibling_matches());
+    }
+
+    /// #1709: an advisory introduced in the sibling's release used to be missed (Clean) and is
+    /// now reported with the sibling named.
+    #[tokio::test]
+    async fn gha_sibling_scan_introduced_in_sibling_release_is_flagged_with_the_tag() {
+        let ScanOutcome::Vulnerable(dv) = scan_gha_with_siblings(
+            "4.8.0",
+            &["4.9.0"],
+            r#"[{"introduced":"4.9.0"},{"fixed":"4.9.1"}]"#,
+        )
+        .await
+        else {
+            panic!("expected Vulnerable");
+        };
+        let tags: Vec<&str> = dv
+            .sibling_match("GHSA-cxww-7g56-2vh6")
+            .expect("sibling-only advisory is attributed")
+            .iter()
+            .map(ConcreteVersion::as_str)
+            .collect();
+        assert_eq!(tags, ["4.9.0"]);
+    }
+
+    #[tokio::test]
+    async fn gha_sibling_scan_unrelated_range_is_clean() {
+        assert_matches!(
+            scan_gha_with_siblings("4.8.0", &["4.9.0"], r#"[{"introduced":"5.0.0"}]"#).await,
+            ScanOutcome::Clean
+        );
+    }
+
+    /// #1709: a sibling that cannot be evaluated never counts as clean.
+    #[tokio::test]
+    async fn gha_sibling_scan_unparseable_sibling_is_skipped_not_clean() {
+        assert_matches!(
+            scan_gha_with_siblings("4.8.0", &["not-a-version"], r#"[{"introduced":"5.0.0"}]"#)
+                .await,
+            ScanOutcome::Skipped(SkipReason::UnevaluableAdvisoryRange)
+        );
+    }
+
+    /// #1709: server-side matched ecosystems cannot evaluate siblings, so the target fails closed.
+    #[tokio::test]
+    async fn server_side_target_with_siblings_is_skipped_unmatchable() {
+        let (_server, client) = mock_client().await;
+        let targets = vec![with_sibling_tags(
+            target("serde", "1.0.0"),
+            "1.0.0",
+            &["1.0.1"],
+        )];
+        let outcomes = client
+            .scan(EcosystemId::Cargo, &targets, TEST_TIMEOUT)
+            .await;
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("serde")),
+            Some(ScanOutcome::Skipped(SkipReason::UnmatchableVersion))
+        );
+    }
+
+    /// #1709: GitLab CI has no OSV ecosystem, so siblings never change its outcome.
+    #[tokio::test]
+    async fn unmappable_ecosystem_target_with_siblings_stays_unmappable() {
+        let (_server, client) = mock_client().await;
+        let targets = vec![with_sibling_tags(
+            target("group/project", "1.0.0"),
+            "1.0.0",
+            &["1.0.1"],
+        )];
+        let outcomes = client
+            .scan(EcosystemId::GitlabCi, &targets, TEST_TIMEOUT)
+            .await;
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("group/project")),
+            Some(ScanOutcome::Skipped(SkipReason::UnmappableEcosystem))
+        );
+    }
+
+    /// #1709 (G1): an advisory that affects the primary is not attributed to a sibling that
+    /// it also affects.
+    #[tokio::test]
+    async fn gha_sibling_scan_primary_and_sibling_both_affected_has_no_sibling_entry() {
+        let ScanOutcome::Vulnerable(dv) =
+            scan_gha_with_siblings("4.8.0", &["4.9.0"], r#"[{"introduced":"0"}]"#).await
+        else {
+            panic!("expected Vulnerable");
+        };
+        assert!(!dv.has_sibling_matches());
+    }
+
+    /// #1709 (G2): every matched sibling is named, lowest first, under a single advisory.
+    #[tokio::test]
+    async fn gha_sibling_scan_names_every_matched_sibling_in_order() {
+        let ScanOutcome::Vulnerable(dv) = scan_gha_with_siblings(
+            "4.8.0",
+            &["4.9.0", "4.10.0", "5.0.0"],
+            r#"[{"introduced":"4.9.0"},{"fixed":"4.11.0"}]"#,
+        )
+        .await
+        else {
+            panic!("expected Vulnerable");
+        };
+        assert_eq!(dv.advisories.total(), 1);
+        let tags: Vec<&str> = dv
+            .sibling_match("GHSA-cxww-7g56-2vh6")
+            .expect("sibling-only advisory")
+            .iter()
+            .map(ConcreteVersion::as_str)
+            .collect();
+        assert_eq!(tags, ["4.9.0", "4.10.0"]);
+    }
+
+    /// #1709 (M2): a sibling-only advisory fixed at or below the primary is not an upgrade
+    /// target; one fixed above the primary still is.
+    #[tokio::test]
+    async fn gha_sibling_scan_lower_sibling_fix_is_not_recommended_as_upgrade() {
+        let ScanOutcome::Vulnerable(dv) = scan_gha_with_siblings(
+            "4.9.0",
+            &["4.8.0"],
+            r#"[{"introduced":"0"},{"fixed":"4.8.1"}]"#,
+        )
+        .await
+        else {
+            panic!("expected Vulnerable");
+        };
+        assert!(dv.sibling_match("GHSA-cxww-7g56-2vh6").is_some());
+        assert!(dv.recommended_fix(None).is_none());
+
+        let ScanOutcome::Vulnerable(dv) = scan_gha_with_siblings(
+            "4.9.0",
+            &["4.8.0"],
+            r#"[{"introduced":"0"},{"fixed":"5.0.0"}]"#,
+        )
+        .await
+        else {
+            panic!("expected Vulnerable");
+        };
+        assert_eq!(dv.recommended_fix(None).unwrap().version, "5.0.0");
     }
 
     #[tokio::test]
@@ -2917,12 +3163,12 @@ mod tests {
             .create_async()
             .await;
 
-        let candidate = ScanTarget {
-            key: crate::test_util::vuln_key("golang.org/x/text"),
-            osv_name: OsvQueryName::Confirmed(OsvPackageName::new("golang.org/x/text").unwrap()),
-            version: OsvVersion::new("0.4.0"),
-            display_version: ConcreteVersion::new("v0.4.0"),
-        };
+        let candidate = ScanTarget::new(
+            crate::test_util::vuln_key("golang.org/x/text"),
+            OsvQueryName::Confirmed(OsvPackageName::new("golang.org/x/text").unwrap()),
+            OsvVersion::new("0.4.0"),
+            ConcreteVersion::new("v0.4.0"),
+        );
         let statuses = client
             .check_candidates(EcosystemId::Go, &[candidate], TEST_TIMEOUT)
             .await;

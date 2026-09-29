@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Breaking
 - **deps-core**: `github::paginate_tags` and `pagination::paginate_pages` now return `Paginated<T>` (items plus a `ListCoverage`), and `TagIndex` records it via `with_coverage`/`coverage` (#1731)
 - **deps-core**: removed `SkipReason::depends_on_tag_index`; `deps-lsp` now decides rescans by comparing scan plans (#1715)
+- **deps-core**: `ResolvedPin` variants now carry `SiblingTags`; `ScanTarget` and `DependencyVulnerabilities` gain sibling-tag fields (#1737)
 
 ### Added
 - **deps-github-actions, deps-core**: new `sha-comment-mismatch` diagnostic and hover warning (severity `diagnostics.sha_comment_mismatch_severity`); a SHA absent from a complete tag index is now outdated (resolves #1722) (#1731)
@@ -100,6 +101,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-gitlab-ci, deps-core**: full-SHA `ref:`/`component:` pins are now classified via the tag index and update-all re-pins them to the latest release's SHA; uppercase-hex SHAs resolve in hover (resolves #1723) (#1728)
+- **deps-core, deps-engine, deps-github-actions**: an OSV scan now checks every release tag on a pinned commit (SHA, exact and floating tag pins), so an advisory affecting only a sibling tag is no longer missed (resolves #1709) (#1737)
+- **deps-core, deps-github-actions**: hover and diagnostics name the sibling release tag an advisory matched instead of the pinned version (resolves #1718) (#1737)
 - **deps-github-actions**: a full-SHA pin absent from the release tag index is now reported outdated by diagnostics, inlay hints, and the update-all lens instead of unresolved (resolves #1720) (#1721)
 - **deps-core**: an explicit OSV `versions` hit above an open-ended range's `last_known_affected_version_range` cap is no longer reported as affected (resolves #1714) (#1717)
 - **deps-gradle**: build script and settings parsers no longer take quadratic time on a single long line with many dependencies, and settings plugin ranges no longer point at an earlier same-prefix plugin (resolves #1701) (#1713)

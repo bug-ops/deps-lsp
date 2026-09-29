@@ -1013,9 +1013,9 @@ let package = Package(
             index.tag_to_sha.insert(tag.to_string(), commit_sha.clone());
             index.insert_sha_pin(
                 commit_sha,
-                deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
-                    tag,
-                )),
+                deps_core::lsp_helpers::ResolvedPin::most_specific(
+                    deps_core::ConcreteVersion::new(tag),
+                ),
             );
             gha_registry.tag_index().insert(
                 deps_core::PackageName::new(name),

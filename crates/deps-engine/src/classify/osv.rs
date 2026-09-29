@@ -12,7 +12,7 @@ use deps_core::ConcreteVersion;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::{
-    OsvNameAvailability, has_unqueryable_resolved_pin, resolve_in_use_version,
+    OsvNameAvailability, has_unqueryable_resolved_pin, resolve_in_use_versions,
 };
 use std::collections::HashMap;
 
@@ -143,7 +143,7 @@ pub fn build_scan_targets(
         // append-only ledger (only `go mod tidy` prunes it), so its last-occurrence-wins
         // parse can yield a stale, no-longer-selected version (see
         // `manifest_requirement_is_resolved_version`).
-        let version = resolve_in_use_version(
+        let versions = resolve_in_use_versions(
             dep,
             &normalized_name,
             resolved_versions,
@@ -152,7 +152,7 @@ pub fn build_scan_targets(
             ecosystem,
         );
 
-        let Some(version) = version else {
+        let Some(versions) = versions else {
             let reason = if has_unqueryable_resolved_pin(dep, formatter, ecosystem) {
                 SkipReason::ResolvedTagNotFullVersion
             } else {
@@ -184,7 +184,13 @@ pub fn build_scan_targets(
             }
         };
 
-        let target = deps_core::osv::ScanTarget::from_native(key, osv_name, version, formatter);
+        let target = deps_core::osv::ScanTarget::from_native(
+            key,
+            osv_name,
+            versions.primary().clone(),
+            formatter,
+        )
+        .with_siblings(&versions, formatter);
         match target_index.entry(target.key.clone()) {
             Entry::Vacant(slot) => {
                 slot.insert(targets.len());
@@ -359,6 +365,7 @@ pub fn build_latest_check_targets(
 ) {
     use deps_core::osv::{SkipReason, StructuralSkipReason, UpgradeStatus, vuln_key_for};
 
+    // TODO(#1727): candidate-side checks do not evaluate sibling release tags of the candidate.
     let mut targets = Vec::new();
     let mut structural = deps_core::osv::LatestStatusMap::new();
     let mut seen = std::collections::HashSet::new();
@@ -1270,9 +1277,9 @@ mod tests {
             let mut index = TagIndex::default();
             index.insert_sha_pin(
                 CommitSha::parse(&sha).unwrap(),
-                deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
-                    "v1",
-                )),
+                deps_core::lsp_helpers::ResolvedPin::most_specific(
+                    deps_core::ConcreteVersion::new("v1"),
+                ),
             );
             tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
             let formatter = GithubActionsFormatter::new(tag_index);
@@ -1387,9 +1394,9 @@ mod tests {
             let mut index = TagIndex::default();
             index.insert_sha_pin(
                 CommitSha::parse(&sha).unwrap(),
-                deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
-                    "v1.3.0",
-                )),
+                deps_core::lsp_helpers::ResolvedPin::most_specific(
+                    deps_core::ConcreteVersion::new("v1.3.0"),
+                ),
             );
             let index = index.with_canonical_repo_name(
                 deps_core::github::CanonicalRepoName::from_commit_url(
@@ -1414,6 +1421,99 @@ mod tests {
             );
             assert!(skipped.is_empty());
             assert_eq!(targets[0].display_version, "v1.3.0");
+        }
+
+        /// #1709: every release tag on the pinned commit reaches the scan target, for a SHA pin
+        /// and for an exact tag pin (primary stays the written tag); no sibling for a lone tag.
+        #[cfg(feature = "github-actions")]
+        #[test]
+        fn build_scan_targets_github_actions_attaches_sibling_release_tags() {
+            use deps_core::lsp_helpers::{CommitSha, TagIndex};
+            use deps_github_actions::{GithubActionsFormatter, GithubActionsRegistry};
+            use std::sync::Arc;
+
+            let sha = "e".repeat(40);
+            let commit = CommitSha::parse(&sha).unwrap();
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = format!(
+                "steps:\n  - uses: actions/checkout@{sha}\n  - uses: other/action@v4.9.0\n"
+            );
+            let parse_result =
+                deps_github_actions::parse_workflow_yaml(&content, &uri).expect("valid yaml");
+
+            let registry = GithubActionsRegistry::new(Arc::new(deps_core::HttpCache::new()));
+            let tag_index = registry.tag_index();
+            let canonical = |repo: &str| {
+                deps_core::github::CanonicalRepoName::from_commit_url(&format!(
+                    "https://api.github.com/repos/{repo}/commits/abc"
+                ))
+            };
+            tag_index.insert(
+                PackageName::new("actions/checkout"),
+                Arc::new(
+                    TagIndex::from_tags([("v4.8.0", &commit), ("v4.9.0", &commit)])
+                        .with_canonical_repo_name(canonical("actions/checkout")),
+                ),
+            );
+            tag_index.insert(
+                PackageName::new("other/action"),
+                Arc::new(
+                    TagIndex::from_tags([("v4.9.0", &commit), ("v4.10.0", &commit)])
+                        .with_canonical_repo_name(canonical("other/action")),
+                ),
+            );
+            let formatter = GithubActionsFormatter::new(tag_index);
+
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &HashMap::new(),
+                &HashMap::new(),
+                &formatter,
+                EcosystemId::GithubActions,
+            );
+
+            assert!(skipped.is_empty(), "{skipped:?}");
+            let versions = |name: &str| {
+                let target = targets
+                    .iter()
+                    .find(|t| t.key.as_str() == name)
+                    .expect("target for name");
+                (
+                    target.display_version.to_string(),
+                    target
+                        .siblings()
+                        .iter()
+                        .map(|s| s.display_version().to_string())
+                        .collect::<Vec<_>>(),
+                )
+            };
+            assert_eq!(
+                versions("actions/checkout"),
+                ("v4.8.0".to_string(), vec!["v4.9.0".to_string()])
+            );
+            assert_eq!(
+                versions("other/action"),
+                ("v4.9.0".to_string(), vec!["v4.10.0".to_string()])
+            );
+        }
+
+        #[test]
+        fn build_scan_targets_without_a_tag_pin_has_no_siblings() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("log4j-core"),
+                    version_req: Some(VersionReq::new("2.14.1")),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let (targets, _) = build_scan_targets(
+                &parse_result,
+                &HashMap::new(),
+                &HashMap::new(),
+                &StubFormatter::DEFAULT,
+                EcosystemId::Maven,
+            );
+            assert!(targets.iter().all(|t| t.siblings().is_empty()));
         }
 
         #[test]

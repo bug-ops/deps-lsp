@@ -1184,12 +1184,22 @@ fn push_vulnerability_hover_section(
                     FieldKind::Prose,
                 );
                 markdown.push_static("\n");
+                if let Some(tags) = dv.sibling_match(&advisory.id) {
+                    markdown.push_static("  *(");
+                    markdown.push_static(formatter.sibling_match_label());
+                    markdown.push_static(" ");
+                    markdown.push_trusted(escape_markdown(
+                        &super::diagnostics::format_matched_tags(tags),
+                    ));
+                    markdown.push_static(")*\n");
+                }
 
-                let has_fixed = advisory.fixed_versions.last().is_some();
+                let has_fixed =
+                    advisory.fixed_versions.last().is_some() && dv.fix_is_upgrade(advisory);
                 let has_aliases = !advisory.aliases.is_empty();
                 if has_fixed || has_aliases {
                     markdown.push_static("  ");
-                    if let Some(fixed) = advisory.fixed_versions.last() {
+                    if let Some(fixed) = advisory.fixed_versions.last().filter(|_| has_fixed) {
                         // #1423: `fixed_versions` is OSV's wire spelling — convert to this
                         // ecosystem's native namespace before showing it (Go's mandatory `v`
                         // prefix is the live-verified symptom otherwise).
@@ -5227,6 +5237,7 @@ mod tests {
         vulns.insert(
             crate::test_util::vuln_key("bad-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
                     3,
@@ -5395,6 +5406,84 @@ mod tests {
         );
     }
 
+    /// #1718: an advisory matched only through a sibling tag is labelled with the formatter's
+    /// wording; an advisory without a sibling match is rendered unchanged.
+    #[test]
+    fn push_vulnerability_hover_section_labels_sibling_only_advisories() {
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, MatchedTags, ScanOutcome, SiblingMatches,
+            VulnSeverity,
+        };
+
+        let mut matches = SiblingMatches::new(crate::osv::OsvVersion::new("1.0.0"));
+        matches.insert(
+            "A-1".to_string(),
+            MatchedTags::from_tags(vec![
+                crate::ConcreteVersion::new("v4.9.0"),
+                crate::ConcreteVersion::new("v4.*10"),
+            ])
+            .unwrap(),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(
+            vec![
+                sample_advisory("A-1", VulnSeverity::High),
+                sample_advisory("A-2", VulnSeverity::High),
+            ],
+            2,
+        ))
+        .with_sibling_matches(matches);
+        let mut markdown = HoverMarkdown::new();
+        push_vulnerability_hover_section(
+            &mut markdown,
+            &crate::test_util::StubFormatter::DEFAULT,
+            Some(&ScanOutcome::Vulnerable(dv)),
+            None,
+        );
+
+        let rendered = markdown.as_str();
+        assert_eq!(rendered.matches("matched tag").count(), 1, "{rendered}");
+        assert!(
+            rendered.contains(r"*(matched tag v4\.9\.0\, v4\.\*10)*"),
+            "{rendered}"
+        );
+    }
+
+    /// #1718: a sibling-only advisory fixed at or below the pinned version shows no "Fixed in".
+    #[test]
+    fn push_vulnerability_hover_section_hides_non_upgrade_fix_of_sibling_only_advisory() {
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, MatchedTags, OsvVersion, ScanOutcome,
+            SiblingMatches, VulnSeverity,
+        };
+
+        let mut matches = SiblingMatches::new(OsvVersion::new("9.0.0"));
+        matches.insert(
+            "A-1".to_string(),
+            MatchedTags::from_tags(vec![crate::ConcreteVersion::new("v8.0.0")]).unwrap(),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(
+            vec![
+                sample_advisory("A-1", VulnSeverity::High),
+                sample_advisory("A-2", VulnSeverity::High),
+            ],
+            2,
+        ))
+        .with_sibling_matches(matches);
+        let mut markdown = HoverMarkdown::new();
+        push_vulnerability_hover_section(
+            &mut markdown,
+            &crate::test_util::StubFormatter::DEFAULT,
+            Some(&ScanOutcome::Vulnerable(dv)),
+            None,
+        );
+
+        assert_eq!(
+            markdown.as_str().matches("Fixed in").count(),
+            1,
+            "{markdown}"
+        );
+    }
+
     #[tokio::test]
     async fn test_generate_hover_malicious_advisory_never_renders_unknown_severity() {
         // SC-001: a MAL-* advisory (e.g. the live MAL-2025-47141 record for
@@ -5415,6 +5504,7 @@ mod tests {
         vulns.insert(
             crate::test_util::vuln_key("bad-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![sample_advisory("MAL-2025-47141", VulnSeverity::Malicious)],
                     1,
@@ -5473,6 +5563,7 @@ mod tests {
         vulns.insert(
             crate::test_util::vuln_key("yaml-rust"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(vec![std::sync::Arc::new(advisory)], 1),
                 fix_target_status: UpgradeStatus::NotChecked,
             }),
@@ -5527,6 +5618,7 @@ mod tests {
         vulns.insert(
             crate::test_util::vuln_key("yaml-rust"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(vec![advisory], 1),
                 fix_target_status: UpgradeStatus::NotChecked,
             }),
@@ -5590,6 +5682,7 @@ mod tests {
         vulns.insert(
             crate::test_util::vuln_key("mixed-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(vec![informational_advisory, graded_advisory], 2),
                 fix_target_status: UpgradeStatus::NotChecked,
             }),
@@ -5678,6 +5771,7 @@ mod tests {
         vulns.insert(
             vulnerable_key,
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
                     1,
@@ -5784,6 +5878,7 @@ mod tests {
         vulns.insert(
             current_key,
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
                     1,

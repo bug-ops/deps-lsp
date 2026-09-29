@@ -764,6 +764,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![
                         std::sync::Arc::new(
@@ -882,6 +883,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(advisories, total),
                 fix_target_status: UpgradeStatus::CandidateClean {
                     version: ConcreteVersion::new("2.0.0"),
@@ -969,6 +971,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(advisories, total),
                 fix_target_status: UpgradeStatus::CandidateClean {
                     version: ConcreteVersion::new("2.0.0"),
@@ -1030,6 +1033,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![
                         std::sync::Arc::new(
@@ -1113,6 +1117,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![
                         std::sync::Arc::new(
@@ -1186,6 +1191,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
                         Advisory::new(
@@ -1250,6 +1256,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
                         Advisory::new(
@@ -1317,6 +1324,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![
                         std::sync::Arc::new(
@@ -1392,6 +1400,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
                         Advisory::new(
@@ -1446,6 +1455,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
                         Advisory::new(
@@ -1508,6 +1518,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
                         Advisory::new(
@@ -1565,6 +1576,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
                         Advisory::new(
@@ -1736,6 +1748,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
                         Advisory::new(
@@ -1837,6 +1850,7 @@ mod tests {
         vulnerabilities.insert(
             vulnerable_key,
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
                         Advisory::new(
@@ -1917,6 +1931,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
                         Advisory::new(
@@ -2042,6 +2057,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
                         Advisory::new(
@@ -2104,6 +2120,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
                         Advisory::new(
@@ -2169,6 +2186,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
                         Advisory::new(
@@ -2236,6 +2254,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
                         Advisory::new(
@@ -2733,6 +2752,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
                         Advisory::new(
@@ -3020,6 +3040,7 @@ mod tests {
             vulnerabilities.insert(
                 crate::test_util::vuln_key("serde"),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                    sibling_matches: None,
                     advisories: Capped::new(
                         vec![std::sync::Arc::new(
                             Advisory::new(
@@ -3707,6 +3728,7 @@ mod tests {
             vulnerabilities.insert(
                 crate::test_util::vuln_key("pkg"),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                    sibling_matches: None,
                     advisories: Capped::new(
                         vec![std::sync::Arc::new(
                             Advisory::new(
@@ -3789,6 +3811,7 @@ mod tests {
             vulnerabilities.insert(
                 crate::test_util::vuln_key("pkg"),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                    sibling_matches: None,
                     advisories: Capped::new(
                         vec![std::sync::Arc::new(
                             Advisory::new(
@@ -3850,6 +3873,7 @@ mod tests {
             vulnerabilities.insert(
                 crate::test_util::vuln_key("pkg"),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                    sibling_matches: None,
                     advisories: Capped::new(
                         vec![std::sync::Arc::new(
                             Advisory::new(

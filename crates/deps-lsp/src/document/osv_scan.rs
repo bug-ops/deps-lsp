@@ -46,6 +46,7 @@ enum PlannedQuery {
     Query {
         name: deps_core::osv::OsvQueryName,
         version: deps_core::osv::OsvVersion,
+        siblings: Vec<deps_core::osv::OsvVersion>,
     },
     Skip(deps_core::osv::SkipReason),
 }
@@ -71,6 +72,11 @@ impl OsvScanPlan {
                 PlannedQuery::Query {
                     name: target.osv_name.clone(),
                     version: target.version.clone(),
+                    siblings: target
+                        .siblings()
+                        .iter()
+                        .map(|s| s.version().clone())
+                        .collect(),
                 },
             )
         });
@@ -1804,9 +1810,9 @@ mod tests {
             let mut index = TagIndex::default();
             index.insert_sha_pin(
                 CommitSha::parse(&sha).unwrap(),
-                deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
-                    "v1.3.0",
-                )),
+                deps_core::lsp_helpers::ResolvedPin::most_specific(
+                    deps_core::ConcreteVersion::new("v1.3.0"),
+                ),
             );
             let index = index.with_canonical_repo_name(
                 deps_core::github::CanonicalRepoName::from_commit_url(
@@ -1891,9 +1897,9 @@ mod tests {
             let mut index = TagIndex::default();
             index.insert_sha_pin(
                 CommitSha::parse(&sha).unwrap(),
-                deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
-                    "v1.3.0",
-                )),
+                deps_core::lsp_helpers::ResolvedPin::most_specific(
+                    deps_core::ConcreteVersion::new("v1.3.0"),
+                ),
             );
             gha_registry
                 .tag_index()
@@ -2007,6 +2013,144 @@ mod tests {
                 Some(deps_core::osv::ScanOutcome::Clean)
             );
             batch.assert_async().await;
+        }
+
+        /// #1709: an exact tag pin used to be independent of the `TagIndex`; now a cold scan
+        /// checks only the written tag, and the warm index adding a sibling release tag must
+        /// change the scan plan so the rescan flags an advisory introduced in that sibling.
+        #[tokio::test]
+        async fn rescan_flags_sibling_release_tag_advisory_for_exact_tag_pin_once_index_warm() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let _batch = server
+                .mock("POST", "/v1/querybatch")
+                .with_status(200)
+                .with_body(r#"{"results":[{"vulns":[{"id":"GHSA-aaaa-bbbb-cccc","modified":"2025-01-01T00:00:00Z"}]}]}"#)
+                .create_async()
+                .await;
+            let _record = server
+                .mock("GET", "/v1/vulns/GHSA-aaaa-bbbb-cccc")
+                .with_status(200)
+                .with_body(
+                    r#"{"id":"GHSA-aaaa-bbbb-cccc","modified":"2025-01-01T00:00:00Z",
+                    "affected":[{"package":{"name":"actions/checkout","ecosystem":"GitHub Actions"},
+                    "ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"4.9.0"},{"fixed":"4.9.1"}]}]}]}"#,
+                )
+                .create_async()
+                .await;
+
+            let mut state = ServerState::new();
+            state.osv = Arc::new(OsvClient::for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                server.url(),
+            ));
+            let state = Arc::new(state);
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+
+            let url = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let content = "steps:\n  - uses: actions/checkout@v4.8.0\n".to_string();
+            let ecosystem: Arc<dyn Ecosystem> = Arc::new(GithubActionsEcosystem::new(Arc::new(
+                deps_core::HttpCache::new(),
+            )));
+            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            state.update_document(
+                uri.clone(),
+                DocumentState::new_from_parse_result(
+                    EcosystemId::GithubActions,
+                    content,
+                    parse_result,
+                ),
+            );
+            let canonical = || {
+                deps_core::github::CanonicalRepoName::from_commit_url(
+                    "https://api.github.com/repos/actions/checkout/commits/abc",
+                )
+            };
+            let registry = ecosystem.registry();
+            let tag_index = registry
+                .as_any()
+                .downcast_ref::<GithubActionsRegistry>()
+                .expect("GithubActionsEcosystem::registry() must return a GithubActionsRegistry")
+                .tag_index();
+            tag_index.insert(
+                PackageName::new("actions/checkout"),
+                Arc::new(TagIndex::default().with_canonical_repo_name(canonical())),
+            );
+
+            let cold_phase_a =
+                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
+                    .await
+                    .expect("a tag-pinned step must produce a phase-A result");
+            run_osv_phase_b_and_commit(
+                &uri,
+                &state,
+                ecosystem.ecosystem_id(),
+                ecosystem.formatter(),
+                5,
+                cold_phase_a,
+            )
+            .await;
+            let key = deps_core::test_util::vuln_key("actions/checkout");
+            assert_matches!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .signals
+                    .vulnerabilities
+                    .get(&key),
+                Some(deps_core::osv::ScanOutcome::Clean)
+            );
+
+            let commit = CommitSha::parse(&"a".repeat(40)).unwrap();
+            tag_index.insert(
+                PackageName::new("actions/checkout"),
+                Arc::new(
+                    TagIndex::from_tags([("v4.8.0", &commit), ("v4.9.0", &commit)])
+                        .with_canonical_repo_name(canonical()),
+                ),
+            );
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+            let doc = state.get_document(&uri).unwrap();
+            let Some(deps_core::osv::ScanOutcome::Vulnerable(dv)) =
+                doc.signals.vulnerabilities.get(&key)
+            else {
+                panic!("warm rescan must flag the sibling-only advisory");
+            };
+            assert!(dv.sibling_match("GHSA-aaaa-bbbb-cccc").is_some());
+        }
+
+        /// #1709: two plans that differ only by a target's sibling tags are not equal, so a
+        /// tag index refresh adding or removing a sibling triggers a rescan (#1715 contract).
+        #[test]
+        fn osv_scan_plan_differs_when_only_siblings_differ() {
+            use deps_core::ConcreteVersion;
+            use deps_core::osv::{OsvPackageName, OsvQueryName, ScanTarget};
+
+            struct Identity;
+            impl deps_core::lsp_helpers::OsvNaming for Identity {}
+
+            let target = |siblings: &[&str]| {
+                let versions = deps_core::lsp_helpers::InUseVersions::for_test(
+                    ConcreteVersion::new("4.8.0"),
+                    siblings.iter().map(|s| ConcreteVersion::new(*s)).collect(),
+                );
+                ScanTarget::from_native(
+                    deps_core::test_util::vuln_key("actions/checkout"),
+                    OsvQueryName::Confirmed(OsvPackageName::new("actions/checkout").unwrap()),
+                    ConcreteVersion::new("4.8.0"),
+                    &Identity,
+                )
+                .with_siblings(&versions, &Identity)
+            };
+            let skipped = deps_core::osv::VulnerabilityMap::new();
+            let plan = |siblings: &[&str]| OsvScanPlan::new(&[target(siblings)], &skipped);
+
+            assert_ne!(plan(&[]), plan(&["4.9.0"]));
+            assert_ne!(plan(&["4.9.0"]), plan(&["4.9.0", "4.10.0"]));
+            assert_eq!(plan(&["4.9.0"]), plan(&["4.9.0"]));
         }
 
         /// #1668: a skip because the resolved tag was only a moving alias (`v2`) is just as

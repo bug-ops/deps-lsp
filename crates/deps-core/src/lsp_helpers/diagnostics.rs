@@ -313,6 +313,20 @@ pub fn sanitize_advisory_text_for_diagnostic(value: &str, max_chars: usize) -> S
     truncate_for_diagnostic(&super::replace_markdown_unsafe_chars(value), max_chars).into_owned()
 }
 
+/// Cap on how many sibling tags [`format_matched_tags`] names before collapsing the rest.
+const MAX_SIBLING_TAGS_RENDERED: usize = 3;
+
+/// Renders the sibling tags an advisory matched as one bounded, sanitized, comma-separated
+/// string: each tag is stripped of invisible characters and truncated before the count-capped
+/// join, so a registry-controlled tag name never reaches a message unbounded.
+pub(crate) fn format_matched_tags(tags: &crate::osv::MatchedTags) -> String {
+    let sanitized: Vec<String> = tags
+        .iter()
+        .map(|tag| sanitize_and_truncate_for_diagnostic(tag.as_str(), MAX_VERSION_DIAGNOSTIC_CHARS))
+        .collect();
+    crate::licenses::join_capped(&sanitized, MAX_SIBLING_TAGS_RENDERED)
+}
+
 /// Stable [`Diagnostic::code`] set on the package-level deprecation diagnostic (issue #205).
 ///
 /// Mirrors [`UNSATISFIABLE_DIAGNOSTIC_CODE`] — lets `build_replacement_action`'s stashed
@@ -1795,7 +1809,7 @@ fn apply_vulnerability_rule<'a>(
     else {
         return None;
     };
-    push_vulnerability_diagnostics(diagnostics, ctx.dep, dv);
+    push_vulnerability_diagnostics(diagnostics, ctx.dep, dv, ctx.formatter);
     Some(dv)
 }
 
@@ -3043,6 +3057,7 @@ fn push_vulnerability_diagnostics(
     diagnostics: &mut Vec<Diagnostic>,
     dep: &dyn Dependency,
     dv: &crate::osv::DependencyVulnerabilities,
+    formatter: &dyn EcosystemFormatter,
 ) {
     let range: Range = version_anchor_range(dep);
 
@@ -3076,6 +3091,14 @@ fn push_vulnerability_diagnostics(
             | crate::osv::VulnSeverity::Low
             | crate::osv::VulnSeverity::Unknown => format!("{advisory_id}: {summary}"),
         };
+        let message = match dv.sibling_match(&advisory.id) {
+            Some(tags) => format!(
+                "{message} ({} {})",
+                formatter.sibling_match_label(),
+                format_matched_tags(tags)
+            ),
+            None => message,
+        };
 
         let mut diagnostic = Diagnostic::new(range, message)
             .with_severity(diagnostic_severity_for(advisory.severity))
@@ -3105,6 +3128,39 @@ mod tests {
 
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    fn matched_tags(tags: &[&str]) -> crate::osv::MatchedTags {
+        crate::osv::MatchedTags::from_tags(
+            tags.iter()
+                .map(|t| crate::ConcreteVersion::new(*t))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    /// #1718: more matched tags than the cap collapse into a "(+N more)" suffix.
+    #[test]
+    fn test_format_matched_tags_caps_the_count() {
+        let rendered = format_matched_tags(&matched_tags(&[
+            "v1.0.0", "v1.0.1", "v1.0.2", "v1.0.3", "v1.0.4",
+        ]));
+        assert_eq!(rendered, "v1.0.0, v1.0.1, v1.0.2 (+2 more)");
+    }
+
+    /// #1718: a registry-controlled tag is truncated per tag and stripped of bidi/invisible
+    /// characters before joining.
+    #[test]
+    fn test_format_matched_tags_truncates_and_strips_invisible_characters() {
+        let long = format!("v{}", "9".repeat(10_000));
+        let rendered =
+            format_matched_tags(&matched_tags(&[long.as_str(), "v1\u{202E}.0.0\u{200D}"]));
+        let (first, second) = rendered.split_once(", ").unwrap();
+        assert!(
+            first.chars().count() <= MAX_VERSION_DIAGNOSTIC_CHARS + 1,
+            "{first}"
+        );
+        assert_eq!(second, "v1 .0.0 ");
+    }
 
     /// #1161 M1 (critic follow-up): a dependency with a real `version_range()` but no
     /// `version_requirement()` — Maven's `<version></version>`, whose zero-width
@@ -6863,6 +6919,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("feed-widget-helper"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(vec![sample_advisory("GHSA-xxxx", VulnSeverity::High)], 1),
                 fix_target_status: UpgradeStatus::NotChecked,
             }),
@@ -6955,6 +7012,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("feed-widget-helper"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![sample_advisory("MAL-2026-16332", VulnSeverity::Malicious)],
                     1,
@@ -7049,6 +7107,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("feed-widget-helper"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
                     1,
@@ -7236,6 +7295,7 @@ mod tests {
         vulnerabilities.insert(
             crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
                     1,
@@ -9040,6 +9100,7 @@ mod tests {
         vulns.insert(
             crate::test_util::vuln_key("vulnerable-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
                     1,
@@ -9066,6 +9127,61 @@ mod tests {
         assert_eq!(vuln_diag.code(), Some("RUSTSEC-2020-0071"));
     }
 
+    /// #1718: a sibling-only advisory's message carries the formatter's label and the tags.
+    #[test]
+    fn test_generate_diagnostics_sibling_only_advisory_names_matched_tags() {
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, ScanOutcome, SiblingMatches, VulnSeverity,
+            VulnerabilityMap,
+        };
+
+        let mut matches = SiblingMatches::new(crate::osv::OsvVersion::new("1.0.0"));
+        matches.insert("A-1".to_string(), matched_tags(&["v4.9.0", "v4.10.0"]));
+        let dv = DependencyVulnerabilities::new(Capped::new(
+            vec![
+                sample_advisory("A-1", VulnSeverity::High),
+                sample_advisory("A-2", VulnSeverity::High),
+            ],
+            2,
+        ))
+        .with_sibling_matches(matches);
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("vulnerable-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            crate::test_util::vuln_key("vulnerable-pkg"),
+            ScanOutcome::Vulnerable(dv),
+        );
+        let (cached, resolved) = (HashMap::new(), HashMap::new());
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached, &resolved).with_vulnerabilities(&vulns),
+            &MOCK_FORMATTER,
+            parse_result.uri(),
+            crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let message_of = |id: &str| {
+            diagnostics
+                .iter()
+                .find(|d| d.code() == Some(id))
+                .expect("advisory diagnostic")
+                .message()
+                .to_string()
+        };
+        assert!(
+            message_of("A-1").ends_with("(matched tag v4.9.0, v4.10.0)"),
+            "{}",
+            message_of("A-1")
+        );
+        assert!(!message_of("A-2").contains("matched tag"));
+    }
+
     #[test]
     fn test_generate_diagnostics_malicious_advisory_is_distinguishable_from_unknown() {
         // SC-002: a MAL-* advisory and an ordinary Unknown-severity advisory on
@@ -9087,6 +9203,7 @@ mod tests {
         vulns.insert(
             crate::test_util::vuln_key("vulnerable-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![
                         sample_advisory("MAL-2025-47141", VulnSeverity::Malicious),
@@ -9164,6 +9281,7 @@ mod tests {
         vulns.insert(
             crate::test_util::vuln_key("vulnerable-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(vec![std::sync::Arc::new(advisory)], 1),
                 fix_target_status: UpgradeStatus::NotChecked,
             }),
@@ -9216,6 +9334,7 @@ mod tests {
         vulns.insert(
             crate::test_util::vuln_key("vulnerable-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![
                         sample_advisory("RUSTSEC-2024-0320", VulnSeverity::Informational),
@@ -9288,6 +9407,7 @@ mod tests {
         vulns.insert(
             crate::test_util::vuln_key("bad-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(vec![advisory], 1),
                 fix_target_status: UpgradeStatus::NotChecked,
             }),
@@ -9343,6 +9463,7 @@ mod tests {
         vulns.insert(
             crate::test_util::vuln_key("noisy-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(advisories, 40),
                 fix_target_status: UpgradeStatus::NotChecked,
             }),
@@ -9421,6 +9542,7 @@ mod tests {
         vulns.insert(
             vulnerable_key,
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
                     1,
@@ -9524,6 +9646,7 @@ mod tests {
         vulns.insert(
             current_key,
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
                     1,
