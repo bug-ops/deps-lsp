@@ -78,7 +78,7 @@ pub trait PackageNaming: Send + Sync {
 /// [`format_version_replacing_for`](Self::format_version_replacing_for) need not guard against
 /// an unexpanded placeholder themselves: [`crate::edit::replacement_text`] is the only
 /// production path that calls into either method, and it never does so once
-/// [`RequirementResolution::requirement_is_placeholder`](super::RequirementResolution::requirement_is_placeholder)
+/// [`RequirementResolution::bounded_requirement_is_placeholder`](super::RequirementResolution::bounded_requirement_is_placeholder)
 /// says `true` for the requirement being replaced.
 pub trait PackageRendering: Send + Sync {
     /// Format version string for code action text edit.
@@ -700,7 +700,7 @@ fn is_wildcard_component(part: &str) -> bool {
 /// `replaceXRange` sets `xp = xm || isX(p)`): `1.x.5` behaves identically to `1.x`, and
 /// `^1.5.x` behaves identically to `^1.5`. Shared by both the plain/partial-version wildcard
 /// check ([`matches_wildcard_components`], #1641) and caret bounding
-/// ([`RequirementResolution::version_satisfies_requirement`]'s `^` branch and
+/// ([`RequirementResolution::version_satisfies_bounded_requirement`]'s `^` branch and
 /// [`caret_admits_up_to_date`], #1637), so neither has to understand wildcards itself — both
 /// just consume a possibly-shorter, wildcard-free `req_parts` slice.
 ///
@@ -833,7 +833,7 @@ fn relax_caret_floors(requirement: &str, bound_sep: &str) -> Option<String> {
 
 /// Whether `latest` is still within a `^`-requirement's exclusive *upper* bound (the
 /// auto-following range's ceiling) — ignoring the requirement's own minor/patch lower-bound
-/// floor #1622 added to [`RequirementResolution::version_satisfies_requirement`]'s `^` branch.
+/// floor #1622 added to [`RequirementResolution::version_satisfies_bounded_requirement`]'s `^` branch.
 ///
 /// [`RequirementResolution::is_bounded_requirement_up_to_date`]'s default asks "is `latest` still
 /// within what this requirement would resolve to", not "does `latest` satisfy every clause of
@@ -888,9 +888,13 @@ fn up_to_date_via_heuristic<F: RequirementResolution + ?Sized>(
     latest: &ConcreteVersion,
 ) -> bool {
     caret_admits_up_to_date(latest.as_str(), requirement.as_str()).unwrap_or_else(|| {
-        formatter.version_satisfies_requirement(latest, requirement.as_str())
-            || relax_caret_floors(requirement.as_str(), " ")
-                .is_some_and(|relaxed| formatter.version_satisfies_requirement(latest, &relaxed))
+        formatter.version_satisfies_bounded_requirement(latest, requirement)
+            || relax_caret_floors(requirement.as_str(), " ").is_some_and(|relaxed| {
+                let relaxed = VersionReq::new(relaxed);
+                BoundedVersionReq::new(&relaxed).is_some_and(|relaxed| {
+                    formatter.version_satisfies_bounded_requirement(latest, relaxed)
+                })
+            })
     })
 }
 
@@ -987,8 +991,8 @@ pub fn up_to_date_for_comparators_via_compiled_matcher<F: RequirementResolution 
 /// prerelease `latest` is judged by its `X.Y.Z`, but only when the matcher opts into
 /// [`RequirementMatcher::strict_prerelease_exclusion`], the same gate `diagnostics.rs` applies
 /// to its numeric-core retry, #1661). Falls back to
-/// [`RequirementResolution::version_satisfies_requirement`] when the requirement does not
-/// compile or the matcher cannot judge `latest`.
+/// [`RequirementResolution::version_satisfies_bounded_requirement`] when the requirement does
+/// not compile or the matcher cannot judge `latest`.
 ///
 /// # Examples
 ///
@@ -1032,7 +1036,7 @@ pub fn up_to_date_via_compiled_matcher<F: RequirementResolution + ?Sized>(
         return admitted;
     }
     let Some(matcher) = formatter.compile_bounded_requirement(requirement) else {
-        return formatter.version_satisfies_requirement(latest, requirement.as_str());
+        return formatter.version_satisfies_bounded_requirement(latest, requirement);
     };
     let core = ConcreteVersion::new(strip_version_suffix(latest.as_str()));
     let admits = |m: &dyn RequirementMatcher| {
@@ -1053,7 +1057,7 @@ pub fn up_to_date_via_compiled_matcher<F: RequirementResolution + ?Sized>(
     if admits(&*matcher) || relaxed.as_deref().is_some_and(admits) {
         true
     } else if matcher.matches(latest).is_none() {
-        formatter.version_satisfies_requirement(latest, requirement.as_str())
+        formatter.version_satisfies_bounded_requirement(latest, requirement)
     } else {
         false
     }
@@ -1064,10 +1068,10 @@ pub fn up_to_date_via_compiled_matcher<F: RequirementResolution + ?Sized>(
 /// Implementors guarantee every method here is a pure function of its arguments — no network
 /// or filesystem access — since these run on the hot hover/diagnostic path. The default
 /// [`classify_requirement_status`](Self::classify_requirement_status) maps
-/// [`requirement_is_unresolved`](Self::requirement_is_unresolved) to its `Unresolved` variant
+/// [`bounded_requirement_is_unresolved`](Self::bounded_requirement_is_unresolved) to its `Unresolved` variant
 /// and otherwise defers to [`is_bounded_requirement_up_to_date`](Self::is_bounded_requirement_up_to_date). Most
 /// ecosystems whose requirement syntax can be unresolved (Maven, Gradle, NuGet, Cargo, npm, ...)
-/// need only override [`requirement_is_placeholder`](Self::requirement_is_placeholder) —
+/// need only override [`bounded_requirement_is_placeholder`](Self::bounded_requirement_is_placeholder) —
 /// `requirement_is_unresolved` defaults to delegating to it. Only `deps-github-actions` and
 /// `deps-gitlab-ci` override `requirement_is_unresolved` directly, since their two predicates
 /// answer genuinely different questions there (see `requirement_is_placeholder`'s doc). Callers
@@ -1081,7 +1085,16 @@ pub trait RequirementResolution: Send + Sync {
     /// which has its own default and its own override points; an ecosystem whose bare
     /// requirement is a floor rather than an auto-following range (see `deps-nuget`)
     /// overrides that method, not this one.
-    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
+    ///
+    /// Takes a [`BoundedVersionReq`]: [`RequirementGate::version_satisfies_requirement`] — the
+    /// entry point callers use — reports an oversized requirement `false` before this hook is
+    /// ever called.
+    fn version_satisfies_bounded_requirement(
+        &self,
+        version: &ConcreteVersion,
+        requirement: BoundedVersionReq<'_>,
+    ) -> bool {
+        let requirement = requirement.as_str();
         let version = version.as_str();
         // Caret allows changes that don't modify the left-most non-zero component, but never
         // below the requirement's own minor/patch floor: ^1.5 -> [1.5.0, 2.0.0), ^0.2 ->
@@ -1194,7 +1207,7 @@ pub trait RequirementResolution: Send + Sync {
     /// Whether `requirement` could not be resolved to a concrete version constraint (e.g. an
     /// unexpanded property/variable placeholder rather than a real version or range).
     ///
-    /// Default: delegates to [`requirement_is_placeholder`](Self::requirement_is_placeholder),
+    /// Default: delegates to [`bounded_requirement_is_placeholder`](Self::bounded_requirement_is_placeholder),
     /// which is correct for every ecosystem except `deps-github-actions` and `deps-gitlab-ci`
     /// (see that method's doc for why their two predicates genuinely differ). Overriding
     /// `requirement_is_placeholder` alone therefore keeps both predicates in sync; only those
@@ -1203,16 +1216,18 @@ pub trait RequirementResolution: Send + Sync {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::RequirementResolution;
+    /// use deps_core::lsp_helpers::{BoundedVersionReq, RequirementResolution};
     /// use deps_core::VersionReq;
     ///
     /// struct DefaultFormatter;
     /// impl RequirementResolution for DefaultFormatter {}
     ///
-    /// assert!(!DefaultFormatter.requirement_is_unresolved(&VersionReq::new("^1.2")));
+    /// let requirement = VersionReq::new("^1.2");
+    /// let bounded = BoundedVersionReq::new(&requirement).unwrap();
+    /// assert!(!DefaultFormatter.bounded_requirement_is_unresolved(bounded));
     /// ```
-    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        self.requirement_is_placeholder(requirement)
+    fn bounded_requirement_is_unresolved(&self, requirement: BoundedVersionReq<'_>) -> bool {
+        self.bounded_requirement_is_placeholder(requirement)
     }
 
     /// Whether `requirement` is an unexpanded placeholder/interpolation (Maven's
@@ -1221,7 +1236,7 @@ pub trait RequirementResolution: Send + Sync {
     /// that must never be overwritten by a manifest rewrite, no matter what other requirement
     /// resolution predicate happens to say about it.
     ///
-    /// Distinct from [`requirement_is_unresolved`](Self::requirement_is_unresolved): that
+    /// Distinct from [`bounded_requirement_is_unresolved`](Self::bounded_requirement_is_unresolved): that
     /// predicate also covers a *concrete but undecidable* ref (a `deps-github-actions`/
     /// `deps-gitlab-ci` SHA or branch pin) which is safe, and sometimes intentional, to
     /// rewrite — a vulnerability-fix quickfix pinning a SHA forward is exactly that. This
@@ -1257,7 +1272,7 @@ pub trait RequirementResolution: Send + Sync {
     /// instead of hand-rolling the same check separately inside
     /// [`format_version_replacing`](PackageRendering::format_version_replacing),
     /// [`compile_bounded_requirement`](Self::compile_bounded_requirement), and
-    /// [`version_satisfies_requirement`](Self::version_satisfies_requirement) — and, since
+    /// [`version_satisfies_bounded_requirement`](Self::version_satisfies_bounded_requirement) — and, since
     /// #1391, need not guard [`format_version_replacing`](PackageRendering::format_version_replacing)/
     /// [`format_version_replacing_for`](PackageRendering::format_version_replacing_for) at all:
     /// [`crate::edit::replacement_text`] is the only production path that ever calls into
@@ -1266,16 +1281,20 @@ pub trait RequirementResolution: Send + Sync {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::RequirementResolution;
+    /// use deps_core::lsp_helpers::{BoundedVersionReq, RequirementResolution};
     /// use deps_core::VersionReq;
     ///
     /// struct DefaultFormatter;
     /// impl RequirementResolution for DefaultFormatter {}
     ///
-    /// assert!(!DefaultFormatter.requirement_is_placeholder(&VersionReq::new("^1.2")));
-    /// assert!(DefaultFormatter.requirement_is_placeholder(&VersionReq::new("{{ version }}")));
+    /// let concrete = VersionReq::new("^1.2");
+    /// let templated = VersionReq::new("{{ version }}");
+    /// let concrete = BoundedVersionReq::new(&concrete).unwrap();
+    /// let templated = BoundedVersionReq::new(&templated).unwrap();
+    /// assert!(!DefaultFormatter.bounded_requirement_is_placeholder(concrete));
+    /// assert!(DefaultFormatter.bounded_requirement_is_placeholder(templated));
     /// ```
-    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+    fn bounded_requirement_is_placeholder(&self, requirement: BoundedVersionReq<'_>) -> bool {
         super::requirement_contains_template_placeholder(requirement.as_str())
     }
 
@@ -1319,7 +1338,7 @@ pub trait RequirementResolution: Send + Sync {
         requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> RequirementStatus {
-        if self.requirement_is_unresolved(requirement.get()) {
+        if self.bounded_requirement_is_unresolved(requirement) {
             return RequirementStatus::Unresolved;
         }
         if self.is_bounded_requirement_up_to_date(requirement, latest) {
@@ -1472,20 +1491,21 @@ pub trait RequirementResolution: Send + Sync {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::RequirementResolution;
+    /// use deps_core::lsp_helpers::{BoundedVersionReq, RequirementResolution};
     /// use deps_core::{ConcreteVersion, VersionReq};
     ///
     /// struct DefaultFormatter;
     /// impl RequirementResolution for DefaultFormatter {}
     ///
-    /// assert!(!DefaultFormatter.requirement_is_undecidable_given_available(
-    ///     &VersionReq::new("1.6.13"),
+    /// let requirement = VersionReq::new("1.6.13");
+    /// assert!(!DefaultFormatter.bounded_requirement_is_undecidable_given_available(
+    ///     BoundedVersionReq::new(&requirement).unwrap(),
     ///     &[ConcreteVersion::new("1.6.9"), ConcreteVersion::new("1.6.14")],
     /// ));
     /// ```
-    fn requirement_is_undecidable_given_available(
+    fn bounded_requirement_is_undecidable_given_available(
         &self,
-        _requirement: &VersionReq,
+        _requirement: BoundedVersionReq<'_>,
         _available: &[ConcreteVersion],
     ) -> bool {
         false
@@ -1586,12 +1606,100 @@ pub trait RequirementResolution: Send + Sync {
 ///
 /// The oversized result is defined once, here, and is consistent across methods:
 /// [`Self::requirement_status`] is `Unresolved`, `is_requirement_up_to_date` is `true`,
-/// `compile_requirement` is `None`, and `requirement_already_resolves_to` is `false`.
+/// `compile_requirement` is `None`, `requirement_already_resolves_to` is `false`,
+/// `requirement_is_unresolved`, `requirement_is_placeholder` and
+/// `requirement_is_undecidable_given_available` are `true` (never rewrite or diagnose
+/// unmodellable text), and `version_satisfies_requirement` is `false`.
 ///
 /// Call sites only need to bring this trait into scope (`use
 /// deps_core::lsp_helpers::RequirementGate;`) to keep using method syntax — it covers
 /// `&dyn EcosystemFormatter` the same way `RequirementResolution` itself does.
 pub trait RequirementGate: RequirementResolution {
+    /// Whether `requirement` could not be resolved to a concrete version constraint
+    /// ([`RequirementResolution::bounded_requirement_is_unresolved`]). An oversized requirement
+    /// is unmodellable and reported `true`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{MAX_REQUIREMENT_LEN, RequirementGate, RequirementResolution};
+    /// use deps_core::VersionReq;
+    ///
+    /// struct DefaultFormatter;
+    /// impl RequirementResolution for DefaultFormatter {}
+    ///
+    /// assert!(!DefaultFormatter.requirement_is_unresolved(&VersionReq::new("^1.2")));
+    /// let oversized = VersionReq::new(&"1".repeat(MAX_REQUIREMENT_LEN + 1));
+    /// assert!(DefaultFormatter.requirement_is_unresolved(&oversized));
+    /// ```
+    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool;
+
+    /// Whether `requirement` is an unexpanded placeholder that must never be overwritten
+    /// ([`RequirementResolution::bounded_requirement_is_placeholder`]). An oversized requirement
+    /// is reported `true`: unmodellable text is never rewritten.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{MAX_REQUIREMENT_LEN, RequirementGate, RequirementResolution};
+    /// use deps_core::VersionReq;
+    ///
+    /// struct DefaultFormatter;
+    /// impl RequirementResolution for DefaultFormatter {}
+    ///
+    /// assert!(DefaultFormatter.requirement_is_placeholder(&VersionReq::new("{{ version }}")));
+    /// let oversized = VersionReq::new(&"1".repeat(MAX_REQUIREMENT_LEN + 1));
+    /// assert!(DefaultFormatter.requirement_is_placeholder(&oversized));
+    /// ```
+    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool;
+
+    /// Whether `requirement` names a region of version space a hidden published version could
+    /// explain ([`RequirementResolution::bounded_requirement_is_undecidable_given_available`]).
+    /// An oversized requirement is reported `true` (diagnostic suppressed).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{MAX_REQUIREMENT_LEN, RequirementGate, RequirementResolution};
+    /// use deps_core::{ConcreteVersion, VersionReq};
+    ///
+    /// struct DefaultFormatter;
+    /// impl RequirementResolution for DefaultFormatter {}
+    ///
+    /// let available = [ConcreteVersion::new("1.0.0")];
+    /// assert!(!DefaultFormatter.requirement_is_undecidable_given_available(&VersionReq::new("1.0.0"), &available));
+    /// let oversized = VersionReq::new(&"1".repeat(MAX_REQUIREMENT_LEN + 1));
+    /// assert!(DefaultFormatter.requirement_is_undecidable_given_available(&oversized, &available));
+    /// ```
+    fn requirement_is_undecidable_given_available(
+        &self,
+        requirement: &VersionReq,
+        available: &[ConcreteVersion],
+    ) -> bool;
+
+    /// General constraint check ([`RequirementResolution::version_satisfies_bounded_requirement`]).
+    /// An oversized requirement is unmodellable and reported `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{MAX_REQUIREMENT_LEN, RequirementGate, RequirementResolution};
+    /// use deps_core::{ConcreteVersion, VersionReq};
+    ///
+    /// struct DefaultFormatter;
+    /// impl RequirementResolution for DefaultFormatter {}
+    ///
+    /// let version = ConcreteVersion::new("1.5.0");
+    /// assert!(DefaultFormatter.version_satisfies_requirement(&version, &VersionReq::new("^1.2")));
+    /// let oversized = VersionReq::new(&"1".repeat(MAX_REQUIREMENT_LEN + 1));
+    /// assert!(!DefaultFormatter.version_satisfies_requirement(&version, &oversized));
+    /// ```
+    fn version_satisfies_requirement(
+        &self,
+        version: &ConcreteVersion,
+        requirement: &VersionReq,
+    ) -> bool;
+
     /// Whether `latest` is already covered by `requirement` under this ecosystem's rules
     /// ([`RequirementResolution::is_bounded_requirement_up_to_date`]). An oversized requirement
     /// is unmodellable and reported `true` (not outdated), matching `Unresolved` from
@@ -1735,6 +1843,36 @@ pub trait RequirementGate: RequirementResolution {
 }
 
 impl<T: RequirementResolution + ?Sized> RequirementGate for T {
+    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+        BoundedVersionReq::new(requirement)
+            .is_none_or(|requirement| self.bounded_requirement_is_unresolved(requirement))
+    }
+
+    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+        BoundedVersionReq::new(requirement)
+            .is_none_or(|requirement| self.bounded_requirement_is_placeholder(requirement))
+    }
+
+    fn requirement_is_undecidable_given_available(
+        &self,
+        requirement: &VersionReq,
+        available: &[ConcreteVersion],
+    ) -> bool {
+        BoundedVersionReq::new(requirement).is_none_or(|requirement| {
+            self.bounded_requirement_is_undecidable_given_available(requirement, available)
+        })
+    }
+
+    fn version_satisfies_requirement(
+        &self,
+        version: &ConcreteVersion,
+        requirement: &VersionReq,
+    ) -> bool {
+        BoundedVersionReq::new(requirement).is_some_and(|requirement| {
+            self.version_satisfies_bounded_requirement(version, requirement)
+        })
+    }
+
     fn is_requirement_up_to_date(
         &self,
         requirement: &VersionReq,
@@ -2072,10 +2210,10 @@ pub trait OsvNaming: Send + Sync {
     /// to downcast to inspect the dependency's source URL host — see
     /// `architecture.md` §2.
     ///
-    /// The default implementation is the identity: OSV is case-sensitive in
-    /// every ecosystem this project supports except PyPI, and for Cargo, npm,
-    /// Go, Maven, Gradle, Dart, Bundler, NuGet, and PyPI the manifest's raw
-    /// name already matches OSV's canonical spelling.
+    /// The default implementation is the identity: for Cargo, npm, Go, Maven,
+    /// Gradle, Dart, Bundler, and NuGet the manifest's raw name already matches
+    /// OSV's canonical spelling. PyPI (PEP 503 normalization) and Composer
+    /// (lowercase) override it.
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<crate::osv::OsvPackageName> {
         crate::osv::OsvPackageName::new_or_skip(dep.name().as_str())
     }
@@ -2372,34 +2510,123 @@ mod tests {
         assert!(!dyn_formatter.requirement_already_resolves_to(&oversized, &latest));
     }
 
+    /// #1665: the four raw-text predicates are gated too — `MisbehavingPredicates` answers each
+    /// with the opposite of the gate's oversized result (`false`/`false`/`false`/`true`), yet the
+    /// gated entry points still report `true`/`true`/`true`/`false` for an oversized requirement.
+    /// The within-cap and at-cap controls prove the gate still dispatches to the hooks.
+    #[test]
+    fn test_oversized_requirement_bypasses_misbehaving_predicate_overrides() {
+        struct MisbehavingPredicates;
+        impl PackageNaming for MisbehavingPredicates {}
+        impl PackageRendering for MisbehavingPredicates {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl RequirementResolution for MisbehavingPredicates {
+            fn bounded_requirement_is_unresolved(
+                &self,
+                _requirement: BoundedVersionReq<'_>,
+            ) -> bool {
+                false
+            }
+
+            fn bounded_requirement_is_placeholder(
+                &self,
+                _requirement: BoundedVersionReq<'_>,
+            ) -> bool {
+                false
+            }
+
+            fn bounded_requirement_is_undecidable_given_available(
+                &self,
+                _requirement: BoundedVersionReq<'_>,
+                _available: &[ConcreteVersion],
+            ) -> bool {
+                false
+            }
+
+            fn version_satisfies_bounded_requirement(
+                &self,
+                _version: &ConcreteVersion,
+                _requirement: BoundedVersionReq<'_>,
+            ) -> bool {
+                true
+            }
+        }
+        impl DiagnosticMessages for MisbehavingPredicates {}
+        impl DiagnosticPolicy for MisbehavingPredicates {}
+        impl SourcePolicy for MisbehavingPredicates {}
+        impl OsvNaming for MisbehavingPredicates {}
+
+        let oversized = VersionReq::new("1".repeat(crate::lsp_helpers::MAX_REQUIREMENT_LEN + 1));
+        let at_cap = VersionReq::new("1".repeat(crate::lsp_helpers::MAX_REQUIREMENT_LEN));
+        let within_cap = VersionReq::new("^1.0");
+        let version = ConcreteVersion::new("1.0.0");
+        let available = [ConcreteVersion::new("1.0.0")];
+
+        for requirement in [&within_cap, &at_cap] {
+            assert!(!MisbehavingPredicates.requirement_is_unresolved(requirement));
+            assert!(!MisbehavingPredicates.requirement_is_placeholder(requirement));
+            assert!(
+                !MisbehavingPredicates
+                    .requirement_is_undecidable_given_available(requirement, &available)
+            );
+            assert!(MisbehavingPredicates.version_satisfies_requirement(&version, requirement));
+        }
+
+        assert!(MisbehavingPredicates.requirement_is_unresolved(&oversized));
+        assert!(MisbehavingPredicates.requirement_is_placeholder(&oversized));
+        assert!(
+            MisbehavingPredicates
+                .requirement_is_undecidable_given_available(&oversized, &available)
+        );
+        assert!(!MisbehavingPredicates.version_satisfies_requirement(&version, &oversized));
+
+        let dyn_formatter: &dyn RequirementResolution = &MisbehavingPredicates;
+        assert!(!dyn_formatter.requirement_is_placeholder(&within_cap));
+        assert!(dyn_formatter.requirement_is_placeholder(&oversized));
+        assert!(dyn_formatter.version_satisfies_requirement(&version, &within_cap));
+        assert!(!dyn_formatter.version_satisfies_requirement(&version, &oversized));
+    }
+
     /// #1636: `~1.5.3`'s own patch floor must be enforced, not just major/minor equality —
     /// `1.5.0` is same major.minor but below the requirement's explicit `.3` floor.
     #[test]
     fn test_version_satisfies_requirement_tilde_enforces_patch_floor() {
-        assert!(
-            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "~1.5.3")
-        );
-        assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.5.3"), "~1.5.3")
-        );
-        assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.5.9"), "~1.5.3")
-        );
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new("~1.5.3")
+        ));
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.3"),
+            &VersionReq::new("~1.5.3")
+        ));
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.9"),
+            &VersionReq::new("~1.5.3")
+        ));
     }
 
     /// A tilde requirement without its own patch component (`~1.5`) keeps the pre-#1636
     /// major/minor-only floor — every patch is admitted.
     #[test]
     fn test_version_satisfies_requirement_tilde_without_patch_admits_any_patch() {
-        assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "~1.5")
-        );
-        assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.5.9"), "~1.5")
-        );
-        assert!(
-            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.6.0"), "~1.5")
-        );
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new("~1.5")
+        ));
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.9"),
+            &VersionReq::new("~1.5")
+        ));
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.6.0"),
+            &VersionReq::new("~1.5")
+        ));
     }
 
     /// impl-critic round 1, S1: a suffixed patch component on either side must not bypass the
@@ -2407,18 +2634,18 @@ mod tests {
     /// treated as unparseable.
     #[test]
     fn test_version_satisfies_requirement_tilde_suffixed_patch_still_enforces_floor() {
-        assert!(
-            !MOCK_FORMATTER
-                .version_satisfies_requirement(&ConcreteVersion::new("1.5.0-beta.1"), "~1.5.3")
-        );
-        assert!(
-            !MOCK_FORMATTER
-                .version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "~1.5.3-beta.1")
-        );
-        assert!(
-            !MOCK_FORMATTER
-                .version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "~1.5.3+build")
-        );
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0-beta.1"),
+            &VersionReq::new("~1.5.3")
+        ));
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new("~1.5.3-beta.1")
+        ));
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new("~1.5.3+build")
+        ));
     }
 
     /// impl-critic round 1, S1: a prerelease candidate at the requirement's exact numeric patch
@@ -2426,10 +2653,10 @@ mod tests {
     /// even though the numeric component matches.
     #[test]
     fn test_version_satisfies_requirement_tilde_prerelease_at_exact_patch_is_rejected() {
-        assert!(
-            !MOCK_FORMATTER
-                .version_satisfies_requirement(&ConcreteVersion::new("1.5.3-beta"), "~1.5.3")
-        );
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.3-beta"),
+            &VersionReq::new("~1.5.3")
+        ));
     }
 
     /// impl-critic round 2, S2: the S1 rejection above must not fire when the requirement
@@ -2440,18 +2667,14 @@ mod tests {
     #[test]
     fn test_version_satisfies_requirement_tilde_prerelease_requirement_admits_same_patch_prerelease()
      {
-        assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(
-                &ConcreteVersion::new("1.5.3-beta.1"),
-                "~1.5.3-beta.1"
-            )
-        );
-        assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(
-                &ConcreteVersion::new("1.5.3-rc.1"),
-                "~1.5.3-beta.1"
-            )
-        );
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.3-beta.1"),
+            &VersionReq::new("~1.5.3-beta.1")
+        ));
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.3-rc.1"),
+            &VersionReq::new("~1.5.3-beta.1")
+        ));
     }
 
     /// Same S1 fix, exercised through `requirement_status` (the real production entry point
@@ -2471,10 +2694,10 @@ mod tests {
     /// way `1.5.3-beta` is.
     #[test]
     fn test_version_satisfies_requirement_tilde_build_metadata_at_exact_patch_is_admitted() {
-        assert!(
-            MOCK_FORMATTER
-                .version_satisfies_requirement(&ConcreteVersion::new("1.5.3+build"), "~1.5.3")
-        );
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.3+build"),
+            &VersionReq::new("~1.5.3")
+        ));
     }
 
     /// A wildcard (`x`/`X`/`*`) patch component in the requirement itself is documented as
@@ -2483,14 +2706,14 @@ mod tests {
     #[test]
     fn test_version_satisfies_requirement_tilde_wildcard_patch_is_permissive() {
         for requirement in ["~1.5.x", "~1.5.X", "~1.5.*"] {
-            assert!(
-                MOCK_FORMATTER
-                    .version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), requirement)
-            );
-            assert!(
-                MOCK_FORMATTER
-                    .version_satisfies_requirement(&ConcreteVersion::new("1.5.9"), requirement)
-            );
+            assert!(MOCK_FORMATTER.version_satisfies_requirement(
+                &ConcreteVersion::new("1.5.0"),
+                &VersionReq::new(requirement)
+            ));
+            assert!(MOCK_FORMATTER.version_satisfies_requirement(
+                &ConcreteVersion::new("1.5.9"),
+                &VersionReq::new(requirement)
+            ));
         }
     }
 
@@ -2498,9 +2721,10 @@ mod tests {
     /// patch `0`, not as automatically satisfying a `~X.Y.Z` requirement's own patch floor.
     #[test]
     fn test_version_satisfies_requirement_tilde_missing_candidate_patch_treated_as_zero() {
-        assert!(
-            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.5"), "~1.5.3")
-        );
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5"),
+            &VersionReq::new("~1.5.3")
+        ));
     }
 
     /// A tilde requirement is enforced through the real production entry point too:
@@ -2524,12 +2748,14 @@ mod tests {
     /// shares a numeric string prefix — `1.20.0` is a different minor (`20`), not `2.x`.
     #[test]
     fn test_version_satisfies_requirement_partial_version_rejects_string_prefix_match() {
-        assert!(
-            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.20.0"), "1.2")
-        );
-        assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.2.5"), "1.2")
-        );
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.20.0"),
+            &VersionReq::new("1.2")
+        ));
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.5"),
+            &VersionReq::new("1.2")
+        ));
     }
 
     /// Same #1636 fix, exercised through the real production entry point.
@@ -2573,12 +2799,12 @@ mod tests {
         let requirement = format!("^{max}");
         assert!(MOCK_FORMATTER.version_satisfies_requirement(
             &ConcreteVersion::new(format!("{max}.0.0")),
-            &requirement
+            &VersionReq::new(&requirement)
         ));
-        assert!(
-            !MOCK_FORMATTER
-                .version_satisfies_requirement(&ConcreteVersion::new("0.0.0"), &requirement)
-        );
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("0.0.0"),
+            &VersionReq::new(&requirement)
+        ));
     }
 
     /// #1622 impl-critic S2: `is_requirement_up_to_date`'s default must not proxy through
@@ -2615,20 +2841,20 @@ mod tests {
     /// `in_use_version.rs`'s lock-file-resolved candidate filtering for Cargo/npm/Deno.
     #[test]
     fn test_version_satisfies_requirement_caret_candidate_suffix_still_enforces_lower_bound() {
-        assert!(
-            !MOCK_FORMATTER
-                .version_satisfies_requirement(&ConcreteVersion::new("1.4.9-beta"), "^1.5")
-        );
-        assert!(
-            !MOCK_FORMATTER
-                .version_satisfies_requirement(&ConcreteVersion::new("1.4.9+build"), "^1.5")
-        );
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.4.9-beta"),
+            &VersionReq::new("^1.5")
+        ));
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.4.9+build"),
+            &VersionReq::new("^1.5")
+        ));
         // The stripped core `1.5.0` meets the floor — accepted as the approximation this
         // heuristic already makes elsewhere (no full semver prerelease-ordering).
-        assert!(
-            MOCK_FORMATTER
-                .version_satisfies_requirement(&ConcreteVersion::new("1.5.0-beta"), "^1.5")
-        );
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0-beta"),
+            &VersionReq::new("^1.5")
+        ));
     }
 
     /// Same S3 fix, exercised through `caret_admits_up_to_date`/`requirement_status` with a
@@ -2657,27 +2883,32 @@ mod tests {
     /// equality, so `1.2.x`/`1.2.*` always rejected every candidate.
     #[test]
     fn test_version_satisfies_requirement_wildcard_matches() {
-        assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.3.0"), "1.x")
-        );
-        assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "1.2.x")
-        );
-        assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.2.5"), "1.2.*")
-        );
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.3.0"),
+            &VersionReq::new("1.x")
+        ));
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.0"),
+            &VersionReq::new("1.2.x")
+        ));
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.5"),
+            &VersionReq::new("1.2.*")
+        ));
     }
 
     /// #1641: a wildcard requirement component must still reject a candidate that disagrees on a
     /// non-wildcard component — the fix must not turn wildcard matching into blanket admission.
     #[test]
     fn test_version_satisfies_requirement_wildcard_rejects_mismatched_component() {
-        assert!(
-            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "1.x")
-        );
-        assert!(
-            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.3.0"), "1.2.x")
-        );
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new("1.x")
+        ));
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.3.0"),
+            &VersionReq::new("1.2.x")
+        ));
     }
 
     /// #1637: `^1.5.x` and `^1.5.*` must bound like `^1.5` (`[1.5.0, 2.0.0)`), not fail open and
@@ -2687,28 +2918,38 @@ mod tests {
     fn test_version_satisfies_requirement_caret_wildcard_bounds_correctly() {
         for requirement in ["^1.5.x", "^1.5.*"] {
             assert!(
-                !MOCK_FORMATTER
-                    .version_satisfies_requirement(&ConcreteVersion::new("1.4.9"), requirement),
+                !MOCK_FORMATTER.version_satisfies_requirement(
+                    &ConcreteVersion::new("1.4.9"),
+                    &VersionReq::new(requirement)
+                ),
                 "{requirement} must reject a candidate below the effective lower bound"
             );
             assert!(
-                MOCK_FORMATTER
-                    .version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), requirement),
+                MOCK_FORMATTER.version_satisfies_requirement(
+                    &ConcreteVersion::new("1.5.0"),
+                    &VersionReq::new(requirement)
+                ),
                 "{requirement} must accept a candidate at the lower bound"
             );
             assert!(
-                MOCK_FORMATTER
-                    .version_satisfies_requirement(&ConcreteVersion::new("1.9.9"), requirement),
+                MOCK_FORMATTER.version_satisfies_requirement(
+                    &ConcreteVersion::new("1.9.9"),
+                    &VersionReq::new(requirement)
+                ),
                 "{requirement} must accept a candidate within range"
             );
             assert!(
-                !MOCK_FORMATTER
-                    .version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), requirement),
+                !MOCK_FORMATTER.version_satisfies_requirement(
+                    &ConcreteVersion::new("2.0.0"),
+                    &VersionReq::new(requirement)
+                ),
                 "{requirement} must reject a candidate at/above the upper bound"
             );
             assert!(
-                !MOCK_FORMATTER
-                    .version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), requirement),
+                !MOCK_FORMATTER.version_satisfies_requirement(
+                    &ConcreteVersion::new("0.9.0"),
+                    &VersionReq::new(requirement)
+                ),
                 "{requirement} must reject a candidate with a lower major version"
             );
         }
@@ -2721,18 +2962,18 @@ mod tests {
     #[test]
     fn test_version_satisfies_requirement_caret_requirement_suffix_still_bounds() {
         let requirement = "^1.5.0-beta.1";
-        assert!(
-            !MOCK_FORMATTER
-                .version_satisfies_requirement(&ConcreteVersion::new("1.4.9"), requirement)
-        );
-        assert!(
-            MOCK_FORMATTER
-                .version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), requirement)
-        );
-        assert!(
-            !MOCK_FORMATTER
-                .version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), requirement)
-        );
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.4.9"),
+            &VersionReq::new(requirement)
+        ));
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.5.0"),
+            &VersionReq::new(requirement)
+        ));
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new(requirement)
+        ));
     }
 
     /// #1637 impl-critic S1: a wildcard *major* component (`^x`, `^*`, `^x.5.0`) means "any
@@ -2743,13 +2984,17 @@ mod tests {
     fn test_version_satisfies_requirement_caret_wildcard_major_matches_any_version() {
         for requirement in ["^x", "^*", "^x.5.0"] {
             assert!(
-                MOCK_FORMATTER
-                    .version_satisfies_requirement(&ConcreteVersion::new("2.3.4"), requirement),
+                MOCK_FORMATTER.version_satisfies_requirement(
+                    &ConcreteVersion::new("2.3.4"),
+                    &VersionReq::new(requirement)
+                ),
                 "{requirement} must admit a high-major candidate"
             );
             assert!(
-                MOCK_FORMATTER
-                    .version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), requirement),
+                MOCK_FORMATTER.version_satisfies_requirement(
+                    &ConcreteVersion::new("0.5.0"),
+                    &VersionReq::new(requirement)
+                ),
                 "{requirement} must admit a zero-major candidate too"
             );
         }
@@ -2827,12 +3072,16 @@ mod tests {
     #[test]
     fn test_version_satisfies_requirement_wildcard_mid_position_truncates_trailing_components() {
         assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.3.4"), "1.x.5"),
+            MOCK_FORMATTER.version_satisfies_requirement(
+                &ConcreteVersion::new("1.3.4"),
+                &VersionReq::new("1.x.5")
+            ),
             "the trailing `.5` after a wildcard must not be enforced"
         );
-        assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.3.5"), "1.x.5")
-        );
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.3.5"),
+            &VersionReq::new("1.x.5")
+        ));
     }
 
     /// #1637/#1641 impl-critic M3: the uppercase `X` wildcard token, in both the plain/partial
@@ -2840,12 +3089,14 @@ mod tests {
     /// unexercised.
     #[test]
     fn test_version_satisfies_requirement_wildcard_uppercase_x() {
-        assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "1.2.X")
-        );
-        assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.6.0"), "^1.5.X")
-        );
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.0"),
+            &VersionReq::new("1.2.X")
+        ));
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.6.0"),
+            &VersionReq::new("^1.5.X")
+        ));
     }
 
     /// #1637 impl-critic M3: a zero-major caret requirement routes through the same truncated
@@ -2854,19 +3105,23 @@ mod tests {
     /// `<1.0.0`, `^0.0.x` -> `<0.1.0`, matching npm).
     #[test]
     fn test_version_satisfies_requirement_caret_zero_major_wildcard_bounds() {
-        assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), "^0.x")
-        );
-        assert!(
-            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "^0.x")
-        );
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("0.5.0"),
+            &VersionReq::new("^0.x")
+        ));
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.0"),
+            &VersionReq::new("^0.x")
+        ));
 
-        assert!(
-            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("0.0.5"), "^0.0.x")
-        );
-        assert!(
-            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("0.1.0"), "^0.0.x")
-        );
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("0.0.5"),
+            &VersionReq::new("^0.0.x")
+        ));
+        assert!(!MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new("0.1.0"),
+            &VersionReq::new("^0.0.x")
+        ));
     }
 
     /// #1641 impl-critic M4: a bare `*`/`x`/`X` requirement (no dot at all) now matches every
@@ -2877,8 +3132,10 @@ mod tests {
     fn test_version_satisfies_requirement_bare_wildcard_matches_any_version() {
         for requirement in ["*", "x", "X"] {
             assert!(
-                MOCK_FORMATTER
-                    .version_satisfies_requirement(&ConcreteVersion::new("9.9.9"), requirement),
+                MOCK_FORMATTER.version_satisfies_requirement(
+                    &ConcreteVersion::new("9.9.9"),
+                    &VersionReq::new(requirement)
+                ),
                 "{requirement} must match any candidate"
             );
         }

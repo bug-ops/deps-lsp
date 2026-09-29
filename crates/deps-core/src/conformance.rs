@@ -53,8 +53,8 @@ use std::any::Any;
 use tower_lsp_server::ls_types::CompletionItem;
 
 use crate::lockfile::LockFileProvider;
-use crate::lsp_helpers::EcosystemFormatter;
-use crate::{ConcreteVersion, Ecosystem, PackageName};
+use crate::lsp_helpers::{EcosystemFormatter, RequirementGate};
+use crate::{ConcreteVersion, Ecosystem, PackageName, VersionReq};
 
 /// Adversarial payload for the `package_url` *display* sink, not the dot-segment fetch-URL
 /// sink [`crate::test_util::ADVERSARIAL_URL_SEGMENTS`] guards.
@@ -304,7 +304,10 @@ pub fn assert_version_satisfies_requirement(
     expected: bool,
 ) {
     assert_eq!(
-        formatter.version_satisfies_requirement(&ConcreteVersion::new(version), requirement),
+        formatter.version_satisfies_requirement(
+            &ConcreteVersion::new(version),
+            &VersionReq::new(requirement)
+        ),
         expected,
         "version_satisfies_requirement({version:?}, {requirement:?}) mismatch"
     );
@@ -794,7 +797,7 @@ pub const UNRESOLVED_REQUIREMENT_CONTROL_DEPENDENCY_NAME: &str = "known-good-con
 /// `RequirementResolution::bounded_requirement_already_resolves_to` or `compile_bounded_requirement` happens
 /// to answer `Some(true)`/decisively for the placeholder — while `replacement_text` would
 /// still destructively rewrite the placeholder if its upstream gate
-/// (`RequirementResolution::requirement_is_placeholder`) were ever wrong. Asserting
+/// (`RequirementResolution::bounded_requirement_is_placeholder`) were ever wrong. Asserting
 /// `replacement_text`'s own `None` result directly closes that gap.
 ///
 /// `reachable` records whether this ecosystem's manifest parser preserves the placeholder as
@@ -1062,7 +1065,7 @@ pub const GENERIC_TEMPLATE_PLACEHOLDERS: &[&str] = &[
 /// # Panics
 ///
 /// Panics (via `assert!`/`assert_eq!`) if any entry of [`GENERIC_TEMPLATE_PLACEHOLDERS`] is
-/// not classified [`crate::lsp_helpers::RequirementResolution::requirement_is_placeholder`],
+/// not classified [`crate::lsp_helpers::RequirementResolution::bounded_requirement_is_placeholder`],
 /// is reported unsatisfiable by [`crate::lsp_helpers::requirement_is_unsatisfiable`], or
 /// produces `Some(_)` from [`crate::edit::replacement_text`].
 pub fn assert_generic_template_placeholders_guarded(
@@ -1134,7 +1137,7 @@ pub fn assert_generic_template_placeholders_guarded(
 /// # Panics
 ///
 /// Panics (via `assert!`) if any `placeholders` entry is not classified
-/// [`crate::lsp_helpers::RequirementResolution::requirement_is_placeholder`], is reported
+/// [`crate::lsp_helpers::RequirementResolution::bounded_requirement_is_placeholder`], is reported
 /// unsatisfiable by [`crate::lsp_helpers::requirement_is_unsatisfiable`], or is rewritten by
 /// [`crate::edit::replacement_text`]; or if any `non_placeholders` entry IS classified a
 /// placeholder.

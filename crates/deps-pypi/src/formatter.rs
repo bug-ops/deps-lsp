@@ -6,6 +6,7 @@ use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
     PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
 };
+use deps_core::osv::OsvPackageName;
 use pep440_rs::{Operator, Version, VersionSpecifiers};
 use std::str::FromStr;
 
@@ -87,7 +88,7 @@ impl PackageRendering for PypiFormatter {
 
     /// Since #1391, `current` is never a placeholder here — the sole production caller,
     /// [`deps_core::edit::replacement_text`], gates on
-    /// [`RequirementResolution::requirement_is_placeholder`] first. PEP 621
+    /// [`RequirementResolution::bounded_requirement_is_placeholder`] first. PEP 621
     /// `dependencies = [...]` array entries could never reach this anyway: an unresolved
     /// `${VAR}` there already fails PEP 440 dependency-specifier parsing at `parse_manifest`
     /// time, so the whole line is dropped before a dependency (and thus `current`) ever exists.
@@ -173,13 +174,16 @@ impl PackageRendering for PypiFormatter {
 }
 
 impl RequirementResolution for PypiFormatter {
-    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
-        let version = version.as_str();
-        let Ok(ver) = Version::from_str(version) else {
+    fn version_satisfies_bounded_requirement(
+        &self,
+        version: &ConcreteVersion,
+        requirement: BoundedVersionReq<'_>,
+    ) -> bool {
+        let Ok(ver) = Version::from_str(version.as_str()) else {
             return false;
         };
 
-        let Ok(specs) = VersionSpecifiers::from_str(requirement) else {
+        let Ok(specs) = VersionSpecifiers::from_str(requirement.as_str()) else {
             return false;
         };
 
@@ -203,8 +207,7 @@ impl RequirementResolution for PypiFormatter {
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        let requirement = requirement.get();
-        if self.requirement_is_unresolved(requirement) {
+        if self.bounded_requirement_is_unresolved(requirement) {
             return None;
         }
         let specs = VersionSpecifiers::from_str(requirement.as_str()).ok()?;
@@ -215,7 +218,7 @@ impl RequirementResolution for PypiFormatter {
     }
 
     // #1370/#1374/#1379/#1391: PyPI's requirement grammar has no placeholder syntax of its
-    // own — `RequirementResolution::requirement_is_placeholder`'s shared default (the
+    // own — `RequirementResolution::bounded_requirement_is_placeholder`'s shared default (the
     // `requirement_contains_template_placeholder` detector) already covers the only
     // unresolved shape PyPI has, so no override is needed here. A PEP 621
     // `dependencies = [...]` entry carrying this shape already fails PEP 440 parsing and is
@@ -246,7 +249,22 @@ impl SourcePolicy for PypiFormatter {
     }
 }
 
-impl OsvNaming for PypiFormatter {}
+impl OsvNaming for PypiFormatter {
+    /// OSV records PyPI package names in their PEP 503 normalized form
+    /// (`affected[].package.name` is always lowercase with runs of `-`/`_`/`.`
+    /// collapsed to `-`), and the advisory matcher compares it with `==` against
+    /// the queried name. A manifest spelling (`Werkzeug`, `Flask_Cors`) must therefore
+    /// be normalized, or the equality filter misses and unrelated packages named in a
+    /// multi-package record leak their fixes.
+    ///
+    /// `None` for a name that fails PEP 508 validation (a separator-only Poetry key such as
+    /// `---` would normalize to an empty string): OSV rejects an empty query name and fails
+    /// the whole batch with it, silently dropping every sibling dependency's advisories.
+    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<OsvPackageName> {
+        self.validate_package_name(dep.name().as_str()).ok()?;
+        OsvPackageName::new_or_skip(self.normalize_package_name(dep.name()))
+    }
+}
 
 /// Truncates `latest`'s PEP 440 release segments to the same segment count
 /// as `source_version`'s release, joined with `.`. Returns `None` if either
@@ -448,7 +466,7 @@ mod tests {
         let native = formatter.osv_version_to_native(&osv_version);
         assert_eq!(native, osv_version.as_str());
         let edit_text = formatter.format_version_for_text_edit(&native);
-        assert!(formatter.version_satisfies_requirement(&native, &edit_text));
+        assert!(formatter.version_satisfies_requirement(&native, &VersionReq::new(&edit_text)));
     }
 
     #[test]
@@ -466,7 +484,7 @@ mod tests {
         for current in ["==2.20.0", "==2.20.*", "~=2.20", "~=2.20.0", ">=2.20,<2.21"] {
             let edit_text = formatter.format_version_replacing(&native, current);
             assert!(
-                formatter.version_satisfies_requirement(&native, &edit_text),
+                formatter.version_satisfies_requirement(&native, &VersionReq::new(&edit_text)),
                 "current={current:?} produced edit_text={edit_text:?}, which does not admit {native:?}"
             );
         }
@@ -719,6 +737,50 @@ mod tests {
             };
             // saturating_sub(2) should give 0, not underflow
             assert!(formatter.is_position_on_dependency(&dep, Position::new(5, 0).into()));
+        }
+    }
+
+    /// #1663: OSV records PyPI names PEP 503-normalized, so a verbatim Poetry table key must be
+    /// normalized before it is used as the OSV query/match name.
+    #[test]
+    fn test_osv_package_name_is_pep503_normalized() {
+        use crate::types::{PypiDependency, PypiDependencySection, PypiDependencySource};
+        use deps_core::position::{Position, Range};
+
+        let dep = |name: &str| PypiDependency {
+            name: name.into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            version_req: None,
+            version_range: None,
+            extras: Vec::new(),
+            extras_range: None,
+            markers: None,
+            markers_range: None,
+            section: PypiDependencySection::Dependencies,
+            source: PypiDependencySource::Registry,
+        };
+
+        for (manifest, osv) in [
+            ("Werkzeug", "werkzeug"),
+            ("Flask_Cors", "flask-cors"),
+            ("plone.namedfile", "plone-namedfile"),
+            ("requests", "requests"),
+            ("A__b", "a-b"),
+            ("a-_.b", "a-b"),
+        ] {
+            assert_eq!(
+                PypiFormatter.osv_package_name(&dep(manifest)),
+                OsvPackageName::new(osv).ok(),
+                "{manifest}"
+            );
+        }
+
+        for invalid in ["", "-", "_", ".", "---", "-a", "a-"] {
+            assert_eq!(
+                PypiFormatter.osv_package_name(&dep(invalid)),
+                None,
+                "{invalid:?}"
+            );
         }
     }
 }

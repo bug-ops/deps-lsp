@@ -138,7 +138,7 @@ impl PackageNaming for MavenFormatter {
     /// `{% %}`/`<%= %>`-shaped groupId/artifactId defensively, though Maven's own tooling
     /// never produces those) is valid Maven, not a malformed coordinate — checked first and
     /// always accepted, the same undecidable treatment `is_unresolved` already gets in
-    /// [`version_satisfies_requirement`](Self::version_satisfies_requirement) and
+    /// [`version_satisfies_bounded_requirement`](Self::version_satisfies_bounded_requirement) and
     /// [`compile_bounded_requirement`](Self::compile_bounded_requirement).
     ///
     /// The missing-`:` branch is defensive: `crate::parser` always builds a
@@ -207,8 +207,13 @@ impl RequirementResolution for MavenFormatter {
     // docs for the two precision differences), but any reordering here must be checked
     // against `compile_bounded_requirement`'s malformed-range guard placement too, since S1/S2
     // happened in `deps-gradle` from exactly this kind of drift between two copies.
-    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
+    fn version_satisfies_bounded_requirement(
+        &self,
+        version: &ConcreteVersion,
+        requirement: BoundedVersionReq<'_>,
+    ) -> bool {
         let version = version.as_str();
+        let requirement = requirement.as_str();
         // Unresolved ${property}/@property@ (or another shared-predicate template
         // placeholder shape) — skip comparison
         if is_unresolved(requirement) {
@@ -222,7 +227,7 @@ impl RequirementResolution for MavenFormatter {
 
     // #1370/#1384/#1391: Maven's `is_unresolved` fully delegates to the shared
     // `requirement_contains_template_placeholder` — the same detector
-    // `RequirementResolution::requirement_is_placeholder`'s shared default calls — so it
+    // `RequirementResolution::bounded_requirement_is_placeholder`'s shared default calls — so it
     // covers `${property}`/`@property@` (the two forms Maven's own tooling actually
     // produces) plus the other four cross-ecosystem shapes (`%VAR%`, `{{ }}`, `{% %}`,
     // `<%= %>`) defensively, with no override needed here.
@@ -446,7 +451,7 @@ mod tests {
         let native = f.osv_version_to_native(&osv_version);
         assert_eq!(native, osv_version.as_str());
         let edit_text = f.format_version_for_text_edit(&native);
-        assert!(f.version_satisfies_requirement(&native, &edit_text));
+        assert!(f.version_satisfies_requirement(&native, &VersionReq::new(&edit_text)));
     }
 
     #[test]
@@ -485,7 +490,7 @@ mod tests {
     /// `MavenMatcher::AlwaysSatisfied`, which reports `Some(true)` against *any* candidate —
     /// including a vulnerability's fix target. Since #1391, the actual guard against a
     /// destructive rewrite is [`deps_core::edit::replacement_text`]'s central placeholder gate
-    /// (backed by `RequirementResolution::requirement_is_placeholder`, which composes the
+    /// (backed by `RequirementResolution::bounded_requirement_is_placeholder`, which composes the
     /// shared generic-template detector for Maven's `${property}` form) — this
     /// `AlwaysSatisfied` classification now only feeds `bounded_requirement_already_resolves_to`'s
     /// secondary no-op check, not the sole line of defense `deps-cli`'s
@@ -707,7 +712,7 @@ mod tests {
     /// it is *also* a malformed range — `is_range` is true and `crate::range::parse_range`
     /// fails on it, so `compile_bounded_requirement`'s malformed-range guard returns `None` (not
     /// `MavenMatcher::AlwaysSatisfied`), making the default `bounded_requirement_already_resolves_to`
-    /// inert. `RequirementResolution::requirement_is_placeholder`'s direct `is_unresolved`
+    /// inert. `RequirementResolution::bounded_requirement_is_placeholder`'s direct `is_unresolved`
     /// check — consulted by `deps_core::edit::replacement_text` before ever calling into the
     /// formatter's rewrite logic — is what actually closes this gap.
     #[test]

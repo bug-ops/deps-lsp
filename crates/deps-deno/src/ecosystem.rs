@@ -353,7 +353,7 @@ mod tests {
     // name) as `version_req`, and neither it nor `classify_npm_imports` special-cases the
     // shape, so it stays a normal registry-sourced `Some(version_requirement)` and reaches
     // `deps_core::edit::plan_vulnerability_fix` directly — depends on
-    // `RequirementResolution::requirement_is_placeholder`'s shared default (`DenoFormatter`
+    // `RequirementResolution::bounded_requirement_is_placeholder`'s shared default (`DenoFormatter`
     // has no override). Supersedes the pre-#1377 `no_placeholder_syntax:` marker here, which
     // predated the discovery that an embedded `@version` slot can itself carry one of these
     // shapes (#1354's own "no placeholder grammar" claim covered only the specifier as a

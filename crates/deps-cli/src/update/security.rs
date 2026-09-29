@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use deps_core::Ecosystem;
 use deps_core::edit::{VulnFixSkip, plan_verified_fix, resolve_verified_fix};
-use deps_core::lsp_helpers::{resolve_in_use_version, resolve_scan_outcome};
+use deps_core::lsp_helpers::{RequirementGate, resolve_in_use_version, resolve_scan_outcome};
 use deps_core::osv::{OsvClient, ScanOutcome};
 
 use crate::analyze::ManifestAnalysis;
@@ -406,28 +406,9 @@ fn classify_vulnerable_dependency(
         // reasons". Only a confirmed exclusion is a real gap; anything else falls back to the
         // legacy "assume already fixed" reading, preserving pre-#1566 behavior.
         Err(VulnFixSkip::NoOpRewrite) => {
-            // #1578 S1: an oversized requirement is a size-based fail-closed guard, never a
-            // confirmed exclusion — `compile_bounded_requirement` (the CWE-400 resource-exhaustion
-            // vector deps-core's own #1472 gate bounds, e.g. `requirement_status`,
-            // `best_candidate_for_requirement`) is never called for it, so it must not be
-            // folded into the same boolean/reason as an actually-confirmed `Some(false)`
-            // matcher verdict below; kept as its own branch reporting
-            // `UnfixableReason::OversizedRequirement` rather than
-            // `UnsupportedRequirementShape`, whose doc/message both assert confirmation.
-            let Some(bounded) = deps_core::lsp_helpers::BoundedVersionReq::new(version_req) else {
-                return unfixable_item(
-                    dep,
-                    current,
-                    UnfixableReason::OversizedRequirement {
-                        target: deps_core::ConcreteVersion::new(version_native.as_str()),
-                    },
-                    ignore_rule_overridden,
-                );
-            };
-
             let fix_concrete = deps_core::ConcreteVersion::new(version_native.as_str());
             let confirmed_excluded = formatter
-                .compile_bounded_requirement(bounded)
+                .compile_requirement(version_req)
                 .is_some_and(|matcher| matcher.matches(&fix_concrete) == Some(false));
             if confirmed_excluded {
                 unfixable_item(
@@ -448,6 +429,17 @@ fn classify_vulnerable_dependency(
                 )
             }
         }
+        // #1578 S1: an oversized requirement is a size-based fail-closed guard, never a
+        // confirmed exclusion; reported as `OversizedRequirement` rather than
+        // `UnsupportedRequirementShape`, whose doc/message both assert confirmation.
+        Err(VulnFixSkip::OversizedRequirement) => unfixable_item(
+            dep,
+            current,
+            UnfixableReason::OversizedRequirement {
+                target: deps_core::ConcreteVersion::new(version_native.as_str()),
+            },
+            ignore_rule_overridden,
+        ),
         // #1370: `UnresolvedPlaceholder` joins the `NoVerifiedFix` bucket, not the
         // `RequirementAlreadyResolves`/`NoOpRewrite` one above — "requires lockfile update"
         // implies the manifest requirement already admits the fix target, which is not known
@@ -797,9 +789,8 @@ mod tests {
     impl SourcePolicy for IndeterminateFormatter {}
     impl OsvNaming for IndeterminateFormatter {}
 
-    /// Issue #1578: echoes `current` back unchanged (so `plan_verified_fix` reaches
-    /// `NoOpRewrite`) but panics if `compile_bounded_requirement` is ever called — proves the
-    /// oversized-requirement gate in `classify_vulnerable_dependency`'s `NoOpRewrite` arm
+    /// Issue #1578: echoes `current` back unchanged but panics if `compile_bounded_requirement`
+    /// is ever called — proves `plan_verified_fix`'s `OversizedRequirement` skip
     /// short-circuits before reaching it, rather than merely happening to also produce the
     /// right outcome.
     struct PanicsIfCompiledFormatter;

@@ -145,7 +145,7 @@ impl PackageRendering for GitlabCiFormatter {
     /// Since #1391, `current` is never an unresolved `$VAR`/`${VAR}`/`%VAR%` GitLab CI
     /// variable reference here — the sole production caller,
     /// [`deps_core::edit::replacement_text`], gates on
-    /// [`RequirementResolution::requirement_is_placeholder`] first (backed by
+    /// [`RequirementResolution::bounded_requirement_is_placeholder`] first (backed by
     /// `contains_unresolved_gitlab_variable`, which also catches a variable reference
     /// embedded inside an otherwise `Tag`-shaped ref, e.g. `v1.2-$BUILD`).
     fn format_version_replacing_for(
@@ -207,14 +207,14 @@ impl RequirementResolution for GitlabCiFormatter {
     /// caller that already has the dependency in hand should call
     /// [`Self::classify_requirement_status_for`] instead, which consults its authoritative
     /// [`crate::types::PinStyle`] rather than re-guessing from text.
-    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+    fn bounded_requirement_is_unresolved(&self, requirement: BoundedVersionReq<'_>) -> bool {
         matches!(
             crate::component::classify_component_pin_style(requirement.as_str()),
             PinStyle::Sha | PinStyle::Branch
         )
     }
 
-    /// #1370: narrower than [`Self::requirement_is_unresolved`] — a SHA/branch pin is a
+    /// #1370: narrower than [`Self::bounded_requirement_is_unresolved`] — a SHA/branch pin is a
     /// concrete but undecidable ref (safe, sometimes intentional, to rewrite forward by a
     /// vulnerability fix), while an unresolved `$VAR`/`${VAR}`/`%VAR%` GitLab CI variable
     /// reference (see `contains_unresolved_gitlab_variable`) has no concrete version text at
@@ -223,7 +223,7 @@ impl RequirementResolution for GitlabCiFormatter {
     /// only ever be `Sha`/`Branch`), a variable reference can be embedded inside an otherwise
     /// `Tag`- or `Partial`-shaped ref (`v1.2-$BUILD`), so this checks the raw text directly
     /// rather than going through `PinStyle` at all.
-    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+    fn bounded_requirement_is_placeholder(&self, requirement: BoundedVersionReq<'_>) -> bool {
         contains_unresolved_gitlab_variable(requirement.as_str())
     }
 
@@ -232,7 +232,7 @@ impl RequirementResolution for GitlabCiFormatter {
     /// within its GitLab tilde-range semantics. A `Tag` pin is compared by normalized
     /// exact-string equality. A SHA/branch pin returns `true` unconditionally — never a
     /// false "outdated" (the diagnostic itself is separately gated by
-    /// [`Self::requirement_is_unresolved`]; this is the boolean fallback for a caller that
+    /// [`Self::bounded_requirement_is_unresolved`]; this is the boolean fallback for a caller that
     /// does not consult that first).
     ///
     /// Text-only, so ambiguous for a shape shared between grammars — see
@@ -339,10 +339,10 @@ impl RequirementResolution for GitlabCiFormatter {
 /// GitLab (or, for the templating forms, external tooling) expands these before/at pipeline
 /// run time; this crate parses `.gitlab-ci.yml` statically and can never resolve one, so a
 /// ref/pin containing this shape is not a value this crate should ever treat as bumpable —
-/// distinct from `RequirementResolution::requirement_is_unresolved` (issue #1365), which stays
+/// distinct from `RequirementResolution::bounded_requirement_is_unresolved` (issue #1365), which stays
 /// a broad "any SHA or branch ref, can't tell if outdated" diagnostic predicate; this is a
 /// narrower predicate backing [`GitlabCiFormatter`]'s
-/// [`RequirementResolution::requirement_is_placeholder`] override, consulted by
+/// [`RequirementResolution::bounded_requirement_is_placeholder`] override, consulted by
 /// [`deps_core::edit::replacement_text`] (the sole production rewrite path, #1391) to tell a
 /// genuinely unresolvable variable/input reference apart from an ordinary,
 /// intentionally-bumpable branch name like `main` (both currently classify as

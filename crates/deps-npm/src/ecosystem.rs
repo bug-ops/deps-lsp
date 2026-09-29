@@ -477,7 +477,7 @@ mod tests {
     // `string_valued_entries`/`classify_non_registry_specifier`, so it stays a normal
     // registry-sourced `Some(version_requirement)` — unlike `catalog:` above, this reaches
     // `deps_core::edit::plan_vulnerability_fix` directly and depends on
-    // `RequirementResolution::requirement_is_placeholder`'s shared default (`NpmFormatter`
+    // `RequirementResolution::bounded_requirement_is_placeholder`'s shared default (`NpmFormatter`
     // has no override), consulted via `deps_core::edit::requirement_is_placeholder_for`.
     deps_core::unresolved_requirement_conformance! {
         mod npm_dollar_placeholder_conformance;

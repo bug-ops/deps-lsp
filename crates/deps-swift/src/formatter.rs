@@ -4,7 +4,6 @@ use deps_core::ConcreteVersion;
 use deps_core::Dependency;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
-use deps_core::VersionReq;
 use deps_core::is_dot_segment;
 use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
@@ -139,20 +138,23 @@ impl PackageRendering for SwiftFormatter {
 }
 
 impl RequirementResolution for SwiftFormatter {
-    /// #1354 hardening: an unresolved requirement (see [`Self::requirement_is_unresolved`])
+    /// #1354 hardening: an unresolved requirement (see [`Self::bounded_requirement_is_unresolved`])
     /// returns `true` (treated as satisfied) rather than falling into `semver::VersionReq`
     /// parsing, which already fails closed for this shape but without the explicit
     /// classification `requirement_status`/`Unresolved` needs — mirrors `NuGetFormatter`'s
     /// identical guard.
-    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
-        if self.requirement_is_unresolved(&VersionReq::new(requirement)) {
+    fn version_satisfies_bounded_requirement(
+        &self,
+        version: &ConcreteVersion,
+        requirement: BoundedVersionReq<'_>,
+    ) -> bool {
+        if self.bounded_requirement_is_unresolved(requirement) {
             return true;
         }
-        let version = version.as_str();
-        let Ok(ver) = semver::Version::parse(version) else {
+        let Ok(ver) = semver::Version::parse(version.as_str()) else {
             return false;
         };
-        let Ok(req) = semver::VersionReq::parse(requirement) else {
+        let Ok(req) = semver::VersionReq::parse(requirement.as_str()) else {
             return false;
         };
         req.matches(&ver)
@@ -166,7 +168,7 @@ impl RequirementResolution for SwiftFormatter {
     /// purely "this requirement string doesn't parse as semver," not a gap in what pagination
     /// could return.
     ///
-    /// #1354: an unresolved interpolation (see [`Self::requirement_is_unresolved`]) is
+    /// #1354: an unresolved interpolation (see [`Self::bounded_requirement_is_unresolved`]) is
     /// checked explicitly first rather than relying on `semver::VersionReq::parse` to keep
     /// failing on it — defense-in-depth against a future interpolation spelling that happens
     /// to parse as valid semver syntax.
@@ -174,24 +176,23 @@ impl RequirementResolution for SwiftFormatter {
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        let requirement = requirement.get();
-        if self.requirement_is_unresolved(requirement) {
+        if self.bounded_requirement_is_unresolved(requirement) {
             return None;
         }
-        compile_semver_requirement(requirement)
+        compile_semver_requirement(requirement.get())
     }
 
     /// #1354: an unexpanded Swift string-interpolation placeholder (`\(...)`) inside a
     /// requirement — see `requirement_contains_unresolved_interpolation`.
     ///
     /// #1370: Swift has no separate "concrete but undecidable ref" case
-    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
+    /// [`Self::bounded_requirement_is_unresolved`] would need to stay broader than this — an
     /// unresolved Swift string interpolation is the only *native* unresolved shape Swift has,
     /// so its default delegates here rather than duplicating the detector (#1380).
     ///
     /// #1391: `shared || native` — `\(...)` has no overlap with the shared
     /// [`requirement_contains_template_placeholder`] detector's forms, so both are checked.
-    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+    fn bounded_requirement_is_placeholder(&self, requirement: BoundedVersionReq<'_>) -> bool {
         let requirement = requirement.as_str();
         requirement_contains_template_placeholder(requirement)
             || requirement_contains_unresolved_interpolation(requirement)
@@ -234,6 +235,7 @@ impl OsvNaming for SwiftFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
 
     use deps_core::test_util::capture_tracing_output;
@@ -399,45 +401,54 @@ mod tests {
     fn test_version_satisfies_up_to_next_major_range() {
         let fmt = SwiftFormatter;
         // upToNextMajor(from: "1.5.0") → ">=1.5.0, <2.0.0"
-        assert!(
-            fmt.version_satisfies_requirement(&ConcreteVersion::new("1.9.9"), ">=1.5.0, <2.0.0")
-        );
-        assert!(
-            !fmt.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), ">=1.5.0, <2.0.0")
-        );
-        assert!(
-            !fmt.version_satisfies_requirement(&ConcreteVersion::new("1.4.9"), ">=1.5.0, <2.0.0")
-        );
+        assert!(fmt.version_satisfies_requirement(
+            &ConcreteVersion::new("1.9.9"),
+            &VersionReq::new(">=1.5.0, <2.0.0")
+        ));
+        assert!(!fmt.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new(">=1.5.0, <2.0.0")
+        ));
+        assert!(!fmt.version_satisfies_requirement(
+            &ConcreteVersion::new("1.4.9"),
+            &VersionReq::new(">=1.5.0, <2.0.0")
+        ));
     }
 
     #[test]
     fn test_version_satisfies_up_to_next_minor_range() {
         let fmt = SwiftFormatter;
         // upToNextMinor(from: "2.3.0") → ">=2.3.0, <2.4.0"
-        assert!(
-            fmt.version_satisfies_requirement(&ConcreteVersion::new("2.3.5"), ">=2.3.0, <2.4.0")
-        );
-        assert!(
-            !fmt.version_satisfies_requirement(&ConcreteVersion::new("2.4.0"), ">=2.3.0, <2.4.0")
-        );
-        assert!(
-            !fmt.version_satisfies_requirement(&ConcreteVersion::new("2.2.9"), ">=2.3.0, <2.4.0")
-        );
+        assert!(fmt.version_satisfies_requirement(
+            &ConcreteVersion::new("2.3.5"),
+            &VersionReq::new(">=2.3.0, <2.4.0")
+        ));
+        assert!(!fmt.version_satisfies_requirement(
+            &ConcreteVersion::new("2.4.0"),
+            &VersionReq::new(">=2.3.0, <2.4.0")
+        ));
+        assert!(!fmt.version_satisfies_requirement(
+            &ConcreteVersion::new("2.2.9"),
+            &VersionReq::new(">=2.3.0, <2.4.0")
+        ));
     }
 
     #[test]
     fn test_version_satisfies_closed_range() {
         let fmt = SwiftFormatter;
         // "1.0.0"..."1.9.9" → ">=1.0.0, <=1.9.9"
-        assert!(
-            fmt.version_satisfies_requirement(&ConcreteVersion::new("1.9.9"), ">=1.0.0, <=1.9.9")
-        );
-        assert!(
-            fmt.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), ">=1.0.0, <=1.9.9")
-        );
-        assert!(
-            !fmt.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), ">=1.0.0, <=1.9.9")
-        );
+        assert!(fmt.version_satisfies_requirement(
+            &ConcreteVersion::new("1.9.9"),
+            &VersionReq::new(">=1.0.0, <=1.9.9")
+        ));
+        assert!(fmt.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.0"),
+            &VersionReq::new(">=1.0.0, <=1.9.9")
+        ));
+        assert!(!fmt.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0"),
+            &VersionReq::new(">=1.0.0, <=1.9.9")
+        ));
     }
 
     fn dep_with_url(name: &str, url: &str) -> SwiftDependency {
@@ -522,7 +533,7 @@ mod tests {
         // Pre-release versions should not satisfy ranges by default (semver crate behavior)
         assert!(!fmt.version_satisfies_requirement(
             &ConcreteVersion::new("2.0.0-beta.1"),
-            ">=1.0.0, <3.0.0"
+            &VersionReq::new(">=1.0.0, <3.0.0")
         ));
     }
 
@@ -537,7 +548,7 @@ mod tests {
         let native = fmt.osv_version_to_native(&osv_version);
         assert_eq!(native, osv_version.as_str());
         let edit_text = fmt.format_version_for_text_edit(&native);
-        assert!(fmt.version_satisfies_requirement(&native, &edit_text));
+        assert!(fmt.version_satisfies_requirement(&native, &VersionReq::new(&edit_text)));
     }
 
     #[test]
@@ -602,9 +613,10 @@ mod tests {
     #[test]
     fn test_version_satisfies_requirement_unresolved_interpolation_returns_true() {
         let fmt = SwiftFormatter;
-        assert!(
-            fmt.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), ">=\\(v), <1.0.0")
-        );
+        assert!(fmt.version_satisfies_requirement(
+            &ConcreteVersion::new("1.2.3"),
+            &VersionReq::new(">=\\(v), <1.0.0")
+        ));
     }
 
     #[test]

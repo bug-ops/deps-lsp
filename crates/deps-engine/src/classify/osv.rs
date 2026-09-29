@@ -519,7 +519,7 @@ fn resolve_fix_target(
             return FixTargetResolution::Skip;
         }
         // `resolve_recommended_fix` can only ever return `NoRecommendedFix`/`UnsafeVersion` —
-        // these four variants exist only for `plan_vulnerability_fix`'s later,
+        // these five variants exist only for `plan_vulnerability_fix`'s later,
         // `resolve_verified_fix`-based decision. Handled explicitly rather than folded into a
         // wildcard (code review finding) so a future `VulnFixSkip` variant, or a change that
         // starts surfacing one of these here, is a compile error instead of silently
@@ -529,7 +529,8 @@ fn resolve_fix_target(
             VulnFixSkip::UnverifiedTarget
             | VulnFixSkip::RequirementAlreadyResolves
             | VulnFixSkip::NoOpRewrite
-            | VulnFixSkip::UnresolvedPlaceholder,
+            | VulnFixSkip::UnresolvedPlaceholder
+            | VulnFixSkip::OversizedRequirement,
         ) => return FixTargetResolution::Skip,
     };
 
@@ -1108,6 +1109,39 @@ mod tests {
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].osv_name, "symfony/http-kernel");
             assert!(skipped.is_empty());
+        }
+
+        /// #1663: a separator-only Poetry key normalizes to an empty OSV name, which OSV
+        /// rejects with a batch-wide HTTP 400 — it must be skipped as `UnmappableName` while a
+        /// valid sibling still yields its (PEP 503-normalized) query.
+        #[cfg(feature = "pypi")]
+        #[test]
+        fn build_scan_targets_pypi_separator_only_key_is_skipped_and_sibling_still_queried() {
+            let dep = |name: &str| MockDep {
+                name: PackageName::new(name),
+                version_req: Some(VersionReq::new("==1.0.0")),
+                source: DependencySource::Registry,
+            };
+            let parse_result = MockParseResult {
+                deps: vec![dep("Werkzeug"), dep("---")],
+            };
+
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &HashMap::new(),
+                &HashMap::new(),
+                &deps_pypi::PypiFormatter,
+                EcosystemId::Pypi,
+            );
+
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].osv_name, "werkzeug");
+            assert_eq!(skipped.len(), 1);
+            // The skip is keyed by the normalized name, which is empty for `---`.
+            assert_matches!(
+                skipped.get(&deps_core::test_util::vuln_key("")),
+                Some(ScanOutcome::Skipped(SkipReason::UnmappableName))
+            );
         }
 
         /// #1556 impl-critic S1: a GitHub Actions SHA pin whose `TagIndex`-resolved tag is

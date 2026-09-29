@@ -5,7 +5,6 @@ use deps_core::ConcreteVersion;
 use deps_core::Dependency;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
-use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
     PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
@@ -273,7 +272,7 @@ impl PackageRendering for BundlerFormatter {
     /// [`Dependency::version_literal`] back unchanged instead of collapsing to a bare
     /// replacement version — this is a genuine text-shape concern (which quote characters
     /// bound the replaced span), not a placeholder-safety one, so it stays here rather than
-    /// moving to [`RequirementResolution::requirement_is_placeholder`] (#1391: the former
+    /// moving to [`RequirementResolution::bounded_requirement_is_placeholder`] (#1391: the former
     /// `#{...}`-interpolation guard this method also carried is gone, since
     /// `deps_core::edit::replacement_text` now enforces that centrally).
     ///
@@ -301,15 +300,18 @@ impl PackageRendering for BundlerFormatter {
 
 impl RequirementResolution for BundlerFormatter {
     /// #1354 hardening: an unresolved requirement (see
-    /// [`Self::requirement_is_unresolved`]) returns `true` (treated as satisfied) rather than
+    /// [`Self::bounded_requirement_is_unresolved`]) returns `true` (treated as satisfied) rather than
     /// falling into `version_matches_requirement`, which would otherwise compare the raw
     /// `#{...}` text against every candidate — mirrors `NuGetFormatter`'s identical guard.
-    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
-        if self.requirement_is_unresolved(&VersionReq::new(requirement)) {
+    fn version_satisfies_bounded_requirement(
+        &self,
+        version: &ConcreteVersion,
+        requirement: BoundedVersionReq<'_>,
+    ) -> bool {
+        if self.bounded_requirement_is_unresolved(requirement) {
             return true;
         }
-        let version = version.as_str();
-        version_matches_requirement(version, requirement)
+        version_matches_requirement(version.as_str(), requirement.as_str())
     }
 
     /// Compiles `requirement` into a `RubygemsMatcher` using the same
@@ -325,15 +327,14 @@ impl RequirementResolution for BundlerFormatter {
     /// precedent in Maven/Gradle/NuGet's `compile_bounded_requirement` (#332). The "could this
     /// requirement be satisfied by a version
     /// RubyGems hid" ambiguity is handled separately in
-    /// [`Self::requirement_is_undecidable_given_available`], which sees `available` and can
+    /// [`Self::bounded_requirement_is_undecidable_given_available`], which sees `available` and can
     /// therefore decide it precisely instead of this method having to guess from
     /// `requirement` alone.
     fn compile_bounded_requirement(
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        let requirement = requirement.get();
-        if self.requirement_is_unresolved(requirement) {
+        if self.bounded_requirement_is_unresolved(requirement) {
             return None;
         }
         compile_requirement_unless(
@@ -344,9 +345,9 @@ impl RequirementResolution for BundlerFormatter {
     }
 
     /// See `exact_pin_could_be_yanked` for the RubyGems-specific rationale and heuristic.
-    fn requirement_is_undecidable_given_available(
+    fn bounded_requirement_is_undecidable_given_available(
         &self,
-        requirement: &VersionReq,
+        requirement: BoundedVersionReq<'_>,
         available: &[ConcreteVersion],
     ) -> bool {
         exact_pin_could_be_yanked(requirement.as_str(), available)
@@ -361,7 +362,7 @@ impl RequirementResolution for BundlerFormatter {
     /// unresolved-variable precedent.
     ///
     /// #1370/#1380: Bundler has no separate "concrete but undecidable ref" case
-    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
+    /// [`Self::bounded_requirement_is_unresolved`] would need to stay broader than this — an
     /// unresolved Ruby interpolation is the only *native* unresolved shape Bundler has, so its
     /// default delegates here rather than duplicating the
     /// `requirement_contains_unresolved_interpolation` detector.
@@ -370,7 +371,7 @@ impl RequirementResolution for BundlerFormatter {
     /// shared [`requirement_contains_template_placeholder`] detector's forms (and, since a
     /// bare `#$VAR` now happens to also match the shared detector's `$IDENT` rule, that overlap
     /// is harmless), so both are checked.
-    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+    fn bounded_requirement_is_placeholder(&self, requirement: BoundedVersionReq<'_>) -> bool {
         let requirement = requirement.as_str();
         requirement_contains_template_placeholder(requirement)
             || requirement_contains_unresolved_interpolation(requirement)
@@ -388,6 +389,7 @@ impl OsvNaming for BundlerFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
 
     #[test]
@@ -848,12 +850,10 @@ mod tests {
     #[test]
     fn test_version_satisfies_requirement_unresolved_interpolation_returns_true() {
         let formatter = BundlerFormatter;
-        assert!(
-            formatter.version_satisfies_requirement(
-                &ConcreteVersion::new("7.0.8"),
-                "~> #{RAILS_VERSION}"
-            )
-        );
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("7.0.8"),
+            &VersionReq::new("~> #{RAILS_VERSION}")
+        ));
     }
 
     /// A minimal [`crate::types::BundlerDependency`] for probing

@@ -1,4 +1,3 @@
-use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
     PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
@@ -86,14 +85,17 @@ impl PackageRendering for GoFormatter {
 }
 
 impl RequirementResolution for GoFormatter {
-    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
-        let version = version.as_str();
-        go_version_matches(version, requirement)
+    fn version_satisfies_bounded_requirement(
+        &self,
+        version: &ConcreteVersion,
+        requirement: BoundedVersionReq<'_>,
+    ) -> bool {
+        go_version_matches(version.as_str(), requirement.as_str())
     }
 
     // #1370/#1377/#1379/#1391: `go.mod`'s own grammar has no placeholder syntax of its own (a
     // `require` line's version field is always a single, space-free token) —
-    // `RequirementResolution::requirement_is_placeholder`'s shared default (the
+    // `RequirementResolution::bounded_requirement_is_placeholder`'s shared default (the
     // `requirement_contains_template_placeholder` detector) already covers the only
     // unresolved shape Go has (a value pre-processed and left unexpanded by tooling outside
     // `go`, e.g. `envsubst` or a Go `text/template` pass), so neither `requirement_is_unresolved`
@@ -107,9 +109,9 @@ impl RequirementResolution for GoFormatter {
     /// [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`] for the shared "undecidable" contract).
     ///
     /// The undecidable predicate is `crate::version::is_pseudo_version` — or an unresolved
-    /// external-templating placeholder ([`Self::requirement_is_unresolved`], #1377/#1379
+    /// external-templating placeholder ([`Self::bounded_requirement_is_placeholder`], #1377/#1379
     /// hardening, defense-in-depth alongside `requirement_is_unsatisfiable`'s own upstream
-    /// `requirement_is_unresolved` gate): `proxy.golang.org/<mod>/@v/list` — the source of
+    /// `bounded_requirement_is_unresolved` gate): `proxy.golang.org/<mod>/@v/list` — the source of
     /// `available` — never lists pseudo-versions (they're derived per-commit, not
     /// enumerable), so a pseudo-version pin can never be found in `available` even when the
     /// exact commit it names is real. A `+incompatible`-suffixed *tag* (not a pseudo-version)
@@ -122,7 +124,7 @@ impl RequirementResolution for GoFormatter {
             requirement.as_str(),
             |req| {
                 crate::version::is_pseudo_version(req)
-                    || self.requirement_is_placeholder(&VersionReq::new(req))
+                    || self.bounded_requirement_is_placeholder(requirement)
             },
             ExactMatcher,
         )
@@ -187,6 +189,7 @@ impl OsvNaming for GoFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
     use deps_core::position::{Position, Range};
 

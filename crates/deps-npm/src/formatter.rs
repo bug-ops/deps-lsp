@@ -423,7 +423,7 @@ fn node_semver_or_gap_excludes(branches: &[node_semver::Range], version: &str) -
 /// reaches `node_semver::Range::parse`, which might otherwise parse a placeholder-shaped
 /// string loosely into an incorrect concrete range instead of failing closed. This internal
 /// guard only ever runs that one shared detector — it is *not* equivalent to
-/// [`RequirementResolution::requirement_is_unresolved`] in general, only for a formatter
+/// [`RequirementResolution::bounded_requirement_is_unresolved`] in general, only for a formatter
 /// whose own override of that method delegates entirely to the shared default (true today of
 /// both `NpmFormatter` and `DenoFormatter`, per each one's own doc comment). A formatter that
 /// overrides `requirement_is_unresolved`/`requirement_is_placeholder` with additional native
@@ -617,7 +617,7 @@ impl RequirementResolution for NpmFormatter {
     }
 
     // #1370/#1374/#1379/#1391: npm's requirement grammar has no placeholder syntax of its
-    // own — `RequirementResolution::requirement_is_placeholder`'s shared default (the
+    // own — `RequirementResolution::bounded_requirement_is_placeholder`'s shared default (the
     // `requirement_contains_template_placeholder` detector) already covers the only
     // unresolved shape npm has, so no override is needed here.
 }

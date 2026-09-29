@@ -302,12 +302,14 @@ impl PackagistRegistry {
             return Ok(idx.and_then(|idx| versions.into_iter().nth(idx)));
         }
 
+        use deps_core::lsp_helpers::RequirementGate;
+
         let formatter = crate::formatter::ComposerFormatter;
-        use deps_core::lsp_helpers::RequirementResolution;
+        let requirement = deps_core::VersionReq::new(req_str);
 
         Ok(versions.into_iter().find(|v| {
             crate::formatter::composer_version_stability(v.version.as_str()) >= floor
-                && formatter.version_satisfies_requirement(&v.version, req_str)
+                && formatter.version_satisfies_requirement(&v.version, &requirement)
         }))
     }
 
@@ -332,8 +334,9 @@ impl PackagistRegistry {
             return select_latest_for_existence_composer(versions, |v| v.as_ref(), floor);
         }
 
+        use deps_core::lsp_helpers::RequirementGate;
+
         let formatter = crate::formatter::ComposerFormatter;
-        use deps_core::lsp_helpers::RequirementResolution;
 
         versions.iter().position(|v| {
             // Always true for Composer (`abandoned` maps to `AdvisoryDeprecated`, which
@@ -341,7 +344,7 @@ impl PackagistRegistry {
             !v.removal_status().blocks_resolution()
                 && crate::formatter::composer_version_stability(v.version_string().as_str())
                     >= floor
-                && formatter.version_satisfies_requirement(v.version_string(), req.as_str())
+                && formatter.version_satisfies_requirement(v.version_string(), req)
         })
     }
 

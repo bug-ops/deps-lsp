@@ -106,9 +106,12 @@ impl PackageRendering for DartFormatter {
 }
 
 impl RequirementResolution for DartFormatter {
-    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
-        let version = version.as_str();
-        version_matches_constraint(version, requirement)
+    fn version_satisfies_bounded_requirement(
+        &self,
+        version: &ConcreteVersion,
+        requirement: BoundedVersionReq<'_>,
+    ) -> bool {
+        version_matches_constraint(version.as_str(), requirement.as_str())
     }
 
     /// Compiles `requirement` into a `PubDevMatcher` using the same comparator as
@@ -117,7 +120,7 @@ impl RequirementResolution for DartFormatter {
     /// per candidate version.
     ///
     /// #1374 hardening: an unresolved placeholder (see
-    /// [`Self::requirement_is_unresolved`]) returns `None` up front — `PubDevMatcher`'s
+    /// [`Self::bounded_requirement_is_unresolved`]) returns `None` up front — `PubDevMatcher`'s
     /// hand-rolled comparator otherwise always decides (`Some`), which would read a
     /// `${VAR}`-shaped constraint as satisfied by no candidate and misreport it
     /// unsatisfiable (`requirement_is_unresolved` already short-circuits that diagnostic
@@ -127,8 +130,7 @@ impl RequirementResolution for DartFormatter {
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        let requirement = requirement.get();
-        if self.requirement_is_unresolved(requirement) {
+        if self.bounded_requirement_is_unresolved(requirement) {
             return None;
         }
         let normalized = normalize_operator_spacing(requirement.as_str().trim()).into_owned();
@@ -136,7 +138,7 @@ impl RequirementResolution for DartFormatter {
     }
 
     // #1370/#1374/#1379/#1391: `pubspec.yaml`'s own version-constraint grammar has no
-    // placeholder syntax of its own — `RequirementResolution::requirement_is_placeholder`'s
+    // placeholder syntax of its own — `RequirementResolution::bounded_requirement_is_placeholder`'s
     // shared default (the `requirement_contains_template_placeholder` detector) already
     // covers the only unresolved shape Dart has (a value pre-processed and left unexpanded by
     // tooling outside Dart, e.g. `envsubst`), so no override is needed here.

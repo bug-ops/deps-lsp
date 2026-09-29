@@ -2789,6 +2789,47 @@ mod osv_version_validation_tests {
         assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("1.0.0")]);
     }
 
+    /// #1663: a multi-package PyPI record (`quart` + `werkzeug`) queried under the PEP 503
+    /// normalized name keeps only `werkzeug`'s fix, so `PypiFormatter::osv_package_name` must
+    /// hand the matcher that normalized spelling.
+    #[test]
+    fn into_advisory_pypi_multi_package_record_keeps_only_queried_package_fix() {
+        let affected = |name: &str, fixed: &str| OsvAffected {
+            versions: vec![],
+            package: Some(OsvPackage {
+                name: name.to_string(),
+                ecosystem: "PyPI".to_string(),
+            }),
+            ecosystem_specific: None,
+            database_specific: None,
+            ranges: vec![OsvRange {
+                range_type: OsvRangeType::Ecosystem,
+                events: vec![OsvEvent {
+                    introduced: None,
+                    last_affected: None,
+                    fixed: Some(fixed.to_string()),
+                }],
+            }],
+        };
+        let record = OsvVulnRecord {
+            id: "GHSA-hrfv-mqp8-q5rw".to_string(),
+            modified: "2023-01-01T00:00:00Z".to_string(),
+            summary: None,
+            aliases: vec![],
+            severity: vec![],
+            database_specific: None,
+            affected: vec![affected("quart", "0.19.4"), affected("werkzeug", "3.0.1")],
+        };
+
+        let advisory = record
+            .into_advisory(
+                &OsvPackageName::new("werkzeug").unwrap(),
+                OsvEcosystem::PyPI,
+            )
+            .expect("valid id");
+        assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("3.0.1")]);
+    }
+
     /// #1482: a PYSEC-shaped record with a `GIT` range's commit-SHA `fixed` event alongside
     /// an `ECOSYSTEM` range's real version fix. The SHA must never enter `fixed_versions` —
     /// mirrors the real `requests` PYSEC-2023-74 shape (`74ea7cf7...` `GIT`-range fix vs.

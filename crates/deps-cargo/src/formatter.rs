@@ -154,11 +154,10 @@ impl RequirementResolution for CargoFormatter {
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        let requirement = requirement.get();
-        if self.requirement_is_unresolved(requirement) {
+        if self.bounded_requirement_is_unresolved(requirement) {
             return None;
         }
-        compile_semver_requirement(requirement)
+        compile_semver_requirement(requirement.get())
     }
 
     /// Comparator-style requirements (`=1.2.3`, `<2`, `>=1.2, <2`) are judged by the compiled
@@ -172,7 +171,7 @@ impl RequirementResolution for CargoFormatter {
     }
 
     // #1370/#1391: `Cargo.toml`'s own TOML grammar has no placeholder syntax of its own —
-    // `RequirementResolution::requirement_is_placeholder`'s shared default (the
+    // `RequirementResolution::bounded_requirement_is_placeholder`'s shared default (the
     // `requirement_contains_template_placeholder` detector) already covers the only
     // unresolved shape Cargo has (a value pre-processed and left unexpanded by tooling
     // outside Cargo, e.g. `envsubst`), so no override is needed here (#1380/#1391).

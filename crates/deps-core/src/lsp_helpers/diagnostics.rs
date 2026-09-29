@@ -701,9 +701,9 @@ impl<'a> BoundedVersionReq<'a> {
 /// 2. `!requirement.as_str().trim().is_empty()`.
 /// 3. `BoundedVersionReq::new(requirement)` is `Some` — see [`MAX_REQUIREMENT_LEN`]; an
 ///    oversized requirement is treated the same as "unmodellable" (suppressed, not warned).
-/// 4. `!formatter.requirement_is_unresolved(requirement)` (FR-005) — an unresolved
+/// 4. `!formatter.bounded_requirement_is_unresolved(requirement)` (FR-005) — an unresolved
 ///    placeholder requirement was never actually checked against anything.
-/// 5. `!formatter.requirement_is_undecidable_given_available(requirement, available)` — this
+/// 5. `!formatter.bounded_requirement_is_undecidable_given_available(requirement, available)` — this
 ///    ecosystem's registry can hide a published version that would have decided the match.
 /// 6. `formatter.compile_bounded_requirement(requirement)` returns `Some(matcher)` — this
 ///    ecosystem opted in and the requirement string itself parses.
@@ -797,17 +797,17 @@ fn unsatisfiable_matcher(
         return None;
     }
     let bounded = BoundedVersionReq::new(requirement)?;
-    // #1391: also consults `requirement_is_placeholder` directly, not only
-    // `requirement_is_unresolved` — closes a gap for `deps-github-actions`/`deps-gitlab-ci`,
-    // whose `requirement_is_unresolved` override answers a narrower question (see that
+    // #1391: also consults the placeholder hook directly, not only the unresolved one — closes
+    // a gap for `deps-github-actions`/`deps-gitlab-ci`, whose
+    // `bounded_requirement_is_unresolved` override answers a narrower question (see that
     // method's doc) and so would not by itself suppress this diagnostic for a placeholder
     // embedded in an otherwise concrete-looking ref (e.g. `v1.2-$BUILD`).
-    if formatter.requirement_is_unresolved(requirement)
-        || formatter.requirement_is_placeholder(requirement)
+    if formatter.bounded_requirement_is_unresolved(bounded)
+        || formatter.bounded_requirement_is_placeholder(bounded)
     {
         return None;
     }
-    if formatter.requirement_is_undecidable_given_available(requirement, available) {
+    if formatter.bounded_requirement_is_undecidable_given_available(bounded, available) {
         return None;
     }
     let matcher = formatter.compile_bounded_requirement(bounded)?;
@@ -966,7 +966,7 @@ fn requirement_matches_only_yanked(
         return None;
     }
     let bounded = BoundedVersionReq::new(requirement)?;
-    if formatter.requirement_is_unresolved(requirement) {
+    if formatter.bounded_requirement_is_unresolved(bounded) {
         return None;
     }
     let matcher = formatter.compile_bounded_requirement(bounded)?;
@@ -9582,7 +9582,10 @@ mod tests {
         }
 
         impl RequirementResolution for TableFormatter {
-            fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+            fn bounded_requirement_is_unresolved(
+                &self,
+                requirement: BoundedVersionReq<'_>,
+            ) -> bool {
                 requirement.as_str() == "unresolved"
             }
 
@@ -9640,6 +9643,58 @@ mod tests {
             let oversized = "1".repeat(MAX_REQUIREMENT_LEN + 1);
             assert!(!requirement_is_unsatisfiable(
                 &formatter,
+                &VersionReq::new(oversized),
+                &versions(&["1.0.0"]),
+            ));
+        }
+
+        /// #1665: the unresolved/placeholder/undecidable predicates are gated behind
+        /// `BoundedVersionReq` construction, which precedes them — an oversized requirement
+        /// is suppressed without any of those hooks (all panicking here) ever running.
+        #[test]
+        fn test_oversized_requirement_never_reaches_predicate_hooks() {
+            struct PanickingPredicates;
+            impl PackageNaming for PanickingPredicates {}
+            impl PackageRendering for PanickingPredicates {
+                fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                    version.to_string()
+                }
+
+                fn package_url(&self, name: &PackageName) -> String {
+                    name.as_str().to_string()
+                }
+            }
+            impl RequirementResolution for PanickingPredicates {
+                fn bounded_requirement_is_unresolved(
+                    &self,
+                    _requirement: BoundedVersionReq<'_>,
+                ) -> bool {
+                    panic!("unresolved hook must not run for an oversized requirement")
+                }
+
+                fn bounded_requirement_is_placeholder(
+                    &self,
+                    _requirement: BoundedVersionReq<'_>,
+                ) -> bool {
+                    panic!("placeholder hook must not run for an oversized requirement")
+                }
+
+                fn bounded_requirement_is_undecidable_given_available(
+                    &self,
+                    _requirement: BoundedVersionReq<'_>,
+                    _available: &[ConcreteVersion],
+                ) -> bool {
+                    panic!("undecidable hook must not run for an oversized requirement")
+                }
+            }
+            impl DiagnosticMessages for PanickingPredicates {}
+            impl DiagnosticPolicy for PanickingPredicates {}
+            impl SourcePolicy for PanickingPredicates {}
+            impl OsvNaming for PanickingPredicates {}
+
+            let oversized = "1".repeat(MAX_REQUIREMENT_LEN + 1);
+            assert!(!requirement_is_unsatisfiable(
+                &PanickingPredicates,
                 &VersionReq::new(oversized),
                 &versions(&["1.0.0"]),
             ));
@@ -10087,7 +10142,10 @@ mod tests {
         }
 
         impl RequirementResolution for TableFormatter {
-            fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+            fn bounded_requirement_is_unresolved(
+                &self,
+                requirement: BoundedVersionReq<'_>,
+            ) -> bool {
                 requirement.as_str() == "unresolved"
             }
 

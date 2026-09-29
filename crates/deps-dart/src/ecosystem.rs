@@ -278,7 +278,7 @@ mod tests {
     // `<%= %>`-shaped literal in the version slot; the YAML parser has no way to distinguish
     // that from an ordinary string, so it stays a normal `Some(version_requirement)` and
     // reaches `deps_core::edit::plan_vulnerability_fix` directly — depends on
-    // `RequirementResolution::requirement_is_placeholder`'s shared default (`DartFormatter`
+    // `RequirementResolution::bounded_requirement_is_placeholder`'s shared default (`DartFormatter`
     // has no override). `{{ }}`/`@VAR@`/`%VAR%` are quoted here (unlike the bare `$`/`<%`
     // forms) because YAML plain scalars may not start with `{`, `@`, or `%` — a grammar-level
     // quoting requirement, unrelated to the placeholder detector itself.

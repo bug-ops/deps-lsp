@@ -130,7 +130,7 @@ impl RequirementResolution for DenoFormatter {
     }
 
     // #1370/#1377/#1380/#1391: `deno.json`/`deno.jsonc`'s own import-specifier grammar has no
-    // placeholder syntax of its own — `RequirementResolution::requirement_is_placeholder`'s
+    // placeholder syntax of its own — `RequirementResolution::bounded_requirement_is_placeholder`'s
     // shared default (the `requirement_contains_template_placeholder` detector) already
     // covers the only unresolved shape Deno has (a value pre-processed and left unexpanded by
     // tooling outside Deno, e.g. `envsubst`), so neither `requirement_is_unresolved` nor
