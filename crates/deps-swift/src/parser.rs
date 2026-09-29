@@ -42,17 +42,22 @@ const LEGACY_LABEL: &str = r#"(?:name\s*:\s*"[^"]*"\s*,\s*)?"#;
 /// Closes a `.package(...)` call, tolerating a trailing comma after the last argument (#1673).
 const CALL_END: &str = r"\s*,?\s*\)";
 
+/// Optional trailing SwiftPM 6.1 `traits: [...]` argument; tolerates strings and one level of
+/// nested brackets (e.g. `.trait(name: "A", condition: .when(traits: ["B"]))`).
+const TRAITS_TAIL: &str =
+    r#"(?:\s*,\s*traits\s*:\s*\[(?:[^\[\]"]|"[^"]*"|\[(?:[^\[\]"]|"[^"]*")*\])*\])?"#;
+
 /// Compiles a `.package(url: "<capture 1>", <requirement>)` pattern.
 ///
 /// Every URL-form regex is built here so the legacy-label prefix and the trailing-comma
 /// tolerance are defined once; `requirement` is the pattern between the URL and the closing
-/// parenthesis and must end without its own `\s*,?\s*\)`.
+/// parenthesis and must end without its own `\s*,?\s*\)`; the optional `traits:` tail is appended here.
 // Compile-time-constant patterns; a malformed literal is a build-visible programmer error,
 // not attacker-influenceable input.
 #[allow(clippy::expect_used)]
 fn url_package_regex(requirement: &str) -> Regex {
     Regex::new(&format!(
-        r#"(?s)\.package\s*\(\s*{LEGACY_LABEL}url\s*:\s*"([^"]+)"\s*,\s*{requirement}{CALL_END}"#
+        r#"(?s)\.package\s*\(\s*{LEGACY_LABEL}url\s*:\s*"([^"]+)"\s*,\s*{requirement}{TRAITS_TAIL}{CALL_END}"#
     ))
     .expect("url package regex")
 }
@@ -104,7 +109,7 @@ static RE_URL_REVISION_LABELLED: LazyLock<Regex> =
 #[allow(clippy::expect_used)]
 static RE_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"(?s)\.package\s*\(\s*{LEGACY_LABEL}path\s*:\s*"([^"]+)"{CALL_END}"#
+        r#"(?s)\.package\s*\(\s*{LEGACY_LABEL}path\s*:\s*"([^"]+)"{TRAITS_TAIL}{CALL_END}"#
     ))
     .expect("RE_PATH")
 });
@@ -1451,5 +1456,182 @@ let package = Package(
                 Some("1.0.0")
             );
         }
+    }
+
+    #[test]
+    fn test_parse_with_trailing_traits_all_forms() {
+        let content = r#"
+let package = Package(
+    dependencies: [
+        .package(url: "https://github.com/a/from", from: "1.0.0", traits: ["X"]),
+        .package(url: "https://github.com/a/major", .upToNextMajor(from: "2.1.0"), traits: []),
+        .package(url: "https://github.com/a/minor", .upToNextMinor(from: "3.1.0"), traits: [.defaults, "Y"]),
+        .package(url: "https://github.com/a/exact", exact: "4.0.0", traits: ["X"]),
+        .package(url: "https://github.com/a/dotexact", .exact("5.0.0"), traits: ["X"]),
+        .package(url: "https://github.com/a/half", "1.0.0"..<"2.0.0", traits: ["X"]),
+        .package(url: "https://github.com/a/closed", "1.0.0"..."2.0.0", traits: ["X"]),
+        .package(url: "https://github.com/a/branch", .branch("main"), traits: ["X"]),
+        .package(url: "https://github.com/a/rev", .revision("abc123"), traits: ["X"]),
+    ]
+)
+"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        let names: Vec<&str> = result
+            .dependencies
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(result.dependencies.len(), 9, "{names:?}");
+        let from = result
+            .dependencies
+            .iter()
+            .find(|d| d.name.as_str() == "a/from")
+            .unwrap();
+        assert_eq!(from.version_literal.as_deref(), Some("1.0.0"));
+        let exact = result
+            .dependencies
+            .iter()
+            .find(|d| d.name.as_str() == "a/exact")
+            .unwrap();
+        assert_eq!(exact.version_literal.as_deref(), Some("4.0.0"));
+    }
+
+    #[test]
+    fn test_parse_multiline_traits_with_nested_conditions() {
+        let content = r#"
+let package = Package(
+    dependencies: [
+        .package(
+            url: "https://github.com/apple/swift-nio.git",
+            from: "2.40.0",
+            traits: [
+                .defaults,
+                .trait(name: "Extra", condition: .when(traits: ["Base"])),
+                "Plain"
+            ]
+        ),
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0"),
+    ]
+)
+"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        let nio = &result.dependencies[0];
+        assert_eq!(nio.name.as_str(), "apple/swift-nio");
+        assert_eq!(nio.version_literal.as_deref(), Some("2.40.0"));
+        assert_eq!(nio.version_range.unwrap().start.line, 5);
+    }
+
+    fn dep<'a>(r: &'a SwiftParseResult, name: &str) -> &'a SwiftDependency {
+        r.dependencies
+            .iter()
+            .find(|d| d.name.as_str() == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+    }
+
+    #[test]
+    fn test_parse_path_with_traits() {
+        let content = r#"
+let package = Package(
+    dependencies: [
+        .package(path: "../Local", traits: ["X"]),
+        .package(
+            path: "../Other",
+            traits: [.defaults, .trait(name: "E", condition: .when(traits: ["B"]))]
+        ),
+    ]
+)
+"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        assert_matches!(&dep(&result, "Local").source, DependencySource::Path { path } if path == "../Local");
+        assert_matches!(&dep(&result, "Other").source, DependencySource::Path { path } if path == "../Other");
+    }
+
+    #[test]
+    fn test_traits_version_ranges_point_at_literals() {
+        let content = r#"
+        .package(url: "https://github.com/a/from", from: "1.0.0", traits: ["X"]),
+        .package(url: "https://github.com/a/major", .upToNextMajor(from: "2.1.0"), traits: ["X"]),
+        .package(url: "https://github.com/a/exact", exact: "4.0.0", traits: ["X"]),
+        .package(url: "https://github.com/a/half", "1.0.0"..<"2.0.0", traits: ["X"]),
+"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 4);
+        let lines: Vec<&str> = content.lines().collect();
+        for (name, literal) in [
+            ("a/from", "1.0.0"),
+            ("a/major", "2.1.0"),
+            ("a/exact", "4.0.0"),
+            ("a/half", "1.0.0"),
+        ] {
+            let range = dep(&result, name).version_range.unwrap();
+            let line = lines[range.start.line as usize];
+            let start = range.start.character as usize;
+            let end = range.end.character as usize;
+            assert_eq!(line.get(start..end), Some(literal), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_traits_with_comments_and_strings_containing_delimiters() {
+        let content = r#"
+        .package(
+            url: "https://github.com/a/one", // pin
+            from: "1.0.0",
+            traits: [
+                // "]" in a comment
+                "we,ird]name", /* ) */ "B"
+            ]
+        ),
+        .package(url: "https://github.com/a/two", from: "2.0.0"),
+"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        assert_eq!(
+            dep(&result, "a/one").version_literal.as_deref(),
+            Some("1.0.0")
+        );
+    }
+
+    #[test]
+    fn test_traits_deeper_nesting_is_skipped_without_panic() {
+        let content = r#"
+        .package(url: "https://github.com/a/deep", from: "1.0.0", traits: [[["X"]]]),
+        .package(url: "https://github.com/a/ok", from: "2.0.0", traits: ["X"]),
+"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert!(
+            result
+                .dependencies
+                .iter()
+                .any(|d| d.name.as_str() == "a/ok")
+        );
+        assert!(
+            result
+                .dependencies
+                .iter()
+                .all(|d| d.name.as_str() != "a/deep")
+        );
+    }
+
+    #[test]
+    fn test_traits_with_trailing_comma_and_labelled_forms() {
+        let content = r#"
+        .package(url: "https://github.com/a/one", from: "1.0.0", traits: ["X"],),
+        .package(url: "https://github.com/a/two", branch: "main", traits: ["X"]),
+        .package(url: "https://github.com/a/three", .upToNextMajor(from: "3.0.0"), traits: ["X"],),
+        .package(name: "Legacy", path: "../Legacy", traits: ["X"],),
+"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 4);
+        assert_eq!(
+            dep(&result, "a/one").version_literal.as_deref(),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            dep(&result, "a/three").version_literal.as_deref(),
+            Some("3.0.0")
+        );
     }
 }
