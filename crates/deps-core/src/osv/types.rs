@@ -1153,6 +1153,9 @@ pub enum SkipReason {
     NonRegistrySource,
     /// No lockfile-resolved or concrete version was available (§3 steps 1-3).
     NoConcreteVersion,
+    /// A tag was resolved (e.g. a SHA pin's hover `**Resolved**` line) but it is a moving
+    /// alias or a non-version name, not a full version OSV.dev can be queried with (#1668).
+    ResolvedTagNotFullVersion,
     /// `EcosystemFormatter::osv_package_name` returned `None`.
     UnmappableName,
     /// `EcosystemId::osv_ecosystem` returned `None`.
@@ -1172,6 +1175,7 @@ impl SkipReason {
         match self {
             Self::NonRegistrySource => "non-registry-source",
             Self::NoConcreteVersion => "no-concrete-version",
+            Self::ResolvedTagNotFullVersion => "resolved-tag-not-full-version",
             Self::UnmappableName => "unmappable-name",
             Self::UnmappableEcosystem => "unmappable-ecosystem",
             Self::QueryFailed => "query-failed",
@@ -1211,6 +1215,10 @@ impl SkipReason {
     ///     SkipReason::NoConcreteVersion.unchecked_reason(),
     ///     Some("no resolved or exact version was available to query")
     /// );
+    /// assert_eq!(
+    ///     SkipReason::ResolvedTagNotFullVersion.unchecked_reason(),
+    ///     Some("the resolved tag is not a full version, so it was not queried")
+    /// );
     /// assert_eq!(SkipReason::NonRegistrySource.unchecked_reason(), None);
     /// ```
     #[must_use]
@@ -1218,12 +1226,39 @@ impl SkipReason {
         match self {
             Self::NonRegistrySource => None,
             Self::NoConcreteVersion => Some("no resolved or exact version was available to query"),
+            Self::ResolvedTagNotFullVersion => {
+                Some("the resolved tag is not a full version, so it was not queried")
+            }
             Self::UnmappableName => {
                 Some("the package name could not be mapped to an OSV.dev ecosystem")
             }
             Self::UnmappableEcosystem => Some("this ecosystem is not supported by OSV.dev"),
             Self::QueryFailed => Some("the OSV.dev query failed"),
             Self::Truncated => Some("the OSV.dev result set was truncated"),
+        }
+    }
+
+    /// Whether this skip can be turned into a real scan by a registry fetch that populates an
+    /// ecosystem's `TagIndex` (a SHA pin's tag resolves only after that fetch lands).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::SkipReason;
+    ///
+    /// assert!(SkipReason::NoConcreteVersion.depends_on_tag_index());
+    /// assert!(SkipReason::ResolvedTagNotFullVersion.depends_on_tag_index());
+    /// assert!(!SkipReason::QueryFailed.depends_on_tag_index());
+    /// ```
+    #[must_use]
+    pub const fn depends_on_tag_index(self) -> bool {
+        match self {
+            Self::NoConcreteVersion | Self::ResolvedTagNotFullVersion => true,
+            Self::NonRegistrySource
+            | Self::UnmappableName
+            | Self::UnmappableEcosystem
+            | Self::QueryFailed
+            | Self::Truncated => false,
         }
     }
 
@@ -1330,6 +1365,10 @@ mod skip_reason_unchecked_reason_tests {
                 SkipReason::UnmappableEcosystem,
                 Some("this ecosystem is not supported by OSV.dev"),
             ),
+            (
+                SkipReason::ResolvedTagNotFullVersion,
+                Some("the resolved tag is not a full version, so it was not queried"),
+            ),
             (SkipReason::QueryFailed, Some("the OSV.dev query failed")),
             (
                 SkipReason::Truncated,
@@ -1352,6 +1391,7 @@ mod skip_reason_unchecked_reason_tests {
     fn unchecked_reason_never_promises_a_remedy() {
         for reason in [
             SkipReason::NoConcreteVersion,
+            SkipReason::ResolvedTagNotFullVersion,
             SkipReason::UnmappableName,
             SkipReason::UnmappableEcosystem,
             SkipReason::QueryFailed,
