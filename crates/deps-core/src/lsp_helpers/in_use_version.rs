@@ -94,8 +94,9 @@ enum BareRequirementPolicy {
 /// NuGet) gets plain [`BareRequirementPolicy::Concrete`]. Gradle in
 /// particular: a bare coordinate version (e.g. `"2.14.1"`) is an exact match
 /// under `GradleFormatter`'s own `version_satisfies_requirement` unless it
-/// uses the `+` dynamic-version suffix, which [`looks_like_a_single_version`]
-/// already rejects via its reject-char set.
+/// uses the `+` dynamic-version suffix, which `looks_like_a_single_version`
+/// rejects for every ecosystem whose `PlusSuffixMeaning` is `Dynamic`; Dart
+/// (`0.8.13+1`) is the exception, where `+N` is part of a concrete version.
 ///
 /// NuGet (#669) is the one member of this group that does *not* have "no
 /// implicit-range default" in the strict sense: a bare `Version="1.0.0"`
@@ -154,6 +155,48 @@ const fn bare_requirement_policy(ecosystem: EcosystemId) -> BareRequirementPolic
         | EcosystemId::Gradle
         | EcosystemId::Swift
         | EcosystemId::NuGet => BareRequirementPolicy::Concrete,
+    }
+}
+
+/// What a `+` inside a version string means under an ecosystem's own grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlusSuffixMeaning {
+    /// `+` marks a dynamic/range version (Gradle's `1.+`), never a concrete pin.
+    Dynamic,
+    /// `+` introduces a numeric build number that is part of a concrete version
+    /// (Dart's `0.8.13+1`): exactly one `+`, text before it, all-digit text after.
+    PartOfVersion,
+}
+
+impl PlusSuffixMeaning {
+    /// Whether every `+` in `s` is placed consistently with this meaning.
+    fn accepts(self, s: &str) -> bool {
+        match self {
+            Self::Dynamic => !s.contains('+'),
+            Self::PartOfVersion => s.split_once('+').is_none_or(|(head, build)| {
+                !head.is_empty() && !build.is_empty() && build.bytes().all(|b| b.is_ascii_digit())
+            }),
+        }
+    }
+}
+
+/// Exhaustive on purpose: a new ecosystem must state what `+` means for it.
+const fn plus_suffix_meaning(ecosystem: EcosystemId) -> PlusSuffixMeaning {
+    match ecosystem {
+        EcosystemId::Dart => PlusSuffixMeaning::PartOfVersion,
+        EcosystemId::Cargo
+        | EcosystemId::GithubActions
+        | EcosystemId::GitlabCi
+        | EcosystemId::Npm
+        | EcosystemId::Composer
+        | EcosystemId::Deno
+        | EcosystemId::Pypi
+        | EcosystemId::Go
+        | EcosystemId::Bundler
+        | EcosystemId::Maven
+        | EcosystemId::Gradle
+        | EcosystemId::Swift
+        | EcosystemId::NuGet => PlusSuffixMeaning::Dynamic,
     }
 }
 
@@ -220,13 +263,16 @@ fn is_dotted_numeric<const N: usize>(core: &str) -> bool {
 ///
 /// Deliberately conservative — see [`concrete_pin_version`]'s doc for why a
 /// false positive here is worse than a false negative.
-fn looks_like_a_single_version(s: &str) -> bool {
+fn looks_like_a_single_version(s: &str, ecosystem: EcosystemId) -> bool {
     if s.is_empty() {
         return false;
     }
     if s.contains([
-        '^', '~', '*', '<', '>', ',', '|', '(', ')', '[', ']', ' ', '\t', ':', '+', 'x', 'X',
+        '^', '~', '*', '<', '>', ',', '|', '(', ')', '[', ']', ' ', '\t', ':', 'x', 'X',
     ]) {
+        return false;
+    }
+    if !plus_suffix_meaning(ecosystem).accepts(s) {
         return false;
     }
     let core = crate::github::normalize_tag(s);
@@ -289,11 +335,11 @@ pub fn concrete_pin_version(requirement: &str, ecosystem: EcosystemId) -> Option
         .filter(|inner| !inner.contains(','));
 
     match pinned.or(bracket_pinned) {
-        Some(body) => looks_like_a_single_version(body).then_some(body),
+        Some(body) => looks_like_a_single_version(body, ecosystem).then_some(body),
         None => match bare_requirement_policy(ecosystem) {
             BareRequirementPolicy::AlwaysRange => None,
             BareRequirementPolicy::Concrete => {
-                looks_like_a_single_version(trimmed).then_some(trimmed)
+                looks_like_a_single_version(trimmed, ecosystem).then_some(trimmed)
             }
             BareRequirementPolicy::ConcreteIfFullVersion => {
                 is_full_semver_shape(trimmed).then_some(trimmed)
@@ -853,6 +899,50 @@ mod tests {
             EcosystemId::NuGet,
         ] {
             assert!(is_concrete_version("2.14.1", eco), "{eco:?}");
+        }
+    }
+
+    #[test]
+    fn is_concrete_version_dart_plus_build_number_is_a_pin() {
+        assert_eq!(
+            concrete_pin_version("0.8.13+1", EcosystemId::Dart),
+            Some("0.8.13+1")
+        );
+        assert_eq!(
+            concrete_pin_version("1.0.0-beta.2+3", EcosystemId::Dart),
+            Some("1.0.0-beta.2+3")
+        );
+    }
+
+    #[test]
+    fn is_concrete_version_dart_malformed_plus_is_rejected() {
+        for req in [
+            "1.+",
+            "4.+",
+            "1+",
+            "1.0.0+",
+            "1.0.0+1+2",
+            "1.0+local",
+            "1.2.3+build",
+        ] {
+            assert!(!is_concrete_version(req, EcosystemId::Dart), "{req}");
+        }
+    }
+
+    #[test]
+    fn is_concrete_version_dart_plus_ranges_stay_non_exact() {
+        for req in ["^0.8.13+1", ">=1.0.0+2", ">=1.0.0+2 <2.0.0", "any"] {
+            assert!(!is_concrete_version(req, EcosystemId::Dart), "{req}");
+        }
+    }
+
+    #[test]
+    fn is_concrete_version_plus_still_dynamic_for_gradle_and_others() {
+        for req in ["1.+", "4.+", "1.2.3+1"] {
+            assert!(!is_concrete_version(req, EcosystemId::Gradle), "{req}");
+        }
+        for &eco in EcosystemId::ALL.iter().filter(|&&e| e != EcosystemId::Dart) {
+            assert!(!is_concrete_version("==0.8.13+1", eco), "{eco:?}");
         }
     }
 
