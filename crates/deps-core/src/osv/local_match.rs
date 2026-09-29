@@ -147,6 +147,7 @@ pub(super) fn match_affected(affected: &[&OsvAffected], version: &LocalVersion) 
             .iter()
             .filter_map(|v| parse_bound(v))
             .any(|v| v == version.0)
+            && !cap_excludes(entry, last_known.as_ref(), version)
         {
             return Verdict::Affected;
         }
@@ -166,6 +167,51 @@ pub(super) fn match_affected(affected: &[&OsvAffected], version: &LocalVersion) 
     verdict
 }
 
+/// Whether the entry's `last_known_affected_version_range` cap rules out `version`, so an
+/// explicit `versions` hit above it is not affected. Applies only where the cap does for
+/// ranges: the entry has an open-ended range.
+fn cap_excludes(
+    entry: &OsvAffected,
+    last_known: Option<&LastKnownRange>,
+    version: &LocalVersion,
+) -> bool {
+    last_known.is_some_and(|cap| {
+        cap.verdict(version) == RangeVerdict::NotAffected
+            && entry
+                .ranges
+                .iter()
+                .any(|range| range_edges(range).is_some_and(|edges| is_open_ended(&edges)))
+    })
+}
+
+/// The range's sorted edges; `None` for a `GIT`/unknown range or an unparsable bound.
+fn range_edges(range: &OsvRange) -> Option<Vec<(Edge, Version)>> {
+    if !matches!(
+        range.range_type,
+        OsvRangeType::Semver | OsvRangeType::Ecosystem
+    ) {
+        return None;
+    }
+    let mut edges = Vec::with_capacity(range.events.len());
+    for event in &range.events {
+        match event_edge(event) {
+            Ok(Some(edge)) => edges.push(edge),
+            Ok(None) => {}
+            Err(UnparsableBound) => return None,
+        }
+    }
+    edges.sort_by(|a, b| a.1.cmp(&b.1));
+    Some(edges)
+}
+
+/// Every event is `introduced`: a mixed range's trailing `introduced` is not capped.
+fn is_open_ended(edges: &[(Edge, Version)]) -> bool {
+    !edges.is_empty()
+        && edges
+            .iter()
+            .all(|(edge, _)| matches!(edge, Edge::Introduced))
+}
+
 fn match_range(
     range: &OsvRange,
     version: &LocalVersion,
@@ -175,19 +221,10 @@ fn match_range(
         OsvRangeType::Git => RangeVerdict::Irrelevant,
         OsvRangeType::Unknown => RangeVerdict::Undeterminable,
         OsvRangeType::Semver | OsvRangeType::Ecosystem => {
-            let mut edges = Vec::with_capacity(range.events.len());
-            for event in &range.events {
-                match event_edge(event) {
-                    Ok(Some(edge)) => edges.push(edge),
-                    Ok(None) => {}
-                    Err(UnparsableBound) => return RangeVerdict::Undeterminable,
-                }
-            }
-            edges.sort_by(|a, b| a.1.cmp(&b.1));
-            // Every event must be `introduced`: a mixed range's trailing `introduced` is not capped.
-            let open_ended = edges
-                .iter()
-                .all(|(edge, _)| matches!(edge, Edge::Introduced));
+            let Some(edges) = range_edges(range) else {
+                return RangeVerdict::Undeterminable;
+            };
+            let open_ended = is_open_ended(&edges);
             let mut affected = false;
             for (edge, bound) in edges {
                 match edge {
@@ -442,6 +479,131 @@ mod tests {
                 "{clean}"
             );
         }
+    }
+
+    fn open_ended_with_versions(cap: &str, versions: serde_json::Value) -> serde_json::Value {
+        json!({
+            "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "1.0.0"}]}],
+            "versions": versions,
+            "database_specific": {"last_known_affected_version_range": cap}
+        })
+    }
+
+    #[test]
+    fn versions_hit_above_last_known_cap_is_not_affected() {
+        let entry = || open_ended_with_versions("< 2.0.0", json!(["1.5.0", "2.0.0", "3.1.0"]));
+        assert_eq!(verdict(entry(), "3.1.0"), Verdict::NotAffected);
+        assert_eq!(verdict(entry(), "2.0.0"), Verdict::NotAffected);
+    }
+
+    #[test]
+    fn versions_hit_below_last_known_cap_is_affected() {
+        let entry = || open_ended_with_versions("<= 2.0.0", json!(["1.5.0", "2.0.0"]));
+        assert_eq!(verdict(entry(), "1.5.0"), Verdict::Affected);
+        assert_eq!(verdict(entry(), "2.0.0"), Verdict::Affected);
+    }
+
+    #[test]
+    fn versions_hit_below_introduced_is_affected_only_through_the_versions_list() {
+        let entry = open_ended_with_versions("< 2.0.0", json!(["0.9.0"]));
+        assert_eq!(verdict(entry, "0.9.0"), Verdict::Affected);
+    }
+
+    #[test]
+    fn versions_hit_excluded_by_cap_falls_through_to_a_closed_range() {
+        let entry = |closed: (&str, &str)| {
+            json!({
+                "ranges": [
+                    {"type": "ECOSYSTEM", "events": [{"introduced": closed.0}, {"fixed": closed.1}]},
+                    {"type": "ECOSYSTEM", "events": [{"introduced": "1.0.0"}]}
+                ],
+                "versions": ["3.1.0"],
+                "database_specific": {"last_known_affected_version_range": "< 2.0.0"}
+            })
+        };
+        assert_eq!(
+            verdict(entry(("3.0.0", "3.5.0")), "3.1.0"),
+            Verdict::Affected
+        );
+        assert_eq!(
+            verdict(entry(("4.0.0", "4.5.0")), "3.1.0"),
+            Verdict::NotAffected
+        );
+    }
+
+    #[test]
+    fn versions_hit_excluded_in_one_entry_is_decided_by_the_next_entry() {
+        let capped = || open_ended_with_versions("< 2.0.0", json!(["3.1.0"]));
+        let covering = semver_range(json!([{"introduced": "3.0.0"}, {"fixed": "3.5.0"}]));
+        let elsewhere = semver_range(json!([{"introduced": "4.0.0"}, {"fixed": "5.0.0"}]));
+        assert_eq!(
+            verdict_for(&[capped(), covering], "3.1.0"),
+            Verdict::Affected
+        );
+        assert_eq!(
+            verdict_for(&[capped(), elsewhere], "3.1.0"),
+            Verdict::NotAffected
+        );
+    }
+
+    #[test]
+    fn versions_hit_with_git_range_is_not_capped() {
+        let entry = json!({
+            "ranges": [{"type": "GIT", "events": [{"introduced": "0"}]}],
+            "versions": ["3.1.0"],
+            "database_specific": {"last_known_affected_version_range": "< 2.0.0"}
+        });
+        assert_eq!(verdict(entry, "3.1.0"), Verdict::Affected);
+    }
+
+    #[test]
+    fn versions_hit_with_unparsable_range_bound_is_not_capped() {
+        let entry = json!({
+            "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "abc"}]}],
+            "versions": ["3.1.0"],
+            "database_specific": {"last_known_affected_version_range": "< 2.0.0"}
+        });
+        assert_eq!(verdict(entry, "3.1.0"), Verdict::Affected);
+    }
+
+    #[test]
+    fn versions_hit_above_cap_written_in_other_forms_is_not_affected() {
+        for cap in ["<= 2.0.0", "< v2.0.0", "< 2.0"] {
+            let entry = open_ended_with_versions(cap, json!(["3.1.0"]));
+            assert_eq!(verdict(entry, "3.1.0"), Verdict::NotAffected, "{cap}");
+        }
+    }
+
+    #[test]
+    fn open_ended_range_above_cap_outside_versions_is_not_affected() {
+        let entry = open_ended_with_versions("< 2.0.0", json!(["1.5.0"]));
+        assert_eq!(verdict(entry, "3.1.0"), Verdict::NotAffected);
+    }
+
+    #[test]
+    fn versions_hit_without_cap_or_open_ended_range_is_unchanged() {
+        let no_cap = json!({
+            "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "1.0.0"}]}],
+            "versions": ["3.1.0"]
+        });
+        assert_eq!(verdict(no_cap, "3.1.0"), Verdict::Affected);
+        let closed = json!({
+            "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "1.0.0"}, {"fixed": "1.5.0"}]}],
+            "versions": ["3.1.0"],
+            "database_specific": {"last_known_affected_version_range": "< 2.0.0"}
+        });
+        assert_eq!(verdict(closed, "3.1.0"), Verdict::Affected);
+        let versions_only = json!({
+            "versions": ["3.1.0"],
+            "database_specific": {"last_known_affected_version_range": "< 2.0.0"}
+        });
+        assert_eq!(verdict(versions_only, "3.1.0"), Verdict::Affected);
+    }
+
+    #[test]
+    fn versions_hit_with_unparsable_cap_stays_affected() {
+        let entry = open_ended_with_versions("garbage", json!(["3.1.0"]));
+        assert_eq!(verdict(entry, "3.1.0"), Verdict::Affected);
     }
 
     #[test]
