@@ -13,6 +13,7 @@ use deps_core::lsp_helpers::{
     RequirementMatcher, RequirementResolution, SourcePolicy, up_to_date_via_compiled_matcher,
     warn_rejected_value,
 };
+use deps_core::osv::OsvPackageName;
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 
 /// Conservative cap on a `jsr:` scope/package-name segment's length (S-L1). JSR's own
@@ -200,9 +201,9 @@ impl OsvNaming for DenoFormatter {
     /// `POST api.osv.dev/v1/query` with `{"ecosystem":"JSR"}` returns `code 3, invalid
     /// ecosystem`) — which cleanly skips them from the scan rather than risking a
     /// cross-registry name collision.
-    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<String> {
+    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<OsvPackageName> {
         match split_scheme(dep.name().as_str()) {
-            Some((Scheme::Npm, rest)) => Some(rest.to_string()),
+            Some((Scheme::Npm, rest)) => Some(OsvPackageName::new(rest)),
             _ => None,
         }
     }
@@ -484,7 +485,7 @@ mod tests {
         let npm_dep = FakeDep(PackageName::new("npm:react"));
         assert_eq!(
             formatter.osv_package_name(&npm_dep),
-            Some("react".to_string())
+            Some(OsvPackageName::new("react"))
         );
 
         let jsr_dep = FakeDep(PackageName::new("jsr:@std/fs"));

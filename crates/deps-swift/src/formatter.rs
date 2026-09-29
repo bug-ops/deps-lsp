@@ -11,6 +11,7 @@ use deps_core::lsp_helpers::{
     RequirementMatcher, RequirementResolution, SourcePolicy, compile_semver_requirement,
     requirement_contains_template_placeholder, warn_rejected_value,
 };
+use deps_core::osv::OsvPackageName;
 
 use crate::types::SwiftDependency;
 
@@ -216,12 +217,12 @@ impl OsvNaming for SwiftFormatter {
     /// cannot distinguish a GitHub coordinate from a same-shaped GitLab/self-hosted
     /// one — attributing a GitHub project's advisories to an unrelated
     /// same-named repo elsewhere would be a false positive, not just a miss.
-    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<String> {
+    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<OsvPackageName> {
         let swift_dep = dep.as_any().downcast_ref::<SwiftDependency>()?;
         let host = reqwest::Url::parse(&swift_dep.url).ok()?;
         host.host_str()
             .is_some_and(crate::is_github_host)
-            .then(|| format!("github.com/{}", dep.name().as_str()))
+            .then(|| OsvPackageName::new(format!("github.com/{}", dep.name().as_str())))
     }
 }
 
@@ -454,7 +455,7 @@ mod tests {
         let dep = dep_with_url("apple/swift-nio", "https://github.com/apple/swift-nio.git");
         assert_eq!(
             fmt.osv_package_name(&dep),
-            Some("github.com/apple/swift-nio".to_string())
+            Some(OsvPackageName::new("github.com/apple/swift-nio"))
         );
     }
 
@@ -467,7 +468,7 @@ mod tests {
         );
         assert_eq!(
             fmt.osv_package_name(&dep),
-            Some("github.com/apple/swift-nio".to_string())
+            Some(OsvPackageName::new("github.com/apple/swift-nio"))
         );
     }
 
@@ -501,7 +502,7 @@ mod tests {
         let dep = dep_with_url("Apple/Swift-NIO", "https://github.com/Apple/Swift-NIO.git");
         assert_eq!(
             fmt.osv_package_name(&dep),
-            Some("github.com/Apple/Swift-NIO".to_string())
+            Some(OsvPackageName::new("github.com/Apple/Swift-NIO"))
         );
         assert_eq!(
             fmt.normalize_package_name(&dep.name),

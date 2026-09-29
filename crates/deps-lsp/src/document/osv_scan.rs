@@ -53,7 +53,7 @@ pub(crate) struct OsvScanResult {
     resolved_generation: ResolvedGeneration,
     vulnerabilities: deps_core::osv::VulnerabilityMap,
     /// `key -> osv_name`, needed to build phase B candidates.
-    osv_name_by_key: HashMap<deps_core::osv::VulnKey, String>,
+    osv_name_by_key: HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvPackageName>,
 }
 
 /// Phase A: builds scan targets, runs [`deps_core::osv::OsvClient::scan`], and
@@ -97,7 +97,7 @@ pub(crate) async fn run_osv_scan_phase_a(
         return None;
     }
 
-    let osv_name_by_key: HashMap<deps_core::osv::VulnKey, String> =
+    let osv_name_by_key: HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvPackageName> =
         deps_engine::classify::osv::osv_name_by_key(&targets);
 
     if !targets.is_empty() {
@@ -654,7 +654,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
 async fn run_osv_fix_target_verification(
     vulnerabilities: &mut deps_core::osv::VulnerabilityMap,
     vulnerable_keys: &[deps_core::osv::VulnKey],
-    osv_name_by_key: &HashMap<deps_core::osv::VulnKey, String>,
+    osv_name_by_key: &HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvPackageName>,
     latest_status: &deps_core::osv::LatestStatusMap,
     ecosystem_id: EcosystemId,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,

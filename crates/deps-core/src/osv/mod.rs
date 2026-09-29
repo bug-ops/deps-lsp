@@ -27,13 +27,11 @@ pub use severity::to_diagnostic_severity as diagnostic_severity_for;
 use types::worst_severity;
 pub use types::{
     Advisory, CandidateStatusMap, CandidateStatuses, Capped, DependencyVulnerabilities,
-    FixRecommendation, LatestStatusMap, OsvEcosystem, OsvVersion, ScanOutcome, ScanTarget,
-    SkipReason, StructuralSkipReason, UpgradeStatus, VulnKey, VulnKeys, VulnSeverity,
+    FixRecommendation, LatestStatusMap, OsvEcosystem, OsvPackageName, OsvVersion, ScanOutcome,
+    ScanTarget, SkipReason, StructuralSkipReason, UpgradeStatus, VulnKey, VulnKeys, VulnSeverity,
     VulnerabilityMap, is_valid_osv_id, validated_osv_url, vuln_key_for, vulnerability_keys,
 };
-use types::{
-    OsvBatchRequest, OsvBatchResponse, OsvPackage, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord,
-};
+use types::{OsvBatchRequest, OsvBatchResponse, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord};
 
 use crate::cache::HttpCache;
 
@@ -206,7 +204,7 @@ impl InFlightRecord {
 /// every open document's scan benefits from the same query/record cache.
 pub struct OsvClient {
     cache: Arc<HttpCache>,
-    query_cache: DashMap<(OsvEcosystem, String, OsvVersion), QueryCacheEntry>,
+    query_cache: DashMap<(OsvEcosystem, OsvPackageName, OsvVersion), QueryCacheEntry>,
     record_cache: DashMap<String, RecordCacheEntry>,
     /// Client-wide bound (permits = [`RECORD_FETCH_CONCURRENCY`]) on concurrent
     /// `/v1/vulns/{id}`/`/v1/query` requests — see [`RECORD_FETCH_CONCURRENCY`]'s doc for why
@@ -517,16 +515,7 @@ impl OsvClient {
             tracing::field::display(crate::redact::RedactedUrl::new(&url)),
         );
 
-        let queries: Vec<OsvQuery> = chunk
-            .iter()
-            .map(|t| OsvQuery {
-                package: OsvPackage {
-                    name: t.osv_name.clone(),
-                    ecosystem: osv_eco.as_str().to_owned(),
-                },
-                version: t.version.clone().into_string(),
-            })
-            .collect();
+        let queries: Vec<OsvQuery> = chunk.iter().map(|t| OsvQuery::new(t, osv_eco)).collect();
 
         let body = OsvBatchRequest { queries };
         let response_bytes = match self.cache.post_json(&url, &body).await {
@@ -703,7 +692,7 @@ impl OsvClient {
     async fn build_outcome(
         &self,
         osv_eco: OsvEcosystem,
-        osv_name: &str,
+        osv_name: &OsvPackageName,
         vuln_ids: &[(String, String)],
         deadline: Instant,
     ) -> ScanOutcome {
@@ -735,7 +724,7 @@ impl OsvClient {
     async fn fetch_records(
         &self,
         osv_eco: OsvEcosystem,
-        osv_name: &str,
+        osv_name: &OsvPackageName,
         ids: &[(String, String)],
         deadline: Instant,
     ) -> Vec<Arc<Advisory>> {
@@ -904,13 +893,7 @@ impl OsvClient {
             tracing::field::display(crate::redact::RedactedUrl::new(&url)),
         );
 
-        let body = OsvQuery {
-            package: OsvPackage {
-                name: target.osv_name.clone(),
-                ecosystem: osv_eco.as_str().to_owned(),
-            },
-            version: target.version.clone().into_string(),
-        };
+        let body = OsvQuery::new(target, osv_eco);
 
         let bytes = match self.cache.post_json(&url, &body).await {
             Ok(b) => b,
@@ -1016,6 +999,19 @@ fn log_scan_summary(outcomes: &VulnerabilityMap) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn osv_query_wire_json_carries_plain_package_name() {
+        let t = ScanTarget::new(
+            crate::test_util::vuln_key("apple/swift-nio"),
+            OsvPackageName::new("github.com/apple/swift-nio"),
+            OsvVersion::new("2.0.0"),
+            ConcreteVersion::new("2.0.0"),
+        );
+        let json = serde_json::to_value(OsvQuery::new(&t, OsvEcosystem::SwiftURL)).unwrap();
+        assert_eq!(json["package"]["name"], "github.com/apple/swift-nio");
+        assert_eq!(json["version"], "2.0.0");
+    }
+
     use super::*;
     use crate::{ConcreteVersion, EcosystemId};
     use std::assert_matches;
@@ -1036,7 +1032,7 @@ mod tests {
     fn target(name: &str, version: &str) -> ScanTarget {
         ScanTarget {
             key: crate::test_util::vuln_key(name),
-            osv_name: name.to_string(),
+            osv_name: OsvPackageName::new(name),
             version: OsvVersion::new(version),
             display_version: ConcreteVersion::new(version),
         }
@@ -2123,7 +2119,7 @@ mod tests {
 
         let candidate = ScanTarget {
             key: crate::test_util::vuln_key("golang.org/x/text"),
-            osv_name: "golang.org/x/text".to_string(),
+            osv_name: OsvPackageName::new("golang.org/x/text"),
             version: OsvVersion::new("0.4.0"),
             display_version: ConcreteVersion::new("v0.4.0"),
         };

@@ -241,7 +241,7 @@ impl RequirementResolution for NuGetFormatter {
     /// outright first, before the undecidable-predicate dispatch below — unlike the bracketed
     /// `[$(Min),$(Max))` form, it has no nested-bracket shape for `parse_range` to trip on
     /// (see [`Self::requirement_is_unresolved`]'s doc), so without this explicit check it
-    /// would parse as an ordinary `VersionRange::Minimum` floor and this method would
+    /// would parse as an ordinary lower-bound-only floor and this method would
     /// decisively (and wrongly) report every version as satisfying it. Not a fix for a
     /// reproducible defect, though: `crate::parser` already degrades this input to
     /// `version_requirement: None` before it ever reaches a `VersionReq` this method is called
@@ -595,10 +595,10 @@ mod tests {
         let f = NuGetFormatter;
         assert_eq!(
             f.osv_package_name(&dep),
-            Some("Newtonsoft.Json".to_string())
+            Some(deps_core::osv::OsvPackageName::new("Newtonsoft.Json"))
         );
         assert_ne!(
-            f.osv_package_name(&dep).unwrap(),
+            f.osv_package_name(&dep).unwrap().as_str(),
             f.normalize_package_name(&dep.name)
         );
     }
@@ -697,7 +697,7 @@ mod tests {
     }
 
     /// A bare `$(SomeProperty)` reference previously parsed as an ordinary
-    /// `VersionRange::Minimum` floor (no bracket for `parse_range`'s nested-bracket guard to
+    /// lower-bound-only floor (no bracket for `parse_range`'s nested-bracket guard to
     /// trip on), so `compile_requirement` would decisively (and wrongly) report every
     /// candidate as satisfying it. See [`NuGetFormatter::compile_requirement`]'s doc for why
     /// this is defense-in-depth rather than a fix for a live code path: were this text ever to

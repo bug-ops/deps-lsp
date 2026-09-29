@@ -186,7 +186,7 @@ enum DepCheckClassification<'a> {
     /// registry-cached version list.
     Target {
         /// `formatter.osv_package_name(dep)`'s resolved value.
-        osv_name: String,
+        osv_name: deps_core::osv::OsvPackageName,
         /// This dependency's registry-cached version list.
         cached: &'a deps_core::lsp_helpers::PackageVersions,
     },
@@ -486,7 +486,7 @@ fn resolve_fix_target(
     dv: &deps_core::osv::DependencyVulnerabilities,
     key: &deps_core::osv::VulnKey,
     latest_status: &deps_core::osv::LatestStatusMap,
-    osv_name_by_key: &HashMap<deps_core::osv::VulnKey, String>,
+    osv_name_by_key: &HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvPackageName>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> FixTargetResolution {
     use deps_core::edit::{VulnFixSkip, resolve_recommended_fix};
@@ -641,7 +641,7 @@ fn resolve_fix_target(
 pub fn collect_fix_target_resolutions(
     vulnerabilities: &deps_core::osv::VulnerabilityMap,
     vulnerable_keys: &[deps_core::osv::VulnKey],
-    osv_name_by_key: &HashMap<deps_core::osv::VulnKey, String>,
+    osv_name_by_key: &HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvPackageName>,
     latest_status: &deps_core::osv::LatestStatusMap,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> (
@@ -747,23 +747,23 @@ pub fn apply_live_fix_target_statuses(
 ///
 /// ```
 /// use deps_core::ConcreteVersion;
-/// use deps_core::osv::{OsvVersion, ScanTarget};
+/// use deps_core::osv::{OsvPackageName, OsvVersion, ScanTarget};
 /// use deps_core::test_util::vuln_key;
 /// use deps_engine::classify::osv::osv_name_by_key;
 ///
 /// let targets = vec![ScanTarget::new(
 ///     vuln_key("serde"),
-///     "serde".to_string(),
+///     OsvPackageName::new("serde"),
 ///     OsvVersion::new("1.0.0"),
 ///     ConcreteVersion::new("1.0.0"),
 /// )];
 /// let map = osv_name_by_key(&targets);
-/// assert_eq!(map.get(&vuln_key("serde")).map(String::as_str), Some("serde"));
+/// assert_eq!(map.get(&vuln_key("serde")), Some(&OsvPackageName::new("serde")));
 /// ```
 #[must_use]
 pub fn osv_name_by_key(
     targets: &[deps_core::osv::ScanTarget],
-) -> HashMap<deps_core::osv::VulnKey, String> {
+) -> HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvPackageName> {
     targets
         .iter()
         .map(|t| (t.key.clone(), t.osv_name.clone()))
@@ -1665,7 +1665,10 @@ mod tests {
         impl DiagnosticPolicy for UnmappableNameFormatter {}
         impl SourcePolicy for UnmappableNameFormatter {}
         impl OsvNaming for UnmappableNameFormatter {
-            fn osv_package_name(&self, _dep: &dyn Dependency) -> Option<String> {
+            fn osv_package_name(
+                &self,
+                _dep: &dyn Dependency,
+            ) -> Option<deps_core::osv::OsvPackageName> {
                 None
             }
         }
@@ -2050,7 +2053,10 @@ mod tests {
                 version: ConcreteVersion::new("3.0.0"),
             });
             let mut osv_name_by_key = HashMap::new();
-            osv_name_by_key.insert(deps_core::test_util::vuln_key("pkg"), "pkg".to_string());
+            osv_name_by_key.insert(
+                deps_core::test_util::vuln_key("pkg"),
+                deps_core::osv::OsvPackageName::new("pkg"),
+            );
 
             let resolution = resolve_fix_target(
                 &dv,
@@ -2063,7 +2069,7 @@ mod tests {
                 resolution,
                 FixTargetResolution::NeedsLiveCheck(deps_core::osv::ScanTarget::new(
                     deps_core::test_util::vuln_key("pkg"),
-                    "pkg".to_string(),
+                    deps_core::osv::OsvPackageName::new("pkg"),
                     OsvVersion::new("1.2.0"),
                     ConcreteVersion::new("1.2.0"),
                 ))
@@ -2082,7 +2088,10 @@ mod tests {
                 reason: deps_core::osv::SkipReason::QueryFailed,
             });
             let mut osv_name_by_key = HashMap::new();
-            osv_name_by_key.insert(deps_core::test_util::vuln_key("pkg"), "pkg".to_string());
+            osv_name_by_key.insert(
+                deps_core::test_util::vuln_key("pkg"),
+                deps_core::osv::OsvPackageName::new("pkg"),
+            );
 
             let resolution = resolve_fix_target(
                 &dv,
@@ -2095,7 +2104,7 @@ mod tests {
                 resolution,
                 FixTargetResolution::NeedsLiveCheck(deps_core::osv::ScanTarget::new(
                     deps_core::test_util::vuln_key("pkg"),
-                    "pkg".to_string(),
+                    deps_core::osv::OsvPackageName::new("pkg"),
                     OsvVersion::new("1.2.0"),
                     ConcreteVersion::new("1.2.0"),
                 ))
@@ -2184,15 +2193,15 @@ mod tests {
             let mut osv_name_by_key = HashMap::new();
             osv_name_by_key.insert(
                 deps_core::test_util::vuln_key("reused"),
-                "reused".to_string(),
+                deps_core::osv::OsvPackageName::new("reused"),
             );
             osv_name_by_key.insert(
                 deps_core::test_util::vuln_key("live-a"),
-                "live-a".to_string(),
+                deps_core::osv::OsvPackageName::new("live-a"),
             );
             osv_name_by_key.insert(
                 deps_core::test_util::vuln_key("live-b"),
-                "live-b".to_string(),
+                deps_core::osv::OsvPackageName::new("live-b"),
             );
 
             let (resolved, live_check_candidates) = collect_fix_target_resolutions(
