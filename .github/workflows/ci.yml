@@ -138,7 +138,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-hack
 
@@ -228,7 +228,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cargo-hack and cargo-nextest
-        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-hack, cargo-nextest
 
@@ -301,7 +301,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cargo-hack and cargo-nextest
-        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-hack, cargo-nextest
 
@@ -324,7 +324,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cargo-machete
-        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-machete
 
@@ -693,7 +693,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@5724fe4561a201b0d36bddf13177e3557b43787b  # cargo-deny
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22  # cargo-deny
 
       - name: Run cargo-deny
         run: cargo deny check
@@ -907,7 +907,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: taiki-e/install-action@ef6302df50adb496d123b03ae2b53322d688ffa1  # nextest
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22  # nextest
 
       - name: Run tests
         run: cargo nextest run --workspace --all-features --no-fail-fast --profile ci
@@ -956,7 +956,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: taiki-e/install-action@ef6302df50adb496d123b03ae2b53322d688ffa1  # nextest
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22  # nextest
 
       - name: Run deps-core tests
         run: cargo nextest run -p deps-core --all-features --no-fail-fast --profile ci
@@ -1008,7 +1008,7 @@ jobs:
 
       - name: Install cross
         if: matrix.use_cross_tool
-        uses: taiki-e/install-action@a82845735191974ac374fc0472388c6df0a158ca  # cross
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22  # cross
 
       # i686-unknown-linux-gnu builds natively on this x86_64 runner via glibc
       # multilib support instead of `cross`/Docker (see the matrix comment above).
@@ -1021,7 +1021,7 @@ jobs:
 
       - name: Install nextest
         if: matrix.run_tests && matrix.native_multilib
-        uses: taiki-e/install-action@ef6302df50adb496d123b03ae2b53322d688ffa1  # nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22  # nextest
 
       # `cross`'s `pre-build` steps for the musl targets (.github/Cross.toml) run `apt-get
       # update && apt-get install cmake` inside a fresh Docker image build on every
@@ -1114,7 +1114,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-nextest, cargo-llvm-cov
 
