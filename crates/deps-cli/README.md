@@ -131,7 +131,7 @@ To drive the `check` pipeline programmatically:
 
 ```toml
 [dependencies]
-deps-cli = "1.3"
+deps-cli = "2.0"
 ```
 
 > [!IMPORTANT]
@@ -268,7 +268,7 @@ a Docker-based action. It writes a SARIF file but does not upload it — wire
 tag rather than `@main` — see the action's own README for why:
 
 ```yaml
-- uses: bug-ops/deps-lsp/crates/github-action@v1.3.0
+- uses: bug-ops/deps-lsp/crates/github-action@v2.0.0
   id: deps-check
   with:
     fail-on: vulnerable,yanked,unsatisfiable

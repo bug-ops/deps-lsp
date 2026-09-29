@@ -29,7 +29,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-composer = "1.3"
+deps-composer = "2.0"
 ```
 
 > [!IMPORTANT]

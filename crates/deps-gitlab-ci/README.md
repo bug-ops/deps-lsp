@@ -44,7 +44,7 @@ provides parsing and registry integration for `.gitlab-ci.yml` and `.gitlab/ci/*
 
 ```toml
 [dependencies]
-deps-gitlab-ci = "1.3"
+deps-gitlab-ci = "2.0"
 ```
 
 > [!IMPORTANT]

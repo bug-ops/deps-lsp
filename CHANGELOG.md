@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.3.0] - 2026-09-29
+## [2.0.0] - 2026-09-29
 
 ### Breaking
 - **deps-core**: `paginate_tags`/`paginate_pages` return `Paginated<T>` (with `ListCoverage`); `ResolvedPin` variants carry `SiblingTags`; `ScanTarget`/`DependencyVulnerabilities` gain sibling-tag fields (#1731, #1737)
@@ -1296,8 +1296,8 @@ CI catch-net once B3 actually lands) is in effect.
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v1.3.0...HEAD
-[1.3.0]: https://github.com/bug-ops/deps-lsp/compare/v1.2.0...v1.3.0
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/bug-ops/deps-lsp/compare/v1.2.0...v2.0.0
 [1.2.0]: https://github.com/bug-ops/deps-lsp/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/bug-ops/deps-lsp/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/bug-ops/deps-lsp/compare/v1.0.0...v1.0.1
