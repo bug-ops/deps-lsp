@@ -310,6 +310,7 @@ pub fn build_latest_check_targets(
 
     let mut targets = Vec::new();
     let mut structural = deps_core::osv::LatestStatusMap::new();
+    let mut seen = std::collections::HashSet::new();
 
     for dep in parse_result.dependencies() {
         let key = vuln_key_for(dep, Some(vuln_keys), formatter);
@@ -333,6 +334,10 @@ pub fn build_latest_check_targets(
                 );
             }
             DepCheckClassification::Target { osv_name, cached } => {
+                // Occurrences sharing a key share one result (see `build_scan_targets`).
+                if !seen.insert(key.clone()) {
+                    continue;
+                }
                 targets.push(deps_core::osv::ScanTarget::from_native(
                     key,
                     osv_name,
@@ -394,6 +399,7 @@ pub fn build_candidate_check_targets(
     let mut rounds: Vec<Vec<deps_core::osv::ScanTarget>> =
         vec![Vec::new(); MAX_CANDIDATE_CHECK_VERSIONS];
     let mut structural = deps_core::osv::CandidateStatusMap::new();
+    let mut seen = std::collections::HashSet::new();
 
     for dep in parse_result.dependencies() {
         let key = vuln_key_for(dep, Some(vuln_keys), formatter);
@@ -419,6 +425,10 @@ pub fn build_candidate_check_targets(
                 }
                 DepCheckClassification::Target { osv_name, cached } => (osv_name, cached),
             };
+
+        if !seen.insert(key.clone()) {
+            continue;
+        }
 
         let yanked: std::collections::HashSet<&ConcreteVersion> = package_versions
             .yanked
@@ -1764,6 +1774,148 @@ mod tests {
                     StructuralSkipReason::UnmappableName
                 ))
             );
+        }
+
+        fn duplicated_registry_dep() -> MockParseResult {
+            MockParseResult {
+                deps: vec![
+                    MockDep {
+                        name: PackageName::new("lodash"),
+                        source: DependencySource::Registry,
+                    },
+                    MockDep {
+                        name: PackageName::new("lodash"),
+                        source: DependencySource::Registry,
+                    },
+                ],
+            }
+        }
+
+        #[test]
+        fn build_latest_check_targets_dedups_duplicate_key_occurrences() {
+            let parse_result = duplicated_registry_dep();
+            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::new("lodash"),
+                PackageVersions::latest_only("4.17.21"),
+            );
+
+            let (targets, structural) = build_latest_check_targets(
+                &parse_result,
+                &cached_versions,
+                &vuln_keys,
+                &StubFormatter::DEFAULT,
+            );
+
+            assert_eq!(
+                targets.len(),
+                1,
+                "two same-key occurrences are checked once"
+            );
+            assert!(structural.is_empty());
+        }
+
+        #[test]
+        fn build_candidate_check_targets_dedups_duplicate_key_occurrences() {
+            let parse_result = duplicated_registry_dep();
+            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let mut cached_versions = HashMap::new();
+            let available: Arc<[ConcreteVersion]> = Arc::from(vec![
+                ConcreteVersion::new("2.0.0"),
+                ConcreteVersion::new("1.0.0"),
+            ]);
+            cached_versions.insert(
+                PackageName::new("lodash"),
+                PackageVersions::new(ConcreteVersion::new("2.0.0"), available),
+            );
+
+            let (rounds, _) = build_candidate_check_targets(
+                &parse_result,
+                &cached_versions,
+                &vuln_keys,
+                &StubFormatter::DEFAULT,
+            );
+
+            assert_eq!(rounds[0].len(), 1);
+            assert_eq!(rounds[1].len(), 1);
+        }
+
+        fn dup_other_dup() -> MockParseResult {
+            let dep = |name: &str| MockDep {
+                name: PackageName::new(name),
+                source: DependencySource::Registry,
+            };
+            MockParseResult {
+                deps: vec![dep("dup"), dep("other"), dep("dup")],
+            }
+        }
+
+        #[test]
+        fn build_latest_check_targets_keeps_first_occurrence_order() {
+            let parse_result = dup_other_dup();
+            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::new("dup"),
+                PackageVersions::latest_only("2.0.0"),
+            );
+            cached_versions.insert(
+                PackageName::new("other"),
+                PackageVersions::latest_only("3.0.0"),
+            );
+
+            let (targets, _) = build_latest_check_targets(
+                &parse_result,
+                &cached_versions,
+                &vuln_keys,
+                &StubFormatter::DEFAULT,
+            );
+
+            let keys: Vec<_> = targets.iter().map(|t| t.key.clone()).collect();
+            assert_eq!(
+                keys,
+                [
+                    deps_core::test_util::vuln_key("dup"),
+                    deps_core::test_util::vuln_key("other")
+                ]
+            );
+            assert_eq!(targets[0].display_version, "2.0.0");
+            assert_eq!(targets[1].display_version, "3.0.0");
+        }
+
+        #[test]
+        fn build_candidate_check_targets_keeps_first_occurrence_order() {
+            let parse_result = dup_other_dup();
+            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let mut cached_versions = HashMap::new();
+            for (name, newest) in [("dup", "2.0.0"), ("other", "3.0.0")] {
+                let available: Arc<[ConcreteVersion]> =
+                    Arc::from(vec![ConcreteVersion::new(newest)]);
+                cached_versions.insert(
+                    PackageName::new(name),
+                    PackageVersions::new(ConcreteVersion::new(newest), available),
+                );
+            }
+
+            let (rounds, _) = build_candidate_check_targets(
+                &parse_result,
+                &cached_versions,
+                &vuln_keys,
+                &StubFormatter::DEFAULT,
+            );
+
+            let keys: Vec<_> = rounds[0].iter().map(|t| t.key.clone()).collect();
+            assert_eq!(
+                keys,
+                [
+                    deps_core::test_util::vuln_key("dup"),
+                    deps_core::test_util::vuln_key("other")
+                ]
+            );
+            assert_eq!(rounds[0][0].display_version, "2.0.0");
+            assert_eq!(rounds[0][1].display_version, "3.0.0");
+            assert!(rounds[1..].iter().all(Vec::is_empty));
         }
 
         #[test]
