@@ -88,6 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle, deps-nuget, deps-swift, deps-bundler, deps-github-actions**: `requirement_is_placeholder` now also composes the shared `requirement_contains_template_placeholder` detector (previously native-syntax-only), so `{{ VAR }}`/`@VAR@`/`%VAR%`/`${VAR}`/`<%= VAR %>` external-templating placeholders are no longer destructively rewritten to a literal version by `deps-cli update` or vulnerability-fix code actions in these five ecosystems (resolves #1390) (#1393)
 
 ### Fixed
+- **deps-swift**: `Package.swift` `.package(...)` calls with a trailing comma after the last argument are no longer skipped; all URL/path regexes now share one builder (resolves #1673) (#PR)
+- **deps-swift**: labelled `exact:`, `branch:`, `revision:` requirements and the legacy `name:` label before `url:`/`path:` are now parsed; branch/revision stay non-version-pinned Git deps (resolves #1672) (#PR)
 - **deps-github-actions, deps-gitlab-ci**: `is_requirement_up_to_date` no longer reports an oversized requirement as outdated; it is treated as up to date, consistent with `Unresolved` (#1664)
 - **deps-npm, deps-deno, deps-core, deps-composer**: comparator, `||`, hyphen, and wildcard tilde/equals npm requirements are no longer reported outdated when `latest` satisfies them, and compound `^` requirements no longer hit the single-caret shortcut (#1656) (#1659)
 - **deps-core, deps-engine**: repeated dependencies with the same in-use signature no longer get a false "OSV.dev query failed" hint (resolves #1655) (#1658)

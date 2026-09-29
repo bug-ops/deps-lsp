@@ -36,83 +36,77 @@ deps_core::impl_parse_result!(
     }
 );
 
-// (?s) DOTALL handles multiline .package() calls.
+/// Optional legacy `name:` label preceding the `url:`/`path:` argument.
+const LEGACY_LABEL: &str = r#"(?:name\s*:\s*"[^"]*"\s*,\s*)?"#;
 
+/// Closes a `.package(...)` call, tolerating a trailing comma after the last argument (#1673).
+const CALL_END: &str = r"\s*,?\s*\)";
+
+/// Compiles a `.package(url: "<capture 1>", <requirement>)` pattern.
+///
+/// Every URL-form regex is built here so the legacy-label prefix and the trailing-comma
+/// tolerance are defined once; `requirement` is the pattern between the URL and the closing
+/// parenthesis and must end without its own `\s*,?\s*\)`.
 // Compile-time-constant patterns; a malformed literal is a build-visible programmer error,
 // not attacker-influenceable input.
 #[allow(clippy::expect_used)]
-static RE_URL_FROM: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*from\s*:\s*"([^"]+)"\s*\)"#)
-        .expect("RE_URL_FROM")
-});
+fn url_package_regex(requirement: &str) -> Regex {
+    Regex::new(&format!(
+        r#"(?s)\.package\s*\(\s*{LEGACY_LABEL}url\s*:\s*"([^"]+)"\s*,\s*{requirement}{CALL_END}"#
+    ))
+    .expect("url package regex")
+}
 
-// Same guarantee as RE_URL_FROM above.
-#[allow(clippy::expect_used)]
+// `from: "x"`.
+static RE_URL_FROM: LazyLock<Regex> =
+    LazyLock::new(|| url_package_regex(r#"from\s*:\s*"([^"]+)""#));
+
 static RE_URL_UP_TO_NEXT_MAJOR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*\.upToNextMajor\s*\(\s*from\s*:\s*"([^"]+)"\s*\)\s*\)"#,
-    )
-    .expect("RE_URL_UP_TO_NEXT_MAJOR")
+    url_package_regex(&format!(
+        r#"\.upToNextMajor\s*\(\s*from\s*:\s*"([^"]+)"{CALL_END}"#
+    ))
 });
 
-// Same guarantee as RE_URL_FROM above.
-#[allow(clippy::expect_used)]
 static RE_URL_UP_TO_NEXT_MINOR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*\.upToNextMinor\s*\(\s*from\s*:\s*"([^"]+)"\s*\)\s*\)"#,
-    )
-    .expect("RE_URL_UP_TO_NEXT_MINOR")
+    url_package_regex(&format!(
+        r#"\.upToNextMinor\s*\(\s*from\s*:\s*"([^"]+)"{CALL_END}"#
+    ))
 });
 
-// Same guarantee as RE_URL_FROM above.
-#[allow(clippy::expect_used)]
-static RE_URL_EXACT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*\.exact\s*\(\s*"([^"]+)"\s*\)\s*\)"#,
-    )
-    .expect("RE_URL_EXACT")
-});
+static RE_URL_EXACT: LazyLock<Regex> =
+    LazyLock::new(|| url_package_regex(&format!(r#"\.exact\s*\(\s*"([^"]+)"{CALL_END}"#)));
 
-// Same guarantee as RE_URL_FROM above.
-#[allow(clippy::expect_used)]
-static RE_URL_RANGE_HALF_OPEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\.\.<\s*"([^"]+)"\s*\)"#,
-    )
-    .expect("RE_URL_RANGE_HALF_OPEN")
-});
+// `exact: "x"`.
+static RE_URL_EXACT_LABELLED: LazyLock<Regex> =
+    LazyLock::new(|| url_package_regex(r#"exact\s*:\s*"([^"]+)""#));
 
-// Same guarantee as RE_URL_FROM above.
-#[allow(clippy::expect_used)]
-static RE_URL_RANGE_CLOSED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\.\.\.\s*"([^"]+)"\s*\)"#,
-    )
-    .expect("RE_URL_RANGE_CLOSED")
-});
+static RE_URL_RANGE_HALF_OPEN: LazyLock<Regex> =
+    LazyLock::new(|| url_package_regex(r#""([^"]+)"\s*\.\.<\s*"([^"]+)""#));
 
-// Same guarantee as RE_URL_FROM above.
-#[allow(clippy::expect_used)]
-static RE_URL_BRANCH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*\.branch\s*\(\s*"([^"]+)"\s*\)\s*\)"#,
-    )
-    .expect("RE_URL_BRANCH")
-});
+static RE_URL_RANGE_CLOSED: LazyLock<Regex> =
+    LazyLock::new(|| url_package_regex(r#""([^"]+)"\s*\.\.\.\s*"([^"]+)""#));
 
-// Same guarantee as RE_URL_FROM above.
-#[allow(clippy::expect_used)]
-static RE_URL_REVISION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?s)\.package\s*\(\s*url\s*:\s*"([^"]+)"\s*,\s*\.revision\s*\(\s*"([^"]+)"\s*\)\s*\)"#,
-    )
-    .expect("RE_URL_REVISION")
-});
+static RE_URL_BRANCH: LazyLock<Regex> =
+    LazyLock::new(|| url_package_regex(&format!(r#"\.branch\s*\(\s*"([^"]+)"{CALL_END}"#)));
 
-// Same guarantee as RE_URL_FROM above.
+// `branch: "x"`.
+static RE_URL_BRANCH_LABELLED: LazyLock<Regex> =
+    LazyLock::new(|| url_package_regex(r#"branch\s*:\s*"([^"]+)""#));
+
+static RE_URL_REVISION: LazyLock<Regex> =
+    LazyLock::new(|| url_package_regex(&format!(r#"\.revision\s*\(\s*"([^"]+)"{CALL_END}"#)));
+
+// `revision: "sha"`.
+static RE_URL_REVISION_LABELLED: LazyLock<Regex> =
+    LazyLock::new(|| url_package_regex(r#"revision\s*:\s*"([^"]+)""#));
+
+// Same guarantee as `url_package_regex` above.
 #[allow(clippy::expect_used)]
 static RE_PATH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?s)\.package\s*\(\s*path\s*:\s*"([^"]+)"\s*\)"#).expect("RE_PATH")
+    Regex::new(&format!(
+        r#"(?s)\.package\s*\(\s*{LEGACY_LABEL}path\s*:\s*"([^"]+)"{CALL_END}"#
+    ))
+    .expect("RE_PATH")
 });
 
 /// Converts a `github.com` Git URL to an `owner/repo` identity string.
@@ -321,8 +315,11 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         matched_ranges.push(full.start()..full.end());
     }
 
-    // 3. .package(url: "...", .exact("..."))
-    for cap in RE_URL_EXACT.captures_iter(&stripped) {
+    // 3. .package(url: "...", .exact("...")) / exact: "..."
+    for cap in RE_URL_EXACT
+        .captures_iter(&stripped)
+        .chain(RE_URL_EXACT_LABELLED.captures_iter(&stripped))
+    {
         let full = cap.get(0).unwrap();
         if is_already_matched(full.start(), full.end(), &matched_ranges) {
             continue;
@@ -458,8 +455,11 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         matched_ranges.push(full.start()..full.end());
     }
 
-    // 7. .package(url: "...", .branch("..."))
-    for cap in RE_URL_BRANCH.captures_iter(&stripped) {
+    // 7. .package(url: "...", .branch("...")) / branch: "..."
+    for cap in RE_URL_BRANCH
+        .captures_iter(&stripped)
+        .chain(RE_URL_BRANCH_LABELLED.captures_iter(&stripped))
+    {
         let full = cap.get(0).unwrap();
         if is_already_matched(full.start(), full.end(), &matched_ranges) {
             continue;
@@ -491,8 +491,11 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         matched_ranges.push(full.start()..full.end());
     }
 
-    // 8. .package(url: "...", .revision("..."))
-    for cap in RE_URL_REVISION.captures_iter(&stripped) {
+    // 8. .package(url: "...", .revision("...")) / revision: "..."
+    for cap in RE_URL_REVISION
+        .captures_iter(&stripped)
+        .chain(RE_URL_REVISION_LABELLED.captures_iter(&stripped))
+    {
         let full = cap.get(0).unwrap();
         if is_already_matched(full.start(), full.end(), &matched_ranges) {
             continue;
@@ -1203,6 +1206,189 @@ let package = Package(
         ] {
             let result = parse_package_swift(content, &test_uri()).unwrap();
             assert_eq!(result.dependencies[0].version_literal(), None, "{content}");
+        }
+    }
+
+    const GH: &str = "https://github.com/apple/swift-nio.git";
+
+    fn parse_one(requirement: &str) -> SwiftDependency {
+        let content = format!(".package(url: \"{GH}\", {requirement})");
+        let mut deps = parse_package_swift(&content, &test_uri())
+            .unwrap()
+            .dependencies;
+        assert_eq!(deps.len(), 1, "no dependency parsed from: {content}");
+        deps.remove(0)
+    }
+
+    /// Regression for #1673: a trailing comma after the last argument, for every form.
+    #[test]
+    fn test_trailing_comma_every_form() {
+        let cases: [(&str, Option<&str>); 11] = [
+            (r#"from: "2.40.0","#, Some(">=2.40.0, <3.0.0")),
+            (
+                r#".upToNextMajor(from: "2.40.0"),"#,
+                Some(">=2.40.0, <3.0.0"),
+            ),
+            (
+                r#".upToNextMajor(from: "2.40.0",),"#,
+                Some(">=2.40.0, <3.0.0"),
+            ),
+            (
+                r#".upToNextMinor(from: "2.40.0"),"#,
+                Some(">=2.40.0, <2.41.0"),
+            ),
+            (r#".exact("2.40.0"),"#, Some("=2.40.0")),
+            (r#"exact: "2.40.0","#, Some("=2.40.0")),
+            (r#""1.0.0"..<"2.0.0","#, Some(">=1.0.0, <2.0.0")),
+            (r#""1.0.0"..."2.0.0","#, Some(">=1.0.0, <=2.0.0")),
+            (r#".branch("main"),"#, None),
+            (r#".revision("abc123"),"#, None),
+            ("branch: \"main\"\n  ,\n", None),
+        ];
+        for (requirement, expected) in cases {
+            let dep = parse_one(requirement);
+            assert_eq!(
+                dep.version_requirement().map(deps_core::VersionReq::as_str),
+                expected,
+                "{requirement}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_trailing_comma_path() {
+        let result = parse_package_swift(r#".package(path: "../Local",)"#, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name(), "Local");
+    }
+
+    #[test]
+    fn test_trailing_comma_multiline_positions() {
+        let content = "let p = [\n    .package(\n        url: \"https://github.com/apple/swift-nio.git\",\n        exact: \"2.40.0\",\n    ),\n]";
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        let vr = dep.version_range.unwrap();
+        assert_eq!((vr.start.line, vr.start.character), (3, 16));
+        assert_eq!((vr.end.line, vr.end.character), (3, 22));
+        assert_eq!(dep.version_literal.as_deref(), Some("2.40.0"));
+        assert_eq!(dep.name_range.start.line, 2);
+    }
+
+    #[test]
+    fn test_exact_labelled() {
+        let dep = parse_one(r#"exact: "3.0.0""#);
+        assert_eq!(dep.name(), "apple/swift-nio");
+        assert_eq!(dep.version_literal.as_deref(), Some("3.0.0"));
+        assert!(dep.version_range.is_some());
+    }
+
+    /// Regression for #1672: labelled `branch:` is a Git-pinned dep with no version requirement.
+    #[test]
+    fn test_branch_labelled() {
+        let dep = parse_one(r#"branch: "main""#);
+        assert_eq!(dep.name(), "apple/swift-nio");
+        assert_eq!(dep.version_requirement(), None);
+        assert!(dep.version_range.is_none());
+        assert_matches!(
+            dep.source(),
+            DependencySource::Git { rev: Some(rev), .. } if rev == "main"
+        );
+    }
+
+    #[test]
+    fn test_revision_labelled() {
+        let dep = parse_one(r#"revision: "abc123""#);
+        assert_eq!(dep.version_requirement(), None);
+        assert!(dep.version_range.is_none());
+        assert_matches!(
+            dep.source(),
+            DependencySource::Git { rev: Some(rev), .. } if rev == "abc123"
+        );
+    }
+
+    #[test]
+    fn test_legacy_name_label_before_url() {
+        let content = format!(r#".package(name: "NIO", url: "{GH}", from: "2.40.0")"#);
+        let result = parse_package_swift(&content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name(), "apple/swift-nio");
+        assert_eq!(dep.url, GH);
+        assert_eq!(
+            dep.name_range.start.character as usize,
+            content.find(GH).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_legacy_name_label_before_url_with_trailing_comma() {
+        let content = format!(r#".package(name: "x", url: "{GH}", branch: "dev",)"#);
+        let result = parse_package_swift(&content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_matches!(
+            result.dependencies[0].source(),
+            DependencySource::Git { rev: Some(rev), .. } if rev == "dev"
+        );
+    }
+
+    #[test]
+    fn test_legacy_name_label_path() {
+        let result =
+            parse_package_swift(r#".package(name: "L", path: "../Local")"#, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name(), "Local");
+    }
+
+    #[test]
+    fn test_mixed_forms_in_one_manifest() {
+        let content = r#"
+.package(url: "https://github.com/a/one", branch: "main",),
+.package(name: "Two", url: "https://github.com/b/two", exact: "1.0.0"),
+.package(url: "https://github.com/c/three", revision: "deadbeef"),
+.package(url: "https://github.com/d/four", from: "1.2.3",),
+"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+        assert_eq!(deps.len(), 4);
+        let names: Vec<&str> = deps.iter().map(|d| Dependency::name(d).as_str()).collect();
+        assert!(names.contains(&"a/one"));
+        assert!(names.contains(&"b/two"));
+        assert!(names.contains(&"c/three"));
+        assert!(names.contains(&"d/four"));
+        let rev_of = |name: &str| {
+            let DependencySource::Git { rev, .. } =
+                deps.iter().find(|d| d.name() == name).unwrap().source()
+            else {
+                panic!("{name} is not a Git dependency");
+            };
+            rev
+        };
+        assert_eq!(rev_of("a/one").as_deref(), Some("main"));
+        assert_eq!(rev_of("c/three").as_deref(), Some("deadbeef"));
+        let literal_of = |name: &str| {
+            deps.iter()
+                .find(|d| d.name() == name)
+                .unwrap()
+                .version_literal
+                .clone()
+        };
+        assert_eq!(literal_of("b/two").as_deref(), Some("1.0.0"));
+        assert_eq!(literal_of("d/four").as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn test_trailing_comma_then_line_comment_and_crlf() {
+        for content in [
+            ".package(url: \"https://github.com/a/b\", from: \"1.0.0\", // c\n)",
+            ".package(url: \"https://github.com/a/b\",\r\n    from: \"1.0.0\", // c\r\n)",
+        ] {
+            let result = parse_package_swift(content, &test_uri()).unwrap();
+            assert_eq!(result.dependencies.len(), 1, "{content:?}");
+            assert_eq!(
+                result.dependencies[0].version_literal.as_deref(),
+                Some("1.0.0")
+            );
         }
     }
 }
