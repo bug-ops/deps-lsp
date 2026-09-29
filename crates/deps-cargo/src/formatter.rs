@@ -2,6 +2,7 @@ use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
     PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
     compile_semver_requirement, format_version_replacing_by_shape,
+    up_to_date_for_comparators_via_compiled_matcher,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName};
@@ -158,6 +159,16 @@ impl RequirementResolution for CargoFormatter {
             return None;
         }
         compile_semver_requirement(requirement)
+    }
+
+    /// Comparator-style requirements (`=1.2.3`, `<2`, `>=1.2, <2`) are judged by the compiled
+    /// `semver` matcher (#1660); bare versions keep the default pin heuristic.
+    fn is_bounded_requirement_up_to_date(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+        latest: &ConcreteVersion,
+    ) -> bool {
+        up_to_date_for_comparators_via_compiled_matcher(self, requirement, latest)
     }
 
     // #1370/#1391: `Cargo.toml`'s own TOML grammar has no placeholder syntax of its own —
@@ -574,15 +585,83 @@ mod tests {
         );
     }
 
-    /// #1656: the compiled-matcher path is npm/deno opt-in; Cargo's pin heuristic is unchanged.
+    fn cargo_up_to_date(requirement: &str, latest: &str) -> bool {
+        CargoFormatter
+            .is_requirement_up_to_date(&VersionReq::new(requirement), &ConcreteVersion::new(latest))
+    }
+
+    /// Bare pins keep the default heuristic: an exact bump is outdated.
     #[test]
     fn test_is_requirement_up_to_date_bare_pin_stays_outdated() {
-        let latest = ConcreteVersion::new("1.0.229");
         for requirement in ["=1.0.228", "1.0.228"] {
             assert!(
-                !CargoFormatter.is_requirement_up_to_date(&VersionReq::new(requirement), &latest),
+                !cargo_up_to_date(requirement, "1.0.229"),
                 "{requirement:?} must stay outdated against 1.0.229"
             );
         }
+    }
+
+    /// #1660: comparator shapes that admit `latest` are up to date.
+    #[test]
+    fn test_is_requirement_up_to_date_comparators_admitting_latest() {
+        for (requirement, latest) in [
+            ("=1.2.3", "1.2.3"),
+            ("<2", "1.5.0"),
+            (">=1.2, <2", "1.5.0"),
+            (">=1.2,<2", "1.5.0"),
+            (">= 1.2, < 2", "1.5.0"),
+            (">=1.0", "1.5.0"),
+            (">=1.2, <2", "1.5.0-beta.1"),
+            ("^1.2, <2", "1.5.0"),
+            ("^1.5, <1.9", "1.4.9"),
+            ("^1.5, <1.9", "1.5.0"),
+            ("> 1.0", "1.5.0"),
+            ("  =1.2.3", "1.2.3"),
+            ("<2", "1.9.9-rc.1"),
+            (">=1.*", "1.5.0"),
+            ("=1.2.3", "1.2.3-beta.1"),
+        ] {
+            assert!(
+                cargo_up_to_date(requirement, latest),
+                "{requirement:?} must be up to date against {latest}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_requirement_up_to_date_comparators_excluding_latest() {
+        for (requirement, latest) in [
+            ("<2", "2.0.0"),
+            (">=1.2, <2", "2.1.0"),
+            ("=1.2.3", "1.2.4"),
+            ("<=1.5", "1.6.0"),
+            (">=1.2, <2", "2.0.0-beta.1"),
+            ("^1.5, <1.9", "1.9.5"),
+            (">1.5.0", "1.5.0"),
+            (">1.9", "1.5.0"),
+            ("<2", "2.0.0-rc.1"),
+            (">=2.*", "1.5.0"),
+        ] {
+            assert!(
+                !cargo_up_to_date(requirement, latest),
+                "{requirement:?} must be outdated against {latest}"
+            );
+        }
+    }
+
+    /// #1622 S2 must survive: a caret's lower-bound floor never makes `latest` outdated.
+    #[test]
+    fn test_is_requirement_up_to_date_caret_floor_ignored() {
+        assert!(cargo_up_to_date("^1.5", "1.4.9"));
+    }
+
+    #[test]
+    fn test_is_requirement_up_to_date_malformed_and_oversized_comparators() {
+        assert!(!cargo_up_to_date(">=1.2 <", "1.5.0"));
+        let oversized = format!(
+            ">={}",
+            "1".repeat(deps_core::lsp_helpers::MAX_REQUIREMENT_LEN)
+        );
+        assert!(cargo_up_to_date(&oversized, "1.5.0"));
     }
 }
