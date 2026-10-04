@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **deps**: bump yanked `yoke-derive` to 0.8.4 so cargo-deny passes (#1746)
+
 ## [2.0.0] - 2026-09-29
 
 ### Breaking
