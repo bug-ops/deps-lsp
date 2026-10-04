@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps**: bump yanked `yoke-derive` to 0.8.4 so cargo-deny passes (#1746)
+- **workspace**: allow `clippy::assert_is_empty` (new in Rust 1.99) to keep CI clippy green (#1746)
 
 ## [2.0.0] - 2026-09-29
 
