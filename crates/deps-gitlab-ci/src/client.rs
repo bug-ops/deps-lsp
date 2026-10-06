@@ -10,11 +10,12 @@ use bytes::Bytes;
 use dashmap::DashSet;
 use deps_core::cache::{CredentialHeader, HttpCache, RequestHeader};
 use deps_core::error::{DepsError, RateLimitEvidence, Result};
-use deps_core::secret::{ApiToken, token_from_env};
+use deps_core::secret::ApiToken;
 use serde::Deserialize;
 use std::sync::Arc;
 
-use crate::host::{GitlabHost, GitlabInstanceHost, token_host_origin};
+use crate::host::GitlabHost;
+use crate::token::TokenBinding;
 
 /// Maximum number of pages fetched per (host, project, endpoint) combination.
 ///
@@ -31,7 +32,8 @@ pub const MAX_GITLAB_PAGES: u32 = 30;
 /// distinct messages).
 const GITLAB_RATE_LIMIT_MESSAGE: &str = "GitLab API rate limit exceeded or authentication required. Set \
      GITLAB_TOKEN to a GitLab Personal/Project Access Token to increase the \
-     limit and access private projects.";
+     limit and access private projects. If the instance is self-hosted, also set \
+     GITLAB_TOKEN_HOST to its hostname.";
 
 /// The actionable error returned when a request hits GitLab's rate limit, or a 401/403
 /// with no `GITLAB_TOKEN` configured (spec FR-014).
@@ -140,8 +142,7 @@ fn parse_gitlab_page<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<Vec<
 #[derive(Clone)]
 pub struct GitlabApiClient {
     cache: Arc<HttpCache>,
-    token: Option<ApiToken>,
-    instance_host: Arc<GitlabInstanceHost>,
+    token: TokenBinding,
     /// Origins already known (H3, #466 review) to reject `order_by=version` with a `400`
     /// — a pre-16.0 self-hosted instance. Memoized per host so the degradation is
     /// discovered once, not rediscovered (and repaid with a wasted round trip) on every
@@ -153,42 +154,36 @@ impl GitlabApiClient {
     /// Creates a new client backed by `cache`.
     ///
     /// Reads `GITLAB_TOKEN` from the environment for authenticated requests, sent as the
-    /// `PRIVATE-TOKEN` header — but only to the single token host (spec FR-005a, see
-    /// [`crate::host::token_host_origin`]).
+    /// `PRIVATE-TOKEN` header only to `gitlab.com` or to the host named by the
+    /// `GITLAB_TOKEN_HOST` environment variable — never to a host taken from LSP settings.
     #[must_use]
-    pub fn new(cache: Arc<HttpCache>, instance_host: Arc<GitlabInstanceHost>) -> Self {
-        let token = token_from_env("GITLAB_TOKEN");
-        if token.is_some() {
-            tracing::info!("GITLAB_TOKEN detected, using authenticated GitLab API requests");
+    pub fn new(cache: Arc<HttpCache>) -> Self {
+        let token = TokenBinding::from_env();
+        if let Some(origin) = token.bound_origin() {
+            tracing::info!(%origin, "GITLAB_TOKEN detected, sending it only to this GitLab origin");
         }
         Self {
             cache,
-            token: token.map(|t| ApiToken::new((*t).clone())),
-            instance_host,
+            token,
             degraded_order_by_hosts: Arc::new(DashSet::new()),
         }
     }
 
-    /// Whether a `GITLAB_TOKEN` was present at construction.
+    /// Whether requests to `origin` carry `GITLAB_TOKEN`: only the env-bound origin does.
     #[must_use]
-    pub const fn has_token(&self) -> bool {
-        self.token.is_some()
+    pub fn sends_token_to(&self, origin: &str) -> bool {
+        self.token.token_for_origin(origin).is_some()
     }
 
-    /// Creates a client with `token` set directly, bypassing the environment — for tests
+    /// Creates a client with `token` bound directly, bypassing the environment — for tests
     /// that need a deterministic token without mutating `std::env` (which is `unsafe` since
     /// Rust 2024 and forbidden workspace-wide).
     #[cfg(test)]
     #[must_use]
-    fn for_test(
-        cache: Arc<HttpCache>,
-        instance_host: Arc<GitlabInstanceHost>,
-        token: Option<&str>,
-    ) -> Self {
+    pub(crate) fn for_test(cache: Arc<HttpCache>, token: TokenBinding) -> Self {
         Self {
             cache,
-            token: token.map(|t| ApiToken::new(t.to_string())),
-            instance_host,
+            token,
             degraded_order_by_hosts: Arc::new(DashSet::new()),
         }
     }
@@ -271,18 +266,9 @@ impl GitlabApiClient {
     /// Fetches `url` through the origin-pinned, connect-address-guarded `CacheTier::Pinned`
     /// transport — the only sanctioned way to send a credential to a workspace-declared
     /// host (issue #561/#562 precedent) — attaching `PRIVATE-TOKEN` only when `host` is the
-    /// single token host (spec FR-005a).
+    /// env-bound token host.
     async fn fetch_pinned(&self, host: &GitlabHost, url: &str) -> Result<Bytes> {
-        // `is_some_and`, never `.unwrap_or(...)`: an invalid instance host must disable the
-        // token outright, not fall back to a default that could coincidentally match `host`
-        // (security review, #466).
-        let is_token_host =
-            token_host_origin(&self.instance_host).is_some_and(|origin| origin == host.origin());
-        let token = if is_token_host {
-            self.token.as_ref()
-        } else {
-            None
-        };
+        let token = self.token.token_for(host);
         let auth_id =
             deps_core::secret::auth_digest(host.origin(), token.map(ApiToken::expose_secret));
         let headers: Vec<RequestHeader<'_>> = token
@@ -301,16 +287,6 @@ impl GitlabApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
-    use std::sync::RwLock;
-
-    fn instance_host(configured: Option<&str>) -> Arc<GitlabInstanceHost> {
-        let policy = Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::All));
-        Arc::new(GitlabInstanceHost::new(
-            Arc::new(RwLock::new(configured.map(str::to_string))),
-            policy,
-        ))
-    }
 
     // --- parse_tags_page / parse_releases_page ---
 
@@ -366,8 +342,8 @@ mod tests {
     async fn test_client_for_test_no_token_by_default_in_unit_tests() {
         // `GITLAB_TOKEN` should not be relied upon in unit tests; this only asserts the
         // constructor is usable without one.
-        let client = GitlabApiClient::new(Arc::new(HttpCache::new()), instance_host(None));
-        let _ = client.has_token();
+        let client = GitlabApiClient::new(Arc::new(HttpCache::new()));
+        let _ = client.sends_token_to(crate::host::GITLAB_COM_ORIGIN);
     }
 
     #[tokio::test]
@@ -386,7 +362,7 @@ mod tests {
             .await;
 
         let cache = Arc::new(HttpCache::new());
-        let client = GitlabApiClient::new(Arc::clone(&cache), instance_host(None));
+        let client = GitlabApiClient::new(Arc::clone(&cache));
 
         let data = client
             .fetch_tags_page(&test_host_for(&server.url()), "org/proj", 1)
@@ -424,7 +400,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = GitlabApiClient::new(Arc::new(HttpCache::new()), instance_host(None));
+        let client = GitlabApiClient::new(Arc::new(HttpCache::new()));
         let data = client
             .fetch_tags_page(&test_host_for(&server.url()), "org/proj", 1)
             .await
@@ -444,7 +420,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = GitlabApiClient::new(Arc::new(HttpCache::new()), instance_host(None));
+        let client = GitlabApiClient::new(Arc::new(HttpCache::new()));
         let data = client
             .fetch_releases_page(&test_host_for(&server.url()), "org/proj", 1)
             .await
@@ -456,7 +432,7 @@ mod tests {
     // --- Token-host containment (spec FR-005a/§9.2 regression, security-relevant) ---
 
     #[tokio::test]
-    async fn test_private_token_present_for_configured_token_host() {
+    async fn test_private_token_present_for_bound_token_host() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/api/v4/projects/org%2Fproj/repository/tags")
@@ -468,22 +444,16 @@ mod tests {
             .await;
 
         let host = test_host_for(&server.url());
-        // `instance_host`'s raw-string path can't reach a `mockito` `127.0.0.1:PORT`
-        // host — it fails `GitlabHost::parse`'s port-rejecting validation, which is
-        // correct for production but unusable here — so this uses the test-only bypass
-        // that stores an already-constructed `GitlabHost` directly.
-        let instance = Arc::new(GitlabInstanceHost::for_test(host.clone()));
         let client = GitlabApiClient::for_test(
             Arc::new(HttpCache::new()),
-            instance,
-            Some("test-gitlab-token"),
+            TokenBinding::for_test("test-gitlab-token", host.origin()),
         );
         client.fetch_tags_page(&host, "org/proj", 1).await.unwrap();
         mock.assert_async().await;
     }
 
     #[tokio::test]
-    async fn test_private_token_absent_for_non_token_host() {
+    async fn test_private_token_absent_for_non_bound_host() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/api/v4/projects/org%2Fproj/repository/tags")
@@ -495,13 +465,32 @@ mod tests {
             .await;
 
         let host = test_host_for(&server.url());
-        // instance_host configured for a DIFFERENT host than the mock server — the mock
-        // server's host is therefore never the token host.
-        let instance = instance_host(Some("gitlab.other-instance.example"));
         let client = GitlabApiClient::for_test(
             Arc::new(HttpCache::new()),
-            instance,
-            Some("test-gitlab-token"),
+            TokenBinding::for_test("test-gitlab-token", "https://gitlab.other-instance.example"),
+        );
+        client.fetch_tags_page(&host, "org/proj", 1).await.unwrap();
+        mock.assert_async().await;
+    }
+
+    /// Regression for #1790: with the token bound to `gitlab.com` (no `GITLAB_TOKEN_HOST`), a
+    /// request to a settings-supplied host carries no `PRIVATE-TOKEN`.
+    #[tokio::test]
+    async fn test_private_token_absent_for_settings_supplied_host() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/v4/projects/org%2Fproj/repository/tags")
+            .match_query(mockito::Matcher::Any)
+            .match_header("private-token", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+
+        let host = test_host_for(&server.url());
+        let client = GitlabApiClient::for_test(
+            Arc::new(HttpCache::new()),
+            TokenBinding::for_test("test-gitlab-token", crate::host::GITLAB_COM_ORIGIN),
         );
         client.fetch_tags_page(&host, "org/proj", 1).await.unwrap();
         mock.assert_async().await;

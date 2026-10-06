@@ -95,8 +95,7 @@ fn gitlab_instance_host_invalid_message(
     format!(
         "deps-lsp: registries.gitlab_instance_host value '{redacted}' is invalid \
          ({error}) and will be ignored — instance-host resolution stays \
-         unresolved and GITLAB_TOKEN will not be sent to gitlab.com or any other \
-         host until this is corrected"
+         unresolved until this is corrected"
     )
 }
 

@@ -27,9 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `PolicyConfigDiff` and `RegistryRuntimeSettings` gain a Swift Keychain field, and `RegistriesConfig` gains `swift_keychain_credentials` (#1771, #1776)
 - **deps-core**: `PolicyConfigDiff` `*_changed` fields are the typed `SettingChange` instead of `bool` (#1771, #1776)
 - **deps-swift**: `ResolvedSwiftRegistry.auth` is no longer public (#1771, #1776)
+- **deps-gitlab-ci**: `GITLAB_TOKEN` is sent to `gitlab.com` or to the host in the `GITLAB_TOKEN_HOST` environment variable, no longer to `registries.gitlab_instance_host`; `token_host_origin` is removed and `GitlabApiClient::new` drops its instance-host parameter (#PR)
 
 ### Security
 - **deps-core, all registry ecosystems**: registry credential headers (`Authorization`, `PRIVATE-TOKEN`) are marked sensitive so they stay out of HTTP-stack debug output (#1772, #1776)
+- **deps-lsp**: repository editor settings can no longer redirect `GITLAB_TOKEN` through `registries.gitlab_instance_host`; the configuration docs now list the trust impact of every repository-settable field (#PR)
 
 ### Added
 - **deps-core, all ecosystems**: `DepsError::HostBlockedByPolicy` shows a policy-specific message when a registry host resolves to a blocked address class at connect time (#1773)

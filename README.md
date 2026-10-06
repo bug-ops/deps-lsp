@@ -209,10 +209,12 @@ export GITHUB_TOKEN=$(gh auth token)   # or a PAT from https://github.com/settin
 
 Set `GITLAB_TOKEN` to a GitLab Personal or Project Access Token to raise GitLab CI/CD's
 unauthenticated rate limit and access private projects. It is sent as `PRIVATE-TOKEN` only to
-`gitlab.com` (default) or, once configured, to `registries.gitlab_instance_host` — never both:
+`gitlab.com` (default) or, for a self-hosted instance, to the host named by `GITLAB_TOKEN_HOST` —
+never to a host taken from editor settings:
 
 ```bash
 export GITLAB_TOKEN=glpat-...
+export GITLAB_TOKEN_HOST=gitlab.mycorp.dev   # self-hosted only; omit for gitlab.com
 ```
 
 ## Development

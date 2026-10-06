@@ -181,15 +181,22 @@ instance host (or an inline `component:` host) is rejected by
 so telling the user to set it would be wrong advice. Two `component:` hosts differing only
 in letter case are grouped under one diagnostic, since hostnames are case-insensitive.
 
-**The one host `GITLAB_TOKEN` is ever sent to.** `registries.gitlab_instance_host`
-*replaces*, not joins, `gitlab.com` as the token's destination — a `component:` include's
-host segment is content read out of a checked-in manifest, so a cloned repository could
-otherwise direct the token to a host of its choosing, and a GitLab Personal/Project
-Access Token is only ever valid for the instance that issued it. Concretely: with the
-setting unset, `GITLAB_TOKEN` is sent only to `gitlab.com`; once set to
-`gitlab.mycorp.dev`, it is sent only there — a `component:` include naming `gitlab.com`
-in that same file is fetched unauthenticated. Every other literal host a `component:`
-include names is always fetched unauthenticated, subject to the same
+**The one host `GITLAB_TOKEN` is ever sent to.** The token's destination comes from the
+process environment, never from `registries.gitlab_instance_host`: editors merge a cloned
+repository's own settings into that value (see
+[Editor workspace settings and trust](../configuration.md#editor-workspace-settings-and-trust)),
+and a GitLab Personal/Project Access Token is only ever valid for the instance that issued it.
+With `GITLAB_TOKEN_HOST` unset, `GITLAB_TOKEN` is sent only to `gitlab.com`; with
+`GITLAB_TOKEN_HOST=gitlab.mycorp.dev` exported next to `GITLAB_TOKEN`, it is sent only there —
+a `component:` include naming `gitlab.com` in that same file is fetched unauthenticated. An
+invalid `GITLAB_TOKEN_HOST` (a port, scheme, path, a trailing dot, or a non-punycode
+internationalized name) disables the token entirely, with a warning in the log, rather than
+falling back to `gitlab.com`. An empty `GITLAB_TOKEN_HOST` is treated as unset, so the token is
+bound to `gitlab.com`. A `401`/`403` from a host the token is not bound to shows a hint to set
+`GITLAB_TOKEN_HOST` if the instance is self-hosted.
+`registries.gitlab_instance_host` still drives host resolution, unauthenticated unless it names
+the same host as `GITLAB_TOKEN_HOST`. Every other literal host a `component:` include names is
+always fetched unauthenticated, subject to the same
 `registries.workspace_registries` `HostClass` policy gate every other ecosystem's
 workspace-declared host goes through. A host that resolves to a blocked address class at
 connect time shows the policy-specific message described under
