@@ -47,6 +47,10 @@ pub mod private {
 /// A boxed, type-erased future used throughout the [`Ecosystem`] trait's async methods.
 pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
+/// Receiver of the package names whose tag index was refreshed, see
+/// [`Ecosystem::tag_index_refreshes`].
+pub type TagIndexRefreshes = tokio::sync::broadcast::Receiver<crate::PackageName>;
+
 /// Runs `ecosystem.parse_manifest(content, uri)` on the blocking-thread pool instead of the
 /// calling tokio worker.
 ///
@@ -1246,6 +1250,21 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         None
     }
 
+    /// Subscribes to tag-index refresh events of this ecosystem.
+    ///
+    /// An ecosystem whose registry keeps a shared [`TagIndex`](crate::lsp_helpers::TagIndex)
+    /// sends the package name on the returned channel whenever a fetch first populates that
+    /// package's index or changes its tag-to-commit mapping. A document that did not trigger
+    /// the fetch uses it to re-evaluate findings that depend on the index (a vulnerability
+    /// scan of a SHA pin only resolves once the index is warm). Each call returns an
+    /// independent receiver; a lagged receiver must treat every package as refreshed.
+    ///
+    /// The default is `None`: the ecosystem has no tag index, or its findings cannot change
+    /// when one refreshes.
+    fn tag_index_refreshes(&self) -> Option<TagIndexRefreshes> {
+        None
+    }
+
     /// Get the ecosystem-specific formatter for LSP response generation.
     ///
     /// The formatter handles version comparison, package URLs, and text formatting.
@@ -2265,6 +2284,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(parsed.uri(), &uri);
+    }
+
+    #[test]
+    fn test_tag_index_refreshes_defaults_to_none() {
+        let ecosystem = StubEcosystem {
+            calling_thread: std::thread::current().id(),
+            should_panic: false,
+            dep_count: 0,
+        };
+        assert!(ecosystem.tag_index_refreshes().is_none());
     }
 
     /// #796: `parse_manifest_blocking` is the single chokepoint every ecosystem's parse

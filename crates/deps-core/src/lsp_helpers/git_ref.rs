@@ -20,7 +20,7 @@ use crate::{Dependency, ParseResult};
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit, WorkspaceEdit};
 
 /// Length of a full, lowercase-or-not hex commit SHA (git's SHA-1 object id).
-const SHA_LEN: usize = 40;
+pub(super) const SHA_LEN: usize = 40;
 
 /// The conventional 7-character display prefix of a commit SHA (the whole string when shorter).
 ///
@@ -696,6 +696,43 @@ pub enum PinResolution {
     Untagged,
 }
 
+/// Where a tag that names a pinned commit sits relative to the newest release, by version.
+///
+/// Decided by [`tag_pin_is_up_to_date`] under [`PartialTagPolicy::Exact`]: a commit tagged only
+/// by a moving alias (`v1`, `1.1`) is not `latest`'s commit, so the alias counts as
+/// [`Self::BelowLatest`] unless its zero-padded version is strictly ahead of `latest`
+/// (`v1.10` over `v1.9.0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagPosition {
+    /// The tag is at or above `latest`: a pre-release of a newer line (`v2.0.0-rc1` over
+    /// `1.9.0`) counts, as semver orders it above the older release.
+    AtOrAboveLatest,
+    /// The tag is below `latest`, or has no version order (`cargo-deny`, `v3-node20`).
+    BelowLatest,
+}
+
+impl TagPosition {
+    /// Positions `tag` relative to `latest`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::TagPosition;
+    ///
+    /// assert_eq!(TagPosition::of("v1", "v1.5.0"), TagPosition::BelowLatest);
+    /// assert_eq!(TagPosition::of("v1.10", "v1.9.0"), TagPosition::AtOrAboveLatest);
+    /// assert_eq!(TagPosition::of("cargo-deny", "v1.5.0"), TagPosition::BelowLatest);
+    /// ```
+    #[must_use]
+    pub fn of(tag: &str, latest: &str) -> Self {
+        if tag_pin_is_up_to_date(tag, latest, PartialTagPolicy::Exact) {
+            Self::AtOrAboveLatest
+        } else {
+            Self::BelowLatest
+        }
+    }
+}
+
 /// Outcome of looking a full-SHA pin up in a repository's [`TagIndex`] against the newest
 /// release, shared by every tags-datasource ecosystem (GitHub Actions, GitLab CI).
 ///
@@ -709,6 +746,8 @@ pub enum ShaPinLookup {
     Indexed {
         /// The tag published at the SHA, verbatim.
         tag: crate::ConcreteVersion,
+        /// Where `tag` sits relative to `latest` by version.
+        position: TagPosition,
     },
     /// The repository's index is populated, [`ListCoverage::Complete`], and no tag points at
     /// the SHA.
@@ -758,6 +797,7 @@ impl ShaPinLookup {
         match index.pin_resolution(sha) {
             PinResolution::Resolved(pin) => Self::Indexed {
                 tag: pin.version().clone(),
+                position: TagPosition::of(pin.version().as_str(), latest.as_str()),
             },
             PinResolution::Untagged => Self::NotIndexed,
             PinResolution::Unresolved => Self::Unverifiable,
@@ -767,45 +807,43 @@ impl ShaPinLookup {
     /// Maps the lookup to a [`RequirementStatus`], or `None` when the caller should fall back
     /// to its own text-based classification (only for [`Self::Unverifiable`]).
     ///
-    /// [`Self::LatestCommit`] is up to date. [`Self::Indexed`] is up to date only when its tag
-    /// is [`is_tag_shaped`] and `tag_is_up_to_date` accepts it, so a non-version tag
-    /// (`cargo-deny`) never reads as current by text; an oversized tag is `Unresolved`.
-    /// [`Self::NotIndexed`] is `Outdated`: `latest` comes from the same fetch, so the pin is
-    /// provably not `latest`'s commit, whatever a trailing `# tag` comment claims.
+    /// [`Self::LatestCommit`] is up to date. [`Self::Indexed`] is up to date only when its
+    /// tag is [`TagPosition::AtOrAboveLatest`]: a commit named
+    /// only by an outdated moving tag (`v1`) or by a non-version tag (`cargo-deny`) is not
+    /// `latest`'s commit and never reads as current by text; an oversized tag is
+    /// `Unresolved`. [`Self::NotIndexed`] is `Outdated`: `latest` comes from the same fetch,
+    /// so the pin is provably not `latest`'s commit, whatever a trailing `# tag` comment
+    /// claims.
     ///
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::{RequirementStatus, ShaPinLookup};
+    /// use deps_core::ConcreteVersion;
+    /// use deps_core::lsp_helpers::{CommitSha, RequirementStatus, ShaPinLookup, TagIndex};
     ///
-    /// assert_eq!(
-    ///     ShaPinLookup::LatestCommit.into_status(|_| false),
-    ///     Some(RequirementStatus::UpToDate)
-    /// );
-    /// assert_eq!(
-    ///     ShaPinLookup::NotIndexed.into_status(|_| true),
-    ///     Some(RequirementStatus::Outdated)
-    /// );
-    /// assert_eq!(ShaPinLookup::Unverifiable.into_status(|_| true), None);
+    /// let old = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let new = CommitSha::parse(&"b".repeat(40)).unwrap();
+    /// let index = TagIndex::from_tags([("v1", &old), ("v1.5.0", &new)]);
+    /// let latest = ConcreteVersion::new("v1.5.0");
+    /// let lookup = ShaPinLookup::resolve(Some(&index), &old, &latest);
+    /// assert_eq!(lookup.status(), Some(RequirementStatus::Outdated));
+    /// assert_eq!(ShaPinLookup::LatestCommit.status(), Some(RequirementStatus::UpToDate));
+    /// assert_eq!(ShaPinLookup::Unverifiable.status(), None);
     /// ```
     #[must_use]
-    pub fn into_status(
-        self,
-        tag_is_up_to_date: impl FnOnce(BoundedVersionReq<'_>) -> bool,
-    ) -> Option<RequirementStatus> {
+    pub fn status(self) -> Option<RequirementStatus> {
         match self {
             Self::LatestCommit => Some(RequirementStatus::UpToDate),
-            Self::Indexed { tag } => {
+            Self::Indexed { tag, position } => {
                 let tag = crate::VersionReq::new(tag.as_str());
-                Some(
-                    BoundedVersionReq::new(&tag).map_or(RequirementStatus::Unresolved, |tag| {
-                        if is_tag_shaped(tag.as_str()) && tag_is_up_to_date(tag) {
-                            RequirementStatus::UpToDate
-                        } else {
-                            RequirementStatus::Outdated
-                        }
-                    }),
-                )
+                Some(if BoundedVersionReq::new(&tag).is_none() {
+                    RequirementStatus::Unresolved
+                } else {
+                    match position {
+                        TagPosition::AtOrAboveLatest => RequirementStatus::UpToDate,
+                        TagPosition::BelowLatest => RequirementStatus::Outdated,
+                    }
+                })
             }
             Self::NotIndexed => Some(RequirementStatus::Outdated),
             Self::Unverifiable => None,
@@ -1869,7 +1907,8 @@ mod tests {
         assert_eq!(
             lookup(Some(&index), &"a".repeat(40), "v1.1.0"),
             Some(ShaPinLookup::Indexed {
-                tag: crate::ConcreteVersion::new("v1.0.0")
+                tag: crate::ConcreteVersion::new("v1.0.0"),
+                position: TagPosition::BelowLatest,
             })
         );
         assert_eq!(
@@ -1901,7 +1940,8 @@ mod tests {
         assert_eq!(
             lookup(Some(&index), &"a".repeat(40), "v1.1.0"),
             Some(ShaPinLookup::Indexed {
-                tag: crate::ConcreteVersion::new("v1.0.0")
+                tag: crate::ConcreteVersion::new("v1.0.0"),
+                position: TagPosition::BelowLatest,
             })
         );
         assert_eq!(
@@ -1911,32 +1951,85 @@ mod tests {
     }
 
     #[test]
-    fn test_sha_pin_lookup_into_status_indexed_branches() {
-        let indexed = |tag: &str| ShaPinLookup::Indexed {
+    fn test_tag_position_table() {
+        use TagPosition::{AtOrAboveLatest as At, BelowLatest as Below};
+        let cases = [
+            ("v1", "v1.5.0", Below),
+            ("1.1", "1.1.3", Below),
+            ("v1.10", "v1.9.0", At),
+            ("v2.0.0-rc1", "1.9.0", At),
+            ("v2", "1.9.0", At),
+            ("v1", "v1.0.0", Below),
+            ("v1.0.0", "1.0.0", At),
+            ("v1.2.3-rc1", "v1.2.3", Below),
+            ("v1.2.4", "v1.2.3", At),
+            ("v1.9.0", "v1.10.0", Below),
+            ("cargo-deny", "v1.5.0", Below),
+            ("v1-rc1", "v1.5.0", Below),
+            ("v1.5.0", "stable", Below),
+            ("v99999999999999999999", "v1.5.0", Below),
+            ("1.1", "1.1.0", Below),
+            ("v1.2", "v1.1.9", At),
+            ("v1.2.3+build5", "v1.2.3", At),
+            ("v1+build5", "v1.5.0", Below),
+            ("v01.2", "v1.1.0", Below),
+            ("v01.2.3", "v1.2.3", Below),
+            ("v1.2.3", "v01.2.3", Below),
+        ];
+        for (tag, latest, expected) in cases {
+            assert_eq!(TagPosition::of(tag, latest), expected, "{tag} vs {latest}");
+        }
+    }
+
+    #[test]
+    fn test_sha_pin_lookup_indexed_by_outdated_moving_tag_is_outdated() {
+        let index = TagIndex::from_tags([("v1", &sha_of('a')), ("v1.5.0", &sha_of('b'))]);
+        let found = lookup(Some(&index), &"a".repeat(40), "v1.5.0").unwrap();
+        assert_eq!(
+            found,
+            ShaPinLookup::Indexed {
+                tag: crate::ConcreteVersion::new("v1"),
+                position: TagPosition::BelowLatest,
+            }
+        );
+        assert_eq!(found.status(), Some(RequirementStatus::Outdated));
+    }
+
+    #[test]
+    fn test_sha_pin_lookup_indexed_by_prerelease_of_newer_line_is_up_to_date() {
+        let index = TagIndex::from_tags([("v2.0.0-rc1", &sha_of('a')), ("1.9.0", &sha_of('b'))]);
+        let found = lookup(Some(&index), &"a".repeat(40), "1.9.0").unwrap();
+        assert_eq!(found.status(), Some(RequirementStatus::UpToDate));
+    }
+
+    #[test]
+    fn test_sha_pin_lookup_status_branches() {
+        let indexed = |tag: &str, position| ShaPinLookup::Indexed {
             tag: crate::ConcreteVersion::new(tag),
+            position,
         };
         assert_eq!(
-            indexed("v1.0.0").into_status(|_| true),
+            indexed("v2.0.0", TagPosition::AtOrAboveLatest).status(),
             Some(RequirementStatus::UpToDate)
         );
         assert_eq!(
-            indexed("v1.0.0").into_status(|_| false),
-            Some(RequirementStatus::Outdated)
-        );
-        assert_eq!(
-            indexed("cargo-deny").into_status(|_| true),
+            indexed("cargo-deny", TagPosition::BelowLatest).status(),
             Some(RequirementStatus::Outdated)
         );
         let oversized = "v".repeat(super::super::MAX_REQUIREMENT_LEN + 1);
         assert_eq!(
-            indexed(&oversized).into_status(|_| true),
+            indexed(&oversized, TagPosition::AtOrAboveLatest).status(),
             Some(RequirementStatus::Unresolved)
         );
         assert_eq!(
-            ShaPinLookup::NotIndexed.into_status(|_| true),
+            ShaPinLookup::LatestCommit.status(),
+            Some(RequirementStatus::UpToDate)
+        );
+        assert_eq!(
+            ShaPinLookup::NotIndexed.status(),
             Some(RequirementStatus::Outdated)
         );
-        assert_eq!(ShaPinLookup::Unverifiable.into_status(|_| true), None);
+        assert_eq!(ShaPinLookup::Unverifiable.status(), None);
     }
 
     fn resolved_pin_for(tags: &[&str]) -> Option<ResolvedPin> {

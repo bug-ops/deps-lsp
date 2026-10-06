@@ -19,12 +19,10 @@
 //! the correct versioning, so they stay fully resolvable. The discriminator is whether the
 //! path segments after `owner/repo` start with `.github/workflows/`.
 
-use crate::types::{
-    ClosingDelimiters, GithubActionsDependency, GithubActionsParseResult, PinStyle, ShaComment,
-};
+use crate::types::{GithubActionsDependency, GithubActionsParseResult, PinStyle, ShaComment};
 use deps_core::lsp_helpers::{
-    CommitSha, LineOffsetTable, MarkedScalar, byte_span_to_range, is_partial_semver_shaped,
-    warn_rejected_value,
+    CommitSha, LineOffsetTable, MarkedScalar, ShaPinTail, byte_span_to_range, read_sha_pin_tail,
+    ref_is_last_on_line, warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
 use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
@@ -38,151 +36,6 @@ use yaml_rust2::scanner::Marker;
 /// extraction of these into the shared, hardened `deps_core::lsp_helpers` scaffolding.
 pub(crate) use deps_core::lsp_helpers::is_full_sha;
 pub(crate) use deps_core::lsp_helpers::is_tag_shaped;
-
-/// Upper bound, in bytes past a ref's end, on how far [`ref_is_last_token_on_line`] and
-/// [`extract_comment_tag`] look ahead on the ref's physical line (issue #885 rework).
-///
-/// Deliberately a separate constant from `deps_core::lsp_helpers::MAX_FALLBACK_SCAN_BYTES`
-/// (code-review finding #4 on the original #885 fix): that constant bounds a byte-offset
-/// *correction* fallback with a completely different cost/correctness profile (a handful of
-/// bytes in real manifests) — reusing it here coupled two unrelated tuning knobs, so that
-/// crate's own consumers (including `deps-gitlab-ci`) would have silently inherited any
-/// widening made for this file's rest-of-line comment/continuation lookahead.
-///
-/// Sized so realistic GitHub Actions inline comments/tags are essentially never truncated:
-/// even a verbose annotation (`# pinned to v4.2.100, see PR #1234 for CVE-XXXX-XXXX`) is
-/// well under a few hundred bytes, leaving an order of magnitude of headroom. Worst-case
-/// cost is still bounded rather than reintroduced as O(document length): with
-/// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (5000) ref-pinned dependencies packed onto
-/// one adversarial physical line, each separated by a whitespace-only gap this large, the
-/// two lookahead scans together visit at most `5000 * 2 * 4096` ≈ 40 MB total (each of the
-/// ~20 MB of distinct gap content visited by both scans) — the distinct content alone is
-/// already most of `deps_core::parser::MAX_YAML_EXPANDED_BYTES`'s 32 MiB document-size
-/// ceiling, so this is close to the worst case such a document can express, not an
-/// understatement of it. `test_build_dependency_rest_of_line_lookup_is_not_quadratic` below
-/// demonstrates this stays a small, constant-per-call cost independent of how much content
-/// follows on the line, unlike the unbounded `find('\n')` scan this issue was filed
-/// against.
-const REST_OF_LINE_WINDOW_BYTES: usize = 4096;
-
-/// Whether [`build_dependency`]'s bounded rest-of-line window ([`REST_OF_LINE_WINDOW_BYTES`])
-/// covers the ref's entire physical line, or was cut short before reaching the real
-/// end-of-line content.
-///
-/// A plain `bool` here previously required the single call site to pass `!window_truncated`
-/// — a negation that a future edit could silently drop or invert, flipping a
-/// security-relevant conservative default to a permissive one with no type-level signal
-/// (code-review finding #7). The two variants make the call site's intent explicit instead.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum WindowCoverage {
-    /// The window reached the line's real end — nothing on the line is unexamined.
-    FullLine,
-    /// The window was cut short by [`REST_OF_LINE_WINDOW_BYTES`]; real content may exist
-    /// just past it that this scan never saw.
-    Truncated,
-}
-
-/// Whether nothing unsafe to overwrite follows the ref on its source line: only
-/// whitespace, or a whitespace-preceded YAML comment (the same comment-start rule
-/// [`extract_comment_tag`] uses), all the way to end of line.
-///
-/// Security audit finding (pre-existing in the #473 quickfix, now shared by the bulk
-/// pin-all-to-SHA aggregator, issue #633): a SHA-pin edit appends `# <tag>` right after
-/// the ref, turning everything after it into a YAML comment. For a `uses:` step written
-/// in **block** style that is safe — nothing meaningful follows on the line. For a step
-/// written in YAML **flow** style (`{uses: actions/checkout@v4, with: {node: 20}}`), real
-/// YAML content (`, with: {...}}`) follows the ref on the same line, and commenting it out
-/// produces invalid YAML (an unterminated flow mapping) — silently breaking the workflow
-/// rather than merely leaving it unpinned. This function has no notion of flow vs. block
-/// context itself; it just checks "would writing a comment here swallow real content",
-/// which is true in exactly the flow-style case and false for ordinary block-style lines.
-///
-/// `rest_of_line` may be a window bounded well short of the line's real end (issue #885
-/// rework); `window` being [`WindowCoverage::FullLine`] is the answer to use only when the
-/// *entire* window is whitespace with no `#`/real content found in it — a case this
-/// function cannot resolve on its own, since real content might still exist just past a
-/// truncated window. Finding a `#` comment or non-whitespace content within the window is
-/// always a definitive answer regardless of `window` (impl-critic finding: gating a found
-/// `#`/non-whitespace answer on "was the window truncated" discarded information the
-/// window already proved, producing a false negative that withheld the SHA-pin quickfix on
-/// a perfectly safe line whose comment tag resolved fine within the window).
-// `bytes[i - 1]` is guarded by the `i > 0` conjunct immediately before it.
-#[allow(clippy::indexing_slicing)]
-fn ref_is_last_token_on_line(rest_of_line: &str, window: WindowCoverage) -> bool {
-    let bytes = rest_of_line.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'#' && i > 0 && bytes[i - 1].is_ascii_whitespace() {
-            return true;
-        }
-        if !b.is_ascii_whitespace() {
-            return false;
-        }
-    }
-    window == WindowCoverage::FullLine
-}
-
-/// The first whitespace-delimited token after a whitespace-preceded `#` in
-/// `rest_of_line` (the raw source text following a ref's end, up to end of line),
-/// accepted as a comment tag whenever it has the shape of a version safe to trust from
-/// free text ([`is_partial_semver_shaped`], issue #907): an optional leading `v`/`V`
-/// followed by 1-3 dot-separated all-digit components, at any precision (`v4`, `v4.2`,
-/// `v4.2.0`) — but, unlike a bare `@ref` pin's `is_tag_shaped` classification, a bare
-/// all-digit token with no `v`/`V` prefix and no dot (`1234`, a ticket number; `20240501`,
-/// a date) is rejected (#907 review finding S1): nothing distinguishes such a token from
-/// an arbitrary numeric annotation a human might write in a *comment*, whereas
-/// `is_tag_shaped` is safe for an actual git *ref*, a domain GitHub itself resolves. The
-/// overwhelmingly common real-world SHA-pin convention pins a major or major.minor
-/// comment (`# v4`, not `# v4.2.0`), which a stricter full-`major.minor.patch`-only gate
-/// rejected outright, silently degrading the ref to a bare, unresolvable SHA for the vast
-/// majority of real workflows.
-///
-/// Returns `(tag_text, byte_offset_in_rest_of_line_where_the_token_ends)`. A `#` not
-/// preceded by whitespace is not a YAML comment and is skipped (only the *first*
-/// whitespace-preceded `#` is considered); a shape-rejected token (`# main`, `# cross`,
-/// `# cargo-deny`, `# 20240501`) or no `#` at all yields `None` — the ref degrades to a
-/// bare, commentless pin.
-///
-/// `window` reflects whether `rest_of_line` was cut short of the line's real end (issue
-/// #885 rework). When the token runs all the way to the end of `rest_of_line` with no
-/// terminating whitespace found *and* the window was [`WindowCoverage::Truncated`], the
-/// token's true extent is unknown — real digits may continue just past the window edge
-/// (e.g. a window boundary landing mid-digit turns `v4.2.100` into `v4.2.10`, which still
-/// passes [`is_partial_semver_shaped`] and would otherwise be silently recorded as the real
-/// version — code-review finding #1). Such an ambiguous token is rejected as `None` rather
-/// than risking a truncated-but-plausible-looking version; a token that ends before the
-/// window's edge (a terminating whitespace was actually observed) is unaffected regardless
-/// of `window`, since its boundary was genuinely seen.
-// `i` indexes ASCII `b'#'`; slice bounds are always char boundaries, and `bytes[i - 1]` is
-// short-circuited by the `i == 0 ||` conjunct.
-#[allow(clippy::string_slice, clippy::indexing_slicing)]
-fn extract_comment_tag(rest_of_line: &str, window: WindowCoverage) -> Option<(&str, usize)> {
-    let bytes = rest_of_line.as_bytes();
-    for i in 0..bytes.len() {
-        if bytes[i] != b'#' {
-            continue;
-        }
-        if i == 0 || !bytes[i - 1].is_ascii_whitespace() {
-            continue;
-        }
-        let after_hash = &rest_of_line[i + 1..];
-        let after_ws = after_hash.trim_start();
-        let ws_len = after_hash.len() - after_ws.len();
-        let terminator = after_ws.find(char::is_whitespace);
-        if terminator.is_none() && window == WindowCoverage::Truncated {
-            // Token has no observed end within the window — its true text may continue
-            // past the edge, so bail rather than risk a truncated value (finding #1).
-            return None;
-        }
-        let token_len = terminator.unwrap_or(after_ws.len());
-        let token = &after_ws[..token_len];
-        return if is_partial_semver_shaped(token) {
-            Some((token, i + 1 + ws_len + token_len))
-        } else {
-            None
-        };
-    }
-    None
-}
 
 /// Outcome of classifying a raw `uses:` scalar value's `owner/repo[...]` prefix.
 enum ParsedUses {
@@ -383,8 +236,7 @@ impl MarkedEventReceiver for WorkflowReceiver {
 /// `owner/repo` prefix does not look like a GitHub identifier (logged and skipped, FR-015).
 // `ref_start`/`ref_end` build on `span_start`, which is char-boundary-aligned (see the trim
 // re-anchoring comment below), plus whole-substring byte counts, so arithmetic never lands
-// mid-character. `token_end` is windowed to `REST_OF_LINE_WINDOW_BYTES`/line end via
-// `line_table` in O(1) rather than an unbounded `find('\n')` scan (issue #885).
+// mid-character; `range_end` comes from `read_sha_pin_tail`, which clamps it to a char boundary.
 #[allow(clippy::string_slice)]
 fn build_dependency(
     content: &str,
@@ -477,78 +329,29 @@ fn build_dependency(
                 });
             }
 
-            // O(1) line-end lookup via `line_table` instead of an unbounded `find('\n')`
-            // scan (issue #885), which cost O(N x remaining-document-length) on a
-            // single-line manifest with N ref-pinned deps. Passing the 1-indexed
-            // `candidate.line()` to `line_start` (0-indexed) lands on the next line's
-            // start, or `content.len()` with no trailing newline; stepping back one byte
-            // is still a char boundary since that byte is the single-byte '\n'.
-            let line_end = line_table
-                .line_start(candidate.line())
-                .unwrap_or(content.len());
-            let line_end = match line_end.checked_sub(1) {
-                Some(i) if content.as_bytes().get(i) == Some(&b'\n') => i,
-                _ => line_end,
-            };
-            // Even a correctly-located line can be enormous (#885's threat model), and
-            // neither downstream function needs more than a short window after the ref, so
-            // cap it at `REST_OF_LINE_WINDOW_BYTES`; `floor_char_boundary` clamps it back
-            // since this bound isn't guaranteed to land on one. `line_end < ref_end` is
-            // defense-in-depth for a desync that shouldn't occur — logged distinctly below
-            // (finding #8) so it doesn't silently look like untruncated instead of failing safe.
-            let line_end_desynced = line_end < ref_end;
-            if line_end_desynced {
-                tracing::debug!(
-                    ref_end,
-                    line_end,
-                    candidate_line = candidate.line(),
-                    "line_table line_end is before ref_end; this should not happen \
-                     in practice — treating the rest-of-line window as truncated"
-                );
-            }
-            let capped_end = ref_end
-                .saturating_add(REST_OF_LINE_WINDOW_BYTES)
-                .min(line_end);
-            let window_truncated = line_end_desynced || capped_end < line_end;
-            let window = if window_truncated {
-                WindowCoverage::Truncated
-            } else {
-                WindowCoverage::FullLine
-            };
-            let capped_end = content.floor_char_boundary(capped_end);
-            let rest_of_line = &content[ref_end..capped_end.max(ref_end)];
             // Computed for every ref-pinned form, not just SHA-with-comment below, since
             // `sha_pin_text_edit_for` needs it for `PinStyle::Tag` too — a flow-style step
             // has real YAML content after the ref that a trailing `# <tag>` would swallow
-            // (#633). `window` matters only as the all-whitespace fallback, where we can't
-            // safely assume nothing unsafe follows (impl-critic S1: a naive bounded window
-            // without it flipped `is_last_on_line` false-to-true, reopening #633).
-            let is_last_on_line = ref_is_last_token_on_line(rest_of_line, window);
+            // (#633).
+            let is_last_on_line =
+                ref_is_last_on_line(content, line_table, ref_end, candidate.line());
 
             if let Some(sha) = CommitSha::parse(&ref_text) {
-                // `extract_comment_tag` can't tell this ref's own comment from an unrelated
-                // later token on a flow-style line (#898), so a comment is read only when
-                // nothing but closing delimiters (#1732) sits between the SHA and the `#`.
-                let closing_delimiters = ClosingDelimiters::parse(rest_of_line, candidate.style());
-                let comment = if closing_delimiters.is_empty() {
-                    (is_plain_scalar && is_last_on_line)
-                        .then(|| extract_comment_tag(rest_of_line, window))
-                        .flatten()
-                } else {
-                    let tail = &rest_of_line[closing_delimiters.byte_len()..];
-                    ref_is_last_token_on_line(tail, window)
-                        .then(|| extract_comment_tag(tail, window))
-                        .flatten()
-                        .map(|(tag, end)| (tag, closing_delimiters.byte_len() + end))
-                };
-
-                return Some(match comment {
-                    Some((tag, token_end)) => {
-                        let comment_end = ref_end + token_end;
+                let read = read_sha_pin_tail(
+                    content,
+                    line_table,
+                    ref_end,
+                    candidate.line(),
+                    candidate.style(),
+                    is_plain_scalar,
+                );
+                return Some(match read.tail {
+                    ShaPinTail::Commented(pin_comment) => {
+                        let tag = pin_comment.tag.as_str().to_string();
+                        let comment_end = read.range_end;
                         let comment = ShaComment::new(
-                            tag.to_string(),
+                            pin_comment,
                             make_range(comment_end - tag.len(), comment_end),
-                            closing_delimiters,
                             content[ref_start..comment_end].to_string(),
                         );
                         GithubActionsDependency {
@@ -565,7 +368,7 @@ fn build_dependency(
                             is_last_on_line,
                         }
                     }
-                    None => GithubActionsDependency {
+                    ShaPinTail::Bare(_) => GithubActionsDependency {
                         name: name.into(),
                         name_range,
                         version_req: Some(ref_text.into()),
@@ -707,6 +510,9 @@ mod tests {
     use deps_core::{Dependency, DepsError};
     use std::assert_matches;
     use yaml_rust2::scanner::TScalarStyle;
+
+    /// Mirrors `deps_core`'s private rest-of-line window size.
+    const REST_OF_LINE_WINDOW_BYTES: usize = 4096;
 
     fn test_uri() -> Url {
         deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml")
@@ -1268,50 +1074,6 @@ mod tests {
 
     // --- issue #633 security audit finding: `is_last_on_line` / YAML flow-style guard ---
 
-    #[test]
-    fn test_ref_is_last_token_on_line_true_for_empty_and_whitespace_only() {
-        assert!(ref_is_last_token_on_line("", WindowCoverage::FullLine));
-        assert!(ref_is_last_token_on_line("   ", WindowCoverage::FullLine));
-    }
-
-    #[test]
-    fn test_ref_is_last_token_on_line_false_for_empty_and_whitespace_only_when_window_truncated() {
-        // #885: an all-whitespace truncated window is inconclusive, so Truncated must be
-        // honored as the fallback.
-        assert!(!ref_is_last_token_on_line("", WindowCoverage::Truncated));
-        assert!(!ref_is_last_token_on_line("   ", WindowCoverage::Truncated));
-    }
-
-    #[test]
-    fn test_ref_is_last_token_on_line_true_for_trailing_comment() {
-        assert!(ref_is_last_token_on_line(
-            " # my note",
-            WindowCoverage::FullLine
-        ));
-    }
-
-    #[test]
-    fn test_ref_is_last_token_on_line_true_for_trailing_comment_even_when_window_truncated() {
-        // #885 (impl-critic point 4): finding a `#` within the window is definitive
-        // regardless of `WindowCoverage`.
-        assert!(ref_is_last_token_on_line(
-            " # my note",
-            WindowCoverage::Truncated
-        ));
-    }
-
-    #[test]
-    fn test_ref_is_last_token_on_line_false_for_flow_collection_continuation() {
-        // The exact shape from the security audit's reproduction: `, with: {node: 20}}`
-        // immediately follows a tag ref inside a YAML flow mapping.
-        assert!(!ref_is_last_token_on_line(
-            ", with: {node: 20}}",
-            WindowCoverage::FullLine
-        ));
-        assert!(!ref_is_last_token_on_line("}", WindowCoverage::FullLine));
-        assert!(!ref_is_last_token_on_line("]", WindowCoverage::FullLine));
-    }
-
     /// Regression for the security audit's live reproduction: a `uses:` step written in
     /// YAML flow-mapping style has real content (`, with: {...}}`) after the ref on the
     /// same line — `is_last_on_line` must be `false` so a SHA-pin edit is withheld
@@ -1459,42 +1221,6 @@ mod tests {
     // `deps_core::lsp_helpers` (#472/GitLab-CI-plan §6.1) — their unit tests moved with
     // them, since they test the shared helper, not this crate's workflow parser.
 
-    #[test]
-    fn test_extract_comment_tag_multiple_hashes_uses_first() {
-        assert_eq!(
-            extract_comment_tag(" # v1.0.0 # v2.0.0", WindowCoverage::FullLine),
-            Some(("v1.0.0", " # v1.0.0".len()))
-        );
-    }
-
-    #[test]
-    fn test_extract_comment_tag_no_hash_returns_none() {
-        assert_eq!(
-            extract_comment_tag(" no comment here", WindowCoverage::FullLine),
-            None
-        );
-    }
-
-    #[test]
-    fn test_extract_comment_tag_rejects_token_reaching_truncated_window_edge() {
-        // Finding #1: a token with no observed terminator in a truncated window is
-        // ambiguous and must be rejected, even with a valid semver shape.
-        assert_eq!(
-            extract_comment_tag(" # v4.2.10", WindowCoverage::Truncated),
-            None
-        );
-    }
-
-    #[test]
-    fn test_extract_comment_tag_accepts_token_reaching_full_line_end() {
-        // The same shape as above is fine when the window covers the real line end:
-        // there is genuinely nothing more to see, so the token is complete.
-        assert_eq!(
-            extract_comment_tag(" # v4.2.10", WindowCoverage::FullLine),
-            Some(("v4.2.10", " # v4.2.10".len()))
-        );
-    }
-
     // --- issue #885: O(1) line-end lookup past a ref-pinned dependency ---
 
     #[test]
@@ -1636,7 +1362,7 @@ mod tests {
     }
 
     // --- issue #898: comment-tag mis-attribution across sibling flow-mapping keys ---
-    // `extract_comment_tag` can't tell this ref's own comment from an unrelated later
+    // `read_sha_pin_tail` can't tell this ref's own comment from an unrelated later
     // token on a flow-style line; gating on `is_last_on_line` (already computed for #633)
     // prevents a flow-style continuation from being misread as the comment.
 
@@ -1695,7 +1421,7 @@ mod tests {
     #[test]
     fn test_block_style_sha_pin_last_on_line_still_attributes_trailing_comment() {
         // Non-regression: an ordinary block-style SHA pin (the overwhelming common
-        // case, and the whole reason `extract_comment_tag` exists) must keep resolving
+        // case, and the whole reason `read_sha_pin_tail` exists) must keep resolving
         // its trailing `# vX.Y.Z` comment — the fix must not become overly conservative.
         let sha = "a".repeat(40);
         let content = format!("steps:\n  - uses: actions/checkout@{sha} # v4.2.0\n");
