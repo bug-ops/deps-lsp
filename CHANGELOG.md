@@ -14,11 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `ShaPinLookup::into_status` replaced by `status()`; `ShaPinLookup::Indexed` gains `position: TagPosition`; `ClosingDelimiters` moves to `lsp_helpers` (re-exported by deps-github-actions) (#1764)
 
 ### Added
-- **deps-core, all ecosystems**: `DepsError::HostBlockedByPolicy` shows a policy-specific message when a registry host resolves to a blocked address class at connect time (#PR)
-- **deps-swift**: follows `Link rel="next"` pages of the SE-0292 release list (#PR)
-- **deps-swift**: `publishedAt` freshness for the newest registry releases (#PR)
-- **deps-swift**: `SWIFTPM_NETRC_DATA` and `~/.netrc` registry credentials, bound to user-declared registries only (#PR)
-- **deps-core**: shared `netrc` parser following SwiftPM's grammar, and `pagination::next_page`/`NextPage` for validated `Link rel="next"` targets (#PR)
+- **deps-core, all ecosystems**: `DepsError::HostBlockedByPolicy` shows a policy-specific message when a registry host resolves to a blocked address class at connect time (#1773)
+- **deps-swift**: follows `Link rel="next"` pages of the SE-0292 release list (#1773)
+- **deps-swift**: `publishedAt` freshness for the newest registry releases (#1773)
+- **deps-swift**: `SWIFTPM_NETRC_DATA` and `~/.netrc` registry credentials, bound to user-declared registries only (#1773)
+- **deps-core**: shared `netrc` parser following SwiftPM's grammar, and `pagination::next_page`/`NextPage` for validated `Link rel="next"` targets (#1773)
 - **deps-core**: `PinResolution`, `TagIndex::pin_resolution`, `PartialTagPolicy`, `tag_pin_is_up_to_date` and `tag_has_precedence` shared by the git-tag ecosystems (#1751)
 - **deps-github-actions**: `Correct version comment to <tag>` quickfix for a SHA pin whose trailing comment names another tag (#1751)
 - **deps-cli**: `--fail-on other` token for uncategorized findings (offline/lock-file/registry notices, `sha-comment-mismatch`) (#1747)
