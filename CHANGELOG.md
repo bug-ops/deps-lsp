@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
-- **deps-core**: `CommitSha::parse` stores lowercase and drops `Borrow<str>`; `TagIndex::resolved_pin`/`tag_for_sha`/`splice_resolved_line` and `ShaPinLookup::resolve` (now infallible) take `&CommitSha`; `resolved_pin_version` returns `PinResolution`
+- **deps-core**: `CommitSha::parse` stores lowercase and drops `Borrow<str>`; `TagIndex::resolved_pin`/`tag_for_sha`/`splice_resolved_line` and `ShaPinLookup::resolve` (now infallible) take `&CommitSha`; `resolved_pin_version` returns `PinResolution` (#1751)
 - **deps-github-actions**: `PinStyle::Sha` carries `sha: CommitSha` and `comment: Option<ShaComment>`; `GithubActionsDependency` loses `version_literal` and `closing_delimiters`; `sha_pin_raw_sha` removed (#1751)
 
 ### Added
