@@ -33,6 +33,10 @@ provides parsing and registry integration for `.gitlab-ci.yml` and `.gitlab/ci/*
 - **SHA-pin classification** — a full 40-hex `ref:`/`component:` SHA pin is classified through
   the route's tag (or release) index: up to date on the latest release's commit, otherwise
   outdated and re-pinned to the latest release's full SHA, never to a bare tag
+- **Unknown-ref diagnostic** — a `project:` tag `ref:` that is a full release no tag of the
+  complete Tags list matches (`ref: 1.2.3` beside tag `v1.2.3`) is reported as `unknown-ref`
+  (`unknown_ref_severity`) and reads unresolved; partial refs that may be branches are never
+  reported
 - **Branch pins left alone** — a branch `ref:` is never offered an update that rewrites the
   branch name into a version
 - **Placeholder guard** — an unresolved `$VAR`/`${VAR}`/`%VAR%` ref and `$[[ inputs.x ]]`

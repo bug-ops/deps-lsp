@@ -647,7 +647,7 @@ impl CommentCheck {
     /// Partial-precision comments (`# v4` over `v4.3.1`) agree when the SHA's most specific
     /// tag extends the comment; `tag_to_sha["v4"]` is not compared for that case since moving
     /// majors legitimately drift. A cold or empty index, or a SHA absent from a truncated
-    /// one, is [`Self::Unverifiable`] rather than a mismatch, unless the truncated index maps
+    /// one ([`PinResolution::Unlisted`]), is [`Self::Unverifiable`] rather than a mismatch, unless the truncated index maps
     /// a full-version comment to another commit ([`CommentMismatch::CommentNamesOtherCommit`]).
     ///
     /// # Examples
@@ -698,19 +698,19 @@ impl CommentCheck {
             return Self::Confirmed;
         }
         match index.pin_resolution(sha, Some(&comment.tag)) {
-            PinResolution::Resolved(pin)
+            PinResolution::Resolved { pin, .. }
                 if comment_names_tag(commented, pin.version().as_str()) =>
             {
                 Self::Confirmed
             }
-            PinResolution::Resolved(pin) => Self::Mismatch(CommentMismatch::ShaIsOtherTag {
+            PinResolution::Resolved { pin, .. } => Self::Mismatch(CommentMismatch::ShaIsOtherTag {
                 actual: pin.version().clone(),
             }),
             PinResolution::Untagged => Self::Mismatch(CommentMismatch::ShaNotInIndex),
             PinResolution::CommentContradicted => {
                 Self::Mismatch(CommentMismatch::CommentNamesOtherCommit)
             }
-            PinResolution::Unresolved => Self::Unverifiable,
+            PinResolution::Unresolved | PinResolution::Unlisted => Self::Unverifiable,
         }
     }
 }

@@ -6,10 +6,9 @@ use deps_core::lsp_helpers::{
     BoundedVersionReq, CandidateTagSource, CommentCheck, CommentSlot, CommitSha,
     DiagnosticMessages, DiagnosticPolicy, OsvNameAvailability, OsvNaming, PackageNaming,
     PackageRendering, PartialTagPolicy, PinResolution, RequirementResolution, RequirementStatus,
-    ResolvedPin, ShaPinLookup, ShaPinTail, SourcePolicy, TagIndex, concrete_pin_version,
-    extends_tag, is_partial_semver_shaped, match_v_prefix_style,
-    requirement_contains_template_placeholder, sha_pin_rewrite, tag_has_precedence,
-    tag_pin_is_up_to_date,
+    ShaPinLookup, ShaPinTail, SourcePolicy, TagIndex, concrete_pin_version,
+    is_partial_semver_shaped, match_v_prefix_style, requirement_contains_template_placeholder,
+    sha_pin_rewrite, tag_has_precedence, tag_pin_is_up_to_date,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
@@ -108,12 +107,23 @@ impl GithubActionsFormatter {
     }
 
     /// The commit `tag` points at per the shared [`TagIndex`], `None` on a cache miss.
-    // TODO(#1768): exact-key lookup misses `v4.1.3` for an OSV fix version `4.1.3`;
-    // reuse `TagIndex::release_tag`.
     fn commit_for_tag(&self, name: &PackageName, tag: &str) -> Option<CommitSha> {
         self.tag_index
             .get(name)
             .and_then(|index| index.tag_to_sha.get(tag).cloned())
+    }
+
+    /// The index's spelling of release `version` and its commit, tolerating a `v` prefix
+    /// mismatch (an OSV fix version `4.1.3` against tag `v4.1.3`); see
+    /// [`TagIndex::release_commit`].
+    fn release_commit_for(
+        &self,
+        name: &PackageName,
+        version: &str,
+    ) -> Option<(ConcreteVersion, CommitSha)> {
+        self.tag_index
+            .get(name)
+            .and_then(|index| index.release_commit(version))
     }
 }
 
@@ -226,10 +236,10 @@ impl PackageRendering for GithubActionsFormatter {
             Some(PinStyle::Tag) => match_v_prefix_style(current, version.as_str()),
             Some(PinStyle::Sha { .. }) => gha_dep
                 .sha_pin_tail()
-                .zip(self.commit_for_tag(dep.name(), version.as_str()))
+                .zip(self.release_commit_for(dep.name(), version.as_str()))
                 .map_or_else(
                     || dep.version_literal().unwrap_or(current).to_string(),
-                    |(tail, sha)| sha_pin_rewrite(&tail, &sha, version),
+                    |(tail, (tag, sha))| sha_pin_rewrite(&tail, &sha, &tag),
                 ),
             Some(PinStyle::Branch) | None => dep.version_literal().unwrap_or(current).to_string(),
         }
@@ -335,11 +345,15 @@ impl RequirementResolution for GithubActionsFormatter {
         requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> RequirementStatus {
-        self.sha_pin_status_from_tag_index(dep, latest)
-            .unwrap_or_else(|| {
-                let status = self.classify_requirement_status(requirement, latest);
-                self.distrust_absent_ahead_tag(dep, requirement, latest, status)
-            })
+        let text = || {
+            let status = self.classify_requirement_status(requirement, latest);
+            let status = self.distrust_unpublished_tag(dep, requirement, latest, status);
+            self.cap_unlisted_tag_pin(dep, requirement, status)
+        };
+        match self.sha_pin_lookup(dep, latest) {
+            Some(lookup) => lookup.status_or_text(text),
+            None => text(),
+        }
     }
 
     /// #1556: a SHA pin's registry-confirmed tag (`TagIndex.sha_to_tag`) is a real,
@@ -349,11 +363,12 @@ impl RequirementResolution for GithubActionsFormatter {
     /// (`# cargo-deny`), or no comment at all all resolve here the same way a full
     /// `# v4.2.0` comment already did before this existed.
     ///
-    /// Not gated on the SHA comment the way `Self::sha_pin_status_from_tag_index` is: that
+    /// Not gated on the SHA comment the way `Self::sha_pin_lookup` is: that
     /// method only needs to *distrust* a human-written comment when one exists, but this
     /// method's job is finding a version at all, so a commentless SHA pin (whose raw SHA is
-    /// its own `version_req`) is just as eligible. [`PinResolution::Unresolved`] on a cold cache
-    /// or truncated index — the honest "unknown", not a fabricated version — and
+    /// its own `version_req`) is just as eligible. [`PinResolution::Unresolved`] on a cold cache —
+    /// the honest "unknown", not a fabricated version — [`PinResolution::Unlisted`] when a
+    /// truncated index lacks the commit or the exact tag (#1769), and
     /// [`PinResolution::Untagged`] when a complete index proves no tag names the commit (#1735).
     ///
     /// #1684: a floating tag pin (`@v4`) resolves the same way through the commit its tag
@@ -367,40 +382,27 @@ impl RequirementResolution for GithubActionsFormatter {
         let Some(gha_dep) = dep.as_any().downcast_ref::<GithubActionsDependency>() else {
             return PinResolution::Unresolved;
         };
-        let resolved = |pin: Option<ResolvedPin>| {
-            pin.map_or(PinResolution::Unresolved, PinResolution::Resolved)
-        };
-        if gha_dep.pin == Some(PinStyle::Tag)
-            && let Some(written) = gha_dep.version_req.as_ref().map(VersionReq::as_str)
-            && concrete_pin_version(written, EcosystemId::GithubActions).is_some()
-        {
-            return resolved(
-                self.tag_index
-                    .get(dep.name())
-                    .and_then(|index| index.resolved_exact_tag(written)),
-            );
-        }
-        let (Some(commit), Some(index)) =
-            (self.pinned_commit(gha_dep), self.tag_index.get(dep.name()))
-        else {
+        let Some(index) = self.tag_index.get(dep.name()) else {
             return PinResolution::Unresolved;
         };
-        if matches!(gha_dep.pin, Some(PinStyle::Sha { .. })) {
-            return index
-                .pin_resolution(&commit, gha_dep.sha_comment().map(ShaComment::comment_tag));
+        match &gha_dep.pin {
+            Some(PinStyle::Sha { sha, comment }) => {
+                index.pin_resolution(sha, comment.as_ref().map(ShaComment::comment_tag))
+            }
+            Some(PinStyle::Tag) => {
+                let Some(written) = gha_dep.version_req.as_ref().map(VersionReq::as_str) else {
+                    return PinResolution::Unresolved;
+                };
+                if concrete_pin_version(written, EcosystemId::GithubActions).is_some() {
+                    index.exact_tag_resolution(written)
+                } else if is_partial_semver_shaped(written) {
+                    index.floating_tag_resolution(written)
+                } else {
+                    PinResolution::Unresolved
+                }
+            }
+            Some(PinStyle::Branch) | None => PinResolution::Unresolved,
         }
-        let Some(written) = gha_dep.version_req.as_ref().map(VersionReq::as_str) else {
-            return PinResolution::Unresolved;
-        };
-        let candidates: Vec<(&str, &CommitSha)> = index
-            .tag_to_sha
-            .iter()
-            .filter(|(tag, sha)| {
-                **sha == commit && (tag.as_str() == written || extends_tag(tag, written))
-            })
-            .map(|(tag, sha)| (tag.as_str(), sha))
-            .collect();
-        resolved(TagIndex::from_tags(candidates).resolved_pin(&commit))
     }
 
     /// `tag_index` is populated as a side effect of [`GithubActionsRegistry`]'s own tags
@@ -454,43 +456,66 @@ impl GithubActionsFormatter {
         }
     }
 
-    /// Downgrades an up-to-date tag pin to [`RequirementStatus::Unresolved`] when the pin sits
-    /// ahead of `latest` and the repository's complete `TagIndex` proves no such tag exists
-    /// (`@v40`, a typo or a deleted tag), so it is not reported as clean (#1753).
+    /// Caps an up-to-date version-shaped tag pin that a truncated `TagIndex` does not list
+    /// ([`TagIndex::cap_status_if_tag_unlisted`]): the list may merely not reach it, so the
+    /// text cannot prove it current (#1769).
+    fn cap_unlisted_tag_pin(
+        &self,
+        dep: &dyn Dependency,
+        requirement: BoundedVersionReq<'_>,
+        status: RequirementStatus,
+    ) -> RequirementStatus {
+        let written = requirement.as_str();
+        let is_tag_pin = dep
+            .as_any()
+            .downcast_ref::<GithubActionsDependency>()
+            .is_some_and(|gha_dep| gha_dep.pin == Some(PinStyle::Tag));
+        let is_version_shaped = concrete_pin_version(written, EcosystemId::GithubActions).is_some()
+            || is_partial_semver_shaped(written);
+        if !is_tag_pin || !is_version_shaped {
+            return status;
+        }
+        self.tag_index.get(dep.name()).map_or(status, |index| {
+            index.cap_status_if_tag_unlisted(written, status)
+        })
+    }
+
+    /// Caps an up-to-date tag pin the repository's complete `TagIndex` proves unpublished
+    /// (`@4.3.1` beside tag `v4.3.1`, `@v40`, a typo or a deleted tag) to
+    /// [`RequirementStatus::Unresolved`], so it is not reported as clean (#1753, #1766). A full
+    /// release shape is capped at any position; a partial one (`@v1`, `@v3-node20`, which may
+    /// be a documented branch pin) only when ahead of `latest`. `Outdated` stays `Outdated`.
     ///
-    /// Never produces `Outdated`, so no downgrade is offered. A cold or truncated index keeps
-    /// `status`. A branch named like a version (`@v5` on a repository with no such tag) is
-    /// indistinguishable from a nonexistent tag and reads `Unresolved` too.
-    fn distrust_absent_ahead_tag(
+    /// A ref like `@v40`, which this status caps but the `unknown-ref` diagnostic never reports
+    /// (it may be a branch), is deliberately left without a finding.
+    fn distrust_unpublished_tag(
         &self,
         dep: &dyn Dependency,
         requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
         status: RequirementStatus,
     ) -> RequirementStatus {
-        let is_absent_ahead_tag = status == RequirementStatus::UpToDate
-            && dep
-                .as_any()
-                .downcast_ref::<GithubActionsDependency>()
-                .is_some_and(|gha_dep| gha_dep.pin == Some(PinStyle::Tag))
-            && self.tag_index.get(dep.name()).is_some_and(|index| {
-                index.proves_ahead_tag_absent(
-                    requirement.as_str(),
-                    latest.as_str(),
-                    PartialTagPolicy::MovingLine,
-                )
-            });
-        if is_absent_ahead_tag {
-            RequirementStatus::Unresolved
-        } else {
-            status
+        let is_tag_pin = dep
+            .as_any()
+            .downcast_ref::<GithubActionsDependency>()
+            .is_some_and(|gha_dep| gha_dep.pin == Some(PinStyle::Tag));
+        if !is_tag_pin {
+            return status;
         }
+        self.tag_index.get(dep.name()).map_or(status, |index| {
+            index.cap_status_if_unpublished(
+                requirement.as_str(),
+                latest.as_str(),
+                PartialTagPolicy::MovingLine,
+                status,
+            )
+        })
     }
 
-    /// Ground-truth status for a full-SHA pin against the repository's `TagIndex` — see
+    /// What the repository's `TagIndex` says about a full-SHA pin against `latest` — see
     /// [`RequirementResolution::classify_requirement_status_for`]. `None` when `dep` isn't a
-    /// full-SHA pin, or the index cannot vouch for the SHA's absence (cold cache, or a
-    /// `Truncated` index); the comment, if any, is then trusted.
+    /// full-SHA pin. A cold index leaves the comment's status standing; a `Truncated` index that
+    /// lacks the SHA lets it stand only short of up to date ([`ShaPinLookup::Unlisted`]).
     ///
     /// #1648: no longer gates on `requirement_is_oversized` itself — this method is only ever
     /// reached through
@@ -504,23 +529,22 @@ impl GithubActionsFormatter {
     /// and a comment naming a tag must not override that). An indexed
     /// SHA is up to date when it is `latest`'s commit, or its tag is a version tag that is
     /// itself up to date; a non-version tag (`cargo-deny`) never counts as up to date by text.
-    fn sha_pin_status_from_tag_index(
+    fn sha_pin_lookup(
         &self,
         dep: &dyn Dependency,
         latest: &ConcreteVersion,
-    ) -> Option<RequirementStatus> {
+    ) -> Option<ShaPinLookup> {
         let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
         let Some(PinStyle::Sha { sha, comment }) = &gha_dep.pin else {
             return None;
         };
         let index = self.tag_index.get(dep.name());
-        ShaPinLookup::resolve(
+        Some(ShaPinLookup::resolve(
             index.as_deref().map(AsRef::as_ref),
             sha,
             latest,
             comment.as_ref().map(ShaComment::comment_tag),
-        )
-        .status()
+        ))
     }
 
     /// Whether a SHA pin's trailing `# tag` comment agrees with the repository's `TagIndex`
@@ -583,7 +607,7 @@ impl OsvNaming for GithubActionsFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::lsp_helpers::{CommentMismatch, CommitSha, RequirementGate};
+    use deps_core::lsp_helpers::{CommentMismatch, CommitSha, RequirementGate, ResolvedPin};
     use deps_core::pagination::ListCoverage;
     use deps_core::parser::DependencySource;
     use deps_core::{Position, Range};
@@ -1685,22 +1709,26 @@ mod tests {
     }
 
     /// #1762: only a full-version comment that the truncated index maps elsewhere is
-    /// contradicted; a moving alias and an unlisted version stay trusted.
+    /// contradicted; a moving alias and an unlisted version stay unverifiable. #1766: the SHA the
+    /// truncated list does not reach never reads up to date from such a comment, whatever its
+    /// shape, while an outdated comment stays outdated.
     #[test]
     fn test_truncated_index_moving_alias_and_unlisted_comments_stay_unverifiable() {
         let fmt = fmt_with_coverage_1722(ListCoverage::Truncated);
-        for comment in ["v2", "v2.87", "v99.0.0"] {
+        for (comment, expected) in [
+            ("v2", RequirementStatus::Unresolved),
+            ("v2.87", RequirementStatus::Unresolved),
+            ("v99.0.0", RequirementStatus::Unresolved),
+            ("v99", RequirementStatus::Unresolved),
+            ("v2.80.0", RequirementStatus::Outdated),
+        ] {
             let d = sha_pin_1720(MISSING_SHA_1720, Some(comment));
             assert_eq!(
                 check_1722(&fmt, &d),
                 CommentCheck::Unverifiable,
                 "{comment}"
             );
-            assert_eq!(
-                status_1720(&fmt, &d),
-                RequirementStatus::UpToDate,
-                "{comment}"
-            );
+            assert_eq!(status_1720(&fmt, &d), expected, "{comment}");
         }
     }
 
@@ -1906,7 +1934,7 @@ mod tests {
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            PinResolution::Resolved(ResolvedPin::most_specific(ConcreteVersion::new("v1")))
+            resolved_complete(ResolvedPin::most_specific(ConcreteVersion::new("v1")))
         );
     }
 
@@ -1935,7 +1963,7 @@ mod tests {
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            PinResolution::Resolved(ResolvedPin::most_specific(ConcreteVersion::new(
+            resolved_complete(ResolvedPin::most_specific(ConcreteVersion::new(
                 "cargo-deny"
             )))
         );
@@ -1962,8 +1990,15 @@ mod tests {
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            PinResolution::Resolved(ResolvedPin::most_specific(ConcreteVersion::new("v4.2.0")))
+            resolved_complete(ResolvedPin::most_specific(ConcreteVersion::new("v4.2.0")))
         );
+    }
+
+    fn resolved_complete(pin: ResolvedPin) -> PinResolution {
+        PinResolution::Resolved {
+            pin,
+            sibling_coverage: ListCoverage::Complete,
+        }
     }
 
     fn floating_tag_pin_for(tag: &str, indexed: &[(&str, &str)]) -> Option<ResolvedPin> {
@@ -1985,8 +2020,9 @@ mod tests {
         d: &GithubActionsDependency,
     ) -> Option<ResolvedPin> {
         match fmt.resolved_pin_version(d) {
-            PinResolution::Resolved(pin) => Some(pin),
+            PinResolution::Resolved { pin, .. } => Some(pin),
             PinResolution::Unresolved
+            | PinResolution::Unlisted
             | PinResolution::Untagged
             | PinResolution::CommentContradicted => None,
         }
@@ -2231,7 +2267,7 @@ mod tests {
         );
         assert_eq!(
             fmt.resolved_pin_version(&commentless),
-            PinResolution::Unresolved
+            PinResolution::Unlisted
         );
     }
 
@@ -2278,16 +2314,165 @@ mod tests {
         }
     }
 
-    /// #1753: a truncated or missing index cannot prove absence, so the old verdict stands.
+    /// #1753/#1769: a missing (cold) index cannot prove absence, so the old verdict stands; a
+    /// truncated one may merely not reach the ref, so the ref is never proven current.
     #[test]
-    fn test_ahead_tag_pin_stays_up_to_date_without_complete_index() {
-        for coverage in [Some(ListCoverage::Truncated), None] {
+    fn test_ahead_tag_pin_without_complete_index() {
+        assert_eq!(
+            tag_pin_status_1753(None, PinStyle::Tag, "v40"),
+            RequirementStatus::UpToDate
+        );
+        let truncated = Some(ListCoverage::Truncated);
+        for written in ["v40", "v4.3.1", "v4"] {
+            let expected = if written == "v4.3.1" || written == "v4" {
+                RequirementStatus::UpToDate
+            } else {
+                RequirementStatus::Unresolved
+            };
             assert_eq!(
-                tag_pin_status_1753(coverage, PinStyle::Tag, "v40"),
-                RequirementStatus::UpToDate,
-                "{coverage:?}"
+                tag_pin_status_1753(truncated, PinStyle::Tag, written),
+                expected,
+                "{written}"
             );
         }
+        assert_eq!(
+            tag_pin_status_1753(truncated, PinStyle::Tag, "v3"),
+            RequirementStatus::Outdated
+        );
+    }
+
+    /// #1766: a full release no tag matches is unknown at any position, while a partial shape
+    /// (a documented branch pin like `ruby/setup-ruby@v1`) keeps #1753's ahead-only rule.
+    #[test]
+    fn test_unpublished_tag_pin_status_by_shape() {
+        let fmt = formatter();
+        let sha = CommitSha::parse(LATEST_SHA_1720).unwrap();
+        fmt.tag_index.insert(
+            PackageName::new("ruby/setup-ruby"),
+            Arc::new(TagIndex::from_tags([("v1.2.0", &sha), ("v1.1.0", &sha)])),
+        );
+        let status = |written: &str| {
+            let mut d = dep(Some(PinStyle::Tag), "ruby/setup-ruby");
+            d.version_req = Some(written.into());
+            fmt.requirement_status_for(
+                &d,
+                &VersionReq::new(written),
+                &ConcreteVersion::new("v1.2.0"),
+            )
+        };
+
+        assert_eq!(status("v1.2.0"), RequirementStatus::UpToDate);
+        assert_eq!(status("1.2.0"), RequirementStatus::Unresolved, "exact refs");
+        assert_eq!(status("v1.10.0"), RequirementStatus::Unresolved);
+        assert_eq!(status("v0.9.0"), RequirementStatus::Outdated);
+        assert_eq!(status("v1"), RequirementStatus::UpToDate, "branch pin");
+        assert_eq!(status("v40"), RequirementStatus::Unresolved);
+        assert_eq!(
+            status("v1.3.0-working"),
+            RequirementStatus::Unresolved,
+            "a partial shape ahead of latest"
+        );
+        assert_eq!(status("v1.0.0-working"), RequirementStatus::Outdated);
+        assert_eq!(status("v3-node20"), RequirementStatus::UpToDate);
+    }
+
+    /// #1769: an exact full-version tag the truncated list does not reach is `Unlisted`, never
+    /// up to date; on a complete index it stays `Unresolved` for resolution and the #1753 rule
+    /// decides the status.
+    #[test]
+    fn test_exact_tag_pin_missing_from_truncated_index_is_unlisted_and_capped() {
+        let tag_dep = |written: &str| {
+            let mut d = dep(Some(PinStyle::Tag), "actions/checkout");
+            d.version_req = Some(written.into());
+            d
+        };
+        let seeded = |coverage| {
+            let fmt = formatter();
+            let sha = CommitSha::parse(LATEST_SHA_1720).unwrap();
+            fmt.tag_index.insert(
+                PackageName::new("actions/checkout"),
+                Arc::new(TagIndex::from_tags([("v4.3.1", &sha)]).with_coverage(coverage)),
+            );
+            fmt
+        };
+
+        let truncated = seeded(ListCoverage::Truncated);
+        assert_eq!(
+            truncated.resolved_pin_version(&tag_dep("v4.8.0")),
+            PinResolution::Unlisted
+        );
+        assert_eq!(
+            tag_pin_status_1753(Some(ListCoverage::Truncated), PinStyle::Tag, "v99.0.0"),
+            RequirementStatus::Unresolved
+        );
+        assert_eq!(
+            tag_pin_status_1753(Some(ListCoverage::Truncated), PinStyle::Tag, "v3.0.0"),
+            RequirementStatus::Outdated
+        );
+        assert_matches!(
+            truncated.resolved_pin_version(&tag_dep("v4.3.1")),
+            PinResolution::Resolved {
+                sibling_coverage: ListCoverage::Truncated,
+                ..
+            }
+        );
+
+        let complete = seeded(ListCoverage::Complete);
+        assert_eq!(
+            complete.resolved_pin_version(&tag_dep("v4.8.0")),
+            PinResolution::Unresolved
+        );
+    }
+
+    /// #1769: the floating-tag sub-selection keeps the whole index's coverage.
+    #[test]
+    fn test_floating_tag_pin_on_truncated_index_carries_truncated_coverage() {
+        let fmt = formatter();
+        let sha = CommitSha::parse(LATEST_SHA_1720).unwrap();
+        fmt.tag_index.insert(
+            PackageName::new("actions/checkout"),
+            Arc::new(
+                TagIndex::from_tags([("v4", &sha), ("v4.3.1", &sha)])
+                    .with_coverage(ListCoverage::Truncated),
+            ),
+        );
+        let mut d = dep(Some(PinStyle::Tag), "actions/checkout");
+        d.version_req = Some("v4".into());
+        assert_matches!(
+            fmt.resolved_pin_version(&d),
+            PinResolution::Resolved {
+                sibling_coverage: ListCoverage::Truncated,
+                ..
+            }
+        );
+    }
+
+    /// #1769: manifest text stands in for an unlisted SHA pin's version, with unknown siblings
+    /// (so a clean OSV answer is later downgraded); a listed pin keeps the index's coverage.
+    #[test]
+    fn test_unlisted_sha_pin_in_use_version_has_unknown_siblings() {
+        use deps_core::lsp_helpers::resolve_in_use_versions;
+
+        let fmt = fmt_with_coverage_1722(ListCoverage::Truncated);
+        let in_use = |sha: &str, comment: &str| {
+            let mut d = sha_pin_1720(sha, Some(comment));
+            d.version_req = Some(comment.into());
+            resolve_in_use_versions(
+                &d,
+                "actions/checkout",
+                &std::collections::HashMap::new(),
+                None,
+                &fmt,
+                EcosystemId::GithubActions,
+            )
+        };
+
+        let unlisted = in_use(MISSING_SHA_1720, "v4.2.0").unwrap();
+        assert_eq!(unlisted.primary().as_str(), "v4.2.0");
+        assert_eq!(unlisted.sibling_coverage(), ListCoverage::Truncated);
+
+        let listed = in_use(OLD_SHA_1720, "v2.87.21").unwrap();
+        assert_eq!(listed.sibling_coverage(), ListCoverage::Truncated);
     }
 
     /// #1753 documented side effect: a branch named like a version and ahead of `latest` is
@@ -2484,6 +2669,56 @@ mod tests {
         assert_eq!(new_text, format!("{} # v5.0.0", "deadbeef".repeat(5)));
     }
 
+    fn seed_index(fmt: &GithubActionsFormatter, name: &str, tags: &[(&str, char)]) {
+        let shas: Vec<(&str, CommitSha)> = tags
+            .iter()
+            .map(|(tag, c)| (*tag, CommitSha::parse(&c.to_string().repeat(40)).unwrap()))
+            .collect();
+        fmt.tag_index.insert(
+            PackageName::new(name),
+            Arc::new(TagIndex::from_tags(shas.iter().map(|(t, s)| (*t, s)))),
+        );
+    }
+
+    /// #1768: an OSV fix version `4.1.3` rewrites to the `v4.1.3` tag, commented in the index's
+    /// own spelling.
+    #[test]
+    fn test_format_version_replacing_for_sha_fix_version_without_v_prefix() {
+        let fmt = formatter();
+        seed_index(&fmt, "actions/checkout", &[("v4.1.3", 'd')]);
+        let d = dep(
+            Some(PinStyle::sha_for_test(&"1".repeat(40), Some("v4.1.2"))),
+            "actions/checkout",
+        );
+        let new_text =
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("4.1.3"), "v4.1.2");
+        assert_eq!(new_text, format!("{} # v4.1.3", "d".repeat(40)));
+    }
+
+    /// A latest bump keeps resolving by the exact key when a differently spelled twin points
+    /// at another commit.
+    #[test]
+    fn test_format_version_replacing_for_sha_latest_bump_survives_conflicting_twins() {
+        let fmt = formatter();
+        seed_index(&fmt, "o/r", &[("v1.2.3", 'a'), ("1.2.3", 'b')]);
+        let d = dep(
+            Some(PinStyle::sha_for_test(&"1".repeat(40), Some("v1.2.2"))),
+            "o/r",
+        );
+        let new_text =
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v1.2.3"), "v1.2.2");
+        assert_eq!(new_text, format!("{} # v1.2.3", "a".repeat(40)));
+    }
+
+    /// The "pin current tag" action stays exact-key: `4.1.3` is not `v4.1.3` there.
+    #[test]
+    fn test_sha_pin_replacement_for_stays_exact_key() {
+        let fmt = formatter();
+        seed_index(&fmt, "actions/checkout", &[("v4.1.3", 'd')]);
+        let name = PackageName::new("actions/checkout");
+        assert_eq!(fmt.sha_pin_replacement_for(&name, "4.1.3"), None);
+    }
+
     /// Issue #1347 critic finding (C1), real-formatter regression: `requirement_is_unresolved`
     /// is `true` for every full-SHA pin (it means "not decidable from text alone", not
     /// "unexpanded placeholder, don't touch") — `deps_core::edit::plan_vulnerability_fix` must
@@ -2546,6 +2781,69 @@ mod tests {
                 .new_text,
             format!("{} # v5.0.0", "deadbeef".repeat(5))
         );
+    }
+
+    /// #1768: an OSV fix version spelled `4.1.3` against the tag `v4.1.3` plans a SHA rewrite
+    /// whose comment keeps the tag's own spelling, and the rewritten pin re-parses to that
+    /// commit and tag (the `deps-cli update --security-only` write path).
+    #[test]
+    fn test_plan_vulnerability_fix_sha_pin_fix_version_without_v_prefix_round_trips() {
+        use deps_core::ParseResult;
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
+        };
+
+        let fmt = formatter();
+        let (old_sha, new_sha) = ("a".repeat(40), "b".repeat(40));
+        fmt.tag_index.insert(
+            PackageName::new("actions/checkout"),
+            Arc::new(TagIndex::from_tags([(
+                "v4.1.3",
+                &CommitSha::parse(&new_sha).unwrap(),
+            )])),
+        );
+        let content = format!("steps:\n  - uses: actions/checkout@{old_sha} # v4.1.2\n");
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let parsed = crate::parser::parse_workflow_yaml(&content, &uri).unwrap();
+        let dep = &parsed.dependencies[0];
+        let range = dep.version_range.expect("SHA pin has a version range");
+
+        let advisory = Arc::new(
+            Advisory::new(
+                "GHSA-test-1768".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec![OsvVersion::new("4.1.3")]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: ConcreteVersion::new("4.1.3"),
+            });
+
+        let planned = plan_vulnerability_fix(dep, range, "v4.1.2", &dv, None, &fmt)
+            .expect("fix is planned for the SHA pin");
+        assert_eq!(planned.edit.new_text, format!("{new_sha} # v4.1.3"));
+
+        assert_eq!(
+            (range.start.character, range.end.character),
+            (27, 27 + 40 + " # v4.1.2".len() as u32),
+            "the edit range spans the SHA and its comment"
+        );
+        let rewritten = content.replacen(&format!("{old_sha} # v4.1.2"), &planned.edit.new_text, 1);
+        let reparsed = crate::parser::parse_workflow_yaml(&rewritten, &uri).unwrap();
+        let reparsed = &reparsed.dependencies()[0];
+        let reparsed = reparsed
+            .as_any()
+            .downcast_ref::<GithubActionsDependency>()
+            .unwrap();
+        assert_matches!(
+            &reparsed.pin,
+            Some(PinStyle::Sha { sha, .. }) if sha.as_str() == new_sha
+        );
+        assert_eq!(reparsed.sha_comment().unwrap().tag(), "v4.1.3");
     }
 
     /// FR-010 sibling fix (security audit finding): a quoted-scalar SHA pin must never get

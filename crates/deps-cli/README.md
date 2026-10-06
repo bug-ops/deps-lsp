@@ -189,10 +189,11 @@ elsewhere in the run — one malformed manifest in a large workspace never hides
 ### `--fail-on` categories
 
 `outdated`, `yanked`, `vulnerable`, `unsatisfiable`, `mutable-ref`, `sha-comment-mismatch`,
-`license`, `deprecated`, `other`. Defaults to `vulnerable,yanked,unsatisfiable` when the flag
-is omitted. `sha-comment-mismatch` selects SHA pins whose trailing version comment is not
-confirmed by the repository's tag index; it is never part of the default policy. `other` covers
-every finding that matches none of the eight specific categories and is never part of the
+`unknown-ref`, `license`, `deprecated`, `other`. Defaults to `vulnerable,yanked,unsatisfiable`
+when the flag is omitted. `sha-comment-mismatch` selects SHA pins whose trailing version comment
+is not confirmed by the repository's tag index; `unknown-ref` selects tag pins whose ref is a
+full release that no published tag matches; neither is part of the default policy. `other`
+covers every finding that matches none of the nine specific categories and is never part of the
 default policy.
 
 **Warning:** `other` also matches informational notices, not only real problems: the offline

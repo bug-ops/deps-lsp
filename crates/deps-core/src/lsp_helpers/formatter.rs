@@ -1605,7 +1605,7 @@ pub trait RequirementResolution: Send + Sync {
     /// for a [`crate::lsp_helpers::ResolvedPin::MostSpecific`] tag), since this hook can itself
     /// resolve to a moving/partial name (#1556 impl-critic S1, #1668).
     ///
-    /// The result has four values ([`crate::lsp_helpers::PinResolution`]): a
+    /// The result has five values ([`crate::lsp_helpers::PinResolution`]): a
     /// [`Resolved`](crate::lsp_helpers::PinResolution::Resolved) pin is authoritative (an
     /// unqueryable one yields no version, never the manifest text), an
     /// [`Untagged`](crate::lsp_helpers::PinResolution::Untagged) pin is proven to name no
@@ -1613,8 +1613,11 @@ pub trait RequirementResolution: Send + Sync {
     /// [`CommentContradicted`](crate::lsp_helpers::PinResolution::CommentContradicted) pin has
     /// a comment that is provably wrong and must not stand in either (an implementor must not
     /// map it to `Unresolved`), and only
-    /// [`Unresolved`](crate::lsp_helpers::PinResolution::Unresolved) lets the manifest text
-    /// stand in.
+    /// [`Unresolved`](crate::lsp_helpers::PinResolution::Unresolved) and
+    /// [`Unlisted`](crate::lsp_helpers::PinResolution::Unlisted) let the manifest text stand
+    /// in. An unlisted pin's text is not authoritative: its sibling tags are unknown, so a
+    /// clean vulnerability answer is not trusted (an implementor must not map it to
+    /// `Unresolved`).
     ///
     /// Default: [`Unresolved`](crate::lsp_helpers::PinResolution::Unresolved) — every
     /// ecosystem's manifest requirement text is authoritative until it opts in.

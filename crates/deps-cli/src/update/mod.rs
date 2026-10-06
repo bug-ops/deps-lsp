@@ -176,6 +176,11 @@ pub struct PlannedUpdateItem {
     /// consulted for this occurrence (`CooldownDisposition::NotEvaluated`/`Cleared`, or
     /// `Blocked { fallback: None }`).
     pub cooldown_fallback: Option<CooldownFallbackNote>,
+    /// When the OSV verdict this item reports (a flagged `latest` it refused to write, or the
+    /// flagged `latest`/fallback of a cooldown-fallback decision) holds only through sibling
+    /// release tags of the version's commit, the tags it matched (#1767). Never set for a
+    /// `--security-only` row without a verified fix, which reports no verdict of its own.
+    pub osv_sibling_match: Option<deps_core::lsp_helpers::SiblingMatchNote>,
 }
 
 /// Why [`PlannedUpdateItem::cooldown_fallback`] is set (spec 075 FR-013) — mirrors
@@ -395,7 +400,19 @@ impl PlannedUpdateItem {
             ignore_rule_overridden,
             gossip_excluded_version,
             cooldown_fallback,
+            osv_sibling_match: None,
         }
+    }
+
+    /// Attaches the sibling-tag attribution of this item's OSV verdict
+    /// ([`Self::osv_sibling_match`]).
+    #[must_use]
+    pub fn with_osv_sibling_match(
+        mut self,
+        osv_sibling_match: Option<deps_core::lsp_helpers::SiblingMatchNote>,
+    ) -> Self {
+        self.osv_sibling_match = osv_sibling_match;
+        self
     }
 
     /// This item's considered/applied target version — delegates to [`Outcome::target`], the
@@ -524,6 +541,9 @@ impl PlannedUpdateItem {
                 reason.push_str(&format!(" (candidate: {version})"));
             }
             None => {}
+        }
+        if let Some(note) = &self.osv_sibling_match {
+            reason.push_str(&format!(" ({note})"));
         }
         reason
     }
@@ -1009,19 +1029,26 @@ fn resolve_from_latest(
     }
 }
 
-/// Spec 075 FR-011/FR-012: `version`'s OSV verdict advisory ids, looked up against `status` —
-/// empty unless the verdict is `Flagged` (an `Unverified` verdict has no advisory list; the two
-/// call sites below never reach this helper for a `Verified`/`NotApplicable` version).
-fn osv_advisory_ids(
+/// What a version's OSV verdict reports for a [`PlannedUpdateItem`]: its advisory ids and, when it
+/// holds only through sibling release tags, the note naming them.
+type OsvVerdictDetails = (
+    Vec<String>,
+    Option<deps_core::lsp_helpers::SiblingMatchNote>,
+);
+
+/// Spec 075 FR-011/FR-012: `version`'s OSV verdict details, looked up against `status` — empty
+/// unless the verdict is `Flagged` (an `Unverified` verdict has no advisory list; the call sites
+/// below never reach this helper for a `Verified`/`NotApplicable` version).
+fn osv_verdict_details(
     status: Option<&deps_core::osv::LatestStatusMap>,
     dep: Option<&dyn deps_core::Dependency>,
     vuln_keys: &deps_core::osv::VulnKeys,
     normalized_name: &str,
     version: &str,
     formatter: &dyn EcosystemFormatter,
-) -> Vec<String> {
+) -> OsvVerdictDetails {
     let Some(dep) = dep else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     match latest_verdict(
         status,
@@ -1031,9 +1058,18 @@ fn osv_advisory_ids(
         version,
         formatter,
     ) {
-        LatestVerdict::Flagged { advisory_ids, .. } => advisory_ids,
+        LatestVerdict::Flagged {
+            advisory_ids,
+            via_sibling_tags,
+            ..
+        } => (
+            advisory_ids,
+            via_sibling_tags
+                .as_ref()
+                .map(|tags| deps_core::lsp_helpers::SiblingMatchNote::new(formatter, tags)),
+        ),
         LatestVerdict::Unverified | LatestVerdict::Verified | LatestVerdict::NotApplicable => {
-            Vec::new()
+            (Vec::new(), None)
         }
     }
 }
@@ -1124,10 +1160,27 @@ fn resolve_occurrence(
         }
     );
     // Fix-cycle item 6 (DRY): "never demote a flagged/unverified latest" is the shared shape
-    // behind rows 5/6/8/FR-003-reject — one closure instead of four hand-rolled copies.
-    let never_demoted = |latest_candidate: UpdateCandidate| {
+    // behind rows 1/2/3/5/6/8/FR-003-reject — one closure instead of hand-rolled copies.
+    // #1767: the plain flagged-`latest` row carries the sibling-tag attribution of the verdict it
+    // refuses to write, like the cooldown-fallback rows that name the same verdict.
+    let resolve_latest_only = |latest_candidate: UpdateCandidate| {
         let (current, outcome, advisory_ids) = resolve_from_latest(latest_candidate, ignore_rules);
-        build(current, outcome, advisory_ids, None)
+        let sibling_match = latest_is_osv_unplannable
+            .then(|| {
+                package_versions.and_then(|versions| {
+                    osv_verdict_details(
+                        analysis.latest_status.as_ref(),
+                        dep_by_key.get(&key).copied(),
+                        vuln_keys,
+                        &normalized_name,
+                        versions.latest.as_str(),
+                        formatter,
+                    )
+                    .1
+                })
+            })
+            .flatten();
+        build(current, outcome, advisory_ids, None).with_osv_sibling_match(sibling_match)
     };
     // DRY (code review finding): the routine "cooldown pause, targeting whatever `latest`
     // itself carries" shape recurs across rows 4/6/(fb.target-mismatch)/(requirement rejected)/11
@@ -1147,14 +1200,12 @@ fn resolve_occurrence(
 
     match disposition {
         CooldownDisposition::NotEvaluated | CooldownDisposition::Cleared => {
-            let (current, outcome, advisory_ids) =
-                resolve_from_latest(latest_candidate, ignore_rules);
-            build(current, outcome, advisory_ids, None)
+            resolve_latest_only(latest_candidate)
         }
         CooldownDisposition::Blocked { fallback: None, .. } => {
             if latest_is_osv_unplannable {
                 // Row 5: never demoted by a routine cooldown pause.
-                never_demoted(latest_candidate)
+                resolve_latest_only(latest_candidate)
             } else {
                 // Row 4.
                 cooldown_skip_from_latest(&latest_candidate)
@@ -1178,7 +1229,7 @@ fn resolve_occurrence(
                 // exists — that regresses #1517's "never masked by cooldown" invariant.
                 None => {
                     if latest_is_osv_unplannable {
-                        never_demoted(latest_candidate)
+                        resolve_latest_only(latest_candidate)
                     } else {
                         cooldown_skip_from_latest(&latest_candidate)
                     }
@@ -1193,7 +1244,7 @@ fn resolve_occurrence(
                     // as "fallback absent" above.
                     if fb.target != fallback.version {
                         return if latest_is_osv_unplannable {
-                            never_demoted(latest_candidate)
+                            resolve_latest_only(latest_candidate)
                         } else {
                             cooldown_skip_from_latest(&latest_candidate)
                         };
@@ -1237,17 +1288,20 @@ fn resolve_occurrence(
                         } else if latest_is_osv_unplannable {
                             // Row 7 (FR-012/OQ3): target the fallback, keep the
                             // flagged/unverified latest's own attribution in the same row.
-                            let advisory_ids =
-                                latest_version.as_ref().map_or_else(Vec::new, |latest| {
-                                    osv_advisory_ids(
-                                        analysis.latest_status.as_ref(),
-                                        dep_by_key.get(&key).copied(),
-                                        vuln_keys,
-                                        &normalized_name,
-                                        latest.as_str(),
-                                        formatter,
-                                    )
-                                });
+                            let (advisory_ids, sibling_match) =
+                                latest_version.as_ref().map_or_else(
+                                    || (Vec::new(), None),
+                                    |latest| {
+                                        osv_verdict_details(
+                                            analysis.latest_status.as_ref(),
+                                            dep_by_key.get(&key).copied(),
+                                            vuln_keys,
+                                            &normalized_name,
+                                            latest.as_str(),
+                                            formatter,
+                                        )
+                                    },
+                                );
                             build(
                                 current,
                                 Outcome::Applied {
@@ -1257,6 +1311,7 @@ fn resolve_occurrence(
                                 advisory_ids,
                                 latest_version.map(CooldownFallbackNote::AppliedInsteadOf),
                             )
+                            .with_osv_sibling_match(sibling_match)
                         } else {
                             // Row 9: the ordinary cooldown-fallback substitution.
                             build(
@@ -1274,7 +1329,7 @@ fn resolve_occurrence(
                         // fallback as a downgrade (or is unavailable) — never write it, and
                         // never demote a flagged/unverified latest here either.
                         if latest_is_osv_unplannable {
-                            never_demoted(latest_candidate)
+                            resolve_latest_only(latest_candidate)
                         } else {
                             cooldown_skip_from_latest(&latest_candidate)
                         }
@@ -1288,7 +1343,7 @@ fn resolve_occurrence(
                     if latest_is_osv_unplannable {
                         // Row 8: both blocked — defer to latest's own attribution, exit 1,
                         // never demoted regardless of why the fallback also failed.
-                        never_demoted(latest_candidate)
+                        resolve_latest_only(latest_candidate)
                     } else if let Some(rule_reason) =
                         ignore_rules.skip_reason(&normalized_name, UpdateKind::Unknown)
                     {
@@ -1312,7 +1367,7 @@ fn resolve_occurrence(
                     ) {
                         // Row 10 (FR-011): the fallback itself is OSV-blocked — exit 1, naming
                         // the fallback version, never a silent cooldown skip.
-                        let advisory_ids = osv_advisory_ids(
+                        let (advisory_ids, sibling_match) = osv_verdict_details(
                             analysis.fallback_status.as_ref(),
                             dep_by_key.get(&key).copied(),
                             vuln_keys,
@@ -1332,6 +1387,7 @@ fn resolve_occurrence(
                                 version: fallback.version.clone(),
                             }),
                         )
+                        .with_osv_sibling_match(sibling_match)
                     } else {
                         // Row 11: fallback blocked by a non-OSV structural reason.
                         cooldown_skip_from_latest(&latest_candidate)
@@ -1940,6 +1996,7 @@ mod tests {
                 version: ConcreteVersion::new("1.2.0"),
                 advisory_ids: Capped::new(vec!["MAL-2026-00001".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
+                via_sibling_tags: None,
             },
         );
         analysis.latest_status = Some(latest_status);
@@ -1970,6 +2027,54 @@ mod tests {
             crate::exit::update_exit_code(&plan),
             crate::exit::EXIT_POLICY_VIOLATION,
             "a flagged latest must never exit clean"
+        );
+    }
+
+    /// #1767: a flagged `latest` that holds only through sibling release tags names them in the
+    /// item's reason and `osv_sibling_match`.
+    #[test]
+    fn test_plan_updates_flagged_latest_via_sibling_tags_names_the_tags() {
+        use deps_core::osv::{Capped, LatestStatusMap, MatchedTags, UpgradeStatus, VulnSeverity};
+
+        let content = "serde = \"1.0.0\"\n";
+        let mut analysis = test_analysis(
+            vec![test_dep(
+                "serde",
+                "1.0.0",
+                Range::new(Position::new(0, 9), Position::new(0, 14)),
+            )],
+            cached("serde", "1.2.0"),
+        );
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            deps_core::test_util::vuln_key("serde"),
+            UpgradeStatus::CandidateVulnerable {
+                version: ConcreteVersion::new("1.2.0"),
+                advisory_ids: Capped::new(vec!["GHSA-xxxx-yyyy-zzzz".to_string()], 1),
+                worst_severity: Some(VulnSeverity::High),
+                via_sibling_tags: Some(MatchedTags::new(ConcreteVersion::new("v1.2.1"), vec![])),
+            },
+        );
+        analysis.latest_status = Some(latest_status);
+
+        let plan = plan_updates_no_cooldown(
+            &analysis,
+            content,
+            &STUB_FORMATTER,
+            &[],
+            &IgnoreRules::empty(),
+        );
+
+        let item = &plan.items[0];
+        let note = item
+            .osv_sibling_match
+            .as_ref()
+            .expect("sibling attribution");
+        assert_eq!(note.tags().iter().next().unwrap().as_str(), "v1.2.1");
+        assert!(
+            item.reason().ends_with("(matched tag v1.2.1)"),
+            "{}",
+            item.reason()
         );
     }
 
@@ -2004,6 +2109,7 @@ mod tests {
                 version: ConcreteVersion::new("1.2.0"),
                 advisory_ids: Capped::new(vec!["MAL-2026-00001".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
+                via_sibling_tags: None,
             },
         );
         analysis.latest_status = Some(latest_status);
@@ -2444,6 +2550,7 @@ mod tests {
                 ignore_rule_overridden: false,
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                osv_sibling_match: None,
             }],
         };
 
@@ -2481,6 +2588,7 @@ mod tests {
                 ignore_rule_overridden: false,
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                osv_sibling_match: None,
             }],
         };
 
@@ -2518,6 +2626,7 @@ mod tests {
                 ignore_rule_overridden: false,
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                osv_sibling_match: None,
             }],
         };
 
@@ -2552,6 +2661,7 @@ mod tests {
                 ignore_rule_overridden: false,
                 gossip_excluded_version: None,
                 cooldown_fallback: None,
+                osv_sibling_match: None,
             }],
         };
 
@@ -2586,6 +2696,7 @@ mod tests {
             ignore_rule_overridden: false,
             gossip_excluded_version: None,
             cooldown_fallback: None,
+            osv_sibling_match: None,
         }
     }
 
@@ -2846,7 +2957,7 @@ mod tests {
     /// `"1.1.0"` compiling to `^1.1.0`) would admit, so the two-phase guard's phase 1/2 checks
     /// pass for any test using this fixture that actually reaches `fallback_edit_excludes_newer`
     /// (most of the tests below do not: their fallback view's own OSV/structural rejection, or
-    /// the ignore-rule short-circuit inside `never_demoted`, resolves the occurrence before the
+    /// the ignore-rule short-circuit inside `resolve_latest_only`, resolves the occurrence before the
     /// guard is ever consulted — see each test's own doc for which case it is).
     fn fallback_scenario_analysis(
         fallback_version: &str,
@@ -3161,6 +3272,10 @@ mod tests {
                 version: ConcreteVersion::new("2.0.0"),
                 advisory_ids: Capped::new(vec!["GHSA-xxxx".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
+                via_sibling_tags: Some(deps_core::osv::MatchedTags::new(
+                    ConcreteVersion::new("v4.9.0"),
+                    vec![],
+                )),
             },
         );
         analysis.latest_status = Some(latest_status);
@@ -3208,6 +3323,14 @@ mod tests {
         assert_eq!(
             plan.items[0].cooldown_fallback,
             Some(CooldownFallbackNote::AppliedInsteadOf("2.0.0".into()))
+        );
+        assert_eq!(
+            plan.items[0]
+                .osv_sibling_match
+                .as_ref()
+                .map(ToString::to_string),
+            Some("matched tag v4.9.0".to_string()),
+            "row 7 must name the sibling tags of the flagged latest it bypassed"
         );
     }
 
@@ -3327,6 +3450,10 @@ mod tests {
                 version: ConcreteVersion::new("1.1.0"),
                 advisory_ids: Capped::new(vec!["GHSA-yyyy".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
+                via_sibling_tags: Some(deps_core::osv::MatchedTags::new(
+                    ConcreteVersion::new("v4.9.0"),
+                    vec![],
+                )),
             },
         );
         analysis.fallback_status = Some(fallback_status);
@@ -3367,6 +3494,14 @@ mod tests {
             Some(CooldownFallbackNote::Blocked {
                 version: "1.1.0".into()
             })
+        );
+        assert_eq!(
+            plan.items[0]
+                .osv_sibling_match
+                .as_ref()
+                .map(ToString::to_string),
+            Some("matched tag v4.9.0".to_string()),
+            "row 10 must name the sibling tags of the blocked fallback"
         );
         assert_eq!(
             crate::exit::update_exit_code(&plan),
@@ -3437,6 +3572,7 @@ mod tests {
                     version: deps_core::ConcreteVersion::new(version),
                     advisory_ids: Capped::new(vec!["GHSA-x".to_string()], 1),
                     worst_severity: Some(VulnSeverity::High),
+                    via_sibling_tags: None,
                 },
             );
             status
@@ -3528,7 +3664,7 @@ mod tests {
     /// actually under test — `RealSemverFormatter` + a working `reparse_quoted_deps` and a
     /// `content` literal matching the exact-pin requirement text are required for that; using
     /// `FALLBACK_FORMATTER`/`never_reparse` (a0-uncompilable) made this test pass through
-    /// `never_demoted`'s OWN, unrelated ignore-rule check instead, leaving the actual row-7
+    /// `resolve_latest_only`'s OWN, unrelated ignore-rule check instead, leaving the actual row-7
     /// branch with zero coverage (proven by mutation: removing the ignore-rule check inside
     /// `requirement_ok` still passed 318/318 deps-cli tests before this fix).
     #[tokio::test]
@@ -3544,6 +3680,7 @@ mod tests {
                 version: ConcreteVersion::new("2.0.0"),
                 advisory_ids: Capped::new(vec!["GHSA-x".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
+                via_sibling_tags: None,
             },
         );
         analysis.latest_status = Some(latest_status);
@@ -3647,6 +3784,7 @@ mod tests {
                 version: ConcreteVersion::new("1.1.0"),
                 advisory_ids: Capped::new(vec!["GHSA-x".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
+                via_sibling_tags: None,
             },
         );
         analysis.fallback_status = Some(fallback_status);

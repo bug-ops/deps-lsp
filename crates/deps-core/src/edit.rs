@@ -1727,6 +1727,7 @@ mod tests {
                     version: ConcreteVersion::new("1.0.8"),
                     advisory_ids: crate::osv::Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                     worst_severity: Some(crate::osv::VulnSeverity::Malicious),
+                    via_sibling_tags: None,
                 },
             );
             let versions = VersionData::new(&cached, &resolved).with_latest_status(&latest_status);
@@ -1894,11 +1895,12 @@ mod tests {
                     &self,
                     _dep: &dyn Dependency,
                 ) -> crate::lsp_helpers::PinResolution {
-                    crate::lsp_helpers::PinResolution::Resolved(
-                        crate::lsp_helpers::ResolvedPin::most_specific(ConcreteVersion::new(
+                    crate::lsp_helpers::PinResolution::Resolved {
+                        pin: crate::lsp_helpers::ResolvedPin::most_specific(ConcreteVersion::new(
                             "v1.3.0",
                         )),
-                    )
+                        sibling_coverage: crate::pagination::ListCoverage::Complete,
+                    }
                 }
             }
             impl crate::lsp_helpers::DiagnosticMessages for ShaPinResolvedFormatter {}

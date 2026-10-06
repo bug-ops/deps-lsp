@@ -189,6 +189,32 @@ mod tests {
         );
     }
 
+    /// #1766: `unknown-ref` fails the run only when selected, and then at any severity.
+    #[test]
+    fn test_exit_code_unknown_ref_fails_only_when_selected() {
+        let mut hint = finding(Category::UnknownRef);
+        hint.severity = deps_core::diagnostic::Severity::Hint;
+        let report = CheckReport {
+            findings: vec![hint],
+        };
+        assert_eq!(
+            exit_code(
+                &report,
+                &FailOnPolicy::new(vec![Category::UnknownRef]),
+                ExecutionOutcome::Clean
+            ),
+            EXIT_POLICY_VIOLATION
+        );
+        assert_eq!(
+            exit_code(
+                &report,
+                &FailOnPolicy::default_categories(),
+                ExecutionOutcome::Clean
+            ),
+            EXIT_CLEAN
+        );
+    }
+
     #[test]
     fn test_exit_code_non_failing_category_is_zero() {
         let report = CheckReport {
@@ -253,6 +279,7 @@ mod tests {
             ignore_rule_overridden: false,
             gossip_excluded_version: None,
             cooldown_fallback: None,
+            osv_sibling_match: None,
         }
     }
 

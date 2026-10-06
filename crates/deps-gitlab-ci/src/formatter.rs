@@ -132,6 +132,20 @@ impl GitlabCiFormatter {
             .and_then(|index| index.tag_to_sha.get(tag).cloned())
     }
 
+    /// The index's spelling of release `version` and its commit, tolerating a `v` prefix
+    /// mismatch (an OSV fix version `4.1.3` against tag `v4.1.3`); see
+    /// [`TagIndex::release_commit`].
+    fn release_commit_for(
+        &self,
+        endpoint: EndpointKind,
+        name: &PackageName,
+        version: &str,
+    ) -> Option<(ConcreteVersion, CommitSha)> {
+        self.tag_index
+            .get(&(endpoint, name.clone()))
+            .and_then(|index| index.release_commit(version))
+    }
+
     /// Whether a SHA pin's trailing `# tag` comment agrees with the repository's tag index;
     /// `None` when `gl_dep` is not a full-SHA pin.
     pub(crate) fn sha_comment_check(&self, gl_dep: &GitlabCiDependency) -> Option<CommentCheck> {
@@ -152,7 +166,7 @@ impl GitlabCiFormatter {
     ///
     /// A component version is a project release and a tag may exist without one, so the
     /// Releases index never proves a tag absent (S1).
-    fn tag_list_index(&self, gl_dep: &GitlabCiDependency) -> Option<Arc<TagIndex>> {
+    pub(crate) fn tag_list_index(&self, gl_dep: &GitlabCiDependency) -> Option<Arc<TagIndex>> {
         match gl_dep.kind.endpoint() {
             EndpointKind::Tags => self
                 .tag_index
@@ -162,32 +176,29 @@ impl GitlabCiFormatter {
         }
     }
 
-    /// Downgrades an up-to-date exact-tag pin to [`RequirementStatus::Unresolved`] when it
-    /// sits ahead of `latest` and the complete tag list proves no such tag exists (`ref:
-    /// v40.0.0`, a typo or a deleted tag), so it is not reported as clean (#1753).
-    ///
-    /// Never produces `Outdated`, so no downgrade is offered.
-    fn distrust_absent_ahead_tag(
+    /// Caps an up-to-date exact-tag pin the complete tag list proves unpublished (`ref:
+    /// v40.0.0`, a typo or a deleted tag) to [`RequirementStatus::Unresolved`], so it is not
+    /// reported as clean (#1753, #1766). A full release shape is capped at any position, a
+    /// partial one only when ahead of `latest`; `Outdated` stays `Outdated`.
+    fn distrust_unpublished_tag(
         &self,
         gl_dep: &GitlabCiDependency,
         requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
         status: RequirementStatus,
     ) -> RequirementStatus {
-        let is_absent_ahead_tag = status == RequirementStatus::UpToDate
-            && gl_dep.pin == Some(PinStyle::Tag)
-            && self.tag_list_index(gl_dep).is_some_and(|index| {
-                index.proves_ahead_tag_absent(
-                    requirement.as_str(),
-                    latest.as_str(),
-                    PartialTagPolicy::Exact,
-                )
-            });
-        if is_absent_ahead_tag {
-            RequirementStatus::Unresolved
-        } else {
-            status
+        if gl_dep.pin != Some(PinStyle::Tag) {
+            return status;
         }
+        self.tag_list_index(gl_dep).map_or(status, |index| {
+            let status = index.cap_status_if_unpublished(
+                requirement.as_str(),
+                latest.as_str(),
+                PartialTagPolicy::Exact,
+                status,
+            );
+            index.cap_status_if_tag_unlisted(requirement.as_str(), status)
+        })
     }
 
     /// The status a SHA pin's own comment implies, for an index that cannot vouch for the SHA:
@@ -215,12 +226,12 @@ impl GitlabCiFormatter {
     /// `latest`'s commit, or its tag is not [`deps_core::lsp_helpers::TagPosition::BelowLatest`]
     /// relative to `latest` (a prerelease newer than `latest` counts as up to date, as for a
     /// `PinStyle::Tag` pin); a non-version tag never counts as up to date by text.
-    fn sha_pin_status_from_tag_index(
+    fn sha_pin_lookup(
         &self,
         gl_dep: &GitlabCiDependency,
         sha: &CommitSha,
         latest: &ConcreteVersion,
-    ) -> Option<RequirementStatus> {
+    ) -> ShaPinLookup {
         let index = self
             .tag_index
             .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()));
@@ -230,7 +241,6 @@ impl GitlabCiFormatter {
             latest,
             gl_dep.sha_comment().map(|comment| &comment.tag),
         )
-        .status()
     }
 }
 
@@ -282,10 +292,10 @@ impl PackageRendering for GitlabCiFormatter {
         match &gl_dep.pin {
             Some(PinStyle::Partial | PinStyle::Latest | PinStyle::Branch) => current.to_string(),
             Some(PinStyle::Sha { tail, .. }) => self
-                .commit_for_tag(gl_dep.kind.endpoint(), &gl_dep.name, version.as_str())
+                .release_commit_for(gl_dep.kind.endpoint(), &gl_dep.name, version.as_str())
                 .map_or_else(
                     || gl_dep.version_literal().unwrap_or(current).to_string(),
-                    |sha| sha_pin_rewrite(tail, &sha, version),
+                    |(tag, sha)| sha_pin_rewrite(tail, &sha, &tag),
                 ),
             Some(PinStyle::Tag) | None => match_v_prefix_style(current, version.as_str()),
         }
@@ -408,16 +418,19 @@ impl RequirementResolution for GitlabCiFormatter {
         let Some(pin) = gl_dep.pin.as_ref() else {
             return self.classify_requirement_status(requirement, latest);
         };
+        let pin_text_status = || {
+            let status = status_for_pin(pin, requirement.as_str(), latest.as_str());
+            self.distrust_unpublished_tag(gl_dep, requirement, latest, status)
+        };
         if let PinStyle::Sha { sha, tail } = pin {
-            if let Some(status) = self.sha_pin_status_from_tag_index(gl_dep, sha, latest) {
-                return status;
-            }
-            if let Some(comment) = tail.comment() {
-                return Self::comment_status(gl_dep, comment, latest);
-            }
+            self.sha_pin_lookup(gl_dep, sha, latest).status_or_text(|| {
+                tail.comment().map_or_else(pin_text_status, |comment| {
+                    Self::comment_status(gl_dep, comment, latest)
+                })
+            })
+        } else {
+            pin_text_status()
         }
-        let status = status_for_pin(pin, requirement.as_str(), latest.as_str());
-        self.distrust_absent_ahead_tag(gl_dep, requirement, latest, status)
     }
 
     /// #1556: mirrors `deps_github_actions::GithubActionsFormatter`'s identical override —
@@ -598,6 +611,13 @@ mod tests {
 
     fn formatter() -> GitlabCiFormatter {
         GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()))
+    }
+
+    fn resolved_complete(pin: ResolvedPin) -> PinResolution {
+        PinResolution::Resolved {
+            pin,
+            sibling_coverage: deps_core::pagination::ListCoverage::Complete,
+        }
     }
 
     fn range() -> Range {
@@ -1031,7 +1051,7 @@ mod tests {
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            PinResolution::Resolved(ResolvedPin::most_specific(ConcreteVersion::new("v1.2.3")))
+            resolved_complete(ResolvedPin::most_specific(ConcreteVersion::new("v1.2.3")))
         );
     }
 
@@ -1041,9 +1061,8 @@ mod tests {
     fn test_resolved_pin_version_classifies_two_component_release_and_alias() {
         use deps_core::lsp_helpers::CommitSha;
 
-        let most_specific = |tag: &str| {
-            PinResolution::Resolved(ResolvedPin::most_specific(ConcreteVersion::new(tag)))
-        };
+        let most_specific =
+            |tag: &str| resolved_complete(ResolvedPin::most_specific(ConcreteVersion::new(tag)));
         let sha = "a".repeat(40);
         let commit = CommitSha::parse(&sha).unwrap();
         for (tags, expected) in [
@@ -1052,7 +1071,7 @@ mod tests {
             (vec!["v2", "v2.9.1"], most_specific("v2.9.1")),
             (
                 vec!["v2.9", "v2.9.1.4"],
-                PinResolution::Resolved(ResolvedPin::alias(ConcreteVersion::new("v2.9"))),
+                resolved_complete(ResolvedPin::alias(ConcreteVersion::new("v2.9"))),
             ),
         ] {
             let fmt = formatter();
@@ -1446,7 +1465,7 @@ mod tests {
         let upper = HEX_SHA_1723.to_ascii_uppercase();
         assert_eq!(
             fmt.resolved_pin_version(&sha_dep_1723(&upper)),
-            PinResolution::Resolved(ResolvedPin::most_specific(ConcreteVersion::new("v1.0.1")))
+            resolved_complete(ResolvedPin::most_specific(ConcreteVersion::new("v1.0.1")))
         );
     }
 
@@ -1503,13 +1522,14 @@ mod tests {
     }
 
     #[test]
-    fn test_absent_ahead_tag_pin_is_kept_on_truncated_or_cold_index() {
+    fn test_absent_ahead_tag_pin_is_unresolved_on_truncated_and_kept_on_cold_index() {
         use crate::types::IncludeKind::Project;
         use deps_core::pagination::ListCoverage;
 
         let d = tag_dep_1753("v40.0.0", Project);
         assert_eq!(status_1723(&formatter(), &d), RequirementStatus::UpToDate);
 
+        // #1769: a truncated list may merely not reach the tag, so it is never proven current.
         let fmt = formatter();
         let sha = deps_core::lsp_helpers::CommitSha::parse(LATEST_SHA_1723).unwrap();
         fmt.tag_index.insert(
@@ -1518,7 +1538,61 @@ mod tests {
                 TagIndex::from_tags([("v1.1.0", &sha)]).with_coverage(ListCoverage::Truncated),
             ),
         );
-        assert_eq!(status_1723(&fmt, &d), RequirementStatus::UpToDate);
+        assert_eq!(status_1723(&fmt, &d), RequirementStatus::Unresolved);
+        let behind = tag_dep_1753("v0.9.0", Project);
+        assert_eq!(status_1723(&fmt, &behind), RequirementStatus::Outdated);
+        let listed = tag_dep_1753("v1.1.0", Project);
+        assert_eq!(status_1723(&fmt, &listed), RequirementStatus::UpToDate);
+    }
+
+    /// #1766: a SHA the truncated list does not reach never reads up to date from its comment,
+    /// whatever the comment's shape; an outdated comment stays outdated, and a cold index
+    /// still trusts the comment.
+    #[test]
+    fn test_unlisted_sha_pin_comment_is_never_up_to_date() {
+        use crate::types::IncludeKind::Project;
+        use deps_core::lsp_helpers::CommitSha;
+        use deps_core::pagination::ListCoverage;
+
+        let fmt = formatter();
+        let latest = CommitSha::parse(LATEST_SHA_1723).unwrap();
+        fmt.tag_index.insert(
+            (EndpointKind::Tags, PackageName::new("gitlab.com/org/proj")),
+            Arc::new(
+                TagIndex::from_tags([("v1.1.0", &latest)]).with_coverage(ListCoverage::Truncated),
+            ),
+        );
+        for (comment, kind, expected) in [
+            ("v1.1.0", Project, RequirementStatus::Unresolved),
+            ("v99.0.0", Project, RequirementStatus::Unresolved),
+            ("v99", Project, RequirementStatus::Unresolved),
+            ("v1.0.0", Project, RequirementStatus::Outdated),
+        ] {
+            let d = commented_sha_dep(comment, kind);
+            assert_eq!(status_1723(&fmt, &d), expected, "{comment}");
+            let expected_check = if comment == "v1.1.0" {
+                CommentCheck::Mismatch(
+                    deps_core::lsp_helpers::CommentMismatch::CommentNamesOtherCommit,
+                )
+            } else {
+                CommentCheck::Unverifiable
+            };
+            assert_eq!(
+                fmt.sha_comment_check(&d),
+                Some(expected_check),
+                "a comment the truncated list maps elsewhere is contradicted, any other is \
+                 unverifiable: {comment}"
+            );
+            assert_eq!(
+                status_1723(&formatter(), &d),
+                if comment == "v1.0.0" {
+                    RequirementStatus::Outdated
+                } else {
+                    RequirementStatus::UpToDate
+                },
+                "cold index trusts the comment: {comment}"
+            );
+        }
     }
 
     /// S1: a component version may exist without a release, so the Releases index never
@@ -1618,6 +1692,32 @@ mod tests {
             )
             .as_deref(),
             Some(LATEST_SHA_1723)
+        );
+    }
+
+    /// #1768: an OSV fix version `1.1.0` resolves to the `v1.1.0` tag's commit.
+    #[test]
+    fn test_format_version_replacing_for_sha_fix_version_without_v_prefix() {
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[]);
+        let d = sha_dep_1723(OLD_SHA_1723);
+        assert_eq!(
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("1.1.0"), OLD_SHA_1723),
+            LATEST_SHA_1723
+        );
+    }
+
+    /// Conflicting twins keep an exact-key latest bump, but an unprefixed request cannot pick one.
+    #[test]
+    fn test_format_version_replacing_for_sha_conflicting_twins() {
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[("1.1.0", HEX_SHA_1723)]);
+        let d = sha_dep_1723(OLD_SHA_1723);
+        assert_eq!(
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v1.1.0"), OLD_SHA_1723),
+            LATEST_SHA_1723
+        );
+        assert_eq!(
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("V1.1.0"), OLD_SHA_1723),
+            OLD_SHA_1723
         );
     }
 

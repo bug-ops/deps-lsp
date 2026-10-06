@@ -208,6 +208,7 @@ pub fn generate_inlay_hints(
                 if let LatestVerdict::Flagged {
                     advisory_ids,
                     malicious,
+                    ..
                 } = verdict
                 {
                     let icon = if malicious { "🚫" } else { "⚠️" };
@@ -248,6 +249,7 @@ pub fn generate_inlay_hints(
                 if let LatestVerdict::Flagged {
                     advisory_ids,
                     malicious,
+                    ..
                 } = verdict
                 {
                     let icon = if malicious { "🚫" } else { "⚠️" };
@@ -611,6 +613,7 @@ mod tests {
                 version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
+                via_sibling_tags: None,
             },
         );
 
@@ -688,6 +691,7 @@ mod tests {
                 version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
+                via_sibling_tags: None,
             },
         );
 

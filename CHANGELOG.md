@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `TagIndex::pin_resolution` and `ShaPinLookup::resolve` take the pin's comment tag; `PinResolution`, `ShaPinLookup` and `CommentMismatch` gain a comment-contradicted variant; `ShaPinComment::new` takes the tag range (#1770)
 - **deps-gitlab-ci**: `PinStyle::Sha` carries the pinned `CommitSha`; `sha_pin_replacement_for` takes a `CommentSlot`; `GitlabCiDependency` gains `comment_slot` (#1770)
 - **deps-cli**: `Category::ShaCommentMismatch` added for `--fail-on sha-comment-mismatch` (#1770)
+- **deps-core**: `PinResolution::Resolved` gains `sibling_coverage` and `Unlisted` is added; `ShaPinLookup::status` becomes `status_or_text`; `proves_ahead_tag_absent` becomes `unpublished_tag_ref` (#TBD)
+- **deps-core**: sibling-tag coverage added to `InUseVersions`, `CandidateSiblings` and `ScanTarget`; `via_sibling_tags` added to `CandidateVulnerable` and `LatestVerdict::Flagged`; `unknown_ref` added to the diagnostic severities (#TBD)
+- **deps-cli**: `Category::UnknownRef`, `PlannedUpdateItem::osv_sibling_match` and `UpdateItemDocument::matched_tags` added (#TBD)
+- **deps-core**: `DiagnosticsConfig::unknown_ref_severity` added, so struct-literal construction no longer compiles (#TBD)
 
 ### Added
 - **deps-core, all ecosystems**: `DepsError::HostBlockedByPolicy` shows a policy-specific message when a registry host resolves to a blocked address class at connect time (#1773)
@@ -35,10 +39,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gitlab-ci**: `Correct version comment to <tag>` quickfix for SHA pins (#1770)
 - **deps-core**: shared `lsp_helpers::sha_comment` module (SHA-pin trailing-comment read, check and rewrite) used by GitHub Actions and GitLab CI (#1764)
 - **deps-core, deps-github-actions**: `Ecosystem::tag_index_refreshes` and `GithubActionsRegistry::subscribe_tag_refreshes` publish tag-index refresh events (#1764)
+- **deps-core, deps-gitlab-ci, deps-lsp**: GitLab CI publishes tag-index refresh events, rescanning other open documents (#TBD)
+- **deps-github-actions, deps-gitlab-ci, deps-cli**: `unknown-ref` diagnostic, `diagnostics.unknown_ref_severity` and `--fail-on unknown-ref` for tag pins no published tag matches (#TBD)
+- **deps-core, deps-cli**: flagged latest candidates name the sibling release tags they match in hover, diagnostics and `update` (#TBD)
 
 ### Changed
 - **deps-core, deps-lsp, deps-cli**: one `osv_checks_enabled` gate for every OSV call site instead of repeated `vulnerabilities_enabled && !offline` conditions (#1775)
 - **deps-github-actions, deps-gitlab-ci**: a tag pin ahead of the latest release is reported up to date instead of offering a downgrade (#1751)
+- **deps-core, deps-github-actions, deps-gitlab-ci**: a truncated tag list fails closed instead of reading a pin as up to date or an OSV answer as clean (#TBD)
+- **deps-github-actions, deps-gitlab-ci**: a full-release tag pin no published tag matches reads unresolved instead of up to date (#TBD)
 - **deps-cli**: `update --security-only` Unfixable rows (`Yanked`, `UnsupportedRequirementShape`, `OversizedRequirement`) now report their `advisory_ids` (#1747)
 - **deps-composer**: OR-branch bounds are computed once when `ComposerMatcher` is built, as in `deps-npm`; behavior unchanged (#1747)
 - **deps-swift**: `Package.resolved` pins map by `kind` (`registry` to a registry source, unknown kinds skipped instead of read as Git) and `SwiftRegistry` routes by dependency source, failing closed for unresolved `id:` sources (#1763)
@@ -46,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-engine, deps-github-actions**: OSV latest, candidate and fix-target checks cover the sibling release tags of the candidate commit and fail closed when they are unknown (#1775)
+- **deps-github-actions, deps-gitlab-ci**: a vulnerability fix version `4.1.3` now rewrites a SHA pin to tag `v4.1.3` (#TBD)
 - **deps-cli**: SARIF advisory rule description no longer carries a per-result sibling-tag note (#1775)
 - **deps-swift**: reparse only for the project `.swiftpm/configuration/registries.json`, not any file named `registries.json` (#1775)
 - **deps-github-actions**: pre-release tag pins (`@v2-beta`, `@v3.0.0-rc.1`) are reported outdated against a newer release (#1751)

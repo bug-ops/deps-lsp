@@ -223,6 +223,7 @@ impl PolicyConfig {
             mutable_ref_pin_severity: _,
             mutable_ref_pin_enabled: _,
             sha_comment_mismatch_severity: _,
+            unknown_ref_severity: _,
             vulnerabilities_enabled: _,
         } = new_diagnostics;
         let CacheConfig {
@@ -276,6 +277,7 @@ impl PolicyConfig {
 /// - `mutable_ref_pin_severity`: `HINT` - Dependencies pinned to a mutable ref (tag/branch) instead of a commit SHA (GitHub Actions `uses:` steps, GitLab CI `project:`/`component:` includes)
 /// - `mutable_ref_pin_enabled`: `true` - Whether the mutable-ref-pin diagnostic runs at all
 /// - `sha_comment_mismatch_severity`: `WARNING` - SHA-pinned GitHub Actions steps whose trailing version comment names a tag that is not the pinned commit's tag
+/// - `unknown_ref_severity`: `WARNING` - Tag pins (GitHub Actions `uses:` steps, GitLab CI `project:` includes) whose ref is a full release that no published tag matches
 ///
 /// # Examples
 ///
@@ -292,6 +294,7 @@ impl PolicyConfig {
 ///     .with_mutable_ref_pin_severity(Severity::Error)
 ///     .with_mutable_ref_pin_enabled(true)
 ///     .with_sha_comment_mismatch_severity(Severity::Error)
+///     .with_unknown_ref_severity(Severity::Error)
 ///     .with_vulnerabilities_enabled(true);
 ///
 /// assert_eq!(config.unknown_severity, Severity::Error);
@@ -341,6 +344,13 @@ pub struct DiagnosticsConfig {
     /// toggle because only a provable mismatch is reported.
     #[serde(default = "default_sha_comment_mismatch_severity")]
     pub sha_comment_mismatch_severity: Severity,
+    /// Severity for a tag pin (GitHub Actions `uses:` step, GitLab CI `project:` include)
+    /// whose ref is a full release that no published tag matches (`4.3.1` beside tag
+    /// `v4.3.1`, a typo, a deleted tag). Severity only; there is no toggle because only a full
+    /// release shape against a complete tag list is reported, so documented branch pins like
+    /// `ruby/setup-ruby@v1` never are.
+    #[serde(default = "default_unknown_ref_severity")]
+    pub unknown_ref_severity: Severity,
     /// Whether to run the OSV.dev vulnerability scan and render its
     /// diagnostics/hover content. Default `true` (opt-out): `cargo audit`/
     /// `npm audit` run by default, and an opt-in gate would undercut the
@@ -378,6 +388,7 @@ impl DiagnosticsConfig {
             mutable_ref_pin_severity: default_mutable_ref_pin_severity(),
             mutable_ref_pin_enabled: true,
             sha_comment_mismatch_severity: default_sha_comment_mismatch_severity(),
+            unknown_ref_severity: default_unknown_ref_severity(),
             vulnerabilities_enabled: true,
         }
     }
@@ -444,6 +455,13 @@ impl DiagnosticsConfig {
         self
     }
 
+    /// Overrides [`Self::unknown_ref_severity`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_unknown_ref_severity(mut self, unknown_ref_severity: Severity) -> Self {
+        self.unknown_ref_severity = unknown_ref_severity;
+        self
+    }
+
     /// Overrides [`Self::vulnerabilities_enabled`]. See [`Self::new`].
     #[must_use]
     pub const fn with_vulnerabilities_enabled(mut self, vulnerabilities_enabled: bool) -> Self {
@@ -469,6 +487,7 @@ impl DiagnosticsConfig {
     /// assert_eq!(severities.mutable_ref_pin, config.mutable_ref_pin_severity);
     /// assert_eq!(severities.mutable_ref_pin_enabled, config.mutable_ref_pin_enabled);
     /// assert_eq!(severities.sha_comment_mismatch, config.sha_comment_mismatch_severity);
+    /// assert_eq!(severities.unknown_ref, config.unknown_ref_severity);
     /// ```
     #[must_use]
     pub const fn to_severities(&self) -> crate::DiagnosticSeverities {
@@ -481,6 +500,7 @@ impl DiagnosticsConfig {
             .with_mutable_ref_pin(self.mutable_ref_pin_severity)
             .with_mutable_ref_pin_enabled(self.mutable_ref_pin_enabled)
             .with_sha_comment_mismatch(self.sha_comment_mismatch_severity)
+            .with_unknown_ref(self.unknown_ref_severity)
             .with_vulnerabilities_enabled(self.vulnerabilities_enabled)
     }
 }
@@ -643,6 +663,10 @@ const fn default_mutable_ref_pin_severity() -> Severity {
 }
 
 const fn default_sha_comment_mismatch_severity() -> Severity {
+    Severity::Warning
+}
+
+const fn default_unknown_ref_severity() -> Severity {
     Severity::Warning
 }
 
@@ -1579,6 +1603,18 @@ mod tests {
             serde_json::from_str(r#"{ "sha_comment_mismatch_severity": 1 }"#).unwrap();
         assert_eq!(config.sha_comment_mismatch_severity, Severity::Error);
         assert_eq!(config.to_severities().sha_comment_mismatch, Severity::Error);
+    }
+
+    #[test]
+    fn test_diagnostics_config_unknown_ref_severity_default_and_override() {
+        let default: DiagnosticsConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.unknown_ref_severity, Severity::Warning);
+        assert_eq!(default.to_severities().unknown_ref, Severity::Warning);
+
+        let config: DiagnosticsConfig =
+            serde_json::from_str(r#"{ "unknown_ref_severity": 4 }"#).unwrap();
+        assert_eq!(config.unknown_ref_severity, Severity::Hint);
+        assert_eq!(config.to_severities().unknown_ref, Severity::Hint);
     }
 
     #[test]

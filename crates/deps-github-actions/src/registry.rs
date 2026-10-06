@@ -13,12 +13,11 @@ use deps_core::pagination::ListCoverage;
 use deps_core::rate_limit::{DEFAULT_COOLDOWN_SECS, RateLimitGate};
 use deps_core::{
     DepsError, EcosystemId, HttpCache, PackageName, PublishTime, RateLimitEvidence, Result,
-    TagIndexRefreshes,
+    TagIndexRefreshSender, TagIndexRefreshes,
 };
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::broadcast;
 
 use crate::types::GithubActionsVersion;
 
@@ -32,10 +31,6 @@ const MAX_TAG_INDEX_ENTRIES: usize = 256;
 /// Maximum number of repositories with a coalescing lock outstanding in
 /// [`GithubActionsRegistry::in_flight`] at once.
 const MAX_IN_FLIGHT_ENTRIES: usize = 256;
-
-/// Capacity of the tag-index refresh channel; a receiver that falls further behind gets
-/// `RecvError::Lagged` and must treat every repository as refreshed.
-const TAG_REFRESH_CHANNEL_CAPACITY: usize = 256;
 
 /// Evicts entries from the in-flight coalescing map, but — unlike
 /// [`deps_core::cache_policy::evict_arbitrary_if_full`] — **only** an entry whose
@@ -80,7 +75,7 @@ pub struct GithubActionsRegistry {
     /// reason `github`'s cache is an `Arc`.
     release_dates: Arc<ReleaseDatesCache>,
     /// Fed by [`Self::populate_tag_index`]; clones of the registry share one channel.
-    tag_refreshes: broadcast::Sender<PackageName>,
+    tag_refreshes: TagIndexRefreshSender,
 }
 
 impl GithubActionsRegistry {
@@ -98,7 +93,7 @@ impl GithubActionsRegistry {
             in_flight: Arc::new(DashMap::new()),
             rate_limit: Arc::new(RateLimitGate::new(DEFAULT_COOLDOWN_SECS)),
             release_dates: Arc::new(ReleaseDatesCache::new()),
-            tag_refreshes: broadcast::channel(TAG_REFRESH_CHANNEL_CAPACITY).0,
+            tag_refreshes: TagIndexRefreshSender::new(),
         }
     }
 
@@ -121,7 +116,7 @@ impl GithubActionsRegistry {
             in_flight: Arc::new(DashMap::new()),
             rate_limit: Arc::new(RateLimitGate::new(DEFAULT_COOLDOWN_SECS)),
             release_dates: Arc::new(ReleaseDatesCache::new()),
-            tag_refreshes: broadcast::channel(TAG_REFRESH_CHANNEL_CAPACITY).0,
+            tag_refreshes: TagIndexRefreshSender::new(),
         }
     }
 
@@ -143,8 +138,8 @@ impl GithubActionsRegistry {
     /// Every successful tags fetch (lifecycle fetches, completion's `get_versions_from`, any
     /// other caller of [`Self::get_versions`]) sends the repository's [`PackageName`] on the
     /// returned channel if, and only if, that fetch first populated the repository's
-    /// [`TagIndex`] or changed its tag-to-commit mapping; a refetch yielding an identical
-    /// mapping sends nothing. The event is sent after the index has been replaced, so a
+    /// [`TagIndex`] or observably changed it ([`TagIndex::observably_differs`]); a refetch
+    /// yielding an identical index sends nothing. The event is sent after the index has been replaced, so a
     /// receiver reading [`Self::tag_index`] on receipt sees the new mapping.
     ///
     /// Each call returns an independent receiver that only observes events sent after it was
@@ -245,18 +240,8 @@ impl GithubActionsRegistry {
         let index = TagIndex::from_tags(valid.iter().map(|(name, sha)| (*name, sha)))
             .with_canonical_repo_name(canonical)
             .with_coverage(coverage);
-        if !self.tag_index.contains_key(name) {
-            deps_core::cache_policy::evict_arbitrary_if_full(
-                &self.tag_index,
-                MAX_TAG_INDEX_ENTRIES,
-            );
-        }
-        let index = Arc::new(index);
-        let previous = self.tag_index.insert(name.clone(), Arc::clone(&index));
-        let changed = previous.is_none_or(|previous| previous.tag_to_sha != index.tag_to_sha);
-        if changed && self.tag_refreshes.send(name.clone()).is_err() {
-            tracing::trace!("tag index refreshed with no subscriber");
-        }
+        self.tag_refreshes
+            .replace(&self.tag_index, name.clone(), index, MAX_TAG_INDEX_ENTRIES);
     }
 
     /// Fetches all semver-tagged versions for `name` (`owner/repo`).
@@ -497,6 +482,7 @@ mod tests {
     use super::*;
 
     use std::assert_matches;
+    use tokio::sync::broadcast;
 
     #[test]
     fn test_parse_tags_response() {

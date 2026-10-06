@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use crate::lsp_helpers::{BoundedVersionReq, EcosystemFormatter, PinResolution, ResolvedPin};
+use crate::pagination::ListCoverage;
 use crate::{ConcreteVersion, Dependency, EcosystemId, PackageName};
 
 /// How a *bare* (no explicit pin marker) version requirement should be treated when
@@ -568,26 +569,69 @@ pub fn resolve_in_use_version(
 /// release tags naming the same commit.
 ///
 /// Siblings come only from a formatter-resolved tag pin (GitHub Actions SHA and exact-tag
-/// pins), each admitted through the same queryability gate as the primary.
+/// pins), each admitted through the same queryability gate as the primary. Every value states
+/// whether its sibling list is complete ([`Self::sibling_coverage`]): a primary read from
+/// manifest text for a pin that a truncated tag list does not reach has unknown siblings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InUseVersions {
     primary: ConcreteVersion,
     siblings: Vec<ConcreteVersion>,
+    sibling_coverage: ListCoverage,
 }
 
 impl InUseVersions {
-    fn without_siblings(primary: ConcreteVersion) -> Self {
+    /// A primary that is not derived from a tag index (lock file, concrete requirement), so
+    /// there are no sibling tags to miss.
+    fn untagged(primary: ConcreteVersion) -> Self {
         Self {
             primary,
             siblings: Vec::new(),
+            sibling_coverage: ListCoverage::Complete,
+        }
+    }
+
+    /// A primary read from manifest text for a tag pin that a truncated tag list does not
+    /// list, so its sibling tags are unknown.
+    fn siblings_unknown(primary: ConcreteVersion) -> Self {
+        Self {
+            primary,
+            siblings: Vec::new(),
+            sibling_coverage: ListCoverage::Truncated,
         }
     }
 
     /// Builds a value without a formatter, for tests of consumers in other crates.
+    ///
+    /// The sibling list is reported complete.
     #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub const fn for_test(primary: ConcreteVersion, siblings: Vec<ConcreteVersion>) -> Self {
-        Self { primary, siblings }
+        Self::for_test_with_coverage(primary, siblings, ListCoverage::Complete)
+    }
+
+    /// Like [`Self::for_test`], with an explicit sibling coverage.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub const fn for_test_with_coverage(
+        primary: ConcreteVersion,
+        siblings: Vec<ConcreteVersion>,
+        sibling_coverage: ListCoverage,
+    ) -> Self {
+        Self {
+            primary,
+            siblings,
+            sibling_coverage,
+        }
+    }
+
+    /// Whether [`Self::siblings`] was read from a complete tag list.
+    ///
+    /// [`ListCoverage::Truncated`] means a sibling tag naming the primary's commit may be
+    /// missing, so a clean OSV answer for the primary and the listed siblings is not
+    /// authoritative.
+    #[must_use]
+    pub const fn sibling_coverage(&self) -> ListCoverage {
+        self.sibling_coverage
     }
 
     /// The version [`resolve_in_use_version`] reports.
@@ -697,7 +741,7 @@ pub fn resolve_in_use_versions(
         return dep
             .version_requirement()
             .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
-            .map(|v| InUseVersions::without_siblings(ConcreteVersion::from(v)));
+            .map(|v| InUseVersions::untagged(ConcreteVersion::from(v)));
     }
 
     if let Some(version) = resolve_occurrence_version(
@@ -707,7 +751,7 @@ pub fn resolve_in_use_versions(
         resolved_version_candidates,
         formatter,
     ) {
-        return Some(InUseVersions::without_siblings(version.clone()));
+        return Some(InUseVersions::untagged(version.clone()));
     }
 
     // #1556: an ecosystem's own out-of-band resolution (e.g. GitHub Actions' `TagIndex`)
@@ -716,16 +760,27 @@ pub fn resolve_in_use_versions(
     // silently superseded) — and still must pass a shape gate, since `TagIndex` can resolve a
     // SHA to a moving alias (`v1`, `v2` next to `v2.9`) that is not a queryable version (#503).
     match formatter.resolved_pin_version(dep) {
-        PinResolution::Resolved(pin) => {
+        PinResolution::Resolved {
+            pin,
+            sibling_coverage,
+        } => {
             let primary = queryable_pin_version(&pin, ecosystem)?;
             let siblings = queryable_siblings(&pin, ecosystem);
-            Some(InUseVersions { primary, siblings })
+            Some(InUseVersions {
+                primary,
+                siblings,
+                sibling_coverage,
+            })
         }
         PinResolution::Untagged | PinResolution::CommentContradicted => None,
         PinResolution::Unresolved => dep
             .version_requirement()
             .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
-            .map(|v| InUseVersions::without_siblings(ConcreteVersion::from(v))),
+            .map(|v| InUseVersions::untagged(ConcreteVersion::from(v))),
+        PinResolution::Unlisted => dep
+            .version_requirement()
+            .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
+            .map(|v| InUseVersions::siblings_unknown(ConcreteVersion::from(v))),
     }
 }
 
@@ -777,7 +832,7 @@ pub fn has_unqueryable_resolved_pin(
 ) -> bool {
     matches!(
         formatter.resolved_pin_version(dep),
-        PinResolution::Resolved(pin) if queryable_pin_version(&pin, ecosystem).is_none()
+        PinResolution::Resolved { pin, .. } if queryable_pin_version(&pin, ecosystem).is_none()
     )
 }
 
@@ -824,15 +879,17 @@ mod tests {
 
     impl FixedResolvedPinFormatter {
         fn most_specific(tag: &str) -> Self {
-            Self(PinResolution::Resolved(ResolvedPin::most_specific(
-                ConcreteVersion::new(tag),
-            )))
+            Self(PinResolution::Resolved {
+                pin: ResolvedPin::most_specific(ConcreteVersion::new(tag)),
+                sibling_coverage: ListCoverage::Complete,
+            })
         }
 
         fn alias(tag: &str) -> Self {
-            Self(PinResolution::Resolved(ResolvedPin::alias(
-                ConcreteVersion::new(tag),
-            )))
+            Self(PinResolution::Resolved {
+                pin: ResolvedPin::alias(ConcreteVersion::new(tag)),
+                sibling_coverage: ListCoverage::Complete,
+            })
         }
 
         fn with_resolution(resolution: PinResolution) -> Self {
@@ -1054,6 +1111,59 @@ mod tests {
                 PinResolution::Unresolved
             )),
             Some(ConcreteVersion::from("v4.2.0"))
+        );
+    }
+
+    /// #1769: the sibling coverage follows where the primary came from.
+    #[test]
+    fn resolve_in_use_versions_states_sibling_coverage_per_source() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let dep = MockDep {
+            name: PackageName::new("actions/checkout"),
+            version_req: VersionReq::new("v4.2.0"),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+        let coverage = |formatter: &FixedResolvedPinFormatter| {
+            resolve_in_use_versions(
+                &dep,
+                "actions/checkout",
+                &HashMap::new(),
+                None,
+                formatter,
+                EcosystemId::GithubActions,
+            )
+            .map(|versions| versions.sibling_coverage())
+        };
+        let resolved = |sibling_coverage| {
+            FixedResolvedPinFormatter::with_resolution(PinResolution::Resolved {
+                pin: ResolvedPin::most_specific(ConcreteVersion::new("v4.2.0")),
+                sibling_coverage,
+            })
+        };
+
+        assert_eq!(
+            coverage(&resolved(ListCoverage::Truncated)),
+            Some(ListCoverage::Truncated)
+        );
+        assert_eq!(
+            coverage(&resolved(ListCoverage::Complete)),
+            Some(ListCoverage::Complete)
+        );
+        assert_eq!(
+            coverage(&FixedResolvedPinFormatter::with_resolution(
+                PinResolution::Unresolved
+            )),
+            Some(ListCoverage::Complete)
+        );
+        assert_eq!(
+            coverage(&FixedResolvedPinFormatter::with_resolution(
+                PinResolution::Unlisted
+            )),
+            Some(ListCoverage::Truncated),
+            "manifest text stands in for an unlisted pin, with its siblings unknown"
         );
     }
 

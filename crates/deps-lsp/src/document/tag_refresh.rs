@@ -494,6 +494,39 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
+    /// #1765: the sweep is ecosystem-generic, so a GitLab peer document that uses a refreshed
+    /// project is rescanned too.
+    #[tokio::test]
+    async fn sweep_rescans_a_gitlab_peer_document_using_a_refreshed_project() {
+        let state = ServerState::new();
+        let url = deps_core::test_util::test_uri("/a/.gitlab-ci.yml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+        let ecosystem =
+            deps_gitlab_ci::GitlabCiEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n    file: a.yml\n";
+        let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+        let project = parse_result.dependencies()[0].name().clone();
+        state.update_document(
+            uri.clone(),
+            DocumentState::new_from_parse_result(
+                EcosystemId::GitlabCi,
+                content.to_string(),
+                parse_result,
+            ),
+        );
+        let seen = Arc::default();
+
+        sweep(
+            &state,
+            EcosystemId::GitlabCi,
+            &RefreshedRepos::Only(HashSet::from([project])),
+            counting_rescan(&seen, RescanOutcome::Unchanged),
+        )
+        .await;
+
+        assert_eq!(*seen.lock().unwrap(), vec![uri]);
+    }
+
     #[tokio::test]
     async fn sweep_ignores_documents_of_other_ecosystems() {
         let state = ServerState::new();

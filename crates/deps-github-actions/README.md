@@ -41,6 +41,10 @@ or `.github/actions/<name>/`, issue #706), and implements `deps_core::Ecosystem`
 - **SHA-comment-mismatch diagnostic** (issue #1722; shared with GitLab CI/CD) — a `@<sha> # vX` pin whose comment is
   provably not that commit's tag gets a warning diagnostic and hover note; severity via
   `sha_comment_mismatch_severity`
+- **Unknown-ref diagnostic** (issue #1766; shared with GitLab CI/CD) — a tag pin that is a full
+  release (`@4.3.1`, `@v4.3.10`) no published tag matches gets a warning diagnostic and an
+  unresolved status; partial refs that may be branches (`@v1`, `@v3-node20`) are not reported;
+  severity via `unknown_ref_severity`
 - **Bulk "Pin all to SHA" code lens** (issue #633) — a "Pin N actions to commit SHA" lens
   applies the per-step quick fix above to every resolvable mutable-tag step in one edit,
   reusing the same `TagIndex` lookup at zero additional network cost

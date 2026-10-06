@@ -132,13 +132,16 @@ subcommands. Paths default to the current directory when none are given to `chec
 ### `--fail-on` categories and exit codes
 
 `--fail-on` takes a comma-separated list of: `outdated`, `yanked`, `vulnerable`,
-`unsatisfiable`, `mutable-ref`, `sha-comment-mismatch`, `license`, `deprecated`, `other`. It defaults to
-`vulnerable,yanked,unsatisfiable` when omitted; an explicit `--fail-on` replaces that default
-list rather than extending it. `sha-comment-mismatch` selects SHA pins (GitHub Actions/GitLab
-CI) whose trailing version comment is not confirmed by the repository's tag index; it matches
-regardless of the finding's severity and is never part of the default policy. `other` covers
-every finding that matches none of the eight specific categories and is never part of the
-default policy.
+`unsatisfiable`, `mutable-ref`, `sha-comment-mismatch`, `unknown-ref`, `license`, `deprecated`,
+`other`. It defaults to `vulnerable,yanked,unsatisfiable` when omitted; an explicit `--fail-on`
+replaces that default list rather than extending it. `sha-comment-mismatch` selects SHA pins
+(GitHub Actions/GitLab CI) whose trailing version comment is not confirmed by the repository's
+tag index; it matches regardless of the finding's severity and is never part of the default
+policy. `unknown-ref` selects tag pins whose ref is a full release that no published tag of the
+repository matches (see [GitHub Actions](ecosystems/github-actions.md#unpublished-refs-and-the-unknown-ref-diagnostic-issue-1766));
+it is likewise severity-agnostic and never part of the default policy. `other` covers every
+finding that matches none of the nine specific categories and is never part of the default
+policy.
 
 **Warning:** `other` also matches informational notices, not only real problems: the offline
 notice, the skipped-lookup notice for any manifest without a lock file, an unresolved
