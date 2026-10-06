@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use zeroize::Zeroizing;
+
 use crate::fs_probe;
 
 /// Upper bound on a [`MtimeFileCache`]'s entry count.
@@ -137,6 +139,9 @@ impl<T> MtimeFileCache<T> {
     /// what the `stat` reported — so a symlink swap or concurrent growth between the `stat`
     /// and the read cannot let an oversized file's content slip through (CWE-367).
     ///
+    /// The content buffer handed to `parse` is zeroized on drop. This is best-effort: the
+    /// growth reallocations inside the capped read may leave copies of the content behind.
+    ///
     /// Always performs one `stat` (the mtime check) — that cost is unavoidable and paid on
     /// every call, cache hit or not — but reads and parses the file's *content* only on a
     /// miss. Compares mtime with `!=`, not `>`: a `git checkout` that restores an older file
@@ -176,7 +181,7 @@ impl<T> MtimeFileCache<T> {
         }
 
         let content = match fs_probe::read_to_string_capped(path, MAX_CACHED_FILE_BYTES).ok()? {
-            Some(content) => content,
+            Some(content) => Zeroizing::new(content),
             None => {
                 // The stat-based pre-filter passed, but the read still hit the cap — a symlink
                 // swap or concurrent growth between the two calls (CWE-367).

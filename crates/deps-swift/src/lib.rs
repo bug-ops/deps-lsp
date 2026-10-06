@@ -25,10 +25,11 @@ pub mod lockfile;
 mod package_location;
 mod package_registry;
 pub mod parser;
+mod published_at;
 pub mod registry;
 pub mod types;
 
-pub use auth::{SwiftEnvCredential, SwiftRegistryAuth};
+pub use auth::{SwiftCredential, SwiftCredentialSource, SwiftRegistryAuth};
 pub use config::SwiftParseContext;
 pub use ecosystem::SwiftEcosystem;
 pub use formatter::SwiftFormatter;

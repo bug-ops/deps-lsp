@@ -693,7 +693,7 @@ impl NuGetRegistry {
                         "NuGet alternate-feed chain resolution halted on a transport error \
                          — not falling back to api.nuget.org or the next configured feed"
                     );
-                    return Err(DepsError::ChainResolutionHalted);
+                    return Err(other.into_chain_halt());
                 }
             }
         }
@@ -2911,6 +2911,36 @@ mod tests {
         let versions = head.get_versions_chained("pkg").await.unwrap();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].version.as_str(), "3.0.0");
+    }
+
+    /// A hop whose host the connect-time resolver guard blocks (a `localhost` name, allowed at
+    /// parse time under `All`; the client is built directly) halts the chain with its actionable
+    /// [`DepsError::HostBlockedByPolicy`] and never tries hop 1.
+    #[tokio::test]
+    async fn test_get_versions_chained_policy_blocked_hop_halts_with_actionable_error() {
+        let mut hop1 = mockito::Server::new_async().await;
+        let hop1_flat = hop1
+            .mock("GET", "/flat/pkg/index.json")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let policy = all_policy();
+        let cache = Arc::new(HttpCache::new());
+        let hop1_client = Arc::new(workspace_client(&hop1.url(), &policy));
+        let port = hop1.socket_address().port();
+        let head = {
+            let feed =
+                NuGetFeedUrl::new(&format!("http://localhost:{port}/index.json"), &policy).unwrap();
+            NuGetRegistry::with_base(cache, &hop(&feed), Arc::clone(&policy), vec![hop1_client])
+        };
+
+        let err = head.get_versions_chained("pkg").await.unwrap_err();
+        assert!(
+            matches!(err, DepsError::HostBlockedByPolicy { .. }),
+            "expected HostBlockedByPolicy, got: {err:?}"
+        );
+        hop1_flat.assert_async().await;
     }
 
     /// A terminal transport error on hop 0 halts the chain — hop 1's `.expect(0)` mock fails

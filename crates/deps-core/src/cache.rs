@@ -724,6 +724,30 @@ impl reqwest::dns::Resolve for BlockedAddrResolver {
     }
 }
 
+/// Maps a failed `send()` to a [`DepsError`], surfacing a connect-time resolver-guard block as
+/// [`DepsError::HostBlockedByPolicy`] instead of a generic transport error.
+///
+/// Walks the source chain before the error is sanitized, since [`SanitizedRegistryError`] drops
+/// the chain. A [`ResolveGuardError::NoAddresses`] stays a transport error.
+fn send_error(url: &str, error: reqwest::Error) -> DepsError {
+    let blocked_class =
+        std::iter::successors(std::error::Error::source(&error), |source| source.source())
+            .find_map(|source| match source.downcast_ref::<ResolveGuardError>() {
+                Some(ResolveGuardError::Blocked { class, .. }) => Some(*class),
+                Some(ResolveGuardError::NoAddresses { .. }) | None => None,
+            });
+    match blocked_class {
+        Some(class) => DepsError::HostBlockedByPolicy {
+            url: RedactedUrl::new(url),
+            class,
+        },
+        None => DepsError::RegistryError {
+            package: RedactedUrl::new(url),
+            source: error.into(),
+        },
+    }
+}
+
 /// Builds a client with `HttpCache`'s shared configuration (user agent, timeout), varying the
 /// redirect policy and resolver — kept in one place so a future client-wide setting (proxy,
 /// connection pool sizing, etc.) can't silently miss any [`Transport`] this module builds. This
@@ -1885,10 +1909,7 @@ impl HttpCache {
             request = request.header(header::IF_MODIFIED_SINCE, last_modified);
         }
 
-        let response = request.send().await.map_err(|e| DepsError::RegistryError {
-            package: RedactedUrl::new(url),
-            source: e.into(),
-        })?;
+        let response = request.send().await.map_err(|e| send_error(url, e))?;
 
         if response.status() == StatusCode::NOT_MODIFIED {
             return Ok(None);
@@ -1948,10 +1969,7 @@ impl HttpCache {
             request = request.header(name, *value);
         }
 
-        let response = request.send().await.map_err(|e| DepsError::RegistryError {
-            package: RedactedUrl::new(url),
-            source: e.into(),
-        })?;
+        let response = request.send().await.map_err(|e| send_error(url, e))?;
 
         if !response.status().is_success() {
             return Err(http_status_error(
@@ -2044,16 +2062,12 @@ impl HttpCache {
         self.ensure_online(url)?;
         ensure_https(url)?;
 
-        let response =
-            client
-                .post(url)
-                .json(body)
-                .send()
-                .await
-                .map_err(|e| DepsError::RegistryError {
-                    package: RedactedUrl::new(url),
-                    source: e.into(),
-                })?;
+        let response = client
+            .post(url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| send_error(url, e))?;
 
         if !response.status().is_success() {
             return Err(http_status_error(
@@ -2188,10 +2202,7 @@ impl HttpCache {
             request = request.header(name, *value);
         }
 
-        let response = request.send().await.map_err(|e| DepsError::RegistryError {
-            package: RedactedUrl::new(url),
-            source: e.into(),
-        })?;
+        let response = request.send().await.map_err(|e| send_error(url, e))?;
 
         if !response.status().is_success() {
             return Err(http_status_error(
@@ -2598,6 +2609,78 @@ mod tests {
         assert!(
             format!("{err:?}").contains("Blocked"),
             "expected rejection at the resolver-guard step, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_error_maps_gated_class_to_host_blocked_by_policy() {
+        let lookup = TestLookup(Arc::new(|_host: &str| vec!["10.0.0.1:0".parse().unwrap()]));
+        let guard = AddrGuard::WorkspaceDeclared(WorkspaceRegistryAccess::PublicOnly);
+        let client = build_guarded_client_with_lookup(guard, lookup);
+        let url = "https://corp.example/index";
+        let error = client.get(url).send().await.unwrap_err();
+        match send_error(url, error) {
+            DepsError::HostBlockedByPolicy { class, .. } => {
+                assert_eq!(class, crate::net_policy::HostClass::PrivateV4);
+            }
+            other => panic!("expected HostBlockedByPolicy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_error_maps_never_a_registry_class_under_baseline() {
+        let lookup = TestLookup(Arc::new(|_host: &str| {
+            vec!["169.254.169.254:0".parse().unwrap()]
+        }));
+        let client = build_guarded_client_with_lookup(AddrGuard::Baseline, lookup);
+        let url = "https://rebound.example/index";
+        let error = client.get(url).send().await.unwrap_err();
+        let mapped = send_error(url, error);
+        assert!(
+            matches!(
+                mapped,
+                DepsError::HostBlockedByPolicy {
+                    class: crate::net_policy::HostClass::LinkLocal
+                        | crate::net_policy::HostClass::CloudMetadata,
+                    ..
+                }
+            ),
+            "{mapped:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_error_keeps_no_addresses_as_registry_error() {
+        let lookup = TestLookup(Arc::new(|_host: &str| Vec::new()));
+        let client = build_guarded_client_with_lookup(AddrGuard::Baseline, lookup);
+        let url = "https://empty.example/index";
+        let error = client.get(url).send().await.unwrap_err();
+        assert!(matches!(
+            send_error(url, error),
+            DepsError::RegistryError { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_surfaces_loopback_name_as_host_blocked_by_policy() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/")
+            .with_status(200)
+            .create_async()
+            .await;
+        let port = server.socket_address().port();
+        let cache = HttpCache::new();
+        let result: Result<Bytes> = cache.get_cached(&format!("http://localhost:{port}/")).await;
+        assert!(
+            matches!(
+                result,
+                Err(DepsError::HostBlockedByPolicy {
+                    class: crate::net_policy::HostClass::Loopback,
+                    ..
+                })
+            ),
+            "{result:?}"
         );
     }
 
@@ -3930,6 +4013,46 @@ mod tests {
         assert_eq!(result.as_ref(), b"stale but good");
         let cached = cache.entries.get(&url).unwrap();
         assert_eq!(cached.etag, Some("\"stale-etag\"".into()));
+    }
+
+    /// A connect-time policy block during revalidation makes no connection, so a warm entry is
+    /// still served (stale-while-revalidate) instead of surfacing `HostBlockedByPolicy`.
+    #[tokio::test]
+    async fn test_get_cached_policy_block_on_refresh_serves_warm_entry() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let url = format!("http://localhost:{}/", server.socket_address().port());
+
+        let cache = HttpCache::new();
+        cache.entries.insert(
+            url.clone(),
+            CachedResponse {
+                body: Bytes::from_static(b"warm"),
+                etag: None,
+                last_modified: None,
+                link: None,
+                fetched_at: Instant::now(),
+            },
+        );
+
+        let logs = crate::test_util::capture_tracing_output_async(async {
+            for _ in 0..2 {
+                let result: Bytes = cache.get_cached(&url).await.unwrap();
+                assert_eq!(result.as_ref(), b"warm");
+            }
+        })
+        .await;
+        assert!(
+            logs.matches("blocking DNS-resolved address").count() >= 2,
+            "revalidation must have been attempted and blocked each time: {logs}"
+        );
+        mock.assert_async().await;
+        assert!(cache.entries.contains_key(&url));
     }
 
     /// #756 round 2 S1 regression: the "conditional request failed, using cache" warn (fired

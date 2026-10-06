@@ -103,7 +103,9 @@ halted, not falling back to pypi.org") accompanies this case so it can be told
 apart from a genuinely missing package.
 
 **Reachability policy**: governed by the same `registries.workspace_registries`
-setting documented in [Cargo](cargo.md#customprivate-registries) — the same
+setting documented in [Cargo](cargo.md#customprivate-registries), including its
+[connect-time message](cargo.md#customprivate-registries) for a host that resolves to a blocked
+address (a blocked index halts the chain with that message) — the same
 `"public_only"`/`"off"`/`"all"` values, the same shared process-wide `HttpCache`
 policy. Only *explicitly-declared* indexes (a primary, every extra, every named
 source) are gated; the implicit `pypi.org` fallback used by the no-explicit-primary

@@ -207,6 +207,14 @@ fn not_found_or(err: DepsError, module_path: &str) -> DepsError {
     core_not_found_or(err, module_path, REGISTRY, &[410])
 }
 
+/// Records a hop's miss in `last_miss`, except that a recorded [`DepsError::HostBlockedByPolicy`]
+/// is never overwritten: a later hop that merely found nothing must not hide a policy block.
+fn record_miss(last_miss: &mut Result<Vec<GoVersion>>, miss: Result<Vec<GoVersion>>) {
+    if !matches!(last_miss, Err(DepsError::HostBlockedByPolicy { .. })) {
+        *last_miss = miss;
+    }
+}
+
 /// Client for interacting with proxy.golang.org.
 ///
 /// Uses the Go module proxy protocol for version lookups and metadata.
@@ -435,12 +443,15 @@ impl GoRegistry {
         for (hop, next_sep) in hops.iter().zip(next_seps.iter()) {
             match hop.get_versions_with_latest_fallback(module_path).await {
                 Ok(versions) if !versions.is_empty() => return Ok(versions),
-                Ok(empty) => last_miss = Ok(empty),
+                Ok(empty) => record_miss(&mut last_miss, Ok(empty)),
                 Err(DepsError::PackageNotFound { .. }) => {
-                    last_miss = Err(DepsError::PackageNotFound {
-                        package: redacted_module_path.clone().into_owned().into(),
-                        registry: REGISTRY,
-                    });
+                    record_miss(
+                        &mut last_miss,
+                        Err(DepsError::PackageNotFound {
+                            package: redacted_module_path.clone().into_owned().into(),
+                            registry: REGISTRY,
+                        }),
+                    );
                 }
                 Err(other) => match next_sep {
                     Some(ChainSeparator::AnyError) => {
@@ -450,7 +461,7 @@ impl GoRegistry {
                             "Go alternate-proxy chain hop failed, but the `|` separator \
                              tolerates any error; falling through to the next hop"
                         );
-                        last_miss = Err(other);
+                        record_miss(&mut last_miss, Err(other));
                     }
                     _ => {
                         tracing::warn!(
@@ -459,7 +470,10 @@ impl GoRegistry {
                             "Go alternate-proxy chain resolution halted on a transport error — \
                              not falling back to proxy.golang.org or the next configured hop"
                         );
-                        return Err(DepsError::ChainResolutionHalted);
+                        return Err(match last_miss {
+                            Err(blocked @ DepsError::HostBlockedByPolicy { .. }) => blocked,
+                            _ => other.into_chain_halt(),
+                        });
                     }
                 },
             }
@@ -1907,6 +1921,108 @@ mod tests {
                 &source,
                 FreshnessSettings::default(),
             )
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+    }
+
+    /// Resolves `github.com/gin-gonic/gin` through a chain whose hop 0 is the `localhost` name
+    /// (allowed at parse time under `All`, rejected by the connect-time resolver guard) followed
+    /// by `hop1`, joined by `separator`. Clients are built directly, bypassing config validation.
+    async fn resolve_through_blocked_hop0(
+        separator: ChainSeparator,
+        hop1: &mockito::Server,
+    ) -> Result<Vec<Box<dyn deps_core::Version>>> {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let port = hop1.socket_address().port();
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let policy = all_policy();
+        let chain = GoProxyChain {
+            key: "go-proxy:blocked".to_string(),
+            hops: vec![
+                url_hop(&format!("http://localhost:{port}"), &policy),
+                url_hop(&hop1.url(), &policy),
+            ],
+            separators: vec![separator],
+        };
+        GoRegistry::register_alternate(&root, &chain);
+        let source = DependencySource::AlternateRegistry {
+            index: "go-proxy:blocked".to_string(),
+            mirrors_crates_io: false,
+        };
+        root.get_versions_from(
+            &deps_core::PackageName::new("github.com/gin-gonic/gin"),
+            &source,
+            FreshnessSettings::default(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_policy_blocked_hop_halts_comma_chain_with_actionable_error() {
+        let mut hop1 = mockito::Server::new_async().await;
+        let untouched = hop1
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("v1.9.1\n")
+            .expect(0)
+            .create_async()
+            .await;
+        let result = resolve_through_blocked_hop0(ChainSeparator::NotFoundOnly, &hop1).await;
+        assert_matches!(result.err(), Some(DepsError::HostBlockedByPolicy { .. }));
+        untouched.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_policy_block_survives_a_later_not_found_on_pipe_chain() {
+        let mut hop1 = mockito::Server::new_async().await;
+        hop1.mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .create_async()
+            .await;
+        let result = resolve_through_blocked_hop0(ChainSeparator::AnyError, &hop1).await;
+        assert_matches!(result.err(), Some(DepsError::HostBlockedByPolicy { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_policy_block_survives_a_later_empty_list_on_pipe_chain() {
+        let mut hop1 = mockito::Server::new_async().await;
+        hop1.mock("GET", "/github.com/gin-gonic/gin/@v/list")
+            .with_status(200)
+            .with_body("")
+            .create_async()
+            .await;
+        hop1.mock("GET", "/github.com/gin-gonic/gin/@latest")
+            .with_status(404)
+            .create_async()
+            .await;
+        let result = resolve_through_blocked_hop0(ChainSeparator::AnyError, &hop1).await;
+        assert_matches!(result.err(), Some(DepsError::HostBlockedByPolicy { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_policy_block_survives_a_later_hop_error_on_pipe_chain() {
+        let mut hop1 = mockito::Server::new_async().await;
+        hop1.mock("GET", mockito::Matcher::Any)
+            .with_status(500)
+            .create_async()
+            .await;
+        let result = resolve_through_blocked_hop0(ChainSeparator::AnyError, &hop1).await;
+        assert_matches!(result.err(), Some(DepsError::HostBlockedByPolicy { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_pipe_chain_falls_through_a_policy_blocked_hop_to_a_hit() {
+        let mut hop1 = mockito::Server::new_async().await;
+        hop1.mock("GET", "/github.com/gin-gonic/gin/@v/list")
+            .with_status(200)
+            .with_body("v1.9.1\n")
+            .create_async()
+            .await;
+        let versions = resolve_through_blocked_hop0(ChainSeparator::AnyError, &hop1)
             .await
             .unwrap();
         assert_eq!(versions.len(), 1);
