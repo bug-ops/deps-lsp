@@ -39,7 +39,6 @@ dashmap = { workspace = true }
 deps-core = { workspace = true }
 pep440_rs = { workspace = true }
 pep508_rs = { workspace = true }
-reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }

@@ -128,7 +128,7 @@ impl DiagnosticsSnapshot {
     }
 
     /// Builds a snapshot from explicit values, for tests that drive diagnostics generation.
-    #[cfg(test)]
+    #[cfg(all(test, any(feature = "cargo", feature = "npm")))]
     pub(crate) const fn for_test(
         freshness: deps_core::FreshnessSettings,
         severities: deps_core::DiagnosticSeverities,

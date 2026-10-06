@@ -612,6 +612,12 @@ fn create_package_completion_item(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(
+        feature = "cargo",
+        feature = "pypi",
+        feature = "maven",
+        feature = "composer"
+    ))]
     fn test_osv_checks(enabled: bool) -> OsvChecks {
         OsvChecks::resolve(enabled, deps_core::NetworkMode::Online)
     }

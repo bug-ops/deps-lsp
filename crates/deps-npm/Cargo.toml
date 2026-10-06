@@ -49,7 +49,6 @@ dashmap = { workspace = true }
 deps-core = { workspace = true }
 dirs = { workspace = true }
 node-semver = { workspace = true }
-reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
