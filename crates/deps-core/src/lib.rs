@@ -172,6 +172,7 @@ pub mod macros;
 pub mod matched_spans;
 pub mod mtime_cache;
 pub mod net_policy;
+pub mod netrc;
 pub mod osv;
 pub mod package;
 pub mod pagination;

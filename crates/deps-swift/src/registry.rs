@@ -7,7 +7,9 @@
 
 use crate::config::ResolvedSwiftRegistry;
 use crate::package_location::RegistryIdentity;
-use crate::package_registry::{PackageRegistryClient, REGISTRY as SE_0292_REGISTRY};
+use crate::package_registry::{
+    PackageRegistryClient, PublishedAtLookup, REGISTRY as SE_0292_REGISTRY,
+};
 use crate::types::{SwiftPackage, SwiftVersion};
 use dashmap::DashMap;
 use deps_core::github::{
@@ -120,7 +122,12 @@ impl SwiftRegistry {
     ///
     /// Never falls back to GitHub: an unregistered `index` or an unparsable identity is
     /// `PackageNotFound`.
-    async fn registry_versions(&self, index: &str, name: &str) -> Result<Vec<SwiftVersion>> {
+    async fn registry_versions(
+        &self,
+        index: &str,
+        name: &str,
+        lookup: PublishedAtLookup,
+    ) -> Result<Vec<SwiftVersion>> {
         let not_found = || DepsError::PackageNotFound {
             package: name.into(),
             registry: SE_0292_REGISTRY,
@@ -130,7 +137,7 @@ impl SwiftRegistry {
             tracing::debug!("no SE-0292 client registered for the dependency's registry");
             return Err(not_found());
         };
-        client.list_releases(&identity).await
+        client.list_releases(&identity, lookup).await
     }
 
     /// Fetches all semver-tagged versions for a package.
@@ -471,8 +478,13 @@ impl deps_core::Registry for SwiftRegistry {
         match route(source) {
             Route::GithubTags => deps_core::Registry::get_versions_with(self, name, freshness),
             Route::Se0292(index) => Box::pin(async move {
+                let lookup = if freshness.is_enabled() {
+                    PublishedAtLookup::Fetch
+                } else {
+                    PublishedAtLookup::Skip
+                };
                 Ok(box_versions(
-                    self.registry_versions(index, name.as_str()).await?,
+                    self.registry_versions(index, name.as_str(), lookup).await?,
                 ))
             }),
             Route::NotFetchable => not_fetchable(name),
@@ -505,7 +517,9 @@ impl deps_core::Registry for SwiftRegistry {
                 deps_core::Registry::get_latest_matching(self, name, req, selection_context)
             }
             Route::Se0292(index) => Box::pin(async move {
-                let versions = self.registry_versions(index, name.as_str()).await?;
+                let versions = self
+                    .registry_versions(index, name.as_str(), PublishedAtLookup::Skip)
+                    .await?;
                 Ok(pick_latest_matching(versions, req.as_str())
                     .map(|v| Box::new(v) as Box<dyn deps_core::Version>))
             }),
@@ -1064,7 +1078,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropping_the_credential_never_serves_the_authenticated_body() {
-        use crate::auth::{SwiftEnvCredential, bind_credential};
+        use crate::auth::{CredentialLookup, SwiftCredential, bind_credential};
         use crate::config::{RegistryTrust, SwiftRegistryUrl, UserTier};
         use deps_core::{PackageName, Registry};
 
@@ -1072,7 +1086,7 @@ mod tests {
         let base = server.url();
         let url = SwiftRegistryUrl::for_test(&base, RegistryTrust::Trusted);
         let tier = UserTier::for_test(&[&base], HashMap::new());
-        let credential = SwiftEnvCredential::Token(deps_core::secret::Redacted::new("t".into()));
+        let credential = SwiftCredential::Token(deps_core::secret::Redacted::new("t".into()));
         let registry = mock_registry("https://api.github.invalid", false);
         let name = PackageName::new("acme.net");
         let source = alternate_source(&base);
@@ -1093,7 +1107,7 @@ mod tests {
             .create_async()
             .await;
         registry.register_alternate(crate::config::ResolvedSwiftRegistry {
-            auth: bind_credential(&url, &tier, Some(&credential)),
+            auth: bind_credential(&url, &tier, CredentialLookup::Shared(&credential)),
             url: url.clone(),
         });
         assert_eq!(fetch().await.unwrap().len(), 4);

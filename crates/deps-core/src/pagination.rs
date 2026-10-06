@@ -52,7 +52,7 @@ impl ListCoverage {
     /// ```
     #[must_use]
     pub fn from_link_header(link: Option<&str>) -> Self {
-        if link.is_some_and(has_next_relation) {
+        if link.is_some_and(|header| !next_targets(header).is_empty()) {
             Self::Truncated
         } else {
             Self::Complete
@@ -60,23 +60,93 @@ impl ListCoverage {
     }
 }
 
-/// Whether any link-value in `header` has a `rel` parameter containing the `next` token.
-fn has_next_relation(header: &str) -> bool {
-    split_outside_quotes(header, ',').any(|link_value| {
-        let mut parts = split_outside_quotes(link_value, ';');
-        let _target = parts.next();
-        parts.any(|param| {
-            let Some((name, value)) = param.split_once('=') else {
-                return false;
-            };
-            name.trim().eq_ignore_ascii_case("rel")
-                && value
+/// What a response's `Link` header says about the page after the current one.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::pagination::{NextPage, next_page};
+/// use url::Url;
+///
+/// let current = Url::parse("https://r.example/api/acme/net").unwrap();
+/// let trusted = Url::parse("https://r.example/api/").unwrap();
+/// let link = Some("<https://r.example/api/acme/net?page=2>; rel=\"next\"");
+/// assert_eq!(
+///     next_page(&current, link, &trusted),
+///     NextPage::Next(Url::parse("https://r.example/api/acme/net?page=2").unwrap())
+/// );
+/// assert_eq!(next_page(&current, None, &trusted), NextPage::Last);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NextPage {
+    /// No `rel="next"` link: the current page is the last one.
+    Last,
+    /// The single, validated URL of the next page.
+    Next(url::Url),
+    /// A `rel="next"` link exists but cannot be followed safely.
+    Rejected,
+}
+
+/// Resolves the next page of a paginated list from a raw `Link` header (RFC 8288).
+///
+/// Exactly one distinct `rel="next"` target may exist across all link-values; the target is
+/// resolved against `current` and must carry no userinfo and stay under the `trusted` prefix
+/// (see [`crate::net_policy::is_trusted_prefix`]). Anything else, including an empty or
+/// unparsable target, is [`NextPage::Rejected`] so the caller never follows a link that could
+/// leave the registry or mix lists.
+#[must_use]
+pub fn next_page(current: &url::Url, link: Option<&str>, trusted: &url::Url) -> NextPage {
+    let Some(header) = link else {
+        return NextPage::Last;
+    };
+    let targets = next_targets(header);
+    let Some((first, rest)) = targets.split_first() else {
+        return NextPage::Last;
+    };
+    if first.is_empty() || rest.iter().any(|other| other != first) {
+        return NextPage::Rejected;
+    }
+    match current.join(first) {
+        Ok(next)
+            if next.username().is_empty()
+                && next.password().is_none()
+                && crate::net_policy::is_trusted_prefix(&next, trusted) =>
+        {
+            NextPage::Next(next)
+        }
+        Ok(_) | Err(_) => NextPage::Rejected,
+    }
+}
+
+/// The raw `<...>` targets of every link-value in `header` whose `rel` parameter contains the
+/// `next` token; a malformed target yields an empty string.
+fn next_targets(header: &str) -> Vec<&str> {
+    split_outside_quotes(header, ',')
+        .filter_map(|link_value| {
+            let mut parts = split_outside_quotes(link_value, ';');
+            let target = parts.next()?;
+            parts.any(is_next_rel).then(|| {
+                target
                     .trim()
-                    .trim_matches('"')
-                    .split_ascii_whitespace()
-                    .any(|token| token.eq_ignore_ascii_case("next"))
+                    .strip_prefix('<')
+                    .and_then(|rest| rest.strip_suffix('>'))
+                    .map_or("", str::trim)
+            })
         })
-    })
+        .collect()
+}
+
+/// Whether a link parameter is `rel` with the `next` token among its values.
+fn is_next_rel(param: &str) -> bool {
+    let Some((name, value)) = param.split_once('=') else {
+        return false;
+    };
+    name.trim().eq_ignore_ascii_case("rel")
+        && value
+            .trim()
+            .trim_matches('"')
+            .split_ascii_whitespace()
+            .any(|token| token.eq_ignore_ascii_case("next"))
 }
 
 /// Splits `input` on `separator`, ignoring separators inside double quotes (honouring `\"`
@@ -332,6 +402,63 @@ mod tests {
             );
         }
         assert_eq!(ListCoverage::from_link_header(None), ListCoverage::Complete);
+    }
+
+    fn next(current: &str, link: Option<&str>, trusted: &str) -> NextPage {
+        next_page(
+            &url::Url::parse(current).unwrap(),
+            link,
+            &url::Url::parse(trusted).unwrap(),
+        )
+    }
+
+    #[test]
+    fn next_page_follows_one_trusted_target_and_rejects_the_rest() {
+        let current = "https://r.example/api/acme/net";
+        let trusted = "https://r.example/api/";
+        let url = |s: &str| NextPage::Next(url::Url::parse(s).unwrap());
+
+        assert_eq!(next(current, None, trusted), NextPage::Last);
+        assert_eq!(
+            next(
+                current,
+                Some(r#"<https://r.example/api/acme/net>; rel="canonical""#),
+                trusted
+            ),
+            NextPage::Last
+        );
+        assert_eq!(
+            next(current, Some(r#"<?page=2>; rel="next""#), trusted),
+            url("https://r.example/api/acme/net?page=2")
+        );
+        assert_eq!(
+            next(
+                current,
+                Some(
+                    r#"<https://r.example/api/acme/net?page=2>; rel=next, <https://r.example/api/acme/net?page=2>; rel="next""#
+                ),
+                trusted
+            ),
+            url("https://r.example/api/acme/net?page=2")
+        );
+
+        let rejected = [
+            r#"<https://r.example/api/acme/net?page=2>; rel="next", <https://r.example/api/acme/net?page=3>; rel="next""#,
+            r#"<>; rel="next""#,
+            r#"https://r.example/api/acme/net?page=2; rel="next""#,
+            r#"<https://evil.example/api/acme/net?page=2>; rel="next""#,
+            r#"<https://r.example/other/acme/net?page=2>; rel="next""#,
+            r#"<http://r.example/api/acme/net?page=2>; rel="next""#,
+            r#"<https://user:pw@r.example/api/acme/net?page=2>; rel="next""#,
+            r#"<https://r.example/apiEVIL/acme/net>; rel="next""#,
+        ];
+        for header in rejected {
+            assert_eq!(
+                next(current, Some(header), trusted),
+                NextPage::Rejected,
+                "{header}"
+            );
+        }
     }
 
     #[test]

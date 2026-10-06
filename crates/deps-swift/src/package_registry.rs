@@ -4,20 +4,56 @@
 //! guarded transport and may carry the environment credential; a `WorkspaceDeclared` one goes
 //! through the connect-address-guarded pinned transport, unauthenticated.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
+use deps_core::HOVER_RECENT_VERSIONS;
+use deps_core::cache::CachedResponse;
+use deps_core::error::PaginationStop;
 use deps_core::github::semver_tags_newest_first;
-use deps_core::pagination::ListCoverage;
+use deps_core::pagination::{NextPage, next_page};
 use deps_core::{DepsError, HttpCache, Result, not_found_or};
 use reqwest::header;
 use serde::Deserialize;
+use url::Url;
 
 use crate::config::{RegistryTrust, ResolvedSwiftRegistry};
-use crate::package_location::RegistryIdentity;
+use crate::package_location::{CanonicalIdentity, RegistryIdentity};
+use crate::published_at::{PublishedAtCache, ReleaseVersion};
 use crate::types::SwiftVersion;
 
 const ACCEPT: &str = "application/vnd.swift.registry.v1+json";
+
+/// Bounds on fetching one release list across all its pages.
+#[derive(Debug, Clone, Copy)]
+struct ListLimits {
+    /// Most pages fetched before giving up.
+    pages: usize,
+    /// Most distinct releases merged before giving up.
+    releases: usize,
+    /// Most response-body bytes read across all pages.
+    body_bytes: usize,
+    /// Overall time for all pages.
+    budget: Duration,
+}
+
+impl ListLimits {
+    const DEFAULT: Self = Self {
+        pages: 10,
+        releases: 10_000,
+        body_bytes: 32 * 1024 * 1024,
+        budget: Duration::from_secs(15),
+    };
+}
+
+/// How long a failed pagination is remembered, so repeated calls fail fast.
+const PAGINATION_FAILURE_TTL: Duration = Duration::from_secs(90);
+
+/// Entries after which the pagination-failure memo is cleared.
+const MAX_PAGINATION_FAILURES: usize = 4096;
 
 /// Display name of an SE-0292 registry in error messages.
 pub(crate) const REGISTRY: &str = "Swift package registry";
@@ -50,11 +86,22 @@ struct Release {
     problem: Option<serde::de::IgnoredAny>,
 }
 
+/// Whether a release listing also looks up each recent release's publication date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublishedAtLookup {
+    /// Only the release list is fetched.
+    Skip,
+    /// The newest releases' `publishedAt` is fetched, best-effort.
+    Fetch,
+}
+
 /// A client for one SE-0292 registry.
 pub(crate) struct PackageRegistryClient {
     cache: Arc<HttpCache>,
     registry: ResolvedSwiftRegistry,
     digest: u64,
+    pagination_failures: DashMap<CanonicalIdentity, (PaginationStop, Instant)>,
+    published_at: PublishedAtCache,
 }
 
 impl PackageRegistryClient {
@@ -64,6 +111,8 @@ impl PackageRegistryClient {
             cache,
             registry,
             digest,
+            pagination_failures: DashMap::new(),
+            published_at: PublishedAtCache::new(),
         }
     }
 
@@ -81,60 +130,242 @@ impl PackageRegistryClient {
         )
     }
 
-    /// Lists `identity`'s releases newest-first; a `releases` key that is not semver is skipped
-    /// and a release with a `problem` is marked yanked.
-    ///
-    /// # Errors
-    ///
-    /// `PackageNotFound` for 404/410, `PaginatedListUnsupported` when the response carries a
-    /// `Link` with `rel="next"` (the page is discarded, never reported as the full list), the
-    /// transport error otherwise, or an API-response error for an invalid body.
-    #[tracing::instrument(skip_all, level = "debug")]
-    pub(crate) async fn list_releases(
-        &self,
-        identity: &RegistryIdentity<'_>,
-    ) -> Result<Vec<SwiftVersion>> {
-        let package = identity.canonical();
-        let url = self.releases_url(identity);
-        let origin = format!("{}/", self.registry.url.as_str());
-
+    /// Fetches one page of a release list over this registry's transport, with its credential
+    /// when `Trusted`.
+    async fn fetch_page(&self, url: &str, origin: &str) -> Result<CachedResponse> {
         let mut headers = vec![(header::ACCEPT, ACCEPT)];
-        let response = match transport_for(self.registry.url.trust()) {
+        match transport_for(self.registry.url.trust()) {
             TransportKind::TrustedOrigin => {
                 if let Some(auth) = &self.registry.auth {
                     headers.push((header::AUTHORIZATION, auth.header_value()));
                 }
                 self.cache
-                    .get_cached_trusted_origin_response(&url, &origin, &headers)
+                    .get_cached_trusted_origin_response(url, origin, &headers)
                     .await
             }
             TransportKind::Pinned => {
                 self.cache
-                    .get_cached_pinned_response(&url, &origin, false, None, &headers)
+                    .get_cached_pinned_response(url, origin, false, None, &headers)
                     .await
             }
         }
-        .map_err(|e| not_found_or(e, &package, REGISTRY, &[410]))?;
+    }
 
-        if ListCoverage::from_link_header(response.link.as_deref()) == ListCoverage::Truncated {
-            return Err(DepsError::PaginatedListUnsupported {
+    fn recent_pagination_failure(&self, package: &CanonicalIdentity) -> Option<PaginationStop> {
+        let entry = self.pagination_failures.get(package)?;
+        let (reason, until) = *entry;
+        (Instant::now() < until).then_some(reason)
+    }
+
+    fn remember_pagination_failure(&self, package: &CanonicalIdentity, reason: PaginationStop) {
+        if self.pagination_failures.len() >= MAX_PAGINATION_FAILURES {
+            self.pagination_failures.clear();
+        }
+        self.pagination_failures.insert(
+            package.clone(),
+            (reason, Instant::now() + PAGINATION_FAILURE_TTL),
+        );
+    }
+
+    /// Follows `Link: rel="next"` pages from the first releases URL and merges them.
+    ///
+    /// Every page is revalidated on every call, so a merged list can only be torn when one
+    /// page's revalidation fails and that page is served stale.
+    ///
+    /// Exceeding any of the [`ListLimits`] fails the whole list.
+    async fn fetch_all_releases(
+        &self,
+        identity: &RegistryIdentity<'_>,
+        limits: ListLimits,
+        merged_pages: &AtomicUsize,
+    ) -> Result<BTreeMap<String, Release>> {
+        let package = identity.canonical();
+        let incomplete = |reason| DepsError::PaginatedListIncomplete {
+            package: package.as_str().into(),
+            registry: REGISTRY,
+            reason,
+        };
+        let first_url = self.releases_url(identity);
+        let origin = format!("{}/", self.registry.url.as_str());
+        let parse_url = |raw: &str| Url::parse(raw).map_err(|_| DepsError::InvalidUri(raw.into()));
+        let (first, trusted) = (parse_url(&first_url)?, parse_url(&origin)?);
+
+        let mut seen = HashSet::from([first.clone()]);
+        let mut current = first.clone();
+        let mut releases = BTreeMap::new();
+        let mut body_bytes = 0usize;
+        for page_number in 1..=limits.pages {
+            let response = self
+                .fetch_page(current.as_str(), &origin)
+                .await
+                .map_err(|e| match (page_number, e.is_not_found()) {
+                    (1, _) => not_found_or(e, package.as_str(), REGISTRY, &[410]),
+                    (_, true) => incomplete(PaginationStop::InvalidNextLink),
+                    (_, false) => e,
+                })?;
+            body_bytes = body_bytes.saturating_add(response.body.len());
+            if body_bytes > limits.body_bytes {
+                return Err(incomplete(PaginationStop::PageCap));
+            }
+            let page: ReleasesResponse =
+                deps_core::parse_json_checked(&response.body).map_err(|source| {
+                    DepsError::ApiResponse {
+                        package: package.as_str().into(),
+                        registry: REGISTRY,
+                        source,
+                    }
+                })?;
+            for (key, mut release) in page.releases {
+                releases
+                    .entry(key)
+                    .and_modify(|merged: &mut Release| {
+                        merged.problem = merged.problem.take().or(release.problem.take());
+                    })
+                    .or_insert(release);
+            }
+            merged_pages.fetch_add(1, Ordering::Relaxed);
+            if releases.len() > limits.releases {
+                return Err(incomplete(PaginationStop::PageCap));
+            }
+
+            match next_page(&current, response.link.as_deref(), &trusted) {
+                NextPage::Last => return Ok(releases),
+                NextPage::Next(next)
+                    if next.path() == first.path() && seen.insert(next.clone()) =>
+                {
+                    current = next;
+                }
+                NextPage::Next(_) | NextPage::Rejected => {
+                    return Err(incomplete(PaginationStop::InvalidNextLink));
+                }
+            }
+        }
+        // TODO(critic): pages revalidated independently can tear the merged release list
+        Err(incomplete(PaginationStop::PageCap))
+    }
+
+    /// Fetches one release's metadata page, `{releases url}/{raw version}`.
+    async fn fetch_release_metadata(
+        &self,
+        identity: &RegistryIdentity<'_>,
+        raw_version: &ReleaseVersion,
+    ) -> Result<CachedResponse> {
+        let releases_url = self.releases_url(identity);
+        let mut url =
+            Url::parse(&releases_url).map_err(|_| DepsError::InvalidUri(releases_url.clone()))?;
+        url.path_segments_mut()
+            .map_err(|()| DepsError::InvalidUri(releases_url))?
+            .push(raw_version.as_str());
+        self.fetch_page(url.as_str(), &format!("{}/", self.registry.url.as_str()))
+            .await
+    }
+
+    /// Fills `published_at` of the newest non-yanked releases from the memoized per-release
+    /// metadata, fetching what is missing within one bounded batch.
+    async fn attach_published_at(
+        &self,
+        identity: &RegistryIdentity<'_>,
+        versions: &mut [SwiftVersion],
+        raw_by_version: &HashMap<String, ReleaseVersion>,
+    ) {
+        let package = identity.canonical();
+        let raw_of = |version: &SwiftVersion| raw_by_version.get(version.version.as_str());
+        let candidates: Vec<ReleaseVersion> = versions
+            .iter()
+            .filter(|version| !version.yanked)
+            .take(HOVER_RECENT_VERSIONS)
+            .filter_map(|version| raw_of(version).cloned())
+            .collect();
+        self.published_at
+            .resolve(&package, &candidates, |raw| {
+                let raw = raw.clone();
+                async move { self.fetch_release_metadata(identity, &raw).await }
+            })
+            .await;
+        for version in versions
+            .iter_mut()
+            .filter(|version| !version.yanked)
+            .take(HOVER_RECENT_VERSIONS)
+        {
+            version.published_at =
+                raw_of(version).and_then(|raw| self.published_at.get(&package, raw));
+        }
+    }
+
+    /// Lists `identity`'s releases newest-first; a `releases` key that is not semver is skipped
+    /// and a release with a `problem` is marked yanked.
+    ///
+    /// With [`PublishedAtLookup::Fetch`], the newest [`HOVER_RECENT_VERSIONS`] non-yanked
+    /// releases also get their `publishedAt` (see [`crate::published_at`]).
+    ///
+    /// Follows `Link: rel="next"` pages (bounded by [`ListLimits::DEFAULT`]: pages, merged
+    /// releases, total body bytes and time; same origin and path, same credential rules as the
+    /// first page) and merges them.
+    ///
+    /// # Errors
+    ///
+    /// `PackageNotFound` for 404/410 on the first page, `PaginatedListIncomplete` when the pages
+    /// cannot be followed to the last one (the partial list is never returned; the outcome is
+    /// remembered for [`PAGINATION_FAILURE_TTL`]), the transport error otherwise, or an
+    /// API-response error for an invalid body.
+    #[tracing::instrument(skip_all, level = "debug")]
+    pub(crate) async fn list_releases(
+        &self,
+        identity: &RegistryIdentity<'_>,
+        lookup: PublishedAtLookup,
+    ) -> Result<Vec<SwiftVersion>> {
+        let package = identity.canonical();
+        if let Some(reason) = self.recent_pagination_failure(&package) {
+            return Err(DepsError::PaginatedListIncomplete {
                 package: package.as_str().into(),
                 registry: REGISTRY,
+                reason,
             });
         }
+        self.list_releases_within(identity, lookup, ListLimits::DEFAULT)
+            .await
+    }
 
-        let parsed: ReleasesResponse =
-            deps_core::parse_json_checked(&response.body).map_err(|source| {
-                DepsError::ApiResponse {
+    async fn list_releases_within(
+        &self,
+        identity: &RegistryIdentity<'_>,
+        lookup: PublishedAtLookup,
+        limits: ListLimits,
+    ) -> Result<Vec<SwiftVersion>> {
+        let package = identity.canonical();
+        let merged_pages = AtomicUsize::new(0);
+        let fetched = tokio::time::timeout(
+            limits.budget,
+            self.fetch_all_releases(identity, limits, &merged_pages),
+        )
+        .await
+        .unwrap_or_else(|_elapsed| {
+            if merged_pages.load(Ordering::Relaxed) == 0 {
+                // A slow first page is an ordinary transient failure, not a partial list.
+                Err(DepsError::CacheError(
+                    "registry did not answer within the time budget".into(),
+                ))
+            } else {
+                Err(DepsError::PaginatedListIncomplete {
                     package: package.as_str().into(),
                     registry: REGISTRY,
-                    source,
-                }
-            })?;
-        Ok(semver_tags_newest_first(
-            parsed.releases,
+                    reason: PaginationStop::TimeBudget,
+                })
+            }
+        });
+        let releases = fetched.inspect_err(|e| {
+            if let DepsError::PaginatedListIncomplete { reason, .. } = e {
+                self.remember_pagination_failure(&package, *reason);
+            }
+        })?;
+        let mut raw_by_version = HashMap::new();
+        let mut versions = semver_tags_newest_first(
+            releases,
             |(key, _)| key.as_str(),
-            |(_, release), normalized, parsed| {
+            |(key, release), normalized, parsed| {
+                raw_by_version
+                    .entry(normalized.to_string())
+                    .or_insert(ReleaseVersion::new(key));
                 Some(SwiftVersion {
                     version: normalized.into(),
                     yanked: release.problem.is_some(),
@@ -142,14 +373,22 @@ impl PackageRegistryClient {
                     prerelease: !parsed.pre.is_empty(),
                 })
             },
-        ))
+        );
+        match lookup {
+            PublishedAtLookup::Skip => {}
+            PublishedAtLookup::Fetch => {
+                self.attach_published_at(identity, &mut versions, &raw_by_version)
+                    .await;
+            }
+        }
+        Ok(versions)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::SwiftEnvCredential;
+    use crate::auth::SwiftCredential;
     use crate::config::{SwiftRegistryUrl, UserTier};
     use deps_core::secret::Redacted;
     use std::assert_matches;
@@ -168,9 +407,13 @@ mod tests {
 
     fn client(base: &str, trust: RegistryTrust, token: Option<&str>) -> PackageRegistryClient {
         let url = SwiftRegistryUrl::for_test(base, trust);
-        let credential = token.map(|t| SwiftEnvCredential::Token(Redacted::new(t.to_string())));
+        let credential = token.map(|t| SwiftCredential::Token(Redacted::new(t.to_string())));
         let user_tier = UserTier::for_test(&[base], std::collections::HashMap::new());
-        let auth = crate::auth::bind_credential(&url, &user_tier, credential.as_ref());
+        let auth = crate::auth::bind_credential(
+            &url,
+            &user_tier,
+            crate::auth::CredentialLookup::shared(credential.as_ref()),
+        );
         PackageRegistryClient::new(
             Arc::new(HttpCache::new()),
             ResolvedSwiftRegistry { url, auth },
@@ -218,7 +461,10 @@ mod tests {
             RegistryTrust::Trusted,
             Some("t0k"),
         );
-        let versions = c.list_releases(&identity()).await.unwrap();
+        let versions = c
+            .list_releases(&identity(), PublishedAtLookup::Skip)
+            .await
+            .unwrap();
         mock.assert_async().await;
 
         let listed: Vec<_> = versions
@@ -248,7 +494,9 @@ mod tests {
             .create_async()
             .await;
         let c = client(&server.url(), RegistryTrust::WorkspaceDeclared, Some("t0k"));
-        c.list_releases(&identity()).await.unwrap();
+        c.list_releases(&identity(), PublishedAtLookup::Skip)
+            .await
+            .unwrap();
         mock.assert_async().await;
     }
 
@@ -262,7 +510,10 @@ mod tests {
                 .create_async()
                 .await;
             let c = client(&server.url(), RegistryTrust::Trusted, None);
-            let err = c.list_releases(&identity()).await.unwrap_err();
+            let err = c
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap_err();
             if not_found {
                 assert_matches!(err, DepsError::PackageNotFound { .. }, "{status}");
             } else {
@@ -272,23 +523,507 @@ mod tests {
         }
     }
 
+    fn next_link(url: &str) -> String {
+        format!(r#"<{url}>; rel="next""#)
+    }
+
+    async fn mock_page(
+        server: &mut mockito::ServerGuard,
+        path_and_query: &str,
+        link: Option<String>,
+        releases: &str,
+    ) -> mockito::Mock {
+        let mut mock = server.mock("GET", path_and_query).with_status(200);
+        if let Some(link) = link {
+            mock = mock.with_header("link", &link);
+        }
+        mock.with_body(format!(r#"{{"releases": {{{releases}}}}}"#))
+            .create_async()
+            .await
+    }
+
+    fn versions_of(versions: &[SwiftVersion]) -> Vec<(String, bool)> {
+        versions
+            .iter()
+            .map(|v| (v.version.as_str().to_string(), v.yanked))
+            .collect()
+    }
+
     #[tokio::test]
-    async fn test_rel_next_link_discards_the_page() {
+    async fn test_rel_next_pages_are_followed_and_merged() {
         let mut server = mockito::Server::new_async().await;
-        let _m = server
+        let base = server.url();
+        let _p1 = mock_page(
+            &mut server,
+            "/acme/net",
+            Some(next_link(&format!("{base}/acme/net?page=2"))),
+            r#""1.0.0": {}, "1.1.0": {}"#,
+        )
+        .await;
+        let _p2 = mock_page(
+            &mut server,
+            "/acme/net?page=2",
+            Some(next_link(&format!("{base}/acme/net?page=3"))),
+            r#""2.0.0": {}, "1.1.0": {"problem": {"status": 410}}"#,
+        )
+        .await;
+        let _p3 = mock_page(&mut server, "/acme/net?page=3", None, r#""3.0.0": {}"#).await;
+
+        let c = client(&base, RegistryTrust::Trusted, None);
+        let versions = c
+            .list_releases(&identity(), PublishedAtLookup::Skip)
+            .await
+            .unwrap();
+        assert_eq!(
+            versions_of(&versions),
+            vec![
+                ("3.0.0".to_string(), false),
+                ("2.0.0".to_string(), false),
+                ("1.1.0".to_string(), true),
+                ("1.0.0".to_string(), false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authorization_is_sent_on_every_page_when_trusted_and_never_when_declared() {
+        for (trust, expected) in [
+            (
+                RegistryTrust::Trusted,
+                mockito::Matcher::Exact("Bearer t0k".to_string()),
+            ),
+            (RegistryTrust::WorkspaceDeclared, mockito::Matcher::Missing),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+            let _p1 = server
+                .mock("GET", "/acme/net")
+                .with_header("link", &next_link(&format!("{base}/acme/net?page=2")))
+                .with_body(r#"{"releases": {"1.0.0": {}}}"#)
+                .create_async()
+                .await;
+            let p2 = server
+                .mock("GET", "/acme/net?page=2")
+                .match_header("authorization", expected)
+                .with_body(r#"{"releases": {"2.0.0": {}}}"#)
+                .create_async()
+                .await;
+            let c = client(&base, trust, Some("t0k"));
+            assert_eq!(
+                c.list_releases(&identity(), PublishedAtLookup::Skip)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            p2.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_page_cap_fails_and_the_failure_is_memoized() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let mut pages = Vec::new();
+        for n in 1..=ListLimits::DEFAULT.pages {
+            let path = if n == 1 {
+                "/acme/net".to_string()
+            } else {
+                format!("/acme/net?page={n}")
+            };
+            let link = next_link(&format!("{base}/acme/net?page={}", n + 1));
+            pages.push(
+                server
+                    .mock("GET", path.as_str())
+                    .with_header("link", &link)
+                    .with_body(format!(r#"{{"releases": {{"{n}.0.0": {{}}}}}}"#))
+                    .expect(1)
+                    .create_async()
+                    .await,
+            );
+        }
+        let c = client(&base, RegistryTrust::Trusted, None);
+        for _ in 0..2 {
+            let err = c
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap_err();
+            assert_matches!(
+                err,
+                DepsError::PaginatedListIncomplete {
+                    reason: PaginationStop::PageCap,
+                    ..
+                }
+            );
+        }
+        for page in pages {
+            page.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unusable_next_links_fail_without_following_them() {
+        let mut server = mockito::Server::new_async().await;
+        let mut other = mockito::Server::new_async().await;
+        let base = server.url();
+        let escaped = other
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let wrong_path = server
+            .mock("GET", "/acme/other?page=2")
+            .expect(0)
+            .create_async()
+            .await;
+        let userinfo = base.replacen("http://", "http://u:p@", 1);
+        let links = [
+            format!(r#"<{}/acme/net>; rel="next""#, other.url()),
+            format!(r#"<{base}/acme/other?page=2>; rel="next""#),
+            format!(r#"<{userinfo}/acme/net?page=2>; rel="next""#),
+            r#"<>; rel="next""#.to_string(),
+            format!(r#"<{base}/acme/net>; rel="next""#),
+            format!(
+                r#"<{base}/acme/net?page=2>; rel="next", <{base}/acme/net?page=3>; rel="next""#
+            ),
+        ];
+        for link in links {
+            let first = server
+                .mock("GET", "/acme/net")
+                .with_header("link", &link)
+                .with_body(r#"{"releases": {"1.0.0": {}}}"#)
+                .create_async()
+                .await;
+            let c = client(&base, RegistryTrust::Trusted, Some("t0k"));
+            let err = c
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap_err();
+            assert_matches!(
+                err,
+                DepsError::PaginatedListIncomplete {
+                    reason: PaginationStop::InvalidNextLink,
+                    ..
+                },
+                "{link}"
+            );
+            first.remove_async().await;
+        }
+        escaped.assert_async().await;
+        wrong_path.assert_async().await;
+    }
+
+    fn limits_with(change: impl FnOnce(&mut ListLimits)) -> ListLimits {
+        let mut limits = ListLimits::DEFAULT;
+        change(&mut limits);
+        limits
+    }
+
+    #[tokio::test]
+    async fn test_release_count_and_body_size_caps_fail_the_list_and_are_memoized() {
+        let tight = [
+            limits_with(|limits| limits.releases = 3),
+            limits_with(|limits| limits.body_bytes = 40),
+        ];
+        for limits in tight {
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+            let page1 = mock_page(
+                &mut server,
+                "/acme/net",
+                Some(next_link(&format!("{base}/acme/net?page=2"))),
+                r#""1.0.0": {}, "1.1.0": {}"#,
+            )
+            .await
+            .expect(1);
+            let page2 = mock_page(
+                &mut server,
+                "/acme/net?page=2",
+                None,
+                r#""2.0.0": {}, "2.1.0": {}"#,
+            )
+            .await
+            .expect(1);
+            let c = client(&base, RegistryTrust::Trusted, None);
+            let first = c
+                .list_releases_within(&identity(), PublishedAtLookup::Skip, limits)
+                .await;
+            let second = c.list_releases(&identity(), PublishedAtLookup::Skip).await;
+            for err in [first.unwrap_err(), second.unwrap_err()] {
+                assert_matches!(
+                    err,
+                    DepsError::PaginatedListIncomplete {
+                        reason: PaginationStop::PageCap,
+                        ..
+                    },
+                    "{limits:?}"
+                );
+            }
+            page1.assert_async().await;
+            page2.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_slow_later_page_hits_the_overall_budget_and_is_memoized() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let _p1 = mock_page(
+            &mut server,
+            "/acme/net",
+            Some(next_link(&format!("{base}/acme/net?page=2"))),
+            r#""1.0.0": {}"#,
+        )
+        .await;
+        let _slow = server
+            .mock("GET", "/acme/net?page=2")
+            .with_chunked_body(|writer| {
+                std::thread::sleep(Duration::from_millis(600));
+                writer.write_all(br#"{"releases": {"2.0.0": {}}}"#)
+            })
+            .create_async()
+            .await;
+        let c = client(&base, RegistryTrust::Trusted, None);
+        let limits = limits_with(|limits| limits.budget = Duration::from_millis(300));
+        let first = c
+            .list_releases_within(&identity(), PublishedAtLookup::Skip, limits)
+            .await;
+        let again = c.list_releases(&identity(), PublishedAtLookup::Skip).await;
+        for err in [first.unwrap_err(), again.unwrap_err()] {
+            assert_matches!(
+                err,
+                DepsError::PaginatedListIncomplete {
+                    reason: PaginationStop::TimeBudget,
+                    ..
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_slow_first_page_is_a_transient_failure_not_a_partial_list() {
+        let mut server = mockito::Server::new_async().await;
+        let _slow = server
             .mock("GET", "/acme/net")
-            .with_status(200)
-            .with_header("link", r#"<https://r.example/acme/net?page=2>; rel="next""#)
-            .with_body(RELEASES)
+            .with_chunked_body(|writer| {
+                std::thread::sleep(Duration::from_millis(600));
+                writer.write_all(br#"{"releases": {"1.0.0": {}}}"#)
+            })
+            .expect_at_least(2)
             .create_async()
             .await;
         let c = client(&server.url(), RegistryTrust::Trusted, None);
-        let err = c.list_releases(&identity()).await.unwrap_err();
-        assert_matches!(err, DepsError::PaginatedListUnsupported { .. });
+        let limits = limits_with(|limits| limits.budget = Duration::from_millis(100));
+        let err = c
+            .list_releases_within(&identity(), PublishedAtLookup::Skip, limits)
+            .await
+            .unwrap_err();
+        assert_matches!(err.fetch_failure(), deps_core::FetchFailure::Transient);
+        assert_matches!(
+            c.list_releases_within(&identity(), PublishedAtLookup::Skip, limits)
+                .await
+                .unwrap_err()
+                .fetch_failure(),
+            deps_core::FetchFailure::Transient,
+            "not memoized: the second call goes to the registry again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_cycle_back_to_an_earlier_page_fails() {
+        for (page2_next, page3_next) in [(2, 3), (3, 2)] {
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+            let link = |n: u32| Some(next_link(&format!("{base}/acme/net?page={n}")));
+            let _p1 = mock_page(&mut server, "/acme/net", link(2), r#""1.0.0": {}"#).await;
+            let _p2 = mock_page(
+                &mut server,
+                "/acme/net?page=2",
+                link(page2_next),
+                r#""2.0.0": {}"#,
+            )
+            .await;
+            let _p3 = mock_page(
+                &mut server,
+                "/acme/net?page=3",
+                link(page3_next),
+                r#""3.0.0": {}"#,
+            )
+            .await;
+            let c = client(&base, RegistryTrust::Trusted, None);
+            assert_matches!(
+                c.list_releases(&identity(), PublishedAtLookup::Skip)
+                    .await
+                    .unwrap_err(),
+                DepsError::PaginatedListIncomplete {
+                    reason: PaginationStop::InvalidNextLink,
+                    ..
+                },
+                "{page2_next}->{page3_next}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_missing_later_page_is_an_incomplete_list_not_an_unknown_package() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let _p1 = mock_page(
+            &mut server,
+            "/acme/net",
+            Some(next_link(&format!("{base}/acme/net?page=2"))),
+            r#""1.0.0": {}"#,
+        )
+        .await;
+        let _p2 = server
+            .mock("GET", "/acme/net?page=2")
+            .with_status(404)
+            .create_async()
+            .await;
+        let c = client(&base, RegistryTrust::Trusted, None);
+        let err = c
+            .list_releases(&identity(), PublishedAtLookup::Skip)
+            .await
+            .unwrap_err();
+        assert!(!err.is_not_found(), "{err:?}");
+        assert_matches!(err, DepsError::PaginatedListIncomplete { .. });
+    }
+
+    fn many_releases() -> String {
+        let releases: Vec<String> = (1..=10)
+            .map(|n| format!(r#""{n}.0.0": {{}}"#))
+            .chain(std::iter::once(
+                r#""11.0.0": {"problem": {"status": 410}}"#.to_string(),
+            ))
+            .collect();
+        format!(r#"{{"releases": {{{}}}}}"#, releases.join(","))
+    }
+
+    #[tokio::test]
+    async fn test_published_at_covers_the_newest_eight_non_yanked_releases_once() {
+        let mut server = mockito::Server::new_async().await;
+        let _list = server
+            .mock("GET", "/acme/net")
+            .with_body(many_releases())
+            .create_async()
+            .await;
+        let mut dated = Vec::new();
+        for n in 3..=10 {
+            dated.push(
+                server
+                    .mock("GET", format!("/acme/net/{n}.0.0").as_str())
+                    .match_header("authorization", "Bearer t0k")
+                    .with_body(format!(
+                        r#"{{"publishedAt": "2025-01-{n:02}T00:00:00.500Z"}}"#
+                    ))
+                    .expect(1)
+                    .create_async()
+                    .await,
+            );
+        }
+        let untouched = [
+            server
+                .mock("GET", "/acme/net/11.0.0")
+                .expect(0)
+                .create_async()
+                .await,
+            server
+                .mock("GET", "/acme/net/2.0.0")
+                .expect(0)
+                .create_async()
+                .await,
+            server
+                .mock("GET", "/acme/net/1.0.0")
+                .expect(0)
+                .create_async()
+                .await,
+        ];
+
+        let c = client(&server.url(), RegistryTrust::Trusted, Some("t0k"));
+        for _ in 0..2 {
+            let versions = c
+                .list_releases(&identity(), PublishedAtLookup::Fetch)
+                .await
+                .unwrap();
+            let dates: Vec<bool> = versions.iter().map(|v| v.published_at.is_some()).collect();
+            assert_eq!(
+                dates,
+                [
+                    false, true, true, true, true, true, true, true, true, false, false
+                ]
+            );
+        }
+        for mock in dated.iter().chain(untouched.iter()) {
+            mock.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_published_at_failures_never_fail_the_list_and_skip_sends_no_requests() {
+        let mut server = mockito::Server::new_async().await;
+        let _list = server
+            .mock("GET", "/acme/net")
+            .with_body(RELEASES)
+            .create_async()
+            .await;
+        let _broken = server
+            .mock("GET", "/acme/net/2.0.0")
+            .with_status(500)
+            .expect(1)
+            .create_async()
+            .await;
+        let _garbage = server
+            .mock("GET", "/acme/net/1.0.0")
+            .with_body("not json")
+            .expect(1)
+            .create_async()
+            .await;
+        let _gone = server
+            .mock("GET", "/acme/net/2.1.0-beta.1")
+            .with_status(410)
+            .expect(1)
+            .create_async()
+            .await;
+        let c = client(&server.url(), RegistryTrust::Trusted, None);
+
+        let versions = c
+            .list_releases(&identity(), PublishedAtLookup::Fetch)
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 4);
+        assert!(versions.iter().all(|v| v.published_at.is_none()));
+
+        let skipped = client(&server.url(), RegistryTrust::Trusted, None);
+        let none_requested = server
+            .mock("GET", mockito::Matcher::Regex("^/acme/net/.+".into()))
+            .expect(0)
+            .create_async()
+            .await;
+        skipped
+            .list_releases(&identity(), PublishedAtLookup::Skip)
+            .await
+            .unwrap();
+        none_requested.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_a_policy_blocked_registry_host_is_actionable() {
+        let server = mockito::Server::new_async().await;
+        let port = server.socket_address().port();
+        // Built directly against a `localhost` name, bypassing config validation.
+        let c = client(
+            &format!("http://localhost:{port}"),
+            RegistryTrust::WorkspaceDeclared,
+            None,
+        );
+        let err = c
+            .list_releases(&identity(), PublishedAtLookup::Skip)
+            .await
+            .unwrap_err();
         assert_matches!(
             err.fetch_failure(),
             deps_core::FetchFailure::Actionable(message)
-                if message == "registry paginates its release list; pagination is not supported yet"
+                if message.contains("loopback") && message.contains("never a registry")
         );
     }
 
@@ -306,7 +1041,13 @@ mod tests {
             .create_async()
             .await;
         let c = client(&server.url(), RegistryTrust::Trusted, None);
-        assert_eq!(c.list_releases(&identity()).await.unwrap().len(), 4);
+        assert_eq!(
+            c.list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap()
+                .len(),
+            4
+        );
     }
 
     #[tokio::test]
@@ -320,7 +1061,9 @@ mod tests {
             .await;
         let c = client(&server.url(), RegistryTrust::Trusted, None);
         assert_matches!(
-            c.list_releases(&identity()).await.unwrap_err(),
+            c.list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap_err(),
             DepsError::ApiResponse { .. }
         );
     }
@@ -347,16 +1090,23 @@ mod tests {
             &[&base],
             std::collections::HashMap::from([(host, crate::config::SwiftAuthType::Basic)]),
         );
-        let credential = SwiftEnvCredential::Login {
+        let credential = SwiftCredential::Login {
             username: Redacted::new("u".to_string()),
             password: Redacted::new("p".to_string()),
         };
-        let auth = crate::auth::bind_credential(&url, &tier, Some(&credential));
+        let auth = crate::auth::bind_credential(
+            &url,
+            &tier,
+            crate::auth::CredentialLookup::Shared(&credential),
+        );
         let client = PackageRegistryClient::new(
             Arc::new(HttpCache::new()),
             ResolvedSwiftRegistry { url, auth },
         );
-        client.list_releases(&identity()).await.unwrap();
+        client
+            .list_releases(&identity(), PublishedAtLookup::Skip)
+            .await
+            .unwrap();
         mock.assert_async().await;
     }
 
@@ -379,7 +1129,12 @@ mod tests {
                 .create_async()
                 .await;
             let c = client(&format!("{}/api", server.url()), trust, Some("t0k"));
-            assert!(c.list_releases(&identity()).await.is_err(), "{trust:?}");
+            assert!(
+                c.list_releases(&identity(), PublishedAtLookup::Skip)
+                    .await
+                    .is_err(),
+                "{trust:?}"
+            );
             escaped.assert_async().await;
         }
     }
@@ -405,7 +1160,13 @@ mod tests {
             RegistryTrust::Trusted,
             None,
         );
-        assert_eq!(c.list_releases(&identity()).await.unwrap().len(), 4);
+        assert_eq!(
+            c.list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap()
+                .len(),
+            4
+        );
     }
 
     #[tokio::test]
@@ -428,7 +1189,12 @@ mod tests {
                 .create_async()
                 .await;
             let c = client(&server.url(), trust, Some("t0k"));
-            assert!(c.list_releases(&identity()).await.is_err(), "{trust:?}");
+            assert!(
+                c.list_releases(&identity(), PublishedAtLookup::Skip)
+                    .await
+                    .is_err(),
+                "{trust:?}"
+            );
             escaped.assert_async().await;
         }
     }

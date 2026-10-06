@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use crate::net_policy::HostClass;
 use crate::package::InvalidPackageName;
 use crate::redact::{RedactedName, RedactedUrl};
 
@@ -368,19 +369,64 @@ pub enum DepsError {
     )]
     ChainResolutionHalted,
 
-    /// A registry answered with a paginated release list (`Link: rel="next"`) that this client
-    /// cannot follow yet, so the first page was discarded rather than reported as the full list.
+    /// A registry's paginated release list (`Link: rel="next"`) could not be followed to its
+    /// end, so what was fetched is discarded rather than reported as the full list.
     /// Carries no response text, so [`Self::fetch_failure`] can classify it as
     /// [`FetchFailure::Actionable`] with a fixed message.
-    #[error(
-        "{package} on {registry}: registry paginates its release list; pagination is not supported yet"
-    )]
-    PaginatedListUnsupported {
+    #[error("{package} on {registry}: {reason}")]
+    PaginatedListIncomplete {
         /// Package whose release list was paginated — stored redacted (#1209).
         package: RedactedName,
         /// Name of the registry that paginated the list.
         registry: &'static str,
+        /// Why following the pages stopped.
+        reason: PaginationStop,
     },
+
+    /// The registry host resolved, at connect time, to an address class the active policy
+    /// refuses to connect to (DNS rebinding or a name that points at an internal address).
+    /// Built only by `crate::cache`; carries no address, so [`Self::fetch_failure`] can classify
+    /// it as [`FetchFailure::Actionable`] with a fixed message.
+    #[error("registry host of {url} resolves to a {class} address, blocked by network policy")]
+    #[non_exhaustive]
+    HostBlockedByPolicy {
+        /// The request URL, stored redacted.
+        url: RedactedUrl,
+        /// The class of the blocked resolved address.
+        class: HostClass,
+    },
+}
+
+/// Why following a registry's paginated release list stopped before its last page.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::error::PaginationStop;
+///
+/// assert_eq!(
+///     PaginationStop::PageCap.to_string(),
+///     "registry release list exceeds the page limit"
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaginationStop {
+    /// The page limit was reached while a `rel="next"` link was still present.
+    PageCap,
+    /// A `rel="next"` link was missing, ambiguous, cyclic, or pointed outside the registry.
+    InvalidNextLink,
+    /// Fetching all pages did not finish within the overall time budget.
+    TimeBudget,
+}
+
+impl std::fmt::Display for PaginationStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::PageCap => "registry release list exceeds the page limit",
+            Self::InvalidNextLink => "registry returned an unusable next-page link",
+            Self::TimeBudget => "registry release list took too long to fetch",
+        })
+    }
 }
 
 /// Hand-written, not derived: originally because a derived `Debug` would have printed
@@ -458,10 +504,20 @@ impl std::fmt::Debug for DepsError {
             Self::InvalidUri(uri) => f.debug_tuple("InvalidUri").field(uri).finish(),
             Self::Offline { url } => f.debug_struct("Offline").field("url", url).finish(),
             Self::ChainResolutionHalted => f.write_str("ChainResolutionHalted"),
-            Self::PaginatedListUnsupported { package, registry } => f
-                .debug_struct("PaginatedListUnsupported")
+            Self::PaginatedListIncomplete {
+                package,
+                registry,
+                reason,
+            } => f
+                .debug_struct("PaginatedListIncomplete")
                 .field("package", package)
                 .field("registry", registry)
+                .field("reason", reason)
+                .finish(),
+            Self::HostBlockedByPolicy { url, class } => f
+                .debug_struct("HostBlockedByPolicy")
+                .field("url", url)
+                .field("class", class)
                 .finish(),
         }
     }
@@ -614,9 +670,22 @@ impl DepsError {
                  index"
                     .to_string(),
             ),
-            Self::PaginatedListUnsupported { .. } => FetchFailure::Actionable(
-                "registry paginates its release list; pagination is not supported yet".to_string(),
-            ),
+            Self::PaginatedListIncomplete { reason, .. } => {
+                FetchFailure::Actionable(format!("{reason}; not showing a partial list"))
+            }
+            Self::HostBlockedByPolicy { class, .. } => {
+                FetchFailure::Actionable(if class.never_a_registry() {
+                    format!(
+                        "registry host resolves to a {class} address, which is never a registry \
+                         under any policy"
+                    )
+                } else {
+                    format!(
+                        "registry host resolves to a {class} address, blocked by \
+                         registries.workspace_registries policy"
+                    )
+                })
+            }
             // Deliberately `Transient`, not `Actionable` (#1295 critic S5, reverted from an
             // earlier `Actionable` attempt): `lsp_helpers::diagnostics` already suppresses
             // every per-dependency fetch-failure message while `versions.offline` is set,
@@ -667,6 +736,45 @@ impl DepsError {
         matches!(self, Self::Offline { .. })
     }
 
+    /// Collapses a failed hop of a multi-hop index chain into the error that halts the chain.
+    ///
+    /// A [`Self::HostBlockedByPolicy`] is kept as is, so its actionable message survives; every
+    /// other error becomes [`Self::ChainResolutionHalted`]. Only for non-not-found errors:
+    /// callers must handle [`Self::is_not_found`] before halting.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::DepsError;
+    ///
+    /// let halted = DepsError::CacheError("reset".into()).into_chain_halt();
+    /// assert!(matches!(halted, DepsError::ChainResolutionHalted));
+    /// ```
+    #[must_use]
+    pub fn into_chain_halt(self) -> Self {
+        match self {
+            Self::HostBlockedByPolicy { .. } => self,
+            Self::ParseError { .. }
+            | Self::RegistryError { .. }
+            | Self::CacheError(_)
+            | Self::RateLimited { .. }
+            | Self::PackageNotFound { .. }
+            | Self::HttpStatus { .. }
+            | Self::ApiResponse { .. }
+            | Self::ResponseTooLarge { .. }
+            | Self::InvalidVersionReq(_)
+            | Self::InvalidPackageName(_)
+            | Self::Io(_)
+            | Self::Json(_)
+            | Self::UnsupportedEcosystem(_)
+            | Self::AmbiguousEcosystem(_)
+            | Self::InvalidUri(_)
+            | Self::Offline { .. }
+            | Self::ChainResolutionHalted
+            | Self::PaginatedListIncomplete { .. } => Self::ChainResolutionHalted,
+        }
+    }
+
     /// A URL-free summary of this error, safe to attach to a `tracing` field or log line at
     /// an outbound-request chokepoint. [`Self::HttpStatus`], [`Self::Offline`],
     /// [`Self::ResponseTooLarge`], and [`Self::RegistryError`]'s own `Display` now redact
@@ -715,7 +823,8 @@ impl DepsError {
             Self::AmbiguousEcosystem(_) => (None, "ambiguous-ecosystem"),
             Self::InvalidUri(_) => (None, "invalid-uri"),
             Self::ChainResolutionHalted => (None, "chain-resolution-halted"),
-            Self::PaginatedListUnsupported { .. } => (None, "paginated-list-unsupported"),
+            Self::PaginatedListIncomplete { .. } => (None, "paginated-list-incomplete"),
+            Self::HostBlockedByPolicy { .. } => (None, "host-blocked-by-policy"),
         }
     }
 }
@@ -732,8 +841,8 @@ impl DepsError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FetchFailure {
     /// The fetch failed with a pre-vetted, safe-to-display hint — produced from
-    /// [`DepsError::RateLimited`], [`DepsError::ChainResolutionHalted`] or
-    /// [`DepsError::PaginatedListUnsupported`] (see
+    /// [`DepsError::RateLimited`], [`DepsError::ChainResolutionHalted`],
+    /// [`DepsError::PaginatedListIncomplete`] or [`DepsError::HostBlockedByPolicy`] (see
     /// [`DepsError::fetch_failure`] for the exhaustive, deliberately-chosen list of which
     /// variants produce this versus [`Self::Transient`]).
     Actionable(String),
@@ -1297,26 +1406,79 @@ mod tests {
     }
 
     #[test]
-    fn paginated_list_unsupported_is_actionable_with_fixed_message() {
-        let err = DepsError::PaginatedListUnsupported {
+    fn paginated_list_incomplete_is_actionable_with_fixed_message() {
+        let incomplete = |reason| DepsError::PaginatedListIncomplete {
             package: "acme.networking".into(),
             registry: "Swift package registry",
+            reason,
         };
+        assert_eq!(
+            incomplete(PaginationStop::PageCap).fetch_failure(),
+            FetchFailure::Actionable(
+                "registry release list exceeds the page limit; not showing a partial list".into()
+            )
+        );
+        let err = incomplete(PaginationStop::InvalidNextLink);
         assert_eq!(
             err.fetch_failure(),
             FetchFailure::Actionable(
-                "registry paginates its release list; pagination is not supported yet".into()
+                "registry returned an unusable next-page link; not showing a partial list".into()
             )
         );
         assert_eq!(
             err.safe_tracing_summary(),
-            (None, "paginated-list-unsupported")
+            (None, "paginated-list-incomplete")
         );
+    }
+
+    #[test]
+    fn host_blocked_by_policy_message_distinguishes_never_a_registry_from_gated() {
+        let blocked = |class| DepsError::HostBlockedByPolicy {
+            url: "https://10.0.0.5.nip.io/api?token=secret".into(),
+            class,
+        };
+        assert_eq!(
+            blocked(HostClass::PrivateV4).fetch_failure(),
+            FetchFailure::Actionable(
+                "registry host resolves to a private (RFC1918) address, blocked by \
+                 registries.workspace_registries policy"
+                    .into()
+            )
+        );
+        assert_eq!(
+            blocked(HostClass::Loopback).fetch_failure(),
+            FetchFailure::Actionable(
+                "registry host resolves to a loopback address, which is never a registry \
+                 under any policy"
+                    .into()
+            )
+        );
+        let err = blocked(HostClass::Cgnat);
+        assert_eq!(err.safe_tracing_summary(), (None, "host-blocked-by-policy"));
+        assert!(!err.is_not_found());
+        assert!(!err.to_string().contains("secret"), "{err}");
+        assert!(!format!("{err:?}").contains("secret"), "{err:?}");
+    }
+
+    #[test]
+    fn into_chain_halt_keeps_policy_block_and_halts_everything_else() {
+        let blocked = DepsError::HostBlockedByPolicy {
+            url: "https://corp.example/".into(),
+            class: HostClass::PrivateV4,
+        };
+        assert!(matches!(
+            blocked.into_chain_halt(),
+            DepsError::HostBlockedByPolicy { .. }
+        ));
+        assert!(matches!(
+            DepsError::CacheError("x".into()).into_chain_halt(),
+            DepsError::ChainResolutionHalted
+        ));
     }
 
     /// Exhaustive companion to the doc-test on [`DepsError::fetch_failure`]: every variant
     /// other than [`DepsError::RateLimited`], [`DepsError::ChainResolutionHalted`] and
-    /// [`DepsError::PaginatedListUnsupported`] must classify as [`FetchFailure::Transient`] — including [`DepsError::Offline`] (#1295
+    /// [`DepsError::PaginatedListIncomplete`] must classify as [`FetchFailure::Transient`] — including [`DepsError::Offline`] (#1295
     /// critic S5: deliberately *not* `Actionable`, see `fetch_failure`'s own comment on that
     /// arm). This is the invariant the doc comment calls security-load-bearing (a future
     /// variant wired to `Actionable` by mistake could leak raw, potentially IP-bearing error
@@ -1324,7 +1486,7 @@ mod tests {
     /// handful of spot checks. The exempted variants carry no arbitrary payload, only a
     /// fixed, pre-vetted message, so each is safe to be an `Actionable`-producing variant (see
     /// their own docs, and #513's M2 fix for `ChainResolutionHalted`). A
-    /// dedicated test above pins `PaginatedListUnsupported`'s fixed message.
+    /// dedicated test above pins `PaginatedListIncomplete`'s fixed messages.
     #[test]
     fn test_fetch_failure_classifies_every_non_rate_limited_variant_as_transient() {
         // A `reqwest::Error` built from an invalid URL — `RequestBuilder::build`

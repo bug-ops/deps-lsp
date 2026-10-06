@@ -384,8 +384,10 @@ pub enum WorkspaceRegistryAccess {
     /// this variant's name is honest about — see the module docs).
     #[default]
     PublicOnly,
-    /// Allow every class — today's pre-hardening behavior, the escape hatch for a workspace
-    /// that legitimately points at an RFC1918/loopback registry.
+    /// Allow every class at parse time — the escape hatch for a workspace that legitimately
+    /// points at an RFC1918 registry. It does not unblock the
+    /// [`HostClass::never_a_registry`] classes (loopback, link-local, metadata, unspecified,
+    /// reserved) at connect time: the resolver guard rejects those under every policy.
     All,
 }
 
