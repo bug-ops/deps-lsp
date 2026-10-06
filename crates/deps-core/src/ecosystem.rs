@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
@@ -854,6 +855,142 @@ impl EcosystemConfig {
     }
 }
 
+/// What a change to a [`WatchedConfig`] file does to an ecosystem's parsed documents.
+///
+/// Exhaustive on purpose: a caller reacting to a config change must decide what each
+/// effect means for its refetch strategy, and adding a variant must fail to compile there.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::WatchedConfigEffect;
+///
+/// assert_ne!(
+///     WatchedConfigEffect::RewritesRequirements,
+///     WatchedConfigEffect::ChangesRouting
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchedConfigEffect {
+    /// The config rewrites a dependency's version requirement directly (e.g. npm's
+    /// `pnpm-workspace.yaml` catalog), so an ordinary diff against the previous parse result
+    /// already detects the change.
+    RewritesRequirements,
+    /// The config changes which registry a dependency resolves through without touching
+    /// names or requirements, so a diff would look like a no-op and a full re-fetch is
+    /// required (issue #1232).
+    ChangesRouting,
+}
+
+/// A non-lockfile config file an ecosystem resolves during manifest parsing, identified by
+/// the trailing path components it must end with.
+///
+/// Matching is component-wise ([`Path::ends_with`]), so a suffix such as
+/// `.swiftpm/configuration/registries.json` does not match an unrelated
+/// `docs/registries.json`, and works with the host's path separator.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+/// use deps_core::{WatchedConfig, WatchedConfigEffect};
+///
+/// const NPMRC: WatchedConfig = WatchedConfig::new(".npmrc", WatchedConfigEffect::ChangesRouting);
+///
+/// assert!(NPMRC.matches(Path::new("/work/app/.npmrc")));
+/// assert!(!NPMRC.matches(Path::new("/work/app/x.npmrc")));
+/// assert_eq!(NPMRC.glob_pattern(), "**/.npmrc");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchedConfig {
+    path_suffix: &'static str,
+    effect: WatchedConfigEffect,
+}
+
+const fn assert_plain_relative_suffix(suffix: &str) {
+    let mut rest = suffix.as_bytes();
+    assert!(!rest.is_empty(), "watched config suffix is empty");
+    assert!(
+        !matches!(rest, [b'/', ..]),
+        "watched config suffix is absolute"
+    );
+    let mut component_len = 0usize;
+    let mut component_dots = 0usize;
+    while let [byte, tail @ ..] = rest {
+        rest = tail;
+        if *byte == b'/' {
+            assert!(
+                !(component_len == 2 && component_dots == 2),
+                "watched config suffix contains `..`"
+            );
+            component_len = 0;
+            component_dots = 0;
+            continue;
+        }
+        assert!(
+            !matches!(*byte, b'*' | b'?' | b'[' | b'\\'),
+            "watched config suffix contains a glob or separator character"
+        );
+        component_len += 1;
+        if *byte == b'.' {
+            component_dots += 1;
+        }
+    }
+    assert!(
+        !(component_len == 2 && component_dots == 2),
+        "watched config suffix contains `..`"
+    );
+}
+
+impl WatchedConfig {
+    /// Creates a watched config. `path_suffix` is a relative, `/`-separated path (no `..`,
+    /// no glob characters) that a changed file's path must end with.
+    ///
+    /// # Panics
+    ///
+    /// Panics (at compile time when used in a `const`) if `path_suffix` is empty, absolute,
+    /// contains `*`, `?`, `[`, `\` or a `..` component.
+    ///
+    /// ```compile_fail
+    /// use deps_core::{WatchedConfig, WatchedConfigEffect};
+    ///
+    /// const BAD: WatchedConfig =
+    ///     WatchedConfig::new("../.npmrc", WatchedConfigEffect::ChangesRouting);
+    /// ```
+    #[must_use]
+    pub const fn new(path_suffix: &'static str, effect: WatchedConfigEffect) -> Self {
+        assert_plain_relative_suffix(path_suffix);
+        Self {
+            path_suffix,
+            effect,
+        }
+    }
+
+    /// The trailing path the watched file must end with.
+    #[must_use]
+    pub const fn path_suffix(&self) -> &'static str {
+        self.path_suffix
+    }
+
+    /// What a change to this file does to parsed documents.
+    #[must_use]
+    pub const fn effect(&self) -> WatchedConfigEffect {
+        self.effect
+    }
+
+    /// Whether `path` is this config file.
+    #[must_use]
+    pub fn matches(&self, path: &Path) -> bool {
+        path.ends_with(self.path_suffix)
+    }
+
+    /// The client-side file-watcher glob that covers this config file.
+    #[must_use]
+    pub fn glob_pattern(&self) -> String {
+        format!("**/{}", self.path_suffix)
+    }
+}
+
 /// How this ecosystem's license strings are sourced.
 ///
 /// Drives three ecosystem-specific license behaviors that used to be re-derived
@@ -1169,32 +1306,22 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         &[]
     }
 
-    /// Non-lockfile config filenames this ecosystem resolves *during* [`Self::parse_manifest`]
-    /// (e.g. `["pnpm-workspace.yaml", ".npmrc"]` for npm's catalog and registry resolution),
+    /// Non-lockfile config files this ecosystem resolves *during* [`Self::parse_manifest`]
+    /// (e.g. `pnpm-workspace.yaml` and `.npmrc` for npm's catalog and registry resolution),
     /// whose values end up baked into a manifest's `ParseResult` rather than looked up
     /// separately the way a [`Self::lockfile_provider`] is.
     ///
     /// Used for file watching alongside [`Self::lockfile_filenames`] — LSP monitors changes
     /// to these files too, but reacts by fully re-parsing every open document of this
     /// ecosystem (not merely refreshing cached resolved versions, since the value isn't kept
-    /// separately from the parse result to refresh in place). Returns empty slice by default.
-    fn watched_config_filenames(&self) -> &[&'static str] {
-        &[]
-    }
-
-    /// Subset of [`Self::watched_config_filenames`] whose change can alter dependency
-    /// *routing* (which registry a dependency resolves through) without changing the
-    /// dependency names or version requirements themselves — a caller reacting to a change
-    /// in one of these filenames must force a full re-fetch rather than diff against the
-    /// previous parse result, since a routing-only edit would otherwise look like a no-op
-    /// (issue #1232).
+    /// separately from the parse result to refresh in place). Each entry's
+    /// [`WatchedConfig::effect`] tells the caller whether a routing-only edit needs a full
+    /// re-fetch instead of a diff (issue #1232).
     ///
     /// # Default Implementation
     ///
-    /// Returns an empty slice: most watched configs (e.g. npm's `pnpm-workspace.yaml`
-    /// catalog) rewrite a dependency's version requirement directly, which an ordinary diff
-    /// against the parse result already detects.
-    fn routing_affecting_watched_configs(&self) -> &[&'static str] {
+    /// Returns an empty slice: no config files are watched.
+    fn watched_configs(&self) -> &[WatchedConfig] {
         &[]
     }
 

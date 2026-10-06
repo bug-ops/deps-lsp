@@ -982,4 +982,47 @@ mod tests {
         let registry = PubDevRegistry::with_base(Arc::new(HttpCache::new()), server.url());
         assert!(registry.get_license("missing").await.is_empty());
     }
+
+    /// Issue #1750: an offline license refresh (run after a lock-file change) must not leave
+    /// the process, and must degrade to "no license" rather than an error on a cold cache.
+    #[tokio::test]
+    async fn get_license_offline_cold_cache_makes_no_request_and_returns_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/packages/http/score")
+            .with_status(200)
+            .with_body(r#"{"tags":["license:mit"]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_offline(deps_core::NetworkMode::Offline);
+        let registry = PubDevRegistry::with_base(cache, server.url());
+
+        assert!(registry.get_license("http").await.is_empty());
+        mock.assert_async().await;
+    }
+
+    /// Issue #1750: a license fetched while online and cached stays resolvable offline, with
+    /// no second request.
+    #[tokio::test]
+    async fn get_license_offline_warm_cache_serves_cached_license_without_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/packages/http/score")
+            .with_status(200)
+            .with_body(r#"{"tags":["license:mit"]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PubDevRegistry::with_base(Arc::clone(&cache), server.url());
+        assert_eq!(registry.get_license("http").await, vec!["MIT".to_string()]);
+
+        cache.set_offline(deps_core::NetworkMode::Offline);
+        assert_eq!(registry.get_license("http").await, vec!["MIT".to_string()]);
+        mock.assert_async().await;
+    }
 }

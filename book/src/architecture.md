@@ -54,7 +54,8 @@ documented contract enforced by code review, not a compiler-enforced wall.
   A separate, single-purpose lookup, `EcosystemRegistry::for_lockfile`, matches an ecosystem's
   `lockfile_filenames()` (`Cargo.lock`, `package-lock.json`, ...) so file-watcher events on a
   lock file route to the right ecosystem for a resolved-version refresh without a full
-  reparse. `for_watched_config` does the same for `watched_config_filenames()` — non-lockfile
+  reparse. `for_watched_config` does the same for `watched_configs()` (path-suffix
+  `WatchedConfig` entries, each tagged routing-changing or requirement-rewriting) — non-lockfile
   config an ecosystem resolves *during* parsing (npm's `pnpm-workspace.yaml`, `.npmrc`) — except
   a change there triggers a full document reparse, not just a cache refresh, since the config's
   value is baked into the parsed `ParseResult` rather than looked up separately.

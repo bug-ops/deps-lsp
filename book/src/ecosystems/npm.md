@@ -27,7 +27,7 @@ hover/diagnostic/completion positioning.
 Hovering the version string shows the latest npm release and whether `^4.18.2` is satisfied;
 an outdated dependency gets an inlay hint and a diagnostic with an "Update to latest version"
 code action. Typing a version prefix completes from the real, live version list; typing a new
-dependency name searches the npm registry. `watched_config_filenames` covers `.npmrc` and
+dependency name searches the npm registry. `watched_configs` covers `.npmrc` and
 `pnpm-workspace.yaml` — editing either one externally (e.g. `git checkout`) triggers a reparse
 of every open `package.json` so pushed diagnostics stay current without waiting for the next
 in-editor edit.

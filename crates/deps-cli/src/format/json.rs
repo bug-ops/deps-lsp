@@ -406,7 +406,7 @@ mod tests {
             category: Category::Outdated,
             code: None,
             advisory_url: None,
-            advisory_severity: None,
+            advisory: None,
             severity: Severity::Hint,
             range: Range::new(Position::new(4, 0), Position::new(4, 10)),
             message: "Newer version available: 1.1.0".to_string(),
@@ -419,6 +419,26 @@ mod tests {
         assert_eq!(document.schema_version, SCHEMA_VERSION);
         assert!(document.findings.is_empty());
         assert!(document.summary.is_empty());
+    }
+
+    /// Advisory facts are SARIF-only: the JSON document must not change with them.
+    #[test]
+    fn test_to_document_ignores_advisory_facts() {
+        let plain = finding();
+        let with_facts = CheckFinding {
+            advisory: Some(crate::report::AdvisoryFacts {
+                severity: deps_core::osv::VulnSeverity::High,
+                text: "RUSTSEC-2024-0001: summary".to_string(),
+            }),
+            ..finding()
+        };
+        let render = |finding| {
+            serde_json::to_value(to_document(&CheckReport {
+                findings: vec![finding],
+            }))
+            .unwrap()
+        };
+        assert_eq!(render(plain), render(with_facts));
     }
 
     #[test]

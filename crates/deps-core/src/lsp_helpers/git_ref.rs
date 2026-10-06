@@ -126,6 +126,27 @@ pub struct TagIndex {
     coverage: ListCoverage,
 }
 
+/// Which release tags on a commit [`TagIndex::resolved_release`] reports as siblings of its
+/// primary tag.
+///
+/// Ordered from narrowest to widest; an ecosystem merging several readings of one key keeps the
+/// widest.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::SiblingScope;
+///
+/// assert!(SiblingScope::SameMajor < SiblingScope::WholeCommit);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SiblingScope {
+    /// Only tags of the primary's own major line, as for an exact-tag pin.
+    SameMajor,
+    /// Every release tag on the commit, as for a SHA pin that names the commit itself.
+    WholeCommit,
+}
+
 /// Other release tags sharing a commit with a [`ResolvedPin`]'s primary tag.
 ///
 /// Each has the same specificity class as the primary (a full-semver release next to a
@@ -556,9 +577,9 @@ impl TagIndex {
     /// Resolves the exact tag `written` (`v4.8.0`) to a pin whose primary is that tag itself,
     /// with the other release tags of the same major line on its commit as siblings.
     ///
-    /// Unlike [`Self::resolved_pin`] the primary is never re-picked: the user wrote that tag.
-    /// Tags of other majors on the same commit are not siblings. `None` when `written` is not
-    /// in the index.
+    /// Shorthand for [`Self::resolved_release`] with [`SiblingScope::SameMajor`]. Unlike
+    /// [`Self::resolved_pin`] the primary is never re-picked: the user wrote that tag. `None`
+    /// when `written` is not in the index.
     ///
     /// # Examples
     ///
@@ -574,21 +595,99 @@ impl TagIndex {
     /// ```
     #[must_use]
     pub fn resolved_exact_tag(&self, written: &str) -> Option<ResolvedPin> {
-        let sha = self.tag_to_sha.get(written)?;
-        let major = tag_components(written).next();
+        self.resolved_release(written, SiblingScope::SameMajor)
+    }
+
+    /// Resolves the tag `tag` (exact key text) to a pin whose primary is that tag, with the
+    /// other release tags on its commit that `scope` admits as siblings.
+    ///
+    /// `None` when `tag` is not a key of the index.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{CommitSha, SiblingScope, TagIndex};
+    ///
+    /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let index = TagIndex::from_tags([("v4.8.0", &sha), ("v4.9.0", &sha), ("v5.0.0", &sha)]);
+    /// let same_major = index.resolved_release("v4.8.0", SiblingScope::SameMajor).unwrap();
+    /// assert_eq!(same_major.siblings().len(), 1);
+    /// let whole_commit = index.resolved_release("v4.8.0", SiblingScope::WholeCommit).unwrap();
+    /// assert_eq!(whole_commit.siblings().len(), 2);
+    /// ```
+    #[must_use]
+    pub fn resolved_release(&self, tag: &str, scope: SiblingScope) -> Option<ResolvedPin> {
+        let sha = self.tag_to_sha.get(tag)?;
+        let major = tag_components(tag).next();
         let names: Vec<&str> = self
             .tag_to_sha
             .iter()
-            .filter(|(name, other)| *other == sha && tag_components(name).next() == major)
+            .filter(|(name, other)| {
+                *other == sha
+                    && match scope {
+                        SiblingScope::SameMajor => tag_components(name).next() == major,
+                        SiblingScope::WholeCommit => true,
+                    }
+            })
             .map(|(name, _)| name.as_str())
             .collect();
-        let siblings = SiblingTags::from_candidates(written, names.iter().copied());
-        let tag = crate::ConcreteVersion::new(written);
-        Some(if names.iter().any(|other| extends_tag(other, written)) {
-            ResolvedPin::Alias { tag, siblings }
+        let siblings = SiblingTags::from_candidates(tag, names.iter().copied());
+        let primary = crate::ConcreteVersion::new(tag);
+        Some(if names.iter().any(|other| extends_tag(other, tag)) {
+            ResolvedPin::Alias {
+                tag: primary,
+                siblings,
+            }
         } else {
-            ResolvedPin::MostSpecific { tag, siblings }
+            ResolvedPin::MostSpecific {
+                tag: primary,
+                siblings,
+            }
         })
+    }
+
+    /// The index key naming the release `version`, tolerating a `v`/`V` prefix mismatch.
+    ///
+    /// Every key equal to `version` after [`crate::github::normalize_tag`] is considered. `None`
+    /// when there is none, or when they point at different commits, an exact key included: an
+    /// ambiguous spelling is never resolved by ranking, because the text a later edit writes may
+    /// be spelled differently from `version`. Otherwise the exact key if present, else the
+    /// smallest matching key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{CommitSha, TagIndex};
+    ///
+    /// let a = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let b = CommitSha::parse(&"b".repeat(40)).unwrap();
+    /// let index = TagIndex::from_tags([("v4.1.3", &a), ("v5.0.0", &a), ("5.0.0", &b)]);
+    /// assert_eq!(index.release_tag("v4.1.3"), Some("v4.1.3"));
+    /// assert_eq!(index.release_tag("4.1.3"), Some("v4.1.3"));
+    /// assert_eq!(index.release_tag("5.0.0"), None);
+    /// assert_eq!(index.release_tag("v5.0.0"), None);
+    /// assert_eq!(index.release_tag("v9.9.9"), None);
+    /// ```
+    #[must_use]
+    pub fn release_tag(&self, version: &str) -> Option<&str> {
+        let normalized = crate::github::normalize_tag(version);
+        let mut matches = self
+            .tag_to_sha
+            .iter()
+            .filter(|(key, _)| crate::github::normalize_tag(key) == normalized);
+        let (first_key, first_sha) = matches.next()?;
+        let mut chosen = first_key.as_str();
+        for (key, sha) in matches {
+            if sha != first_sha {
+                return None;
+            }
+            chosen = chosen.min(key.as_str());
+        }
+        Some(
+            self.tag_to_sha
+                .get_key_value(version)
+                .map_or(chosen, |(key, _)| key.as_str()),
+        )
     }
 
     /// Attaches the repository's canonical casing as reported by GitHub.
@@ -2173,6 +2272,61 @@ mod tests {
         let pin = index.resolved_exact_tag("v4.8.0").unwrap();
         assert!(matches!(pin, ResolvedPin::Alias { .. }));
         assert!(pin.siblings().is_empty());
+    }
+
+    #[test]
+    fn test_release_tag_exact_normalized_and_missing() {
+        let a = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let index = TagIndex::from_tags([("v4.1.3", &a), ("4.2.0", &a)]);
+        assert_eq!(index.release_tag("v4.1.3"), Some("v4.1.3"));
+        assert_eq!(index.release_tag("4.1.3"), Some("v4.1.3"));
+        assert_eq!(index.release_tag("V4.2.0"), Some("4.2.0"));
+        assert_eq!(index.release_tag("v9.9.9"), None);
+    }
+
+    /// Any conflicting spelling makes the lookup ambiguous, an exact key included.
+    #[test]
+    fn test_release_tag_conflicting_spellings_are_none_even_with_an_exact_key() {
+        let a = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let b = CommitSha::parse(&"b".repeat(40)).unwrap();
+        let index = TagIndex::from_tags([("4.1.3", &b), ("v4.1.3", &a)]);
+        for version in ["4.1.3", "v4.1.3", "V4.1.3"] {
+            assert_eq!(index.release_tag(version), None, "{version}");
+        }
+    }
+
+    /// Spellings of one commit agree; the unprefixed request gets a deterministic key.
+    #[test]
+    fn test_release_tag_agreeing_spellings_resolve_deterministically() {
+        let a = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let index = TagIndex::from_tags([("v4.1.3", &a), ("V4.1.3", &a)]);
+        assert_eq!(index.release_tag("4.1.3"), Some("V4.1.3"));
+        assert_eq!(index.release_tag("v4.1.3"), Some("v4.1.3"));
+    }
+
+    #[test]
+    fn test_resolved_release_scope_same_major_vs_whole_commit() {
+        let a = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let b = CommitSha::parse(&"b".repeat(40)).unwrap();
+        let index = TagIndex::from_tags([
+            ("v4.8.0", &a),
+            ("v4.9.0", &a),
+            ("v5.0.0", &a),
+            ("v4.7.0", &b),
+        ]);
+        let same = index
+            .resolved_release("v4.8.0", SiblingScope::SameMajor)
+            .unwrap();
+        assert_eq!(sibling_names(&same), ["v4.9.0"]);
+        let whole = index
+            .resolved_release("v4.8.0", SiblingScope::WholeCommit)
+            .unwrap();
+        assert_eq!(sibling_names(&whole), ["v4.9.0", "v5.0.0"]);
+        assert_eq!(
+            index.resolved_release("4.8.0", SiblingScope::WholeCommit),
+            None,
+            "exact key text only"
+        );
     }
 
     /// A pre-release never beats its own release, in either fetch order (#1668 critic).

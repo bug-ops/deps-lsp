@@ -47,11 +47,12 @@ pub async fn handle_code_lens(
         return vec![];
     }
 
-    let (network, severities) = {
+    let (network, severities, osv_checks_enabled) = {
         let config = config.read().await;
         (
             config.policy.network.mode(),
             config.policy.diagnostics.to_severities(),
+            config.policy.osv_checks_enabled(),
         )
     };
 
@@ -73,7 +74,7 @@ pub async fn handle_code_lens(
                 .signals
                 .snapshot()
                 .with_vulnerabilities()
-                .with_latest_status(severities.vulnerabilities_enabled && network.is_online())
+                .with_latest_status(osv_checks_enabled)
                 .finish();
             Some((
                 ecosystem,

@@ -140,7 +140,7 @@ mod tests {
             category,
             code: None,
             advisory_url: None,
-            advisory_severity: None,
+            advisory: None,
             severity,
             range: Range::new(Position::new(4, 0), Position::new(4, 10)),
             message: "Newer version available: 1.1.0".to_string(),

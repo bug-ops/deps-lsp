@@ -73,7 +73,8 @@ On Unix, a `.swiftpm` that is a regular file (or any other stat failure besides 
 makes the project tier unusable, which fails closed; Windows reports "not found" for that path, so
 the project tier is simply absent there. The user-level file is not watched: edits to it
 (and to `SWIFTPM_REGISTRY_*` variables, read once at startup) take effect on the next manifest
-parse, not immediately; only a `registries.json` change inside the workspace triggers a reparse.
+parse, not immediately; only a change to the project's
+`.swiftpm/configuration/registries.json` triggers a reparse (an unrelated `registries.json` elsewhere in the workspace does not).
 
 ### Trust and credentials
 
@@ -120,8 +121,6 @@ policy-gated, which SwiftPM does not do.
   latest version or up-to-date mark is derived from a partial page.
 - A project-declared hostname that resolves to a blocked address class shows the generic
   fetch-failure message rather than a policy-specific one.
-- `registries.json` is watched by basename, so an unrelated file with that name elsewhere in the
-  workspace causes one extra reparse.
 - No `id:` name completion (SE-0292 has no search endpoint) and no `publishedAt` freshness.
 
 `Package.resolved` `registry` pins are shown as registry sources, and a pin of an unrecognized

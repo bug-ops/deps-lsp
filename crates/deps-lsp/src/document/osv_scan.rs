@@ -518,7 +518,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
     //
     // B.1b (#1524): candidate-check rounds for the same snapshot, sharing this one
     // `vuln_keys`/`parse_result`/`cached_versions` read rather than a second document lookup.
-    let (targets, mut latest_status, candidate_rounds, mut candidate_status) = {
+    let (targets, mut latest_status, candidate_rounds, mut candidate_status, candidate_tags) = {
         let Some(doc) = state.get_document(uri) else {
             return;
         };
@@ -532,10 +532,17 @@ pub(crate) async fn run_osv_phase_b_and_commit(
             formatter,
             ecosystem_id,
         );
+        let candidate_tags = deps_engine::classify::osv::candidate_tag_sources(
+            parse_result,
+            &vuln_keys,
+            formatter,
+            ecosystem_id,
+        );
         let (targets, latest_status) = deps_engine::classify::osv::build_latest_check_targets(
             parse_result,
             &doc.signals.cached_versions,
             &vuln_keys,
+            &candidate_tags,
             formatter,
         );
         let (candidate_rounds, candidate_status) =
@@ -543,9 +550,16 @@ pub(crate) async fn run_osv_phase_b_and_commit(
                 parse_result,
                 &doc.signals.cached_versions,
                 &vuln_keys,
+                &candidate_tags,
                 formatter,
             );
-        (targets, latest_status, candidate_rounds, candidate_status)
+        (
+            targets,
+            latest_status,
+            candidate_rounds,
+            candidate_status,
+            candidate_tags,
+        )
     };
 
     if !targets.is_empty() {
@@ -569,6 +583,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
             &vulnerable_keys,
             &result.osv_name_by_key,
             &latest_status,
+            &candidate_tags,
             ecosystem_id,
             formatter,
             &state.osv,
@@ -747,6 +762,7 @@ async fn run_osv_fix_target_verification(
     vulnerable_keys: &[deps_core::osv::VulnKey],
     osv_name_by_key: &HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvQueryName>,
     latest_status: &deps_core::osv::LatestStatusMap,
+    candidate_tags: &deps_engine::classify::osv::CandidateTagSources,
     ecosystem_id: EcosystemId,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     osv: &deps_core::osv::OsvClient,
@@ -760,6 +776,7 @@ async fn run_osv_fix_target_verification(
             vulnerable_keys,
             osv_name_by_key,
             latest_status,
+            candidate_tags,
             formatter,
         );
 

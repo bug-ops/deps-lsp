@@ -526,9 +526,7 @@ pub async fn analyze_manifest(
     // `scope.vulnerabilities` (code review finding 6): `update`'s default mode never reads
     // `ManifestAnalysis::vulnerabilities`, so it declares this scope out entirely rather than
     // paying for a scan nothing consumes.
-    let run_osv_scan = scope.vulnerabilities
-        && ctx.policy.diagnostics.vulnerabilities_enabled
-        && network.is_online();
+    let run_osv_scan = scope.vulnerabilities && ctx.policy.osv_checks_enabled();
     let osv_scan = async {
         if run_osv_scan {
             let (targets, skipped) = build_scan_targets(
@@ -559,7 +557,7 @@ pub async fn analyze_manifest(
     // `update`'s default mode never reads `ManifestAnalysis::vulnerabilities`, but it always
     // needs to know whether the `latest` it's about to write is itself safe. Still gated on
     // the same `vulnerabilities_enabled`/`!offline` policy every other OSV call respects.
-    let run_latest_check = ctx.policy.diagnostics.vulnerabilities_enabled && network.is_online();
+    let run_latest_check = ctx.policy.osv_checks_enabled();
 
     // Spec 075 FR-010: the fallback-candidate OSV round only fires when
     // `scope.cooldown_fallback` is set AND at least one dependency's `cooldown_disposition`
@@ -596,14 +594,28 @@ pub async fn analyze_manifest(
         )
     });
 
+    let candidate_tags = vuln_keys.as_ref().map(|keys| {
+        deps_engine::classify::osv::candidate_tag_sources(
+            parse_result.as_ref(),
+            keys,
+            formatter,
+            ecosystem_id,
+        )
+    });
+
     let latest_check = async {
-        let (true, Some(vuln_keys)) = (run_latest_check, vuln_keys.as_ref()) else {
+        let (true, Some(vuln_keys), Some(candidate_tags)) = (
+            run_latest_check,
+            vuln_keys.as_ref(),
+            candidate_tags.as_ref(),
+        ) else {
             return None;
         };
         let (targets, mut latest_status) = build_latest_check_targets(
             parse_result.as_ref(),
             &cached_versions,
             vuln_keys,
+            candidate_tags,
             formatter,
         );
         if !targets.is_empty() {
@@ -627,15 +639,21 @@ pub async fn analyze_manifest(
     // way `latest` itself is. Result is a wholly separate map — never merged into
     // `latest_status` (see `ManifestAnalysis::fallback_status`'s doc for why).
     let fallback_check = async {
-        let (true, Some(vuln_keys), Some(view)) = (
+        let (true, Some(vuln_keys), Some(candidate_tags), Some(view)) = (
             run_fallback_check,
             vuln_keys.as_ref(),
+            candidate_tags.as_ref(),
             cooldown_fallback_view_map.as_ref(),
         ) else {
             return None;
         };
-        let (targets, mut fallback_status) =
-            build_latest_check_targets(parse_result.as_ref(), view, vuln_keys, formatter);
+        let (targets, mut fallback_status) = build_latest_check_targets(
+            parse_result.as_ref(),
+            view,
+            vuln_keys,
+            candidate_tags,
+            formatter,
+        );
         if !targets.is_empty() {
             let timeout = Duration::from_secs(
                 ctx.policy

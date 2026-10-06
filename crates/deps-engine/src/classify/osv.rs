@@ -12,9 +12,114 @@ use deps_core::ConcreteVersion;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::{
-    OsvNameAvailability, has_unqueryable_resolved_pin, resolve_in_use_versions,
+    CandidateSiblings, CandidateSiblingsUnknown, CandidateTagSource, OsvNameAvailability,
+    TaggedVersions, has_unqueryable_resolved_pin, resolve_in_use_versions,
 };
 use std::collections::HashMap;
+
+/// Per-[`deps_core::osv::VulnKey`] sibling-tag sources for phase B's candidate checks (#1727).
+///
+/// Built once per phase B from the parsed manifest and shared by the latest, candidate and
+/// fix-target builders, so all three agree on which candidate versions have sibling release
+/// tags and none of them can silently skip the lookup.
+#[derive(Debug, Clone)]
+pub struct CandidateTagSources {
+    ecosystem: EcosystemId,
+    by_key: HashMap<deps_core::osv::VulnKey, CandidateTagSource>,
+}
+
+impl CandidateTagSources {
+    /// The sibling release tags of `candidate` for the dependency scanned under `key`.
+    ///
+    /// A key absent from the sources is an error when any other dependency is tag based: phase A
+    /// keys embed tag-index-derived signatures and can differ from phase B's, so an unknown key
+    /// cannot be assumed to have no siblings. In an ecosystem without tag-based dependencies
+    /// there is nothing to look up and the answer is an empty list.
+    ///
+    /// # Errors
+    ///
+    /// [`CandidateSiblingsUnknown`] when the siblings cannot be established.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{
+    ///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    ///     RequirementResolution, SourcePolicy,
+    /// };
+    /// use deps_core::osv::vulnerability_keys;
+    /// use deps_core::test_util::{stub_parse_result_with_dependencies, vuln_key};
+    /// use deps_core::{ConcreteVersion, EcosystemId, PackageName};
+    /// use deps_engine::classify::osv::candidate_tag_sources;
+    /// use std::collections::HashMap;
+    ///
+    /// struct SimpleFormatter;
+    /// impl PackageNaming for SimpleFormatter {}
+    /// impl PackageRendering for SimpleFormatter {
+    ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+    ///         version.to_string()
+    ///     }
+    ///     fn package_url(&self, name: &PackageName) -> String {
+    ///         name.as_str().to_string()
+    ///     }
+    /// }
+    /// impl RequirementResolution for SimpleFormatter {}
+    /// impl DiagnosticMessages for SimpleFormatter {}
+    /// impl DiagnosticPolicy for SimpleFormatter {}
+    /// impl SourcePolicy for SimpleFormatter {}
+    /// impl OsvNaming for SimpleFormatter {}
+    ///
+    /// let parsed = stub_parse_result_with_dependencies(1);
+    /// let keys = vulnerability_keys(
+    ///     parsed.as_ref(),
+    ///     &HashMap::new(),
+    ///     None,
+    ///     &SimpleFormatter,
+    ///     EcosystemId::Cargo,
+    /// );
+    /// let sources =
+    ///     candidate_tag_sources(parsed.as_ref(), &keys, &SimpleFormatter, EcosystemId::Cargo);
+    /// let siblings = sources
+    ///     .siblings_for(&vuln_key("dep-0"), &ConcreteVersion::new("2.0.0"))
+    ///     .unwrap();
+    /// assert!(deps_core::lsp_helpers::TaggedVersions::siblings(&siblings).is_empty());
+    /// ```
+    pub fn siblings_for(
+        &self,
+        key: &deps_core::osv::VulnKey,
+        candidate: &ConcreteVersion,
+    ) -> Result<CandidateSiblings, CandidateSiblingsUnknown> {
+        match self.by_key.get(key) {
+            Some(source) => source.siblings_of(candidate, self.ecosystem),
+            None if self.by_key.values().any(CandidateTagSource::is_tag_based) => {
+                Err(CandidateSiblingsUnknown)
+            }
+            None => CandidateTagSource::NotTagBased.siblings_of(candidate, self.ecosystem),
+        }
+    }
+}
+
+/// Collects each dependency's [`CandidateTagSource`] under its phase-B scan key.
+///
+/// Occurrences sharing a key are merged by [`CandidateTagSource::merge`].
+#[must_use]
+pub fn candidate_tag_sources(
+    parse_result: &dyn deps_core::ParseResult,
+    vuln_keys: &deps_core::osv::VulnKeys,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+    ecosystem: EcosystemId,
+) -> CandidateTagSources {
+    let mut by_key: HashMap<deps_core::osv::VulnKey, CandidateTagSource> = HashMap::new();
+    for dep in parse_result.dependencies() {
+        let key = deps_core::osv::vuln_key_for(dep, Some(vuln_keys), formatter);
+        let source = formatter.candidate_tag_source(dep);
+        match by_key.remove(&key) {
+            Some(existing) => by_key.insert(key, existing.merge(source)),
+            None => by_key.insert(key, source),
+        };
+    }
+    CandidateTagSources { ecosystem, by_key }
+}
 
 /// Builds the OSV scan targets for one manifest's dependencies, applying the
 /// version-selection policy from `architecture.md` §3 in order:
@@ -310,7 +415,7 @@ fn classify_dep_for_check_targets<'a>(
 /// use deps_core::osv::{UpgradeStatus, vulnerability_keys};
 /// use deps_core::test_util::stub_parse_result_with_dependencies;
 /// use deps_core::{ConcreteVersion, EcosystemId, PackageName};
-/// use deps_engine::classify::osv::build_latest_check_targets;
+/// use deps_engine::classify::osv::{build_latest_check_targets, candidate_tag_sources};
 /// use std::collections::HashMap;
 ///
 /// struct SimpleFormatter;
@@ -343,10 +448,18 @@ fn classify_dep_for_check_targets<'a>(
 ///     EcosystemId::Cargo,
 /// );
 ///
+/// let candidate_tags = candidate_tag_sources(
+///     parsed.as_ref(),
+///     &vuln_keys,
+///     &SimpleFormatter,
+///     EcosystemId::Cargo,
+/// );
+///
 /// let (targets, structural) = build_latest_check_targets(
 ///     parsed.as_ref(),
 ///     &cached_versions,
 ///     &vuln_keys,
+///     &candidate_tags,
 ///     &SimpleFormatter,
 /// );
 ///
@@ -358,6 +471,7 @@ pub fn build_latest_check_targets(
     parse_result: &dyn deps_core::ParseResult,
     cached_versions: &HashMap<PackageName, deps_core::lsp_helpers::PackageVersions>,
     vuln_keys: &deps_core::osv::VulnKeys,
+    candidate_tags: &CandidateTagSources,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> (
     Vec<deps_core::osv::ScanTarget>,
@@ -365,7 +479,6 @@ pub fn build_latest_check_targets(
 ) {
     use deps_core::osv::{SkipReason, StructuralSkipReason, UpgradeStatus, vuln_key_for};
 
-    // TODO(#1727): candidate-side checks do not evaluate sibling release tags of the candidate.
     let mut targets = Vec::new();
     let mut structural = deps_core::osv::LatestStatusMap::new();
     let mut seen = std::collections::HashSet::new();
@@ -405,12 +518,30 @@ pub fn build_latest_check_targets(
                 if !seen.insert(key.clone()) {
                     continue;
                 }
-                targets.push(deps_core::osv::ScanTarget::from_native(
-                    key,
-                    deps_core::osv::OsvQueryName::Confirmed(osv_name),
-                    cached.latest.clone(),
-                    formatter,
-                ));
+                let Ok(siblings) = candidate_tags.siblings_for(&key, &cached.latest) else {
+                    structural.insert(
+                        key,
+                        UpgradeStatus::CandidateUnverified {
+                            version: cached.latest.clone(),
+                            reason: SkipReason::SiblingTagsUnknown,
+                        },
+                    );
+                    continue;
+                };
+                tracing::debug!(
+                    key = %key,
+                    siblings = siblings.siblings().len(),
+                    "OSV latest check: candidate sibling tags"
+                );
+                targets.push(
+                    deps_core::osv::ScanTarget::from_native(
+                        key,
+                        deps_core::osv::OsvQueryName::Confirmed(osv_name),
+                        cached.latest.clone(),
+                        formatter,
+                    )
+                    .with_siblings(&siblings, formatter),
+                );
             }
         }
     }
@@ -456,6 +587,7 @@ pub fn build_candidate_check_targets(
     parse_result: &dyn deps_core::ParseResult,
     cached_versions: &HashMap<PackageName, deps_core::lsp_helpers::PackageVersions>,
     vuln_keys: &deps_core::osv::VulnKeys,
+    candidate_tags: &CandidateTagSources,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> (
     Vec<Vec<deps_core::osv::ScanTarget>>,
@@ -518,12 +650,24 @@ pub fn build_candidate_check_targets(
             let Some(bucket) = rounds.get_mut(rank) else {
                 continue;
             };
-            bucket.push(deps_core::osv::ScanTarget::from_native(
-                key.clone(),
-                deps_core::osv::OsvQueryName::Confirmed(osv_name.clone()),
-                version.clone(),
-                formatter,
-            ));
+            // Unknown siblings: no target, so the candidate reads as unverified (fail-closed).
+            let Ok(siblings) = candidate_tags.siblings_for(&key, version) else {
+                continue;
+            };
+            tracing::debug!(
+                key = %key,
+                siblings = siblings.siblings().len(),
+                "OSV candidate check: candidate sibling tags"
+            );
+            bucket.push(
+                deps_core::osv::ScanTarget::from_native(
+                    key.clone(),
+                    deps_core::osv::OsvQueryName::Confirmed(osv_name.clone()),
+                    version.clone(),
+                    formatter,
+                )
+                .with_siblings(&siblings, formatter),
+            );
         }
     }
 
@@ -557,6 +701,7 @@ fn resolve_fix_target(
     key: &deps_core::osv::VulnKey,
     latest_status: &deps_core::osv::LatestStatusMap,
     osv_name_by_key: &HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvQueryName>,
+    candidate_tags: &CandidateTagSources,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> FixTargetResolution {
     use deps_core::edit::{VulnFixSkip, resolve_recommended_fix};
@@ -636,12 +781,27 @@ fn resolve_fix_target(
             return FixTargetResolution::Skip;
         }
     };
-    FixTargetResolution::NeedsLiveCheck(ScanTarget::new(
-        key.clone(),
-        OsvQueryName::Confirmed(osv_name),
-        fix.version,
-        ConcreteVersion::new(version_native),
-    ))
+    let display_version = ConcreteVersion::new(version_native);
+    let Ok(siblings) = candidate_tags.siblings_for(key, &display_version) else {
+        return FixTargetResolution::Resolved(UpgradeStatus::CandidateUnverified {
+            version: display_version,
+            reason: deps_core::osv::SkipReason::SiblingTagsUnknown,
+        });
+    };
+    tracing::debug!(
+        key = %key,
+        siblings = siblings.siblings().len(),
+        "OSV fix-target check: candidate sibling tags"
+    );
+    FixTargetResolution::NeedsLiveCheck(
+        ScanTarget::new(
+            key.clone(),
+            OsvQueryName::Confirmed(osv_name),
+            fix.version,
+            display_version,
+        )
+        .with_siblings(&siblings, formatter),
+    )
 }
 /// Pure aggregation step of `run_osv_fix_target_verification`: resolves every vulnerable
 /// dependency's fix target via `resolve_fix_target`.
@@ -662,11 +822,11 @@ fn resolve_fix_target(
 /// };
 /// use deps_core::osv::{
 ///     Advisory, Capped, DependencyVulnerabilities, OsvVersion, ScanOutcome, UpgradeStatus,
-///     VulnSeverity, VulnerabilityMap,
+///     VulnSeverity, VulnerabilityMap, vulnerability_keys,
 /// };
-/// use deps_core::test_util::vuln_key;
-/// use deps_core::{ConcreteVersion, PackageName};
-/// use deps_engine::classify::osv::collect_fix_target_resolutions;
+/// use deps_core::test_util::{stub_parse_result_with_dependencies, vuln_key};
+/// use deps_core::{ConcreteVersion, EcosystemId, PackageName};
+/// use deps_engine::classify::osv::{candidate_tag_sources, collect_fix_target_resolutions};
 /// use std::collections::HashMap;
 /// use std::sync::Arc;
 ///
@@ -708,11 +868,26 @@ fn resolve_fix_target(
 ///
 /// // F (the fix, 1.2.0) equals the already-checked "latest" candidate — resolved without a
 /// // live network check.
+/// let parsed = stub_parse_result_with_dependencies(1);
+/// let vuln_keys = vulnerability_keys(
+///     parsed.as_ref(),
+///     &HashMap::new(),
+///     None,
+///     &SimpleFormatter,
+///     EcosystemId::Cargo,
+/// );
+/// let candidate_tags = candidate_tag_sources(
+///     parsed.as_ref(),
+///     &vuln_keys,
+///     &SimpleFormatter,
+///     EcosystemId::Cargo,
+/// );
 /// let (resolved, live_check_candidates) = collect_fix_target_resolutions(
 ///     &vulnerabilities,
 ///     &[vuln_key("pkg")],
 ///     &HashMap::new(),
 ///     &latest_status_map,
+///     &candidate_tags,
 ///     &SimpleFormatter,
 /// );
 ///
@@ -724,6 +899,7 @@ pub fn collect_fix_target_resolutions(
     vulnerable_keys: &[deps_core::osv::VulnKey],
     osv_name_by_key: &HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvQueryName>,
     latest_status: &deps_core::osv::LatestStatusMap,
+    candidate_tags: &CandidateTagSources,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> (
     Vec<(deps_core::osv::VulnKey, deps_core::osv::UpgradeStatus)>,
@@ -738,7 +914,14 @@ pub fn collect_fix_target_resolutions(
         let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities.get(key) else {
             continue;
         };
-        match resolve_fix_target(dv, key, latest_status, osv_name_by_key, formatter) {
+        match resolve_fix_target(
+            dv,
+            key,
+            latest_status,
+            osv_name_by_key,
+            candidate_tags,
+            formatter,
+        ) {
             FixTargetResolution::Skip => {}
             FixTargetResolution::Resolved(status) => resolved.push((key.clone(), status)),
             FixTargetResolution::NeedsLiveCheck(target) => live_check_candidates.push(target),
@@ -855,9 +1038,57 @@ pub fn osv_name_by_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::classify::resolved::collect_in_use_versions;
     use deps_core::VersionReq;
     use std::assert_matches;
+
+    fn no_tags() -> CandidateTagSources {
+        CandidateTagSources {
+            ecosystem: EcosystemId::Cargo,
+            by_key: HashMap::new(),
+        }
+    }
+
+    fn tagged_source(
+        tags: &[(&str, char)],
+        scope: deps_core::lsp_helpers::SiblingScope,
+    ) -> CandidateTagSource {
+        let shas: Vec<(&str, deps_core::lsp_helpers::CommitSha)> = tags
+            .iter()
+            .map(|(tag, c)| {
+                (
+                    *tag,
+                    deps_core::lsp_helpers::CommitSha::parse(&c.to_string().repeat(40)).unwrap(),
+                )
+            })
+            .collect();
+        CandidateTagSource::Indexed {
+            index: std::sync::Arc::new(deps_core::lsp_helpers::TagIndex::from_tags(
+                shas.iter().map(|(tag, sha)| (*tag, sha)),
+            )),
+            scope,
+        }
+    }
+
+    fn sources_with(key: &str, source: CandidateTagSource) -> CandidateTagSources {
+        CandidateTagSources {
+            ecosystem: EcosystemId::GithubActions,
+            by_key: HashMap::from([(deps_core::test_util::vuln_key(key), source)]),
+        }
+    }
+
+    #[test]
+    fn siblings_for_key_miss_is_unknown_only_when_some_entry_is_tag_based() {
+        let candidate = ConcreteVersion::new("1.0.0");
+        let missing = deps_core::test_util::vuln_key("missing");
+
+        let tag_based = sources_with("other", CandidateTagSource::NotYetIndexed);
+        assert!(tag_based.siblings_for(&missing, &candidate).is_err());
+
+        let plain = sources_with("other", CandidateTagSource::NotTagBased);
+        assert!(plain.siblings_for(&missing, &candidate).is_ok());
+    }
 
     mod osv_scan_target_tests {
         use super::*;
@@ -2046,6 +2277,7 @@ mod tests {
                 &parse_result,
                 &cached_versions,
                 &vuln_keys,
+                &no_tags(),
                 &AwaitingNameFormatter::default(),
             );
 
@@ -2067,6 +2299,7 @@ mod tests {
                 &parse_result,
                 &cached_versions,
                 &vuln_keys,
+                &no_tags(),
                 &AwaitingNameFormatter::default(),
             );
 
@@ -2327,6 +2560,124 @@ mod tests {
             )
         }
 
+        fn gha_like_fixture() -> (MockParseResult, HashMap<PackageName, PackageVersions>) {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("gha-action"),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::new("gha-action"),
+                PackageVersions::latest_only("v4.8.0"),
+            );
+            (parse_result, cached_versions)
+        }
+
+        #[test]
+        fn build_latest_check_targets_attaches_candidate_siblings_without_touching_the_version() {
+            let (parse_result, cached_versions) = gha_like_fixture();
+            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let sources = sources_with(
+                "gha-action",
+                tagged_source(
+                    &[("v4.8.0", 'a'), ("v4.9.0", 'a'), ("v5.0.0", 'a')],
+                    deps_core::lsp_helpers::SiblingScope::SameMajor,
+                ),
+            );
+
+            let (targets, structural) = build_latest_check_targets(
+                &parse_result,
+                &cached_versions,
+                &vuln_keys,
+                &sources,
+                &StubFormatter::DEFAULT,
+            );
+
+            assert!(structural.is_empty());
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].display_version, "v4.8.0");
+            let siblings: Vec<&str> = targets[0]
+                .siblings()
+                .iter()
+                .map(|s| s.display_version().as_str())
+                .collect();
+            assert_eq!(siblings, ["v4.9.0"]);
+        }
+
+        #[test]
+        fn build_latest_check_targets_whole_commit_scope_spans_majors() {
+            let (parse_result, cached_versions) = gha_like_fixture();
+            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let sources = sources_with(
+                "gha-action",
+                tagged_source(
+                    &[("v4.8.0", 'a'), ("v5.0.0", 'a')],
+                    deps_core::lsp_helpers::SiblingScope::WholeCommit,
+                ),
+            );
+
+            let (targets, _) = build_latest_check_targets(
+                &parse_result,
+                &cached_versions,
+                &vuln_keys,
+                &sources,
+                &StubFormatter::DEFAULT,
+            );
+
+            assert_eq!(targets[0].siblings().len(), 1);
+        }
+
+        #[test]
+        fn build_latest_check_targets_cold_tag_index_is_unverified_not_clean() {
+            let (parse_result, cached_versions) = gha_like_fixture();
+            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let sources = sources_with("gha-action", CandidateTagSource::NotYetIndexed);
+
+            let (targets, structural) = build_latest_check_targets(
+                &parse_result,
+                &cached_versions,
+                &vuln_keys,
+                &sources,
+                &StubFormatter::DEFAULT,
+            );
+
+            assert!(targets.is_empty());
+            assert_eq!(
+                structural.get(&deps_core::test_util::vuln_key("gha-action")),
+                Some(&UpgradeStatus::CandidateUnverified {
+                    version: ConcreteVersion::new("v4.8.0"),
+                    reason: deps_core::osv::SkipReason::SiblingTagsUnknown,
+                })
+            );
+        }
+
+        #[test]
+        fn build_candidate_check_targets_omits_candidates_with_unknown_siblings() {
+            let (parse_result, cached_versions) = gha_like_fixture();
+            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+
+            let (control, _) = build_candidate_check_targets(
+                &parse_result,
+                &cached_versions,
+                &vuln_keys,
+                &no_tags(),
+                &StubFormatter::DEFAULT,
+            );
+            assert!(control.iter().any(|round| !round.is_empty()));
+
+            let cold = sources_with("gha-action", CandidateTagSource::NotYetIndexed);
+            let (rounds, _) = build_candidate_check_targets(
+                &parse_result,
+                &cached_versions,
+                &vuln_keys,
+                &cold,
+                &StubFormatter::DEFAULT,
+            );
+            assert!(rounds.iter().all(Vec::is_empty));
+        }
+
         #[test]
         fn build_latest_check_targets_non_registry_source_is_structurally_unchecked() {
             let parse_result = MockParseResult {
@@ -2343,6 +2694,7 @@ mod tests {
                 &parse_result,
                 &HashMap::new(),
                 &vuln_keys,
+                &no_tags(),
                 &StubFormatter::DEFAULT,
             );
 
@@ -2371,6 +2723,7 @@ mod tests {
                 &parse_result,
                 &HashMap::new(),
                 &vuln_keys,
+                &no_tags(),
                 &StubFormatter::DEFAULT,
             );
 
@@ -2405,6 +2758,7 @@ mod tests {
                 &parse_result,
                 &cached_versions,
                 &vuln_keys,
+                &no_tags(),
                 &UnmappableNameFormatter,
             );
 
@@ -2449,6 +2803,7 @@ mod tests {
                 &parse_result,
                 &cached_versions,
                 &vuln_keys,
+                &no_tags(),
                 &StubFormatter::DEFAULT,
             );
 
@@ -2478,6 +2833,7 @@ mod tests {
                 &parse_result,
                 &cached_versions,
                 &vuln_keys,
+                &no_tags(),
                 &StubFormatter::DEFAULT,
             );
 
@@ -2513,6 +2869,7 @@ mod tests {
                 &parse_result,
                 &cached_versions,
                 &vuln_keys,
+                &no_tags(),
                 &StubFormatter::DEFAULT,
             );
 
@@ -2546,6 +2903,7 @@ mod tests {
                 &parse_result,
                 &cached_versions,
                 &vuln_keys,
+                &no_tags(),
                 &StubFormatter::DEFAULT,
             );
 
@@ -2586,6 +2944,7 @@ mod tests {
                 &parse_result,
                 &cached_versions,
                 &vuln_keys,
+                &no_tags(),
                 &StubFormatter::DEFAULT,
             );
 
@@ -2649,6 +3008,105 @@ mod tests {
             map
         }
 
+        fn name_map(key: &str) -> HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvQueryName> {
+            HashMap::from([(
+                deps_core::test_util::vuln_key(key),
+                deps_core::osv::OsvQueryName::Confirmed(
+                    deps_core::osv::OsvPackageName::new(key).unwrap(),
+                ),
+            )])
+        }
+
+        #[test]
+        fn resolve_fix_target_attaches_siblings_and_keeps_the_native_version() {
+            let dv = dv(vec![advisory("A1", &["1.2.0"])]);
+            let sources = sources_with(
+                "pkg",
+                tagged_source(
+                    &[("1.2.0", 'a'), ("1.2.1", 'a')],
+                    deps_core::lsp_helpers::SiblingScope::SameMajor,
+                ),
+            );
+
+            let resolution = resolve_fix_target(
+                &dv,
+                &deps_core::test_util::vuln_key("pkg"),
+                &HashMap::new(),
+                &name_map("pkg"),
+                &sources,
+                &StubFormatter::DEFAULT,
+            );
+
+            let FixTargetResolution::NeedsLiveCheck(target) = resolution else {
+                panic!("expected a live check, got {resolution:?}");
+            };
+            assert_eq!(target.display_version, "1.2.0");
+            assert_eq!(target.siblings().len(), 1);
+        }
+
+        #[test]
+        fn resolve_fix_target_phase_a_key_missing_from_phase_b_sources_is_unverified() {
+            let dv = dv(vec![advisory("A1", &["1.2.0"])]);
+            let sources = sources_with("other", CandidateTagSource::NotYetIndexed);
+
+            let resolution = resolve_fix_target(
+                &dv,
+                &deps_core::test_util::vuln_key("pkg"),
+                &HashMap::new(),
+                &name_map("pkg"),
+                &sources,
+                &StubFormatter::DEFAULT,
+            );
+
+            assert_eq!(
+                resolution,
+                FixTargetResolution::Resolved(UpgradeStatus::CandidateUnverified {
+                    version: ConcreteVersion::new("1.2.0"),
+                    reason: deps_core::osv::SkipReason::SiblingTagsUnknown,
+                })
+            );
+        }
+
+        #[test]
+        fn resolve_fix_target_looks_up_siblings_only_after_reuse_and_provisional_checks() {
+            let cold = sources_with("pkg", CandidateTagSource::NotYetIndexed);
+            let dv = dv(vec![advisory("A1", &["1.2.0"])]);
+            let key = deps_core::test_util::vuln_key("pkg");
+
+            let reused = UpgradeStatus::CandidateClean {
+                version: ConcreteVersion::new("1.2.0"),
+            };
+            assert_eq!(
+                resolve_fix_target(
+                    &dv,
+                    &key,
+                    &latest_status_map(reused.clone()),
+                    &HashMap::new(),
+                    &cold,
+                    &StubFormatter::DEFAULT,
+                ),
+                FixTargetResolution::Resolved(reused)
+            );
+
+            let provisional = HashMap::from([(
+                key.clone(),
+                deps_core::osv::OsvQueryName::Provisional(
+                    deps_core::osv::OsvPackageName::new("pkg").unwrap(),
+                ),
+            )]);
+            assert_eq!(
+                resolve_fix_target(
+                    &dv,
+                    &key,
+                    &HashMap::new(),
+                    &provisional,
+                    &cold,
+                    &StubFormatter::DEFAULT,
+                ),
+                FixTargetResolution::Skip
+            );
+        }
+
         #[test]
         fn resolve_fix_target_skips_when_no_fix_is_recommended() {
             // No advisory has a known fix, so `recommended_fix()` returns `None`.
@@ -2658,6 +3116,7 @@ mod tests {
                 &deps_core::test_util::vuln_key("pkg"),
                 &HashMap::new(),
                 &HashMap::new(),
+                &no_tags(),
                 &StubFormatter::DEFAULT,
             );
             assert_eq!(resolution, FixTargetResolution::Skip);
@@ -2678,6 +3137,7 @@ mod tests {
                 &deps_core::test_util::vuln_key("pkg"),
                 &latest_status_map,
                 &HashMap::new(),
+                &no_tags(),
                 &StubFormatter::DEFAULT,
             );
             assert_eq!(resolution, FixTargetResolution::Resolved(latest_status));
@@ -2706,6 +3166,7 @@ mod tests {
                 &deps_core::test_util::vuln_key("pkg"),
                 &latest_status_map,
                 &osv_name_by_key,
+                &no_tags(),
                 &StubFormatter::DEFAULT,
             );
             assert_eq!(
@@ -2745,6 +3206,7 @@ mod tests {
                 &deps_core::test_util::vuln_key("pkg"),
                 &latest_status_map,
                 &osv_name_by_key,
+                &no_tags(),
                 &StubFormatter::DEFAULT,
             );
             assert_eq!(
@@ -2783,6 +3245,7 @@ mod tests {
                     &key,
                     &latest_status_map,
                     &osv_name_by_key,
+                    &no_tags(),
                     &StubFormatter::DEFAULT,
                 ),
                 FixTargetResolution::Skip
@@ -2795,6 +3258,7 @@ mod tests {
                 &[key],
                 &osv_name_by_key,
                 &latest_status_map,
+                &no_tags(),
                 &StubFormatter::DEFAULT,
             );
             assert!(resolved.is_empty(), "{resolved:?}");
@@ -2815,6 +3279,7 @@ mod tests {
                 &deps_core::test_util::vuln_key("pkg"),
                 &HashMap::new(),
                 &HashMap::new(),
+                &no_tags(),
                 &StubFormatter::DEFAULT,
             );
             assert_eq!(resolution, FixTargetResolution::Skip);
@@ -2832,6 +3297,7 @@ mod tests {
                 &deps_core::test_util::vuln_key("pkg"),
                 &HashMap::new(),
                 &HashMap::new(),
+                &no_tags(),
                 &StubFormatter::DEFAULT,
             );
             assert_eq!(resolution, FixTargetResolution::Skip);
@@ -2908,6 +3374,7 @@ mod tests {
                 &vulnerable_keys,
                 &osv_name_by_key,
                 &latest_status,
+                &no_tags(),
                 &StubFormatter::DEFAULT,
             );
 

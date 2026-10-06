@@ -3,12 +3,12 @@
 use dashmap::DashMap;
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, CommentCheck, CommitSha, DiagnosticMessages, DiagnosticPolicy,
-    OsvNameAvailability, OsvNaming, PackageNaming, PackageRendering, PartialTagPolicy,
-    PinResolution, RequirementResolution, RequirementStatus, ResolvedPin, ShaPinLookup,
-    SourcePolicy, TagIndex, concrete_pin_version, extends_tag, is_partial_semver_shaped,
-    match_v_prefix_style, requirement_contains_template_placeholder, sha_pin_rewrite,
-    tag_has_precedence, tag_pin_is_up_to_date,
+    BoundedVersionReq, CandidateTagSource, CommentCheck, CommitSha, DiagnosticMessages,
+    DiagnosticPolicy, OsvNameAvailability, OsvNaming, PackageNaming, PackageRendering,
+    PartialTagPolicy, PinResolution, RequirementResolution, RequirementStatus, ResolvedPin,
+    ShaPinLookup, SourcePolicy, TagIndex, concrete_pin_version, extends_tag,
+    is_partial_semver_shaped, match_v_prefix_style, requirement_contains_template_placeholder,
+    sha_pin_rewrite, tag_has_precedence, tag_pin_is_up_to_date,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
@@ -103,6 +103,8 @@ impl GithubActionsFormatter {
     }
 
     /// The commit `tag` points at per the shared [`TagIndex`], `None` on a cache miss.
+    // TODO(#1768): exact-key lookup misses `v4.1.3` for an OSV fix version `4.1.3`;
+    // reuse `TagIndex::release_tag`.
     fn commit_for_tag(&self, name: &PackageName, tag: &str) -> Option<CommitSha> {
         self.tag_index
             .get(name)
@@ -398,6 +400,23 @@ impl RequirementResolution for GithubActionsFormatter {
     /// [`GithubActionsRegistry`]: crate::registry::GithubActionsRegistry
     fn resolved_pin_version_depends_on_registry_fetch(&self) -> bool {
         true
+    }
+
+    /// A SHA pin names its whole commit, so a candidate's siblings span every major; any other
+    /// pin keeps the exact-tag same-major rule. Absent index entry: not yet fetched.
+    fn candidate_tag_source(&self, dep: &dyn Dependency) -> CandidateTagSource {
+        let Some(index) = self.tag_index.get(dep.name()) else {
+            return CandidateTagSource::NotYetIndexed;
+        };
+        let is_sha_pin = dep
+            .as_any()
+            .downcast_ref::<GithubActionsDependency>()
+            .is_some_and(|gha_dep| matches!(gha_dep.pin, Some(PinStyle::Sha { .. })));
+        if is_sha_pin {
+            CandidateTagSource::commit_pin(Arc::clone(&index))
+        } else {
+            CandidateTagSource::tag_pin(Arc::clone(&index))
+        }
     }
 }
 
@@ -1715,6 +1734,45 @@ mod tests {
             in_use_version_1735(&fmt, &d),
             Some(ConcreteVersion::new("v2.87.21"))
         );
+    }
+
+    /// #1727: a SHA pin gets whole-commit candidate siblings, any other pin same-major, and a
+    /// repository without an index entry is not yet indexed.
+    #[test]
+    fn test_candidate_tag_source_scope_follows_pin_style() {
+        use deps_core::lsp_helpers::{CandidateTagSource, SiblingScope};
+
+        let sha = "a".repeat(40);
+        let fmt = formatter();
+        let commit = CommitSha::parse(&sha).unwrap();
+        let tag_dep = dep(Some(PinStyle::Tag), "actions/checkout");
+        let sha_dep = dep(
+            Some(PinStyle::sha_for_test(&sha, Some("v4.8.0"))),
+            "actions/checkout",
+        );
+        assert!(matches!(
+            fmt.candidate_tag_source(&tag_dep),
+            CandidateTagSource::NotYetIndexed
+        ));
+
+        fmt.tag_index.insert(
+            PackageName::new("actions/checkout"),
+            Arc::new(TagIndex::from_tags([("v4.8.0", &commit)])),
+        );
+        assert!(matches!(
+            fmt.candidate_tag_source(&tag_dep),
+            CandidateTagSource::Indexed {
+                scope: SiblingScope::SameMajor,
+                ..
+            }
+        ));
+        assert!(matches!(
+            fmt.candidate_tag_source(&sha_dep),
+            CandidateTagSource::Indexed {
+                scope: SiblingScope::WholeCommit,
+                ..
+            }
+        ));
     }
 
     // --- #1556: resolved_pin_version ---

@@ -1636,6 +1636,19 @@ pub trait RequirementResolution: Send + Sync {
     fn resolved_pin_version_depends_on_registry_fetch(&self) -> bool {
         false
     }
+
+    /// Where the sibling release tags of `dep`'s *candidate* versions (registry latest, upgrade
+    /// candidates, a recommended fix target) come from, so phase B's OSV checks can evaluate
+    /// them like phase A evaluates the in-use version's siblings (#1727).
+    ///
+    /// Default: [`NotTagBased`](crate::lsp_helpers::CandidateTagSource::NotTagBased) — a
+    /// candidate version has no sibling names. A git-tag-based ecosystem returns
+    /// [`NotYetIndexed`](crate::lsp_helpers::CandidateTagSource::NotYetIndexed) until its tag
+    /// index is populated, which keeps the candidate unverified instead of reporting it clean.
+    fn candidate_tag_source(&self, dep: &dyn Dependency) -> crate::lsp_helpers::CandidateTagSource {
+        let _ = dep;
+        crate::lsp_helpers::CandidateTagSource::NotTagBased
+    }
 }
 
 /// The un-overridable entry point for requirement resolution questions.

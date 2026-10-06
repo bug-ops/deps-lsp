@@ -410,6 +410,7 @@ impl OsvClient {
                             .is_complete()
                             .then(|| worst_severity(dv.advisories.items()))
                             .flatten();
+                        // TODO(#1767): record which sibling tag matched (`dv.sibling_match`).
                         UpgradeStatus::CandidateVulnerable {
                             version,
                             advisory_ids: Capped::new(
@@ -2071,20 +2072,25 @@ mod tests {
         target.with_siblings(&versions, &IdentityNaming)
     }
 
-    async fn scan_gha_with_siblings(primary: &str, siblings: &[&str], events: &str) -> ScanOutcome {
+    async fn gha_sibling_fixture(events: &str) -> (mockito::ServerGuard, OsvClient) {
         let (mut server, client) = mock_client().await;
-        let _batch = server
+        server
             .mock("POST", "/v1/querybatch")
             .with_status(200)
             .with_body(GHA_UNVERSIONED_BODY)
             .create_async()
             .await;
-        let _record = server
+        server
             .mock("GET", "/v1/vulns/GHSA-cxww-7g56-2vh6")
             .with_status(200)
             .with_body(gha_record("GHSA-cxww-7g56-2vh6", events))
             .create_async()
             .await;
+        (server, client)
+    }
+
+    async fn scan_gha_with_siblings(primary: &str, siblings: &[&str], events: &str) -> ScanOutcome {
+        let (_server, client) = gha_sibling_fixture(events).await;
         let targets = vec![with_sibling_tags(
             target("actions/download-artifact", primary),
             primary,
@@ -2096,6 +2102,42 @@ mod tests {
         outcomes
             .remove(&crate::test_util::vuln_key("actions/download-artifact"))
             .expect("one outcome per target")
+    }
+
+    /// #1727: a candidate affected only through a sibling tag is a vulnerable candidate, and the
+    /// status keeps the candidate's own version.
+    #[tokio::test]
+    async fn check_candidates_sibling_only_hit_is_candidate_vulnerable() {
+        let (_server, client) =
+            gha_sibling_fixture(r#"[{"introduced":"4.9.0"},{"fixed":"4.9.1"}]"#).await;
+        let candidate = target("actions/download-artifact", "4.8.0").with_siblings(
+            &crate::lsp_helpers::CandidateSiblings::for_test(vec![ConcreteVersion::new("4.9.0")]),
+            &IdentityNaming,
+        );
+        let statuses = client
+            .check_candidates(EcosystemId::GithubActions, &[candidate], TEST_TIMEOUT)
+            .await;
+        assert_matches!(
+            statuses.get(&crate::test_util::vuln_key("actions/download-artifact")),
+            Some(UpgradeStatus::CandidateVulnerable { version, .. }) if version.as_str() == "4.8.0"
+        );
+    }
+
+    /// #1727: a candidate without sibling hits stays clean.
+    #[tokio::test]
+    async fn check_candidates_unrelated_sibling_is_candidate_clean() {
+        let (_server, client) = gha_sibling_fixture(r#"[{"introduced":"5.0.0"}]"#).await;
+        let candidate = target("actions/download-artifact", "4.8.0").with_siblings(
+            &crate::lsp_helpers::CandidateSiblings::for_test(vec![ConcreteVersion::new("4.9.0")]),
+            &IdentityNaming,
+        );
+        let statuses = client
+            .check_candidates(EcosystemId::GithubActions, &[candidate], TEST_TIMEOUT)
+            .await;
+        assert_matches!(
+            statuses.get(&crate::test_util::vuln_key("actions/download-artifact")),
+            Some(UpgradeStatus::CandidateClean { .. })
+        );
     }
 
     /// #1709: an advisory fixed in the sibling's release still affects the primary; nothing is

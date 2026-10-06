@@ -718,13 +718,7 @@ pub fn resolve_in_use_versions(
     match formatter.resolved_pin_version(dep) {
         PinResolution::Resolved(pin) => {
             let primary = queryable_pin_version(&pin, ecosystem)?;
-            let siblings = pin
-                .siblings()
-                .iter()
-                .filter_map(|tag| {
-                    queryable_pin_version(&ResolvedPin::most_specific(tag.clone()), ecosystem)
-                })
-                .collect();
+            let siblings = queryable_siblings(&pin, ecosystem);
             Some(InUseVersions { primary, siblings })
         }
         PinResolution::Untagged => None,
@@ -733,6 +727,19 @@ pub fn resolve_in_use_versions(
             .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
             .map(|v| InUseVersions::without_siblings(ConcreteVersion::from(v))),
     }
+}
+
+/// The siblings of `pin` that pass the same queryability gate as its primary.
+pub(super) fn queryable_siblings(
+    pin: &ResolvedPin,
+    ecosystem: EcosystemId,
+) -> Vec<ConcreteVersion> {
+    pin.siblings()
+        .iter()
+        .filter_map(|tag| {
+            queryable_pin_version(&ResolvedPin::most_specific(tag.clone()), ecosystem)
+        })
+        .collect()
 }
 
 /// The version a [`ResolvedPin`] may be queried with: a full `major.minor.patch` tag, or a

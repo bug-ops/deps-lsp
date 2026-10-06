@@ -162,8 +162,7 @@ impl ConfigSideEffects {
             license_policy: config.policy.license_policy.to_policy(),
             typosquat_enabled: config.policy.typosquat.enabled,
             gossip_enabled: config.policy.gossip.enabled,
-            osv_latest_check_enabled: config.policy.diagnostics.vulnerabilities_enabled
-                && !config.policy.network.offline,
+            osv_latest_check_enabled: config.policy.osv_checks_enabled(),
         }
     }
 }
@@ -413,11 +412,11 @@ impl Backend {
         // Snapshot before the loop and drop the guard: re-reading `self.config` per URI
         // inside the loop would hold this guard across a nested read of the same
         // write-preferring `RwLock`, and a writer queued in between would block it forever.
-        let (snapshot, vulnerabilities_enabled) = {
+        let (snapshot, osv_checks_enabled) = {
             let config = self.config.read().await;
             (
                 diagnostics::DiagnosticsSnapshot::from_config(&config),
-                config.policy.diagnostics.vulnerabilities_enabled && !config.policy.network.offline,
+                config.policy.osv_checks_enabled(),
             )
         };
 
@@ -469,7 +468,7 @@ impl Backend {
                     resolved_changed,
                 },
                 ChangeTaskTriggerGates {
-                    vulnerabilities_enabled,
+                    osv_checks_enabled,
                     requires_dedicated_fetch: ecosystem_impl
                         .license_source()
                         .requires_dedicated_fetch(),
@@ -1142,15 +1141,15 @@ impl LanguageServer for Backend {
                 continue;
             }
 
-            let ecosystems = self.state.ecosystem_registry.for_watched_config(filename);
+            let ecosystems = self.state.ecosystem_registry.for_watched_config(&path);
             if !ecosystems.is_empty() {
                 let ecosystem_ids: Vec<deps_core::EcosystemId> =
-                    ecosystems.iter().map(|e| e.ecosystem_id()).collect();
+                    ecosystems.iter().map(|(e, _)| e.ecosystem_id()).collect();
                 // A routing-only change (e.g. `.npmrc`) needs a full refetch, not a diff (issue #1232 S1).
-                let refetch = if ecosystems
-                    .iter()
-                    .any(|e| e.routing_affecting_watched_configs().contains(&filename))
-                {
+                let refetch = if ecosystems.iter().any(|(_, effect)| match effect {
+                    deps_core::WatchedConfigEffect::ChangesRouting => true,
+                    deps_core::WatchedConfigEffect::RewritesRequirements => false,
+                }) {
                     crate::document::RefetchPolicy::AllDependencies
                 } else {
                     crate::document::RefetchPolicy::Diff
@@ -2180,7 +2179,7 @@ mod tests {
     /// `.npmrc` watched-file change. Under the pre-fix unconditional `RefetchPolicy::Diff`,
     /// the dependency name/version-requirement here never changes, so the diff is empty, the
     /// fetch (and its cache drop) never runs, and `cached_versions` would stay stale forever.
-    /// Under the fix, `DenoEcosystem::routing_affecting_watched_configs()` lists `.npmrc`, so
+    /// Under the fix, `DenoEcosystem::watched_configs()` marks `.npmrc` as `ChangesRouting`, so
     /// the reparse uses `RefetchPolicy::AllDependencies`, which drops `cached_versions` unconditionally before
     /// attempting the (network, expected-to-fail in this sandboxed test) fetch — an empty
     /// map is proof the forced refetch actually ran, the same observation technique
@@ -2256,6 +2255,86 @@ mod tests {
             "a routing-only `.npmrc` change did not force a refetch: stale cached_versions \
              from the old registry survived (RefetchPolicy must be AllDependencies for \
              `.npmrc`, not Diff, since the dependency set itself never changed)"
+        );
+    }
+
+    /// Issue #1759: only the project-tier `.swiftpm/configuration/registries.json` is a
+    /// watched Swift config; a `registries.json` anywhere else must not trigger a reparse.
+    /// A reparse is observed the same way as in `test_npmrc_routing_only_change_forces_refetch_1232_s1`:
+    /// swift's config is routing-affecting, so a reparse drops `cached_versions`.
+    #[cfg(feature = "swift")]
+    #[tokio::test]
+    async fn test_swift_registries_json_watch_is_project_tier_only_1759() {
+        use crate::document::DocumentState;
+        use deps_core::{EcosystemId, PackageName, PackageVersions};
+        use tower_lsp_server::ls_types::{FileChangeType, FileEvent};
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+
+        let manifest_url = deps_core::test_util::test_uri("/test/swiftapp/Package.swift");
+        let manifest_uri = crate::lsp_types_interop::to_lsp_uri(&manifest_url);
+        let ecosystem = backend
+            .state
+            .ecosystem_registry
+            .get(EcosystemId::Swift)
+            .unwrap();
+        let content = r#"// swift-tools-version: 5.9
+import PackageDescription
+let package = Package(
+    name: "App",
+    dependencies: [
+        .package(url: "https://github.com/acme/pkg", from: "1.0.0"),
+    ]
+)
+"#
+        .to_string();
+        let parse = ecosystem
+            .parse_manifest(&content, &manifest_url)
+            .await
+            .unwrap();
+        let mut doc = DocumentState::new_from_parse_result(EcosystemId::Swift, content, parse);
+        doc.set_version(Some(1));
+        doc.update_cached_versions(HashMap::from([(
+            PackageName::new("acme/pkg"),
+            PackageVersions::latest_only("1.0.0"),
+        )]));
+        backend.state.update_document(manifest_uri.clone(), doc);
+
+        let fire = |path: &'static str| {
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(path));
+            backend.did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri,
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+        };
+        let cached_is_empty = || {
+            backend
+                .state
+                .get_document(&manifest_uri)
+                .is_some_and(|d| d.signals.cached_versions.is_empty())
+        };
+
+        fire("/test/swiftapp/docs/registries.json").await;
+        // Four times the reparse debounce: a wrongly-triggered reparse would have landed by now.
+        tokio::time::sleep(crate::document::reparse::RECONFIGURE_DEBOUNCE * 4).await;
+        assert!(
+            !cached_is_empty(),
+            "an unrelated registries.json must not trigger a reparse"
+        );
+
+        fire("/test/swiftapp/.swiftpm/configuration/registries.json").await;
+        let cleared = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !cached_is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            cleared.is_ok(),
+            "the project-tier registries.json change must force a refetch"
         );
     }
 
@@ -3114,6 +3193,91 @@ mod tests {
             doc.signals.resolved_versions_generation, generation_before,
             "no rescan scheduled offline, so the generation must not bump"
         );
+    }
+
+    /// Issue #1750 case (c): offline, with a cold HTTP cache, a lock-file move of a tier-3
+    /// (Dart) dependency leaves its license absent — the previous version's license is evicted
+    /// and the blocked refresh must not bring a stale one back.
+    #[cfg(feature = "dart")]
+    #[tokio::test]
+    async fn test_offline_lockfile_move_cold_cache_leaves_license_absent_1750() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        use crate::document::DocumentState;
+        use deps_core::{EcosystemId, NetworkMode, PackageName};
+
+        fn lock(version: &str) -> String {
+            format!(
+                "packages:\n  http:\n    dependency: \"direct main\"\n    description:\n      \
+                 name: http\n      sha256: \"aa\"\n      url: \"https://pub.dev\"\n    \
+                 source: hosted\n    version: \"{version}\"\n"
+            )
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pubspec.lock");
+        std::fs::write(&lockfile_path, lock("0.13.6")).unwrap();
+        let uri = Uri::from_file_path(temp_dir.path().join("pubspec.yaml")).unwrap();
+        let content = "name: app\ndependencies:\n  http: ^0.13.6\n".to_string();
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+        backend.config.write().await.policy.network.offline = true;
+        backend.state.cache.set_offline(NetworkMode::Offline);
+        backend
+            .state
+            .set_license_policy(deps_core::LicensePolicy::new(
+                Vec::new(),
+                vec!["BSD-3-Clause".to_string()],
+            ));
+
+        let ecosystem = backend
+            .state
+            .ecosystem_registry
+            .get(EcosystemId::Dart)
+            .unwrap();
+        let parse_result = ecosystem
+            .parse_manifest(
+                &content,
+                &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+            )
+            .await
+            .unwrap();
+        let doc = DocumentState::new_from_parse_result(EcosystemId::Dart, content, parse_result);
+        backend.state.update_document(uri.clone(), doc);
+
+        backend
+            .handle_lockfile_change(&lockfile_path, EcosystemId::Dart)
+            .await;
+        let http = PackageName::new("http");
+        backend
+            .state
+            .documents
+            .get_mut(&uri)
+            .unwrap()
+            .merge_licenses(HashMap::from([(
+                http.clone(),
+                vec!["BSD-3-Clause".to_string()],
+            )]));
+
+        std::fs::write(&lockfile_path, lock("1.1.0")).unwrap();
+        backend
+            .handle_lockfile_change(&lockfile_path, EcosystemId::Dart)
+            .await;
+
+        // Eviction is synchronous; the blocked refresh runs on a detached task, so keep
+        // observing for a bounded window to catch a late stale write.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            let present = backend
+                .state
+                .with_document(&uri, |doc| doc.signals.licenses.contains_key(&http))
+                .unwrap();
+            assert!(
+                !present,
+                "a moved dependency's license must stay absent offline with a cold cache"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     #[test]

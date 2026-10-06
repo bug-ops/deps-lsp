@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use std::sync::Arc;
 
-use crate::{Ecosystem, EcosystemId};
+use crate::{Ecosystem, EcosystemId, WatchedConfigEffect};
 
 /// Registry for all available ecosystems.
 ///
@@ -447,41 +447,43 @@ impl EcosystemRegistry {
         patterns
     }
 
-    /// Get *every* ecosystem matching a [`Ecosystem::watched_config_filenames`] entry —
-    /// mirrors [`Self::for_lockfile`]'s exact/single-`*`-wildcard matching, but scanning the
-    /// *config* list instead of the lockfile one, and returning all matches rather than the
-    /// first: more than one ecosystem can watch the same config filename (e.g. both npm and
-    /// Deno resolve `.npmrc`), and a single-winner lookup would leave the other silently
-    /// unreparsed on save (#1232).
+    /// Get *every* ecosystem watching `path`, each paired with the
+    /// [`crate::WatchedConfigEffect`] of its matching [`Ecosystem::watched_configs`] entry.
+    ///
+    /// Matching is [`crate::WatchedConfig::matches`] (component-wise path suffix). More than one
+    /// ecosystem can watch the same config file (e.g. both npm and Deno resolve `.npmrc`),
+    /// and a single-winner lookup would leave the other silently unreparsed on save (#1232).
     ///
     /// # Examples
     ///
     /// ```no_run
+    /// use std::path::Path;
     /// use deps_core::EcosystemRegistry;
     ///
     /// let registry = EcosystemRegistry::new();
     /// // registry.register(npm_ecosystem);
     ///
-    /// for ecosystem in registry.for_watched_config(".npmrc") {
-    ///     println!(".npmrc handled by: {}", ecosystem.display_name());
+    /// for (ecosystem, effect) in registry.for_watched_config(Path::new("/app/.npmrc")) {
+    ///     println!(".npmrc handled by: {} ({effect:?})", ecosystem.display_name());
     /// }
     /// ```
-    pub fn for_watched_config(&self, filename: &str) -> Vec<Arc<dyn Ecosystem>> {
+    pub fn for_watched_config(
+        &self,
+        path: &std::path::Path,
+    ) -> Vec<(Arc<dyn Ecosystem>, WatchedConfigEffect)> {
         let mut matched = Vec::new();
         for entry in self.ecosystems.iter() {
             let ecosystem = entry.value();
-            let matches = ecosystem
-                .watched_config_filenames()
-                .iter()
-                .any(|pattern| lockfile_pattern_matches(pattern, filename));
-            if matches {
-                matched.push(Arc::clone(ecosystem));
+            for config in ecosystem.watched_configs() {
+                if config.matches(path) {
+                    matched.push((Arc::clone(ecosystem), config.effect()));
+                }
             }
         }
         matched
     }
 
-    /// Get all [`Ecosystem::watched_config_filenames`] glob patterns for file watching —
+    /// Get all [`Ecosystem::watched_configs`] glob patterns for file watching —
     /// mirrors [`Self::all_lockfile_patterns`], scanning the *config* list instead.
     ///
     /// Deduplicated (issue #1232 M1): more than one ecosystem can watch the same config
@@ -508,8 +510,8 @@ impl EcosystemRegistry {
         let mut patterns: Vec<String> = Vec::new();
         for entry in self.ecosystems.iter() {
             let ecosystem = entry.value();
-            for filename in ecosystem.watched_config_filenames() {
-                let pattern = format!("**/{filename}");
+            for config in ecosystem.watched_configs() {
+                let pattern = config.glob_pattern();
                 if seen.insert(pattern.clone()) {
                     patterns.push(pattern);
                 }
@@ -619,13 +621,14 @@ pub fn manifest_pattern_matches(filename: &str, pattern: &str) -> bool {
 mod tests {
     use super::*;
     use std::any::Any;
+    use std::path::Path;
     #[cfg(feature = "lsp-responses")]
     use tower_lsp_server::ls_types::Position;
 
     #[cfg(feature = "lsp-responses")]
     use crate::completion::Completions;
     use crate::test_util::StubFormatter;
-    use crate::{ParseResult, Registry, lsp_helpers::EcosystemFormatter};
+    use crate::{ParseResult, Registry, WatchedConfig, lsp_helpers::EcosystemFormatter};
 
     struct MockEcosystem {
         id: &'static str,
@@ -633,8 +636,14 @@ mod tests {
         display_name: &'static str,
         filenames: &'static [&'static str],
         lockfiles: &'static [&'static str],
-        watched_configs: &'static [&'static str],
+        watched_configs: &'static [WatchedConfig],
     }
+
+    const PNPM_WORKSPACE: WatchedConfig = WatchedConfig::new(
+        "pnpm-workspace.yaml",
+        WatchedConfigEffect::RewritesRequirements,
+    );
+    const NPMRC: WatchedConfig = WatchedConfig::new(".npmrc", WatchedConfigEffect::ChangesRouting);
 
     impl crate::ecosystem::private::Sealed for MockEcosystem {}
 
@@ -662,7 +671,7 @@ mod tests {
             self.lockfiles
         }
 
-        fn watched_config_filenames(&self) -> &[&'static str] {
+        fn watched_configs(&self) -> &[WatchedConfig] {
             self.watched_configs
         }
 
@@ -1490,21 +1499,31 @@ mod tests {
             display_name: "npm",
             filenames: &["package.json"],
             lockfiles: &["package-lock.json"],
-            watched_configs: &["pnpm-workspace.yaml", ".npmrc"],
+            watched_configs: &[PNPM_WORKSPACE, NPMRC],
         });
 
         registry.register(npm);
 
-        let retrieved = registry.for_watched_config("pnpm-workspace.yaml");
+        let retrieved = registry.for_watched_config(Path::new("/app/pnpm-workspace.yaml"));
         assert_eq!(retrieved.len(), 1);
-        assert_eq!(retrieved[0].id(), "npm");
-        let retrieved = registry.for_watched_config(".npmrc");
+        assert_eq!(retrieved[0].0.id(), "npm");
+        assert_eq!(retrieved[0].1, WatchedConfigEffect::RewritesRequirements);
+        let retrieved = registry.for_watched_config(Path::new("/app/.npmrc"));
         assert_eq!(retrieved.len(), 1);
-        assert_eq!(retrieved[0].id(), "npm");
+        assert_eq!(retrieved[0].0.id(), "npm");
+        assert_eq!(retrieved[0].1, WatchedConfigEffect::ChangesRouting);
 
         // A lockfile is not a watched config, and vice versa.
-        assert!(registry.for_watched_config("package-lock.json").is_empty());
-        assert!(registry.for_watched_config("unknown.yaml").is_empty());
+        assert!(
+            registry
+                .for_watched_config(Path::new("/app/package-lock.json"))
+                .is_empty()
+        );
+        assert!(
+            registry
+                .for_watched_config(Path::new("/app/unknown.yaml"))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1519,7 +1538,7 @@ mod tests {
             display_name: "npm",
             filenames: &["package.json"],
             lockfiles: &["package-lock.json"],
-            watched_configs: &["pnpm-workspace.yaml", ".npmrc"],
+            watched_configs: &[PNPM_WORKSPACE, NPMRC],
         });
         let deno = Arc::new(MockEcosystem {
             id: "deno",
@@ -1527,24 +1546,75 @@ mod tests {
             display_name: "Deno",
             filenames: &["deno.json", "deno.jsonc"],
             lockfiles: &[],
-            watched_configs: &[".npmrc"],
+            watched_configs: &[NPMRC],
         });
 
         registry.register(npm);
         registry.register(deno);
 
         let mut ids: Vec<&str> = registry
-            .for_watched_config(".npmrc")
+            .for_watched_config(Path::new("/app/.npmrc"))
             .iter()
-            .map(|e| e.id())
+            .map(|(e, _)| e.id())
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, ["deno", "npm"]);
 
         // pnpm-workspace.yaml is still npm-only.
-        let retrieved = registry.for_watched_config("pnpm-workspace.yaml");
+        let retrieved = registry.for_watched_config(Path::new("/app/pnpm-workspace.yaml"));
         assert_eq!(retrieved.len(), 1);
-        assert_eq!(retrieved[0].id(), "npm");
+        assert_eq!(retrieved[0].0.id(), "npm");
+    }
+
+    #[test]
+    fn test_for_watched_config_matches_path_suffix_not_basename() {
+        const SWIFT_PROJECT: WatchedConfig = WatchedConfig::new(
+            ".swiftpm/configuration/registries.json",
+            WatchedConfigEffect::ChangesRouting,
+        );
+        let registry = EcosystemRegistry::new();
+        registry.register(Arc::new(MockEcosystem {
+            id: "swift",
+            ecosystem: EcosystemId::Swift,
+            display_name: "Swift",
+            filenames: &["Package.swift"],
+            lockfiles: &[],
+            watched_configs: &[SWIFT_PROJECT],
+        }));
+
+        assert_eq!(
+            registry
+                .for_watched_config(Path::new("/p/.swiftpm/configuration/registries.json"))
+                .len(),
+            1
+        );
+        assert!(
+            registry
+                .for_watched_config(Path::new("/p/docs/registries.json"))
+                .is_empty()
+        );
+        assert!(
+            registry
+                .for_watched_config(Path::new("/p/configuration/registries.json"))
+                .is_empty()
+        );
+        assert_eq!(
+            registry.all_watched_config_patterns(),
+            vec!["**/.swiftpm/configuration/registries.json"]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_watched_config_matches_backslash_paths() {
+        const SWIFT_PROJECT: WatchedConfig = WatchedConfig::new(
+            ".swiftpm/configuration/registries.json",
+            WatchedConfigEffect::ChangesRouting,
+        );
+        assert!(SWIFT_PROJECT.matches(Path::new(
+            r"C:\work\app\.swiftpm\configuration\registries.json"
+        )));
+        assert!(!SWIFT_PROJECT.matches(Path::new(r"C:\work\app\docs\registries.json")));
     }
 
     #[test]
@@ -1556,7 +1626,7 @@ mod tests {
             display_name: "npm",
             filenames: &["package.json"],
             lockfiles: &["package-lock.json"],
-            watched_configs: &["pnpm-workspace.yaml", ".npmrc"],
+            watched_configs: &[PNPM_WORKSPACE, NPMRC],
         });
 
         registry.register(ecosystem);
@@ -1591,7 +1661,7 @@ mod tests {
             display_name: "npm",
             filenames: &["package.json"],
             lockfiles: &["package-lock.json"],
-            watched_configs: &["pnpm-workspace.yaml", ".npmrc"],
+            watched_configs: &[PNPM_WORKSPACE, NPMRC],
         });
         let deno = Arc::new(MockEcosystem {
             id: "deno",
@@ -1599,7 +1669,7 @@ mod tests {
             display_name: "Deno",
             filenames: &["deno.json", "deno.jsonc"],
             lockfiles: &[],
-            watched_configs: &[".npmrc"],
+            watched_configs: &[NPMRC],
         });
 
         registry.register(npm);
