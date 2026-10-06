@@ -64,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-composer**: OR-branch bounds are computed once when `ComposerMatcher` is built, as in `deps-npm`; behavior unchanged (#1747)
 - **deps-swift**: `Package.resolved` pins map by `kind` (`registry` to a registry source, unknown kinds skipped instead of read as Git) and `SwiftRegistry` routes by dependency source, failing closed for unresolved `id:` sources (#1763)
 - **deps-github-actions, deps-gitlab-ci**: tag-to-SHA quickfixes write `<sha> # <tag>` through the shared rewrite rule, and a bare SHA when the ref is quoted, in a flow mapping or the tag is not version-shaped (#1770)
+- **SECURITY.md**: supported versions table lists 2.0.x as supported and older lines as unsupported (#PR)
 
 ### Fixed
 - **deps-engine, deps-github-actions**: OSV latest, candidate and fix-target checks cover the sibling release tags of the candidate commit and fail closed when they are unknown (#1775)
