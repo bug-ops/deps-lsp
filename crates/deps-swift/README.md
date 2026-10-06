@@ -14,6 +14,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 - **Regex-based parser** — Parse all 9 `.package()` call signatures without requiring a Swift toolchain, including labelled `exact:`/`branch:`/`revision:`/`name:` forms, trailing commas, a trailing `traits:` argument, and `.package(id:)` registry dependencies
 - **GitHub API registry** — Resolve versions from repository tags via the GitHub REST API
+- **SE-0292 package registries** — Resolve `.package(id:)` dependencies through the registry their scope maps to in `registries.json` (project and user tiers), with `SWIFTPM_REGISTRY_TOKEN` or `SWIFTPM_REGISTRY_LOGIN`/`SWIFTPM_REGISTRY_PASSWORD` credentials. The single environment credential is sent to every registry URL declared in the user-level `registries.json`, including a public `[default]`, and never to a URL declared only by the project; this is stricter than released SwiftPM (see the [deps-lsp book](https://bug-ops.github.io/deps-lsp/ecosystems/swift.html#package-registries-se-0292))
 - **Lock file parsing** — Extract resolved versions from `Package.resolved`
 - **All version forms** — `from`, `upToNextMajor`, `upToNextMinor`, `exact`, half-open range, closed range, `branch`, `revision`, `path`
 - **GITHUB_TOKEN support** — Authenticated requests raise the rate limit from 60 to 5,000 requests/hour

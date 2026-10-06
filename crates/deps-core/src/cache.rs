@@ -887,6 +887,49 @@ async fn read_body_capped(url: &str, mut response: Response, limit: BodyLimit) -
     Ok(body.freeze())
 }
 
+/// Stands in for a `Link` header value that is not visible ASCII, so a caller detecting
+/// pagination fails closed (treats the list as truncated) instead of silently ignoring it.
+const UNREADABLE_LINK: &str = r#"<>; rel="next""#;
+
+/// The response headers a [`CachedResponse`] keeps, captured before the body consumes the
+/// response.
+struct ResponseValidators {
+    etag: Option<String>,
+    last_modified: Option<String>,
+    link: Option<String>,
+}
+
+impl ResponseValidators {
+    fn from_headers(headers: &header::HeaderMap) -> Self {
+        let single = |name: header::HeaderName| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        };
+        let links: Vec<&str> = headers
+            .get_all(header::LINK)
+            .iter()
+            .map(|v| v.to_str().unwrap_or(UNREADABLE_LINK))
+            .collect();
+        Self {
+            etag: single(header::ETAG),
+            last_modified: single(header::LAST_MODIFIED),
+            link: (!links.is_empty()).then(|| links.join(", ")),
+        }
+    }
+
+    fn into_response(self, body: Bytes) -> CachedResponse {
+        CachedResponse {
+            body,
+            etag: self.etag,
+            last_modified: self.last_modified,
+            link: self.link,
+            fetched_at: Instant::now(),
+        }
+    }
+}
+
 /// Cached HTTP response with validation headers.
 ///
 /// Stores response body and cache validation headers (ETag, Last-Modified)
@@ -915,6 +958,10 @@ pub struct CachedResponse {
     pub etag: Option<String>,
     /// `Last-Modified` header from the response, used for `If-Modified-Since` revalidation.
     pub last_modified: Option<String>,
+    /// Raw `Link` header (RFC 8288) from the response, kept so a caller can detect a paginated
+    /// list (see `pagination::ListCoverage::from_link_header`). Several `Link` headers are
+    /// joined with `, `. Carried over unchanged on a 304 revalidation.
+    pub link: Option<String>,
     /// Local time the response was fetched, used for TTL expiry checks.
     pub fetched_at: Instant,
 }
@@ -942,8 +989,16 @@ impl CachedResponse {
             body,
             etag: None,
             last_modified: None,
+            link: None,
             fetched_at: Instant::now(),
         }
+    }
+
+    /// Attaches the response's `Link` header. See [`Self::link`].
+    #[must_use]
+    pub fn with_link(mut self, link: impl Into<String>) -> Self {
+        self.link = Some(link.into());
+        self
     }
 
     /// Attaches the response's `ETag` header. See [`Self::etag`].
@@ -1343,6 +1398,7 @@ impl HttpCache {
     ) -> Result<Bytes> {
         self.get_cached_with_headers_via(url, extra_headers, &self.baseline, None)
             .await
+            .map(|response| response.body)
     }
 
     /// Like [`Self::get_cached`], but additionally stops any redirect hop that does not match
@@ -1372,6 +1428,7 @@ impl HttpCache {
         let transport = self.transport_for_origin(trusted_origin);
         self.get_cached_with_headers_via(url, &[], &transport, None)
             .await
+            .map(|response| response.body)
     }
 
     /// Like [`Self::get_cached_trusted_origin`], but additionally injects `extra_headers`
@@ -1419,6 +1476,24 @@ impl HttpCache {
         trusted_origin: &str,
         extra_headers: &[(header::HeaderName, &str)],
     ) -> Result<Bytes> {
+        self.get_cached_trusted_origin_response(url, trusted_origin, extra_headers)
+            .await
+            .map(|response| response.body)
+    }
+
+    /// Like [`Self::get_cached_trusted_origin_with_headers`], but returns the whole
+    /// [`CachedResponse`] (body plus `ETag`, `Last-Modified` and `Link`) instead of the body
+    /// alone. For a caller that must inspect response headers, e.g. to detect a paginated list.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_cached_trusted_origin`].
+    pub async fn get_cached_trusted_origin_response(
+        &self,
+        url: &str,
+        trusted_origin: &str,
+        extra_headers: &[(header::HeaderName, &str)],
+    ) -> Result<CachedResponse> {
         let transport = self.transport_for_origin(trusted_origin);
         self.get_cached_with_headers_via(url, extra_headers, &transport, None)
             .await
@@ -1467,6 +1542,26 @@ impl HttpCache {
         auth_id: Option<u64>,
         extra_headers: &[(header::HeaderName, &str)],
     ) -> Result<Bytes> {
+        self.get_cached_pinned_response(url, trusted_origin, authenticated, auth_id, extra_headers)
+            .await
+            .map(|response| response.body)
+    }
+
+    /// Like [`Self::get_cached_pinned_with_headers`], but returns the whole
+    /// [`CachedResponse`] (body plus `ETag`, `Last-Modified` and `Link`) instead of the body
+    /// alone.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_cached`].
+    pub async fn get_cached_pinned_response(
+        &self,
+        url: &str,
+        trusted_origin: &str,
+        authenticated: bool,
+        auth_id: Option<u64>,
+        extra_headers: &[(header::HeaderName, &str)],
+    ) -> Result<CachedResponse> {
         let transport = self.transport_for_pinned(trusted_origin, authenticated);
         self.get_cached_with_headers_via(url, extra_headers, &transport, auth_id)
             .await
@@ -1556,6 +1651,7 @@ impl HttpCache {
             .clone();
         self.get_cached_with_headers_via(url, extra_headers, &transport, None)
             .await
+            .map(|response| response.body)
     }
 
     /// Updates the policy governing [`Self::get_cached_workspace`], rebuilding the workspace
@@ -1599,15 +1695,7 @@ impl HttpCache {
         #[cfg(test)]
         self.workspace_rebuilds.fetch_add(1, Ordering::Relaxed);
 
-        let mut freed_bytes = 0usize;
-        self.entries.retain(|k, v| {
-            let keep = !k.starts_with(Self::PINNED_KEY_PREFIX);
-            if !keep {
-                freed_bytes += v.body.len();
-            }
-            keep
-        });
-        self.total_bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
+        self.evict_entries_where(|key| key.starts_with(Self::PINNED_KEY_PREFIX));
         self.trusted_clients
             .retain(|(_, tier), _| !matches!(tier, CacheTier::Pinned { .. }));
     }
@@ -1624,7 +1712,7 @@ impl HttpCache {
         extra_headers: &[(header::HeaderName, &str)],
         transport: &Transport,
         auth_id: Option<u64>,
-    ) -> Result<Bytes> {
+    ) -> Result<CachedResponse> {
         if self.entries.len() >= MAX_CACHE_ENTRIES
             || self.total_bytes.load(Ordering::Relaxed) >= MAX_CACHE_BYTES
         {
@@ -1646,7 +1734,12 @@ impl HttpCache {
             // broken instrumentation (#756 S3) on a path that's neither a hit nor a miss.
             tracing::Span::current().record("cache", "disabled");
             return self
-                .transport_only_via(url, extra_headers, BodyLimit::DEFAULT, &transport.client)
+                .transport_only_response_via(
+                    url,
+                    extra_headers,
+                    BodyLimit::DEFAULT,
+                    &transport.client,
+                )
                 .await;
         }
 
@@ -1659,7 +1752,7 @@ impl HttpCache {
                 // allocation. The only branch below that is a genuine zero-network "hit"
                 // (#756 S3); every other branch still issued a request.
                 tracing::Span::current().record("cache", "hit");
-                return Ok(cached.body);
+                return Ok(cached);
             }
             match self
                 .conditional_request_with_headers(
@@ -1675,12 +1768,12 @@ impl HttpCache {
                 // `hit` (no request) and `refreshed` (full re-fetch).
                 Ok(None) => {
                     tracing::Span::current().record("cache", "revalidated");
-                    return Ok(cached.body);
+                    return Ok(cached);
                 }
                 // Stale entry cost a full re-fetch, same as a miss — must not report as a hit.
-                Ok(Some(new_body)) => {
+                Ok(Some(refreshed)) => {
                     tracing::Span::current().record("cache", "refreshed");
-                    return Ok(new_body);
+                    return Ok(refreshed);
                 }
                 Err(e) => {
                     debug_assert!(
@@ -1750,7 +1843,7 @@ impl HttpCache {
                         cause,
                         "conditional request failed, using cache"
                     );
-                    return Ok(cached.body);
+                    return Ok(cached);
                 }
             }
         }
@@ -1767,7 +1860,7 @@ impl HttpCache {
     ///
     /// # Returns
     ///
-    /// - `Ok(Some(Bytes))` - Server returned 200 OK with new content
+    /// - `Ok(Some(CachedResponse))` - Server returned 200 OK with new content
     /// - `Ok(None)` - Server returned 304 Not Modified (cache is valid)
     /// - `Err(_)` - Network or HTTP error occurred
     async fn conditional_request_with_headers(
@@ -1777,7 +1870,7 @@ impl HttpCache {
         extra_headers: &[(header::HeaderName, &str)],
         client: &Client,
         cache_key: &str,
-    ) -> Result<Option<Bytes>> {
+    ) -> Result<Option<CachedResponse>> {
         self.ensure_online(url)?;
         ensure_https(url)?;
         let mut request = client.get(url);
@@ -1809,29 +1902,12 @@ impl HttpCache {
             ));
         }
 
-        let etag = response
-            .headers()
-            .get(header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        let last_modified = response
-            .headers()
-            .get(header::LAST_MODIFIED)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
+        let validators = ResponseValidators::from_headers(response.headers());
         let body = read_body_capped(url, response, BodyLimit::DEFAULT).await?;
+        let fresh = validators.into_response(body);
+        self.store_entry(cache_key.to_string(), fresh.clone());
 
-        self.store_entry(
-            cache_key.to_string(),
-            CachedResponse {
-                body: body.clone(),
-                etag,
-                last_modified,
-                fetched_at: Instant::now(),
-            },
-        );
-
-        Ok(Some(body))
+        Ok(Some(fresh))
     }
 
     /// Fetches a fresh response from the network and stores it in the cache.
@@ -1854,7 +1930,7 @@ impl HttpCache {
         extra_headers: &[(header::HeaderName, &str)],
         client: &Client,
         cache_key: &str,
-    ) -> Result<Bytes> {
+    ) -> Result<CachedResponse> {
         self.ensure_online(url)?;
         ensure_https(url)?;
         // #756 security follow-up (S-A): `RedactedUrl`, not the raw `url` — this is the
@@ -1885,29 +1961,12 @@ impl HttpCache {
             ));
         }
 
-        let etag = response
-            .headers()
-            .get(header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        let last_modified = response
-            .headers()
-            .get(header::LAST_MODIFIED)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
+        let validators = ResponseValidators::from_headers(response.headers());
         let body = read_body_capped(url, response, BodyLimit::DEFAULT).await?;
+        let fresh = validators.into_response(body);
+        self.store_entry(cache_key.to_string(), fresh.clone());
 
-        self.store_entry(
-            cache_key.to_string(),
-            CachedResponse {
-                body: body.clone(),
-                etag,
-                last_modified,
-                fetched_at: Instant::now(),
-            },
-        );
-
-        Ok(body)
+        Ok(fresh)
     }
 
     /// POSTs `body` as JSON and returns the response body.
@@ -2108,6 +2167,19 @@ impl HttpCache {
         limit: BodyLimit,
         client: &Client,
     ) -> Result<Bytes> {
+        self.transport_only_response_via(url, extra_headers, limit, client)
+            .await
+            .map(|response| response.body)
+    }
+
+    /// [`Self::transport_only_via`] that also keeps the response validators and `Link` header.
+    async fn transport_only_response_via(
+        &self,
+        url: &str,
+        extra_headers: &[(header::HeaderName, &str)],
+        limit: BodyLimit,
+        client: &Client,
+    ) -> Result<CachedResponse> {
         self.ensure_online(url)?;
         ensure_https(url)?;
 
@@ -2129,7 +2201,9 @@ impl HttpCache {
             ));
         }
 
-        read_body_capped(url, response, limit).await
+        let validators = ResponseValidators::from_headers(response.headers());
+        let body = read_body_capped(url, response, limit).await?;
+        Ok(validators.into_response(body))
     }
 
     /// Inserts (or replaces) a cache entry, keeping [`Self::total_bytes`] in sync.
@@ -2168,6 +2242,40 @@ impl HttpCache {
     pub fn clear(&self) {
         self.entries.clear();
         self.total_bytes.store(0, Ordering::Relaxed);
+    }
+
+    /// Drops every baseline-tier entry whose URL starts with `url_prefix`, returning how many.
+    ///
+    /// For a caller whose request credential or trust changed: the baseline tier keys by URL
+    /// alone, so a body fetched under the old credential would otherwise be revalidated and
+    /// served under the new one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::cache::HttpCache;
+    ///
+    /// assert_eq!(HttpCache::new().evict_url_prefix("https://registry.example/api/"), 0);
+    /// ```
+    pub fn evict_url_prefix(&self, url_prefix: &str) -> usize {
+        self.evict_entries_where(|key| key.starts_with(url_prefix))
+    }
+
+    /// Removes every entry whose key satisfies `matches`, keeping [`Self::total_bytes`] in sync;
+    /// returns how many were removed.
+    fn evict_entries_where(&self, matches: impl Fn(&str) -> bool) -> usize {
+        let mut freed_bytes = 0usize;
+        let mut evicted = 0usize;
+        self.entries.retain(|key, value| {
+            let drop_entry = matches(key);
+            if drop_entry {
+                freed_bytes += value.body.len();
+                evicted += 1;
+            }
+            !drop_entry
+        });
+        self.total_bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
+        evicted
     }
 
     /// Returns the number of cached entries.
@@ -2633,17 +2741,17 @@ mod tests {
         let source_url = format!("{}/api/source", server_a.url());
 
         let cache = HttpCache::new();
-        let result: Bytes = cache
+        let result: CachedResponse = cache
             .get_cached_with_headers_via(&source_url, &[], &Transport::baseline(), None)
             .await
             .unwrap();
-        assert_eq!(result.as_ref(), b"redirected data");
+        assert_eq!(result.body.as_ref(), b"redirected data");
 
         let policy = Arc::new(RegistryAccessPolicy::new(
             WorkspaceRegistryAccess::PublicOnly,
         ));
         let workspace_cache = HttpCache::with_policy(Arc::clone(&policy));
-        let result: Result<Bytes> = workspace_cache
+        let result: Result<CachedResponse> = workspace_cache
             .get_cached_with_headers_via(&source_url, &[], &Transport::workspace(&policy), None)
             .await;
         assert!(
@@ -2671,7 +2779,7 @@ mod tests {
         ));
         let cache = HttpCache::with_policy(Arc::clone(&policy));
         let source_url = format!("{}/api/source", server.url());
-        let result: Result<Bytes> = cache
+        let result: Result<CachedResponse> = cache
             .get_cached_with_headers_via(&source_url, &[], &Transport::workspace(&policy), None)
             .await;
 
@@ -3067,6 +3175,7 @@ mod tests {
                 body: Bytes::from_static(&[1, 2, 3]),
                 etag: None,
                 last_modified: None,
+                link: None,
                 fetched_at: Instant::now(),
             },
         );
@@ -3081,6 +3190,7 @@ mod tests {
             body: Bytes::from_static(&[1, 2, 3]),
             etag: Some("test".into()),
             last_modified: Some("date".into()),
+            link: None,
             fetched_at: Instant::now(),
         };
         let cloned = response.clone();
@@ -3100,6 +3210,7 @@ mod tests {
                 body: Bytes::new(),
                 etag: None,
                 last_modified: None,
+                link: None,
                 fetched_at: Instant::now(),
             },
         );
@@ -3159,6 +3270,119 @@ mod tests {
         assert_eq!(result2.as_ref(), b"original data");
     }
 
+    const NEXT_LINK: &str = r#"<https://r.example/p?page=2>; rel="next""#;
+
+    #[tokio::test]
+    async fn test_response_captures_link_on_200_and_keeps_it_on_304() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/api/data", server.url());
+        let origin = format!("{}/", server.url());
+        let cache = HttpCache::new();
+
+        let first = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_header("etag", "\"abc\"")
+            .with_header("link", NEXT_LINK)
+            .with_body("page one")
+            .create_async()
+            .await;
+        let response = cache
+            .get_cached_trusted_origin_response(&url, &origin, &[])
+            .await
+            .unwrap();
+        assert_eq!(response.link.as_deref(), Some(NEXT_LINK));
+        first.remove_async().await;
+
+        let _revalidate = server
+            .mock("GET", "/api/data")
+            .match_header("if-none-match", "\"abc\"")
+            .with_status(304)
+            .create_async()
+            .await;
+        let response = cache
+            .get_cached_trusted_origin_response(&url, &origin, &[])
+            .await
+            .unwrap();
+        assert_eq!(response.body.as_ref(), b"page one");
+        assert_eq!(response.link.as_deref(), Some(NEXT_LINK));
+    }
+
+    #[tokio::test]
+    async fn test_evict_url_prefix_drops_only_matching_entries() {
+        let mut server = mockito::Server::new_async().await;
+        let _a = server
+            .mock("GET", "/api/a")
+            .with_status(200)
+            .with_body("a")
+            .create_async()
+            .await;
+        let _b = server
+            .mock("GET", "/other/b")
+            .with_status(200)
+            .with_body("b")
+            .create_async()
+            .await;
+        let cache = HttpCache::new();
+        cache
+            .get_cached(&format!("{}/api/a", server.url()))
+            .await
+            .unwrap();
+        cache
+            .get_cached(&format!("{}/other/b", server.url()))
+            .await
+            .unwrap();
+        assert_eq!(cache.evict_url_prefix(&format!("{}/api/", server.url())), 1);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_unreadable_link_header_reads_as_a_next_relation() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/api/data", server.url());
+        let origin = format!("{}/", server.url());
+        let cache = HttpCache::new();
+
+        let _m = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_header("link", "<https://r.example/p>; title=\"caf\u{e9}\"")
+            .with_body("page one")
+            .create_async()
+            .await;
+        let response = cache
+            .get_cached_trusted_origin_response(&url, &origin, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::pagination::ListCoverage::from_link_header(response.link.as_deref()),
+            crate::pagination::ListCoverage::Truncated
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pinned_response_captures_link_with_cache_disabled() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/api/data", server.url());
+        let origin = format!("{}/", server.url());
+        let cache = HttpCache::new();
+        cache.set_cache_enabled(CacheMode::Disabled);
+
+        let _m = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_header("link", NEXT_LINK)
+            .with_body("page one")
+            .create_async()
+            .await;
+        let response = cache
+            .get_cached_pinned_response(&url, &origin, false, None, &[])
+            .await
+            .unwrap();
+        assert_eq!(response.link.as_deref(), Some(NEXT_LINK));
+        assert_eq!(cache.len(), 0);
+    }
+
     #[tokio::test]
     async fn test_get_cached_304_not_modified() {
         let mut server = mockito::Server::new_async().await;
@@ -3203,6 +3427,7 @@ mod tests {
                 body: Bytes::from_static(b"cached"),
                 etag: Some("\"tag123\"".into()),
                 last_modified: None,
+                link: None,
                 fetched_at: Instant::now(),
             },
         );
@@ -3231,6 +3456,7 @@ mod tests {
                 body: Bytes::from_static(b"cached"),
                 etag: None,
                 last_modified: Some("Wed, 21 Oct 2024 07:28:00 GMT".into()),
+                link: None,
                 fetched_at: Instant::now(),
             },
         );
@@ -3259,6 +3485,7 @@ mod tests {
                 body: Bytes::from_static(b"stale data"),
                 etag: Some("\"old\"".into()),
                 last_modified: None,
+                link: None,
                 fetched_at: Instant::now(),
             },
         );
@@ -3280,7 +3507,7 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/api/missing", server.url());
-        let result: Result<Bytes> = cache
+        let result: Result<CachedResponse> = cache
             .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
             .await;
 
@@ -3309,7 +3536,7 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/repos/owner/repo/tags", server.url());
-        let result: Result<Bytes> = cache
+        let result: Result<CachedResponse> = cache
             .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
             .await;
 
@@ -3338,7 +3565,7 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/repos/owner/repo/tags", server.url());
-        let result: Result<Bytes> = cache
+        let result: Result<CachedResponse> = cache
             .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
             .await;
 
@@ -3363,7 +3590,7 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/repos/owner/repo/tags", server.url());
-        let result: Result<Bytes> = cache
+        let result: Result<CachedResponse> = cache
             .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
             .await;
 
@@ -3485,7 +3712,7 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/api/data", server.url());
-        let _: Bytes = cache
+        let _: CachedResponse = cache
             .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
             .await
             .unwrap();
@@ -3523,11 +3750,11 @@ mod tests {
         let cache = HttpCache::new();
         let output =
             crate::test_util::capture_tracing_output_async_at(tracing::Level::DEBUG, async {
-                let result: Bytes = cache
+                let result: CachedResponse = cache
                     .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
                     .await
                     .unwrap();
-                assert_eq!(result.as_ref(), b"ok");
+                assert_eq!(result.body.as_ref(), b"ok");
             })
             .await;
 
@@ -3632,7 +3859,7 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/api/huge", server.url());
-        let result: Result<Bytes> = cache
+        let result: Result<CachedResponse> = cache
             .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
             .await;
 
@@ -3662,12 +3889,12 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/api/exact", server.url());
-        let result: Bytes = cache
+        let result: CachedResponse = cache
             .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
             .await
             .unwrap();
 
-        assert_eq!(result.len(), MAX_RESPONSE_BYTES);
+        assert_eq!(result.body.len(), MAX_RESPONSE_BYTES);
     }
 
     #[tokio::test]
@@ -3682,6 +3909,7 @@ mod tests {
                 body: Bytes::from_static(b"stale but good"),
                 etag: Some("\"stale-etag\"".into()),
                 last_modified: None,
+                link: None,
                 fetched_at: Instant::now(),
             },
         );
@@ -3725,6 +3953,7 @@ mod tests {
                 body: Bytes::from_static(b"stale but good"),
                 etag: Some("\"stale-etag\"".into()),
                 last_modified: None,
+                link: None,
                 fetched_at: Instant::now(),
             },
         );
@@ -3774,6 +4003,7 @@ mod tests {
                 body: Bytes::from_static(b"cached"),
                 etag: None,
                 last_modified: None,
+                link: None,
                 fetched_at: Instant::now(),
             },
         );
@@ -3997,6 +4227,7 @@ mod tests {
             body: Bytes::from(vec![0u8; size]),
             etag: None,
             last_modified: None,
+            link: None,
             fetched_at: Instant::now(),
         }
     }
@@ -4352,6 +4583,7 @@ mod tests {
                 body: Bytes::from_static(b"warm cached body"),
                 etag: Some("\"tag123\"".into()),
                 last_modified: None,
+                link: None,
                 fetched_at: Instant::now(),
             },
         );

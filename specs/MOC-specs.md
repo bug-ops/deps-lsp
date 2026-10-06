@@ -26,6 +26,7 @@ status: moc
 | 044 | [[044-precommit-hooks-ecosystem/spec\|New ecosystem: pre-commit hooks (.pre-commit-config.yaml repo/rev pins)]] | specify | draft — research/new ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, tracked in issue #575 |
 | 047 | [[047-elixir-hex-ecosystem/spec\|New ecosystem: Elixir Hex (mix.exs dependency version hints)]] | specify | draft — research/new-ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, issue #642 |
 | 051 | [[051-disk-persistent-registry-cache/spec\|Disk-persistent registry cache]] | specify | draft — research/enhancement, P4, 9 open `[NEEDS CLARIFICATION]` items, tracked in issue #700 |
+| 077 | [[077-swift-registry-client/spec\|Swift Package Registry (SE-0292) client for .package(id:) dependencies]] | specify | draft — enhancement/security, P4, 0 open `[NEEDS CLARIFICATION]` items, issue #1691; follow-ups: Link pagination, netrc/Keychain, publishedAt, SCM swizzling, HostBlockedByPolicy, path-suffix watched configs, #1459 |
 
 ## Completed Specs
 

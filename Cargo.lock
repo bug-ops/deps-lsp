@@ -646,6 +646,7 @@ dependencies = [
 name = "deps-core"
 version = "2.0.0"
 dependencies = [
+ "base64 0.23.1",
  "bytes",
  "criterion",
  "dashmap",
@@ -897,7 +898,6 @@ dependencies = [
 name = "deps-nuget"
 version = "2.0.0"
 dependencies = [
- "base64 0.23.1",
  "bytes",
  "criterion",
  "dashmap",
@@ -945,18 +945,23 @@ dependencies = [
 name = "deps-swift"
 version = "2.0.0"
 dependencies = [
+ "dashmap",
  "deps-core",
+ "dirs",
  "mockito",
  "regex",
  "reqwest",
  "semver",
  "serde",
+ "serde_json",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
  "tower-lsp-server",
  "tracing",
  "url",
  "urlencoding",
+ "zeroize",
 ]
 
 [[package]]

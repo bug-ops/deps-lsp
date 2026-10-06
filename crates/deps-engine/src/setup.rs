@@ -487,14 +487,14 @@ pub fn register_ecosystems(
     runtime: &EcosystemRuntime,
 ) -> Vec<deps_core::EcosystemId> {
     let policy = Arc::clone(&runtime.policy);
-    // Keeps `policy` used even when none of its consumers (cargo, npm, pypi, go, nuget,
+    // Keeps `policy` used even when none of its consumers (cargo, npm, pypi, go, swift, nuget,
     // gitlab-ci) are compiled in.
     let _ = &policy;
     // Keeps `registry`/`cache` used even when every ecosystem feature is compiled out.
     let _ = (&registry, &cache);
     let mut workspace_registry_ecosystems = Vec::new();
-    // Keeps `mut` used even when none of the five features that push into this vec below
-    // (cargo, npm, pypi, go, nuget) are enabled.
+    // Keeps `mut` used even when none of the features that push into this vec below
+    // (cargo, npm, pypi, go, swift, nuget) are enabled.
     let _ = &mut workspace_registry_ecosystems;
 
     #[cfg(feature = "cargo")]
@@ -608,7 +608,19 @@ pub fn register_ecosystems(
     register!("dart", DartEcosystem, registry, &cache);
     register!("maven", MavenEcosystem, registry, &cache);
     register!("gradle", GradleEcosystem, registry, &cache);
-    register!("swift", SwiftEcosystem, registry, &cache);
+
+    // swift is explicit, not via `register!`: the macro's default `SwiftParseContext` would never
+    // see a live `registries.workspace_registries` update, nor read the user-level
+    // `registries.json` and registry credential from the environment.
+    #[cfg(feature = "swift")]
+    {
+        let swift_context = deps_swift::SwiftParseContext::from_environment(Arc::clone(&policy));
+        registry.register(Arc::new(SwiftEcosystem::with_context(
+            Arc::new(SwiftRegistry::new(Arc::clone(&cache))),
+            swift_context,
+        )));
+        workspace_registry_ecosystems.push(deps_core::EcosystemId::Swift);
+    }
 
     // composer is explicit, not via `register!` (#1212 impl-critic follow-up): shares
     // `runtime.lockfile_cache` with whatever else in this process reads `composer.lock` by the
@@ -771,6 +783,8 @@ mod tests {
         expected.push("pypi");
         #[cfg(feature = "go")]
         expected.push("go");
+        #[cfg(feature = "swift")]
+        expected.push("swift");
         #[cfg(feature = "nuget")]
         expected.push("nuget");
         expected.sort_unstable();

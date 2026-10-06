@@ -46,13 +46,13 @@ deps_core::impl_dependency!(SwiftDependency {
     version_literal: version_literal,
 });
 
-/// Version information for a Swift package (GitHub tag).
+/// Version information for a Swift package (GitHub tag or SE-0292 registry release).
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct SwiftVersion {
     /// Semver version string (v prefix stripped)
     pub version: deps_core::ConcreteVersion,
-    /// Always false for GitHub tags
+    /// Always false for GitHub tags; true for an SE-0292 release that carries a `problem`
     pub yanked: bool,
     /// GitHub Release publish time for this tag, if a matching Release exists
     /// among the newest ~100 (see `SwiftRegistry::release_dates`). `None` for a

@@ -367,6 +367,20 @@ pub enum DepsError {
          to a less-trusted index"
     )]
     ChainResolutionHalted,
+
+    /// A registry answered with a paginated release list (`Link: rel="next"`) that this client
+    /// cannot follow yet, so the first page was discarded rather than reported as the full list.
+    /// Carries no response text, so [`Self::fetch_failure`] can classify it as
+    /// [`FetchFailure::Actionable`] with a fixed message.
+    #[error(
+        "{package} on {registry}: registry paginates its release list; pagination is not supported yet"
+    )]
+    PaginatedListUnsupported {
+        /// Package whose release list was paginated — stored redacted (#1209).
+        package: RedactedName,
+        /// Name of the registry that paginated the list.
+        registry: &'static str,
+    },
 }
 
 /// Hand-written, not derived: originally because a derived `Debug` would have printed
@@ -444,6 +458,11 @@ impl std::fmt::Debug for DepsError {
             Self::InvalidUri(uri) => f.debug_tuple("InvalidUri").field(uri).finish(),
             Self::Offline { url } => f.debug_struct("Offline").field("url", url).finish(),
             Self::ChainResolutionHalted => f.write_str("ChainResolutionHalted"),
+            Self::PaginatedListUnsupported { package, registry } => f
+                .debug_struct("PaginatedListUnsupported")
+                .field("package", package)
+                .field("registry", registry)
+                .finish(),
         }
     }
 }
@@ -595,6 +614,9 @@ impl DepsError {
                  index"
                     .to_string(),
             ),
+            Self::PaginatedListUnsupported { .. } => FetchFailure::Actionable(
+                "registry paginates its release list; pagination is not supported yet".to_string(),
+            ),
             // Deliberately `Transient`, not `Actionable` (#1295 critic S5, reverted from an
             // earlier `Actionable` attempt): `lsp_helpers::diagnostics` already suppresses
             // every per-dependency fetch-failure message while `versions.offline` is set,
@@ -693,6 +715,7 @@ impl DepsError {
             Self::AmbiguousEcosystem(_) => (None, "ambiguous-ecosystem"),
             Self::InvalidUri(_) => (None, "invalid-uri"),
             Self::ChainResolutionHalted => (None, "chain-resolution-halted"),
+            Self::PaginatedListUnsupported { .. } => (None, "paginated-list-unsupported"),
         }
     }
 }
@@ -709,7 +732,8 @@ impl DepsError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FetchFailure {
     /// The fetch failed with a pre-vetted, safe-to-display hint — produced from
-    /// [`DepsError::RateLimited`] or [`DepsError::ChainResolutionHalted`] (see
+    /// [`DepsError::RateLimited`], [`DepsError::ChainResolutionHalted`] or
+    /// [`DepsError::PaginatedListUnsupported`] (see
     /// [`DepsError::fetch_failure`] for the exhaustive, deliberately-chosen list of which
     /// variants produce this versus [`Self::Transient`]).
     Actionable(String),
@@ -1272,16 +1296,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn paginated_list_unsupported_is_actionable_with_fixed_message() {
+        let err = DepsError::PaginatedListUnsupported {
+            package: "acme.networking".into(),
+            registry: "Swift package registry",
+        };
+        assert_eq!(
+            err.fetch_failure(),
+            FetchFailure::Actionable(
+                "registry paginates its release list; pagination is not supported yet".into()
+            )
+        );
+        assert_eq!(
+            err.safe_tracing_summary(),
+            (None, "paginated-list-unsupported")
+        );
+    }
+
     /// Exhaustive companion to the doc-test on [`DepsError::fetch_failure`]: every variant
-    /// other than [`DepsError::RateLimited`] and [`DepsError::ChainResolutionHalted`] must
-    /// classify as [`FetchFailure::Transient`] — including [`DepsError::Offline`] (#1295
+    /// other than [`DepsError::RateLimited`], [`DepsError::ChainResolutionHalted`] and
+    /// [`DepsError::PaginatedListUnsupported`] must classify as [`FetchFailure::Transient`] — including [`DepsError::Offline`] (#1295
     /// critic S5: deliberately *not* `Actionable`, see `fetch_failure`'s own comment on that
     /// arm). This is the invariant the doc comment calls security-load-bearing (a future
     /// variant wired to `Actionable` by mistake could leak raw, potentially IP-bearing error
     /// text into a diagnostic), so it must be a real test enumerating every variant, not just a
-    /// handful of spot checks. The two exempted variants carry no arbitrary payload, only a
+    /// handful of spot checks. The exempted variants carry no arbitrary payload, only a
     /// fixed, pre-vetted message, so each is safe to be an `Actionable`-producing variant (see
-    /// their own docs, and #513's M2 fix for `ChainResolutionHalted`).
+    /// their own docs, and #513's M2 fix for `ChainResolutionHalted`). A
+    /// dedicated test above pins `PaginatedListUnsupported`'s fixed message.
     #[test]
     fn test_fetch_failure_classifies_every_non_rate_limited_variant_as_transient() {
         // A `reqwest::Error` built from an invalid URL — `RequestBuilder::build`

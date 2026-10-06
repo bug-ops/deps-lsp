@@ -458,6 +458,9 @@ pub enum ResolvedSource {
         /// Checksum/integrity hash
         checksum: String,
     },
+    /// From a registry whose lock format records neither the registry URL nor a checksum
+    /// (SwiftPM writes `location: ""` for an SE-0292 registry pin).
+    RegistryPin,
     /// From git with commit hash
     Git {
         /// Git repository URL
@@ -491,6 +494,7 @@ impl std::fmt::Debug for ResolvedSource {
                 .field("url", &crate::net_policy::RedactedUrl::new(url))
                 .field("rev", rev)
                 .finish(),
+            Self::RegistryPin => f.write_str("RegistryPin"),
             Self::Path { path } => f
                 .debug_struct("Path")
                 .field("path", &crate::net_policy::redact_declaration_key(path))

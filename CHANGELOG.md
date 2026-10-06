@@ -15,11 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `PinResolution`, `TagIndex::pin_resolution`, `PartialTagPolicy`, `tag_pin_is_up_to_date` and `tag_has_precedence` shared by the git-tag ecosystems (#1751)
 - **deps-github-actions**: `Correct version comment to <tag>` quickfix for a SHA pin whose trailing comment names another tag (#1751)
 - **deps-cli**: `--fail-on other` token for uncategorized findings (offline/lock-file/registry notices, `sha-comment-mismatch`) (#1747)
+- **deps-swift**: SE-0292 registry client resolves `.package(id:)` dependencies through `registries.json` (project and user tiers), binding the environment credential to user-declared registry URLs only (#PR)
+- **deps-core**: `secret::basic_auth_header`, `CachedResponse::link` with `HttpCache::get_cached_{trusted_origin,pinned}_response`, `ListCoverage::from_link_header` and `DepsError::PaginatedListUnsupported` (#PR)
 
 ### Changed
 - **deps-github-actions, deps-gitlab-ci**: a tag pin ahead of the latest release is reported up to date instead of offering a downgrade (#1751)
 - **deps-cli**: `update --security-only` Unfixable rows (`Yanked`, `UnsupportedRequirementShape`, `OversizedRequirement`) now report their `advisory_ids` (#1747)
 - **deps-composer**: OR-branch bounds are computed once when `ComposerMatcher` is built, as in `deps-npm`; behavior unchanged (#1747)
+- **deps-swift**: `Package.resolved` pins map by `kind` (`registry` to a registry source, unknown kinds skipped instead of read as Git) and `SwiftRegistry` routes by dependency source, failing closed for unresolved `id:` sources (#PR)
 
 ### Fixed
 - **deps-github-actions**: pre-release tag pins (`@v2-beta`, `@v3.0.0-rc.1`) are reported outdated against a newer release (#1751)

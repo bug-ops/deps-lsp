@@ -5,6 +5,32 @@ use std::fmt;
 const MAX_SCOPE_LEN: usize = 39;
 const MAX_NAME_LEN: usize = 100;
 
+/// A canonical (ASCII-lowercase) SE-0292 registry scope, the single key `registries.json`
+/// scopes are matched by.
+///
+/// SwiftPM identities are case-insensitive, so `Acme` and `acme` must select the same entry.
+/// The inner string is private: a value can only come from [`Self::parse`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct RegistryScope(String);
+
+impl RegistryScope {
+    /// Parses `scope` on the SE-0292 scope grammar and lowercases it; `None` if it does not conform.
+    pub(crate) fn parse(scope: &str) -> Option<Self> {
+        is_valid_part(scope, MAX_SCOPE_LEN, b"-").then(|| Self(scope.to_ascii_lowercase()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RegistryScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// A validated SE-0292 registry package identity (`scope.name`).
 ///
 /// Fields are private, so a value can only be produced by [`Self::parse`] and is always
@@ -26,9 +52,25 @@ impl<'a> RegistryIdentity<'a> {
             .then_some(Self { scope, name })
     }
 
-    /// The registry scope, i.e. the alias key looked up in `registries.json`.
+    /// The registry scope as written.
+    #[cfg(test)]
     pub(crate) const fn scope(&self) -> &'a str {
         self.scope
+    }
+
+    /// The case-folded scope, the key `registries.json` entries are matched by.
+    pub(crate) fn scope_key(&self) -> RegistryScope {
+        RegistryScope(self.scope.to_ascii_lowercase())
+    }
+
+    /// The case-folded package name, the second path segment of a registry request.
+    pub(crate) fn name_key(&self) -> String {
+        self.name.to_ascii_lowercase()
+    }
+
+    /// The lowercase `scope.name` identity, as sent on the wire and written in `Package.resolved`.
+    pub(crate) fn canonical(&self) -> String {
+        self.to_string().to_ascii_lowercase()
     }
 }
 
@@ -109,6 +151,22 @@ mod tests {
             &long_name,
         ] {
             assert!(RegistryIdentity::parse(id).is_none(), "{id}");
+        }
+    }
+
+    #[test]
+    fn test_scope_key_and_canonical_fold_case() {
+        let id = RegistryIdentity::parse("Apple.Swift-NIO").unwrap();
+        assert_eq!(id.scope_key().as_str(), "apple");
+        assert_eq!(id.canonical(), "apple.swift-nio");
+        assert_eq!(Some(id.scope_key()), RegistryScope::parse("APPLE"));
+    }
+
+    #[test]
+    fn test_registry_scope_rejects_invalid_scopes() {
+        let too_long = "a".repeat(40);
+        for scope in ["", "a.b", "-a", "a-", "a--b", "a b", too_long.as_str()] {
+            assert!(RegistryScope::parse(scope).is_none(), "{scope}");
         }
     }
 
