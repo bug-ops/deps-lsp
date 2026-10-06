@@ -453,13 +453,13 @@ impl Ecosystem for GitlabCiEcosystem {
                 && let Some(sha) = gl_dep
                     .version_req
                     .as_ref()
-                    .map(deps_core::VersionReq::as_str)
+                    .and_then(|req| deps_core::lsp_helpers::CommitSha::parse(req.as_str()))
                 && let Some(resolved_tag) =
                     self.formatter
-                        .resolved_tag_for_sha(gl_dep.kind.endpoint(), dep.name(), sha)
+                        .resolved_tag_for_sha(gl_dep.kind.endpoint(), dep.name(), &sha)
             {
                 hover.rewrite_markdown(|md| {
-                    deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, sha)
+                    deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, &sha)
                 });
             }
 
@@ -490,7 +490,7 @@ impl Ecosystem for GitlabCiEcosystem {
                                 deps_core::lsp_helpers::splice_resolved_line(
                                     md,
                                     resolved.version.as_str(),
-                                    sha.as_str(),
+                                    sha,
                                 )
                             });
                         }
@@ -1801,7 +1801,11 @@ mod tests {
         #[test]
         fn test_splice_resolved_line_after_requirement() {
             let markdown = "# org/proj\n\n**Requirement**: `v1.0.0`\n\n**Latest**: `v1.1.0`\n";
-            let spliced = splice_resolved_line(markdown, "v1.0.0", &"a".repeat(40));
+            let spliced = splice_resolved_line(
+                markdown,
+                "v1.0.0",
+                &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            );
             let req_pos = spliced.find("**Requirement**").unwrap();
             let resolved_pos = spliced.find("**Resolved**").unwrap();
             let latest_pos = spliced.find("**Latest**").unwrap();

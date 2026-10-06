@@ -3623,14 +3623,17 @@ mod vulnerability_keys_candidates_tests {
         fn resolved_pin_version(
             &self,
             dep: &dyn crate::Dependency,
-        ) -> Option<crate::lsp_helpers::ResolvedPin> {
-            let tags: &[&str] = match dep.version_requirement()?.as_str() {
+        ) -> crate::lsp_helpers::PinResolution {
+            let Some(req) = dep.version_requirement() else {
+                return crate::lsp_helpers::PinResolution::Unresolved;
+            };
+            let tags: &[&str] = match req.as_str() {
                 "with-sibling" => &["v4.8.0", "v4.9.0"],
                 _ => &["v4.8.0"],
             };
             let sha = crate::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap();
             let index = crate::lsp_helpers::TagIndex::from_tags(tags.iter().map(|t| (*t, &sha)));
-            index.resolved_pin(sha.as_str())
+            index.pin_resolution(&sha)
         }
     }
     impl crate::lsp_helpers::DiagnosticMessages for PinByRequirementFormatter {}

@@ -1,16 +1,15 @@
 //! GitHub Actions ecosystem formatter.
 
 use dashmap::DashMap;
-#[cfg(any(test, feature = "lsp-responses"))]
 use deps_core::VersionReq;
 use deps_core::github::normalize_tag;
 use deps_core::lsp_helpers::{
     BoundedVersionReq, CommitSha, DiagnosticMessages, DiagnosticPolicy, OsvNameAvailability,
-    OsvNaming, PackageNaming, PackageRendering, RequirementResolution, RequirementStatus,
-    ResolvedPin, ShaPinLookup, SourcePolicy, TagIndex, concrete_pin_version, extends_tag,
-    is_partial_semver_shaped, match_v_prefix_style, requirement_contains_template_placeholder,
+    OsvNaming, PackageNaming, PackageRendering, PartialTagPolicy, PinResolution,
+    RequirementResolution, RequirementStatus, ResolvedPin, ShaPinLookup, SourcePolicy, TagIndex,
+    concrete_pin_version, extends_tag, is_partial_semver_shaped, match_v_prefix_style,
+    requirement_contains_template_placeholder, tag_has_precedence, tag_pin_is_up_to_date,
 };
-use deps_core::pagination::ListCoverage;
 use deps_core::parser::DependencySource;
 use deps_core::{
     ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName,
@@ -19,7 +18,7 @@ use deps_core::{
 use std::sync::Arc;
 
 use crate::parser::{is_full_sha, is_tag_shaped};
-use crate::types::{GithubActionsDependency, PinStyle};
+use crate::types::{GithubActionsDependency, PinStyle, ShaComment};
 
 /// Formatter for GitHub Actions ecosystem LSP responses.
 pub struct GithubActionsFormatter {
@@ -217,21 +216,24 @@ impl PackageRendering for GithubActionsFormatter {
         };
         match &gha_dep.pin {
             Some(PinStyle::Tag) => match_v_prefix_style(current, version.as_str()),
-            Some(PinStyle::Sha { comment_tag }) => {
-                let literal = || dep.version_literal().unwrap_or(current).to_string();
-                match self.commit_for_tag(dep.name(), version.as_str()) {
+            Some(PinStyle::Sha { comment, .. }) => {
+                match (self.commit_for_tag(dep.name(), version.as_str()), comment) {
                     // A parsed comment already proves the tail is safe to rewrite (its
                     // closers are re-emitted); a commentless pin needs a plain, last-on-line
                     // scalar, since `# {tag}` inside quotes breaks the string (#473) and
                     // after a flow ref comments out real YAML (#633/#898).
-                    Some(sha)
-                        if comment_tag.is_some()
-                            || (gha_dep.is_plain_scalar && gha_dep.is_last_on_line) =>
-                    {
-                        format!("{sha}{} # {}", gha_dep.closing_delimiters, version.as_str())
+                    (Some(sha), Some(comment)) => {
+                        format!(
+                            "{sha}{} # {}",
+                            comment.closing_delimiters(),
+                            version.as_str()
+                        )
                     }
-                    Some(sha) if comment_tag.is_none() => sha.to_string(),
-                    Some(_) | None => literal(),
+                    (Some(sha), None) if gha_dep.is_plain_scalar && gha_dep.is_last_on_line => {
+                        format!("{sha} # {}", version.as_str())
+                    }
+                    (Some(sha), None) => sha.to_string(),
+                    (None, _) => dep.version_literal().unwrap_or(current).to_string(),
                 }
             }
             Some(PinStyle::Branch) | None => dep.version_literal().unwrap_or(current).to_string(),
@@ -273,41 +275,25 @@ impl PackageRendering for GithubActionsFormatter {
 }
 
 impl RequirementResolution for GithubActionsFormatter {
-    /// A major-only or major.minor requirement (`v4`) is up to date while `latest`'s
-    /// corresponding leading components match; a full version is compared component-for-
-    /// component. `v`/`V` is normalized off both sides first. An unparseable requirement
-    /// (a bare SHA or branch name — neither is dot-separated all-digit) returns `true`,
-    /// never a false "outdated": [`Self::bounded_requirement_is_unresolved`] is what actually
-    /// gates those out of the diagnostic/inlay-hint path; this is only the fallback for a
-    /// caller that does not consult that hook first.
+    /// A major-only or major.minor requirement (`v4`) is up to date while `latest` extends it;
+    /// any other tag is compared by semver precedence (see [`tag_pin_is_up_to_date`]), so a
+    /// pre-release of an older line (`v2-beta` against `v7.0.0`) is outdated and a pin ahead of
+    /// `latest` is not. `v`/`V` is normalized off both sides first. A requirement that is not
+    /// tag-shaped (a bare SHA or branch name), or is tag-shaped but places on no version line
+    /// (`v1.x`, a release-line branch), returns `true`, never a false "outdated". A bare SHA or
+    /// branch name is additionally reported unresolved by
+    /// [`Self::bounded_requirement_is_unresolved`]; a tag-shaped non-version like `v1.x` is not,
+    /// so it reaches this method and reads as up to date, as it did before pre-release
+    /// ordering existed.
     fn is_bounded_requirement_up_to_date(
         &self,
         requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> bool {
-        let requirement = requirement.get();
-        let req = requirement
-            .as_str()
-            .strip_prefix(['v', 'V'])
-            .unwrap_or(requirement.as_str());
-        let lat = latest
-            .as_str()
-            .strip_prefix(['v', 'V'])
-            .unwrap_or(latest.as_str());
-
-        let req_parts: Vec<&str> = req.split('.').collect();
-        let lat_parts: Vec<&str> = lat.split('.').collect();
-
-        let is_all_digits = |parts: &[&str]| {
-            !parts.is_empty()
-                && parts
-                    .iter()
-                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-        };
-        if !is_all_digits(&req_parts) || req_parts.len() > lat_parts.len() {
-            return true;
-        }
-        req_parts.iter().zip(lat_parts.iter()).all(|(r, l)| r == l)
+        let requirement = requirement.as_str();
+        !is_tag_shaped(requirement)
+            || !tag_has_precedence(requirement)
+            || tag_pin_is_up_to_date(requirement, latest.as_str(), PartialTagPolicy::MovingLine)
     }
 
     /// A bare SHA or branch ref is recognizable from the requirement string alone: a
@@ -365,12 +351,12 @@ impl RequirementResolution for GithubActionsFormatter {
     /// (`# cargo-deny`), or no comment at all all resolve here the same way a full
     /// `# v4.2.0` comment already did before this existed.
     ///
-    /// Not gated on `comment_tag` the way `Self::sha_pin_status_from_tag_index` is: that
+    /// Not gated on the SHA comment the way `Self::sha_pin_status_from_tag_index` is: that
     /// method only needs to *distrust* a human-written comment when one exists, but this
     /// method's job is finding a version at all, so a commentless SHA pin (whose raw SHA is
-    /// its own `version_req`) is just as eligible. `None` on any `TagIndex` miss (cold
-    /// cache, or a SHA no currently-fetched tag points at) — the honest "unknown", not a
-    /// fabricated version.
+    /// its own `version_req`) is just as eligible. [`PinResolution::Unresolved`] on a cold cache
+    /// or truncated index — the honest "unknown", not a fabricated version — and
+    /// [`PinResolution::Untagged`] when a complete index proves no tag names the commit (#1735).
     ///
     /// #1684: a floating tag pin (`@v4`) resolves the same way through the commit its tag
     /// points at, see `Self::pinned_commit`, but only to a release that extends (or equals)
@@ -379,20 +365,34 @@ impl RequirementResolution for GithubActionsFormatter {
     ///
     /// An exact full-semver tag pin (`@v4.8.0`) keeps itself as the primary and gains the other
     /// releases of its major line on the same commit as siblings (#1709).
-    fn resolved_pin_version(&self, dep: &dyn Dependency) -> Option<ResolvedPin> {
-        let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-        if gha_dep.pin == Some(PinStyle::Tag) {
-            let written = gha_dep.version_req.as_ref()?.as_str();
-            if concrete_pin_version(written, EcosystemId::GithubActions).is_some() {
-                return self.tag_index.get(dep.name())?.resolved_exact_tag(written);
-            }
+    fn resolved_pin_version(&self, dep: &dyn Dependency) -> PinResolution {
+        let Some(gha_dep) = dep.as_any().downcast_ref::<GithubActionsDependency>() else {
+            return PinResolution::Unresolved;
+        };
+        let resolved = |pin: Option<ResolvedPin>| {
+            pin.map_or(PinResolution::Unresolved, PinResolution::Resolved)
+        };
+        if gha_dep.pin == Some(PinStyle::Tag)
+            && let Some(written) = gha_dep.version_req.as_ref().map(VersionReq::as_str)
+            && concrete_pin_version(written, EcosystemId::GithubActions).is_some()
+        {
+            return resolved(
+                self.tag_index
+                    .get(dep.name())
+                    .and_then(|index| index.resolved_exact_tag(written)),
+            );
         }
-        let commit = self.pinned_commit(gha_dep)?;
-        let index = self.tag_index.get(dep.name())?;
-        if gha_dep.pin != Some(PinStyle::Tag) {
-            return index.resolved_pin(commit.as_str());
+        let (Some(commit), Some(index)) =
+            (self.pinned_commit(gha_dep), self.tag_index.get(dep.name()))
+        else {
+            return PinResolution::Unresolved;
+        };
+        if matches!(gha_dep.pin, Some(PinStyle::Sha { .. })) {
+            return index.pin_resolution(&commit);
         }
-        let written = gha_dep.version_req.as_ref()?.as_str();
+        let Some(written) = gha_dep.version_req.as_ref().map(VersionReq::as_str) else {
+            return PinResolution::Unresolved;
+        };
         let candidates: Vec<(&str, &CommitSha)> = index
             .tag_to_sha
             .iter()
@@ -401,7 +401,7 @@ impl RequirementResolution for GithubActionsFormatter {
             })
             .map(|(tag, sha)| (tag.as_str(), sha))
             .collect();
-        TagIndex::from_tags(candidates).resolved_pin(commit.as_str())
+        resolved(TagIndex::from_tags(candidates).resolved_pin(&commit))
     }
 
     /// `tag_index` is populated as a side effect of [`GithubActionsRegistry`]'s own tags
@@ -424,7 +424,7 @@ impl GithubActionsFormatter {
     /// yield `None`, keeping exact tags on the text path.
     pub(crate) fn pinned_commit(&self, gha_dep: &GithubActionsDependency) -> Option<CommitSha> {
         match &gha_dep.pin {
-            Some(PinStyle::Sha { .. }) => CommitSha::parse(crate::types::sha_pin_raw_sha(gha_dep)?),
+            Some(PinStyle::Sha { sha, .. }) => Some(sha.clone()),
             Some(PinStyle::Tag) => {
                 let tag = gha_dep.version_req.as_ref()?.as_str();
                 let floating = is_partial_semver_shaped(tag)
@@ -461,60 +461,63 @@ impl GithubActionsFormatter {
         latest: &ConcreteVersion,
     ) -> Option<RequirementStatus> {
         let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-        let Some(PinStyle::Sha { .. }) = &gha_dep.pin else {
+        let Some(PinStyle::Sha { sha, .. }) = &gha_dep.pin else {
             return None;
         };
-        let sha = crate::types::sha_pin_raw_sha(gha_dep)?;
         let index = self.tag_index.get(dep.name());
-        ShaPinLookup::resolve(index.as_deref().map(AsRef::as_ref), sha, latest)?
+        ShaPinLookup::resolve(index.as_deref().map(AsRef::as_ref), sha, latest)
             .into_status(|tag| self.is_bounded_requirement_up_to_date(tag, latest))
     }
 
     /// Whether a SHA pin's trailing `# tag` comment agrees with the repository's `TagIndex`
-    /// (#1722). `None` when `gha_dep` is not a full-SHA pin.
+    /// (#1722).
     ///
     /// Partial-precision comments (`# v4` over `v4.3.1`) agree when the SHA's most specific
     /// tag extends the comment; `tag_to_sha["v4"]` is not compared for that case since moving
-    /// majors legitimately drift.
-    pub(crate) fn sha_comment_check(
+    /// majors legitimately drift. `None` when `gha_dep` is not a SHA pin.
+    pub(crate) fn sha_comment_check<'a>(
         &self,
-        gha_dep: &GithubActionsDependency,
-    ) -> Option<CommentCheck> {
-        let Some(PinStyle::Sha { comment_tag }) = &gha_dep.pin else {
+        gha_dep: &'a GithubActionsDependency,
+    ) -> Option<CommentCheck<'a>> {
+        let Some(PinStyle::Sha { sha, comment }) = &gha_dep.pin else {
             return None;
         };
-        let sha = crate::types::sha_pin_raw_sha(gha_dep)?;
-        if !is_full_sha(sha) {
-            return None;
-        }
-        let Some(comment) = comment_tag else {
-            return Some(CommentCheck::NoComment);
+        Some(self.check_sha_comment(&gha_dep.name, sha, comment.as_ref()))
+    }
+
+    fn check_sha_comment<'a>(
+        &self,
+        name: &PackageName,
+        sha: &CommitSha,
+        comment: Option<&'a ShaComment>,
+    ) -> CommentCheck<'a> {
+        let Some(comment) = comment else {
+            return CommentCheck::NoComment;
         };
-        let sha = sha.to_ascii_lowercase();
-        let Some(index) = self
-            .tag_index
-            .get(&gha_dep.name)
-            .filter(|index| !index.is_empty())
-        else {
-            return Some(CommentCheck::Unverifiable);
+        let Some(index) = self.tag_index.get(name).filter(|index| !index.is_empty()) else {
+            return CommentCheck::Unverifiable;
         };
-        if index
-            .tag_to_sha
-            .get(comment.as_str())
-            .is_some_and(|commit| commit.as_str() == sha)
-        {
-            return Some(CommentCheck::Confirmed);
+        if index.tag_to_sha.get(comment.tag()) == Some(sha) {
+            return CommentCheck::Confirmed;
         }
-        Some(match (index.tag_for_sha(&sha), index.coverage()) {
-            (Some(actual), _) if comment_names_tag(comment, actual) => CommentCheck::Confirmed,
-            (Some(actual), _) => CommentCheck::Mismatch(CommentMismatch::ShaIsOtherTag {
-                actual: ConcreteVersion::new(actual),
-            }),
-            (None, ListCoverage::Complete) => {
-                CommentCheck::Mismatch(CommentMismatch::ShaNotInIndex)
+        match index.pin_resolution(sha) {
+            PinResolution::Resolved(pin)
+                if comment_names_tag(comment.tag(), pin.version().as_str()) =>
+            {
+                CommentCheck::Confirmed
             }
-            (None, ListCoverage::Truncated) => CommentCheck::Unverifiable,
-        })
+            PinResolution::Resolved(pin) => CommentCheck::Mismatch {
+                comment,
+                kind: CommentMismatch::ShaIsOtherTag {
+                    actual: pin.version().clone(),
+                },
+            },
+            PinResolution::Untagged => CommentCheck::Mismatch {
+                comment,
+                kind: CommentMismatch::ShaNotInIndex,
+            },
+            PinResolution::Unresolved => CommentCheck::Unverifiable,
+        }
     }
 }
 
@@ -529,7 +532,7 @@ fn comment_names_tag(comment: &str, actual: &str) -> bool {
 
 /// Verdict on whether a SHA pin's trailing `# tag` comment matches the pinned commit (#1722).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CommentCheck {
+pub(crate) enum CommentCheck<'a> {
     /// The pin has no version comment to check.
     NoComment,
     /// The index cannot vouch either way (cold cache, or the SHA is absent from a truncated index).
@@ -537,7 +540,12 @@ pub(crate) enum CommentCheck {
     /// The comment names the pinned commit's tag.
     Confirmed,
     /// The comment provably does not name the pinned commit's tag.
-    Mismatch(CommentMismatch),
+    Mismatch {
+        /// The comment that was judged.
+        comment: &'a ShaComment,
+        /// Why it does not match.
+        kind: CommentMismatch,
+    },
 }
 
 /// Why a SHA pin's comment does not match its commit.
@@ -598,6 +606,7 @@ mod tests {
     use deps_core::pagination::ListCoverage;
     use deps_core::parser::DependencySource;
     use deps_core::{Position, Range};
+    use std::assert_matches;
 
     fn formatter() -> GithubActionsFormatter {
         GithubActionsFormatter {
@@ -979,18 +988,16 @@ mod tests {
         );
     }
 
-    fn dep(pin: Option<PinStyle>, name: &str, literal: Option<&str>) -> GithubActionsDependency {
+    fn dep(pin: Option<PinStyle>, name: &str) -> GithubActionsDependency {
         GithubActionsDependency {
             name: name.into(),
             name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
             version_req: Some("v4".into()),
             version_range: Some(Range::new(Position::new(0, 0), Position::new(0, 1))),
-            version_literal: literal.map(str::to_string),
             pin,
             source: DependencySource::Registry,
             is_plain_scalar: true,
             is_last_on_line: true,
-            closing_delimiters: crate::types::ClosingDelimiters::default(),
         }
     }
 
@@ -1107,11 +1114,8 @@ mod tests {
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
         let d = dep(
-            Some(PinStyle::Sha {
-                comment_tag: Some("v4".to_string()),
-            }),
+            Some(PinStyle::sha_for_test(&sha, Some("v4"))),
             "actions/checkout",
-            Some(format!("{sha} # v4").as_str()),
         );
 
         // Confirms the naive comment-only path would say "up to date" here, so this test
@@ -1150,11 +1154,8 @@ mod tests {
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
         let d = dep(
-            Some(PinStyle::Sha {
-                comment_tag: Some("v4".to_string()),
-            }),
+            Some(PinStyle::sha_for_test(&sha, Some("v4"))),
             "actions/checkout",
-            Some(format!("{sha} # v4").as_str()),
         );
 
         let oversized = VersionReq::new("1".repeat(MAX_REQUIREMENT_LEN + 1));
@@ -1201,11 +1202,8 @@ mod tests {
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
         let d = dep(
-            Some(PinStyle::Sha {
-                comment_tag: Some("v4".to_string()),
-            }),
+            Some(PinStyle::sha_for_test(&sha, Some("v4"))),
             "actions/checkout",
-            Some(format!("{sha} # v4").as_str()),
         );
 
         assert_eq!(
@@ -1216,10 +1214,8 @@ mod tests {
 
     /// #907 review C1: the parser's comment-tag rule only requires the `#` to be
     /// *preceded* by whitespace, so a two-space or tab gap before the `#` is a valid
-    /// literal (`ecosystem.rs`'s `generate_hover` SHA-pin branch already documents and
-    /// handles this). `sha_pin_status_from_tag_index` must extract the SHA the same
-    /// whitespace-token way, or it silently misses the `TagIndex` lookup and falls back
-    /// to trusting the (possibly stale) comment — reopening exactly the false-`UpToDate`
+    /// comment. The parsed pin must still reach the `TagIndex` ground truth, or it falls
+    /// back to trusting the (possibly stale) comment — reopening exactly the false-`UpToDate`
     /// gap S2 fixed.
     #[test]
     fn test_requirement_status_for_sha_pin_ground_truth_survives_non_single_space_gap() {
@@ -1235,23 +1231,20 @@ mod tests {
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
-        for literal in [format!("{sha}  # v4"), format!("{sha}\t# v4")] {
-            let d = dep(
-                Some(PinStyle::Sha {
-                    comment_tag: Some("v4".to_string()),
-                }),
-                "actions/checkout",
-                Some(literal.as_str()),
-            );
+        for gap in ["  ", "\t"] {
+            let content = format!("steps:\n  - uses: actions/checkout@{sha}{gap}# v4\n");
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let parsed = crate::parser::parse_workflow_yaml(&content, &uri).unwrap();
+            let d = &parsed.dependencies[0];
             assert_eq!(
                 fmt.requirement_status_for(
-                    &d,
+                    d,
                     &VersionReq::new("v4"),
                     &ConcreteVersion::new("v4.3.1")
                 ),
                 RequirementStatus::Outdated,
                 "must still reach the tag_index ground truth (v4.0.0, outdated) through a \
-                 non-single-space gap: {literal:?}"
+                 non-single-space gap: {gap:?}"
             );
         }
     }
@@ -1265,11 +1258,8 @@ mod tests {
         let sha = "a".repeat(40);
         let fmt = formatter();
         let d = dep(
-            Some(PinStyle::Sha {
-                comment_tag: Some("v4".to_string()),
-            }),
+            Some(PinStyle::sha_for_test(&sha, Some("v4"))),
             "actions/checkout",
-            Some(format!("{sha} # v4").as_str()),
         );
 
         assert_eq!(
@@ -1303,11 +1293,8 @@ mod tests {
 
     fn sha_pin_1720(sha: &str, comment_tag: Option<&str>) -> GithubActionsDependency {
         let mut d = dep(
-            Some(PinStyle::Sha {
-                comment_tag: comment_tag.map(str::to_string),
-            }),
+            Some(PinStyle::sha_for_test(sha, comment_tag)),
             "EmbarkStudios/cargo-deny-action",
-            Some(&comment_tag.map_or_else(|| sha.to_string(), |tag| format!("{sha} # {tag}"))),
         );
         d.version_req = Some(comment_tag.map_or_else(|| sha.into(), Into::into));
         d
@@ -1338,7 +1325,7 @@ mod tests {
             .as_any()
             .downcast_ref::<GithubActionsDependency>()
             .unwrap();
-        assert_eq!(d.pin, Some(PinStyle::Sha { comment_tag: None }));
+        assert_matches!(d.pin, Some(PinStyle::Sha { comment: None, .. }));
         assert_eq!(status_1720(&fmt, d), RequirementStatus::Outdated);
     }
 
@@ -1461,8 +1448,18 @@ mod tests {
 
     // --- #1722: comment-vs-SHA verdict ---
 
-    fn check_1722(fmt: &GithubActionsFormatter, d: &GithubActionsDependency) -> CommentCheck {
+    fn check_1722<'a>(
+        fmt: &GithubActionsFormatter,
+        d: &'a GithubActionsDependency,
+    ) -> CommentCheck<'a> {
         fmt.sha_comment_check(d).expect("full-SHA pin")
+    }
+
+    fn mismatch_1722(check: CommentCheck<'_>) -> Option<CommentMismatch> {
+        match check {
+            CommentCheck::Mismatch { kind, .. } => Some(kind),
+            CommentCheck::NoComment | CommentCheck::Unverifiable | CommentCheck::Confirmed => None,
+        }
     }
 
     fn fmt_with_coverage_1722(coverage: ListCoverage) -> GithubActionsFormatter {
@@ -1483,13 +1480,6 @@ mod tests {
         let fmt = fmt_with_release_index_1720(&[]);
         let d = sha_pin_1720(MISSING_SHA_1720, None);
         assert_eq!(check_1722(&fmt, &d), CommentCheck::NoComment);
-    }
-
-    #[test]
-    fn test_comment_check_non_sha_pin_is_none() {
-        let fmt = fmt_with_release_index_1720(&[]);
-        let d = dep(Some(PinStyle::Tag), "EmbarkStudios/cargo-deny-action", None);
-        assert_eq!(fmt.sha_comment_check(&d), None);
     }
 
     #[test]
@@ -1522,8 +1512,8 @@ mod tests {
         let fmt = fmt_with_release_index_1720(&[]);
         let d = sha_pin_1720(LATEST_SHA_1720, Some("v2.87.20"));
         assert_eq!(
-            check_1722(&fmt, &d),
-            CommentCheck::Mismatch(CommentMismatch::ShaIsOtherTag {
+            mismatch_1722(check_1722(&fmt, &d)),
+            Some(CommentMismatch::ShaIsOtherTag {
                 actual: ConcreteVersion::new("v2.87.22")
             })
         );
@@ -1563,8 +1553,8 @@ mod tests {
         );
         let prefix = sha_pin_1720(OLD_SHA_1720, Some("v4.3"));
         assert_eq!(
-            check_1722(&fmt, &prefix),
-            CommentCheck::Mismatch(CommentMismatch::ShaIsOtherTag {
+            mismatch_1722(check_1722(&fmt, &prefix)),
+            Some(CommentMismatch::ShaIsOtherTag {
                 actual: ConcreteVersion::new("v4.3.1-rc.1")
             })
         );
@@ -1591,8 +1581,8 @@ mod tests {
         for comment in ["v3", "v2.86"] {
             let d = sha_pin_1720(LATEST_SHA_1720, Some(comment));
             assert_eq!(
-                check_1722(&fmt, &d),
-                CommentCheck::Mismatch(CommentMismatch::ShaIsOtherTag {
+                mismatch_1722(check_1722(&fmt, &d)),
+                Some(CommentMismatch::ShaIsOtherTag {
                     actual: ConcreteVersion::new("v2.87.22")
                 }),
                 "{comment}"
@@ -1606,8 +1596,8 @@ mod tests {
         for comment in ["v2.87.22", "v2.87.20"] {
             let d = sha_pin_1720(MISSING_SHA_1720, Some(comment));
             assert_eq!(
-                check_1722(&fmt, &d),
-                CommentCheck::Mismatch(CommentMismatch::ShaNotInIndex),
+                mismatch_1722(check_1722(&fmt, &d)),
+                Some(CommentMismatch::ShaNotInIndex),
                 "{comment}"
             );
         }
@@ -1654,10 +1644,119 @@ mod tests {
 
         let wrong = sha_pin_1720(OLD_SHA_1720, Some("v2.87.22"));
         assert_eq!(
-            check_1722(&fmt, &wrong),
-            CommentCheck::Mismatch(CommentMismatch::ShaIsOtherTag {
+            mismatch_1722(check_1722(&fmt, &wrong)),
+            Some(CommentMismatch::ShaIsOtherTag {
                 actual: ConcreteVersion::new("v2.87.21")
             })
+        );
+    }
+
+    // --- #1740: pre-release pins against the newest release ---
+
+    #[test]
+    fn test_prerelease_tag_pin_is_outdated_against_newest_release() {
+        let fmt = formatter();
+        let latest = ConcreteVersion::new("v7.0.0");
+        for pinned in ["v2-beta", "v3.0.0-rc.1", "v2.1-rc", "v6.9.9"] {
+            assert_eq!(
+                fmt.requirement_status(&VersionReq::new(pinned), &latest),
+                RequirementStatus::Outdated,
+                "{pinned}"
+            );
+        }
+        for pinned in ["v7", "v7.0", "v7.0.0", "7.0.0", "v8-beta"] {
+            assert_eq!(
+                fmt.requirement_status(&VersionReq::new(pinned), &latest),
+                RequirementStatus::UpToDate,
+                "{pinned}"
+            );
+        }
+    }
+
+    /// impl-critic S1: a tag-shaped ref that is no version (a release-line branch like `v1.x`)
+    /// or a variant tag (`v3-node20`) stays "not outdated", so no update is planned for it.
+    #[test]
+    fn test_non_version_tag_shaped_refs_are_not_outdated() {
+        let fmt = formatter();
+        let latest = ConcreteVersion::new("v1.10.1");
+        for pinned in ["v1.x", "v1.*", "v1.2.x", "v1_2", "v3-node20", "v1.2-stable"] {
+            assert_eq!(
+                fmt.requirement_status(&VersionReq::new(pinned), &latest),
+                RequirementStatus::UpToDate,
+                "{pinned}"
+            );
+        }
+        assert_eq!(
+            fmt.requirement_status(&VersionReq::new("v2-beta"), &ConcreteVersion::new("v7.0.0")),
+            RequirementStatus::Outdated
+        );
+    }
+
+    /// A SHA whose indexed tag is an older pre-release of the latest line is outdated too.
+    #[test]
+    fn test_sha_pin_on_older_prerelease_tag_is_outdated() {
+        let fmt = fmt_with_release_index_1720(&[("v2.87.21-rc.1", MISSING_SHA_1720)]);
+        let d = sha_pin_1720(MISSING_SHA_1720, None);
+        assert_eq!(status_1720(&fmt, &d), RequirementStatus::Outdated);
+    }
+
+    // --- #1735: a trailing comment must not stand in for an untagged commit ---
+
+    fn in_use_version_1735(
+        fmt: &GithubActionsFormatter,
+        d: &GithubActionsDependency,
+    ) -> Option<ConcreteVersion> {
+        deps_core::lsp_helpers::resolve_in_use_version(
+            d,
+            "embarkstudios/cargo-deny-action",
+            &std::collections::HashMap::new(),
+            None,
+            fmt,
+            EcosystemId::GithubActions,
+        )
+    }
+
+    #[test]
+    fn test_in_use_version_commit_absent_from_complete_index_ignores_comment() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        let d = sha_pin_1720(MISSING_SHA_1720, Some("v2.87.22"));
+        assert_eq!(in_use_version_1735(&fmt, &d), None);
+    }
+
+    #[test]
+    fn test_in_use_version_commit_absent_from_truncated_index_keeps_comment() {
+        let fmt = fmt_with_coverage_1722(ListCoverage::Truncated);
+        let d = sha_pin_1720(MISSING_SHA_1720, Some("v2.87.22"));
+        assert_eq!(
+            in_use_version_1735(&fmt, &d),
+            Some(ConcreteVersion::new("v2.87.22"))
+        );
+        assert_eq!(
+            in_use_version_1735(&formatter(), &d),
+            Some(ConcreteVersion::new("v2.87.22")),
+            "a cold cache still lets the comment stand in provisionally"
+        );
+    }
+
+    #[test]
+    fn test_in_use_version_commit_resolving_to_alias_ignores_comment() {
+        let fmt = formatter();
+        let sha = CommitSha::parse(OLD_SHA_1720).unwrap();
+        fmt.tag_index.insert(
+            PackageName::new("EmbarkStudios/cargo-deny-action"),
+            Arc::new(TagIndex::from_tags([("v1", &sha), ("v1.0.0.1", &sha)])),
+        );
+        let d = sha_pin_1720(OLD_SHA_1720, Some("v4.2.0"));
+        assert_eq!(in_use_version_1735(&fmt, &d), None);
+    }
+
+    #[test]
+    fn test_in_use_version_indexed_commit_uses_registry_tag_not_comment() {
+        let fmt = fmt_with_release_index_1720(&[]);
+        let d = sha_pin_1720(OLD_SHA_1720, Some("v2.87.22"));
+        assert_eq!(
+            in_use_version_1735(&fmt, &d),
+            Some(ConcreteVersion::new("v2.87.21"))
         );
     }
 
@@ -1680,22 +1779,18 @@ mod tests {
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
         let d = dep(
-            Some(PinStyle::Sha {
-                comment_tag: Some("v1".to_string()),
-            }),
+            Some(PinStyle::sha_for_test(&sha, Some("v1"))),
             "actions/checkout",
-            Some(format!("{sha} # v1").as_str()),
         );
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            Some(ResolvedPin::most_specific(ConcreteVersion::new("v1")))
+            PinResolution::Resolved(ResolvedPin::most_specific(ConcreteVersion::new("v1")))
         );
     }
 
     /// A literal tool-name comment (`# cargo-deny`) isn't tag-shaped at all, so it never
-    /// even becomes a `comment_tag` (`crate::types::sha_pin_raw_sha` falls back to the raw
-    /// SHA) — must still resolve via the `TagIndex`, matching #551's identical literal-tag
+    /// even becomes a `comment` — must still resolve via the `TagIndex`, matching #551's identical literal-tag
     /// convention.
     #[test]
     fn test_resolved_pin_version_sha_pin_literal_comment_resolves_via_tag_index() {
@@ -1712,15 +1807,14 @@ mod tests {
             .insert(PackageName::new("taiki-e/install-action"), Arc::new(index));
 
         let mut d = dep(
-            Some(PinStyle::Sha { comment_tag: None }),
+            Some(PinStyle::sha_for_test(&sha, None)),
             "taiki-e/install-action",
-            Some(format!("{sha} # cargo-deny").as_str()),
         );
         d.version_req = Some(sha.into());
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            Some(ResolvedPin::most_specific(ConcreteVersion::new(
+            PinResolution::Resolved(ResolvedPin::most_specific(ConcreteVersion::new(
                 "cargo-deny"
             )))
         );
@@ -1742,16 +1836,12 @@ mod tests {
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
-        let mut d = dep(
-            Some(PinStyle::Sha { comment_tag: None }),
-            "actions/checkout",
-            None,
-        );
+        let mut d = dep(Some(PinStyle::sha_for_test(&sha, None)), "actions/checkout");
         d.version_req = Some(sha.into());
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            Some(ResolvedPin::most_specific(ConcreteVersion::new("v4.2.0")))
+            PinResolution::Resolved(ResolvedPin::most_specific(ConcreteVersion::new("v4.2.0")))
         );
     }
 
@@ -1764,9 +1854,19 @@ mod tests {
         let index = TagIndex::from_tags(commits.iter().map(|(name, sha)| (*name, sha)));
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
-        let mut d = dep(Some(PinStyle::Tag), "actions/checkout", None);
+        let mut d = dep(Some(PinStyle::Tag), "actions/checkout");
         d.version_req = Some(tag.into());
-        fmt.resolved_pin_version(&d)
+        resolved_pin_of(&fmt, &d)
+    }
+
+    fn resolved_pin_of(
+        fmt: &GithubActionsFormatter,
+        d: &GithubActionsDependency,
+    ) -> Option<ResolvedPin> {
+        match fmt.resolved_pin_version(d) {
+            PinResolution::Resolved(pin) => Some(pin),
+            PinResolution::Unresolved | PinResolution::Untagged => None,
+        }
     }
 
     /// #1684: a floating tag pin resolves through the commit its tag points at.
@@ -1832,7 +1932,7 @@ mod tests {
 
     /// #1684 (critic N3): missing tags and a cold index stay on the text path.
     #[test]
-    fn test_resolved_pin_version_unindexed_tag_returns_none() {
+    fn test_resolved_pin_version_unindexed_tag_is_unresolved() {
         let sha = "a".repeat(40);
         let warm = [("v4", sha.as_str()), ("v4.1.2", sha.as_str())];
         assert_eq!(floating_tag_pin_for("v5", &warm), None);
@@ -1908,7 +2008,7 @@ mod tests {
         }
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
-        let mut d = dep(Some(PinStyle::Tag), "actions/checkout", None);
+        let mut d = dep(Some(PinStyle::Tag), "actions/checkout");
         assert_eq!(
             fmt.pinned_commit(&d).map(|c| c.as_str().to_string()),
             Some(sha)
@@ -1925,13 +2025,9 @@ mod tests {
             PackageName::new("actions/checkout"),
             Arc::new(TagIndex::from_tags(tags.iter().map(|t| (*t, &commit)))),
         );
-        let mut d = dep(
-            Some(PinStyle::Sha { comment_tag: None }),
-            "actions/checkout",
-            None,
-        );
+        let mut d = dep(Some(PinStyle::sha_for_test(&sha, None)), "actions/checkout");
         d.version_req = Some(sha.into());
-        fmt.resolved_pin_version(&d)
+        resolved_pin_of(&fmt, &d)
     }
 
     /// #1668: the most specific tag on the commit wins and is classified by whether another
@@ -1958,35 +2054,60 @@ mod tests {
         );
     }
 
-    /// Cold cache (no `TagIndex` entry for this SHA yet) must stay the honest `None` — never
-    /// fabricate a version.
+    /// Cold cache (no `TagIndex` entry for this SHA yet) must stay the honest `Unresolved`,
+    /// never a fabricated version.
     #[test]
-    fn test_resolved_pin_version_sha_pin_tag_index_miss_returns_none() {
+    fn test_resolved_pin_version_sha_pin_tag_index_miss_is_unresolved() {
         let sha = "d".repeat(40);
         let fmt = formatter();
         let d = dep(
-            Some(PinStyle::Sha {
-                comment_tag: Some("v1".to_string()),
-            }),
+            Some(PinStyle::sha_for_test(&sha, Some("v1"))),
             "actions/checkout",
-            Some(format!("{sha} # v1").as_str()),
         );
 
-        assert_eq!(fmt.resolved_pin_version(&d), None);
+        assert_eq!(fmt.resolved_pin_version(&d), PinResolution::Unresolved);
     }
 
-    /// A `Tag`/`Branch` pin has no SHA to resolve at all — must stay `None`, leaving
+    /// #1735: a SHA absent from a populated, complete index is proven untagged, while a
+    /// truncated index proves nothing.
+    #[test]
+    fn test_resolved_pin_version_sha_pin_absent_from_index_is_untagged_only_when_complete() {
+        let tagged = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let d = dep(
+            Some(PinStyle::sha_for_test(&"d".repeat(40), Some("v1.0.0"))),
+            "actions/checkout",
+        );
+        for (coverage, expected) in [
+            (
+                deps_core::pagination::ListCoverage::Complete,
+                PinResolution::Untagged,
+            ),
+            (
+                deps_core::pagination::ListCoverage::Truncated,
+                PinResolution::Unresolved,
+            ),
+        ] {
+            let fmt = formatter();
+            fmt.tag_index.insert(
+                PackageName::new("actions/checkout"),
+                Arc::new(TagIndex::from_tags([("v1.0.0", &tagged)]).with_coverage(coverage)),
+            );
+            assert_eq!(fmt.resolved_pin_version(&d), expected, "{coverage:?}");
+        }
+    }
+
+    /// A `Tag`/`Branch` pin has no SHA to resolve at all — must stay `Unresolved`, leaving
     /// `concrete_pin_version`'s own text-shape ladder as the sole source for those pins.
     #[test]
-    fn test_resolved_pin_version_non_sha_pin_returns_none() {
+    fn test_resolved_pin_version_non_sha_pin_is_unresolved() {
         let fmt = formatter();
         assert_eq!(
-            fmt.resolved_pin_version(&dep(Some(PinStyle::Tag), "actions/checkout", None)),
-            None
+            fmt.resolved_pin_version(&dep(Some(PinStyle::Tag), "actions/checkout")),
+            PinResolution::Unresolved
         );
         assert_eq!(
-            fmt.resolved_pin_version(&dep(Some(PinStyle::Branch), "dev/tool", None)),
-            None
+            fmt.resolved_pin_version(&dep(Some(PinStyle::Branch), "dev/tool")),
+            PinResolution::Unresolved
         );
     }
 
@@ -2009,11 +2130,8 @@ mod tests {
 
         let old_sha = "c".repeat(40);
         let d = dep(
-            Some(PinStyle::Sha {
-                comment_tag: Some("v3".to_string()),
-            }),
+            Some(PinStyle::sha_for_test(&old_sha, Some("v3"))),
             "actions/checkout",
-            Some(format!("{old_sha} # v3").as_str()),
         );
         let written = fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v4"), "v3");
         assert_eq!(written, format!("{sha} # v4"));
@@ -2125,7 +2243,7 @@ mod tests {
     #[test]
     fn test_format_version_replacing_for_tag_preserves_v_style() {
         let fmt = formatter();
-        let d = dep(Some(PinStyle::Tag), "actions/checkout", None);
+        let d = dep(Some(PinStyle::Tag), "actions/checkout");
         assert_eq!(
             fmt.format_version_replacing_for(&d, &ConcreteVersion::new("5.0.0"), "v4"),
             "v5.0.0"
@@ -2148,11 +2266,8 @@ mod tests {
         fmt.tag_index.insert(name, Arc::new(index));
 
         let d = dep(
-            Some(PinStyle::Sha {
-                comment_tag: Some("v4.2.0".to_string()),
-            }),
+            Some(PinStyle::sha_for_test(&"1".repeat(40), Some("v4.2.0"))),
             "actions/checkout",
-            Some("oldsha # v4.2.0"),
         );
         let new_text =
             fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v5.0.0"), "v4.2.0");
@@ -2183,11 +2298,8 @@ mod tests {
 
         let old_sha = "a".repeat(40);
         let d = dep(
-            Some(PinStyle::Sha {
-                comment_tag: Some("v4.2.0".to_string()),
-            }),
+            Some(PinStyle::sha_for_test(&old_sha, Some("v4.2.0"))),
             "actions/checkout",
-            Some(&format!("{old_sha} # v4.2.0")),
         );
         assert!(
             fmt.requirement_is_unresolved(&VersionReq::new(old_sha)),
@@ -2240,21 +2352,17 @@ mod tests {
         );
         fmt.tag_index.insert(name, Arc::new(index));
 
-        let mut d = dep(
-            Some(PinStyle::Sha {
-                comment_tag: Some("v4.2.0".to_string()),
-            }),
-            "actions/checkout",
-            Some("oldsha\" # v4.2.0"),
+        let content = format!(
+            "steps:\n  - uses: \"actions/checkout@{}\" # v4.2.0\n",
+            "a".repeat(40)
         );
-        d.is_plain_scalar = false;
-        d.closing_delimiters = crate::types::ClosingDelimiters::parse(
-            "\" # v4.2.0",
-            yaml_rust2::scanner::TScalarStyle::DoubleQuoted,
-        );
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let parsed = crate::parser::parse_workflow_yaml(&content, &uri).unwrap();
+        let d = &parsed.dependencies[0];
+        assert!(!d.is_plain_scalar);
 
         let new_text =
-            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v5.0.0"), "v4.2.0");
+            fmt.format_version_replacing_for(d, &ConcreteVersion::new("v5.0.0"), "v4.2.0");
         assert_eq!(new_text, format!("{}\" # v5.0.0", "deadbeef".repeat(5)));
     }
 
@@ -2276,11 +2384,7 @@ mod tests {
         fmt.tag_index.insert(name, Arc::new(index));
 
         let sha = "11bd71901bbe5b1630ceea73d27597364c9af683";
-        let mut d = dep(
-            Some(PinStyle::Sha { comment_tag: None }),
-            "actions/checkout",
-            None,
-        );
+        let mut d = dep(Some(PinStyle::sha_for_test(sha, None)), "actions/checkout");
         d.is_last_on_line = false;
 
         // #1724: only the 40 hex is rewritten; `version_range` never covers the flow siblings.
@@ -2305,14 +2409,10 @@ mod tests {
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
-        let mut d = dep(
-            Some(PinStyle::Sha { comment_tag: None }),
-            "actions/checkout",
-            None,
-        );
+        let sha = "11bd71901bbe5b1630ceea73d27597364c9af683";
+        let mut d = dep(Some(PinStyle::sha_for_test(sha, None)), "actions/checkout");
         d.is_plain_scalar = false;
 
-        let sha = "11bd71901bbe5b1630ceea73d27597364c9af683";
         assert_eq!(
             fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v5.0.0"), sha),
             "deadbeef".repeat(5)
@@ -2340,11 +2440,11 @@ mod tests {
         fmt.tag_index.insert(name, Arc::new(index));
 
         let d = dep(
-            Some(PinStyle::Sha {
-                comment_tag: Some("v4.2.0".to_string()),
-            }),
+            Some(PinStyle::sha_for_test(
+                "11bd71901bbe5b1630ceea73d27597364c9af683",
+                Some("v4.2.0"),
+            )),
             "actions/checkout",
-            Some("11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.0"),
         );
         assert!(d.is_last_on_line);
 
@@ -2358,23 +2458,21 @@ mod tests {
         // B1: on a TagIndex miss, the guard must compare against the raw literal span, never
         // `current` (the synthesized tag requirement), or a SHA pin silently downgrades to tag.
         let fmt = formatter();
+        let sha = "a".repeat(40);
         let d = dep(
-            Some(PinStyle::Sha {
-                comment_tag: Some("v4.2.0".to_string()),
-            }),
+            Some(PinStyle::sha_for_test(&sha, Some("v4.2.0"))),
             "actions/checkout",
-            Some("oldsha # v4.2.0"),
         );
         let new_text =
             fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v5.0.0"), "v4.2.0");
-        assert_eq!(new_text, "oldsha # v4.2.0");
+        assert_eq!(new_text, format!("{sha} # v4.2.0"));
         assert_ne!(new_text, "v4.2.0");
     }
 
     #[test]
     fn test_format_version_replacing_for_branch_returns_current_unchanged() {
         let fmt = formatter();
-        let d = dep(Some(PinStyle::Branch), "dev/tool", None);
+        let d = dep(Some(PinStyle::Branch), "dev/tool");
         assert_eq!(
             fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v1.0.0"), "main"),
             "main"
@@ -2452,11 +2550,8 @@ mod tests {
         let via_sha_pin_action = fmt.sha_pin_replacement_for(&name, "v4").unwrap();
 
         let sha_dep = dep(
-            Some(PinStyle::Sha {
-                comment_tag: Some("v3".to_string()),
-            }),
+            Some(PinStyle::sha_for_test(&"c".repeat(40), Some("v3"))),
             "actions/checkout",
-            Some("oldsha # v3"),
         );
         let via_outdated_sha_update =
             fmt.format_version_replacing_for(&sha_dep, &ConcreteVersion::new("v4"), "v3");

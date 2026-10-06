@@ -8,11 +8,13 @@
 //! module (which globs `use super::*;`) keeps referencing them unqualified, unchanged from
 //! before the move.
 
-use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
+use deps_core::lsp_helpers::{PackageRendering, is_partial_semver_shaped};
+use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit, WorkspaceEdit};
 
 use super::{
-    GithubActionsDependency, GithubActionsFormatter, MUTABLE_REF_PIN_DIAGNOSTIC_CODE,
-    ParseResultTrait, PinStyle, Url,
+    CommentCheck, CommentMismatch, GithubActionsDependency, GithubActionsFormatter,
+    MUTABLE_REF_PIN_DIAGNOSTIC_CODE, ParseResultTrait, PinStyle,
+    SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE, Url, sanitize_for_message,
 };
 
 /// Leading version-constraint operators stripped from a completion prefix before matching
@@ -24,16 +26,9 @@ pub(super) const VERSION_OPERATOR_CHARS: &[char] = &[];
 /// see `GithubActionsEcosystem::generate_completions`'s doc for why this check exists
 /// (issue #1182) and why it cannot be a check on the extracted completion prefix.
 ///
-/// Finds the dependency whose (deliberately widened) `version_range` contains
-/// `position` and, only when it is a [`PinStyle::Sha`] with a `comment_tag` (the one
-/// form where `version_range` extends past the ref's own text), compares `position`
-/// against the SHA's own end column — [`crate::types::sha_pin_raw_sha`]'s length, added
-/// to the range's start — rather than the range's own (widened) end. A position exactly
-/// at that column (cursor immediately after the last SHA character, still typing it) is
-/// deliberately *not* past it, so a commentless SHA pin's ordinary end-of-ref position is
-/// unaffected; a [`PinStyle::Sha`] with no `comment_tag` has no widened tail at all
-/// (`sha_pin_raw_sha` still resolves it, but its `version_range` already ends exactly at
-/// the SHA's own end, so this predicate can never fire for it).
+/// Only a [`PinStyle::Sha`] with a `comment` has a `version_range` extending past the ref, so
+/// only there is `position` compared against the SHA's own end column (range start plus SHA
+/// length). A position exactly at that column (still typing the SHA) is not past it.
 pub(super) fn position_past_sha_pin_own_ref(
     parse_result: &dyn ParseResultTrait,
     position: Position,
@@ -49,18 +44,14 @@ pub(super) fn position_past_sha_pin_own_ref(
         let Some(gha_dep) = dep.as_any().downcast_ref::<GithubActionsDependency>() else {
             return false;
         };
-        if !matches!(
-            gha_dep.pin,
-            Some(PinStyle::Sha {
-                comment_tag: Some(_)
-            })
-        ) {
-            return false;
-        }
-        let Some(sha) = crate::types::sha_pin_raw_sha(gha_dep) else {
+        let Some(PinStyle::Sha {
+            sha,
+            comment: Some(_),
+        }) = &gha_dep.pin
+        else {
             return false;
         };
-        let Ok(sha_len) = u32::try_from(sha.len()) else {
+        let Ok(sha_len) = u32::try_from(sha.as_str().len()) else {
             return false;
         };
         position.character > range.start.character.saturating_add(sha_len)
@@ -102,6 +93,64 @@ pub(super) fn build_sha_pin_action(
         formatter,
         MUTABLE_REF_PIN_DIAGNOSTIC_CODE,
     )
+}
+
+/// Builds the "Correct version comment" quickfix (#1734) for the SHA pin at `position` whose
+/// trailing `# tag` comment names a different tag than the one the pinned commit carries.
+///
+/// The edit replaces only the comment's tag token with the registry-confirmed tag, so the
+/// written SHA casing, closing delimiters, and spacing are untouched. `None` when there is no
+/// such mismatch (including [`CommentMismatch::ShaNotInIndex`], where no tag can be offered).
+///
+/// The tag text comes from the registry's tag list, so it is offered only when the parser would
+/// read it back as a comment tag and sanitization leaves it unchanged (no invisible or bidi
+/// characters, within the length cap). A comment token with trailing punctuation (`v4-beta,`)
+/// is left alone: the corrected token would no longer parse as a comment tag, hiding the
+/// warning without confirming the pin.
+pub(super) fn build_sha_comment_fix_action(
+    parse_result: &dyn ParseResultTrait,
+    position: Position,
+    uri: &Url,
+    formatter: &GithubActionsFormatter,
+) -> Option<CodeAction> {
+    let dep = parse_result
+        .dependencies()
+        .into_iter()
+        .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
+    let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+    let Some(CommentCheck::Mismatch {
+        comment,
+        kind: CommentMismatch::ShaIsOtherTag { actual },
+    }) = formatter.sha_comment_check(gha_dep)
+    else {
+        return None;
+    };
+    let actual = actual.as_str();
+    if !is_partial_semver_shaped(actual)
+        || sanitize_for_message(actual) != actual
+        || comment.tag().ends_with(|c: char| c.is_ascii_punctuation())
+    {
+        return None;
+    }
+    let version_range = gha_dep.version_range?;
+    let changes =
+        deps_core::lsp_helpers::single_file_edit(uri, comment.tag_range(), actual.to_string());
+    Some(CodeAction {
+        title: format!(
+            "Correct version comment to `{}`",
+            sanitize_for_message(actual)
+        ),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        data: Some(serde_json::json!({
+            "diagnostic_codes": [SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE],
+            "diagnostic_range": tower_lsp_server::ls_types::Range::from(version_range),
+        })),
+        ..Default::default()
+    })
 }
 
 /// Builds one [`TextEdit`] per `PinStyle::Tag` step in `parse_result` resolvable to a

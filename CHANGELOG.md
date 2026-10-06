@@ -7,14 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+- **deps-core**: `CommitSha::parse` stores lowercase and drops `Borrow<str>`; `TagIndex::resolved_pin`/`tag_for_sha`/`splice_resolved_line` and `ShaPinLookup::resolve` (now infallible) take `&CommitSha`; `resolved_pin_version` returns `PinResolution` (#1751)
+- **deps-github-actions**: `PinStyle::Sha` carries `sha: CommitSha` and `comment: Option<ShaComment>`; `GithubActionsDependency` loses `version_literal` and `closing_delimiters`; `sha_pin_raw_sha` removed (#1751)
+
 ### Added
+- **deps-core**: `PinResolution`, `TagIndex::pin_resolution`, `PartialTagPolicy`, `tag_pin_is_up_to_date` and `tag_has_precedence` shared by the git-tag ecosystems (#1751)
+- **deps-github-actions**: `Correct version comment to <tag>` quickfix for a SHA pin whose trailing comment names another tag (#1751)
 - **deps-cli**: `--fail-on other` token for uncategorized findings (offline/lock-file/registry notices, `sha-comment-mismatch`) (#1747)
 
 ### Changed
+- **deps-github-actions, deps-gitlab-ci**: a tag pin ahead of the latest release is reported up to date instead of offering a downgrade (#1751)
 - **deps-cli**: `update --security-only` Unfixable rows (`Yanked`, `UnsupportedRequirementShape`, `OversizedRequirement`) now report their `advisory_ids` (#1747)
 - **deps-composer**: OR-branch bounds are computed once when `ComposerMatcher` is built, as in `deps-npm`; behavior unchanged (#1747)
 
 ### Fixed
+- **deps-github-actions**: pre-release tag pins (`@v2-beta`, `@v3.0.0-rc.1`) are reported outdated against a newer release (#1751)
+- **deps-core**: OSV, hover and diagnostics no longer take the version from a SHA pin's comment once the tag index shows the commit has no matching release tag (#1751)
 - **deps**: bump yanked `yoke-derive` to 0.8.4 so cargo-deny passes (#1746)
 - **workspace**: allow `clippy::assert_is_empty` (new in Rust 1.99) to keep CI clippy green (#1746)
 - **deps-lsp**: lock-file-change OSV rescan is now also suppressed in offline mode, matching the phase A gate (#1747)

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::lsp_helpers::{BoundedVersionReq, EcosystemFormatter, ResolvedPin};
+use crate::lsp_helpers::{BoundedVersionReq, EcosystemFormatter, PinResolution, ResolvedPin};
 use crate::{ConcreteVersion, Dependency, EcosystemId, PackageName};
 
 /// How a *bare* (no explicit pin marker) version requirement should be treated when
@@ -715,22 +715,24 @@ pub fn resolve_in_use_versions(
     // version above (impl-critic M2: a stronger existing resolution source must not be
     // silently superseded) — and still must pass a shape gate, since `TagIndex` can resolve a
     // SHA to a moving alias (`v1`, `v2` next to `v2.9`) that is not a queryable version (#503).
-    if let Some(pin) = formatter.resolved_pin_version(dep)
-        && let Some(primary) = queryable_pin_version(&pin, ecosystem)
-    {
-        let siblings = pin
-            .siblings()
-            .iter()
-            .filter_map(|tag| {
-                queryable_pin_version(&ResolvedPin::most_specific(tag.clone()), ecosystem)
-            })
-            .collect();
-        return Some(InUseVersions { primary, siblings });
+    match formatter.resolved_pin_version(dep) {
+        PinResolution::Resolved(pin) => {
+            let primary = queryable_pin_version(&pin, ecosystem)?;
+            let siblings = pin
+                .siblings()
+                .iter()
+                .filter_map(|tag| {
+                    queryable_pin_version(&ResolvedPin::most_specific(tag.clone()), ecosystem)
+                })
+                .collect();
+            Some(InUseVersions { primary, siblings })
+        }
+        PinResolution::Untagged => None,
+        PinResolution::Unresolved => dep
+            .version_requirement()
+            .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
+            .map(|v| InUseVersions::without_siblings(ConcreteVersion::from(v))),
     }
-
-    dep.version_requirement()
-        .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
-        .map(|v| InUseVersions::without_siblings(ConcreteVersion::from(v)))
 }
 
 /// The version a [`ResolvedPin`] may be queried with: a full `major.minor.patch` tag, or a
@@ -756,7 +758,7 @@ fn is_major_minor_shape(s: &str) -> bool {
 /// non-version name).
 ///
 /// "Resolved" means [`RequirementResolution::resolved_pin_version`](crate::lsp_helpers::RequirementResolution::resolved_pin_version)
-/// returned `Some`.
+/// returned [`PinResolution::Resolved`].
 ///
 /// Lets a caller that got `None` from [`resolve_in_use_version`] tell "a tag was resolved but
 /// is not a full version" apart from "nothing was resolved at all" (#1668).
@@ -766,9 +768,10 @@ pub fn has_unqueryable_resolved_pin(
     formatter: &dyn EcosystemFormatter,
     ecosystem: EcosystemId,
 ) -> bool {
-    formatter
-        .resolved_pin_version(dep)
-        .is_some_and(|pin| queryable_pin_version(&pin, ecosystem).is_none())
+    matches!(
+        formatter.resolved_pin_version(dep),
+        PinResolution::Resolved(pin) if queryable_pin_version(&pin, ecosystem).is_none()
+    )
 }
 
 #[cfg(test)]
@@ -810,21 +813,29 @@ mod tests {
     /// A formatter whose `resolved_pin_version` always returns a fixed value regardless of
     /// `dep` — exercises `resolve_in_use_version`'s own full-semver-shape gate on the hook's
     /// output (#1556 critic S1), independent of any ecosystem's own `TagIndex` plumbing.
-    struct FixedResolvedPinFormatter(ResolvedPin);
+    struct FixedResolvedPinFormatter(PinResolution);
 
     impl FixedResolvedPinFormatter {
         fn most_specific(tag: &str) -> Self {
-            Self(ResolvedPin::most_specific(ConcreteVersion::new(tag)))
+            Self(PinResolution::Resolved(ResolvedPin::most_specific(
+                ConcreteVersion::new(tag),
+            )))
         }
 
         fn alias(tag: &str) -> Self {
-            Self(ResolvedPin::alias(ConcreteVersion::new(tag)))
+            Self(PinResolution::Resolved(ResolvedPin::alias(
+                ConcreteVersion::new(tag),
+            )))
+        }
+
+        fn with_resolution(resolution: PinResolution) -> Self {
+            Self(resolution)
         }
 
         fn from_index(tags: &[&str]) -> Self {
             let sha = crate::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap();
             let index = crate::lsp_helpers::TagIndex::from_tags(tags.iter().map(|t| (*t, &sha)));
-            Self(index.resolved_pin(sha.as_str()).unwrap())
+            Self(index.pin_resolution(&sha))
         }
     }
 
@@ -838,8 +849,8 @@ mod tests {
         }
     }
     impl crate::lsp_helpers::RequirementResolution for FixedResolvedPinFormatter {
-        fn resolved_pin_version(&self, _dep: &dyn Dependency) -> Option<ResolvedPin> {
-            Some(self.0.clone())
+        fn resolved_pin_version(&self, _dep: &dyn Dependency) -> PinResolution {
+            self.0.clone()
         }
     }
     impl crate::lsp_helpers::DiagnosticMessages for FixedResolvedPinFormatter {}
@@ -986,6 +997,51 @@ mod tests {
             EcosystemId::GithubActions,
         );
         assert_eq!(result, Some(ConcreteVersion::from("v1.3.0")));
+    }
+
+    /// #1735: the commit's trailing comment (`version_req`) must not stand in for the version
+    /// when the index proves the commit is untagged, nor when the resolved tag is an
+    /// unqueryable alias; it still does when the index has no evidence either way.
+    #[test]
+    fn resolve_in_use_version_comment_text_only_stands_in_when_unresolved() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let dep = MockDep {
+            name: PackageName::new("actions/checkout"),
+            version_req: VersionReq::new("v4.2.0"),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+        let resolve = |formatter: &FixedResolvedPinFormatter| {
+            resolve_in_use_version(
+                &dep,
+                "actions/checkout",
+                &HashMap::new(),
+                None,
+                formatter,
+                EcosystemId::GithubActions,
+            )
+        };
+
+        assert_eq!(
+            resolve(&FixedResolvedPinFormatter::with_resolution(
+                PinResolution::Untagged
+            )),
+            None
+        );
+        assert_eq!(resolve(&FixedResolvedPinFormatter::alias("v1")), None);
+        assert!(!has_unqueryable_resolved_pin(
+            &dep,
+            &FixedResolvedPinFormatter::with_resolution(PinResolution::Untagged),
+            EcosystemId::GithubActions
+        ));
+        assert_eq!(
+            resolve(&FixedResolvedPinFormatter::with_resolution(
+                PinResolution::Unresolved
+            )),
+            Some(ConcreteVersion::from("v4.2.0"))
+        );
     }
 
     #[test]

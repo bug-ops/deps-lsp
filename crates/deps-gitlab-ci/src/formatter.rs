@@ -2,13 +2,13 @@
 
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementResolution, RequirementStatus, ResolvedPin, ShaPinLookup,
-    SourcePolicy, TagIndex, match_v_prefix_style, requirement_contains_template_placeholder,
-    warn_rejected_value,
+    BoundedVersionReq, CommitSha, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, PartialTagPolicy, PinResolution, RequirementResolution, RequirementStatus,
+    ShaPinLookup, SourcePolicy, TagIndex, match_v_prefix_style,
+    requirement_contains_template_placeholder, tag_pin_is_up_to_date, warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
-use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
+use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName};
 use std::sync::Arc;
 
 use crate::host::is_valid_gitlab_coordinate;
@@ -49,7 +49,7 @@ impl GitlabCiFormatter {
         &self,
         endpoint: EndpointKind,
         name: &PackageName,
-        sha: &str,
+        sha: &CommitSha,
     ) -> Option<String> {
         self.tag_index
             .get(&(endpoint, name.clone()))
@@ -127,15 +127,12 @@ impl GitlabCiFormatter {
         requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> Option<RequirementStatus> {
+        let sha = CommitSha::parse(requirement.as_str())?;
         let index = self
             .tag_index
             .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()));
-        ShaPinLookup::resolve(
-            index.as_deref().map(AsRef::as_ref),
-            requirement.as_str(),
-            latest,
-        )?
-        .into_status(|tag| self.is_bounded_requirement_up_to_date(tag, latest))
+        ShaPinLookup::resolve(index.as_deref().map(AsRef::as_ref), &sha, latest)
+            .into_status(|tag| self.is_bounded_requirement_up_to_date(tag, latest))
     }
 }
 
@@ -333,15 +330,25 @@ impl RequirementResolution for GitlabCiFormatter {
     /// Keyed by `(endpoint, name)`, not `name` alone (validation finding S2) — same
     /// disambiguation `Self::resolved_tag_for_sha` applies, since a `project:` and
     /// `component:` include can textually collide on name across endpoints.
-    fn resolved_pin_version(&self, dep: &dyn Dependency) -> Option<ResolvedPin> {
-        let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
+    fn resolved_pin_version(&self, dep: &dyn Dependency) -> PinResolution {
+        let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
+            return PinResolution::Unresolved;
+        };
         if gl_dep.pin != Some(PinStyle::Sha) {
-            return None;
+            return PinResolution::Unresolved;
         }
-        let sha = gl_dep.version_req.as_ref().map(VersionReq::as_str)?;
+        let Some(sha) = gl_dep
+            .version_req
+            .as_ref()
+            .and_then(|req| CommitSha::parse(req.as_str()))
+        else {
+            return PinResolution::Unresolved;
+        };
         self.tag_index
-            .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()))?
-            .resolved_pin(sha)
+            .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()))
+            .map_or(PinResolution::Unresolved, |index| {
+                index.pin_resolution(&sha)
+            })
     }
 
     /// `tag_index` is populated as a side effect of [`GitlabCiRegistry`]'s own tags fetch,
@@ -418,9 +425,7 @@ fn status_for_pin(pin: &PinStyle, requirement: &str, latest: &str) -> Requiremen
         PinStyle::Sha | PinStyle::Branch => RequirementStatus::Unresolved,
         PinStyle::Latest => RequirementStatus::UpToDate,
         PinStyle::Tag => {
-            if deps_core::github::normalize_tag(requirement)
-                == deps_core::github::normalize_tag(latest)
-            {
+            if tag_pin_is_up_to_date(requirement, latest, PartialTagPolicy::Exact) {
                 RequirementStatus::UpToDate
             } else {
                 RequirementStatus::Outdated
@@ -469,7 +474,9 @@ impl OsvNaming for GitlabCiFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
+    use deps_core::lsp_helpers::ResolvedPin;
     use deps_core::position::{Position, Range};
 
     fn formatter() -> GitlabCiFormatter {
@@ -847,6 +854,28 @@ mod tests {
         );
     }
 
+    /// #1740: a tag pin is compared by semver precedence, never by the "non-numeric means
+    /// current" shortcut; a bare partial tag stays an exact literal for GitLab refs.
+    #[test]
+    fn test_status_for_tag_pin_compares_prerelease_by_precedence() {
+        let cases = [
+            ("v2-beta", "v7.0.0", RequirementStatus::Outdated),
+            ("v3.0.0-rc.1", "v7.0.0", RequirementStatus::Outdated),
+            ("v1", "v1.3.0", RequirementStatus::Outdated),
+            ("v1.3.0", "v1.3.0", RequirementStatus::UpToDate),
+            ("1.3.0", "v1.3.0", RequirementStatus::UpToDate),
+            ("v5.0.0-rc.1", "v4.9.0", RequirementStatus::UpToDate),
+            ("v8-beta", "v7.0.0", RequirementStatus::UpToDate),
+        ];
+        for (requirement, latest, expected) in cases {
+            assert_eq!(
+                status_for_pin(&PinStyle::Tag, requirement, latest),
+                expected,
+                "{requirement} vs {latest}"
+            );
+        }
+    }
+
     // --- #1556: resolved_pin_version ---
 
     /// A `PinStyle::Sha` pin's exact version is knowable from the shared `TagIndex` even
@@ -882,7 +911,7 @@ mod tests {
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            Some(ResolvedPin::most_specific(ConcreteVersion::new("v1.2.3")))
+            PinResolution::Resolved(ResolvedPin::most_specific(ConcreteVersion::new("v1.2.3")))
         );
     }
 
@@ -892,7 +921,9 @@ mod tests {
     fn test_resolved_pin_version_classifies_two_component_release_and_alias() {
         use deps_core::lsp_helpers::CommitSha;
 
-        let most_specific = |tag: &str| Some(ResolvedPin::most_specific(ConcreteVersion::new(tag)));
+        let most_specific = |tag: &str| {
+            PinResolution::Resolved(ResolvedPin::most_specific(ConcreteVersion::new(tag)))
+        };
         let sha = "a".repeat(40);
         let commit = CommitSha::parse(&sha).unwrap();
         for (tags, expected) in [
@@ -901,7 +932,7 @@ mod tests {
             (vec!["v2", "v2.9.1"], most_specific("v2.9.1")),
             (
                 vec!["v2.9", "v2.9.1.4"],
-                Some(ResolvedPin::alias(ConcreteVersion::new("v2.9"))),
+                PinResolution::Resolved(ResolvedPin::alias(ConcreteVersion::new("v2.9"))),
             ),
         ] {
             let fmt = formatter();
@@ -960,14 +991,14 @@ mod tests {
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            None,
+            PinResolution::Unresolved,
             "a project: (Tags) include must not resolve through a component: (Releases) entry"
         );
     }
 
-    /// Cold cache (no `TagIndex` entry yet) must stay the honest `None`.
+    /// Cold cache (no `TagIndex` entry yet) must stay the honest `Unresolved`.
     #[test]
-    fn test_resolved_pin_version_sha_pin_tag_index_miss_returns_none() {
+    fn test_resolved_pin_version_sha_pin_tag_index_miss_is_unresolved() {
         let sha = "c".repeat(40);
         let fmt = formatter();
         let mut d = dep(
@@ -980,12 +1011,12 @@ mod tests {
         );
         d.version_req = Some(sha.into());
 
-        assert_eq!(fmt.resolved_pin_version(&d), None);
+        assert_eq!(fmt.resolved_pin_version(&d), PinResolution::Unresolved);
     }
 
-    /// A `Tag`/`Branch`/`Partial`/`Latest` pin has no SHA to resolve — must stay `None`.
+    /// A `Tag`/`Branch`/`Partial`/`Latest` pin has no SHA to resolve — must stay `Unresolved`.
     #[test]
-    fn test_resolved_pin_version_non_sha_pin_returns_none() {
+    fn test_resolved_pin_version_non_sha_pin_is_unresolved() {
         let fmt = formatter();
         for pin in [
             PinStyle::Tag,
@@ -998,7 +1029,11 @@ mod tests {
                 "gitlab.com/org/proj",
                 DependencySource::Registry,
             );
-            assert_eq!(fmt.resolved_pin_version(&d), None, "{pin:?}");
+            assert_eq!(
+                fmt.resolved_pin_version(&d),
+                PinResolution::Unresolved,
+                "{pin:?}"
+            );
         }
     }
 
@@ -1161,7 +1196,7 @@ mod tests {
         let upper = HEX_SHA_1723.to_ascii_uppercase();
         assert_eq!(
             fmt.resolved_pin_version(&sha_dep_1723(&upper)),
-            Some(ResolvedPin::most_specific(ConcreteVersion::new("v1.0.1")))
+            PinResolution::Resolved(ResolvedPin::most_specific(ConcreteVersion::new("v1.0.1")))
         );
     }
 
