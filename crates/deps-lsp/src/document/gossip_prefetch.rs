@@ -22,8 +22,8 @@ use tracing::Instrument;
 const GOSSIP_PREFETCH_TIMEOUT_CEILING_SECS: u64 = 30;
 
 /// Background pre-fetch of GOSSIP cooldown/low-usage findings for a document's declared
-/// dependencies (issue #1456, spec 072), gated on [`ServerState::is_gossip_enabled`] and
-/// `network.offline` — both checked here, before the document guard is even taken, so a
+/// dependencies (issue #1456, spec 072), gated on [`ServerState::gossip_checks`]
+/// (enabled and online) — checked here, before the document guard is even taken, so a
 /// disabled/offline server does zero work per document lifecycle event.
 ///
 /// The network dispatch goes through
@@ -54,7 +54,7 @@ pub(crate) async fn run_gossip_prefetch(
     ecosystem: Arc<dyn Ecosystem>,
     fetch_timeout_secs: u64,
 ) -> bool {
-    if !state.is_gossip_enabled() || state.cache.is_offline() {
+    if !state.gossip_checks().is_active() {
         return false;
     }
 
@@ -74,7 +74,7 @@ pub(crate) async fn run_gossip_prefetch(
             ecosystem.ecosystem_id(),
             parse_result.as_ref(),
             ecosystem.formatter(),
-            deps_core::NetworkMode::Online, // already checked `state.cache.is_offline()` above.
+            deps_core::NetworkMode::Online, // the active gate already folds the network state.
             Some(&state.deps_dev),
         ),
     )
@@ -170,7 +170,7 @@ pub(crate) fn spawn_gossip_mismatch_refetch_if_needed(
     ecosystem: &Arc<dyn Ecosystem>,
     config: &Arc<RwLock<DepsConfig>>,
 ) {
-    if !state.is_gossip_enabled() || state.cache.is_offline() {
+    if !state.gossip_checks().is_active() {
         return;
     }
 
@@ -242,7 +242,7 @@ async fn run_gossip_mismatch_refetch(
     // (or a network-mode flip to offline) while this detached task is still in flight (it
     // can outlive the fetch that triggered it by up to the batch call's own timeout) must
     // not still force-refresh and republish.
-    if !state.is_gossip_enabled() || state.cache.is_offline() {
+    if !state.gossip_checks().is_active() {
         return;
     }
 
@@ -535,7 +535,7 @@ mod tests {
     }
 
     /// Code-review finding #5 regression: the spawned body must re-check
-    /// `is_gossip_enabled` for itself — a config reload disabling GOSSIP while this task is
+    /// `gossip_checks` for itself — a config reload disabling GOSSIP while this task is
     /// still in flight (or, as tested here, simply called with the gate already off) must
     /// not perform the refetch at all.
     #[tokio::test]

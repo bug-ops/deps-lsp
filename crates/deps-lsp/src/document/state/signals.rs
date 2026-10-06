@@ -10,7 +10,7 @@
 
 use deps_core::lsp_helpers::EcosystemFormatter;
 use deps_core::osv::{CandidateStatusMap, LatestStatusMap, VulnerabilityMap};
-use deps_core::policy_config::{OsvChecks, OsvState};
+use deps_core::policy_config::{CheckState, OsvChecks};
 use deps_core::{
     ConcreteVersion, DependencyOutcomes, GossipFindings, PackageName, PackageVersions,
     TyposquatSignal, VersionData,
@@ -384,7 +384,7 @@ impl SignalsSnapshotBuilder<'_> {
     }
 
     /// Attaches [`PackageSignals::latest_status`] (issue #1517) when `osv_checks` is
-    /// [`OsvState::Active`], leaving it `None` otherwise (critique S3) — checking never actually
+    /// [`CheckState::Active`], leaving it `None` otherwise (critique S3) — checking never actually
     /// runs while offline either (`document::lifecycle`'s phase-A spawn gate matches), so both
     /// conditions must degrade the same way here.
     ///
@@ -401,23 +401,23 @@ impl SignalsSnapshotBuilder<'_> {
     #[must_use]
     pub(crate) fn with_latest_status(mut self, osv_checks: OsvChecks) -> Self {
         match osv_checks.state() {
-            OsvState::Active => self.latest_status = Some(self.signals.latest_status.clone()),
-            OsvState::Inactive => {}
+            CheckState::Active => self.latest_status = Some(self.signals.latest_status.clone()),
+            CheckState::Inactive => {}
         }
         self
     }
 
     /// Attaches [`PackageSignals::candidate_status`] (issue #1524) when `osv_checks` is
-    /// [`OsvState::Active`], leaving it `None` otherwise — mirrors [`Self::with_latest_status`]'s
+    /// [`CheckState::Active`], leaving it `None` otherwise — mirrors [`Self::with_latest_status`]'s
     /// exact gating rationale (an absent map means [`deps_core::lsp_helpers::LatestVerdict::NotApplicable`],
     /// a present-but-empty one means [`deps_core::lsp_helpers::LatestVerdict::Unverified`]).
     #[must_use]
     pub(crate) fn with_candidate_status(mut self, osv_checks: OsvChecks) -> Self {
         match osv_checks.state() {
-            OsvState::Active => {
+            CheckState::Active => {
                 self.candidate_status = Some(self.signals.candidate_status.clone());
             }
-            OsvState::Inactive => {}
+            CheckState::Inactive => {}
         }
         self
     }

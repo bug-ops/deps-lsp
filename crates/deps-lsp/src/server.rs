@@ -13,7 +13,7 @@ use crate::file_watcher;
 use crate::handlers::{
     code_actions, code_lens, completion, diagnostics, document_link, hover, inlay_hints,
 };
-use deps_core::policy_config::{OsvChecks, OsvState};
+use deps_core::policy_config::{GossipChecks, OsvChecks, TyposquatChecks};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -141,8 +141,8 @@ struct ConfigSideEffects {
     cache: deps_core::CacheMode,
     cold_start_min_interval: std::time::Duration,
     license_policy: deps_core::LicensePolicy,
-    typosquat_enabled: bool,
-    gossip_enabled: bool,
+    typosquat_checks: TyposquatChecks,
+    gossip_checks: GossipChecks,
     /// Issue #1517 critique S5: `vulnerabilities_enabled && !offline`, the same effective
     /// condition `document::lifecycle`'s phase-A spawn gate and every renderer's
     /// `with_latest_status` attach already check (critique S3).
@@ -162,8 +162,8 @@ impl ConfigSideEffects {
                 config.cold_start.rate_limit_ms,
             ),
             license_policy: config.policy.license_policy.to_policy(),
-            typosquat_enabled: config.policy.typosquat.enabled,
-            gossip_enabled: config.policy.gossip.enabled,
+            typosquat_checks: config.policy.typosquat_checks(),
+            gossip_checks: config.policy.gossip_checks(),
             osv_checks: config.policy.osv_checks(),
         }
     }
@@ -215,10 +215,9 @@ impl Backend {
         self.state
             .cache
             .set_registry_policy(effects.registries.workspace_registries);
-        self.state.nuget_user_profile_sources.store(
-            effects.registries.nuget_user_profile_sources,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.state
+            .nuget_user_profile_sources
+            .set(effects.registries.nuget_user_profile_sources);
         self.state
             .keychain_credentials
             .set(effects.registries.swift_keychain_credentials);
@@ -244,9 +243,9 @@ impl Backend {
         // site (push and pull) reads the same resolved policy.
         self.state.set_license_policy(effects.license_policy);
         // Issue #1437: same rationale, for the typosquat-similarity diagnostic's opt-in flag.
-        self.state.set_typosquat_enabled(effects.typosquat_enabled);
+        self.state.set_typosquat_checks(effects.typosquat_checks);
         // Issue #1456, spec 072: same rationale, for GOSSIP's opt-in flag.
-        self.state.set_gossip_enabled(effects.gossip_enabled);
+        self.state.set_gossip_checks(effects.gossip_checks);
         // Issue #1517 critique S5: same rationale, for the OSV latest-check's effective state.
         self.state.set_osv_checks(effects.osv_checks);
     }
@@ -937,12 +936,12 @@ impl LanguageServer for Backend {
         // `trigger_typosquat_prefetch_for_open_documents` is called below, `self.config`
         // already holds this new value (the write guard has landed), so passing it directly
         // needs no separate snapshot here.
-        let typosquat_enabled = effects.typosquat_enabled;
-        let was_typosquat_enabled = self.state.is_typosquat_enabled();
+        let typosquat_checks = effects.typosquat_checks;
+        let was_typosquat_checks = self.state.typosquat_checks();
         let typosquat_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
         // Issue #1456, spec 072: same rationale, for GOSSIP's opt-in flag.
-        let gossip_enabled = effects.gossip_enabled;
-        let was_gossip_enabled = self.state.is_gossip_enabled();
+        let gossip_checks = effects.gossip_checks;
+        let was_gossip_checks = self.state.gossip_checks();
         let gossip_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
         // Issue #1517 critique S5: same rationale, for the OSV latest-check's effective
         // (`vulnerabilities_enabled && !offline`) state — neither flag alone is a
@@ -974,7 +973,7 @@ impl LanguageServer for Backend {
         // its next edit or reopen — trigger it immediately on the disabled->enabled
         // transition specifically (not on every `did_change_configuration`, which would
         // needlessly re-fetch on every unrelated setting change while already enabled).
-        if typosquat_enabled && !was_typosquat_enabled {
+        if typosquat_checks.activated_since(was_typosquat_checks) {
             trigger_typosquat_prefetch_for_open_documents(
                 &self.state,
                 &self.client,
@@ -984,7 +983,7 @@ impl LanguageServer for Backend {
             .await;
         }
         // Issue #1456, spec 072: same rationale, for GOSSIP's opt-in flag.
-        if gossip_enabled && !was_gossip_enabled {
+        if gossip_checks.activated_since(was_gossip_checks) {
             trigger_gossip_prefetch_for_open_documents(
                 &self.state,
                 &self.client,
@@ -994,10 +993,7 @@ impl LanguageServer for Backend {
             .await;
         }
         // Issue #1517 critique S5: same rationale, for the OSV latest-check's effective state.
-        if matches!(
-            (osv_checks.state(), was_osv_checks.state()),
-            (OsvState::Active, OsvState::Inactive)
-        ) {
+        if osv_checks.activated_since(was_osv_checks) {
             trigger_osv_rescan_for_open_documents(
                 &self.state,
                 &self.client,
@@ -3835,7 +3831,7 @@ let package = Package(
             let backend = service.inner();
 
             assert!(
-                !backend.state.is_typosquat_enabled(),
+                !backend.state.typosquat_checks().is_active(),
                 "must default to disabled before any config is applied"
             );
 
@@ -3850,7 +3846,7 @@ let package = Package(
 
             assert!(result.is_ok());
             assert!(backend.config.read().await.policy.typosquat.enabled);
-            assert!(backend.state.is_typosquat_enabled());
+            assert!(backend.state.typosquat_checks().is_active());
         }
 
         /// Issue #1456, spec 072, mirroring `test_initialize_applies_valid_typosquat_config`.
@@ -3860,7 +3856,7 @@ let package = Package(
             let backend = service.inner();
 
             assert!(
-                !backend.state.is_gossip_enabled(),
+                !backend.state.gossip_checks().is_active(),
                 "must default to disabled before any config is applied"
             );
 
@@ -3875,7 +3871,7 @@ let package = Package(
 
             assert!(result.is_ok());
             assert!(backend.config.read().await.policy.gossip.enabled);
-            assert!(backend.state.is_gossip_enabled());
+            assert!(backend.state.gossip_checks().is_active());
         }
 
         /// Tester gap: an invalid SPDX entry must be dropped (with a warning) rather than
@@ -4083,6 +4079,51 @@ let package = Package(
             assert!(backend.state.osv_checks().is_active());
         }
 
+        /// Typosquat and GOSSIP gates fold in network reachability, so an enabled feature goes
+        /// `Inactive` while offline and its offline -> online edge is observable — the edge
+        /// `did_change_configuration` uses to trigger the catch-up prefetch.
+        #[tokio::test]
+        async fn test_did_change_configuration_typosquat_gossip_gates_follow_network() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({
+                        "typosquat": { "enabled": true },
+                        "gossip": { "enabled": true },
+                        "network": { "offline": true }
+                    }),
+                })
+                .await;
+            let offline_typosquat = backend.state.typosquat_checks();
+            let offline_gossip = backend.state.gossip_checks();
+            assert!(!offline_typosquat.is_active());
+            assert!(!offline_gossip.is_active());
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({
+                        "typosquat": { "enabled": true },
+                        "gossip": { "enabled": true },
+                        "network": { "offline": false }
+                    }),
+                })
+                .await;
+            assert!(
+                backend
+                    .state
+                    .typosquat_checks()
+                    .activated_since(offline_typosquat)
+            );
+            assert!(
+                backend
+                    .state
+                    .gossip_checks()
+                    .activated_since(offline_gossip)
+            );
+        }
+
         /// Issue #1437, mirroring `initialize_tests::test_initialize_applies_valid_typosquat_config`:
         /// proves `workspace/didChangeConfiguration` reaches the same `parse_config` ->
         /// `TyposquatConfig` deserializer path and mirrors the result onto `ServerState`.
@@ -4098,7 +4139,7 @@ let package = Package(
                 .await;
 
             assert!(backend.config.read().await.policy.typosquat.enabled);
-            assert!(backend.state.is_typosquat_enabled());
+            assert!(backend.state.typosquat_checks().is_active());
         }
 
         /// Issue #1456, spec 072, mirroring
@@ -4115,7 +4156,7 @@ let package = Package(
                 .await;
 
             assert!(backend.config.read().await.policy.gossip.enabled);
-            assert!(backend.state.is_gossip_enabled());
+            assert!(backend.state.gossip_checks().is_active());
         }
 
         /// Issue #483 (critic M6a): the primary UX of the flag — a live

@@ -153,11 +153,12 @@ pub struct PlannedUpdateItem {
     pub outcome: Outcome,
     /// OSV advisory ids this item resolves. Populated in `--security-only` mode — for
     /// `Unfixable` rows only when a fix is known (`Yanked`, `UnsupportedRequirementShape`,
-    /// `OversizedRequirement`; empty for `NoVerifiedFix` and `FetchFailedOrAbsent`, #1618) —
+    /// `OversizedRequirement`, `NoReleaseTagForFix`; empty for `NoVerifiedFix` and
+    /// `FetchFailedOrAbsent`, #1618) —
     /// and also in default mode for a cooldown-fallback decision that names a `Flagged`
     /// `latest`/fallback verdict (spec 075 FR-011/FR-012) — empty for an `Unverified` verdict,
     /// which carries no advisory list to report.
-    pub advisory_ids: Vec<String>,
+    pub advisory_ids: Vec<deps_core::osv::OsvId>,
     /// Whether a matching `[update].ignore` rule exists but was overridden (FR-008,
     /// `--security-only` mode only — the rule never applies in default mode, since a match
     /// there is reported via [`Outcome::Skipped`] with reason [`SkipReason::IgnoreRule`]
@@ -292,7 +293,7 @@ pub enum SkipReason {
 
 /// Why a `--security-only` candidate could not be fixed.
 ///
-/// The three variants that reject a specific, known fix target (#1614) carry it inline, so
+/// The four variants that reject a specific, known fix target (#1614, #1779) carry it inline, so
 /// `--security-only` output can report the rejected version instead of nothing; the two that
 /// mean no fix target was ever established carry none.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +336,15 @@ pub enum UnfixableReason {
         /// The fix target the oversized requirement was never checked against.
         target: ConcreteVersion,
     },
+    /// A commit (SHA) pin cannot be rewritten to the fix target because a complete tag list
+    /// proves no release tag names that version (#1779). Distinct from
+    /// [`Outcome::RequiresLockfileUpdate`]: the declared requirement does not already admit the
+    /// fix, so the dependency stays vulnerable until a release tag exists. A missing, cold or
+    /// truncated tag list is [`Self::NoVerifiedFix`] instead, since absence is then unproven.
+    NoReleaseTagForFix {
+        /// The fix target that has no release tag.
+        target: ConcreteVersion,
+    },
 }
 
 impl Outcome {
@@ -363,7 +373,8 @@ impl Outcome {
             Self::Unfixable(
                 UnfixableReason::Yanked { target }
                 | UnfixableReason::UnsupportedRequirementShape { target }
-                | UnfixableReason::OversizedRequirement { target },
+                | UnfixableReason::OversizedRequirement { target }
+                | UnfixableReason::NoReleaseTagForFix { target },
             ) => Some(target),
             Self::Unfixable(
                 UnfixableReason::NoVerifiedFix | UnfixableReason::FetchFailedOrAbsent,
@@ -387,7 +398,7 @@ impl PlannedUpdateItem {
         name: String,
         current: CurrentVersion,
         outcome: Outcome,
-        advisory_ids: Vec<String>,
+        advisory_ids: Vec<deps_core::osv::OsvId>,
         ignore_rule_overridden: bool,
         gossip_excluded_version: Option<deps_core::ConcreteVersion>,
         cooldown_fallback: Option<CooldownFallbackNote>,
@@ -513,6 +524,9 @@ impl PlannedUpdateItem {
             }
             Outcome::Unfixable(UnfixableReason::OversizedRequirement { .. }) => {
                 "the declared requirement is too large to safely evaluate; treating as unfixable — manual edit required"
+            }
+            Outcome::Unfixable(UnfixableReason::NoReleaseTagForFix { .. }) => {
+                "the fix version has no matching release in the repository's complete tag/release list, so the commit pin cannot be rewritten — wait for a release or edit manually"
             }
         };
         let mut reason = base.to_string();
@@ -980,7 +994,7 @@ fn latest_current_target(candidate: &UpdateCandidate) -> (CurrentVersion, Option
 fn resolve_from_latest(
     latest_candidate: UpdateCandidate,
     ignore_rules: &IgnoreRules,
-) -> (CurrentVersion, Outcome, Vec<String>) {
+) -> (CurrentVersion, Outcome, Vec<deps_core::osv::OsvId>) {
     match latest_candidate {
         UpdateCandidate::Planned(p) => {
             let target = p.target.clone();
@@ -1032,7 +1046,7 @@ fn resolve_from_latest(
 /// What a version's OSV verdict reports for a [`PlannedUpdateItem`]: its advisory ids and, when it
 /// holds only through sibling release tags, the note naming them.
 type OsvVerdictDetails = (
-    Vec<String>,
+    Vec<deps_core::osv::OsvId>,
     Option<deps_core::lsp_helpers::SiblingMatchNote>,
 );
 
@@ -1113,7 +1127,7 @@ fn resolve_occurrence(
 
     let build = |current: CurrentVersion,
                  outcome: Outcome,
-                 advisory_ids: Vec<String>,
+                 advisory_ids: Vec<deps_core::osv::OsvId>,
                  cooldown_fallback: Option<CooldownFallbackNote>| {
         PlannedUpdateItem::new(
             name.clone(),
@@ -1994,7 +2008,7 @@ mod tests {
             deps_core::test_util::vuln_key("serde"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.2.0"),
-                advisory_ids: Capped::new(vec!["MAL-2026-00001".to_string()], 1),
+                advisory_ids: Capped::new(vec![deps_core::test_util::osv_id("MAL-2026-00001")], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
                 via_sibling_tags: None,
             },
@@ -2050,7 +2064,10 @@ mod tests {
             deps_core::test_util::vuln_key("serde"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.2.0"),
-                advisory_ids: Capped::new(vec!["GHSA-xxxx-yyyy-zzzz".to_string()], 1),
+                advisory_ids: Capped::new(
+                    vec![deps_core::test_util::osv_id("GHSA-xxxx-yyyy-zzzz")],
+                    1,
+                ),
                 worst_severity: Some(VulnSeverity::High),
                 via_sibling_tags: Some(MatchedTags::new(ConcreteVersion::new("v1.2.1"), vec![])),
             },
@@ -2107,7 +2124,7 @@ mod tests {
             deps_core::test_util::vuln_key("serde"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.2.0"),
-                advisory_ids: Capped::new(vec!["MAL-2026-00001".to_string()], 1),
+                advisory_ids: Capped::new(vec![deps_core::test_util::osv_id("MAL-2026-00001")], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
                 via_sibling_tags: None,
             },
@@ -3270,7 +3287,7 @@ mod tests {
             deps_core::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("2.0.0"),
-                advisory_ids: Capped::new(vec!["GHSA-xxxx".to_string()], 1),
+                advisory_ids: Capped::new(vec![deps_core::test_util::osv_id("GHSA-xxxx")], 1),
                 worst_severity: Some(VulnSeverity::High),
                 via_sibling_tags: Some(deps_core::osv::MatchedTags::new(
                     ConcreteVersion::new("v4.9.0"),
@@ -3448,7 +3465,7 @@ mod tests {
             deps_core::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.1.0"),
-                advisory_ids: Capped::new(vec!["GHSA-yyyy".to_string()], 1),
+                advisory_ids: Capped::new(vec![deps_core::test_util::osv_id("GHSA-yyyy")], 1),
                 worst_severity: Some(VulnSeverity::High),
                 via_sibling_tags: Some(deps_core::osv::MatchedTags::new(
                     ConcreteVersion::new("v4.9.0"),
@@ -3570,7 +3587,7 @@ mod tests {
                 deps_core::test_util::vuln_key("pkg"),
                 UpgradeStatus::CandidateVulnerable {
                     version: deps_core::ConcreteVersion::new(version),
-                    advisory_ids: Capped::new(vec!["GHSA-x".to_string()], 1),
+                    advisory_ids: Capped::new(vec![deps_core::test_util::osv_id("GHSA-x")], 1),
                     worst_severity: Some(VulnSeverity::High),
                     via_sibling_tags: None,
                 },
@@ -3678,7 +3695,7 @@ mod tests {
             deps_core::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("2.0.0"),
-                advisory_ids: Capped::new(vec!["GHSA-x".to_string()], 1),
+                advisory_ids: Capped::new(vec![deps_core::test_util::osv_id("GHSA-x")], 1),
                 worst_severity: Some(VulnSeverity::High),
                 via_sibling_tags: None,
             },
@@ -3782,7 +3799,7 @@ mod tests {
             deps_core::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.1.0"),
-                advisory_ids: Capped::new(vec!["GHSA-x".to_string()], 1),
+                advisory_ids: Capped::new(vec![deps_core::test_util::osv_id("GHSA-x")], 1),
                 worst_severity: Some(VulnSeverity::High),
                 via_sibling_tags: None,
             },

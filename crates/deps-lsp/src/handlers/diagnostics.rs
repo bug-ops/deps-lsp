@@ -304,12 +304,12 @@ pub(crate) async fn generate_diagnostics_internal(
         // concurrent flag flip as the pre-refactor read site (right after releasing this
         // same lock), and tighter than reading before entering the closure would be.
         let online = network.is_online();
-        let typosquat_visibility = if state.is_typosquat_enabled() && online {
+        let typosquat_visibility = if state.typosquat_checks().is_active() && online {
             PrefetchVisibility::Render
         } else {
             PrefetchVisibility::Suppress
         };
-        let gossip_visibility = if state.is_gossip_enabled() && online {
+        let gossip_visibility = if state.gossip_checks().is_active() && online {
             PrefetchVisibility::Render
         } else {
             PrefetchVisibility::Suppress

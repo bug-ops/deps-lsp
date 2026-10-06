@@ -125,7 +125,8 @@ include:
   not a missing tag. An exact tag `ref:` that a truncated Tags list does not reach is unresolved
   as well, never up to date. A partial `project:` ref (`1.2`) is read as a branch, so the
   truncated-list rule for floating partial pins described there does not apply. See [GitHub Actions](github-actions.md#unpublished-refs-and-the-unknown-ref-diagnostic-issue-1766)
-  for the shape rules.
+  for the shape rules. The `Change ref to published tag <tag>` quickfix rewrites the `ref:` to
+  the single published spelling that matches (issue #1781).
 - A tags fetch that first populates or changes a project's tag index rescans every other open
   `.gitlab-ci.yml` that uses it, as for GitHub Actions (issue #1765).
 - The `Correct version comment to <tag>` quickfix rewrites only the comment's tag to the tag the

@@ -351,9 +351,7 @@ fn parse_composer_json_inner(content: &str, uri: &Url) -> Result<(ComposerParseR
                     }
                 },
                 other => {
-                    let range = position()
-                        .map(|(name_range, _)| name_range)
-                        .unwrap_or_default();
+                    let range = position().map_or_default(|(name_range, _)| name_range);
                     MinimumStability::Invalid(InvalidStabilityOccurrence {
                         range,
                         raw: other.to_string(),

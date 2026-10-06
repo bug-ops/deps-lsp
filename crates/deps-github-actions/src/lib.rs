@@ -50,11 +50,9 @@ pub use deps_core::lsp_helpers::ClosingDelimiters;
 /// Flags a `uses:` step pinned to a tag rather than a full commit SHA, a supply-chain
 /// hardening recommendation distinct from the outdated-version check.
 ///
-/// Local to this crate rather than a shared `deps-core` diagnostic kind — mirrors the
-/// shape of `deps_core::UNSATISFIABLE_DIAGNOSTIC_CODE`/`deps_core::DEPRECATED_DIAGNOSTIC_CODE`,
-/// but no second ecosystem needs the same "mutable ref" concept yet (spec 031's resolved
-/// Open Questions), so generalizing into `deps-core` would be premature.
-pub const MUTABLE_REF_PIN_DIAGNOSTIC_CODE: &str = "mutable-ref-pin";
+/// Defined in `deps-core` next to [`deps_core::diagnostic::DiagnosticKind::MutableRefPin`],
+/// which derives it; re-exported here because code-action `data.diagnostic_codes` still names it.
+pub use deps_core::diagnostic::GITHUB_ACTIONS_MUTABLE_REF_PIN_DIAGNOSTIC_CODE as MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 
 /// Stable [`tower_lsp_server::ls_types::Diagnostic::code`] for the SHA-comment-mismatch
 /// diagnostic (issue #1722), shared with every ecosystem through `deps-core`.

@@ -10,7 +10,7 @@ use deps_core::hover::Hover;
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, WatchedConfig,
     WatchedConfigEffect,
-    diagnostic::{Diagnostic, Severity},
+    diagnostic::{Diagnostic, DiagnosticKind, Severity},
     lsp_helpers::{DiagnosticSeverities, EcosystemFormatter},
 };
 use std::any::Any;
@@ -357,7 +357,7 @@ fn catalog_diagnostics(parse_result: &dyn ParseResultTrait, severity: Severity) 
             let origin = npm_dep.catalog.as_ref()?;
             let range = npm_dep.version_range?;
             let message = origin.diagnostic_message(npm_dep.name.as_str())?;
-            Some(Diagnostic::new(range, message).with_severity(severity))
+            Some(Diagnostic::new(DiagnosticKind::Notice, range, message).with_severity(severity))
         })
         .collect()
 }

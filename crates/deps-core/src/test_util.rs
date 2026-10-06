@@ -170,6 +170,24 @@ pub fn vuln_key(name: &str) -> crate::osv::VulnKey {
     crate::osv::VulnKey::from_name(name.to_string())
 }
 
+/// Builds a validated [`crate::osv::OsvId`] from a literal fixture id.
+///
+/// # Panics
+///
+/// Panics if `raw` is not a valid OSV advisory id.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::test_util::osv_id;
+///
+/// assert_eq!(osv_id("RUSTSEC-2020-0071").as_str(), "RUSTSEC-2020-0071");
+/// ```
+#[must_use]
+pub fn osv_id(raw: &str) -> crate::osv::OsvId {
+    crate::osv::OsvId::parse(raw).expect("fixture id must be a valid OSV id")
+}
+
 /// Minimal [`crate::Metadata`] fixture for tests that only care about a package's name and
 /// latest version — e.g. exercising [`crate::Ecosystem::completion_insert_text`].
 ///

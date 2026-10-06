@@ -3,7 +3,7 @@
 use dashmap::DashMap;
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, CandidateTagSource, CommentCheck, CommentSlot, CommitSha,
+    BoundedVersionReq, CandidateTagSource, CommentCheck, CommentSlot, CommitRewrite, CommitSha,
     DiagnosticMessages, DiagnosticPolicy, OsvNameAvailability, OsvNaming, PackageNaming,
     PackageRendering, PartialTagPolicy, PinResolution, RequirementResolution, RequirementStatus,
     ShaPinLookup, ShaPinTail, SourcePolicy, TagIndex, concrete_pin_version,
@@ -356,6 +356,21 @@ impl RequirementResolution for GithubActionsFormatter {
         }
     }
 
+    fn commit_rewrite_for(&self, dep: &dyn Dependency, version: &ConcreteVersion) -> CommitRewrite {
+        let is_sha_pin = dep
+            .as_any()
+            .downcast_ref::<GithubActionsDependency>()
+            .is_some_and(|gha_dep| matches!(gha_dep.pin, Some(PinStyle::Sha { .. })));
+        if !is_sha_pin {
+            return CommitRewrite::NotACommitPin;
+        }
+        self.tag_index
+            .get(dep.name())
+            .map_or(CommitRewrite::IndexUnavailable, |index| {
+                index.commit_rewrite_to(version.as_str())
+            })
+    }
+
     /// #1556: a SHA pin's registry-confirmed tag (`TagIndex.sha_to_tag`) is a real,
     /// concrete version regardless of whether the pin's trailing `# comment` happens to
     /// have the full `major.minor.patch` shape [`deps_core::lsp_helpers::concrete_pin_version`]
@@ -366,7 +381,7 @@ impl RequirementResolution for GithubActionsFormatter {
     /// Not gated on the SHA comment the way `Self::sha_pin_lookup` is: that
     /// method only needs to *distrust* a human-written comment when one exists, but this
     /// method's job is finding a version at all, so a commentless SHA pin (whose raw SHA is
-    /// its own `version_req`) is just as eligible. [`PinResolution::Unresolved`] on a cold cache —
+    /// its own `version_req`) is just as eligible. [`PinResolution::NotYetIndexed`] on a cold cache (SHA and concrete tag pins) —
     /// the honest "unknown", not a fabricated version — [`PinResolution::Unlisted`] when a
     /// truncated index lacks the commit or the exact tag (#1769), and
     /// [`PinResolution::Untagged`] when a complete index proves no tag names the commit (#1735),
@@ -384,7 +399,7 @@ impl RequirementResolution for GithubActionsFormatter {
             return PinResolution::Unresolved;
         };
         let Some(index) = self.tag_index.get(dep.name()) else {
-            return PinResolution::Unresolved;
+            return Self::cold_cache_resolution(gha_dep);
         };
         match &gha_dep.pin {
             Some(PinStyle::Sha { sha, comment }) => {
@@ -433,6 +448,23 @@ impl RequirementResolution for GithubActionsFormatter {
 }
 
 impl GithubActionsFormatter {
+    /// What a cold (or failed) tag fetch means for `gha_dep`: only a SHA pin or a concrete tag
+    /// pin has sibling release tags to miss, so only those are [`PinResolution::NotYetIndexed`];
+    /// branch, floating-tag and unpinned refs have none and stay [`PinResolution::Unresolved`].
+    fn cold_cache_resolution(gha_dep: &GithubActionsDependency) -> PinResolution {
+        match &gha_dep.pin {
+            Some(PinStyle::Sha { .. }) => PinResolution::NotYetIndexed,
+            Some(PinStyle::Tag)
+                if gha_dep.version_req.as_ref().is_some_and(|req| {
+                    concrete_pin_version(req.as_str(), EcosystemId::GithubActions).is_some()
+                }) =>
+            {
+                PinResolution::NotYetIndexed
+            }
+            Some(PinStyle::Tag | PinStyle::Branch) | None => PinResolution::Unresolved,
+        }
+    }
+
     /// The commit `gha_dep` is pinned to: the raw SHA of a full-SHA pin, or the commit a
     /// *floating* tag pin (`@v4`, `@v4.1` — partial-semver-shaped but not a concrete
     /// version) currently points at per the `TagIndex` (#1684).
@@ -609,6 +641,7 @@ impl OsvNaming for GithubActionsFormatter {
 mod tests {
     use super::*;
     use deps_core::lsp_helpers::{CommentMismatch, CommitSha, RequirementGate, ResolvedPin};
+    use deps_core::osv::SiblingCoverage;
     use deps_core::pagination::ListCoverage;
     use deps_core::parser::DependencySource;
     use deps_core::{Position, Range};
@@ -2023,6 +2056,7 @@ mod tests {
         match fmt.resolved_pin_version(d) {
             PinResolution::Resolved { pin, .. } => Some(pin),
             PinResolution::Unresolved
+            | PinResolution::NotYetIndexed
             | PinResolution::Unlisted
             | PinResolution::Untagged
             | PinResolution::Unpublished
@@ -2215,10 +2249,10 @@ mod tests {
         );
     }
 
-    /// Cold cache (no `TagIndex` entry for this SHA yet) must stay the honest `Unresolved`,
-    /// never a fabricated version.
+    /// Cold cache (no `TagIndex` entry for this repository yet) must be the honest
+    /// `NotYetIndexed`, never a fabricated version (#1780).
     #[test]
-    fn test_resolved_pin_version_sha_pin_tag_index_miss_is_unresolved() {
+    fn test_resolved_pin_version_sha_pin_tag_index_miss_is_not_yet_indexed() {
         let sha = "d".repeat(40);
         let fmt = formatter();
         let d = dep(
@@ -2226,7 +2260,35 @@ mod tests {
             "actions/checkout",
         );
 
-        assert_eq!(fmt.resolved_pin_version(&d), PinResolution::Unresolved);
+        assert_eq!(fmt.resolved_pin_version(&d), PinResolution::NotYetIndexed);
+    }
+
+    /// #1780: on a cold cache only the pins that have sibling release tags to miss (SHA and
+    /// concrete tag pins) are `NotYetIndexed`; branch, floating-tag and unpinned refs have none.
+    #[test]
+    fn test_resolved_pin_version_cold_cache_is_not_yet_indexed_only_for_sibling_bearing_pins() {
+        let fmt = formatter();
+        let tag_pin = |req: &str| {
+            let mut d = dep(Some(PinStyle::Tag), "actions/checkout");
+            d.version_req = Some(req.into());
+            d
+        };
+        assert_eq!(
+            fmt.resolved_pin_version(&tag_pin("v4.8.0")),
+            PinResolution::NotYetIndexed
+        );
+        assert_eq!(
+            fmt.resolved_pin_version(&tag_pin("v4")),
+            PinResolution::Unresolved
+        );
+        assert_eq!(
+            fmt.resolved_pin_version(&dep(Some(PinStyle::Branch), "actions/checkout")),
+            PinResolution::Unresolved
+        );
+        assert_eq!(
+            fmt.resolved_pin_version(&dep(None, "actions/checkout")),
+            PinResolution::Unresolved
+        );
     }
 
     /// #1735: a SHA absent from a populated, complete index is proven untagged, while a
@@ -2524,10 +2586,83 @@ mod tests {
 
         let unlisted = in_use(MISSING_SHA_1720, "v4.2.0").unwrap();
         assert_eq!(unlisted.primary().as_str(), "v4.2.0");
-        assert_eq!(unlisted.sibling_coverage(), ListCoverage::Truncated);
+        assert_eq!(unlisted.sibling_coverage(), SiblingCoverage::Truncated);
 
         let listed = in_use(OLD_SHA_1720, "v2.87.21").unwrap();
-        assert_eq!(listed.sibling_coverage(), ListCoverage::Truncated);
+        assert_eq!(listed.sibling_coverage(), SiblingCoverage::Truncated);
+    }
+
+    /// #1779: a SHA pin's fix to a version with no release tag is `NoReleaseTagForFix` only when
+    /// a complete, populated tag list proves the absence; a missing, empty or truncated list is
+    /// `UnverifiedTarget`, and a tag pin never depends on the index.
+    #[test]
+    fn test_sha_pin_fix_without_release_tag_is_explicit_only_for_a_complete_index() {
+        use deps_core::edit::{VulnFixSkip, plan_verified_fix};
+
+        let d = sha_pin_1720(OLD_SHA_1720, Some("v2.87.21"));
+        let range = d.version_range.unwrap();
+        let plan = |fmt: &GithubActionsFormatter, target: &str| {
+            plan_verified_fix(
+                &d,
+                range,
+                d.version_req.as_ref().unwrap().as_str(),
+                target,
+                fmt,
+            )
+        };
+
+        let complete = fmt_with_release_index_1720(&[]);
+        assert_eq!(
+            plan(&complete, "v2.87.99"),
+            Err(VulnFixSkip::NoReleaseTagForFix)
+        );
+        assert_eq!(
+            plan(&complete, "2.87.99"),
+            Err(VulnFixSkip::NoReleaseTagForFix)
+        );
+        assert!(
+            plan(&complete, "v2.87.22").is_ok(),
+            "a published tag still rewrites"
+        );
+
+        assert_eq!(
+            plan(&formatter(), "v2.87.99"),
+            Err(VulnFixSkip::UnverifiedTarget),
+            "a missing index proves nothing"
+        );
+        assert_eq!(
+            plan(&fmt_with_coverage_1722(ListCoverage::Truncated), "v2.87.99"),
+            Err(VulnFixSkip::UnverifiedTarget)
+        );
+
+        let mut tag_pin = dep(Some(PinStyle::Tag), "EmbarkStudios/cargo-deny-action");
+        tag_pin.version_req = Some("v2.87.21".into());
+        assert_eq!(
+            complete.commit_rewrite_for(&tag_pin, &ConcreteVersion::new("v9.9.9")),
+            CommitRewrite::NotACommitPin
+        );
+    }
+
+    /// #1780: a cold tag cache reports the manifest-text primary with `NotYetIndexed` siblings,
+    /// so a clean scan is never counted as fully checked.
+    #[test]
+    fn test_cold_cache_pin_in_use_version_has_not_yet_indexed_siblings() {
+        use deps_core::lsp_helpers::resolve_in_use_versions;
+
+        let fmt = formatter();
+        let mut d = sha_pin_1720(MISSING_SHA_1720, Some("v4.2.0"));
+        d.version_req = Some("v4.2.0".into());
+        let in_use = resolve_in_use_versions(
+            &d,
+            "actions/checkout",
+            &std::collections::HashMap::new(),
+            None,
+            &fmt,
+            EcosystemId::GithubActions,
+        )
+        .unwrap();
+        assert_eq!(in_use.primary().as_str(), "v4.2.0");
+        assert_eq!(in_use.sibling_coverage(), SiblingCoverage::NotYetIndexed);
     }
 
     /// #1753 documented side effect: a branch named like a version and ahead of `latest` is

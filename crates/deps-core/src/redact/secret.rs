@@ -207,6 +207,12 @@ impl ApiToken {
     }
 }
 
+impl From<Redacted> for ApiToken {
+    fn from(value: Redacted) -> Self {
+        Self(value)
+    }
+}
+
 impl std::fmt::Debug for ApiToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ApiToken(***)")
@@ -246,6 +252,26 @@ pub fn basic_auth_header(username: &str, password: &str) -> Redacted {
     user_pass.push_str(password);
     let encoded = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&*user_pass));
     Redacted::new(format!("Basic {}", *encoded))
+}
+
+/// Formats `token` into a pre-formatted `Bearer <token>` `Authorization` header value.
+///
+/// The `Bearer` counterpart of [`basic_auth_header`]: every ecosystem that builds a `Bearer`
+/// header (GitHub, Cargo sparse registries, Swift) routes through it so the format cannot
+/// diverge between them.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::secret::bearer_auth_header;
+///
+/// let header = bearer_auth_header("tok");
+/// assert_eq!(header.expose_secret(), "Bearer tok");
+/// assert_eq!(format!("{header:?}"), "Redacted(***)");
+/// ```
+#[must_use]
+pub fn bearer_auth_header(token: &str) -> Redacted {
+    Redacted::new(format!("Bearer {token}"))
 }
 
 /// Reads `var` from the environment, treating an unset or empty value as absent.

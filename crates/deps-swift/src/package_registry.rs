@@ -6,17 +6,19 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use deps_core::HOVER_RECENT_VERSIONS;
-use deps_core::cache::CachedResponse;
+use deps_core::cache::{CachedResponse, CredentialPartition};
 use deps_core::error::PaginationStop;
 use deps_core::github::semver_tags_newest_first;
-use deps_core::keychain_credentials::KeychainGeneration;
+use deps_core::keychain_credentials::{KeychainGeneration, KeychainSnapshot};
 use deps_core::pagination::{NextPage, next_page};
+use deps_core::policy_config::KeychainCredentials;
 use deps_core::{CredentialHeader, DepsError, HttpCache, RequestHeader, Result, not_found_or};
 use serde::Deserialize;
 use url::Url;
@@ -108,7 +110,7 @@ pub(crate) struct PackageRegistryClient {
 }
 
 /// Whether a request carried a credential.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CredentialPresence {
     Anonymous,
     Credentialed,
@@ -117,10 +119,21 @@ enum CredentialPresence {
 /// What the cached responses of a Keychain-bound registry were fetched under: a response
 /// obtained anonymously (lookup pending, refused, not found) must not answer a later
 /// credentialed request, nor the reverse after the setting changed.
+///
+/// [`Self::partition`] is folded into the cache key, so the separation holds even when two
+/// fetches under different states interleave; evicting on a change only frees memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CredentialState {
     presence: CredentialPresence,
     generation: KeychainGeneration,
+}
+
+impl CredentialState {
+    fn partition(self, digest: u64) -> CredentialPartition {
+        let mut hasher = DefaultHasher::new();
+        (digest, self.presence, self.generation).hash(&mut hasher);
+        CredentialPartition::new(hasher.finish())
+    }
 }
 
 impl PackageRegistryClient {
@@ -137,7 +150,8 @@ impl PackageRegistryClient {
     }
 
     /// Records what the next request is sent under and drops this registry's cached responses
-    /// when that differs from the previous request's.
+    /// when that differs from the previous request's, to free bodies of a state that no longer
+    /// applies.
     fn note_credential_state(&self, state: CredentialState) {
         let previous = self
             .credential_state
@@ -148,6 +162,31 @@ impl PackageRegistryClient {
             self.cache
                 .evict_url_prefix(&format!("{}/", self.registry.url.as_str()));
         }
+    }
+
+    /// The partition an offline read uses: the last online state's, but only while that state is
+    /// still current (same generation, setting still enabled). Otherwise the anonymous state at
+    /// the current generation, whose partition no credentialed response was stored under, so the
+    /// read misses and fails closed instead of serving a body fetched under a credential the
+    /// setting has since withdrawn.
+    fn offline_partition(&self, current: KeychainSnapshot) -> CredentialPartition {
+        let last = *self
+            .credential_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let state = match last {
+            Some(state)
+                if state.generation == current.generation
+                    && current.setting == KeychainCredentials::Enabled =>
+            {
+                state
+            }
+            Some(_) | None => CredentialState {
+                presence: CredentialPresence::Anonymous,
+                generation: current.generation,
+            },
+        };
+        state.partition(self.digest)
     }
 
     /// The trust and credential digest this client was built from.
@@ -170,23 +209,28 @@ impl PackageRegistryClient {
         let mut headers = vec![RequestHeader::Accept(ACCEPT)];
         match transport_for(self.registry.url.trust()) {
             TransportKind::TrustedOrigin => {
-                // Offline, no request is sent, so `security` must not run (it could prompt).
-                let auth = match &self.registry.auth {
-                    Some(RegistryAuth::Header(auth)) => Some(Cow::Borrowed(auth)),
+                // Offline, no request is sent, so `security` must not run (it could prompt); the
+                // cache is then read under the last online state.
+                let (auth, auth_id) = match &self.registry.auth {
+                    Some(RegistryAuth::Header(auth)) => (Some(Cow::Borrowed(auth)), None),
                     Some(RegistryAuth::Keychain(credential)) if !self.cache.is_offline() => {
                         let KeychainAuthorization { auth, generation } =
                             credential.authorization().await;
-                        self.note_credential_state(CredentialState {
+                        let state = CredentialState {
                             presence: if auth.is_some() {
                                 CredentialPresence::Credentialed
                             } else {
                                 CredentialPresence::Anonymous
                             },
                             generation,
-                        });
-                        auth.map(Cow::Owned)
+                        };
+                        self.note_credential_state(state);
+                        (auth.map(Cow::Owned), Some(state.partition(self.digest)))
                     }
-                    Some(RegistryAuth::Keychain(_)) | None => None,
+                    Some(RegistryAuth::Keychain(credential)) => {
+                        (None, Some(self.offline_partition(credential.snapshot())))
+                    }
+                    None => (None, None),
                 };
                 if let Some(auth) = auth.as_deref() {
                     headers.push(RequestHeader::Credential(
@@ -195,7 +239,7 @@ impl PackageRegistryClient {
                     ));
                 }
                 self.cache
-                    .get_cached_trusted_origin_response(url, origin, &headers)
+                    .get_cached_trusted_origin_response(url, origin, auth_id, &headers)
                     .await
             }
             TransportKind::Pinned => {
@@ -225,7 +269,7 @@ impl PackageRegistryClient {
     /// Follows `Link: rel="next"` pages from the first releases URL and merges them.
     ///
     /// Every page is revalidated on every call, so a merged list can only be torn when one
-    /// page's revalidation fails and that page is served stale.
+    /// page's revalidation fails and that page is served stale (#1802).
     ///
     /// Exceeding any of the [`ListLimits`] fails the whole list.
     async fn fetch_all_releases(
@@ -295,7 +339,6 @@ impl PackageRegistryClient {
                 }
             }
         }
-        // TODO(critic): pages revalidated independently can tear the merged release list
         Err(incomplete(PaginationStop::PageCap))
     }
 
@@ -447,6 +490,31 @@ mod tests {
     use crate::config::{SwiftRegistryUrl, UserTier};
     use deps_core::secret::Redacted;
     use std::assert_matches;
+
+    #[test]
+    fn credential_partitions_differ_by_presence_generation_and_digest() {
+        let state = |presence, generation| CredentialState {
+            presence,
+            generation,
+        };
+        let anonymous = state(CredentialPresence::Anonymous, KeychainGeneration::INITIAL);
+        let credentialed = state(
+            CredentialPresence::Credentialed,
+            KeychainGeneration::INITIAL,
+        );
+        let later = state(
+            CredentialPresence::Credentialed,
+            KeychainGeneration::INITIAL.next(),
+        );
+        let partitions = [
+            anonymous.partition(1),
+            credentialed.partition(1),
+            later.partition(1),
+            credentialed.partition(2),
+        ];
+        let distinct: HashSet<_> = partitions.into_iter().collect();
+        assert_eq!(distinct.len(), partitions.len());
+    }
 
     const RELEASES: &str = r#"{"releases": {
         "1.0.0": {"url": "https://r/acme/net/1.0.0"},
@@ -1257,7 +1325,7 @@ mod tests {
     mod keychain {
         use super::*;
         use crate::auth::{CredentialLookup, KeychainBinding};
-        use crate::keychain::BackendError;
+        use crate::keychain::KeychainError;
         use crate::keychain::KeychainStore;
         use crate::keychain::fake::Fake;
         use deps_core::keychain_credentials::KeychainCredentialsHandle;
@@ -1313,7 +1381,7 @@ mod tests {
                 .with_body(RELEASES)
                 .create_async()
                 .await;
-            let fake = Fake::new(Err(BackendError::NotFound), Ok("unused"));
+            let fake = Fake::new(Err(KeychainError::NotFound), Ok("unused"));
             let (client, _handle) = keychain_client(&format!("{}/api", server.url()), &fake);
             client
                 .list_releases(&identity(), PublishedAtLookup::Skip)
@@ -1347,7 +1415,7 @@ mod tests {
 
         #[tokio::test]
         async fn test_refused_and_transient_send_no_credential() {
-            for reply in [BackendError::Refused, BackendError::Transient] {
+            for reply in [KeychainError::Refused, KeychainError::Transient] {
                 let mut server = mockito::Server::new_async().await;
                 let mock = server
                     .mock("GET", "/api/acme/net")
@@ -1404,7 +1472,7 @@ mod tests {
                 .with_body(RELEASES)
                 .create_async()
                 .await;
-            let fake = Fake::new(Ok("user"), Err(BackendError::Transient));
+            let fake = Fake::new(Ok("user"), Err(KeychainError::Transient));
             let (client, _handle) = keychain_client(&format!("{}/api", server.url()), &fake);
 
             let first = client
@@ -1482,6 +1550,91 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(fake.find_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
             assert_eq!(fake.secret_calls(), 0);
+        }
+
+        /// Mocks the credentialed releases response, served exactly once.
+        async fn credentialed_releases_mock(server: &mut mockito::ServerGuard) -> mockito::Mock {
+            server
+                .mock("GET", "/api/acme/net")
+                .match_header("authorization", "Basic dXNlcjpodW50ZXIy")
+                .with_status(200)
+                .with_body(RELEASES)
+                .expect(1)
+                .create_async()
+                .await
+        }
+
+        /// While the last online state is still current, an offline read is served from the
+        /// cache under that state's partition.
+        #[tokio::test]
+        async fn test_offline_reads_under_the_last_online_partition_while_it_is_current() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = credentialed_releases_mock(&mut server).await;
+            let fake = Fake::found();
+            let (client, _handle) = keychain_client(&format!("{}/api", server.url()), &fake);
+            client
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap();
+            client.cache.set_offline(deps_core::NetworkMode::Offline);
+
+            let offline = client
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await;
+            assert!(offline.is_ok(), "{offline:?}");
+            mock.assert_async().await;
+        }
+
+        /// L1: after the setting is disabled, an offline read must not be answered from a body
+        /// that was fetched under the withdrawn credential.
+        #[tokio::test]
+        async fn test_offline_does_not_serve_a_credentialed_body_after_the_setting_is_disabled() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = credentialed_releases_mock(&mut server).await;
+            let fake = Fake::found();
+            let (client, handle) = keychain_client(&format!("{}/api", server.url()), &fake);
+            client
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap();
+            handle.set(KeychainCredentials::Disabled);
+            client.cache.set_offline(deps_core::NetworkMode::Offline);
+
+            let offline = client
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await;
+            assert!(offline.is_err(), "{offline:?}");
+            mock.assert_async().await;
+        }
+
+        /// A body fetched anonymously (setting off) never answers an offline request once the
+        /// setting is enabled again: the generation moved on, so the read misses.
+        #[tokio::test]
+        async fn test_offline_anonymous_body_cannot_answer_after_the_setting_is_enabled() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/api/acme/net")
+                .match_header("authorization", mockito::Matcher::Missing)
+                .with_status(200)
+                .with_body(RELEASES)
+                .expect(1)
+                .create_async()
+                .await;
+            let fake = Fake::found();
+            let (client, handle) = keychain_client(&format!("{}/api", server.url()), &fake);
+            handle.set(KeychainCredentials::Disabled);
+            client
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap();
+            handle.set(KeychainCredentials::Enabled);
+            client.cache.set_offline(deps_core::NetworkMode::Offline);
+
+            let offline = client
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await;
+            assert!(offline.is_err(), "{offline:?}");
+            mock.assert_async().await;
         }
 
         #[tokio::test]

@@ -271,7 +271,7 @@ async fn run_check(
 
     let mut findings = Vec::new();
 
-    // TODO(deviation #4, spec 062 tasks.md T024 / spec.md NFR-004): manifests are processed
+    // Deviation #4 (spec 062 tasks.md T024 / spec.md NFR-004): manifests are processed
     // sequentially, not fanned out via `buffer_unordered`, deliberately — per-manifest fetch
     // concurrency is already bounded by `fetch_latest_versions_parallel`, which is what NFR-004
     // gates; only affects wall-clock time on monorepo-of-monorepos scale (perf-reviewed, non-blocking).

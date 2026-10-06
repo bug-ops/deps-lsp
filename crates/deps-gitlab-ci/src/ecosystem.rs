@@ -14,11 +14,10 @@ use deps_core::lsp_helpers::{PackageNaming, PackageRendering};
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
     Ecosystem, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
-    diagnostic::{Diagnostic, Severity},
+    diagnostic::{Diagnostic, DiagnosticKind, GitTagsPlatform, Severity},
     lsp_helpers::{
-        CommentCheck, EcosystemFormatter, MAX_DIAGNOSTIC_VALUE_CHARS,
+        CommentCheck, EcosystemFormatter, MAX_DIAGNOSTIC_VALUE_CHARS, UnknownRefTarget,
         sanitize_and_truncate_for_diagnostic, sha_comment_mismatch_diagnostic,
-        unknown_ref_diagnostic_for,
     },
 };
 use std::any::Any;
@@ -27,8 +26,6 @@ use std::sync::{Arc, RwLock};
 use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
 use url::Url;
 
-use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
-use crate::UNRESOLVED_HOST_DIAGNOSTIC_CODE;
 use crate::client::GitlabApiClient;
 use crate::formatter::GitlabCiFormatter;
 use crate::host::GitlabInstanceHost;
@@ -42,8 +39,8 @@ mod lsp;
 #[cfg(feature = "lsp-responses")]
 use lsp::{
     COMPONENT_PIN_RESOLUTION_TIMEOUT, VERSION_OPERATOR_CHARS, build_dynamic_component_pin_action,
-    build_sha_comment_fix_action, build_sha_pin_action, collect_pin_all_to_sha_edits,
-    splice_project_line,
+    build_sha_comment_fix_action, build_sha_pin_action, build_unknown_ref_fix_action,
+    collect_pin_all_to_sha_edits, splice_project_line,
 };
 
 /// Maximum character count of an interpolated raw host expression before truncation —
@@ -424,6 +421,12 @@ impl Ecosystem for GitlabCiEcosystem {
                 uri,
                 &self.formatter,
             ));
+            actions.extend(build_unknown_ref_fix_action(
+                parse_result,
+                position,
+                uri,
+                &self.formatter,
+            ));
             if let Some(action) = build_dynamic_component_pin_action(
                 parse_result,
                 position,
@@ -632,9 +635,12 @@ fn unresolved_host_diagnostics(parse_result: &dyn ParseResultTrait) -> Vec<Diagn
                 HostRef::Literal(_) | HostRef::PolicyBlocked { .. } => return None,
             };
             Some(
-                Diagnostic::new(gl_dep.name_range, message)
-                    .with_severity(Severity::Information)
-                    .with_code(UNRESOLVED_HOST_DIAGNOSTIC_CODE),
+                Diagnostic::new(
+                    DiagnosticKind::UnresolvedGitlabHost,
+                    gl_dep.name_range,
+                    message,
+                )
+                .with_severity(Severity::Information),
             )
         })
         .collect()
@@ -679,6 +685,7 @@ fn mutable_ref_pin_diagnostics(
                 // itself, mirroring the FR-012 unresolved-host diagnostic's convention.
                 return Some(
                     Diagnostic::new(
+                        DiagnosticKind::MutableRefPin(GitTagsPlatform::GitlabCi),
                         gl_dep.name_range,
                         format!(
                             "{name} project has no `ref:`; GitLab CI defaults to the project's \
@@ -686,8 +693,7 @@ fn mutable_ref_pin_diagnostics(
                              to a tag or commit SHA (manual edit — no automated fix available)"
                         ),
                     )
-                    .with_severity(severity)
-                    .with_code(MUTABLE_REF_PIN_DIAGNOSTIC_CODE),
+                    .with_severity(severity),
                 );
             };
 
@@ -743,9 +749,12 @@ fn mutable_ref_pin_diagnostics(
                 )
             };
             Some(
-                Diagnostic::new(range, message)
-                    .with_severity(severity)
-                    .with_code(MUTABLE_REF_PIN_DIAGNOSTIC_CODE),
+                Diagnostic::new(
+                    DiagnosticKind::MutableRefPin(GitTagsPlatform::GitlabCi),
+                    range,
+                    message,
+                )
+                .with_severity(severity),
             )
         })
         .collect()
@@ -795,6 +804,22 @@ fn sha_comment_mismatch_diagnostics(
         .collect()
 }
 
+/// The `project:` tag pin `gl_dep` and the Tags list that can speak for it, shared by the
+/// unknown-ref diagnostic and its quick fix (#1781). `None` for a non-tag pin, a pin without a
+/// ref or range, a `component:` include (a version without a release is not a missing tag), and
+/// a project whose tags have not been fetched.
+pub(crate) fn unknown_ref_target<'a>(
+    formatter: &GitlabCiFormatter,
+    gl_dep: &'a GitlabCiDependency,
+) -> Option<UnknownRefTarget<'a>> {
+    if gl_dep.pin != Some(PinStyle::Tag) {
+        return None;
+    }
+    let written = gl_dep.version_req.as_ref()?.as_str();
+    let index = formatter.tag_list_index(gl_dep)?;
+    Some(UnknownRefTarget::new(index, written, gl_dep.version_range?))
+}
+
 /// One unknown-ref diagnostic (#1766) per `project:` include whose `ref:` is a full release
 /// the complete Tags list lacks; silent for a partial shape (it may be a branch), a
 /// `component:` include (a version without a release is not a missing tag), and a cold, empty
@@ -809,18 +834,7 @@ fn unknown_ref_diagnostics(
         .into_iter()
         .filter_map(|dep| {
             let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
-            if gl_dep.pin != Some(PinStyle::Tag) {
-                return None;
-            }
-            let written = gl_dep.version_req.as_ref()?.as_str();
-            let index = formatter.tag_list_index(gl_dep)?;
-            unknown_ref_diagnostic_for(
-                &index,
-                &gl_dep.name,
-                written,
-                gl_dep.version_range?,
-                severity,
-            )
+            unknown_ref_target(formatter, gl_dep)?.diagnostic(&gl_dep.name, severity)
         })
         .collect()
 }
@@ -831,6 +845,7 @@ fn unknown_ref_diagnostics(
 mod tests {
     use super::*;
     use crate::types::EndpointKind;
+    use crate::{MUTABLE_REF_PIN_DIAGNOSTIC_CODE, UNRESOLVED_HOST_DIAGNOSTIC_CODE};
     use dashmap::DashMap;
 
     #[test]
@@ -3553,6 +3568,15 @@ mod tests {
                 )
             }
 
+            fn unknown_ref_fix(&self, line: u32, column: u32) -> Option<CodeAction> {
+                build_unknown_ref_fix_action(
+                    self.parse_result.as_ref(),
+                    Position::new(line, column),
+                    &self.uri,
+                    &self.eco.formatter,
+                )
+            }
+
             fn only_dep(&self) -> GitlabCiDependency {
                 let deps = deps_core::ParseResult::dependencies(self.parse_result.as_ref());
                 assert_eq!(deps.len(), 1);
@@ -3801,6 +3825,40 @@ mod tests {
 
             for silent in ["v1.120.0", "v1", "v40", "v1.119.0-working", "main"] {
                 assert!(codes(silent).await.is_empty(), "{silent}");
+            }
+        }
+
+        /// #1781: the quick fix rewrites a `project:` ref to the published spelling exactly where
+        /// the unknown-ref diagnostic fires, and is withheld for an unmatched or partial ref.
+        #[tokio::test]
+        async fn test_unknown_ref_fix_rewrites_project_ref_to_published_tag() {
+            let content = project_pin("1.120.0");
+            let fixture = CommentFixture::new(&content, &v117_v120_tags(), "v1.120.0").await;
+            let range = fixture.only_dep().version_range.unwrap();
+            let action = fixture
+                .unknown_ref_fix(range.start.line, range.start.character)
+                .expect("1.120.0 has a published spelling");
+            assert_eq!(action.title, "Change ref to published tag `v1.120.0`");
+            let edit = &action
+                .edit
+                .unwrap()
+                .changes
+                .unwrap()
+                .into_values()
+                .next()
+                .unwrap()[0];
+            assert_eq!(apply_edit(&content, edit), project_pin("v1.120.0"));
+
+            for silent in ["v1.119.0", "v1", "v1.120.0", "main"] {
+                let content = project_pin(silent);
+                let fixture = CommentFixture::new(&content, &v117_v120_tags(), "v1.120.0").await;
+                let range = fixture.only_dep().version_range.unwrap();
+                assert!(
+                    fixture
+                        .unknown_ref_fix(range.start.line, range.start.character)
+                        .is_none(),
+                    "{silent}"
+                );
             }
         }
 

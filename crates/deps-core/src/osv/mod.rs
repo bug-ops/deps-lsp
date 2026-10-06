@@ -29,17 +29,16 @@ pub use severity::to_diagnostic_severity as diagnostic_severity_for;
 use types::worst_severity;
 pub use types::{
     Advisory, CandidateStatusMap, CandidateStatuses, Capped, DependencyVulnerabilities,
-    EmptyOsvPackageName, FixRecommendation, LatestStatusMap, MatchedTags, OsvEcosystem,
-    OsvPackageName, OsvQueryName, OsvVersion, ScanOutcome, ScanTarget, ScanVersion, SiblingMatches,
-    SkipReason, StructuralSkipReason, UpgradeStatus, VersionMatching, VulnKey, VulnKeys,
-    VulnSeverity, VulnerabilityMap, is_valid_osv_id, validated_osv_url, vuln_key_for,
+    EmptyOsvPackageName, FixRecommendation, InvalidOsvId, LatestStatusMap, MatchedTags,
+    OsvEcosystem, OsvId, OsvPackageName, OsvQueryName, OsvVersion, ScanOutcome, ScanTarget,
+    ScanVersion, SiblingCoverage, SiblingMatches, SkipReason, StructuralSkipReason, UpgradeStatus,
+    VersionMatching, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap, vuln_key_for,
     vulnerability_keys,
 };
 use types::{OsvBatchRequest, OsvBatchResponse, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord};
 
 use crate::ConcreteVersion;
 use crate::cache::HttpCache;
-use crate::pagination::ListCoverage;
 
 /// Advisories rendered (§7) per dependency in hover/diagnostics/`deps-cli` output.
 ///
@@ -239,6 +238,7 @@ impl InFlightRecord {
 pub struct OsvClient {
     cache: Arc<HttpCache>,
     query_cache: DashMap<QueryCacheKey, QueryCacheEntry>,
+    // TODO(#1806): key by `OsvId` instead of `String`.
     record_cache: DashMap<String, RecordCacheEntry>,
     /// Raw records keyed by advisory id, validated by `modified` — lets a
     /// [`VersionMatching::LocalUnversioned`] scan of another version of the same package match
@@ -414,7 +414,11 @@ impl OsvClient {
                         UpgradeStatus::CandidateVulnerable {
                             version,
                             advisory_ids: Capped::new(
-                                dv.advisories.items().iter().map(|a| a.id.clone()).collect(),
+                                dv.advisories
+                                    .items()
+                                    .iter()
+                                    .map(|a| a.id().clone())
+                                    .collect(),
                                 dv.advisories.total(),
                             ),
                             worst_severity,
@@ -451,7 +455,8 @@ impl OsvClient {
     /// A clean answer for an [`OsvQueryName::Provisional`] target is downgraded to
     /// [`SkipReason::CanonicalNameUnconfirmed`]: only a hit under an unconfirmed name is
     /// authoritative. Likewise a clean answer for a target whose sibling tags came from a
-    /// [`ListCoverage::Truncated`] list is downgraded to [`SkipReason::SiblingTagsUnknown`]: an
+    /// incomplete list ([`SiblingCoverage::Truncated`] or a cold/failed
+    /// [`SiblingCoverage::NotYetIndexed`] one) is downgraded to [`SkipReason::SiblingTagsUnknown`]: an
     /// advisory against an unlisted sibling would have been missed, while a hit stays
     /// authoritative.
     async fn resolve(
@@ -475,8 +480,8 @@ impl OsvClient {
                 }
             }
             match t.sibling_coverage() {
-                ListCoverage::Complete => {}
-                ListCoverage::Truncated => {
+                SiblingCoverage::Complete => {}
+                SiblingCoverage::Truncated | SiblingCoverage::NotYetIndexed => {
                     if let Some(outcome @ ScanOutcome::Clean) = outcomes.get_mut(&t.key) {
                         *outcome = ScanOutcome::Skipped(SkipReason::SiblingTagsUnknown);
                     }
@@ -770,7 +775,7 @@ impl OsvClient {
             .map(|s| (LocalVersion::parse(s.version()), s.display_version()))
             .collect();
         let mut affected = Vec::new();
-        let mut sibling_only: HashMap<String, MatchedTags> = HashMap::new();
+        let mut sibling_only: HashMap<OsvId, MatchedTags> = HashMap::new();
         let mut undeterminable = 0usize;
         for record in records {
             let ranges = record.affected_for(target.osv_name.name(), osv_eco);
@@ -790,9 +795,10 @@ impl OsvClient {
             let is_affected = primary_verdict == Verdict::Affected || !matched_siblings.is_empty();
             if is_affected {
                 if primary_verdict != Verdict::Affected
+                    && let Some(id) = OsvId::parse(&record.id)
                     && let Some(tags) = MatchedTags::from_tags(matched_siblings)
                 {
-                    sibling_only.insert(record.id.clone(), tags);
+                    sibling_only.insert(id, tags);
                 }
                 affected.push(record);
             } else if primary_verdict == Verdict::Undeterminable || sibling_undeterminable {
@@ -808,8 +814,8 @@ impl OsvClient {
             ScanOutcome::Vulnerable(dv) => {
                 let mut matches = SiblingMatches::new(target.version.clone());
                 for advisory in dv.advisories.items() {
-                    if let Some(tags) = sibling_only.remove(&advisory.id) {
-                        matches.insert(advisory.id.clone(), tags);
+                    if let Some(tags) = sibling_only.remove(advisory.id()) {
+                        matches.insert(advisory.id().clone(), tags);
                     }
                 }
                 ScanOutcome::Vulnerable(if matches.is_empty() {
@@ -929,7 +935,7 @@ impl OsvClient {
                 continue;
             };
             let advisory = Arc::new(advisory);
-            vuln_ids.push((advisory.id.clone(), advisory.modified.clone()));
+            vuln_ids.push((advisory.id().as_str().to_owned(), advisory.modified.clone()));
             self.store_record_cache(&advisory);
             if advisories.len() < MAX_ADVISORY_RECORDS {
                 advisories.push(advisory);
@@ -1249,7 +1255,7 @@ impl OsvClient {
             });
         }
         self.record_cache.insert(
-            advisory.id.clone(),
+            advisory.id().as_str().to_owned(),
             RecordCacheEntry {
                 advisory: Arc::clone(advisory),
                 modified: advisory.modified.clone(),
@@ -1719,7 +1725,10 @@ mod tests {
         let ScanOutcome::Vulnerable(dv) = scan_gha("4.1.2").await else {
             panic!("expected Vulnerable");
         };
-        assert_eq!(dv.advisories.items()[0].id, "GHSA-cxww-7g56-2vh6");
+        assert_eq!(
+            dv.advisories.items()[0].id().as_str(),
+            "GHSA-cxww-7g56-2vh6"
+        );
     }
 
     #[tokio::test]
@@ -2194,7 +2203,7 @@ mod tests {
             panic!("expected Vulnerable");
         };
         let tags: Vec<&str> = dv
-            .sibling_match("GHSA-cxww-7g56-2vh6")
+            .sibling_match(&crate::test_util::osv_id("GHSA-cxww-7g56-2vh6"))
             .expect("sibling-only advisory is attributed")
             .iter()
             .map(ConcreteVersion::as_str)
@@ -2211,11 +2220,15 @@ mod tests {
     }
 
     async fn scan_gha_truncated_siblings(events: &str) -> ScanOutcome {
+        scan_gha_with_coverage(events, SiblingCoverage::Truncated).await
+    }
+
+    async fn scan_gha_with_coverage(events: &str, coverage: SiblingCoverage) -> ScanOutcome {
         let (_server, client) = gha_sibling_fixture(events).await;
         let versions = crate::lsp_helpers::InUseVersions::for_test_with_coverage(
             ConcreteVersion::new("4.8.0"),
             vec![ConcreteVersion::new("4.9.0")],
-            ListCoverage::Truncated,
+            coverage,
         );
         let targets = vec![
             target("actions/download-artifact", "4.8.0").with_siblings(&versions, &IdentityNaming),
@@ -2237,6 +2250,33 @@ mod tests {
         );
     }
 
+    /// #1780: a cold (or failed) tag fetch has no sibling data at all, so a clean answer must
+    /// not count as fully checked either.
+    #[tokio::test]
+    async fn gha_not_yet_indexed_sibling_scan_clean_is_downgraded_to_sibling_tags_unknown() {
+        assert_matches!(
+            scan_gha_with_coverage(
+                r#"[{"introduced":"5.0.0"}]"#,
+                SiblingCoverage::NotYetIndexed
+            )
+            .await,
+            ScanOutcome::Skipped(SkipReason::SiblingTagsUnknown)
+        );
+    }
+
+    /// #1780: a hit stays authoritative on a cold cache.
+    #[tokio::test]
+    async fn gha_not_yet_indexed_sibling_scan_hit_stays_vulnerable() {
+        assert_matches!(
+            scan_gha_with_coverage(
+                r#"[{"introduced":"4.8.0"},{"fixed":"4.8.1"}]"#,
+                SiblingCoverage::NotYetIndexed
+            )
+            .await,
+            ScanOutcome::Vulnerable(_)
+        );
+    }
+
     /// #1769: a hit is authoritative whatever the list coverage.
     #[tokio::test]
     async fn gha_truncated_sibling_scan_hit_stays_vulnerable() {
@@ -2252,7 +2292,7 @@ mod tests {
         let candidate = target("actions/download-artifact", "4.8.0").with_siblings(
             &crate::lsp_helpers::CandidateSiblings::for_test_with_coverage(
                 vec![ConcreteVersion::new("4.9.0")],
-                ListCoverage::Truncated,
+                crate::pagination::ListCoverage::Truncated,
             ),
             &IdentityNaming,
         );
@@ -2340,7 +2380,7 @@ mod tests {
         };
         assert_eq!(dv.advisories.total(), 1);
         let tags: Vec<&str> = dv
-            .sibling_match("GHSA-cxww-7g56-2vh6")
+            .sibling_match(&crate::test_util::osv_id("GHSA-cxww-7g56-2vh6"))
             .expect("sibling-only advisory")
             .iter()
             .map(ConcreteVersion::as_str)
@@ -2361,7 +2401,10 @@ mod tests {
         else {
             panic!("expected Vulnerable");
         };
-        assert!(dv.sibling_match("GHSA-cxww-7g56-2vh6").is_some());
+        assert!(
+            dv.sibling_match(&crate::test_util::osv_id("GHSA-cxww-7g56-2vh6"))
+                .is_some()
+        );
         assert!(dv.recommended_fix(None).is_none());
 
         let ScanOutcome::Vulnerable(dv) = scan_gha_with_siblings(
@@ -2695,7 +2738,7 @@ mod tests {
         };
         assert_eq!(dv.advisories.total(), 1);
         assert_eq!(dv.advisories.items().len(), 1);
-        assert_eq!(dv.advisories.items()[0].id, "RUSTSEC-2020-0071");
+        assert_eq!(dv.advisories.items()[0].id().as_str(), "RUSTSEC-2020-0071");
         assert_eq!(dv.advisories.items()[0].severity, VulnSeverity::High);
         assert_eq!(
             dv.advisories.items()[0].fixed_versions,
@@ -2950,7 +2993,7 @@ mod tests {
             statuses.get(&crate::test_util::vuln_key("bad-pkg")),
             Some(UpgradeStatus::CandidateVulnerable { version, advisory_ids, .. })
                 if version == "2.0.0"
-                    && advisory_ids.items() == ["ADV-1".to_string()]
+                    && advisory_ids.items() == [crate::test_util::osv_id("ADV-1")]
                     && advisory_ids.total() == 1
         );
     }
@@ -3045,7 +3088,7 @@ mod tests {
         assert_matches!(
             statuses.get(&crate::test_util::vuln_key("other")),
             Some(UpgradeStatus::CandidateVulnerable { version, advisory_ids, .. })
-                if version == "3.0.0" && advisory_ids.items() == ["ADV-1".to_string()]
+                if version == "3.0.0" && advisory_ids.items() == [crate::test_util::osv_id("ADV-1")]
         );
     }
 
@@ -3076,7 +3119,7 @@ mod tests {
         assert_matches!(
             statuses.get(&crate::test_util::vuln_key("dup")),
             Some(UpgradeStatus::CandidateVulnerable { advisory_ids, .. })
-                if advisory_ids.items() == ["ADV-1".to_string()] && advisory_ids.total() == 1
+                if advisory_ids.items() == [crate::test_util::osv_id("ADV-1")] && advisory_ids.total() == 1
         );
     }
 
@@ -3234,7 +3277,7 @@ mod tests {
                 statuses.get(&crate::test_util::vuln_key("bad-pkg"))
             );
         };
-        assert_eq!(advisory_ids.items(), ["ADV-OK".to_string()]);
+        assert_eq!(advisory_ids.items(), [crate::test_util::osv_id("ADV-OK")]);
         assert_eq!(
             advisory_ids.total(),
             2,

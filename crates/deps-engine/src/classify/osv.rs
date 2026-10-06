@@ -729,7 +729,7 @@ fn resolve_fix_target(
             return FixTargetResolution::Skip;
         }
         // `resolve_recommended_fix` can only ever return `NoRecommendedFix`/`UnsafeVersion` —
-        // these five variants exist only for `plan_vulnerability_fix`'s later,
+        // these six variants exist only for `plan_vulnerability_fix`'s later,
         // `resolve_verified_fix`-based decision. Handled explicitly rather than folded into a
         // wildcard (code review finding) so a future `VulnFixSkip` variant, or a change that
         // starts surfacing one of these here, is a compile error instead of silently
@@ -739,6 +739,7 @@ fn resolve_fix_target(
             VulnFixSkip::UnverifiedTarget
             | VulnFixSkip::RequirementAlreadyResolves
             | VulnFixSkip::NoOpRewrite
+            | VulnFixSkip::NoReleaseTagForFix
             | VulnFixSkip::UnresolvedPlaceholder
             | VulnFixSkip::OversizedRequirement,
         ) => return FixTargetResolution::Skip,
@@ -1790,7 +1791,7 @@ mod tests {
             assert!(
                 targets
                     .iter()
-                    .all(|t| t.sibling_coverage() == ListCoverage::Truncated),
+                    .all(|t| t.sibling_coverage() == deps_core::osv::SiblingCoverage::Truncated),
                 "{targets:?}"
             );
         }
@@ -2741,7 +2742,10 @@ mod tests {
                 &StubFormatter::DEFAULT,
             );
 
-            assert_eq!(targets[0].sibling_coverage(), ListCoverage::Truncated);
+            assert_eq!(
+                targets[0].sibling_coverage(),
+                deps_core::osv::SiblingCoverage::Truncated
+            );
         }
 
         #[test]

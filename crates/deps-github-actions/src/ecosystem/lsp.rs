@@ -11,10 +11,8 @@
 use deps_core::lsp_helpers::{CommentCheck, PackageRendering};
 use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
 
-use super::{
-    GithubActionsDependency, GithubActionsFormatter, MUTABLE_REF_PIN_DIAGNOSTIC_CODE,
-    ParseResultTrait, Url,
-};
+use super::{GithubActionsDependency, GithubActionsFormatter, ParseResultTrait, Url};
+use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 
 /// Leading version-constraint operators stripped from a completion prefix before matching
 /// it against registry versions. Empty: a `uses:` ref is a bare tag/branch/SHA, with no
@@ -107,6 +105,23 @@ pub(super) fn build_sha_comment_fix_action(
         gha_dep.sha_comment()?.pin_comment(),
         &mismatch,
     )
+}
+
+/// Builds the "Change ref to published tag" quickfix (#1781) for the tag-pinned step at
+/// `position` whose ref the repository's complete tag list proves unpublished.
+///
+/// Selects the pin through the same [`super::unknown_ref_target`] the diagnostic uses, then
+/// delegates to [`deps_core::lsp_helpers::UnknownRefTarget::fix_action`].
+pub(super) fn build_unknown_ref_fix_action(
+    parse_result: &dyn ParseResultTrait,
+    position: Position,
+    uri: &Url,
+    formatter: &GithubActionsFormatter,
+) -> Option<CodeAction> {
+    let dep =
+        deps_core::lsp_helpers::dependency_at_position(parse_result, position.into(), formatter)?;
+    let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+    super::unknown_ref_target(formatter, gha_dep)?.fix_action(uri)
 }
 
 /// Builds one [`TextEdit`] per `PinStyle::Tag` step in `parse_result` resolvable to a

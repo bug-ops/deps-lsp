@@ -1304,7 +1304,8 @@ mod tests {
         fn test_nuget_user_profile_sources_change_scopes_to_nuget_only() {
             let old = DepsConfig::default();
             let mut new = DepsConfig::default();
-            new.policy.registries.nuget_user_profile_sources = true;
+            new.policy.registries.nuget_user_profile_sources =
+                deps_core::policy_config::UserProfileSources::Enabled;
 
             let scope = reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS)
                 .expect("must trigger a reparse");
@@ -1355,7 +1356,8 @@ mod tests {
             let old = DepsConfig::default();
             let mut new = DepsConfig::default();
             new.policy.registries.workspace_registries = WorkspaceRegistriesSetting::Off;
-            new.policy.registries.nuget_user_profile_sources = true;
+            new.policy.registries.nuget_user_profile_sources =
+                deps_core::policy_config::UserProfileSources::Enabled;
 
             let scope = reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS)
                 .expect("must trigger a reparse");

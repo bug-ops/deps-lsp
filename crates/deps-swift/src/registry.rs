@@ -403,8 +403,7 @@ fn parse_license_response(data: &[u8]) -> Vec<String> {
         .license
         .and_then(|l| l.spdx_id)
         .filter(|id| !id.is_empty() && id != GITHUB_LICENSE_NOASSERTION)
-        .map(|id| vec![id])
-        .unwrap_or_default()
+        .map_or_default(|id| vec![id])
 }
 
 /// Where a dependency's lookups go.

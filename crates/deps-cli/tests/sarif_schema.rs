@@ -11,8 +11,8 @@
 use deps_cli::format::sarif::to_sarif;
 use deps_cli::report::{AdvisoryFacts, Category, CheckFinding, CheckReport};
 use deps_core::EcosystemId;
-use deps_core::diagnostic::Severity;
-use deps_core::osv::VulnSeverity;
+use deps_core::diagnostic::{DiagnosticKind, GitTagsPlatform, Severity};
+use deps_core::osv::{OsvId, VulnSeverity};
 use deps_core::position::{Position, Range};
 use std::path::PathBuf;
 
@@ -57,14 +57,28 @@ fn schema_validator() -> jsonschema::Validator {
     jsonschema::validator_for(&schema).expect("vendored SARIF schema must itself be valid")
 }
 
+fn kind_for(category: Category) -> DiagnosticKind {
+    match category {
+        Category::Outdated => DiagnosticKind::Outdated,
+        Category::Yanked => DiagnosticKind::Yanked,
+        Category::Vulnerable => DiagnosticKind::AdvisoryOverflow,
+        Category::Unsatisfiable => DiagnosticKind::Unsatisfiable,
+        Category::MutableRefPin => DiagnosticKind::MutableRefPin(GitTagsPlatform::GithubActions),
+        Category::ShaCommentMismatch => DiagnosticKind::ShaCommentMismatch,
+        Category::UnknownRef => DiagnosticKind::UnknownRef,
+        Category::License => DiagnosticKind::LicensePolicy,
+        Category::Deprecated => DiagnosticKind::Deprecated,
+        Category::Other => DiagnosticKind::Notice,
+    }
+}
+
 fn finding(category: Category, severity: Severity) -> CheckFinding {
     CheckFinding {
         ecosystem: EcosystemId::Cargo,
         manifest_path: PathBuf::from("Cargo.toml"),
         dependency_name: Some("serde".to_string()),
         requirement: Some("1.0".to_string()),
-        category,
-        code: None,
+        kind: kind_for(category),
         advisory_url: None,
         advisory: None,
         severity,
@@ -111,7 +125,8 @@ fn test_multi_category_report_produces_schema_valid_sarif() {
 #[test]
 fn test_advisory_coded_finding_produces_schema_valid_sarif() {
     let mut vulnerable = finding(Category::Vulnerable, Severity::Error);
-    vulnerable.code = Some("RUSTSEC-2020-0071".to_string());
+    vulnerable.kind =
+        DiagnosticKind::Advisory(OsvId::parse("RUSTSEC-2020-0071").expect("valid osv id"));
     vulnerable.message = "RUSTSEC-2020-0071: Potential segfault in the time crate".to_string();
     vulnerable.advisory_url = Some("https://osv.dev/vulnerability/RUSTSEC-2020-0071".to_string());
     vulnerable.advisory = Some(AdvisoryFacts {
@@ -123,14 +138,13 @@ fn test_advisory_coded_finding_produces_schema_valid_sarif() {
     });
 }
 
-/// Regression test for issue #1077 MEDIUM security review: a malformed advisory `code` (one
-/// that would produce an invalid `helpUri`) must not break the *whole* SARIF document's
-/// schema validation — the offending `helpUri` must be omitted, not emitted unvalidated.
+/// Regression test for issue #1077 MEDIUM security review: a malformed advisory id can no
+/// longer reach a finding at all (#1785) — it is rejected at `OsvId::parse`, and a
+/// vulnerability finding without an id still produces a schema-valid document.
 #[test]
-fn test_malformed_advisory_id_does_not_break_schema_validation() {
-    let mut vulnerable = finding(Category::Vulnerable, Severity::Error);
-    vulnerable.code = Some("evil id\nwith\"quotes and spaces".to_string());
+fn test_malformed_advisory_id_is_rejected_and_fallback_is_schema_valid() {
+    assert!(OsvId::parse("evil id\nwith\"quotes and spaces").is_none());
     assert_valid_sarif(&CheckReport {
-        findings: vec![vulnerable],
+        findings: vec![finding(Category::Vulnerable, Severity::Error)],
     });
 }

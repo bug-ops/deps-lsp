@@ -3,7 +3,9 @@ use deps_core::HttpCache;
 use deps_core::lockfile::LockFileCache;
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
-use deps_core::policy_config::{OsvChecks, OsvChecksCell};
+use deps_core::policy_config::{
+    AtomicToggle, GossipChecks, OsvChecks, PolicyConfig, TyposquatChecks, UserProfileSources,
+};
 use deps_core::{
     ConcreteVersion, DependencyOutcomes, DepsDevClient, EcosystemId, EcosystemRegistry,
     GossipFindings, LicensePolicy, PackageName, PackageVersions, ParseResult, TyposquatSignal,
@@ -1012,7 +1014,7 @@ pub struct ServerState {
     /// Live-updatable `registries.nuget_user_profile_sources` setting (issue #561, FR-006) —
     /// the same handle `crate::register_ecosystems` hands to `NuGetEcosystem`'s
     /// `NuGetParseContext`, bundled inside `EcosystemRuntime`. See that struct's docs.
-    pub nuget_user_profile_sources: Arc<AtomicBool>,
+    pub nuget_user_profile_sources: Arc<AtomicToggle<UserProfileSources>>,
     /// Live-updatable `registries.swift_keychain_credentials` setting (#1771) — the same handle
     /// `crate::register_ecosystems` hands to `SwiftParseContext::with_keychain`, bundled inside
     /// `EcosystemRuntime`, and the source of the "credential resolved" event.
@@ -1045,20 +1047,21 @@ pub struct ServerState {
     /// `handlers::diagnostics::generate_diagnostics_internal` on every diagnostics
     /// generation call — both the pull path and every push-path background refresh — rather
     /// than threaded as a caller-supplied parameter, since diagnostics has multiple
-    /// producers all replacing the same client-visible diagnostic set. A plain `AtomicBool`,
-    /// not `RwLock<Arc<..>>` like `license_policy`: this is a single opt-in/opt-out flag,
-    /// not a structured value. Defaults to `false` (disabled) until
+    /// producers all replacing the same client-visible diagnostic set. An `AtomicToggle`,
+    /// not `RwLock<Arc<..>>` like `license_policy`: this is a single opt-in/opt-out gate,
+    /// not a structured value. It holds the resolved gate (`enabled && online`), so an
+    /// offline -> online transition is observable as an edge. Defaults to inactive until
     /// `Backend::initialize`/`did_change_configuration` first parses
     /// `initializationOptions.typosquat`.
-    pub typosquat_enabled: AtomicBool,
+    typosquat_checks: AtomicToggle<TyposquatChecks>,
     /// Live-updatable `policy.gossip.enabled` setting (issue #1456, spec 072), mirroring
-    /// `typosquat_enabled`'s exact rationale and shape. Defaults to `false` (disabled)
-    /// until `Backend::initialize`/`did_change_configuration` first parses
+    /// `typosquat_checks`'s exact rationale and shape. Defaults to inactive until
+    /// `Backend::initialize`/`did_change_configuration` first parses
     /// `initializationOptions.gossip`.
-    pub gossip_enabled: AtomicBool,
+    gossip_checks: AtomicToggle<GossipChecks>,
     /// Whether the OSV latest-check (issue #1517) is currently *effectively* enabled —
     /// `policy.diagnostics.vulnerabilities_enabled && !policy.network.offline`, mirroring
-    /// `typosquat_enabled`'s rationale but tracking a derived, two-flag condition rather than
+    /// `typosquat_checks`'s rationale but tracking a derived, two-flag condition rather than
     /// a single config field. Used only to detect the disabled/offline -> enabled transition
     /// (critique S5): `Backend::did_change_configuration` compares this against the freshly
     /// resolved value and, on an `Inactive` -> `Active` edge, triggers an immediate rescan for every
@@ -1068,12 +1071,12 @@ pub struct ServerState {
     /// either flag is not a parse-affecting config change (`config::reparse_scope`) and
     /// schedules no reparse/refetch of its own. Defaults to `true`
     /// (`DepsConfig::default()`'s own `vulnerabilities_enabled: true`, `offline: false`) —
-    /// unlike `typosquat_enabled`/`gossip_enabled`, which are opt-in features defaulting
+    /// unlike `typosquat_checks`/`gossip_checks`, which are opt-in features defaulting
     /// `false`, the OSV latest-check is opt-out, so starting this at `false` would spuriously
     /// read as a disabled->enabled transition on the very first `did_change_configuration` a
     /// client sends without ever having called `Backend::initialize` with
     /// `initializationOptions` first.
-    osv_checks: OsvChecksCell,
+    osv_checks: AtomicToggle<OsvChecks>,
     /// Ecosystem ids `crate::register_ecosystems` actually threaded the live
     /// `registry_policy` handle into (issue #592 security M1) — the single source of truth
     /// `config::reparse_scope`'s caller uses to scope a `registries.workspace_registries`
@@ -1174,9 +1177,8 @@ impl ServerState {
         // the exact same defaults (`RegistryAccessPolicy`'s own `Default` resolves to the same
         // `WorkspaceRegistryAccess::PublicOnly` as `PolicyConfig::default()`'s
         // `registries.workspace_registries`).
-        let runtime = crate::EcosystemRuntime::from_policy(
-            &deps_core::policy_config::PolicyConfig::default(),
-        );
+        let default_policy = PolicyConfig::default();
+        let runtime = crate::EcosystemRuntime::from_policy(&default_policy);
         let registry_policy = Arc::clone(&runtime.policy);
         let nuget_user_profile_sources = Arc::clone(&runtime.nuget_user_profile_sources);
         let keychain_credentials = Arc::clone(&runtime.keychain_credentials);
@@ -1219,9 +1221,9 @@ impl ServerState {
             keychain_credentials,
             gitlab_instance_host,
             license_policy: RwLock::new(Arc::new(LicensePolicy::default())),
-            typosquat_enabled: AtomicBool::new(false),
-            gossip_enabled: AtomicBool::new(false),
-            osv_checks: OsvChecksCell::default(),
+            typosquat_checks: AtomicToggle::new(default_policy.typosquat_checks()),
+            gossip_checks: AtomicToggle::new(default_policy.gossip_checks()),
+            osv_checks: AtomicToggle::new(default_policy.osv_checks()),
             workspace_registry_ecosystems,
             cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
@@ -1321,35 +1323,54 @@ impl ServerState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(policy);
     }
 
-    /// Returns whether the typosquat-similarity diagnostic is currently enabled (issue
-    /// #1437). Read by every diagnostics-generation call site — see
-    /// [`Self::typosquat_enabled`]'s field doc.
-    pub fn is_typosquat_enabled(&self) -> bool {
-        self.typosquat_enabled.load(Ordering::Relaxed)
+    /// Returns the typosquat-similarity gate as of the last applied config (issue #1437).
+    /// Read by every diagnostics-generation call site — see [`Self::typosquat_checks`]'s
+    /// field doc.
+    pub fn typosquat_checks(&self) -> TyposquatChecks {
+        self.typosquat_checks.get()
     }
 
-    /// Replaces the active `policy.typosquat.enabled` flag (issue #1437).
+    /// Replaces the active typosquat gate (issue #1437).
     ///
     /// Called from `Backend::initialize`/`did_change_configuration` once the new
     /// `DepsConfig` is parsed, so every subsequent diagnostics generation call picks up the
     /// new setting without any call site needing a signature change (mirrors
     /// [`Self::set_license_policy`]).
-    pub fn set_typosquat_enabled(&self, enabled: bool) {
-        self.typosquat_enabled.store(enabled, Ordering::Relaxed);
+    pub fn set_typosquat_checks(&self, checks: TyposquatChecks) {
+        self.typosquat_checks.set(checks);
     }
 
-    /// Returns whether GOSSIP-sourced signals are currently enabled (issue #1456, spec
-    /// 072). Read by every diagnostics-generation call site — see
-    /// [`Self::gossip_enabled`]'s field doc.
-    pub fn is_gossip_enabled(&self) -> bool {
-        self.gossip_enabled.load(Ordering::Relaxed)
+    /// Returns the GOSSIP gate as of the last applied config (issue #1456, spec 072). Read
+    /// by every diagnostics-generation call site — see [`Self::gossip_checks`]'s field doc.
+    pub fn gossip_checks(&self) -> GossipChecks {
+        self.gossip_checks.get()
     }
 
-    /// Replaces the active `policy.gossip.enabled` flag (issue #1456, spec 072).
+    /// Replaces the active GOSSIP gate (issue #1456, spec 072).
     ///
-    /// Mirrors [`Self::set_typosquat_enabled`]'s exact rationale.
-    pub fn set_gossip_enabled(&self, enabled: bool) {
-        self.gossip_enabled.store(enabled, Ordering::Relaxed);
+    /// Mirrors [`Self::set_typosquat_checks`]'s exact rationale.
+    pub fn set_gossip_checks(&self, checks: GossipChecks) {
+        self.gossip_checks.set(checks);
+    }
+
+    /// Test-only: opens or closes the typosquat gate on an otherwise default (online) policy.
+    #[cfg(test)]
+    pub(crate) fn set_typosquat_enabled(&self, enabled: bool) {
+        let policy = PolicyConfig {
+            typosquat: deps_core::policy_config::TyposquatConfig::new().with_enabled(enabled),
+            ..PolicyConfig::default()
+        };
+        self.set_typosquat_checks(policy.typosquat_checks());
+    }
+
+    /// Test-only: opens or closes the GOSSIP gate on an otherwise default (online) policy.
+    #[cfg(test)]
+    pub(crate) fn set_gossip_enabled(&self, enabled: bool) {
+        let policy = PolicyConfig {
+            gossip: deps_core::policy_config::GossipConfig::new().with_enabled(enabled),
+            ..PolicyConfig::default()
+        };
+        self.set_gossip_checks(policy.gossip_checks());
     }
 
     /// Returns the OSV gate as of the last applied config (issue #1517 critique S5). See
@@ -1360,7 +1381,7 @@ impl ServerState {
 
     /// Replaces the tracked effective OSV latest-check state (issue #1517 critique S5).
     ///
-    /// Mirrors [`Self::set_typosquat_enabled`]'s exact rationale; called from
+    /// Mirrors [`Self::set_typosquat_checks`]'s exact rationale; called from
     /// `Backend::apply_resolved_config` with the gate resolved by the caller.
     pub fn set_osv_checks(&self, checks: OsvChecks) {
         self.osv_checks.set(checks);

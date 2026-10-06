@@ -10,10 +10,10 @@
 //!
 //! | outcome | kept |
 //! |---|---|
-//! | [`Found`](KeychainOutcome::Found) | for the process lifetime |
-//! | [`NotFound`](KeychainOutcome::NotFound) | 5 minutes |
-//! | [`Refused`](KeychainOutcome::Refused) | until the generation advances or the process restarts |
-//! | [`Transient`](KeychainOutcome::Transient) | never |
+//! | `Ok` (found) | for the process lifetime |
+//! | [`NotFound`](KeychainError::NotFound) | 5 minutes |
+//! | [`Refused`](KeychainError::Refused) | until the generation advances or the process restarts |
+//! | [`Transient`](KeychainError::Transient) | never |
 //!
 //! The generation is the opt-in setting's toggle counter: advancing it purges every entry
 //! (zeroizing `Found` secrets) and aborts in-flight lookups, so a dialog for a revoked setting
@@ -27,7 +27,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use deps_core::secret::Redacted;
@@ -39,7 +39,9 @@ use tokio::task::AbortHandle;
 use tokio::time::{Instant, timeout};
 use zeroize::Zeroizing;
 
-use deps_core::keychain_credentials::{KeychainGeneration, KeychainGenerationObserver};
+use deps_core::keychain_credentials::{
+    KeychainCredentialsHandle, KeychainGeneration, KeychainGenerationObserver,
+};
 
 use crate::auth::SwiftCredential;
 
@@ -103,60 +105,22 @@ impl KeychainServer {
     }
 }
 
-/// The result of a Keychain lookup, as seen by a caller.
-#[derive(Debug, Clone)]
-pub(crate) enum KeychainOutcome {
-    /// The item exists and its secret was read.
-    Found(SwiftCredential),
+/// A Keychain lookup failure.
+///
+/// Also the log-safe view of an outcome: it carries no credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeychainError {
     /// No matching item (`security` exit code 44).
     NotFound,
-    /// The user denied access, or the lookup failed in a way retrying will not fix.
+    /// Denied, cancelled, unparsable, or the tool is unusable; retrying will not fix it.
     Refused,
-    /// The lookup timed out or its task died; the next call retries.
+    /// The lookup timed out, its task died, or no prompt was shown (for example a locked
+    /// keychain with interaction disallowed); the next call retries.
     Transient,
 }
 
-/// A backend failure that is not a timeout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BackendError {
-    /// No matching item.
-    NotFound,
-    /// Denied, cancelled, unparsable, or the tool is unusable.
-    Refused,
-    /// No prompt was shown (for example a locked keychain with interaction disallowed); a later
-    /// attempt may succeed.
-    Transient,
-}
-
-/// An outcome without its credential, safe to log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OutcomeKind {
-    Found,
-    NotFound,
-    Refused,
-    Transient,
-}
-
-impl KeychainOutcome {
-    const fn kind(&self) -> OutcomeKind {
-        match self {
-            Self::Found(_) => OutcomeKind::Found,
-            Self::NotFound => OutcomeKind::NotFound,
-            Self::Refused => OutcomeKind::Refused,
-            Self::Transient => OutcomeKind::Transient,
-        }
-    }
-}
-
-impl From<BackendError> for KeychainOutcome {
-    fn from(error: BackendError) -> Self {
-        match error {
-            BackendError::NotFound => Self::NotFound,
-            BackendError::Refused => Self::Refused,
-            BackendError::Transient => Self::Transient,
-        }
-    }
-}
+/// The result of a Keychain lookup, as seen by a caller.
+pub(crate) type KeychainOutcome = Result<SwiftCredential, KeychainError>;
 
 /// The two Keychain reads a lookup performs.
 ///
@@ -169,14 +133,14 @@ pub(crate) trait KeychainBackend: Send + Sync + 'static {
     fn find_account<'a>(
         &'a self,
         server: &'a KeychainServer,
-    ) -> BoxFuture<'a, Result<Redacted, BackendError>>;
+    ) -> BoxFuture<'a, Result<Redacted, KeychainError>>;
 
     /// Reads the secret of `account`'s item for `server`. May show an access prompt.
     fn read_secret<'a>(
         &'a self,
         server: &'a KeychainServer,
         account: &'a Redacted,
-    ) -> BoxFuture<'a, Result<Redacted, BackendError>>;
+    ) -> BoxFuture<'a, Result<Redacted, KeychainError>>;
 }
 
 /// The real backend: `/usr/bin/security find-internet-password`, run through `tokio::process`
@@ -220,7 +184,7 @@ impl SecurityCli {
         &self,
         args: &[OsString],
         capture: Capture,
-    ) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+    ) -> Result<Zeroizing<Vec<u8>>, KeychainError> {
         let (stdout, stderr) = match capture {
             Capture::Stdout => (Stdio::piped(), Stdio::null()),
             Capture::Stderr => (Stdio::null(), Stdio::piped()),
@@ -234,11 +198,11 @@ impl SecurityCli {
             .spawn()
             .map_err(|error| {
                 tracing::warn!(kind = ?error.kind(), "cannot spawn the macOS `security` tool");
-                BackendError::Refused
+                KeychainError::Refused
             })?;
         let mut stream: Box<dyn tokio::io::AsyncRead + Send + Unpin> = match capture {
-            Capture::Stdout => Box::new(child.stdout.take().ok_or(BackendError::Refused)?),
-            Capture::Stderr => Box::new(child.stderr.take().ok_or(BackendError::Refused)?),
+            Capture::Stdout => Box::new(child.stdout.take().ok_or(KeychainError::Refused)?),
+            Capture::Stderr => Box::new(child.stderr.take().ok_or(KeychainError::Refused)?),
         };
         let mut output = Zeroizing::new(Vec::new());
         let read = (&mut stream)
@@ -248,11 +212,11 @@ impl SecurityCli {
         drop(stream);
         let status = child.wait().await;
         if read.is_err() {
-            return Err(BackendError::Refused);
+            return Err(KeychainError::Refused);
         }
         match status {
             Ok(status) => classify_exit(status.code()).map(|()| output),
-            Err(_) => Err(BackendError::Refused),
+            Err(_) => Err(KeychainError::Refused),
         }
     }
 }
@@ -261,13 +225,13 @@ impl KeychainBackend for SecurityCli {
     fn find_account<'a>(
         &'a self,
         server: &'a KeychainServer,
-    ) -> BoxFuture<'a, Result<Redacted, BackendError>> {
+    ) -> BoxFuture<'a, Result<Redacted, KeychainError>> {
         Box::pin(async move {
             let output = self.run(&Self::base_args(server), Capture::Stdout).await?;
-            let text = std::str::from_utf8(&output).map_err(|_| BackendError::Refused)?;
+            let text = std::str::from_utf8(&output).map_err(|_| KeychainError::Refused)?;
             parse_account(text)
                 .map(Redacted::new)
-                .ok_or(BackendError::Refused)
+                .ok_or(KeychainError::Refused)
         })
     }
 
@@ -275,7 +239,7 @@ impl KeychainBackend for SecurityCli {
         &'a self,
         server: &'a KeychainServer,
         account: &'a Redacted,
-    ) -> BoxFuture<'a, Result<Redacted, BackendError>> {
+    ) -> BoxFuture<'a, Result<Redacted, KeychainError>> {
         Box::pin(async move {
             let mut args = Self::base_args(server);
             args.push("-a".into());
@@ -284,20 +248,20 @@ impl KeychainBackend for SecurityCli {
             // that looks like hex; `-g` marks the hex form with `0x`.
             args.push("-g".into());
             let output = self.run(&args, Capture::Stderr).await?;
-            let text = std::str::from_utf8(&output).map_err(|_| BackendError::Refused)?;
+            let text = std::str::from_utf8(&output).map_err(|_| KeychainError::Refused)?;
             parse_password(text)
                 .map(Redacted::new)
-                .ok_or(BackendError::Refused)
+                .ok_or(KeychainError::Refused)
         })
     }
 }
 
-fn classify_exit(code: Option<i32>) -> Result<(), BackendError> {
+fn classify_exit(code: Option<i32>) -> Result<(), KeychainError> {
     match code {
         Some(0) => Ok(()),
-        Some(NOT_FOUND_EXIT_CODE) => Err(BackendError::NotFound),
-        Some(INTERACTION_NOT_ALLOWED_EXIT_CODE) => Err(BackendError::Transient),
-        _ => Err(BackendError::Refused),
+        Some(NOT_FOUND_EXIT_CODE) => Err(KeychainError::NotFound),
+        Some(INTERACTION_NOT_ALLOWED_EXIT_CODE) => Err(KeychainError::Transient),
+        _ => Err(KeychainError::Refused),
     }
 }
 
@@ -324,8 +288,7 @@ fn parse_blob(output: &str, prefix: &str) -> Option<String> {
         return decode_hex_utf8(hex).filter(|decoded| !decoded.is_empty());
     }
     value
-        .strip_prefix('"')
-        .and_then(|quoted| quoted.strip_suffix('"'))
+        .strip_circumfix('"', '"')
         .filter(|decoded| !decoded.is_empty())
         .map(str::to_owned)
 }
@@ -418,8 +381,8 @@ impl Waiter {
 
     async fn wait(mut self) -> KeychainOutcome {
         let outcome = match self.outcome.wait_for(Option::is_some).await {
-            Ok(value) => value.clone().unwrap_or(KeychainOutcome::Transient),
-            Err(_) => KeychainOutcome::Transient,
+            Ok(value) => value.clone().unwrap_or(Err(KeychainError::Transient)),
+            Err(_) => Err(KeychainError::Transient),
         };
         self.delivered = true;
         outcome
@@ -430,7 +393,7 @@ impl Drop for Waiter {
     fn drop(&mut self) {
         if !self.delivered {
             self.signal.abandoned.store(true, Ordering::SeqCst);
-            let found = matches!(&*self.outcome.borrow(), Some(KeychainOutcome::Found(_)));
+            let found = matches!(&*self.outcome.borrow(), Some(Ok(_)));
             self.signal.announce_if_due(found, &self.resolved);
         }
     }
@@ -465,15 +428,40 @@ impl KeychainGenerationObserver for KeychainStore {
     }
 }
 
-/// The process-wide Keychain credential store, shared through [`Arc`].
+/// Serializes interactive lookups: one dialog at a time.
+static SYSTEM_PROMPT: Semaphore = Semaphore::const_new(1);
+
+/// Live system stores, one per [`KeychainCredentialsHandle`].
+static SYSTEM_STORES: Mutex<Vec<(Weak<KeychainCredentialsHandle>, Weak<KeychainStore>)>> =
+    Mutex::new(Vec::new());
+
+/// Where a store queues for the one-dialog-at-a-time permit.
+enum PromptGate {
+    /// The process-wide permit, shared by every system store.
+    ProcessWide,
+    /// A permit private to one store, so tests on a paused runtime never share one.
+    Local(Semaphore),
+}
+
+impl PromptGate {
+    fn semaphore(&self) -> &Semaphore {
+        match self {
+            Self::ProcessWide => &SYSTEM_PROMPT,
+            Self::Local(semaphore) => semaphore,
+        }
+    }
+}
+
+/// The Keychain credential store of one [`KeychainCredentialsHandle`], shared through [`Arc`].
 ///
-/// One lookup per server runs at a time; one semaphore serializes the whole interactive lookup
-/// (either read can raise a dialog) across servers; one 10-minute budget, started once a lookup
-/// holds the semaphore, bounds a whole lookup, and exceeding it is
-/// [`KeychainOutcome::Transient`].
+/// One lookup per server runs at a time; one permit serializes the whole interactive lookup
+/// (either read can raise a dialog) across servers, and for system stores that permit is
+/// process-wide, so at most one macOS prompt is open whatever the number of stores; one
+/// 10-minute budget, started once a lookup holds the permit, bounds a whole lookup, and
+/// exceeding it is [`KeychainError::Transient`].
 pub(crate) struct KeychainStore {
     backend: Box<dyn KeychainBackend>,
-    prompt: Semaphore,
+    prompt: PromptGate,
     state: Mutex<State>,
     resolved: broadcast::Sender<()>,
 }
@@ -490,15 +478,39 @@ impl KeychainStore {
     pub(crate) fn new(backend: impl KeychainBackend, resolved: broadcast::Sender<()>) -> Self {
         Self {
             backend: Box::new(backend),
-            prompt: Semaphore::new(1),
+            prompt: PromptGate::Local(Semaphore::new(1)),
             state: Mutex::new(State::default()),
             resolved,
         }
     }
 
-    /// The store over the real `/usr/bin/security` backend.
-    pub(crate) fn system(resolved: broadcast::Sender<()>) -> Self {
-        Self::new(SecurityCli::new(), resolved)
+    /// The store over the real `/usr/bin/security` backend, queueing on the process-wide prompt
+    /// permit.
+    fn system(resolved: broadcast::Sender<()>) -> Self {
+        Self {
+            prompt: PromptGate::ProcessWide,
+            ..Self::new(SecurityCli::new(), resolved)
+        }
+    }
+
+    /// The system store of `handle`: the first call creates it and registers it as the handle's
+    /// generation observer; later calls with the same handle return the same store, so there is
+    /// one memo per handle.
+    pub(crate) fn system_for(handle: &Arc<KeychainCredentialsHandle>) -> Arc<Self> {
+        let mut stores = SYSTEM_STORES.lock().unwrap_or_else(PoisonError::into_inner);
+        stores.retain(|(handle, store)| handle.strong_count() > 0 && store.strong_count() > 0);
+        let target = Arc::downgrade(handle);
+        if let Some(store) = stores
+            .iter()
+            .find(|(candidate, _)| Weak::ptr_eq(candidate, &target))
+            .and_then(|(_, store)| store.upgrade())
+        {
+            return store;
+        }
+        let store = Arc::new(Self::system(handle.resolved_sender()));
+        handle.register_observer(Arc::downgrade(&store) as _);
+        stores.push((target, Arc::downgrade(&store)));
+        store
     }
 
     #[cfg(test)]
@@ -534,7 +546,7 @@ impl KeychainStore {
     ///
     /// Returns memoized outcomes immediately and otherwise joins (or starts) the server's
     /// single-flight lookup. Dropping the returned future abandons only the wait, never the
-    /// lookup. A `generation` older than the store's yields [`KeychainOutcome::Transient`].
+    /// lookup. A `generation` older than the store's yields [`Err(KeychainError::Transient)`].
     pub(crate) async fn resolve(
         self: &Arc<Self>,
         server: &KeychainServer,
@@ -554,16 +566,16 @@ impl KeychainStore {
     fn join(self: &Arc<Self>, server: &KeychainServer, generation: KeychainGeneration) -> Joined {
         let mut state = self.lock();
         if generation < state.generation {
-            return Joined::Ready(KeychainOutcome::Transient);
+            return Joined::Ready(Err(KeychainError::Transient));
         }
         match state.entries.get(server) {
             Some(Entry::Found(credential)) => {
-                return Joined::Ready(KeychainOutcome::Found(credential.clone()));
+                return Joined::Ready(Ok(credential.clone()));
             }
-            Some(Entry::Refused) => return Joined::Ready(KeychainOutcome::Refused),
+            Some(Entry::Refused) => return Joined::Ready(Err(KeychainError::Refused)),
             Some(Entry::NotFound { since }) => {
                 if since.elapsed() < NOT_FOUND_TTL {
-                    return Joined::Ready(KeychainOutcome::NotFound);
+                    return Joined::Ready(Err(KeychainError::NotFound));
                 }
                 state.entries.remove(server);
             }
@@ -608,27 +620,22 @@ impl KeychainStore {
         };
         // Queueing for the one-dialog-at-a-time permit is not part of the budget, so a server
         // that waited behind others still gets its full lookup time.
-        let outcome = match self.prompt.acquire().await {
+        let outcome = match self.prompt.semaphore().acquire().await {
             Ok(_permit) => timeout(LOOKUP_BUDGET, self.lookup(&server))
                 .await
-                .unwrap_or(KeychainOutcome::Transient),
-            Err(_) => KeychainOutcome::Transient,
+                .unwrap_or(Err(KeychainError::Transient)),
+            Err(_) => Err(KeychainError::Transient),
         };
         self.finish(&server, generation, id, outcome, &sender);
     }
 
     async fn lookup(&self, server: &KeychainServer) -> KeychainOutcome {
-        let account = match self.backend.find_account(server).await {
-            Ok(account) => account,
-            Err(error) => return error.into(),
-        };
-        match self.backend.read_secret(server, &account).await {
-            Ok(password) => KeychainOutcome::Found(SwiftCredential::Login {
-                username: account,
-                password,
-            }),
-            Err(error) => error.into(),
-        }
+        let account = self.backend.find_account(server).await?;
+        let password = self.backend.read_secret(server, &account).await?;
+        Ok(SwiftCredential::Login {
+            username: account,
+            password,
+        })
     }
 
     fn finish(
@@ -652,12 +659,12 @@ impl KeychainStore {
                 | None => return,
             };
             match &outcome {
-                KeychainOutcome::Found(credential) => {
+                Ok(credential) => {
                     state
                         .entries
                         .insert(server.clone(), Entry::Found(credential.clone()));
                 }
-                KeychainOutcome::NotFound => {
+                Err(KeychainError::NotFound) => {
                     state.entries.insert(
                         server.clone(),
                         Entry::NotFound {
@@ -665,17 +672,17 @@ impl KeychainStore {
                         },
                     );
                 }
-                KeychainOutcome::Refused => {
+                Err(KeychainError::Refused) => {
                     state.entries.insert(server.clone(), Entry::Refused);
                 }
-                KeychainOutcome::Transient => {
+                Err(KeychainError::Transient) => {
                     state.entries.remove(server);
                 }
             }
             signal
         };
-        let found = matches!(outcome, KeychainOutcome::Found(_));
-        tracing::debug!(outcome = ?outcome.kind(), "keychain lookup finished");
+        let found = outcome.is_ok();
+        tracing::debug!(outcome = ?outcome.as_ref().map(|_| ()), "keychain lookup finished");
         sender.send_replace(Some(outcome));
         signal.announce_if_due(found, &self.resolved);
     }
@@ -688,7 +695,7 @@ pub(crate) mod fake {
 
     use super::*;
 
-    pub(crate) type Reply = Result<&'static str, BackendError>;
+    pub(crate) type Reply = Result<&'static str, KeychainError>;
 
     #[derive(Clone)]
     pub(crate) struct Fake {
@@ -754,7 +761,7 @@ pub(crate) mod fake {
         fn find_account<'a>(
             &'a self,
             _server: &'a KeychainServer,
-        ) -> BoxFuture<'a, Result<Redacted, BackendError>> {
+        ) -> BoxFuture<'a, Result<Redacted, KeychainError>> {
             Box::pin(async move {
                 self.find_calls.fetch_add(1, Ordering::SeqCst);
                 self.enter_call();
@@ -769,7 +776,7 @@ pub(crate) mod fake {
             &'a self,
             _server: &'a KeychainServer,
             _account: &'a Redacted,
-        ) -> BoxFuture<'a, Result<Redacted, BackendError>> {
+        ) -> BoxFuture<'a, Result<Redacted, KeychainError>> {
             Box::pin(async move {
                 self.secret_calls.fetch_add(1, Ordering::SeqCst);
                 self.enter_call();
@@ -812,9 +819,7 @@ mod tests {
 
     fn password(outcome: &KeychainOutcome) -> String {
         match outcome {
-            KeychainOutcome::Found(SwiftCredential::Login { password, .. }) => {
-                password.expose_secret().to_owned()
-            }
+            Ok(SwiftCredential::Login { password, .. }) => password.expose_secret().to_owned(),
             other => panic!("expected a found login, got {other:?}"),
         }
     }
@@ -867,10 +872,19 @@ mod tests {
     #[test]
     fn maps_exit_codes() {
         assert_eq!(classify_exit(Some(0)), Ok(()));
-        assert_eq!(classify_exit(Some(44)), Err(BackendError::NotFound));
-        assert_eq!(classify_exit(Some(36)), Err(BackendError::Transient));
-        assert_eq!(classify_exit(Some(128)), Err(BackendError::Refused));
-        assert_eq!(classify_exit(None), Err(BackendError::Refused));
+        assert_eq!(classify_exit(Some(44)), Err(KeychainError::NotFound));
+        assert_eq!(classify_exit(Some(36)), Err(KeychainError::Transient));
+        assert_eq!(classify_exit(Some(128)), Err(KeychainError::Refused));
+        assert_eq!(classify_exit(None), Err(KeychainError::Refused));
+    }
+
+    #[test]
+    fn system_store_is_one_per_handle() {
+        let handle = Arc::new(KeychainCredentialsHandle::default());
+        let other = Arc::new(KeychainCredentialsHandle::default());
+        let first = KeychainStore::system_for(&handle);
+        assert!(Arc::ptr_eq(&first, &KeychainStore::system_for(&handle)));
+        assert!(!Arc::ptr_eq(&first, &KeychainStore::system_for(&other)));
     }
 
     #[test]
@@ -878,7 +892,7 @@ mod tests {
         let fake = Fake::found();
         let rendered = format!("{:?}", KeychainStore::new(fake, test_sender()));
         assert_eq!(rendered, "KeychainStore { .. }");
-        let credential = KeychainOutcome::Found(SwiftCredential::Login {
+        let credential: KeychainOutcome = Ok(SwiftCredential::Login {
             username: Redacted::new("user".to_owned()),
             password: Redacted::new("hunter2".to_owned()),
         });
@@ -904,34 +918,34 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn not_found_expires_after_five_minutes() {
-        let fake = Fake::new(Err(BackendError::NotFound), Ok("x"));
+        let fake = Fake::new(Err(KeychainError::NotFound), Ok("x"));
         let store = store(&fake);
         let host = server("a.example");
         assert!(matches!(
             store.resolve(&host, generation(0)).await,
-            KeychainOutcome::NotFound
+            Err(KeychainError::NotFound)
         ));
         tokio::time::advance(Duration::from_mins(4)).await;
-        store.resolve(&host, generation(0)).await;
+        drop(store.resolve(&host, generation(0)).await);
         assert_eq!(fake.find_calls.load(Ordering::SeqCst), 1);
         tokio::time::advance(Duration::from_mins(2)).await;
-        store.resolve(&host, generation(0)).await;
+        drop(store.resolve(&host, generation(0)).await);
         assert_eq!(fake.find_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(start_paused = true)]
     async fn refused_sticks_until_the_generation_advances() {
-        let fake = Fake::new(Ok("user"), Err(BackendError::Refused));
+        let fake = Fake::new(Ok("user"), Err(KeychainError::Refused));
         let store = store(&fake);
         let host = server("a.example");
         assert!(matches!(
             store.resolve(&host, generation(0)).await,
-            KeychainOutcome::Refused
+            Err(KeychainError::Refused)
         ));
         tokio::time::advance(Duration::from_hours(48)).await;
         assert!(matches!(
             store.resolve(&host, generation(0)).await,
-            KeychainOutcome::Refused
+            Err(KeychainError::Refused)
         ));
         assert_eq!(fake.secret_calls(), 1);
 
@@ -950,11 +964,11 @@ mod tests {
         let host = server("a.example");
         assert!(matches!(
             store.resolve(&host, generation(0)).await,
-            KeychainOutcome::Transient
+            Err(KeychainError::Transient)
         ));
         assert!(matches!(
             store.resolve(&host, generation(0)).await,
-            KeychainOutcome::Transient
+            Err(KeychainError::Transient)
         ));
         assert_eq!(fake.secret_calls(), 2);
     }
@@ -967,11 +981,11 @@ mod tests {
         let host = server("a.example");
         assert!(matches!(
             store.resolve(&host, generation(0)).await,
-            KeychainOutcome::Transient
+            Err(KeychainError::Transient)
         ));
         assert!(matches!(
             store.resolve(&host, generation(0)).await,
-            KeychainOutcome::Transient
+            Err(KeychainError::Transient)
         ));
         assert_eq!(fake.secret_calls(), 2);
     }
@@ -1019,7 +1033,7 @@ mod tests {
             .await
             .expect("resolved after an abandoned wait")
             .expect("resolved channel open");
-        store.resolve(&host, generation(0)).await;
+        drop(store.resolve(&host, generation(0)).await);
         assert!(matches!(
             resolved.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
@@ -1036,7 +1050,7 @@ mod tests {
         let fake = Fake::found().delayed(Duration::from_secs(1));
         let store = store(&fake);
         let mut resolved = store.subscribe_resolved();
-        store.resolve(&server("a.example"), generation(0)).await;
+        drop(store.resolve(&server("a.example"), generation(0)).await);
         assert!(matches!(
             resolved.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
@@ -1046,7 +1060,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn no_resolved_broadcast_for_a_non_found_result() {
         let fake =
-            Fake::new(Ok("user"), Err(BackendError::Refused)).delayed(Duration::from_secs(30));
+            Fake::new(Ok("user"), Err(KeychainError::Refused)).delayed(Duration::from_secs(30));
         let store = store(&fake);
         let mut resolved = store.subscribe_resolved();
         let host = server("a.example");
@@ -1103,7 +1117,7 @@ mod tests {
             .await
             .expect("an aborted lookup releases its waiters at once")
             .unwrap();
-        assert!(matches!(outcome, KeychainOutcome::Transient));
+        assert!(matches!(outcome, Err(KeychainError::Transient)));
     }
 
     #[tokio::test]
@@ -1111,10 +1125,10 @@ mod tests {
         let fake = Fake::found();
         let store = store(&fake);
         let host = server("a.example");
-        store.resolve(&host, generation(0)).await;
+        drop(store.resolve(&host, generation(0)).await);
         store.advance_generation(generation(1));
         assert!(store.lock().entries.is_empty());
-        store.resolve(&host, generation(1)).await;
+        drop(store.resolve(&host, generation(1)).await);
         assert_eq!(fake.secret_calls(), 2);
     }
 
@@ -1152,8 +1166,8 @@ mod tests {
     async fn a_found_memo_is_per_server() {
         let fake = Fake::found();
         let store = store(&fake);
-        store.resolve(&server("a.example"), generation(0)).await;
-        store.resolve(&server("b.example"), generation(0)).await;
+        drop(store.resolve(&server("a.example"), generation(0)).await);
+        drop(store.resolve(&server("b.example"), generation(0)).await);
         assert_eq!(fake.find_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fake.secret_calls(), 2);
         assert_eq!(store.memoized_entries(), 2);
@@ -1183,16 +1197,16 @@ mod tests {
 
     #[tokio::test]
     async fn an_interaction_not_allowed_failure_is_transient_and_not_memoized() {
-        let fake = Fake::new(Ok("user"), Err(BackendError::Transient));
+        let fake = Fake::new(Ok("user"), Err(KeychainError::Transient));
         let store = store(&fake);
         let host = server("a.example");
         assert!(matches!(
             store.resolve(&host, generation(0)).await,
-            KeychainOutcome::Transient
+            Err(KeychainError::Transient)
         ));
         assert!(matches!(
             store.resolve(&host, generation(0)).await,
-            KeychainOutcome::Transient
+            Err(KeychainError::Transient)
         ));
         assert_eq!(fake.secret_calls(), 2);
         assert_eq!(store.memoized_entries(), 0);
@@ -1222,7 +1236,7 @@ mod tests {
         store.advance_generation(generation(3));
         assert!(matches!(
             store.resolve(&server("a.example"), generation(2)).await,
-            KeychainOutcome::Transient
+            Err(KeychainError::Transient)
         ));
         assert_eq!(fake.find_calls.load(Ordering::SeqCst), 0);
     }
@@ -1252,8 +1266,7 @@ esac"#,
             );
             let store = Arc::new(KeychainStore::new(backend, test_sender()));
             let outcome = store.resolve(&server("a.example"), generation(0)).await;
-            let KeychainOutcome::Found(SwiftCredential::Login { username, password }) = outcome
-            else {
+            let Ok(SwiftCredential::Login { username, password }) = outcome else {
                 panic!("expected a login, got {outcome:?}");
             };
             assert_eq!(username.expose_secret(), "alice");
@@ -1268,7 +1281,7 @@ esac"#,
                 Arc::new(store)
                     .resolve(&server("a.example"), generation(0))
                     .await,
-                KeychainOutcome::NotFound
+                Err(KeychainError::NotFound)
             ));
             let dir = tempfile::tempdir().unwrap();
             let store = KeychainStore::new(script_backend(&dir, "exit 128"), test_sender());
@@ -1276,7 +1289,7 @@ esac"#,
                 Arc::new(store)
                     .resolve(&server("a.example"), generation(0))
                     .await,
-                KeychainOutcome::Refused
+                Err(KeychainError::Refused)
             ));
         }
 
@@ -1294,7 +1307,7 @@ esac"#,
                 Arc::new(store)
                     .resolve(&server("a.example"), generation(0))
                     .await,
-                KeychainOutcome::Refused
+                Err(KeychainError::Refused)
             ));
         }
 
@@ -1306,7 +1319,7 @@ esac"#,
             let store = Arc::new(KeychainStore::new(backend, test_sender()));
             assert!(matches!(
                 store.resolve(&server("a.example"), generation(0)).await,
-                KeychainOutcome::Refused
+                Err(KeychainError::Refused)
             ));
         }
 
@@ -1318,8 +1331,40 @@ esac"#,
                 Arc::new(store)
                     .resolve(&server("a.example"), generation(0))
                     .await,
-                KeychainOutcome::Refused
+                Err(KeychainError::Refused)
             ));
         }
+    }
+
+    /// Every system store queues on the one process-wide prompt permit, whatever the number of
+    /// handles; a store built over a fake backend keeps a permit of its own. Creating a system
+    /// store never runs the `security` CLI (only a lookup does).
+    #[test]
+    fn test_system_stores_share_the_process_wide_prompt_permit() {
+        let handle = |setting| Arc::new(KeychainCredentialsHandle::new(setting));
+        let (first, second) = (
+            handle(deps_core::policy_config::KeychainCredentials::Enabled),
+            handle(deps_core::policy_config::KeychainCredentials::Enabled),
+        );
+        let store_a = KeychainStore::system_for(&first);
+        let store_b = KeychainStore::system_for(&second);
+
+        assert!(!Arc::ptr_eq(&store_a, &store_b), "one memo per handle");
+        assert!(Arc::ptr_eq(&store_a, &KeychainStore::system_for(&first)));
+        assert!(std::ptr::eq(
+            store_a.prompt.semaphore(),
+            store_b.prompt.semaphore()
+        ));
+        assert!(std::ptr::eq(
+            store_a.prompt.semaphore(),
+            &raw const SYSTEM_PROMPT
+        ));
+
+        let (sender, _) = broadcast::channel(1);
+        let local = KeychainStore::new(Fake::found(), sender);
+        assert!(!std::ptr::eq(
+            local.prompt.semaphore(),
+            &raw const SYSTEM_PROMPT
+        ));
     }
 }

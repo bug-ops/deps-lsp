@@ -742,7 +742,10 @@ fn push_latest_hover_section(
         }
         if !advisory_ids.is_empty() {
             markdown.push_static("> ");
-            markdown.push_text(&advisory_ids.join(", "), FieldKind::Prose);
+            markdown.push_text(
+                &crate::osv::OsvId::join(advisory_ids, ", "),
+                FieldKind::Prose,
+            );
             markdown.push_static("\n");
         }
         if let Some(tags) = via_sibling_tags {
@@ -1132,7 +1135,7 @@ fn push_deprecation_hover_section(
 /// is." Treating that as "nothing to report" would silently drop a real
 /// signal this feature must never suppress.
 fn candidate_vulnerable_line_should_render(
-    candidate_ids: &crate::osv::Capped<String>,
+    candidate_ids: &crate::osv::Capped<crate::osv::OsvId>,
     known_advisories: &[Arc<crate::osv::Advisory>],
 ) -> bool {
     if !candidate_ids.is_complete() || candidate_ids.items().is_empty() {
@@ -1141,7 +1144,7 @@ fn candidate_vulnerable_line_should_render(
     !candidate_ids.items().iter().all(|id| {
         known_advisories
             .iter()
-            .find(|advisory| &advisory.id == id)
+            .find(|advisory| advisory.id() == id)
             .is_some_and(|advisory| advisory.severity == crate::osv::VulnSeverity::Informational)
     })
 }
@@ -1181,7 +1184,7 @@ fn push_vulnerability_hover_section(
             let display_advisories = dv.advisories_for_display();
             for advisory in display_advisories.items() {
                 markdown.push_static("- **");
-                markdown.push_link(&advisory.id, FieldKind::Prose, advisory.url());
+                markdown.push_link(advisory.id().as_str(), FieldKind::Prose, &advisory.url());
                 markdown.push_static("** — ");
                 markdown.push_static(severity_label(advisory.severity));
                 markdown.push_static("\n  ");
@@ -1193,7 +1196,7 @@ fn push_vulnerability_hover_section(
                     FieldKind::Prose,
                 );
                 markdown.push_static("\n");
-                if let Some(tags) = dv.sibling_match(&advisory.id) {
+                if let Some(tags) = dv.sibling_match(advisory.id()) {
                     let note = SiblingMatchNote::new(formatter, tags);
                     markdown.push_static("  *(");
                     markdown.push_trusted(escape_markdown(&note.to_string()));
@@ -1866,7 +1869,7 @@ mod tests {
     fn push_latest_hover_section_flagged_suppresses_cooldown_callout() {
         let mut markdown = HoverMarkdown::new();
         let verdict = LatestVerdict::Flagged {
-            advisory_ids: vec!["MAL-2026-16332".to_string()],
+            advisory_ids: vec![crate::test_util::osv_id("MAL-2026-16332")],
             malicious: true,
             via_sibling_tags: None,
         };
@@ -1899,7 +1902,7 @@ mod tests {
     fn push_latest_hover_section_flagged_non_malicious_uses_flagged_wording() {
         let mut markdown = HoverMarkdown::new();
         let verdict = LatestVerdict::Flagged {
-            advisory_ids: vec!["GHSA-xxxx".to_string()],
+            advisory_ids: vec![crate::test_util::osv_id("GHSA-xxxx")],
             malicious: false,
             via_sibling_tags: None,
         };
@@ -2960,7 +2963,7 @@ mod tests {
 
         assert!(
             !candidate_vulnerable_line_should_render(
-                &Capped::new(vec!["RUSTSEC-2024-0320".to_string()], 1),
+                &Capped::new(vec![crate::test_util::osv_id("RUSTSEC-2024-0320")], 1),
                 std::slice::from_ref(&informational)
             ),
             "all-known-Informational, complete set must suppress the line"
@@ -2969,8 +2972,8 @@ mod tests {
             candidate_vulnerable_line_should_render(
                 &Capped::new(
                     vec![
-                        "RUSTSEC-2024-0320".to_string(),
-                        "RUSTSEC-2020-0071".to_string()
+                        crate::test_util::osv_id("RUSTSEC-2024-0320"),
+                        crate::test_util::osv_id("RUSTSEC-2020-0071")
                     ],
                     2
                 ),
@@ -2980,7 +2983,7 @@ mod tests {
         );
         assert!(
             candidate_vulnerable_line_should_render(
-                &Capped::new(vec!["RUSTSEC-UNKNOWN-ID".to_string()], 1),
+                &Capped::new(vec![crate::test_util::osv_id("RUSTSEC-UNKNOWN-ID")], 1),
                 std::slice::from_ref(&informational)
             ),
             "an id with no known severity must default to rendering the line, not suppressing it"
@@ -2997,7 +3000,7 @@ mod tests {
         );
         assert!(
             candidate_vulnerable_line_should_render(
-                &Capped::new(vec!["RUSTSEC-2024-0320".to_string()], 2),
+                &Capped::new(vec![crate::test_util::osv_id("RUSTSEC-2024-0320")], 2),
                 std::slice::from_ref(&informational)
             ),
             "L2/FR-010: an all-known-Informational but INCOMPLETE (truncated) set \
@@ -5275,7 +5278,7 @@ mod tests {
             crate::test_util::vuln_key("bad-pkg"),
             UpgradeStatus::CandidateVulnerable {
                 version: "2.0.0".into(),
-                advisory_ids: Capped::new(vec!["RUSTSEC-2020-0071".to_string()], 1),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("RUSTSEC-2020-0071")], 1),
                 worst_severity: Some(VulnSeverity::Critical),
                 via_sibling_tags: None,
             },
@@ -5334,7 +5337,7 @@ mod tests {
         let dv = DependencyVulnerabilities::new(Capped::new(vec![Arc::new(advisory)], 1));
         let latest = UpgradeStatus::CandidateVulnerable {
             version: ConcreteVersion::new("V".repeat(500)),
-            advisory_ids: Capped::new(vec!["RUSTSEC-2020-0071".to_string()], 1),
+            advisory_ids: Capped::new(vec![crate::test_util::osv_id("RUSTSEC-2020-0071")], 1),
             worst_severity: Some(VulnSeverity::High),
             via_sibling_tags: None,
         };
@@ -5444,7 +5447,7 @@ mod tests {
 
         let mut matches = SiblingMatches::new(crate::osv::OsvVersion::new("1.0.0"));
         matches.insert(
-            "A-1".to_string(),
+            crate::test_util::osv_id("A-1"),
             MatchedTags::from_tags(vec![
                 crate::ConcreteVersion::new("v4.9.0"),
                 crate::ConcreteVersion::new("v4.*10"),
@@ -5485,7 +5488,7 @@ mod tests {
 
         let mut matches = SiblingMatches::new(OsvVersion::new("9.0.0"));
         matches.insert(
-            "A-1".to_string(),
+            crate::test_util::osv_id("A-1"),
             MatchedTags::from_tags(vec![crate::ConcreteVersion::new("v8.0.0")]).unwrap(),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(
@@ -5516,7 +5519,7 @@ mod tests {
 
         UpgradeStatus::CandidateVulnerable {
             version: crate::ConcreteVersion::new("v4.8.0"),
-            advisory_ids: Capped::new(vec!["A-1".to_string()], 1),
+            advisory_ids: Capped::new(vec![crate::test_util::osv_id("A-1")], 1),
             worst_severity: Some(VulnSeverity::High),
             via_sibling_tags: Some(MatchedTags::new(
                 crate::ConcreteVersion::new("v4.9.0"),
@@ -5554,7 +5557,7 @@ mod tests {
     #[test]
     fn push_latest_hover_section_flagged_callout_names_sibling_tags() {
         let verdict = LatestVerdict::Flagged {
-            advisory_ids: vec!["A-1".to_string()],
+            advisory_ids: vec![crate::test_util::osv_id("A-1")],
             malicious: false,
             via_sibling_tags: Some(crate::osv::MatchedTags::new(
                 crate::ConcreteVersion::new("v4.9.0"),
@@ -5722,7 +5725,7 @@ mod tests {
             crate::test_util::vuln_key("yaml-rust"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("0.5.0"),
-                advisory_ids: Capped::new(vec!["RUSTSEC-2024-0320".to_string()], 1),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("RUSTSEC-2024-0320")], 1),
                 worst_severity: Some(VulnSeverity::Informational),
                 via_sibling_tags: None,
             },
@@ -5789,8 +5792,8 @@ mod tests {
                 version: ConcreteVersion::new("2.0.0"),
                 advisory_ids: Capped::new(
                     vec![
-                        "RUSTSEC-2024-0320".to_string(),
-                        "RUSTSEC-2020-0071".to_string(),
+                        crate::test_util::osv_id("RUSTSEC-2024-0320"),
+                        crate::test_util::osv_id("RUSTSEC-2020-0071"),
                     ],
                     2,
                 ),

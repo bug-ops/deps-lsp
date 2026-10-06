@@ -16,11 +16,11 @@ use deps_core::keychain_credentials::{
 use deps_core::mtime_cache::{DEFAULT_MAX_CACHED_FILES, MtimeFileCache};
 use deps_core::netrc::{DefaultEntry, Netrc, NetrcFlavor, NetrcLogin};
 use deps_core::policy_config::KeychainCredentials;
-use deps_core::secret::{Redacted, basic_auth_header};
+use deps_core::secret::{Redacted, basic_auth_header, bearer_auth_header};
 use zeroize::Zeroizing;
 
 use crate::config::{SwiftAuthType, SwiftRegistryUrl, UserConfigPlatform, UserTier};
-use crate::keychain::{KeychainOutcome, KeychainServer, KeychainStore};
+use crate::keychain::{KeychainError, KeychainServer, KeychainStore};
 
 const TOKEN_VAR: &str = "SWIFTPM_REGISTRY_TOKEN";
 const LOGIN_VAR: &str = "SWIFTPM_REGISTRY_LOGIN";
@@ -129,7 +129,7 @@ impl SwiftCredential {
 }
 
 fn bearer(secret: &Redacted) -> SwiftRegistryAuth {
-    SwiftRegistryAuth(Redacted::new(format!("Bearer {}", secret.expose_secret())))
+    SwiftRegistryAuth(bearer_auth_header(secret.expose_secret()))
 }
 
 fn basic(username: &str, password: &Redacted) -> SwiftRegistryAuth {
@@ -224,14 +224,20 @@ impl KeychainCredential {
             KeychainCredentials::Disabled => None,
             KeychainCredentials::Enabled => {
                 match self.binding.store.resolve(&self.server, generation).await {
-                    KeychainOutcome::Found(credential) => Some(credential.format(self.auth_type)),
-                    KeychainOutcome::NotFound
-                    | KeychainOutcome::Refused
-                    | KeychainOutcome::Transient => None,
+                    Ok(credential) => Some(credential.format(self.auth_type)),
+                    Err(
+                        KeychainError::NotFound | KeychainError::Refused | KeychainError::Transient,
+                    ) => None,
                 }
             }
         };
         KeychainAuthorization { auth, generation }
+    }
+
+    /// The setting and generation this credential would be resolved under right now, without
+    /// running a lookup.
+    pub(crate) fn snapshot(&self) -> KeychainSnapshot {
+        self.binding.handle.snapshot()
     }
 
     /// Hashes what identifies this credential's source, never a secret.

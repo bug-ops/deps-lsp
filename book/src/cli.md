@@ -303,10 +303,15 @@ explicit choice.
   - `unfixable` — no independently-verified fix target exists, the registry fetch for that
     dependency failed, the fix target is itself yanked, the declared requirement's syntax has
     no safe single-value rewrite and is confirmed not to already admit the fix target, or the
-    declared requirement is too large to safely evaluate. For the last three causes (a yanked,
-    confirmed-unsupported-requirement-shape, or oversized-requirement fix target), the table's
-    target column and JSON `target` field report that rejected version instead of staying
-    empty, so the operator can see what was ruled out even though nothing was written.
+    declared requirement is too large to safely evaluate, or a commit (SHA) pin's fix version
+    has no matching release in the repository's complete tag list (GitHub Actions, GitLab CI;
+    for a GitLab `component:` include, its release list), so the pin cannot be rewritten and
+    still points at the vulnerable commit. A missing, cold or
+    truncated tag list cannot prove that, and is reported as no verified fix instead. For the
+    last four causes (a yanked, confirmed-unsupported-requirement-shape, oversized-requirement
+    or no-release-tag fix target), the table's target column and JSON `target` field report
+    that rejected version instead of staying empty, so the operator can see what was ruled out
+    even though nothing was written.
 
   For a registry that does not report yank status at all, the yank check is inert for that
   ecosystem (a documented limitation, not a bug) — such a dependency can still be classified

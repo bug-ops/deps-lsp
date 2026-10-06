@@ -171,8 +171,7 @@ pub fn parse_package_json_with_context(
 
     let npm_config: NpmConfig = manifest_dir
         .as_deref()
-        .map(|dir| crate::config::resolve(dir, &ctx.config_cache, &ctx.policy))
-        .unwrap_or_default();
+        .map_or_default(|dir| crate::config::resolve(dir, &ctx.config_cache, &ctx.policy));
 
     let mut blocked_registries = Vec::new();
     let mut rejected_registries = Vec::new();
@@ -184,8 +183,7 @@ pub fn parse_package_json_with_context(
         let version_req = dep
             .version_req
             .as_ref()
-            .map(deps_core::VersionReq::as_str)
-            .unwrap_or_default();
+            .map_or_default(deps_core::VersionReq::as_str);
         if let Some(source) = classify_non_registry_specifier(version_req) {
             dep.source = source;
             continue;

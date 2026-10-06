@@ -117,9 +117,9 @@ fn build_vulnerability_fix_action(
     let displayed_ids: HashSet<&str> = display_advisories
         .items()
         .iter()
-        .map(|a| a.id.as_str())
+        .map(|a| a.id().as_str())
         .collect();
-    let diagnostic_codes: Vec<&String> = fix
+    let diagnostic_codes: Vec<&crate::osv::OsvId> = fix
         .advisory_ids
         .iter()
         .filter(|id| displayed_ids.contains(id.as_str()))
@@ -141,7 +141,7 @@ fn build_vulnerability_fix_action(
     // listing every one of them would overflow an editor's code-action menu.
     let (first_id, rest_ids) = fix.advisory_ids.split_first()?;
     let fixes = if rest_ids.is_empty() {
-        first_id.clone()
+        first_id.to_string()
     } else {
         format!("{first_id} +{} more", rest_ids.len())
     };
@@ -1059,7 +1059,7 @@ mod tests {
                 ),
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
                     version: ConcreteVersion::new("1.2.0"),
-                    advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+                    advisory_ids: Capped::new(vec![crate::test_util::osv_id("A1")], 1),
                     worst_severity: Some(VulnSeverity::High),
                     via_sibling_tags: None,
                 },
@@ -1070,7 +1070,7 @@ mod tests {
             crate::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("3.0.0"),
-                advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("A1")], 1),
                 worst_severity: Some(VulnSeverity::High),
                 via_sibling_tags: None,
             },
@@ -1144,7 +1144,7 @@ mod tests {
                 ),
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
                     version: ConcreteVersion::new("1.2.0"),
-                    advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+                    advisory_ids: Capped::new(vec![crate::test_util::osv_id("A1")], 1),
                     worst_severity: Some(VulnSeverity::High),
                     via_sibling_tags: None,
                 },
@@ -1209,7 +1209,7 @@ mod tests {
                 ),
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
                     version: ConcreteVersion::new("1.2.0"),
-                    advisory_ids: Capped::new(vec!["A2".to_string()], 1),
+                    advisory_ids: Capped::new(vec![crate::test_util::osv_id("A2")], 1),
                     worst_severity: Some(VulnSeverity::High),
                     via_sibling_tags: None,
                 },
@@ -1278,7 +1278,7 @@ mod tests {
                 // applies — a claim the verification actually contradicts.
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
                     version: ConcreteVersion::new("1.2.0"),
-                    advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+                    advisory_ids: Capped::new(vec![crate::test_util::osv_id("A1")], 1),
                     worst_severity: Some(VulnSeverity::High),
                     via_sibling_tags: None,
                 },
@@ -1358,7 +1358,7 @@ mod tests {
                 // anything, including the still-applying A1 itself.
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
                     version: ConcreteVersion::new("1.2.0"),
-                    advisory_ids: Capped::new(vec!["A2".to_string()], 2),
+                    advisory_ids: Capped::new(vec![crate::test_util::osv_id("A2")], 2),
                     worst_severity: Some(VulnSeverity::High),
                     via_sibling_tags: None,
                 },
@@ -2402,7 +2402,7 @@ mod tests {
             crate::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("2.0.0"),
-                advisory_ids: Capped::new(vec!["MAL-2026-00001".to_string()], 1),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("MAL-2026-00001")], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
                 via_sibling_tags: None,
             },
@@ -2475,7 +2475,7 @@ mod tests {
             ConcreteVersion::new("1.5.0"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.5.0"),
-                advisory_ids: Capped::new(vec!["MAL-2026-00002".to_string()], 1),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("MAL-2026-00002")], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
                 via_sibling_tags: None,
             },

@@ -600,6 +600,7 @@ name = "deps-cli"
 version = "2.0.0"
 dependencies = [
  "clap",
+ "dashmap",
  "deps-core",
  "deps-engine",
  "ignore",

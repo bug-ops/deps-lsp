@@ -10,39 +10,15 @@
 //! stays in this crate rather than `deps_core` per `specs/062-cli-check-mode/plan.md`'s
 //! `[NEEDS CLARIFICATION: O-4]` marker — see that doc before moving it.
 
-use deps_core::diagnostic::{Diagnostic, Severity};
-use deps_core::lsp_helpers::{
-    DEPRECATED_DIAGNOSTIC_CODE, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
-    SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE, UNKNOWN_REF_DIAGNOSTIC_CODE,
-    UNSATISFIABLE_DIAGNOSTIC_CODE, redact_name_for_diagnostic, redact_requirement_for_diagnostic,
-};
-use deps_core::osv::{OsvClient, ScanOutcome, VulnKeys, VulnSeverity, VulnerabilityMap};
+use deps_core::diagnostic::{Diagnostic, DiagnosticKind, Severity};
+use deps_core::lsp_helpers::{redact_name_for_diagnostic, redact_requirement_for_diagnostic};
+use deps_core::osv::{OsvClient, OsvId, ScanOutcome, VulnKeys, VulnSeverity, VulnerabilityMap};
 use deps_core::policy_config::PolicyConfig;
 use deps_core::position::Range;
 use deps_core::{Dependency, Ecosystem, EcosystemId, HttpCache};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// Every non-`deps-core` diagnostic code constant in the workspace, mirrored here as
-/// literals rather than importing `deps-github-actions`/`deps-gitlab-ci` directly (both are
-/// optional, feature-gated dependencies of `deps-engine`; importing their constants
-/// unconditionally would break a `--no-default-features --features cargo`-style build, and
-/// `#[cfg]`-gating each match arm was judged not worth the complexity for three stable
-/// strings). **This list must stay exhaustive** — issue C3 (spec 062 review) was exactly one
-/// ecosystem-owned code (`UNRESOLVED_HOST_DIAGNOSTIC_CODE`) missing from it, which silently
-/// misclassified an informational notice as `Category::Vulnerable`. Before trusting
-/// [`classify`]'s fallback again, re-run
-/// `grep -rn 'pub const.*_DIAGNOSTIC_CODE.*: &str' crates/*/src/lib.rs crates/*/src/ecosystem.rs`
-/// across the workspace and add anything new here.
-const GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE: &str = "mutable-ref-pin";
-/// See [`GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE`]'s doc.
-const GITLAB_CI_MUTABLE_REF_PIN_CODE: &str = "gitlab-ci-mutable-ref-pin";
-/// `deps_gitlab_ci::UNRESOLVED_HOST_DIAGNOSTIC_CODE` — an informational notice (INFORMATION
-/// severity, never a vulnerability), emitted unconditionally whenever GitLab CI's
-/// `registries.gitlab_instance_host` is unset/invalid. See
-/// [`GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE`]'s doc for why this is a literal.
-const GITLAB_CI_UNRESOLVED_HOST_CODE: &str = "unresolved-gitlab-host";
 
 /// A category a [`CheckFinding`] can be classified into.
 ///
@@ -246,31 +222,24 @@ pub struct CheckFinding {
     /// [`deps_core::lsp_helpers::redact_requirement_for_diagnostic`] (#1258, #1300), so this
     /// is never the raw manifest value either.
     pub requirement: Option<String>,
-    /// The classified category (see [`Category`]).
-    pub category: Category,
-    /// The diagnostic's own `code`, when it carried a string one (spec 062 review S3,
-    /// issue #1075): a vulnerability diagnostic's code is an OSV advisory id
-    /// (`RUSTSEC-...`/`GHSA-...`), finer-grained than [`Self::category`]; the workspace's
-    /// other stable diagnostic-code constants (`UNSATISFIABLE_DIAGNOSTIC_CODE`, etc.) are
-    /// 1:1 with a category, so carrying them here changes nothing beyond echoing
-    /// `category`. `None` when `classify` fell back to matching the diagnostic's message
-    /// text instead of its code (`Outdated`/`Yanked`/`Other`).
-    pub code: Option<String>,
-    /// The advisory's own `https://osv.dev/vulnerability/{id}` page, when [`Self::code`] is
-    /// an OSV advisory id — sourced from the diagnostic's `code_description.href` (already
+    /// What the producing diagnostic reported. [`Self::category`] and [`Self::code`] are both
+    /// derived from it, so they can never disagree (#1784).
+    pub kind: DiagnosticKind,
+    /// The advisory's own `https://osv.dev/vulnerability/{id}` page, when [`Self::kind`] is
+    /// [`DiagnosticKind::Advisory`] — sourced from the diagnostic's `code_description.href` (already
     /// `Uri`-parsed and validated by `deps_core::lsp_helpers::diagnostics::
     /// push_vulnerability_diagnostics` before it ever reaches a `Diagnostic`), not
-    /// re-derived from `code` — the authoritative URL OSV itself gave us, rather than a
+    /// re-derived from the id — the authoritative URL OSV itself gave us, rather than a
     /// second, redundant formula that could drift from it. `None` whenever `code_description`
     /// is absent (every non-advisory finding, and the rare case where OSV's own `url` failed
     /// `Uri` parsing upstream).
     pub advisory_url: Option<String>,
-    /// What this manifest's OSV scan fetched about the advisory [`Self::code`] names (issue
+    /// What this manifest's OSV scan fetched about the advisory [`Self::kind`] names (issue
     /// #1077 C2): looked up by advisory id from the same scan results `generate_diagnostics`
     /// consumed, not re-derived from [`Self::severity`] (the three-bucket [`Severity`] `code`
     /// already collapsed into is too coarse to recover a CVSS-style grade from). `None` for
-    /// every non-advisory finding, and for an advisory `code` this run's scan did not itself
-    /// fetch (e.g. a stale `code` from a formatter that does not source it from a live scan).
+    /// every non-advisory finding, and for an advisory id this run's scan did not itself
+    /// fetch (e.g. a stale id from a formatter that does not source it from a live scan).
     pub advisory: Option<AdvisoryFacts>,
     /// The diagnostic's severity.
     pub severity: Severity,
@@ -278,6 +247,45 @@ pub struct CheckFinding {
     pub range: Range,
     /// The diagnostic's human-readable message.
     pub message: String,
+}
+
+impl CheckFinding {
+    /// The `--fail-on` category, classified from [`Self::kind`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_cli::report::{Category, CheckFinding};
+    /// use deps_core::EcosystemId;
+    /// use deps_core::diagnostic::{DiagnosticKind, Severity};
+    /// use deps_core::position::Range;
+    /// use std::path::PathBuf;
+    ///
+    /// let finding = CheckFinding {
+    ///     ecosystem: EcosystemId::Cargo,
+    ///     manifest_path: PathBuf::from("Cargo.toml"),
+    ///     dependency_name: None,
+    ///     requirement: None,
+    ///     kind: DiagnosticKind::Yanked,
+    ///     advisory_url: None,
+    ///     advisory: None,
+    ///     severity: Severity::Warning,
+    ///     range: Range::default(),
+    ///     message: "yanked".to_string(),
+    /// };
+    /// assert_eq!(finding.category(), Category::Yanked);
+    /// ```
+    #[must_use]
+    pub const fn category(&self) -> Category {
+        classify(&self.kind)
+    }
+
+    /// The stable wire code derived from [`Self::kind`]: an OSV advisory id for a vulnerability
+    /// finding, a fixed sentinel for the other coded kinds, `None` for the rest.
+    #[must_use]
+    pub fn code(&self) -> Option<&str> {
+        self.kind.code()
+    }
 }
 
 /// What one scanned advisory contributes to a [`CheckFinding`]: its severity bucket and its own
@@ -323,7 +331,7 @@ impl CheckReport {
     /// ```
     /// use deps_cli::report::{Category, CheckFinding, CheckReport};
     /// use deps_core::EcosystemId;
-    /// use deps_core::diagnostic::Severity;
+    /// use deps_core::diagnostic::{DiagnosticKind, Severity};
     /// use deps_core::position::Range;
     /// use std::path::PathBuf;
     ///
@@ -333,8 +341,7 @@ impl CheckReport {
     ///         manifest_path: PathBuf::from("Cargo.toml"),
     ///         dependency_name: Some("serde".to_string()),
     ///         requirement: Some("1.0".to_string()),
-    ///         category: Category::Outdated,
-    ///         code: None,
+    ///         kind: DiagnosticKind::Outdated,
     ///         advisory_url: None,
     ///         advisory: None,
     ///         severity: Severity::Hint,
@@ -348,7 +355,7 @@ impl CheckReport {
     pub fn summary(&self) -> BTreeMap<Category, usize> {
         let mut counts = BTreeMap::new();
         for finding in &self.findings {
-            *counts.entry(finding.category).or_insert(0_usize) += 1;
+            *counts.entry(finding.category()).or_insert(0_usize) += 1;
         }
         counts
     }
@@ -400,7 +407,7 @@ impl FailOnPolicy {
     pub fn matches(&self, findings: &[CheckFinding]) -> bool {
         findings
             .iter()
-            .any(|finding| self.categories.contains(&finding.category))
+            .any(|finding| self.categories.contains(&finding.category()))
     }
 }
 
@@ -615,7 +622,7 @@ impl<'a> DependencyIndex<'a> {
 /// (key, id) pair this index has no entry for — both resolve to `CheckFinding::advisory: None`.
 fn advisory_index(
     vulnerabilities: Option<&VulnerabilityMap>,
-) -> HashMap<(deps_core::osv::VulnKey, String), AdvisoryFacts> {
+) -> HashMap<(deps_core::osv::VulnKey, OsvId), AdvisoryFacts> {
     let mut index = HashMap::new();
     let Some(vulnerabilities) = vulnerabilities else {
         return index;
@@ -624,7 +631,7 @@ fn advisory_index(
         if let ScanOutcome::Vulnerable(dv) = outcome {
             for advisory in dv.advisories.items() {
                 index.insert(
-                    (dependency_key.clone(), advisory.id.clone()),
+                    (dependency_key.clone(), advisory.id().clone()),
                     AdvisoryFacts {
                         severity: advisory.severity,
                         text: deps_core::lsp_helpers::advisory_text(advisory),
@@ -652,25 +659,27 @@ fn to_finding(
     dep_index: &DependencyIndex<'_>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     diagnostic: Diagnostic,
-    advisory_facts: &HashMap<(deps_core::osv::VulnKey, String), AdvisoryFacts>,
+    advisory_facts: &HashMap<(deps_core::osv::VulnKey, OsvId), AdvisoryFacts>,
     vuln_keys: &VulnKeys,
     cached_versions: &HashMap<deps_core::PackageName, deps_core::lsp_helpers::PackageVersions>,
 ) -> CheckFinding {
-    let category = classify(&diagnostic, formatter);
     let dep = dep_index.lookup(diagnostic.range);
-    let code = diagnostic.code().map(str::to_string);
     let advisory_url = diagnostic
         .code_description
         .as_ref()
         .map(|code_description| code_description.href.as_str().to_string());
-    let facts = code.as_deref().zip(dep).and_then(|(code, dep)| {
-        // Deliberately narrower than resolve_scan_outcome: None on synthetic ranges, no further fallback.
-        if dep.name_range_is_synthetic() {
-            return None;
-        }
-        let dependency_key = deps_core::osv::vuln_key_for(dep, Some(vuln_keys), formatter);
-        advisory_facts.get(&(dependency_key, code.to_string()))
-    });
+    let facts = if let DiagnosticKind::Advisory(id) = diagnostic.kind() {
+        dep.and_then(|dep| {
+            // Deliberately narrower than resolve_scan_outcome: None on synthetic ranges, no further fallback.
+            if dep.name_range_is_synthetic() {
+                return None;
+            }
+            let dependency_key = deps_core::osv::vuln_key_for(dep, Some(vuln_keys), formatter);
+            advisory_facts.get(&(dependency_key, id.clone()))
+        })
+    } else {
+        None
+    };
     let advisory = facts.cloned();
     // Spec 074 FR-005: attribute an `Outdated` finding to an active GOSSIP cooldown when it
     // is the sole reason a newer version was excluded from being "latest" — matched by the
@@ -679,7 +688,7 @@ fn to_finding(
     // key). No `deps-core` change: this only reads the additive
     // `PackageVersions::gossip_excluded_version` field `deps-engine`'s fetch already set.
     let mut message = diagnostic.message().to_string();
-    if category == Category::Outdated
+    if classify(diagnostic.kind()) == Category::Outdated
         && let Some(dep) = dep
         && cached_versions
             .get(dep.name())
@@ -696,8 +705,7 @@ fn to_finding(
         requirement: dep
             .and_then(Dependency::version_requirement)
             .map(redact_requirement_for_diagnostic),
-        category,
-        code,
+        kind: diagnostic.kind().clone(),
         advisory_url,
         advisory,
         severity: diagnostic.severity.unwrap_or(Severity::Warning),
@@ -706,52 +714,32 @@ fn to_finding(
     }
 }
 
-/// Classifies a `generate_diagnostics` [`Diagnostic`] into a [`Category`].
+/// Classifies a diagnostic's [`DiagnosticKind`] into a `--fail-on` [`Category`].
 ///
-/// Diagnostics that carry one of the workspace's known non-advisory codes (the three
-/// `deps-core` sentinels, the two mutable-ref-pin codes, the SHA-comment-mismatch and unknown-ref codes, or
-/// GitLab CI's [`GITLAB_CI_UNRESOLVED_HOST_CODE`] notice) classify directly from `code`. A
-/// vulnerability advisory id (an OSV id such as `RUSTSEC-...`/`GHSA-...`) is the only other
-/// free-form `code` value `generate_diagnostics_from_cache` ever sets, so any `Some(code)`
-/// that matches none of the known non-advisory codes classifies as [`Category::Vulnerable`] —
-/// this fallback is sound only as long as the known-code list above stays exhaustive (see
-/// that list's own doc for the regression this already caused once). An outdated diagnostic carries no code but
-/// always starts with the fixed prefix `apply_outdated_rule` uses; a yanked diagnostic carries
-/// no code either, but always contains `formatter.yanked_message()` verbatim — the same text
-/// it was built from. The advisory-overflow summary line ("+N more advisories") also carries
-/// no code but always ends with that fixed suffix, and is still [`Category::Vulnerable`].
-/// Anything else (unknown-package, collapsed fetch-failure, blocked-registry,
-/// offline/dependency-count notices) classifies as [`Category::Other`].
-fn classify(
-    diagnostic: &Diagnostic,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
-) -> Category {
-    if let Some(code) = diagnostic.code() {
-        return match code {
-            UNSATISFIABLE_DIAGNOSTIC_CODE => Category::Unsatisfiable,
-            LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE => Category::License,
-            DEPRECATED_DIAGNOSTIC_CODE => Category::Deprecated,
-            GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE | GITLAB_CI_MUTABLE_REF_PIN_CODE => {
-                Category::MutableRefPin
-            }
-            SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE => Category::ShaCommentMismatch,
-            UNKNOWN_REF_DIAGNOSTIC_CODE => Category::UnknownRef,
-            GITLAB_CI_UNRESOLVED_HOST_CODE => Category::Other,
-            _ => Category::Vulnerable,
-        };
+/// Every kind is listed with no wildcard arm, so adding a [`DiagnosticKind`] variant fails to
+/// compile here until its category is decided (#1784).
+/// [`DiagnosticKind::Typosquat`] maps to [`Category::Other`]: there is no dedicated
+/// category, and `Other` is the documented bucket for a finding that matches none.
+/// [`DiagnosticKind::FlaggedLatest`], [`DiagnosticKind::UnverifiedLatest`],
+/// [`DiagnosticKind::UnresolvedGitlabHost`] and [`DiagnosticKind::Notice`] are likewise `Other`;
+/// the "+N more advisories" overflow line is still a [`Category::Vulnerable`] finding.
+const fn classify(kind: &DiagnosticKind) -> Category {
+    match kind {
+        DiagnosticKind::Outdated => Category::Outdated,
+        DiagnosticKind::Yanked => Category::Yanked,
+        DiagnosticKind::Advisory(_) | DiagnosticKind::AdvisoryOverflow => Category::Vulnerable,
+        DiagnosticKind::Unsatisfiable => Category::Unsatisfiable,
+        DiagnosticKind::LicensePolicy => Category::License,
+        DiagnosticKind::Deprecated => Category::Deprecated,
+        DiagnosticKind::MutableRefPin(_) => Category::MutableRefPin,
+        DiagnosticKind::ShaCommentMismatch => Category::ShaCommentMismatch,
+        DiagnosticKind::UnknownRef => Category::UnknownRef,
+        DiagnosticKind::FlaggedLatest
+        | DiagnosticKind::UnverifiedLatest
+        | DiagnosticKind::Typosquat
+        | DiagnosticKind::UnresolvedGitlabHost
+        | DiagnosticKind::Notice => Category::Other,
     }
-    if diagnostic.message().starts_with("Newer version available") {
-        return Category::Outdated;
-    }
-    if diagnostic.message().contains(formatter.yanked_message()) {
-        return Category::Yanked;
-    }
-    // The advisory-overflow summary line carries no code but is still a vulnerability finding
-    // (M1, spec 062 review) — else a manifest over `ADVISORY_DISPLAY_CAP` reports it as `Other`.
-    if diagnostic.message().ends_with("more advisories") {
-        return Category::Vulnerable;
-    }
-    Category::Other
 }
 
 /// Builds a file URI from a filesystem path, without any path-existence check. Returns
@@ -772,6 +760,26 @@ pub(crate) fn path_to_uri(path: &Path) -> Option<url::Url> {
     url::Url::from_file_path(&absolute).ok()
 }
 
+/// A representative [`DiagnosticKind`] for `category`, for tests that build a [`CheckFinding`]
+/// from a category alone.
+#[cfg(test)]
+pub(crate) fn kind_for(category: Category) -> DiagnosticKind {
+    use deps_core::diagnostic::GitTagsPlatform;
+
+    match category {
+        Category::Outdated => DiagnosticKind::Outdated,
+        Category::Yanked => DiagnosticKind::Yanked,
+        Category::Vulnerable => DiagnosticKind::AdvisoryOverflow,
+        Category::Unsatisfiable => DiagnosticKind::Unsatisfiable,
+        Category::MutableRefPin => DiagnosticKind::MutableRefPin(GitTagsPlatform::GithubActions),
+        Category::ShaCommentMismatch => DiagnosticKind::ShaCommentMismatch,
+        Category::UnknownRef => DiagnosticKind::UnknownRef,
+        Category::License => DiagnosticKind::LicensePolicy,
+        Category::Deprecated => DiagnosticKind::Deprecated,
+        Category::Other => DiagnosticKind::Notice,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,8 +791,7 @@ mod tests {
             manifest_path: PathBuf::from("Cargo.toml"),
             dependency_name: Some("serde".to_string()),
             requirement: Some("1.0".to_string()),
-            category,
-            code: None,
+            kind: kind_for(category),
             advisory_url: None,
             advisory: None,
             severity: Severity::Warning,
@@ -918,105 +925,88 @@ mod tests {
     const STUB_FORMATTER: deps_core::test_util::StubFormatter =
         deps_core::test_util::StubFormatter::new().with_package_url_prefix("");
 
-    fn diagnostic_with(code: Option<&str>, message: &str) -> Diagnostic {
-        let diagnostic =
-            Diagnostic::new(Range::default(), message).with_severity(Severity::Warning);
-        match code {
-            Some(code) => diagnostic.with_code(code),
-            None => diagnostic,
+    fn diagnostic_with(kind: DiagnosticKind, message: &str) -> Diagnostic {
+        Diagnostic::new(kind, Range::default(), message).with_severity(Severity::Warning)
+    }
+
+    fn advisory_kind(id: &str) -> DiagnosticKind {
+        DiagnosticKind::Advisory(deps_core::test_util::osv_id(id))
+    }
+
+    /// Pins every [`DiagnosticKind`] to its category. Adding a variant fails to compile here
+    /// (via [`classify`]'s own exhaustive match) and needs a row below.
+    #[test]
+    fn test_classify_maps_every_kind() {
+        use deps_core::diagnostic::GitTagsPlatform;
+
+        let cases = [
+            (DiagnosticKind::Outdated, Category::Outdated),
+            (DiagnosticKind::FlaggedLatest, Category::Other),
+            (DiagnosticKind::UnverifiedLatest, Category::Other),
+            (DiagnosticKind::Yanked, Category::Yanked),
+            (advisory_kind("RUSTSEC-2024-0001"), Category::Vulnerable),
+            (DiagnosticKind::AdvisoryOverflow, Category::Vulnerable),
+            (DiagnosticKind::Unsatisfiable, Category::Unsatisfiable),
+            (DiagnosticKind::LicensePolicy, Category::License),
+            (DiagnosticKind::Deprecated, Category::Deprecated),
+            (DiagnosticKind::Typosquat, Category::Other),
+            (
+                DiagnosticKind::MutableRefPin(GitTagsPlatform::GithubActions),
+                Category::MutableRefPin,
+            ),
+            (
+                DiagnosticKind::MutableRefPin(GitTagsPlatform::GitlabCi),
+                Category::MutableRefPin,
+            ),
+            (
+                DiagnosticKind::ShaCommentMismatch,
+                Category::ShaCommentMismatch,
+            ),
+            (DiagnosticKind::UnknownRef, Category::UnknownRef),
+            (DiagnosticKind::UnresolvedGitlabHost, Category::Other),
+            (DiagnosticKind::Notice, Category::Other),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(classify(&kind), expected, "{kind:?}");
         }
     }
 
+    /// M1 (#1784 plan): there is no dedicated typosquat category, so it files under `Other`.
     #[test]
-    fn test_classify_unsatisfiable_by_code() {
-        let d = diagnostic_with(Some(UNSATISFIABLE_DIAGNOSTIC_CODE), "no matching version");
-        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Unsatisfiable);
-    }
-
-    #[test]
-    fn test_classify_license_by_code() {
-        let d = diagnostic_with(
-            Some(LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE),
-            "GPL-3.0 denied",
-        );
-        assert_eq!(classify(&d, &STUB_FORMATTER), Category::License);
-    }
-
-    #[test]
-    fn test_classify_deprecated_by_code() {
-        let d = diagnostic_with(Some(DEPRECATED_DIAGNOSTIC_CODE), "package deprecated");
-        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Deprecated);
-    }
-
-    #[test]
-    fn test_classify_mutable_ref_pin_by_code() {
-        let d = diagnostic_with(Some(GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE), "pinned to a tag");
-        assert_eq!(classify(&d, &STUB_FORMATTER), Category::MutableRefPin);
-        let d = diagnostic_with(Some(GITLAB_CI_MUTABLE_REF_PIN_CODE), "pinned to a tag");
-        assert_eq!(classify(&d, &STUB_FORMATTER), Category::MutableRefPin);
-    }
-
-    #[test]
-    fn test_classify_sha_comment_mismatch_by_code() {
-        let d = diagnostic_with(
-            Some(SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE),
-            "SHA is not the commit of the tag in the comment",
-        );
-        assert_eq!(classify(&d, &STUB_FORMATTER), Category::ShaCommentMismatch);
-    }
-
-    /// #1766: without an explicit arm the free-form-code fallback would file this as Vulnerable.
-    #[test]
-    fn test_classify_unknown_ref_by_code() {
-        let d = diagnostic_with(
-            Some(UNKNOWN_REF_DIAGNOSTIC_CODE),
-            "`4.3.1` is not a published tag of actions/checkout",
-        );
-        assert_eq!(classify(&d, &STUB_FORMATTER), Category::UnknownRef);
-    }
-
-    #[test]
-    fn test_classify_advisory_code_is_vulnerable() {
-        let d = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
-        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Vulnerable);
-    }
-
-    #[test]
-    fn test_classify_outdated_by_message_prefix() {
-        let d = diagnostic_with(None, "Newer version available: 2.0.0");
-        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Outdated);
-    }
-
-    #[test]
-    fn test_classify_yanked_by_formatter_message() {
-        let d = diagnostic_with(None, "This version has been yanked (1.0.0)");
-        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Yanked);
-    }
-
-    #[test]
-    fn test_classify_unknown_package_is_other() {
-        let d = diagnostic_with(None, "Unknown package 'left-pad'");
-        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Other);
+    fn test_classify_typosquat_is_other() {
+        assert_eq!(classify(&DiagnosticKind::Typosquat), Category::Other);
     }
 
     /// Regression test for M1 (spec 062 review): the trailing "+N more advisories" overflow
     /// summary carries no code but is still a vulnerability finding, not `Other`.
     #[test]
     fn test_classify_advisory_overflow_summary_is_vulnerable() {
-        let d = diagnostic_with(None, "+5 more advisories");
-        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Vulnerable);
+        assert_eq!(
+            classify(&DiagnosticKind::AdvisoryOverflow),
+            Category::Vulnerable
+        );
     }
 
     /// Regression test for C3 (spec 062 review): GitLab CI's `unresolved-gitlab-host` notice
-    /// is informational (INFORMATION severity, never a vulnerability) and must not fall
-    /// through to the advisory-id fallback.
+    /// is informational (INFORMATION severity, never a vulnerability).
     #[test]
     fn test_classify_gitlab_unresolved_host_is_other_not_vulnerable() {
-        let d = diagnostic_with(
-            Some(GITLAB_CI_UNRESOLVED_HOST_CODE),
-            "registries.gitlab_instance_host is unset; skipping component/project host resolution",
+        assert_eq!(
+            classify(&DiagnosticKind::UnresolvedGitlabHost),
+            Category::Other
         );
-        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Other);
+    }
+
+    /// The finding's category and code both derive from its kind and can never disagree.
+    #[test]
+    fn test_check_finding_category_and_code_derive_from_kind() {
+        let mut f = finding(Category::Outdated);
+        f.kind = advisory_kind("RUSTSEC-2024-0001");
+        assert_eq!(f.category(), Category::Vulnerable);
+        assert_eq!(f.code(), Some("RUSTSEC-2024-0001"));
+        f.kind = DiagnosticKind::Outdated;
+        assert_eq!(f.category(), Category::Outdated);
+        assert_eq!(f.code(), None);
     }
 
     /// A single-dependency parse result whose one dependency ("dep-0") sits at
@@ -1116,7 +1106,7 @@ mod tests {
     fn test_to_finding_extracts_string_code_from_diagnostic() {
         let parse_result = empty_dep_index();
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
+        let diagnostic = diagnostic_with(advisory_kind("RUSTSEC-2024-0001"), "advisory summary");
         let finding = to_finding(
             EcosystemId::Cargo,
             Path::new("Cargo.toml"),
@@ -1127,14 +1117,15 @@ mod tests {
             &VulnKeys::default(),
             &HashMap::new(),
         );
-        assert_eq!(finding.code.as_deref(), Some("RUSTSEC-2024-0001"));
+        assert_eq!(finding.code(), Some("RUSTSEC-2024-0001"));
     }
 
     #[test]
     fn test_to_finding_code_is_none_without_a_diagnostic_code() {
         let parse_result = empty_dep_index();
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let diagnostic = diagnostic_with(None, "Newer version available: 2.0.0");
+        let diagnostic =
+            diagnostic_with(DiagnosticKind::Outdated, "Newer version available: 2.0.0");
         let finding = to_finding(
             EcosystemId::Cargo,
             Path::new("Cargo.toml"),
@@ -1145,7 +1136,7 @@ mod tests {
             &VulnKeys::default(),
             &HashMap::new(),
         );
-        assert!(finding.code.is_none());
+        assert!(finding.code().is_none());
     }
 
     /// Spec 074 FR-005: an `Outdated` finding whose dependency has a
@@ -1154,7 +1145,8 @@ mod tests {
     fn test_to_finding_attributes_outdated_to_gossip_when_excluded() {
         let parse_result = dep_index_with_named_dependency("serde");
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let diagnostic = diagnostic_with(None, "Newer version available: 1.0.0");
+        let diagnostic =
+            diagnostic_with(DiagnosticKind::Outdated, "Newer version available: 1.0.0");
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
             PackageName::new("serde"),
@@ -1171,7 +1163,7 @@ mod tests {
             &VulnKeys::default(),
             &cached_versions,
         );
-        assert_eq!(finding.category, Category::Outdated);
+        assert_eq!(finding.category(), Category::Outdated);
         assert!(
             finding.message.contains("GOSSIP"),
             "message must attribute the exclusion to GOSSIP: {:?}",
@@ -1185,7 +1177,8 @@ mod tests {
     fn test_to_finding_does_not_attribute_when_no_gossip_exclusion() {
         let parse_result = dep_index_with_named_dependency("serde");
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let diagnostic = diagnostic_with(None, "Newer version available: 1.0.0");
+        let diagnostic =
+            diagnostic_with(DiagnosticKind::Outdated, "Newer version available: 1.0.0");
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
             PackageName::new("serde"),
@@ -1201,7 +1194,7 @@ mod tests {
             &VulnKeys::default(),
             &cached_versions,
         );
-        assert_eq!(finding.category, Category::Outdated);
+        assert_eq!(finding.category(), Category::Outdated);
         assert!(!finding.message.contains("GOSSIP"));
     }
 
@@ -1212,7 +1205,7 @@ mod tests {
         let href: url::Url = "https://osv.dev/vulnerability/RUSTSEC-2024-0001"
             .parse()
             .expect("valid URL");
-        let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary")
+        let diagnostic = diagnostic_with(advisory_kind("RUSTSEC-2024-0001"), "advisory summary")
             .with_code_description(deps_core::diagnostic::CodeDescription::new(href));
         let finding = to_finding(
             EcosystemId::Cargo,
@@ -1234,7 +1227,7 @@ mod tests {
     fn test_to_finding_advisory_url_is_none_without_code_description() {
         let parse_result = empty_dep_index();
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
+        let diagnostic = diagnostic_with(advisory_kind("RUSTSEC-2024-0001"), "advisory summary");
         let finding = to_finding(
             EcosystemId::Cargo,
             Path::new("Cargo.toml"),
@@ -1257,7 +1250,7 @@ mod tests {
             "https://svcacct:glpat-AAAABBBBCCCCDDDD@gitlab.corp/g/p",
         );
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let diagnostic = diagnostic_with(None, "Unknown package");
+        let diagnostic = diagnostic_with(DiagnosticKind::Notice, "Unknown package");
 
         let finding = to_finding(
             EcosystemId::Cargo,
@@ -1290,7 +1283,7 @@ mod tests {
             "https://svcacct:glpat-AAAABBBBCCCCDDDD@gitlab.corp/g/p",
         );
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let diagnostic = diagnostic_with(None, "Unknown package");
+        let diagnostic = diagnostic_with(DiagnosticKind::Notice, "Unknown package");
 
         let finding = to_finding(
             EcosystemId::Cargo,
@@ -1338,7 +1331,8 @@ mod tests {
         let malicious_path = Path::new("src/\u{202E}\x1Bsneaky/Cargo.toml");
         let parse_result = empty_dep_index();
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let diagnostic = diagnostic_with(None, "Newer version available: 2.0.0");
+        let diagnostic =
+            diagnostic_with(DiagnosticKind::Outdated, "Newer version available: 2.0.0");
 
         let finding = to_finding(
             EcosystemId::Cargo,
@@ -1404,7 +1398,8 @@ mod tests {
             "https://svcacct:hunter2@gitlab.corp/g/p.git",
         );
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let diagnostic = diagnostic_with(None, "Newer version available: 2.0.0");
+        let diagnostic =
+            diagnostic_with(DiagnosticKind::Outdated, "Newer version available: 2.0.0");
 
         let finding = to_finding(
             EcosystemId::Cargo,
@@ -1437,7 +1432,8 @@ mod tests {
         let parse_result =
             dep_index_with_named_dependency_and_requirement("some-pkg", "^1.0\u{202E}\x1B[31m");
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let diagnostic = diagnostic_with(None, "Newer version available: 2.0.0");
+        let diagnostic =
+            diagnostic_with(DiagnosticKind::Outdated, "Newer version available: 2.0.0");
 
         let finding = to_finding(
             EcosystemId::Cargo,
@@ -1477,7 +1473,7 @@ mod tests {
     fn test_to_finding_resolves_advisory_severity_from_index() {
         let parse_result = dep_index_with_one_dependency();
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
+        let diagnostic = diagnostic_with(advisory_kind("RUSTSEC-2024-0001"), "advisory summary");
 
         let vuln_keys = deps_core::osv::vulnerability_keys(
             parse_result.as_ref(),
@@ -1490,7 +1486,7 @@ mod tests {
         severities.insert(
             (
                 deps_core::test_util::vuln_key("dep-0"),
-                "RUSTSEC-2024-0001".to_string(),
+                deps_core::test_util::osv_id("RUSTSEC-2024-0001"),
             ),
             AdvisoryFacts {
                 severity: VulnSeverity::Critical,
@@ -1521,7 +1517,7 @@ mod tests {
     fn test_to_finding_advisory_severity_is_none_for_an_unindexed_code() {
         let parse_result = dep_index_with_one_dependency();
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
+        let diagnostic = diagnostic_with(advisory_kind("RUSTSEC-2024-0001"), "advisory summary");
         let vuln_keys = deps_core::osv::vulnerability_keys(
             parse_result.as_ref(),
             &HashMap::new(),
@@ -1550,12 +1546,12 @@ mod tests {
     fn test_to_finding_advisory_severity_is_none_without_a_matched_dependency() {
         let parse_result = empty_dep_index();
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
+        let diagnostic = diagnostic_with(advisory_kind("RUSTSEC-2024-0001"), "advisory summary");
         let mut severities = HashMap::new();
         severities.insert(
             (
                 deps_core::test_util::vuln_key("dep-0"),
-                "RUSTSEC-2024-0001".to_string(),
+                deps_core::test_util::osv_id("RUSTSEC-2024-0001"),
             ),
             AdvisoryFacts {
                 severity: VulnSeverity::Critical,
@@ -1599,7 +1595,7 @@ mod tests {
             index
                 .get(&(
                     deps_core::test_util::vuln_key("serde"),
-                    "RUSTSEC-2024-0001".to_string()
+                    deps_core::test_util::osv_id("RUSTSEC-2024-0001")
                 ))
                 .map(|facts| facts.severity),
             Some(VulnSeverity::High)
@@ -1645,7 +1641,7 @@ mod tests {
             index
                 .get(&(
                     deps_core::test_util::vuln_key("package-a"),
-                    "GHSA-shared-id".to_string()
+                    deps_core::test_util::osv_id("GHSA-shared-id")
                 ))
                 .map(|facts| facts.severity),
             Some(VulnSeverity::Critical)
@@ -1654,7 +1650,7 @@ mod tests {
             index
                 .get(&(
                     deps_core::test_util::vuln_key("package-b"),
-                    "GHSA-shared-id".to_string()
+                    deps_core::test_util::osv_id("GHSA-shared-id")
                 ))
                 .map(|facts| facts.severity),
             Some(VulnSeverity::Low)
@@ -1807,7 +1803,7 @@ mod tests {
             &VulnKeys::default(),
             &cached_versions,
         );
-        assert_eq!(finding.category, Category::Outdated);
+        assert_eq!(finding.category(), Category::Outdated);
         assert!(
             finding.message.contains("deps.dev/GOSSIP"),
             "the GOSSIP wording must survive into the SARIF finding: {}",

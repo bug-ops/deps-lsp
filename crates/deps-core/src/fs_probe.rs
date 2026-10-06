@@ -262,8 +262,7 @@ pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     })?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
+        .map_or_default(|d| d.as_nanos());
     let tmp_path = dir.join(format!(
         "{}.deps-cli-{}-{nanos}.tmp",
         file_name.to_string_lossy(),

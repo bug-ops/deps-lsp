@@ -514,10 +514,45 @@ pub struct ScanTarget {
     #[raw]
     siblings: Vec<ScanVersion>,
     /// Whether [`Self::siblings`] is the complete list of release tags on the target's commit.
-    /// [`ListCoverage::Truncated`] makes a clean answer non-authoritative. Set only via
-    /// [`Self::with_siblings`].
+    /// Anything but [`SiblingCoverage::Complete`] makes a clean answer non-authoritative. Set
+    /// only via [`Self::with_siblings`].
     #[raw]
-    sibling_coverage: ListCoverage,
+    sibling_coverage: SiblingCoverage,
+}
+
+/// Whether a scan target's sibling release tags were read from a complete tag list.
+///
+/// Exhaustive so each consumer decides what every state means: anything but
+/// [`Self::Complete`] makes a clean OSV answer non-authoritative, because an advisory against
+/// an unlisted sibling would have been missed.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::SiblingCoverage;
+/// use deps_core::pagination::ListCoverage;
+///
+/// assert_eq!(SiblingCoverage::from(ListCoverage::Complete), SiblingCoverage::Complete);
+/// assert_eq!(SiblingCoverage::from(ListCoverage::Truncated), SiblingCoverage::Truncated);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SiblingCoverage {
+    /// The siblings came from a complete tag list, or the version is not a git tag at all.
+    Complete,
+    /// The tag list is truncated, so a sibling tag naming the commit may be missing.
+    Truncated,
+    /// The repository's tag list has not been fetched yet (cold cache) or its fetch failed, so
+    /// no sibling data exists. Reported again as soon as a later fetch populates the index.
+    NotYetIndexed,
+}
+
+impl From<ListCoverage> for SiblingCoverage {
+    fn from(coverage: ListCoverage) -> Self {
+        match coverage {
+            ListCoverage::Complete => Self::Complete,
+            ListCoverage::Truncated => Self::Truncated,
+        }
+    }
 }
 
 /// One sibling release tag of a [`ScanTarget`]: the same wire/native split as the target's own
@@ -565,7 +600,7 @@ impl ScanTarget {
     ///   surfacing back to the user instead of `version`
     ///
     /// The target has no sibling tags and claims a complete sibling list
-    /// ([`ListCoverage::Complete`]), which is right only for a version that is not a git tag.
+    /// ([`SiblingCoverage::Complete`]), which is right only for a version that is not a git tag.
     /// A target whose version comes from a tag index must go through [`Self::with_siblings`], which
     /// states the real coverage.
     #[must_use]
@@ -581,7 +616,7 @@ impl ScanTarget {
             version,
             display_version,
             siblings: Vec::new(),
-            sibling_coverage: ListCoverage::Complete,
+            sibling_coverage: SiblingCoverage::Complete,
         }
     }
 
@@ -593,8 +628,8 @@ impl ScanTarget {
     /// implement it) keeps arbitrary tags from being attached. The target's own `version` and
     /// `display_version` are never touched. Only [`crate::osv::OsvClient`]'s local-matching path
     /// evaluates siblings; a server-side matched target carrying any is skipped fail-closed.
-    /// The sibling list's coverage is taken from `versions`; a [`ListCoverage::Truncated`] one
-    /// downgrades a clean scan answer to [`SkipReason::SiblingTagsUnknown`].
+    /// The sibling list's coverage is taken from `versions`; any state but
+    /// [`SiblingCoverage::Complete`] downgrades a clean scan answer to [`SkipReason::SiblingTagsUnknown`].
     #[must_use]
     pub fn with_siblings(
         mut self,
@@ -615,7 +650,7 @@ impl ScanTarget {
 
     /// Whether [`Self::siblings`] is the complete list of release tags on the target's commit.
     #[must_use]
-    pub const fn sibling_coverage(&self) -> ListCoverage {
+    pub const fn sibling_coverage(&self) -> SiblingCoverage {
         self.sibling_coverage
     }
 
@@ -677,7 +712,7 @@ mod scan_target_debug_redaction_tests {
             version: OsvVersion::new("1.0.0"),
             display_version: ConcreteVersion::new("1.0.0"),
             siblings: Vec::new(),
-            sibling_coverage: crate::pagination::ListCoverage::Complete,
+            sibling_coverage: crate::osv::SiblingCoverage::Complete,
         },
     );
 }
@@ -750,8 +785,9 @@ pub enum VulnSeverity {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Advisory {
-    /// Advisory identifier (e.g. `"RUSTSEC-2020-0071"`, `"GHSA-..."`).
-    pub id: String,
+    /// Advisory identifier (e.g. `"RUSTSEC-2020-0071"`, `"GHSA-..."`). Private so the
+    /// validated invariant cannot be bypassed by a field write (#1785); read via [`Self::id`].
+    id: OsvId,
     /// RFC3339 last-modified timestamp — the [`crate::osv::OsvClient`] record-cache validator.
     pub modified: String,
     /// Human-readable one-line summary, if OSV provided one.
@@ -768,10 +804,6 @@ pub struct Advisory {
     /// recorded no fix. The highest entry is the one to surface as "the fix" — see
     /// `architecture.md` §6 for why the *first* one is not.
     pub fixed_versions: Vec<OsvVersion>,
-    /// `https://osv.dev/vulnerability/{id}`, always derived from [`Self::id`] via
-    /// [`validated_osv_url`]. Private (not `pub`) rather than a plain field — see
-    /// [`Self::new`]'s doc for why (#1271). Read via [`Self::url()`].
-    url: String,
 }
 
 impl Advisory {
@@ -780,9 +812,9 @@ impl Advisory {
     /// [`Self::fixed_versions`] left empty/`None` — chain the corresponding `with_*` setters
     /// to attach them.
     ///
-    /// Returns `None` if `id` fails [`is_valid_osv_id`] — mirrors
+    /// Returns `None` if `id` fails [`OsvId::parse`] — mirrors
     /// `OsvVulnRecord::into_advisory`'s own early return for the same check, so a
-    /// caller cannot construct an `Advisory` whose URL [`validated_osv_url`] could not
+    /// caller cannot construct an `Advisory` whose URL [`OsvId::osv_url`] could not
     /// build safely.
     ///
     /// This is the only way to set the URL outside this module: unlike a merely
@@ -819,7 +851,7 @@ impl Advisory {
     /// ```
     #[must_use]
     pub fn new(id: String, modified: String, severity: VulnSeverity) -> Option<Self> {
-        let url = validated_osv_url(&id)?;
+        let id = OsvId::parse(&id)?;
         Some(Self {
             id,
             modified,
@@ -828,16 +860,34 @@ impl Advisory {
             severity,
             cvss_vector: None,
             fixed_versions: Vec::new(),
-            url,
         })
+    }
+
+    /// Returns the validated advisory identifier.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::{Advisory, VulnSeverity};
+    ///
+    /// let advisory = Advisory::new(
+    ///     "RUSTSEC-2020-0071".to_string(),
+    ///     "2023-01-01T00:00:00Z".to_string(),
+    ///     VulnSeverity::High,
+    /// )
+    /// .expect("valid osv id");
+    /// assert_eq!(advisory.id().as_str(), "RUSTSEC-2020-0071");
+    /// ```
+    #[must_use]
+    pub const fn id(&self) -> &OsvId {
+        &self.id
     }
 
     /// Returns `https://osv.dev/vulnerability/{id}` — [`Self::id`]'s advisory page on
     /// OSV.dev.
     ///
-    /// The only accessor for the private `url` field (#1271): every `Advisory` in existence
-    /// was built by [`Self::new`], so this value is always [`validated_osv_url`]'s output for
-    /// [`Self::id`], never an arbitrary caller-supplied string.
+    /// Derived from [`Self::id`] through [`OsvId::osv_url`] on every call (#1271), so it can never
+    /// disagree with the id and is never an arbitrary caller-supplied string.
     ///
     /// # Examples
     ///
@@ -853,8 +903,8 @@ impl Advisory {
     /// assert_eq!(advisory.url(), "https://osv.dev/vulnerability/RUSTSEC-2020-0071");
     /// ```
     #[must_use]
-    pub fn url(&self) -> &str {
-        &self.url
+    pub fn url(&self) -> String {
+        self.id.osv_url()
     }
 
     /// Attaches a human-readable one-line summary. See [`Self::summary`].
@@ -1024,7 +1074,7 @@ pub enum UpgradeStatus {
         /// treating it as the complete set of advisories still affecting this
         /// candidate; an incomplete list means some are missing, not that none
         /// exist.
-        advisory_ids: Capped<String>,
+        advisory_ids: Capped<OsvId>,
         /// The most severe [`VulnSeverity`] among `advisory_ids`'s full records, or `None` when
         /// no record could be fetched for any of them (issue #1517) — a caller must treat `None`
         /// as blocking (never render this candidate as safe), never as "no advisories". Exists
@@ -1158,7 +1208,7 @@ impl MatchedTags {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SiblingMatches {
     primary: OsvVersion,
-    tags: HashMap<String, MatchedTags>,
+    tags: HashMap<OsvId, MatchedTags>,
 }
 
 impl SiblingMatches {
@@ -1169,7 +1219,7 @@ impl SiblingMatches {
         }
     }
 
-    pub(crate) fn insert(&mut self, id: String, tags: MatchedTags) {
+    pub(crate) fn insert(&mut self, id: OsvId, tags: MatchedTags) {
         self.tags.insert(id, tags);
     }
 
@@ -1224,10 +1274,41 @@ impl DependencyVulnerabilities {
         self
     }
 
+    /// Attaches sibling-tag matches bound to `primary`, for tests of consumers in other crates
+    /// that cannot reach [`crate::osv::OsvClient`]'s own construction path.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::{Capped, DependencyVulnerabilities, MatchedTags, OsvId, OsvVersion};
+    /// use deps_core::ConcreteVersion;
+    ///
+    /// let id = OsvId::parse("RUSTSEC-2024-0001").unwrap();
+    /// let dv = DependencyVulnerabilities::new(Capped::new(vec![], 0)).with_sibling_matches_for_test(
+    ///     OsvVersion::new("0.9.0"),
+    ///     [(id.clone(), MatchedTags::new(ConcreteVersion::new("v4.9.0"), vec![]))],
+    /// );
+    /// assert!(dv.sibling_match(&id).is_some());
+    /// ```
+    #[cfg(any(test, feature = "test-util"))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
+    #[must_use]
+    pub fn with_sibling_matches_for_test(
+        self,
+        primary: OsvVersion,
+        matches: impl IntoIterator<Item = (OsvId, MatchedTags)>,
+    ) -> Self {
+        let mut sibling_matches = SiblingMatches::new(primary);
+        for (id, tags) in matches {
+            sibling_matches.insert(id, tags);
+        }
+        self.with_sibling_matches(sibling_matches)
+    }
+
     /// The sibling release tags advisory `id` matched instead of the scanned primary version;
     /// `None` when it matched the primary version itself.
     #[must_use]
-    pub fn sibling_match(&self, id: &str) -> Option<&MatchedTags> {
+    pub fn sibling_match(&self, id: &OsvId) -> Option<&MatchedTags> {
         self.sibling_matches.as_ref()?.tags.get(id)
     }
 
@@ -1359,7 +1440,7 @@ pub struct FixRecommendation {
     /// Advisory ids this recommendation actually resolves, sorted by
     /// severity descending (worst first) and tied by id — the order a
     /// title should list them in.
-    pub advisory_ids: Vec<String>,
+    pub advisory_ids: Vec<OsvId>,
 }
 
 /// Numeric ranking used only to sort [`FixRecommendation::advisory_ids`],
@@ -1455,7 +1536,8 @@ impl DependencyVulnerabilities {
     ///
     /// let fix = dv.recommended_fix(None).unwrap();
     /// assert_eq!(fix.version, "1.2.0");
-    /// assert_eq!(fix.advisory_ids, vec!["RUSTSEC-1".to_string()]);
+    /// let ids: Vec<&str> = fix.advisory_ids.iter().map(|id| id.as_str()).collect();
+    /// assert_eq!(ids, ["RUSTSEC-1"]);
     /// ```
     ///
     /// # Arguments
@@ -1466,7 +1548,7 @@ impl DependencyVulnerabilities {
     ///   `upgrade_status` field's [`UpgradeStatus::NotChecked`] default).
     #[must_use]
     pub fn recommended_fix(&self, latest: Option<&UpgradeStatus>) -> Option<FixRecommendation> {
-        let still_applying: &[String] = match latest {
+        let still_applying: &[OsvId] = match latest {
             Some(UpgradeStatus::CandidateVulnerable { advisory_ids, .. }) => advisory_ids.items(),
             Some(
                 UpgradeStatus::NotChecked
@@ -1551,10 +1633,13 @@ pub enum SkipReason {
     /// The ecosystem is matched locally and an advisory exists for the package, but its
     /// affected ranges could not be evaluated against the in-use version — possibly vulnerable.
     UnevaluableAdvisoryRange,
-    /// The sibling release tags of the version could not be established (cold or truncated tag
-    /// index), so a clean answer for the version alone is not trustworthy. Phase B reports it
-    /// for a candidate whose siblings are unknown or incomplete; phase A reports it when a
-    /// truncated tag list left the in-use version's siblings possibly incomplete.
+    /// The sibling release tags of the version could not be established (truncated tag index,
+    /// or a cold or failed tag fetch), so a clean answer for the version alone is not
+    /// trustworthy. Phase B reports it for a candidate whose siblings are unknown or
+    /// incomplete; phase A reports it when a truncated tag list left the in-use version's
+    /// siblings possibly incomplete, or when no tag list has been fetched yet. A failed fetch
+    /// (403/404) stays downgraded until a later fetch succeeds, because the tag index is only
+    /// populated on success; the LSP rescans as soon as it is.
     SiblingTagsUnknown,
 }
 
@@ -2246,10 +2331,14 @@ pub fn vulnerability_keys(
                             signature.push(' ');
                             signature.push_str(sibling.as_str());
                         }
-                        // Only a truncated list is marked, so ecosystems without tag indexes
+                        // Only an incomplete list is marked, so ecosystems without tag indexes
                         // keep their keys.
-                        if v.sibling_coverage() == ListCoverage::Truncated {
-                            signature.push_str(" truncated");
+                        match v.sibling_coverage() {
+                            SiblingCoverage::Complete => {}
+                            SiblingCoverage::Truncated => signature.push_str(" truncated"),
+                            SiblingCoverage::NotYetIndexed => {
+                                signature.push_str(" not-yet-indexed");
+                            }
                         }
                         signature
                     }
@@ -2501,49 +2590,105 @@ pub(super) struct OsvEvent {
     pub(super) last_affected: Option<String>,
 }
 
-/// Returns `true` if `id` matches OSV's advisory id grammar
-/// (`[A-Za-z0-9._-]+`, non-empty, capped at 128 bytes).
+/// Error returned when a string fails OSV's advisory id grammar. See [`OsvId::parse`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid OSV advisory id")]
+pub struct InvalidOsvId;
+
+/// A validated OSV advisory id (`[A-Za-z0-9._-]+`, non-empty, at most 128 bytes, and never the
+/// RFC 3986 dot-segments `"."`/`".."`).
 ///
 /// The same alphabet every real id scheme in this space uses (`RUSTSEC-2020-0071`,
-/// `GHSA-xxxx-yyyy-zzzz`, `CVE-2020-26235`); real ids are a few dozen
-/// characters, so the cap exists only to bound how much of a record-supplied
-/// string can ride along into `Diagnostic.code`, hover markdown, and a
-/// `CodeAction` title. `id` is echoed verbatim into a markdown link
-/// destination (`push_vulnerability_hover_section`) and a `Diagnostic.code`,
-/// so this is the parse-boundary chokepoint that keeps a malformed id from
-/// ever reaching either — rejecting it here means every downstream consumer
-/// can treat `Advisory.id` as inherently safe, rather than needing to
-/// sanitize it again at each render site.
+/// `GHSA-xxxx-yyyy-zzzz`, `CVE-2020-26235`); the cap only bounds how much of a record-supplied
+/// string can ride along into a `Diagnostic` code, hover markdown and a `CodeAction` title.
+/// [`Self::parse`] is the only constructor, so every render site can treat an `OsvId` as
+/// inherently safe to embed in a markdown link destination or a URI path segment, by type
+/// rather than by a check that a later field write could bypass.
 ///
 /// The bare character class alone is not sufficient (issue #1077 review): `.` is an allowed
-/// character (real ids can contain it), so a lone `id` of exactly `"."` or `".."` — RFC 3986's
-/// two dot-segments — would otherwise still pass, and `https://osv.dev/vulnerability/..`
-/// normalizes (`remove_dot_segments`) to `https://osv.dev/`, walking a consumer's link up and
-/// out of `/vulnerability/` without `id` ever containing a literal `/`. Both are rejected as an
-/// explicit special case.
-pub fn is_valid_osv_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id != "."
-        && id != ".."
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+/// character, so a lone `"."` or `".."` would otherwise pass, and
+/// `https://osv.dev/vulnerability/..` normalizes to `https://osv.dev/`. Both are rejected
+/// explicitly.
+///
+/// `Deserialize` goes through [`Self::parse`] (`try_from = "String"`), never a transparent
+/// passthrough, so a wire value cannot forge an unvalidated id.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::OsvId;
+///
+/// let id = OsvId::parse("RUSTSEC-2020-0071").expect("valid id");
+/// assert_eq!(id.as_str(), "RUSTSEC-2020-0071");
+/// assert_eq!(id.osv_url(), "https://osv.dev/vulnerability/RUSTSEC-2020-0071");
+///
+/// assert!(OsvId::parse("..").is_none());
+/// assert!(OsvId::parse("../evil").is_none());
+/// ```
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "String")]
+pub struct OsvId(String);
+
+impl OsvId {
+    /// Parses `raw` against the OSV advisory id grammar, returning `None` if it does not match.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let valid = !raw.is_empty()
+            && raw.len() <= 128
+            && raw != "."
+            && raw != ".."
+            && raw
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        valid.then(|| Self(raw.to_owned()))
+    }
+
+    /// Returns the validated id as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Joins `ids` with `separator` for human-readable detail text.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::OsvId;
+    ///
+    /// let ids = [OsvId::parse("A-1").unwrap(), OsvId::parse("A-2").unwrap()];
+    /// assert_eq!(OsvId::join(&ids, ", "), "A-1, A-2");
+    /// ```
+    #[must_use]
+    pub fn join(ids: &[Self], separator: &str) -> String {
+        ids.iter()
+            .map(Self::as_str)
+            .collect::<Vec<_>>()
+            .join(separator)
+    }
+
+    /// Builds `https://osv.dev/vulnerability/{id}`; safe by construction because the id
+    /// cannot contain `/` or be a dot-segment.
+    #[must_use]
+    pub fn osv_url(&self) -> String {
+        format!("https://osv.dev/vulnerability/{}", self.0)
+    }
 }
 
-/// Builds `https://osv.dev/vulnerability/{id}`, or `None` if `id` fails [`is_valid_osv_id`].
-///
-/// The single validated construction path for this URL (issue #1077 review): used by
-/// `OsvVulnRecord::into_advisory` to build [`Advisory::url`], and reusable by any downstream
-/// consumer that only has a bare advisory-id *string* (not a whole [`Advisory`]) and needs to
-/// independently confirm it is safe to embed as a URI path segment before doing so — e.g.
-/// `deps-cli`'s SARIF `helpUri`, which cannot assume every `code` string it sees necessarily
-/// went through this crate's own OSV-response parsing (`crate::report::classify`'s documented
-/// "any unrecognized diagnostic code -> Vulnerable" fallback can hand it a string this crate
-/// never validated at all).
-#[must_use]
-pub fn validated_osv_url(id: &str) -> Option<String> {
-    is_valid_osv_id(id).then(|| format!("https://osv.dev/vulnerability/{id}"))
+impl TryFrom<String> for OsvId {
+    type Error = InvalidOsvId;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::parse(&raw).ok_or(InvalidOsvId)
+    }
+}
+
+impl std::fmt::Display for OsvId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 impl OsvVulnRecord {
@@ -2565,7 +2710,7 @@ impl OsvVulnRecord {
     }
 
     /// Converts a raw wire record into the `deps-lsp`-facing [`Advisory`],
-    /// or `None` if the record's id fails [`is_valid_osv_id`] (dropped, same
+    /// or `None` if the record's id fails [`OsvId::parse`] (dropped, same
     /// as a 404 on `/v1/vulns/{id}` — the dependency renders with whichever
     /// advisories did resolve, never a half-trusted one). Individual `fixed`
     /// events failing [`is_safe_version_string`] are dropped the same way,
@@ -2583,10 +2728,10 @@ impl OsvVulnRecord {
         osv_name: &OsvPackageName,
         osv_eco: OsvEcosystem,
     ) -> Option<Advisory> {
-        if !is_valid_osv_id(&self.id) {
+        let Some(id) = OsvId::parse(&self.id) else {
             tracing::warn!(id = ?self.id, "OSV record has a malformed id, dropping");
             return None;
-        }
+        };
 
         let relevant = self.affected_for(osv_name, osv_eco);
         // Every `affected[]` entry named a different package: OSV returned
@@ -2663,17 +2808,14 @@ impl OsvVulnRecord {
         fixed_versions.dedup();
 
         // Exhaustive literal (not `Advisory::new`) so a future new field fails to compile here.
-        let url = validated_osv_url(&self.id)?;
-
         Some(Advisory {
-            id: self.id,
+            id,
             modified: self.modified,
             summary: self.summary,
             aliases: self.aliases,
             severity,
             cvss_vector,
             fixed_versions: fixed_versions.into_iter().map(OsvVersion::new).collect(),
-            url,
         })
     }
 }
@@ -2684,7 +2826,7 @@ mod recommended_fix_tests {
 
     fn advisory(id: &str, severity: VulnSeverity, fixed_versions: &[&str]) -> Arc<Advisory> {
         Arc::new(Advisory {
-            id: id.to_string(),
+            id: crate::test_util::osv_id(id),
             modified: "2023-01-01T00:00:00Z".to_string(),
             summary: None,
             aliases: vec![],
@@ -2695,7 +2837,6 @@ mod recommended_fix_tests {
                 .copied()
                 .map(OsvVersion::new)
                 .collect(),
-            url: String::new(),
         })
     }
 
@@ -2716,7 +2857,10 @@ mod recommended_fix_tests {
         let mut matches = SiblingMatches::new(OsvVersion::new("4.8.0"));
         for (id, tags) in matched {
             let tags = tags.iter().map(|t| ConcreteVersion::new(*t)).collect();
-            matches.insert((*id).to_string(), MatchedTags::from_tags(tags).unwrap());
+            matches.insert(
+                crate::test_util::osv_id(id),
+                MatchedTags::from_tags(tags).unwrap(),
+            );
         }
         DependencyVulnerabilities::new(Capped::new(advisories, total)).with_sibling_matches(matches)
     }
@@ -2785,7 +2929,13 @@ mod recommended_fix_tests {
         let fix = vulns.recommended_fix(None).unwrap();
         assert_eq!(fix.version, "1.3.0");
         // Sorted by severity descending: Critical (A2) before High (A1).
-        assert_eq!(fix.advisory_ids, vec!["A2".to_string(), "A1".to_string()]);
+        assert_eq!(
+            fix.advisory_ids,
+            vec![
+                crate::test_util::osv_id("A2"),
+                crate::test_util::osv_id("A1")
+            ]
+        );
     }
 
     #[test]
@@ -2799,14 +2949,14 @@ mod recommended_fix_tests {
         ]);
         let latest = UpgradeStatus::CandidateVulnerable {
             version: ConcreteVersion::new("1.2.0"),
-            advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+            advisory_ids: Capped::new(vec![crate::test_util::osv_id("A1")], 1),
             worst_severity: Some(VulnSeverity::High),
             via_sibling_tags: None,
         };
 
         let fix = vulns.recommended_fix(Some(&latest)).unwrap();
         assert_eq!(fix.version, "1.2.0");
-        assert_eq!(fix.advisory_ids, vec!["A2".to_string()]);
+        assert_eq!(fix.advisory_ids, vec![crate::test_util::osv_id("A2")]);
     }
 
     #[test]
@@ -2814,7 +2964,7 @@ mod recommended_fix_tests {
         let vulns = dv(vec![advisory("A1", VulnSeverity::High, &["1.1.0"])]);
         let latest = UpgradeStatus::CandidateVulnerable {
             version: ConcreteVersion::new("1.1.0"),
-            advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+            advisory_ids: Capped::new(vec![crate::test_util::osv_id("A1")], 1),
             worst_severity: Some(VulnSeverity::High),
             via_sibling_tags: None,
         };
@@ -2828,7 +2978,7 @@ mod recommended_fix_tests {
             version: ConcreteVersion::new("2.0.0"),
         };
         let fix = vulns.recommended_fix(Some(&latest)).unwrap();
-        assert_eq!(fix.advisory_ids, vec!["A1".to_string()]);
+        assert_eq!(fix.advisory_ids, vec![crate::test_util::osv_id("A1")]);
     }
 
     #[test]
@@ -2841,7 +2991,7 @@ mod recommended_fix_tests {
             reason: SkipReason::QueryFailed,
         };
         let fix = vulns.recommended_fix(Some(&latest)).unwrap();
-        assert_eq!(fix.advisory_ids, vec!["A1".to_string()]);
+        assert_eq!(fix.advisory_ids, vec![crate::test_util::osv_id("A1")]);
     }
 
     #[test]
@@ -2853,7 +3003,7 @@ mod recommended_fix_tests {
 
         let fix = vulns.recommended_fix(None).unwrap();
         assert_eq!(fix.version, "1.1.0");
-        assert_eq!(fix.advisory_ids, vec!["A1".to_string()]);
+        assert_eq!(fix.advisory_ids, vec![crate::test_util::osv_id("A1")]);
     }
 
     #[test]
@@ -2867,14 +3017,14 @@ mod recommended_fix_tests {
         ]);
         let latest = UpgradeStatus::CandidateVulnerable {
             version: ConcreteVersion::new("3.0.0"),
-            advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+            advisory_ids: Capped::new(vec![crate::test_util::osv_id("A1")], 1),
             worst_severity: Some(VulnSeverity::High),
             via_sibling_tags: None,
         };
 
         let fix = vulns.recommended_fix(Some(&latest)).unwrap();
         assert_eq!(fix.version, "1.2.0");
-        assert_eq!(fix.advisory_ids, vec!["A2".to_string()]);
+        assert_eq!(fix.advisory_ids, vec![crate::test_util::osv_id("A2")]);
     }
 
     #[test]
@@ -2885,7 +3035,13 @@ mod recommended_fix_tests {
         ]);
 
         let fix = vulns.recommended_fix(None).unwrap();
-        assert_eq!(fix.advisory_ids, vec!["A1".to_string(), "B1".to_string()]);
+        assert_eq!(
+            fix.advisory_ids,
+            vec![
+                crate::test_util::osv_id("A1"),
+                crate::test_util::osv_id("B1")
+            ]
+        );
     }
 }
 
@@ -2895,14 +3051,13 @@ mod advisories_for_display_tests {
 
     fn advisory(id: &str, severity: VulnSeverity) -> Arc<Advisory> {
         Arc::new(Advisory {
-            id: id.to_string(),
+            id: crate::test_util::osv_id(id),
             modified: "2023-01-01T00:00:00Z".to_string(),
             summary: None,
             aliases: vec![],
             severity,
             cvss_vector: None,
             fixed_versions: vec![],
-            url: String::new(),
         })
     }
 
@@ -2960,13 +3115,13 @@ mod advisories_for_display_tests {
             advisory("A", VulnSeverity::High),
         ];
 
-        let ids_a: Vec<String> = dv(ordered_a, 3)
+        let ids_a: Vec<OsvId> = dv(ordered_a, 3)
             .advisories_for_display()
             .items()
             .iter()
             .map(|a| a.id.clone())
             .collect();
-        let ids_b: Vec<String> = dv(ordered_b, 3)
+        let ids_b: Vec<OsvId> = dv(ordered_b, 3)
             .advisories_for_display()
             .items()
             .iter()
@@ -2976,7 +3131,11 @@ mod advisories_for_display_tests {
         assert_eq!(ids_a, ids_b);
         assert_eq!(
             ids_a,
-            vec!["B".to_string(), "A".to_string(), "C".to_string()]
+            vec![
+                crate::test_util::osv_id("B"),
+                crate::test_util::osv_id("A"),
+                crate::test_util::osv_id("C")
+            ]
         );
     }
 
@@ -3029,45 +3188,51 @@ mod osv_version_validation_tests {
     }
 
     #[test]
-    fn is_valid_osv_id_rejects_over_length_cap() {
+    fn osv_id_rejects_over_length_cap() {
         let long_id = "A".repeat(129);
-        assert!(!is_valid_osv_id(&long_id));
-        assert!(is_valid_osv_id(&"A".repeat(128)));
+        assert!(OsvId::parse(&long_id).is_none());
+        assert!(OsvId::parse(&"A".repeat(128)).is_some());
+    }
+
+    #[test]
+    fn osv_id_rejects_empty_and_foreign_characters() {
+        assert!(OsvId::parse("").is_none());
+        assert!(OsvId::parse("GHSA xxxx").is_none());
+        assert!(OsvId::parse("vulnerable\u{202E}").is_none());
+    }
+
+    /// #1785: `Deserialize` must go through `OsvId::parse`, never a transparent passthrough.
+    #[test]
+    fn osv_id_deserialize_rejects_invalid_and_accepts_valid() {
+        assert!(serde_json::from_str::<OsvId>("\"../evil\"").is_err());
+        assert!(serde_json::from_str::<OsvId>("\"..\"").is_err());
+        let id: OsvId = serde_json::from_str("\"RUSTSEC-2020-0071\"").unwrap();
+        assert_eq!(id.as_str(), "RUSTSEC-2020-0071");
+        assert_eq!(serde_json::to_string(&id).unwrap(), "\"RUSTSEC-2020-0071\"");
     }
 
     /// Regression test for issue #1077 review: `.`/`..` pass the bare character-class
     /// allowlist (`.` is an allowed character) but are RFC 3986 dot-segments that would
     /// normalize `https://osv.dev/vulnerability/{id}` up and out of `/vulnerability/`.
     #[test]
-    fn is_valid_osv_id_rejects_dot_segments() {
-        assert!(!is_valid_osv_id("."));
-        assert!(!is_valid_osv_id(".."));
+    fn osv_id_parse_rejects_dot_segments() {
+        assert!(OsvId::parse(".").is_none());
+        assert!(OsvId::parse("..").is_none());
         // A real id containing dots (but not equal to a bare dot-segment) is still valid.
-        assert!(is_valid_osv_id("RUSTSEC-2020-0071"));
+        assert!(OsvId::parse("RUSTSEC-2020-0071").is_some());
+        assert!(OsvId::parse("A.B").is_some());
     }
 
     #[test]
-    fn validated_osv_url_builds_the_expected_url_for_a_valid_id() {
+    fn osv_url_builds_the_expected_url_for_a_valid_id() {
         assert_eq!(
-            validated_osv_url("RUSTSEC-2020-0071"),
-            Some("https://osv.dev/vulnerability/RUSTSEC-2020-0071".to_string())
+            OsvId::parse("RUSTSEC-2020-0071").unwrap().osv_url(),
+            "https://osv.dev/vulnerability/RUSTSEC-2020-0071"
         );
     }
 
-    #[test]
-    fn validated_osv_url_rejects_a_dot_segment_id() {
-        assert_eq!(validated_osv_url(".."), None);
-    }
-
-    #[test]
-    fn validated_osv_url_rejects_an_id_containing_a_slash() {
-        // A `/` is not in the allowlist, so a multi-segment traversal attempt embedded in the
-        // id (e.g. `../evil`) can never reach `Uri` parsing in the first place.
-        assert_eq!(validated_osv_url("../evil"), None);
-    }
-
     /// #1271: `Advisory::new` takes only `id`, never a caller-supplied `url` — this asserts
-    /// the derived value actually matches `validated_osv_url`'s own formula, so the two can't
+    /// the derived value actually matches `OsvId::osv_url`'s own formula, so the two can't
     /// drift apart.
     #[test]
     fn advisory_new_derives_url_from_id() {
@@ -3079,11 +3244,11 @@ mod osv_version_validation_tests {
         .expect("valid osv id");
         assert_eq!(
             advisory.url(),
-            validated_osv_url("RUSTSEC-2020-0071").unwrap()
+            OsvId::parse("RUSTSEC-2020-0071").unwrap().osv_url()
         );
     }
 
-    /// #1271: an id that fails `is_valid_osv_id` (and so cannot produce a safe `url`) must
+    /// #1271: an id that fails `OsvId::parse` (and so cannot produce a safe `url`) must
     /// make `Advisory` unconstructible via `new` — a future caller cannot bypass this by
     /// supplying a raw `url` directly, since the constructor no longer accepts one at all.
     #[test]
@@ -3791,6 +3956,9 @@ mod vulnerability_keys_candidates_tests {
             let Some(req) = dep.version_requirement() else {
                 return crate::lsp_helpers::PinResolution::Unresolved;
             };
+            if req.as_str() == "v4.8.0" {
+                return crate::lsp_helpers::PinResolution::NotYetIndexed;
+            }
             let tags: &[&str] = match req.as_str() {
                 "with-sibling" => &["v4.8.0", "v4.9.0"],
                 _ => &["v4.8.0"],
@@ -3902,5 +4070,33 @@ mod vulnerability_keys_candidates_tests {
         assert_ne!(complete, truncated);
         assert!(!complete.as_str().ends_with("truncated"));
         assert!(truncated.as_str().ends_with("truncated"));
+    }
+    /// #1780: a cold tag cache scans differently from a complete one, so it gets its own key.
+    #[test]
+    fn vulnerability_keys_differ_when_the_tag_index_is_not_yet_populated() {
+        use crate::lsp_helpers::test_support::MockParseResult;
+
+        let dep = |requirement: &str, line: u32| MockDep {
+            name: PackageName::new("actions/checkout"),
+            version_req: VersionReq::new(requirement),
+            version_range: Range::new(Position::new(line, 10), Position::new(line, 20)),
+            name_range: Range::new(Position::new(line, 0), Position::new(line, 8)),
+        };
+        let parse_result = MockParseResult {
+            deps: vec![dep("alone", 0), dep("v4.8.0", 1)],
+            uri: crate::test_util::test_uri("/test/workflow.yml"),
+        };
+
+        let keys = vulnerability_keys(
+            &parse_result,
+            &std::collections::HashMap::new(),
+            None,
+            &PinByRequirementFormatter,
+            EcosystemId::GithubActions,
+        );
+        let deps = parse_result.dependencies();
+        let cold = keys.get(&deps[1].name_range()).unwrap();
+        assert_ne!(keys.get(&deps[0].name_range()).unwrap(), cold);
+        assert!(cold.as_str().ends_with("not-yet-indexed"));
     }
 }

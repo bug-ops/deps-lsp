@@ -429,17 +429,20 @@ mod tests {
 
     #[test]
     fn test_to_lsp_diagnostic_converts_every_field() {
-        use deps_core::diagnostic::{CodeDescription, Diagnostic, RelatedInformation, Severity};
+        use deps_core::diagnostic::{
+            CodeDescription, Diagnostic, DiagnosticKind, RelatedInformation, Severity,
+        };
+        use deps_core::osv::OsvId;
         use deps_core::position::{Position, Range};
 
         let related_uri = url::Url::parse("file:///Cargo.toml").unwrap();
         let code_href = url::Url::parse("https://osv.dev/GHSA-xxxx").unwrap();
         let diagnostic = Diagnostic::new(
+            DiagnosticKind::Advisory(OsvId::parse("GHSA-xxxx").unwrap()),
             Range::new(Position::new(0, 0), Position::new(0, 5)),
             "vulnerable",
         )
         .with_severity(Severity::Error)
-        .with_code("GHSA-xxxx")
         .with_code_description(CodeDescription::new(code_href.clone()))
         .with_related_information(vec![RelatedInformation::new(
             related_uri.clone(),

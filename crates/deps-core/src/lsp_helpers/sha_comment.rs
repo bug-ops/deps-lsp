@@ -17,7 +17,7 @@ use super::{
     byte_span_to_range, extends_tag, is_partial_semver_shaped, markdown_code_span,
     position_in_range, redact_name_for_diagnostic, sanitize_and_truncate_for_diagnostic, short_sha,
 };
-use crate::diagnostic::{Diagnostic, Severity};
+use crate::diagnostic::{Diagnostic, DiagnosticKind, Severity};
 use crate::github::normalize_tag;
 use crate::position::{Position, Range};
 use crate::{ConcreteVersion, PackageName};
@@ -710,9 +710,10 @@ impl CommentCheck {
             PinResolution::CommentContradicted => {
                 Self::Mismatch(CommentMismatch::CommentNamesOtherCommit)
             }
-            PinResolution::Unresolved | PinResolution::Unlisted | PinResolution::Unpublished => {
-                Self::Unverifiable
-            }
+            PinResolution::Unresolved
+            | PinResolution::Unlisted
+            | PinResolution::Unpublished
+            | PinResolution::NotYetIndexed => Self::Unverifiable,
         }
     }
 }
@@ -772,9 +773,7 @@ pub fn sha_comment_mismatch_diagnostic(
             format!("{name}: SHA {sha} is not the commit of `{comment}` named in the comment")
         }
     };
-    Diagnostic::new(range, message)
-        .with_severity(severity)
-        .with_code(SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE)
+    Diagnostic::new(DiagnosticKind::ShaCommentMismatch, range, message).with_severity(severity)
 }
 
 /// The hover warning line for a SHA-comment mismatch (#1722).

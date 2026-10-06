@@ -8,7 +8,7 @@ use deps_core::EcosystemId;
 use deps_core::completion::{
     COMPLETION_SEARCH_TIMEOUT, CompletionOrigin, is_valid_completion_prefix_len,
 };
-use deps_core::policy_config::{OsvChecks, OsvState};
+use deps_core::policy_config::{CheckState, OsvChecks};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -354,11 +354,11 @@ fn apply_osv_latest_verdict_to_completions(
             );
             let normalized_name = formatter.normalize_package_name(dep.name());
             let (latest_status, candidate_status) = match osv_checks.state() {
-                OsvState::Active => (
+                CheckState::Active => (
                     Some(&doc.signals.latest_status),
                     Some(&doc.signals.candidate_status),
                 ),
-                OsvState::Inactive => (None, None),
+                CheckState::Inactive => (None, None),
             };
 
             // The item identified as "latest" is checked against `latest_status` (#1517, phase
@@ -411,7 +411,10 @@ fn apply_osv_latest_verdict_to_completions(
                 if advisory_ids.is_empty() {
                     " (flagged by OSV)".to_string()
                 } else {
-                    format!(" (flagged by OSV: {})", advisory_ids.join(", "))
+                    format!(
+                        " (flagged by OSV: {})",
+                        deps_core::osv::OsvId::join(&advisory_ids, ", ")
+                    )
                 },
                 Some(CompletionItemTag::DEPRECATED),
             ),
@@ -967,7 +970,7 @@ mod tests {
             deps_core::test_util::vuln_key("serde"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.2.0"),
-                advisory_ids: Capped::new(vec!["MAL-2026-00001".to_string()], 1),
+                advisory_ids: Capped::new(vec![deps_core::test_util::osv_id("MAL-2026-00001")], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
                 via_sibling_tags: None,
             },
@@ -1214,7 +1217,10 @@ mod tests {
                     ConcreteVersion::new("1.2.0"),
                     UpgradeStatus::CandidateVulnerable {
                         version: ConcreteVersion::new("1.2.0"),
-                        advisory_ids: Capped::new(vec!["MAL-2026-00002".to_string()], 1),
+                        advisory_ids: Capped::new(
+                            vec![deps_core::test_util::osv_id("MAL-2026-00002")],
+                            1,
+                        ),
                         worst_severity: Some(VulnSeverity::Malicious),
                         via_sibling_tags: None,
                     },
@@ -1414,7 +1420,7 @@ mod tests {
             deps_core::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.0.8"),
-                advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                advisory_ids: Capped::new(vec![deps_core::test_util::osv_id("MAL-2026-16332")], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
                 via_sibling_tags: None,
             },
@@ -1429,7 +1435,10 @@ mod tests {
                     ConcreteVersion::new("1.0.6"),
                     UpgradeStatus::CandidateVulnerable {
                         version: ConcreteVersion::new("1.0.6"),
-                        advisory_ids: Capped::new(vec!["MAL-2026-16331".to_string()], 1),
+                        advisory_ids: Capped::new(
+                            vec![deps_core::test_util::osv_id("MAL-2026-16331")],
+                            1,
+                        ),
                         worst_severity: Some(VulnSeverity::Malicious),
                         via_sibling_tags: None,
                     },
@@ -1542,7 +1551,10 @@ mod tests {
                     ConcreteVersion::new("2.31.0"),
                     UpgradeStatus::CandidateVulnerable {
                         version: ConcreteVersion::new("2.31.0"),
-                        advisory_ids: Capped::new(vec!["MAL-2026-00003".to_string()], 1),
+                        advisory_ids: Capped::new(
+                            vec![deps_core::test_util::osv_id("MAL-2026-00003")],
+                            1,
+                        ),
                         worst_severity: Some(VulnSeverity::Malicious),
                         via_sibling_tags: None,
                     },
@@ -1630,7 +1642,7 @@ mod tests {
             deps_core::test_util::vuln_key("org.example:evil-lib"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("9.9.9"),
-                advisory_ids: Capped::new(vec!["MAL-2026-00004".to_string()], 1),
+                advisory_ids: Capped::new(vec![deps_core::test_util::osv_id("MAL-2026-00004")], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
                 via_sibling_tags: None,
             },
@@ -1644,7 +1656,10 @@ mod tests {
                     ConcreteVersion::new("9.8.0"),
                     UpgradeStatus::CandidateVulnerable {
                         version: ConcreteVersion::new("9.8.0"),
-                        advisory_ids: Capped::new(vec!["MAL-2026-00005".to_string()], 1),
+                        advisory_ids: Capped::new(
+                            vec![deps_core::test_util::osv_id("MAL-2026-00005")],
+                            1,
+                        ),
                         worst_severity: Some(VulnSeverity::Malicious),
                         via_sibling_tags: None,
                     },
@@ -1836,7 +1851,10 @@ mod tests {
                     ConcreteVersion::new("0.5.0"),
                     UpgradeStatus::CandidateVulnerable {
                         version: ConcreteVersion::new("0.5.0"),
-                        advisory_ids: Capped::new(vec!["MAL-2026-00006".to_string()], 1),
+                        advisory_ids: Capped::new(
+                            vec![deps_core::test_util::osv_id("MAL-2026-00006")],
+                            1,
+                        ),
                         worst_severity: Some(VulnSeverity::Malicious),
                         via_sibling_tags: None,
                     },

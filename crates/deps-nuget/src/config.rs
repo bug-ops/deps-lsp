@@ -43,7 +43,6 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use deps_core::config_trust::{self, EnvVarSyntax};
 use deps_core::net_policy::{
@@ -52,6 +51,7 @@ use deps_core::net_policy::{
     ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
+use deps_core::policy_config::{AtomicToggle, UserProfileSources};
 use deps_core::redact::sanitize_invisible;
 use deps_core::{BlockedSourceClass, EcosystemId, PackageName, RejectedSourceClass};
 use quick_xml::Reader;
@@ -1540,7 +1540,7 @@ pub struct NuGetParseContext {
     /// Live-updatable `registries.nuget_user_profile_sources` setting (FR-006) — gates only the
     /// *routing* half of a user-profile file's contribution (see [`resolve_with_context`]'s doc); the
     /// credential half always applies regardless of this flag.
-    pub user_profile_sources: Arc<AtomicBool>,
+    pub user_profile_sources: Arc<AtomicToggle<UserProfileSources>>,
 }
 
 impl NuGetParseContext {
@@ -1550,7 +1550,7 @@ impl NuGetParseContext {
     pub fn new(
         policy: Arc<RegistryAccessPolicy>,
         config_cache: Arc<NuGetConfigCache>,
-        user_profile_sources: Arc<AtomicBool>,
+        user_profile_sources: Arc<AtomicToggle<UserProfileSources>>,
     ) -> Self {
         Self {
             policy,
@@ -1617,7 +1617,7 @@ pub(crate) fn resolve(
         config_cache,
         policy,
         None,
-        &AtomicBool::new(false),
+        &AtomicToggle::default(),
     )
 }
 
@@ -1662,12 +1662,11 @@ pub fn resolve_with_context(
     config_cache: &NuGetConfigCache,
     policy: &RegistryAccessPolicy,
     user_profile_config: Option<&Path>,
-    user_profile_sources: &AtomicBool,
+    user_profile_sources: &AtomicToggle<UserProfileSources>,
 ) -> NuGetConfig {
     let ancestors = collect_config_ancestors(manifest_dir, config_cache, user_profile_config);
 
-    let user_profile_sources_enabled =
-        user_profile_sources.load(std::sync::atomic::Ordering::Relaxed);
+    let user_profile_sources = user_profile_sources.get();
 
     // S2 fix (impl-critic, issue #576 follow-up): identity of the exact config state this
     // resolve is built from — see `config_ancestors_fingerprint`'s doc. Computed before the
@@ -1675,7 +1674,7 @@ pub fn resolve_with_context(
     // warnings against it below.
     let config_fingerprint = config_ancestors_fingerprint(&ancestors);
 
-    let accumulated = accumulate_config_tiers(&ancestors, policy, user_profile_sources_enabled);
+    let accumulated = accumulate_config_tiers(&ancestors, policy, user_profile_sources);
 
     bind_credentials_and_finalize(accumulated, config_cache, config_fingerprint)
 }
@@ -1780,13 +1779,13 @@ struct AccumulatedConfig {
 /// `<packageSourceCredentials>` values, and its own `<clear/>`/`<add>`/`<remove>` batch
 /// tracked separately as `user_profile_add`) always applies; its routing half (`sources`,
 /// `sources_cleared`, `removed`/`nuget_org_removed`, `disabled`, `mapping`) is skipped
-/// entirely when `user_profile_sources_enabled` is false (NFR-005). A repo-tier file's
+/// entirely when `user_profile_sources` is `Disabled` (NFR-005). A repo-tier file's
 /// contribution is unaffected by the flag and always applies in full. `cleared` is sticky for
 /// the rest of the walk once set — see this module's doc.
 fn accumulate_config_tiers(
     ancestors: &[(ConfigTier, Arc<RawNuGetConfigFile>)],
     policy: &RegistryAccessPolicy,
-    user_profile_sources_enabled: bool,
+    user_profile_sources: UserProfileSources,
 ) -> AccumulatedConfig {
     let mut sources: Vec<PackageSourceEntry> = Vec::new();
     let mut cleared = false;
@@ -1828,9 +1827,12 @@ fn accumulate_config_tiers(
                 user_profile_add.retain(|e| !key_candidates_overlap(&e.key, key));
             }
 
-            if !user_profile_sources_enabled {
-                // Routing half skipped entirely for this file (FR-006).
-                continue;
+            match user_profile_sources {
+                UserProfileSources::Enabled => {}
+                UserProfileSources::Disabled => {
+                    // Routing half skipped entirely for this file (FR-006).
+                    continue;
+                }
             }
         } else {
             repo_credentialed_raw.extend(file.credentialed_keys.iter().cloned());
@@ -3491,7 +3493,13 @@ mod tests {
         );
         let cache = NuGetConfigCache::new();
         let policy = all_policy();
-        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+        let config = resolve_ctx(
+            &repo,
+            &cache,
+            &policy,
+            Some(&user_profile),
+            UserProfileSources::Disabled,
+        );
 
         let occurrence = only_rejected(
             config.rejected_reason_for(&pkg("Any.Package")),
@@ -3580,7 +3588,13 @@ mod tests {
         );
         let cache = NuGetConfigCache::new();
         let policy = all_policy();
-        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+        let config = resolve_ctx(
+            &repo,
+            &cache,
+            &policy,
+            Some(&user_profile),
+            UserProfileSources::Disabled,
+        );
 
         let occurrence = only_rejected(
             config.rejected_reason_for(&pkg("Any.Package")),
@@ -3624,7 +3638,13 @@ mod tests {
         );
         let cache = NuGetConfigCache::new();
         let policy = all_policy();
-        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+        let config = resolve_ctx(
+            &repo,
+            &cache,
+            &policy,
+            Some(&user_profile),
+            UserProfileSources::Disabled,
+        );
 
         let occurrence = only_rejected(
             config.rejected_reason_for(&pkg("Any.Package")),
@@ -4559,14 +4579,14 @@ mod tests {
         cache: &NuGetConfigCache,
         policy: &RegistryAccessPolicy,
         user_profile: Option<&Path>,
-        flag_on: bool,
+        flag_on: UserProfileSources,
     ) -> NuGetConfig {
         resolve_with_context(
             repo_dir,
             cache,
             policy,
             user_profile,
-            &AtomicBool::new(flag_on),
+            &AtomicToggle::new(flag_on),
         )
     }
 
@@ -4601,7 +4621,13 @@ mod tests {
         );
         let cache = NuGetConfigCache::new();
         let policy = all_policy();
-        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+        let config = resolve_ctx(
+            &repo,
+            &cache,
+            &policy,
+            Some(&user_profile),
+            UserProfileSources::Disabled,
+        );
 
         let chains = config.resolved_chains();
         assert_eq!(chains.len(), 1);
@@ -4645,7 +4671,13 @@ mod tests {
         );
         let cache = NuGetConfigCache::new();
         let policy = all_policy();
-        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+        let config = resolve_ctx(
+            &repo,
+            &cache,
+            &policy,
+            Some(&user_profile),
+            UserProfileSources::Disabled,
+        );
 
         assert!(
             config.resolved_chains().is_empty(),
@@ -4690,7 +4722,13 @@ mod tests {
         );
         let cache = NuGetConfigCache::new();
         let policy = all_policy();
-        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+        let config = resolve_ctx(
+            &repo,
+            &cache,
+            &policy,
+            Some(&user_profile),
+            UserProfileSources::Disabled,
+        );
 
         // The repo's CorpFeed is not machine-wide disabled by a user-profile suppression —
         // only the credential binding is refused, which here means the entry fails closed
@@ -4782,7 +4820,13 @@ mod tests {
         );
         let cache = NuGetConfigCache::new();
         let policy = all_policy();
-        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+        let config = resolve_ctx(
+            &repo,
+            &cache,
+            &policy,
+            Some(&user_profile),
+            UserProfileSources::Disabled,
+        );
 
         assert!(config.resolved_chains().is_empty());
         // No `<clear/>` anywhere in the chain, so the dropped CorpFeed leaves the implicit
@@ -4931,7 +4975,13 @@ mod tests {
         );
         let cache = NuGetConfigCache::new();
         let policy = all_policy();
-        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+        let config = resolve_ctx(
+            &repo,
+            &cache,
+            &policy,
+            Some(&user_profile),
+            UserProfileSources::Disabled,
+        );
 
         assert!(
             config.resolved_chains().is_empty(),
@@ -4972,7 +5022,13 @@ mod tests {
         let policy = all_policy();
 
         let log = deps_core::test_util::capture_tracing_output(|| {
-            let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+            let config = resolve_ctx(
+                &repo,
+                &cache,
+                &policy,
+                Some(&user_profile),
+                UserProfileSources::Disabled,
+            );
             assert!(
                 config.resolved_chains().is_empty(),
                 "unresolvable credential binding must still fail the source closed"
@@ -5022,7 +5078,7 @@ mod tests {
         let policy = all_policy();
 
         let log = deps_core::test_util::capture_tracing_output(|| {
-            let _ = resolve_ctx(&repo, &cache, &policy, None, false);
+            let _ = resolve_ctx(&repo, &cache, &policy, None, UserProfileSources::Disabled);
         });
 
         assert!(
@@ -5066,7 +5122,7 @@ mod tests {
 
         let log = deps_core::test_util::capture_tracing_output(|| {
             for _ in 0..4 {
-                let _ = resolve_ctx(&repo, &cache, &policy, None, false);
+                let _ = resolve_ctx(&repo, &cache, &policy, None, UserProfileSources::Disabled);
             }
 
             // C1/S2 fix (impl-critic): a genuine content change (distinguishable mtime) must
@@ -5107,7 +5163,7 @@ mod tests {
                 .unwrap();
 
             for _ in 0..2 {
-                let _ = resolve_ctx(&repo, &cache, &policy, None, false);
+                let _ = resolve_ctx(&repo, &cache, &policy, None, UserProfileSources::Disabled);
             }
         });
 
@@ -5148,7 +5204,7 @@ mod tests {
         let policy = all_policy();
 
         let log = deps_core::test_util::capture_tracing_output_at(tracing::Level::DEBUG, || {
-            let config = resolve_ctx(&repo, &cache, &policy, None, false);
+            let config = resolve_ctx(&repo, &cache, &policy, None, UserProfileSources::Disabled);
             assert_eq!(
                 config.resolve_source_for(&pkg("CorpFeed.Package")),
                 DependencySource::Registry,
@@ -5212,7 +5268,13 @@ mod tests {
         let policy = all_policy();
 
         let log = deps_core::test_util::capture_tracing_output_at(tracing::Level::DEBUG, || {
-            let _ = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+            let _ = resolve_ctx(
+                &repo,
+                &cache,
+                &policy,
+                Some(&user_profile),
+                UserProfileSources::Disabled,
+            );
         });
 
         assert_eq!(
@@ -5259,7 +5321,13 @@ mod tests {
         );
         let cache = NuGetConfigCache::new();
         let policy = all_policy();
-        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+        let config = resolve_ctx(
+            &repo,
+            &cache,
+            &policy,
+            Some(&user_profile),
+            UserProfileSources::Disabled,
+        );
 
         // Resolves to plain `Registry` (public index), never `HasCredentials`.
         assert_eq!(
@@ -5305,8 +5373,15 @@ mod tests {
         let cache = NuGetConfigCache::new();
         let policy = all_policy();
 
-        let with_profile = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
-        let without_profile = resolve_ctx(&repo, &cache, &policy, None, false);
+        let with_profile = resolve_ctx(
+            &repo,
+            &cache,
+            &policy,
+            Some(&user_profile),
+            UserProfileSources::Disabled,
+        );
+        let without_profile =
+            resolve_ctx(&repo, &cache, &policy, None, UserProfileSources::Disabled);
 
         let hops_of = |c: &NuGetConfig| -> Vec<String> {
             c.valid_hops()
@@ -5340,10 +5415,22 @@ mod tests {
         let cache = NuGetConfigCache::new();
         let policy = all_policy();
 
-        let flag_off = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+        let flag_off = resolve_ctx(
+            &repo,
+            &cache,
+            &policy,
+            Some(&user_profile),
+            UserProfileSources::Disabled,
+        );
         assert!(flag_off.resolved_chains().is_empty());
 
-        let flag_on = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), true);
+        let flag_on = resolve_ctx(
+            &repo,
+            &cache,
+            &policy,
+            Some(&user_profile),
+            UserProfileSources::Enabled,
+        );
         assert_matches!(
             flag_on.resolve_source_for(&pkg("Any.Package")),
             DependencySource::AlternateRegistry { .. }
@@ -5472,7 +5559,7 @@ mod tests {
         let policy = all_policy();
 
         let log = deps_core::test_util::capture_tracing_output_at(tracing::Level::DEBUG, || {
-            let _ = resolve_ctx(&repo, &cache, &policy, None, false);
+            let _ = resolve_ctx(&repo, &cache, &policy, None, UserProfileSources::Disabled);
         });
 
         assert!(

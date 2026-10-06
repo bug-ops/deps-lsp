@@ -160,22 +160,79 @@ impl SettingChange {
     }
 }
 
-/// The two states of the OSV gate, for exhaustive `match`es on an [`OsvChecks`].
+/// The two states of a network-check gate, for exhaustive `match`es on a [`Checks`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OsvState {
-    /// OSV checks may run.
+pub enum CheckState {
+    /// The check may run.
     Active,
-    /// OSV checks are disabled or the network is unreachable.
+    /// The check is disabled or the network is unreachable.
     Inactive,
 }
 
-/// The result of the OSV gate: scanning enabled and the network reachable.
+mod sealed {
+    /// Seals [`super::NetworkCheck`] to the markers this module defines.
+    pub trait Sealed {}
+
+    /// Bool round-trip for [`super::AtomicToggle`] storage; sealed so a value can only be
+    /// rebuilt from the bool it was stored as.
+    pub trait ToggleRepr: Sized {
+        fn from_repr(on: bool) -> Self;
+        fn to_repr(self) -> bool;
+    }
+}
+
+use sealed::ToggleRepr;
+
+/// A feature gated on both its config switch and network reachability.
 ///
-/// Opaque: the only constructors are [`OsvChecks::resolve`] and [`PolicyConfig::osv_checks`]
-/// (plus the cell this module owns), so every OSV call site agrees on the
-/// `vulnerabilities_enabled && online` rule. Construction outside the gate is impossible:
-/// the field is private and there is no constructor from [`OsvState`]. Callers inspect the
-/// value through [`OsvChecks::state`], an exhaustive enum, or [`OsvChecks::is_active`].
+/// Sealed: the markers [`Osv`], [`Typosquat`] and [`Gossip`] are the only implementors, so a
+/// gate for one feature can never be passed where another feature's gate is expected.
+pub trait NetworkCheck: sealed::Sealed {
+    /// Whether `policy` enables the feature itself, ignoring network reachability.
+    fn enabled(policy: &PolicyConfig) -> bool;
+}
+
+/// Marker for the OSV vulnerability check.
+#[derive(Debug, Clone, Copy)]
+pub enum Osv {}
+
+/// Marker for the typosquat-similarity check.
+#[derive(Debug, Clone, Copy)]
+pub enum Typosquat {}
+
+/// Marker for the GOSSIP (deps.dev findings) check.
+#[derive(Debug, Clone, Copy)]
+pub enum Gossip {}
+
+impl sealed::Sealed for Osv {}
+impl sealed::Sealed for Typosquat {}
+impl sealed::Sealed for Gossip {}
+
+impl NetworkCheck for Osv {
+    fn enabled(policy: &PolicyConfig) -> bool {
+        policy.diagnostics.vulnerabilities_enabled
+    }
+}
+
+impl NetworkCheck for Typosquat {
+    fn enabled(policy: &PolicyConfig) -> bool {
+        policy.typosquat.enabled
+    }
+}
+
+impl NetworkCheck for Gossip {
+    fn enabled(policy: &PolicyConfig) -> bool {
+        policy.gossip.enabled
+    }
+}
+
+/// The result of a feature gate: the feature enabled and the network reachable.
+///
+/// Opaque and tagged with the feature marker `F`: the only constructors are
+/// [`PolicyConfig::checks`] and, for snapshot-based OSV call sites, [`OsvChecks::resolve`],
+/// so every call site agrees on the `enabled && online` rule and a [`TyposquatChecks`]
+/// cannot be passed where a [`GossipChecks`] is expected. Callers inspect the value through
+/// [`Checks::state`], an exhaustive enum, or [`Checks::is_active`].
 ///
 /// # Examples
 ///
@@ -191,113 +248,293 @@ pub enum OsvState {
 /// Forging an active value does not compile:
 ///
 /// ```compile_fail
-/// use deps_core::policy_config::{OsvChecks, OsvState};
+/// use deps_core::policy_config::{CheckState, Checks, Osv};
 ///
-/// let forged = OsvChecks(OsvState::Active);
+/// let forged = Checks::<Osv>(CheckState::Active, std::marker::PhantomData);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OsvChecks(OsvState);
+///
+/// Gates for different features do not mix:
+///
+/// ```compile_fail
+/// use deps_core::policy_config::{GossipChecks, PolicyConfig, Typosquat};
+///
+/// let typosquat = PolicyConfig::default().checks::<Typosquat>();
+/// let _: GossipChecks = typosquat;
+/// ```
+pub struct Checks<F: NetworkCheck>(CheckState, std::marker::PhantomData<fn() -> F>);
 
-impl OsvChecks {
-    /// The single definition of the OSV gate.
-    ///
-    /// [`PolicyConfig::osv_checks`] is the entry point for code that holds a policy; this
-    /// function serves snapshot-based call sites that carry the two inputs separately (e.g.
-    /// diagnostics generation, which must observe a caller-captured severities snapshot).
-    #[must_use]
-    pub const fn resolve(vulnerabilities_enabled: bool, network: crate::NetworkMode) -> Self {
-        Self::from_active(vulnerabilities_enabled && network.is_online())
+/// The OSV vulnerability-check gate.
+pub type OsvChecks = Checks<Osv>;
+/// The typosquat-similarity-check gate.
+pub type TyposquatChecks = Checks<Typosquat>;
+/// The GOSSIP-check gate.
+pub type GossipChecks = Checks<Gossip>;
+
+impl<F: NetworkCheck> Clone for Checks<F> {
+    fn clone(&self) -> Self {
+        *self
     }
+}
 
+impl<F: NetworkCheck> Copy for Checks<F> {}
+
+impl<F: NetworkCheck> PartialEq for Checks<F> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<F: NetworkCheck> Eq for Checks<F> {}
+
+impl<F: NetworkCheck> std::fmt::Debug for Checks<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Checks").field(&self.0).finish()
+    }
+}
+
+impl<F: NetworkCheck> Checks<F> {
     const fn from_active(active: bool) -> Self {
-        Self(if active {
-            OsvState::Active
-        } else {
-            OsvState::Inactive
-        })
+        Self(
+            if active {
+                CheckState::Active
+            } else {
+                CheckState::Inactive
+            },
+            std::marker::PhantomData,
+        )
     }
 
     /// The gate state, for exhaustive `match`es.
     #[must_use]
-    pub const fn state(self) -> OsvState {
+    pub const fn state(self) -> CheckState {
         self.0
     }
 
-    /// Whether checks may run, for leaf conditions where a `match` adds nothing.
+    /// Whether the check may run, for leaf conditions where a `match` adds nothing.
     #[must_use]
     pub const fn is_active(self) -> bool {
         match self.0 {
-            OsvState::Active => true,
-            OsvState::Inactive => false,
+            CheckState::Active => true,
+            CheckState::Inactive => false,
         }
     }
-}
 
-/// Lock-free live storage for an [`OsvChecks`] value shared across tasks.
-///
-/// # Examples
-///
-/// ```
-/// use deps_core::NetworkMode;
-/// use deps_core::policy_config::{OsvChecks, OsvChecksCell};
-///
-/// let cell = OsvChecksCell::default();
-/// assert!(cell.get().is_active());
-/// cell.set(OsvChecks::resolve(false, NetworkMode::Online));
-/// assert!(!cell.get().is_active());
-/// ```
-#[derive(Debug)]
-pub struct OsvChecksCell(std::sync::atomic::AtomicBool);
-
-impl Default for OsvChecksCell {
-    /// Starts active, matching the default policy.
-    fn default() -> Self {
-        Self(std::sync::atomic::AtomicBool::new(true))
-    }
-}
-
-impl OsvChecksCell {
-    /// Reads the current gate result.
-    #[must_use]
-    pub fn get(&self) -> OsvChecks {
-        OsvChecks::from_active(self.0.load(std::sync::atomic::Ordering::Relaxed))
-    }
-
-    /// Stores a new gate result.
-    pub fn set(&self, checks: OsvChecks) {
-        self.0
-            .store(checks.is_active(), std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-impl PolicyConfig {
-    /// Whether OSV vulnerability checks may run: scanning is enabled and the network is
-    /// reachable.
+    /// Whether this gate is `Active` while `previous` was `Inactive`: the edge that must
+    /// trigger a catch-up pass over already-open documents.
     ///
-    /// Single source of the `vulnerabilities_enabled && !offline` gate that every OSV call
-    /// site must agree on; reading the two flags separately lets a site forget one of them.
+    /// Covers both a feature being enabled and the network coming back online.
     ///
     /// # Examples
     ///
     /// ```
-    /// use deps_core::policy_config::PolicyConfig;
+    /// use deps_core::NetworkMode;
+    /// use deps_core::policy_config::OsvChecks;
     ///
-    /// let mut policy = PolicyConfig::default();
-    /// assert!(policy.osv_checks().is_active());
-    ///
-    /// policy.network.offline = true;
-    /// assert!(!policy.osv_checks().is_active());
-    ///
-    /// policy.network.offline = false;
-    /// policy.diagnostics.vulnerabilities_enabled = false;
-    /// assert!(!policy.osv_checks().is_active());
+    /// let offline = OsvChecks::resolve(true, NetworkMode::Offline);
+    /// let online = OsvChecks::resolve(true, NetworkMode::Online);
+    /// assert!(online.activated_since(offline));
+    /// assert!(!offline.activated_since(online));
+    /// assert!(!online.activated_since(online));
     /// ```
     #[must_use]
-    pub fn osv_checks(&self) -> OsvChecks {
-        OsvChecks::resolve(
-            self.diagnostics.vulnerabilities_enabled,
-            self.network.mode(),
+    pub const fn activated_since(self, previous: Self) -> bool {
+        matches!(
+            (self.0, previous.0),
+            (CheckState::Active, CheckState::Inactive)
         )
+    }
+}
+
+impl Checks<Osv> {
+    /// The OSV gate for call sites that carry the two inputs separately (e.g. diagnostics
+    /// generation, which must observe a caller-captured severities snapshot).
+    ///
+    /// [`PolicyConfig::checks`] is the entry point for code that holds a policy.
+    #[must_use]
+    pub const fn resolve(vulnerabilities_enabled: bool, network: crate::NetworkMode) -> Self {
+        Self::from_active(vulnerabilities_enabled && network.is_online())
+    }
+}
+
+impl<F: NetworkCheck> ToggleRepr for Checks<F> {
+    fn from_repr(on: bool) -> Self {
+        Self::from_active(on)
+    }
+
+    fn to_repr(self) -> bool {
+        self.is_active()
+    }
+}
+
+/// A value an [`AtomicToggle`] can store: a two-state type with no other construction path.
+///
+/// Sealed; implemented for every [`Checks`] gate and for [`UserProfileSources`].
+pub trait ToggleValue: ToggleRepr + Copy {}
+
+impl<F: NetworkCheck> ToggleValue for Checks<F> {}
+
+/// Lock-free live storage for a two-state setting shared across tasks.
+///
+/// Typed by the stored value, so a typosquat toggle cannot be read as a gossip gate and no
+/// call site handles the underlying `bool`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::policy_config::{AtomicToggle, Osv, PolicyConfig};
+///
+/// let mut policy = PolicyConfig::default();
+/// let toggle = AtomicToggle::new(policy.checks::<Osv>());
+/// assert!(toggle.get().is_active());
+///
+/// policy.diagnostics.vulnerabilities_enabled = false;
+/// toggle.set(policy.checks());
+/// assert!(!toggle.get().is_active());
+/// ```
+pub struct AtomicToggle<T: ToggleValue>(
+    std::sync::atomic::AtomicBool,
+    std::marker::PhantomData<fn() -> T>,
+);
+
+impl<T: ToggleValue> std::fmt::Debug for AtomicToggle<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("AtomicToggle")
+            .field(&self.0.load(std::sync::atomic::Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl<T: ToggleValue + Default> Default for AtomicToggle<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T: ToggleValue> AtomicToggle<T> {
+    /// Creates a toggle holding `value`.
+    #[must_use]
+    pub fn new(value: T) -> Self {
+        Self(
+            std::sync::atomic::AtomicBool::new(value.to_repr()),
+            std::marker::PhantomData,
+        )
+    }
+
+    /// Reads the current value.
+    #[must_use]
+    pub fn get(&self) -> T {
+        T::from_repr(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Stores a new value.
+    pub fn set(&self, value: T) {
+        self.0
+            .store(value.to_repr(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether a NuGet user-profile `NuGet.Config` source may become a routing hop.
+///
+/// The typed form of `registries.nuget_user_profile_sources`; the config file still spells
+/// it as a JSON boolean.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::policy_config::UserProfileSources;
+///
+/// let parsed: UserProfileSources = serde_json::from_str("true").unwrap();
+/// assert_eq!(parsed, UserProfileSources::Enabled);
+/// assert_eq!(UserProfileSources::default(), UserProfileSources::Disabled);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UserProfileSources {
+    /// User-profile sources only supply credentials for repo-declared entries.
+    #[default]
+    Disabled,
+    /// User-profile sources also become routing hops.
+    Enabled,
+}
+
+impl UserProfileSources {
+    /// The single named conversion from the config boundary's `bool` representation.
+    ///
+    /// Deliberately not a `From<bool>` impl, which would let any unrelated `bool` convert
+    /// (same rationale as [`crate::NetworkMode::from_offline_flag`]).
+    #[must_use]
+    pub const fn from_enabled_flag(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for UserProfileSources {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        bool::deserialize(deserializer).map(Self::from_enabled_flag)
+    }
+}
+
+impl ToggleRepr for UserProfileSources {
+    fn from_repr(on: bool) -> Self {
+        Self::from_enabled_flag(on)
+    }
+
+    fn to_repr(self) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::Enabled => true,
+        }
+    }
+}
+
+impl ToggleValue for UserProfileSources {}
+
+impl PolicyConfig {
+    /// The gate for feature `F`: enabled by this policy and the network reachable.
+    ///
+    /// Single source of the `enabled && !offline` rule every gated call site must agree on;
+    /// reading the two flags separately lets a site forget one of them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::policy_config::{Gossip, Osv, PolicyConfig};
+    ///
+    /// let mut policy = PolicyConfig::default();
+    /// assert!(policy.checks::<Osv>().is_active());
+    /// assert!(!policy.checks::<Gossip>().is_active());
+    ///
+    /// policy.gossip.enabled = true;
+    /// assert!(policy.checks::<Gossip>().is_active());
+    ///
+    /// policy.network.offline = true;
+    /// assert!(!policy.checks::<Gossip>().is_active());
+    /// assert!(!policy.checks::<Osv>().is_active());
+    /// ```
+    #[must_use]
+    pub fn checks<F: NetworkCheck>(&self) -> Checks<F> {
+        Checks::from_active(F::enabled(self) && self.network.mode().is_online())
+    }
+
+    /// The OSV vulnerability-check gate. See [`Self::checks`].
+    #[must_use]
+    pub fn osv_checks(&self) -> OsvChecks {
+        self.checks()
+    }
+
+    /// The typosquat-similarity-check gate. See [`Self::checks`].
+    #[must_use]
+    pub fn typosquat_checks(&self) -> TyposquatChecks {
+        self.checks()
+    }
+
+    /// The GOSSIP-check gate. See [`Self::checks`].
+    #[must_use]
+    pub fn gossip_checks(&self) -> GossipChecks {
+        self.checks()
     }
 
     /// Reports which leaf fields differ between `old` and `new`.
@@ -317,11 +554,11 @@ impl PolicyConfig {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::policy_config::PolicyConfig;
+    /// use deps_core::policy_config::{PolicyConfig, UserProfileSources};
     ///
     /// let old = PolicyConfig::default();
     /// let mut new = PolicyConfig::default();
-    /// new.registries.nuget_user_profile_sources = true;
+    /// new.registries.nuget_user_profile_sources = UserProfileSources::Enabled;
     ///
     /// let diff = PolicyConfig::diff(&old, &new);
     /// assert!(diff.nuget_user_profile_sources_changed.is_changed());
@@ -1138,7 +1375,7 @@ pub struct RegistriesConfig {
     /// unless explicitly opted in.
     #[serde(default)]
     #[raw]
-    pub nuget_user_profile_sources: bool,
+    pub nuget_user_profile_sources: UserProfileSources,
     /// Issue #1771: whether SE-0292 registry credentials may be read from the macOS Keychain
     /// (through `/usr/bin/security`, which can show an access prompt). Opt-in; only
     /// user-declared registries receive a Keychain credential, and only on macOS.
@@ -1193,7 +1430,7 @@ impl RegistriesConfig {
     pub fn new() -> Self {
         Self {
             workspace_registries: WorkspaceRegistriesSetting::PublicOnly,
-            nuget_user_profile_sources: false,
+            nuget_user_profile_sources: UserProfileSources::Disabled,
             swift_keychain_credentials: KeychainCredentials::Disabled,
             gitlab_instance_host: String::new(),
         }
@@ -1213,7 +1450,7 @@ impl RegistriesConfig {
     #[must_use]
     pub const fn with_nuget_user_profile_sources(
         mut self,
-        nuget_user_profile_sources: bool,
+        nuget_user_profile_sources: UserProfileSources,
     ) -> Self {
         self.nuget_user_profile_sources = nuget_user_profile_sources;
         self
@@ -1251,7 +1488,7 @@ pub struct RegistryRuntimeSettings {
     /// Resolved workspace-registry access policy — see [`WorkspaceRegistriesSetting::to_policy`].
     pub workspace_registries: crate::net_policy::WorkspaceRegistryAccess,
     /// See [`RegistriesConfig::nuget_user_profile_sources`].
-    pub nuget_user_profile_sources: bool,
+    pub nuget_user_profile_sources: UserProfileSources,
     /// See [`RegistriesConfig::swift_keychain_credentials`].
     pub swift_keychain_credentials: KeychainCredentials,
     /// See [`RegistriesConfig::gitlab_instance_host`] — normalized from an empty string to
@@ -1688,6 +1925,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_checks_gate_requires_feature_enabled_and_online() {
+        let mut policy = PolicyConfig::default();
+        assert!(policy.osv_checks().is_active());
+        assert!(!policy.typosquat_checks().is_active());
+        assert!(!policy.gossip_checks().is_active());
+
+        policy.typosquat.enabled = true;
+        policy.gossip.enabled = true;
+        assert!(policy.typosquat_checks().is_active());
+        assert!(policy.gossip_checks().is_active());
+
+        policy.network.offline = true;
+        assert!(!policy.osv_checks().is_active());
+        assert!(!policy.typosquat_checks().is_active());
+        assert!(!policy.gossip_checks().is_active());
+    }
+
+    #[test]
+    fn test_checks_activated_since_detects_offline_to_online_edge() {
+        let mut policy = PolicyConfig::default();
+        policy.typosquat.enabled = true;
+        policy.network.offline = true;
+        let offline = policy.typosquat_checks();
+        policy.network.offline = false;
+        let online = policy.typosquat_checks();
+
+        assert!(online.activated_since(offline));
+        assert!(!offline.activated_since(online));
+        assert!(!online.activated_since(online));
+        assert_eq!(online.state(), CheckState::Active);
+    }
+
+    #[test]
+    fn test_atomic_toggle_round_trips_typed_values() {
+        let toggle = AtomicToggle::new(UserProfileSources::Disabled);
+        assert_eq!(toggle.get(), UserProfileSources::Disabled);
+        toggle.set(UserProfileSources::Enabled);
+        assert_eq!(toggle.get(), UserProfileSources::Enabled);
+
+        let gate = AtomicToggle::new(PolicyConfig::default().gossip_checks());
+        assert!(!gate.get().is_active());
+        let mut policy = PolicyConfig::default();
+        policy.gossip.enabled = true;
+        gate.set(policy.gossip_checks());
+        assert!(gate.get().is_active());
+    }
+
+    #[test]
+    fn test_user_profile_sources_deserializes_from_bool() {
+        let registries: RegistriesConfig =
+            serde_json::from_str(r#"{"nuget_user_profile_sources": true}"#).unwrap();
+        assert_eq!(
+            registries.nuget_user_profile_sources,
+            UserProfileSources::Enabled
+        );
+        let registries: RegistriesConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            registries.nuget_user_profile_sources,
+            UserProfileSources::Disabled
+        );
+        assert!(serde_json::from_str::<UserProfileSources>(r#""enabled""#).is_err());
+    }
+
+    #[test]
     fn test_policy_config_defaults() {
         let policy = PolicyConfig::default();
         assert!(policy.diagnostics.vulnerabilities_enabled);
@@ -1764,7 +2065,10 @@ mod tests {
     fn test_registries_config_resolve_normalizes_empty_gitlab_instance_host_to_none() {
         let resolved = RegistriesConfig::default().resolve();
         assert_eq!(resolved.gitlab_instance_host, None);
-        assert!(!resolved.nuget_user_profile_sources);
+        assert_eq!(
+            resolved.nuget_user_profile_sources,
+            UserProfileSources::Disabled
+        );
     }
 
     #[test]
@@ -1773,14 +2077,17 @@ mod tests {
 
         let config = RegistriesConfig {
             workspace_registries: WorkspaceRegistriesSetting::All,
-            nuget_user_profile_sources: true,
+            nuget_user_profile_sources: UserProfileSources::Enabled,
             swift_keychain_credentials: KeychainCredentials::Enabled,
             gitlab_instance_host: "gitlab.corp".to_string(),
         };
 
         let resolved = config.resolve();
         assert_eq!(resolved.workspace_registries, WorkspaceRegistryAccess::All);
-        assert!(resolved.nuget_user_profile_sources);
+        assert_eq!(
+            resolved.nuget_user_profile_sources,
+            UserProfileSources::Enabled
+        );
         assert_eq!(
             resolved.swift_keychain_credentials,
             KeychainCredentials::Enabled
@@ -1964,7 +2271,7 @@ mod tests {
     fn test_policy_config_diff_nuget_user_profile_sources_change() {
         let old = PolicyConfig::default();
         let mut new = PolicyConfig::default();
-        new.registries.nuget_user_profile_sources = true;
+        new.registries.nuget_user_profile_sources = UserProfileSources::Enabled;
 
         let diff = PolicyConfig::diff(&old, &new);
         assert!(!diff.workspace_registries_changed.is_changed());
@@ -2044,7 +2351,7 @@ mod tests {
         1,
         RegistryRuntimeSettings {
             workspace_registries: crate::net_policy::WorkspaceRegistryAccess::PublicOnly,
-            nuget_user_profile_sources: false,
+            nuget_user_profile_sources: UserProfileSources::Disabled,
             swift_keychain_credentials: KeychainCredentials::Disabled,
             gitlab_instance_host: Some(crate::conformance::CREDENTIAL_PROBE_URL.to_string()),
         },

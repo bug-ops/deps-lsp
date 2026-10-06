@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use crate::lsp_helpers::{BoundedVersionReq, EcosystemFormatter, PinResolution, ResolvedPin};
-use crate::pagination::ListCoverage;
+use crate::osv::SiblingCoverage;
 use crate::{ConcreteVersion, Dependency, EcosystemId, PackageName};
 
 /// How a *bare* (no explicit pin marker) version requirement should be treated when
@@ -576,7 +576,7 @@ pub fn resolve_in_use_version(
 pub struct InUseVersions {
     primary: ConcreteVersion,
     siblings: Vec<ConcreteVersion>,
-    sibling_coverage: ListCoverage,
+    sibling_coverage: SiblingCoverage,
 }
 
 impl InUseVersions {
@@ -586,7 +586,7 @@ impl InUseVersions {
         Self {
             primary,
             siblings: Vec::new(),
-            sibling_coverage: ListCoverage::Complete,
+            sibling_coverage: SiblingCoverage::Complete,
         }
     }
 
@@ -596,7 +596,17 @@ impl InUseVersions {
         Self {
             primary,
             siblings: Vec::new(),
-            sibling_coverage: ListCoverage::Truncated,
+            sibling_coverage: SiblingCoverage::Truncated,
+        }
+    }
+
+    /// A primary read from manifest text for a tag pin whose repository tag list has not been
+    /// fetched yet (or failed to fetch), so its sibling tags are unknown.
+    fn not_yet_indexed(primary: ConcreteVersion) -> Self {
+        Self {
+            primary,
+            siblings: Vec::new(),
+            sibling_coverage: SiblingCoverage::NotYetIndexed,
         }
     }
 
@@ -606,7 +616,7 @@ impl InUseVersions {
     #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub const fn for_test(primary: ConcreteVersion, siblings: Vec<ConcreteVersion>) -> Self {
-        Self::for_test_with_coverage(primary, siblings, ListCoverage::Complete)
+        Self::for_test_with_coverage(primary, siblings, SiblingCoverage::Complete)
     }
 
     /// Like [`Self::for_test`], with an explicit sibling coverage.
@@ -615,7 +625,7 @@ impl InUseVersions {
     pub const fn for_test_with_coverage(
         primary: ConcreteVersion,
         siblings: Vec<ConcreteVersion>,
-        sibling_coverage: ListCoverage,
+        sibling_coverage: SiblingCoverage,
     ) -> Self {
         Self {
             primary,
@@ -626,11 +636,11 @@ impl InUseVersions {
 
     /// Whether [`Self::siblings`] was read from a complete tag list.
     ///
-    /// [`ListCoverage::Truncated`] means a sibling tag naming the primary's commit may be
-    /// missing, so a clean OSV answer for the primary and the listed siblings is not
-    /// authoritative.
+    /// Anything but [`SiblingCoverage::Complete`] means a sibling tag naming the primary's
+    /// commit may be missing, so a clean OSV answer for the primary and the listed siblings is
+    /// not authoritative.
     #[must_use]
-    pub const fn sibling_coverage(&self) -> ListCoverage {
+    pub const fn sibling_coverage(&self) -> SiblingCoverage {
         self.sibling_coverage
     }
 
@@ -769,7 +779,7 @@ pub fn resolve_in_use_versions(
             Some(InUseVersions {
                 primary,
                 siblings,
-                sibling_coverage,
+                sibling_coverage: sibling_coverage.into(),
             })
         }
         PinResolution::Untagged
@@ -783,6 +793,10 @@ pub fn resolve_in_use_versions(
             .version_requirement()
             .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
             .map(|v| InUseVersions::siblings_unknown(ConcreteVersion::from(v))),
+        PinResolution::NotYetIndexed => dep
+            .version_requirement()
+            .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
+            .map(|v| InUseVersions::not_yet_indexed(ConcreteVersion::from(v))),
     }
 }
 
@@ -841,6 +855,7 @@ pub fn has_unqueryable_resolved_pin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pagination::ListCoverage;
     use crate::position::Range;
 
     /// Minimal formatter with a real `compile_bounded_requirement` (Cargo-style `semver::VersionReq`
@@ -1148,24 +1163,31 @@ mod tests {
 
         assert_eq!(
             coverage(&resolved(ListCoverage::Truncated)),
-            Some(ListCoverage::Truncated)
+            Some(SiblingCoverage::Truncated)
         );
         assert_eq!(
             coverage(&resolved(ListCoverage::Complete)),
-            Some(ListCoverage::Complete)
+            Some(SiblingCoverage::Complete)
         );
         assert_eq!(
             coverage(&FixedResolvedPinFormatter::with_resolution(
                 PinResolution::Unresolved
             )),
-            Some(ListCoverage::Complete)
+            Some(SiblingCoverage::Complete)
         );
         assert_eq!(
             coverage(&FixedResolvedPinFormatter::with_resolution(
                 PinResolution::Unlisted
             )),
-            Some(ListCoverage::Truncated),
+            Some(SiblingCoverage::Truncated),
             "manifest text stands in for an unlisted pin, with its siblings unknown"
+        );
+        assert_eq!(
+            coverage(&FixedResolvedPinFormatter::with_resolution(
+                PinResolution::NotYetIndexed
+            )),
+            Some(SiblingCoverage::NotYetIndexed),
+            "manifest text stands in for a cold-cache pin, with its siblings unknown"
         );
     }
 
