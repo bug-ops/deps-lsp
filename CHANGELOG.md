@@ -18,14 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `TagIndex::pin_resolution` and `ShaPinLookup::resolve` take the pin's comment tag; `PinResolution`, `ShaPinLookup` and `CommentMismatch` gain a comment-contradicted variant; `ShaPinComment::new` takes the tag range (#1770)
 - **deps-gitlab-ci**: `PinStyle::Sha` carries the pinned `CommitSha`; `sha_pin_replacement_for` takes a `CommentSlot`; `GitlabCiDependency` gains `comment_slot` (#1770)
 - **deps-cli**: `Category::ShaCommentMismatch` added for `--fail-on sha-comment-mismatch` (#1770)
-- **deps-lsp**: `ServerState.osv_latest_check_enabled`, `is_osv_latest_check_enabled` and `set_osv_latest_check_enabled` are replaced by `osv_checks`/`set_osv_checks` over the typed `OsvChecks` (#1774, #PR)
-- **deps-core**: `HttpCache` extra-header parameters take `RequestHeader` instead of `(HeaderName, &str)` (#1772, #PR)
-- **deps-core**: `PolicyConfigDiff` and `RegistryRuntimeSettings` gain a Swift Keychain field, and `RegistriesConfig` gains `swift_keychain_credentials` (#1771, #PR)
-- **deps-core**: `PolicyConfigDiff` `*_changed` fields are the typed `SettingChange` instead of `bool` (#1771, #PR)
-- **deps-swift**: `ResolvedSwiftRegistry.auth` is no longer public (#1771, #PR)
+- **deps-lsp**: `ServerState.osv_latest_check_enabled`, `is_osv_latest_check_enabled` and `set_osv_latest_check_enabled` are replaced by `osv_checks`/`set_osv_checks` over the typed `OsvChecks` (#1774, #1776)
+- **deps-core**: `HttpCache` extra-header parameters take `RequestHeader` instead of `(HeaderName, &str)` (#1772, #1776)
+- **deps-core**: `PolicyConfigDiff` and `RegistryRuntimeSettings` gain a Swift Keychain field, and `RegistriesConfig` gains `swift_keychain_credentials` (#1771, #1776)
+- **deps-core**: `PolicyConfigDiff` `*_changed` fields are the typed `SettingChange` instead of `bool` (#1771, #1776)
+- **deps-swift**: `ResolvedSwiftRegistry.auth` is no longer public (#1771, #1776)
 
 ### Security
-- **deps-core, all registry ecosystems**: registry credential headers (`Authorization`, `PRIVATE-TOKEN`) are marked sensitive so they stay out of HTTP-stack debug output (#1772, #PR)
+- **deps-core, all registry ecosystems**: registry credential headers (`Authorization`, `PRIVATE-TOKEN`) are marked sensitive so they stay out of HTTP-stack debug output (#1772, #1776)
 
 ### Added
 - **deps-core, all ecosystems**: `DepsError::HostBlockedByPolicy` shows a policy-specific message when a registry host resolves to a blocked address class at connect time (#1773)
@@ -33,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-swift**: `publishedAt` freshness for the newest registry releases (#1773)
 - **deps-swift**: `SWIFTPM_NETRC_DATA` and `~/.netrc` registry credentials, bound to user-declared registries only (#1773)
 - **deps-core**: shared `netrc` parser following SwiftPM's grammar, and `pagination::next_page`/`NextPage` for validated `Link rel="next"` targets (#1773)
-- **deps-swift, deps-core**: `registries.swift_keychain_credentials` opt-in macOS Keychain credentials for SE-0292 registries (user-declared registries only, ignored by deps-cli) (#1771, #PR)
+- **deps-swift, deps-core**: `registries.swift_keychain_credentials` opt-in macOS Keychain credentials for SE-0292 registries (user-declared registries only, ignored by deps-cli) (#1771, #1776)
 - **deps-core**: `PinResolution`, `TagIndex::pin_resolution`, `PartialTagPolicy`, `tag_pin_is_up_to_date` and `tag_has_precedence` shared by the git-tag ecosystems (#1751)
 - **deps-github-actions**: `Correct version comment to <tag>` quickfix for a SHA pin whose trailing comment names another tag (#1751)
 - **deps-cli**: `--fail-on other` token for uncategorized findings (offline/lock-file/registry notices, `unresolved-gitlab-host`) (#1747)
@@ -46,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-github-actions**: `Ecosystem::tag_index_refreshes` and `GithubActionsRegistry::subscribe_tag_refreshes` publish tag-index refresh events (#1764)
 
 ### Changed
-- **deps-core, deps-lsp, deps-cli**: one typed `OsvChecks` gate (`Active`/`Inactive`) for every OSV call site instead of repeated `vulnerabilities_enabled && !offline` conditions and OSV booleans (#1775, #1774, #PR)
+- **deps-core, deps-lsp, deps-cli**: one typed `OsvChecks` gate (`Active`/`Inactive`) for every OSV call site instead of repeated `vulnerabilities_enabled && !offline` conditions and OSV booleans (#1775, #1774, #1776)
 - **deps-github-actions, deps-gitlab-ci**: a tag pin ahead of the latest release is reported up to date instead of offering a downgrade (#1751)
 - **deps-cli**: `update --security-only` Unfixable rows (`Yanked`, `UnsupportedRequirementShape`, `OversizedRequirement`) now report their `advisory_ids` (#1747)
 - **deps-composer**: OR-branch bounds are computed once when `ComposerMatcher` is built, as in `deps-npm`; behavior unchanged (#1747)
