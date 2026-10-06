@@ -458,9 +458,6 @@ pub enum ResolvedSource {
         /// Checksum/integrity hash
         checksum: String,
     },
-    /// From a registry whose lock format records neither the registry URL nor a checksum
-    /// (SwiftPM writes `location: ""` for an SE-0292 registry pin).
-    RegistryPin,
     /// From git with commit hash
     Git {
         /// Git repository URL
@@ -473,6 +470,9 @@ pub enum ResolvedSource {
         /// Relative or absolute path
         path: String,
     },
+    /// From a registry whose lock format records neither the registry URL nor a checksum
+    /// (SwiftPM writes `location: ""` for an SE-0292 registry pin).
+    RegistryPin,
 }
 
 impl std::fmt::Debug for ResolvedSource {
