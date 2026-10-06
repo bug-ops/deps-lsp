@@ -70,10 +70,13 @@ pub struct CheckArgs {
     pub format: OutputFormat,
 
     /// Comma-separated categories that make the run exit with code 1
-    /// (`outdated,yanked,vulnerable,unsatisfiable,mutable-ref,license,deprecated`).
-    /// Defaults to `vulnerable,yanked,unsatisfiable` when omitted (FR-010). A finding that
-    /// matches none of the seven categories (e.g. an unresolved/unknown package) is always
-    /// reported but can never fail a run through this flag.
+    /// (`outdated,yanked,vulnerable,unsatisfiable,mutable-ref,license,deprecated,other`).
+    /// Defaults to `vulnerable,yanked,unsatisfiable` when omitted (FR-010); an explicit
+    /// value replaces that default. `other` covers every finding matching none of the seven
+    /// specific categories, including informational notices: offline, skipped lookups for
+    /// manifests without a lock file, unresolved GitLab hosts, dependency-ceiling,
+    /// registry-fetch failures and `sha-comment-mismatch`. It therefore fails any manifest
+    /// without a lock file and every `--offline` run.
     #[arg(long, value_delimiter = ',')]
     pub fail_on: Vec<Category>,
 
@@ -320,6 +323,15 @@ mod tests {
             unreachable!()
         };
         assert_eq!(args.fail_on, vec![Category::MutableRefPin]);
+    }
+
+    #[test]
+    fn test_fail_on_other_token_is_accepted() {
+        let cli = Cli::parse_from(["deps-cli", "check", "--fail-on", "vulnerable,other"]);
+        let Command::Check(args) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(args.fail_on, vec![Category::Vulnerable, Category::Other]);
     }
 
     #[test]

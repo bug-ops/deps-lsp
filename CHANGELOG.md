@@ -7,9 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **deps-cli**: `--fail-on other` token for uncategorized findings (offline/lock-file/registry notices, `sha-comment-mismatch`) (#PR)
+
+### Changed
+- **deps-cli**: `update --security-only` Unfixable rows (`Yanked`, `UnsupportedRequirementShape`, `OversizedRequirement`) now report their `advisory_ids` (#PR)
+- **deps-composer**: OR-branch bounds are computed once when `ComposerMatcher` is built, as in `deps-npm`; behavior unchanged (#PR)
+
 ### Fixed
 - **deps**: bump yanked `yoke-derive` to 0.8.4 so cargo-deny passes (#1746)
 - **workspace**: allow `clippy::assert_is_empty` (new in Rust 1.99) to keep CI clippy green (#1746)
+- **deps-lsp**: lock-file-change OSV rescan is now also suppressed in offline mode, matching the phase A gate (#PR)
 
 ## [2.0.0] - 2026-09-29
 

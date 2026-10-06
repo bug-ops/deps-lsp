@@ -272,6 +272,7 @@ fn classify_vulnerable_dependency(
             dep,
             current,
             UnfixableReason::FetchFailedOrAbsent,
+            &[],
             ignore_rule_overridden,
         );
     }
@@ -290,6 +291,7 @@ fn classify_vulnerable_dependency(
                 dep,
                 current,
                 UnfixableReason::NoVerifiedFix,
+                &[],
                 ignore_rule_overridden,
             );
         }
@@ -338,6 +340,7 @@ fn classify_vulnerable_dependency(
             UnfixableReason::Yanked {
                 target: deps_core::ConcreteVersion::new(version_native),
             },
+            &fix.advisory_ids,
             ignore_rule_overridden,
         );
     }
@@ -417,6 +420,7 @@ fn classify_vulnerable_dependency(
                     UnfixableReason::UnsupportedRequirementShape {
                         target: fix_concrete,
                     },
+                    &fix.advisory_ids,
                     ignore_rule_overridden,
                 )
             } else {
@@ -438,6 +442,7 @@ fn classify_vulnerable_dependency(
             UnfixableReason::OversizedRequirement {
                 target: deps_core::ConcreteVersion::new(version_native.as_str()),
             },
+            &fix.advisory_ids,
             ignore_rule_overridden,
         ),
         // #1370: `UnresolvedPlaceholder` joins the `NoVerifiedFix` bucket, not the
@@ -453,6 +458,7 @@ fn classify_vulnerable_dependency(
             dep,
             current,
             UnfixableReason::NoVerifiedFix,
+            &[],
             ignore_rule_overridden,
         ),
     }
@@ -518,13 +524,14 @@ fn unfixable_item(
     dep: &dyn deps_core::Dependency,
     current: CurrentVersion,
     reason: UnfixableReason,
+    advisory_ids: &[String],
     ignore_rule_overridden: bool,
 ) -> PlannedUpdateItem {
     PlannedUpdateItem::new(
         dep.name().as_str().to_string(),
         current,
         Outcome::Unfixable(reason),
-        Vec::new(),
+        advisory_ids.to_vec(),
         ignore_rule_overridden,
         None,
         None,
@@ -1060,6 +1067,7 @@ mod tests {
             Some(&deps_core::ConcreteVersion::from("1.5.2")),
             "an Unfixable item with a rejected fix target must report it (#1614)"
         );
+        assert_eq!(item.advisory_ids, ["RUSTSEC-2024-0001"], "#1618");
         assert!(
             !item.reason().contains("regenerate the lock file"),
             "message must not claim the fix is already admitted: {}",
@@ -1433,6 +1441,7 @@ mod tests {
             Some(&deps_core::ConcreteVersion::from("1.0.2")),
             "a yanked-unfixable item must report the rejected fix target (#1614)"
         );
+        assert_eq!(item.advisory_ids, ["RUSTSEC-2024-0001"], "#1618");
     }
 
     /// #1344 C3: since the requirement-already-admits-fix gate moved inside
@@ -1678,6 +1687,7 @@ mod tests {
             "got {:?}",
             item.outcome
         );
+        assert_eq!(item.advisory_ids, ["RUSTSEC-2024-0001"], "#1618");
         assert_eq!(
             item.target(),
             Some(&deps_core::ConcreteVersion::from("1.5.2")),

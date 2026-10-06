@@ -73,11 +73,28 @@ fn requirement_is_composer_unresolved(requirement: &str) -> bool {
 /// [`ComposerFormatter::compile_bounded_requirement`]. Shares `version_satisfies_requirement`'s
 /// hand-rolled comparator, which has no external parser to fail on, so this always
 /// decides (`Some`).
-struct ComposerMatcher(String);
+struct ComposerMatcher {
+    requirement: String,
+    or_gap_branches: Option<Vec<VersionRange<String>>>,
+}
+
+impl ComposerMatcher {
+    fn new(requirement: String) -> Self {
+        let or_gap_branches = or_gap_branches(&requirement);
+        Self {
+            requirement,
+            or_gap_branches,
+        }
+    }
+}
 
 impl RequirementMatcher for ComposerMatcher {
     fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-        Some(walk_requirement(&AdmitLeaf, version.as_str(), &self.0))
+        Some(walk_requirement(
+            &AdmitLeaf,
+            version.as_str(),
+            &self.requirement,
+        ))
     }
 
     /// Composer's requirement grammar is not strict SemVer 2.0.0 (#299) — must not opt in.
@@ -86,14 +103,19 @@ impl RequirementMatcher for ComposerMatcher {
     }
 
     fn explicitly_excludes(&self, version: &ConcreteVersion) -> bool {
-        composer_explicitly_excludes(version.as_str(), &self.0)
+        let version = version.as_str();
+        walk_requirement(&ExcludeLeaf, version, &self.requirement)
+            || self.or_gap_branches.as_deref().is_some_and(|branches| {
+                !walk_requirement(&AdmitLeaf, version, &self.requirement)
+                    && or_gap_excludes_version(branches, version)
+            })
     }
 }
 
 /// Strips a leading `v`/`V` and a trailing `@stability` flag from one OR-branch (or the
 /// whole requirement, before any `||` split), returning `None` for the wildcard sentinel
 /// (empty, or `*`) — shared by [`walk_requirement`] and the OR-gap bound derivation
-/// ([`composer_or_gap_excludes`]), which both need this per-branch normalization.
+/// ([`or_gap_branches`]), which both need this per-branch normalization.
 fn strip_branch_affixes(branch: &str) -> Option<&str> {
     let branch = branch.trim();
     // Only strip when it leaves something behind — a bare "v"/"V" branch must fall through
@@ -116,7 +138,7 @@ fn strip_branch_affixes(branch: &str) -> Option<&str> {
 /// Normalizes a top-level comma AND-separator to whitespace — Composer treats the two
 /// identically (`composer/semver`'s `VersionParser::parseConstraints`) — and runs the result
 /// through [`normalize_operator_spacing`]. Shared by [`walk_requirement`]'s AND-splitting and
-/// the OR-gap bound derivation ([`composer_or_gap_excludes`]) so both stay in sync, mirroring
+/// the OR-gap bound derivation ([`or_gap_branches`]) so both stay in sync, mirroring
 /// this project's #1596/#1598 admit/exclude-walker dedup precedent.
 fn normalize_and_separators(requirement: &str) -> Cow<'_, str> {
     if !requirement.contains(',') {
@@ -137,12 +159,12 @@ fn normalize_and_separators(requirement: &str) -> Cow<'_, str> {
 /// this leaves a genuinely blank segment visible to the caller instead of silently discarding
 /// it (impl-critic M1): two separator runs with only whitespace between them (`"A || || B"`),
 /// or a trailing run (`"A ||"`), each produce an empty/whitespace-only element here. The
-/// caller — [`walk_requirement`] and [`composer_or_gap_excludes`] — treats any such
+/// caller — [`walk_requirement`] and [`or_gap_branches`] — treats any such
 /// blank-after-trim branch as a malformed OR expression (`composer/semver` itself rejects these
 /// shapes) and fails closed, rather than the two callers silently disagreeing on how to handle
 /// it depending on how the blanks happened to be produced.
 ///
-/// Shared by [`walk_requirement`]'s OR-splitting and [`composer_or_gap_excludes`]'s `||`/`|`-
+/// Shared by [`walk_requirement`]'s OR-splitting and [`or_gap_branches`]'s `||`/`|`-
 /// branch enumeration, mirroring this project's #1596/#1598 admit/exclude-walker dedup
 /// precedent.
 // `start`/`i` come from `char_indices()`, and every split point sits immediately before/after
@@ -294,7 +316,7 @@ fn hyphen_range_edges(normalized: &str) -> Option<HyphenRangeMatch<'_>> {
 /// Shared OR (`||`/`|`)/AND (whitespace or comma)-splitting tree-walker for Composer's
 /// requirement grammar, including its `v`-prefix and `@stability`-flag stripping — the
 /// traversal [`ComposerFormatter::version_satisfies_requirement`] and
-/// [`composer_explicitly_excludes`] both need identically (PR #1589 had to fix the same
+/// `ComposerMatcher::explicitly_excludes` both need identically (PR #1589 had to fix the same
 /// `normalize_operator_spacing` spacing bug in both functions because they did not share this
 /// walker; #1591 extracted it). #1603: a comma is Composer's other AND separator
 /// (`">=1.0,<2.0"` == `">=1.0 <2.0"`) and must be split identically to whitespace, or a
@@ -382,7 +404,7 @@ fn walk_requirement<L: RequirementLeaf>(leaf: &L, version: &str, requirement: &s
 /// A single non-combinator requirement clause's evaluation, plumbed into [`walk_requirement`].
 /// The OR/AND splitting and `v`-prefix/stability-flag normalization are identical for both
 /// [`ComposerFormatter::version_satisfies_requirement`]'s "does this admit `version`" question
-/// ([`AdmitLeaf`]) and [`composer_explicitly_excludes`]'s "does this explicitly ban `version`"
+/// ([`AdmitLeaf`]) and `ComposerMatcher::explicitly_excludes`'s "does this explicitly ban `version`"
 /// question ([`ExcludeLeaf`]) — only what a leaf decides, and how an AND-group folds its
 /// clauses' results, differ.
 ///
@@ -526,16 +548,6 @@ impl RequirementLeaf for ExcludeLeaf {
         };
         cmp.op == CmpOp::Ne && compare_versions(version, cmp.version).is_eq()
     }
-}
-
-/// Thin [`walk_requirement`] wrapper for "does this explicitly ban `version`" — see
-/// [`ExcludeLeaf`], combined with the `||`-alternation-gap check (#1601, see
-/// [`composer_or_gap_excludes`]): a `!=` clause and an OR-gap are two independently sufficient
-/// ways Composer can explicitly exclude a version with no single admitted-range ceiling to
-/// blame it on.
-fn composer_explicitly_excludes(version: &str, requirement: &str) -> bool {
-    walk_requirement(&ExcludeLeaf, version, requirement)
-        || composer_or_gap_excludes(version, requirement)
 }
 
 /// Strips a leading `v`/`V` from a clause's bound text — the same normalization
@@ -702,7 +714,7 @@ fn clause_bound(clause: &str) -> Option<VersionRange<String>> {
 /// unrecognized clause shape.
 ///
 /// Returns `None` when no clause contributed a bound (an all-`!=`/wildcard/unrecognized-clause
-/// branch — functionally inert either way for [`composer_or_gap_excludes`]'s gap detection, so
+/// branch — functionally inert either way for [`or_gap_branches`]'s gap detection, so
 /// omitting it from the `branches` list is equivalent to the alternative of keeping it with no
 /// edges) or, via [`range_from_edges`], `Some(VersionRange::Empty)` when the intersected bound
 /// turns out unsatisfiable (impl-critic M1: `lower > upper`, or equal with either edge
@@ -756,54 +768,57 @@ fn intersect_clause_bounds<'a>(
     range_from_edges(lower, upper, compare_owned)
 }
 
-/// Whether `version` is explicitly excluded by an OR-alternation gap (#1601, same class as
-/// Maven's #1590 disjoint-range gap): not admitted by any `||`/`|`-branch, yet sitting past one
-/// branch's upper edge and before another's lower edge — Composer's counterpart of
-/// `deps-maven`'s `range::explicitly_excludes`, generalized through
-/// [`deps_core::interval::union_gap_excludes`] (the same representation-agnostic predicate
-/// `deps-npm`'s own `||`-gap detection routes through).
+/// Precompiles the per-branch bounds [`or_gap_excludes_version`] needs for OR-alternation gap
+/// detection (#1601, same class as Maven's #1590 disjoint-range gap), once per requirement —
+/// mirroring `deps-npm`'s `NodeSemverMatcher`, which compiles its OR branches at construction.
 ///
-/// Coverage is checked once, up front, via the real matcher
-/// (`ComposerFormatter::version_satisfies_requirement`) over the *whole* original requirement
-/// — not by re-deriving "covered" from the same [`VersionRange`]s used for edge detection
-/// (impl-critic S2): a branch whose bound [`branch_bound`] cannot characterize (caret/tilde/
-/// bare-partial — see [`clause_bound`]'s doc) is filtered out of the `branches` list entirely,
-/// so a bound-derived "covered" check could never see a candidate that only the *real* matcher
-/// knows is admitted by exactly such a branch — reporting both `matches == true` and
-/// `explicitly_excludes == true` for the same candidate simultaneously. Routing "covered"
-/// through the real matcher first, before any branch is filtered, rules that out: once this
-/// early return has passed, no member below can be covering `version` either, so the
-/// `union_gap_excludes` `covers` callback below is intentionally always `false`.
-///
-/// A version stripped here is *only* used against [`compare_versions`]-based edge comparisons
-/// (impl-critic S1) — the coverage check above passes the original, unstripped `version` to
-/// the real matcher instead, which already strips it internally
-/// ([`walk_requirement`]'s own leading strip); `compare_versions` has no such built-in
-/// stripping; a real Packagist tag left un-stripped here (e.g. `v1.5.0`, common for
-/// `symfony/*`) would silently defeat every gap comparison.
-fn composer_or_gap_excludes(version: &str, requirement: &str) -> bool {
-    if walk_requirement(&AdmitLeaf, version, requirement) {
-        return false;
-    }
-    let Some(stripped_requirement) = strip_branch_affixes(requirement) else {
-        return false;
-    };
+/// Returns `None` when the requirement has no `||`/`|` alternation, is a wildcard, or has a blank
+/// branch (a malformed shape that fails closed). A branch whose bound [`branch_bound`] cannot
+/// characterize (caret/tilde/bare-partial — see [`clause_bound`]'s doc) is filtered out of the
+/// list entirely.
+fn or_gap_branches(requirement: &str) -> Option<Vec<VersionRange<String>>> {
+    let stripped_requirement = strip_branch_affixes(requirement)?;
     if !stripped_requirement.contains('|') {
-        return false;
+        return None;
     }
     let raw_branches = split_or_branches(stripped_requirement);
     if has_blank_or_branch(&raw_branches) {
-        return false;
+        return None;
     }
-    let branches: Vec<VersionRange<String>> = raw_branches
-        .into_iter()
-        .filter_map(|b| branch_bound(b.trim()))
-        .collect();
+    Some(
+        raw_branches
+            .into_iter()
+            .filter_map(|b| branch_bound(b.trim()))
+            .collect(),
+    )
+}
+
+/// Whether `version` is explicitly excluded by an OR-alternation gap: sitting past one branch's
+/// upper edge and before another's lower edge — Composer's counterpart of `deps-maven`'s
+/// `range::explicitly_excludes`, generalized through [`deps_core::interval::union_gap_excludes`]
+/// (the same representation-agnostic predicate `deps-npm`'s own `||`-gap detection routes
+/// through). `branches` come from [`or_gap_branches`].
+///
+/// The caller must have already ruled out coverage via the real matcher
+/// (`ComposerFormatter::version_satisfies_requirement`) over the *whole* original requirement
+/// (impl-critic S2): because [`or_gap_branches`] drops branches it cannot characterize, a
+/// bound-derived "covered" check could never see a candidate admitted only by such a branch,
+/// reporting both `matches == true` and `explicitly_excludes == true` simultaneously. Once that
+/// check has passed, no member can be covering `version` either, so the `union_gap_excludes`
+/// `covers` callback is intentionally always `false`.
+///
+/// A version stripped here is *only* used against [`compare_versions`]-based edge comparisons
+/// (impl-critic S1) — the coverage check passes the original, unstripped `version` to the real
+/// matcher instead, which already strips it internally ([`walk_requirement`]'s own leading
+/// strip); `compare_versions` has no such built-in stripping, so a real Packagist tag left
+/// un-stripped here (e.g. `v1.5.0`, common for `symfony/*`) would silently defeat every gap
+/// comparison.
+fn or_gap_excludes_version(branches: &[VersionRange<String>], version: &str) -> bool {
     let version = version.strip_prefix(['v', 'V']).unwrap_or(version);
     let cmp = |a: &str, b: &String| compare_versions(a, b);
     deps_core::interval::union_gap_excludes(
-        &branches,
-        // Coverage is already ruled out by the real-matcher check above.
+        branches,
+        // Coverage is already ruled out by the real-matcher check in the caller.
         |_: &VersionRange<String>| false,
         |b: &VersionRange<String>| {
             deps_core::interval::admits_at_or_above(version, b.upper_edge(), cmp)
@@ -977,7 +992,7 @@ impl RequirementResolution for ComposerFormatter {
                     || r.ends_with("-dev")
                     || r.contains("@dev")
             },
-            ComposerMatcher,
+            ComposerMatcher::new,
         )
     }
 
@@ -1338,6 +1353,11 @@ mod tests {
     use std::collections::HashMap;
     #[cfg(feature = "lsp-responses")]
     use tower_lsp_server::ls_types::Position;
+
+    fn composer_explicitly_excludes(version: &str, requirement: &str) -> bool {
+        ComposerMatcher::new(requirement.to_string())
+            .explicitly_excludes(&ConcreteVersion::new(version))
+    }
 
     #[test]
     fn test_normalize_package_name() {
@@ -1900,7 +1920,7 @@ mod tests {
 
     /// Documents the deliberate scope limit from `clause_bound`'s doc: a union made
     /// *entirely* of caret/tilde branches has no recognized bound anywhere, so
-    /// `composer_or_gap_excludes` has no branches left to compare and never fires — this is
+    /// `or_gap_branches` yields no branches to compare and never fires — this is
     /// always safe (no false exclusion), just a known gap in detection coverage, unlike npm's
     /// `NodeSemverMatcher`, whose probe-based approach handles this same shape (see that
     /// module's own `^1.0.0 || ^3.0.0` regression test).
@@ -1923,7 +1943,7 @@ mod tests {
 
     /// impl-critic S2: a candidate actually admitted by an unrecognized (caret) branch must
     /// never simultaneously be reported as explicitly excluded by a gap between the OTHER,
-    /// recognized branches — `composer_or_gap_excludes`'s up-front real-matcher coverage check
+    /// recognized branches — `ComposerMatcher::explicitly_excludes`'s real-matcher coverage check
     /// must see every branch, not just the ones with a derivable bound.
     #[test]
     fn test_composer_explicitly_excludes_or_gap_no_contradiction_with_opaque_branch() {

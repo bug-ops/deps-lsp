@@ -91,7 +91,7 @@ runs; neither `sarif-file` nor `exit-code` is set in that case.
 | Input | Description | Default |
 |-------|-------------|---------|
 | `paths` | Space-separated paths to walk | `deps-cli`'s own default (repository root) |
-| `fail-on` | Comma-separated categories that exit 1 (`outdated,yanked,vulnerable,unsatisfiable,mutable-ref,license,deprecated`) | `vulnerable,yanked,unsatisfiable` |
+| `fail-on` | Comma-separated categories that exit 1 (`outdated,yanked,vulnerable,unsatisfiable,mutable-ref,license,deprecated,other`) | `vulnerable,yanked,unsatisfiable` |
 | `cooldown` | Overrides `freshness.cooldown_secs` (e.g. `3d`) | unset |
 | `config` | Path to a **fully-trusted** `deps.toml` config file — see warning below | unset (`deps-cli`'s own hardened auto-discovery of `./deps.toml`) |
 

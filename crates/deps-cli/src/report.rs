@@ -47,16 +47,17 @@ const GITLAB_CI_UNRESOLVED_HOST_CODE: &str = "unresolved-gitlab-host";
 /// is a literal.
 const GITHUB_ACTIONS_SHA_COMMENT_MISMATCH_CODE: &str = "sha-comment-mismatch";
 
-/// A category a [`CheckFinding`] can be classified into — the seven `--fail-on` tokens FR-009
-/// defines, plus [`Category::Other`].
+/// A category a [`CheckFinding`] can be classified into — the eight `--fail-on` tokens
+/// (the seven FR-009 defines, plus [`Category::Other`], #1733).
 ///
 /// `Other` covers a `generate_diagnostics` finding that matches none of the seven (an
-/// "Unknown package", a collapsed registry-lookup failure, or a workspace-registry/
-/// offline/dependency-count notice). It is never selectable via `--fail-on`
-/// (`#[value(skip)]`) and never matched by [`FailOnPolicy`] — it exists purely so
-/// [`CheckFinding`] stays a 1:1 mapping of every diagnostic `generate_diagnostics` produced,
-/// per spec 062 `tasks.md` T020, rather than silently dropping findings this crate cannot
-/// classify.
+/// "Unknown package", a collapsed registry-lookup failure, a `sha-comment-mismatch` hint, or
+/// a workspace-registry/offline/dependency-count notice). It is selectable via
+/// `--fail-on other` (which therefore fails any manifest without a lock file and every
+/// offline run, as those notices are `Other`) but is not in
+/// [`FailOnPolicy::default_categories`] — it exists so [`CheckFinding`] stays a 1:1 mapping of
+/// every diagnostic `generate_diagnostics` produced, per spec 062 `tasks.md` T020, rather than
+/// silently dropping findings this crate cannot classify.
 ///
 /// `Serialize`/`Deserialize` (#1626, manual impls below [`Self::as_str`]) produce/accept the
 /// exact same tokens as [`Self::as_str`] — used directly as
@@ -91,7 +92,6 @@ pub enum Category {
     /// The registry reports the package itself as deprecated/abandoned.
     Deprecated,
     /// A `generate_diagnostics` finding that does not map to any category above.
-    #[value(skip)]
     Other,
 }
 
@@ -801,6 +801,13 @@ mod tests {
         assert!(!policy.matches(&[finding(Category::Deprecated)]));
         assert!(!policy.matches(&[finding(Category::MutableRefPin)]));
         assert!(!policy.matches(&[finding(Category::Other)]));
+    }
+
+    #[test]
+    fn test_fail_on_policy_other_category_matches_only_other() {
+        let policy = FailOnPolicy::new(vec![Category::Other]);
+        assert!(policy.matches(&[finding(Category::Other)]));
+        assert!(!policy.matches(&[finding(Category::Vulnerable)]));
     }
 
     #[test]
