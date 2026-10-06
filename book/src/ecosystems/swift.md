@@ -94,13 +94,26 @@ the pair alone is ignored with a warning naming it). The header format comes fro
 `authentication` map only: `token` (or no entry) sends `Bearer`, `basic` sends `Basic`; a login of
 `token` with no entry is also sent as `Bearer`, as SwiftPM does. `authentication` is keyed by host and
 non-default port, like SwiftPM (`swift.acme.dev:8443` does not match a portless key); unlike
-SwiftPM, an explicit default port (`:443`) is treated as absent. netrc and macOS Keychain
-credentials are not read.
+SwiftPM, an explicit default port (`:443`) is treated as absent.
 
-**The single environment credential is sent to every trusted registry URL**, including a public
-`[default]` listed in the user-level file next to a private scoped registry. If you do not want
-the token sent to a public registry, do not list it in the user-level `registries.json` while the
-variable is exported (declare it in the project file instead).
+When the variables are unset, credentials come from the content of `SWIFTPM_NETRC_DATA`, else from
+`~/.netrc` (the first source that exists wins, as in SwiftPM; macOS Keychain is not read). A netrc
+is matched by the registry's host, ignoring the port, and is sent as `Basic` unless the
+user-level `authentication` entry says `token` (or the login is `token`). `SWIFTPM_NETRC_DATA`
+is parsed once at startup, first matching machine wins and host names compare case-sensitively;
+an unusable value logs a warning naming only the variable and is skipped. `~/.netrc` is re-read
+whenever it changes, the last matching machine wins and host names compare case-insensitively; an
+absent or invalid file yields no credential. The grammar follows SwiftPM's `Netrc.swift`
+(quoted values, `#` comments after whitespace, `account` between login and password, entries
+missing a login or password dropped).
+
+**A single credential is sent to every trusted registry URL**, including a public `[default]`
+listed in the user-level file next to a private scoped registry. If you do not want a token
+sent to a public registry, do not list it in the user-level `registries.json` while the variable
+is exported (declare it in the project file instead). With netrc the credential depends on the
+host, but a `default` entry applies to every trusted host without a `machine` entry, public
+registries included. On Linux, and from `SWIFTPM_NETRC_DATA` on every platform, a `default` entry
+is honored; on macOS the `default` entry of `~/.netrc` is ignored.
 
 ### Deviation from SwiftPM
 
@@ -113,16 +126,32 @@ here where SwiftPM `main` would authenticate; add that exact URL to your user-le
 authentication type is also taken from the user tier only, and workspace-declared URLs are
 policy-gated, which SwiftPM does not do.
 
+On macOS SwiftPM reads credentials from the Keychain and not from `~/.netrc` (unless forced);
+`deps-swift` has no Keychain support and does read `~/.netrc` there, but ignores its `default`
+entry. Keychain-only credentials are therefore not available.
+
 ### Limitations
 
-- **Paginated release lists.** A response carrying `Link: <...>; rel="next"` is discarded and the
-  dependency shows "registry paginates its release list; pagination is not supported yet" (#1754); no
-  latest version or up-to-date mark is derived from a partial page.
-- A project-declared hostname that resolves to a blocked address class shows the generic
-  fetch-failure message rather than a policy-specific one.
+- **Paginated release lists.** `Link: <...>; rel="next"` pages are followed (at most 10 pages,
+  10,000 releases, 32 MiB of response bodies and 15 seconds in total; same origin and path as the
+  registry URL, same credential rules) and merged. A missing, ambiguous, repeated or foreign next
+  link, or a list over a limit, discards everything fetched and the dependency shows "registry
+  returned an unusable next-page link", "registry release list exceeds the page limit" or
+  "registry release list took too long to fetch"; no latest version or up-to-date mark is derived
+  from a partial list.
+  The failure is remembered for 90 seconds. Every page is revalidated on every request, so a merged
+  list can be inconsistent only when one page's revalidation fails and that page is served
+  from cache.
+- **Publication dates.** With freshness enabled, the newest 8 non-yanked releases get their
+  `publishedAt` from one metadata request each (`GET {base}/{scope}/{name}/{version}`), at most 4
+  at a time and within one 2-second budget per lookup. Dates are remembered for the life of the
+  process (a registry's answer for a release does not change); a failed request is retried after
+  90 seconds. A missing date never fails the version list.
+- A hostname that resolves to a blocked address class shows the policy-specific message described
+  under [Cargo](cargo.md#customprivate-registries).
 - `registries.json` is watched by basename, so an unrelated file with that name elsewhere in the
   workspace causes one extra reparse.
-- No `id:` name completion (SE-0292 has no search endpoint) and no `publishedAt` freshness.
+- No `id:` name completion (SE-0292 has no search endpoint).
 
 `Package.resolved` `registry` pins are shown as registry sources, and a pin of an unrecognized
 `kind` is skipped instead of being treated as a source-control pin.

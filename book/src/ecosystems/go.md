@@ -110,7 +110,10 @@ narrowed to "skip only when not found" just because the hop in between
 turned out invalid.
 
 **Reachability policy**: governed by the same `registries.workspace_registries`
-setting documented in [Cargo](cargo.md#customprivate-registries). The default
+setting documented in [Cargo](cargo.md#customprivate-registries), including its
+[connect-time message](cargo.md#customprivate-registries) for a host that resolves to a blocked
+address. A hop blocked this way halts a `,` chain with that message; in a `|` chain a later
+not-found or error does not hide it. The default
 public chain (`https://proxy.golang.org,direct`) used when `$GOENV` declares no
 `GOPROXY` override is never subject to this gate — it is the same
 ungated public-tier client `deps-go` already uses today. A hop blocked by the

@@ -151,7 +151,9 @@ explicit fail-closed state, never a silent fallback to `api.nuget.org` (the
 same issue #248/#502/#513 regression class Cargo/npm/PyPI already closed).
 
 **Reachability policy**: governed by the same `registries.workspace_registries`
-setting documented in [Cargo](cargo.md#customprivate-registries). Additionally,
+setting documented in [Cargo](cargo.md#customprivate-registries), including its
+[connect-time message](cargo.md#customprivate-registries) for a host that resolves to a blocked
+address (a blocked feed halts the chain with that message). Additionally,
 a workspace-declared feed's own service-index resource URLs
 (`PackageBaseAddress`/`SearchQueryService`/`RegistrationsBaseUrl`) are
 re-validated against this same policy before being trusted — NuGet's service

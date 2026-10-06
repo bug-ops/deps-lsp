@@ -17,11 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: `Category::ShaCommentMismatch` added for `--fail-on sha-comment-mismatch` (#1770)
 
 ### Added
+- **deps-core, all ecosystems**: `DepsError::HostBlockedByPolicy` shows a policy-specific message when a registry host resolves to a blocked address class at connect time (#1773)
+- **deps-swift**: follows `Link rel="next"` pages of the SE-0292 release list (#1773)
+- **deps-swift**: `publishedAt` freshness for the newest registry releases (#1773)
+- **deps-swift**: `SWIFTPM_NETRC_DATA` and `~/.netrc` registry credentials, bound to user-declared registries only (#1773)
+- **deps-core**: shared `netrc` parser following SwiftPM's grammar, and `pagination::next_page`/`NextPage` for validated `Link rel="next"` targets (#1773)
 - **deps-core**: `PinResolution`, `TagIndex::pin_resolution`, `PartialTagPolicy`, `tag_pin_is_up_to_date` and `tag_has_precedence` shared by the git-tag ecosystems (#1751)
 - **deps-github-actions**: `Correct version comment to <tag>` quickfix for a SHA pin whose trailing comment names another tag (#1751)
 - **deps-cli**: `--fail-on other` token for uncategorized findings (offline/lock-file/registry notices, `unresolved-gitlab-host`) (#1747)
 - **deps-swift**: SE-0292 registry client resolves `.package(id:)` dependencies through `registries.json` (project and user tiers), binding the environment credential to user-declared registry URLs only (#1763)
-- **deps-core**: `secret::basic_auth_header`, `CachedResponse::link` with `HttpCache::get_cached_{trusted_origin,pinned}_response`, `ListCoverage::from_link_header` and `DepsError::PaginatedListUnsupported` (#1763)
+- **deps-core**: `secret::basic_auth_header`, `CachedResponse::link` with `HttpCache::get_cached_{trusted_origin,pinned}_response`, `ListCoverage::from_link_header` (#1763)
 - **deps-cli**: `--fail-on sha-comment-mismatch` category for SHA pins whose version comment is not confirmed by the tag index (#1770)
 - **deps-core**: `TagIndex::proves_ahead_tag_absent` and a shared `Correct version comment` action builder (#1770)
 - **deps-gitlab-ci**: `Correct version comment to <tag>` quickfix for SHA pins (#1770)

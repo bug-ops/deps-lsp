@@ -179,7 +179,9 @@ setting unset, `GITLAB_TOKEN` is sent only to `gitlab.com`; once set to
 in that same file is fetched unauthenticated. Every other literal host a `component:`
 include names is always fetched unauthenticated, subject to the same
 `registries.workspace_registries` `HostClass` policy gate every other ecosystem's
-workspace-declared host goes through.
+workspace-declared host goes through. A host that resolves to a blocked address class at
+connect time shows the policy-specific message described under
+[Cargo](cargo.md#customprivate-registries).
 
 A `workspace/didChangeConfiguration` that changes `registries.gitlab_instance_host`
 re-parses every already-open GitLab CI document immediately, the same as

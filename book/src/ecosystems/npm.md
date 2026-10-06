@@ -68,7 +68,9 @@ never a silent fallback to `registry.npmjs.org`, matching Cargo's equivalent
 guarantee for a misconfigured registry alias.
 
 **Reachability policy**: governed by the same `registries.workspace_registries`
-setting documented in [Cargo](cargo.md#customprivate-registries) — unlike
+setting documented in [Cargo](cargo.md#customprivate-registries), including its
+[connect-time message](cargo.md#customprivate-registries) for a host that resolves to a blocked
+address — unlike
 Cargo's `$CARGO_HOME`-is-trusted split, npm's project and user `.npmrc` tiers
 are policy-*symmetric*: phase 1 has no credential provenance to protect, so
 there is no tier that is "the user's own configuration" in the way
