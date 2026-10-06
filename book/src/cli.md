@@ -132,10 +132,16 @@ subcommands. Paths default to the current directory when none are given to `chec
 ### `--fail-on` categories and exit codes
 
 `--fail-on` takes a comma-separated list of: `outdated`, `yanked`, `vulnerable`,
-`unsatisfiable`, `mutable-ref`, `license`, `deprecated`. It defaults to
-`vulnerable,yanked,unsatisfiable` when omitted. A finding that matches none of these seven
-(e.g. an unresolved/unknown package) is always reported but can never fail a run through
-this flag.
+`unsatisfiable`, `mutable-ref`, `license`, `deprecated`, `other`. It defaults to
+`vulnerable,yanked,unsatisfiable` when omitted; an explicit `--fail-on` replaces that default
+list rather than extending it. `other` covers every finding that matches none of the seven
+specific categories and is never part of the default policy.
+
+**Warning:** `other` also matches informational notices, not only real problems: the offline
+notice, the skipped-lookup notice for any manifest without a lock file, an unresolved
+self-hosted GitLab host, the dependency-ceiling notice, collapsed registry-fetch failures, and
+`sha-comment-mismatch` hints. It therefore fails the run on any manifest without a lock file
+and on every `--offline` run, and cannot target one of these findings alone.
 
 | Exit code | Meaning |
 |---|---|

@@ -439,6 +439,43 @@ fn test_default_mode_ignores_gitignore_through_the_real_binary_and_exits_clean()
     );
 }
 
+/// #1733: `--fail-on other` must turn an uncategorized finding into exit 1 — here the
+/// offline notice, which is `Other` — while the default policy leaves the same run at exit 0.
+#[test]
+fn test_fail_on_other_exits_one_on_other_finding_and_default_policy_exits_zero() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0\"\n",
+    )
+    .expect("write fixture manifest");
+
+    let run = |extra: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_deps-cli"))
+            .args(["check", "--offline"])
+            .args(extra)
+            .arg(dir.path())
+            .output()
+            .expect("run the real deps-cli binary")
+    };
+
+    let default = run(&[]);
+    assert_eq!(
+        default.status.code(),
+        Some(0),
+        "default policy must not fail on an Other finding — stderr: {}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+    let other = run(&["--fail-on", "other"]);
+    assert_eq!(
+        other.status.code(),
+        Some(1),
+        "--fail-on other must fail on an Other finding — stdout: {} stderr: {}",
+        String::from_utf8_lossy(&other.stdout),
+        String::from_utf8_lossy(&other.stderr)
+    );
+}
+
 /// Issue #1124's own repro, exercised through the real binary (mirroring reviewer follow-up
 /// #5's rationale above for `--respect-gitignore`): a manifest replaced by a broken symlink
 /// must not be silently dropped from the scan, and the warning must distinguish this case

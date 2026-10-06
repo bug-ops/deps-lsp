@@ -187,10 +187,16 @@ elsewhere in the run — one malformed manifest in a large workspace never hides
 
 ### `--fail-on` categories
 
-`outdated`, `yanked`, `vulnerable`, `unsatisfiable`, `mutable-ref`, `license`, `deprecated`.
-Defaults to `vulnerable,yanked,unsatisfiable` when the flag is omitted. A finding that matches
-none of these seven categories (for example, an unresolved or unknown package) is always
-reported in the output but can never fail a run through this flag.
+`outdated`, `yanked`, `vulnerable`, `unsatisfiable`, `mutable-ref`, `license`, `deprecated`,
+`other`. Defaults to `vulnerable,yanked,unsatisfiable` when the flag is omitted. `other` covers
+every finding that matches none of the seven specific categories and is never part of the
+default policy.
+
+**Warning:** `other` also matches informational notices, not only real problems: the offline
+notice, the skipped-lookup notice for any manifest without a lock file, an unresolved
+self-hosted GitLab host, the dependency-ceiling notice, collapsed registry-fetch failures, and
+`sha-comment-mismatch` hints. It therefore fails the run on any manifest without a lock file
+and on every `--offline` run, and cannot target one of these findings alone.
 
 ### `update` subcommand
 

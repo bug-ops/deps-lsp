@@ -292,7 +292,9 @@ pub struct UpdateItemDocument {
     pub outcome: OutcomeToken,
     /// A one-line human-readable reason for `outcome`.
     pub reason: String,
-    /// OSV advisory ids this item resolves — non-empty only in `--security-only` mode.
+    /// OSV advisory ids this item resolves — non-empty only in `--security-only` mode; for
+    /// `unfixable` rows only when a fix is known (`Yanked`, `UnsupportedRequirementShape`,
+    /// `OversizedRequirement`), empty for `NoVerifiedFix` and `FetchFailedOrAbsent`.
     pub advisory_ids: Vec<String>,
     /// Spec 075 FR-013: this item's cooldown-fallback attribution, when one was consulted.
     /// Additive (NFR-005) — omitted entirely, not `null`, when the item has none.

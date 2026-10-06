@@ -151,10 +151,12 @@ pub struct PlannedUpdateItem {
     /// makes a target only representable where the variant actually carries one, rather than
     /// as a second, independently settable item-level field). Read it via [`Self::target`].
     pub outcome: Outcome,
-    /// OSV advisory ids this item resolves. Populated in `--security-only` mode, and also in
-    /// default mode for a cooldown-fallback decision that names a `Flagged` `latest`/fallback
-    /// verdict (spec 075 FR-011/FR-012) — empty for an `Unverified` verdict, which carries no
-    /// advisory list to report.
+    /// OSV advisory ids this item resolves. Populated in `--security-only` mode — for
+    /// `Unfixable` rows only when a fix is known (`Yanked`, `UnsupportedRequirementShape`,
+    /// `OversizedRequirement`; empty for `NoVerifiedFix` and `FetchFailedOrAbsent`, #1618) —
+    /// and also in default mode for a cooldown-fallback decision that names a `Flagged`
+    /// `latest`/fallback verdict (spec 075 FR-011/FR-012) — empty for an `Unverified` verdict,
+    /// which carries no advisory list to report.
     pub advisory_ids: Vec<String>,
     /// Whether a matching `[update].ignore` rule exists but was overridden (FR-008,
     /// `--security-only` mode only — the rule never applies in default mode, since a match
