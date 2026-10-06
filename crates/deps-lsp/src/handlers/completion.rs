@@ -960,6 +960,7 @@ mod tests {
                 version: ConcreteVersion::new("1.2.0"),
                 advisory_ids: Capped::new(vec!["MAL-2026-00001".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
+                via_sibling_tags: None,
             },
         );
         doc.update_latest_status(latest_status);
@@ -1206,6 +1207,7 @@ mod tests {
                         version: ConcreteVersion::new("1.2.0"),
                         advisory_ids: Capped::new(vec!["MAL-2026-00002".to_string()], 1),
                         worst_severity: Some(VulnSeverity::Malicious),
+                        via_sibling_tags: None,
                     },
                 ))
                 .collect(),
@@ -1405,6 +1407,7 @@ mod tests {
                 version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
+                via_sibling_tags: None,
             },
         );
         doc.update_latest_status(latest_status);
@@ -1419,6 +1422,7 @@ mod tests {
                         version: ConcreteVersion::new("1.0.6"),
                         advisory_ids: Capped::new(vec!["MAL-2026-16331".to_string()], 1),
                         worst_severity: Some(VulnSeverity::Malicious),
+                        via_sibling_tags: None,
                     },
                 ))
                 .collect(),
@@ -1531,6 +1535,7 @@ mod tests {
                         version: ConcreteVersion::new("2.31.0"),
                         advisory_ids: Capped::new(vec!["MAL-2026-00003".to_string()], 1),
                         worst_severity: Some(VulnSeverity::Malicious),
+                        via_sibling_tags: None,
                     },
                 ))
                 .collect(),
@@ -1618,6 +1623,7 @@ mod tests {
                 version: ConcreteVersion::new("9.9.9"),
                 advisory_ids: Capped::new(vec!["MAL-2026-00004".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
+                via_sibling_tags: None,
             },
         );
         doc.update_latest_status(latest_status);
@@ -1631,6 +1637,7 @@ mod tests {
                         version: ConcreteVersion::new("9.8.0"),
                         advisory_ids: Capped::new(vec!["MAL-2026-00005".to_string()], 1),
                         worst_severity: Some(VulnSeverity::Malicious),
+                        via_sibling_tags: None,
                     },
                 ))
                 .collect(),
@@ -1822,6 +1829,7 @@ mod tests {
                         version: ConcreteVersion::new("0.5.0"),
                         advisory_ids: Capped::new(vec!["MAL-2026-00006".to_string()], 1),
                         worst_severity: Some(VulnSeverity::Malicious),
+                        via_sibling_tags: None,
                     },
                 ))
                 .collect(),

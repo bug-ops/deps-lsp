@@ -22,10 +22,10 @@ use super::diagnostics::{MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_VALUE_CHARS};
 use super::diagnostics::{MAX_DIAGNOSTIC_PROSE_CHARS, MAX_VERSION_DIAGNOSTIC_CHARS};
 use super::hover_markdown::{FieldKind, HoverMarkdown};
 use super::{
-    CooldownBlocker, CooldownPrecedence, EcosystemFormatter, HOVER_RECENT_VERSIONS, LatestVerdict,
-    VersionData, await_versions_fetch, cooldown_precedence, escape_markdown, in_use_version,
-    latest_verdict, markdown_code_span, position_in_range, resolve_in_use_version,
-    resolve_scan_outcome,
+    CooldownBlocker, CooldownPrecedence, DiagnosticMessages, EcosystemFormatter,
+    HOVER_RECENT_VERSIONS, LatestVerdict, SiblingMatchNote, VersionData, await_versions_fetch,
+    cooldown_precedence, escape_markdown, in_use_version, latest_verdict, markdown_code_span,
+    position_in_range, resolve_in_use_version, resolve_scan_outcome,
 };
 use crate::github::normalize_tag;
 
@@ -327,6 +327,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         now,
         precedence,
         &latest_verdict_result,
+        formatter,
     );
 
     let vuln_outcome = versions
@@ -701,6 +702,7 @@ fn push_latest_hover_section(
     now: PublishTime,
     precedence: CooldownPrecedence,
     latest_verdict: &LatestVerdict,
+    messages: &dyn DiagnosticMessages,
 ) {
     let Some((latest_ver, raw_published_at)) = latest_line else {
         return;
@@ -724,6 +726,7 @@ fn push_latest_hover_section(
     if let LatestVerdict::Flagged {
         advisory_ids,
         malicious,
+        via_sibling_tags,
     } = latest_verdict
     {
         if *malicious {
@@ -741,6 +744,12 @@ fn push_latest_hover_section(
             markdown.push_static("> ");
             markdown.push_text(&advisory_ids.join(", "), FieldKind::Prose);
             markdown.push_static("\n");
+        }
+        if let Some(tags) = via_sibling_tags {
+            let note = SiblingMatchNote::new(messages, tags);
+            markdown.push_static("> *(");
+            markdown.push_trusted(escape_markdown(&note.to_string()));
+            markdown.push_static(")*\n");
         }
         markdown.push_static("\n");
         return;
@@ -1185,12 +1194,9 @@ fn push_vulnerability_hover_section(
                 );
                 markdown.push_static("\n");
                 if let Some(tags) = dv.sibling_match(&advisory.id) {
+                    let note = SiblingMatchNote::new(formatter, tags);
                     markdown.push_static("  *(");
-                    markdown.push_static(formatter.sibling_match_label());
-                    markdown.push_static(" ");
-                    markdown.push_trusted(escape_markdown(
-                        &super::diagnostics::format_matched_tags(tags),
-                    ));
+                    markdown.push_trusted(escape_markdown(&note.to_string()));
                     markdown.push_static(")*\n");
                 }
 
@@ -1231,6 +1237,7 @@ fn push_vulnerability_hover_section(
             if let Some(crate::osv::UpgradeStatus::CandidateVulnerable {
                 version,
                 advisory_ids,
+                via_sibling_tags,
                 ..
             }) = latest_status
                 // Deliberately the full (fix-computation) `dv.advisories`, not
@@ -1240,7 +1247,14 @@ fn push_vulnerability_hover_section(
             {
                 markdown.push_static("\n\u{26a0}\u{fe0f} Latest version ");
                 markdown.push_code(version.as_str(), FieldKind::Version);
-                markdown.push_static(" is also affected.\n");
+                markdown.push_static(" is also affected");
+                if let Some(tags) = via_sibling_tags {
+                    let note = SiblingMatchNote::new(formatter, tags);
+                    markdown.push_static(" *(");
+                    markdown.push_trusted(escape_markdown(&note.to_string()));
+                    markdown.push_static(")*");
+                }
+                markdown.push_static(".\n");
             }
 
             markdown.push_static("\n");
@@ -1717,6 +1731,7 @@ mod tests {
             PublishTime::now(),
             CooldownPrecedence::Cleared,
             &LatestVerdict::NotApplicable,
+            &MOCK_FORMATTER,
         );
         assert!(markdown.as_str().len() < long.len(), "got: {markdown}");
         assert!(markdown.as_str().contains('…'));
@@ -1736,6 +1751,7 @@ mod tests {
             PublishTime::now(),
             CooldownPrecedence::Cleared,
             &LatestVerdict::NotApplicable,
+            &MOCK_FORMATTER,
         );
         assert_eq!(markdown.as_str(), format!("**Latest**: `{at_cap}`\n\n"));
 
@@ -1748,6 +1764,7 @@ mod tests {
             PublishTime::now(),
             CooldownPrecedence::Cleared,
             &LatestVerdict::NotApplicable,
+            &MOCK_FORMATTER,
         );
         assert_eq!(
             markdown.as_str(),
@@ -1769,6 +1786,7 @@ mod tests {
             PublishTime::now(),
             CooldownPrecedence::Cleared,
             &LatestVerdict::NotApplicable,
+            &MOCK_FORMATTER,
         );
         assert!(!markdown.as_str().contains('\u{0600}'), "got: {markdown}");
     }
@@ -1785,6 +1803,7 @@ mod tests {
             PublishTime::from_unix_secs(1_000),
             CooldownPrecedence::Blocked(CooldownBlocker::Gossip),
             &LatestVerdict::NotApplicable,
+            &MOCK_FORMATTER,
         );
         assert!(
             markdown.as_str().contains("deps.dev/GOSSIP"),
@@ -1806,6 +1825,7 @@ mod tests {
                 published_at: PublishTime::from_unix_secs(999_999),
             }),
             &LatestVerdict::NotApplicable,
+            &MOCK_FORMATTER,
         );
         assert!(
             !markdown.as_str().contains("deps.dev/GOSSIP"),
@@ -1831,6 +1851,7 @@ mod tests {
             PublishTime::from_unix_secs(1_000_000),
             CooldownPrecedence::Cleared,
             &LatestVerdict::NotApplicable,
+            &MOCK_FORMATTER,
         );
         assert!(
             !markdown.as_str().contains("Recently published"),
@@ -1847,6 +1868,7 @@ mod tests {
         let verdict = LatestVerdict::Flagged {
             advisory_ids: vec!["MAL-2026-16332".to_string()],
             malicious: true,
+            via_sibling_tags: None,
         };
         push_latest_hover_section(
             &mut markdown,
@@ -1855,6 +1877,7 @@ mod tests {
             PublishTime::from_unix_secs(1_000_000),
             CooldownPrecedence::Blocked(CooldownBlocker::Gossip),
             &verdict,
+            &MOCK_FORMATTER,
         );
         assert!(
             !markdown.as_str().contains("Recently published"),
@@ -1878,6 +1901,7 @@ mod tests {
         let verdict = LatestVerdict::Flagged {
             advisory_ids: vec!["GHSA-xxxx".to_string()],
             malicious: false,
+            via_sibling_tags: None,
         };
         push_latest_hover_section(
             &mut markdown,
@@ -1886,6 +1910,7 @@ mod tests {
             PublishTime::now(),
             CooldownPrecedence::Cleared,
             &verdict,
+            &MOCK_FORMATTER,
         );
         assert!(
             markdown.as_str().contains("flagged by OSV.dev"),
@@ -5252,6 +5277,7 @@ mod tests {
                 version: "2.0.0".into(),
                 advisory_ids: Capped::new(vec!["RUSTSEC-2020-0071".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Critical),
+                via_sibling_tags: None,
             },
         );
 
@@ -5310,6 +5336,7 @@ mod tests {
             version: ConcreteVersion::new("V".repeat(500)),
             advisory_ids: Capped::new(vec!["RUSTSEC-2020-0071".to_string()], 1),
             worst_severity: Some(VulnSeverity::High),
+            via_sibling_tags: None,
         };
 
         let outcome = ScanOutcome::Vulnerable(dv);
@@ -5484,6 +5511,73 @@ mod tests {
         );
     }
 
+    fn sibling_only_latest() -> crate::osv::UpgradeStatus {
+        use crate::osv::{Capped, MatchedTags, UpgradeStatus, VulnSeverity};
+
+        UpgradeStatus::CandidateVulnerable {
+            version: crate::ConcreteVersion::new("v4.8.0"),
+            advisory_ids: Capped::new(vec!["A-1".to_string()], 1),
+            worst_severity: Some(VulnSeverity::High),
+            via_sibling_tags: Some(MatchedTags::new(
+                crate::ConcreteVersion::new("v4.9.0"),
+                vec![],
+            )),
+        }
+    }
+
+    /// #1767: "Latest version X is also affected" names the sibling tags the latest matched.
+    #[test]
+    fn push_vulnerability_hover_section_also_affected_names_sibling_tags() {
+        use crate::osv::{Capped, DependencyVulnerabilities, ScanOutcome, VulnSeverity};
+
+        let dv = DependencyVulnerabilities::new(Capped::new(
+            vec![sample_advisory("A-1", VulnSeverity::High)],
+            1,
+        ));
+        let mut markdown = HoverMarkdown::new();
+        push_vulnerability_hover_section(
+            &mut markdown,
+            &crate::test_util::StubFormatter::DEFAULT,
+            Some(&ScanOutcome::Vulnerable(dv)),
+            Some(&sibling_only_latest()),
+        );
+
+        assert!(
+            markdown
+                .as_str()
+                .contains("is also affected *(matched tag v4\\.9\\.0)*."),
+            "{markdown}"
+        );
+    }
+
+    /// #1767: the flagged-latest callout names the sibling tags too.
+    #[test]
+    fn push_latest_hover_section_flagged_callout_names_sibling_tags() {
+        let verdict = LatestVerdict::Flagged {
+            advisory_ids: vec!["A-1".to_string()],
+            malicious: false,
+            via_sibling_tags: Some(crate::osv::MatchedTags::new(
+                crate::ConcreteVersion::new("v4.9.0"),
+                vec![],
+            )),
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_latest_hover_section(
+            &mut markdown,
+            Some(("v4.8.0", None)),
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+            CooldownPrecedence::Cleared,
+            &verdict,
+            &MOCK_FORMATTER,
+        );
+
+        assert!(
+            markdown.as_str().contains("> *(matched tag v4\\.9\\.0)*"),
+            "{markdown}"
+        );
+    }
+
     #[tokio::test]
     async fn test_generate_hover_malicious_advisory_never_renders_unknown_severity() {
         // SC-001: a MAL-* advisory (e.g. the live MAL-2025-47141 record for
@@ -5630,6 +5724,7 @@ mod tests {
                 version: ConcreteVersion::new("0.5.0"),
                 advisory_ids: Capped::new(vec!["RUSTSEC-2024-0320".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Informational),
+                via_sibling_tags: None,
             },
         );
 
@@ -5700,6 +5795,7 @@ mod tests {
                     2,
                 ),
                 worst_severity: Some(VulnSeverity::High),
+                via_sibling_tags: None,
             },
         );
 

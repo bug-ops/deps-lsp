@@ -734,6 +734,41 @@ impl TagIndex {
         )
     }
 
+    /// The index key naming the release `version` and the commit it points at, for rewriting a
+    /// SHA pin to that release (`<sha> # <key>`).
+    ///
+    /// An exact key wins even when a differently spelled twin (`4.1.3` beside `v4.1.3`) points
+    /// elsewhere: git resolves the written text exactly, so that is the tag the user meant.
+    /// Without an exact key this is [`Self::release_tag`], so a fix version `4.1.3` finds
+    /// `v4.1.3` and the comment is written in the key's own spelling, while conflicting twins
+    /// yield `None`.
+    ///
+    /// Callers rewriting a pin to an OSV fix version must first verify that version through
+    /// [`Self::release_tag`] (the sibling lookup of a fix-target check does): the exact-key
+    /// preference alone would bind `4.1.3` to a twin spelling's commit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{CommitSha, TagIndex};
+    ///
+    /// let a = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let b = CommitSha::parse(&"b".repeat(40)).unwrap();
+    /// let index = TagIndex::from_tags([("v4.1.3", &a), ("5.0.0", &a), ("v5.0.0", &b)]);
+    /// let (tag, sha) = index.release_commit("4.1.3").unwrap();
+    /// assert_eq!((tag.as_str(), &sha), ("v4.1.3", &a));
+    /// assert_eq!(index.release_commit("5.0.0").unwrap().1, a);
+    /// assert!(index.release_commit("v9.9.9").is_none());
+    /// ```
+    #[must_use]
+    pub fn release_commit(&self, version: &str) -> Option<(crate::ConcreteVersion, CommitSha)> {
+        let (key, sha) = self.tag_to_sha.get_key_value(version).or_else(|| {
+            let key = self.release_tag(version)?;
+            self.tag_to_sha.get_key_value(key)
+        })?;
+        Some((crate::ConcreteVersion::new(key), sha.clone()))
+    }
+
     /// Attaches the repository's canonical casing as reported by GitHub.
     #[must_use]
     pub fn with_canonical_repo_name(
@@ -791,40 +826,184 @@ impl TagIndex {
     /// the comment beside it names another commit, or nothing.
     ///
     /// [`PinResolution::Untagged`] requires a populated, [`ListCoverage::Complete`] index that
-    /// lacks `sha`; an empty or truncated index is [`PinResolution::Unresolved`], except that a
-    /// [`ListCoverage::Truncated`] index which lacks `sha` yet maps the full-version `comment`
-    /// to a different commit is [`PinResolution::CommentContradicted`]. A moving-alias comment
-    /// (`# v4`) is never contradicted, since such a tag legitimately drifts.
+    /// lacks `sha`; an empty index is [`PinResolution::Unresolved`]. A populated
+    /// [`ListCoverage::Truncated`] index which lacks `sha` is [`PinResolution::Unlisted`],
+    /// except that one which maps the full-version `comment` to a different commit is
+    /// [`PinResolution::CommentContradicted`]. A moving-alias comment (`# v4`) is never
+    /// contradicted, since such a tag legitimately drifts.
     ///
     /// A comment naming a full version the truncated index does not list at all (a forged
-    /// `# v99.0.0`) is still [`PinResolution::Unresolved`].
+    /// `# v99.0.0`) is [`PinResolution::Unlisted`], not trusted.
     ///
     /// # Examples
     ///
     /// ```
     /// use deps_core::lsp_helpers::{CommitSha, PinResolution, TagIndex};
+    /// use deps_core::pagination::ListCoverage;
     ///
     /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
     /// let other = CommitSha::parse(&"b".repeat(40)).unwrap();
     /// let index = TagIndex::from_tags([("v1.0.0", &sha)]);
-    /// assert!(matches!(index.pin_resolution(&sha, None), PinResolution::Resolved(_)));
+    /// assert!(matches!(index.pin_resolution(&sha, None), PinResolution::Resolved { .. }));
     /// assert_eq!(index.pin_resolution(&other, None), PinResolution::Untagged);
     /// assert_eq!(TagIndex::default().pin_resolution(&other, None), PinResolution::Unresolved);
+    /// let truncated = TagIndex::from_tags([("v1.0.0", &sha)]).with_coverage(ListCoverage::Truncated);
+    /// assert_eq!(truncated.pin_resolution(&other, None), PinResolution::Unlisted);
     /// ```
     #[must_use]
     pub fn pin_resolution(&self, sha: &CommitSha, comment: Option<&CommentTag>) -> PinResolution {
-        // TODO(#1766): a truncated index with the SHA and a full-version comment both absent,
-        // the comment ahead of latest, is still trusted for status and the GitHub Actions OSV query.
         if let Some(pin) = self.sha_to_tag.get(sha) {
-            return PinResolution::Resolved(pin.clone());
+            return PinResolution::Resolved {
+                pin: pin.clone(),
+                sibling_coverage: self.coverage,
+            };
+        }
+        if self.is_empty() {
+            return PinResolution::Unresolved;
         }
         match self.coverage {
-            ListCoverage::Complete if !self.is_empty() => PinResolution::Untagged,
-            ListCoverage::Complete => PinResolution::Unresolved,
+            ListCoverage::Complete => PinResolution::Untagged,
             ListCoverage::Truncated if self.comment_names_other_commit(sha, comment) => {
                 PinResolution::CommentContradicted
             }
-            ListCoverage::Truncated => PinResolution::Unresolved,
+            ListCoverage::Truncated => PinResolution::Unlisted,
+        }
+    }
+
+    /// What the index proves about a pin written as the exact tag `written` (`v4.8.0`).
+    ///
+    /// [`PinResolution::Resolved`] when the tag is listed, with [`Self::resolved_exact_tag`]'s
+    /// siblings. A tag missing from a populated [`ListCoverage::Truncated`] index is
+    /// [`PinResolution::Unlisted`], since the list may simply not reach it; missing from a
+    /// complete index, or from an empty one, it is [`PinResolution::Unresolved`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{CommitSha, PinResolution, TagIndex};
+    /// use deps_core::pagination::ListCoverage;
+    ///
+    /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let complete = TagIndex::from_tags([("v4.8.0", &sha)]);
+    /// assert!(matches!(complete.exact_tag_resolution("v4.8.0"), PinResolution::Resolved { .. }));
+    /// assert_eq!(complete.exact_tag_resolution("v4.9.0"), PinResolution::Unresolved);
+    /// let truncated = TagIndex::from_tags([("v4.8.0", &sha)]).with_coverage(ListCoverage::Truncated);
+    /// assert_eq!(truncated.exact_tag_resolution("v4.9.0"), PinResolution::Unlisted);
+    /// ```
+    #[must_use]
+    pub fn exact_tag_resolution(&self, written: &str) -> PinResolution {
+        match self.resolved_exact_tag(written) {
+            Some(pin) => PinResolution::Resolved {
+                pin,
+                sibling_coverage: self.coverage,
+            },
+            None => self.unlisted_or_unresolved(),
+        }
+    }
+
+    /// What the index proves about a pin written as the floating tag `written` (`v4`, `v4.1`).
+    ///
+    /// Resolves through the commit `written` currently points at, to the most specific release
+    /// that equals or extends `written` on that commit: a commit that also carries an unrelated
+    /// `v5.0.0` is not reported as that version. [`PinResolution::Unresolved`] when `written`
+    /// names no release on its commit. A `written` that a populated [`ListCoverage::Truncated`]
+    /// index does not list is [`PinResolution::Unlisted`], and an unlisted one on a complete
+    /// index [`PinResolution::Unresolved`]. The sub-selection never narrows
+    /// [`PinResolution::Resolved`]'s `sibling_coverage`: it is this index's own.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{CommitSha, PinResolution, TagIndex};
+    /// use deps_core::pagination::ListCoverage;
+    ///
+    /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let index = TagIndex::from_tags([("v4", &sha), ("v4.2.0", &sha), ("v5.0.0", &sha)])
+    ///     .with_coverage(ListCoverage::Truncated);
+    /// let PinResolution::Resolved { pin, sibling_coverage } = index.floating_tag_resolution("v4")
+    /// else {
+    ///     panic!("v4 resolves");
+    /// };
+    /// assert_eq!(pin.version().as_str(), "v4.2.0");
+    /// assert_eq!(sibling_coverage, ListCoverage::Truncated);
+    /// ```
+    #[must_use]
+    pub fn floating_tag_resolution(&self, written: &str) -> PinResolution {
+        let Some(commit) = self.tag_to_sha.get(written) else {
+            return self.unlisted_or_unresolved();
+        };
+        let candidates = self
+            .tag_to_sha
+            .iter()
+            .filter(|(tag, sha)| {
+                *sha == commit && (tag.as_str() == written || extends_tag(tag, written))
+            })
+            .map(|(tag, sha)| (tag.as_str(), sha));
+        Self::from_tags(candidates)
+            .resolved_pin(commit)
+            .map_or(PinResolution::Unresolved, |pin| PinResolution::Resolved {
+                pin,
+                sibling_coverage: self.coverage,
+            })
+    }
+
+    /// Caps an up-to-date status read from the text of a tag pin `written` that this index
+    /// proves unpublished (see [`Self::unpublished_tag_ref`] and [`UnpublishedRef::cap_status`]):
+    /// a full release at any position, a partial shape only when ahead of `latest`. Any other
+    /// pin, and an index that cannot prove absence, leave `status`.
+    #[must_use]
+    pub fn cap_status_if_unpublished(
+        &self,
+        written: &str,
+        latest: &str,
+        policy: PartialTagPolicy,
+        status: RequirementStatus,
+    ) -> RequirementStatus {
+        self.unpublished_tag_ref(written).map_or(status, |kind| {
+            kind.cap_status(written, latest, policy, status)
+        })
+    }
+
+    /// Caps a status read from the text of the tag pin `written` to never up to date when a
+    /// populated [`ListCoverage::Truncated`] index does not list that exact tag (#1769): the
+    /// list may simply not reach it, so the text cannot prove it current. Any other index leaves
+    /// `status`; an outdated status stays outdated.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{CommitSha, RequirementStatus, TagIndex};
+    /// use deps_core::pagination::ListCoverage;
+    ///
+    /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let truncated = TagIndex::from_tags([("v4.8.0", &sha)]).with_coverage(ListCoverage::Truncated);
+    /// let up = RequirementStatus::UpToDate;
+    /// assert_eq!(truncated.cap_status_if_tag_unlisted("v9.0.0", up), RequirementStatus::Unresolved);
+    /// assert_eq!(truncated.cap_status_if_tag_unlisted("v4.8.0", up), up);
+    /// let complete = TagIndex::from_tags([("v4.8.0", &sha)]);
+    /// assert_eq!(complete.cap_status_if_tag_unlisted("v9.0.0", up), up);
+    /// ```
+    #[must_use]
+    pub fn cap_status_if_tag_unlisted(
+        &self,
+        written: &str,
+        status: RequirementStatus,
+    ) -> RequirementStatus {
+        if matches!(self.unlisted_or_unresolved(), PinResolution::Unlisted)
+            && !self.tag_to_sha.contains_key(written)
+        {
+            status.never_up_to_date()
+        } else {
+            status
+        }
+    }
+
+    /// [`PinResolution::Unlisted`] for a populated truncated index, else
+    /// [`PinResolution::Unresolved`].
+    fn unlisted_or_unresolved(&self) -> PinResolution {
+        match self.coverage {
+            ListCoverage::Truncated if !self.is_empty() => PinResolution::Unlisted,
+            ListCoverage::Truncated | ListCoverage::Complete => PinResolution::Unresolved,
         }
     }
 
@@ -852,51 +1031,70 @@ impl TagIndex {
         named_elsewhere
     }
 
-    /// Whether the index proves no tag spelled `tag` (with or without a `v` prefix) exists.
+    /// What the index proves about a tag-shaped ref `written` (`4.3.1`, `v40`) that no tag of
+    /// that exact text matches: `None` when the ref is listed, is not tag-shaped, or the index
+    /// cannot speak for absence (empty or [`ListCoverage::Truncated`]).
     ///
-    /// Requires a populated, [`ListCoverage::Complete`] index; an empty or truncated one proves
-    /// nothing.
-    #[must_use]
-    pub(crate) fn proves_tag_absent(&self, tag: &str) -> bool {
-        if self.coverage != ListCoverage::Complete || self.is_empty() {
-            return false;
-        }
-        let bare = crate::github::normalize_tag(tag);
-        ![tag, bare, &format!("v{bare}")]
-            .iter()
-            .any(|spelling| self.tag_to_sha.contains_key(*spelling))
-    }
-
-    /// Whether `written` sits ahead of `latest` by version and the index proves
-    /// no such tag exists, so a mistyped or nonexistent pin (`@v40`) is not current.
+    /// Git refs are exact, so `4.3.1` is missing from a repository that only tags `v4.3.1`. The
+    /// [`UnpublishedRef`] says how plausible a branch of that name is; see its variants.
     ///
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::{CommitSha, PartialTagPolicy, TagIndex};
+    /// use deps_core::lsp_helpers::{CommitSha, TagIndex, UnpublishedRef};
     ///
     /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
-    /// let index = TagIndex::from_tags([("v4.3.1", &sha), ("v5.0.0-rc.1", &sha)]);
-    /// let proves = |written| index.proves_ahead_tag_absent(written, "v4.3.1", PartialTagPolicy::MovingLine);
-    /// assert!(proves("v40"));
-    /// assert!(!proves("v5.0.0-rc.1"));
-    /// assert!(!proves("v4"));
+    /// let index = TagIndex::from_tags([("v4.3.1", &sha)]);
+    /// assert_eq!(index.unpublished_tag_ref("4.3.1"), Some(UnpublishedRef::Release));
+    /// assert_eq!(index.unpublished_tag_ref("v40"), Some(UnpublishedRef::Partial));
+    /// assert_eq!(index.unpublished_tag_ref("v4.3.1"), None);
     /// ```
     #[must_use]
-    pub fn proves_ahead_tag_absent(
-        &self,
-        written: &str,
-        latest: &str,
-        policy: PartialTagPolicy,
-    ) -> bool {
-        tag_pin_position(written, latest, policy) == TagPinPosition::Ahead
-            && self.proves_tag_absent(written)
+    pub fn unpublished_tag_ref(&self, written: &str) -> Option<UnpublishedRef> {
+        if self.coverage != ListCoverage::Complete
+            || self.is_empty()
+            || !is_tag_shaped(written)
+            || self.tag_to_sha.contains_key(written)
+        {
+            return None;
+        }
+        Some(if is_release_shaped(written) {
+            UnpublishedRef::Release
+        } else {
+            UnpublishedRef::Partial
+        })
     }
 
     /// Whether the index holds no tag in either direction.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tag_to_sha.is_empty() && self.sha_to_tag.is_empty()
+    }
+
+    /// Whether `other` differs from `self` in anything a finding is derived from: the
+    /// tag-to-commit mapping, the list coverage, or the canonical repository name.
+    ///
+    /// Drives [`crate::TagIndexRefreshSender`]: a refetch that changes none of these cannot
+    /// change a finding, so it must not trigger a rescan.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{CommitSha, TagIndex};
+    /// use deps_core::pagination::ListCoverage;
+    ///
+    /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let complete = TagIndex::from_tags([("v1", &sha)]);
+    /// let same = TagIndex::from_tags([("v1", &sha)]);
+    /// let truncated = TagIndex::from_tags([("v1", &sha)]).with_coverage(ListCoverage::Truncated);
+    /// assert!(!complete.observably_differs(&same));
+    /// assert!(complete.observably_differs(&truncated));
+    /// ```
+    #[must_use]
+    pub fn observably_differs(&self, other: &Self) -> bool {
+        self.tag_to_sha != other.tag_to_sha
+            || self.coverage != other.coverage
+            || self.canonical_repo_name != other.canonical_repo_name
     }
 }
 
@@ -906,17 +1104,95 @@ impl TagIndex {
 /// The variants are exhaustive so a consumer must decide what each means for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinResolution {
-    /// No out-of-band evidence (cold cache, truncated or empty index): manifest text may stand
-    /// in for the pin's version.
+    /// No out-of-band evidence (cold cache, empty index, or a pin the index cannot speak
+    /// about): manifest text may stand in for the pin's version.
     Unresolved,
+    /// A [`ListCoverage::Truncated`] index does not list the pinned commit or exact tag, so a
+    /// tag beyond the fetched list may name it. Manifest text may stand in for the pin's
+    /// version, but nothing derived from that text is authoritative: a clean OSV answer is
+    /// not trustworthy and a status read from the text never reads as up to date.
+    Unlisted,
     /// A truncated index lacks the commit but maps the comment's full-version tag to another
     /// commit, so the comment is provably wrong and must not stand in for the pin's version.
     CommentContradicted,
     /// A tag names the commit.
-    Resolved(ResolvedPin),
+    Resolved {
+        /// The resolved tag and the other release tags on its commit.
+        pin: ResolvedPin,
+        /// Whether `pin`'s siblings were read from a complete tag list; a truncated one may
+        /// have hidden further sibling tags.
+        sibling_coverage: ListCoverage,
+    },
     /// The index proves no release tag names the commit, so manifest text (a trailing
     /// comment) must not stand in for its version.
     Untagged,
+}
+
+/// How plausible it is that a tag-shaped ref no published tag matches is a branch instead, as
+/// reported by [`TagIndex::unpublished_tag_ref`].
+///
+/// Exhaustive so each consumer decides what every shape means. Top actions document branch pins
+/// that look like tags (`ruby/setup-ruby@v1`, `pnpm/action-setup@v3`,
+/// `aws-actions/configure-aws-credentials@v3-node20`, `codecov/codecov-action@v5.x`), so only a
+/// full release shape is reported as unknown.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{PartialTagPolicy, RequirementStatus, UnpublishedRef};
+///
+/// let capped = |kind: UnpublishedRef, written| {
+///     kind.cap_status(written, "v4.3.1", PartialTagPolicy::MovingLine, RequirementStatus::UpToDate)
+/// };
+/// assert_eq!(capped(UnpublishedRef::Release, "4.3.1"), RequirementStatus::Unresolved);
+/// assert_eq!(capped(UnpublishedRef::Partial, "v40"), RequirementStatus::Unresolved);
+/// assert_eq!(capped(UnpublishedRef::Partial, "v1"), RequirementStatus::UpToDate);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnpublishedRef {
+    /// A full release (`4.3.1`, `v4.3.10`, `v5.0.0-rc.1`: a plain `major.minor.patch` core, or one
+    /// with a recognized pre-release label): a branch with that name is implausible, so the ref
+    /// names nothing and is unknown at any position.
+    Release,
+    /// Any other tag-shaped ref (`v1`, `v5.x`, `v3-node20`, `v40`, `v3.4.0-working`): it may be a
+    /// branch, so only a ref ahead of the newest release is distrusted, and it is not reported.
+    Partial,
+}
+
+impl UnpublishedRef {
+    /// Caps a status read from the text of an unpublished ref: it never reads as up to date when
+    /// the ref is a [`Self::Release`], or a [`Self::Partial`] ahead of `latest`. An outdated
+    /// status stays outdated, since the bump target is valid either way.
+    #[must_use]
+    pub fn cap_status(
+        self,
+        written: &str,
+        latest: &str,
+        policy: PartialTagPolicy,
+        status: RequirementStatus,
+    ) -> RequirementStatus {
+        if status != RequirementStatus::UpToDate {
+            return status;
+        }
+        match self {
+            Self::Release => RequirementStatus::Unresolved,
+            Self::Partial => {
+                if tag_pin_position(written, latest, policy) == TagPinPosition::Ahead {
+                    RequirementStatus::Unresolved
+                } else {
+                    status
+                }
+            }
+        }
+    }
+}
+
+/// Whether `tag` is a full release: a plain `major.minor.patch` core, optionally with a
+/// recognized pre-release label (`rc`, `beta`, ...); a branch named like it is implausible.
+fn is_release_shaped(tag: &str) -> bool {
+    comparable_version(tag).is_some_and(|version| {
+        version.pre.is_empty() || is_prerelease_suffix(&format!("-{}", version.pre.as_str()))
+    })
 }
 
 /// Where a tag that names a pinned commit sits relative to the newest release, by version.
@@ -975,23 +1251,26 @@ pub enum ShaPinLookup {
     /// The repository's index is populated, [`ListCoverage::Complete`], and no tag points at
     /// the SHA.
     NotIndexed,
-    /// The index cannot vouch for the SHA either way: no populated index yet (cold cache), or
-    /// the SHA is absent from a [`ListCoverage::Truncated`] index.
+    /// No populated index yet (cold cache): the index says nothing about the SHA, so manifest
+    /// text may stand in for its status.
     Unverifiable,
+    /// A [`ListCoverage::Truncated`] index lacks the SHA: a tag beyond the fetched list may
+    /// name it. Manifest text may stand in for its status, except that it never reads as up to
+    /// date.
+    Unlisted,
     /// A [`ListCoverage::Truncated`] index lacks the SHA but maps the comment's full-version
     /// tag to another commit: the comment is provably wrong, so neither it nor the SHA vouches
-    /// for a status. Its [`Self::status`] is `Some(Unresolved)`, not `None` like
-    /// [`Self::Unverifiable`], because the comment is provably wrong and so must not be used as
-    /// the status fallback.
+    /// for a status. Its [`Self::status_or_text`] is `Unresolved`, never the text status,
+    /// because the comment must not be used as the status fallback.
     CommentContradicted,
 }
 
 impl ShaPinLookup {
     /// Looks `sha` up in `index` relative to `latest`.
     ///
-    /// A missing or empty `index`, or a SHA absent from a truncated one, yields
-    /// [`Self::Unverifiable`], never [`Self::NotIndexed`], so a cold cache or a capped tag
-    /// list is not mistaken for proof that the pin is stale. The one exception is a
+    /// A missing or empty `index` yields [`Self::Unverifiable`], and a SHA absent from a
+    /// truncated one [`Self::Unlisted`], never [`Self::NotIndexed`], so a cold cache or a capped
+    /// tag list is not mistaken for proof that the pin is stale. The one exception is a
     /// full-version `comment` that the truncated index maps to a different commit
     /// ([`Self::CommentContradicted`]).
     ///
@@ -1027,18 +1306,19 @@ impl ShaPinLookup {
             return Self::LatestCommit;
         }
         match index.pin_resolution(sha, comment) {
-            PinResolution::Resolved(pin) => Self::Indexed {
+            PinResolution::Resolved { pin, .. } => Self::Indexed {
                 tag: pin.version().clone(),
                 position: TagPosition::of(pin.version().as_str(), latest.as_str()),
             },
             PinResolution::Untagged => Self::NotIndexed,
             PinResolution::Unresolved => Self::Unverifiable,
+            PinResolution::Unlisted => Self::Unlisted,
             PinResolution::CommentContradicted => Self::CommentContradicted,
         }
     }
 
-    /// Maps the lookup to a [`RequirementStatus`], or `None` when the caller should fall back
-    /// to its own text-based classification (only for [`Self::Unverifiable`]).
+    /// Maps the lookup to a [`RequirementStatus`], asking `text` for the manifest-text status
+    /// only when the index cannot rule it out.
     ///
     /// [`Self::LatestCommit`] is up to date. [`Self::Indexed`] is up to date only when its
     /// tag is [`TagPosition::AtOrAboveLatest`]: a commit named
@@ -1047,7 +1327,10 @@ impl ShaPinLookup {
     /// `Unresolved`. [`Self::NotIndexed`] is `Outdated`: `latest` comes from the same fetch,
     /// so the pin is provably not `latest`'s commit, whatever a trailing `# tag` comment
     /// claims. [`Self::CommentContradicted`] is `Unresolved`: the comment is wrong, so it must
-    /// not be trusted, yet the pin's own age is unknown.
+    /// not be trusted, yet the pin's own age is unknown. [`Self::Unverifiable`] is `text()`.
+    /// [`Self::Unlisted`] is `text()` with `UpToDate` capped to `Unresolved`: a pin the truncated
+    /// list does not reach may be older than any comment claims, whatever the comment's shape
+    /// (`# v99.0.0`, `# v99`, a moving `# v4`); an `Outdated` text stays `Outdated`.
     ///
     /// # Examples
     ///
@@ -1060,32 +1343,35 @@ impl ShaPinLookup {
     /// let index = TagIndex::from_tags([("v1", &old), ("v1.5.0", &new)]);
     /// let latest = ConcreteVersion::new("v1.5.0");
     /// let lookup = ShaPinLookup::resolve(Some(&index), &old, &latest, None);
-    /// assert_eq!(lookup.status(), Some(RequirementStatus::Outdated));
-    /// assert_eq!(ShaPinLookup::LatestCommit.status(), Some(RequirementStatus::UpToDate));
-    /// assert_eq!(ShaPinLookup::Unverifiable.status(), None);
+    /// let text = || RequirementStatus::UpToDate;
+    /// assert_eq!(lookup.status_or_text(text), RequirementStatus::Outdated);
+    /// assert_eq!(ShaPinLookup::LatestCommit.status_or_text(text), RequirementStatus::UpToDate);
+    /// assert_eq!(ShaPinLookup::Unverifiable.status_or_text(text), RequirementStatus::UpToDate);
+    /// assert_eq!(ShaPinLookup::Unlisted.status_or_text(text), RequirementStatus::Unresolved);
     /// assert_eq!(
-    ///     ShaPinLookup::CommentContradicted.status(),
-    ///     Some(RequirementStatus::Unresolved)
+    ///     ShaPinLookup::CommentContradicted.status_or_text(text),
+    ///     RequirementStatus::Unresolved
     /// );
     /// ```
     #[must_use]
-    pub fn status(self) -> Option<RequirementStatus> {
+    pub fn status_or_text(self, text: impl FnOnce() -> RequirementStatus) -> RequirementStatus {
         match self {
-            Self::LatestCommit => Some(RequirementStatus::UpToDate),
+            Self::LatestCommit => RequirementStatus::UpToDate,
             Self::Indexed { tag, position } => {
                 let tag = crate::VersionReq::new(tag.as_str());
-                Some(if BoundedVersionReq::new(&tag).is_none() {
+                if BoundedVersionReq::new(&tag).is_none() {
                     RequirementStatus::Unresolved
                 } else {
                     match position {
                         TagPosition::AtOrAboveLatest => RequirementStatus::UpToDate,
                         TagPosition::BelowLatest => RequirementStatus::Outdated,
                     }
-                })
+                }
             }
-            Self::NotIndexed => Some(RequirementStatus::Outdated),
-            Self::CommentContradicted => Some(RequirementStatus::Unresolved),
-            Self::Unverifiable => None,
+            Self::NotIndexed => RequirementStatus::Outdated,
+            Self::CommentContradicted => RequirementStatus::Unresolved,
+            Self::Unverifiable => text(),
+            Self::Unlisted => text().never_up_to_date(),
         }
     }
 }
@@ -2011,36 +2297,62 @@ mod tests {
         }
     }
 
+    /// #1766: the shape of an unpublished ref decides how plausible a branch of that name is;
+    /// an exact key match, a truncated or empty index, or a non-tag ref never reports one.
     #[test]
-    fn test_proves_tag_absent_needs_a_populated_complete_index() {
+    fn test_unpublished_tag_ref_shape_table() {
+        use UnpublishedRef::{Partial, Release};
+
         let sha = sha_of('a');
-        let complete = TagIndex::from_tags([("v4.3.1", &sha)]);
-        assert!(complete.proves_tag_absent("v40"));
-        assert!(!complete.proves_tag_absent("v4.3.1"));
-        assert!(
-            !complete.proves_tag_absent("4.3.1"),
-            "spelling variant is present"
-        );
-        let bare = TagIndex::from_tags([("4.3.1", &sha)]);
-        assert!(!bare.proves_tag_absent("v4.3.1"));
+        let complete = TagIndex::from_tags([("v4.3.1", &sha), ("v4", &sha), ("v5.x", &sha)]);
+        for (written, expected) in [
+            ("4.3.1", Some(Release)),
+            ("v4.3.10", Some(Release)),
+            ("V4.3.2", Some(Release)),
+            ("v5.0.0-rc.1", Some(Release)),
+            ("v5.0.0-beta", Some(Release)),
+            ("v1", Some(Partial)),
+            ("v40", Some(Partial)),
+            ("v5.0", Some(Partial)),
+            ("v3-node20", Some(Partial)),
+            ("v1.2.3-node20", Some(Partial)),
+            ("v3.4.0-working", Some(Partial)),
+            ("v4.3.1", None),
+            ("v4", None),
+            ("v5.x", None),
+            ("main", None),
+            ("", None),
+        ] {
+            assert_eq!(complete.unpublished_tag_ref(written), expected, "{written}");
+        }
+
         let truncated =
             TagIndex::from_tags([("v4.3.1", &sha)]).with_coverage(ListCoverage::Truncated);
-        assert!(!truncated.proves_tag_absent("v40"));
-        assert!(!TagIndex::default().proves_tag_absent("v40"));
+        let empty = TagIndex::default();
+        for written in ["4.3.1", "v40", "v1"] {
+            assert_eq!(truncated.unpublished_tag_ref(written), None, "{written}");
+            assert_eq!(empty.unpublished_tag_ref(written), None, "{written}");
+        }
     }
 
+    /// #1766: a full release is unknown at any position; a partial shape only when ahead of
+    /// `latest` (#1753), so a documented branch pin (`v1`) stays up to date; outdated stays so.
     #[test]
-    fn test_proves_ahead_tag_absent_requires_ahead_position() {
-        let sha = sha_of('a');
-        let index = TagIndex::from_tags([("v4.3.1", &sha), ("v5.0.0", &sha)]);
-        let proves = |written| {
-            index.proves_ahead_tag_absent(written, "v4.3.1", PartialTagPolicy::MovingLine)
+    fn test_unpublished_ref_cap_status_by_shape_and_position() {
+        use RequirementStatus::{Outdated, Unresolved, UpToDate};
+        use UnpublishedRef::{Partial, Release};
+
+        let cap = |kind: UnpublishedRef, written, status| {
+            kind.cap_status(written, "v4.3.1", PartialTagPolicy::MovingLine, status)
         };
-        assert!(proves("v40"));
-        assert!(!proves("v5.0.0"), "listed ahead tag");
-        assert!(!proves("v4"), "moving line is never ahead");
-        assert!(!proves("v3"), "behind is outdated, not absent-ahead");
-        assert!(!proves("v4.3.1"));
+        assert_eq!(cap(Release, "4.3.1", UpToDate), Unresolved);
+        assert_eq!(cap(Release, "v9.0.0", UpToDate), Unresolved);
+        assert_eq!(cap(Release, "v3.0.0", Outdated), Outdated);
+        assert_eq!(cap(Partial, "v40", UpToDate), Unresolved);
+        assert_eq!(cap(Partial, "v4", UpToDate), UpToDate);
+        assert_eq!(cap(Partial, "v1", Outdated), Outdated);
+        assert_eq!(cap(Partial, "v3-node20", UpToDate), UpToDate);
+        assert_eq!(cap(Partial, "v40", Unresolved), Unresolved);
     }
 
     fn comment_tag(text: &str) -> CommentTag {
@@ -2065,13 +2377,13 @@ mod tests {
         for benign in ["v1", "v1.2.0"] {
             assert_eq!(
                 truncated.pin_resolution(&pinned, Some(&comment_tag(benign))),
-                PinResolution::Unresolved,
+                PinResolution::Unlisted,
                 "{benign}"
             );
         }
         assert_eq!(
             truncated.pin_resolution(&pinned, None),
-            PinResolution::Unresolved
+            PinResolution::Unlisted
         );
         assert_eq!(
             truncated.pin_resolution(&latest, Some(&full)),
@@ -2095,7 +2407,7 @@ mod tests {
         truncated.tag_to_sha.insert("1.1.0".into(), pinned.clone());
         assert_eq!(
             truncated.pin_resolution(&pinned, Some(&comment_tag("v1.1.0"))),
-            PinResolution::Unresolved,
+            PinResolution::Unlisted,
             "a variant tag pointing at the pin means the comment is not contradicted"
         );
     }
@@ -2109,10 +2421,86 @@ mod tests {
         let newest = crate::ConcreteVersion::new("v1.2.0");
         let lookup = ShaPinLookup::resolve(Some(&truncated), &pinned, &newest, Some(&comment));
         assert_eq!(lookup, ShaPinLookup::CommentContradicted);
-        assert_eq!(lookup.status(), Some(RequirementStatus::Unresolved));
+        assert_eq!(
+            lookup.status_or_text(|| RequirementStatus::UpToDate),
+            RequirementStatus::Unresolved
+        );
         assert_eq!(
             ShaPinLookup::resolve(Some(&truncated), &pinned, &newest, None),
-            ShaPinLookup::Unverifiable
+            ShaPinLookup::Unlisted
+        );
+    }
+
+    /// #1766: a SHA the truncated list does not reach never reads as up to date from text, in
+    /// whatever shape the comment is written; an outdated text status is kept.
+    #[test]
+    fn test_sha_pin_lookup_unlisted_caps_up_to_date_text() {
+        for text in [
+            RequirementStatus::UpToDate,
+            RequirementStatus::Outdated,
+            RequirementStatus::Unresolved,
+        ] {
+            let expected = if text == RequirementStatus::UpToDate {
+                RequirementStatus::Unresolved
+            } else {
+                text
+            };
+            assert_eq!(ShaPinLookup::Unlisted.status_or_text(|| text), expected);
+            assert_eq!(ShaPinLookup::Unverifiable.status_or_text(|| text), text);
+        }
+    }
+
+    #[test]
+    fn test_exact_tag_resolution_listed_missing_complete_and_truncated() {
+        let sha = sha_of('a');
+        let complete = TagIndex::from_tags([("v4.8.0", &sha)]);
+        assert_matches!(
+            complete.exact_tag_resolution("v4.8.0"),
+            PinResolution::Resolved {
+                sibling_coverage: ListCoverage::Complete,
+                ..
+            }
+        );
+        assert_eq!(
+            complete.exact_tag_resolution("v4.9.0"),
+            PinResolution::Unresolved
+        );
+        let truncated =
+            TagIndex::from_tags([("v4.8.0", &sha)]).with_coverage(ListCoverage::Truncated);
+        assert_matches!(
+            truncated.exact_tag_resolution("v4.8.0"),
+            PinResolution::Resolved {
+                sibling_coverage: ListCoverage::Truncated,
+                ..
+            }
+        );
+        assert_eq!(
+            truncated.exact_tag_resolution("v4.9.0"),
+            PinResolution::Unlisted
+        );
+        let empty = TagIndex::default().with_coverage(ListCoverage::Truncated);
+        assert_eq!(
+            empty.exact_tag_resolution("v4.9.0"),
+            PinResolution::Unresolved
+        );
+    }
+
+    /// The floating-tag sub-selection keeps the whole index's coverage.
+    #[test]
+    fn test_floating_tag_resolution_keeps_truncated_coverage() {
+        let sha = sha_of('a');
+        let index = TagIndex::from_tags([("v4", &sha), ("v4.2.0", &sha), ("v5.0.0", &sha)])
+            .with_coverage(ListCoverage::Truncated);
+        assert_matches!(
+            index.floating_tag_resolution("v4"),
+            PinResolution::Resolved { pin, sibling_coverage: ListCoverage::Truncated }
+                if pin.version().as_str() == "v4.2.0"
+        );
+        assert_eq!(index.floating_tag_resolution("v9"), PinResolution::Unlisted);
+        let complete = TagIndex::from_tags([("v4", &sha)]);
+        assert_eq!(
+            complete.floating_tag_resolution("v9"),
+            PinResolution::Unresolved
         );
     }
 
@@ -2146,7 +2534,7 @@ mod tests {
         let index = TagIndex::from_tags([("v1.0.0", &sha)]);
         assert_matches!(
             index.pin_resolution(&sha, None),
-            PinResolution::Resolved(pin) if pin.version().as_str() == "v1.0.0"
+            PinResolution::Resolved { pin, .. } if pin.version().as_str() == "v1.0.0"
         );
         assert_eq!(index.pin_resolution(&other, None), PinResolution::Untagged);
 
@@ -2154,11 +2542,14 @@ mod tests {
             TagIndex::from_tags([("v1.0.0", &sha)]).with_coverage(ListCoverage::Truncated);
         assert_eq!(
             truncated.pin_resolution(&other, None),
-            PinResolution::Unresolved
+            PinResolution::Unlisted
         );
         assert_matches!(
             truncated.pin_resolution(&sha, None),
-            PinResolution::Resolved(_)
+            PinResolution::Resolved {
+                sibling_coverage: ListCoverage::Truncated,
+                ..
+            }
         );
         assert_eq!(
             TagIndex::default().pin_resolution(&other, None),
@@ -2317,7 +2708,7 @@ mod tests {
             .with_coverage(ListCoverage::Truncated);
         assert_eq!(
             lookup(Some(&index), &"c".repeat(40), "v1.1.0"),
-            Some(ShaPinLookup::Unverifiable)
+            Some(ShaPinLookup::Unlisted)
         );
         assert_eq!(
             lookup(Some(&index), &"a".repeat(40), "v1.1.0"),
@@ -2374,14 +2765,20 @@ mod tests {
                 position: TagPosition::BelowLatest,
             }
         );
-        assert_eq!(found.status(), Some(RequirementStatus::Outdated));
+        assert_eq!(
+            found.status_or_text(|| RequirementStatus::UpToDate),
+            RequirementStatus::Outdated
+        );
     }
 
     #[test]
     fn test_sha_pin_lookup_indexed_by_prerelease_of_newer_line_is_up_to_date() {
         let index = TagIndex::from_tags([("v2.0.0-rc1", &sha_of('a')), ("1.9.0", &sha_of('b'))]);
         let found = lookup(Some(&index), &"a".repeat(40), "1.9.0").unwrap();
-        assert_eq!(found.status(), Some(RequirementStatus::UpToDate));
+        assert_eq!(
+            found.status_or_text(|| RequirementStatus::Unresolved),
+            RequirementStatus::UpToDate
+        );
     }
 
     #[test]
@@ -2390,28 +2787,32 @@ mod tests {
             tag: crate::ConcreteVersion::new(tag),
             position,
         };
+        let text = || RequirementStatus::Unresolved;
         assert_eq!(
-            indexed("v2.0.0", TagPosition::AtOrAboveLatest).status(),
-            Some(RequirementStatus::UpToDate)
+            indexed("v2.0.0", TagPosition::AtOrAboveLatest).status_or_text(text),
+            RequirementStatus::UpToDate
         );
         assert_eq!(
-            indexed("cargo-deny", TagPosition::BelowLatest).status(),
-            Some(RequirementStatus::Outdated)
+            indexed("cargo-deny", TagPosition::BelowLatest).status_or_text(text),
+            RequirementStatus::Outdated
         );
         let oversized = "v".repeat(super::super::MAX_REQUIREMENT_LEN + 1);
         assert_eq!(
-            indexed(&oversized, TagPosition::AtOrAboveLatest).status(),
-            Some(RequirementStatus::Unresolved)
+            indexed(&oversized, TagPosition::AtOrAboveLatest).status_or_text(text),
+            RequirementStatus::Unresolved
         );
         assert_eq!(
-            ShaPinLookup::LatestCommit.status(),
-            Some(RequirementStatus::UpToDate)
+            ShaPinLookup::LatestCommit.status_or_text(text),
+            RequirementStatus::UpToDate
         );
         assert_eq!(
-            ShaPinLookup::NotIndexed.status(),
-            Some(RequirementStatus::Outdated)
+            ShaPinLookup::NotIndexed.status_or_text(text),
+            RequirementStatus::Outdated
         );
-        assert_eq!(ShaPinLookup::Unverifiable.status(), None);
+        assert_eq!(
+            ShaPinLookup::Unverifiable.status_or_text(|| RequirementStatus::Outdated),
+            RequirementStatus::Outdated
+        );
     }
 
     fn resolved_pin_for(tags: &[&str]) -> Option<ResolvedPin> {
@@ -2585,6 +2986,34 @@ mod tests {
         let index = TagIndex::from_tags([("v4.1.3", &a), ("V4.1.3", &a)]);
         assert_eq!(index.release_tag("4.1.3"), Some("V4.1.3"));
         assert_eq!(index.release_tag("v4.1.3"), Some("v4.1.3"));
+    }
+
+    #[test]
+    fn test_release_commit_exact_key_wins_over_a_conflicting_twin() {
+        let a = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let b = CommitSha::parse(&"b".repeat(40)).unwrap();
+        let index = TagIndex::from_tags([("4.1.3", &b), ("v4.1.3", &a)]);
+        let (tag, sha) = index.release_commit("4.1.3").unwrap();
+        assert_eq!((tag.as_str(), sha), ("4.1.3", b));
+        let (tag, sha) = index.release_commit("v4.1.3").unwrap();
+        assert_eq!((tag.as_str(), sha), ("v4.1.3", a));
+    }
+
+    #[test]
+    fn test_release_commit_unprefixed_version_finds_the_prefixed_key() {
+        let a = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let index = TagIndex::from_tags([("v4.1.3", &a)]);
+        let (tag, sha) = index.release_commit("4.1.3").unwrap();
+        assert_eq!((tag.as_str(), sha), ("v4.1.3", a));
+        assert!(index.release_commit("4.1.4").is_none());
+    }
+
+    #[test]
+    fn test_release_commit_conflicting_twins_without_an_exact_key_are_none() {
+        let a = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let b = CommitSha::parse(&"b".repeat(40)).unwrap();
+        let index = TagIndex::from_tags([("v4.1.3", &a), ("V4.1.3", &b)]);
+        assert!(index.release_commit("4.1.3").is_none());
     }
 
     #[test]

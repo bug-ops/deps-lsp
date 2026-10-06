@@ -38,6 +38,7 @@ pub(crate) mod test_support;
 #[cfg(test)]
 #[cfg(feature = "lsp-responses")]
 pub(crate) mod test_support_lsp;
+mod unknown_ref;
 
 /// Generic replacement for this module's former `TextEdit`-only `dedup_overlapping_edits`
 /// (#1329) — re-exported here so every existing `lsp_helpers::dedup_overlapping_edits(edits,
@@ -59,10 +60,11 @@ pub use code_lenses::{
 pub use diagnostics::{
     BoundedVersionReq, DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities,
     LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE, MAX_DIAGNOSTIC_VALUE_CHARS, MAX_REQUIREMENT_LEN,
-    TYPOSQUAT_DIAGNOSTIC_CODE, TyposquatFetchOutcome, UNSATISFIABLE_DIAGNOSTIC_CODE, advisory_text,
-    compile_requirement_unless, fetch_gossip_findings_batch, fetch_typosquat_signals,
-    force_refresh_gossip_findings, generate_diagnostics_from_cache, redact_name_for_diagnostic,
-    redact_requirement_for_diagnostic, requirement_is_unsatisfiable, requirement_len_exceeds_cap,
+    SiblingMatchNote, TYPOSQUAT_DIAGNOSTIC_CODE, TyposquatFetchOutcome,
+    UNSATISFIABLE_DIAGNOSTIC_CODE, advisory_text, compile_requirement_unless,
+    fetch_gossip_findings_batch, fetch_typosquat_signals, force_refresh_gossip_findings,
+    generate_diagnostics_from_cache, redact_name_for_diagnostic, redact_requirement_for_diagnostic,
+    requirement_is_unsatisfiable, requirement_len_exceeds_cap,
     sanitize_advisory_text_for_diagnostic, sanitize_and_truncate_for_diagnostic,
     truncate_for_diagnostic,
 };
@@ -87,10 +89,10 @@ pub use formatter::{
 };
 pub use git_ref::{
     CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, PartialTagPolicy, PinResolution, ResolvedPin,
-    ShaPinLookup, SiblingScope, SiblingTags, TagIndex, TagPosition, byte_span_to_range,
-    extends_tag, is_full_sha, is_null_tag, is_partial_semver_shaped, is_plain_null, is_tag_shaped,
-    locate_value_span, marker_byte_offset, match_v_prefix_style, short_sha, tag_has_precedence,
-    tag_pin_is_up_to_date,
+    ShaPinLookup, SiblingScope, SiblingTags, TagIndex, TagPosition, UnpublishedRef,
+    byte_span_to_range, extends_tag, is_full_sha, is_null_tag, is_partial_semver_shaped,
+    is_plain_null, is_tag_shaped, locate_value_span, marker_byte_offset, match_v_prefix_style,
+    short_sha, tag_has_precedence, tag_pin_is_up_to_date,
 };
 #[cfg(feature = "lsp-responses")]
 pub use git_ref::{
@@ -114,6 +116,9 @@ pub use sha_comment::{
     SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE, ShaPinComment, ShaPinTail, ShaPinTailRead,
     comment_slot_after, position_past_sha, read_sha_pin_tail, ref_is_last_on_line,
     sha_comment_mismatch_diagnostic, sha_comment_mismatch_hover_line, sha_pin_rewrite,
+};
+pub use unknown_ref::{
+    UNKNOWN_REF_DIAGNOSTIC_CODE, unknown_ref_diagnostic, unknown_ref_diagnostic_for,
 };
 
 /// Maximum number of recent versions hover's "Recent versions" section renders.
@@ -2249,6 +2254,9 @@ pub enum LatestVerdict {
         /// Whether the worst affecting advisory is a confirmed-malicious-package record
         /// ([`VulnSeverity::Malicious`]) — renderers use this to escalate wording/severity.
         malicious: bool,
+        /// The sibling release tags through which the checked version is affected, when every
+        /// advisory matched through siblings alone; `None` makes no claim about how.
+        via_sibling_tags: Option<crate::osv::MatchedTags>,
     },
     /// The version was never definitively checked against OSV: no entry for this dependency
     /// (including the pre-phase-B window, where an empty map is attached deliberately so this
@@ -2391,6 +2399,7 @@ fn upgrade_status_to_verdict(
             version,
             advisory_ids,
             worst_severity,
+            via_sibling_tags,
         }) => {
             if version != expected_version {
                 return LatestVerdict::Unverified;
@@ -2401,6 +2410,7 @@ fn upgrade_status_to_verdict(
                 LatestVerdict::Flagged {
                     advisory_ids: advisory_ids.items().to_vec(),
                     malicious: *worst_severity == Some(VulnSeverity::Malicious),
+                    via_sibling_tags: via_sibling_tags.clone(),
                 }
             }
         }
@@ -3311,6 +3321,31 @@ pub enum RequirementStatus {
     /// The requirement could not be resolved to a concrete constraint, so no comparison
     /// could be made.
     Unresolved,
+}
+
+impl RequirementStatus {
+    /// Maps [`Self::UpToDate`] to [`Self::Unresolved`], leaving every other status.
+    ///
+    /// The one definition of the cap applied to a status read from text that a truncated tag
+    /// list cannot confirm (#1769): such a pin may be older than the text claims, but an
+    /// outdated text status stays outdated.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::RequirementStatus::{Outdated, UpToDate, Unresolved};
+    ///
+    /// assert_eq!(UpToDate.never_up_to_date(), Unresolved);
+    /// assert_eq!(Outdated.never_up_to_date(), Outdated);
+    /// assert_eq!(Unresolved.never_up_to_date(), Unresolved);
+    /// ```
+    #[must_use]
+    pub const fn never_up_to_date(self) -> Self {
+        match self {
+            Self::UpToDate => Self::Unresolved,
+            Self::Outdated | Self::Unresolved => self,
+        }
+    }
 }
 
 /// A `requirement` compiled by one ecosystem, ready to test candidate versions against.

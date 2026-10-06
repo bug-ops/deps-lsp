@@ -39,6 +39,7 @@ use types::{OsvBatchRequest, OsvBatchResponse, OsvQuery, OsvSingleQueryResponse,
 
 use crate::ConcreteVersion;
 use crate::cache::HttpCache;
+use crate::pagination::ListCoverage;
 
 /// Advisories rendered (§7) per dependency in hover/diagnostics/`deps-cli` output.
 ///
@@ -410,7 +411,6 @@ impl OsvClient {
                             .is_complete()
                             .then(|| worst_severity(dv.advisories.items()))
                             .flatten();
-                        // TODO(#1767): record which sibling tag matched (`dv.sibling_match`).
                         UpgradeStatus::CandidateVulnerable {
                             version,
                             advisory_ids: Capped::new(
@@ -418,6 +418,7 @@ impl OsvClient {
                                 dv.advisories.total(),
                             ),
                             worst_severity,
+                            via_sibling_tags: dv.sibling_only_tags(),
                         }
                     }
                     Some(ScanOutcome::Skipped(reason)) => UpgradeStatus::CandidateUnverified {
@@ -449,6 +450,9 @@ impl OsvClient {
     ///
     /// A clean answer for an [`OsvQueryName::Provisional`] target is downgraded to
     /// [`SkipReason::CanonicalNameUnconfirmed`]: only a hit under an unconfirmed name is
+    /// authoritative. Likewise a clean answer for a target whose sibling tags came from a
+    /// [`ListCoverage::Truncated`] list is downgraded to [`SkipReason::SiblingTagsUnknown`]: an
+    /// advisory against an unlisted sibling would have been missed, while a hit stays
     /// authoritative.
     async fn resolve(
         &self,
@@ -467,6 +471,14 @@ impl OsvClient {
                 OsvQueryName::Provisional(_) => {
                     if let Some(outcome @ ScanOutcome::Clean) = outcomes.get_mut(&t.key) {
                         *outcome = ScanOutcome::Skipped(SkipReason::CanonicalNameUnconfirmed);
+                    }
+                }
+            }
+            match t.sibling_coverage() {
+                ListCoverage::Complete => {}
+                ListCoverage::Truncated => {
+                    if let Some(outcome @ ScanOutcome::Clean) = outcomes.get_mut(&t.key) {
+                        *outcome = ScanOutcome::Skipped(SkipReason::SiblingTagsUnknown);
                     }
                 }
             }
@@ -2117,10 +2129,22 @@ mod tests {
         let statuses = client
             .check_candidates(EcosystemId::GithubActions, &[candidate], TEST_TIMEOUT)
             .await;
-        assert_matches!(
-            statuses.get(&crate::test_util::vuln_key("actions/download-artifact")),
-            Some(UpgradeStatus::CandidateVulnerable { version, .. }) if version.as_str() == "4.8.0"
-        );
+        let Some(UpgradeStatus::CandidateVulnerable {
+            version,
+            via_sibling_tags,
+            ..
+        }) = statuses.get(&crate::test_util::vuln_key("actions/download-artifact"))
+        else {
+            panic!("expected CandidateVulnerable: {statuses:?}");
+        };
+        assert_eq!(version.as_str(), "4.8.0");
+        let tags: Vec<&str> = via_sibling_tags
+            .as_ref()
+            .expect("the only advisory matched through a sibling")
+            .iter()
+            .map(ConcreteVersion::as_str)
+            .collect();
+        assert_eq!(tags, ["4.9.0"]);
     }
 
     /// #1727: a candidate without sibling hits stays clean.
@@ -2183,6 +2207,64 @@ mod tests {
         assert_matches!(
             scan_gha_with_siblings("4.8.0", &["4.9.0"], r#"[{"introduced":"5.0.0"}]"#).await,
             ScanOutcome::Clean
+        );
+    }
+
+    async fn scan_gha_truncated_siblings(events: &str) -> ScanOutcome {
+        let (_server, client) = gha_sibling_fixture(events).await;
+        let versions = crate::lsp_helpers::InUseVersions::for_test_with_coverage(
+            ConcreteVersion::new("4.8.0"),
+            vec![ConcreteVersion::new("4.9.0")],
+            ListCoverage::Truncated,
+        );
+        let targets = vec![
+            target("actions/download-artifact", "4.8.0").with_siblings(&versions, &IdentityNaming),
+        ];
+        let mut outcomes = client
+            .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+            .await;
+        outcomes
+            .remove(&crate::test_util::vuln_key("actions/download-artifact"))
+            .expect("one outcome per target")
+    }
+
+    /// #1769: a clean answer over a possibly incomplete sibling list is not authoritative.
+    #[tokio::test]
+    async fn gha_truncated_sibling_scan_clean_is_downgraded_to_sibling_tags_unknown() {
+        assert_matches!(
+            scan_gha_truncated_siblings(r#"[{"introduced":"5.0.0"}]"#).await,
+            ScanOutcome::Skipped(SkipReason::SiblingTagsUnknown)
+        );
+    }
+
+    /// #1769: a hit is authoritative whatever the list coverage.
+    #[tokio::test]
+    async fn gha_truncated_sibling_scan_hit_stays_vulnerable() {
+        assert_matches!(
+            scan_gha_truncated_siblings(r#"[{"introduced":"4.9.0"},{"fixed":"4.9.1"}]"#).await,
+            ScanOutcome::Vulnerable(_)
+        );
+    }
+
+    #[tokio::test]
+    async fn check_candidates_truncated_siblings_clean_is_candidate_unverified() {
+        let (_server, client) = gha_sibling_fixture(r#"[{"introduced":"5.0.0"}]"#).await;
+        let candidate = target("actions/download-artifact", "4.8.0").with_siblings(
+            &crate::lsp_helpers::CandidateSiblings::for_test_with_coverage(
+                vec![ConcreteVersion::new("4.9.0")],
+                ListCoverage::Truncated,
+            ),
+            &IdentityNaming,
+        );
+        let statuses = client
+            .check_candidates(EcosystemId::GithubActions, &[candidate], TEST_TIMEOUT)
+            .await;
+        assert_matches!(
+            statuses.get(&crate::test_util::vuln_key("actions/download-artifact")),
+            Some(UpgradeStatus::CandidateUnverified {
+                reason: SkipReason::SiblingTagsUnknown,
+                ..
+            })
         );
     }
 

@@ -13,8 +13,8 @@
 use deps_core::diagnostic::{Diagnostic, Severity};
 use deps_core::lsp_helpers::{
     DEPRECATED_DIAGNOSTIC_CODE, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
-    SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE, UNSATISFIABLE_DIAGNOSTIC_CODE,
-    redact_name_for_diagnostic, redact_requirement_for_diagnostic,
+    SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE, UNKNOWN_REF_DIAGNOSTIC_CODE,
+    UNSATISFIABLE_DIAGNOSTIC_CODE, redact_name_for_diagnostic, redact_requirement_for_diagnostic,
 };
 use deps_core::osv::{OsvClient, ScanOutcome, VulnKeys, VulnSeverity, VulnerabilityMap};
 use deps_core::policy_config::PolicyConfig;
@@ -44,11 +44,12 @@ const GITLAB_CI_MUTABLE_REF_PIN_CODE: &str = "gitlab-ci-mutable-ref-pin";
 /// [`GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE`]'s doc for why this is a literal.
 const GITLAB_CI_UNRESOLVED_HOST_CODE: &str = "unresolved-gitlab-host";
 
-/// A category a [`CheckFinding`] can be classified into — the nine `--fail-on` tokens
-/// (the seven FR-009 defines, plus [`Category::Other`], #1733, and
-/// [`Category::ShaCommentMismatch`], #1748).
+/// A category a [`CheckFinding`] can be classified into.
 ///
-/// `Other` covers a `generate_diagnostics` finding that matches none of the eight (an
+/// The ten `--fail-on` tokens: the seven FR-009 defines, plus [`Category::Other`] (#1733),
+/// [`Category::ShaCommentMismatch`] (#1748) and [`Category::UnknownRef`] (#1766).
+///
+/// `Other` covers a `generate_diagnostics` finding that matches none of the nine (an
 /// "Unknown package", a collapsed registry-lookup failure, or a
 /// workspace-registry/offline/dependency-count notice). It is selectable via
 /// `--fail-on other` (which therefore fails any manifest without a lock file and every
@@ -71,6 +72,7 @@ const GITLAB_CI_UNRESOLVED_HOST_CODE: &str = "unresolved-gitlab-host";
 /// assert_eq!(Category::MutableRefPin.as_str(), "mutable-ref");
 /// assert_eq!(Category::License.as_str(), "license");
 /// assert_eq!(Category::ShaCommentMismatch.as_str(), "sha-comment-mismatch");
+/// assert_eq!(Category::UnknownRef.as_str(), "unknown-ref");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, clap::ValueEnum)]
 pub enum Category {
@@ -90,6 +92,10 @@ pub enum Category {
     /// (GitHub Actions/GitLab CI).
     #[value(name = "sha-comment-mismatch")]
     ShaCommentMismatch,
+    /// A tag pin's ref is a full release that no published tag of the repository matches
+    /// (GitHub Actions/GitLab CI).
+    #[value(name = "unknown-ref")]
+    UnknownRef,
     /// The resolved license violates the configured allow/deny policy.
     License,
     /// The registry reports the package itself as deprecated/abandoned.
@@ -109,6 +115,7 @@ impl Category {
             Self::Unsatisfiable => "unsatisfiable",
             Self::MutableRefPin => "mutable-ref",
             Self::ShaCommentMismatch => "sha-comment-mismatch",
+            Self::UnknownRef => "unknown-ref",
             Self::License => "license",
             Self::Deprecated => "deprecated",
             Self::Other => "other",
@@ -151,6 +158,9 @@ impl Category {
             Self::ShaCommentMismatch => {
                 "The version comment next to a SHA pin is not confirmed by the repository's tag index."
             }
+            Self::UnknownRef => {
+                "The ref of a tag pin is a full release that no published tag of the repository matches."
+            }
             Self::License => "The resolved license violates the configured allow/deny policy.",
             Self::Deprecated => {
                 "The registry reports the package itself as deprecated or abandoned."
@@ -191,6 +201,7 @@ impl<'de> serde::Deserialize<'de> for Category {
             "unsatisfiable" => Ok(Self::Unsatisfiable),
             "mutable-ref" => Ok(Self::MutableRefPin),
             "sha-comment-mismatch" => Ok(Self::ShaCommentMismatch),
+            "unknown-ref" => Ok(Self::UnknownRef),
             "license" => Ok(Self::License),
             "deprecated" => Ok(Self::Deprecated),
             "other" => Ok(Self::Other),
@@ -203,6 +214,7 @@ impl<'de> serde::Deserialize<'de> for Category {
                     "unsatisfiable",
                     "mutable-ref",
                     "sha-comment-mismatch",
+                    "unknown-ref",
                     "license",
                     "deprecated",
                     "other",
@@ -697,7 +709,7 @@ fn to_finding(
 /// Classifies a `generate_diagnostics` [`Diagnostic`] into a [`Category`].
 ///
 /// Diagnostics that carry one of the workspace's known non-advisory codes (the three
-/// `deps-core` sentinels, the two mutable-ref-pin codes, the SHA-comment-mismatch code, or
+/// `deps-core` sentinels, the two mutable-ref-pin codes, the SHA-comment-mismatch and unknown-ref codes, or
 /// GitLab CI's [`GITLAB_CI_UNRESOLVED_HOST_CODE`] notice) classify directly from `code`. A
 /// vulnerability advisory id (an OSV id such as `RUSTSEC-...`/`GHSA-...`) is the only other
 /// free-form `code` value `generate_diagnostics_from_cache` ever sets, so any `Some(code)`
@@ -723,6 +735,7 @@ fn classify(
                 Category::MutableRefPin
             }
             SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE => Category::ShaCommentMismatch,
+            UNKNOWN_REF_DIAGNOSTIC_CODE => Category::UnknownRef,
             GITLAB_CI_UNRESOLVED_HOST_CODE => Category::Other,
             _ => Category::Vulnerable,
         };
@@ -791,6 +804,7 @@ mod tests {
             Category::ShaCommentMismatch.as_str(),
             "sha-comment-mismatch"
         );
+        assert_eq!(Category::UnknownRef.as_str(), "unknown-ref");
         assert_eq!(Category::License.as_str(), "license");
         assert_eq!(Category::Deprecated.as_str(), "deprecated");
         assert_eq!(Category::Other.as_str(), "other");
@@ -807,6 +821,7 @@ mod tests {
             Category::Unsatisfiable,
             Category::MutableRefPin,
             Category::ShaCommentMismatch,
+            Category::UnknownRef,
             Category::License,
             Category::Deprecated,
             Category::Other,
@@ -838,7 +853,17 @@ mod tests {
         assert!(!policy.matches(&[finding(Category::Deprecated)]));
         assert!(!policy.matches(&[finding(Category::MutableRefPin)]));
         assert!(!policy.matches(&[finding(Category::ShaCommentMismatch)]));
+        assert!(!policy.matches(&[finding(Category::UnknownRef)]));
         assert!(!policy.matches(&[finding(Category::Other)]));
+    }
+
+    #[test]
+    fn test_fail_on_policy_unknown_ref_matches_only_unknown_ref() {
+        let policy = FailOnPolicy::new(vec![Category::UnknownRef]);
+        let mut hint = finding(Category::UnknownRef);
+        hint.severity = Severity::Hint;
+        assert!(policy.matches(&[hint]));
+        assert!(!policy.matches(&[finding(Category::Vulnerable)]));
     }
 
     #[test]
@@ -938,6 +963,16 @@ mod tests {
             "SHA is not the commit of the tag in the comment",
         );
         assert_eq!(classify(&d, &STUB_FORMATTER), Category::ShaCommentMismatch);
+    }
+
+    /// #1766: without an explicit arm the free-form-code fallback would file this as Vulnerable.
+    #[test]
+    fn test_classify_unknown_ref_by_code() {
+        let d = diagnostic_with(
+            Some(UNKNOWN_REF_DIAGNOSTIC_CODE),
+            "`4.3.1` is not a published tag of actions/checkout",
+        );
+        assert_eq!(classify(&d, &STUB_FORMATTER), Category::UnknownRef);
     }
 
     #[test]

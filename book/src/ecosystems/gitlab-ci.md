@@ -112,10 +112,22 @@ include:
   comment is never deleted when the tag index has no answer.
 - A comment naming a tag that is not the pinned commit's tag raises `sha-comment-mismatch`
   (severity `diagnostics.sha_comment_mismatch_severity`) and a hover warning. Nothing is reported
-  while the tag index is cold, or while a truncated tag list lacks the SHA. The exception is a
-  comment naming a full version (`# v1.117.0`) that the truncated list maps to another commit:
-  that comment is provably wrong, so it is not trusted, the status is unresolved and the
-  mismatch is reported.
+  while the tag index is cold, or while a truncated tag list lacks the SHA; a SHA the truncated
+  list lacks never reads as up to date from its comment, whatever the comment's shape (unresolved
+  instead). The exception is a comment naming a full version (`# v1.117.0`) that the truncated
+  list maps to another commit: that comment is provably wrong, so it is not trusted, the status
+  is unresolved and the mismatch is reported.
+- A `project:` tag `ref:` that is a full release no tag of the complete Tags list matches
+  (`ref: 1.117.0` beside tag `v1.117.0`) is unresolved instead of up to date and raises
+  `unknown-ref` (severity `diagnostics.unknown_ref_severity`). A partial or suffixed ref
+  (`v1`, `v1.x`, `v3-node20`) may be a branch, so it keeps the ahead-of-latest rule and is never
+  reported; a `component:` include is never reported either, since a version without a release is
+  not a missing tag. An exact tag `ref:` that a truncated Tags list does not reach is unresolved
+  as well, never up to date. A partial `project:` ref (`1.2`) is read as a branch, so the
+  truncated-list rule for floating partial pins described there does not apply. See [GitHub Actions](github-actions.md#unpublished-refs-and-the-unknown-ref-diagnostic-issue-1766)
+  for the shape rules.
+- A tags fetch that first populates or changes a project's tag index rescans every other open
+  `.gitlab-ci.yml` that uses it, as for GitHub Actions (issue #1765).
 - The `Correct version comment to <tag>` quickfix rewrites only the comment's tag to the tag the
   pinned commit carries. It is offered only when the comment names another tag of that commit,
   not for an unknown SHA, a confirmed comment or a pin without one.

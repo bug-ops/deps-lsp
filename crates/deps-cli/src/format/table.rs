@@ -230,6 +230,7 @@ mod tests {
             ignore_rule_overridden: false,
             gossip_excluded_version: None,
             cooldown_fallback: None,
+            osv_sibling_match: None,
         }
     }
 

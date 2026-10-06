@@ -300,6 +300,10 @@ pub struct UpdateItemDocument {
     /// Additive (NFR-005) — omitted entirely, not `null`, when the item has none.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cooldown_fallback: Option<CooldownFallbackDocument>,
+    /// The sibling release tags the item's OSV verdict holds through, when it holds only
+    /// through them (#1767). Additive — omitted entirely when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub matched_tags: Vec<String>,
 }
 
 /// [`crate::update::CooldownFallbackNote`]'s JSON shape (spec 075 FR-013).
@@ -353,6 +357,15 @@ pub fn update_to_document(
             outcome: OutcomeToken::from(&item.outcome),
             reason: crate::sanitize::sanitize_message_for_display(&item.reason()),
             advisory_ids: item.advisory_ids.clone(),
+            matched_tags: item
+                .osv_sibling_match
+                .as_ref()
+                .map_or_else(Vec::new, |note| {
+                    note.tags()
+                        .iter()
+                        .map(|tag| crate::sanitize::sanitize_message_for_display(tag.as_str()))
+                        .collect()
+                }),
             cooldown_fallback: item.cooldown_fallback.as_ref().map(|note| match note {
                 crate::update::CooldownFallbackNote::AppliedInsteadOf(latest) => {
                     CooldownFallbackDocument::AppliedInsteadOf {
@@ -524,6 +537,18 @@ mod tests {
     }
 
     #[test]
+    fn test_summary_counts_unknown_ref_under_its_own_key() {
+        let mut unknown = finding();
+        unknown.category = Category::UnknownRef;
+        let document = to_document(&CheckReport {
+            findings: vec![unknown],
+        });
+        let rendered = serde_json::to_string(&document).expect("must serialize");
+        assert!(rendered.contains("\"unknown-ref\":1"), "{rendered}");
+        assert_eq!(document.summary.get(&Category::UnknownRef), Some(&1));
+    }
+
+    #[test]
     fn test_render_round_trips_through_serde_json() {
         let report = CheckReport {
             findings: vec![finding()],
@@ -570,6 +595,7 @@ mod tests {
             ignore_rule_overridden: false,
             gossip_excluded_version: None,
             cooldown_fallback: None,
+            osv_sibling_match: None,
         }
     }
 
@@ -605,6 +631,46 @@ mod tests {
         assert_eq!(item.target.as_deref(), Some("1.2.0"));
         assert_eq!(item.outcome, OutcomeToken::Applied);
         assert_eq!(item.advisory_ids, vec!["RUSTSEC-2024-0001".to_string()]);
+    }
+
+    /// #1767: a sibling-tag attribution reaches the JSON item as `matched_tags` (and the
+    /// reason line), and is omitted entirely when absent.
+    #[test]
+    fn test_update_to_document_carries_matched_tags() {
+        use deps_core::ConcreteVersion;
+        use deps_core::lsp_helpers::{DiagnosticMessages, SiblingMatchNote};
+        use deps_core::osv::MatchedTags;
+
+        struct Messages;
+        impl DiagnosticMessages for Messages {}
+
+        let tags = MatchedTags::new(
+            ConcreteVersion::new("v4.9.0"),
+            vec![ConcreteVersion::new("v4.9.1")],
+        );
+        let item = update_item(applied_outcome())
+            .with_osv_sibling_match(Some(SiblingMatchNote::new(&Messages, &tags)));
+        let plan = crate::update::UpdatePlan { items: vec![item] };
+        let document = update_to_document(&plan, DryRun::No);
+        assert_eq!(document.items[0].matched_tags, ["v4.9.0", "v4.9.1"]);
+        assert!(
+            document.items[0]
+                .reason
+                .ends_with("(matched tag v4.9.0, v4.9.1)"),
+            "{}",
+            document.items[0].reason
+        );
+
+        let rendered = render_update(&plan, DryRun::No).expect("render must succeed");
+        assert!(rendered.contains("matched_tags"));
+        let plain = render_update(
+            &crate::update::UpdatePlan {
+                items: vec![update_item(applied_outcome())],
+            },
+            DryRun::No,
+        )
+        .expect("render must succeed");
+        assert!(!plain.contains("matched_tags"));
     }
 
     #[test]

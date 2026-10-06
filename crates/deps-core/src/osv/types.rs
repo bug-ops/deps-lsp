@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ConcreteVersion;
 use crate::lsp_helpers::is_safe_version_string;
+use crate::pagination::ListCoverage;
 
 /// The `package.ecosystem` value OSV.dev expects for a queried [`crate::EcosystemId`]
 /// (`crate::EcosystemId::osv_ecosystem`'s return type).
@@ -512,6 +513,11 @@ pub struct ScanTarget {
     /// of them affects the dependency. Set only via [`Self::with_siblings`].
     #[raw]
     siblings: Vec<ScanVersion>,
+    /// Whether [`Self::siblings`] is the complete list of release tags on the target's commit.
+    /// [`ListCoverage::Truncated`] makes a clean answer non-authoritative. Set only via
+    /// [`Self::with_siblings`].
+    #[raw]
+    sibling_coverage: ListCoverage,
 }
 
 /// One sibling release tag of a [`ScanTarget`]: the same wire/native split as the target's own
@@ -557,6 +563,11 @@ impl ScanTarget {
     ///   (`EcosystemFormatter::osv_version`) — sent to OSV, never shown to the user
     /// * `display_version` - The same version in the ecosystem's native spelling, for
     ///   surfacing back to the user instead of `version`
+    ///
+    /// The target has no sibling tags and claims a complete sibling list
+    /// ([`ListCoverage::Complete`]), which is right only for a version that is not a git tag.
+    /// A target whose version comes from a tag index must go through [`Self::with_siblings`], which
+    /// states the real coverage.
     #[must_use]
     pub fn new(
         key: VulnKey,
@@ -570,6 +581,7 @@ impl ScanTarget {
             version,
             display_version,
             siblings: Vec::new(),
+            sibling_coverage: ListCoverage::Complete,
         }
     }
 
@@ -581,6 +593,8 @@ impl ScanTarget {
     /// implement it) keeps arbitrary tags from being attached. The target's own `version` and
     /// `display_version` are never touched. Only [`crate::osv::OsvClient`]'s local-matching path
     /// evaluates siblings; a server-side matched target carrying any is skipped fail-closed.
+    /// The sibling list's coverage is taken from `versions`; a [`ListCoverage::Truncated`] one
+    /// downgrades a clean scan answer to [`SkipReason::SiblingTagsUnknown`].
     #[must_use]
     pub fn with_siblings(
         mut self,
@@ -595,7 +609,14 @@ impl ScanTarget {
                 display_version: native.clone(),
             })
             .collect();
+        self.sibling_coverage = versions.sibling_coverage();
         self
+    }
+
+    /// Whether [`Self::siblings`] is the complete list of release tags on the target's commit.
+    #[must_use]
+    pub const fn sibling_coverage(&self) -> ListCoverage {
+        self.sibling_coverage
     }
 
     /// The sibling release tags attached via [`Self::with_siblings`].
@@ -656,6 +677,7 @@ mod scan_target_debug_redaction_tests {
             version: OsvVersion::new("1.0.0"),
             display_version: ConcreteVersion::new("1.0.0"),
             siblings: Vec::new(),
+            sibling_coverage: crate::pagination::ListCoverage::Complete,
         },
     );
 }
@@ -1011,6 +1033,11 @@ pub enum UpgradeStatus {
         /// "outdated" status for that dependency's latest — a caller checks this field before
         /// treating [`Self::CandidateVulnerable`] as a hard block.
         worst_severity: Option<VulnSeverity>,
+        /// The sibling release tags through which the candidate is affected, `Some` only when
+        /// `advisory_ids` is complete and non-empty and every advisory matched through
+        /// siblings alone ([`DependencyVulnerabilities::sibling_only_tags`]); otherwise no
+        /// claim is made about how the candidate is affected.
+        via_sibling_tags: Option<MatchedTags>,
     },
     /// The candidate upgrade version's OSV status could not be determined, but a version was
     /// still attempted or is otherwise known: either the check itself failed (transient — query
@@ -1083,8 +1110,14 @@ pub struct DependencyVulnerabilities {
 }
 
 /// Sibling release tags an advisory matched, never empty by construction.
+///
+/// Shared (`Arc`) so an `Option<MatchedTags>` field stays pointer-sized in the status types
+/// that hold it and rendering a note never copies the tags.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MatchedTags {
+pub struct MatchedTags(Arc<NonEmptyTags>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NonEmptyTags {
     first: ConcreteVersion,
     rest: Vec<ConcreteVersion>,
 }
@@ -1093,15 +1126,28 @@ impl MatchedTags {
     pub(crate) fn from_tags(tags: Vec<ConcreteVersion>) -> Option<Self> {
         let mut tags = tags.into_iter();
         let first = tags.next()?;
-        Some(Self {
-            first,
-            rest: tags.collect(),
-        })
+        Some(Self::new(first, tags.collect()))
+    }
+
+    /// Builds the set from its lowest tag and the rest, in ascending order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::ConcreteVersion;
+    /// use deps_core::osv::MatchedTags;
+    ///
+    /// let tags = MatchedTags::new(ConcreteVersion::new("v4.9.0"), vec![ConcreteVersion::new("v4.9.1")]);
+    /// assert_eq!(tags.iter().count(), 2);
+    /// ```
+    #[must_use]
+    pub fn new(first: ConcreteVersion, rest: Vec<ConcreteVersion>) -> Self {
+        Self(Arc::new(NonEmptyTags { first, rest }))
     }
 
     /// The matched tags, lowest version first.
     pub fn iter(&self) -> impl Iterator<Item = &ConcreteVersion> {
-        std::iter::once(&self.first).chain(&self.rest)
+        std::iter::once(&self.0.first).chain(&self.0.rest)
     }
 }
 
@@ -1189,6 +1235,35 @@ impl DependencyVulnerabilities {
     #[must_use]
     pub const fn has_sibling_matches(&self) -> bool {
         self.sibling_matches.is_some()
+    }
+
+    /// The sibling tags the scanned version is affected through, when that is the whole story:
+    /// the union of every advisory's matched tags (lowest version first), `Some` only if the
+    /// advisory list is complete, non-empty and every advisory in it matched through siblings
+    /// alone. Any advisory matching the scanned version itself, or a list that may hold
+    /// advisories this call cannot see, makes no sibling claim.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::{Capped, DependencyVulnerabilities};
+    ///
+    /// let dv = DependencyVulnerabilities::new(Capped::new(vec![], 0));
+    /// assert!(dv.sibling_only_tags().is_none());
+    /// ```
+    #[must_use]
+    pub fn sibling_only_tags(&self) -> Option<MatchedTags> {
+        let matches = self.sibling_matches.as_ref()?;
+        if self.advisories.items().is_empty() || !self.advisories.is_complete() {
+            return None;
+        }
+        let mut tags = Vec::new();
+        for advisory in self.advisories.items() {
+            tags.extend(matches.tags.get(&advisory.id)?.iter().cloned());
+        }
+        tags.sort_by(|a, b| super::compare_version_strings(a.as_str(), b.as_str()));
+        tags.dedup();
+        MatchedTags::from_tags(tags)
     }
 
     /// Whether the "fixed in" version of `advisory` may be shown or followed as an upgrade: false
@@ -1476,8 +1551,10 @@ pub enum SkipReason {
     /// The ecosystem is matched locally and an advisory exists for the package, but its
     /// affected ranges could not be evaluated against the in-use version — possibly vulnerable.
     UnevaluableAdvisoryRange,
-    /// A candidate version's sibling release tags could not be established (cold or partial tag
-    /// index), so a clean answer for the candidate alone is not trustworthy. Phase B only.
+    /// The sibling release tags of the version could not be established (cold or truncated tag
+    /// index), so a clean answer for the version alone is not trustworthy. Phase B reports it
+    /// for a candidate whose siblings are unknown or incomplete; phase A reports it when a
+    /// truncated tag list left the in-use version's siblings possibly incomplete.
     SiblingTagsUnknown,
 }
 
@@ -2169,6 +2246,11 @@ pub fn vulnerability_keys(
                             signature.push(' ');
                             signature.push_str(sibling.as_str());
                         }
+                        // Only a truncated list is marked, so ecosystems without tag indexes
+                        // keep their keys.
+                        if v.sibling_coverage() == ListCoverage::Truncated {
+                            signature.push_str(" truncated");
+                        }
                         signature
                     }
                     None => "u".to_string(),
@@ -2626,6 +2708,65 @@ mod recommended_fix_tests {
         }
     }
 
+    fn with_matches(
+        advisories: Vec<Arc<Advisory>>,
+        total: usize,
+        matched: &[(&str, &[&str])],
+    ) -> DependencyVulnerabilities {
+        let mut matches = SiblingMatches::new(OsvVersion::new("4.8.0"));
+        for (id, tags) in matched {
+            let tags = tags.iter().map(|t| ConcreteVersion::new(*t)).collect();
+            matches.insert((*id).to_string(), MatchedTags::from_tags(tags).unwrap());
+        }
+        DependencyVulnerabilities::new(Capped::new(advisories, total)).with_sibling_matches(matches)
+    }
+
+    fn tag_names(tags: &MatchedTags) -> Vec<&str> {
+        tags.iter().map(ConcreteVersion::as_str).collect()
+    }
+
+    /// #1767: only a complete, non-empty list whose every advisory matched through siblings
+    /// alone claims a sibling-only verdict; the tags are the sorted union.
+    #[test]
+    fn sibling_only_tags_requires_every_advisory_to_match_through_siblings() {
+        let two = || {
+            vec![
+                advisory("A1", VulnSeverity::High, &[]),
+                advisory("A2", VulnSeverity::High, &[]),
+            ]
+        };
+
+        let all = with_matches(
+            two(),
+            2,
+            &[("A1", &["v4.10.0", "v4.9.0"]), ("A2", &["v4.9.0"])],
+        );
+        assert_eq!(
+            tag_names(&all.sibling_only_tags().unwrap()),
+            ["v4.9.0", "v4.10.0"]
+        );
+
+        let mixed = with_matches(two(), 2, &[("A1", &["v4.9.0"])]);
+        assert!(
+            mixed.sibling_only_tags().is_none(),
+            "A2 matched the primary"
+        );
+
+        let incomplete = with_matches(
+            vec![advisory("A1", VulnSeverity::High, &[])],
+            2,
+            &[("A1", &["v4.9.0"])],
+        );
+        assert!(incomplete.sibling_only_tags().is_none());
+
+        assert!(dv(vec![]).sibling_only_tags().is_none());
+        assert!(
+            dv(vec![advisory("A1", VulnSeverity::High, &[])])
+                .sibling_only_tags()
+                .is_none()
+        );
+    }
+
     #[test]
     fn no_advisory_has_a_fix_returns_none() {
         let vulns = dv(vec![advisory("A1", VulnSeverity::High, &[])]);
@@ -2660,6 +2801,7 @@ mod recommended_fix_tests {
             version: ConcreteVersion::new("1.2.0"),
             advisory_ids: Capped::new(vec!["A1".to_string()], 1),
             worst_severity: Some(VulnSeverity::High),
+            via_sibling_tags: None,
         };
 
         let fix = vulns.recommended_fix(Some(&latest)).unwrap();
@@ -2674,6 +2816,7 @@ mod recommended_fix_tests {
             version: ConcreteVersion::new("1.1.0"),
             advisory_ids: Capped::new(vec!["A1".to_string()], 1),
             worst_severity: Some(VulnSeverity::High),
+            via_sibling_tags: None,
         };
         assert!(vulns.recommended_fix(Some(&latest)).is_none());
     }
@@ -2726,6 +2869,7 @@ mod recommended_fix_tests {
             version: ConcreteVersion::new("3.0.0"),
             advisory_ids: Capped::new(vec!["A1".to_string()], 1),
             worst_severity: Some(VulnSeverity::High),
+            via_sibling_tags: None,
         };
 
         let fix = vulns.recommended_fix(Some(&latest)).unwrap();
@@ -3651,8 +3795,14 @@ mod vulnerability_keys_candidates_tests {
                 "with-sibling" => &["v4.8.0", "v4.9.0"],
                 _ => &["v4.8.0"],
             };
+            let coverage = if req.as_str() == "truncated" {
+                ListCoverage::Truncated
+            } else {
+                ListCoverage::Complete
+            };
             let sha = crate::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap();
-            let index = crate::lsp_helpers::TagIndex::from_tags(tags.iter().map(|t| (*t, &sha)));
+            let index = crate::lsp_helpers::TagIndex::from_tags(tags.iter().map(|t| (*t, &sha)))
+                .with_coverage(coverage);
             index.pin_resolution(&sha, None)
         }
     }
@@ -3720,5 +3870,37 @@ mod vulnerability_keys_candidates_tests {
             keys.get(&deps[0].name_range()),
             keys.get(&deps[1].name_range())
         );
+    }
+
+    /// #1769: a truncated sibling list scans differently from a complete one with the same tags,
+    /// so the two must not share a key; a complete list keeps the unmarked key.
+    #[test]
+    fn vulnerability_keys_differ_when_only_the_sibling_coverage_differs() {
+        use crate::lsp_helpers::test_support::MockParseResult;
+
+        let dep = |requirement: &str, line: u32| MockDep {
+            name: PackageName::new("actions/checkout"),
+            version_req: VersionReq::new(requirement),
+            version_range: Range::new(Position::new(line, 10), Position::new(line, 20)),
+            name_range: Range::new(Position::new(line, 0), Position::new(line, 8)),
+        };
+        let parse_result = MockParseResult {
+            deps: vec![dep("alone", 0), dep("truncated", 1)],
+            uri: crate::test_util::test_uri("/test/workflow.yml"),
+        };
+
+        let keys = vulnerability_keys(
+            &parse_result,
+            &std::collections::HashMap::new(),
+            None,
+            &PinByRequirementFormatter,
+            EcosystemId::GithubActions,
+        );
+        let deps = parse_result.dependencies();
+        let complete = keys.get(&deps[0].name_range()).unwrap();
+        let truncated = keys.get(&deps[1].name_range()).unwrap();
+        assert_ne!(complete, truncated);
+        assert!(!complete.as_str().ends_with("truncated"));
+        assert!(truncated.as_str().ends_with("truncated"));
     }
 }

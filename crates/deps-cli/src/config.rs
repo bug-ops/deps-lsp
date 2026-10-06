@@ -269,7 +269,8 @@ pub fn load(explicit_path: Option<&Path>, default_dir: &Path) -> Result<CliConfi
 /// someone notices and adds it to a reset list.
 ///
 /// The only fields kept from `parsed`: `policy.diagnostics`'s `*_severity` values. These
-/// are purely cosmetic (`table`/`json` severity display) —
+/// only set how loudly a finding is displayed (the `table`/`json` severity and the SARIF
+/// level, which a code-scanning threshold may read) —
 /// [`crate::report::FailOnPolicy::matches`] checks a finding's `Category`, never its
 /// severity, so no severity value can suppress or weaken a `--fail-on` match. Everything else
 /// reverts to its default: `policy.diagnostics.{mutable_ref_pin,vulnerabilities}_enabled`
@@ -297,7 +298,8 @@ pub fn safe_auto_discovered_config(parsed: CliConfig) -> CliConfig {
                 .with_mutable_ref_pin_severity(parsed.policy.diagnostics.mutable_ref_pin_severity)
                 .with_sha_comment_mismatch_severity(
                     parsed.policy.diagnostics.sha_comment_mismatch_severity,
-                ),
+                )
+                .with_unknown_ref_severity(parsed.policy.diagnostics.unknown_ref_severity),
             ..PolicyConfig::default()
         },
         ..CliConfig::default()
@@ -838,7 +840,7 @@ b = 2
         let dir = tempfile::tempdir().expect("create temp dir");
         std::fs::write(
             dir.path().join(DEFAULT_CONFIG_FILENAME),
-            "[diagnostics]\nmutable_ref_pin_severity = 1\nsha_comment_mismatch_severity = 1\n",
+            "[diagnostics]\nmutable_ref_pin_severity = 1\nsha_comment_mismatch_severity = 1\nunknown_ref_severity = 1\n",
         )
         .expect("write deps.toml");
         let config = load(None, dir.path()).expect("auto-discovered file must still load");
@@ -848,6 +850,10 @@ b = 2
         );
         assert_eq!(
             config.policy.diagnostics.sha_comment_mismatch_severity,
+            deps_core::diagnostic::Severity::Error
+        );
+        assert_eq!(
+            config.policy.diagnostics.unknown_ref_severity,
             deps_core::diagnostic::Severity::Error
         );
     }

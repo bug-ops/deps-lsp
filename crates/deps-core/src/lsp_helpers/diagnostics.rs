@@ -19,9 +19,9 @@ use crate::{
 };
 
 use super::{
-    CooldownBlocker, CooldownDisposition, EcosystemFormatter, LatestVerdict, PackageVersions,
-    RequirementGate, RequirementMatcher, RequirementStatus, VersionData, cooldown_disposition,
-    resolve_scan_outcome, version_range_is_synthetic_empty,
+    CooldownBlocker, CooldownDisposition, DiagnosticMessages, EcosystemFormatter, LatestVerdict,
+    PackageVersions, RequirementGate, RequirementMatcher, RequirementStatus, VersionData,
+    cooldown_disposition, resolve_scan_outcome, version_range_is_synthetic_empty,
 };
 
 /// Stable [`Diagnostic::code`] set on the unsatisfiable-requirement diagnostic.
@@ -327,6 +327,74 @@ pub(crate) fn format_matched_tags(tags: &crate::osv::MatchedTags) -> String {
     crate::licenses::join_capped(&sanitized, MAX_SIBLING_TAGS_RENDERED)
 }
 
+/// States that a version is affected through sibling release tags of its commit rather than its
+/// own tag, e.g. `matched release tag v4.9.0`.
+///
+/// The single place that words and sanitizes this fact, so hover, diagnostics and `deps-cli`
+/// never describe it differently. The label comes from the ecosystem
+/// ([`DiagnosticMessages::sibling_match_label`]); the tags are bounded and stripped of invisible
+/// characters on display.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::ConcreteVersion;
+/// use deps_core::lsp_helpers::{DiagnosticMessages, SiblingMatchNote};
+/// use deps_core::osv::MatchedTags;
+///
+/// struct Messages;
+/// impl DiagnosticMessages for Messages {}
+///
+/// let tags = MatchedTags::new(ConcreteVersion::new("v4.9.0"), vec![]);
+/// let note = SiblingMatchNote::new(&Messages, &tags);
+/// assert_eq!(note.to_string(), "matched tag v4.9.0");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiblingMatchNote {
+    label: &'static str,
+    tags: crate::osv::MatchedTags,
+}
+
+impl SiblingMatchNote {
+    /// Pairs `tags` (shared, not copied) with the ecosystem's label for a sibling match.
+    #[must_use]
+    pub fn new(messages: &dyn DiagnosticMessages, tags: &crate::osv::MatchedTags) -> Self {
+        Self {
+            label: messages.sibling_match_label(),
+            tags: tags.clone(),
+        }
+    }
+
+    /// The matched sibling tags, unsanitized.
+    #[must_use]
+    pub const fn tags(&self) -> &crate::osv::MatchedTags {
+        &self.tags
+    }
+}
+
+impl std::fmt::Display for SiblingMatchNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.label, format_matched_tags(&self.tags))
+    }
+}
+
+/// The ` (ids; note)` detail of a flagged-latest message: advisory ids and the sibling-match
+/// note, either or both, or nothing.
+fn flagged_detail(advisory_ids: &[String], via_sibling_tags: Option<&SiblingMatchNote>) -> String {
+    let mut parts = Vec::new();
+    if !advisory_ids.is_empty() {
+        parts.push(advisory_ids.join(", "));
+    }
+    if let Some(note) = via_sibling_tags {
+        parts.push(note.to_string());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join("; "))
+    }
+}
+
 /// Stable [`Diagnostic::code`] set on the package-level deprecation diagnostic (issue #205).
 ///
 /// Mirrors [`UNSATISFIABLE_DIAGNOSTIC_CODE`] — lets `build_replacement_action`'s stashed
@@ -359,6 +427,7 @@ pub const DEPRECATED_DIAGNOSTIC_CODE: &str = "deprecated-package";
 /// assert_eq!(severities.mutable_ref_pin, Severity::Hint);
 /// assert!(severities.mutable_ref_pin_enabled);
 /// assert_eq!(severities.sha_comment_mismatch, Severity::Warning);
+/// assert_eq!(severities.unknown_ref, Severity::Warning);
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,6 +463,11 @@ pub struct DiagnosticSeverities {
     /// `SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE`). No `_enabled` toggle: only a provable
     /// mismatch is reported.
     pub sha_comment_mismatch: Severity,
+    /// Severity for a tag pin whose ref is a full release that no published tag matches
+    /// (`unknown-ref`, `UNKNOWN_REF_DIAGNOSTIC_CODE`; #1766). No `_enabled` toggle: only a
+    /// full release shape that the complete tag list lacks is reported, so a branch pin like
+    /// `ruby/setup-ruby@v1` never is; lower the severity to hide it in the editor.
+    pub unknown_ref: Severity,
     /// Whether OSV vulnerability checking is enabled at all (issue #1517), mirroring
     /// `deps_lsp::config::DiagnosticsConfig::vulnerabilities_enabled`'s exact shape and
     /// default (`true`, opt-out). Consulted by the `deps-lsp` diagnostics handler to decide
@@ -442,6 +516,7 @@ impl DiagnosticSeverities {
             mutable_ref_pin: Severity::Hint,
             mutable_ref_pin_enabled: true,
             sha_comment_mismatch: Severity::Warning,
+            unknown_ref: Severity::Warning,
             vulnerabilities_enabled: true,
         }
     }
@@ -500,6 +575,13 @@ impl DiagnosticSeverities {
     #[must_use]
     pub const fn with_sha_comment_mismatch(mut self, sha_comment_mismatch: Severity) -> Self {
         self.sha_comment_mismatch = sha_comment_mismatch;
+        self
+    }
+
+    /// Overrides [`Self::unknown_ref`]. See [`Self::with_outdated`].
+    #[must_use]
+    pub const fn with_unknown_ref(mut self, unknown_ref: Severity) -> Self {
+        self.unknown_ref = unknown_ref;
         self
     }
 
@@ -1374,6 +1456,11 @@ fn offline_notice(
 /// has no such restriction: it renders per-dependency, on demand, not as a standing
 /// diagnostic, so it uses [`SkipReason::unchecked_reason`] directly for every
 /// non-`NonRegistrySource` variant.
+///
+/// [`SkipReason::SiblingTagsUnknown`] (phase A's truncated tag list and phase B's unknown
+/// candidate siblings alike) is hover-only by design: for a repository over the tag fetch cap it
+/// is as permanent as the structural reasons, so a standing Problems-panel entry could never be
+/// resolved.
 const fn should_notify_in_diagnostics(reason: SkipReason) -> bool {
     match reason {
         SkipReason::NoConcreteVersion
@@ -2629,6 +2716,7 @@ fn push_flagged_latest_admitted_by_requirement(
         LatestVerdict::Flagged {
             advisory_ids,
             malicious,
+            via_sibling_tags,
         } => {
             let severity = if malicious {
                 Severity::Error
@@ -2645,11 +2733,10 @@ fn push_flagged_latest_admitted_by_requirement(
                 return;
             }
 
-            let ids = if advisory_ids.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", advisory_ids.join(", "))
-            };
+            let note = via_sibling_tags
+                .as_ref()
+                .map(|tags| SiblingMatchNote::new(ctx.formatter, tags));
+            let ids = flagged_detail(&advisory_ids, note.as_ref());
             let latest = sanitize_and_truncate_for_diagnostic(latest, MAX_VERSION_DIAGNOSTIC_CHARS);
             diagnostics.push(
                 Diagnostic::new(
@@ -2830,12 +2917,12 @@ fn apply_outdated_rule(
         LatestVerdict::Flagged {
             advisory_ids,
             malicious,
+            via_sibling_tags,
         } => {
-            let ids = if advisory_ids.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", advisory_ids.join(", "))
-            };
+            let note = via_sibling_tags
+                .as_ref()
+                .map(|tags| SiblingMatchNote::new(ctx.formatter, tags));
+            let ids = flagged_detail(advisory_ids, note.as_ref());
             let severity = if *malicious {
                 Severity::Error
             } else {
@@ -3117,11 +3204,7 @@ fn push_vulnerability_diagnostics(
 
         let message = advisory_text(advisory);
         let message = match dv.sibling_match(&advisory.id) {
-            Some(tags) => format!(
-                "{message} ({} {})",
-                formatter.sibling_match_label(),
-                format_matched_tags(tags)
-            ),
+            Some(tags) => format!("{message} ({})", SiblingMatchNote::new(formatter, tags)),
             None => message,
         };
 
@@ -5575,6 +5658,8 @@ mod tests {
 
     /// #1675: an advisory whose range could not be evaluated must be visible outside the hover
     /// footer, while a non-SemVer pin (a permanent, benign state) must not leave a standing notice.
+    /// `SiblingTagsUnknown` is hover-only by design (it is permanent for a repository over the tag
+    /// fetch cap), in phase A and phase B alike.
     #[test]
     fn test_skip_reason_notice_for_local_matching_reasons() {
         use crate::osv::SkipReason;
@@ -6668,6 +6753,7 @@ mod tests {
                 version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
+                via_sibling_tags: None,
             },
         );
 
@@ -6711,6 +6797,71 @@ mod tests {
         );
     }
 
+    fn flagged_via_siblings_diagnostics(version_req: &str, latest: &str) -> Vec<Diagnostic> {
+        use crate::osv::{Capped, LatestStatusMap, MatchedTags, UpgradeStatus, VulnSeverity};
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "pkg".into(),
+                version_req: version_req.into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("pkg".into(), PackageVersions::latest_only(latest));
+        let resolved_versions = HashMap::new();
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("pkg"),
+            UpgradeStatus::CandidateVulnerable {
+                version: ConcreteVersion::new(latest),
+                advisory_ids: Capped::new(vec!["GHSA-yyyy".to_string()], 1),
+                worst_severity: Some(VulnSeverity::High),
+                via_sibling_tags: Some(MatchedTags::new(ConcreteVersion::new("v4.9.0"), vec![])),
+            },
+        );
+
+        generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        )
+    }
+
+    /// #1767: both flagged-latest diagnostics name the sibling tags the latest matched.
+    #[test]
+    fn test_flagged_latest_diagnostics_name_the_matched_sibling_tags() {
+        let admitted = flagged_via_siblings_diagnostics("^1.0", "1.5.0");
+        assert_eq!(admitted.len(), 1, "{admitted:?}");
+        assert!(
+            admitted[0]
+                .message()
+                .contains("(GHSA-yyyy; matched tag v4.9.0)"),
+            "{}",
+            admitted[0].message()
+        );
+
+        let outdated = flagged_via_siblings_diagnostics("1.0", "2.0.0");
+        assert_eq!(outdated.len(), 1, "{outdated:?}");
+        assert!(
+            outdated[0]
+                .message()
+                .contains("(GHSA-yyyy; matched tag v4.9.0) — do not upgrade"),
+            "{}",
+            outdated[0].message()
+        );
+    }
+
     /// Non-malicious `Flagged` (e.g. a graded but non-critical vulnerability) renders at
     /// Warning severity, not Error.
     #[test]
@@ -6751,6 +6902,7 @@ mod tests {
                 version: ConcreteVersion::new("2.0.0"),
                 advisory_ids: Capped::new(vec!["GHSA-xxxx".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
+                via_sibling_tags: None,
             },
         );
 
@@ -6811,6 +6963,7 @@ mod tests {
                 version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
+                via_sibling_tags: None,
             },
         );
 
@@ -6868,6 +7021,7 @@ mod tests {
                 version: ConcreteVersion::new("1.5.0"),
                 advisory_ids: Capped::new(vec!["GHSA-yyyy".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
+                via_sibling_tags: None,
             },
         );
 
@@ -6938,6 +7092,7 @@ mod tests {
                 version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["GHSA-xxxx".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
+                via_sibling_tags: None,
             },
         );
 
@@ -7031,6 +7186,7 @@ mod tests {
                 version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
+                via_sibling_tags: None,
             },
         );
 
@@ -7126,6 +7282,7 @@ mod tests {
                 version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
+                via_sibling_tags: None,
             },
         );
 

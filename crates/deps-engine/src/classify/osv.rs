@@ -1054,6 +1054,14 @@ mod tests {
         tags: &[(&str, char)],
         scope: deps_core::lsp_helpers::SiblingScope,
     ) -> CandidateTagSource {
+        tagged_source_with_coverage(tags, scope, deps_core::pagination::ListCoverage::Complete)
+    }
+
+    fn tagged_source_with_coverage(
+        tags: &[(&str, char)],
+        scope: deps_core::lsp_helpers::SiblingScope,
+        coverage: deps_core::pagination::ListCoverage,
+    ) -> CandidateTagSource {
         let shas: Vec<(&str, deps_core::lsp_helpers::CommitSha)> = tags
             .iter()
             .map(|(tag, c)| {
@@ -1064,9 +1072,12 @@ mod tests {
             })
             .collect();
         CandidateTagSource::Indexed {
-            index: std::sync::Arc::new(deps_core::lsp_helpers::TagIndex::from_tags(
-                shas.iter().map(|(tag, sha)| (*tag, sha)),
-            )),
+            index: std::sync::Arc::new(
+                deps_core::lsp_helpers::TagIndex::from_tags(
+                    shas.iter().map(|(tag, sha)| (*tag, sha)),
+                )
+                .with_coverage(coverage),
+            ),
             scope,
         }
     }
@@ -1725,6 +1736,62 @@ mod tests {
             assert_eq!(
                 versions("other/action"),
                 ("v4.9.0".to_string(), vec!["v4.10.0".to_string()])
+            );
+        }
+
+        /// #1769: a truncated tag list marks the in-use target's sibling list incomplete, for a
+        /// listed SHA pin and for an exact tag pin the list does not reach (read from text).
+        #[cfg(feature = "github-actions")]
+        #[test]
+        fn build_scan_targets_github_actions_truncated_index_marks_siblings_incomplete() {
+            use deps_core::lsp_helpers::{CommitSha, TagIndex};
+            use deps_core::pagination::ListCoverage;
+            use deps_github_actions::{GithubActionsFormatter, GithubActionsRegistry};
+            use std::sync::Arc;
+
+            let sha = "e".repeat(40);
+            let commit = CommitSha::parse(&sha).unwrap();
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = format!(
+                "steps:\n  - uses: actions/checkout@{sha}\n  - uses: other/action@v4.9.0\n"
+            );
+            let parse_result =
+                deps_github_actions::parse_workflow_yaml(&content, &uri).expect("valid yaml");
+
+            let registry = GithubActionsRegistry::new(Arc::new(deps_core::HttpCache::new()));
+            let tag_index = registry.tag_index();
+            let canonical = |repo: &str| {
+                deps_core::github::CanonicalRepoName::from_commit_url(&format!(
+                    "https://api.github.com/repos/{repo}/commits/abc"
+                ))
+            };
+            for (repo, tag) in [("actions/checkout", "v4.8.0"), ("other/action", "v4.1.0")] {
+                tag_index.insert(
+                    PackageName::new(repo),
+                    Arc::new(
+                        TagIndex::from_tags([(tag, &commit)])
+                            .with_canonical_repo_name(canonical(repo))
+                            .with_coverage(ListCoverage::Truncated),
+                    ),
+                );
+            }
+            let formatter = GithubActionsFormatter::new(tag_index);
+
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &HashMap::new(),
+                &HashMap::new(),
+                &formatter,
+                EcosystemId::GithubActions,
+            );
+
+            assert!(skipped.is_empty(), "{skipped:?}");
+            assert_eq!(targets.len(), 2);
+            assert!(
+                targets
+                    .iter()
+                    .all(|t| t.sibling_coverage() == ListCoverage::Truncated),
+                "{targets:?}"
             );
         }
 
@@ -2604,6 +2671,33 @@ mod tests {
                 .map(|s| s.display_version().as_str())
                 .collect();
             assert_eq!(siblings, ["v4.9.0"]);
+        }
+
+        /// #1769: a truncated tag list marks the candidate target's sibling list incomplete.
+        #[test]
+        fn build_latest_check_targets_truncated_index_marks_siblings_incomplete() {
+            use deps_core::pagination::ListCoverage;
+
+            let (parse_result, cached_versions) = gha_like_fixture();
+            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let sources = sources_with(
+                "gha-action",
+                tagged_source_with_coverage(
+                    &[("v4.8.0", 'a'), ("v4.9.0", 'a')],
+                    deps_core::lsp_helpers::SiblingScope::SameMajor,
+                    ListCoverage::Truncated,
+                ),
+            );
+
+            let (targets, _) = build_latest_check_targets(
+                &parse_result,
+                &cached_versions,
+                &vuln_keys,
+                &sources,
+                &StubFormatter::DEFAULT,
+            );
+
+            assert_eq!(targets[0].sibling_coverage(), ListCoverage::Truncated);
         }
 
         #[test]
