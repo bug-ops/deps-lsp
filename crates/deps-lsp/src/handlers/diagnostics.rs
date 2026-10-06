@@ -170,6 +170,20 @@ pub(crate) async fn publish_document_diagnostics(
     client.publish_diagnostics(uri.clone(), diags, None).await;
 }
 
+/// Like [`publish_document_diagnostics`], but builds the snapshot from the live `config` at
+/// publish time, so a `didChangeConfiguration` that landed while a background task was
+/// fetching is reflected instead of overwritten by the task's spawn-time values (#1794).
+pub(crate) async fn publish_document_diagnostics_live(
+    state: &Arc<ServerState>,
+    client: &Client,
+    uri: &Uri,
+    config: &RwLock<DepsConfig>,
+    dep_count: usize,
+) {
+    let snapshot = DiagnosticsSnapshot::from_config(&*config.read().await);
+    publish_document_diagnostics(state, client, uri, &snapshot, dep_count).await;
+}
+
 /// Handles diagnostic requests using trait-based delegation.
 #[tracing::instrument(
     skip(state, config, client, full_config),

@@ -80,6 +80,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-github-actions, deps-gitlab-ci**: a tag pin ahead of latest that a complete tag list lacks (`@v40`) is reported unresolved instead of up to date (#1770)
 - **deps-core**: a SHA pin's full-version comment that a truncated tag index maps to another commit is reported as `sha-comment-mismatch` and no longer trusted for status or the OSV query (#1770)
 - **deps-lsp**: tag-index-dependent diagnostics of other open GitHub Actions documents are republished after a tag-index refresh, also with OSV off or offline (#1770)
+- **deps-lsp**: push-only clients get diagnostics republished after a `didChangeConfiguration` that changes no parse-affecting setting (#PR)
 
 ## [2.0.0] - 2026-09-29
 

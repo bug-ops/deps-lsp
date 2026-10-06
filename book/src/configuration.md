@@ -186,7 +186,10 @@ An invalid `GITLAB_TOKEN_HOST` disables the token entirely. See
 > vulnerability, and GitHub tags), across every ecosystem. Already-cached data keeps serving; an
 > uncached dependency shows an offline marker in inlay hints, and hover appends a footer stating
 > that version *and* vulnerability data were not checked. Toggling it via
-> `workspace/didChangeConfiguration` takes effect immediately, with no editor restart.
+> `workspace/didChangeConfiguration` takes effect immediately, with no editor restart. A change
+> to `diagnostics.*` (for example `vulnerabilities_enabled` or a `*_severity`) republishes
+> diagnostics for every open document, so clients that only receive `publishDiagnostics` (no
+> `workspace/diagnostic/refresh` support) do not keep stale diagnostics.
 
 > **Note:** The supply-chain trust signal only appears for **npm, Cargo, Go, Maven, PyPI,
 > Bundler, and NuGet** (Composer, Dart, and Swift have no deps.dev coverage) and only for a
