@@ -13,7 +13,7 @@
 
 use crate::types::{GitlabCiVersion, PinStyle};
 use deps_core::github::normalize_tag;
-use deps_core::lsp_helpers::{is_full_sha, is_tag_shaped};
+use deps_core::lsp_helpers::{CommitSha, is_tag_shaped};
 
 /// Literal `~latest` pin text (spec FR-007).
 pub(crate) const LATEST: &str = "~latest";
@@ -34,12 +34,13 @@ fn is_partial_semver_shaped(raw: &str) -> bool {
 /// # Examples
 ///
 /// ```
+/// use deps_core::lsp_helpers::CommitSha;
 /// use deps_gitlab_ci::component::classify_component_pin_style;
 /// use deps_gitlab_ci::PinStyle;
 ///
 /// assert_eq!(
-///     classify_component_pin_style(&"a".repeat(40)),
-///     PinStyle::sha_without_comment()
+///     classify_component_pin_style(&"A".repeat(40)),
+///     PinStyle::sha_without_comment(CommitSha::parse(&"a".repeat(40)).unwrap())
 /// );
 /// assert_eq!(classify_component_pin_style("~latest"), PinStyle::Latest);
 /// assert_eq!(classify_component_pin_style("1.2"), PinStyle::Partial);
@@ -48,8 +49,8 @@ fn is_partial_semver_shaped(raw: &str) -> bool {
 /// ```
 #[must_use]
 pub fn classify_component_pin_style(raw: &str) -> PinStyle {
-    if is_full_sha(raw) {
-        PinStyle::sha_without_comment()
+    if let Some(sha) = CommitSha::parse(raw) {
+        PinStyle::sha_without_comment(sha)
     } else if raw == LATEST {
         PinStyle::Latest
     } else if is_partial_semver_shaped(raw) {
@@ -137,9 +138,9 @@ pub fn resolve_component_pin(
     releases: &[GitlabCiVersion],
 ) -> Option<GitlabCiVersion> {
     match pin {
-        PinStyle::Sha { .. } => releases
+        PinStyle::Sha { sha, .. } => releases
             .iter()
-            .find(|r| r.sha.as_ref().is_some_and(|s| s.as_str() == raw))
+            .find(|r| r.sha.as_ref() == Some(sha))
             .cloned(),
         // An exact release match always wins regardless of the parse-time shape guess —
         // FR-007's priority order puts it ahead of the "branch" honest-unknown, and the
@@ -192,7 +193,7 @@ mod tests {
     fn test_classify_sha() {
         assert_eq!(
             classify_component_pin_style(&"a".repeat(40)),
-            PinStyle::sha_without_comment()
+            PinStyle::sha_without_comment(CommitSha::parse(&"a".repeat(40)).unwrap())
         );
     }
 
@@ -230,11 +231,30 @@ mod tests {
     // --- resolve_component_pin: FR-007 priority ladder ---
 
     #[test]
+    fn test_classify_uppercase_sha_keeps_lowercase_commit() {
+        let upper = "A".repeat(40);
+        assert_eq!(
+            classify_component_pin_style(&upper),
+            PinStyle::sha_without_comment(CommitSha::parse(&"a".repeat(40)).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_resolve_uppercase_sha_finds_lowercase_release() {
+        let lower = "a".repeat(40);
+        let upper = lower.to_ascii_uppercase();
+        let releases = vec![release("1.0.0", &lower)];
+        let pin = classify_component_pin_style(&upper);
+        let resolved = resolve_component_pin(&pin, &upper, &releases).unwrap();
+        assert_eq!(resolved.version.as_str(), "1.0.0");
+    }
+
+    #[test]
     fn test_resolve_sha() {
         let sha = "a".repeat(40);
         let releases = vec![release("1.0.0", &sha)];
-        let resolved =
-            resolve_component_pin(&PinStyle::sha_without_comment(), &sha, &releases).unwrap();
+        let pin = PinStyle::sha_without_comment(CommitSha::parse(&sha).unwrap());
+        let resolved = resolve_component_pin(&pin, &sha, &releases).unwrap();
         assert_eq!(resolved.version.as_str(), "1.0.0");
     }
 

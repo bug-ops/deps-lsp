@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `Ecosystem::watched_config_filenames`/`routing_affecting_watched_configs` replaced by `watched_configs() -> &[WatchedConfig]`; `EcosystemRegistry::for_watched_config` takes a `&Path` and returns `(ecosystem, effect)` pairs; watched configs match by path suffix and no longer accept `*` wildcards (#1775)
 - **deps-engine**: `build_latest_check_targets`, `build_candidate_check_targets` and `collect_fix_target_resolutions` take a `candidate_tags` parameter; `ScanTarget::with_siblings` is generic over the sealed `TaggedVersions`; new `SkipReason::SiblingTagsUnknown` and `RequirementResolution::candidate_tag_source` hook (deps-core) (#1775)
 - **deps-cli**: `CheckFinding.advisory_severity` replaced by `advisory: Option<AdvisoryFacts>`; a SARIF advisory rule has no `fullDescription` when the scan did not fetch the advisory (#1775)
+- **deps-core**: `TagIndex::pin_resolution` and `ShaPinLookup::resolve` take the pin's comment tag; `PinResolution`, `ShaPinLookup` and `CommentMismatch` gain a comment-contradicted variant; `ShaPinComment::new` takes the tag range (#1770)
+- **deps-gitlab-ci**: `PinStyle::Sha` carries the pinned `CommitSha`; `sha_pin_replacement_for` takes a `CommentSlot`; `GitlabCiDependency` gains `comment_slot` (#1770)
+- **deps-cli**: `Category::ShaCommentMismatch` added for `--fail-on sha-comment-mismatch` (#1770)
 
 ### Added
 - **deps-core, all ecosystems**: `DepsError::HostBlockedByPolicy` shows a policy-specific message when a registry host resolves to a blocked address class at connect time (#1773)
@@ -24,9 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: shared `netrc` parser following SwiftPM's grammar, and `pagination::next_page`/`NextPage` for validated `Link rel="next"` targets (#1773)
 - **deps-core**: `PinResolution`, `TagIndex::pin_resolution`, `PartialTagPolicy`, `tag_pin_is_up_to_date` and `tag_has_precedence` shared by the git-tag ecosystems (#1751)
 - **deps-github-actions**: `Correct version comment to <tag>` quickfix for a SHA pin whose trailing comment names another tag (#1751)
-- **deps-cli**: `--fail-on other` token for uncategorized findings (offline/lock-file/registry notices, `sha-comment-mismatch`) (#1747)
+- **deps-cli**: `--fail-on other` token for uncategorized findings (offline/lock-file/registry notices, `unresolved-gitlab-host`) (#1747)
 - **deps-swift**: SE-0292 registry client resolves `.package(id:)` dependencies through `registries.json` (project and user tiers), binding the environment credential to user-declared registry URLs only (#1763)
 - **deps-core**: `secret::basic_auth_header`, `CachedResponse::link` with `HttpCache::get_cached_{trusted_origin,pinned}_response`, `ListCoverage::from_link_header` (#1763)
+- **deps-cli**: `--fail-on sha-comment-mismatch` category for SHA pins whose version comment is not confirmed by the tag index (#1770)
+- **deps-core**: `TagIndex::proves_ahead_tag_absent` and a shared `Correct version comment` action builder (#1770)
+- **deps-gitlab-ci**: `Correct version comment to <tag>` quickfix for SHA pins (#1770)
 - **deps-core**: shared `lsp_helpers::sha_comment` module (SHA-pin trailing-comment read, check and rewrite) used by GitHub Actions and GitLab CI (#1764)
 - **deps-core, deps-github-actions**: `Ecosystem::tag_index_refreshes` and `GithubActionsRegistry::subscribe_tag_refreshes` publish tag-index refresh events (#1764)
 
@@ -36,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: `update --security-only` Unfixable rows (`Yanked`, `UnsupportedRequirementShape`, `OversizedRequirement`) now report their `advisory_ids` (#1747)
 - **deps-composer**: OR-branch bounds are computed once when `ComposerMatcher` is built, as in `deps-npm`; behavior unchanged (#1747)
 - **deps-swift**: `Package.resolved` pins map by `kind` (`registry` to a registry source, unknown kinds skipped instead of read as Git) and `SwiftRegistry` routes by dependency source, failing closed for unresolved `id:` sources (#1763)
+- **deps-github-actions, deps-gitlab-ci**: tag-to-SHA quickfixes write `<sha> # <tag>` through the shared rewrite rule, and a bare SHA when the ref is quoted, in a flow mapping or the tag is not version-shaped (#1770)
 
 ### Fixed
 - **deps-engine, deps-github-actions**: OSV latest, candidate and fix-target checks cover the sibling release tags of the candidate commit and fail closed when they are unknown (#1775)
@@ -49,6 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps**: bump yanked `yoke-derive` to 0.8.4 so cargo-deny passes (#1746)
 - **workspace**: allow `clippy::assert_is_empty` (new in Rust 1.99) to keep CI clippy green (#1746)
 - **deps-lsp**: lock-file-change OSV rescan is now also suppressed in offline mode, matching the phase A gate (#1747)
+- **deps-github-actions, deps-gitlab-ci**: a tag pin ahead of latest that a complete tag list lacks (`@v40`) is reported unresolved instead of up to date (#1770)
+- **deps-core**: a SHA pin's full-version comment that a truncated tag index maps to another commit is reported as `sha-comment-mismatch` and no longer trusted for status or the OSV query (#1770)
+- **deps-lsp**: tag-index-dependent diagnostics of other open GitHub Actions documents are republished after a tag-index refresh, also with OSV off or offline (#1770)
 
 ## [2.0.0] - 2026-09-29
 

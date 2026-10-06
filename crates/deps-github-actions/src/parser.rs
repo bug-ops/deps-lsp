@@ -351,7 +351,6 @@ fn build_dependency(
                         let comment_end = read.range_end;
                         let comment = ShaComment::new(
                             pin_comment,
-                            make_range(comment_end - tag.len(), comment_end),
                             content[ref_start..comment_end].to_string(),
                         );
                         GithubActionsDependency {

@@ -8,21 +8,13 @@
 //! module (which globs `use super::*;`) keeps referencing them unqualified, unchanged from
 //! before the move.
 
-use deps_core::lsp_helpers::{
-    CommentCheck, CommentMismatch, MAX_DIAGNOSTIC_VALUE_CHARS, PackageRendering,
-    SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE, is_partial_semver_shaped,
-    sanitize_and_truncate_for_diagnostic,
-};
-use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit, WorkspaceEdit};
+use deps_core::lsp_helpers::{CommentCheck, PackageRendering};
+use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
 
 use super::{
     GithubActionsDependency, GithubActionsFormatter, MUTABLE_REF_PIN_DIAGNOSTIC_CODE,
     ParseResultTrait, Url,
 };
-
-fn sanitize_for_message(value: &str) -> String {
-    sanitize_and_truncate_for_diagnostic(value, MAX_DIAGNOSTIC_VALUE_CHARS)
-}
 
 /// Leading version-constraint operators stripped from a completion prefix before matching
 /// it against registry versions. Empty: a `uses:` ref is a bare tag/branch/SHA, with no
@@ -93,15 +85,8 @@ pub(super) fn build_sha_pin_action(
 /// Builds the "Correct version comment" quickfix (#1734) for the SHA pin at `position` whose
 /// trailing `# tag` comment names a different tag than the one the pinned commit carries.
 ///
-/// The edit replaces only the comment's tag token with the registry-confirmed tag, so the
-/// written SHA casing, closing delimiters, and spacing are untouched. `None` when there is no
-/// such mismatch (including [`CommentMismatch::ShaNotInIndex`], where no tag can be offered).
-///
-/// The tag text comes from the registry's tag list, so it is offered only when the parser would
-/// read it back as a comment tag and sanitization leaves it unchanged (no invisible or bidi
-/// characters, within the length cap). A comment token with trailing punctuation (`v4-beta,`)
-/// is left alone: the corrected token would no longer parse as a comment tag, hiding the
-/// warning without confirming the pin.
+/// Locates the pin and its [`CommentCheck`] mismatch, then delegates to the shared
+/// [`deps_core::lsp_helpers::build_sha_comment_fix_action`].
 pub(super) fn build_sha_comment_fix_action(
     parse_result: &dyn ParseResultTrait,
     position: Position,
@@ -113,38 +98,15 @@ pub(super) fn build_sha_comment_fix_action(
         .into_iter()
         .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
     let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-    let Some(CommentCheck::Mismatch(CommentMismatch::ShaIsOtherTag { actual })) =
-        formatter.sha_comment_check(gha_dep)
-    else {
+    let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gha_dep)? else {
         return None;
     };
-    let comment = gha_dep.sha_comment()?;
-    let actual = actual.as_str();
-    if !is_partial_semver_shaped(actual)
-        || sanitize_for_message(actual) != actual
-        || comment.tag().ends_with(|c: char| c.is_ascii_punctuation())
-    {
-        return None;
-    }
-    let version_range = gha_dep.version_range?;
-    let changes =
-        deps_core::lsp_helpers::single_file_edit(uri, comment.tag_range(), actual.to_string());
-    Some(CodeAction {
-        title: format!(
-            "Correct version comment to `{}`",
-            sanitize_for_message(actual)
-        ),
-        kind: Some(CodeActionKind::QUICKFIX),
-        edit: Some(WorkspaceEdit {
-            changes: Some(changes),
-            ..Default::default()
-        }),
-        data: Some(serde_json::json!({
-            "diagnostic_codes": [SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE],
-            "diagnostic_range": tower_lsp_server::ls_types::Range::from(version_range),
-        })),
-        ..Default::default()
-    })
+    deps_core::lsp_helpers::build_sha_comment_fix_action(
+        uri,
+        gha_dep.version_range?,
+        gha_dep.sha_comment()?.pin_comment(),
+        &mismatch,
+    )
 }
 
 /// Builds one [`TextEdit`] per `PinStyle::Tag` step in `parse_result` resolvable to a

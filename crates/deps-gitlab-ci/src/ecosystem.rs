@@ -16,7 +16,7 @@ use deps_core::{
     Ecosystem, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
     diagnostic::{Diagnostic, Severity},
     lsp_helpers::{
-        CommentCheck, CommitSha, EcosystemFormatter, MAX_DIAGNOSTIC_VALUE_CHARS,
+        CommentCheck, EcosystemFormatter, MAX_DIAGNOSTIC_VALUE_CHARS,
         sanitize_and_truncate_for_diagnostic, sha_comment_mismatch_diagnostic,
     },
 };
@@ -41,7 +41,8 @@ mod lsp;
 #[cfg(feature = "lsp-responses")]
 use lsp::{
     COMPONENT_PIN_RESOLUTION_TIMEOUT, VERSION_OPERATOR_CHARS, build_dynamic_component_pin_action,
-    build_sha_pin_action, collect_pin_all_to_sha_edits, splice_project_line,
+    build_sha_comment_fix_action, build_sha_pin_action, collect_pin_all_to_sha_edits,
+    splice_project_line,
 };
 
 /// Maximum character count of an interpolated raw host expression before truncation —
@@ -405,6 +406,12 @@ impl Ecosystem for GitlabCiEcosystem {
                 uri,
                 &self.formatter,
             ));
+            actions.extend(build_sha_comment_fix_action(
+                parse_result,
+                position,
+                uri,
+                &self.formatter,
+            ));
             if let Some(action) = build_dynamic_component_pin_action(
                 parse_result,
                 position,
@@ -465,28 +472,21 @@ impl Ecosystem for GitlabCiEcosystem {
                 hover.rewrite_markdown(|md| splice_project_line(md, &url));
             }
 
-            if matches!(gl_dep.pin, Some(PinStyle::Sha { .. }))
-                && let Some(sha) = gl_dep
-                    .version_req
-                    .as_ref()
-                    .and_then(|req| deps_core::lsp_helpers::CommitSha::parse(req.as_str()))
+            if let Some(sha) = gl_dep.pinned_sha()
                 && let Some(resolved_tag) =
                     self.formatter
-                        .resolved_tag_for_sha(gl_dep.kind.endpoint(), dep.name(), &sha)
+                        .resolved_tag_for_sha(gl_dep.kind.endpoint(), dep.name(), sha)
             {
                 hover.rewrite_markdown(|md| {
-                    deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, &sha)
+                    deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, sha)
                 });
             }
 
             if let Some(CommentCheck::Mismatch(mismatch)) = self.formatter.sha_comment_check(gl_dep)
                 && let Some(comment) = gl_dep.sha_comment()
-                && let Some(sha) = gl_dep
-                    .version_req
-                    .as_ref()
-                    .and_then(|req| CommitSha::parse(req.as_str()))
+                && let Some(sha) = gl_dep.pinned_sha()
             {
-                let line = sha_comment_mismatch_hover_line(&sha, &comment.tag, &mismatch);
+                let line = sha_comment_mismatch_hover_line(sha, &comment.tag, &mismatch);
                 hover.rewrite_markdown(|md| deps_core::lsp_helpers::splice_hover_line(md, &line));
             }
 
@@ -770,11 +770,11 @@ fn sha_comment_mismatch_diagnostics(
                 return None;
             };
             let comment = gl_dep.sha_comment()?;
-            let sha = CommitSha::parse(gl_dep.version_req.as_ref()?.as_str())?;
+            let sha = gl_dep.pinned_sha()?;
             Some(sha_comment_mismatch_diagnostic(
                 gl_dep.version_range?,
                 &gl_dep.name,
-                &sha,
+                sha,
                 &comment.tag,
                 &mismatch,
                 severity,
@@ -952,6 +952,7 @@ mod tests {
             kind: IncludeKind::Component,
             host,
             pin: Some(PinStyle::Tag),
+            comment_slot: deps_core::lsp_helpers::CommentSlot::Unavailable,
             project_path: "org/proj".to_string(),
         };
         let parse_result = crate::types::GitlabCiParseResult {
@@ -1005,6 +1006,7 @@ mod tests {
             kind: IncludeKind::Component,
             host,
             pin: Some(PinStyle::Tag),
+            comment_slot: deps_core::lsp_helpers::CommentSlot::Unavailable,
             project_path: "org/proj".to_string(),
         };
         let parse_result = crate::types::GitlabCiParseResult {
@@ -1060,6 +1062,7 @@ mod tests {
             kind: IncludeKind::Component,
             host,
             pin: Some(PinStyle::Tag),
+            comment_slot: deps_core::lsp_helpers::CommentSlot::Unavailable,
             project_path: "org/proj".to_string(),
         };
         let parse_result = crate::types::GitlabCiParseResult {
@@ -1345,6 +1348,7 @@ mod tests {
             kind: IncludeKind::Project,
             host: HostRef::Literal(crate::host::GitlabHost::for_test("gitlab.com")),
             pin: Some(PinStyle::Tag),
+            comment_slot: deps_core::lsp_helpers::CommentSlot::Unavailable,
             project_path: "org/proj".to_string(),
         };
         let parse_result = crate::types::GitlabCiParseResult {
@@ -1577,6 +1581,7 @@ mod tests {
                 kind,
                 host: HostRef::Literal(crate::host::GitlabHost::for_test("gitlab.com")),
                 pin: Some(pin),
+                comment_slot: deps_core::lsp_helpers::CommentSlot::Unavailable,
                 project_path: "org/proj".to_string(),
             }
         };
@@ -1664,7 +1669,9 @@ mod tests {
                 "component sha",
                 make_dep(
                     IncludeKind::Component,
-                    PinStyle::sha_without_comment(),
+                    PinStyle::sha_without_comment(
+                        deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+                    ),
                     resolved_source.clone(),
                 ),
                 false,
@@ -1758,6 +1765,7 @@ mod tests {
             kind: IncludeKind::Project,
             host: HostRef::Unresolved("$CI_SERVER_FQDN".to_string()),
             pin,
+            comment_slot: deps_core::lsp_helpers::CommentSlot::Unavailable,
             project_path: "org/proj".to_string(),
         }
     }
@@ -2043,7 +2051,7 @@ mod tests {
                 .get(&deps_core::to_ls_uri(&uri))
                 .unwrap();
             assert_eq!(text_edits.len(), 1);
-            assert_eq!(text_edits[0].new_text, sha);
+            assert_eq!(text_edits[0].new_text, format!("{sha} # v1.0.0"));
         }
 
         #[test]
@@ -2168,8 +2176,14 @@ mod tests {
             let edit0 = action0.edit.as_ref().unwrap();
             let edit1 = action1.edit.as_ref().unwrap();
             let ls_uri = deps_core::to_ls_uri(&uri);
-            assert_eq!(edit0.changes.as_ref().unwrap()[&ls_uri][0].new_text, sha1);
-            assert_eq!(edit1.changes.as_ref().unwrap()[&ls_uri][0].new_text, sha2);
+            assert_eq!(
+                edit0.changes.as_ref().unwrap()[&ls_uri][0].new_text,
+                format!("{sha1} # v1.0.0")
+            );
+            assert_eq!(
+                edit1.changes.as_ref().unwrap()[&ls_uri][0].new_text,
+                format!("{sha2} # v2.0.0")
+            );
         }
 
         /// Validation Fix 2 regression, exercised at the actual quickfix-production boundary
@@ -2247,12 +2261,12 @@ mod tests {
 
             assert_eq!(
                 action0.edit.as_ref().unwrap().changes.as_ref().unwrap()[&ls_uri][0].new_text,
-                project_sha,
+                format!("{project_sha} # v1.0.0"),
                 "the project: include must resolve its own Tags-route SHA, not the component's"
             );
             assert_eq!(
                 action1.edit.as_ref().unwrap().changes.as_ref().unwrap()[&ls_uri][0].new_text,
-                component_sha,
+                format!("{component_sha} # 1.0.0"),
                 "the component: include must resolve its own Releases-route SHA, not the project's"
             );
         }
@@ -2313,6 +2327,7 @@ mod tests {
                 kind: IncludeKind::Component,
                 host: HostRef::Literal(crate::host::GitlabHost::for_test(&host_bare)),
                 pin: Some(pin),
+                comment_slot: deps_core::lsp_helpers::CommentSlot::Unavailable,
                 project_path: "org/proj".to_string(),
             };
             let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -2520,6 +2535,7 @@ mod tests {
                 kind: IncludeKind::Component,
                 host: HostRef::Literal(crate::host::GitlabHost::for_test(&host_bare)),
                 pin: Some(PinStyle::Latest),
+                comment_slot: deps_core::lsp_helpers::CommentSlot::Unavailable,
                 project_path: "org/proj".to_string(),
             };
             let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -2645,8 +2661,16 @@ mod tests {
             let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
 
             assert_eq!(edits.len(), 2);
-            assert!(edits.iter().any(|e| e.new_text == sha1));
-            assert!(edits.iter().any(|e| e.new_text == sha2));
+            assert!(
+                edits
+                    .iter()
+                    .any(|e| e.new_text == format!("{sha1} # v1.0.0"))
+            );
+            assert!(
+                edits
+                    .iter()
+                    .any(|e| e.new_text == format!("{sha2} # v2.0.0"))
+            );
         }
 
         #[tokio::test]
@@ -2715,7 +2739,7 @@ mod tests {
 
             let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
             assert_eq!(edits.len(), 1);
-            assert_eq!(edits[0].new_text, sha);
+            assert_eq!(edits[0].new_text, format!("{sha} # 2.0.0"));
         }
 
         #[tokio::test]
@@ -2755,7 +2779,8 @@ mod tests {
             let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
             assert_eq!(edits.len(), 1);
             assert_eq!(
-                edits[0].new_text, sha_high,
+                edits[0].new_text,
+                format!("{sha_high} # 1.2.5"),
                 "1.2 must pick the highest matching release (1.2.5), not 1.2.0 or the \
              out-of-range 1.3.0"
             );
@@ -2845,7 +2870,8 @@ mod tests {
             let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
             assert_eq!(edits.len(), 1);
             assert_eq!(
-                edits[0].new_text, sha_last,
+                edits[0].new_text,
+                format!("{sha_last} # v1.2.0"),
                 "on a semver tie, the LAST entry in available's order must win, matching \
              resolve_component_pin's documented max_by behavior"
             );
@@ -2935,6 +2961,7 @@ mod tests {
                 kind: IncludeKind::Project,
                 host: HostRef::Unresolved("$CI_SERVER_FQDN".to_string()),
                 pin: Some(PinStyle::Tag),
+                comment_slot: deps_core::lsp_helpers::CommentSlot::Unavailable,
                 project_path: "org/proj".to_string(),
             }
         }
@@ -3457,6 +3484,45 @@ mod tests {
             }
         }
 
+        impl CommentFixture {
+            fn pin_all(&self) -> Vec<TextEdit> {
+                let resolved = std::collections::HashMap::new();
+                collect_pin_all_to_sha_edits(
+                    self.parse_result.as_ref(),
+                    &self.eco.formatter,
+                    deps_core::VersionData::new(&self.cached, &resolved),
+                )
+            }
+
+            fn pin_action(&self, line: u32, column: u32) -> Option<CodeAction> {
+                build_sha_pin_action(
+                    self.parse_result.as_ref(),
+                    Position::new(line, column),
+                    &self.uri,
+                    &self.eco.formatter,
+                )
+            }
+
+            fn fix_action(&self, line: u32, column: u32) -> Option<CodeAction> {
+                build_sha_comment_fix_action(
+                    self.parse_result.as_ref(),
+                    Position::new(line, column),
+                    &self.uri,
+                    &self.eco.formatter,
+                )
+            }
+
+            fn only_dep(&self) -> GitlabCiDependency {
+                let deps = deps_core::ParseResult::dependencies(self.parse_result.as_ref());
+                assert_eq!(deps.len(), 1);
+                deps[0]
+                    .as_any()
+                    .downcast_ref::<GitlabCiDependency>()
+                    .unwrap()
+                    .clone()
+            }
+        }
+
         /// Applies one single-line ASCII edit to `content`.
         #[allow(clippy::string_slice)] // single-line ASCII fixtures
         fn apply_edit(content: &str, edit: &TextEdit) -> String {
@@ -3781,6 +3847,157 @@ mod tests {
             assert!(!at(10 + 40), "cursor right after the SHA");
             assert!(at(10 + 43));
             assert!(at(10 + 47));
+        }
+
+        fn one_tag(tag: &str) -> [(&str, &str); 1] {
+            [(tag, SHA_V117)]
+        }
+
+        /// #1760: a plain literal tag ref gains the tag as a trailing comment, and the rewritten
+        /// pin re-parses as a commented SHA pin whose comment the index confirms.
+        #[tokio::test]
+        async fn test_pin_plain_project_tag_appends_comment_and_round_trips() {
+            let content = project_pin("v1.117.0");
+            let fixture = CommentFixture::new(&content, &one_tag("v1.117.0"), "v1.117.0").await;
+            let edits = fixture.pin_all();
+            assert_eq!(edits.len(), 1, "{edits:?}");
+            assert_eq!(edits[0].new_text, format!("{SHA_V117} # v1.117.0"));
+            let action = fixture.pin_action(2, 12).expect("pin action");
+            let changes = action.edit.unwrap().changes.unwrap();
+            let action_edits = changes.values().next().unwrap();
+            assert_eq!(action_edits[0].new_text, edits[0].new_text);
+
+            let updated = apply_edit(&content, &edits[0]);
+            let settled = CommentFixture::new(&updated, &one_tag("v1.117.0"), "v1.117.0").await;
+            let dep = settled.only_dep();
+            assert!(dep.sha_comment().is_some(), "{dep:?}");
+            assert_eq!(
+                settled.eco.formatter.sha_comment_check(&dep),
+                Some(CommentCheck::Confirmed)
+            );
+        }
+
+        /// #1760: a quoted ref cannot take a comment, so it gets the bare SHA and keeps its quotes.
+        #[tokio::test]
+        async fn test_pin_quoted_project_tag_writes_bare_sha() {
+            let content = project_pin("\"v1.117.0\"");
+            let fixture = CommentFixture::new(&content, &one_tag("v1.117.0"), "v1.117.0").await;
+            let edits = fixture.pin_all();
+            assert_eq!(edits.len(), 1, "{edits:?}");
+            assert_eq!(edits[0].new_text, SHA_V117);
+            assert_eq!(
+                apply_edit(&content, &edits[0]),
+                project_pin(&format!("\"{SHA_V117}\""))
+            );
+        }
+
+        /// #1760: a flow-style ref gets the bare SHA and its neighbouring keys survive.
+        #[tokio::test]
+        async fn test_pin_flow_project_tag_writes_bare_sha_and_keeps_siblings() {
+            let content = "include:\n  - {project: gitlab-org/cli, ref: v1.117.0, file: ci.yml}\n"
+                .to_string();
+            let fixture = CommentFixture::new(&content, &one_tag("v1.117.0"), "v1.117.0").await;
+            let edits = fixture.pin_all();
+            assert_eq!(edits.len(), 1, "{edits:?}");
+            assert_eq!(
+                apply_edit(&content, &edits[0]),
+                format!(
+                    "include:\n  - {{project: gitlab-org/cli, ref: {SHA_V117}, file: ci.yml}}\n"
+                )
+            );
+        }
+
+        /// #1760: a plain `component:` tag gets the release name as a comment.
+        #[tokio::test]
+        async fn test_pin_plain_component_tag_appends_comment() {
+            let content = "include:\n  - component: gitlab.com/org/proj/comp@1.2.0\n".to_string();
+            let fixture = CommentFixture::new(&content, &one_tag("1.2.0"), "1.2.0").await;
+            let edits = fixture.pin_all();
+            assert_eq!(edits.len(), 1, "{edits:?}");
+            assert_eq!(
+                apply_edit(&content, &edits[0]),
+                format!("include:\n  - component: gitlab.com/org/proj/comp@{SHA_V117} # 1.2.0\n")
+            );
+        }
+
+        /// #1760: an aliased ref is not an editable literal, so no pin action or edit exists.
+        #[tokio::test]
+        async fn test_pin_aliased_ref_offers_nothing() {
+            let content =
+                "x: &pin v1.117.0\ninclude:\n  - project: gitlab-org/cli\n    ref: *pin\n"
+                    .to_string();
+            let fixture = CommentFixture::new(&content, &one_tag("v1.117.0"), "v1.117.0").await;
+            assert!(fixture.pin_all().is_empty());
+            assert!(fixture.pin_action(3, 11).is_none());
+        }
+
+        /// #1760: `Latest`/`Partial` component pins go through the same rewrite as a tag pin.
+        #[tokio::test]
+        async fn test_pin_dynamic_component_pins_share_the_comment_rule() {
+            for (version, quoted, expected) in [
+                ("~latest", false, format!("{SHA_V117} # 1.2.0")),
+                ("1.2", false, format!("{SHA_V117} # 1.2.0")),
+                ("~latest", true, SHA_V117.to_string()),
+            ] {
+                let field = if quoted {
+                    format!("\"gitlab.com/org/proj/comp@{version}\"")
+                } else {
+                    format!("gitlab.com/org/proj/comp@{version}")
+                };
+                let content = format!("include:\n  - component: {field}\n");
+                let fixture = CommentFixture::new(&content, &one_tag("1.2.0"), "1.2.0").await;
+                let edits = fixture.pin_all();
+                assert_eq!(edits.len(), 1, "{version} {quoted}: {edits:?}");
+                assert_eq!(edits[0].new_text, expected, "{version} {quoted}");
+            }
+        }
+
+        const COMMENT_FIX_TAGS: [(&str, &str); 2] =
+            [("v1.117.0", SHA_V117), ("v1.100.0", SHA_OTHER)];
+
+        /// #1760: "Correct version comment" rewrites only the tag of a comment naming another tag.
+        #[tokio::test]
+        async fn test_correct_version_comment_action_on_other_tag() {
+            let content = project_pin(&format!("{SHA_V117} # v1.100.0"));
+            let fixture = CommentFixture::new(&content, &COMMENT_FIX_TAGS, "v1.117.0").await;
+            let action = fixture.fix_action(2, 12).expect("fix action");
+            assert_eq!(action.title, "Correct version comment to `v1.117.0`");
+            let changes = action.edit.unwrap().changes.unwrap();
+            let edit = &changes.values().next().unwrap()[0];
+            assert_eq!(
+                apply_edit(&content, edit),
+                project_pin(&format!("{SHA_V117} # v1.117.0"))
+            );
+        }
+
+        /// The fix action is offered for `ShaIsOtherTag` only: not for a confirmed comment, a
+        /// missing comment, or a SHA the index does not know.
+        #[tokio::test]
+        async fn test_correct_version_comment_action_absent_for_other_states() {
+            for ref_text in [
+                format!("{SHA_V117} # v1.117.0"),
+                SHA_V117.to_string(),
+                format!("{SHA_V120} # v1.117.0"),
+            ] {
+                let content = project_pin(&ref_text);
+                let fixture = CommentFixture::new(&content, &COMMENT_FIX_TAGS, "v1.117.0").await;
+                assert!(fixture.fix_action(2, 12).is_none(), "{ref_text}");
+            }
+        }
+
+        /// The comment's tag range is in UTF-16 columns even when non-ASCII text precedes it.
+        #[tokio::test]
+        async fn test_correct_version_comment_action_range_is_utf16() {
+            let content = format!(
+                "include:\n  - {{file: \"é.yml\", project: gitlab-org/cli, ref: {SHA_V117}}} # v1.100.0\n"
+            );
+            let fixture = CommentFixture::new(&content, &COMMENT_FIX_TAGS, "v1.117.0").await;
+            let dep = fixture.only_dep();
+            let comment = dep.sha_comment().expect("comment");
+            let line: Vec<u16> = content.lines().nth(1).unwrap().encode_utf16().collect();
+            let start = comment.tag_range.start.character as usize;
+            let end = comment.tag_range.end.character as usize;
+            assert_eq!(String::from_utf16(&line[start..end]).unwrap(), "v1.100.0");
         }
     }
 }

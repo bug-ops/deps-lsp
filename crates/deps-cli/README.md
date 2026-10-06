@@ -12,9 +12,10 @@ no editor required.
 This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) workspace. `deps-cli
 check` walks a workspace, routes every manifest it finds through the same 14-ecosystem
 classification pipeline (`deps-engine`) that powers `deps-lsp`'s hover and diagnostics, and
-reports outdated/yanked/vulnerable/unsatisfiable/deprecated/license/mutable-ref-pin findings as
-a table, as JSON, or as SARIF 2.1.0, with a CI-friendly exit code. `deps-cli update` is the
-write-back counterpart: it plans and applies version-requirement edits to one manifest.
+reports outdated/yanked/vulnerable/unsatisfiable/deprecated/license/mutable-ref-pin/
+sha-comment-mismatch findings as a table, as JSON, or as SARIF 2.1.0, with a CI-friendly exit
+code. `deps-cli update` is the write-back counterpart: it plans and applies
+version-requirement edits to one manifest.
 
 > [!IMPORTANT]
 > `deps-cli` implements no classification logic of its own — every verdict comes from the exact
@@ -187,16 +188,18 @@ elsewhere in the run — one malformed manifest in a large workspace never hides
 
 ### `--fail-on` categories
 
-`outdated`, `yanked`, `vulnerable`, `unsatisfiable`, `mutable-ref`, `license`, `deprecated`,
-`other`. Defaults to `vulnerable,yanked,unsatisfiable` when the flag is omitted. `other` covers
-every finding that matches none of the seven specific categories and is never part of the
+`outdated`, `yanked`, `vulnerable`, `unsatisfiable`, `mutable-ref`, `sha-comment-mismatch`,
+`license`, `deprecated`, `other`. Defaults to `vulnerable,yanked,unsatisfiable` when the flag
+is omitted. `sha-comment-mismatch` selects SHA pins whose trailing version comment is not
+confirmed by the repository's tag index; it is never part of the default policy. `other` covers
+every finding that matches none of the eight specific categories and is never part of the
 default policy.
 
 **Warning:** `other` also matches informational notices, not only real problems: the offline
 notice, the skipped-lookup notice for any manifest without a lock file, an unresolved
-self-hosted GitLab host, the dependency-ceiling notice, collapsed registry-fetch failures, and
-`sha-comment-mismatch` hints. It therefore fails the run on any manifest without a lock file
-and on every `--offline` run, and cannot target one of these findings alone.
+self-hosted GitLab host, the dependency-ceiling notice, and collapsed registry-fetch failures.
+It therefore fails the run on any manifest without a lock file and on every `--offline` run,
+and cannot target one of these findings alone.
 
 ### `update` subcommand
 

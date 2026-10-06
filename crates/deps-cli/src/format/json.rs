@@ -506,6 +506,24 @@ mod tests {
     }
 
     #[test]
+    fn test_summary_counts_sha_comment_mismatch_under_its_own_key() {
+        let mut mismatch = finding();
+        mismatch.category = Category::ShaCommentMismatch;
+        let document = to_document(&CheckReport {
+            findings: vec![mismatch],
+        });
+        let rendered = serde_json::to_string(&document).expect("must serialize");
+        assert!(
+            rendered.contains("\"sha-comment-mismatch\":1"),
+            "{rendered}"
+        );
+        assert_eq!(
+            document.summary.get(&Category::ShaCommentMismatch),
+            Some(&1)
+        );
+    }
+
+    #[test]
     fn test_render_round_trips_through_serde_json() {
         let report = CheckReport {
             findings: vec![finding()],

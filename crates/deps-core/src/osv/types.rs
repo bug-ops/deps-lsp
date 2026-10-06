@@ -3653,7 +3653,7 @@ mod vulnerability_keys_candidates_tests {
             };
             let sha = crate::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap();
             let index = crate::lsp_helpers::TagIndex::from_tags(tags.iter().map(|t| (*t, &sha)));
-            index.pin_resolution(&sha)
+            index.pin_resolution(&sha, None)
         }
     }
     impl crate::lsp_helpers::DiagnosticMessages for PinByRequirementFormatter {}

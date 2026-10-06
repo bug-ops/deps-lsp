@@ -65,7 +65,12 @@ A pin whose SHA is absent from the loaded tag index is reported outdated even wh
 version comment, since the comment cannot make a non-release commit the latest release. The
 "absent" verdict is only drawn from a complete tag list: a repository with more tags than the
 fetch cap (30 pages of 100) yields a truncated index, and a SHA missing from it stays
-unverifiable (comment trusted, no mismatch diagnostic) instead of being called outdated.
+unverifiable (comment trusted, no mismatch diagnostic) instead of being called outdated. The one
+exception is a comment naming a full version (`# v4.2.0`) that the truncated index maps to a
+different commit: that comment is provably wrong, so it is not trusted, the status is unresolved
+and the `sha-comment-mismatch` diagnostic fires. Tags are matched by version, so `# 4.2.0`,
+`# V4.2.0` and `# v4.2.0+build` are contradicted by the tag `v4.2.0` as well. A comment naming a
+version the truncated index does not list stays unverifiable.
 
 A SHA pin whose commit is tagged only by a floating tag below the latest release (`v1` or `1.1`
 while the latest is `v1.1.0` on another commit) is reported outdated (issue #1730). A tag at or
@@ -84,8 +89,11 @@ without a `# tag` comment; any words after the old tag stay in the comment
 When a tags fetch adds or changes a repository's tag index, every other open workflow that uses
 that repository is rescanned: its vulnerability check and diagnostics are refreshed without an
 edit or reopen. Events are coalesced over 250 ms and the rescan runs for at most 4 documents at
-a time. It applies only while vulnerability checking is enabled and the server is online. GitLab
-CI/CD does not emit refresh events.
+a time. The vulnerability rescan applies only while vulnerability checking is enabled and the
+server is online, but diagnostics are republished (and inlay hints and code lenses refreshed once
+per batch when a document did not already request its own) regardless, since the tag index also drives the status and comment checks. A document
+that is still loading is skipped and publishes after its own load. GitLab CI/CD does not emit
+refresh events.
 
 ### Comment mismatch diagnostic (issue #1722)
 
@@ -94,7 +102,8 @@ When the trailing comment names a tag that is provably not the pinned commit's t
 hover adds a `**Warning**` line, either `comment says v2.87.20, but SHA is v2.87.22` or
 `SHA is not the commit of any release tag`. A partial-precision comment (`# v4`) agrees with a
 SHA whose most specific tag extends it. Nothing is reported while the tag index is cold or when
-the SHA is absent from a truncated index. Severity defaults to warning and is set with
+the SHA is absent from a truncated index, unless the comment names a full version that index maps
+to another commit. Severity defaults to warning and is set with
 `diagnostics.sha_comment_mismatch_severity`; there is no on/off toggle.
 
 The `Correct version comment to <tag>` quickfix rewrites only the comment's tag token to the
@@ -107,7 +116,9 @@ characters, is overly long, or when the comment token ends in punctuation.
 A tag pin is compared with the latest release by SemVer precedence. A pre-release pin
 (`@v2-beta`, `@v3.0.0-rc.1`) is reported outdated once a newer release exists, while a partial pin
 (`@v4`) stays current as long as the latest release extends it. A pin that is ahead of the latest
-release is reported up to date. Refs that are not on a version line (`@v1.x`, `@v3-node20`) are
+release is reported up to date, unless the tag index is complete and has no such tag (`@v40`, a
+typo or a deleted tag): that pin is unresolved, never outdated, so no downgrade is offered. A
+branch named like a version and ahead of the latest release reads the same way. Refs that are not on a version line (`@v1.x`, `@v3-node20`) are
 never reported outdated. SHA pins are matched case-insensitively and shown in lowercase.
 
 ### Updating quoted and flow-style pins (issue #1724)
@@ -115,6 +126,9 @@ never reported outdated. SHA pins are matched case-insensitively and shown in lo
 Update-all and the update quickfix rewrite a plain scalar SHA pin to `<new sha> # <tag>`. For a
 quoted or flow-style pin (`uses: 'owner/repo@<sha>'`, `{uses: owner/repo@<sha>, with: {...}}`)
 without a comment only the 40-hex SHA is replaced, so the quoting and flow structure stay intact.
+The same holds for a tag that does not read as a version (`@stable`): the pin is converted
+and rewritten to the bare SHA with no `# <tag>` comment, since a comment the next parse could not
+read back would pile up on every update.
 
 ### Comments after quotes and flow mappings (issue #1732)
 

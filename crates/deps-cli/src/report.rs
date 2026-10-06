@@ -44,12 +44,13 @@ const GITLAB_CI_MUTABLE_REF_PIN_CODE: &str = "gitlab-ci-mutable-ref-pin";
 /// [`GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE`]'s doc for why this is a literal.
 const GITLAB_CI_UNRESOLVED_HOST_CODE: &str = "unresolved-gitlab-host";
 
-/// A category a [`CheckFinding`] can be classified into — the eight `--fail-on` tokens
-/// (the seven FR-009 defines, plus [`Category::Other`], #1733).
+/// A category a [`CheckFinding`] can be classified into — the nine `--fail-on` tokens
+/// (the seven FR-009 defines, plus [`Category::Other`], #1733, and
+/// [`Category::ShaCommentMismatch`], #1748).
 ///
-/// `Other` covers a `generate_diagnostics` finding that matches none of the seven (an
-/// "Unknown package", a collapsed registry-lookup failure, a `sha-comment-mismatch` hint, or
-/// a workspace-registry/offline/dependency-count notice). It is selectable via
+/// `Other` covers a `generate_diagnostics` finding that matches none of the eight (an
+/// "Unknown package", a collapsed registry-lookup failure, or a
+/// workspace-registry/offline/dependency-count notice). It is selectable via
 /// `--fail-on other` (which therefore fails any manifest without a lock file and every
 /// offline run, as those notices are `Other`) but is not in
 /// [`FailOnPolicy::default_categories`] — it exists so [`CheckFinding`] stays a 1:1 mapping of
@@ -69,6 +70,7 @@ const GITLAB_CI_UNRESOLVED_HOST_CODE: &str = "unresolved-gitlab-host";
 ///
 /// assert_eq!(Category::MutableRefPin.as_str(), "mutable-ref");
 /// assert_eq!(Category::License.as_str(), "license");
+/// assert_eq!(Category::ShaCommentMismatch.as_str(), "sha-comment-mismatch");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, clap::ValueEnum)]
 pub enum Category {
@@ -84,6 +86,10 @@ pub enum Category {
     /// CI).
     #[value(name = "mutable-ref")]
     MutableRefPin,
+    /// A SHA pin's trailing version comment is not confirmed by the repository's tag index
+    /// (GitHub Actions/GitLab CI).
+    #[value(name = "sha-comment-mismatch")]
+    ShaCommentMismatch,
     /// The resolved license violates the configured allow/deny policy.
     License,
     /// The registry reports the package itself as deprecated/abandoned.
@@ -102,6 +108,7 @@ impl Category {
             Self::Vulnerable => "vulnerable",
             Self::Unsatisfiable => "unsatisfiable",
             Self::MutableRefPin => "mutable-ref",
+            Self::ShaCommentMismatch => "sha-comment-mismatch",
             Self::License => "license",
             Self::Deprecated => "deprecated",
             Self::Other => "other",
@@ -140,6 +147,9 @@ impl Category {
             Self::Unsatisfiable => "No published version satisfies the declared requirement.",
             Self::MutableRefPin => {
                 "Pinned to a mutable ref (tag or branch) instead of a commit SHA."
+            }
+            Self::ShaCommentMismatch => {
+                "The version comment next to a SHA pin is not confirmed by the repository's tag index."
             }
             Self::License => "The resolved license violates the configured allow/deny policy.",
             Self::Deprecated => {
@@ -180,6 +190,7 @@ impl<'de> serde::Deserialize<'de> for Category {
             "vulnerable" => Ok(Self::Vulnerable),
             "unsatisfiable" => Ok(Self::Unsatisfiable),
             "mutable-ref" => Ok(Self::MutableRefPin),
+            "sha-comment-mismatch" => Ok(Self::ShaCommentMismatch),
             "license" => Ok(Self::License),
             "deprecated" => Ok(Self::Deprecated),
             "other" => Ok(Self::Other),
@@ -191,6 +202,7 @@ impl<'de> serde::Deserialize<'de> for Category {
                     "vulnerable",
                     "unsatisfiable",
                     "mutable-ref",
+                    "sha-comment-mismatch",
                     "license",
                     "deprecated",
                     "other",
@@ -685,13 +697,13 @@ fn to_finding(
 /// Classifies a `generate_diagnostics` [`Diagnostic`] into a [`Category`].
 ///
 /// Diagnostics that carry one of the workspace's known non-advisory codes (the three
-/// `deps-core` sentinels, the two mutable-ref-pin codes, or GitLab CI's
-/// [`GITLAB_CI_UNRESOLVED_HOST_CODE`] notice) classify directly from `code`. A vulnerability
-/// advisory id (an OSV id such as `RUSTSEC-...`/`GHSA-...`) is the only other free-form `code`
-/// value `generate_diagnostics_from_cache` ever sets, so any `Some(code)` that matches none of
-/// the known non-advisory codes classifies as [`Category::Vulnerable`] — this fallback is
-/// sound only as long as the known-code list above stays exhaustive (see that list's own doc
-/// for the regression this already caused once). An outdated diagnostic carries no code but
+/// `deps-core` sentinels, the two mutable-ref-pin codes, the SHA-comment-mismatch code, or
+/// GitLab CI's [`GITLAB_CI_UNRESOLVED_HOST_CODE`] notice) classify directly from `code`. A
+/// vulnerability advisory id (an OSV id such as `RUSTSEC-...`/`GHSA-...`) is the only other
+/// free-form `code` value `generate_diagnostics_from_cache` ever sets, so any `Some(code)`
+/// that matches none of the known non-advisory codes classifies as [`Category::Vulnerable`] —
+/// this fallback is sound only as long as the known-code list above stays exhaustive (see
+/// that list's own doc for the regression this already caused once). An outdated diagnostic carries no code but
 /// always starts with the fixed prefix `apply_outdated_rule` uses; a yanked diagnostic carries
 /// no code either, but always contains `formatter.yanked_message()` verbatim — the same text
 /// it was built from. The advisory-overflow summary line ("+N more advisories") also carries
@@ -710,9 +722,8 @@ fn classify(
             GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE | GITLAB_CI_MUTABLE_REF_PIN_CODE => {
                 Category::MutableRefPin
             }
-            GITLAB_CI_UNRESOLVED_HOST_CODE | SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE => {
-                Category::Other
-            }
+            SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE => Category::ShaCommentMismatch,
+            GITLAB_CI_UNRESOLVED_HOST_CODE => Category::Other,
             _ => Category::Vulnerable,
         };
     }
@@ -776,6 +787,10 @@ mod tests {
         assert_eq!(Category::Vulnerable.as_str(), "vulnerable");
         assert_eq!(Category::Unsatisfiable.as_str(), "unsatisfiable");
         assert_eq!(Category::MutableRefPin.as_str(), "mutable-ref");
+        assert_eq!(
+            Category::ShaCommentMismatch.as_str(),
+            "sha-comment-mismatch"
+        );
         assert_eq!(Category::License.as_str(), "license");
         assert_eq!(Category::Deprecated.as_str(), "deprecated");
         assert_eq!(Category::Other.as_str(), "other");
@@ -791,6 +806,7 @@ mod tests {
             Category::Vulnerable,
             Category::Unsatisfiable,
             Category::MutableRefPin,
+            Category::ShaCommentMismatch,
             Category::License,
             Category::Deprecated,
             Category::Other,
@@ -821,6 +837,16 @@ mod tests {
         assert!(!policy.matches(&[finding(Category::License)]));
         assert!(!policy.matches(&[finding(Category::Deprecated)]));
         assert!(!policy.matches(&[finding(Category::MutableRefPin)]));
+        assert!(!policy.matches(&[finding(Category::ShaCommentMismatch)]));
+        assert!(!policy.matches(&[finding(Category::Other)]));
+    }
+
+    #[test]
+    fn test_fail_on_policy_sha_comment_mismatch_is_severity_agnostic() {
+        let policy = FailOnPolicy::new(vec![Category::ShaCommentMismatch]);
+        let mut hint = finding(Category::ShaCommentMismatch);
+        hint.severity = Severity::Hint;
+        assert!(policy.matches(&[hint]));
         assert!(!policy.matches(&[finding(Category::Other)]));
     }
 
@@ -906,12 +932,12 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_sha_comment_mismatch_is_other() {
+    fn test_classify_sha_comment_mismatch_by_code() {
         let d = diagnostic_with(
             Some(SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE),
             "SHA is not the commit of the tag in the comment",
         );
-        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Other);
+        assert_eq!(classify(&d, &STUB_FORMATTER), Category::ShaCommentMismatch);
     }
 
     #[test]

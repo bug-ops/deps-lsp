@@ -4,8 +4,8 @@
 required. It walks a workspace, routes every manifest it finds through the exact same
 14-ecosystem classification pipeline (`deps-engine`) that powers `deps-lsp`'s hover and
 diagnostics, and reports outdated/yanked/vulnerable/unsatisfiable/deprecated/license/
-mutable-ref-pin findings as a table, as JSON, or as SARIF 2.1.0, with a CI-friendly exit
-code.
+mutable-ref-pin/sha-comment-mismatch findings as a table, as JSON, or as SARIF 2.1.0, with a
+CI-friendly exit code.
 
 > **Note:** `deps-cli` implements no classification logic of its own — every verdict comes
 > from the same function `deps-lsp` calls for its LSP diagnostics, so a `deps-cli check`
@@ -132,16 +132,19 @@ subcommands. Paths default to the current directory when none are given to `chec
 ### `--fail-on` categories and exit codes
 
 `--fail-on` takes a comma-separated list of: `outdated`, `yanked`, `vulnerable`,
-`unsatisfiable`, `mutable-ref`, `license`, `deprecated`, `other`. It defaults to
+`unsatisfiable`, `mutable-ref`, `sha-comment-mismatch`, `license`, `deprecated`, `other`. It defaults to
 `vulnerable,yanked,unsatisfiable` when omitted; an explicit `--fail-on` replaces that default
-list rather than extending it. `other` covers every finding that matches none of the seven
-specific categories and is never part of the default policy.
+list rather than extending it. `sha-comment-mismatch` selects SHA pins (GitHub Actions/GitLab
+CI) whose trailing version comment is not confirmed by the repository's tag index; it matches
+regardless of the finding's severity and is never part of the default policy. `other` covers
+every finding that matches none of the eight specific categories and is never part of the
+default policy.
 
 **Warning:** `other` also matches informational notices, not only real problems: the offline
 notice, the skipped-lookup notice for any manifest without a lock file, an unresolved
-self-hosted GitLab host, the dependency-ceiling notice, collapsed registry-fetch failures, and
-`sha-comment-mismatch` hints. It therefore fails the run on any manifest without a lock file
-and on every `--offline` run, and cannot target one of these findings alone.
+self-hosted GitLab host, the dependency-ceiling notice, and collapsed registry-fetch failures.
+It therefore fails the run on any manifest without a lock file and on every `--offline` run,
+and cannot target one of these findings alone.
 
 | Exit code | Meaning |
 |---|---|
