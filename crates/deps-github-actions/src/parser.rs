@@ -20,10 +20,10 @@
 //! path segments after `owner/repo` start with `.github/workflows/`.
 
 use crate::types::{
-    ClosingDelimiters, GithubActionsDependency, GithubActionsParseResult, PinStyle,
+    ClosingDelimiters, GithubActionsDependency, GithubActionsParseResult, PinStyle, ShaComment,
 };
 use deps_core::lsp_helpers::{
-    LineOffsetTable, MarkedScalar, byte_span_to_range, is_partial_semver_shaped,
+    CommitSha, LineOffsetTable, MarkedScalar, byte_span_to_range, is_partial_semver_shaped,
     warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
@@ -419,26 +419,22 @@ fn build_dependency(
             name_range: make_range(span_start, span_end),
             version_req: None,
             version_range: None,
-            version_literal: None,
             pin: None,
             source: DependencySource::Path {
                 path: trimmed_value,
             },
             is_plain_scalar,
             is_last_on_line: true,
-            closing_delimiters: ClosingDelimiters::default(),
         }),
         ParsedUses::Docker => Some(GithubActionsDependency {
             name: trimmed_value.clone().into(),
             name_range: make_range(span_start, span_end),
             version_req: None,
             version_range: None,
-            version_literal: None,
             pin: None,
             source: DependencySource::Url { url: trimmed_value },
             is_plain_scalar,
             is_last_on_line: true,
-            closing_delimiters: ClosingDelimiters::default(),
         }),
         ParsedUses::NoAt { name } => {
             let name_end = span_start + name.len();
@@ -447,12 +443,10 @@ fn build_dependency(
                 name_range: make_range(span_start, name_end),
                 version_req: None,
                 version_range: None,
-                version_literal: None,
                 pin: None,
                 source: DependencySource::Registry,
                 is_plain_scalar,
                 is_last_on_line: true,
-                closing_delimiters: ClosingDelimiters::default(),
             })
         }
         ParsedUses::Ref {
@@ -474,14 +468,12 @@ fn build_dependency(
                     name_range,
                     version_req: None,
                     version_range: None,
-                    version_literal: None,
                     pin: None,
                     source: DependencySource::Url {
                         url: format!("https://github.com/{name}"),
                     },
                     is_plain_scalar,
                     is_last_on_line: true,
-                    closing_delimiters: ClosingDelimiters::default(),
                 });
             }
 
@@ -533,7 +525,7 @@ fn build_dependency(
             // without it flipped `is_last_on_line` false-to-true, reopening #633).
             let is_last_on_line = ref_is_last_token_on_line(rest_of_line, window);
 
-            if is_full_sha(&ref_text) {
+            if let Some(sha) = CommitSha::parse(&ref_text) {
                 // `extract_comment_tag` can't tell this ref's own comment from an unrelated
                 // later token on a flow-style line (#898), so a comment is read only when
                 // nothing but closing delimiters (#1732) sits between the SHA and the `#`.
@@ -551,31 +543,37 @@ fn build_dependency(
                 };
 
                 return Some(match comment {
-                    Some((tag, token_end)) => GithubActionsDependency {
-                        name: name.into(),
-                        name_range,
-                        version_req: Some(tag.into()),
-                        version_range: Some(make_range(ref_start, ref_end + token_end)),
-                        version_literal: Some(content[ref_start..ref_end + token_end].to_string()),
-                        pin: Some(PinStyle::Sha {
-                            comment_tag: Some(tag.to_string()),
-                        }),
-                        source: DependencySource::Registry,
-                        is_plain_scalar,
-                        is_last_on_line,
-                        closing_delimiters,
-                    },
+                    Some((tag, token_end)) => {
+                        let comment_end = ref_end + token_end;
+                        let comment = ShaComment::new(
+                            tag.to_string(),
+                            make_range(comment_end - tag.len(), comment_end),
+                            closing_delimiters,
+                            content[ref_start..comment_end].to_string(),
+                        );
+                        GithubActionsDependency {
+                            name: name.into(),
+                            name_range,
+                            version_req: Some(tag.into()),
+                            version_range: Some(make_range(ref_start, comment_end)),
+                            pin: Some(PinStyle::Sha {
+                                sha,
+                                comment: Some(comment),
+                            }),
+                            source: DependencySource::Registry,
+                            is_plain_scalar,
+                            is_last_on_line,
+                        }
+                    }
                     None => GithubActionsDependency {
                         name: name.into(),
                         name_range,
                         version_req: Some(ref_text.into()),
                         version_range: Some(make_range(ref_start, ref_end)),
-                        version_literal: None,
-                        pin: Some(PinStyle::Sha { comment_tag: None }),
+                        pin: Some(PinStyle::Sha { sha, comment: None }),
                         source: DependencySource::Registry,
                         is_plain_scalar,
                         is_last_on_line,
-                        closing_delimiters: ClosingDelimiters::default(),
                     },
                 });
             }
@@ -590,12 +588,10 @@ fn build_dependency(
                 name_range,
                 version_req: Some(ref_text.into()),
                 version_range: Some(make_range(ref_start, ref_end)),
-                version_literal: None,
                 pin: Some(pin),
                 source: DependencySource::Registry,
                 is_plain_scalar,
                 is_last_on_line,
-                closing_delimiters: ClosingDelimiters::default(),
             })
         }
         ParsedUses::Malformed => {
@@ -728,6 +724,22 @@ mod tests {
         &line[range.start.character as usize..range.end.character as usize]
     }
 
+    fn comment_tag_of(dep: &GithubActionsDependency) -> Option<&str> {
+        dep.sha_comment().map(ShaComment::tag)
+    }
+
+    fn is_commentless_sha(dep: &GithubActionsDependency) -> bool {
+        matches!(dep.pin, Some(PinStyle::Sha { comment: None, .. }))
+    }
+
+    /// Text of a single-line `range`, addressed in UTF-16 columns like the LSP.
+    fn utf16_slice(content: &str, range: Range) -> String {
+        let line = content.lines().nth(range.start.line as usize).unwrap();
+        let units: Vec<u16> = line.encode_utf16().collect();
+        String::from_utf16(&units[range.start.character as usize..range.end.character as usize])
+            .unwrap()
+    }
+
     // --- R1: marker/range-derivation sanity, verified before anything else depends on it ---
 
     #[test]
@@ -792,12 +804,62 @@ mod tests {
             slice(&content, dep.version_range().unwrap()),
             format!("{sha} # v4.2.0")
         );
-        assert_eq!(
-            dep.pin,
-            Some(PinStyle::Sha {
-                comment_tag: Some("v4.2.0".to_string())
-            })
-        );
+        assert_eq!(comment_tag_of(dep), Some("v4.2.0"));
+    }
+
+    #[test]
+    fn test_sha_pin_carries_lowercase_commit_sha_and_parsed_comment() {
+        let upper = "A1B2C3D4E5".repeat(4);
+        let content = format!("steps:\n  - uses: actions/checkout@{upper} # v4.2.0\n");
+        let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        let Some(PinStyle::Sha { sha, comment }) = &dep.pin else {
+            panic!("expected a SHA pin, got {:?}", dep.pin);
+        };
+        assert_eq!(sha.as_str(), upper.to_ascii_lowercase());
+        let comment = comment.as_ref().expect("commented SHA pin");
+        assert_eq!(comment.tag(), "v4.2.0");
+        assert_eq!(comment.literal(), format!("{upper} # v4.2.0"));
+        assert_eq!(dep.version_literal(), Some(comment.literal()));
+        assert_eq!(slice(&content, comment.tag_range()), "v4.2.0");
+    }
+
+    #[test]
+    fn test_sha_comment_tag_range_covers_only_the_tag_token() {
+        let sha = "a".repeat(40);
+        for (uses, closers) in [
+            (format!("actions/checkout@{sha}  # v4"), ""),
+            (format!("actions/checkout@{sha}\t# v4.2.0-rc.1"), ""),
+            (format!("\"actions/checkout@{sha}\" # v4"), "\""),
+            (format!("{{uses: actions/checkout@{sha}}} # v4"), "}"),
+        ] {
+            let flow = uses.starts_with('{');
+            let content = if flow {
+                format!("steps:\n  - {uses}\n")
+            } else {
+                format!("steps:\n  - uses: {uses}\n")
+            };
+            let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+            let dep = &result.dependencies[0];
+            let comment = dep.sha_comment().unwrap_or_else(|| panic!("{uses}"));
+            assert_eq!(
+                slice(&content, comment.tag_range()),
+                comment.tag(),
+                "{uses}"
+            );
+            assert_eq!(comment.closing_delimiters().to_string(), closers, "{uses}");
+        }
+    }
+
+    #[test]
+    fn test_sha_comment_tag_range_is_utf16_correct_for_non_ascii_suffix() {
+        let sha = "a".repeat(40);
+        let content =
+            format!("steps:\n  - {{name: \"日本\", uses: actions/checkout@{sha}}} # v4-β\n");
+        let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
+        let comment = result.dependencies[0].sha_comment().expect("commented pin");
+        assert_eq!(comment.tag(), "v4-β");
+        assert_eq!(utf16_slice(&content, comment.tag_range()), "v4-β");
     }
 
     #[test]
@@ -830,7 +892,7 @@ mod tests {
             Some(sha)
         );
         assert_eq!(dep.version_literal(), None);
-        assert_eq!(dep.pin, Some(PinStyle::Sha { comment_tag: None }));
+        assert!(is_commentless_sha(dep));
     }
 
     #[test]
@@ -847,13 +909,7 @@ mod tests {
                 Some(suffix),
                 "{suffix}"
             );
-            assert_eq!(
-                dep.pin,
-                Some(PinStyle::Sha {
-                    comment_tag: Some(suffix.to_string())
-                }),
-                "{suffix}"
-            );
+            assert_eq!(comment_tag_of(dep), Some(suffix), "{suffix}");
         }
     }
 
@@ -872,11 +928,7 @@ mod tests {
                 Some(sha),
                 "{suffix}"
             );
-            assert_eq!(
-                dep.pin,
-                Some(PinStyle::Sha { comment_tag: None }),
-                "{suffix}"
-            );
+            assert!(is_commentless_sha(dep), "{suffix}");
         }
     }
 
@@ -918,21 +970,19 @@ mod tests {
                 format!("steps:\n  - uses: {quote}actions/checkout@{sha}{quote} # v4.2.0\n");
             let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
             let dep = &result.dependencies[0];
+            assert_eq!(comment_tag_of(dep), Some("v4.2.0"));
             assert_eq!(
-                dep.pin,
-                Some(PinStyle::Sha {
-                    comment_tag: Some("v4.2.0".to_string())
-                })
-            );
-            assert_eq!(
-                dep.version_literal.as_deref(),
+                dep.version_literal(),
                 Some(format!("{sha}{quote} # v4.2.0").as_str())
             );
             assert_eq!(
                 slice(&content, dep.version_range().unwrap()),
                 format!("{sha}{quote} # v4.2.0")
             );
-            assert_eq!(dep.closing_delimiters.to_string(), quote.to_string());
+            assert_eq!(
+                dep.sha_comment().unwrap().closing_delimiters().to_string(),
+                quote.to_string()
+            );
             assert!(!dep.is_plain_scalar);
         }
     }
@@ -952,19 +1002,17 @@ mod tests {
             let content = format!("steps:\n  - {flow} # v4\n");
             let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
             let dep = &result.dependencies[0];
-            assert_eq!(
-                dep.pin,
-                Some(PinStyle::Sha {
-                    comment_tag: Some("v4".to_string())
-                }),
-                "{flow}"
-            );
+            assert_eq!(comment_tag_of(dep), Some("v4"), "{flow}");
             assert_eq!(
                 slice(&content, dep.version_range().unwrap()),
                 format!("{sha}{closers} # v4"),
                 "{flow}"
             );
-            assert_eq!(dep.closing_delimiters.to_string(), closers, "{flow}");
+            assert_eq!(
+                dep.sha_comment().unwrap().closing_delimiters().to_string(),
+                closers,
+                "{flow}"
+            );
         }
     }
 
@@ -981,8 +1029,7 @@ mod tests {
             let content = format!("steps:\n  - {flow} # v4\n");
             let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
             let dep = &result.dependencies[0];
-            assert_eq!(dep.pin, Some(PinStyle::Sha { comment_tag: None }), "{flow}");
-            assert!(dep.closing_delimiters.is_empty());
+            assert!(is_commentless_sha(dep), "{flow}");
             assert_eq!(slice(&content, dep.version_range().unwrap()), sha);
         }
     }
@@ -1519,12 +1566,7 @@ mod tests {
         let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
         let dep = &result.dependencies[0];
         assert!(
-            !matches!(
-                dep.pin,
-                Some(PinStyle::Sha {
-                    comment_tag: Some(_)
-                })
-            ),
+            dep.sha_comment().is_none(),
             "a comment tag straddling the window boundary must not be accepted at all, \
              truncated or otherwise; got {:?}",
             dep.pin
@@ -1540,7 +1582,7 @@ mod tests {
         let content = format!("steps:\n  - uses: actions/checkout@{sha}{padding}# v4.2.0\n");
         let result = parse_workflow_yaml(&content, &test_uri()).unwrap();
         let dep = &result.dependencies[0];
-        assert!(matches!(dep.pin, Some(PinStyle::Sha { comment_tag: None })));
+        assert!(is_commentless_sha(dep));
     }
 
     #[test]
@@ -1611,8 +1653,8 @@ mod tests {
         let dep = &result.dependencies[0];
         assert_eq!(dep.name(), "actions/checkout");
         assert!(!dep.is_last_on_line);
-        assert_eq!(dep.pin, Some(PinStyle::Sha { comment_tag: None }));
-        assert_eq!(dep.version_literal, None);
+        assert!(is_commentless_sha(dep));
+        assert_eq!(dep.version_literal(), None);
         assert_eq!(
             slice(&content, dep.version_range().unwrap()),
             sha,
@@ -1637,8 +1679,8 @@ mod tests {
 
         assert!(!dep0.is_last_on_line);
         assert!(!dep1.is_last_on_line);
-        assert_eq!(dep0.pin, Some(PinStyle::Sha { comment_tag: None }));
-        assert_eq!(dep1.pin, Some(PinStyle::Sha { comment_tag: None }));
+        assert!(is_commentless_sha(dep0));
+        assert!(is_commentless_sha(dep1));
 
         let range0 = dep0.version_range().unwrap();
         let range1 = dep1.version_range().unwrap();
@@ -1661,17 +1703,15 @@ mod tests {
         assert_eq!(result.dependencies.len(), 1);
         let dep = &result.dependencies[0];
         assert!(dep.is_last_on_line);
-        assert_eq!(
-            dep.pin,
-            Some(PinStyle::Sha {
-                comment_tag: Some("v4.2.0".to_string())
-            })
-        );
+        assert_eq!(comment_tag_of(dep), Some("v4.2.0"));
         assert_eq!(
             dep.version_requirement().map(deps_core::VersionReq::as_str),
             Some("v4.2.0")
         );
-        assert_eq!(dep.version_literal, Some(format!("{sha} # v4.2.0")));
+        assert_eq!(
+            dep.version_literal(),
+            Some(format!("{sha} # v4.2.0").as_str())
+        );
         assert_eq!(
             slice(&content, dep.version_range().unwrap()),
             format!("{sha} # v4.2.0")

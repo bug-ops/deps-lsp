@@ -1605,22 +1605,27 @@ pub trait RequirementResolution: Send + Sync {
     /// for a [`crate::lsp_helpers::ResolvedPin::MostSpecific`] tag), since this hook can itself
     /// resolve to a moving/partial name (#1556 impl-critic S1, #1668).
     ///
-    /// Default: `None` — every ecosystem's manifest requirement text is authoritative until
-    /// it opts in.
-    fn resolved_pin_version(
-        &self,
-        dep: &dyn Dependency,
-    ) -> Option<crate::lsp_helpers::ResolvedPin> {
+    /// The result is three-valued ([`crate::lsp_helpers::PinResolution`]): a
+    /// [`Resolved`](crate::lsp_helpers::PinResolution::Resolved) pin is authoritative (an
+    /// unqueryable one yields no version, never the manifest text), an
+    /// [`Untagged`](crate::lsp_helpers::PinResolution::Untagged) pin is proven to name no
+    /// release (its trailing comment must not stand in), and only
+    /// [`Unresolved`](crate::lsp_helpers::PinResolution::Unresolved) lets the manifest text
+    /// stand in.
+    ///
+    /// Default: [`Unresolved`](crate::lsp_helpers::PinResolution::Unresolved) — every
+    /// ecosystem's manifest requirement text is authoritative until it opts in.
+    fn resolved_pin_version(&self, dep: &dyn Dependency) -> crate::lsp_helpers::PinResolution {
         let _ = dep;
-        None
+        crate::lsp_helpers::PinResolution::Unresolved
     }
 
-    /// Whether [`Self::resolved_pin_version`] may only start returning `Some` for a given
-    /// dependency once this ecosystem's own registry fetch completes (e.g. GitHub Actions'/
+    /// Whether [`Self::resolved_pin_version`] may only start returning a non-`Unresolved` value
+    /// for a given dependency once this ecosystem's own registry fetch completes (e.g. GitHub Actions'/
     /// GitLab CI's `TagIndex`, populated as a side effect of `Registry::get_versions` — not
     /// present yet at document-open/edit time).
     ///
-    /// Default: `false` — every ecosystem whose `resolved_pin_version` stays `None`
+    /// Default: `false` — every ecosystem whose `resolved_pin_version` stays `Unresolved`
     /// unconditionally, or is already sourced from data available before any fetch, has
     /// nothing to wait for. An ecosystem overriding `resolved_pin_version` with a value
     /// sourced from its own registry fetch MUST override this to `true`, or `deps-lsp`'s OSV

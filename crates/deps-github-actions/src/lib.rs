@@ -40,7 +40,7 @@ pub use parser::parse_workflow_yaml;
 pub use registry::GithubActionsRegistry;
 pub use types::{
     ClosingDelimiters, GithubActionsDependency, GithubActionsParseResult, GithubActionsVersion,
-    PinStyle,
+    PinStyle, ShaComment,
 };
 
 /// Stable [`tower_lsp_server::ls_types::Diagnostic::code`] for the mutable-ref-pin

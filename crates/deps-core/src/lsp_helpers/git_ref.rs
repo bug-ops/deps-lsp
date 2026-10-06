@@ -54,9 +54,11 @@ pub fn is_full_sha(s: &str) -> bool {
     s.len() == SHA_LEN && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// A validated, full 40-hex-character git commit SHA.
+/// A validated, lowercase-canonical, full 40-hex-character git commit SHA.
 ///
-/// The only constructor is [`CommitSha::parse`], which routes every value through
+/// Equality and hashing are therefore independent of the case a pin was written in:
+/// registries report lowercase hex, while a manifest may spell the SHA in uppercase. The
+/// only constructor is [`CommitSha::parse`], which routes every value through
 /// [`is_full_sha`] — the shared allowlist gate for the one registry-controlled string in
 /// each git-tags-datasource ecosystem (GitHub Actions, GitLab CI) that is later spliced
 /// verbatim into a manifest text edit and a hover string with no other validation (security
@@ -67,8 +69,8 @@ pub struct CommitSha(String);
 impl CommitSha {
     /// Validates `s` as a full 40-hex-character commit SHA via [`is_full_sha`].
     ///
-    /// Stores `s` verbatim, not lowercased — [`is_full_sha`] accepts uppercase hex, and
-    /// lowercasing would diverge from the exact text a registry API returned.
+    /// The text is stored lowercased: [`is_full_sha`] accepts uppercase hex, and registries
+    /// report lowercase, so the canonical form is what makes `CommitSha` values comparable.
     ///
     /// # Examples
     ///
@@ -77,13 +79,14 @@ impl CommitSha {
     ///
     /// assert!(CommitSha::parse(&"a".repeat(40)).is_some());
     /// assert!(CommitSha::parse("not-a-sha").is_none());
+    /// assert_eq!(CommitSha::parse(&"A".repeat(40)), CommitSha::parse(&"a".repeat(40)));
     /// ```
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
-        is_full_sha(s).then(|| Self(s.to_string()))
+        is_full_sha(s).then(|| Self(s.to_ascii_lowercase()))
     }
 
-    /// The validated SHA text, verbatim as constructed.
+    /// The validated SHA text, lowercase.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -93,12 +96,6 @@ impl CommitSha {
 impl std::fmt::Display for CommitSha {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
-    }
-}
-
-impl std::borrow::Borrow<str> for CommitSha {
-    fn borrow(&self) -> &str {
-        &self.0
     }
 }
 
@@ -148,7 +145,7 @@ pub struct TagIndex {
 ///
 /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
 /// let index = TagIndex::from_tags([("v4.8.0", &sha), ("v4.9.0", &sha), ("v4.9.1-rc1", &sha)]);
-/// let pin = index.resolved_pin(sha.as_str()).unwrap();
+/// let pin = index.resolved_pin(&sha).unwrap();
 /// let siblings: Vec<&str> = pin.siblings().iter().map(|t| t.as_str()).collect();
 /// assert_eq!(siblings, ["v4.9.0"]);
 /// ```
@@ -354,6 +351,146 @@ pub fn extends_tag(longer: &str, shorter: &str) -> bool {
     tag_components(shorter).all(|c| longer.next() == Some(c)) && longer.next().is_some()
 }
 
+/// How a partial release tag (`v4`, `v4.2`) written in a manifest is judged against the newest
+/// release by [`tag_pin_is_up_to_date`].
+///
+/// Exhaustive so each ecosystem states which reading its ref syntax has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialTagPolicy {
+    /// A partial tag names a moving line that follows the newest release of that line
+    /// (GitHub Actions `uses: owner/repo@v4`).
+    MovingLine,
+    /// A partial tag is just a literal tag name, current only when it is the newest tag.
+    Exact,
+}
+
+/// Pre-release labels a partial release core may carry (`v2-beta`) and still be ordered.
+const PRERELEASE_LABELS: [&str; 10] = [
+    "alpha", "beta", "rc", "pre", "preview", "dev", "canary", "next", "nightly", "snapshot",
+];
+
+/// Whether `suffix` (starting at `-` or `+`) reads as a pre-release or build marker rather than
+/// a variant name such as `-node20`.
+fn is_prerelease_suffix(suffix: &str) -> bool {
+    let Some(rest) = suffix.strip_prefix('-') else {
+        return true;
+    };
+    let rest = rest.to_ascii_lowercase();
+    let (label, tail) = rest.split_at(
+        rest.find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(rest.len()),
+    );
+    PRERELEASE_LABELS.contains(&label) && tail.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// Whether `tag` is a bare partial release: one or two all-digit components, no suffix. A
+/// ref without a `v` prefix (`@4`) is one too, unlike a free-text comment token.
+fn is_bare_partial_release(tag: &str) -> bool {
+    tag_components(tag).count() < 3
+        && tag_components(tag).all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A bare partial release zero-padded to a full version (`v4` -> `4.0.0`).
+fn padded_release(tag: &str) -> Option<semver::Version> {
+    if !is_bare_partial_release(tag) {
+        return None;
+    }
+    let normalized = crate::github::normalize_tag(tag);
+    let padding = ".0".repeat(3usize.checked_sub(tag_components(tag).count())?);
+    semver::Version::parse(&format!("{normalized}{padding}")).ok()
+}
+
+/// Parses `tag` into a precedence-comparable semver version, build metadata dropped.
+///
+/// A partial release core with a recognized pre-release suffix (`v2-beta`, `v2.1-rc`) is padded
+/// to three components (`2.0.0-beta`, `2.1.0-rc`); a bare partial release (`v4`) has no
+/// precedence of its own and yields `None`, as does a variant suffix (`v3-node20`).
+fn orderable_tag(tag: &str) -> Option<semver::Version> {
+    let normalized = crate::github::normalize_tag(tag);
+    let mut version = match semver::Version::parse(normalized) {
+        Ok(version) => version,
+        Err(_) if is_partial_semver_shaped(tag) => {
+            let (core, suffix) = normalized.split_at(normalized.find(['-', '+'])?);
+            if !is_prerelease_suffix(suffix) {
+                return None;
+            }
+            let padding = ".0".repeat(3usize.checked_sub(core.split('.').count())?);
+            semver::Version::parse(&format!("{core}{padding}{suffix}")).ok()?
+        }
+        Err(_) => return None,
+    };
+    version.build = semver::BuildMetadata::EMPTY;
+    Some(version)
+}
+
+/// Whether [`tag_pin_is_up_to_date`] can place `tag` on the version line at all.
+///
+/// `false` for a tag-shaped ref that is no version (`v1.x`, a release-line branch) or carries a
+/// variant suffix (`v3-node20`); an ecosystem whose refs may be branches treats those as
+/// unknown rather than outdated.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::tag_has_precedence;
+///
+/// assert!(tag_has_precedence("v4"));
+/// assert!(tag_has_precedence("v2-beta"));
+/// assert!(tag_has_precedence("v4.2.0"));
+/// assert!(!tag_has_precedence("v1.x"));
+/// assert!(!tag_has_precedence("v3-node20"));
+/// ```
+#[must_use]
+pub fn tag_has_precedence(tag: &str) -> bool {
+    is_bare_partial_release(tag) || orderable_tag(tag).is_some()
+}
+
+/// Whether a version tag written in a manifest is at least as new as the newest release `latest`.
+///
+/// Rules, in order: the same tag (ignoring a `v` prefix) is current; under
+/// [`PartialTagPolicy::MovingLine`] a partial release (`v4`, `v4.2`) is current when `latest`
+/// extends it, and a written tag that extends a less precise `latest` is current; otherwise
+/// both tags are compared by semver precedence, so a pre-release of an older line (`v2-beta`
+/// against `v7.0.0`) is outdated while a pin ahead of `latest` is not. A bare partial release
+/// whose zero-padded version is strictly ahead of `latest` (`v5` against `v4.9.0`) is current
+/// too. Anything else without precedence (`v4.x`, a bare partial release under
+/// [`PartialTagPolicy::Exact`]) is outdated.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{PartialTagPolicy, tag_pin_is_up_to_date};
+///
+/// assert!(tag_pin_is_up_to_date("v4", "v4.3.1", PartialTagPolicy::MovingLine));
+/// assert!(!tag_pin_is_up_to_date("v4", "v4.3.1", PartialTagPolicy::Exact));
+/// assert!(!tag_pin_is_up_to_date("v2-beta", "v7.0.0", PartialTagPolicy::MovingLine));
+/// assert!(tag_pin_is_up_to_date("v5.0.0-rc.1", "v4.9.0", PartialTagPolicy::Exact));
+/// ```
+#[must_use]
+pub fn tag_pin_is_up_to_date(written: &str, latest: &str, policy: PartialTagPolicy) -> bool {
+    use crate::github::normalize_tag;
+
+    if normalize_tag(written) == normalize_tag(latest) {
+        return true;
+    }
+    if policy == PartialTagPolicy::MovingLine
+        && ((is_bare_partial_release(written) && extends_tag(latest, written))
+            || extends_tag(written, latest))
+    {
+        return true;
+    }
+    if matches!(
+        (padded_release(written), orderable_tag(latest)),
+        (Some(written), Some(latest)) if written > latest
+    ) {
+        return true;
+    }
+    matches!(
+        (orderable_tag(written), orderable_tag(latest)),
+        (Some(written), Some(latest)) if written >= latest
+    )
+}
+
 impl TagIndex {
     /// Builds a `TagIndex` from `(name, sha)` pairs, preferring the most specific name when
     /// several entries share one SHA.
@@ -378,7 +515,7 @@ impl TagIndex {
     /// // "v1" (a bare-major moving tag) is listed before "v0.1.0" (the precise release) —
     /// // the SHA -> tag map must still prefer the more specific name.
     /// let index = TagIndex::from_tags([("v1", &sha), ("v0.1.0", &sha)]);
-    /// assert_eq!(index.tag_for_sha(sha.as_str()), Some("v0.1.0"));
+    /// assert_eq!(index.tag_for_sha(&sha), Some("v0.1.0"));
     /// assert_eq!(index.tag_to_sha.get("v1"), Some(&sha));
     /// ```
     #[must_use]
@@ -497,25 +634,43 @@ impl TagIndex {
     ///
     /// `None` when no tag points at `sha`.
     #[must_use]
-    pub fn resolved_pin(&self, sha: &str) -> Option<ResolvedPin> {
-        self.pin_for_sha(sha).cloned()
+    pub fn resolved_pin(&self, sha: &CommitSha) -> Option<ResolvedPin> {
+        self.sha_to_tag.get(sha).cloned()
     }
 
     /// The tag text published at `sha`, without its alias classification.
     #[must_use]
-    pub fn tag_for_sha(&self, sha: &str) -> Option<&str> {
-        self.tag_version_for_sha(sha)
-            .map(crate::ConcreteVersion::as_str)
+    pub fn tag_for_sha(&self, sha: &CommitSha) -> Option<&str> {
+        self.sha_to_tag.get(sha).map(|pin| pin.version().as_str())
     }
 
-    fn pin_for_sha(&self, sha: &str) -> Option<&ResolvedPin> {
-        self.sha_to_tag
-            .get(sha)
-            .or_else(|| self.sha_to_tag.get(sha.to_ascii_lowercase().as_str()))
-    }
-
-    fn tag_version_for_sha(&self, sha: &str) -> Option<&crate::ConcreteVersion> {
-        self.pin_for_sha(sha).map(ResolvedPin::version)
+    /// What the index proves about `sha`: the tag naming it, that no release tag names it, or
+    /// nothing.
+    ///
+    /// [`PinResolution::Untagged`] requires a populated, [`ListCoverage::Complete`] index that
+    /// lacks `sha`; an empty or truncated index is [`PinResolution::Unresolved`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{CommitSha, PinResolution, TagIndex};
+    ///
+    /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let other = CommitSha::parse(&"b".repeat(40)).unwrap();
+    /// let index = TagIndex::from_tags([("v1.0.0", &sha)]);
+    /// assert!(matches!(index.pin_resolution(&sha), PinResolution::Resolved(_)));
+    /// assert_eq!(index.pin_resolution(&other), PinResolution::Untagged);
+    /// assert_eq!(TagIndex::default().pin_resolution(&other), PinResolution::Unresolved);
+    /// ```
+    #[must_use]
+    pub fn pin_resolution(&self, sha: &CommitSha) -> PinResolution {
+        if let Some(pin) = self.sha_to_tag.get(sha) {
+            return PinResolution::Resolved(pin.clone());
+        }
+        match self.coverage {
+            ListCoverage::Complete if !self.is_empty() => PinResolution::Untagged,
+            ListCoverage::Complete | ListCoverage::Truncated => PinResolution::Unresolved,
+        }
     }
 
     /// Whether the index holds no tag in either direction.
@@ -523,6 +678,22 @@ impl TagIndex {
     pub fn is_empty(&self) -> bool {
         self.tag_to_sha.is_empty() && self.sha_to_tag.is_empty()
     }
+}
+
+/// What a repository's [`TagIndex`] proves about a pinned commit, as returned by
+/// [`TagIndex::pin_resolution`].
+///
+/// The variants are exhaustive so a consumer must decide what each means for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinResolution {
+    /// No out-of-band evidence (cold cache, truncated or empty index): manifest text may stand
+    /// in for the pin's version.
+    Unresolved,
+    /// A tag names the commit.
+    Resolved(ResolvedPin),
+    /// The index proves no release tag names the commit, so manifest text (a trailing
+    /// comment) must not stand in for its version.
+    Untagged,
 }
 
 /// Outcome of looking a full-SHA pin up in a repository's [`TagIndex`] against the newest
@@ -548,12 +719,11 @@ pub enum ShaPinLookup {
 }
 
 impl ShaPinLookup {
-    /// Looks `sha` up in `index` relative to `latest`; `None` when `sha` is not a full SHA.
+    /// Looks `sha` up in `index` relative to `latest`.
     ///
-    /// The lookup key is lowercased: registries report lowercase hex, while a pin may be
-    /// written in uppercase. A missing or empty `index`, or a SHA absent from a truncated one,
-    /// yields [`Self::Unverifiable`], never [`Self::NotIndexed`], so a cold cache or a
-    /// capped tag list is not mistaken for proof that the pin is stale.
+    /// A missing or empty `index`, or a SHA absent from a truncated one, yields
+    /// [`Self::Unverifiable`], never [`Self::NotIndexed`], so a cold cache or a capped tag
+    /// list is not mistaken for proof that the pin is stale.
     ///
     /// # Examples
     ///
@@ -561,43 +731,37 @@ impl ShaPinLookup {
     /// use deps_core::ConcreteVersion;
     /// use deps_core::lsp_helpers::{CommitSha, ShaPinLookup, TagIndex};
     ///
-    /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let sha = CommitSha::parse(&"A".repeat(40)).unwrap();
     /// let index = TagIndex::from_tags([("v1.0.0", &sha)]);
     /// let latest = ConcreteVersion::new("v1.0.0");
     /// assert_eq!(
-    ///     ShaPinLookup::resolve(Some(&index), &"A".repeat(40), &latest),
-    ///     Some(ShaPinLookup::LatestCommit)
+    ///     ShaPinLookup::resolve(Some(&index), &sha, &latest),
+    ///     ShaPinLookup::LatestCommit
     /// );
     /// assert_eq!(
-    ///     ShaPinLookup::resolve(None, sha.as_str(), &latest),
-    ///     Some(ShaPinLookup::Unverifiable)
+    ///     ShaPinLookup::resolve(None, &sha, &latest),
+    ///     ShaPinLookup::Unverifiable
     /// );
     /// ```
     #[must_use]
     pub fn resolve(
         index: Option<&TagIndex>,
-        sha: &str,
+        sha: &CommitSha,
         latest: &crate::ConcreteVersion,
-    ) -> Option<Self> {
-        if !is_full_sha(sha) {
-            return None;
-        }
-        let sha = sha.to_ascii_lowercase();
+    ) -> Self {
         let Some(index) = index.filter(|index| !index.is_empty()) else {
-            return Some(Self::Unverifiable);
+            return Self::Unverifiable;
         };
-        if index
-            .tag_to_sha
-            .get(latest.as_str())
-            .is_some_and(|commit| commit.as_str() == sha)
-        {
-            return Some(Self::LatestCommit);
+        if index.tag_to_sha.get(latest.as_str()) == Some(sha) {
+            return Self::LatestCommit;
         }
-        Some(match (index.tag_version_for_sha(&sha), index.coverage()) {
-            (Some(tag), _) => Self::Indexed { tag: tag.clone() },
-            (None, ListCoverage::Complete) => Self::NotIndexed,
-            (None, ListCoverage::Truncated) => Self::Unverifiable,
-        })
+        match index.pin_resolution(sha) {
+            PinResolution::Resolved(pin) => Self::Indexed {
+                tag: pin.version().clone(),
+            },
+            PinResolution::Untagged => Self::NotIndexed,
+            PinResolution::Unresolved => Self::Unverifiable,
+        }
     }
 
     /// Maps the lookup to a [`RequirementStatus`], or `None` when the caller should fall back
@@ -1460,14 +1624,14 @@ pub fn sha_pin_text_edit(pinning: &impl ShaPinning, dep: &dyn Dependency) -> Opt
 /// use deps_core::lsp_helpers::splice_resolved_line;
 ///
 /// let markdown = "**Current**: `v3`\n\nSome body.";
-/// let sha = "a".repeat(40);
+/// let sha = deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap();
 /// let out = splice_resolved_line(markdown, "v3.0.0", &sha);
 /// assert!(out.contains("**Resolved**: `v3.0.0`"));
 /// ```
 #[cfg(feature = "lsp-responses")]
 #[must_use]
-pub fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String {
-    let short_sha = short_sha(sha);
+pub fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &CommitSha) -> String {
+    let short_sha = short_sha(sha.as_str());
     // `resolved_tag` is tag-index/registry-controlled and unbounded (#1311), and — like
     // any git tag — has no legitimate use for an invisible/bidi character, so it gets
     // the same `sanitize_invisible`-then-truncate treatment `HoverMarkdown`'s
@@ -1530,6 +1694,7 @@ pub fn splice_hover_line(markdown: &str, line: &str) -> String {
 )]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn test_is_full_sha_accepts_and_rejects() {
@@ -1545,17 +1710,104 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_sha_parse_preserves_case() {
-        let sha = "A".repeat(40);
-        assert_eq!(CommitSha::parse(&sha).unwrap().as_str(), sha);
+    fn test_commit_sha_parse_canonicalizes_to_lowercase() {
+        let upper = CommitSha::parse(&"ABCDEF0123".repeat(4)).unwrap();
+        let lower = CommitSha::parse(&"abcdef0123".repeat(4)).unwrap();
+        assert_eq!(upper, lower);
+        assert_eq!(upper.as_str(), "abcdef0123".repeat(4));
+        assert_eq!(upper.to_string(), "abcdef0123".repeat(4));
     }
 
     #[test]
-    fn test_commit_sha_borrow_str_enables_hashmap_lookup_by_str() {
-        let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    fn test_commit_sha_hash_lookup_is_case_independent() {
         let mut map = std::collections::HashMap::new();
-        map.insert(sha.clone(), "v1.0.0".to_string());
-        assert_eq!(map.get(sha.as_str()), Some(&"v1.0.0".to_string()));
+        map.insert(CommitSha::parse(&"a".repeat(40)).unwrap(), "v1.0.0");
+        let upper = CommitSha::parse(&"A".repeat(40)).unwrap();
+        assert_eq!(map.get(&upper), Some(&"v1.0.0"));
+    }
+
+    #[test]
+    fn test_pin_resolution_variants() {
+        let sha = sha_of('a');
+        let other = sha_of('b');
+        let index = TagIndex::from_tags([("v1.0.0", &sha)]);
+        assert_matches!(
+            index.pin_resolution(&sha),
+            PinResolution::Resolved(pin) if pin.version().as_str() == "v1.0.0"
+        );
+        assert_eq!(index.pin_resolution(&other), PinResolution::Untagged);
+
+        let truncated =
+            TagIndex::from_tags([("v1.0.0", &sha)]).with_coverage(ListCoverage::Truncated);
+        assert_eq!(truncated.pin_resolution(&other), PinResolution::Unresolved);
+        assert_matches!(truncated.pin_resolution(&sha), PinResolution::Resolved(_));
+        assert_eq!(
+            TagIndex::default().pin_resolution(&other),
+            PinResolution::Unresolved
+        );
+    }
+
+    #[test]
+    fn test_tag_has_precedence() {
+        for tag in [
+            "v4",
+            "v4.2",
+            "4.2.0",
+            "v2-beta",
+            "v2.1-rc.1",
+            "v3.0.0-rc.1",
+            "v2+b5",
+        ] {
+            assert!(tag_has_precedence(tag), "{tag}");
+        }
+        for tag in [
+            "v1.x",
+            "v1.*",
+            "v1_2",
+            "v3-node20",
+            "v1.2-stable",
+            "v2-beta.01",
+            "main",
+        ] {
+            assert!(!tag_has_precedence(tag), "{tag}");
+        }
+    }
+
+    #[test]
+    fn test_tag_pin_is_up_to_date_table() {
+        use PartialTagPolicy::{Exact, MovingLine};
+        let cases = [
+            ("v2-beta", "v7.0.0", MovingLine, false),
+            ("v3.0.0-rc.1", "v7.0.0", MovingLine, false),
+            ("v3.0.0-rc.1", "v3.0.0-rc.1", MovingLine, true),
+            ("v4", "v4.3.1", MovingLine, true),
+            ("v4", "v4.3.1", Exact, false),
+            ("v4.2", "v4.2.5", MovingLine, true),
+            ("v4.2", "v4.3.0", MovingLine, false),
+            ("v5.0.0-rc.1", "v4.9.0", MovingLine, true),
+            ("v5.0.0-rc.1", "v4.9.0", Exact, true),
+            ("v8-beta", "v7.0.0", MovingLine, true),
+            ("4.2.0", "v4.2.0", MovingLine, true),
+            ("v4.x", "v4.3.1", MovingLine, false),
+            ("v5", "v4.9.0", MovingLine, true),
+            ("v5", "v4.9.0", Exact, true),
+            ("v4.10", "v4.9.0", Exact, true),
+            ("v4", "v4.0.0", Exact, false),
+            ("v3-node20", "v7.0.0", MovingLine, false),
+            ("v2-beta.01", "v7.0.0", MovingLine, false),
+            ("v4.2.0", "v4", MovingLine, true),
+            ("v4.2.0", "v4.2.0+build.5", Exact, true),
+            ("v2.1-rc", "v2.1.0", Exact, false),
+            ("v1", "v1.3.0", Exact, false),
+            ("v4.1.0", "v4.2.0", MovingLine, false),
+        ];
+        for (written, latest, policy, expected) in cases {
+            assert_eq!(
+                tag_pin_is_up_to_date(written, latest, policy),
+                expected,
+                "{written} vs {latest} ({policy:?})"
+            );
+        }
     }
 
     #[test]
@@ -1572,7 +1824,7 @@ mod tests {
         // The moving tag ("v1") listed before the precise release ("v0.1.15") — sha_to_tag
         // must still resolve to the semver-parseable one, regardless of iteration order.
         let index = TagIndex::from_tags([("v1", &sha), ("v0.1.15", &sha)]);
-        assert_eq!(index.tag_for_sha(sha.as_str()), Some("v0.1.15"));
+        assert_eq!(index.tag_for_sha(&sha), Some("v0.1.15"));
         assert_eq!(index.tag_to_sha.get("v1"), Some(&sha));
         assert_eq!(index.tag_to_sha.get("v0.1.15"), Some(&sha));
     }
@@ -1582,7 +1834,12 @@ mod tests {
     }
 
     fn lookup(index: Option<&TagIndex>, sha: &str, latest: &str) -> Option<ShaPinLookup> {
-        ShaPinLookup::resolve(index, sha, &crate::ConcreteVersion::new(latest))
+        let sha = CommitSha::parse(sha)?;
+        Some(ShaPinLookup::resolve(
+            index,
+            &sha,
+            &crate::ConcreteVersion::new(latest),
+        ))
     }
 
     #[test]
@@ -1654,14 +1911,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tag_index_lookups_are_case_insensitive_on_sha() {
-        let index = TagIndex::from_tags([("v1.0.0", &sha_of('a'))]);
-        let upper = "A".repeat(40);
-        assert_eq!(index.tag_for_sha(&upper), Some("v1.0.0"));
-        assert!(index.resolved_pin(&upper).is_some());
-    }
-
-    #[test]
     fn test_sha_pin_lookup_into_status_indexed_branches() {
         let indexed = |tag: &str| ShaPinLookup::Indexed {
             tag: crate::ConcreteVersion::new(tag),
@@ -1693,7 +1942,7 @@ mod tests {
     fn resolved_pin_for(tags: &[&str]) -> Option<ResolvedPin> {
         let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
         let index = TagIndex::from_tags(tags.iter().map(|t| (*t, &sha)));
-        index.resolved_pin(sha.as_str())
+        index.resolved_pin(&sha)
     }
 
     /// #1668: `v2.9` next to its moving alias `v2` is the most specific name, regardless of the
@@ -1921,7 +2170,7 @@ mod tests {
     fn test_tag_index_empty_input_yields_empty_index() {
         let index = TagIndex::from_tags(std::iter::empty());
         assert!(index.is_empty());
-        assert_eq!(index.resolved_pin(&"a".repeat(40)), None);
+        assert_eq!(index.resolved_pin(&sha_of('a')), None);
     }
 
     #[test]
@@ -1929,8 +2178,8 @@ mod tests {
         let a = CommitSha::parse(&"a".repeat(40)).unwrap();
         let b = CommitSha::parse(&"b".repeat(40)).unwrap();
         let index = TagIndex::from_tags([("v2", &a), ("v2.9", &a), ("v3", &b)]);
-        assert_eq!(index.resolved_pin(a.as_str()), most_specific("v2.9"));
-        assert_eq!(index.resolved_pin(b.as_str()), most_specific("v3"));
+        assert_eq!(index.resolved_pin(&a), most_specific("v2.9"));
+        assert_eq!(index.resolved_pin(&b), most_specific("v3"));
     }
 
     #[test]
@@ -1938,15 +2187,15 @@ mod tests {
         let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
         let mut index = TagIndex::from_tags([("v2.9", &sha), ("v2.9.1.4", &sha)]);
         assert_eq!(
-            index.resolved_pin(sha.as_str()),
+            index.resolved_pin(&sha),
             Some(ResolvedPin::alias(crate::ConcreteVersion::new("v2.9")))
         );
-        assert_eq!(index.tag_for_sha(sha.as_str()), Some("v2.9"));
+        assert_eq!(index.tag_for_sha(&sha), Some("v2.9"));
         index.insert_sha_pin(
             sha.clone(),
             ResolvedPin::most_specific(crate::ConcreteVersion::new("v3.0")),
         );
-        assert_eq!(index.resolved_pin(sha.as_str()), most_specific("v3.0"));
+        assert_eq!(index.resolved_pin(&sha), most_specific("v3.0"));
     }
 
     #[test]
@@ -1961,7 +2210,7 @@ mod tests {
 
     #[test]
     fn test_tag_index_resolved_pin_none_for_unknown_sha() {
-        assert_eq!(TagIndex::default().resolved_pin(&"b".repeat(40)), None);
+        assert_eq!(TagIndex::default().resolved_pin(&sha_of('b')), None);
     }
 
     #[test]
@@ -2464,7 +2713,7 @@ mod tests {
         #[test]
         fn splice_resolved_line_truncates_overlong_resolved_tag() {
             let long_tag = "9".repeat(5000);
-            let sha = "a".repeat(40);
+            let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
             let out = splice_resolved_line("", &long_tag, &sha);
             assert!(out.len() < long_tag.len(), "got: {out}");
             assert!(out.contains('…'));
@@ -2475,7 +2724,7 @@ mod tests {
         #[test]
         fn splice_resolved_line_boundary_at_and_over_cap() {
             let cap = MAX_VERSION_DIAGNOSTIC_CHARS;
-            let sha = "a".repeat(40);
+            let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
 
             // `short_sha` always renders with a trailing `…` of its own (it's a fixed
             // 7-char prefix of a 40-char SHA), so a blanket "no ellipsis anywhere"
@@ -2498,7 +2747,7 @@ mod tests {
         /// — the same treatment `HoverMarkdown`'s `Name`/`Version` field kinds now apply.
         #[test]
         fn splice_resolved_line_strips_u0600_from_resolved_tag() {
-            let sha = "a".repeat(40);
+            let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
             let out = splice_resolved_line("", &format!("v1.0{}0", '\u{0600}'), &sha);
             assert!(
                 !out.contains('\u{0600}'),

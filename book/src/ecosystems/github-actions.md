@@ -77,6 +77,19 @@ SHA whose most specific tag extends it. Nothing is reported while the tag index 
 the SHA is absent from a truncated index. Severity defaults to warning and is set with
 `diagnostics.sha_comment_mismatch_severity`; there is no on/off toggle.
 
+The `Correct version comment to <tag>` quickfix rewrites only the comment's tag token to the
+tag the SHA actually carries, leaving the SHA, its casing and any closing quote or `}` untouched.
+It is withheld when the registry tag is not a plain version, contains control or bidirectional
+characters, is overly long, or when the comment token ends in punctuation.
+
+### Tag pins and release ordering
+
+A tag pin is compared with the latest release by SemVer precedence. A pre-release pin
+(`@v2-beta`, `@v3.0.0-rc.1`) is reported outdated once a newer release exists, while a partial pin
+(`@v4`) stays current as long as the latest release extends it. A pin that is ahead of the latest
+release is reported up to date. Refs that are not on a version line (`@v1.x`, `@v3-node20`) are
+never reported outdated. SHA pins are matched case-insensitively and shown in lowercase.
+
 ### Updating quoted and flow-style pins (issue #1724)
 
 Update-all and the update quickfix rewrite a plain scalar SHA pin to `<new sha> # <tag>`. For a

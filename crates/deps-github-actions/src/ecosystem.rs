@@ -29,8 +29,8 @@ use deps_core::lsp_helpers::TagIndex;
 mod lsp;
 #[cfg(feature = "lsp-responses")]
 use lsp::{
-    VERSION_OPERATOR_CHARS, build_sha_pin_action, collect_pin_all_to_sha_edits,
-    position_past_sha_pin_own_ref,
+    VERSION_OPERATOR_CHARS, build_sha_comment_fix_action, build_sha_pin_action,
+    collect_pin_all_to_sha_edits, position_past_sha_pin_own_ref,
 };
 
 /// Whether `gha_dep`'s ref is diagnosable as a tag — either because
@@ -278,6 +278,12 @@ impl Ecosystem for GithubActionsEcosystem {
                 uri,
                 &self.formatter,
             ));
+            actions.extend(build_sha_comment_fix_action(
+                parse_result,
+                position,
+                uri,
+                &self.formatter,
+            ));
             actions
         })
     }
@@ -354,11 +360,11 @@ impl Ecosystem for GithubActionsEcosystem {
                 return Some(hover);
             };
 
-            use deps_core::lsp_helpers::RequirementResolution;
-            let resolved_tag = self
-                .formatter
-                .resolved_pin_version(dep)
-                .map(|pin| pin.version().as_str().to_string());
+            use deps_core::lsp_helpers::{PinResolution, RequirementResolution};
+            let resolved_tag = match self.formatter.resolved_pin_version(dep) {
+                PinResolution::Resolved(pin) => Some(pin.version().as_str().to_string()),
+                PinResolution::Unresolved | PinResolution::Untagged => None,
+            };
 
             let written_tag = gha_dep
                 .version_req
@@ -368,17 +374,14 @@ impl Ecosystem for GithubActionsEcosystem {
                 !(gha_dep.pin == Some(PinStyle::Tag) && written_tag == Some(resolved.as_str()))
             }) {
                 hover.rewrite_markdown(|md| {
-                    deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, sha.as_str())
+                    deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, &sha)
                 });
             }
 
-            if let Some(CommentCheck::Mismatch(mismatch)) =
+            if let Some(CommentCheck::Mismatch { comment, kind }) =
                 self.formatter.sha_comment_check(gha_dep)
-                && let Some(PinStyle::Sha {
-                    comment_tag: Some(comment),
-                }) = &gha_dep.pin
             {
-                let line = sha_comment_mismatch_hover_line(sha.as_str(), comment, &mismatch);
+                let line = sha_comment_mismatch_hover_line(sha.as_str(), comment.tag(), &kind);
                 hover.rewrite_markdown(|md| deps_core::lsp_helpers::splice_hover_line(md, &line));
             }
 
@@ -486,9 +489,8 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 /// question the same way: a diagnostic's advisory text needs no live cache hit the way
 /// an actual destructive edit does).
 ///
-/// Not the same predicate [`GithubActionsEcosystem::generate_hover`]'s footer guard
-/// checks: that guard still hand-rolls its own, narrower check (missing
-/// `is_last_on_line`) pending PR #1187, so no parity claim is made with it here.
+/// [`GithubActionsEcosystem::generate_hover`]'s footer guard reaches the same predicate
+/// through `resolve_static_sha_pin`.
 pub(crate) fn is_sha_pinnable_tag(gha_dep: &GithubActionsDependency) -> bool {
     gha_dep.pin == Some(PinStyle::Tag) && gha_dep.is_plain_scalar && gha_dep.is_last_on_line
 }
@@ -570,20 +572,16 @@ fn sha_comment_mismatch_diagnostics(
         .into_iter()
         .filter_map(|dep| {
             let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-            let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gha_dep)? else {
-                return None;
-            };
-            let PinStyle::Sha {
-                comment_tag: Some(comment),
-            } = gha_dep.pin.as_ref()?
+            let CommentCheck::Mismatch { comment, kind } = formatter.sha_comment_check(gha_dep)?
             else {
                 return None;
             };
             let range = gha_dep.version_range?;
-            let sha = deps_core::lsp_helpers::short_sha(crate::types::sha_pin_raw_sha(gha_dep)?);
+            let sha = formatter.pinned_commit(gha_dep)?;
+            let sha = deps_core::lsp_helpers::short_sha(sha.as_str());
             let name = deps_core::lsp_helpers::redact_name_for_diagnostic(&gha_dep.name);
-            let comment = sanitize_for_message(comment);
-            let message = match mismatch {
+            let comment = sanitize_for_message(comment.tag());
+            let message = match kind {
                 CommentMismatch::ShaIsOtherTag { actual } => format!(
                     "{name}: SHA {sha} is not the commit of `{comment}` named in the comment \
                      (it is `{}`)",
@@ -771,12 +769,10 @@ mod tests {
                 name_range: range,
                 version_req: Some("v4\n0".into()),
                 version_range: Some(range),
-                version_literal: None,
                 pin: Some(PinStyle::Tag),
                 source: DependencySource::Registry,
                 is_plain_scalar: true,
                 is_last_on_line: true,
-                closing_delimiters: crate::types::ClosingDelimiters::default(),
             }],
             uri: deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml"),
             dependency_truncation: None,
@@ -1581,11 +1577,15 @@ mod tests {
             required: &[];
         }
 
+        fn sha_of(c: char) -> deps_core::lsp_helpers::CommitSha {
+            deps_core::lsp_helpers::CommitSha::parse(&c.to_string().repeat(40)).unwrap()
+        }
+
         #[test]
         fn test_splice_resolved_line_after_requirement() {
             let markdown =
                 "# actions/checkout\n\n**Requirement**: `v4.2.0`\n\n**Latest**: `v4.3.0`\n";
-            let spliced = splice_resolved_line(markdown, "v4.2.0", &"a".repeat(40));
+            let spliced = splice_resolved_line(markdown, "v4.2.0", &sha_of('a'));
             let req_pos = spliced.find("**Requirement**").unwrap();
             let resolved_pos = spliced.find("**Resolved**").unwrap();
             let latest_pos = spliced.find("**Latest**").unwrap();
@@ -1597,7 +1597,7 @@ mod tests {
         #[test]
         fn test_splice_resolved_line_after_current_when_present() {
             let markdown = "# actions/checkout\n\n**Current**: `v4.2.0`\n\n**Requirement**: `v4`\n";
-            let spliced = splice_resolved_line(markdown, "v4.2.0", &"b".repeat(40));
+            let spliced = splice_resolved_line(markdown, "v4.2.0", &sha_of('b'));
             let current_pos = spliced.find("**Current**").unwrap();
             let resolved_pos = spliced.find("**Resolved**").unwrap();
             let requirement_pos = spliced.find("**Requirement**").unwrap();
@@ -1608,7 +1608,7 @@ mod tests {
         #[test]
         fn test_splice_resolved_line_falls_back_to_append_when_no_anchor() {
             let markdown = "# actions/checkout\n\nno anchors here\n";
-            let spliced = splice_resolved_line(markdown, "v4.2.0", &"c".repeat(40));
+            let spliced = splice_resolved_line(markdown, "v4.2.0", &sha_of('c'));
             assert!(spliced.starts_with(markdown));
             assert!(spliced.contains("**Resolved**"));
         }
@@ -1709,7 +1709,7 @@ mod tests {
         fn index_most_specific(sha: &str) -> String {
             let commit = deps_core::lsp_helpers::CommitSha::parse(sha).unwrap();
             TagIndex::from_tags(["v4", "v4.2.2", "v5.0.0"].into_iter().map(|t| (t, &commit)))
-                .tag_for_sha(sha)
+                .tag_for_sha(&commit)
                 .unwrap()
                 .to_string()
         }
@@ -2492,6 +2492,169 @@ mod tests {
                 .tag_index
                 .insert(deps_core::PackageName::new("owner/action"), Arc::new(index));
             (eco, "owner/action".to_string(), [a, b, missing])
+        }
+
+        /// Applies the single text edit of `action` to a one-edit-per-line ASCII `content`.
+        #[cfg(feature = "lsp-responses")]
+        fn apply_single_edit(content: &str, uri: &Url, action: &CodeAction) -> String {
+            let edits = action
+                .edit
+                .as_ref()
+                .and_then(|edit| edit.changes.as_ref())
+                .and_then(|changes| changes.get(&deps_core::to_ls_uri(uri)))
+                .expect("one file edit");
+            assert_eq!(edits.len(), 1);
+            let edit = &edits[0];
+            assert_eq!(edit.range.start.line, edit.range.end.line);
+            let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+            let line = &mut lines[edit.range.start.line as usize];
+            line.replace_range(
+                edit.range.start.character as usize..edit.range.end.character as usize,
+                &edit.new_text,
+            );
+            lines.join("\n") + "\n"
+        }
+
+        #[cfg(feature = "lsp-responses")]
+        fn comment_fix_at(
+            eco: &GithubActionsEcosystem,
+            content: &str,
+            dep_index: usize,
+        ) -> Option<(CodeAction, String)> {
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+            let range = deps_core::ParseResult::dependencies(&parse_result)[dep_index]
+                .version_range()
+                .unwrap();
+            let action = build_sha_comment_fix_action(
+                &parse_result,
+                Position::new(range.start.line, range.start.character),
+                &uri,
+                &eco.formatter,
+            )?;
+            let fixed = apply_single_edit(content, &uri, &action);
+            Some((action, fixed))
+        }
+
+        /// #1734: a mismatching comment gets a quickfix that rewrites only the tag token,
+        /// keeping the written SHA casing and the closing delimiters, for the latest SHA and
+        /// an older one alike; the corrected pin no longer mismatches.
+        #[cfg(feature = "lsp-responses")]
+        #[test]
+        fn test_sha_comment_fix_rewrites_only_the_tag_token() {
+            let (eco, name, [a, b, _missing]) = mismatch_fixture();
+            let upper = a.to_ascii_uppercase();
+            let content = format!(
+                "steps:\n\
+                 \x20 - uses: {name}@{upper} # v2.87.22\n\
+                 \x20 - uses: {name}@{b} # v2.87.20\n\
+                 \x20 - uses: \"{name}@{a}\" # v2.86\n\
+                 \x20 - {{uses: {name}@{a}}} # v1\n"
+            );
+            let cases = [
+                (0, format!("{upper} # v2.87.20"), "v2.87.20"),
+                (1, format!("{b} # v2.87.22"), "v2.87.22"),
+                (2, format!("{a}\" # v2.87.20"), "v2.87.20"),
+                (3, format!("{a}}} # v2.87.20"), "v2.87.20"),
+            ];
+            for (dep_index, expected_literal, tag) in cases {
+                let (action, fixed) = comment_fix_at(&eco, &content, dep_index)
+                    .unwrap_or_else(|| panic!("dep {dep_index} must offer the comment fix"));
+                assert_eq!(
+                    action.title,
+                    format!("Correct version comment to `{tag}`"),
+                    "dep {dep_index}"
+                );
+                assert_eq!(
+                    action.kind,
+                    Some(tower_lsp_server::ls_types::CodeActionKind::QUICKFIX)
+                );
+                let fixed_line = fixed.lines().nth(dep_index + 1).unwrap();
+                assert!(fixed_line.contains(&expected_literal), "{fixed_line}");
+                assert!(
+                    comment_fix_at(&eco, &fixed, dep_index).is_none(),
+                    "{fixed_line}"
+                );
+            }
+        }
+
+        fn eco_with_single_tag(tag: &str) -> (GithubActionsEcosystem, String, String) {
+            let eco = GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+            let sha = "a".repeat(40);
+            let commit = deps_core::lsp_helpers::CommitSha::parse(&sha).unwrap();
+            eco.formatter.tag_index.insert(
+                deps_core::PackageName::new("owner/action"),
+                Arc::new(TagIndex::from_tags([(tag, &commit)])),
+            );
+            let content = format!("steps:\n  - uses: owner/action@{sha} # v0.9.0\n");
+            (eco, sha, content)
+        }
+
+        /// #1734 (impl-critic S2): registry tag text is never spliced into the manifest unless
+        /// it is a plain, sanitized, bounded version tag.
+        #[cfg(feature = "lsp-responses")]
+        #[test]
+        fn test_sha_comment_fix_withheld_for_unsafe_or_non_release_tags() {
+            let overlong = format!("v1.0.0-{}", "a".repeat(300));
+            for tag in [
+                "v1.0.0\u{200B}",
+                "v1.0.\u{202E}0",
+                "v1.0.0\u{0007}",
+                "cargo-deny",
+                "v1.0.0.1",
+                overlong.as_str(),
+            ] {
+                let (eco, _sha, content) = eco_with_single_tag(tag);
+                assert!(
+                    comment_fix_at(&eco, &content, 0).is_none(),
+                    "{tag:?} must not be offered"
+                );
+            }
+            let (eco, _sha, content) = eco_with_single_tag("v1.0.0");
+            assert!(comment_fix_at(&eco, &content, 0).is_some());
+        }
+
+        /// #1734: a fix is withheld for a token with trailing punctuation (`v4-beta,`), whose
+        /// corrected form would not re-parse as a comment tag; a clean token re-parses
+        /// confirmed after the edit.
+        #[cfg(feature = "lsp-responses")]
+        #[test]
+        fn test_sha_comment_fix_is_idempotent_or_withheld() {
+            let (eco, sha, _) = eco_with_single_tag("v4.0.0");
+            let punctuated = format!("steps:\n  - uses: owner/action@{sha} # v4-beta, pinned\n");
+            assert!(comment_fix_at(&eco, &punctuated, 0).is_none());
+
+            let clean = format!("steps:\n  - uses: owner/action@{sha} # v4-beta pinned\n");
+            let (_, fixed) = comment_fix_at(&eco, &clean, 0).expect("fix offered");
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let reparsed = crate::parser::parse_workflow_yaml(&fixed, &uri).unwrap();
+            assert_eq!(
+                reparsed.dependencies[0].sha_comment().unwrap().tag(),
+                "v4.0.0"
+            );
+            assert!(comment_fix_at(&eco, &fixed, 0).is_none());
+        }
+
+        /// #1734: nothing to correct, or nothing to correct *to*, offers no fix.
+        #[cfg(feature = "lsp-responses")]
+        #[test]
+        fn test_sha_comment_fix_absent_unless_another_tag_is_proven() {
+            let (eco, name, [a, b, missing]) = mismatch_fixture();
+            let content = format!(
+                "steps:\n\
+                 \x20 - uses: {name}@{b} # v2.87.22\n\
+                 \x20 - uses: {name}@{a} # v2.87\n\
+                 \x20 - uses: {name}@{a}\n\
+                 \x20 - uses: {name}@{missing} # v2.87.22\n"
+            );
+            for dep_index in 0..4 {
+                assert!(
+                    comment_fix_at(&eco, &content, dep_index).is_none(),
+                    "dep {dep_index}"
+                );
+            }
+            let cold = GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+            assert!(comment_fix_at(&cold, &content, 1).is_none());
         }
 
         async fn sha_comment_diagnostics(

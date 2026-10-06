@@ -1,5 +1,6 @@
 //! GitHub Actions dependency and version types.
 
+use deps_core::lsp_helpers::CommitSha;
 use deps_core::parser::DependencySource;
 use deps_core::position::Range;
 use std::fmt;
@@ -19,9 +20,11 @@ pub enum PinStyle {
     /// A 40-character commit SHA ref, optionally annotated with a trailing
     /// `# vX.Y.Z` comment naming the tag it corresponds to.
     Sha {
-        /// The tag named by the `# vX`/`# vX.Y`/`# vX.Y.Z` comment, if present and
-        /// tag-shaped (see `parser`'s comment-tag rule, issue #907).
-        comment_tag: Option<String>,
+        /// The pinned commit, validated and lowercase-canonical.
+        sha: CommitSha,
+        /// The `# vX`/`# vX.Y`/`# vX.Y.Z` comment, if present and tag-shaped (see
+        /// `parser`'s comment-tag rule, issue #907).
+        comment: Option<ShaComment>,
     },
     /// A branch ref, e.g. `@main`.
     Branch,
@@ -61,11 +64,11 @@ impl Delimiter {
 /// For instance the closing `"` of `uses: "a/b@<sha>" # v4`, or the `}` of
 /// `{uses: a/b@<sha>} # v4`. Blanks before the `}` (`{ uses: a/b@<sha> } # v4`) are kept.
 ///
-/// Non-empty only for a [`PinStyle::Sha`] whose `comment_tag` was read past those
-/// delimiters; every SHA-comment rewrite re-emits them verbatim so the surrounding quote or
-/// flow mapping stays balanced. At most one `}` is accepted: further closers end an outer
-/// collection, where a trailing comment cannot be attributed to this ref. Restricted by
-/// construction to ASCII characters, so its byte length equals its column width.
+/// Non-empty only for a [`ShaComment`] that was read past those delimiters; every SHA-comment
+/// rewrite re-emits them verbatim so the surrounding quote or flow mapping stays balanced. At most
+/// one `}` is accepted: further closers end an outer collection, where a trailing comment cannot
+/// be attributed to this ref. Restricted by construction to ASCII characters, so its byte length
+/// equals its column width.
 ///
 /// # Examples
 ///
@@ -131,6 +134,95 @@ impl fmt::Display for ClosingDelimiters {
     }
 }
 
+/// The trailing `# <tag>` comment of a SHA-pinned `uses:` step.
+///
+/// Built only by the parser, so `tag` is always a tag-shaped token (see `parser`'s
+/// comment-tag rule, issue #907) and `literal` is exactly the text the dependency's
+/// `version_range` spans (`<sha>{closers} # <tag>`).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::Dependency;
+/// use deps_github_actions::{PinStyle, parse_workflow_yaml};
+///
+/// let sha = "a".repeat(40);
+/// let content = format!("steps:\n  - uses: actions/checkout@{sha} # v4.2.0\n");
+/// let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+/// let result = parse_workflow_yaml(&content, &uri).unwrap();
+/// let Some(PinStyle::Sha { comment: Some(comment), .. }) = &result.dependencies[0].pin else {
+///     unreachable!("fixture is a commented SHA pin");
+/// };
+/// assert_eq!(comment.tag(), "v4.2.0");
+/// assert_eq!(comment.literal(), format!("{sha} # v4.2.0"));
+/// assert!(comment.closing_delimiters().is_empty());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShaComment {
+    tag: String,
+    tag_range: Range,
+    closers: ClosingDelimiters,
+    literal: String,
+}
+
+impl ShaComment {
+    pub(crate) const fn new(
+        tag: String,
+        tag_range: Range,
+        closers: ClosingDelimiters,
+        literal: String,
+    ) -> Self {
+        Self {
+            tag,
+            tag_range,
+            closers,
+            literal,
+        }
+    }
+
+    /// The tag named by the comment (`v4.2.0`), without the `#`.
+    #[must_use]
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    /// LSP range of the tag token alone, excluding the `#` and surrounding blanks.
+    #[must_use]
+    pub const fn tag_range(&self) -> Range {
+        self.tag_range
+    }
+
+    /// The closing quote/flow closers between the SHA and the comment.
+    #[must_use]
+    pub const fn closing_delimiters(&self) -> &ClosingDelimiters {
+        &self.closers
+    }
+
+    /// The raw `<sha>{closers} # <tag>` text the dependency's `version_range` spans.
+    #[must_use]
+    pub fn literal(&self) -> &str {
+        &self.literal
+    }
+}
+
+#[cfg(test)]
+impl PinStyle {
+    /// A [`PinStyle::Sha`] with a synthetic `# tag` comment, for tests that build dependencies
+    /// by hand instead of parsing a workflow.
+    pub(crate) fn sha_for_test(sha: &str, comment_tag: Option<&str>) -> Self {
+        let sha = CommitSha::parse(sha).expect("test SHA must be 40 hex characters");
+        let comment = comment_tag.map(|tag| {
+            ShaComment::new(
+                tag.to_string(),
+                Range::default(),
+                ClosingDelimiters::default(),
+                format!("{sha} # {tag}"),
+            )
+        });
+        Self::Sha { sha, comment }
+    }
+}
+
 /// Parsed `uses:` dependency from a GitHub Actions workflow file, with position tracking.
 ///
 /// `name` is `owner/repo` — truncated at the second `/` for a subdirectory action
@@ -144,19 +236,15 @@ pub struct GithubActionsDependency {
     /// LSP range of the `owner/repo` text (truncated at the second `/`).
     pub name_range: Range,
     /// Normalized version requirement: the tag text for a [`PinStyle::Tag`] or a
-    /// [`PinStyle::Sha`] with a `comment_tag`, the raw SHA for a commentless
+    /// [`PinStyle::Sha`] with a `comment`, the raw SHA for a commentless
     /// [`PinStyle::Sha`], the branch name for [`PinStyle::Branch`] — `None` for a
     /// non-resolvable source.
     pub version_req: Option<deps_core::VersionReq>,
-    /// LSP range of the ref text — for a [`PinStyle::Sha`] with a `comment_tag`, this
+    /// LSP range of the ref text — for a [`PinStyle::Sha`] with a `comment`, this
     /// extends through the comment token (`<40hex> # v4.2.0`), including any
     /// [`ClosingDelimiters`] in between (`<40hex>" # v4.2.0`). `None` for a
     /// non-resolvable source or a bare `uses: owner/repo` with no `@` at all.
     pub version_range: Option<Range>,
-    /// The raw literal text `version_range` spans, when it differs from `version_req` —
-    /// populated only for the SHA-with-comment form, where `version_req` is the
-    /// comment-derived tag but `version_range` spans the full `<sha> # <tag>` text.
-    pub version_literal: Option<String>,
     /// How the ref is pinned; `None` for a non-resolvable source.
     pub pin: Option<PinStyle>,
     /// Dependency source: [`DependencySource::Registry`] for any `@ref` form (tag, SHA,
@@ -189,45 +277,51 @@ pub struct GithubActionsDependency {
     /// finding, issue #633) — see
     /// `crate::formatter::GithubActionsFormatter::sha_pin_replacement_for`'s caller.
     pub is_last_on_line: bool,
-    /// Closing quote/flow closers between the SHA and its `# tag` comment, when
-    /// `version_range` spans them (see [`ClosingDelimiters`]); empty for every other form.
-    pub closing_delimiters: ClosingDelimiters,
 }
 
-deps_core::impl_dependency!(GithubActionsDependency {
-    name: name,
-    name_range: name_range,
-    version: version_req,
-    version_range: version_range,
-    source: source,
-    version_literal: version_literal,
-});
-
-/// Extracts the raw 40-hex SHA text a `PinStyle::Sha` pin's literal encodes, or `None` for
-/// any other pin style.
-///
-/// With a comment tag, the SHA is the literal's leading run of hex digits — not a
-/// `split_once(" # ")` exact-space match, since the `#` only has to be
-/// *whitespace-preceded* and a closing quote/brace may directly follow the SHA. Without
-/// one, `version_req` already *is* the bare SHA.
-///
-/// Shared by `ecosystem.rs`'s `generate_hover` `**Resolved**` splice and
-/// `formatter.rs`'s `requirement_status_for` ground-truth lookup (#907 review DRY note) so
-/// the two can never diverge on what "the pinned SHA" means for a given dependency.
-#[must_use]
-pub(crate) fn sha_pin_raw_sha(dep: &GithubActionsDependency) -> Option<&str> {
-    match &dep.pin {
-        Some(PinStyle::Sha {
-            comment_tag: Some(_),
-        }) => dep
-            .version_literal
-            .as_deref()?
-            .split(|c: char| !c.is_ascii_hexdigit())
-            .next(),
-        Some(PinStyle::Sha { comment_tag: None }) => {
-            dep.version_req.as_ref().map(deps_core::VersionReq::as_str)
+impl GithubActionsDependency {
+    /// The SHA pin's comment, when the step is a commented [`PinStyle::Sha`].
+    #[must_use]
+    pub const fn sha_comment(&self) -> Option<&ShaComment> {
+        match &self.pin {
+            Some(PinStyle::Sha {
+                comment: Some(comment),
+                ..
+            }) => Some(comment),
+            Some(PinStyle::Sha { comment: None, .. } | PinStyle::Tag | PinStyle::Branch) | None => {
+                None
+            }
         }
-        _ => None,
+    }
+}
+
+impl deps_core::Dependency for GithubActionsDependency {
+    fn name(&self) -> &deps_core::PackageName {
+        &self.name
+    }
+
+    fn name_range(&self) -> Range {
+        self.name_range
+    }
+
+    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+        self.version_req.as_ref()
+    }
+
+    fn version_range(&self) -> Option<Range> {
+        self.version_range
+    }
+
+    fn source(&self) -> DependencySource {
+        self.source.clone()
+    }
+
+    fn version_literal(&self) -> Option<&str> {
+        self.sha_comment().map(ShaComment::literal)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -330,12 +424,10 @@ mod tests {
             name_range: range(),
             version_req: Some("v4".into()),
             version_range: Some(range()),
-            version_literal: None,
             pin: Some(PinStyle::Tag),
             source: DependencySource::Registry,
             is_plain_scalar: true,
             is_last_on_line: true,
-            closing_delimiters: ClosingDelimiters::default(),
         };
         assert_eq!(dep.name(), "actions/checkout");
         assert_eq!(
@@ -352,16 +444,18 @@ mod tests {
             name_range: range(),
             version_req: Some("v4.2.0".into()),
             version_range: Some(range()),
-            version_literal: Some("b4ffde65f46336ab88eb53be808477a3936bae11 # v4.2.0".to_string()),
-            pin: Some(PinStyle::Sha {
-                comment_tag: Some("v4.2.0".to_string()),
-            }),
+            pin: Some(PinStyle::sha_for_test(
+                "b4ffde65f46336ab88eb53be808477a3936bae11",
+                Some("v4.2.0"),
+            )),
             source: DependencySource::Registry,
             is_plain_scalar: true,
             is_last_on_line: true,
-            closing_delimiters: ClosingDelimiters::default(),
         };
-        assert_eq!(dep.version_literal(), dep.version_literal.as_deref());
+        assert_eq!(
+            dep.version_literal(),
+            Some("b4ffde65f46336ab88eb53be808477a3936bae11 # v4.2.0")
+        );
         assert_ne!(
             dep.version_literal(),
             dep.version_requirement().map(deps_core::VersionReq::as_str)
@@ -396,12 +490,10 @@ mod tests {
                 name_range: range(),
                 version_req: Some("v4".into()),
                 version_range: Some(range()),
-                version_literal: None,
                 pin: Some(PinStyle::Tag),
                 source: DependencySource::Registry,
                 is_plain_scalar: true,
                 is_last_on_line: true,
-                closing_delimiters: ClosingDelimiters::default(),
             }],
             uri,
             dependency_truncation: None,

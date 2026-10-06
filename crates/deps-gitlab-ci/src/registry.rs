@@ -924,7 +924,7 @@ mod tests {
             .expect("expected a TagIndex entry");
         let expected_sha = CommitSha::parse(&sha).unwrap();
         assert_eq!(
-            index.tag_for_sha(expected_sha.as_str()),
+            index.tag_for_sha(&expected_sha),
             Some("v1.0.0"),
             "sha_to_tag must prefer the semver-parseable tag over the bare moving one"
         );
