@@ -727,7 +727,7 @@ pub fn resolve_in_use_versions(
                 .collect();
             Some(InUseVersions { primary, siblings })
         }
-        PinResolution::Untagged => None,
+        PinResolution::Untagged | PinResolution::CommentContradicted => None,
         PinResolution::Unresolved => dep
             .version_requirement()
             .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
@@ -835,7 +835,7 @@ mod tests {
         fn from_index(tags: &[&str]) -> Self {
             let sha = crate::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap();
             let index = crate::lsp_helpers::TagIndex::from_tags(tags.iter().map(|t| (*t, &sha)));
-            Self(index.pin_resolution(&sha))
+            Self(index.pin_resolution(&sha, None))
         }
     }
 
@@ -1027,6 +1027,12 @@ mod tests {
         assert_eq!(
             resolve(&FixedResolvedPinFormatter::with_resolution(
                 PinResolution::Untagged
+            )),
+            None
+        );
+        assert_eq!(
+            resolve(&FixedResolvedPinFormatter::with_resolution(
+                PinResolution::CommentContradicted
             )),
             None
         );

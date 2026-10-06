@@ -1,6 +1,6 @@
 //! GitLab CI dependency and version types.
 
-use deps_core::lsp_helpers::{CommentSlot, ShaPinComment, ShaPinTail};
+use deps_core::lsp_helpers::{CommentSlot, CommitSha, ShaPinComment, ShaPinTail};
 use deps_core::parser::DependencySource;
 use deps_core::position::Range;
 use url::Url;
@@ -177,6 +177,8 @@ impl GitlabRoute {
 pub enum PinStyle {
     /// A 40-character commit SHA, with whatever trailing `# vX` comment follows it.
     Sha {
+        /// The pinned commit, validated and lowercased.
+        sha: CommitSha,
         /// The comment naming the pinned tag, or whether one may be appended.
         tail: ShaPinTail,
     },
@@ -193,11 +195,23 @@ pub enum PinStyle {
 }
 
 impl PinStyle {
-    /// A SHA pin that carries no comment and cannot gain one: the classification a pin has
-    /// before its source line is read, and the only one an alias or a text-only guess can have.
+    /// A SHA pin of `sha` that carries no comment and cannot gain one: the classification a
+    /// pin has before its source line is read, and the only one an alias or a text-only guess
+    /// can have.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::CommitSha;
+    /// use deps_gitlab_ci::PinStyle;
+    ///
+    /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// assert!(matches!(PinStyle::sha_without_comment(sha), PinStyle::Sha { .. }));
+    /// ```
     #[must_use]
-    pub const fn sha_without_comment() -> Self {
+    pub const fn sha_without_comment(sha: CommitSha) -> Self {
         Self::Sha {
+            sha,
             tail: ShaPinTail::Bare(CommentSlot::Unavailable),
         }
     }
@@ -262,6 +276,11 @@ pub struct GitlabCiDependency {
     /// (no `ref:` key at all).
     #[raw]
     pub pin: Option<PinStyle>,
+    /// Whether a `# tag` comment can be written after this ref once it becomes a SHA: only a
+    /// literal plain scalar that is last on its line can. [`CommentSlot::Unavailable`] for an
+    /// alias, a quoted scalar, a flow-style entry and a ref with no `ref:` at all.
+    #[raw]
+    pub comment_slot: CommentSlot,
     /// The bare `org/sub/proj[/component]` path, without a host prefix — kept for URL
     /// construction and the registry's own fetch-path use.
     #[redact(key)]
@@ -269,11 +288,21 @@ pub struct GitlabCiDependency {
 }
 
 impl GitlabCiDependency {
+    /// The pinned commit of a SHA pin, as classified at parse time.
+    #[must_use]
+    pub(crate) const fn pinned_sha(&self) -> Option<&CommitSha> {
+        match &self.pin {
+            Some(PinStyle::Sha { sha, .. }) => Some(sha),
+            Some(PinStyle::Tag | PinStyle::Branch | PinStyle::Latest | PinStyle::Partial)
+            | None => None,
+        }
+    }
+
     /// The trailing comment of a SHA pin, if it has one.
     #[must_use]
     pub const fn sha_comment(&self) -> Option<&ShaPinComment> {
         match &self.pin {
-            Some(PinStyle::Sha { tail }) => tail.comment(),
+            Some(PinStyle::Sha { tail, .. }) => tail.comment(),
             Some(PinStyle::Tag | PinStyle::Branch | PinStyle::Latest | PinStyle::Partial)
             | None => None,
         }
@@ -424,6 +453,7 @@ mod tests {
             kind: IncludeKind::Project,
             host,
             pin: Some(PinStyle::Tag),
+            comment_slot: deps_core::lsp_helpers::CommentSlot::Unavailable,
             project_path: "org/proj".to_string(),
         }
     }
@@ -465,6 +495,7 @@ mod tests {
             kind: IncludeKind::Project,
             host: HostRef::Unresolved("$CI_SERVER_FQDN".into()),
             pin: Some(PinStyle::Tag),
+            comment_slot: deps_core::lsp_helpers::CommentSlot::Unavailable,
             project_path: deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string(),
         },
     );

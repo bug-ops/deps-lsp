@@ -369,7 +369,9 @@ impl Ecosystem for GithubActionsEcosystem {
             use deps_core::lsp_helpers::{PinResolution, RequirementResolution};
             let resolved_tag = match self.formatter.resolved_pin_version(dep) {
                 PinResolution::Resolved(pin) => Some(pin.version().as_str().to_string()),
-                PinResolution::Unresolved | PinResolution::Untagged => None,
+                PinResolution::Unresolved
+                | PinResolution::Untagged
+                | PinResolution::CommentContradicted => None,
             };
 
             let written_tag = gha_dep

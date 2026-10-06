@@ -36,8 +36,9 @@ use crate::types::{
 };
 use deps_core::Result;
 use deps_core::lsp_helpers::{
-    LineOffsetTable, MarkedScalar, ShaPinTail, byte_span_to_range, is_full_sha, is_plain_null,
-    is_tag_shaped, marker_byte_offset, read_sha_pin_tail, warn_rejected_value,
+    CommentSlot, CommitSha, LineOffsetTable, MarkedScalar, ShaPinTail, byte_span_to_range,
+    comment_slot_after, is_plain_null, is_tag_shaped, marker_byte_offset, read_sha_pin_tail,
+    warn_rejected_value,
 };
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::parser::DependencySource;
@@ -254,6 +255,17 @@ impl RawField {
     /// `is_alias_occurrence` carrier).
     const fn is_alias(&self) -> bool {
         matches!(self, Self::Alias { .. })
+    }
+
+    /// Whether a `# tag` comment can follow this field's text once it ends at `ref_end`: only
+    /// a literal plain scalar that is last on its line can take one.
+    fn comment_slot(&self, content: &str, table: &LineOffsetTable, ref_end: usize) -> CommentSlot {
+        match self {
+            Self::Literal(scalar) => {
+                comment_slot_after(content, table, ref_end, scalar.line(), scalar.is_plain())
+            }
+            Self::Alias { .. } => CommentSlot::Unavailable,
+        }
     }
 
     /// Resolves the field's raw byte span within `content` — a literal's via
@@ -1028,8 +1040,8 @@ fn locate_alias_span(
 /// `deps-github-actions` uses, with no third "confirmed by the registry" state (this crate
 /// has no per-repository tag/SHA cross-reference the way GHA's `TagIndex` does).
 pub(crate) fn classify_project_pin(ref_text: &str) -> PinStyle {
-    if is_full_sha(ref_text) {
-        PinStyle::sha_without_comment()
+    if let Some(sha) = CommitSha::parse(ref_text) {
+        PinStyle::sha_without_comment(sha)
     } else if is_tag_shaped(ref_text) {
         PinStyle::Tag
     } else {
@@ -1050,8 +1062,8 @@ fn attach_sha_tail(
     pin: PinStyle,
     ref_end: usize,
 ) -> (PinStyle, usize) {
-    match (&pin, field) {
-        (PinStyle::Sha { .. }, RawField::Literal(scalar)) => {
+    match (pin, field) {
+        (PinStyle::Sha { sha, .. }, RawField::Literal(scalar)) => {
             let read = read_sha_pin_tail(
                 content,
                 line_table,
@@ -1060,9 +1072,15 @@ fn attach_sha_tail(
                 scalar.style(),
                 scalar.is_plain(),
             );
-            (PinStyle::Sha { tail: read.tail }, read.range_end)
+            (
+                PinStyle::Sha {
+                    sha,
+                    tail: read.tail,
+                },
+                read.range_end,
+            )
         }
-        _ => (pin, ref_end),
+        (pin, _) => (pin, ref_end),
     }
 }
 
@@ -1071,9 +1089,11 @@ fn widened_literal(content: &str, pin: &PinStyle, start: usize, end: usize) -> O
     match pin {
         PinStyle::Sha {
             tail: ShaPinTail::Commented(_),
+            ..
         } => content.get(start..end).map(str::to_string),
         PinStyle::Sha {
             tail: ShaPinTail::Bare(_),
+            ..
         }
         | PinStyle::Tag
         | PinStyle::Branch
@@ -1231,39 +1251,56 @@ fn build_project_dependency(
     let host = resolve_project_host(instance_host);
     let name = host_qualified_name(&host, project_field.text(), None);
 
-    let (version_req, version_range, version_literal, pin, is_plain_scalar, is_alias_occurrence) =
-        match ref_field {
-            Some(ref_field) => {
-                let (rs, re) = ref_field.span(content, line_table)?;
-                let (pin, range_end) = attach_sha_tail(
-                    content,
-                    line_table,
-                    &ref_field,
-                    classify_project_pin(ref_field.text()),
-                    re,
-                );
-                let range = byte_span_to_range(content, line_table, rs, range_end);
-                let literal = widened_literal(content, &pin, rs, range_end);
-                let plain = ref_field.is_plain();
-                // #912 critic S1: scoped to the field that actually backs `version_range` —
-                // every SHA-pin/completion write path this flag gates only ever touches
-                // `version_range` (never `name_range`, which `literal_span_matches` already
-                // can't satisfy against a host-qualified name regardless). An OR with
-                // `project_is_alias` here withheld a fully auto-fixable literal `ref:` and
-                // appended a factually false "no automated fix available" suffix whenever
-                // `project:` alone was aliased.
-                let is_alias = ref_field.is_alias();
-                (
-                    Some(ref_field.into_text().into()),
-                    Some(range),
-                    literal,
-                    Some(pin),
-                    plain,
-                    is_alias,
-                )
-            }
-            None => (None, None, None, None, project_is_plain, project_is_alias),
-        };
+    let (
+        version_req,
+        version_range,
+        version_literal,
+        pin,
+        is_plain_scalar,
+        is_alias_occurrence,
+        comment_slot,
+    ) = match ref_field {
+        Some(ref_field) => {
+            let (rs, re) = ref_field.span(content, line_table)?;
+            let comment_slot = ref_field.comment_slot(content, line_table, re);
+            let (pin, range_end) = attach_sha_tail(
+                content,
+                line_table,
+                &ref_field,
+                classify_project_pin(ref_field.text()),
+                re,
+            );
+            let range = byte_span_to_range(content, line_table, rs, range_end);
+            let literal = widened_literal(content, &pin, rs, range_end);
+            let plain = ref_field.is_plain();
+            // #912 critic S1: scoped to the field that actually backs `version_range` —
+            // every SHA-pin/completion write path this flag gates only ever touches
+            // `version_range` (never `name_range`, which `literal_span_matches` already
+            // can't satisfy against a host-qualified name regardless). An OR with
+            // `project_is_alias` here withheld a fully auto-fixable literal `ref:` and
+            // appended a factually false "no automated fix available" suffix whenever
+            // `project:` alone was aliased.
+            let is_alias = ref_field.is_alias();
+            (
+                Some(ref_field.into_text().into()),
+                Some(range),
+                literal,
+                Some(pin),
+                plain,
+                is_alias,
+                comment_slot,
+            )
+        }
+        None => (
+            None,
+            None,
+            None,
+            None,
+            project_is_plain,
+            project_is_alias,
+            CommentSlot::Unavailable,
+        ),
+    };
 
     let (source, route) = build_source_and_route(&host, EndpointKind::Tags);
 
@@ -1280,6 +1317,7 @@ fn build_project_dependency(
             kind: IncludeKind::Project,
             host,
             pin,
+            comment_slot,
             project_path: project_field.into_text(),
         },
         route,
@@ -1347,6 +1385,7 @@ fn build_component_dependency(
     // unrelated document text, so both ranges collapse onto the whole alias-token span
     // instead of the usual name/version split.
     let classified_pin = crate::component::classify_component_pin_style(ref_text);
+    let comment_slot = component_field.comment_slot(content, line_table, raw_end);
     let (name_range, version_range, version_literal, pin) = if is_alias_occurrence {
         let alias_range = byte_span_to_range(content, line_table, raw_start, raw_end);
         (alias_range, alias_range, None, classified_pin)
@@ -1385,6 +1424,7 @@ fn build_component_dependency(
             kind: IncludeKind::Component,
             host,
             pin: Some(pin),
+            comment_slot,
             project_path,
         },
         route,
@@ -1635,6 +1675,7 @@ mod tests {
         assert_eq!(
             result.dependencies[0].pin,
             Some(PinStyle::Sha {
+                sha: CommitSha::parse(&sha).unwrap(),
                 tail: ShaPinTail::Bare(CommentSlot::Appendable)
             })
         );
@@ -1702,6 +1743,7 @@ mod tests {
         assert_eq!(
             dep.pin,
             Some(PinStyle::Sha {
+                sha: CommitSha::parse(&sha).unwrap(),
                 tail: ShaPinTail::Bare(CommentSlot::Appendable)
             })
         );
@@ -1718,6 +1760,7 @@ mod tests {
         assert_eq!(
             dep.pin,
             Some(PinStyle::Sha {
+                sha: CommitSha::parse(&sha).unwrap(),
                 tail: ShaPinTail::Bare(CommentSlot::Unavailable)
             })
         );
@@ -1731,7 +1774,12 @@ mod tests {
         let dep = only_dep(&content);
         assert!(dep.is_alias_occurrence);
         assert!(dep.version_literal.is_none());
-        assert_eq!(dep.pin, Some(PinStyle::sha_without_comment()));
+        assert_eq!(
+            dep.pin,
+            Some(PinStyle::sha_without_comment(
+                CommitSha::parse(&sha).unwrap()
+            ))
+        );
     }
 
     #[test]
