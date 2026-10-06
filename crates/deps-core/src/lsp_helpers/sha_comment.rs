@@ -710,7 +710,9 @@ impl CommentCheck {
             PinResolution::CommentContradicted => {
                 Self::Mismatch(CommentMismatch::CommentNamesOtherCommit)
             }
-            PinResolution::Unresolved | PinResolution::Unlisted => Self::Unverifiable,
+            PinResolution::Unresolved | PinResolution::Unlisted | PinResolution::Unpublished => {
+                Self::Unverifiable
+            }
         }
     }
 }

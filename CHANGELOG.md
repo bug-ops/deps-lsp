@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `PolicyConfigDiff` `*_changed` fields are the typed `SettingChange` instead of `bool` (#1771, #1776)
 - **deps-swift**: `ResolvedSwiftRegistry.auth` is no longer public (#1771, #1776)
 - **deps-gitlab-ci**: `GITLAB_TOKEN` is sent to `gitlab.com` or to the host in the `GITLAB_TOKEN_HOST` environment variable, no longer to `registries.gitlab_instance_host`; `token_host_origin` is removed and `GitlabApiClient::new` drops its instance-host parameter (#PR)
+- **deps-core**: `PinResolution::Unpublished` added for a full-release tag pin absent from a complete tag index (#PR)
 
 ### Security
 - **deps-core, all registry ecosystems**: registry credential headers (`Authorization`, `PRIVATE-TOKEN`) are marked sensitive so they stay out of HTTP-stack debug output (#1772, #1776)
@@ -81,6 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: a SHA pin's full-version comment that a truncated tag index maps to another commit is reported as `sha-comment-mismatch` and no longer trusted for status or the OSV query (#1770)
 - **deps-lsp**: tag-index-dependent diagnostics of other open GitHub Actions documents are republished after a tag-index refresh, also with OSV off or offline (#1770)
 - **deps-lsp**: push-only clients get diagnostics republished after a `didChangeConfiguration` that changes no parse-affecting setting (#PR)
+- **deps-core, deps-github-actions**: a tag pin no published tag matches reports vulnerability data as not checked instead of clean (#PR)
 
 ## [2.0.0] - 2026-09-29
 

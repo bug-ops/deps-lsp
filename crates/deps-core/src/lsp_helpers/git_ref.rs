@@ -875,7 +875,8 @@ impl TagIndex {
     /// [`PinResolution::Resolved`] when the tag is listed, with [`Self::resolved_exact_tag`]'s
     /// siblings. A tag missing from a populated [`ListCoverage::Truncated`] index is
     /// [`PinResolution::Unlisted`], since the list may simply not reach it; missing from a
-    /// complete index, or from an empty one, it is [`PinResolution::Unresolved`].
+    /// complete index it is [`PinResolution::Unpublished`] when the ref has a full release shape
+    /// ([`UnpublishedRef::Release`]), otherwise, like on an empty index, [`PinResolution::Unresolved`].
     ///
     /// # Examples
     ///
@@ -886,7 +887,8 @@ impl TagIndex {
     /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
     /// let complete = TagIndex::from_tags([("v4.8.0", &sha)]);
     /// assert!(matches!(complete.exact_tag_resolution("v4.8.0"), PinResolution::Resolved { .. }));
-    /// assert_eq!(complete.exact_tag_resolution("v4.9.0"), PinResolution::Unresolved);
+    /// assert_eq!(complete.exact_tag_resolution("v4.9.0"), PinResolution::Unpublished);
+    /// assert_eq!(TagIndex::default().exact_tag_resolution("v4.9.0"), PinResolution::Unresolved);
     /// let truncated = TagIndex::from_tags([("v4.8.0", &sha)]).with_coverage(ListCoverage::Truncated);
     /// assert_eq!(truncated.exact_tag_resolution("v4.9.0"), PinResolution::Unlisted);
     /// ```
@@ -897,7 +899,10 @@ impl TagIndex {
                 pin,
                 sibling_coverage: self.coverage,
             },
-            None => self.unlisted_or_unresolved(),
+            None => match self.unpublished_tag_ref(written) {
+                Some(UnpublishedRef::Release) => PinResolution::Unpublished,
+                Some(UnpublishedRef::Partial) | None => self.unlisted_or_unresolved(),
+            },
         }
     }
 
@@ -1126,6 +1131,11 @@ pub enum PinResolution {
     /// The index proves no release tag names the commit, so manifest text (a trailing
     /// comment) must not stand in for its version.
     Untagged,
+    /// A complete index lists no tag of this exact text for a full-release-shaped tag pin
+    /// (`4.2.2` when only `v4.2.2` is published): the ref names no release, so manifest text
+    /// must not stand in for its version and a vulnerability answer for that text is not
+    /// about this pin.
+    Unpublished,
 }
 
 /// How plausible it is that a tag-shaped ref no published tag matches is a branch instead, as
@@ -1311,7 +1321,7 @@ impl ShaPinLookup {
                 position: TagPosition::of(pin.version().as_str(), latest.as_str()),
             },
             PinResolution::Untagged => Self::NotIndexed,
-            PinResolution::Unresolved => Self::Unverifiable,
+            PinResolution::Unresolved | PinResolution::Unpublished => Self::Unverifiable,
             PinResolution::Unlisted => Self::Unlisted,
             PinResolution::CommentContradicted => Self::CommentContradicted,
         }
@@ -2450,6 +2460,34 @@ mod tests {
         }
     }
 
+    /// #1795: only the exact-tag lookup proves a tag ref unpublished; a commit lookup never
+    /// does, so `ShaPinLookup` and the SHA comment check never see `Unpublished`.
+    #[test]
+    fn test_commit_lookup_never_yields_unpublished() {
+        let sha = sha_of('a');
+        let other = sha_of('b');
+        for index in [
+            TagIndex::from_tags([("v4.8.0", &sha)]),
+            TagIndex::from_tags([("v4.8.0", &sha)]).with_coverage(ListCoverage::Truncated),
+            TagIndex::default(),
+        ] {
+            assert_ne!(
+                index.pin_resolution(&other, None),
+                PinResolution::Unpublished
+            );
+        }
+        let index = TagIndex::from_tags([("v4.8.0", &sha)]);
+        assert_eq!(
+            ShaPinLookup::resolve(
+                Some(&index),
+                &other,
+                &crate::ConcreteVersion::new("v4.8.0"),
+                None
+            ),
+            ShaPinLookup::NotIndexed
+        );
+    }
+
     #[test]
     fn test_exact_tag_resolution_listed_missing_complete_and_truncated() {
         let sha = sha_of('a');
@@ -2463,7 +2501,7 @@ mod tests {
         );
         assert_eq!(
             complete.exact_tag_resolution("v4.9.0"),
-            PinResolution::Unresolved
+            PinResolution::Unpublished
         );
         let truncated =
             TagIndex::from_tags([("v4.8.0", &sha)]).with_coverage(ListCoverage::Truncated);

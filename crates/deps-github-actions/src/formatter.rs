@@ -369,7 +369,8 @@ impl RequirementResolution for GithubActionsFormatter {
     /// its own `version_req`) is just as eligible. [`PinResolution::Unresolved`] on a cold cache —
     /// the honest "unknown", not a fabricated version — [`PinResolution::Unlisted`] when a
     /// truncated index lacks the commit or the exact tag (#1769), and
-    /// [`PinResolution::Untagged`] when a complete index proves no tag names the commit (#1735).
+    /// [`PinResolution::Untagged`] when a complete index proves no tag names the commit (#1735),
+    /// [`PinResolution::Unpublished`] when it lacks a full-release tag pin's exact tag (#1795).
     ///
     /// #1684: a floating tag pin (`@v4`) resolves the same way through the commit its tag
     /// points at, see `Self::pinned_commit`, but only to a release that extends (or equals)
@@ -2024,6 +2025,7 @@ mod tests {
             PinResolution::Unresolved
             | PinResolution::Unlisted
             | PinResolution::Untagged
+            | PinResolution::Unpublished
             | PinResolution::CommentContradicted => None,
         }
     }
@@ -2294,6 +2296,60 @@ mod tests {
         )
     }
 
+    fn in_use_version_1795(
+        coverage: Option<ListCoverage>,
+        written: &str,
+    ) -> Option<ConcreteVersion> {
+        let fmt = formatter();
+        if let Some(coverage) = coverage {
+            let sha = CommitSha::parse(LATEST_SHA_1720).unwrap();
+            fmt.tag_index.insert(
+                PackageName::new("actions/checkout"),
+                Arc::new(TagIndex::from_tags([("v4.2.2", &sha)]).with_coverage(coverage)),
+            );
+        }
+        let mut d = dep(Some(PinStyle::Tag), "actions/checkout");
+        d.version_req = Some(written.into());
+        deps_core::lsp_helpers::resolve_in_use_version(
+            &d,
+            "actions/checkout",
+            &std::collections::HashMap::new(),
+            None,
+            &fmt,
+            EcosystemId::GithubActions,
+        )
+    }
+
+    /// #1795: a full-release tag pin no tag of a complete index matches has no in-use version, so
+    /// its vulnerability data reads as not checked rather than clean.
+    #[test]
+    fn test_in_use_version_unpublished_tag_pin_is_none_on_complete_index() {
+        for written in ["4.2.2", "V4.2.2", "v999.0.0"] {
+            assert_eq!(
+                in_use_version_1795(Some(ListCoverage::Complete), written),
+                None,
+                "{written}"
+            );
+        }
+        assert_eq!(
+            in_use_version_1795(Some(ListCoverage::Complete), "v4.2.2"),
+            Some(ConcreteVersion::new("v4.2.2"))
+        );
+    }
+
+    /// #1795: only a complete index proves absence; a cold or truncated one lets the text stand.
+    #[test]
+    fn test_in_use_version_tag_pin_without_complete_index_keeps_text() {
+        assert_eq!(
+            in_use_version_1795(None, "v999.0.0"),
+            Some(ConcreteVersion::new("v999.0.0"))
+        );
+        assert_eq!(
+            in_use_version_1795(Some(ListCoverage::Truncated), "v999.0.0"),
+            Some(ConcreteVersion::new("v999.0.0"))
+        );
+    }
+
     /// #1753: a tag pin ahead of `latest` is current only when the complete index lists it.
     #[test]
     fn test_nonexistent_ahead_tag_pin_is_unresolved_on_complete_index() {
@@ -2377,8 +2433,7 @@ mod tests {
     }
 
     /// #1769: an exact full-version tag the truncated list does not reach is `Unlisted`, never
-    /// up to date; on a complete index it stays `Unresolved` for resolution and the #1753 rule
-    /// decides the status.
+    /// up to date; on a complete index it is `Unpublished` and the #1753 rule decides the status.
     #[test]
     fn test_exact_tag_pin_missing_from_truncated_index_is_unlisted_and_capped() {
         let tag_dep = |written: &str| {
@@ -2420,7 +2475,7 @@ mod tests {
         let complete = seeded(ListCoverage::Complete);
         assert_eq!(
             complete.resolved_pin_version(&tag_dep("v4.8.0")),
-            PinResolution::Unresolved
+            PinResolution::Unpublished
         );
     }
 

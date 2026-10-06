@@ -1605,11 +1605,13 @@ pub trait RequirementResolution: Send + Sync {
     /// for a [`crate::lsp_helpers::ResolvedPin::MostSpecific`] tag), since this hook can itself
     /// resolve to a moving/partial name (#1556 impl-critic S1, #1668).
     ///
-    /// The result has five values ([`crate::lsp_helpers::PinResolution`]): a
+    /// The result has six values ([`crate::lsp_helpers::PinResolution`]): a
     /// [`Resolved`](crate::lsp_helpers::PinResolution::Resolved) pin is authoritative (an
     /// unqueryable one yields no version, never the manifest text), an
     /// [`Untagged`](crate::lsp_helpers::PinResolution::Untagged) pin is proven to name no
-    /// release (its trailing comment must not stand in), a
+    /// release (its trailing comment must not stand in), an
+    /// [`Unpublished`](crate::lsp_helpers::PinResolution::Unpublished) tag pin names no
+    /// published tag (its text must not stand in either), a
     /// [`CommentContradicted`](crate::lsp_helpers::PinResolution::CommentContradicted) pin has
     /// a comment that is provably wrong and must not stand in either (an implementor must not
     /// map it to `Unresolved`), and only

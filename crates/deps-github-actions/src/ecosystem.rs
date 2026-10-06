@@ -378,6 +378,7 @@ impl Ecosystem for GithubActionsEcosystem {
                 PinResolution::Unresolved
                 | PinResolution::Unlisted
                 | PinResolution::Untagged
+                | PinResolution::Unpublished
                 | PinResolution::CommentContradicted => None,
             };
 

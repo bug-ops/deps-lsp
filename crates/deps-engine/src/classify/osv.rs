@@ -2506,6 +2506,50 @@ mod tests {
             );
         }
 
+        /// #1795: a full-release tag pin no published tag matches is never queried, so hover and
+        /// diagnostics report vulnerability data as not checked (`NoConcreteVersion`'s footer)
+        /// instead of a clean result; a listed tag is still scanned.
+        #[cfg(feature = "github-actions")]
+        #[test]
+        fn build_scan_targets_github_actions_unpublished_tag_pin_is_not_checked() {
+            use deps_core::lsp_helpers::{CommitSha, TagIndex};
+            use deps_core::osv::{ScanOutcome, SkipReason};
+            use deps_github_actions::{GithubActionsFormatter, GithubActionsRegistry};
+            use std::sync::Arc;
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let parse_result = deps_github_actions::parse_workflow_yaml(
+                "steps:\n  - uses: actions/checkout@4.2.2\n  - uses: actions/checkout@v999.0.0\n",
+                &uri,
+            )
+            .expect("valid yaml");
+            let registry = GithubActionsRegistry::new(Arc::new(deps_core::HttpCache::new()));
+            let commit = CommitSha::parse(&"a".repeat(40)).unwrap();
+            registry.tag_index().insert(
+                PackageName::new("actions/checkout"),
+                Arc::new(
+                    TagIndex::from_tags([("v4.2.2", &commit)]).with_canonical_repo_name(
+                        deps_core::github::CanonicalRepoName::from_commit_url(
+                            "https://api.github.com/repos/actions/checkout/commits/abc",
+                        ),
+                    ),
+                ),
+            );
+
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &HashMap::new(),
+                &HashMap::new(),
+                &GithubActionsFormatter::new(registry.tag_index()),
+                EcosystemId::GithubActions,
+            );
+            assert!(targets.is_empty(), "{targets:?}");
+            assert_matches!(
+                skipped.get(&deps_core::test_util::vuln_key("actions/checkout")),
+                Some(ScanOutcome::Skipped(SkipReason::NoConcreteVersion))
+            );
+        }
+
         /// #1694: a written name that is not a valid OSV name stays a fail-closed skip.
         #[test]
         fn build_scan_targets_awaiting_name_without_fallback_is_unconfirmed_skip() {

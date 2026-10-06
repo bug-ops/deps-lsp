@@ -772,7 +772,9 @@ pub fn resolve_in_use_versions(
                 sibling_coverage,
             })
         }
-        PinResolution::Untagged | PinResolution::CommentContradicted => None,
+        PinResolution::Untagged
+        | PinResolution::CommentContradicted
+        | PinResolution::Unpublished => None,
         PinResolution::Unresolved => dep
             .version_requirement()
             .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
