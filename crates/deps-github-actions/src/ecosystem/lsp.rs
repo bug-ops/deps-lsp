@@ -8,14 +8,21 @@
 //! module (which globs `use super::*;`) keeps referencing them unqualified, unchanged from
 //! before the move.
 
-use deps_core::lsp_helpers::{PackageRendering, is_partial_semver_shaped};
+use deps_core::lsp_helpers::{
+    CommentCheck, CommentMismatch, MAX_DIAGNOSTIC_VALUE_CHARS, PackageRendering,
+    SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE, is_partial_semver_shaped,
+    sanitize_and_truncate_for_diagnostic,
+};
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit, WorkspaceEdit};
 
 use super::{
-    CommentCheck, CommentMismatch, GithubActionsDependency, GithubActionsFormatter,
-    MUTABLE_REF_PIN_DIAGNOSTIC_CODE, ParseResultTrait, PinStyle,
-    SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE, Url, sanitize_for_message,
+    GithubActionsDependency, GithubActionsFormatter, MUTABLE_REF_PIN_DIAGNOSTIC_CODE,
+    ParseResultTrait, Url,
 };
+
+fn sanitize_for_message(value: &str) -> String {
+    sanitize_and_truncate_for_diagnostic(value, MAX_DIAGNOSTIC_VALUE_CHARS)
+}
 
 /// Leading version-constraint operators stripped from a completion prefix before matching
 /// it against registry versions. Empty: a `uses:` ref is a bare tag/branch/SHA, with no
@@ -38,23 +45,11 @@ pub(super) fn position_past_sha_pin_own_ref(
         let Some(range) = dep.version_range() else {
             return false;
         };
-        if !deps_core::position_in_range(position, range) {
-            return false;
-        }
         let Some(gha_dep) = dep.as_any().downcast_ref::<GithubActionsDependency>() else {
             return false;
         };
-        let Some(PinStyle::Sha {
-            sha,
-            comment: Some(_),
-        }) = &gha_dep.pin
-        else {
-            return false;
-        };
-        let Ok(sha_len) = u32::try_from(sha.as_str().len()) else {
-            return false;
-        };
-        position.character > range.start.character.saturating_add(sha_len)
+        gha_dep.sha_comment().is_some()
+            && deps_core::lsp_helpers::position_past_sha(range, position)
     })
 }
 
@@ -118,13 +113,12 @@ pub(super) fn build_sha_comment_fix_action(
         .into_iter()
         .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
     let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-    let Some(CommentCheck::Mismatch {
-        comment,
-        kind: CommentMismatch::ShaIsOtherTag { actual },
-    }) = formatter.sha_comment_check(gha_dep)
+    let Some(CommentCheck::Mismatch(CommentMismatch::ShaIsOtherTag { actual })) =
+        formatter.sha_comment_check(gha_dep)
     else {
         return None;
     };
+    let comment = gha_dep.sha_comment()?;
     let actual = actual.as_str();
     if !is_partial_semver_shaped(actual)
         || sanitize_for_message(actual) != actual

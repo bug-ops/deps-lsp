@@ -67,6 +67,26 @@ version comment, since the comment cannot make a non-release commit the latest r
 fetch cap (30 pages of 100) yields a truncated index, and a SHA missing from it stays
 unverifiable (comment trusted, no mismatch diagnostic) instead of being called outdated.
 
+A SHA pin whose commit is tagged only by a floating tag below the latest release (`v1` or `1.1`
+while the latest is `v1.1.0` on another commit) is reported outdated (issue #1730). A tag at or
+above the latest release, including `v3.0.0-rc1`, counts as up to date.
+
+**Trade-off.** A non-release commit newer than the latest release that carries only a floating tag
+is also reported outdated, and update-all re-pins it to the latest release. Making that case
+distinguishable is tracked in #1725.
+
+When the update target is not version-shaped (a release named `stable`), the SHA is rewritten
+without a `# tag` comment; any words after the old tag stay in the comment
+(`# v1.0.0 pinned for CVE` becomes `# pinned for CVE`).
+
+### Peer-document rescan (issue #1716)
+
+When a tags fetch adds or changes a repository's tag index, every other open workflow that uses
+that repository is rescanned: its vulnerability check and diagnostics are refreshed without an
+edit or reopen. Events are coalesced over 250 ms and the rescan runs for at most 4 documents at
+a time. It applies only while vulnerability checking is enabled and the server is online. GitLab
+CI/CD does not emit refresh events.
+
 ### Comment mismatch diagnostic (issue #1722)
 
 When the trailing comment names a tag that is provably not the pinned commit's tag, the

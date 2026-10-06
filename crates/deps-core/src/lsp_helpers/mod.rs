@@ -31,6 +31,7 @@ mod hover_markdown;
 mod in_use_version;
 #[cfg(feature = "lsp-responses")]
 mod inlay_hints;
+mod sha_comment;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]
@@ -82,9 +83,9 @@ pub use formatter::{
 };
 pub use git_ref::{
     CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, PartialTagPolicy, PinResolution, ResolvedPin,
-    ShaPinLookup, SiblingTags, TagIndex, byte_span_to_range, extends_tag, is_full_sha, is_null_tag,
-    is_partial_semver_shaped, is_plain_null, is_tag_shaped, locate_value_span, marker_byte_offset,
-    match_v_prefix_style, short_sha, tag_has_precedence, tag_pin_is_up_to_date,
+    ShaPinLookup, SiblingTags, TagIndex, TagPosition, byte_span_to_range, extends_tag, is_full_sha,
+    is_null_tag, is_partial_semver_shaped, is_plain_null, is_tag_shaped, locate_value_span,
+    marker_byte_offset, match_v_prefix_style, short_sha, tag_has_precedence, tag_pin_is_up_to_date,
 };
 #[cfg(feature = "lsp-responses")]
 pub use git_ref::{
@@ -101,6 +102,12 @@ pub use in_use_version::{
 };
 #[cfg(feature = "lsp-responses")]
 pub use inlay_hints::generate_inlay_hints;
+pub use sha_comment::{
+    ClosingDelimiters, CommentCheck, CommentMismatch, CommentRemainder, CommentSlot, CommentTag,
+    SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE, ShaPinComment, ShaPinTail, ShaPinTailRead,
+    position_past_sha, read_sha_pin_tail, ref_is_last_on_line, sha_comment_mismatch_diagnostic,
+    sha_comment_mismatch_hover_line, sha_pin_rewrite,
+};
 
 /// Maximum number of recent versions hover's "Recent versions" section renders.
 ///

@@ -95,6 +95,37 @@ outdated and update-all re-pins it to the latest release's full SHA (never to a 
 Before the index is populated the pin stays unresolved. This includes a pin on a non-release
 commit newer than the latest release, which is reported outdated (effectively a downgrade).
 
+### SHA-pin trailing comments (issue #1743)
+
+A literal SHA `ref:` (or component `@<sha>`) may carry a trailing tag comment, as in GitHub
+Actions:
+
+```yaml
+include:
+  - project: 'my-group/my-project'
+    ref: 44790937c6a1e4f0b1b1f1a0d0f6c2e3f4a5b6c7 # v1.117.0
+    file: '/templates/build.yml'
+```
+
+- Update-all and the update quickfix rewrite the SHA and the comment together
+  (`<new sha> # v1.120.0`). A plain or quoted pin without a comment gains one; quotes are kept. A
+  comment is never deleted when the tag index has no answer.
+- A comment naming a tag that is not the pinned commit's tag raises `sha-comment-mismatch`
+  (severity `diagnostics.sha_comment_mismatch_severity`) and a hover warning. Nothing is reported
+  while the tag index is cold.
+- A non-version update target (a release named `stable`) writes no `# tag`; trailing words in the
+  old comment are kept.
+- Version completion is withheld inside the comment.
+- A comment on an alias site (`ref: *pin # v1.0.0`) is never read: the comment can go stale after
+  the anchor is updated, with no mismatch diagnostic and no rewrite.
+- The "Pin to commit SHA" quickfix on a tag pin writes a bare SHA without `# tag`.
+
+A SHA pin tagged only by a floating tag below the latest release (`v1.1` while the latest is
+`v1.1.0` on another commit) is reported outdated. SHA pins and tag pins are compared by the same
+tag order, so a pre-release above the latest release (`v2.0.0-rc1` against latest `1.9.0`) is up
+to date either way. As in GitHub Actions, a non-release commit newer than the latest release that
+carries only a floating tag is reported outdated (tracked in #1725).
+
 **Self-hosted instances.** `include: - project:` carries **no host segment in GitLab's
 own syntax at all** — the instance is always implicit. Set
 `registries.gitlab_instance_host` to the host such an include (and a

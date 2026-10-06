@@ -1,5 +1,6 @@
 //! GitLab CI dependency and version types.
 
+use deps_core::lsp_helpers::{CommentSlot, ShaPinComment, ShaPinTail};
 use deps_core::parser::DependencySource;
 use deps_core::position::Range;
 use url::Url;
@@ -174,8 +175,11 @@ impl GitlabRoute {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinStyle {
-    /// A 40-character commit SHA.
-    Sha,
+    /// A 40-character commit SHA, with whatever trailing `# vX` comment follows it.
+    Sha {
+        /// The comment naming the pinned tag, or whether one may be appended.
+        tail: ShaPinTail,
+    },
     /// An exact published tag (`project:`) or release name (`component:`).
     Tag,
     /// Honest-unknown: not a SHA, not an exact tag/release, not `~latest`, not
@@ -186,6 +190,17 @@ pub enum PinStyle {
     Latest,
     /// A partial semantic version, e.g. `1.2` or `1` (`component:` only).
     Partial,
+}
+
+impl PinStyle {
+    /// A SHA pin that carries no comment and cannot gain one: the classification a pin has
+    /// before its source line is read, and the only one an alias or a text-only guess can have.
+    #[must_use]
+    pub const fn sha_without_comment() -> Self {
+        Self::Sha {
+            tail: ShaPinTail::Bare(CommentSlot::Unavailable),
+        }
+    }
 }
 
 /// Parsed `include:` dependency from a `.gitlab-ci.yml`-syntax file, with position
@@ -210,9 +225,8 @@ pub struct GitlabCiDependency {
     /// LSP range of the ref/pin text.
     #[raw]
     pub version_range: Option<Range>,
-    /// The raw literal text, when it differs from `version_req` (unused today — no
-    /// GitLab CI pin form carries a comment-derived requirement the way GitHub Actions'
-    /// SHA-with-comment form does; kept for [`deps_core::ecosystem::Dependency`] parity).
+    /// The raw text of [`Self::version_range`], when it differs from `version_req`: a SHA pin
+    /// followed by a `# vX` comment, whose range spans both while `version_req` stays the SHA.
     #[raw]
     pub version_literal: Option<String>,
     /// Dependency source: [`DependencySource::AlternateRegistry`] when [`Self::host`] is
@@ -252,6 +266,18 @@ pub struct GitlabCiDependency {
     /// construction and the registry's own fetch-path use.
     #[redact(key)]
     pub project_path: String,
+}
+
+impl GitlabCiDependency {
+    /// The trailing comment of a SHA pin, if it has one.
+    #[must_use]
+    pub const fn sha_comment(&self) -> Option<&ShaPinComment> {
+        match &self.pin {
+            Some(PinStyle::Sha { tail }) => tail.comment(),
+            Some(PinStyle::Tag | PinStyle::Branch | PinStyle::Latest | PinStyle::Partial)
+            | None => None,
+        }
+    }
 }
 
 deps_core::impl_dependency!(GitlabCiDependency {

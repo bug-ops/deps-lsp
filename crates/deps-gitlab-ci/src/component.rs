@@ -37,7 +37,10 @@ fn is_partial_semver_shaped(raw: &str) -> bool {
 /// use deps_gitlab_ci::component::classify_component_pin_style;
 /// use deps_gitlab_ci::PinStyle;
 ///
-/// assert_eq!(classify_component_pin_style(&"a".repeat(40)), PinStyle::Sha);
+/// assert_eq!(
+///     classify_component_pin_style(&"a".repeat(40)),
+///     PinStyle::sha_without_comment()
+/// );
 /// assert_eq!(classify_component_pin_style("~latest"), PinStyle::Latest);
 /// assert_eq!(classify_component_pin_style("1.2"), PinStyle::Partial);
 /// assert_eq!(classify_component_pin_style("1.0.0"), PinStyle::Tag);
@@ -46,7 +49,7 @@ fn is_partial_semver_shaped(raw: &str) -> bool {
 #[must_use]
 pub fn classify_component_pin_style(raw: &str) -> PinStyle {
     if is_full_sha(raw) {
-        PinStyle::Sha
+        PinStyle::sha_without_comment()
     } else if raw == LATEST {
         PinStyle::Latest
     } else if is_partial_semver_shaped(raw) {
@@ -134,7 +137,7 @@ pub fn resolve_component_pin(
     releases: &[GitlabCiVersion],
 ) -> Option<GitlabCiVersion> {
     match pin {
-        PinStyle::Sha => releases
+        PinStyle::Sha { .. } => releases
             .iter()
             .find(|r| r.sha.as_ref().is_some_and(|s| s.as_str() == raw))
             .cloned(),
@@ -187,7 +190,10 @@ mod tests {
 
     #[test]
     fn test_classify_sha() {
-        assert_eq!(classify_component_pin_style(&"a".repeat(40)), PinStyle::Sha);
+        assert_eq!(
+            classify_component_pin_style(&"a".repeat(40)),
+            PinStyle::sha_without_comment()
+        );
     }
 
     #[test]
@@ -227,7 +233,8 @@ mod tests {
     fn test_resolve_sha() {
         let sha = "a".repeat(40);
         let releases = vec![release("1.0.0", &sha)];
-        let resolved = resolve_component_pin(&PinStyle::Sha, &sha, &releases).unwrap();
+        let resolved =
+            resolve_component_pin(&PinStyle::sha_without_comment(), &sha, &releases).unwrap();
         assert_eq!(resolved.version.as_str(), "1.0.0");
     }
 

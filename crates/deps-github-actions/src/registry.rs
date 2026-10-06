@@ -13,10 +13,12 @@ use deps_core::pagination::ListCoverage;
 use deps_core::rate_limit::{DEFAULT_COOLDOWN_SECS, RateLimitGate};
 use deps_core::{
     DepsError, EcosystemId, HttpCache, PackageName, PublishTime, RateLimitEvidence, Result,
+    TagIndexRefreshes,
 };
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 
 use crate::types::GithubActionsVersion;
 
@@ -30,6 +32,10 @@ const MAX_TAG_INDEX_ENTRIES: usize = 256;
 /// Maximum number of repositories with a coalescing lock outstanding in
 /// [`GithubActionsRegistry::in_flight`] at once.
 const MAX_IN_FLIGHT_ENTRIES: usize = 256;
+
+/// Capacity of the tag-index refresh channel; a receiver that falls further behind gets
+/// `RecvError::Lagged` and must treat every repository as refreshed.
+const TAG_REFRESH_CHANNEL_CAPACITY: usize = 256;
 
 /// Evicts entries from the in-flight coalescing map, but — unlike
 /// [`deps_core::cache_policy::evict_arbitrary_if_full`] — **only** an entry whose
@@ -73,6 +79,8 @@ pub struct GithubActionsRegistry {
     /// `GithubActionsRegistry` is `Clone` and clones must share one memo, the same
     /// reason `github`'s cache is an `Arc`.
     release_dates: Arc<ReleaseDatesCache>,
+    /// Fed by [`Self::populate_tag_index`]; clones of the registry share one channel.
+    tag_refreshes: broadcast::Sender<PackageName>,
 }
 
 impl GithubActionsRegistry {
@@ -90,6 +98,7 @@ impl GithubActionsRegistry {
             in_flight: Arc::new(DashMap::new()),
             rate_limit: Arc::new(RateLimitGate::new(DEFAULT_COOLDOWN_SECS)),
             release_dates: Arc::new(ReleaseDatesCache::new()),
+            tag_refreshes: broadcast::channel(TAG_REFRESH_CHANNEL_CAPACITY).0,
         }
     }
 
@@ -112,6 +121,7 @@ impl GithubActionsRegistry {
             in_flight: Arc::new(DashMap::new()),
             rate_limit: Arc::new(RateLimitGate::new(DEFAULT_COOLDOWN_SECS)),
             release_dates: Arc::new(ReleaseDatesCache::new()),
+            tag_refreshes: broadcast::channel(TAG_REFRESH_CHANNEL_CAPACITY).0,
         }
     }
 
@@ -126,6 +136,23 @@ impl GithubActionsRegistry {
     #[must_use]
     pub fn tag_index(&self) -> Arc<DashMap<PackageName, Arc<TagIndex>>> {
         Arc::clone(&self.tag_index)
+    }
+
+    /// Subscribes to tag-index refresh events.
+    ///
+    /// Every successful tags fetch (lifecycle fetches, completion's `get_versions_from`, any
+    /// other caller of [`Self::get_versions`]) sends the repository's [`PackageName`] on the
+    /// returned channel if, and only if, that fetch first populated the repository's
+    /// [`TagIndex`] or changed its tag-to-commit mapping; a refetch yielding an identical
+    /// mapping sends nothing. The event is sent after the index has been replaced, so a
+    /// receiver reading [`Self::tag_index`] on receipt sees the new mapping.
+    ///
+    /// Each call returns an independent receiver that only observes events sent after it was
+    /// created. A receiver that falls more than 256 events behind gets
+    /// `RecvError::Lagged` and must treat every repository as refreshed.
+    #[must_use]
+    pub fn subscribe_tag_refreshes(&self) -> TagIndexRefreshes {
+        self.tag_refreshes.subscribe()
     }
 
     /// Builds the error for a request short-circuited by an already-tripped
@@ -224,7 +251,12 @@ impl GithubActionsRegistry {
                 MAX_TAG_INDEX_ENTRIES,
             );
         }
-        self.tag_index.insert(name.clone(), Arc::new(index));
+        let index = Arc::new(index);
+        let previous = self.tag_index.insert(name.clone(), Arc::clone(&index));
+        let changed = previous.is_none_or(|previous| previous.tag_to_sha != index.tag_to_sha);
+        if changed && self.tag_refreshes.send(name.clone()).is_err() {
+            tracing::trace!("tag index refreshed with no subscriber");
+        }
     }
 
     /// Fetches all semver-tagged versions for `name` (`owner/repo`).
@@ -581,6 +613,142 @@ mod tests {
 
     fn mock_registry(base: &str, has_token: bool) -> GithubActionsRegistry {
         GithubActionsRegistry::for_test(Arc::new(HttpCache::new()), base, has_token)
+    }
+
+    fn github_tag(name: &str, sha: &str) -> GithubTag {
+        let mut tag = GithubTag::default();
+        tag.name = name.to_string();
+        tag.commit.sha = sha.to_string();
+        tag
+    }
+
+    fn tags_body(entries: &[(&str, &str)]) -> String {
+        let items: Vec<String> = entries
+            .iter()
+            .map(|(name, sha)| format!(r#"{{"name": "{name}", "commit": {{"sha": "{sha}"}}}}"#))
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    #[test]
+    fn test_populate_tag_index_emits_on_first_populate_and_changed_mapping_only() {
+        let registry = mock_registry("http://localhost", false);
+        let mut refreshes = registry.subscribe_tag_refreshes();
+        let name = PackageName::new("actions/checkout");
+        let (sha_a, sha_b) = ("a".repeat(40), "b".repeat(40));
+
+        registry.populate_tag_index(&name, &[github_tag("v4", &sha_a)], ListCoverage::Complete);
+        assert_eq!(refreshes.try_recv().ok(), Some(name.clone()));
+
+        registry.populate_tag_index(&name, &[github_tag("v4", &sha_a)], ListCoverage::Complete);
+        assert_matches!(
+            refreshes.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        );
+
+        registry.populate_tag_index(&name, &[github_tag("v4", &sha_b)], ListCoverage::Complete);
+        assert_eq!(refreshes.try_recv().ok(), Some(name.clone()));
+
+        registry.populate_tag_index(
+            &name,
+            &[github_tag("v4", &sha_b), github_tag("v4.1.0", &sha_b)],
+            ListCoverage::Complete,
+        );
+        assert_eq!(refreshes.try_recv().ok(), Some(name));
+    }
+
+    #[test]
+    fn test_populate_tag_index_event_is_sent_after_the_index_is_replaced() {
+        let registry = mock_registry("http://localhost", false);
+        let mut refreshes = registry.subscribe_tag_refreshes();
+        let name = PackageName::new("actions/checkout");
+        let sha = "c".repeat(40);
+
+        registry.populate_tag_index(&name, &[github_tag("v4", &sha)], ListCoverage::Complete);
+
+        let refreshed = refreshes.try_recv().unwrap();
+        let index = registry.tag_index().get(&refreshed).map(|e| Arc::clone(&e));
+        assert_eq!(
+            index.and_then(|index| index.tag_to_sha.get("v4").cloned()),
+            CommitSha::parse(&sha)
+        );
+    }
+
+    #[test]
+    fn test_populate_tag_index_without_subscriber_does_not_fail() {
+        let registry = mock_registry("http://localhost", false);
+        let name = PackageName::new("actions/checkout");
+        registry.populate_tag_index(
+            &name,
+            &[github_tag("v4", &"d".repeat(40))],
+            ListCoverage::Complete,
+        );
+        assert!(registry.tag_index.contains_key(&name));
+    }
+
+    #[test]
+    fn test_clones_share_one_refresh_channel() {
+        let registry = mock_registry("http://localhost", false);
+        let clone = registry.clone();
+        let mut refreshes = registry.subscribe_tag_refreshes();
+        let name = PackageName::new("actions/checkout");
+        clone.populate_tag_index(
+            &name,
+            &[github_tag("v4", &"e".repeat(40))],
+            ListCoverage::Complete,
+        );
+        assert_eq!(refreshes.try_recv().ok(), Some(name));
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_emits_tag_refresh_on_first_fetch() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/actions/checkout/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(tags_body(&[("v4.2.0", &"a".repeat(40))]))
+            .create_async()
+            .await;
+        let registry = mock_registry(&server.url(), false);
+        let mut refreshes = registry.subscribe_tag_refreshes();
+
+        registry.get_versions("actions/checkout").await.unwrap();
+
+        assert_eq!(
+            refreshes.try_recv().ok(),
+            Some(PackageName::new("actions/checkout"))
+        );
+    }
+
+    /// Completion fetches through `Registry::get_versions_from`, not the lifecycle path.
+    #[tokio::test]
+    async fn test_get_versions_from_completion_path_emits_tag_refresh() {
+        use deps_core::parser::DependencySource;
+        use deps_core::{FreshnessSettings, Registry};
+
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/actions/checkout/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(tags_body(&[("v4.2.0", &"a".repeat(40))]))
+            .create_async()
+            .await;
+        let registry = mock_registry(&server.url(), false);
+        let mut refreshes = registry.subscribe_tag_refreshes();
+        let name = PackageName::new("actions/checkout");
+
+        Registry::get_versions_from(
+            &registry,
+            &name,
+            &DependencySource::Registry,
+            FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(refreshes.try_recv().ok(), Some(name));
     }
 
     #[tokio::test]

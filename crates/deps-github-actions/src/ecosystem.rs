@@ -18,12 +18,12 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
 use url::Url;
 
-use crate::{MUTABLE_REF_PIN_DIAGNOSTIC_CODE, SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE};
+use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 
-use crate::formatter::{CommentCheck, CommentMismatch, GithubActionsFormatter};
+use crate::formatter::GithubActionsFormatter;
 use crate::registry::GithubActionsRegistry;
 use crate::types::{GithubActionsDependency, PinStyle};
-use deps_core::lsp_helpers::TagIndex;
+use deps_core::lsp_helpers::{CommentCheck, TagIndex};
 
 #[cfg(feature = "lsp-responses")]
 mod lsp;
@@ -152,6 +152,12 @@ impl Ecosystem for GithubActionsEcosystem {
 
     fn formatter(&self) -> &dyn EcosystemFormatter {
         &self.formatter
+    }
+
+    /// Emits a repository's name whenever its tag index is first populated or its tag-to-commit
+    /// mapping changes; see [`GithubActionsRegistry::subscribe_tag_refreshes`] for the contract.
+    fn tag_index_refreshes(&self) -> Option<deps_core::TagIndexRefreshes> {
+        Some(self.registry.subscribe_tag_refreshes())
     }
 
     // No `complete_package_name` override: GHA has no package-name search endpoint, so
@@ -378,10 +384,15 @@ impl Ecosystem for GithubActionsEcosystem {
                 });
             }
 
-            if let Some(CommentCheck::Mismatch { comment, kind }) =
+            if let Some(CommentCheck::Mismatch(mismatch)) =
                 self.formatter.sha_comment_check(gha_dep)
+                && let Some(comment) = gha_dep.sha_comment()
             {
-                let line = sha_comment_mismatch_hover_line(sha.as_str(), comment.tag(), &kind);
+                let line = deps_core::lsp_helpers::sha_comment_mismatch_hover_line(
+                    &sha,
+                    &comment.pin_comment().tag,
+                    &mismatch,
+                );
                 hover.rewrite_markdown(|md| deps_core::lsp_helpers::splice_hover_line(md, &line));
             }
 
@@ -550,13 +561,6 @@ fn mutable_ref_pin_diagnostics(
         .collect()
 }
 
-fn sanitize_for_message(value: &str) -> String {
-    deps_core::lsp_helpers::sanitize_and_truncate_for_diagnostic(
-        value,
-        deps_core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS,
-    )
-}
-
 /// Builds one SHA-comment-mismatch [`Diagnostic`] (issue #1722) per SHA-pinned step whose
 /// trailing `# tag` comment provably names a different commit than the pinned SHA.
 ///
@@ -572,56 +576,61 @@ fn sha_comment_mismatch_diagnostics(
         .into_iter()
         .filter_map(|dep| {
             let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-            let CommentCheck::Mismatch { comment, kind } = formatter.sha_comment_check(gha_dep)?
-            else {
+            let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gha_dep)? else {
                 return None;
             };
-            let range = gha_dep.version_range?;
-            let sha = formatter.pinned_commit(gha_dep)?;
-            let sha = deps_core::lsp_helpers::short_sha(sha.as_str());
-            let name = deps_core::lsp_helpers::redact_name_for_diagnostic(&gha_dep.name);
-            let comment = sanitize_for_message(comment.tag());
-            let message = match kind {
-                CommentMismatch::ShaIsOtherTag { actual } => format!(
-                    "{name}: SHA {sha} is not the commit of `{comment}` named in the comment \
-                     (it is `{}`)",
-                    sanitize_for_message(actual.as_str())
-                ),
-                CommentMismatch::ShaNotInIndex => format!(
-                    "{name}: SHA {sha} is not the commit of any release tag; the comment \
-                     names `{comment}`"
-                ),
-            };
-            Some(
-                Diagnostic::new(range, message)
-                    .with_severity(severity)
-                    .with_code(SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE),
-            )
+            let comment = gha_dep.sha_comment()?;
+            Some(deps_core::lsp_helpers::sha_comment_mismatch_diagnostic(
+                gha_dep.version_range?,
+                &gha_dep.name,
+                &formatter.pinned_commit(gha_dep)?,
+                &comment.pin_comment().tag,
+                &mismatch,
+                severity,
+            ))
         })
         .collect()
-}
-
-/// The hover warning line for a SHA-comment mismatch (issue #1722).
-#[cfg(feature = "lsp-responses")]
-fn sha_comment_mismatch_hover_line(sha: &str, comment: &str, mismatch: &CommentMismatch) -> String {
-    use deps_core::lsp_helpers::markdown_code_span;
-    let sha = markdown_code_span(&format!("{}…", deps_core::lsp_helpers::short_sha(sha)));
-    let comment = markdown_code_span(&sanitize_for_message(comment));
-    match mismatch {
-        CommentMismatch::ShaIsOtherTag { actual } => format!(
-            "**Warning**: comment says {comment}, but SHA {sha} is {}",
-            markdown_code_span(&sanitize_for_message(actual.as_str()))
-        ),
-        CommentMismatch::ShaNotInIndex => format!(
-            "**Warning**: SHA {sha} is not the commit of any release tag; comment says {comment}"
-        ),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lsp-responses")]
+    use crate::SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_ecosystem_tag_index_refreshes_carries_registry_fetches() {
+        let sha = "a".repeat(40);
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/actions/checkout/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name": "v4", "commit": {{"sha": "{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+        let registry = GithubActionsRegistry::for_test(
+            Arc::new(deps_core::HttpCache::new()),
+            server.url(),
+            false,
+        );
+        let formatter = GithubActionsFormatter::new(registry.tag_index());
+        let eco = GithubActionsEcosystem {
+            registry: Arc::new(registry),
+            formatter,
+        };
+        let mut refreshes = eco.tag_index_refreshes().expect("GHA has a tag index");
+
+        eco.registry.get_versions("actions/checkout").await.unwrap();
+
+        assert_eq!(
+            refreshes.try_recv().ok(),
+            Some(PackageName::new("actions/checkout"))
+        );
+    }
 
     /// Spec 076 FR-025/SC-018 (T005): GitHub Actions has no compiled requirement model at
     /// all — `fallback_edit_excludes_newer`'s check a0 (`OriginalUncompilable`) rejects it

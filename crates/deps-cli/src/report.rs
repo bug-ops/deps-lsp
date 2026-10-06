@@ -13,7 +13,8 @@
 use deps_core::diagnostic::{Diagnostic, Severity};
 use deps_core::lsp_helpers::{
     DEPRECATED_DIAGNOSTIC_CODE, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
-    UNSATISFIABLE_DIAGNOSTIC_CODE, redact_name_for_diagnostic, redact_requirement_for_diagnostic,
+    SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE, UNSATISFIABLE_DIAGNOSTIC_CODE,
+    redact_name_for_diagnostic, redact_requirement_for_diagnostic,
 };
 use deps_core::osv::{OsvClient, ScanOutcome, VulnKeys, VulnSeverity, VulnerabilityMap};
 use deps_core::policy_config::PolicyConfig;
@@ -42,10 +43,6 @@ const GITLAB_CI_MUTABLE_REF_PIN_CODE: &str = "gitlab-ci-mutable-ref-pin";
 /// `registries.gitlab_instance_host` is unset/invalid. See
 /// [`GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE`]'s doc for why this is a literal.
 const GITLAB_CI_UNRESOLVED_HOST_CODE: &str = "unresolved-gitlab-host";
-/// `deps_github_actions::SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE` — a supply-chain hygiene
-/// warning, not a vulnerability. See [`GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE`]'s doc for why this
-/// is a literal.
-const GITHUB_ACTIONS_SHA_COMMENT_MISMATCH_CODE: &str = "sha-comment-mismatch";
 
 /// A category a [`CheckFinding`] can be classified into — the eight `--fail-on` tokens
 /// (the seven FR-009 defines, plus [`Category::Other`], #1733).
@@ -689,7 +686,7 @@ fn classify(
             GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE | GITLAB_CI_MUTABLE_REF_PIN_CODE => {
                 Category::MutableRefPin
             }
-            GITLAB_CI_UNRESOLVED_HOST_CODE | GITHUB_ACTIONS_SHA_COMMENT_MISMATCH_CODE => {
+            GITLAB_CI_UNRESOLVED_HOST_CODE | SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE => {
                 Category::Other
             }
             _ => Category::Vulnerable,
@@ -887,7 +884,7 @@ mod tests {
     #[test]
     fn test_classify_sha_comment_mismatch_is_other() {
         let d = diagnostic_with(
-            Some(GITHUB_ACTIONS_SHA_COMMENT_MISMATCH_CODE),
+            Some(SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE),
             "SHA is not the commit of the tag in the comment",
         );
         assert_eq!(classify(&d, &STUB_FORMATTER), Category::Other);
