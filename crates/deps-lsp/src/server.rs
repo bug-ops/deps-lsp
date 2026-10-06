@@ -4,9 +4,10 @@ use crate::document::tag_refresh::{TagRefreshLifecycle, TagRefreshSubscriptions}
 use crate::document::{
     CLIENT_REFRESH_TIMEOUT, ChangeTaskTriggerGates, RefreshKind, ResolvedVersionMove, ServerState,
     change_task_triggers, handle_document_change, handle_document_open, refresh_with_timeout,
-    reload_resolved_versions, rescan_after_resolved_version_change, run_license_prefetch,
-    spawn_supervised, trigger_gossip_prefetch_for_open_documents,
-    trigger_osv_rescan_for_open_documents, trigger_typosquat_prefetch_for_open_documents,
+    reload_resolved_versions, republish_diagnostics_for_open_documents,
+    rescan_after_resolved_version_change, run_license_prefetch, spawn_supervised,
+    trigger_gossip_prefetch_for_open_documents, trigger_osv_rescan_for_open_documents,
+    trigger_typosquat_prefetch_for_open_documents,
 };
 use crate::file_watcher;
 use crate::handlers::{
@@ -95,8 +96,7 @@ fn gitlab_instance_host_invalid_message(
     format!(
         "deps-lsp: registries.gitlab_instance_host value '{redacted}' is invalid \
          ({error}) and will be ignored — instance-host resolution stays \
-         unresolved and GITLAB_TOKEN will not be sent to gitlab.com or any other \
-         host until this is corrected"
+         unresolved until this is corrected"
     )
 }
 
@@ -662,7 +662,7 @@ impl Backend {
 
     /// Whether the client implements `workspace/diagnostic/refresh`, the notification
     /// used to nudge a pull-diagnostics client to re-request diagnostics after a
-    /// configuration change (§2.1). Push-only clients are a known v1 gap (M2).
+    /// configuration change (§2.1). Push-only clients get a republish instead (#1794).
     async fn diagnostic_refresh_supported(&self) -> bool {
         let caps = self.client_capabilities.read().await;
         caps.as_ref()
@@ -1054,11 +1054,17 @@ impl LanguageServer for Backend {
             }
             None => {
                 // Nothing parse-affecting changed. Hover/completion/code actions pick up
-                // the new config for free on demand; diagnostics are pull-based, so a
-                // pull-capable client must be told to re-request them (push-only clients
-                // are a known v1 gap, M2). Timeout-bounded (#493) against a hanging client.
+                // the new config for free on demand; a pull-capable client is told to
+                // re-request diagnostics (timeout-bounded, #493), a push-only one gets them
+                // republished (#1794).
                 if self.diagnostic_refresh_supported().await {
                     refresh_with_timeout(RefreshKind::Diagnostics, &self.client).await;
+                } else {
+                    republish_diagnostics_for_open_documents(
+                        &self.state,
+                        &self.client,
+                        Arc::clone(&self.config),
+                    );
                 }
             }
         }

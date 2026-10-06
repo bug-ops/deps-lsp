@@ -271,11 +271,11 @@ impl GitlabCiRegistry {
             // A *tokened* 401/403 is scoped to this one project (private/insufficient-scope),
             // not treated as a workspace-wide outage — mirrors
             // `deps_github_actions::registry::GithubActionsRegistry::map_tags_error`'s
-            // identical `has_token()` split. Same `Inferred`-by-construction reasoning as the
+            // identical per-origin token split. Same `Inferred`-by-construction reasoning as the
             // 429 arm above.
             DepsError::HttpStatus {
                 status: 401 | 403, ..
-            } if !self.client.has_token() => {
+            } if !self.client.sends_token_to(origin) => {
                 self.rate_limit_gate(origin).trip();
                 gitlab_rate_limit_error(RateLimitEvidence::Inferred)
             }
@@ -546,22 +546,14 @@ impl deps_core::Registry for GitlabCiRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::GitlabInstanceHost;
     use deps_core::Registry;
-    use deps_core::net_policy::RegistryAccessPolicy;
     use deps_core::parser::DependencySource;
-    use std::sync::RwLock;
 
     /// A client backed by an in-memory cache and no configured instance host — sufficient
     /// for every test in this module that never actually issues a live request (route-table
     /// and error-mapping tests), and reused as the base for tests that do via `mockito`.
     fn test_client() -> Arc<GitlabApiClient> {
-        let policy = Arc::new(RegistryAccessPolicy::default());
-        let instance_host = Arc::new(GitlabInstanceHost::new(Arc::new(RwLock::new(None)), policy));
-        Arc::new(GitlabApiClient::new(
-            Arc::new(deps_core::HttpCache::new()),
-            instance_host,
-        ))
+        Arc::new(GitlabApiClient::new(Arc::new(deps_core::HttpCache::new())))
     }
 
     fn route(origin: &str, endpoint: EndpointKind) -> GitlabRoute {
@@ -1152,6 +1144,41 @@ mod tests {
             },
         );
         assert!(matches!(err, DepsError::PackageNotFound { .. }));
+    }
+
+    /// #1790: a 401 from a host the token is not bound to gets the actionable
+    /// `GITLAB_TOKEN_HOST` remedy even though a token exists; a 401 from the bound host does not.
+    #[test]
+    fn test_map_error_401_is_origin_scoped_to_the_token_binding() {
+        let client = Arc::new(GitlabApiClient::for_test(
+            Arc::new(deps_core::HttpCache::new()),
+            crate::token::TokenBinding::for_test("glpat-secret", "https://gitlab.com"),
+        ));
+        let registry = GitlabCiRegistry::new(client);
+        let unauthorized = |origin: &str| DepsError::HttpStatus {
+            url: format!("{origin}/x").into(),
+            status: 401,
+        };
+
+        match registry.map_error(
+            "https://gitlab.corp",
+            "org/proj",
+            unauthorized("https://gitlab.corp"),
+        ) {
+            DepsError::RateLimited { message, .. } => {
+                assert!(message.contains("GITLAB_TOKEN_HOST"), "message: {message}");
+                assert!(!message.contains("gitlab.corp"), "message: {message}");
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        assert!(matches!(
+            registry.map_error(
+                "https://gitlab.com",
+                "org/proj",
+                unauthorized("https://gitlab.com")
+            ),
+            DepsError::HttpStatus { status: 401, .. }
+        ));
     }
 
     #[test]

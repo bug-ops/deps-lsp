@@ -48,8 +48,8 @@ pub(crate) mod tag_refresh;
 pub(crate) use diff::reload_resolved_versions;
 pub(crate) use lifecycle::{
     ChangeTaskTriggerGates, ResolvedVersionMove, change_task_triggers,
-    trigger_gossip_prefetch_for_open_documents, trigger_osv_rescan_for_open_documents,
-    trigger_typosquat_prefetch_for_open_documents,
+    republish_diagnostics_for_open_documents, trigger_gossip_prefetch_for_open_documents,
+    trigger_osv_rescan_for_open_documents, trigger_typosquat_prefetch_for_open_documents,
 };
 pub use lifecycle::{ensure_document_loaded, handle_document_change, handle_document_open};
 pub use loader::load_document_from_disk;

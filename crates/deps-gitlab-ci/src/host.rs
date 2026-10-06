@@ -5,8 +5,9 @@
 //! - [`GitlabHost`] — a validated, policy-gated host newtype, produced once per unique host
 //!   string encountered in a manifest (a `component:` prefix) or read from configuration.
 //! - [`GitlabInstanceHost`] — the live-updatable `registries.gitlab_instance_host` setting,
-//!   which is both the host `project:` includes resolve against when set, and the *only*
-//!   host `GITLAB_TOKEN` may ever be attached to (replacing, not extending, `gitlab.com`).
+//!   which is the host `project:` includes resolve against when set. It never carries
+//!   `GITLAB_TOKEN`: the credential's destination comes from the process environment, see
+//!   the `token` module.
 
 use deps_core::EcosystemId;
 use deps_core::net_policy::{
@@ -15,8 +16,7 @@ use deps_core::net_policy::{
 };
 use std::sync::{Arc, RwLock};
 
-/// The default GitLab.com host — the token host when `registries.gitlab_instance_host` is
-/// unset (FR-005a).
+/// The default GitLab.com host — the token host when `GITLAB_TOKEN_HOST` is unset.
 pub const GITLAB_COM: &str = "gitlab.com";
 
 /// `GITLAB_COM`'s normalized, ASCII-serialized origin — the value every token-host
@@ -70,16 +70,21 @@ impl GitlabHost {
     /// assert!(GitlabHost::parse("169.254.169.254", &policy).is_err());
     /// ```
     pub fn parse(raw: &str, policy: &RegistryAccessPolicy) -> Result<Self, IndexUrlError> {
+        Self::parse_gated(raw, PolicyGate::Enforce(policy))
+    }
+
+    /// Structural validation only, with no host-class policy check — for a host whose
+    /// provenance is the user's own process environment, not a workspace file.
+    pub(crate) fn parse_trusted(raw: &str) -> Result<Self, IndexUrlError> {
+        Self::parse_gated(raw, PolicyGate::Skip)
+    }
+
+    fn parse_gated(raw: &str, gate: PolicyGate<'_>) -> Result<Self, IndexUrlError> {
         if raw.contains([':', '?', '#', '@', '/']) {
             return Err(IndexUrlError::InvalidUrl(RedactedUrl::new(raw)));
         }
         let candidate = format!("https://{raw}");
-        let url = validate_index_url(
-            &candidate,
-            raw,
-            EcosystemId::GitlabCi,
-            PolicyGate::Enforce(policy),
-        )?;
+        let url = validate_index_url(&candidate, raw, EcosystemId::GitlabCi, gate)?;
         let raw_lowercased = raw.to_ascii_lowercase();
         if url.host_str() != Some(raw_lowercased.as_str()) {
             return Err(IndexUrlError::InvalidUrl(RedactedUrl::new(raw)));
@@ -174,16 +179,12 @@ pub(crate) fn is_valid_path_segment(seg: &str) -> bool {
 
 /// Outcome of resolving `registries.gitlab_instance_host` (spec FR-005a/FR-011a).
 ///
-/// Distinct from a plain `Option<GitlabHost>` (security review, issue #466 H-security):
-/// [`token_host_origin`] must tell "unset" — the correct, intentional `gitlab.com` default —
-/// apart from "configured but rejected", which must **never** fall back to `gitlab.com`.
-/// Collapsing the two meant an invalid/policy-rejected value silently redirected
-/// `PRIVATE-TOKEN` to `gitlab.com`, leaking a self-hosted credential to the wrong host.
-/// [`Self::Blocked`] is kept distinct from [`Self::Invalid`] for the same reason `crate::parser`
-/// needs them apart (issue #967): a policy block has a different fix (relax the policy) than a
-/// malformed value (reconfigure the setting). [`GitlabInstanceHost::get`] still collapses
-/// `Unset`/`Invalid`/`Blocked` to `None` for every other caller (host *resolution*, not token
-/// routing or diagnostic messaging, where "can't resolve" is the same outcome either way).
+/// Distinct from a plain `Option<GitlabHost>` so diagnostics can tell "unset" apart from
+/// "configured but rejected". [`Self::Blocked`] is kept distinct from [`Self::Invalid`] for the
+/// same reason `crate::parser` needs them apart (issue #967): a policy block has a different fix
+/// (relax the policy) than a malformed value (reconfigure the setting). [`GitlabInstanceHost::get`] still collapses
+/// `Unset`/`Invalid`/`Blocked` to `None` for host *resolution*, where "can't resolve" is the
+/// same outcome either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InstanceHostOutcome {
     /// `registries.gitlab_instance_host` is not configured.
@@ -225,20 +226,14 @@ pub(crate) enum InstanceHostOutcome {
 /// [`RegistryAccessPolicy`] mutates in place: a host accepted under a looser policy must not
 /// keep resolving once the policy tightens). A rejected value is treated as unset for host
 /// *resolution* purposes ([`Self::get`] returns `None`), but is tracked distinctly
-/// (`InstanceHostOutcome::Invalid`/`InstanceHostOutcome::Blocked`) for token-host routing —
-/// see [`token_host_origin`] — and for diagnostic messaging — see `crate::parser`.
+/// (`InstanceHostOutcome::Invalid`/`InstanceHostOutcome::Blocked`) for diagnostic messaging —
+/// see `crate::parser`.
 pub struct GitlabInstanceHost {
     raw: Arc<RwLock<Option<String>>>,
     policy: Arc<RegistryAccessPolicy>,
     /// Last `(raw, policy)` this instance validated, and the outcome — both re-checked on
     /// every [`Self::resolve`] so a stale outcome from either axis can never be served.
     memo: RwLock<Option<(String, WorkspaceRegistryAccess, InstanceHostOutcome)>>,
-    /// Test-only escape hatch: when set, [`Self::resolve`] returns this directly, bypassing
-    /// [`GitlabHost::parse`]'s port-rejecting validation — needed only because a `mockito`
-    /// server's `127.0.0.1:PORT` host could otherwise never stand in for a *configured*
-    /// instance host in a test (production self-hosted GitLab hosts never need a port).
-    #[cfg(test)]
-    test_override: Option<GitlabHost>,
 }
 
 impl GitlabInstanceHost {
@@ -251,21 +246,6 @@ impl GitlabInstanceHost {
             raw,
             policy,
             memo: RwLock::new(None),
-            #[cfg(test)]
-            test_override: None,
-        }
-    }
-
-    /// Test-only: builds a handle whose [`Self::get`] always returns `host` directly. See
-    /// [`Self::test_override`]'s doc for why this bypass exists.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn for_test(host: GitlabHost) -> Self {
-        Self {
-            raw: Arc::new(RwLock::new(None)),
-            policy: Arc::new(RegistryAccessPolicy::default()),
-            memo: RwLock::new(None),
-            test_override: Some(host),
         }
     }
 
@@ -277,9 +257,8 @@ impl GitlabInstanceHost {
     /// `InstanceHostOutcome::Blocked` to the same `None`: for host *resolution* (what a
     /// `project:`/`$...`-relative `component:` include resolves against), "not configured"
     /// and "configured but rejected" are the same outcome. They are **not** the same outcome
-    /// for token routing — see [`token_host_origin`], which calls `Self::resolve` directly
-    /// instead — nor for diagnostic messaging, where a caller needs to tell the two apart:
-    /// see `Self::resolve` (`pub(crate)`, used by `crate::parser`).
+    /// for diagnostic messaging, where a caller needs to tell the two apart: see
+    /// `Self::resolve` (`pub(crate)`, used by `crate::parser`).
     #[must_use]
     pub fn get(&self) -> Option<GitlabHost> {
         match self.resolve() {
@@ -298,11 +277,6 @@ impl GitlabInstanceHost {
     /// match on one [`Self::resolve`] call, not call two separate accessors that could each
     /// observe a different outcome if the underlying config is written between them.
     pub(crate) fn resolve(&self) -> InstanceHostOutcome {
-        #[cfg(test)]
-        if let Some(host) = &self.test_override {
-            return InstanceHostOutcome::Valid(host.clone());
-        }
-
         let Some(raw) = self
             .raw
             .read()
@@ -331,8 +305,7 @@ impl GitlabInstanceHost {
                     %class,
                     "registries.gitlab_instance_host is blocked by the current \
                      registries.workspace_registries policy; treating it as unset for host \
-                     resolution and disabling GITLAB_TOKEN entirely (it is not redirected to \
-                     gitlab.com)"
+                     resolution"
                 );
                 InstanceHostOutcome::Blocked {
                     raw: raw.clone(),
@@ -343,8 +316,7 @@ impl GitlabInstanceHost {
                 tracing::warn!(
                     error = %e,
                     "registries.gitlab_instance_host is invalid; treating it as unset for host \
-                     resolution and disabling GITLAB_TOKEN entirely (it is not redirected to \
-                     gitlab.com)"
+                     resolution"
                 );
                 InstanceHostOutcome::Invalid
             }
@@ -355,50 +327,6 @@ impl GitlabInstanceHost {
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((raw, policy_now, outcome.clone()));
         outcome
-    }
-}
-
-/// The one host `PRIVATE-TOKEN` may be attached to (FR-005a): the configured
-/// `registries.gitlab_instance_host`'s origin when set, **replacing** — not joined with —
-/// [`GITLAB_COM_ORIGIN`] otherwise.
-///
-/// Returns `None` when the setting is configured but **invalid** (security review, issue
-/// #466): the pre-fix version collapsed "unset" and "invalid" into the same fallback,
-/// silently redirecting `PRIVATE-TOKEN` to `gitlab.com` for a rejected value instead of
-/// disabling it — an invalid value must send the token nowhere, not to a default host the
-/// user never configured. Callers compare with `.is_some_and(|o| o == host.origin())`
-/// (never `.unwrap_or(...)`) so `None` can never equal any host's origin.
-///
-/// # Examples
-///
-/// ```
-/// use deps_core::net_policy::RegistryAccessPolicy;
-/// use deps_gitlab_ci::host::{GITLAB_COM_ORIGIN, GitlabInstanceHost, token_host_origin};
-/// use std::sync::{Arc, RwLock};
-///
-/// let policy = Arc::new(RegistryAccessPolicy::default());
-/// let unset = GitlabInstanceHost::new(Arc::new(RwLock::new(None)), Arc::clone(&policy));
-/// assert_eq!(token_host_origin(&unset).as_deref(), Some(GITLAB_COM_ORIGIN));
-///
-/// let set = GitlabInstanceHost::new(
-///     Arc::new(RwLock::new(Some("gitlab.mycorp.dev".to_string()))),
-///     Arc::clone(&policy),
-/// );
-/// assert_eq!(token_host_origin(&set).as_deref(), Some("https://gitlab.mycorp.dev"));
-///
-/// // An invalid value is disabled outright, never redirected to `gitlab.com`.
-/// let invalid = GitlabInstanceHost::new(
-///     Arc::new(RwLock::new(Some("127.0.0.1".to_string()))),
-///     policy,
-/// );
-/// assert_eq!(token_host_origin(&invalid), None);
-/// ```
-#[must_use]
-pub fn token_host_origin(instance_host: &GitlabInstanceHost) -> Option<String> {
-    match instance_host.resolve() {
-        InstanceHostOutcome::Unset => Some(GITLAB_COM_ORIGIN.to_string()),
-        InstanceHostOutcome::Valid(host) => Some(host.origin().to_string()),
-        InstanceHostOutcome::Invalid | InstanceHostOutcome::Blocked { .. } => None,
     }
 }
 
@@ -619,42 +547,5 @@ mod tests {
             handle.get().is_none(),
             "the same host must be rejected once the policy tightens, not served from a stale memo"
         );
-    }
-
-    #[test]
-    fn test_token_host_origin_unset_is_gitlab_com() {
-        let policy = Arc::new(RegistryAccessPolicy::default());
-        let handle = GitlabInstanceHost::new(Arc::new(RwLock::new(None)), policy);
-        assert_eq!(
-            token_host_origin(&handle).as_deref(),
-            Some(GITLAB_COM_ORIGIN)
-        );
-    }
-
-    #[test]
-    fn test_token_host_origin_set_replaces_gitlab_com() {
-        let policy = Arc::new(RegistryAccessPolicy::default());
-        let raw = Arc::new(RwLock::new(Some("gitlab.mycorp.dev".to_string())));
-        let handle = GitlabInstanceHost::new(raw, policy);
-        assert_eq!(
-            token_host_origin(&handle).as_deref(),
-            Some("https://gitlab.mycorp.dev")
-        );
-        assert_ne!(
-            token_host_origin(&handle).as_deref(),
-            Some(GITLAB_COM_ORIGIN)
-        );
-    }
-
-    /// Security regression (#466 review): an invalid/policy-rejected instance host must
-    /// disable the token outright, never fall back to `gitlab.com` — collapsing "unset" and
-    /// "invalid" into one `None` (pre-fix) silently redirected `PRIVATE-TOKEN` to
-    /// `gitlab.com`, leaking a self-hosted credential to the wrong host.
-    #[test]
-    fn test_token_host_origin_invalid_value_disables_token_not_gitlab_com() {
-        let policy = Arc::new(RegistryAccessPolicy::default());
-        let raw = Arc::new(RwLock::new(Some("127.0.0.1".to_string())));
-        let handle = GitlabInstanceHost::new(raw, policy);
-        assert_eq!(token_host_origin(&handle), None);
     }
 }

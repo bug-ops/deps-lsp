@@ -200,9 +200,10 @@ pub enum ConfigError {
 /// that target can be an untrusted PR branch from a fork. Two live-verified attacks follow
 /// from trusting it fully:
 ///
-/// - **F1**: `registries.gitlab_instance_host` is the one host `GITLAB_TOKEN` is ever
-///   attached to, and `registries.workspace_registries = "all"` lifts `net_policy`'s SSRF
-///   gate for loopback/RFC1918/cloud-metadata hosts (credential exfiltration/SSRF).
+/// - **F1**: `registries.gitlab_instance_host` redirects GitLab host resolution (it no longer
+///   carries `GITLAB_TOKEN`, which is bound to the `GITLAB_TOKEN_HOST` environment variable),
+///   and `registries.workspace_registries = "all"` lifts `net_policy`'s SSRF gate for
+///   loopback/RFC1918/cloud-metadata hosts.
 /// - **F1-follow-up**: `diagnostics.{mutable_ref_pin,vulnerabilities}_enabled = false` or
 ///   `network.offline = true` silently disable the exact check that would have caught a
 ///   vulnerability the same PR introduces — defeating `check`'s CI-gating purpose without

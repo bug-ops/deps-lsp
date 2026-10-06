@@ -1147,8 +1147,9 @@ pub struct RegistriesConfig {
     #[raw]
     pub swift_keychain_credentials: KeychainCredentials,
     /// Issue #466, spec FR-005a/FR-011a: the GitLab instance host that `project:` includes
-    /// and `$CI_SERVER_FQDN`-relative `component:` includes resolve against, and — replacing,
-    /// not joined with, `gitlab.com` — the *only* host `GITLAB_TOKEN` may be sent to.
+    /// and `$CI_SERVER_FQDN`-relative `component:` includes resolve against. It never
+    /// receives `GITLAB_TOKEN`: that is bound to `gitlab.com` or the `GITLAB_TOKEN_HOST`
+    /// environment variable (#1790).
     /// `#[serde(default)]`: additive-safe, same rationale as `nuget_user_profile_sources`
     /// above. Default `""` (unset); an empty string is written through as `None` into the
     /// shared `Arc<RwLock<Option<String>>>` handle. **No validation happens at deserialization

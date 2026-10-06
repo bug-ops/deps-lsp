@@ -164,6 +164,8 @@ pub(crate) struct LspClient {
     /// Lets a test prove the server actually attempted the refresh (capability
     /// negotiation worked) even though the harness deliberately never answered it.
     unanswered_refresh_requests: u64,
+    /// `workspace/diagnostic/refresh` requests auto-answered so far.
+    diagnostic_refresh_requests: u64,
 }
 
 impl LspClient {
@@ -188,7 +190,14 @@ impl LspClient {
             progress_create_requests: 0,
             respond_to_refresh_requests: true,
             unanswered_refresh_requests: 0,
+            diagnostic_refresh_requests: 0,
         }
+    }
+
+    /// Number of `workspace/diagnostic/refresh` requests auto-answered so far.
+    #[allow(dead_code)] // Used by the #1794 pull-client test
+    pub(crate) fn diagnostic_refresh_request_count(&self) -> u64 {
+        self.diagnostic_refresh_requests
     }
 
     /// Number of `window/workDoneProgress/create` requests auto-answered so far.
@@ -394,6 +403,10 @@ impl LspClient {
                 self.unanswered_refresh_requests += 1;
                 return;
             }
+            "workspace/diagnostic/refresh" => {
+                self.diagnostic_refresh_requests += 1;
+                json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null })
+            }
             "workspace/inlayHint/refresh"
             | "workspace/codeLens/refresh"
             | "client/registerCapability" => {
@@ -426,6 +439,21 @@ impl LspClient {
     /// requests to a client that declined the capability (see #290).
     #[allow(dead_code)] // Used by the #290 capability-gating regression test
     pub(crate) fn initialize_with_progress_support(&mut self, work_done_progress: bool) -> Value {
+        self.initialize_with_capabilities(work_done_progress, false)
+    }
+
+    /// Initialize the LSP session declaring `workspace.diagnostics.refreshSupport`, i.e. a
+    /// pull-diagnostics-capable client (#1794).
+    #[allow(dead_code)] // Used by the #1794 pull-client test
+    pub(crate) fn initialize_with_diagnostic_refresh_support(&mut self) -> Value {
+        self.initialize_with_capabilities(true, true)
+    }
+
+    fn initialize_with_capabilities(
+        &mut self,
+        work_done_progress: bool,
+        diagnostic_refresh: bool,
+    ) -> Value {
         self.send(&json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -442,6 +470,9 @@ impl LspClient {
                         },
                         "codeLens": {
                             "refreshSupport": true
+                        },
+                        "diagnostics": {
+                            "refreshSupport": diagnostic_refresh
                         }
                     },
                     "textDocument": {
@@ -486,6 +517,16 @@ impl LspClient {
                     "text": text
                 }
             }
+        }));
+    }
+
+    /// Sends a `workspace/didChangeConfiguration` notification carrying `settings`.
+    #[allow(dead_code)] // Used by the #1794 push-only republish regression test
+    pub(crate) fn did_change_configuration(&mut self, settings: Value) {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeConfiguration",
+            "params": { "settings": settings }
         }));
     }
 

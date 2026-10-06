@@ -228,7 +228,9 @@ typosquat diagnostic is `deps-lsp` only, and a non-default `[typosquat]` section
 > repository a CI job is checking is not a trusted source for the policy that judges it. A
 > checked-in `deps.toml` on an attacker-controlled branch must not be able to disable the
 > vulnerability scan, force `network.offline` to hide every registry/OSV-derived finding, or
-> redirect `GITLAB_TOKEN` to another host via `registries.gitlab_instance_host`. Any section
+> redirect GitLab host resolution via `registries.gitlab_instance_host`. (`GITLAB_TOKEN` is never
+> sent to that host: it is bound to `gitlab.com` or the `GITLAB_TOKEN_HOST` environment variable,
+> so an explicit `--config` does not authenticate a self-hosted host by itself.) Any section
 > ignored this way is named in a warning on stderr. Only a config path given explicitly via
 > `--config` — the operator's own choice, not the scanned repository's — is trusted in
 > full.

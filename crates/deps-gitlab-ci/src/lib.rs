@@ -46,6 +46,7 @@ pub mod formatter;
 pub mod host;
 pub mod parser;
 pub mod registry;
+pub mod token;
 pub mod types;
 
 pub use ecosystem::GitlabCiEcosystem;

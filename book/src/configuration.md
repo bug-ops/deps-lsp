@@ -39,13 +39,39 @@ control, see [Conventions](cross-ecosystem/conventions.md).
 | `registries` | `workspace_registries` | `"public_only"` | Which workspace-declared registry index hosts are ever fetched, across every ecosystem (Cargo's `.cargo/config.toml`/`[source]`, npm's `.npmrc`, PyPI's `--index-url`/Poetry/uv sources, Go's `$GOENV` `GOPROXY`, NuGet's `NuGet.Config`, Swift's `registries.json`) — `"public_only"`, `"off"`, or `"all"`; see [Cargo Custom/Private Registries](ecosystems/cargo.md#customprivate-registries), [npm Custom/Private Registries](ecosystems/npm.md#customprivate-registries), [PyPI Custom/Private Indexes](ecosystems/pypi.md#customprivate-indexes), [Go GOPROXY/GOPRIVATE Support](ecosystems/go.md#goproxygoprivate-support), [NuGet Private/Custom Feeds](ecosystems/nuget.md#privatecustom-feeds), and [Swift Package Registries](ecosystems/swift.md#package-registries-se-0292). |
 | `registries` | `nuget_user_profile_sources` | `false` | Whether a NuGet user-profile-tier `NuGet.Config` source with no repo-declared counterpart becomes a routing hop (`AlternateRegistry`-sourced — OSV/deps.dev/hover-trust suppressed for it), instead of only ever supplying credentials for a matching repo-declared source; see [NuGet Private/Custom Feeds](ecosystems/nuget.md#privatecustom-feeds) |
 | `registries` | `swift_keychain_credentials` | `"disabled"` | `"enabled"` also reads macOS Keychain credentials for user-declared Swift SE-0292 registries (may show a macOS access prompt; ignored by `deps-cli`); see [Swift macOS Keychain credentials](ecosystems/swift.md#macos-keychain-credentials) |
-| `registries` | `gitlab_instance_host` | `""` | The self-hosted GitLab instance host that a `project:` include and a `$CI_SERVER_FQDN`-relative `component:` include resolve against, and the *only* host an optional `GITLAB_TOKEN` is ever sent to — replacing, not joined with, `gitlab.com`. Unset (`""`) means neither form is version-resolved; see [GitLab CI/CD Self-Hosted Instances](ecosystems/gitlab-ci.md#self-hosted-instances) |
+| `registries` | `gitlab_instance_host` | `""` | The self-hosted GitLab instance host that a `project:` include and a `$CI_SERVER_FQDN`-relative `component:` include resolve against, which never receives `GITLAB_TOKEN` (the token goes only to `gitlab.com` or the host in the `GITLAB_TOKEN_HOST` environment variable). Unset (`""`) means neither form is version-resolved; see [GitLab CI/CD Self-Hosted Instances](ecosystems/gitlab-ci.md#self-hosted-instances) |
 | `network` | `offline` | `false` | Block every outbound registry/OSV/GitHub request; already-cached data still serves, uncached dependencies show an offline marker |
 | `supply_chain` | `enabled` | `true` | Show the [OpenSSF Scorecard/build-provenance hover line](cross-ecosystem/yanked-and-vulnerabilities.md#supply-chain-trust-signal-issue-543), backed by deps.dev requests; `false` disables the requests and the section entirely |
 | `license_policy` | `allow` | `[]` | SPDX identifiers a dependency's license must include at least one of, when non-empty; produces a WARNING diagnostic otherwise. Invalid entries are dropped with a logged warning, not rejected. See [License Policy Diagnostic](cross-ecosystem/licensing.md#license-policy-diagnostic-issue-661) |
 | `license_policy` | `deny` | `[]` | SPDX identifiers a dependency's license must not include any of; produces an ERROR diagnostic when matched (wins over `allow`). Invalid entries are dropped with a logged warning, not rejected. See [License Policy Diagnostic](cross-ecosystem/licensing.md#license-policy-diagnostic-issue-661) |
 | `typosquat` | `enabled` | `false` | Whether the [typosquat-similarity diagnostic](cross-ecosystem/typosquat-detection.md) runs at all — opt-in, backed by deps.dev's v3alpha `GetSimilarlyNamedPackages`/`GetDependents` endpoints |
 | `gossip` | `enabled` | `false` | Whether [deps.dev GOSSIP signals](cross-ecosystem/gossip-signals.md) (Dynamic Cooldown, low-usage) are fetched at all — opt-in, backed by deps.dev's v3alpha `GetFindingsBatch`/`GetFindings` endpoints |
+
+### Editor workspace settings and trust
+
+Editors merge project-level settings into the `initializationOptions` and
+`workspace/didChangeConfiguration` payloads the server receives: Zed's `.zed/settings.json`,
+VS Code's `.vscode/settings.json`, Helix's `.helix/languages.toml`, and coc.nvim's
+`.vim/coc-settings.json`. The server cannot tell a repository-written value from a user-written
+one, so any `registries.*` or `diagnostics.*` field can be set by a repository you open. Credentials
+are therefore never bound to a settings value; they come from your process environment.
+
+| Setting | What a repository can do with it |
+|---|---|
+| `registries.gitlab_instance_host` | Redirect GitLab host resolution (unauthenticated requests only). `GITLAB_TOKEN` is not sent to it unless you also export the same host as `GITLAB_TOKEN_HOST` |
+| `registries.workspace_registries` | Set `"all"`, lifting the private/loopback/cloud-metadata network guard for workspace-declared registry URLs (unauthenticated, blind requests to internal hosts). Treat a repository's editor settings as trusted only if you would trust its code |
+| `registries.nuget_user_profile_sources` | Add user-profile NuGet sources as routing hops; credentials stay bound to the URL declared in your own user-level `NuGet.Config` |
+| `registries.swift_keychain_credentials` | Trigger a macOS Keychain access prompt; the credential goes only to registries declared in your user-level `registries.json` |
+| `diagnostics.vulnerabilities_enabled`, `network.offline` | Hide vulnerability findings or all registry data in the editor |
+
+> **Warning:** If your editor lets a repository's settings change the server's environment or
+> binary (for example Zed's `lsp.<id>.binary`), that is already code execution under the
+> editor's own trust prompt, which this server cannot guard against.
+
+`GITLAB_TOKEN` is sent only to `gitlab.com`, or to the single host named by the
+`GITLAB_TOKEN_HOST` environment variable when set (for example `GITLAB_TOKEN_HOST=gitlab.mycorp.dev`).
+An invalid `GITLAB_TOKEN_HOST` disables the token entirely. See
+[GitLab CI/CD Self-Hosted Instances](ecosystems/gitlab-ci.md#self-hosted-instances).
 
 ## Full Example
 
@@ -160,7 +186,10 @@ control, see [Conventions](cross-ecosystem/conventions.md).
 > vulnerability, and GitHub tags), across every ecosystem. Already-cached data keeps serving; an
 > uncached dependency shows an offline marker in inlay hints, and hover appends a footer stating
 > that version *and* vulnerability data were not checked. Toggling it via
-> `workspace/didChangeConfiguration` takes effect immediately, with no editor restart.
+> `workspace/didChangeConfiguration` takes effect immediately, with no editor restart. A change
+> to `diagnostics.*` (for example `vulnerabilities_enabled` or a `*_severity`) republishes
+> diagnostics for every open document, so clients that only receive `publishDiagnostics` (no
+> `workspace/diagnostic/refresh` support) do not keep stale diagnostics.
 
 > **Note:** The supply-chain trust signal only appears for **npm, Cargo, Go, Maven, PyPI,
 > Bundler, and NuGet** (Composer, Dart, and Swift have no deps.dev coverage) and only for a

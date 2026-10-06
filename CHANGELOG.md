@@ -27,9 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `PolicyConfigDiff` and `RegistryRuntimeSettings` gain a Swift Keychain field, and `RegistriesConfig` gains `swift_keychain_credentials` (#1771, #1776)
 - **deps-core**: `PolicyConfigDiff` `*_changed` fields are the typed `SettingChange` instead of `bool` (#1771, #1776)
 - **deps-swift**: `ResolvedSwiftRegistry.auth` is no longer public (#1771, #1776)
+- **deps-gitlab-ci**: `GITLAB_TOKEN` is sent to `gitlab.com` or to the host in the `GITLAB_TOKEN_HOST` environment variable, no longer to `registries.gitlab_instance_host`; `token_host_origin` is removed and `GitlabApiClient::new` drops its instance-host parameter (#1797)
+- **deps-core**: `PinResolution::Unpublished` added for a full-release tag pin absent from a complete tag index (#1797)
 
 ### Security
 - **deps-core, all registry ecosystems**: registry credential headers (`Authorization`, `PRIVATE-TOKEN`) are marked sensitive so they stay out of HTTP-stack debug output (#1772, #1776)
+- **deps-lsp**: repository editor settings can no longer redirect `GITLAB_TOKEN` through `registries.gitlab_instance_host`; the configuration docs now list the trust impact of every repository-settable field (#1797)
 
 ### Added
 - **deps-core, all ecosystems**: `DepsError::HostBlockedByPolicy` shows a policy-specific message when a registry host resolves to a blocked address class at connect time (#1773)
@@ -61,6 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-composer**: OR-branch bounds are computed once when `ComposerMatcher` is built, as in `deps-npm`; behavior unchanged (#1747)
 - **deps-swift**: `Package.resolved` pins map by `kind` (`registry` to a registry source, unknown kinds skipped instead of read as Git) and `SwiftRegistry` routes by dependency source, failing closed for unresolved `id:` sources (#1763)
 - **deps-github-actions, deps-gitlab-ci**: tag-to-SHA quickfixes write `<sha> # <tag>` through the shared rewrite rule, and a bare SHA when the ref is quoted, in a flow mapping or the tag is not version-shaped (#1770)
+- **deps**: lock-only bump of tokio 1.53.2, toml-span 0.7.2 and 30 transitive crates (#1797)
+- **SECURITY.md**: supported versions table lists 2.0.x as supported and older lines as unsupported (#1797)
 
 ### Fixed
 - **deps-engine, deps-github-actions**: OSV latest, candidate and fix-target checks cover the sibling release tags of the candidate commit and fail closed when they are unknown (#1775)
@@ -78,6 +83,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-github-actions, deps-gitlab-ci**: a tag pin ahead of latest that a complete tag list lacks (`@v40`) is reported unresolved instead of up to date (#1770)
 - **deps-core**: a SHA pin's full-version comment that a truncated tag index maps to another commit is reported as `sha-comment-mismatch` and no longer trusted for status or the OSV query (#1770)
 - **deps-lsp**: tag-index-dependent diagnostics of other open GitHub Actions documents are republished after a tag-index refresh, also with OSV off or offline (#1770)
+- **deps-lsp**: push-only clients get diagnostics republished after a `didChangeConfiguration` that changes no parse-affecting setting (#1797)
+- **deps-core, deps-github-actions**: a tag pin no published tag matches reports vulnerability data as not checked instead of clean (#1797)
+- **deps-lsp**: the build-script commit stamp follows new commits on the same branch and works in linked worktrees (#1797)
 
 ## [2.0.0] - 2026-09-29
 

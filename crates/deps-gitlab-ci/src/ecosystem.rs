@@ -167,7 +167,7 @@ impl GitlabCiEcosystem {
             gitlab_instance_host_raw,
             Arc::clone(&policy),
         ));
-        let client = Arc::new(GitlabApiClient::new(cache, Arc::clone(&instance_host)));
+        let client = Arc::new(GitlabApiClient::new(cache));
         let registry = Arc::new(GitlabCiRegistry::new(client));
         let formatter = GitlabCiFormatter::new(registry.routes(), registry.tag_index());
         Self {
@@ -2333,15 +2333,7 @@ mod tests {
             Url,
             Position,
         ) {
-            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::default());
-            let instance_host = Arc::new(crate::host::GitlabInstanceHost::new(
-                Arc::new(RwLock::new(None)),
-                Arc::clone(&policy),
-            ));
-            let client = Arc::new(GitlabApiClient::new(
-                Arc::new(HttpCache::new()),
-                instance_host,
-            ));
+            let client = Arc::new(GitlabApiClient::new(Arc::new(HttpCache::new())));
             let registry = GitlabCiRegistry::new(client);
             let formatter = GitlabCiFormatter::new(registry.routes(), registry.tag_index());
 
@@ -2531,15 +2523,7 @@ mod tests {
                 .create_async()
                 .await;
 
-            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::default());
-            let instance_host = Arc::new(crate::host::GitlabInstanceHost::new(
-                Arc::new(RwLock::new(None)),
-                Arc::clone(&policy),
-            ));
-            let client = Arc::new(GitlabApiClient::new(
-                Arc::new(HttpCache::new()),
-                instance_host,
-            ));
+            let client = Arc::new(GitlabApiClient::new(Arc::new(HttpCache::new())));
             let registry = GitlabCiRegistry::new(client);
             let formatter = GitlabCiFormatter::new(registry.routes(), registry.tag_index());
 

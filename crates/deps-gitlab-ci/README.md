@@ -24,8 +24,9 @@ provides parsing and registry integration for `.gitlab-ci.yml` and `.gitlab/ci/*
   `include:` key across the multi-document `spec:` header form GitLab CI component files use
 - **Self-hosted GitLab instance support** — an optional `registries.gitlab_instance_host`
   setting names the instance a host-less `project:` include and a `$CI_SERVER_FQDN`-relative
-  `component:` include resolve against, and is the *one* host an optional `GITLAB_TOKEN`
-  (via the `PRIVATE-TOKEN` header) is ever sent to — replacing, not joined with, `gitlab.com`
+  `component:` include resolve against; an optional `GITLAB_TOKEN` (via the `PRIVATE-TOKEN`
+  header) is sent only to `gitlab.com` or the host in the `GITLAB_TOKEN_HOST` environment
+  variable, never to the setting's value
 - **Full `component:` pin priority ladder** — commit SHA, exact release name, `~latest`
   (highest published non-prerelease release), and partial semver (`1.2`, `1`) via
   `semver::VersionReq` range matching, per GitLab's own documented CI/CD Catalog resolution

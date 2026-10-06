@@ -190,7 +190,8 @@ A `401` never triggers a new lookup, and without a found item no credential is s
 - Without a URL port, the lookup omits `-P`, so an item stored for any port of that host matches.
 - The item's account name is passed to `security` as an argument and is visible to other processes
   of your user in the process list; the secret is never passed as an argument and never logged.
-- Editor workspace settings (`.zed/settings.json`, `.vscode/settings.json`) in a cloned repository
+- Editor workspace settings (`.zed/settings.json`, `.vscode/settings.json`; see
+  [Editor workspace settings and trust](../configuration.md#editor-workspace-settings-and-trust)) in a cloned repository
   can enable this setting and therefore trigger the access prompt. The credential still goes only
   to registries declared in your user-level `registries.json`, never to hosts the repository
   declares.

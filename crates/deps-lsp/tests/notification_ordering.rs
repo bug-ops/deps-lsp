@@ -147,6 +147,166 @@ serde = "1.0.0"
     let _shutdown_response = client.shutdown();
 }
 
+/// LSP `DiagnosticSeverity::Hint`, the default `diagnostics.outdated_severity`.
+#[cfg(feature = "cargo")]
+const OLD_OUTDATED_SEVERITY: u64 = 4;
+
+#[cfg(feature = "cargo")]
+fn diagnostic_severities(notification: &common::CapturedNotification) -> Vec<u64> {
+    notification
+        .params
+        .get("diagnostics")
+        .and_then(|d| d.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|d| d.get("severity").and_then(|s| s.as_u64()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Regression test for #1794: a push-only client (no `workspace.diagnostics.refreshSupport`)
+/// must receive a fresh `textDocument/publishDiagnostics` after a `didChangeConfiguration`
+/// that changes no parse-affecting setting (here, a diagnostic severity).
+#[cfg(feature = "cargo")]
+#[test]
+fn test_push_only_client_gets_republish_after_non_parse_config_change() {
+    let mut client = LspClient::spawn();
+
+    let _init_response = client.initialize();
+    client.clear_notifications();
+
+    let cargo_toml = r#"[package]
+name = "test-package"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1.0.0"
+"#;
+    let uri = fixture_uri("Cargo.toml");
+    client.did_open(&uri, "toml", cargo_toml);
+
+    let _initial = client
+        .wait_for_notification(20, |n| {
+            n.method == "textDocument/publishDiagnostics" && n.params["uri"] == uri.as_str()
+        })
+        .expect("Server should publish diagnostics once the document's fetch completes");
+    std::thread::sleep(Duration::from_secs(2));
+    client.clear_notifications();
+
+    client.did_change_configuration(serde_json::json!({
+        "diagnostics": { "outdated_severity": 1 }
+    }));
+
+    let republish = client
+        .wait_for_notification(20, |n| {
+            n.method == "textDocument/publishDiagnostics" && n.params["uri"] == uri.as_str()
+        })
+        .expect(
+            "Server must republish diagnostics to a push-only client after a non-parse-affecting \
+             didChangeConfiguration (#1794)",
+        );
+    assert!(
+        !diagnostic_severities(&republish).contains(&OLD_OUTDATED_SEVERITY),
+        "the republish must carry the new severity, got {:?}",
+        republish.params
+    );
+
+    let _shutdown_response = client.shutdown();
+}
+
+/// #1794: a configuration change that lands while a document is still loading must win over the
+/// open task's spawn-time snapshot, and must not publish an empty set for the loading document.
+#[cfg(feature = "cargo")]
+#[test]
+fn test_config_change_mid_load_publishes_new_severity() {
+    let mut client = LspClient::spawn();
+
+    let _init_response = client.initialize();
+    client.clear_notifications();
+
+    let cargo_toml = r#"[package]
+name = "test-package"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1.0.0"
+"#;
+    let uri = fixture_uri("Cargo.toml");
+    client.did_open(&uri, "toml", cargo_toml);
+    client.did_change_configuration(serde_json::json!({
+        "diagnostics": { "outdated_severity": 1 }
+    }));
+
+    let _ = client.wait_for_notification(60, |_| false);
+    let published: Vec<_> = client
+        .get_notifications()
+        .into_iter()
+        .filter(|n| {
+            n.method == "textDocument/publishDiagnostics" && n.params["uri"] == uri.as_str()
+        })
+        .collect();
+    let last = published.last().expect("diagnostics must be published");
+    assert!(
+        !diagnostic_severities(last).contains(&OLD_OUTDATED_SEVERITY),
+        "the last publish must carry the new severity, got {:?}",
+        last.params
+    );
+
+    let _shutdown_response = client.shutdown();
+}
+
+/// #1794: a pull-capable client is told to refresh and must not also get an unsolicited push.
+#[cfg(feature = "cargo")]
+#[test]
+fn test_pull_client_gets_refresh_not_republish_after_non_parse_config_change() {
+    let mut client = LspClient::spawn();
+
+    let _init_response = client.initialize_with_diagnostic_refresh_support();
+    client.clear_notifications();
+
+    let cargo_toml = r#"[package]
+name = "test-package"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1.0.0"
+"#;
+    let uri = fixture_uri("Cargo.toml");
+    client.did_open(&uri, "toml", cargo_toml);
+    let _initial = client
+        .wait_for_notification(20, |n| {
+            n.method == "textDocument/publishDiagnostics" && n.params["uri"] == uri.as_str()
+        })
+        .expect("Server should publish diagnostics once the document's fetch completes");
+    std::thread::sleep(Duration::from_secs(2));
+    client.clear_notifications();
+    let refreshes_before = client.diagnostic_refresh_request_count();
+
+    client.did_change_configuration(serde_json::json!({
+        "diagnostics": { "outdated_severity": 1 }
+    }));
+
+    let _ = client.wait_for_notification(30, |_| false);
+    assert!(
+        client.diagnostic_refresh_request_count() > refreshes_before,
+        "a pull client must get workspace/diagnostic/refresh"
+    );
+    assert!(
+        client
+            .get_notifications()
+            .iter()
+            .all(|n| n.method != "textDocument/publishDiagnostics"),
+        "a pull client must not also receive a publishDiagnostics push"
+    );
+
+    let _shutdown_response = client.shutdown();
+}
+
 /// Verifies that progress notifications follow the expected lifecycle.
 ///
 /// Per the LSP work-done-progress protocol, `window/workDoneProgress/create`
