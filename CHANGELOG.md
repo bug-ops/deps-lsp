@@ -83,6 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: tag-index-dependent diagnostics of other open GitHub Actions documents are republished after a tag-index refresh, also with OSV off or offline (#1770)
 - **deps-lsp**: push-only clients get diagnostics republished after a `didChangeConfiguration` that changes no parse-affecting setting (#PR)
 - **deps-core, deps-github-actions**: a tag pin no published tag matches reports vulnerability data as not checked instead of clean (#PR)
+- **deps-lsp**: the build-script commit stamp follows new commits on the same branch and works in linked worktrees (#PR)
 
 ## [2.0.0] - 2026-09-29
 
