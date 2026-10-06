@@ -1,14 +1,22 @@
-//! Swift package registry using GitHub API.
+//! Swift package registry: a router over GitHub tags (`url:` dependencies) and SE-0292 registries
+//! (`id:` dependencies).
 //!
-//! Fetches package versions from GitHub tags and searches repositories.
-//! Non-GitHub URLs get empty version lists with a tracing warning.
+//! `Registry` dependencies fetch versions from GitHub tags and search repositories. An
+//! `AlternateRegistry` dependency is dispatched to the SE-0292 client registered for its URL; with
+//! no client registered the lookup fails closed, and an `id:` name is never sent to GitHub.
 
+use crate::config::ResolvedSwiftRegistry;
+use crate::package_location::RegistryIdentity;
+use crate::package_registry::{PackageRegistryClient, REGISTRY as SE_0292_REGISTRY};
 use crate::types::{SwiftPackage, SwiftVersion};
+use dashmap::DashMap;
 use deps_core::github::{
     GithubTag, GithubTagsClient, ReleaseDatesCache, classify_tags_fetch_error, paginate_tags,
     semver_tags_newest_first, validate_owner_repo,
 };
-use deps_core::{EcosystemId, HttpCache, PublishTime, Result};
+use deps_core::parser::DependencySource;
+use deps_core::registry::{CapResult, KeyShape, register_capped_with_occupied};
+use deps_core::{DepsError, EcosystemId, HttpCache, PublishTime, Result, Version};
 use serde::Deserialize;
 use std::any::Any;
 use std::collections::HashMap;
@@ -18,7 +26,8 @@ use std::sync::Arc;
 /// used in not-found and API-response error messages.
 pub const REGISTRY: &str = "GitHub";
 
-/// Client for fetching Swift package information from GitHub.
+/// Client for fetching Swift package information from GitHub, plus the router that sends
+/// `id:` dependencies to their registered SE-0292 registry clients.
 #[derive(Clone)]
 pub struct SwiftRegistry {
     github: GithubTagsClient,
@@ -26,6 +35,9 @@ pub struct SwiftRegistry {
     /// `SwiftRegistry` is `Clone` and clones must share one memo, the same reason
     /// `github`'s cache is an `Arc`.
     release_dates: Arc<ReleaseDatesCache>,
+    cache: Arc<HttpCache>,
+    /// SE-0292 clients keyed by normalized registry URL; `Arc` for the same sharing reason.
+    alternates: Arc<DashMap<String, Arc<PackageRegistryClient>>>,
 }
 
 impl SwiftRegistry {
@@ -35,9 +47,90 @@ impl SwiftRegistry {
     /// (5000 req/h vs 60 req/h unauthenticated).
     pub fn new(cache: Arc<HttpCache>) -> Self {
         Self {
-            github: GithubTagsClient::new(cache),
+            github: GithubTagsClient::new(Arc::clone(&cache)),
             release_dates: Arc::new(ReleaseDatesCache::new()),
+            cache,
+            alternates: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Registers (or refreshes) the SE-0292 client for `registry`'s URL.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::HttpCache;
+    /// use deps_core::registry::CapResult;
+    /// use deps_swift::{SwiftParseContext, SwiftRegistry, parse_package_swift_with_context};
+    /// use std::sync::Arc;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let config = dir.path().join(".swiftpm/configuration/registries.json");
+    /// std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    /// std::fs::write(
+    ///     &config,
+    ///     r#"{"registries": {"acme": {"url": "https://swift.acme.dev/api"}}, "version": 1}"#,
+    /// )
+    /// .unwrap();
+    /// let uri = url::Url::from_file_path(dir.path().join("Package.swift")).unwrap();
+    /// let parsed = parse_package_swift_with_context(
+    ///     r#".package(id: "acme.net", from: "1.0.0")"#,
+    ///     &uri,
+    ///     &SwiftParseContext::default(),
+    /// )
+    /// .unwrap();
+    ///
+    /// let registry = SwiftRegistry::new(Arc::new(HttpCache::new()));
+    /// for resolved in parsed.resolved_registries {
+    ///     assert_eq!(registry.register_alternate(resolved), CapResult::Inserted);
+    /// }
+    /// ```
+    ///
+    /// An already-registered URL keeps its client unless its trust or credential changed, in
+    /// which case the client is rebuilt. Once the shared alternate-registry cap is reached a new
+    /// URL is refused rather than evicting a client a live document may still use; the
+    /// returned [`CapResult`] says so, and the caller must not leave a dependency tagged as
+    /// resolvable through a refused URL.
+    pub fn register_alternate(&self, registry: ResolvedSwiftRegistry) -> CapResult {
+        let key = registry.url.as_str().to_string();
+        let digest = registry.digest();
+        let build = || {
+            Arc::new(PackageRegistryClient::new(
+                Arc::clone(&self.cache),
+                registry.clone(),
+            ))
+        };
+        register_capped_with_occupied(
+            &self.alternates,
+            key,
+            EcosystemId::Swift,
+            KeyShape::Url,
+            build,
+            |current| {
+                if current.digest() != digest {
+                    self.cache
+                        .evict_url_prefix(&format!("{}/", registry.url.as_str()));
+                    *current = build();
+                }
+            },
+        )
+    }
+
+    /// Lists `name`'s (`scope.name`) releases from the client registered for `index`.
+    ///
+    /// Never falls back to GitHub: an unregistered `index` or an unparsable identity is
+    /// `PackageNotFound`.
+    async fn registry_versions(&self, index: &str, name: &str) -> Result<Vec<SwiftVersion>> {
+        let not_found = || DepsError::PackageNotFound {
+            package: name.into(),
+            registry: SE_0292_REGISTRY,
+        };
+        let identity = RegistryIdentity::parse(name).ok_or_else(not_found)?;
+        let Some(client) = self.alternates.get(index).map(|entry| Arc::clone(&entry)) else {
+            tracing::debug!("no SE-0292 client registered for the dependency's registry");
+            return Err(not_found());
+        };
+        client.list_releases(&identity).await
     }
 
     /// Fetches all semver-tagged versions for a package.
@@ -148,19 +241,10 @@ impl SwiftRegistry {
         name: &str,
         req_str: &str,
     ) -> Result<Option<SwiftVersion>> {
-        let versions = self.get_versions(name).await?;
-
-        let req = match semver::VersionReq::parse(req_str) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(req = ?req_str, error = %e, "failed to parse version req");
-                return Ok(None);
-            }
-        };
-
-        Ok(versions.into_iter().find(|v| {
-            semver::Version::parse(v.version.as_str()).is_ok_and(|ver| req.matches(&ver))
-        }))
+        Ok(pick_latest_matching(
+            self.get_versions(name).await?,
+            req_str,
+        ))
     }
 
     /// Searches GitHub repositories for Swift packages.
@@ -192,6 +276,23 @@ impl SwiftRegistry {
         let data = self.github.fetch_authenticated(&url).await?;
         parse_search_response(&data)
     }
+}
+
+/// The newest non-yanked version in `versions` (newest-first) matching `req_str`.
+///
+/// An unparseable `req_str` is not an error: it resolves to `None`.
+fn pick_latest_matching(versions: Vec<SwiftVersion>, req_str: &str) -> Option<SwiftVersion> {
+    let req = match semver::VersionReq::parse(req_str) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(req = ?req_str, error = %e, "failed to parse version req");
+            return None;
+        }
+    };
+    versions.into_iter().find(|v| {
+        !v.removal_status().blocks_resolution()
+            && semver::Version::parse(v.version.as_str()).is_ok_and(|ver| req.matches(&ver))
+    })
 }
 
 /// Converts raw tags (possibly accumulated across pages) into a
@@ -299,6 +400,47 @@ fn parse_license_response(data: &[u8]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Where a dependency's lookups go.
+enum Route<'a> {
+    GithubTags,
+    Se0292(&'a str),
+    NotFetchable,
+}
+
+/// The single source-to-backend decision for every lookup.
+fn route(source: &DependencySource) -> Route<'_> {
+    match source {
+        DependencySource::Registry => Route::GithubTags,
+        DependencySource::AlternateRegistry { index, .. } => Route::Se0292(index),
+        DependencySource::Git { .. }
+        | DependencySource::Path { .. }
+        | DependencySource::Url { .. }
+        | DependencySource::Sdk { .. }
+        | DependencySource::Workspace
+        | DependencySource::CustomRegistry { .. } => Route::NotFetchable,
+        // `DependencySource` is `#[non_exhaustive]`: a future variant is not fetchable until
+        // routed explicitly.
+        _ => Route::NotFetchable,
+    }
+}
+
+/// A lookup for a source this router does not fetch: `PackageNotFound`, never a GitHub request.
+fn not_fetchable<T: Send + 'static>(
+    name: &deps_core::PackageName,
+) -> deps_core::ecosystem::BoxFuture<'static, Result<T>> {
+    Box::pin(std::future::ready(Err(DepsError::PackageNotFound {
+        package: name.as_str().into(),
+        registry: SE_0292_REGISTRY,
+    })))
+}
+
+fn box_versions(versions: Vec<SwiftVersion>) -> Vec<Box<dyn deps_core::Version>> {
+    versions
+        .into_iter()
+        .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+        .collect()
+}
+
 impl deps_core::Registry for SwiftRegistry {
     deps_core::impl_registry_versions_method!(get_versions);
 
@@ -313,11 +455,28 @@ impl deps_core::Registry for SwiftRegistry {
             } else {
                 self.get_versions(name.as_str()).await?
             };
-            Ok(versions
-                .into_iter()
-                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                .collect())
+            Ok(box_versions(versions))
         })
+    }
+
+    /// Routes by `source`: `Registry` to GitHub tags, `AlternateRegistry` to its registered
+    /// SE-0292 client, anything else (e.g. an unresolved `CustomRegistry`) to `PackageNotFound`,
+    /// so a name is never sent to a registry the dependency did not resolve to.
+    fn get_versions_from<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        source: &'a DependencySource,
+        freshness: deps_core::FreshnessSettings,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
+        match route(source) {
+            Route::GithubTags => deps_core::Registry::get_versions_with(self, name, freshness),
+            Route::Se0292(index) => Box::pin(async move {
+                Ok(box_versions(
+                    self.registry_versions(index, name.as_str()).await?,
+                ))
+            }),
+            Route::NotFetchable => not_fetchable(name),
+        }
     }
 
     fn get_latest_matching<'a>(
@@ -332,6 +491,26 @@ impl deps_core::Registry for SwiftRegistry {
                 .await?;
             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
         })
+    }
+
+    fn get_latest_matching_from<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        source: &'a DependencySource,
+        req: &'a deps_core::VersionReq,
+        selection_context: &'a deps_core::SelectionContext,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
+        match route(source) {
+            Route::GithubTags => {
+                deps_core::Registry::get_latest_matching(self, name, req, selection_context)
+            }
+            Route::Se0292(index) => Box::pin(async move {
+                let versions = self.registry_versions(index, name.as_str()).await?;
+                Ok(pick_latest_matching(versions, req.as_str())
+                    .map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+            }),
+            Route::NotFetchable => not_fetchable(name),
+        }
     }
 
     fn search_raw<'a>(
@@ -367,15 +546,16 @@ impl deps_core::Registry for SwiftRegistry {
         }
         let parsed_req = semver::VersionReq::parse(req.as_str()).ok()?;
         versions.iter().position(|v| {
-            semver::Version::parse(v.version_string().as_str())
-                .is_ok_and(|ver| parsed_req.matches(&ver))
+            !v.removal_status().blocks_resolution()
+                && semver::Version::parse(v.version_string().as_str())
+                    .is_ok_and(|ver| parsed_req.matches(&ver))
         })
     }
 
-    // `Version::removal_status` is hardcoded `Available` (`registry.rs:173`) —
-    // Swift package registries expose no per-tag yank/deprecation signal (#233).
+    // SE-0292 releases with a `problem` are yanked; the GitHub path yields only `Available`
+    // (tags carry no yank signal, #233).
     fn reports_yanked(&self) -> bool {
-        false
+        true
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -670,10 +850,266 @@ mod tests {
     /// `mockito::Server::url()`) instead of the real GitHub API, for tests driving
     /// `Registry::get_versions_with` end-to-end without a live network call.
     fn mock_registry(base: &str, has_token: bool) -> SwiftRegistry {
+        let cache = Arc::new(HttpCache::new());
         SwiftRegistry {
-            github: GithubTagsClient::for_test(Arc::new(HttpCache::new()), base, has_token),
+            github: GithubTagsClient::for_test(Arc::clone(&cache), base, has_token),
             release_dates: Arc::new(deps_core::github::ReleaseDatesCache::new()),
+            cache,
+            alternates: Arc::new(DashMap::new()),
         }
+    }
+
+    // --- SE-0292 routing (spec 077) ---
+
+    const RELEASES: &str = r#"{"releases": {
+        "1.0.0": {"url": "https://r.example/acme/net/1.0.0"},
+        "1.2.0": {"url": "https://r.example/acme/net/1.2.0"},
+        "1.5.0": {"url": "https://r.example/acme/net/1.5.0", "problem": {"status": 410}},
+        "2.0.0": {"url": "https://r.example/acme/net/2.0.0"}
+    }}"#;
+
+    fn alternate_source(index: &str) -> DependencySource {
+        DependencySource::AlternateRegistry {
+            index: index.to_string(),
+            mirrors_crates_io: false,
+        }
+    }
+
+    fn resolved_for(
+        base: &str,
+        trust: crate::config::RegistryTrust,
+    ) -> crate::config::ResolvedSwiftRegistry {
+        crate::config::ResolvedSwiftRegistry {
+            url: crate::config::SwiftRegistryUrl::for_test(base, trust),
+            auth: None,
+        }
+    }
+
+    /// A GitHub mock server that fails the test on any request, proving an `id:` name never
+    /// reaches GitHub.
+    async fn forbidden_github() -> (mockito::ServerGuard, mockito::Mock) {
+        let mut github = mockito::Server::new_async().await;
+        let mock = github
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        (github, mock)
+    }
+
+    #[tokio::test]
+    async fn test_unregistered_alternate_registry_is_package_not_found_and_never_hits_github() {
+        use deps_core::{FreshnessSettings, PackageName, Registry};
+
+        let (github, never) = forbidden_github().await;
+        let registry = mock_registry(&github.url(), false);
+        let name = PackageName::new("acme.net");
+
+        let err = Registry::get_versions_from(
+            &registry,
+            &name,
+            &alternate_source("https://unregistered.example/api"),
+            FreshnessSettings::default(),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert!(matches!(err, DepsError::PackageNotFound { .. }), "{err:?}");
+
+        let req = deps_core::VersionReq::new("^1.0.0");
+        let err = Registry::get_latest_matching_from(
+            &registry,
+            &name,
+            &alternate_source("https://unregistered.example/api"),
+            &req,
+            &deps_core::SelectionContext::none(),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert!(matches!(err, DepsError::PackageNotFound { .. }), "{err:?}");
+        never.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_custom_registry_is_never_fetched() {
+        use deps_core::{FreshnessSettings, PackageName, Registry};
+
+        let (github, never) = forbidden_github().await;
+        let registry = mock_registry(&github.url(), false);
+        let source = DependencySource::CustomRegistry {
+            url: "acme".to_string(),
+        };
+        let err = Registry::get_versions_from(
+            &registry,
+            &PackageName::new("acme.net"),
+            &source,
+            FreshnessSettings::default(),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert!(matches!(err, DepsError::PackageNotFound { .. }), "{err:?}");
+        never.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_registered_alternate_is_routed_to_its_client_not_github() {
+        use deps_core::{FreshnessSettings, PackageName, Registry};
+
+        let (github, never) = forbidden_github().await;
+        let mut se_0292 = mockito::Server::new_async().await;
+        let listing = se_0292
+            .mock("GET", "/acme/net")
+            .with_status(200)
+            .with_body(RELEASES)
+            .expect(2)
+            .create_async()
+            .await;
+        let registry = mock_registry(&github.url(), false);
+        let base = se_0292.url();
+        registry.register_alternate(resolved_for(
+            &base,
+            crate::config::RegistryTrust::WorkspaceDeclared,
+        ));
+        let source = alternate_source(&base);
+        let name = PackageName::new("Acme.Net");
+
+        let versions =
+            Registry::get_versions_from(&registry, &name, &source, FreshnessSettings::default())
+                .await
+                .unwrap();
+        assert_eq!(versions.len(), 4);
+        assert!(registry.reports_yanked());
+        assert!(
+            versions
+                .iter()
+                .any(|v| v.removal_status().blocks_resolution())
+        );
+
+        // `1.5.0` is yanked, so `^1.0.0` resolves to `1.2.0`.
+        let req = deps_core::VersionReq::new("^1.0.0");
+        let latest = Registry::get_latest_matching_from(
+            &registry,
+            &name,
+            &source,
+            &req,
+            &deps_core::SelectionContext::none(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(latest.version_string(), "1.2.0");
+
+        listing.assert_async().await;
+        never.assert_async().await;
+    }
+
+    #[test]
+    fn test_select_latest_matching_skips_yanked_versions() {
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(SwiftVersion {
+                version: "1.5.0".into(),
+                yanked: true,
+                published_at: None,
+                prerelease: false,
+            }),
+            Box::new(SwiftVersion {
+                version: "1.2.0".into(),
+                yanked: false,
+                published_at: None,
+                prerelease: false,
+            }),
+        ];
+        let registry = mock_registry("https://api.github.invalid", false);
+        let picked = deps_core::Registry::select_latest_matching(
+            &registry,
+            &versions,
+            &deps_core::VersionReq::new("^1.0.0"),
+            &deps_core::SelectionContext::none(),
+        );
+        assert_eq!(picked, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_reregistration_rebuilds_the_client_only_when_trust_or_credential_changed() {
+        use crate::config::RegistryTrust::{Trusted, WorkspaceDeclared};
+
+        let registry = mock_registry("https://api.github.invalid", false);
+        let key = "https://r.example/api";
+        registry.register_alternate(resolved_for(key, WorkspaceDeclared));
+        let first = registry
+            .alternates
+            .get(key)
+            .map(|c| Arc::clone(&c))
+            .unwrap();
+
+        registry.register_alternate(resolved_for(key, WorkspaceDeclared));
+        let same = registry
+            .alternates
+            .get(key)
+            .map(|c| Arc::clone(&c))
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &same));
+
+        registry.register_alternate(resolved_for(key, Trusted));
+        let rebuilt = registry
+            .alternates
+            .get(key)
+            .map(|c| Arc::clone(&c))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+        assert_eq!(registry.alternates.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dropping_the_credential_never_serves_the_authenticated_body() {
+        use crate::auth::{SwiftEnvCredential, bind_credential};
+        use crate::config::{RegistryTrust, SwiftRegistryUrl, UserTier};
+        use deps_core::{PackageName, Registry};
+
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let url = SwiftRegistryUrl::for_test(&base, RegistryTrust::Trusted);
+        let tier = UserTier::for_test(&[&base], HashMap::new());
+        let credential = SwiftEnvCredential::Token(deps_core::secret::Redacted::new("t".into()));
+        let registry = mock_registry("https://api.github.invalid", false);
+        let name = PackageName::new("acme.net");
+        let source = alternate_source(&base);
+        let fetch = || {
+            Registry::get_versions_from(
+                &registry,
+                &name,
+                &source,
+                deps_core::FreshnessSettings::default(),
+            )
+        };
+
+        let authenticated = server
+            .mock("GET", "/acme/net")
+            .match_header("authorization", "Bearer t")
+            .with_status(200)
+            .with_body(RELEASES)
+            .create_async()
+            .await;
+        registry.register_alternate(crate::config::ResolvedSwiftRegistry {
+            auth: bind_credential(&url, &tier, Some(&credential)),
+            url: url.clone(),
+        });
+        assert_eq!(fetch().await.unwrap().len(), 4);
+        authenticated.remove_async().await;
+
+        let _rejected = server
+            .mock("GET", "/acme/net")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(401)
+            .create_async()
+            .await;
+        registry.register_alternate(crate::config::ResolvedSwiftRegistry { url, auth: None });
+        assert!(
+            fetch().await.is_err(),
+            "the stale authenticated body was served"
+        );
     }
 
     // --- get_versions: 403 classification (#1295) ---

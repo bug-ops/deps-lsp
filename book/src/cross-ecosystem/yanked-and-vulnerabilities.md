@@ -56,7 +56,7 @@ section for how the two are deduplicated.
 | Go | No | module proxy reports no retraction data |
 | Maven | No | Maven Central has no retraction concept |
 | Gradle | No | delegates to the same Maven Central registry as Maven |
-| Swift | No | Swift package registries expose no per-tag yank signal |
+| Swift | Partial | SE-0292 registry releases carrying a `problem` are yanked; GitHub-tag dependencies have no yank signal |
 | NuGet | No | unlisted versions are not distinguishable from listed ones today |
 | Composer | No | Packagist's `abandoned` flag is package-level, not per-version — enabling it would fire on nearly every dependency of an abandoned package rather than the specific withdrawn release |
 | Deno | Yes | JSR `meta.json` per-version `yanked` (genuine) for `jsr:` specifiers; npm `deprecated` (same package-level caveat as the npm row above) for `npm:` specifiers |
@@ -120,7 +120,7 @@ dependency, so only one yanked diagnostic is ever shown per dependency.
 | Maven | No | `MavenVersion::is_yanked` is a hardcoded `false` constant — Maven Central does not support version retraction |
 | Gradle | No | reuses Maven Central's registry client, same hardcoded `false` |
 | NuGet | No | `NuGetVersion::is_yanked` is a hardcoded `false` constant |
-| Swift | No | `SwiftVersion.yanked` is a field that is always `false` for GitHub tags (no such concept in the source) |
+| Swift | Partial | `SwiftVersion.yanked` is `true` for an SE-0292 registry release with a `problem`, always `false` for GitHub tags (no such concept in the source); `SwiftRegistry::reports_yanked` is `true` |
 | Deno | `jsr:` yes, any requirement shape; `npm:` no | JSR `meta.json` per-version `yanked` for `jsr:` specifiers; npm `deprecated` (unconditionally off, see restriction above) for `npm:` specifiers |
 | GitHub Actions | No | GitHub's tags API exposes no yank/deprecation signal for actions — `GithubActionsRegistry::reports_yanked` is hardcoded `false`, same architectural gap as Swift |
 

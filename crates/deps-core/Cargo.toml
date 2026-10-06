@@ -51,6 +51,7 @@ lsp-responses = ["dep:tower-lsp-server"]
 test-util = ["dep:tracing-subscriber", "dep:tempfile"]
 
 [dependencies]
+base64 = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 deps-core-macros = { workspace = true }

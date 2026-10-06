@@ -35,7 +35,6 @@ fuzzing = []
 lsp-responses = ["dep:tower-lsp-server", "deps-core/lsp-responses"]
 
 [dependencies]
-base64 = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 deps-core = { workspace = true }

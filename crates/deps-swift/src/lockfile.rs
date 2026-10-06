@@ -46,11 +46,29 @@ struct PinV1 {
     state: PinState,
 }
 
+/// A `Package.resolved` v2/v3 pin `kind`.
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum PinKind {
+    /// A Git remote; also what a missing `kind` means.
+    #[default]
+    #[serde(rename = "remoteSourceControl")]
+    RemoteSourceControl,
+    /// A local checkout, written by SwiftPM as `fileSystem` in older lock files.
+    #[serde(rename = "localSourceControl", alias = "fileSystem")]
+    LocalSourceControl,
+    /// An SE-0292 registry package.
+    #[serde(rename = "registry")]
+    Registry,
+    /// A kind this parser does not know; the pin is skipped.
+    #[serde(other)]
+    Unrecognized,
+}
+
 #[derive(Deserialize)]
 struct PinV2 {
     identity: String,
     #[serde(default)]
-    kind: String,
+    kind: PinKind,
     location: String,
     state: PinState,
 }
@@ -130,30 +148,31 @@ fn parse_package_resolved(content: String) -> Result<ResolvedPackages> {
                 return Ok(packages);
             };
             for pin in pins {
-                // For fileSystem pins, location is a local path — use identity as name.
-                // For remote pins, derive owner/repo from the URL.
-                let name = if pin.kind == "fileSystem" {
-                    pin.identity.clone()
-                } else {
-                    url_to_identity(&pin.location).unwrap_or(pin.identity.clone())
+                let Some(version) = pin.state.version.as_deref() else {
+                    continue;
                 };
-                if let Some(version) = pin.state.version {
-                    let version = version
-                        .strip_prefix(['v', 'V'])
-                        .unwrap_or(&version)
-                        .to_string();
-                    let source = if pin.kind == "fileSystem" {
-                        ResolvedSource::Path {
-                            path: pin.location.clone(),
-                        }
-                    } else {
+                let version = version
+                    .strip_prefix(['v', 'V'])
+                    .unwrap_or(version)
+                    .to_string();
+                let (name, source) = match pin.kind {
+                    PinKind::Unrecognized => {
+                        tracing::debug!("skipping Package.resolved pin of unrecognized kind");
+                        continue;
+                    }
+                    PinKind::LocalSourceControl => {
+                        (pin.identity, ResolvedSource::Path { path: pin.location })
+                    }
+                    PinKind::Registry => (pin.identity, ResolvedSource::RegistryPin),
+                    PinKind::RemoteSourceControl => (
+                        url_to_identity(&pin.location).unwrap_or(pin.identity),
                         ResolvedSource::Git {
                             url: pin.location,
                             rev: pin.state.revision.unwrap_or_default(),
-                        }
-                    };
-                    packages.insert(ResolvedPackage::new(name, version, source));
-                }
+                        },
+                    ),
+                };
+                packages.insert(ResolvedPackage::new(name, version, source));
             }
         }
         v => {
@@ -284,6 +303,55 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         let pkg = resolved.get("local-pkg").unwrap();
         assert_matches!(pkg.source, ResolvedSource::Path { .. });
+    }
+
+    async fn resolve_pins(pins: &str) -> deps_core::lockfile::ResolvedPackages {
+        let content = format!(r#"{{"pins": [{pins}], "version": 3}}"#);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Package.resolved");
+        tokio::fs::write(&path, content).await.unwrap();
+        SwiftLockParser.parse_lockfile(&path).await.unwrap()
+    }
+
+    fn pin(kind_field: &str) -> String {
+        format!(
+            r#"{{"identity": "acme.net", {kind_field} "location": "", "state": {{"version": "1.0.0"}}}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn test_registry_pin_maps_to_registry_source() {
+        let resolved = resolve_pins(&pin(r#""kind": "registry","#)).await;
+        assert_matches!(
+            resolved.get("acme.net").unwrap().source,
+            ResolvedSource::RegistryPin
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_source_control_and_legacy_file_system_map_to_path() {
+        for kind in ["localSourceControl", "fileSystem"] {
+            let resolved = resolve_pins(&pin(&format!(r#""kind": "{kind}","#))).await;
+            assert_matches!(
+                resolved.get("acme.net").unwrap().source,
+                ResolvedSource::Path { .. }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_missing_kind_defaults_to_remote_source_control() {
+        let resolved = resolve_pins(&pin("")).await;
+        assert_matches!(
+            resolved.get("acme.net").unwrap().source,
+            ResolvedSource::Git { .. }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unrecognized_kind_is_skipped() {
+        let resolved = resolve_pins(&pin(r#""kind": "somethingNew","#)).await;
+        assert_eq!(resolved.len(), 0);
     }
 
     // #758: shared `LockFileProvider` conformance, replacing test_invalid_json_returns_error

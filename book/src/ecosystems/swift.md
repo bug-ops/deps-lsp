@@ -26,8 +26,106 @@ the manifest, it is read to show each dependency's actual pinned (in-use) revisi
 
 A `traits:` argument (SwiftPM 6.1) of any shape is accepted after the requirement; its value is
 never parsed. A `.package(id: "scope.name", from: "1.0.0")` registry dependency (SE-0292) is
-parsed and shown in hover/inlay hints (in-use version from `Package.resolved`), but is not
-version-resolved: `deps-swift` has no Swift package registry client.
+resolved through the registry its scope maps to; see
+[Package Registries (SE-0292)](#package-registries-se-0292).
+
+## Package Registries (SE-0292)
+
+SwiftPM has no public default registry, so an `id:` dependency is only version-resolved when its
+scope (or a `[default]` entry) maps to a registry in a `registries.json` file, the same file
+`swift package-registry set` writes:
+
+```json
+{
+  "registries": {
+    "[default]": { "url": "https://tuist.dev/api/registry/swift" },
+    "acme": { "url": "https://swift.acme.dev/api" }
+  },
+  "authentication": { "swift.acme.dev": { "type": "token" } },
+  "version": 1
+}
+```
+
+`GET {url}/{scope}/{name}` is sent with `Accept: application/vnd.swift.registry.v1+json` using the
+lowercase identity (`Apple.Swift-NIO` is requested as `apple/swift-nio`; scopes match
+case-insensitively). Releases whose key is not semver are skipped; a release with a `problem` is
+marked yanked. With no matching entry the dependency is shown but never fetched, and an `id:` name
+is never sent to GitHub or any other registry.
+
+### Configuration tiers
+
+| Tier | Path |
+|------|------|
+| Project | `<directory of Package.swift>/.swiftpm/configuration/registries.json` (no ancestor walk) |
+| User (macOS) | `~/Library/org.swift.swiftpm/configuration/registries.json` |
+| User (other) | `$XDG_CONFIG_HOME/swiftpm/configuration/registries.json` if `XDG_CONFIG_HOME` is set, else `~/.swiftpm/configuration/registries.json` |
+
+The project tier overrides the user tier per scope and for `[default]`; a scoped entry in either
+tier wins over `[default]`. Exactly one user-tier path is read, with no existence fallback; an
+empty or relative `XDG_CONFIG_HOME` makes the user tier unusable. The file is decoded with
+SwiftPM's strictness (`version` must be `1`, scope keys must follow the scope grammar,
+`authentication.type` must be `basic` or `token`, `security` must be an object when present, unknown
+keys are ignored). A tier that exists but is unusable (unreadable, not a regular file, over 8 MiB,
+or failing that decode) leaves every `id:` dependency unresolved with a warning; it never falls
+back to the other tier's `[default]`.
+
+On Unix, a `.swiftpm` that is a regular file (or any other stat failure besides "not found") also
+makes the project tier unusable, which fails closed; Windows reports "not found" for that path, so
+the project tier is simply absent there. The user-level file is not watched: edits to it
+(and to `SWIFTPM_REGISTRY_*` variables, read once at startup) take effect on the next manifest
+parse, not immediately; only a `registries.json` change inside the workspace triggers a reparse.
+
+### Trust and credentials
+
+A registry URL is **trusted** exactly when it equals (after normalization: lowercase host, default
+port and trailing `/` dropped, path case kept) a URL declared in the *user-level* file, whichever
+tier declared it in the current workspace. Any other URL is **workspace-declared**. Trust never
+depends on the workspace, so a hostile repository cannot redirect a credential.
+
+| | Trusted | Workspace-declared |
+|---|---------|--------------------|
+| Reachability | exempt from `registries.workspace_registries` (like Cargo's `$CARGO_HOME`), except loopback, link-local, cloud-metadata, unspecified and reserved hosts, which are never fetched | gated by `registries.workspace_registries` |
+| Redirects | confined to the registry's base URL | confined to the registry's base URL |
+| Credential | attached | never attached |
+
+Credentials are read once at startup from `SWIFTPM_REGISTRY_TOKEN`, or from
+`SWIFTPM_REGISTRY_LOGIN` together with `SWIFTPM_REGISTRY_PASSWORD` (the token wins; one variable of
+the pair alone is ignored with a warning naming it). The header format comes from the user-level
+`authentication` map only: `token` (or no entry) sends `Bearer`, `basic` sends `Basic`; a login of
+`token` with no entry is also sent as `Bearer`, as SwiftPM does. `authentication` is keyed by host and
+non-default port, like SwiftPM (`swift.acme.dev:8443` does not match a portless key); unlike
+SwiftPM, an explicit default port (`:443`) is treated as absent. netrc and macOS Keychain
+credentials are not read.
+
+**The single environment credential is sent to every trusted registry URL**, including a public
+`[default]` listed in the user-level file next to a private scoped registry. If you do not want
+the token sent to a public registry, do not list it in the user-level `registries.json` while the
+variable is exported (declare it in the project file instead).
+
+### Deviation from SwiftPM
+
+Released SwiftPM 6.4.x sends environment credentials to every host; SwiftPM `main` (since
+swiftlang/swift-package-manager#10507, unreleased) binds them to the origins of every configured
+registry across both tiers, project tier included. `deps-swift` is stricter: user-tier provenance
+plus an exact full-URL match, so path-tenanted shared hosts (`host/api/swift/<repo>`) never receive
+another tenant's credential. A project-only registry on a host you trust therefore gets `401`
+here where SwiftPM `main` would authenticate; add that exact URL to your user-level file. The
+authentication type is also taken from the user tier only, and workspace-declared URLs are
+policy-gated, which SwiftPM does not do.
+
+### Limitations
+
+- **Paginated release lists.** A response carrying `Link: <...>; rel="next"` is discarded and the
+  dependency shows "registry paginates its release list; pagination is not supported yet" (#1754); no
+  latest version or up-to-date mark is derived from a partial page.
+- A project-declared hostname that resolves to a blocked address class shows the generic
+  fetch-failure message rather than a policy-specific one.
+- `registries.json` is watched by basename, so an unrelated file with that name elsewhere in the
+  workspace causes one extra reparse.
+- No `id:` name completion (SE-0292 has no search endpoint) and no `publishedAt` freshness.
+
+`Package.resolved` `registry` pins are shown as registry sources, and a pin of an unrecognized
+`kind` is skipped instead of being treated as a source-control pin.
 
 ## Non-GitHub Package Hosts (issues #979, #983, #924)
 

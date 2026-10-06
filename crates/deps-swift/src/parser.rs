@@ -4,6 +4,7 @@
 //! comments to avoid false positives. Byte offsets are preserved during
 //! comment stripping for accurate LSP position tracking.
 
+use crate::config::{ResolvedSwiftRegistry, SwiftParseContext, SwiftRegistriesConfig};
 use crate::package_location::{PackageLocation, RegistryIdentity};
 use crate::types::SwiftDependency;
 use deps_core::Result;
@@ -26,6 +27,13 @@ pub struct SwiftParseResult {
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
     pub dependency_truncation: Option<(usize, usize)>,
+    /// SE-0292 registries the manifest's `id:` dependencies resolved to (deduplicated), for
+    /// [`crate::SwiftRegistry::register_alternate`].
+    pub resolved_registries: Vec<ResolvedSwiftRegistry>,
+    /// `id:` dependencies whose registry URL is blocked by the workspace-registry policy.
+    pub blocked_registries: Vec<deps_core::BlockedRegistryOccurrence>,
+    /// `id:` dependencies whose registry entry was rejected for another reason.
+    pub rejected_registries: Vec<deps_core::RejectedRegistryOccurrence>,
 }
 
 deps_core::impl_parse_result!(
@@ -34,6 +42,8 @@ deps_core::impl_parse_result!(
         dependencies: dependencies,
         uri: uri,
         dependency_truncation: dependency_truncation,
+        blocked_registries: blocked_registries,
+        rejected_registries: rejected_registries,
     }
 );
 
@@ -188,9 +198,13 @@ pub(crate) fn parse_git_url(url: &str) -> Option<reqwest::Url> {
 /// (`EcosystemFormatter::can_resolve_source` defaults to `Registry`-only, which this crate
 /// does not override).
 ///
-/// An `id:` dependency (SE-0292) resolves to [`DependencySource::CustomRegistry`] keyed by its
-/// scope: shown in hover/inlay output but never queried, as no Swift registry client exists.
-fn resolve_registry_source(location: PackageLocation<'_>) -> (String, DependencySource) {
+/// An `id:` dependency (SE-0292) resolves through `resolver`: to an `AlternateRegistry` when its
+/// scope maps to a valid registry, otherwise to a `CustomRegistry` that is shown but never queried.
+fn resolve_registry_source(
+    location: PackageLocation<'_>,
+    name_range: Range,
+    resolver: &mut IdResolver<'_>,
+) -> (String, DependencySource) {
     match location {
         PackageLocation::Url(url_str) => match url_to_identity(url_str) {
             Some(identity) => (identity, DependencySource::Registry),
@@ -202,13 +216,61 @@ fn resolve_registry_source(location: PackageLocation<'_>) -> (String, Dependency
                 },
             ),
         },
-        // TODO(#1691): resolve `.package(id:)` via an SE-0292 registry client.
-        PackageLocation::Id(id) => (
-            id.to_string(),
-            DependencySource::CustomRegistry {
-                url: id.scope().to_string(),
-            },
-        ),
+        PackageLocation::Id(id) => (id.to_string(), resolver.resolve(&id, name_range)),
+    }
+}
+
+/// Resolves `id:` dependencies against `registries.json`, reading the tiers lazily on the first
+/// one so a manifest without `id:` dependencies does no file I/O.
+struct IdResolver<'c> {
+    context: Option<(&'c SwiftParseContext, &'c Url)>,
+    config: std::cell::OnceCell<SwiftRegistriesConfig>,
+    used: Vec<ResolvedSwiftRegistry>,
+    blocked: Vec<deps_core::BlockedRegistryOccurrence>,
+    rejected: Vec<deps_core::RejectedRegistryOccurrence>,
+}
+
+impl<'c> IdResolver<'c> {
+    /// A resolver with no registry configuration: every `id:` stays an unresolved `CustomRegistry`.
+    const fn unconfigured() -> Self {
+        Self {
+            context: None,
+            config: std::cell::OnceCell::new(),
+            used: Vec::new(),
+            blocked: Vec::new(),
+            rejected: Vec::new(),
+        }
+    }
+
+    const fn configured(context: &'c SwiftParseContext, uri: &'c Url) -> Self {
+        Self {
+            context: Some((context, uri)),
+            config: std::cell::OnceCell::new(),
+            used: Vec::new(),
+            blocked: Vec::new(),
+            rejected: Vec::new(),
+        }
+    }
+
+    fn resolve(&mut self, id: &RegistryIdentity<'_>, name_range: Range) -> DependencySource {
+        let scope = id.scope_key();
+        let Some((context, uri)) = self.context else {
+            return DependencySource::CustomRegistry {
+                url: scope.to_string(),
+            };
+        };
+        let config = self.config.get_or_init(|| context.resolve(uri));
+        if let Some(blocked) = config.blocked_class_for(&scope) {
+            self.blocked.push(blocked.into_occurrence(name_range));
+        } else if let Some(rejected) = config.rejected_reason_for(&scope) {
+            self.rejected.push(rejected.into_occurrence(name_range));
+        }
+        if let Some(resolved) = config.resolved_registry_for(&scope)
+            && !self.used.iter().any(|used| used.url == resolved.url)
+        {
+            self.used.push(resolved.clone());
+        }
+        config.resolve_source_for(&scope)
     }
 }
 
@@ -259,12 +321,56 @@ fn next_minor(major: &str, minor: &str) -> String {
 /// Parses a Package.swift file and returns all dependencies with LSP positions.
 ///
 /// Uses regex matching after stripping comments. Byte offsets are preserved
-/// throughout so LSP positions are computed correctly.
+/// throughout so LSP positions are computed correctly. Without a registry configuration, every
+/// `id:` dependency stays an unresolved `CustomRegistry`; see
+/// [`parse_package_swift_with_context`].
 ///
 /// # Errors
 ///
 /// Infallible by construction: unrecognized lines are skipped rather than erroring.
 /// Returns [`Result`] only to match the shared parser signature every ecosystem implements.
+///
+/// # Examples
+///
+/// ```
+/// use deps_swift::parse_package_swift;
+///
+/// let uri = url::Url::parse("file:///proj/Package.swift").unwrap();
+/// let manifest = r#".package(url: "https://github.com/apple/swift-nio", from: "2.0.0")"#;
+/// assert_eq!(parse_package_swift(manifest, &uri).unwrap().dependencies.len(), 1);
+/// ```
+pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult> {
+    parse_with_resolver(content, uri, IdResolver::unconfigured())
+}
+
+/// Like [`parse_package_swift`], but resolves `id:` dependencies against the project and user
+/// `registries.json` tiers described by `context`.
+///
+/// # Errors
+///
+/// Same as [`parse_package_swift`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_swift::{SwiftParseContext, parse_package_swift_with_context};
+///
+/// // No `registries.json` applies to a URI without a file path, so the `id:` stays unresolved.
+/// let uri = url::Url::parse("untitled:Package.swift").unwrap();
+/// let manifest = r#".package(id: "Acme.Net", from: "1.0.0")"#;
+/// let parsed = parse_package_swift_with_context(manifest, &uri, &SwiftParseContext::default())
+///     .unwrap();
+/// assert_eq!(parsed.dependencies.len(), 1);
+/// assert!(parsed.resolved_registries.is_empty());
+/// ```
+pub fn parse_package_swift_with_context(
+    content: &str,
+    uri: &Url,
+    context: &SwiftParseContext,
+) -> Result<SwiftParseResult> {
+    parse_with_resolver(content, uri, IdResolver::configured(context, uri))
+}
+
 // Every capture-group slice below (`url.start()..url.end()`, etc.) uses regex match offsets,
 // always char boundaries; offsets taken on `stripped` are valid in `content` too because
 // `strip_comments` overwrites byte-for-byte (length- and boundary-preserving). Group 0
@@ -272,7 +378,11 @@ fn next_minor(major: &str, minor: &str) -> String {
 // mandatory (never `?`-optional), so their `unwrap()` is always `Some`. The alternative `url`/`id`
 // head is optional per group and goes through `locate` instead.
 #[allow(clippy::string_slice, clippy::unwrap_used)]
-pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult> {
+fn parse_with_resolver(
+    content: &str,
+    uri: &Url,
+    mut resolver: IdResolver<'_>,
+) -> Result<SwiftParseResult> {
     let stripped = strip_comments(content);
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
@@ -313,10 +423,11 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             matched.insert(full.start()..full.end());
             continue;
         }
-        let (name, source) = resolve_registry_source(location);
+        let name_range = make_range(url_span.start, url_span.end);
+        let (name, source) = resolve_registry_source(location, name_range, &mut resolver);
         dependencies.push(SwiftDependency {
             name: name.into(),
-            name_range: make_range(url_span.start, url_span.end),
+            name_range,
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             version_literal: Some(ver_str.to_string()),
@@ -349,10 +460,11 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             matched.insert(full.start()..full.end());
             continue;
         }
-        let (name, source) = resolve_registry_source(location);
+        let name_range = make_range(url_span.start, url_span.end);
+        let (name, source) = resolve_registry_source(location, name_range, &mut resolver);
         dependencies.push(SwiftDependency {
             name: name.into(),
-            name_range: make_range(url_span.start, url_span.end),
+            name_range,
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             version_literal: Some(ver_str.to_string()),
@@ -385,10 +497,11 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             matched.insert(full.start()..full.end());
             continue;
         }
-        let (name, source) = resolve_registry_source(location);
+        let name_range = make_range(url_span.start, url_span.end);
+        let (name, source) = resolve_registry_source(location, name_range, &mut resolver);
         dependencies.push(SwiftDependency {
             name: name.into(),
-            name_range: make_range(url_span.start, url_span.end),
+            name_range,
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             version_literal: Some(ver_str.to_string()),
@@ -420,10 +533,11 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             matched.insert(full.start()..full.end());
             continue;
         }
-        let (name, source) = resolve_registry_source(location);
+        let name_range = make_range(url_span.start, url_span.end);
+        let (name, source) = resolve_registry_source(location, name_range, &mut resolver);
         dependencies.push(SwiftDependency {
             name: name.into(),
-            name_range: make_range(url_span.start, url_span.end),
+            name_range,
             version_req: Some(version_req.into()),
             version_range: Some(make_range(lower.start(), lower.end())),
             // Deliberately `None`, unlike every other registry form: `version_range` spans
@@ -461,10 +575,11 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             matched.insert(full.start()..full.end());
             continue;
         }
-        let (name, source) = resolve_registry_source(location);
+        let name_range = make_range(url_span.start, url_span.end);
+        let (name, source) = resolve_registry_source(location, name_range, &mut resolver);
         dependencies.push(SwiftDependency {
             name: name.into(),
-            name_range: make_range(url_span.start, url_span.end),
+            name_range,
             version_req: Some(version_req.into()),
             version_range: Some(make_range(lower.start(), lower.end())),
             // See the half-open range form above (#367 C1): `version_range` spans only
@@ -497,10 +612,11 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
             matched.insert(full.start()..full.end());
             continue;
         }
-        let (name, source) = resolve_registry_source(location);
+        let name_range = make_range(url_span.start, url_span.end);
+        let (name, source) = resolve_registry_source(location, name_range, &mut resolver);
         dependencies.push(SwiftDependency {
             name: name.into(),
-            name_range: make_range(url_span.start, url_span.end),
+            name_range,
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             version_literal: Some(ver_str.to_string()),
@@ -619,6 +735,9 @@ pub fn parse_package_swift(content: &str, uri: &Url) -> Result<SwiftParseResult>
         dependencies,
         uri: uri.clone(),
         dependency_truncation: budget.truncation(),
+        resolved_registries: resolver.used,
+        blocked_registries: resolver.blocked,
+        rejected_registries: resolver.rejected,
     })
 }
 
@@ -852,6 +971,156 @@ let package = Package(
     fn test_empty_content() {
         let result = parse_package_swift("", &test_uri()).unwrap();
         assert!(result.dependencies.is_empty());
+    }
+
+    mod registry_context {
+        use super::*;
+        use crate::config::{SwiftParseContext, UserConfigPath};
+        use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+        use std::sync::Arc;
+
+        const MANIFEST: &str = r#".package(id: "Acme.Net", from: "1.0.0")"#;
+
+        struct Workspace {
+            dir: tempfile::TempDir,
+        }
+
+        impl Workspace {
+            fn with_project_registries(json: &str) -> Self {
+                let dir = tempfile::tempdir().unwrap();
+                let config = dir.path().join(".swiftpm/configuration/registries.json");
+                std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+                std::fs::write(config, json).unwrap();
+                Self { dir }
+            }
+
+            fn uri(&self) -> Url {
+                Url::from_file_path(self.dir.path().join("Package.swift")).unwrap()
+            }
+
+            fn context(&self, access: WorkspaceRegistryAccess) -> SwiftParseContext {
+                SwiftParseContext::new(
+                    Arc::new(RegistryAccessPolicy::new(access)),
+                    Arc::default(),
+                    UserConfigPath::Path(self.dir.path().join("no-user-tier.json")),
+                    None,
+                )
+            }
+        }
+
+        fn registries(url: &str) -> String {
+            format!(r#"{{"registries": {{"[default]": {{"url": "{url}"}}}}, "version": 1}}"#)
+        }
+
+        #[test]
+        fn test_id_dependency_resolves_to_the_configured_registry() {
+            let ws = Workspace::with_project_registries(&registries("https://swift.acme.dev/api"));
+            let ctx = ws.context(WorkspaceRegistryAccess::PublicOnly);
+            let result = parse_package_swift_with_context(MANIFEST, &ws.uri(), &ctx).unwrap();
+
+            assert_eq!(result.dependencies.len(), 1);
+            assert_eq!(
+                result.dependencies[0].source,
+                DependencySource::AlternateRegistry {
+                    index: "https://swift.acme.dev/api".into(),
+                    mirrors_crates_io: false,
+                }
+            );
+            assert_eq!(result.dependencies[0].url, "");
+            assert_eq!(result.resolved_registries.len(), 1);
+            assert!(result.blocked_registries.is_empty());
+            assert!(result.rejected_registries.is_empty());
+        }
+
+        #[test]
+        fn test_id_dependency_without_a_matching_entry_keeps_the_canonical_scope() {
+            let ws = Workspace::with_project_registries(
+                r#"{"registries": {"other": {"url": "https://other.dev"}}, "version": 1}"#,
+            );
+            let ctx = ws.context(WorkspaceRegistryAccess::PublicOnly);
+            let result = parse_package_swift_with_context(MANIFEST, &ws.uri(), &ctx).unwrap();
+            assert_eq!(
+                result.dependencies[0].source,
+                DependencySource::CustomRegistry { url: "acme".into() }
+            );
+            assert!(result.resolved_registries.is_empty());
+        }
+
+        #[test]
+        fn test_blocked_registry_is_reported_at_the_id_literal() {
+            let ws = Workspace::with_project_registries(&registries("https://10.0.0.5"));
+            let ctx = ws.context(WorkspaceRegistryAccess::PublicOnly);
+            let result = parse_package_swift_with_context(MANIFEST, &ws.uri(), &ctx).unwrap();
+
+            assert_eq!(result.blocked_registries.len(), 1);
+            assert_eq!(result.blocked_registries[0].declaration_key, "[default]");
+            assert_eq!(
+                result.blocked_registries[0].range,
+                result.dependencies[0].name_range
+            );
+            assert_eq!(
+                deps_core::ParseResult::blocked_registries(&result).len(),
+                1,
+                "the trait method must expose the field"
+            );
+            assert_matches!(
+                result.dependencies[0].source,
+                DependencySource::CustomRegistry { .. }
+            );
+        }
+
+        #[test]
+        fn test_rejected_registry_is_reported_and_its_userinfo_redacted() {
+            let ws = Workspace::with_project_registries(&registries(
+                "https://user:hunter2@swift.acme.dev",
+            ));
+            let ctx = ws.context(WorkspaceRegistryAccess::PublicOnly);
+            let result = parse_package_swift_with_context(MANIFEST, &ws.uri(), &ctx).unwrap();
+
+            assert_eq!(result.rejected_registries.len(), 1);
+            assert!(result.blocked_registries.is_empty());
+            assert!(!format!("{:?}", result.dependencies[0].source).contains("hunter2"));
+            assert_eq!(
+                deps_core::ParseResult::rejected_registries(&result).len(),
+                1
+            );
+        }
+
+        #[test]
+        fn test_unusable_tier_leaves_every_id_unresolved() {
+            let ws = Workspace::with_project_registries("not json");
+            let ctx = ws.context(WorkspaceRegistryAccess::PublicOnly);
+            let result = parse_package_swift_with_context(MANIFEST, &ws.uri(), &ctx).unwrap();
+            assert_matches!(
+                result.dependencies[0].source,
+                DependencySource::CustomRegistry { .. }
+            );
+            assert!(result.resolved_registries.is_empty());
+        }
+
+        #[test]
+        fn test_manifest_without_id_dependencies_does_no_registry_file_io() {
+            let ws = Workspace::with_project_registries(&registries("https://swift.acme.dev"));
+            let ctx = ws.context(WorkspaceRegistryAccess::PublicOnly);
+            let _guard = deps_core::fs_probe::snapshot_guard();
+            let (stats_before, reads_before) = deps_core::fs_probe::snapshot();
+            let manifest = r#".package(url: "https://github.com/apple/swift-nio", from: "2.0.0")"#;
+            let result = parse_package_swift_with_context(manifest, &ws.uri(), &ctx).unwrap();
+            assert_eq!(result.dependencies.len(), 1);
+            assert_eq!(
+                deps_core::fs_probe::snapshot(),
+                (stats_before, reads_before)
+            );
+        }
+
+        #[test]
+        fn test_unconfigured_parse_never_resolves_an_id() {
+            let result = parse_package_swift(MANIFEST, &test_uri()).unwrap();
+            assert_eq!(
+                result.dependencies[0].source,
+                DependencySource::CustomRegistry { url: "acme".into() }
+            );
+        }
     }
 
     #[test]
@@ -1811,7 +2080,7 @@ let package = Package(
         }
     }
 
-    /// Pins current behavior: ids are compared case-sensitively (SwiftPM lowercases them); see #1691.
+    /// Case variants stay separate entries as written; they canonicalize only when resolved.
     #[test]
     fn test_registry_id_case_variants_are_distinct_dependencies() {
         let content = r#"

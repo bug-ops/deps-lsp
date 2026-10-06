@@ -211,7 +211,14 @@ impl DiagnosticMessages for SwiftFormatter {
 
 impl DiagnosticPolicy for SwiftFormatter {}
 
-impl SourcePolicy for SwiftFormatter {}
+impl SourcePolicy for SwiftFormatter {
+    /// Widens [`SourcePolicy::can_resolve_source`] so an `id:` dependency resolved to an SE-0292
+    /// registry is looked up through the router's per-source dispatch; an unresolved
+    /// `CustomRegistry` keeps the default `false`.
+    fn resolves_alternate_registry(&self) -> bool {
+        true
+    }
+}
 
 impl OsvNaming for SwiftFormatter {
     /// Raw `dep.name()`, NOT [`Self::normalize_package_name`]: that

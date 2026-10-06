@@ -15,12 +15,15 @@ use tower_lsp_server::ls_types::{CompletionItem, Range as LspRange};
 use tower_lsp_server::ls_types::{CompletionTextEdit, TextEdit};
 use url::Url;
 
+use crate::config::SwiftParseContext;
 use crate::formatter::SwiftFormatter;
 use crate::lockfile::SwiftLockParser;
 use crate::registry::SwiftRegistry;
 #[cfg(test)]
 #[cfg(feature = "lsp-responses")]
 use crate::types::SwiftPackage;
+use deps_core::parser::DependencySource;
+use deps_core::registry::CapResult;
 
 #[cfg(feature = "lsp-responses")]
 mod lsp;
@@ -65,15 +68,33 @@ pub struct SwiftEcosystem {
     registry: Arc<SwiftRegistry>,
     formatter: SwiftFormatter,
     lockfile_provider: Arc<SwiftLockParser>,
+    context: SwiftParseContext,
 }
 
 impl SwiftEcosystem {
-    /// Creates a new Swift ecosystem with the given HTTP cache.
+    /// Creates a new Swift ecosystem with the given HTTP cache and a hermetic
+    /// [`SwiftParseContext`] (no user-level `registries.json`, no credential).
+    ///
+    /// Production registration goes through [`Self::with_context`].
     pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
+        Self::with_context(
+            Arc::new(SwiftRegistry::new(cache)),
+            SwiftParseContext::default(),
+        )
+    }
+
+    /// Creates a Swift ecosystem around `registry`, resolving `id:` dependencies through `ctx`.
+    ///
+    /// `deps_engine::setup::register_ecosystems` shares one workspace-registry policy handle
+    /// with the server through `ctx`, so a live `registries.workspace_registries` change reaches
+    /// the next parse.
+    #[must_use]
+    pub fn with_context(registry: Arc<SwiftRegistry>, ctx: SwiftParseContext) -> Self {
         Self {
-            registry: Arc::new(SwiftRegistry::new(cache)),
+            registry,
             formatter: SwiftFormatter,
             lockfile_provider: Arc::new(SwiftLockParser),
+            context: ctx,
         }
     }
 
@@ -135,13 +156,40 @@ impl Ecosystem for SwiftEcosystem {
         &["Package.resolved"]
     }
 
+    // TODO(#1759): watch only `.swiftpm/configuration/registries.json`; until then an unrelated
+    // `registries.json` costs an extra reparse.
+    fn watched_config_filenames(&self) -> &[&'static str] {
+        &["registries.json"]
+    }
+
+    fn routing_affecting_watched_configs(&self) -> &[&'static str] {
+        &["registries.json"]
+    }
+
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
         uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
-            let result = crate::parser::parse_package_swift(content, uri)?;
+            let mut result =
+                crate::parser::parse_package_swift_with_context(content, uri, &self.context)?;
+            let refused: Vec<String> = result
+                .resolved_registries
+                .iter()
+                .filter(|registry| {
+                    self.registry.register_alternate((*registry).clone())
+                        == CapResult::RefusedAtCapacity
+                })
+                .map(|registry| registry.url.as_str().to_string())
+                .collect();
+            for dependency in &mut result.dependencies {
+                if let DependencySource::AlternateRegistry { index, .. } = &dependency.source
+                    && refused.contains(index)
+                {
+                    dependency.source = DependencySource::CustomRegistry { url: index.clone() };
+                }
+            }
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
         })
     }
@@ -312,6 +360,148 @@ mod tests {
             fallback_edit_outcome(content, "2.1.0", &["2.2.0", "2.1.0", "1.0.0"]).await,
             deps_core::lsp_helpers::FallbackEditVerdict::Writable
         );
+    }
+
+    #[test]
+    fn test_registries_json_is_watched_and_routing_affecting() {
+        let ecosystem = SwiftEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        assert!(
+            ecosystem
+                .watched_config_filenames()
+                .contains(&"registries.json")
+        );
+        assert!(
+            ecosystem
+                .routing_affecting_watched_configs()
+                .contains(&"registries.json")
+        );
+    }
+
+    #[test]
+    fn test_formatter_resolves_alternate_but_not_custom_registries() {
+        use deps_core::lsp_helpers::SourcePolicy;
+        use deps_core::parser::DependencySource;
+
+        let alternate = DependencySource::AlternateRegistry {
+            index: "https://swift.acme.dev".into(),
+            mirrors_crates_io: false,
+        };
+        let custom = DependencySource::CustomRegistry { url: "acme".into() };
+        assert!(SwiftFormatter.can_resolve_source(&alternate));
+        assert!(!SwiftFormatter.can_resolve_source(&custom));
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_name_completion_never_rewrites_an_alternate_registry_id_literal() {
+        assert!(!is_url_source(
+            &deps_core::parser::DependencySource::AlternateRegistry {
+                index: "https://swift.acme.dev".into(),
+                mirrors_crates_io: false,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_registry_refused_at_the_client_cap_leaves_the_dependency_unresolved() {
+        use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".swiftpm/configuration/registries.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            r#"{"registries": {"acme": {"url": "https://over-cap.example/api"}}, "version": 1}"#,
+        )
+        .unwrap();
+
+        let registry = Arc::new(SwiftRegistry::new(Arc::new(deps_core::HttpCache::new())));
+        let context = SwiftParseContext::new(
+            Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)),
+            Arc::default(),
+            crate::config::UserConfigPath::NoUserTier,
+            None,
+        );
+        let ecosystem = SwiftEcosystem::with_context(Arc::clone(&registry), context);
+        let uri = Url::from_file_path(dir.path().join("Package.swift")).unwrap();
+        let manifest = r#".package(id: "Acme.Net", from: "1.0.0")"#;
+
+        for i in 0..deps_core::registry::MAX_ALTERNATE_REGISTRIES {
+            let url = crate::config::SwiftRegistryUrl::for_test(
+                &format!("https://filler-{i}.example"),
+                crate::config::RegistryTrust::WorkspaceDeclared,
+            );
+            assert_eq!(
+                registry
+                    .register_alternate(crate::config::ResolvedSwiftRegistry { url, auth: None }),
+                CapResult::Inserted
+            );
+        }
+
+        let parsed = ecosystem.parse_manifest(manifest, &uri).await.unwrap();
+        assert_eq!(
+            parsed.dependencies()[0].source(),
+            DependencySource::CustomRegistry {
+                url: "https://over-cap.example/api".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_manifest_registers_the_registry_and_resolves_the_id_dependency() {
+        use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+
+        let mut server = mockito::Server::new_async().await;
+        let listing = server
+            .mock("GET", "/acme/net")
+            .with_status(200)
+            .with_body(r#"{"releases": {"1.0.0": {"url": "u"}, "1.4.0": {"url": "u"}}}"#)
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".swiftpm/configuration/registries.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                r#"{{"registries": {{"acme": {{"url": "{}"}}}}, "version": 1}}"#,
+                server.url()
+            ),
+        )
+        .unwrap();
+
+        let registry = Arc::new(SwiftRegistry::new(Arc::new(deps_core::HttpCache::new())));
+        let context = SwiftParseContext::new(
+            Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)),
+            Arc::default(),
+            crate::config::UserConfigPath::NoUserTier,
+            None,
+        );
+        let ecosystem = SwiftEcosystem::with_context(Arc::clone(&registry), context);
+        let uri = Url::from_file_path(dir.path().join("Package.swift")).unwrap();
+
+        let parsed = ecosystem
+            .parse_manifest(r#".package(id: "Acme.Net", from: "1.0.0")"#, &uri)
+            .await
+            .unwrap();
+        let dependency = &parsed.dependencies()[0];
+        let source = dependency.source();
+        assert!(matches!(
+            source,
+            deps_core::parser::DependencySource::AlternateRegistry { .. }
+        ));
+
+        let versions = deps_core::Registry::get_versions_from(
+            registry.as_ref(),
+            dependency.name(),
+            &source,
+            deps_core::FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(versions.len(), 2);
+        listing.assert_async().await;
     }
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id,
@@ -726,6 +916,9 @@ mod tests {
                 dependencies: vec![dep],
                 uri,
                 dependency_truncation: None,
+                resolved_registries: Vec::new(),
+                blocked_registries: Vec::new(),
+                rejected_registries: Vec::new(),
             };
             let cache = Arc::new(deps_core::HttpCache::new());
             let eco = SwiftEcosystem::new(cache);
@@ -831,6 +1024,9 @@ mod tests {
                 dependencies: vec![],
                 uri,
                 dependency_truncation: None,
+                resolved_registries: Vec::new(),
+                blocked_registries: Vec::new(),
+                rejected_registries: Vec::new(),
             };
             let cache = Arc::new(deps_core::HttpCache::new());
             let eco = SwiftEcosystem::new(cache);
@@ -882,6 +1078,9 @@ mod tests {
                 dependencies: vec![dep],
                 uri,
                 dependency_truncation: None,
+                resolved_registries: Vec::new(),
+                blocked_registries: Vec::new(),
+                rejected_registries: Vec::new(),
             };
             let content = "let x = \"https://github.com/apple/swift-nio\"\n2.0.0";
             let cache = Arc::new(deps_core::HttpCache::new());

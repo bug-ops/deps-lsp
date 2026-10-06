@@ -32,6 +32,81 @@ pub enum ListCoverage {
     Truncated,
 }
 
+impl ListCoverage {
+    /// Classifies a single-response list from its raw `Link` header (RFC 8288): [`Self::Truncated`]
+    /// iff some link-value carries a `rel` token equal to `next` (case-insensitive, quoted or
+    /// unquoted, possibly among several space-separated tokens), [`Self::Complete`] otherwise.
+    ///
+    /// The link target is never read or dereferenced; only the relation types are inspected.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::pagination::ListCoverage;
+    ///
+    /// let next = Some("<https://r.example/p?page=2>; rel=\"next\"");
+    /// assert_eq!(ListCoverage::from_link_header(next), ListCoverage::Truncated);
+    /// let canonical = Some("<https://r.example/p>; rel=\"canonical\"");
+    /// assert_eq!(ListCoverage::from_link_header(canonical), ListCoverage::Complete);
+    /// assert_eq!(ListCoverage::from_link_header(None), ListCoverage::Complete);
+    /// ```
+    #[must_use]
+    pub fn from_link_header(link: Option<&str>) -> Self {
+        if link.is_some_and(has_next_relation) {
+            Self::Truncated
+        } else {
+            Self::Complete
+        }
+    }
+}
+
+/// Whether any link-value in `header` has a `rel` parameter containing the `next` token.
+fn has_next_relation(header: &str) -> bool {
+    split_outside_quotes(header, ',').any(|link_value| {
+        let mut parts = split_outside_quotes(link_value, ';');
+        let _target = parts.next();
+        parts.any(|param| {
+            let Some((name, value)) = param.split_once('=') else {
+                return false;
+            };
+            name.trim().eq_ignore_ascii_case("rel")
+                && value
+                    .trim()
+                    .trim_matches('"')
+                    .split_ascii_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("next"))
+        })
+    })
+}
+
+/// Splits `input` on `separator`, ignoring separators inside double quotes (honouring `\"`
+/// quoted-pairs) or a `<...>` target.
+fn split_outside_quotes(input: &str, separator: char) -> impl Iterator<Item = &str> {
+    let mut in_quotes = false;
+    let mut in_target = false;
+    let mut start = 0;
+    let mut pieces = Vec::new();
+    let mut escaped = false;
+    for (idx, ch) in input.char_indices() {
+        if std::mem::take(&mut escaped) {
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => escaped = true,
+            '"' if !in_target => in_quotes = !in_quotes,
+            '<' if !in_quotes => in_target = true,
+            '>' if !in_quotes => in_target = false,
+            c if c == separator && !in_quotes && !in_target => {
+                pieces.extend(input.get(start..idx));
+                start = idx + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    pieces.extend(input.get(start..));
+    pieces.into_iter()
+}
+
 /// Items collected by [`paginate_pages`] together with how completely they cover the list.
 ///
 /// # Examples
@@ -220,6 +295,44 @@ mod tests {
     use super::*;
     #[cfg(feature = "test-util")]
     use crate::test_util::capture_tracing_output_async;
+
+    #[test]
+    fn from_link_header_grammar() {
+        let truncated = [
+            r#"<https://r/p?page=2>; rel="next""#,
+            "<https://r/p?page=2>; rel=next",
+            r#"<https://r/p?page=2>; rel="Next""#,
+            r#"<https://r/p?page=2>; REL="NEXT""#,
+            r#"<https://r/p?page=2>; rel="last next""#,
+            r#"<https://r/p>; rel="latest-version", <https://r/p?page=2>; rel="next""#,
+            r#"<https://r/p?a=1,2>; title="x, y"; rel="next""#,
+            r#"<https://r/p>; title="a\", <https://r/q>; rel=\"x"; rel="next""#,
+            r#"<https://r/p>; title="a \" b"; rel="next""#,
+        ];
+        for header in truncated {
+            assert_eq!(
+                ListCoverage::from_link_header(Some(header)),
+                ListCoverage::Truncated,
+                "{header}"
+            );
+        }
+        let complete = [
+            r#"<https://r/p>; rel="latest-version""#,
+            r#"<https://r/p>; rel="canonical""#,
+            r#"<https://r/next>; rel="nextish""#,
+            r#"<https://r/p>; title="x \"; rel=next\" y""#,
+            r#"<https://r/p?rel=next>; title="rel=next""#,
+            "",
+        ];
+        for header in complete {
+            assert_eq!(
+                ListCoverage::from_link_header(Some(header)),
+                ListCoverage::Complete,
+                "{header}"
+            );
+        }
+        assert_eq!(ListCoverage::from_link_header(None), ListCoverage::Complete);
+    }
 
     #[test]
     fn test_page_has_more_full_page_continues() {

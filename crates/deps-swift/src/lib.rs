@@ -11,18 +11,25 @@
 //! - Hover tooltips with package metadata
 //! - Code actions to update versions
 //! - Diagnostics for unknown packages
+//! - SE-0292 package registries for `.package(id:)` dependencies, configured through
+//!   `registries.json` ([`config`])
 //!
 //! Uses regex-based parsing (no Swift toolchain required) and GitHub API
 //! for package discovery. Compatible with WASM (Zed extension) targets.
 
+mod auth;
+pub mod config;
 pub mod ecosystem;
 pub mod formatter;
 pub mod lockfile;
 mod package_location;
+mod package_registry;
 pub mod parser;
 pub mod registry;
 pub mod types;
 
+pub use auth::{SwiftEnvCredential, SwiftRegistryAuth};
+pub use config::SwiftParseContext;
 pub use ecosystem::SwiftEcosystem;
 pub use formatter::SwiftFormatter;
 pub use lockfile::SwiftLockParser;
@@ -32,7 +39,7 @@ pub use lockfile::SwiftLockParser;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use lockfile::fuzz_parse_package_resolved;
-pub use parser::{SwiftParseResult, parse_package_swift};
+pub use parser::{SwiftParseResult, parse_package_swift, parse_package_swift_with_context};
 pub use registry::SwiftRegistry;
 pub use types::{SwiftDependency, SwiftPackage, SwiftVersion};
 

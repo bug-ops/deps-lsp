@@ -213,6 +213,35 @@ impl std::fmt::Display for ApiToken {
     }
 }
 
+/// Formats `username`/`password` into a pre-formatted `Basic base64(username:password)`
+/// `Authorization` header value.
+///
+/// Every intermediate (the raw `user:pass` string and its reversible base64 encoding) is held
+/// in [`Zeroizing`] from the point of construction, so no un-zeroized plaintext copy outlives
+/// the call. Shared by every ecosystem that builds a `Basic` header (NuGet, Swift), so the
+/// encoding cannot diverge between them.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::secret::basic_auth_header;
+///
+/// let header = basic_auth_header("user", "pass");
+/// assert_eq!(header.expose_secret(), "Basic dXNlcjpwYXNz");
+/// assert_eq!(format!("{header:?}"), "Redacted(***)");
+/// ```
+#[must_use]
+pub fn basic_auth_header(username: &str, password: &str) -> Redacted {
+    use base64::Engine;
+
+    let mut user_pass = Zeroizing::new(String::with_capacity(username.len() + 1 + password.len()));
+    user_pass.push_str(username);
+    user_pass.push(':');
+    user_pass.push_str(password);
+    let encoded = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&*user_pass));
+    Redacted::new(format!("Basic {}", *encoded))
+}
+
 /// Reads `var` from the environment, treating an unset or empty value as absent.
 ///
 /// Returns a [`zeroize::Zeroizing`] wrapper so the raw token text is wiped from memory once
@@ -305,6 +334,14 @@ mod tests {
         assert_eq!(format!("{token:?}"), "ApiToken(***)");
         assert_eq!(format!("{token}"), "***");
         assert_eq!(token.expose_secret(), "hunter2");
+    }
+
+    #[test]
+    fn basic_auth_header_encodes_user_and_password() {
+        assert_eq!(
+            super::basic_auth_header("user", "pass").expose_secret(),
+            "Basic dXNlcjpwYXNz"
+        );
     }
 
     #[test]

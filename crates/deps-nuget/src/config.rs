@@ -45,7 +45,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use base64::Engine;
 use deps_core::config_trust::{self, EnvVarSyntax};
 use deps_core::net_policy::{
     BlockedHostReason, HostClass, IndexUrlError, RedactedUrl, RegistryAccessPolicy,
@@ -288,16 +287,7 @@ impl NuGetAuth {
     /// reversible, not encryption) is held in [`Zeroizing`] from the point of construction,
     /// not just the final header value, so no un-zeroized plaintext copy is left behind.
     pub(crate) fn new(username: &str, password: &str) -> Self {
-        let mut user_pass =
-            Zeroizing::new(String::with_capacity(username.len() + 1 + password.len()));
-        user_pass.push_str(username);
-        user_pass.push(':');
-        user_pass.push_str(password);
-        let encoded = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&*user_pass));
-        Self(deps_core::secret::Redacted::new(format!(
-            "Basic {}",
-            *encoded
-        )))
+        Self(deps_core::secret::basic_auth_header(username, password))
     }
 
     /// The pre-formatted header value. Never logged, printed, or otherwise surfaced — callers
@@ -4728,6 +4718,16 @@ mod tests {
             expand_credential(&credential),
             Err(NuGetFeedUrlError::HasCredentials)
         );
+    }
+
+    /// The header bytes stay identical after the move to `deps_core::secret::basic_auth_header`.
+    #[test]
+    fn test_nuget_auth_header_is_the_known_basic_vector() {
+        assert_eq!(
+            NuGetAuth::new("user", "pass").header_value(),
+            "Basic dXNlcjpwYXNz"
+        );
+        assert_eq!(NuGetAuth::new("", "").header_value(), "Basic Og==");
     }
 
     /// SC-002/NFR-001: `Debug`/`Display` on the credential-holding types never leak the
