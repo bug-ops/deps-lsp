@@ -173,7 +173,9 @@ without a version and matches their affected ranges locally against the pinned v
   count; for an exact tag pin (`@v4.8.0`) only the releases of the same major version do, and
   for a floating tag (`@v4`) only the releases that extend the written tag. Pre-release tags are
   never checked as siblings. A sibling-only advisory whose fix is not newer than the pinned
-  version is not offered as a fix.
+  version is not offered as a fix. The same sibling check applies to the latest version, to
+  upgrade candidates and to a recommended fix target; while a candidate's sibling tags are
+  unknown (tag index not loaded yet) it is shown as "not checked", never as clean.
 - An affected range that has only an `introduced` event and no `fixed` event is treated as open-ended
   unless the advisory's `database_specific.last_known_affected_version_range` gives a parsable
   upper bound (`< X` or `<= X`); versions above that bound are not reported as affected, whether

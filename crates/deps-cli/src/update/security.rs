@@ -128,6 +128,21 @@ pub async fn plan_security_updates(
     // (vulnerabilities checking disabled, or offline) degrades to an empty map, which
     // `collect_fix_target_resolutions` already treats as "nothing to reuse, always live-check"
     // — never a silently-suppressed fix.
+    let vuln_key_by_range = deps_core::osv::vulnerability_keys(
+        analysis.parse_result.as_ref(),
+        &analysis.resolved_versions,
+        Some(&analysis.resolved_version_candidates),
+        formatter,
+        ecosystem_id,
+    );
+
+    let candidate_tags = deps_engine::classify::osv::candidate_tag_sources(
+        analysis.parse_result.as_ref(),
+        &vuln_key_by_range,
+        formatter,
+        ecosystem_id,
+    );
+
     static EMPTY_LATEST_STATUS: std::sync::LazyLock<deps_core::osv::LatestStatusMap> =
         std::sync::LazyLock::new(deps_core::osv::LatestStatusMap::new);
     let latest_status = analysis
@@ -140,6 +155,7 @@ pub async fn plan_security_updates(
             &vulnerable_keys,
             &osv_name_by_key,
             latest_status,
+            &candidate_tags,
             formatter,
         );
 
@@ -156,14 +172,6 @@ pub async fn plan_security_updates(
             .await;
         deps_engine::classify::osv::apply_live_fix_target_statuses(&mut vulnerabilities, statuses);
     }
-
-    let vuln_key_by_range = deps_core::osv::vulnerability_keys(
-        analysis.parse_result.as_ref(),
-        &analysis.resolved_versions,
-        Some(&analysis.resolved_version_candidates),
-        formatter,
-        ecosystem_id,
-    );
 
     let mut items = Vec::new();
     for dep in analysis.parse_result.dependencies() {

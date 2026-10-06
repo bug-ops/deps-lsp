@@ -17,6 +17,7 @@ use crate::{
     TyposquatSignal, VersionReq,
 };
 
+mod candidate_tags;
 #[cfg(feature = "lsp-responses")]
 mod code_actions;
 #[cfg(feature = "lsp-responses")]
@@ -45,6 +46,9 @@ pub(crate) mod test_support_lsp;
 /// type.
 #[cfg(feature = "lsp-responses")]
 pub use crate::edit::dedup_overlapping_edits;
+pub use candidate_tags::{
+    CandidateSiblings, CandidateSiblingsUnknown, CandidateTagSource, TaggedVersions,
+};
 #[cfg(feature = "lsp-responses")]
 pub use code_actions::generate_code_actions;
 #[cfg(feature = "lsp-responses")]
@@ -55,7 +59,7 @@ pub use code_lenses::{
 pub use diagnostics::{
     BoundedVersionReq, DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities,
     LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE, MAX_DIAGNOSTIC_VALUE_CHARS, MAX_REQUIREMENT_LEN,
-    TYPOSQUAT_DIAGNOSTIC_CODE, TyposquatFetchOutcome, UNSATISFIABLE_DIAGNOSTIC_CODE,
+    TYPOSQUAT_DIAGNOSTIC_CODE, TyposquatFetchOutcome, UNSATISFIABLE_DIAGNOSTIC_CODE, advisory_text,
     compile_requirement_unless, fetch_gossip_findings_batch, fetch_typosquat_signals,
     force_refresh_gossip_findings, generate_diagnostics_from_cache, redact_name_for_diagnostic,
     redact_requirement_for_diagnostic, requirement_is_unsatisfiable, requirement_len_exceeds_cap,
@@ -83,9 +87,10 @@ pub use formatter::{
 };
 pub use git_ref::{
     CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, PartialTagPolicy, PinResolution, ResolvedPin,
-    ShaPinLookup, SiblingTags, TagIndex, TagPosition, byte_span_to_range, extends_tag, is_full_sha,
-    is_null_tag, is_partial_semver_shaped, is_plain_null, is_tag_shaped, locate_value_span,
-    marker_byte_offset, match_v_prefix_style, short_sha, tag_has_precedence, tag_pin_is_up_to_date,
+    ShaPinLookup, SiblingScope, SiblingTags, TagIndex, TagPosition, byte_span_to_range,
+    extends_tag, is_full_sha, is_null_tag, is_partial_semver_shaped, is_plain_null, is_tag_shaped,
+    locate_value_span, marker_byte_offset, match_v_prefix_style, short_sha, tag_has_precedence,
+    tag_pin_is_up_to_date,
 };
 #[cfg(feature = "lsp-responses")]
 pub use git_ref::{

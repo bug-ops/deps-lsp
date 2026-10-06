@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-github-actions**: `PinStyle::Sha` carries `sha: CommitSha` and `comment: Option<ShaComment>`; `GithubActionsDependency` loses `version_literal` and `closing_delimiters`; `sha_pin_raw_sha` removed (#1751)
 - **deps-gitlab-ci**: `PinStyle::Sha` carries a `ShaPinTail` (#1764)
 - **deps-core**: `ShaPinLookup::into_status` replaced by `status()`; `ShaPinLookup::Indexed` gains `position: TagPosition`; `ClosingDelimiters` moves to `lsp_helpers` (re-exported by deps-github-actions) (#1764)
+- **deps-core**: `Ecosystem::watched_config_filenames`/`routing_affecting_watched_configs` replaced by `watched_configs() -> &[WatchedConfig]`; `EcosystemRegistry::for_watched_config` takes a `&Path` and returns `(ecosystem, effect)` pairs; watched configs match by path suffix and no longer accept `*` wildcards (#1775)
+- **deps-engine**: `build_latest_check_targets`, `build_candidate_check_targets` and `collect_fix_target_resolutions` take a `candidate_tags` parameter; `ScanTarget::with_siblings` is generic over the sealed `TaggedVersions`; new `SkipReason::SiblingTagsUnknown` and `RequirementResolution::candidate_tag_source` hook (deps-core) (#1775)
+- **deps-cli**: `CheckFinding.advisory_severity` replaced by `advisory: Option<AdvisoryFacts>`; a SARIF advisory rule has no `fullDescription` when the scan did not fetch the advisory (#1775)
 - **deps-core**: `TagIndex::pin_resolution` and `ShaPinLookup::resolve` take the pin's comment tag; `PinResolution`, `ShaPinLookup` and `CommentMismatch` gain a comment-contradicted variant; `ShaPinComment::new` takes the tag range (#1770)
 - **deps-gitlab-ci**: `PinStyle::Sha` carries the pinned `CommitSha`; `sha_pin_replacement_for` takes a `CommentSlot`; `GitlabCiDependency` gains `comment_slot` (#1770)
 - **deps-cli**: `Category::ShaCommentMismatch` added for `--fail-on sha-comment-mismatch` (#1770)
@@ -34,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-github-actions**: `Ecosystem::tag_index_refreshes` and `GithubActionsRegistry::subscribe_tag_refreshes` publish tag-index refresh events (#1764)
 
 ### Changed
+- **deps-core, deps-lsp, deps-cli**: one `osv_checks_enabled` gate for every OSV call site instead of repeated `vulnerabilities_enabled && !offline` conditions (#1775)
 - **deps-github-actions, deps-gitlab-ci**: a tag pin ahead of the latest release is reported up to date instead of offering a downgrade (#1751)
 - **deps-cli**: `update --security-only` Unfixable rows (`Yanked`, `UnsupportedRequirementShape`, `OversizedRequirement`) now report their `advisory_ids` (#1747)
 - **deps-composer**: OR-branch bounds are computed once when `ComposerMatcher` is built, as in `deps-npm`; behavior unchanged (#1747)
@@ -41,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-github-actions, deps-gitlab-ci**: tag-to-SHA quickfixes write `<sha> # <tag>` through the shared rewrite rule, and a bare SHA when the ref is quoted, in a flow mapping or the tag is not version-shaped (#1770)
 
 ### Fixed
+- **deps-engine, deps-github-actions**: OSV latest, candidate and fix-target checks cover the sibling release tags of the candidate commit and fail closed when they are unknown (#1775)
+- **deps-cli**: SARIF advisory rule description no longer carries a per-result sibling-tag note (#1775)
+- **deps-swift**: reparse only for the project `.swiftpm/configuration/registries.json`, not any file named `registries.json` (#1775)
 - **deps-github-actions**: pre-release tag pins (`@v2-beta`, `@v3.0.0-rc.1`) are reported outdated against a newer release (#1751)
 - **deps-core**: OSV, hover and diagnostics no longer take the version from a SHA pin's comment once the tag index shows the commit has no matching release tag (#1751)
 - **deps-gitlab-ci**: SHA pins read and rewrite the trailing `# vX` comment and report `sha-comment-mismatch` (#1764)

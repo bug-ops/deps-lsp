@@ -253,20 +253,46 @@ pub struct CheckFinding {
     /// is absent (every non-advisory finding, and the rare case where OSV's own `url` failed
     /// `Uri` parsing upstream).
     pub advisory_url: Option<String>,
-    /// The OSV-derived severity bucket for [`Self::code`], when it names an advisory this
-    /// manifest's OSV scan actually fetched (issue #1077 C2) — looked up by advisory id from
-    /// the same scan results `generate_diagnostics` consumed, not re-derived from
-    /// [`Self::severity`] (the three-bucket [`Severity`] `code` already collapsed into is too
-    /// coarse to recover a CVSS-style grade from). `None` for every non-advisory finding, and
-    /// for an advisory `code` this run's scan did not itself fetch (e.g. a stale `code` from a
-    /// formatter that does not source it from a live scan).
-    pub advisory_severity: Option<VulnSeverity>,
+    /// What this manifest's OSV scan fetched about the advisory [`Self::code`] names (issue
+    /// #1077 C2): looked up by advisory id from the same scan results `generate_diagnostics`
+    /// consumed, not re-derived from [`Self::severity`] (the three-bucket [`Severity`] `code`
+    /// already collapsed into is too coarse to recover a CVSS-style grade from). `None` for
+    /// every non-advisory finding, and for an advisory `code` this run's scan did not itself
+    /// fetch (e.g. a stale `code` from a formatter that does not source it from a live scan).
+    pub advisory: Option<AdvisoryFacts>,
     /// The diagnostic's severity.
     pub severity: Severity,
     /// The diagnostic's range within the manifest.
     pub range: Range,
     /// The diagnostic's human-readable message.
     pub message: String,
+}
+
+/// What one scanned advisory contributes to a [`CheckFinding`]: its severity bucket and its own
+/// sanitized one-line text.
+///
+/// The text is [`deps_core::lsp_helpers::advisory_text`], so unlike [`CheckFinding::message`] it
+/// never carries a per-dependency note such as a sibling-tag match and is safe as a rule-level
+/// description.
+///
+/// # Examples
+///
+/// ```
+/// use deps_cli::report::AdvisoryFacts;
+/// use deps_core::osv::VulnSeverity;
+///
+/// let facts = AdvisoryFacts {
+///     severity: VulnSeverity::High,
+///     text: "RUSTSEC-2024-0001: summary".to_string(),
+/// };
+/// assert_eq!(facts.severity, VulnSeverity::High);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvisoryFacts {
+    /// The OSV-derived severity bucket.
+    pub severity: VulnSeverity,
+    /// The advisory's own `id: summary` text.
+    pub text: String,
 }
 
 /// The full result of one `check` invocation.
@@ -298,7 +324,7 @@ impl CheckReport {
     ///         category: Category::Outdated,
     ///         code: None,
     ///         advisory_url: None,
-    ///         advisory_severity: None,
+    ///         advisory: None,
     ///         severity: Severity::Hint,
     ///         range: Range::default(),
     ///         message: "Newer version available: 1.1".to_string(),
@@ -485,8 +511,7 @@ pub async fn check_manifest(
         .await;
 
     let dep_index = DependencyIndex::build(analysis.parse_result.as_ref());
-    // TODO(#1726): mark advisories matched only through a sibling release tag in the report.
-    let advisory_severities = advisory_severity_index(analysis.vulnerabilities.as_ref());
+    let advisory_facts = advisory_index(analysis.vulnerabilities.as_ref());
     // Same per-occurrence key `vulnerabilities` was built under, so a shared advisory id
     // across two dependencies can never resolve to the wrong one's severity (issue #1077 review #4).
     let vuln_keys = deps_core::osv::vulnerability_keys(
@@ -505,7 +530,7 @@ pub async fn check_manifest(
                 &dep_index,
                 formatter,
                 diagnostic,
-                &advisory_severities,
+                &advisory_facts,
                 &vuln_keys,
                 &analysis.cached_versions,
             )
@@ -563,9 +588,8 @@ impl<'a> DependencyIndex<'a> {
 
 /// Indexes every advisory this manifest's OSV scan fetched, keyed by (the [`VulnerabilityMap`]
 /// key identifying the specific dependency occurrence, advisory id) rather than by advisory id
-/// alone (issue #1077 review #4), so [`to_finding`] can attach a
-/// [`CheckFinding::advisory_severity`] without re-deriving a grade from the coarser
-/// [`Severity`] a `Diagnostic` carries.
+/// alone (issue #1077 review #4), so [`to_finding`] can attach a [`CheckFinding::advisory`]
+/// without re-deriving a grade from the coarser [`Severity`] a `Diagnostic` carries.
 ///
 /// A bare `HashMap<String, VulnSeverity>` keyed only by advisory id would let one dependency's
 /// severity silently overwrite another's (unspecified `HashMap` iteration order) whenever two
@@ -576,11 +600,10 @@ impl<'a> DependencyIndex<'a> {
 /// with how the scan actually mapped occurrences to results.
 ///
 /// `None` `vulnerabilities` (scan disabled, or offline) yields an empty index, same as a
-/// (key, id) pair this index has no entry for — both resolve to
-/// `CheckFinding::advisory_severity: None`.
-fn advisory_severity_index(
+/// (key, id) pair this index has no entry for — both resolve to `CheckFinding::advisory: None`.
+fn advisory_index(
     vulnerabilities: Option<&VulnerabilityMap>,
-) -> HashMap<(deps_core::osv::VulnKey, String), VulnSeverity> {
+) -> HashMap<(deps_core::osv::VulnKey, String), AdvisoryFacts> {
     let mut index = HashMap::new();
     let Some(vulnerabilities) = vulnerabilities else {
         return index;
@@ -590,7 +613,10 @@ fn advisory_severity_index(
             for advisory in dv.advisories.items() {
                 index.insert(
                     (dependency_key.clone(), advisory.id.clone()),
-                    advisory.severity,
+                    AdvisoryFacts {
+                        severity: advisory.severity,
+                        text: deps_core::lsp_helpers::advisory_text(advisory),
+                    },
                 );
             }
         }
@@ -600,9 +626,8 @@ fn advisory_severity_index(
 
 /// Converts one `generate_diagnostics` [`Diagnostic`] into a [`CheckFinding`], classifying
 /// its [`Category`] (see [`classify`]) and, when its range matches a manifest occurrence
-/// (from [`DependencyIndex`]), its `dependency_name`/`requirement`. `advisory_severities` and
-/// `vuln_keys` together resolve [`CheckFinding::advisory_severity`] — see
-/// [`advisory_severity_index`].
+/// (from [`DependencyIndex`]), its `dependency_name`/`requirement`. `advisory_facts` and
+/// `vuln_keys` together resolve [`CheckFinding::advisory`] — see [`advisory_index`].
 #[allow(
     clippy::too_many_arguments,
     reason = "internal (non-pub) call-site-controlled classification/attribution inputs; \
@@ -615,7 +640,7 @@ fn to_finding(
     dep_index: &DependencyIndex<'_>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     diagnostic: Diagnostic,
-    advisory_severities: &HashMap<(deps_core::osv::VulnKey, String), VulnSeverity>,
+    advisory_facts: &HashMap<(deps_core::osv::VulnKey, String), AdvisoryFacts>,
     vuln_keys: &VulnKeys,
     cached_versions: &HashMap<deps_core::PackageName, deps_core::lsp_helpers::PackageVersions>,
 ) -> CheckFinding {
@@ -626,16 +651,15 @@ fn to_finding(
         .code_description
         .as_ref()
         .map(|code_description| code_description.href.as_str().to_string());
-    let advisory_severity = code.as_deref().zip(dep).and_then(|(code, dep)| {
+    let facts = code.as_deref().zip(dep).and_then(|(code, dep)| {
         // Deliberately narrower than resolve_scan_outcome: None on synthetic ranges, no further fallback.
         if dep.name_range_is_synthetic() {
             return None;
         }
         let dependency_key = deps_core::osv::vuln_key_for(dep, Some(vuln_keys), formatter);
-        advisory_severities
-            .get(&(dependency_key, code.to_string()))
-            .copied()
+        advisory_facts.get(&(dependency_key, code.to_string()))
     });
+    let advisory = facts.cloned();
     // Spec 074 FR-005: attribute an `Outdated` finding to an active GOSSIP cooldown when it
     // is the sole reason a newer version was excluded from being "latest" — matched by the
     // occurrence's own (pre-redaction) `PackageName`, never `CheckFinding::dependency_name`
@@ -663,7 +687,7 @@ fn to_finding(
         category,
         code,
         advisory_url,
-        advisory_severity,
+        advisory,
         severity: diagnostic.severity.unwrap_or(Severity::Warning),
         range: diagnostic.range,
         message,
@@ -749,7 +773,7 @@ mod tests {
             category,
             code: None,
             advisory_url: None,
-            advisory_severity: None,
+            advisory: None,
             severity: Severity::Warning,
             range: Range::default(),
             message: "test".to_string(),
@@ -1433,7 +1457,10 @@ mod tests {
                 deps_core::test_util::vuln_key("dep-0"),
                 "RUSTSEC-2024-0001".to_string(),
             ),
-            VulnSeverity::Critical,
+            AdvisoryFacts {
+                severity: VulnSeverity::Critical,
+                text: "RUSTSEC-2024-0001: advisory summary".to_string(),
+            },
         );
 
         let finding = to_finding(
@@ -1446,7 +1473,13 @@ mod tests {
             &vuln_keys,
             &HashMap::new(),
         );
-        assert_eq!(finding.advisory_severity, Some(VulnSeverity::Critical));
+        assert_eq!(
+            finding.advisory,
+            Some(AdvisoryFacts {
+                severity: VulnSeverity::Critical,
+                text: "RUSTSEC-2024-0001: advisory summary".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -1472,7 +1505,7 @@ mod tests {
             &vuln_keys,
             &HashMap::new(),
         );
-        assert!(finding.advisory_severity.is_none());
+        assert!(finding.advisory.is_none());
     }
 
     /// Regression test for issue #1077 review #4: no matching dependency occurrence at all
@@ -1489,7 +1522,10 @@ mod tests {
                 deps_core::test_util::vuln_key("dep-0"),
                 "RUSTSEC-2024-0001".to_string(),
             ),
-            VulnSeverity::Critical,
+            AdvisoryFacts {
+                severity: VulnSeverity::Critical,
+                text: "RUSTSEC-2024-0001: advisory summary".to_string(),
+            },
         );
 
         let finding = to_finding(
@@ -1502,11 +1538,11 @@ mod tests {
             &VulnKeys::default(),
             &HashMap::new(),
         );
-        assert!(finding.advisory_severity.is_none());
+        assert!(finding.advisory.is_none());
     }
 
     #[test]
-    fn test_advisory_severity_index_collects_from_vulnerable_outcomes() {
+    fn test_advisory_index_collects_from_vulnerable_outcomes() {
         use deps_core::osv::{Advisory, Capped, DependencyVulnerabilities};
         use std::sync::Arc;
 
@@ -1523,13 +1559,15 @@ mod tests {
             ScanOutcome::Vulnerable(dv),
         );
 
-        let index = advisory_severity_index(Some(&map));
+        let index = advisory_index(Some(&map));
         assert_eq!(
-            index.get(&(
-                deps_core::test_util::vuln_key("serde"),
-                "RUSTSEC-2024-0001".to_string()
-            )),
-            Some(&VulnSeverity::High)
+            index
+                .get(&(
+                    deps_core::test_util::vuln_key("serde"),
+                    "RUSTSEC-2024-0001".to_string()
+                ))
+                .map(|facts| facts.severity),
+            Some(VulnSeverity::High)
         );
     }
 
@@ -1537,7 +1575,7 @@ mod tests {
     /// records legitimately share one advisory id must not let one silently overwrite the
     /// other's severity bucket.
     #[test]
-    fn test_advisory_severity_index_does_not_collide_across_dependencies_sharing_an_advisory_id() {
+    fn test_advisory_index_does_not_collide_across_dependencies_sharing_an_advisory_id() {
         use deps_core::osv::{Advisory, Capped, DependencyVulnerabilities};
         use std::sync::Arc;
 
@@ -1567,26 +1605,30 @@ mod tests {
             ))),
         );
 
-        let index = advisory_severity_index(Some(&map));
+        let index = advisory_index(Some(&map));
         assert_eq!(
-            index.get(&(
-                deps_core::test_util::vuln_key("package-a"),
-                "GHSA-shared-id".to_string()
-            )),
-            Some(&VulnSeverity::Critical)
+            index
+                .get(&(
+                    deps_core::test_util::vuln_key("package-a"),
+                    "GHSA-shared-id".to_string()
+                ))
+                .map(|facts| facts.severity),
+            Some(VulnSeverity::Critical)
         );
         assert_eq!(
-            index.get(&(
-                deps_core::test_util::vuln_key("package-b"),
-                "GHSA-shared-id".to_string()
-            )),
-            Some(&VulnSeverity::Low)
+            index
+                .get(&(
+                    deps_core::test_util::vuln_key("package-b"),
+                    "GHSA-shared-id".to_string()
+                ))
+                .map(|facts| facts.severity),
+            Some(VulnSeverity::Low)
         );
     }
 
     #[test]
-    fn test_advisory_severity_index_empty_without_vulnerabilities() {
-        assert!(advisory_severity_index(None).is_empty());
+    fn test_advisory_index_empty_without_vulnerabilities() {
+        assert!(advisory_index(None).is_empty());
     }
 
     /// Spec 075 SC-007/FR-006: `ManifestAnalysis::version_data()` finally wires live GOSSIP

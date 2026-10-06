@@ -160,7 +160,7 @@ mod tests {
             category,
             code: None,
             advisory_url: None,
-            advisory_severity: None,
+            advisory: None,
             severity: Severity::Warning,
             range: Range::default(),
             message: "test".to_string(),

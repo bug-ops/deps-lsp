@@ -2,11 +2,12 @@
 
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, CommentCheck, CommentSlot, CommitSha, DiagnosticMessages, DiagnosticPolicy,
-    OsvNaming, PackageNaming, PackageRendering, PartialTagPolicy, PinResolution,
-    RequirementResolution, RequirementStatus, ShaPinComment, ShaPinLookup, ShaPinTail,
-    SourcePolicy, TagIndex, match_v_prefix_style, requirement_contains_template_placeholder,
-    sha_pin_rewrite, tag_pin_is_up_to_date, warn_rejected_value,
+    BoundedVersionReq, CandidateTagSource, CommentCheck, CommentSlot, CommitSha,
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    PartialTagPolicy, PinResolution, RequirementResolution, RequirementStatus, ShaPinComment,
+    ShaPinLookup, ShaPinTail, SourcePolicy, TagIndex, match_v_prefix_style,
+    requirement_contains_template_placeholder, sha_pin_rewrite, tag_pin_is_up_to_date,
+    warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName};
@@ -453,6 +454,27 @@ impl RequirementResolution for GitlabCiFormatter {
     fn resolved_pin_version_depends_on_registry_fetch(&self) -> bool {
         true
     }
+
+    /// Same rule as GitHub Actions' override: a SHA pin names its whole commit, any other pin
+    /// keeps the same-major rule. GitLab CI maps to no OSV ecosystem today, so this is not
+    /// consulted yet; stating it keeps the default `NotTagBased` from silently failing open once
+    /// GitLab CI gains OSV coverage.
+    fn candidate_tag_source(&self, dep: &dyn Dependency) -> CandidateTagSource {
+        let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
+            return CandidateTagSource::NotTagBased;
+        };
+        let Some(index) = self
+            .tag_index
+            .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()))
+        else {
+            return CandidateTagSource::NotYetIndexed;
+        };
+        if matches!(gl_dep.pin, Some(PinStyle::Sha { .. })) {
+            CandidateTagSource::commit_pin(Arc::clone(&index))
+        } else {
+            CandidateTagSource::tag_pin(Arc::clone(&index))
+        }
+    }
 }
 
 /// Whether `text` contains an unresolved GitLab CI variable/interpolation placeholder:
@@ -571,7 +593,7 @@ mod tests {
     use super::*;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
-    use deps_core::lsp_helpers::ResolvedPin;
+    use deps_core::lsp_helpers::{ResolvedPin, SiblingScope};
     use deps_core::position::{Position, Range};
 
     fn formatter() -> GitlabCiFormatter {
@@ -1211,6 +1233,36 @@ mod tests {
         );
         d.version_req = Some(sha.into());
         d
+    }
+
+    #[test]
+    fn test_candidate_tag_source_follows_index_presence_and_pin_style() {
+        let cold = formatter();
+        let d = sha_dep_1723(LATEST_SHA_1723);
+        assert!(matches!(
+            cold.candidate_tag_source(&d),
+            CandidateTagSource::NotYetIndexed
+        ));
+
+        let warm = fmt_with_index_1723(d.kind.endpoint(), &[]);
+        assert!(matches!(
+            warm.candidate_tag_source(&d),
+            CandidateTagSource::Indexed {
+                scope: SiblingScope::WholeCommit,
+                ..
+            }
+        ));
+        let tag_dep = GitlabCiDependency {
+            pin: Some(PinStyle::Tag),
+            ..sha_dep_1723(LATEST_SHA_1723)
+        };
+        assert!(matches!(
+            warm.candidate_tag_source(&tag_dep),
+            CandidateTagSource::Indexed {
+                scope: SiblingScope::SameMajor,
+                ..
+            }
+        ));
     }
 
     fn status_1723(fmt: &GitlabCiFormatter, d: &GitlabCiDependency) -> RequirementStatus {

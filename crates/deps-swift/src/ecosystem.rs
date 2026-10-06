@@ -3,7 +3,8 @@
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, is_safe_registry_url,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, WatchedConfig,
+    WatchedConfigEffect, is_safe_registry_url,
     lsp_helpers::{EcosystemFormatter, warn_rejected_value},
 };
 use std::any::Any;
@@ -139,6 +140,11 @@ impl SwiftEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for SwiftEcosystem {}
 
+const WATCHED_CONFIGS: [WatchedConfig; 1] = [WatchedConfig::new(
+    crate::config::PROJECT_REGISTRIES_SUFFIX,
+    WatchedConfigEffect::ChangesRouting,
+)];
+
 impl Ecosystem for SwiftEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::Swift
@@ -156,14 +162,8 @@ impl Ecosystem for SwiftEcosystem {
         &["Package.resolved"]
     }
 
-    // TODO(#1759): watch only `.swiftpm/configuration/registries.json`; until then an unrelated
-    // `registries.json` costs an extra reparse.
-    fn watched_config_filenames(&self) -> &[&'static str] {
-        &["registries.json"]
-    }
-
-    fn routing_affecting_watched_configs(&self) -> &[&'static str] {
-        &["registries.json"]
+    fn watched_configs(&self) -> &[WatchedConfig] {
+        &WATCHED_CONFIGS
     }
 
     fn parse_manifest<'a>(
@@ -363,18 +363,16 @@ mod tests {
     }
 
     #[test]
-    fn test_registries_json_is_watched_and_routing_affecting() {
+    fn test_project_registries_json_is_watched_and_routing_affecting() {
         let ecosystem = SwiftEcosystem::new(Arc::new(deps_core::HttpCache::new()));
-        assert!(
-            ecosystem
-                .watched_config_filenames()
-                .contains(&"registries.json")
-        );
-        assert!(
-            ecosystem
-                .routing_affecting_watched_configs()
-                .contains(&"registries.json")
-        );
+        let [config] = ecosystem.watched_configs() else {
+            panic!("swift watches exactly the project registries.json");
+        };
+        assert_eq!(config.effect(), WatchedConfigEffect::ChangesRouting);
+        assert!(config.matches(std::path::Path::new(
+            "/p/.swiftpm/configuration/registries.json"
+        )));
+        assert!(!config.matches(std::path::Path::new("/p/docs/registries.json")));
     }
 
     #[test]

@@ -8,7 +8,8 @@
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, WatchedConfig,
+    WatchedConfigEffect, lsp_helpers::EcosystemFormatter,
 };
 use std::any::Any;
 use std::sync::Arc;
@@ -163,6 +164,11 @@ impl DenoEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for DenoEcosystem {}
 
+const WATCHED_CONFIGS: [WatchedConfig; 1] = [WatchedConfig::new(
+    ".npmrc",
+    WatchedConfigEffect::ChangesRouting,
+)];
+
 impl Ecosystem for DenoEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::Deno
@@ -178,12 +184,8 @@ impl Ecosystem for DenoEcosystem {
 
     /// `.npmrc` drives `AlternateRegistry` vs `CustomRegistry` classification for
     /// `npm:`-scope imports (#1202/#1212/#1227), mirroring `NpmEcosystem`.
-    fn watched_config_filenames(&self) -> &[&'static str] {
-        &[".npmrc"]
-    }
-
-    fn routing_affecting_watched_configs(&self) -> &[&'static str] {
-        &[".npmrc"]
+    fn watched_configs(&self) -> &[WatchedConfig] {
+        &WATCHED_CONFIGS
     }
 
     fn parse_manifest<'a>(

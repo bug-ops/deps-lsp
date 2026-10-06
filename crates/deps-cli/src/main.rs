@@ -410,8 +410,7 @@ fn run_update_command(runtime: &tokio::runtime::Runtime, args: &UpdateArgs) -> E
     }
 
     // FR-015: hard-error rather than silently scanning zero dependencies and exiting 0.
-    if args.security_only && (policy.network.offline || !policy.diagnostics.vulnerabilities_enabled)
-    {
+    if args.security_only && !policy.osv_checks_enabled() {
         eprintln!(
             "deps-cli: error: --security-only requires network access and vulnerability scanning to be enabled (network.offline and diagnostics.vulnerabilities_enabled)"
         );

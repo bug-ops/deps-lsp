@@ -40,6 +40,9 @@ use crate::auth::{CredentialLookup, SwiftCredentialSource, SwiftRegistryAuth, bi
 use crate::package_location::RegistryScope;
 
 const REGISTRIES_FILE: &str = "registries.json";
+
+/// Project-tier `registries.json` location relative to the directory of `Package.swift`.
+pub(crate) const PROJECT_REGISTRIES_SUFFIX: &str = ".swiftpm/configuration/registries.json";
 const DEFAULT_KEY: &str = "[default]";
 const MAX_WARNED_KEYS: usize = 256;
 
@@ -864,9 +867,9 @@ impl SwiftParseContext {
         let project = deps_core::lockfile::resolve_manifest_file_path(manifest_uri)
             .and_then(|path| {
                 path.parent().map(|dir| {
-                    dir.join(".swiftpm")
-                        .join("configuration")
-                        .join(REGISTRIES_FILE)
+                    Path::new(PROJECT_REGISTRIES_SUFFIX)
+                        .components()
+                        .fold(dir.to_path_buf(), |acc, component| acc.join(component))
                 })
             })
             .map_or(TierFile::Absent, |path| self.cache.read(&path));

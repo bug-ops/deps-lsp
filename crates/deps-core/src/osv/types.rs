@@ -576,14 +576,15 @@ impl ScanTarget {
     /// Attaches the sibling release tags of `versions`, deriving each wire version via
     /// `naming.osv_version`.
     ///
-    /// Taking [`crate::lsp_helpers::InUseVersions`] (which only
-    /// [`crate::lsp_helpers::resolve_in_use_versions`] produces) keeps arbitrary tags from being
-    /// attached. Only [`crate::osv::OsvClient`]'s local-matching path evaluates siblings; a
-    /// server-side matched target carrying any is skipped fail-closed.
+    /// Taking a sealed [`crate::lsp_helpers::TaggedVersions`] (only
+    /// [`crate::lsp_helpers::InUseVersions`] and [`crate::lsp_helpers::CandidateSiblings`]
+    /// implement it) keeps arbitrary tags from being attached. The target's own `version` and
+    /// `display_version` are never touched. Only [`crate::osv::OsvClient`]'s local-matching path
+    /// evaluates siblings; a server-side matched target carrying any is skipped fail-closed.
     #[must_use]
     pub fn with_siblings(
         mut self,
-        versions: &crate::lsp_helpers::InUseVersions,
+        versions: &impl crate::lsp_helpers::TaggedVersions,
         naming: &dyn crate::lsp_helpers::OsvNaming,
     ) -> Self {
         self.siblings = versions
@@ -1475,6 +1476,9 @@ pub enum SkipReason {
     /// The ecosystem is matched locally and an advisory exists for the package, but its
     /// affected ranges could not be evaluated against the in-use version — possibly vulnerable.
     UnevaluableAdvisoryRange,
+    /// A candidate version's sibling release tags could not be established (cold or partial tag
+    /// index), so a clean answer for the candidate alone is not trustworthy. Phase B only.
+    SiblingTagsUnknown,
 }
 
 impl SkipReason {
@@ -1491,6 +1495,7 @@ impl SkipReason {
             Self::Truncated => "truncated",
             Self::UnmatchableVersion => "unmatchable-version",
             Self::UnevaluableAdvisoryRange => "unevaluable-advisory-range",
+            Self::SiblingTagsUnknown => "sibling-tags-unknown",
         }
     }
 
@@ -1555,6 +1560,9 @@ impl SkipReason {
             Self::UnevaluableAdvisoryRange => Some(
                 "an advisory exists for this package but its affected range could not be evaluated",
             ),
+            Self::SiblingTagsUnknown => {
+                Some("the release tags sharing this version's commit could not be determined")
+            }
         }
     }
 
@@ -1684,6 +1692,10 @@ mod skip_reason_unchecked_reason_tests {
                     "an advisory exists for this package but its affected range could not be evaluated",
                 ),
             ),
+            (
+                SkipReason::SiblingTagsUnknown,
+                Some("the release tags sharing this version's commit could not be determined"),
+            ),
         ];
         for (reason, expected) in cases {
             assert_eq!(
@@ -1692,6 +1704,14 @@ mod skip_reason_unchecked_reason_tests {
                 "unexpected text for {reason:?}"
             );
         }
+    }
+
+    /// #1727: unknown candidate sibling tags are transient and never storable as structural.
+    #[test]
+    fn sibling_tags_unknown_is_transient() {
+        let reason = SkipReason::SiblingTagsUnknown;
+        assert!(!reason.is_structural());
+        assert_eq!(reason.as_str(), "sibling-tags-unknown");
     }
 
     /// #1683: the unconfirmed-name skip is transient and never storable as structural.

@@ -1385,7 +1385,8 @@ const fn should_notify_in_diagnostics(reason: SkipReason) -> bool {
         SkipReason::NonRegistrySource
         | SkipReason::UnmappableName
         | SkipReason::UnmappableEcosystem
-        | SkipReason::UnmatchableVersion => false,
+        | SkipReason::UnmatchableVersion
+        | SkipReason::SiblingTagsUnknown => false,
     }
 }
 
@@ -3014,6 +3015,51 @@ fn push_deprecation_diagnostic(
     );
 }
 
+/// The sanitized, advisory-intrinsic one-line text of `advisory`: `id: summary`, with the
+/// `[MALWARE]`/`[INFORMATIONAL]` tag for those severities.
+///
+/// The base of every advisory diagnostic message; per-dependency notes (such as a sibling-tag
+/// match) are appended by the caller. Reports that describe the advisory itself (a SARIF rule
+/// description) use this text, never a diagnostic message.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::advisory_text;
+/// use deps_core::osv::{Advisory, VulnSeverity};
+///
+/// let advisory = Advisory::new(
+///     "RUSTSEC-2024-0001".to_string(),
+///     "2024-01-01T00:00:00Z".to_string(),
+///     VulnSeverity::High,
+/// )
+/// .unwrap();
+/// assert_eq!(advisory_text(&advisory), "RUSTSEC-2024-0001: (no summary provided)");
+/// ```
+#[must_use]
+pub fn advisory_text(advisory: &crate::osv::Advisory) -> String {
+    let advisory_id =
+        sanitize_advisory_text_for_diagnostic(advisory.id.as_str(), MAX_DIAGNOSTIC_PROSE_CHARS);
+    let summary = sanitize_advisory_text_for_diagnostic(
+        advisory
+            .summary
+            .as_deref()
+            .unwrap_or("(no summary provided)"),
+        MAX_DIAGNOSTIC_PROSE_CHARS,
+    );
+    match advisory.severity {
+        crate::osv::VulnSeverity::Malicious => format!("{advisory_id}: [MALWARE] {summary}"),
+        crate::osv::VulnSeverity::Informational => {
+            format!("{advisory_id}: [INFORMATIONAL] {summary}")
+        }
+        crate::osv::VulnSeverity::Critical
+        | crate::osv::VulnSeverity::High
+        | crate::osv::VulnSeverity::Medium
+        | crate::osv::VulnSeverity::Low
+        | crate::osv::VulnSeverity::Unknown => format!("{advisory_id}: {summary}"),
+    }
+}
+
 /// Pushes one [`Diagnostic`] per advisory (each with its own severity, code,
 /// and clickable `code_description`), capped at
 /// [`crate::osv::ADVISORY_DISPLAY_CAP`] plus a trailing "+N more advisories" entry.
@@ -3069,28 +3115,7 @@ fn push_vulnerability_diagnostics(
             .ok()
             .map(CodeDescription::new);
 
-        let advisory_id =
-            sanitize_advisory_text_for_diagnostic(advisory.id.as_str(), MAX_DIAGNOSTIC_PROSE_CHARS);
-        let summary = sanitize_advisory_text_for_diagnostic(
-            advisory
-                .summary
-                .as_deref()
-                .unwrap_or("(no summary provided)"),
-            MAX_DIAGNOSTIC_PROSE_CHARS,
-        );
-        let message = match advisory.severity {
-            crate::osv::VulnSeverity::Malicious => {
-                format!("{advisory_id}: [MALWARE] {summary}")
-            }
-            crate::osv::VulnSeverity::Informational => {
-                format!("{advisory_id}: [INFORMATIONAL] {summary}")
-            }
-            crate::osv::VulnSeverity::Critical
-            | crate::osv::VulnSeverity::High
-            | crate::osv::VulnSeverity::Medium
-            | crate::osv::VulnSeverity::Low
-            | crate::osv::VulnSeverity::Unknown => format!("{advisory_id}: {summary}"),
-        };
+        let message = advisory_text(advisory);
         let message = match dv.sibling_match(&advisory.id) {
             Some(tags) => format!(
                 "{message} ({} {})",
@@ -5556,6 +5581,7 @@ mod tests {
 
         assert!(skip_notice_present(SkipReason::UnevaluableAdvisoryRange));
         assert!(!skip_notice_present(SkipReason::UnmatchableVersion));
+        assert!(!skip_notice_present(SkipReason::SiblingTagsUnknown));
     }
 
     /// Issue #1392 (critic S2, M4): two dependencies skipped for the *same* reason must

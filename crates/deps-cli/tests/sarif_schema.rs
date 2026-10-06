@@ -9,7 +9,7 @@
 #![allow(clippy::expect_used)]
 
 use deps_cli::format::sarif::to_sarif;
-use deps_cli::report::{Category, CheckFinding, CheckReport};
+use deps_cli::report::{AdvisoryFacts, Category, CheckFinding, CheckReport};
 use deps_core::EcosystemId;
 use deps_core::diagnostic::Severity;
 use deps_core::osv::VulnSeverity;
@@ -66,7 +66,7 @@ fn finding(category: Category, severity: Severity) -> CheckFinding {
         category,
         code: None,
         advisory_url: None,
-        advisory_severity: None,
+        advisory: None,
         severity,
         range: Range::new(Position::new(4, 0), Position::new(4, 10)),
         message: "Newer version available: 1.1.0".to_string(),
@@ -114,7 +114,10 @@ fn test_advisory_coded_finding_produces_schema_valid_sarif() {
     vulnerable.code = Some("RUSTSEC-2020-0071".to_string());
     vulnerable.message = "RUSTSEC-2020-0071: Potential segfault in the time crate".to_string();
     vulnerable.advisory_url = Some("https://osv.dev/vulnerability/RUSTSEC-2020-0071".to_string());
-    vulnerable.advisory_severity = Some(VulnSeverity::High);
+    vulnerable.advisory = Some(AdvisoryFacts {
+        severity: VulnSeverity::High,
+        text: vulnerable.message.clone(),
+    });
     assert_valid_sarif(&CheckReport {
         findings: vec![vulnerable],
     });

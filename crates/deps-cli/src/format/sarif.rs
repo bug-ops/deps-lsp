@@ -24,10 +24,12 @@
 //!   back to [`deps_core::osv::validated_osv_url`] (the same validated-construction path
 //!   `deps-core`'s own OSV client uses for [`deps_core::osv::Advisory::url`]) only when that is
 //!   unavailable;
-//! - `fullDescription`, built from the finding's own message, which already embeds the
-//!   advisory's OSV-provided summary (`push_vulnerability_diagnostics`);
+//! - `fullDescription`, built from the [`AdvisoryFacts::text`] of [`CheckFinding::advisory`] —
+//!   the advisory's own OSV-provided summary, never a finding's message, which may carry a
+//!   per-dependency note (a sibling-tag match) that is wrong as rule-level text; absent when the
+//!   scan did not fetch the advisory;
 //! - `properties["security-severity"]`, from `security_severity_score`, when
-//!   [`CheckFinding::advisory_severity`] names a graded bucket.
+//!   [`CheckFinding::advisory`] names a graded bucket.
 //!
 //! A category-only rule gets none of the three: it has no natural per-rule URL, no
 //! single-advisory description, and no per-advisory severity to report.
@@ -45,7 +47,7 @@
 //! uploads for the same commit — see that function's doc for the category/run-id split GitHub
 //! expects it to follow.
 
-use crate::report::{Category, CheckFinding, CheckReport};
+use crate::report::{AdvisoryFacts, Category, CheckFinding, CheckReport};
 use deps_core::diagnostic::Severity;
 use deps_core::osv::{VulnSeverity, is_valid_osv_id, validated_osv_url};
 use deps_core::position::Range;
@@ -160,9 +162,8 @@ struct RuleMeta<'a> {
     /// See [`is_advisory_finding`] — carried from the finding that first produced this rule id,
     /// not re-derived from the id string in [`build_rule_descriptor`].
     is_advisory: bool,
-    message: &'a str,
+    advisory: Option<&'a AdvisoryFacts>,
     advisory_url: Option<String>,
-    advisory_severity: Option<VulnSeverity>,
 }
 
 /// Collects one [`RuleMeta`] per distinct rule id across `findings` (reusing each finding's
@@ -185,12 +186,18 @@ fn collect_rule_meta<'a>(
     for (finding, context) in findings.iter().zip(contexts) {
         rules
             .entry(context.rule_id.clone())
+            .and_modify(|meta: &mut RuleMeta<'_>| {
+                // A later finding fills in advisory facts the first one lacked (a synthetic
+                // range or a key miss), so the rule never loses its description to ordering.
+                if meta.advisory.is_none() {
+                    meta.advisory = finding.advisory.as_ref();
+                }
+            })
             .or_insert_with(|| RuleMeta {
                 category: finding.category,
                 is_advisory: is_advisory_finding(finding),
-                message: finding.message.as_str(),
+                advisory: finding.advisory.as_ref(),
                 advisory_url: finding.advisory_url.clone(),
-                advisory_severity: finding.advisory_severity,
             });
     }
     rules
@@ -212,16 +219,19 @@ fn build_rule_descriptor(id: &str, meta: &RuleMeta<'_>) -> ReportingDescriptor {
 
     let (help_uri, full_description) = if is_advisory {
         let help_uri = meta.advisory_url.clone().or_else(|| validated_osv_url(id));
-        let full_description = MultiformatMessageString::builder()
-            .text(meta.message.to_string())
-            .build();
-        (help_uri, Some(full_description))
+        let full_description = meta.advisory.map(|facts| {
+            MultiformatMessageString::builder()
+                .text(facts.text.clone())
+                .build()
+        });
+        (help_uri, full_description)
     } else {
         (None, None)
     };
 
     let properties = if is_advisory {
-        meta.advisory_severity
+        meta.advisory
+            .map(|facts| facts.severity)
             .and_then(security_severity_score)
             .map(|score| {
                 let mut additional_properties = BTreeMap::new();
@@ -501,7 +511,7 @@ mod tests {
             category,
             code: None,
             advisory_url: None,
-            advisory_severity: None,
+            advisory: None,
             severity,
             range: Range::new(Position::new(4, 0), Position::new(4, 10)),
             message: "Newer version available: 1.1.0".to_string(),
@@ -512,6 +522,10 @@ mod tests {
         CheckFinding {
             code: Some(code.to_string()),
             message: message.to_string(),
+            advisory: Some(AdvisoryFacts {
+                severity: VulnSeverity::Unknown,
+                text: message.to_string(),
+            }),
             ..finding(category, Severity::Warning)
         }
     }
@@ -857,6 +871,64 @@ mod tests {
         assert_eq!(rule.name.as_deref(), Some("RUSTSEC-2020-0071"));
     }
 
+    /// #1726: a per-dependency note in the result message must not leak into the rule-level
+    /// description.
+    #[test]
+    fn test_rule_full_description_excludes_the_sibling_note_the_result_message_carries() {
+        let base = "GHSA-cxww-7g56-2vh6: summary";
+        let report = CheckReport {
+            findings: vec![CheckFinding {
+                message: format!("{base} (also affects sibling tag v4.9.0)"),
+                advisory: Some(AdvisoryFacts {
+                    severity: VulnSeverity::High,
+                    text: base.to_string(),
+                }),
+                ..finding_with_code(Category::Vulnerable, "GHSA-cxww-7g56-2vh6", base)
+            }],
+        };
+        let sarif = to_sarif(&report);
+        let run = &sarif.runs[0];
+        let rule = &run.tool.driver.rules.as_ref().unwrap()[0];
+        assert_eq!(rule.full_description.as_ref().unwrap().text, base);
+        let result = &run.results.as_ref().unwrap()[0];
+        assert!(
+            result
+                .message
+                .text
+                .as_deref()
+                .unwrap()
+                .contains("sibling tag")
+        );
+    }
+
+    /// The rule keeps its description when only a later finding carries the advisory facts.
+    #[test]
+    fn test_rule_full_description_comes_from_the_first_finding_that_has_one() {
+        let without = CheckFinding {
+            advisory: None,
+            ..finding_with_code(Category::Vulnerable, "GHSA-aaaa-bbbb-cccc", "first")
+        };
+        let with = finding_with_code(Category::Vulnerable, "GHSA-aaaa-bbbb-cccc", "second");
+        let sarif = to_sarif(&CheckReport {
+            findings: vec![without, with],
+        });
+        let rule = &sarif.runs[0].tool.driver.rules.as_ref().unwrap()[0];
+        assert_eq!(rule.full_description.as_ref().unwrap().text, "second");
+    }
+
+    #[test]
+    fn test_rule_without_advisory_text_has_no_full_description() {
+        let report = CheckReport {
+            findings: vec![CheckFinding {
+                advisory: None,
+                ..finding_with_code(Category::Vulnerable, "GHSA-aaaa-bbbb-cccc", "m")
+            }],
+        };
+        let sarif = to_sarif(&report);
+        let rule = &sarif.runs[0].tool.driver.rules.as_ref().unwrap()[0];
+        assert!(rule.full_description.is_none());
+    }
+
     #[test]
     fn test_build_rule_descriptor_category_only_rule_has_no_help_uri_or_full_description() {
         let report = CheckReport {
@@ -975,7 +1047,10 @@ mod tests {
     #[test]
     fn test_build_rule_descriptor_sets_security_severity_from_advisory_bucket() {
         let mut finding = finding_with_code(Category::Vulnerable, "RUSTSEC-2020-0071", "msg");
-        finding.advisory_severity = Some(VulnSeverity::Critical);
+        finding.advisory = Some(AdvisoryFacts {
+            severity: VulnSeverity::Critical,
+            text: "msg".to_string(),
+        });
         let report = CheckReport {
             findings: vec![finding],
         };
@@ -991,7 +1066,10 @@ mod tests {
     #[test]
     fn test_build_rule_descriptor_omits_security_severity_for_an_ungraded_bucket() {
         let mut finding = finding_with_code(Category::Vulnerable, "RUSTSEC-2020-0071", "msg");
-        finding.advisory_severity = Some(VulnSeverity::Unknown);
+        finding.advisory = Some(AdvisoryFacts {
+            severity: VulnSeverity::Unknown,
+            text: "msg".to_string(),
+        });
         let report = CheckReport {
             findings: vec![finding],
         };

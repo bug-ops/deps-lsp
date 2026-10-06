@@ -48,15 +48,14 @@ pub async fn handle_completion(
     );
 
     // Acquires the config RwLock before the DashMap shard guard, never the reverse
-    // (matches hover.rs/diagnostics.rs). `vulnerabilities_enabled`/`network` feed the OSV
-    // latest-verdict gate below (issue #1517 critique S1/S3) — same pair every other
+    // (matches hover.rs/diagnostics.rs). `osv_checks_enabled` feeds the OSV
+    // latest-verdict gate below (issue #1517 critique S1/S3) — the same gate every other
     // renderer reads before deciding whether `latest_status` applies at all.
-    let (freshness, vulnerabilities_enabled, network) = {
+    let (freshness, osv_checks_enabled) = {
         let config = config.read().await;
         (
             config.policy.freshness.to_freshness(),
-            config.policy.diagnostics.vulnerabilities_enabled,
-            config.policy.network.mode(),
+            config.policy.osv_checks_enabled(),
         )
     };
 
@@ -208,7 +207,7 @@ pub async fn handle_completion(
         &state,
         uri,
         position,
-        vulnerabilities_enabled && network.is_online(),
+        osv_checks_enabled,
         origin,
         &mut items,
     );
@@ -249,7 +248,7 @@ pub async fn handle_completion(
 /// functions every other renderer calls) closes both: an absent/stale entry resolves to
 /// [`deps_core::lsp_helpers::LatestVerdict::Unverified`] (fail closed), not "untouched".
 ///
-/// `vulnerabilities_enabled` (`policy.diagnostics.vulnerabilities_enabled && network.is_online()`,
+/// `osv_checks_enabled` (`policy.osv_checks_enabled()`,
 /// resolved by the caller) selects whether `Some(&doc.signals.latest_status)`/`Some(&doc.signals.
 /// candidate_status)` or `None` is passed to `latest_verdict`/`candidate_verdict` — mirrors
 /// `SignalsSnapshotBuilder::with_latest_status`'s same gate (issue #1517 design point 7):
@@ -283,7 +282,7 @@ fn apply_osv_latest_verdict_to_completions(
     state: &ServerState,
     uri: &Uri,
     position: Position,
-    vulnerabilities_enabled: bool,
+    osv_checks_enabled: bool,
     origin: CompletionOrigin,
     items: &mut [CompletionItem],
 ) {
@@ -298,7 +297,7 @@ fn apply_osv_latest_verdict_to_completions(
     // (untouched), never `Unverified`. Checking it this early, alongside `origin`, means a
     // later lookup miss can safely fail closed unconditionally, without needing to re-check
     // this flag at that point too.
-    if items.is_empty() || origin != CompletionOrigin::Version || !vulnerabilities_enabled {
+    if items.is_empty() || origin != CompletionOrigin::Version || !osv_checks_enabled {
         return;
     }
 
@@ -360,8 +359,8 @@ fn apply_osv_latest_verdict_to_completions(
                 doc.ecosystem,
             );
             let normalized_name = formatter.normalize_package_name(dep.name());
-            let latest_status = vulnerabilities_enabled.then_some(&doc.signals.latest_status);
-            let candidate_status = vulnerabilities_enabled.then_some(&doc.signals.candidate_status);
+            let latest_status = osv_checks_enabled.then_some(&doc.signals.latest_status);
+            let candidate_status = osv_checks_enabled.then_some(&doc.signals.candidate_status);
 
             // The item identified as "latest" is checked against `latest_status` (#1517, phase
             // B's single "latest" check); every other item against `candidate_status` (#1524,

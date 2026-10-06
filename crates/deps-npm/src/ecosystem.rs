@@ -8,7 +8,8 @@ use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
 use deps_core::hover::Hover;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, WatchedConfig,
+    WatchedConfigEffect,
     diagnostic::{Diagnostic, Severity},
     lsp_helpers::{DiagnosticSeverities, EcosystemFormatter},
 };
@@ -109,6 +110,14 @@ impl NpmEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for NpmEcosystem {}
 
+const WATCHED_CONFIGS: [WatchedConfig; 2] = [
+    WatchedConfig::new(
+        "pnpm-workspace.yaml",
+        WatchedConfigEffect::RewritesRequirements,
+    ),
+    WatchedConfig::new(".npmrc", WatchedConfigEffect::ChangesRouting),
+];
+
 impl Ecosystem for NpmEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::Npm
@@ -126,12 +135,8 @@ impl Ecosystem for NpmEcosystem {
         &["package-lock.json", "pnpm-lock.yaml"]
     }
 
-    fn watched_config_filenames(&self) -> &[&'static str] {
-        &["pnpm-workspace.yaml", ".npmrc"]
-    }
-
-    fn routing_affecting_watched_configs(&self) -> &[&'static str] {
-        &[".npmrc"]
+    fn watched_configs(&self) -> &[WatchedConfig] {
+        &WATCHED_CONFIGS
     }
 
     fn parse_manifest<'a>(
@@ -497,12 +502,23 @@ mod tests {
     }
 
     #[test]
-    fn test_ecosystem_watched_config_filenames() {
+    fn test_ecosystem_watched_configs() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
+        let configs: Vec<_> = ecosystem
+            .watched_configs()
+            .iter()
+            .map(|c| (c.path_suffix(), c.effect()))
+            .collect();
         assert_eq!(
-            ecosystem.watched_config_filenames(),
-            &["pnpm-workspace.yaml", ".npmrc"]
+            configs,
+            [
+                (
+                    "pnpm-workspace.yaml",
+                    WatchedConfigEffect::RewritesRequirements
+                ),
+                (".npmrc", WatchedConfigEffect::ChangesRouting),
+            ]
         );
     }
 

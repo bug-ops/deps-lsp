@@ -118,7 +118,57 @@ pub struct PolicyConfigDiff {
     pub gitlab_instance_host_changed: bool,
 }
 
+/// The single definition of the OSV gate: scanning enabled and the network reachable.
+///
+/// [`PolicyConfig::osv_checks_enabled`] is the entry point for code that holds a policy; this
+/// function exists for snapshot-based call sites that carry the two inputs separately (e.g.
+/// diagnostics generation, which must observe a caller-captured severities snapshot).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::NetworkMode;
+/// use deps_core::policy_config::osv_checks_active;
+///
+/// assert!(osv_checks_active(true, NetworkMode::Online));
+/// assert!(!osv_checks_active(true, NetworkMode::Offline));
+/// assert!(!osv_checks_active(false, NetworkMode::Online));
+/// ```
+#[must_use]
+pub const fn osv_checks_active(vulnerabilities_enabled: bool, network: crate::NetworkMode) -> bool {
+    vulnerabilities_enabled && network.is_online()
+}
+
 impl PolicyConfig {
+    /// Whether OSV vulnerability checks may run: scanning is enabled and the network is
+    /// reachable.
+    ///
+    /// Single source of the `vulnerabilities_enabled && !offline` gate that every OSV call
+    /// site must agree on; reading the two flags separately lets a site forget one of them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::policy_config::PolicyConfig;
+    ///
+    /// let mut policy = PolicyConfig::default();
+    /// assert!(policy.osv_checks_enabled());
+    ///
+    /// policy.network.offline = true;
+    /// assert!(!policy.osv_checks_enabled());
+    ///
+    /// policy.network.offline = false;
+    /// policy.diagnostics.vulnerabilities_enabled = false;
+    /// assert!(!policy.osv_checks_enabled());
+    /// ```
+    #[must_use]
+    pub fn osv_checks_enabled(&self) -> bool {
+        osv_checks_active(
+            self.diagnostics.vulnerabilities_enabled,
+            self.network.mode(),
+        )
+    }
+
     /// Reports which leaf fields differ between `old` and `new`.
     ///
     /// Exhaustively destructures both snapshots' sections — no `..` rest pattern at any
