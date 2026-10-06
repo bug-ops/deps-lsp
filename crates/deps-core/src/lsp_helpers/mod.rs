@@ -88,11 +88,11 @@ pub use formatter::{
     up_to_date_for_comparators_via_compiled_matcher, up_to_date_via_compiled_matcher,
 };
 pub use git_ref::{
-    CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, PartialTagPolicy, PinResolution, ResolvedPin,
-    ShaPinLookup, SiblingScope, SiblingTags, TagIndex, TagPosition, UnpublishedRef,
-    byte_span_to_range, extends_tag, is_full_sha, is_null_tag, is_partial_semver_shaped,
-    is_plain_null, is_tag_shaped, locate_value_span, marker_byte_offset, match_v_prefix_style,
-    short_sha, tag_has_precedence, tag_pin_is_up_to_date,
+    CommitRewrite, CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, PartialTagPolicy,
+    PinResolution, ResolvedPin, ShaPinLookup, SiblingScope, SiblingTags, TagIndex, TagPosition,
+    UnpublishedRef, byte_span_to_range, extends_tag, is_full_sha, is_null_tag,
+    is_partial_semver_shaped, is_plain_null, is_tag_shaped, locate_value_span, marker_byte_offset,
+    match_v_prefix_style, short_sha, tag_has_precedence, tag_pin_is_up_to_date,
 };
 #[cfg(feature = "lsp-responses")]
 pub use git_ref::{
@@ -117,8 +117,11 @@ pub use sha_comment::{
     comment_slot_after, position_past_sha, read_sha_pin_tail, ref_is_last_on_line,
     sha_comment_mismatch_diagnostic, sha_comment_mismatch_hover_line, sha_pin_rewrite,
 };
+#[cfg(feature = "lsp-responses")]
+pub use unknown_ref::build_unknown_ref_fix_action;
 pub use unknown_ref::{
-    UNKNOWN_REF_DIAGNOSTIC_CODE, unknown_ref_diagnostic, unknown_ref_diagnostic_for,
+    UNKNOWN_REF_DIAGNOSTIC_CODE, UnknownRefTarget, dependency_at_position, unknown_ref_diagnostic,
+    unknown_ref_diagnostic_for,
 };
 
 /// Maximum number of recent versions hover's "Recent versions" section renders.
@@ -2250,7 +2253,7 @@ pub enum LatestVerdict {
     /// determined, which is treated as blocking rather than silently passed through).
     Flagged {
         /// Advisory ids affecting the checked version, for display.
-        advisory_ids: Vec<String>,
+        advisory_ids: Vec<crate::osv::OsvId>,
         /// Whether the worst affecting advisory is a confirmed-malicious-package record
         /// ([`VulnSeverity::Malicious`]) — renderers use this to escalate wording/severity.
         malicious: bool,

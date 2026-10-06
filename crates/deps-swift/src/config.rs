@@ -675,12 +675,9 @@ impl SwiftRegistriesConfig {
             return Self::default();
         };
 
-        let user_tier = user.as_deref().map(UserTier::from_raw).unwrap_or_default();
+        let user_tier = user.as_deref().map_or_default(UserTier::from_raw);
         let mut default = user.as_ref().and_then(|raw| raw.default.clone());
-        let mut scoped = user
-            .as_ref()
-            .map(|raw| raw.scoped.clone())
-            .unwrap_or_default();
+        let mut scoped = user.as_ref().map_or_default(|raw| raw.scoped.clone());
         if let Some(project) = &project {
             if project.default.is_some() {
                 default.clone_from(&project.default);
@@ -867,8 +864,9 @@ impl SwiftParseContext {
         }
     }
 
-    /// Adds the opt-in macOS Keychain credential source, gated by `handle` and owning the one
-    /// process-wide store; clones of this context share that store and its memo.
+    /// Adds the opt-in macOS Keychain credential source, gated by `handle`. The store and its
+    /// memo are per handle, shared by every context built with the same handle and by clones;
+    /// interactive lookups are serialized process-wide, so at most one macOS prompt is open.
     ///
     /// The Keychain is read only on macOS, ahead of `~/.netrc` and behind the environment and
     /// `SWIFTPM_NETRC_DATA`.
@@ -899,8 +897,8 @@ impl SwiftParseContext {
     ) -> Self {
         match platform {
             UserConfigPlatform::MacOs => {
-                let store = KeychainStore::system(handle.resolved_sender());
-                self.with_keychain_store(handle, Arc::new(store))
+                let store = KeychainStore::system_for(&handle);
+                self.with_keychain_binding(handle, store)
             }
             UserConfigPlatform::Other => Self {
                 keychain: Some(KeychainWiring::Unsupported {
@@ -912,12 +910,21 @@ impl SwiftParseContext {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_keychain_store(
-        mut self,
+        self,
         handle: Arc<KeychainCredentialsHandle>,
         store: Arc<KeychainStore>,
     ) -> Self {
         handle.register_observer(Arc::downgrade(&store) as _);
+        self.with_keychain_binding(handle, store)
+    }
+
+    fn with_keychain_binding(
+        mut self,
+        handle: Arc<KeychainCredentialsHandle>,
+        store: Arc<KeychainStore>,
+    ) -> Self {
         self.keychain = Some(KeychainWiring::Supported(KeychainBinding::new(
             store, handle,
         )));

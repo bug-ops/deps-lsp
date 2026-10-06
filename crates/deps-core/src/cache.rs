@@ -1030,6 +1030,37 @@ impl ResponseValidators {
     }
 }
 
+/// Identifies the credential state a trusted-origin response was fetched under, so the cache can
+/// keep bodies of different states apart (see
+/// [`HttpCache::get_cached_trusted_origin_response`]).
+///
+/// A distinct type from the credential-header digests used for pinned requests: the two are
+/// both hashes, but only a partition is a statement about "which state", and mixing them up
+/// would silently share or split cache entries.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::cache::CredentialPartition;
+///
+/// assert_eq!(CredentialPartition::new(7), CredentialPartition::new(7));
+/// assert_ne!(CredentialPartition::new(7), CredentialPartition::new(8));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CredentialPartition(u64);
+
+impl CredentialPartition {
+    /// Wraps the caller's hash of its credential state.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Cached HTTP response with validation headers.
 ///
 /// Stores response body and cache validation headers (ETag, Last-Modified)
@@ -1360,6 +1391,15 @@ impl HttpCache {
     /// control character no URL string this module writes can start with.
     const PINNED_KEY_PREFIX: char = '\u{2}';
 
+    /// The prefix marking a [`CacheTier::Baseline`] key partitioned by a caller-supplied
+    /// `auth_id`, followed by that id as 16 fixed-width hex digits and then the URL. Distinct
+    /// from [`Self::WS_KEY_PREFIX`] and [`Self::PINNED_KEY_PREFIX`], so it can collide with
+    /// neither them nor a bare-URL key.
+    const BASELINE_AUTH_KEY_PREFIX: char = '\u{3}';
+
+    /// Byte length of [`Self::BASELINE_AUTH_KEY_PREFIX`] plus the 16-digit id field.
+    const BASELINE_AUTH_KEY_HEAD_LEN: usize = 1 + 16;
+
     /// Computes the cache-map key for `url` under `tier` — `Cow::Borrowed(url)` for
     /// [`CacheTier::Baseline`] (allocation-free, and identical to every entry this cache wrote
     /// before this policy-tier split existed), or a policy-digit-prefixed owned key for
@@ -1376,9 +1416,12 @@ impl HttpCache {
     /// recompute mid-request — a policy flip between two recomputations would read and write
     /// under different keys for what should be one atomic operation.
     ///
-    /// `auth_id` (FR-014) is folded in only for [`CacheTier::Pinned`] — a separate credential
+    /// `auth_id` (FR-014) is folded in for [`CacheTier::Pinned`] — a separate credential
     /// identity from `digest` (see that variant's docs), so a rotated or distinct credential
-    /// against the same origin never reads back a body fetched under a different one.
+    /// against the same origin never reads back a body fetched under a different one — and
+    /// for [`CacheTier::Baseline`] when `Some`, as [`Self::BASELINE_AUTH_KEY_PREFIX`] plus the
+    /// id, so a caller whose credential state varies per request gets one partition per state.
+    /// A `None` baseline key stays the bare URL.
     /// `authenticated` (the tier's own field) is folded in too, so an authenticated and an
     /// unauthenticated fetch against the same origin/`auth_id` can never share an entry either
     /// — relevant only in principle today (every current caller correlates `authenticated` and
@@ -1398,7 +1441,10 @@ impl HttpCache {
     /// same concatenated string.
     fn cache_key<'a>(&self, url: &'a str, tier: CacheTier, auth_id: Option<u64>) -> Cow<'a, str> {
         match tier {
-            CacheTier::Baseline => Cow::Borrowed(url),
+            CacheTier::Baseline => match auth_id {
+                None => Cow::Borrowed(url),
+                Some(id) => Cow::Owned(format!("{}{id:016x}{url}", Self::BASELINE_AUTH_KEY_PREFIX)),
+            },
             CacheTier::WorkspaceDeclared(snapshot) => {
                 Cow::Owned(format!("{}{}{url}", Self::WS_KEY_PREFIX, snapshot.to_u8()))
             }
@@ -1577,7 +1623,7 @@ impl HttpCache {
         trusted_origin: &str,
         extra_headers: &[RequestHeader<'_>],
     ) -> Result<Bytes> {
-        self.get_cached_trusted_origin_response(url, trusted_origin, extra_headers)
+        self.get_cached_trusted_origin_response(url, trusted_origin, None, extra_headers)
             .await
             .map(|response| response.body)
     }
@@ -1586,6 +1632,11 @@ impl HttpCache {
     /// [`CachedResponse`] (body plus `ETag`, `Last-Modified` and `Link`) instead of the body
     /// alone. For a caller that must inspect response headers, e.g. to detect a paginated list.
     ///
+    /// `partition` splits the cache by the caller's credential state: `None` shares the plain
+    /// per-URL entry, while `Some(partition)` reads and writes only entries stored under that
+    /// same partition, so a body fetched under one credential state is never served under
+    /// another.
+    ///
     /// # Errors
     ///
     /// Same as [`Self::get_cached_trusted_origin`].
@@ -1593,11 +1644,17 @@ impl HttpCache {
         &self,
         url: &str,
         trusted_origin: &str,
+        partition: Option<CredentialPartition>,
         extra_headers: &[RequestHeader<'_>],
     ) -> Result<CachedResponse> {
         let transport = self.transport_for_origin(trusted_origin);
-        self.get_cached_with_headers_via(url, extra_headers, &transport, None)
-            .await
+        self.get_cached_with_headers_via(
+            url,
+            extra_headers,
+            &transport,
+            partition.map(CredentialPartition::get),
+        )
+        .await
     }
 
     /// Like [`Self::get_cached_trusted_origin_with_headers`], but for an origin-pinned,
@@ -1801,8 +1858,8 @@ impl HttpCache {
             .retain(|(_, tier), _| !matches!(tier, CacheTier::Pinned { .. }));
     }
 
-    /// `auth_id` (FR-014) is meaningful only under [`CacheTier::Pinned`] — every other tier
-    /// ignores it (see [`Self::cache_key`]'s docs).
+    /// `auth_id` (FR-014) is meaningful only under [`CacheTier::Pinned`] and
+    /// [`CacheTier::Baseline`] — every other tier ignores it (see [`Self::cache_key`]'s docs).
     #[tracing::instrument(
         skip(self, extra_headers, transport, auth_id),
         fields(url = %RedactedUrl::new(url), cache = tracing::field::Empty)
@@ -2324,9 +2381,9 @@ impl HttpCache {
 
     /// Drops every baseline-tier entry whose URL starts with `url_prefix`, returning how many.
     ///
-    /// For a caller whose request credential or trust changed: the baseline tier keys by URL
-    /// alone, so a body fetched under the old credential would otherwise be revalidated and
-    /// served under the new one.
+    /// For a caller whose request credential or trust changed: drops bare-URL entries and
+    /// `auth_id`-partitioned ones alike, as memory hygiene for bodies fetched under a state that
+    /// no longer applies.
     ///
     /// # Examples
     ///
@@ -2336,7 +2393,14 @@ impl HttpCache {
     /// assert_eq!(HttpCache::new().evict_url_prefix("https://registry.example/api/"), 0);
     /// ```
     pub fn evict_url_prefix(&self, url_prefix: &str) -> usize {
-        self.evict_entries_where(|key| key.starts_with(url_prefix))
+        self.evict_entries_where(|key| {
+            let url = if key.starts_with(Self::BASELINE_AUTH_KEY_PREFIX) {
+                key.get(Self::BASELINE_AUTH_KEY_HEAD_LEN..)
+            } else {
+                Some(key)
+            };
+            url.is_some_and(|url| url.starts_with(url_prefix))
+        })
     }
 
     /// Removes every entry whose key satisfies `matches`, keeping [`Self::total_bytes`] in sync;
@@ -3499,7 +3563,7 @@ mod tests {
             .create_async()
             .await;
         let response = cache
-            .get_cached_trusted_origin_response(&url, &origin, &[])
+            .get_cached_trusted_origin_response(&url, &origin, None, &[])
             .await
             .unwrap();
         assert_eq!(response.link.as_deref(), Some(NEXT_LINK));
@@ -3512,7 +3576,7 @@ mod tests {
             .create_async()
             .await;
         let response = cache
-            .get_cached_trusted_origin_response(&url, &origin, &[])
+            .get_cached_trusted_origin_response(&url, &origin, None, &[])
             .await
             .unwrap();
         assert_eq!(response.body.as_ref(), b"page one");
@@ -3547,6 +3611,58 @@ mod tests {
         assert_eq!(cache.len(), 1);
     }
 
+    #[test]
+    fn test_baseline_auth_partition_keys_never_collide() {
+        let cache = HttpCache::new();
+        let url = "https://r.example/p";
+        let bare = cache.cache_key(url, CacheTier::Baseline, None);
+        let zero = cache.cache_key(url, CacheTier::Baseline, Some(0));
+        let one = cache.cache_key(url, CacheTier::Baseline, Some(1));
+        let pinned = cache.cache_key(
+            url,
+            CacheTier::Pinned {
+                digest: 0,
+                authenticated: false,
+            },
+            Some(0),
+        );
+        assert_eq!(bare, url);
+        let keys = [&bare, &zero, &one, &pinned];
+        for (i, left) in keys.iter().enumerate() {
+            for right in &keys[i + 1..] {
+                assert_ne!(left, right);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_auth_id_partitions_baseline_entries_and_eviction_reaches_them() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/api/data", server.url());
+        let origin = format!("{}/", server.url());
+        let _m = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_body("body")
+            .expect(3)
+            .create_async()
+            .await;
+        let cache = HttpCache::new();
+        for partition in [
+            None,
+            Some(CredentialPartition::new(1)),
+            Some(CredentialPartition::new(2)),
+        ] {
+            cache
+                .get_cached_trusted_origin_response(&url, &origin, partition, &[])
+                .await
+                .unwrap();
+        }
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.evict_url_prefix(&format!("{}/api/", server.url())), 3);
+        assert!(cache.is_empty());
+    }
+
     #[tokio::test]
     async fn test_unreadable_link_header_reads_as_a_next_relation() {
         let mut server = mockito::Server::new_async().await;
@@ -3562,7 +3678,7 @@ mod tests {
             .create_async()
             .await;
         let response = cache
-            .get_cached_trusted_origin_response(&url, &origin, &[])
+            .get_cached_trusted_origin_response(&url, &origin, None, &[])
             .await
             .unwrap();
         assert_eq!(

@@ -569,8 +569,7 @@ async fn parse_and_diff_manifest(
 
     let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> = parse_result
         .as_ref()
-        .map(|pr| dependency_version_map(pr.as_ref()))
-        .unwrap_or_default();
+        .map_or_default(|pr| dependency_version_map(pr.as_ref()));
     let new_selection_context = parse_result
         .as_deref()
         .map_or_else(deps_core::SelectionContext::none, |pr| {
@@ -840,8 +839,7 @@ pub(crate) async fn handle_document_change_guarded(
         RefetchPolicy::Diff => Vec::new(),
         RefetchPolicy::AllDependencies => parse_result
             .as_deref()
-            .map(|pr| dependency_version_map(pr).into_keys().collect())
-            .unwrap_or_default(),
+            .map_or_default(|pr| dependency_version_map(pr).into_keys().collect()),
     };
 
     if !commit_parsed_document(
@@ -1267,7 +1265,7 @@ async fn run_document_change_task(
     // persisted set self-corrects regardless of how many aborted edits happened in between.
     // The pre-fetch's result depends only on declared package *names* (see
     // `run_typosquat_prefetch`'s own doc), so a version-only edit can never change its
-    // outcome. Self-guards internally too (`ServerState::is_typosquat_enabled`/offline), so
+    // outcome. Self-guards internally too (`ServerState::typosquat_checks`), so
     // this remains a no-op spawn for the common (disabled) case, same as the open-path spawn.
     // Deliberately *not* joined before either of this function's diagnostics publishes below
     // (impl-critic N2) — see `spawn_typosquat_prefetch_and_republish`'s own doc for why.

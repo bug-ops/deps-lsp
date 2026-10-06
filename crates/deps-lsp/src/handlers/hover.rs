@@ -27,17 +27,16 @@ pub async fn handle_hover(
     }
 
     // Acquires the config RwLock before the DashMap shard guard, never the reverse (matches diagnostics.rs).
-    let (freshness, network, supply_chain_enabled, gossip_enabled, osv_checks) = {
+    let (freshness, network, supply_chain_enabled, gossip_checks, osv_checks) = {
         let config = config.read().await;
         (
             config.policy.freshness.to_freshness(),
             config.policy.network.mode(),
             config.policy.supply_chain.enabled,
-            config.policy.gossip.enabled,
+            config.policy.gossip_checks(),
             config.policy.osv_checks(),
         )
     };
-    let online = network.is_online();
 
     // Release the DashMap shard `Ref` before awaiting `generate_hover`'s registry fetch —
     // holding it across the await would block a concurrent `documents.get_mut` on the same
@@ -45,7 +44,7 @@ pub async fn handle_hover(
     // Issue #1456, spec 072: `gossip_visibility` is resolved to `Suppress` (rather than
     // simply omitting the dimension) so a disabled or offline transition stops rendering a
     // previously-populated `gossip_findings` map immediately, not merely stops refreshing it.
-    let gossip_visibility = if gossip_enabled && online {
+    let gossip_visibility = if gossip_checks.is_active() {
         PrefetchVisibility::Render
     } else {
         PrefetchVisibility::Suppress
@@ -82,7 +81,7 @@ pub async fn handle_hover(
     }
     // Issue #1456, spec 072 FR-009: a separate gate from `supply_chain_enabled` above —
     // see `VersionData::gossip_client`'s doc for why the two must not be conflated.
-    if gossip_enabled && online {
+    if gossip_checks.is_active() {
         versions = versions.with_gossip_client(&state.deps_dev);
     }
 

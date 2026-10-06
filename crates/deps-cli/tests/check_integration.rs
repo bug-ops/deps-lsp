@@ -11,7 +11,7 @@
 //! doc comment for exactly what is (and is not) proved without a request-counting test
 //! double (spec 062 review S6).
 //!
-//! // TODO(critic): FR-005 automated parity test vs deps-lsp handlers::diagnostics (T025)
+//! // TODO(#1803): FR-005 automated parity test vs deps-lsp handlers::diagnostics (T025)
 //!
 //! A live cross-tool parity check against `deps-lsp`'s own diagnostics path (FR-005/SC-001)
 //! is deferred to manual verification (`.claude/rules/continuous-improvement.md`) and a
@@ -760,7 +760,7 @@ mod tier3_license_prefetch_parity {
             result
                 .findings
                 .iter()
-                .any(|f| f.category == Category::License
+                .any(|f| f.category() == Category::License
                     && f.dependency_name.as_deref() == Some("http")),
             "expected a license-policy finding for 'http', got: {:?}",
             result.findings
@@ -786,7 +786,7 @@ mod tier3_license_prefetch_parity {
             .expect("check_manifest must not fail for a well-formed fixture");
 
         let has_license_finding = result.findings.iter().any(|f| {
-            f.category == Category::License
+            f.category() == Category::License
                 && f.dependency_name.as_deref() == Some("apple/swift-nio")
         });
         // #1283 S2: the license feed swallows *any* fetch error to "no license found", so a
@@ -833,7 +833,7 @@ mod tier3_license_prefetch_parity {
             result
                 .findings
                 .iter()
-                .any(|f| f.category == Category::License
+                .any(|f| f.category() == Category::License
                     && f.dependency_name.as_deref() == Some("com.squareup.okhttp3:okhttp")),
             "expected a license-policy finding for 'com.squareup.okhttp3:okhttp', got: {:?}",
             result.findings
@@ -865,7 +865,7 @@ mod tier3_license_prefetch_parity {
             result
                 .findings
                 .iter()
-                .any(|f| f.category == Category::License
+                .any(|f| f.category() == Category::License
                     && f.dependency_name.as_deref() == Some("jsr:@std/fs")),
             "expected a license-policy finding for 'jsr:@std/fs', got: {:?}",
             result.findings
@@ -927,7 +927,7 @@ mod tier3_wiring_regression {
             result
                 .findings
                 .iter()
-                .any(|f| f.category == Category::License
+                .any(|f| f.category() == Category::License
                     && f.dependency_name.as_deref() == Some("dep-0")),
             "check_manifest did not reach the tier-3 license prefetch wiring: {:?}",
             result.findings

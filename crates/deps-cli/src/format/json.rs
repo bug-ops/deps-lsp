@@ -189,7 +189,7 @@ pub fn to_document(report: &CheckReport) -> ReportDocument {
             manifest_path: finding.manifest_path.display().to_string(),
             dependency_name: finding.dependency_name.clone(),
             requirement: finding.requirement.clone(),
-            category: finding.category,
+            category: finding.category(),
             severity: SeverityToken::from(finding.severity),
             range: RangeDocument {
                 start: PositionDocument {
@@ -295,7 +295,7 @@ pub struct UpdateItemDocument {
     /// OSV advisory ids this item resolves — non-empty only in `--security-only` mode; for
     /// `unfixable` rows only when a fix is known (`Yanked`, `UnsupportedRequirementShape`,
     /// `OversizedRequirement`), empty for `NoVerifiedFix` and `FetchFailedOrAbsent`.
-    pub advisory_ids: Vec<String>,
+    pub advisory_ids: Vec<deps_core::osv::OsvId>,
     /// Spec 075 FR-013: this item's cooldown-fallback attribution, when one was consulted.
     /// Additive (NFR-005) — omitted entirely, not `null`, when the item has none.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -406,7 +406,7 @@ mod tests {
     use super::*;
     use crate::report::{Category, CheckFinding};
     use deps_core::EcosystemId;
-    use deps_core::diagnostic::Severity;
+    use deps_core::diagnostic::{DiagnosticKind, Severity};
     use deps_core::position::{Position, Range};
     use std::path::PathBuf;
 
@@ -416,8 +416,7 @@ mod tests {
             manifest_path: PathBuf::from("Cargo.toml"),
             dependency_name: Some("serde".to_string()),
             requirement: Some("1.0".to_string()),
-            category: Category::Outdated,
-            code: None,
+            kind: DiagnosticKind::Outdated,
             advisory_url: None,
             advisory: None,
             severity: Severity::Hint,
@@ -494,7 +493,7 @@ mod tests {
     #[test]
     fn test_summary_key_order_is_lexicographic_not_declaration_order() {
         let mut deprecated = finding();
-        deprecated.category = Category::Deprecated;
+        deprecated.kind = crate::report::kind_for(Category::Deprecated);
         let document = to_document(&CheckReport {
             findings: vec![finding(), deprecated],
         });
@@ -521,7 +520,7 @@ mod tests {
     #[test]
     fn test_summary_counts_sha_comment_mismatch_under_its_own_key() {
         let mut mismatch = finding();
-        mismatch.category = Category::ShaCommentMismatch;
+        mismatch.kind = crate::report::kind_for(Category::ShaCommentMismatch);
         let document = to_document(&CheckReport {
             findings: vec![mismatch],
         });
@@ -539,7 +538,7 @@ mod tests {
     #[test]
     fn test_summary_counts_unknown_ref_under_its_own_key() {
         let mut unknown = finding();
-        unknown.category = Category::UnknownRef;
+        unknown.kind = crate::report::kind_for(Category::UnknownRef);
         let document = to_document(&CheckReport {
             findings: vec![unknown],
         });
@@ -571,7 +570,7 @@ mod tests {
     #[test]
     fn test_to_document_snapshot() {
         let mut other = finding();
-        other.category = Category::Vulnerable;
+        other.kind = crate::report::kind_for(Category::Vulnerable);
         other.severity = Severity::Error;
         other.manifest_path = PathBuf::from("package.json");
         other.dependency_name = None;
@@ -591,7 +590,7 @@ mod tests {
                 "1.0.0",
             )),
             outcome,
-            advisory_ids: vec!["RUSTSEC-2024-0001".to_string()],
+            advisory_ids: vec![deps_core::test_util::osv_id("RUSTSEC-2024-0001")],
             ignore_rule_overridden: false,
             gossip_excluded_version: None,
             cooldown_fallback: None,
@@ -630,7 +629,10 @@ mod tests {
         assert_eq!(item.current, "1.0.0");
         assert_eq!(item.target.as_deref(), Some("1.2.0"));
         assert_eq!(item.outcome, OutcomeToken::Applied);
-        assert_eq!(item.advisory_ids, vec!["RUSTSEC-2024-0001".to_string()]);
+        assert_eq!(
+            item.advisory_ids,
+            vec![deps_core::test_util::osv_id("RUSTSEC-2024-0001")]
+        );
     }
 
     /// #1767: a sibling-tag attribution reaches the JSON item as `matched_tags` (and the

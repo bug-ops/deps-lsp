@@ -10,9 +10,8 @@
 //! was rejected.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
-use deps_core::policy_config::PolicyConfig;
+use deps_core::policy_config::{AtomicToggle, PolicyConfig, UserProfileSources};
 use deps_core::{EcosystemRegistry, HttpCache};
 
 /// Live-updatable settings [`register_ecosystems`] threads into every ecosystem that needs them.
@@ -28,7 +27,7 @@ pub struct EcosystemRuntime {
     /// `registries.nuget_user_profile_sources` (issue #561, FR-006) — whether a NuGet
     /// user-profile-tier `NuGet.Config` source with no repo-declared counterpart becomes a
     /// routing hop, not just a credential source. Default `false`.
-    pub nuget_user_profile_sources: Arc<AtomicBool>,
+    pub nuget_user_profile_sources: Arc<AtomicToggle<UserProfileSources>>,
     /// `registries.gitlab_instance_host` (issue #466, spec FR-005a/FR-011a) — the raw
     /// configured GitLab instance host string, or `None` when unset. A feature-agnostic
     /// `Arc<RwLock<Option<String>>>` (not a `deps-gitlab-ci` type) since this struct is
@@ -67,20 +66,20 @@ impl EcosystemRuntime {
     /// ```
     /// use deps_core::net_policy::RegistryAccessPolicy;
     /// use deps_engine::setup::EcosystemRuntime;
-    /// use std::sync::atomic::AtomicBool;
+    /// use deps_core::policy_config::{AtomicToggle, UserProfileSources};
     /// use std::sync::{Arc, RwLock};
     ///
     /// let runtime = EcosystemRuntime::new(
     ///     Arc::new(RegistryAccessPolicy::default()),
-    ///     Arc::new(AtomicBool::new(false)),
+    ///     Arc::new(AtomicToggle::new(UserProfileSources::Disabled)),
     ///     Arc::new(RwLock::new(None)),
     /// );
-    /// assert!(!runtime.nuget_user_profile_sources.load(std::sync::atomic::Ordering::Relaxed));
+    /// assert_eq!(runtime.nuget_user_profile_sources.get(), UserProfileSources::Disabled);
     /// ```
     #[must_use]
     pub fn new(
         policy: Arc<deps_core::net_policy::RegistryAccessPolicy>,
-        nuget_user_profile_sources: Arc<AtomicBool>,
+        nuget_user_profile_sources: Arc<AtomicToggle<UserProfileSources>>,
         gitlab_instance_host: Arc<std::sync::RwLock<Option<String>>>,
     ) -> Self {
         Self {
@@ -159,11 +158,11 @@ impl EcosystemRuntime {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::policy_config::PolicyConfig;
+    /// use deps_core::policy_config::{PolicyConfig, UserProfileSources};
     /// use deps_engine::setup::EcosystemRuntime;
     ///
     /// let runtime = EcosystemRuntime::from_policy(&PolicyConfig::default());
-    /// assert!(!runtime.nuget_user_profile_sources.load(std::sync::atomic::Ordering::Relaxed));
+    /// assert_eq!(runtime.nuget_user_profile_sources.get(), UserProfileSources::Disabled);
     /// ```
     #[must_use]
     pub fn from_policy(policy: &PolicyConfig) -> Self {
@@ -172,7 +171,7 @@ impl EcosystemRuntime {
             Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
                 resolved.workspace_registries,
             )),
-            Arc::new(AtomicBool::new(resolved.nuget_user_profile_sources)),
+            Arc::new(AtomicToggle::new(resolved.nuget_user_profile_sources)),
             Arc::new(std::sync::RwLock::new(resolved.gitlab_instance_host)),
         )
         .with_keychain_credentials(Arc::new(
@@ -706,26 +705,26 @@ mod tests {
     fn test_runtime() -> EcosystemRuntime {
         EcosystemRuntime::new(
             Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-            Arc::new(AtomicBool::new(false)),
+            Arc::default(),
             Arc::new(std::sync::RwLock::new(None)),
         )
     }
 
     /// The doctest on [`EcosystemRuntime::from_policy`] only exercises `PolicyConfig::default()`
-    /// (empty `gitlab_instance_host` -> `None`, `nuget_user_profile_sources` -> `false`). This
+    /// (empty `gitlab_instance_host` -> `None`, `nuget_user_profile_sources` -> `Disabled`). This
     /// covers its other branches: a non-empty `gitlab_instance_host`, `nuget_user_profile_sources
     /// = true`, and a non-default `workspace_registries` setting.
     #[test]
     fn test_from_policy_non_default_branches() {
         use deps_core::net_policy::WorkspaceRegistryAccess;
         use deps_core::policy_config::{
-            PolicyConfig, RegistriesConfig, WorkspaceRegistriesSetting,
+            PolicyConfig, RegistriesConfig, UserProfileSources, WorkspaceRegistriesSetting,
         };
 
         let policy = PolicyConfig {
             registries: RegistriesConfig::new()
                 .with_workspace_registries(WorkspaceRegistriesSetting::All)
-                .with_nuget_user_profile_sources(true)
+                .with_nuget_user_profile_sources(UserProfileSources::Enabled)
                 .with_gitlab_instance_host("gitlab.corp"),
             ..PolicyConfig::default()
         };
@@ -733,10 +732,9 @@ mod tests {
         let runtime = EcosystemRuntime::from_policy(&policy);
 
         assert_eq!(runtime.policy.get(), WorkspaceRegistryAccess::All);
-        assert!(
-            runtime
-                .nuget_user_profile_sources
-                .load(std::sync::atomic::Ordering::Relaxed)
+        assert_eq!(
+            runtime.nuget_user_profile_sources.get(),
+            UserProfileSources::Enabled
         );
         assert_eq!(
             runtime

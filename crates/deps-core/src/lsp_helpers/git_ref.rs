@@ -1070,6 +1070,39 @@ impl TagIndex {
         })
     }
 
+    /// Whether a SHA pin can be rewritten to the release `version` using this index (#1779).
+    ///
+    /// [`CommitRewrite::NoReleaseTag`] only when the index is populated and
+    /// [`ListCoverage::Complete`] yet names no release `version`: absence is then proven.
+    /// An empty or truncated index cannot prove it, so that is
+    /// [`CommitRewrite::IndexUnavailable`] (as is a missing index, which the caller reports
+    /// itself).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{CommitRewrite, CommitSha, TagIndex};
+    /// use deps_core::pagination::ListCoverage;
+    ///
+    /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let index = TagIndex::from_tags([("v4.1.3", &sha)]);
+    /// assert_eq!(index.commit_rewrite_to("4.1.3"), CommitRewrite::Resolved);
+    /// assert_eq!(index.commit_rewrite_to("9.9.9"), CommitRewrite::NoReleaseTag);
+    /// let truncated = TagIndex::from_tags([("v4.1.3", &sha)]).with_coverage(ListCoverage::Truncated);
+    /// assert_eq!(truncated.commit_rewrite_to("9.9.9"), CommitRewrite::IndexUnavailable);
+    /// assert_eq!(TagIndex::default().commit_rewrite_to("9.9.9"), CommitRewrite::IndexUnavailable);
+    /// ```
+    #[must_use]
+    pub fn commit_rewrite_to(&self, version: &str) -> CommitRewrite {
+        if self.release_commit(version).is_some() {
+            CommitRewrite::Resolved
+        } else if self.coverage == ListCoverage::Complete && !self.is_empty() {
+            CommitRewrite::NoReleaseTag
+        } else {
+            CommitRewrite::IndexUnavailable
+        }
+    }
+
     /// Whether the index holds no tag in either direction.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -1103,15 +1136,46 @@ impl TagIndex {
     }
 }
 
+/// Whether a dependency's commit pin can be rewritten to a given release version, as returned
+/// by [`super::RequirementResolution::commit_rewrite_for`] (#1779).
+///
+/// Exhaustive so each consumer decides what every state means: only
+/// [`Self::NoReleaseTag`] is proof that the fix version has no release tag.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::CommitRewrite;
+///
+/// assert_ne!(CommitRewrite::NoReleaseTag, CommitRewrite::IndexUnavailable);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitRewrite {
+    /// The dependency is not a commit pin: its rewrite does not depend on a tag index.
+    NotACommitPin,
+    /// A release tag exists, so the pin can be rewritten to its commit.
+    Resolved,
+    /// A complete tag list proves no release tag names this version.
+    NoReleaseTag,
+    /// The tag list is missing, cold, empty or truncated, so the pin's rewrite cannot be
+    /// confirmed.
+    IndexUnavailable,
+}
+
 /// What a repository's [`TagIndex`] proves about a pinned commit, as returned by
 /// [`TagIndex::pin_resolution`].
 ///
 /// The variants are exhaustive so a consumer must decide what each means for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinResolution {
-    /// No out-of-band evidence (cold cache, empty index, or a pin the index cannot speak
-    /// about): manifest text may stand in for the pin's version.
+    /// No out-of-band evidence (empty index, or a pin the index cannot speak about): manifest
+    /// text may stand in for the pin's version.
     Unresolved,
+    /// The repository's tag list has not been fetched yet (cold cache) or its fetch failed, so
+    /// the index cannot speak about a tag pin at all. Manifest text may stand in for the pin's
+    /// version, but its sibling tags are unknown: a clean OSV answer is not trustworthy until
+    /// a later fetch populates the index.
+    NotYetIndexed,
     /// A [`ListCoverage::Truncated`] index does not list the pinned commit or exact tag, so a
     /// tag beyond the fetched list may name it. Manifest text may stand in for the pin's
     /// version, but nothing derived from that text is authoritative: a clean OSV answer is
@@ -1321,7 +1385,9 @@ impl ShaPinLookup {
                 position: TagPosition::of(pin.version().as_str(), latest.as_str()),
             },
             PinResolution::Untagged => Self::NotIndexed,
-            PinResolution::Unresolved | PinResolution::Unpublished => Self::Unverifiable,
+            PinResolution::Unresolved
+            | PinResolution::Unpublished
+            | PinResolution::NotYetIndexed => Self::Unverifiable,
             PinResolution::Unlisted => Self::Unlisted,
             PinResolution::CommentContradicted => Self::CommentContradicted,
         }

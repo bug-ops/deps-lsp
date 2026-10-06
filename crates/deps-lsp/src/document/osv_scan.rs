@@ -47,7 +47,7 @@ enum PlannedQuery {
         name: deps_core::osv::OsvQueryName,
         version: deps_core::osv::OsvVersion,
         siblings: Vec<deps_core::osv::OsvVersion>,
-        sibling_coverage: deps_core::pagination::ListCoverage,
+        sibling_coverage: deps_core::osv::SiblingCoverage,
     },
     Skip(deps_core::osv::SkipReason),
 }
@@ -263,7 +263,7 @@ pub(crate) enum RescanOutcome {
 /// the session.
 ///
 /// No-op while [`ServerState::osv_checks`] (vulnerabilities enabled and not offline) is
-/// [`deps_core::policy_config::OsvState::Inactive`], read live so a setting change during the
+/// [`deps_core::policy_config::CheckState::Inactive`], read live so a setting change during the
 /// preceding fetch is honored (#1704).
 ///
 /// Cheap no-op in the overwhelmingly common case: returns immediately unless both (a) this
@@ -2151,7 +2151,10 @@ mod tests {
             else {
                 panic!("warm rescan must flag the sibling-only advisory");
             };
-            assert!(dv.sibling_match("GHSA-aaaa-bbbb-cccc").is_some());
+            assert!(
+                dv.sibling_match(&deps_core::osv::OsvId::parse("GHSA-aaaa-bbbb-cccc").unwrap())
+                    .is_some()
+            );
         }
 
         /// #1709: two plans that differ only by a target's sibling tags are not equal, so a
@@ -2819,7 +2822,7 @@ mod tests {
             assert_matches!(
                 doc.signals.osv_scan_plan.0.get(&key),
                 Some(PlannedQuery::Query {
-                    sibling_coverage: ListCoverage::Truncated,
+                    sibling_coverage: deps_core::osv::SiblingCoverage::Truncated,
                     ..
                 })
             );

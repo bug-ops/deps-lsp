@@ -966,7 +966,7 @@ fn is_symlink(path: &Path) -> bool {
 /// succeeds empty (the latter whenever `path == display_root`, e.g. an explicitly-given root).
 fn display_relative_path(path: &Path, display_root: &Path) -> PathBuf {
     let stripped = path.strip_prefix(display_root).unwrap_or(path);
-    if stripped.as_os_str().is_empty() {
+    if stripped.is_empty() {
         path.to_path_buf()
     } else {
         stripped.to_path_buf()

@@ -9,7 +9,7 @@ use deps_core::hover::Hover;
 use deps_core::lsp_helpers::ShaPinning;
 use deps_core::{
     Ecosystem, PackageName, ParseResult as ParseResultTrait, Registry, Result,
-    diagnostic::{Diagnostic, Severity},
+    diagnostic::{Diagnostic, DiagnosticKind, GitTagsPlatform, Severity},
     lsp_helpers::EcosystemFormatter,
 };
 use std::any::Any;
@@ -18,19 +18,17 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
 use url::Url;
 
-use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
-
 use crate::formatter::GithubActionsFormatter;
 use crate::registry::GithubActionsRegistry;
 use crate::types::{GithubActionsDependency, PinStyle};
-use deps_core::lsp_helpers::{CommentCheck, TagIndex};
+use deps_core::lsp_helpers::{CommentCheck, TagIndex, UnknownRefTarget};
 
 #[cfg(feature = "lsp-responses")]
 mod lsp;
 #[cfg(feature = "lsp-responses")]
 use lsp::{
     VERSION_OPERATOR_CHARS, build_sha_comment_fix_action, build_sha_pin_action,
-    collect_pin_all_to_sha_edits, position_past_sha_pin_own_ref,
+    build_unknown_ref_fix_action, collect_pin_all_to_sha_edits, position_past_sha_pin_own_ref,
 };
 
 /// Whether `gha_dep`'s ref is diagnosable as a tag — either because
@@ -296,6 +294,12 @@ impl Ecosystem for GithubActionsEcosystem {
                 uri,
                 &self.formatter,
             ));
+            actions.extend(build_unknown_ref_fix_action(
+                parse_result,
+                position,
+                uri,
+                &self.formatter,
+            ));
             actions
         })
     }
@@ -376,6 +380,7 @@ impl Ecosystem for GithubActionsEcosystem {
             let resolved_tag = match self.formatter.resolved_pin_version(dep) {
                 PinResolution::Resolved { pin, .. } => Some(pin.version().as_str().to_string()),
                 PinResolution::Unresolved
+                | PinResolution::NotYetIndexed
                 | PinResolution::Unlisted
                 | PinResolution::Untagged
                 | PinResolution::Unpublished
@@ -563,9 +568,12 @@ fn mutable_ref_pin_diagnostics(
                 )
             };
             Some(
-                Diagnostic::new(range, message)
-                    .with_severity(severity)
-                    .with_code(MUTABLE_REF_PIN_DIAGNOSTIC_CODE),
+                Diagnostic::new(
+                    DiagnosticKind::MutableRefPin(GitTagsPlatform::GithubActions),
+                    range,
+                    message,
+                )
+                .with_severity(severity),
             )
         })
         .collect()
@@ -602,6 +610,28 @@ fn sha_comment_mismatch_diagnostics(
         .collect()
 }
 
+/// The tag pin `gha_dep` and the index that can speak for it, shared by the unknown-ref
+/// diagnostic and its quick fix (#1781). `None` for a non-tag pin, a pin without a ref or range,
+/// and a repository whose tags have not been fetched.
+pub(crate) fn unknown_ref_target<'a>(
+    formatter: &GithubActionsFormatter,
+    gha_dep: &'a GithubActionsDependency,
+) -> Option<UnknownRefTarget<'a>> {
+    if gha_dep.pin != Some(PinStyle::Tag) {
+        return None;
+    }
+    let written = gha_dep.version_req.as_ref()?.as_str();
+    let index = formatter
+        .tag_index
+        .get(&gha_dep.name)
+        .map(|index| Arc::clone(&index))?;
+    Some(UnknownRefTarget::new(
+        index,
+        written,
+        gha_dep.version_range?,
+    ))
+}
+
 /// Builds one unknown-ref [`Diagnostic`] (#1766) per tag-pinned step whose ref is a full
 /// release that the repository's complete tag list lacks (`actions/checkout@4.3.1` beside tag
 /// `v4.3.1`).
@@ -618,18 +648,7 @@ fn unknown_ref_diagnostics(
         .into_iter()
         .filter_map(|dep| {
             let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-            if gha_dep.pin != Some(PinStyle::Tag) {
-                return None;
-            }
-            let written = gha_dep.version_req.as_ref()?.as_str();
-            let index = formatter.tag_index.get(&gha_dep.name)?;
-            deps_core::lsp_helpers::unknown_ref_diagnostic_for(
-                &index,
-                &gha_dep.name,
-                written,
-                gha_dep.version_range?,
-                severity,
-            )
+            unknown_ref_target(formatter, gha_dep)?.diagnostic(&gha_dep.name, severity)
         })
         .collect()
 }
@@ -724,7 +743,7 @@ mod tests {
     // --- issue #473: mutable-ref-pin diagnostic + "Pin to commit SHA" code action ---
 
     fn mutable_ref_pin_code() -> String {
-        MUTABLE_REF_PIN_DIAGNOSTIC_CODE.into()
+        deps_core::diagnostic::GITHUB_ACTIONS_MUTABLE_REF_PIN_DIAGNOSTIC_CODE.into()
     }
 
     async fn diagnostics_for(content: &str) -> Vec<Diagnostic> {
@@ -2790,6 +2809,41 @@ mod tests {
             )
             .await;
             assert!(hint.iter().all(|d| d.severity == Some(Severity::Hint)));
+        }
+
+        /// #1781: the quick fix rewrites exactly the unpublished ref to the published spelling,
+        /// exactly where the diagnostic fires, and the rewritten pin no longer reports.
+        #[cfg(feature = "lsp-responses")]
+        #[test]
+        fn test_unknown_ref_fix_rewrites_the_ref_where_the_diagnostic_fires() {
+            let (eco, name, [a, ..]) = mismatch_fixture();
+            let content = format!(
+                "steps:\n\
+                 \x20 - uses: {name}@2.87.22\n\
+                 \x20 - uses: {name}@v2.87.99\n\
+                 \x20 - uses: {name}@v40\n\
+                 \x20 - uses: {name}@{a}\n"
+            );
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let parse_result = crate::parser::parse_workflow_yaml(&content, &uri).unwrap();
+            let fix_at = |dep_index: usize, text: &str| {
+                let range = deps_core::ParseResult::dependencies(&parse_result)[dep_index]
+                    .version_range()
+                    .unwrap();
+                let position = Position::new(range.start.line, range.start.character);
+                build_unknown_ref_fix_action(&parse_result, position, &uri, &eco.formatter)
+                    .map(|action| (action.title.clone(), apply_single_edit(text, &uri, &action)))
+            };
+
+            let (title, fixed) = fix_at(0, &content).expect("2.87.22 has a published spelling");
+            assert_eq!(title, "Change ref to published tag `v2.87.22`");
+            assert!(fixed.contains(&format!("{name}@v2.87.22\n")), "{fixed}");
+            assert!(fix_at(1, &content).is_none(), "no tag matches v2.87.99");
+            assert!(
+                fix_at(2, &content).is_none(),
+                "a partial shape may be a branch"
+            );
+            assert!(fix_at(3, &content).is_none(), "a SHA pin is not a tag pin");
         }
 
         /// #1766: a cold, empty or truncated tag list proves nothing, so nothing is reported.

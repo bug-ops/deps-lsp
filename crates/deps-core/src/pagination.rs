@@ -128,8 +128,7 @@ fn next_targets(header: &str) -> Vec<&str> {
             parts.any(is_next_rel).then(|| {
                 target
                     .trim()
-                    .strip_prefix('<')
-                    .and_then(|rest| rest.strip_suffix('>'))
+                    .strip_circumfix('<', '>')
                     .map_or("", str::trim)
             })
         })

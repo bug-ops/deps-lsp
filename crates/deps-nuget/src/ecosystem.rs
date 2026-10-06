@@ -1284,7 +1284,7 @@ mod tests {
                 policy: Arc::clone(&policy),
                 config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
                 user_profile_config: None,
-                user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                user_profile_sources: Arc::default(),
             };
             let eco = NuGetEcosystem::with_context(root, context);
 
@@ -1761,7 +1761,7 @@ mod tests {
                 policy: Arc::clone(&policy),
                 config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
                 user_profile_config: None,
-                user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                user_profile_sources: Arc::default(),
             };
             let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
 
@@ -1822,7 +1822,7 @@ mod tests {
                 policy: Arc::clone(&policy),
                 config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
                 user_profile_config: None,
-                user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                user_profile_sources: Arc::default(),
             };
             let eco = NuGetEcosystem::with_context(
                 Arc::new(NuGetRegistry::new(Arc::new(deps_core::HttpCache::new()))),
@@ -1889,7 +1889,7 @@ mod tests {
                 policy: Arc::clone(&policy),
                 config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
                 user_profile_config: None,
-                user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                user_profile_sources: Arc::default(),
             };
             let eco = NuGetEcosystem::with_context(
                 Arc::new(NuGetRegistry::new(Arc::new(deps_core::HttpCache::new()))),
@@ -1976,7 +1976,7 @@ mod tests {
                     policy: Arc::clone(&policy),
                     config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
                     user_profile_config: None,
-                    user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    user_profile_sources: Arc::default(),
                 };
                 let eco = NuGetEcosystem::with_context(
                     Arc::new(NuGetRegistry::new(Arc::new(deps_core::HttpCache::new()))),
@@ -2070,7 +2070,7 @@ mod tests {
                 policy: Arc::clone(&policy),
                 config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
                 user_profile_config: None,
-                user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                user_profile_sources: Arc::default(),
             };
             let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
 
@@ -2158,7 +2158,7 @@ mod tests {
                 policy: Arc::clone(&policy),
                 config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
                 user_profile_config: None,
-                user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                user_profile_sources: Arc::default(),
             };
             let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
 

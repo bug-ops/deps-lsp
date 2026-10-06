@@ -4,11 +4,13 @@ use std::sync::Arc;
 use futures::stream::{self, StreamExt};
 
 use crate::deps_dev::deps_dev_system;
-use crate::diagnostic::{CodeDescription, Diagnostic, RelatedInformation, Severity};
+use crate::diagnostic::{
+    CodeDescription, Diagnostic, DiagnosticKind, RelatedInformation, Severity,
+};
 use crate::licenses::{
     ViolationReason, evaluate as evaluate_license_policy, resolve_license_entries,
 };
-use crate::osv::{ScanOutcome, SkipReason, UpgradeStatus, diagnostic_severity_for};
+use crate::osv::{OsvId, ScanOutcome, SkipReason, UpgradeStatus, diagnostic_severity_for};
 use crate::position::{Position, Range};
 use crate::redact::{RedactedUrl, redact_declaration_key, sanitize_invisible};
 use crate::{
@@ -97,7 +99,7 @@ const MAX_BLOCKED_REGISTRY_RELATED_INFO: usize = 9;
 /// `summary`/a registry's deprecation `reason` both pass through unvalidated
 /// (`OsvVulnRecord::into_advisory`, resp. the registry client). `advisory.id` is *not*
 /// actually unbounded on the real path: `into_advisory` already rejects any record whose id
-/// fails `crate::osv::is_valid_osv_id` (ASCII alphanumeric/`.`/`_`/`-`, `<= 128` bytes) before
+/// fails `crate::osv::OsvId::parse` (ASCII alphanumeric/`.`/`_`/`-`, `<= 128` bytes) before
 /// an `Advisory` can exist, so this cap on `id` is defense-in-depth for a state that should
 /// already be unreachable, not a fix for a reachable gap.
 ///
@@ -294,7 +296,7 @@ pub fn sanitize_and_truncate_for_diagnostic(value: &str, max_chars: usize) -> St
 /// `summary` is the genuinely untrusted half of this sink — it passes through
 /// `OsvVulnRecord::into_advisory` unvalidated. `id` is run through the same treatment for
 /// defense-in-depth, but on the real path it is already constrained by
-/// `crate::osv::is_valid_osv_id` (ASCII alphanumeric/`.`/`_`/`-`, `<= 128` bytes) before an
+/// `crate::osv::OsvId::parse` (ASCII alphanumeric/`.`/`_`/`-`, `<= 128` bytes) before an
 /// `Advisory` can exist at all, so this call is a no-op for `id` in practice.
 ///
 /// # Examples
@@ -380,10 +382,13 @@ impl std::fmt::Display for SiblingMatchNote {
 
 /// The ` (ids; note)` detail of a flagged-latest message: advisory ids and the sibling-match
 /// note, either or both, or nothing.
-fn flagged_detail(advisory_ids: &[String], via_sibling_tags: Option<&SiblingMatchNote>) -> String {
+pub(crate) fn flagged_detail(
+    advisory_ids: &[OsvId],
+    via_sibling_tags: Option<&SiblingMatchNote>,
+) -> String {
     let mut parts = Vec::new();
     if !advisory_ids.is_empty() {
-        parts.push(advisory_ids.join(", "));
+        parts.push(OsvId::join(advisory_ids, ", "));
     }
     if let Some(note) = via_sibling_tags {
         parts.push(note.to_string());
@@ -1363,6 +1368,7 @@ fn dependency_ceiling_notice(diagnostics: &mut Vec<Diagnostic>, parse_result: &d
     if let Some((kept, total)) = parse_result.dependency_truncation() {
         diagnostics.push(
             Diagnostic::new(
+                DiagnosticKind::Notice,
                 Range {
                     start: Position::new(0, 0),
                     end: Position::new(0, 0),
@@ -1398,6 +1404,7 @@ fn invalid_minimum_stability_notice(
         let raw = sanitize_and_truncate_for_diagnostic(&occurrence.raw, MAX_DIAGNOSTIC_VALUE_CHARS);
         diagnostics.push(
             Diagnostic::new(
+                DiagnosticKind::Notice,
                 occurrence.range,
                 format!(
                     "minimum-stability \"{raw}\" is not one of dev, alpha, beta, RC, stable; \
@@ -1434,6 +1441,7 @@ fn offline_notice(
     if versions.network.is_offline() && !deps.is_empty() {
         diagnostics.push(
             Diagnostic::new(
+                DiagnosticKind::Notice,
                 Range {
                     start: Position::new(0, 0),
                     end: Position::new(0, 0),
@@ -1457,7 +1465,7 @@ fn offline_notice(
 /// diagnostic, so it uses [`SkipReason::unchecked_reason`] directly for every
 /// non-`NonRegistrySource` variant.
 ///
-/// [`SkipReason::SiblingTagsUnknown`] (phase A's truncated tag list and phase B's unknown
+/// [`SkipReason::SiblingTagsUnknown`] (phase A's truncated tag list or cold/failed tag fetch, and phase B's unknown
 /// candidate siblings alike) is hover-only by design: for a repository over the tag fetch cap it
 /// is as permanent as the structural reasons, so a standing Problems-panel entry could never be
 /// resolved.
@@ -1606,6 +1614,7 @@ fn skip_reason_notice(
 
     diagnostics.push(
         Diagnostic::new(
+            DiagnosticKind::Notice,
             Range {
                 start: Position::new(0, 0),
                 end: Position::new(0, 0),
@@ -1780,6 +1789,7 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
     // #993).
     let redacted_key = redact_declaration_key(&occurrence.declaration_key);
     Diagnostic::new(
+        DiagnosticKind::Notice,
         occurrence.range,
         format!(
             "registry index \"{}\" blocked by registries.workspace_registries policy \
@@ -1798,6 +1808,7 @@ fn build_rejected_registry_diagnostic(occurrence: &RejectedRegistryOccurrence) -
     let redacted_value = RedactedUrl::new(&occurrence.raw_value).into_inner();
     let redacted_key = redact_declaration_key(&occurrence.declaration_key);
     Diagnostic::new(
+        DiagnosticKind::Notice,
         occurrence.range,
         format!(
             "registry entry \"{}\" rejected: {} (declaration: {})",
@@ -1965,6 +1976,7 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
     };
     diagnostics.push(
         Diagnostic::new(
+            DiagnosticKind::LicensePolicy,
             ctx.dep.name_range(),
             format!(
                 "{}: {} {}",
@@ -1976,8 +1988,7 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
                 violation.reason
             ),
         )
-        .with_severity(severity)
-        .with_code(LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE),
+        .with_severity(severity),
     );
 }
 
@@ -2022,6 +2033,7 @@ fn apply_typosquat_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'_>
 
     diagnostics.push(
         Diagnostic::new(
+            DiagnosticKind::Typosquat,
             ctx.dep.name_range(),
             format!(
                 "{} has far fewer dependents ({}) than the similarly named {} ({}) — double-\
@@ -2032,8 +2044,7 @@ fn apply_typosquat_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'_>
                 signal.suspected_dependent_count,
             ),
         )
-        .with_severity(Severity::Hint)
-        .with_code(TYPOSQUAT_DIAGNOSTIC_CODE),
+        .with_severity(Severity::Hint),
     );
 }
 
@@ -2378,6 +2389,7 @@ fn apply_in_use_yanked_rule(
         );
         diagnostics.push(
             Diagnostic::new(
+                DiagnosticKind::Yanked,
                 version_anchor_range(ctx.dep),
                 format!("{} ({})", ctx.formatter.yanked_message(), yanked_version),
             )
@@ -2453,6 +2465,7 @@ fn apply_unknown_package_rule(
         Err(reason) => {
             diagnostics.push(
                 Diagnostic::new(
+                    DiagnosticKind::Notice,
                     dep.name_range(),
                     format!(
                         "Invalid package name '{}': {reason}",
@@ -2478,7 +2491,7 @@ fn apply_unknown_package_rule(
             };
             fetch_failed.push(FetchFailureEntry {
                 name: redacted_name,
-                diagnostic: Diagnostic::new(dep.name_range(), message)
+                diagnostic: Diagnostic::new(DiagnosticKind::Notice, dep.name_range(), message)
                     .with_severity(ctx.severities.unknown),
                 failure: fetch_failure.cloned(),
             });
@@ -2487,6 +2500,7 @@ fn apply_unknown_package_rule(
         Ok(()) if can_resolve_source => {
             diagnostics.push(
                 Diagnostic::new(
+                    DiagnosticKind::Notice,
                     dep.name_range(),
                     format!(
                         "Unknown package '{}'",
@@ -2566,9 +2580,12 @@ fn apply_unsatisfiable_rule(
         );
     }
     diagnostics.push(
-        Diagnostic::new(resolved.version_range, message)
-            .with_severity(ctx.severities.unsatisfiable)
-            .with_code(UNSATISFIABLE_DIAGNOSTIC_CODE),
+        Diagnostic::new(
+            DiagnosticKind::Unsatisfiable,
+            resolved.version_range,
+            message,
+        )
+        .with_severity(ctx.severities.unsatisfiable),
     );
     RuleFlow::Stop
 }
@@ -2646,6 +2663,7 @@ fn apply_yanked_only_rule(
         sanitize_and_truncate_for_diagnostic(latest.as_str(), MAX_VERSION_DIAGNOSTIC_CHARS);
     diagnostics.push(
         Diagnostic::new(
+            DiagnosticKind::Yanked,
             resolved.version_range,
             format!("{}; latest is {latest}", ctx.formatter.yanked_message()),
         )
@@ -2740,6 +2758,7 @@ fn push_flagged_latest_admitted_by_requirement(
             let latest = sanitize_and_truncate_for_diagnostic(latest, MAX_VERSION_DIAGNOSTIC_CHARS);
             diagnostics.push(
                 Diagnostic::new(
+                    DiagnosticKind::FlaggedLatest,
                     resolved.version_range,
                     format!(
                         "This requirement already admits {latest}{ids}, which OSV.dev flags as \
@@ -2856,6 +2875,7 @@ fn push_unverified_latest_check_failed(
     let latest = sanitize_and_truncate_for_diagnostic(latest, MAX_VERSION_DIAGNOSTIC_CHARS);
     diagnostics.push(
         Diagnostic::new(
+            DiagnosticKind::UnverifiedLatest,
             resolved.version_range,
             format!(
                 "This requirement already admits {latest}; whether it is safe could not be \
@@ -2913,7 +2933,7 @@ fn apply_outdated_rule(
 
     let latest =
         sanitize_and_truncate_for_diagnostic(latest.as_str(), MAX_VERSION_DIAGNOSTIC_CHARS);
-    let (message, severity) = match &verdict {
+    let (kind, message, severity) = match &verdict {
         LatestVerdict::Flagged {
             advisory_ids,
             malicious,
@@ -2929,11 +2949,13 @@ fn apply_outdated_rule(
                 Severity::Warning
             };
             (
+                DiagnosticKind::FlaggedLatest,
                 format!("Latest version {latest} is flagged by OSV{ids} — do not upgrade"),
                 severity,
             )
         }
         LatestVerdict::Unverified => (
+            DiagnosticKind::Outdated,
             format!("Newer version available: {latest} (not yet verified against OSV)"),
             ctx.severities.outdated,
         ),
@@ -2968,10 +2990,11 @@ fn apply_outdated_rule(
                     format!("Newer version available: {latest}")
                 }
             };
-            (message, ctx.severities.outdated)
+            (DiagnosticKind::Outdated, message, ctx.severities.outdated)
         }
     };
-    diagnostics.push(Diagnostic::new(resolved.version_range, message).with_severity(severity));
+    diagnostics
+        .push(Diagnostic::new(kind, resolved.version_range, message).with_severity(severity));
 }
 
 /// R8 — fetch-failure collapse (#479, #480 S2, #478/#485).
@@ -3031,7 +3054,7 @@ fn push_collapsed_fetch_failures(
                     )
                 })
                 .collect();
-            let mut diagnostic = Diagnostic::new(range, message);
+            let mut diagnostic = Diagnostic::new(DiagnosticKind::Notice, range, message);
             diagnostic.severity = severity;
             diagnostics.push(diagnostic.with_related_information(related_information));
         }
@@ -3096,9 +3119,8 @@ fn push_deprecation_diagnostic(
     }
 
     diagnostics.push(
-        Diagnostic::new(range, message)
-            .with_severity(severities.deprecated)
-            .with_code(DEPRECATED_DIAGNOSTIC_CODE),
+        Diagnostic::new(DiagnosticKind::Deprecated, range, message)
+            .with_severity(severities.deprecated),
     );
 }
 
@@ -3126,7 +3148,7 @@ fn push_deprecation_diagnostic(
 #[must_use]
 pub fn advisory_text(advisory: &crate::osv::Advisory) -> String {
     let advisory_id =
-        sanitize_advisory_text_for_diagnostic(advisory.id.as_str(), MAX_DIAGNOSTIC_PROSE_CHARS);
+        sanitize_advisory_text_for_diagnostic(advisory.id().as_str(), MAX_DIAGNOSTIC_PROSE_CHARS);
     let summary = sanitize_advisory_text_for_diagnostic(
         advisory
             .summary
@@ -3175,17 +3197,13 @@ pub fn advisory_text(advisory: &crate::osv::Advisory) -> String {
 /// from an ordinary unscored CVE's `WARNING` severity but may not render distinctly in
 /// every client's UI chrome.
 ///
-/// `Diagnostic.code` is passed the raw `advisory.id` here, not the
-/// `sanitize_advisory_text_for_diagnostic`-passed copy used in the message text (#1262
-/// critic follow-up) — `with_code` (#1280) sanitizes it at the setter, the same
-/// defense-in-depth treatment `message` gets, so this is not an unsanitized value reaching
-/// a client. It is also already constrained to ASCII alphanumeric/`.`/`_`/`-` at `<= 128`
-/// bytes by [`crate::osv::is_valid_osv_id`] — the only non-test construction path of
-/// [`crate::osv::Advisory`] — before an `Advisory` can exist at all. The binding agreement
-/// between the published `code` and `diagnostic_codes` (this module's `code_actions.rs:214`
-/// and `deps-lsp`'s `handlers/code_actions.rs`'s `bind_diagnostics`, which matches `code`
-/// against raw `fix.advisory_ids`) rests on `is_valid_osv_id` forbidding unsafe characters
-/// at ingest on both sides, not on `code` staying unsanitized.
+/// The diagnostic's kind is [`DiagnosticKind::Advisory`] carrying the advisory's own
+/// [`crate::osv::OsvId`], whose `code` is therefore constrained to ASCII
+/// alphanumeric/`.`/`_`/`-` at `<= 128` bytes by [`crate::osv::OsvId::parse`] — the only
+/// construction path of [`crate::osv::Advisory`] — so it needs no further sanitization. The
+/// binding agreement between the published `code` and `diagnostic_codes` (this module's
+/// `code_actions.rs:214` and `deps-lsp`'s `handlers/code_actions.rs`'s `bind_diagnostics`,
+/// which matches `code` against `fix.advisory_ids`) rests on that same type on both sides.
 fn push_vulnerability_diagnostics(
     diagnostics: &mut Vec<Diagnostic>,
     dep: &dyn Dependency,
@@ -3203,14 +3221,17 @@ fn push_vulnerability_diagnostics(
             .map(CodeDescription::new);
 
         let message = advisory_text(advisory);
-        let message = match dv.sibling_match(&advisory.id) {
+        let message = match dv.sibling_match(advisory.id()) {
             Some(tags) => format!("{message} ({})", SiblingMatchNote::new(formatter, tags)),
             None => message,
         };
 
-        let mut diagnostic = Diagnostic::new(range, message)
-            .with_severity(diagnostic_severity_for(advisory.severity))
-            .with_code(advisory.id.clone());
+        let mut diagnostic = Diagnostic::new(
+            DiagnosticKind::Advisory(advisory.id().clone()),
+            range,
+            message,
+        )
+        .with_severity(diagnostic_severity_for(advisory.severity));
         if let Some(code_description) = code_description {
             diagnostic = diagnostic.with_code_description(code_description);
         }
@@ -3220,8 +3241,12 @@ fn push_vulnerability_diagnostics(
     let remaining = display_advisories.remaining();
     if remaining > 0 {
         diagnostics.push(
-            Diagnostic::new(range, format!("+{remaining} more advisories"))
-                .with_severity(Severity::Information),
+            Diagnostic::new(
+                DiagnosticKind::AdvisoryOverflow,
+                range,
+                format!("+{remaining} more advisories"),
+            )
+            .with_severity(Severity::Information),
         );
     }
 }
@@ -6751,7 +6776,7 @@ mod tests {
             crate::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.0.8"),
-                advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("MAL-2026-16332")], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
                 via_sibling_tags: None,
             },
@@ -6784,6 +6809,7 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].severity, Some(Severity::Error));
+        assert_eq!(diagnostics[0].kind(), &DiagnosticKind::FlaggedLatest);
         assert!(
             diagnostics[0].message().contains("flagged by OSV"),
             "got: {}",
@@ -6820,7 +6846,7 @@ mod tests {
             crate::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new(latest),
-                advisory_ids: Capped::new(vec!["GHSA-yyyy".to_string()], 1),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("GHSA-yyyy")], 1),
                 worst_severity: Some(VulnSeverity::High),
                 via_sibling_tags: Some(MatchedTags::new(ConcreteVersion::new("v4.9.0"), vec![])),
             },
@@ -6900,7 +6926,7 @@ mod tests {
             crate::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("2.0.0"),
-                advisory_ids: Capped::new(vec!["GHSA-xxxx".to_string()], 1),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("GHSA-xxxx")], 1),
                 worst_severity: Some(VulnSeverity::High),
                 via_sibling_tags: None,
             },
@@ -6919,6 +6945,7 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
+        assert_eq!(diagnostics[0].kind(), &DiagnosticKind::FlaggedLatest);
         assert!(diagnostics[0].message().contains("flagged by OSV"));
     }
 
@@ -6961,7 +6988,7 @@ mod tests {
             crate::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.0.8"),
-                advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("MAL-2026-16332")], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
                 via_sibling_tags: None,
             },
@@ -6980,6 +7007,7 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].severity, Some(Severity::Error));
+        assert_eq!(diagnostics[0].kind(), &DiagnosticKind::FlaggedLatest);
         assert!(
             diagnostics[0].message().contains("already admits"),
             "got: {}",
@@ -7019,7 +7047,7 @@ mod tests {
             crate::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.5.0"),
-                advisory_ids: Capped::new(vec!["GHSA-yyyy".to_string()], 1),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("GHSA-yyyy")], 1),
                 worst_severity: Some(VulnSeverity::High),
                 via_sibling_tags: None,
             },
@@ -7090,7 +7118,7 @@ mod tests {
             crate::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.0.8"),
-                advisory_ids: Capped::new(vec!["GHSA-xxxx".to_string()], 1),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("GHSA-xxxx")], 1),
                 worst_severity: Some(VulnSeverity::High),
                 via_sibling_tags: None,
             },
@@ -7184,7 +7212,7 @@ mod tests {
             crate::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.0.8"),
-                advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("MAL-2026-16332")], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
                 via_sibling_tags: None,
             },
@@ -7280,7 +7308,7 @@ mod tests {
             crate::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.0.8"),
-                advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("MAL-2026-16332")], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
                 via_sibling_tags: None,
             },
@@ -7373,6 +7401,7 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].severity, Some(Severity::Hint));
+        assert_eq!(diagnostics[0].kind(), &DiagnosticKind::UnverifiedLatest);
         assert!(diagnostics[0].message().contains("already admits"));
         assert!(diagnostics[0].message().contains("1.5.0"));
         assert!(
@@ -7656,6 +7685,7 @@ mod tests {
             diagnostics[0].severity,
             Some(DiagnosticSeverities::default().outdated)
         );
+        assert_eq!(diagnostics[0].kind(), &DiagnosticKind::Outdated);
         assert!(
             diagnostics[0]
                 .message()
@@ -9308,6 +9338,10 @@ mod tests {
             .expect("vulnerability diagnostic must be emitted even without registry data");
         assert_eq!(vuln_diag.severity, Some(Severity::Warning));
         assert_eq!(vuln_diag.code(), Some("RUSTSEC-2020-0071"));
+        assert_eq!(
+            vuln_diag.kind(),
+            &DiagnosticKind::Advisory(crate::test_util::osv_id("RUSTSEC-2020-0071"))
+        );
     }
 
     /// #1718: a sibling-only advisory's message carries the formatter's label and the tags.
@@ -9319,7 +9353,10 @@ mod tests {
         };
 
         let mut matches = SiblingMatches::new(crate::osv::OsvVersion::new("1.0.0"));
-        matches.insert("A-1".to_string(), matched_tags(&["v4.9.0", "v4.10.0"]));
+        matches.insert(
+            crate::test_util::osv_id("A-1"),
+            matched_tags(&["v4.9.0", "v4.10.0"]),
+        );
         let dv = DependencyVulnerabilities::new(Capped::new(
             vec![
                 sample_advisory("A-1", VulnSeverity::High),
@@ -9430,7 +9467,7 @@ mod tests {
     /// `MAX_DIAGNOSTIC_PROSE_CHARS` before it reaches the client-visible vulnerability
     /// diagnostic message.
     ///
-    /// `id` uses a benign, `is_valid_osv_id`-shaped value here rather than a bidi payload
+    /// `id` uses a benign, `OsvId`-shaped value here rather than a bidi payload
     /// (critic M1): on the real (non-test) construction path, `OsvVulnRecord::into_advisory`
     /// already rejects any record whose id fails that validation before an `Advisory` can
     /// exist at all, so a malformed `id` reaching this function is not a reachable state —

@@ -938,8 +938,15 @@ pub enum VulnFixSkip {
     UnsafeVersion,
     /// The internal fix-target verification gate could not confirm the fix target F against
     /// OSV — F was never live-checked, or the live check found F still vulnerable to an
-    /// advisory this recommendation claims to resolve.
+    /// advisory this recommendation claims to resolve. Also reported when a commit pin's
+    /// rewrite to F cannot be confirmed because its tag list is missing, cold, empty or
+    /// truncated ([`crate::lsp_helpers::CommitRewrite::IndexUnavailable`]).
     UnverifiedTarget,
+    /// A commit (SHA) pin cannot be rewritten to the fix target because a complete tag list
+    /// proves no release tag names that version
+    /// ([`crate::lsp_helpers::CommitRewrite::NoReleaseTag`], #1779). The requirement does not
+    /// already admit the fix, so this is never a lockfile-only update.
+    NoReleaseTagForFix,
     /// The dependency's declared requirement, left unedited, already resolves forward to the
     /// fix target under this ecosystem's own resolution rules — nothing to rewrite (#1344).
     RequirementAlreadyResolves,
@@ -1048,6 +1055,7 @@ pub fn resolve_recommended_fix(
 /// `pub(crate)`: `deps-cli update --security-only` (#1329) used to call this directly to
 /// distinguish "no verified fix target" from [`plan_vulnerability_fix`]'s other `None` cause,
 /// but now matches on [`VulnFixSkip`] directly (#1350), so this no longer needs to be `pub`.
+// TODO(#1806): carry advisory ids as `OsvId` instead of `&str`.
 #[must_use]
 pub(crate) fn fix_target_is_verified(
     dv: &crate::osv::DependencyVulnerabilities,
@@ -1071,7 +1079,7 @@ pub(crate) fn fix_target_is_verified(
                 .advisories
                 .items()
                 .iter()
-                .map(|a| a.id.as_str())
+                .map(|a| a.id().as_str())
                 .collect();
             advisory_ids
                 .items()
@@ -1310,8 +1318,10 @@ pub fn plan_vulnerability_fix(
 /// # Errors
 ///
 /// Returns [`VulnFixSkip::OversizedRequirement`], [`VulnFixSkip::UnresolvedPlaceholder`],
-/// [`VulnFixSkip::RequirementAlreadyResolves`], or [`VulnFixSkip::NoOpRewrite`] — the causes
-/// that can still make an edit unnecessary once the fix is already known resolved and verified.
+/// [`VulnFixSkip::RequirementAlreadyResolves`], [`VulnFixSkip::NoReleaseTagForFix`],
+/// [`VulnFixSkip::UnverifiedTarget`] (a commit pin whose tag list is unavailable), or
+/// [`VulnFixSkip::NoOpRewrite`] — the causes that can still make an edit unnecessary or
+/// impossible once the fix is already known resolved and verified.
 pub fn plan_verified_fix(
     dep: &dyn Dependency,
     version_range: crate::position::Range,
@@ -1349,6 +1359,17 @@ pub fn plan_verified_fix(
         });
     if requirement_already_resolves_to_fix {
         return Err(VulnFixSkip::RequirementAlreadyResolves);
+    }
+
+    match formatter.commit_rewrite_for(dep, &fix_concrete) {
+        crate::lsp_helpers::CommitRewrite::NoReleaseTag => {
+            return Err(VulnFixSkip::NoReleaseTagForFix);
+        }
+        crate::lsp_helpers::CommitRewrite::IndexUnavailable => {
+            return Err(VulnFixSkip::UnverifiedTarget);
+        }
+        crate::lsp_helpers::CommitRewrite::NotACommitPin
+        | crate::lsp_helpers::CommitRewrite::Resolved => {}
     }
 
     // Unreachable after the gate above; fails closed rather than unwrapping.
@@ -1725,7 +1746,10 @@ mod tests {
                 crate::test_util::vuln_key("feed-widget-helper"),
                 crate::osv::UpgradeStatus::CandidateVulnerable {
                     version: ConcreteVersion::new("1.0.8"),
-                    advisory_ids: crate::osv::Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                    advisory_ids: crate::osv::Capped::new(
+                        vec![crate::test_util::osv_id("MAL-2026-16332")],
+                        1,
+                    ),
                     worst_severity: Some(crate::osv::VulnSeverity::Malicious),
                     via_sibling_tags: None,
                 },

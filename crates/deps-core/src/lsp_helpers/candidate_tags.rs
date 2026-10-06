@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use super::in_use_version::queryable_siblings;
 use super::{InUseVersions, SiblingScope, TagIndex};
+use crate::osv::SiblingCoverage;
 use crate::pagination::ListCoverage;
 use crate::{ConcreteVersion, EcosystemId};
 
@@ -29,9 +30,9 @@ pub trait TaggedVersions: private::Sealed {
 
     /// Whether [`Self::siblings`] was read from a complete tag list.
     ///
-    /// A [`ListCoverage::Truncated`] list may be missing sibling tags, so a clean OSV answer
-    /// for the target is not authoritative.
-    fn sibling_coverage(&self) -> ListCoverage;
+    /// Anything but [`SiblingCoverage::Complete`] may be missing sibling tags, so a clean OSV
+    /// answer for the target is not authoritative.
+    fn sibling_coverage(&self) -> SiblingCoverage;
 }
 
 impl private::Sealed for InUseVersions {}
@@ -41,7 +42,7 @@ impl TaggedVersions for InUseVersions {
         Self::siblings(self)
     }
 
-    fn sibling_coverage(&self) -> ListCoverage {
+    fn sibling_coverage(&self) -> SiblingCoverage {
         Self::sibling_coverage(self)
     }
 }
@@ -94,8 +95,8 @@ impl TaggedVersions for CandidateSiblings {
         &self.0
     }
 
-    fn sibling_coverage(&self) -> ListCoverage {
-        self.1
+    fn sibling_coverage(&self) -> SiblingCoverage {
+        self.1.into()
     }
 }
 

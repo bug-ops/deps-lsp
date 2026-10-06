@@ -538,8 +538,7 @@ fn gossip_findings_from_entry(entry: &GossipVersionFindingsWire) -> GossipFindin
                     let alternative_packages = finding
                         .low_usage_context
                         .as_ref()
-                        .map(|ctx| ctx.alternative_packages.clone())
-                        .unwrap_or_default();
+                        .map_or_default(|ctx| ctx.alternative_packages.clone());
                     low_usage = Some(GossipLowUsage {
                         risk: finding.risk.into(),
                         alternative_packages,

@@ -75,8 +75,7 @@ fn parse_version_license(data: &[u8]) -> Vec<String> {
     response
         .license
         .filter(|l| !l.is_empty())
-        .map(|l| vec![l])
-        .unwrap_or_default()
+        .map_or_default(|l| vec![l])
 }
 
 /// Upper bound on how many results [`JsrRegistry::search`] fetches from the wire before

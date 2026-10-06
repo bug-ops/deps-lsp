@@ -2,14 +2,14 @@
 //!
 //! Each distinct SARIF rule id becomes one `tool.driver.rules` entry, and each
 //! [`CheckFinding`] becomes one `run.results` entry with its [`Range`] translated to a
-//! SARIF physical location region. A rule id is [`CheckFinding::code`] when the finding is
-//! [`Category::Vulnerable`] *and* `code` passes [`deps_core::osv::is_valid_osv_id`]
-//! (`is_advisory_finding`), falling back to its [`Category`] wire token otherwise (issue
-//! #1075, spec 062 review S3: FR-008 says "each existing diagnostic code becomes a SARIF rule
-//! id"; issue #1077 review #2: `code` is never trusted as a rule id/name verbatim without that
-//! validity check). A vulnerability finding's `code` is its OSV advisory id
-//! (`RUSTSEC-...`/`GHSA-...`), so distinct advisories now produce distinct rules instead of
-//! collapsing into one shared `vulnerable` rule. `code` is deliberately *not* used for the
+//! SARIF physical location region. A rule id is the advisory id when the finding's
+//! [`CheckFinding::kind`] is [`DiagnosticKind::Advisory`] (a validated
+//! [`deps_core::osv::OsvId`], so it is safe as a rule id/name by construction), falling back to
+//! its [`Category`] wire token otherwise (issue #1075, spec 062 review S3: FR-008 says "each
+//! existing diagnostic code becomes a SARIF rule id"). A vulnerability finding's id is its OSV
+//! advisory id (`RUSTSEC-...`/`GHSA-...`), so distinct advisories now produce distinct rules
+//! instead of collapsing into one shared `vulnerable` rule. The code is deliberately *not* used
+//! for the
 //! other coded categories (`Unsatisfiable`/`License`/`Deprecated`/`MutableRefPin`): their
 //! diagnostic-code constants are already 1:1 with a `Category` (no finer granularity to gain),
 //! and `MutableRefPin` alone has two internal code constants (GitHub Actions' and GitLab CI's)
@@ -21,7 +21,7 @@
 //! [`Category::description`]. An advisory rule additionally gets:
 //! - `helpUri`, preferring [`CheckFinding::advisory_url`] — the authoritative
 //!   `https://osv.dev/vulnerability/{id}` page OSV itself gave the diagnostic — and falling
-//!   back to [`deps_core::osv::validated_osv_url`] (the same validated-construction path
+//!   back to [`deps_core::osv::OsvId::osv_url`] (the same validated-construction path
 //!   `deps-core`'s own OSV client uses for [`deps_core::osv::Advisory::url`]) only when that is
 //!   unavailable;
 //! - `fullDescription`, built from the [`AdvisoryFacts::text`] of [`CheckFinding::advisory`] —
@@ -48,8 +48,8 @@
 //! expects it to follow.
 
 use crate::report::{AdvisoryFacts, Category, CheckFinding, CheckReport};
-use deps_core::diagnostic::Severity;
-use deps_core::osv::{VulnSeverity, is_valid_osv_id, validated_osv_url};
+use deps_core::diagnostic::{DiagnosticKind, Severity};
+use deps_core::osv::{OsvId, VulnSeverity};
 use deps_core::position::Range;
 use serde_sarif::sarif::{
     ArtifactLocation, Location, MultiformatMessageString, PhysicalLocation, PropertyBag, Region,
@@ -121,37 +121,27 @@ pub fn to_sarif(report: &CheckReport) -> Sarif {
         .build()
 }
 
-/// Whether `finding` is eligible for an advisory-keyed rule: [`Category::Vulnerable`] with a
-/// `code` that also passes [`is_valid_osv_id`] (issue #1077 review #2) — a `code` that fails
-/// the allowlist falls back to the plain category-token rule instead of being trusted as a
-/// rule id/name verbatim. `classify` (`crate::report`) documents that its "any unrecognized
-/// diagnostic code -> `Vulnerable`" fallback is only sound as long as the known-code list it
-/// maintains stays exhaustive; this is the independent, defense-in-depth check on the `code`
-/// value itself for exactly the case where that fallback let something unexpected through.
+/// The advisory id `finding` is keyed by, when it is an advisory finding.
 ///
 /// This is the single source of truth both [`sarif_rule_id`] and [`collect_rule_meta`] use —
-/// carried into [`RuleMeta::is_advisory`] rather than re-derived later by comparing the rule id
+/// carried into [`RuleMeta::advisory_id`] rather than re-derived later by comparing the rule id
 /// string against the category token (issue #1077 review #3): a *valid* advisory id that
 /// happens to equal a category token verbatim (e.g. an OSV id literally spelled `"license"` —
 /// contrived, but within the allowlist) would otherwise silently misclassify as category-only,
 /// dropping `helpUri`/`fullDescription`/`security-severity` for a finding that legitimately
 /// earned them.
-fn is_advisory_finding(finding: &CheckFinding) -> bool {
-    finding.category == Category::Vulnerable && finding.code.as_deref().is_some_and(is_valid_osv_id)
+const fn advisory_id(finding: &CheckFinding) -> Option<&OsvId> {
+    if let DiagnosticKind::Advisory(id) = &finding.kind {
+        Some(id)
+    } else {
+        None
+    }
 }
 
-/// The SARIF rule id `finding` belongs to — see the module doc for the code-first,
-/// category-fallback rule, and [`is_advisory_finding`] for exactly when `code` is trusted.
+/// The SARIF rule id `finding` belongs to — see the module doc for the advisory-first,
+/// category-fallback rule.
 fn sarif_rule_id(finding: &CheckFinding) -> &str {
-    if is_advisory_finding(finding) {
-        // `is_advisory_finding` already confirmed `finding.code` is `Some`.
-        finding
-            .code
-            .as_deref()
-            .unwrap_or_else(|| finding.category.as_str())
-    } else {
-        finding.category.as_str()
-    }
+    advisory_id(finding).map_or_else(|| finding.category().as_str(), OsvId::as_str)
 }
 
 /// The data [`build_rule_descriptor`] needs for one distinct rule id, collected from whichever
@@ -159,9 +149,9 @@ fn sarif_rule_id(finding: &CheckFinding) -> &str {
 /// deliberate here.
 struct RuleMeta<'a> {
     category: Category,
-    /// See [`is_advisory_finding`] — carried from the finding that first produced this rule id,
-    /// not re-derived from the id string in [`build_rule_descriptor`].
-    is_advisory: bool,
+    /// See [`advisory_id`] — carried from the finding that first produced this rule id, not
+    /// re-derived from the id string in [`build_rule_descriptor`].
+    advisory_id: Option<&'a OsvId>,
     advisory: Option<&'a AdvisoryFacts>,
     advisory_url: Option<String>,
 }
@@ -194,8 +184,8 @@ fn collect_rule_meta<'a>(
                 }
             })
             .or_insert_with(|| RuleMeta {
-                category: finding.category,
-                is_advisory: is_advisory_finding(finding),
+                category: finding.category(),
+                advisory_id: advisory_id(finding),
                 advisory: finding.advisory.as_ref(),
                 advisory_url: finding.advisory_url.clone(),
             });
@@ -211,14 +201,17 @@ fn collect_rule_meta<'a>(
 /// this rule has three independent optional pieces (`help_uri`, `full_description`,
 /// `properties`) to fill in.
 fn build_rule_descriptor(id: &str, meta: &RuleMeta<'_>) -> ReportingDescriptor {
-    let is_advisory = meta.is_advisory;
+    let is_advisory = meta.advisory_id.is_some();
 
     let short_description = MultiformatMessageString::builder()
         .text(meta.category.description())
         .build();
 
     let (help_uri, full_description) = if is_advisory {
-        let help_uri = meta.advisory_url.clone().or_else(|| validated_osv_url(id));
+        let help_uri = meta
+            .advisory_url
+            .clone()
+            .or_else(|| meta.advisory_id.map(OsvId::osv_url));
         let full_description = meta.advisory.map(|facts| {
             MultiformatMessageString::builder()
                 .text(facts.text.clone())
@@ -499,6 +492,7 @@ pub fn render(report: &CheckReport) -> Result<String, serde_json::Error> {
 mod tests {
     use super::*;
     use deps_core::EcosystemId;
+    use deps_core::diagnostic::GitTagsPlatform;
     use deps_core::position::Position;
     use std::path::PathBuf;
 
@@ -508,8 +502,7 @@ mod tests {
             manifest_path: PathBuf::from("Cargo.toml"),
             dependency_name: Some("serde".to_string()),
             requirement: Some("1.0".to_string()),
-            category,
-            code: None,
+            kind: crate::report::kind_for(category),
             advisory_url: None,
             advisory: None,
             severity,
@@ -518,15 +511,23 @@ mod tests {
         }
     }
 
-    fn finding_with_code(category: Category, code: &str, message: &str) -> CheckFinding {
+    fn advisory_finding(id: &str, message: &str) -> CheckFinding {
         CheckFinding {
-            code: Some(code.to_string()),
+            kind: DiagnosticKind::Advisory(deps_core::test_util::osv_id(id)),
             message: message.to_string(),
             advisory: Some(AdvisoryFacts {
                 severity: VulnSeverity::Unknown,
                 text: message.to_string(),
             }),
-            ..finding(category, Severity::Warning)
+            ..finding(Category::Vulnerable, Severity::Warning)
+        }
+    }
+
+    fn finding_with_kind(kind: DiagnosticKind, message: &str) -> CheckFinding {
+        CheckFinding {
+            kind,
+            message: message.to_string(),
+            ..finding(Category::Outdated, Severity::Warning)
         }
     }
 
@@ -748,8 +749,7 @@ mod tests {
     #[test]
     fn test_to_sarif_rule_id_uses_code_when_present() {
         let report = CheckReport {
-            findings: vec![finding_with_code(
-                Category::Vulnerable,
+            findings: vec![advisory_finding(
                 "RUSTSEC-2020-0071",
                 "RUSTSEC-2020-0071: Potential segfault in the time crate",
             )],
@@ -767,8 +767,8 @@ mod tests {
     fn test_to_sarif_distinct_advisory_codes_produce_distinct_rules() {
         let report = CheckReport {
             findings: vec![
-                finding_with_code(Category::Vulnerable, "RUSTSEC-2020-0071", "advisory A"),
-                finding_with_code(Category::Vulnerable, "GHSA-xxxx-yyyy-zzzz", "advisory B"),
+                advisory_finding("RUSTSEC-2020-0071", "advisory A"),
+                advisory_finding("GHSA-xxxx-yyyy-zzzz", "advisory B"),
             ],
         };
         let sarif = to_sarif(&report);
@@ -799,9 +799,8 @@ mod tests {
     #[test]
     fn test_to_sarif_coded_non_vulnerable_finding_still_uses_category_rule_id() {
         let report = CheckReport {
-            findings: vec![finding_with_code(
-                Category::Unsatisfiable,
-                "unsatisfiable-requirement",
+            findings: vec![finding_with_kind(
+                DiagnosticKind::Unsatisfiable,
                 "no matching version",
             )],
         };
@@ -823,14 +822,12 @@ mod tests {
     fn test_to_sarif_mutable_ref_pin_does_not_split_on_differing_codes() {
         let report = CheckReport {
             findings: vec![
-                finding_with_code(
-                    Category::MutableRefPin,
-                    "mutable-ref-pin",
+                finding_with_kind(
+                    DiagnosticKind::MutableRefPin(GitTagsPlatform::GithubActions),
                     "pinned to a tag",
                 ),
-                finding_with_code(
-                    Category::MutableRefPin,
-                    "gitlab-ci-mutable-ref-pin",
+                finding_with_kind(
+                    DiagnosticKind::MutableRefPin(GitTagsPlatform::GitlabCi),
                     "pinned to a tag",
                 ),
             ],
@@ -848,8 +845,7 @@ mod tests {
     #[test]
     fn test_build_rule_descriptor_advisory_rule_has_help_uri_and_full_description() {
         let report = CheckReport {
-            findings: vec![finding_with_code(
-                Category::Vulnerable,
+            findings: vec![advisory_finding(
                 "RUSTSEC-2020-0071",
                 "RUSTSEC-2020-0071: Potential segfault in the time crate",
             )],
@@ -883,7 +879,7 @@ mod tests {
                     severity: VulnSeverity::High,
                     text: base.to_string(),
                 }),
-                ..finding_with_code(Category::Vulnerable, "GHSA-cxww-7g56-2vh6", base)
+                ..advisory_finding("GHSA-cxww-7g56-2vh6", base)
             }],
         };
         let sarif = to_sarif(&report);
@@ -906,9 +902,9 @@ mod tests {
     fn test_rule_full_description_comes_from_the_first_finding_that_has_one() {
         let without = CheckFinding {
             advisory: None,
-            ..finding_with_code(Category::Vulnerable, "GHSA-aaaa-bbbb-cccc", "first")
+            ..advisory_finding("GHSA-aaaa-bbbb-cccc", "first")
         };
-        let with = finding_with_code(Category::Vulnerable, "GHSA-aaaa-bbbb-cccc", "second");
+        let with = advisory_finding("GHSA-aaaa-bbbb-cccc", "second");
         let sarif = to_sarif(&CheckReport {
             findings: vec![without, with],
         });
@@ -921,7 +917,7 @@ mod tests {
         let report = CheckReport {
             findings: vec![CheckFinding {
                 advisory: None,
-                ..finding_with_code(Category::Vulnerable, "GHSA-aaaa-bbbb-cccc", "m")
+                ..advisory_finding("GHSA-aaaa-bbbb-cccc", "m")
             }],
         };
         let sarif = to_sarif(&report);
@@ -950,7 +946,7 @@ mod tests {
 
     #[test]
     fn test_build_rule_descriptor_prefers_advisory_url_over_derived_formula() {
-        let mut finding = finding_with_code(Category::Vulnerable, "RUSTSEC-2020-0071", "msg");
+        let mut finding = advisory_finding("RUSTSEC-2020-0071", "msg");
         finding.advisory_url =
             Some("https://osv.dev/vulnerability/RUSTSEC-2020-0071?utm=x".to_string());
         let report = CheckReport {
@@ -965,63 +961,6 @@ mod tests {
         );
     }
 
-    /// Regression test for issue #1077 MEDIUM security review: an advisory id that would
-    /// produce an invalid URI (a literal space here) must never reach `helpUri` unvalidated.
-    #[test]
-    fn test_build_rule_descriptor_omits_help_uri_for_a_malformed_advisory_id() {
-        let report = CheckReport {
-            findings: vec![finding_with_code(
-                Category::Vulnerable,
-                "RUSTSEC with a space",
-                "msg",
-            )],
-        };
-        let sarif = to_sarif(&report);
-        let rules = sarif.runs[0].tool.driver.rules.as_ref().unwrap();
-        assert_eq!(
-            rules.len(),
-            1,
-            "a code failing the allowlist must fall back to the category-token rule, not \
-             become its own rule id (issue #1077 review #2)"
-        );
-        assert_eq!(rules[0].id, "vulnerable");
-        assert!(
-            rules[0].help_uri.is_none(),
-            "a malformed advisory id must not become an unvalidated helpUri"
-        );
-
-        let results = sarif.runs[0].results.as_ref().unwrap();
-        assert_eq!(results[0].rule_id.as_deref(), Some("vulnerable"));
-    }
-
-    /// Regression test for issue #1077 MEDIUM/S3 security review: a `.`/`..` advisory id is a
-    /// syntactically valid URI path segment but would retarget the link away from
-    /// `/vulnerability/`. Also fails [`is_valid_osv_id`] (issue #1077 review #1/#2), so it
-    /// falls back to the category-token rule entirely, not just to a bare `helpUri` omission.
-    #[test]
-    fn test_build_rule_descriptor_omits_help_uri_for_a_traversal_id() {
-        let report = CheckReport {
-            findings: vec![finding_with_code(Category::Vulnerable, "..", "msg")],
-        };
-        let sarif = to_sarif(&report);
-        let rules = sarif.runs[0].tool.driver.rules.as_ref().unwrap();
-        assert_eq!(rules[0].id, "vulnerable");
-        assert!(rules[0].help_uri.is_none());
-    }
-
-    /// Regression test for issue #1077 review #1: a multi-segment traversal embedded in the
-    /// code (a `/` is not in the allowlist) must be rejected the same way a bare `..` is.
-    #[test]
-    fn test_build_rule_descriptor_omits_help_uri_for_an_embedded_slash_traversal() {
-        let report = CheckReport {
-            findings: vec![finding_with_code(Category::Vulnerable, "../evil", "msg")],
-        };
-        let sarif = to_sarif(&report);
-        let rules = sarif.runs[0].tool.driver.rules.as_ref().unwrap();
-        assert_eq!(rules[0].id, "vulnerable");
-        assert!(rules[0].help_uri.is_none());
-    }
-
     /// Regression test for issue #1077 review #3: a *valid* advisory id that happens to equal
     /// a category token verbatim must still be treated as a genuine advisory rule (getting
     /// `helpUri`/`fullDescription`), not misclassified as category-only by a string comparison
@@ -1029,7 +968,7 @@ mod tests {
     #[test]
     fn test_build_rule_descriptor_advisory_id_equal_to_a_category_token_is_still_advisory() {
         let report = CheckReport {
-            findings: vec![finding_with_code(Category::Vulnerable, "vulnerable", "msg")],
+            findings: vec![advisory_finding("vulnerable", "msg")],
         };
         let sarif = to_sarif(&report);
         let rules = sarif.runs[0].tool.driver.rules.as_ref().unwrap();
@@ -1046,7 +985,7 @@ mod tests {
 
     #[test]
     fn test_build_rule_descriptor_sets_security_severity_from_advisory_bucket() {
-        let mut finding = finding_with_code(Category::Vulnerable, "RUSTSEC-2020-0071", "msg");
+        let mut finding = advisory_finding("RUSTSEC-2020-0071", "msg");
         finding.advisory = Some(AdvisoryFacts {
             severity: VulnSeverity::Critical,
             text: "msg".to_string(),
@@ -1065,7 +1004,7 @@ mod tests {
 
     #[test]
     fn test_build_rule_descriptor_omits_security_severity_for_an_ungraded_bucket() {
-        let mut finding = finding_with_code(Category::Vulnerable, "RUSTSEC-2020-0071", "msg");
+        let mut finding = advisory_finding("RUSTSEC-2020-0071", "msg");
         finding.advisory = Some(AdvisoryFacts {
             severity: VulnSeverity::Unknown,
             text: "msg".to_string(),
@@ -1081,11 +1020,7 @@ mod tests {
     #[test]
     fn test_build_rule_descriptor_omits_security_severity_without_advisory_severity_data() {
         let report = CheckReport {
-            findings: vec![finding_with_code(
-                Category::Vulnerable,
-                "RUSTSEC-2020-0071",
-                "msg",
-            )],
+            findings: vec![advisory_finding("RUSTSEC-2020-0071", "msg")],
         };
         let sarif = to_sarif(&report);
         let rule = &sarif.runs[0].tool.driver.rules.as_ref().unwrap()[0];

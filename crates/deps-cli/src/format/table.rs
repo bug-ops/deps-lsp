@@ -48,7 +48,7 @@ pub fn render(report: &CheckReport) -> String {
                 finding.range.start.line + 1,
                 finding.range.start.character + 1,
                 dependency,
-                finding.category,
+                finding.category(),
                 finding.message,
             );
         }
@@ -137,8 +137,7 @@ mod tests {
             manifest_path: PathBuf::from(path),
             dependency_name: Some("serde".to_string()),
             requirement: Some("1.0".to_string()),
-            category,
-            code: None,
+            kind: crate::report::kind_for(category),
             advisory_url: None,
             advisory: None,
             severity,

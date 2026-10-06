@@ -2,10 +2,10 @@ use tower_lsp_server::ls_types::{InlayHint, InlayHintKind, InlayHintLabel, Inlay
 
 use crate::{ConcreteVersion, EcosystemConfig, ParseResult};
 
-use super::diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
+use super::diagnostics::{MAX_VERSION_DIAGNOSTIC_CHARS, flagged_detail};
 use super::{
-    EcosystemFormatter, LatestVerdict, RequirementGate, RequirementStatus, VersionData,
-    in_use_version, latest_verdict, sanitize_and_truncate_for_diagnostic,
+    EcosystemFormatter, LatestVerdict, RequirementGate, RequirementStatus, SiblingMatchNote,
+    VersionData, in_use_version, latest_verdict, sanitize_and_truncate_for_diagnostic,
 };
 
 /// Sanitizes and caps a version-shaped string (`latest` or `resolved_version`) for
@@ -208,21 +208,18 @@ pub fn generate_inlay_hints(
                 if let LatestVerdict::Flagged {
                     advisory_ids,
                     malicious,
-                    ..
+                    via_sibling_tags,
                 } = verdict
                 {
                     let icon = if malicious { "🚫" } else { "⚠️" };
-                    flagged_tooltip = Some(if advisory_ids.is_empty() {
-                        "This requirement already admits a version OSV.dev flags — do not \
-                         rely on it being safe"
-                            .to_string()
-                    } else {
-                        format!(
-                            "This requirement already admits a version OSV.dev flags ({}) — \
-                             do not rely on it being safe",
-                            advisory_ids.join(", ")
-                        )
-                    });
+                    let note = via_sibling_tags
+                        .as_ref()
+                        .map(|tags| SiblingMatchNote::new(formatter, tags));
+                    flagged_tooltip = Some(format!(
+                        "This requirement already admits a version OSV.dev flags{} — do not \
+                         rely on it being safe",
+                        flagged_detail(&advisory_ids, note.as_ref())
+                    ));
                     format!("{icon} {}", sanitize_hint_version(latest.as_str()))
                 } else if let Some(resolved) = &resolved_version {
                     format!(
@@ -249,18 +246,17 @@ pub fn generate_inlay_hints(
                 if let LatestVerdict::Flagged {
                     advisory_ids,
                     malicious,
-                    ..
+                    via_sibling_tags,
                 } = verdict
                 {
                     let icon = if malicious { "🚫" } else { "⚠️" };
-                    flagged_tooltip = Some(if advisory_ids.is_empty() {
-                        "Flagged by OSV.dev — do not upgrade to this version".to_string()
-                    } else {
-                        format!(
-                            "Flagged by OSV.dev ({}) — do not upgrade to this version",
-                            advisory_ids.join(", ")
-                        )
-                    });
+                    let note = via_sibling_tags
+                        .as_ref()
+                        .map(|tags| SiblingMatchNote::new(formatter, tags));
+                    flagged_tooltip = Some(format!(
+                        "Flagged by OSV.dev{} — do not upgrade to this version",
+                        flagged_detail(&advisory_ids, note.as_ref())
+                    ));
                     format!("{icon} {} flagged", sanitize_hint_version(latest.as_str()))
                 } else {
                     config
@@ -611,7 +607,7 @@ mod tests {
             crate::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.0.8"),
-                advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("MAL-2026-16332")], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
                 via_sibling_tags: None,
             },
@@ -644,6 +640,84 @@ mod tests {
             }
             other => panic!("expected a tooltip naming the advisory, got: {other:?}"),
         }
+    }
+
+    /// The tooltip of the single inlay hint for a `version_req` dependency whose cached latest
+    /// `1.0.8` is OSV-flagged through the sibling tag `v4.9.0`.
+    fn sibling_flagged_latest_tooltip(version_req: &str) -> String {
+        use crate::osv::{Capped, LatestStatusMap, MatchedTags, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            network: crate::NetworkMode::Online,
+        };
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "widget".into(),
+                version_req: version_req.into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("widget".into(), PackageVersions::latest_only("1.0.8"));
+        let resolved_versions = HashMap::new();
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("widget"),
+            UpgradeStatus::CandidateVulnerable {
+                version: ConcreteVersion::new("1.0.8"),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("A-1")], 1),
+                worst_severity: Some(VulnSeverity::High),
+                via_sibling_tags: Some(MatchedTags::new(ConcreteVersion::new("v4.9.0"), vec![])),
+            },
+        );
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status),
+            crate::LoadingState::Loaded,
+            &config,
+            &MOCK_FORMATTER,
+        );
+        assert_eq!(hints.len(), 1);
+        match &hints[0].tooltip {
+            Some(InlayHintTooltip::String(tooltip)) => tooltip.clone(),
+            other => panic!("expected a string tooltip, got: {other:?}"),
+        }
+    }
+
+    /// #1782: the flagged-latest tooltip names the sibling tags in the `Outdated` arm.
+    #[test]
+    fn test_inlay_hint_outdated_flagged_tooltip_names_sibling_tags() {
+        let tooltip = sibling_flagged_latest_tooltip("1.0.4");
+        assert!(
+            tooltip.contains("A-1; matched tag v4.9.0"),
+            "got: {tooltip}"
+        );
+        assert!(tooltip.starts_with("Flagged by OSV.dev"), "got: {tooltip}");
+    }
+
+    /// #1782: the flagged-latest tooltip names the sibling tags in the `UpToDate` arm.
+    #[test]
+    fn test_inlay_hint_up_to_date_flagged_tooltip_names_sibling_tags() {
+        let tooltip = sibling_flagged_latest_tooltip("^1.0.4");
+        assert!(
+            tooltip.contains("A-1; matched tag v4.9.0"),
+            "got: {tooltip}"
+        );
+        assert!(
+            tooltip.starts_with("This requirement already admits"),
+            "got: {tooltip}"
+        );
     }
 
     /// Issue #1526: a caret requirement already admits `latest` (`UpToDate`, not `Outdated`),
@@ -689,7 +763,7 @@ mod tests {
             crate::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
                 version: ConcreteVersion::new("1.0.8"),
-                advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                advisory_ids: Capped::new(vec![crate::test_util::osv_id("MAL-2026-16332")], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
                 via_sibling_tags: None,
             },

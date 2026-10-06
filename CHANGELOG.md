@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
+- **deps-core**: `Advisory.id` is a private `OsvId` read via `id()`, `Advisory::url()` returns `String`, and `is_valid_osv_id`/`validated_osv_url` are replaced by `OsvId::parse`/`osv_url`; advisory id fields and `SiblingMatches` use `OsvId` (#1807)
+- **deps-core**: `Diagnostic::new` takes an exhaustive `DiagnosticKind` and `Diagnostic::with_code` is removed; the diagnostic code is no longer sanitized (#1807)
+- **deps-cli**: `CheckFinding.category`/`.code` fields are replaced by `kind` with `category()`/`code()` methods; `advisory_ids` in `update` types and JSON are `OsvId` (wire format unchanged) (#1807)
+- **deps-core, deps-lsp, deps-nuget**: typosquat and gossip gates are typed `Checks<F>` built by `PolicyConfig::checks`; `OsvChecksCell` becomes `AtomicToggle`, `OsvState` becomes `CheckState`, `ServerState::typosquat_enabled`/`gossip_enabled` and their accessors are removed, and `nuget_user_profile_sources` is the typed `UserProfileSources` (#1807)
+- **deps-core**: `PinResolution::NotYetIndexed` added; `SiblingCoverage` replaces `ListCoverage` in `ScanTarget`, `InUseVersions` and `TaggedVersions::sibling_coverage` (#1807)
+- **deps-core, deps-cli, deps-engine**: `CommitRewrite`, `RequirementResolution::commit_rewrite_for`, `VulnFixSkip::NoReleaseTagForFix` and `UnfixableReason::NoReleaseTagForFix` added (#1807)
+- **deps-core**: `HttpCache::get_cached_trusted_origin_response` takes `Option<CredentialPartition>`; `DependencyVulnerabilities::with_sibling_matches_for_test` added behind `test-util` (#1807)
 - **deps-core**: `CommitSha::parse` stores lowercase and drops `Borrow<str>`; `TagIndex::resolved_pin`/`tag_for_sha`/`splice_resolved_line` and `ShaPinLookup::resolve` (now infallible) take `&CommitSha`; `resolved_pin_version` returns `PinResolution` (#1751)
 - **deps-github-actions**: `PinStyle::Sha` carries `sha: CommitSha` and `comment: Option<ShaComment>`; `GithubActionsDependency` loses `version_literal` and `closing_delimiters`; `sha_pin_raw_sha` removed (#1751)
 - **deps-gitlab-ci**: `PinStyle::Sha` carries a `ShaPinTail` (#1764)
@@ -35,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: repository editor settings can no longer redirect `GITLAB_TOKEN` through `registries.gitlab_instance_host`; the configuration docs now list the trust impact of every repository-settable field (#1797)
 
 ### Added
+- **deps-github-actions, deps-gitlab-ci**: unknown-ref quick fix rewrites the ref to the published tag spelling when exactly one tag matches (#1807)
+- **deps-core**: `secret::bearer_auth_header`, `CredentialPartition` and `lsp_helpers::dependency_at_position` (#1807)
 - **deps-core, all ecosystems**: `DepsError::HostBlockedByPolicy` shows a policy-specific message when a registry host resolves to a blocked address class at connect time (#1773)
 - **deps-swift**: follows `Link rel="next"` pages of the SE-0292 release list (#1773)
 - **deps-swift**: `publishedAt` freshness for the newest registry releases (#1773)
@@ -56,6 +65,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cli**: flagged latest candidates name the sibling release tags they match in hover, diagnostics and `update` (#1783)
 
 ### Changed
+- **deps-lsp**: typosquat and gossip prefetch also fires on an offline to online transition (#1807)
+- **deps-core, deps-lsp, deps-cli**: inlay-hint tooltips and `update --security-only` NoVerifiedFix rows name the matched sibling tags (#1807)
 - **deps-core, deps-lsp, deps-cli**: one typed `OsvChecks` gate (`Active`/`Inactive`) for every OSV call site instead of repeated `vulnerabilities_enabled && !offline` conditions and OSV booleans (#1775, #1774, #1776)
 - **deps-github-actions, deps-gitlab-ci**: a tag pin ahead of the latest release is reported up to date instead of offering a downgrade (#1751)
 - **deps-core, deps-github-actions, deps-gitlab-ci**: a truncated tag list fails closed instead of reading a pin as up to date or an OSV answer as clean (#1783)
@@ -68,6 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SECURITY.md**: supported versions table lists 2.0.x as supported and older lines as unsupported (#1797)
 
 ### Fixed
+- **deps-github-actions, deps-gitlab-ci**: a cold or failed tag fetch reports sibling tags unknown instead of a clean OSV result (#1807)
+- **deps-cli**: `update --security-only` reports a SHA pin whose fix version has no release tag as unfixable, and a missing tag list as no verified fix (#1807)
+- **deps-swift**: an offline request no longer serves a response fetched under a Keychain credential that was since disabled (#1807)
 - **deps-engine, deps-github-actions**: OSV latest, candidate and fix-target checks cover the sibling release tags of the candidate commit and fail closed when they are unknown (#1775)
 - **deps-github-actions, deps-gitlab-ci**: a vulnerability fix version `4.1.3` now rewrites a SHA pin to tag `v4.1.3` (#1783)
 - **deps-cli**: SARIF advisory rule description no longer carries a per-result sibling-tag note (#1775)

@@ -16,7 +16,134 @@
 //! module's docs for why the conversion lives in `deps-lsp` rather than here for
 //! `url::Url`-carrying types).
 
+use crate::lsp_helpers::{
+    DEPRECATED_DIAGNOSTIC_CODE, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
+    SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE, TYPOSQUAT_DIAGNOSTIC_CODE, UNKNOWN_REF_DIAGNOSTIC_CODE,
+    UNSATISFIABLE_DIAGNOSTIC_CODE,
+};
+use crate::osv::OsvId;
 use crate::position::Range;
+
+/// Wire code of GitHub Actions' mutable-ref-pin diagnostic.
+pub const GITHUB_ACTIONS_MUTABLE_REF_PIN_DIAGNOSTIC_CODE: &str = "mutable-ref-pin";
+
+/// Wire code of GitLab CI's mutable-ref-pin diagnostic.
+pub const GITLAB_CI_MUTABLE_REF_PIN_DIAGNOSTIC_CODE: &str = "gitlab-ci-mutable-ref-pin";
+
+/// Wire code of GitLab CI's unresolved-instance-host notice.
+pub const GITLAB_CI_UNRESOLVED_HOST_DIAGNOSTIC_CODE: &str = "unresolved-gitlab-host";
+
+/// Git-tag-pinning CI platform a mutable-ref-pin diagnostic was raised for.
+///
+/// A dedicated two-variant enum rather than [`crate::EcosystemId`], which would admit
+/// ecosystems that have no mutable-ref-pin diagnostic at all.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::diagnostic::{DiagnosticKind, GitTagsPlatform};
+///
+/// let kind = DiagnosticKind::MutableRefPin(GitTagsPlatform::GitlabCi);
+/// assert_eq!(kind.code(), Some("gitlab-ci-mutable-ref-pin"));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GitTagsPlatform {
+    /// GitHub Actions workflows.
+    GithubActions,
+    /// GitLab CI/CD pipelines.
+    GitlabCi,
+}
+
+/// What a [`Diagnostic`] reports, set by the producer.
+///
+/// Exhaustive (no `#[non_exhaustive]`) on purpose: every consumer that classifies diagnostics
+/// (e.g. `deps-cli check`'s `--fail-on` categories) matches it without a wildcard arm, so a new
+/// kind fails to compile until every classifier has decided what to do with it (#1784). The
+/// wire [`Self::code`] is derived from the kind, never set independently.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::diagnostic::DiagnosticKind;
+/// use deps_core::osv::OsvId;
+///
+/// let advisory = DiagnosticKind::Advisory(OsvId::parse("GHSA-xxxx-yyyy-zzzz").unwrap());
+/// assert_eq!(advisory.code(), Some("GHSA-xxxx-yyyy-zzzz"));
+/// assert_eq!(DiagnosticKind::Outdated.code(), None);
+/// assert_eq!(DiagnosticKind::Unsatisfiable.code(), Some("unsatisfiable-requirement"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DiagnosticKind {
+    /// A newer version than the requirement admits is available.
+    Outdated,
+    /// The requirement already admits a latest version OSV flags as vulnerable/malicious.
+    FlaggedLatest,
+    /// The OSV check for the requirement's admitted latest version could not be completed.
+    UnverifiedLatest,
+    /// The resolved or only-matching version is yanked.
+    Yanked,
+    /// One OSV advisory affecting the resolved version.
+    Advisory(OsvId),
+    /// The trailing "+N more advisories" summary line.
+    AdvisoryOverflow,
+    /// The requirement matches no published version.
+    Unsatisfiable,
+    /// The declared license violates the configured policy.
+    LicensePolicy,
+    /// The package is deprecated.
+    Deprecated,
+    /// The package name resembles a far more popular one.
+    Typosquat,
+    /// A mutable git ref (branch or floating tag) is pinned instead of a commit.
+    MutableRefPin(GitTagsPlatform),
+    /// A SHA pin whose trailing version comment disagrees with the pinned commit.
+    ShaCommentMismatch,
+    /// A git ref that does not exist upstream.
+    UnknownRef,
+    /// GitLab CI's instance host is unset or invalid.
+    UnresolvedGitlabHost,
+    /// An informational or failure notice with no machine-readable code: unknown package, fetch
+    /// failure, offline/blocked-registry/dependency-count notices.
+    Notice,
+}
+
+impl DiagnosticKind {
+    /// Returns the stable machine-readable wire code for this kind, if it has one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::diagnostic::DiagnosticKind;
+    ///
+    /// assert_eq!(DiagnosticKind::Typosquat.code(), Some("typosquat-suspect"));
+    /// assert_eq!(DiagnosticKind::Notice.code(), None);
+    /// ```
+    #[must_use]
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Advisory(id) => Some(id.as_str()),
+            Self::Unsatisfiable => Some(UNSATISFIABLE_DIAGNOSTIC_CODE),
+            Self::LicensePolicy => Some(LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE),
+            Self::Deprecated => Some(DEPRECATED_DIAGNOSTIC_CODE),
+            Self::Typosquat => Some(TYPOSQUAT_DIAGNOSTIC_CODE),
+            Self::MutableRefPin(GitTagsPlatform::GithubActions) => {
+                Some(GITHUB_ACTIONS_MUTABLE_REF_PIN_DIAGNOSTIC_CODE)
+            }
+            Self::MutableRefPin(GitTagsPlatform::GitlabCi) => {
+                Some(GITLAB_CI_MUTABLE_REF_PIN_DIAGNOSTIC_CODE)
+            }
+            Self::ShaCommentMismatch => Some(SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE),
+            Self::UnknownRef => Some(UNKNOWN_REF_DIAGNOSTIC_CODE),
+            Self::UnresolvedGitlabHost => Some(GITLAB_CI_UNRESOLVED_HOST_DIAGNOSTIC_CODE),
+            Self::Outdated
+            | Self::FlaggedLatest
+            | Self::UnverifiedLatest
+            | Self::Yanked
+            | Self::AdvisoryOverflow
+            | Self::Notice => None,
+        }
+    }
+}
 
 /// A diagnostic severity level, field-for-field identical to
 /// `tower_lsp_server::ls_types::DiagnosticSeverity`'s four defined values, but carrying no
@@ -266,46 +393,56 @@ impl RelatedInformation {
 /// # Examples
 ///
 /// ```
-/// use deps_core::diagnostic::{Diagnostic, Severity};
+/// use deps_core::diagnostic::{Diagnostic, DiagnosticKind, Severity};
 /// use deps_core::position::{Position, Range};
 ///
 /// let diagnostic = Diagnostic::new(
+///     DiagnosticKind::Unsatisfiable,
 ///     Range::new(Position::new(0, 0), Position::new(0, 10)),
-///     "newer version available",
+///     "no version matches",
 /// )
-/// .with_severity(Severity::Hint)
-/// .with_code("outdated");
+/// .with_severity(Severity::Hint);
 ///
-/// assert_eq!(diagnostic.message(), "newer version available");
+/// assert_eq!(diagnostic.message(), "no version matches");
 /// assert_eq!(diagnostic.severity, Some(Severity::Hint));
-/// assert_eq!(diagnostic.code(), Some("outdated"));
+/// assert_eq!(diagnostic.kind(), &DiagnosticKind::Unsatisfiable);
+/// assert_eq!(diagnostic.code(), Some("unsatisfiable-requirement"));
 /// ```
 ///
 /// # The sanitization backstop this design relies on (issue #1280)
 ///
-/// `message` and `code` are private, and `Self` does not implement `Default` — the only way
+/// `message` and `kind` are private, and `Self` does not implement `Default` — the only way
 /// to build or mutate a `Diagnostic` from outside this crate is through [`Self::new`] and the
-/// `with_*` builders, every one of which sanitizes the value it sets. Each of the following
-/// fails to compile:
+/// `with_*` builders, every one of which sanitizes the value it sets. The wire `code` is
+/// derived from `kind`, so it is always a static sentinel or a validated [`OsvId`] (#1785).
+/// Each of the following fails to compile:
 ///
 /// Setting `message` directly (the field does not exist from outside this crate):
 ///
 /// ```compile_fail
-/// use deps_core::diagnostic::Diagnostic;
+/// use deps_core::diagnostic::{Diagnostic, DiagnosticKind};
 /// use deps_core::position::{Position, Range};
 ///
-/// let mut d = Diagnostic::new(Range::new(Position::new(0, 0), Position::new(0, 1)), "safe");
+/// let mut d = Diagnostic::new(
+///     DiagnosticKind::Notice,
+///     Range::new(Position::new(0, 0), Position::new(0, 1)),
+///     "safe",
+/// );
 /// d.message = "raw".to_string();
 /// ```
 ///
-/// Setting `code` directly:
+/// Setting `kind` directly:
 ///
 /// ```compile_fail
-/// use deps_core::diagnostic::Diagnostic;
+/// use deps_core::diagnostic::{Diagnostic, DiagnosticKind};
 /// use deps_core::position::{Position, Range};
 ///
-/// let mut d = Diagnostic::new(Range::new(Position::new(0, 0), Position::new(0, 1)), "safe");
-/// d.code = Some("raw".to_string());
+/// let mut d = Diagnostic::new(
+///     DiagnosticKind::Notice,
+///     Range::new(Position::new(0, 0), Position::new(0, 1)),
+///     "safe",
+/// );
+/// d.kind = DiagnosticKind::Outdated;
 /// ```
 ///
 /// Constructing via `Default` (not implemented):
@@ -322,7 +459,7 @@ pub struct Diagnostic {
     pub range: Range,
     /// Severity, if classified.
     pub severity: Option<Severity>,
-    code: Option<String>,
+    kind: DiagnosticKind,
     /// Advisory/rule URL for `code`, e.g. an OSV advisory page.
     pub code_description: Option<CodeDescription>,
     message: String,
@@ -332,8 +469,8 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    /// Builds a [`Diagnostic`] from its `range`/`message` fields, with every other field left
-    /// unset. Chain the `with_*` builders to set them.
+    /// Builds a [`Diagnostic`] from its `kind`/`range`/`message` fields, with every other field
+    /// left unset. Chain the `with_*` builders to set them.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate must call this constructor to build a new value.
@@ -350,21 +487,22 @@ impl Diagnostic {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::diagnostic::Diagnostic;
+    /// use deps_core::diagnostic::{Diagnostic, DiagnosticKind};
     /// use deps_core::position::{Position, Range};
     ///
     /// let diagnostic = Diagnostic::new(
+    ///     DiagnosticKind::Notice,
     ///     Range::new(Position::new(2, 0), Position::new(2, 6)),
     ///     "package not found",
     /// );
     /// assert_eq!(diagnostic.severity, None);
     /// ```
     #[must_use]
-    pub fn new(range: Range, message: impl Into<String>) -> Self {
+    pub fn new(kind: DiagnosticKind, range: Range, message: impl Into<String>) -> Self {
         Self {
             range,
             severity: None,
-            code: None,
+            kind,
             code_description: None,
             message: crate::lsp_helpers::replace_markdown_unsafe_chars(&message.into()),
             related_information: None,
@@ -376,10 +514,11 @@ impl Diagnostic {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::diagnostic::Diagnostic;
+    /// use deps_core::diagnostic::{Diagnostic, DiagnosticKind};
     /// use deps_core::position::{Position, Range};
     ///
     /// let diagnostic = Diagnostic::new(
+    ///     DiagnosticKind::Notice,
     ///     Range::new(Position::new(0, 0), Position::new(0, 1)),
     ///     "package not found",
     /// );
@@ -390,45 +529,51 @@ impl Diagnostic {
         &self.message
     }
 
-    /// Returns the stable machine-readable code identifying the diagnostic kind (e.g.
-    /// `"unsatisfiable-requirement"`), if set.
+    /// Returns what this diagnostic reports.
     ///
     /// # Examples
     ///
     /// ```
-    /// use deps_core::diagnostic::Diagnostic;
+    /// use deps_core::diagnostic::{Diagnostic, DiagnosticKind};
     /// use deps_core::position::{Position, Range};
     ///
     /// let diagnostic = Diagnostic::new(
+    ///     DiagnosticKind::Yanked,
     ///     Range::new(Position::new(0, 0), Position::new(0, 1)),
-    ///     "package not found",
-    /// )
-    /// .with_code("unknown-package");
-    /// assert_eq!(diagnostic.code(), Some("unknown-package"));
+    ///     "yanked",
+    /// );
+    /// assert_eq!(diagnostic.kind(), &DiagnosticKind::Yanked);
+    /// ```
+    #[must_use]
+    pub const fn kind(&self) -> &DiagnosticKind {
+        &self.kind
+    }
+
+    /// Returns the stable machine-readable code derived from [`Self::kind`] (e.g.
+    /// `"unsatisfiable-requirement"`), if the kind has one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::diagnostic::{Diagnostic, DiagnosticKind};
+    /// use deps_core::position::{Position, Range};
+    ///
+    /// let diagnostic = Diagnostic::new(
+    ///     DiagnosticKind::Deprecated,
+    ///     Range::new(Position::new(0, 0), Position::new(0, 1)),
+    ///     "deprecated",
+    /// );
+    /// assert_eq!(diagnostic.code(), Some("deprecated-package"));
     /// ```
     #[must_use]
     pub fn code(&self) -> Option<&str> {
-        self.code.as_deref()
+        self.kind.code()
     }
 
     /// Overrides [`Self::severity`]. See [`Self::new`].
     #[must_use]
     pub const fn with_severity(mut self, severity: Severity) -> Self {
         self.severity = Some(severity);
-        self
-    }
-
-    /// Overrides the diagnostic's `code` (see [`Self::code`]). See [`Self::new`].
-    ///
-    /// `code` is sanitized through the same markdown-unsafe-character filter as `message`
-    /// (#1280) — it reaches the same client-visible sinks (the editor's Problems panel,
-    /// SARIF `ruleId`), so it gets the same defense-in-depth guarantee, on top of (not
-    /// instead of) producer-side validation.
-    #[must_use]
-    pub fn with_code(mut self, code: impl Into<String>) -> Self {
-        self.code = Some(crate::lsp_helpers::replace_markdown_unsafe_chars(
-            &code.into(),
-        ));
         self
     }
 
@@ -461,11 +606,11 @@ mod tests {
         let href = url::Url::parse("https://osv.dev/GHSA-xxxx").unwrap();
         let related_uri = url::Url::parse("file:///Cargo.toml").unwrap();
         let diagnostic = Diagnostic::new(
+            DiagnosticKind::Advisory(OsvId::parse("GHSA-xxxx").unwrap()),
             Range::new(Position::new(0, 0), Position::new(0, 4)),
             "vulnerable",
         )
         .with_severity(Severity::Error)
-        .with_code("GHSA-xxxx")
         .with_code_description(CodeDescription::new(href.clone()))
         .with_related_information(vec![RelatedInformation::new(
             related_uri.clone(),
@@ -487,6 +632,7 @@ mod tests {
         use crate::position::Position;
 
         let diagnostic = Diagnostic::new(
+            DiagnosticKind::Notice,
             Range::new(Position::new(0, 0), Position::new(0, 1)),
             "message",
         );
@@ -545,24 +691,46 @@ mod tests {
         use crate::position::Position;
 
         let diagnostic = Diagnostic::new(
+            DiagnosticKind::Notice,
             Range::new(Position::new(0, 0), Position::new(0, 1)),
             "vulnerable\u{202E}gnp.sj",
         );
         assert_eq!(diagnostic.message(), "vulnerable gnp.sj");
     }
 
-    /// #1280: `with_code` gets the same sanitization backstop as `message` — a `code` value
-    /// reaches the same client-visible sinks (Problems panel, SARIF `ruleId`).
     #[test]
-    fn test_diagnostic_with_code_sanitizes_bidi_override() {
-        use crate::position::Position;
-
-        let diagnostic = Diagnostic::new(
-            Range::new(Position::new(0, 0), Position::new(0, 1)),
-            "vulnerable",
-        )
-        .with_code("GHSA-xxxx\u{202E}gnp.sj");
-        assert_eq!(diagnostic.code(), Some("GHSA-xxxx gnp.sj"));
+    fn test_kind_code_matches_wire_sentinels() {
+        assert_eq!(
+            DiagnosticKind::MutableRefPin(GitTagsPlatform::GithubActions).code(),
+            Some("mutable-ref-pin")
+        );
+        assert_eq!(
+            DiagnosticKind::MutableRefPin(GitTagsPlatform::GitlabCi).code(),
+            Some("gitlab-ci-mutable-ref-pin")
+        );
+        assert_eq!(
+            DiagnosticKind::UnresolvedGitlabHost.code(),
+            Some("unresolved-gitlab-host")
+        );
+        assert_eq!(
+            DiagnosticKind::ShaCommentMismatch.code(),
+            Some("sha-comment-mismatch")
+        );
+        assert_eq!(DiagnosticKind::UnknownRef.code(), Some("unknown-ref"));
+        assert_eq!(
+            DiagnosticKind::LicensePolicy.code(),
+            Some("license-policy-violation")
+        );
+        for kind in [
+            DiagnosticKind::Outdated,
+            DiagnosticKind::FlaggedLatest,
+            DiagnosticKind::UnverifiedLatest,
+            DiagnosticKind::Yanked,
+            DiagnosticKind::AdvisoryOverflow,
+            DiagnosticKind::Notice,
+        ] {
+            assert_eq!(kind.code(), None);
+        }
     }
 
     /// #1276: same backstop applies to `RelatedInformation::new`.

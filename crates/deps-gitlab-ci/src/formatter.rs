@@ -2,7 +2,7 @@
 
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, CandidateTagSource, CommentCheck, CommentSlot, CommitSha,
+    BoundedVersionReq, CandidateTagSource, CommentCheck, CommentSlot, CommitRewrite, CommitSha,
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     PartialTagPolicy, PinResolution, RequirementResolution, RequirementStatus, ShaPinComment,
     ShaPinLookup, ShaPinTail, SourcePolicy, TagIndex, match_v_prefix_style,
@@ -433,6 +433,20 @@ impl RequirementResolution for GitlabCiFormatter {
         }
     }
 
+    fn commit_rewrite_for(&self, dep: &dyn Dependency, version: &ConcreteVersion) -> CommitRewrite {
+        let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
+            return CommitRewrite::NotACommitPin;
+        };
+        if !matches!(gl_dep.pin, Some(PinStyle::Sha { .. })) {
+            return CommitRewrite::NotACommitPin;
+        }
+        self.tag_index
+            .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()))
+            .map_or(CommitRewrite::IndexUnavailable, |index| {
+                index.commit_rewrite_to(version.as_str())
+            })
+    }
+
     /// #1556: mirrors `deps_github_actions::GithubActionsFormatter`'s identical override —
     /// a `PinStyle::Sha` pin's exact version is knowable from the shared [`TagIndex`]'s
     /// `sha_to_tag` even though the SHA text itself always fails
@@ -442,6 +456,9 @@ impl RequirementResolution for GitlabCiFormatter {
     /// is read from [`PinStyle::Sha`] itself, so no shape re-check is needed. The trailing
     /// comment only reaches the index through
     /// [`TagIndex::pin_resolution`], which refuses a comment it can contradict.
+    ///
+    /// A SHA pin whose repository has no index yet (cold cache or failed tag fetch) is
+    /// [`PinResolution::NotYetIndexed`]: its sibling tags are unknown until a fetch succeeds.
     ///
     /// Keyed by `(endpoint, name)`, not `name` alone (validation finding S2) — same
     /// disambiguation `Self::resolved_tag_for_sha` applies, since a `project:` and
@@ -455,7 +472,7 @@ impl RequirementResolution for GitlabCiFormatter {
         };
         self.tag_index
             .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()))
-            .map_or(PinResolution::Unresolved, |index| {
+            .map_or(PinResolution::NotYetIndexed, |index| {
                 index.pin_resolution(sha, gl_dep.sha_comment().map(|comment| &comment.tag))
             })
     }
@@ -1134,14 +1151,15 @@ mod tests {
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            PinResolution::Unresolved,
+            PinResolution::NotYetIndexed,
             "a project: (Tags) include must not resolve through a component: (Releases) entry"
         );
     }
 
-    /// Cold cache (no `TagIndex` entry yet) must stay the honest `Unresolved`.
+    /// Cold cache (no `TagIndex` entry yet) is the honest `NotYetIndexed` (#1780), never a
+    /// fabricated version.
     #[test]
-    fn test_resolved_pin_version_sha_pin_tag_index_miss_is_unresolved() {
+    fn test_resolved_pin_version_sha_pin_tag_index_miss_is_not_yet_indexed() {
         let sha = "c".repeat(40);
         let fmt = formatter();
         let mut d = dep(
@@ -1156,7 +1174,56 @@ mod tests {
         );
         d.version_req = Some(sha.into());
 
-        assert_eq!(fmt.resolved_pin_version(&d), PinResolution::Unresolved);
+        assert_eq!(fmt.resolved_pin_version(&d), PinResolution::NotYetIndexed);
+    }
+
+    /// #1779: a SHA pin's rewrite to a version without a release tag is `NoReleaseTag` only for a
+    /// complete, populated Tags list; a missing index is `IndexUnavailable`; a tag pin is not a
+    /// commit pin at all.
+    #[test]
+    fn test_commit_rewrite_for_distinguishes_missing_tag_from_unavailable_index() {
+        use deps_core::lsp_helpers::{CommitRewrite, CommitSha};
+
+        let sha = "c".repeat(40);
+        let fmt = formatter();
+        let source = || DependencySource::AlternateRegistry {
+            index: "gitlab:abc".into(),
+            mirrors_crates_io: false,
+        };
+        let mut d = dep(
+            Some(PinStyle::sha_without_comment(
+                CommitSha::parse(&sha).unwrap(),
+            )),
+            "gitlab.com/org/proj",
+            source(),
+        );
+        d.version_req = Some(sha.clone().into());
+        let missing = ConcreteVersion::new("v9.9.9");
+
+        assert_eq!(
+            fmt.commit_rewrite_for(&d, &missing),
+            CommitRewrite::IndexUnavailable
+        );
+
+        let commit = CommitSha::parse(&sha).unwrap();
+        fmt.tag_index.insert(
+            (d.kind.endpoint(), PackageName::new("gitlab.com/org/proj")),
+            Arc::new(TagIndex::from_tags([("v1.0.0", &commit)])),
+        );
+        assert_eq!(
+            fmt.commit_rewrite_for(&d, &missing),
+            CommitRewrite::NoReleaseTag
+        );
+        assert_eq!(
+            fmt.commit_rewrite_for(&d, &ConcreteVersion::new("1.0.0")),
+            CommitRewrite::Resolved
+        );
+
+        let tag_pin = dep(Some(PinStyle::Tag), "gitlab.com/org/proj", source());
+        assert_eq!(
+            fmt.commit_rewrite_for(&tag_pin, &missing),
+            CommitRewrite::NotACommitPin
+        );
     }
 
     /// A `Tag`/`Branch`/`Partial`/`Latest` pin has no SHA to resolve — must stay `Unresolved`.

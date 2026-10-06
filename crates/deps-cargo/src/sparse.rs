@@ -264,9 +264,8 @@ impl SparseIndexClient {
         auth: Option<AuthToken>,
         registry_display_name: &'static str,
     ) -> Self {
-        let auth_header = auth.map(|token| {
-            deps_core::secret::Redacted::new(format!("Bearer {}", token.expose_secret()))
-        });
+        let auth_header =
+            auth.map(|token| deps_core::secret::bearer_auth_header(token.expose_secret()));
         Self {
             trust: index.trust(),
             base_url: index.as_str().to_string(),

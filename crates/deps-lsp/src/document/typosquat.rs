@@ -164,8 +164,8 @@ impl FromIterator<(PackageName, TyposquatSourceEligibility)> for TyposquatGate {
 }
 
 /// Background pre-fetch of a typosquat-suspect signal per direct dependency (issue #1437,
-/// spec 071), gated on [`ServerState::is_typosquat_enabled`] and `network.offline` — both
-/// checked here, before the document guard is even taken, so a disabled/offline server does
+/// spec 071), gated on [`ServerState::typosquat_checks`] (enabled and online) — checked
+/// here, before the document guard is even taken, so a disabled/offline server does
 /// zero work per document lifecycle event. Mirrors `document::osv_scan::run_license_prefetch`'s
 /// shape closely: target collection happens while holding the document guard (dropped before
 /// the network dispatch, which goes through `deps_core::lsp_helpers::fetch_typosquat_signals` —
@@ -220,7 +220,7 @@ pub(crate) async fn run_typosquat_prefetch(
     ecosystem: Arc<dyn Ecosystem>,
     fetch_timeout_secs: u64,
 ) -> bool {
-    if !state.is_typosquat_enabled() || state.cache.is_offline() {
+    if !state.typosquat_checks().is_active() {
         return false;
     }
 
@@ -251,7 +251,7 @@ pub(crate) async fn run_typosquat_prefetch(
             ecosystem.ecosystem_id(),
             parse_result.as_ref(),
             ecosystem.formatter(),
-            deps_core::NetworkMode::Online, // already checked `state.cache.is_offline()` above.
+            deps_core::NetworkMode::Online, // the active gate already folds the network state.
             Some(&state.deps_dev),
         ),
     )

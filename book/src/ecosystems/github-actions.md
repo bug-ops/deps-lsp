@@ -149,6 +149,10 @@ Nothing is reported while the tag index is cold, empty or truncated. `deps-cli c
 --fail-on unknown-ref` fails on the diagnostic regardless of its severity; it is not part of the
 default `--fail-on` set.
 
+When exactly one published tag matches the written ref after normalization (`4.3.1` beside tag
+`v4.3.1`), the `Change ref to published tag <tag>` quickfix rewrites the ref to that spelling
+(issue #1781). It is withheld when no tag or several differently-targeted tags match.
+
 In the editor the verdict is only as fresh as the last tags fetch of that repository. Every
 document open or edit that uses it re-requests the tags (a conditional request, so an unchanged
 list is cheap) and refreshes the diagnostics, so a pin bumped to a tag published after the last
@@ -206,8 +210,9 @@ without a version and matches their affected ranges locally against the pinned v
   diagnostic name it (`matched release tag v4.9.0`). For a SHA pin all release tags on the commit
   count; for an exact tag pin (`@v4.8.0`) only the releases of the same major version do, and
   for a floating tag (`@v4`) only the releases that extend the written tag. Pre-release tags are
-  never checked as siblings. When a tag list was truncated (more than 3000 tags), the sibling
-  list may be incomplete: a clean answer for such a pin is shown as not fully checked in hover
+  never checked as siblings. When a tag list was truncated (more than 3000 tags), or has not
+  been fetched yet (cold cache) or failed to fetch, the sibling list may be incomplete: a clean
+  answer for such a pin is shown as not fully checked in hover
   rather than as clean (no diagnostic is raised), and `deps-cli update` refuses a `latest` it
   cannot verify the same way. A sibling-only advisory whose fix is not newer than the pinned
   version is not offered as a fix. The same sibling check applies to the latest version, to

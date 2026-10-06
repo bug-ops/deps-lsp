@@ -89,7 +89,7 @@ pub struct AnalysisScope {
     /// public-registry-content source) and never include freshness; GOSSIP and the local
     /// `freshness.cooldown_secs` heuristic are deliberately independent signals (NFR-004),
     /// mirroring `deps-lsp`'s own `run_gossip_prefetch`, which likewise gates only on
-    /// `is_gossip_enabled()`/offline. `false` under `update --security-only`: that mode's fix
+    /// `gossip_checks()`. `false` under `update --security-only`: that mode's fix
     /// target comes from the advisory's `recommended_fix()`, never the freshness/GOSSIP-filtered
     /// registry pick (FR-014), so the prefetch's result would never be read — an avoidable
     /// network call.

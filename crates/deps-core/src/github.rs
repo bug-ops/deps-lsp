@@ -258,7 +258,7 @@ impl GithubTagsClient {
         let has_token = token.is_some();
         let auth_token = token.map(|token| {
             tracing::info!("GITHUB_TOKEN detected, using authenticated GitHub API requests");
-            crate::secret::ApiToken::new(format!("Bearer {}", *token))
+            crate::secret::bearer_auth_header(&token).into()
         });
 
         Self {

@@ -5,9 +5,12 @@
 use std::time::Duration;
 
 use deps_core::Ecosystem;
-use deps_core::edit::{VulnFixSkip, plan_verified_fix, resolve_verified_fix};
+use deps_core::edit::{
+    VulnFixSkip, plan_verified_fix, resolve_recommended_fix, resolve_verified_fix,
+};
+use deps_core::lsp_helpers::CommitRewrite;
 use deps_core::lsp_helpers::{RequirementGate, resolve_in_use_version, resolve_scan_outcome};
-use deps_core::osv::{OsvClient, ScanOutcome};
+use deps_core::osv::{OsvClient, OsvId, ScanOutcome};
 
 use crate::analyze::ManifestAnalysis;
 use crate::update::ignore::IgnoreRules;
@@ -295,13 +298,29 @@ fn classify_vulnerable_dependency(
     let (fix, version_native) = match resolve_verified_fix(dv, latest, formatter) {
         Ok(pair) => pair,
         Err(_) => {
+            // #1779: the live fix-target check already rejected a commit pin's fix version with
+            // no release tag (its candidate tags cannot be resolved), so name that cause here
+            // when a complete tag list proves it, instead of the generic no-verified-fix.
+            if let Ok((fix, version_native)) = resolve_recommended_fix(dv, latest, formatter) {
+                let target = deps_core::ConcreteVersion::new(version_native);
+                if formatter.commit_rewrite_for(dep, &target) == CommitRewrite::NoReleaseTag {
+                    return unfixable_item(
+                        dep,
+                        current,
+                        UnfixableReason::NoReleaseTagForFix { target },
+                        &fix.advisory_ids,
+                        ignore_rule_overridden,
+                    );
+                }
+            }
             return unfixable_item(
                 dep,
                 current,
                 UnfixableReason::NoVerifiedFix,
                 &[],
                 ignore_rule_overridden,
-            );
+            )
+            .with_osv_sibling_match(sibling_match_note(dv, formatter));
         }
     };
 
@@ -453,6 +472,17 @@ fn classify_vulnerable_dependency(
             &fix.advisory_ids,
             ignore_rule_overridden,
         ),
+        // #1779: a commit pin whose fix version has no release tag in a complete tag list is
+        // never a lockfile-only update — the requirement does not already admit the fix.
+        Err(VulnFixSkip::NoReleaseTagForFix) => unfixable_item(
+            dep,
+            current,
+            UnfixableReason::NoReleaseTagForFix {
+                target: deps_core::ConcreteVersion::new(version_native.as_str()),
+            },
+            &fix.advisory_ids,
+            ignore_rule_overridden,
+        ),
         // #1370: `UnresolvedPlaceholder` joins the `NoVerifiedFix` bucket, not the
         // `RequirementAlreadyResolves`/`NoOpRewrite` one above — "requires lockfile update"
         // implies the manifest requirement already admits the fix target, which is not known
@@ -468,8 +498,20 @@ fn classify_vulnerable_dependency(
             UnfixableReason::NoVerifiedFix,
             &[],
             ignore_rule_overridden,
-        ),
+        )
+        .with_osv_sibling_match(sibling_match_note(dv, formatter)),
     }
+}
+
+/// The note naming the sibling release tags `dv`'s verdict holds through, when it holds through
+/// them alone.
+fn sibling_match_note(
+    dv: &deps_core::osv::DependencyVulnerabilities,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+) -> Option<deps_core::lsp_helpers::SiblingMatchNote> {
+    dv.sibling_only_tags()
+        .as_ref()
+        .map(|tags| deps_core::lsp_helpers::SiblingMatchNote::new(formatter, tags))
 }
 
 /// `--security-only`'s `current` resolution (M8/code-review finding 4): the resolved in-use
@@ -532,7 +574,7 @@ fn unfixable_item(
     dep: &dyn deps_core::Dependency,
     current: CurrentVersion,
     reason: UnfixableReason,
-    advisory_ids: &[String],
+    advisory_ids: &[OsvId],
     ignore_rule_overridden: bool,
 ) -> PlannedUpdateItem {
     PlannedUpdateItem::new(
@@ -550,7 +592,7 @@ fn requires_lockfile_update_item(
     dep: &dyn deps_core::Dependency,
     current: CurrentVersion,
     target: deps_core::ConcreteVersion,
-    advisory_ids: &[String],
+    advisory_ids: &[OsvId],
     ignore_rule_overridden: bool,
 ) -> PlannedUpdateItem {
     PlannedUpdateItem::new(
@@ -713,6 +755,45 @@ mod tests {
     impl DiagnosticPolicy for UnsupportedShapeFormatter {}
     impl SourcePolicy for UnsupportedShapeFormatter {}
     impl OsvNaming for UnsupportedShapeFormatter {}
+
+    /// A commit-pin formatter (like GitHub Actions/GitLab CI SHA pins): echoes the declared
+    /// literal back, has no requirement matcher, and reports a fixed [`CommitRewrite`] verdict.
+    struct CommitPinFormatter(deps_core::lsp_helpers::CommitRewrite);
+    impl PackageNaming for CommitPinFormatter {}
+    impl PackageRendering for CommitPinFormatter {
+        fn format_version_for_text_edit(&self, v: &deps_core::ConcreteVersion) -> String {
+            v.to_string()
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.as_str().to_string()
+        }
+        fn format_version_replacing(
+            &self,
+            _version: &deps_core::ConcreteVersion,
+            current: &str,
+        ) -> String {
+            current.to_string()
+        }
+    }
+    impl RequirementResolution for CommitPinFormatter {
+        fn compile_bounded_requirement(
+            &self,
+            _requirement: deps_core::lsp_helpers::BoundedVersionReq<'_>,
+        ) -> Option<Box<dyn RequirementMatcher>> {
+            None
+        }
+        fn commit_rewrite_for(
+            &self,
+            _dep: &dyn deps_core::Dependency,
+            _version: &deps_core::ConcreteVersion,
+        ) -> deps_core::lsp_helpers::CommitRewrite {
+            self.0
+        }
+    }
+    impl DiagnosticMessages for CommitPinFormatter {}
+    impl DiagnosticPolicy for CommitPinFormatter {}
+    impl SourcePolicy for CommitPinFormatter {}
+    impl OsvNaming for CommitPinFormatter {}
 
     /// Code review regression (S1 fix): mirrors `NuGetFormatter::bounded_requirement_already_resolves_to`'s
     /// real bare-floor override — the raw matcher mathematically admits the fix (`Some(true)`),
@@ -1075,7 +1156,11 @@ mod tests {
             Some(&deps_core::ConcreteVersion::from("1.5.2")),
             "an Unfixable item with a rejected fix target must report it (#1614)"
         );
-        assert_eq!(item.advisory_ids, ["RUSTSEC-2024-0001"], "#1618");
+        assert_eq!(
+            item.advisory_ids,
+            [deps_core::test_util::osv_id("RUSTSEC-2024-0001")],
+            "#1618"
+        );
         assert!(
             !item.reason().contains("regenerate the lock file"),
             "message must not claim the fix is already admitted: {}",
@@ -1326,6 +1411,79 @@ mod tests {
         ));
     }
 
+    /// #1782: a `NoVerifiedFix` row carries no sibling note unless its verdict holds through
+    /// sibling tags alone.
+    #[test]
+    fn test_classify_no_verified_fix_row_without_sibling_matches_has_no_note() {
+        let dep = dep("serde", "0.9");
+        let dv = deps_core::osv::DependencyVulnerabilities::new(Capped::new(
+            vec![advisory("RUSTSEC-2024-0001", "1.0.2")],
+            1,
+        ));
+        let analysis = test_analysis(cached_with("serde", "1.0.2"), HashSet::new());
+        let formatter = TestFormatter {
+            requirement_already_admits_fix: false,
+            osv_native_differs: false,
+        };
+        let item = classify_vulnerable_dependency(
+            &dep,
+            &dv,
+            None,
+            "serde",
+            &analysis,
+            &formatter,
+            EcosystemId::Cargo,
+            &IgnoreRules::empty(),
+        );
+        assert!(matches!(
+            item.outcome,
+            Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
+        ));
+        assert!(item.osv_sibling_match.is_none());
+        assert!(sibling_match_note(&dv, &formatter).is_none());
+    }
+
+    /// #1782: a `NoVerifiedFix` row whose verdict holds through sibling tags alone names them.
+    #[test]
+    fn test_classify_no_verified_fix_row_names_matched_sibling_tags() {
+        use deps_core::osv::{MatchedTags, OsvId, OsvVersion};
+
+        let dep = dep("serde", "0.9");
+        let id = OsvId::parse("RUSTSEC-2024-0001").expect("valid osv id");
+        let dv = deps_core::osv::DependencyVulnerabilities::new(Capped::new(
+            vec![advisory("RUSTSEC-2024-0001", "1.0.2")],
+            1,
+        ))
+        .with_sibling_matches_for_test(
+            OsvVersion::new("0.9.0"),
+            [(
+                id,
+                MatchedTags::new(deps_core::ConcreteVersion::new("v4.9.0"), vec![]),
+            )],
+        );
+        let analysis = test_analysis(cached_with("serde", "1.0.2"), HashSet::new());
+        let formatter = TestFormatter {
+            requirement_already_admits_fix: false,
+            osv_native_differs: false,
+        };
+        let item = classify_vulnerable_dependency(
+            &dep,
+            &dv,
+            None,
+            "serde",
+            &analysis,
+            &formatter,
+            EcosystemId::Cargo,
+            &IgnoreRules::empty(),
+        );
+        assert!(matches!(
+            item.outcome,
+            Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
+        ));
+        let note = item.osv_sibling_match.expect("sibling note attached");
+        assert!(note.to_string().contains("v4.9.0"), "got: {note}");
+    }
+
     /// #1350 S1 regression: an unverified fix target must report `Unfixable(NoVerifiedFix)`
     /// even when the dependency also has no declared `version_requirement()` — the
     /// `resolve_verified_fix` check must run BEFORE the C1 no-requirement guard, exactly as
@@ -1449,7 +1607,11 @@ mod tests {
             Some(&deps_core::ConcreteVersion::from("1.0.2")),
             "a yanked-unfixable item must report the rejected fix target (#1614)"
         );
-        assert_eq!(item.advisory_ids, ["RUSTSEC-2024-0001"], "#1618");
+        assert_eq!(
+            item.advisory_ids,
+            [deps_core::test_util::osv_id("RUSTSEC-2024-0001")],
+            "#1618"
+        );
     }
 
     /// #1344 C3: since the requirement-already-admits-fix gate moved inside
@@ -1664,6 +1826,236 @@ mod tests {
         );
     }
 
+    /// #1779: a SHA pin whose fix version has no release tag in a complete tag list is
+    /// `Unfixable(NoReleaseTagForFix)` — never `RequiresLockfileUpdate`, which would claim the
+    /// declared requirement already admits the fix.
+    #[test]
+    fn test_classify_commit_pin_without_release_tag_is_unfixable_not_requires_lockfile_update() {
+        let dep = dep("foo", "0.9");
+        let dv = verified_dv("1.5.2");
+        let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
+        let item = classify_vulnerable_dependency(
+            &dep,
+            &dv,
+            None,
+            "foo",
+            &analysis,
+            &CommitPinFormatter(deps_core::lsp_helpers::CommitRewrite::NoReleaseTag),
+            EcosystemId::Cargo,
+            &IgnoreRules::empty(),
+        );
+        assert!(
+            matches!(
+                &item.outcome,
+                Outcome::Unfixable(UnfixableReason::NoReleaseTagForFix { target })
+                    if target.as_str() == "1.5.2"
+            ),
+            "got {:?}",
+            item.outcome
+        );
+        assert!(!item.advisory_ids.is_empty());
+    }
+
+    /// #1779: a missing, cold or truncated tag list cannot prove the tag absent, so the commit
+    /// pin is `NoVerifiedFix`, never `NoReleaseTagForFix` or `RequiresLockfileUpdate`.
+    #[test]
+    fn test_classify_commit_pin_with_unavailable_index_is_no_verified_fix() {
+        let dep = dep("foo", "0.9");
+        let dv = verified_dv("1.5.2");
+        let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
+        let item = classify_vulnerable_dependency(
+            &dep,
+            &dv,
+            None,
+            "foo",
+            &analysis,
+            &CommitPinFormatter(deps_core::lsp_helpers::CommitRewrite::IndexUnavailable),
+            EcosystemId::Cargo,
+            &IgnoreRules::empty(),
+        );
+        assert!(
+            matches!(
+                item.outcome,
+                Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
+            ),
+            "got {:?}",
+            item.outcome
+        );
+    }
+
+    const GHA_SHA_PIN: &str = "1111111111111111111111111111111111111111";
+
+    /// Runs `--security-only`'s real fix-target pipeline for one GitHub Actions SHA pin whose
+    /// OSV fix version is `fix`, over a real `GithubActionsFormatter` backed by `index`
+    /// (`None`: the repository's tags were never fetched): `build_scan_targets`,
+    /// `collect_fix_target_resolutions` (which can resolve nothing here without a live OSV
+    /// check), then `classify_vulnerable_dependency`.
+    fn classify_gha_sha_pin(
+        index: Option<deps_core::lsp_helpers::TagIndex>,
+        fix: &str,
+    ) -> PlannedUpdateItem {
+        use deps_engine::setup::{GithubActionsFormatter, parse_workflow_yaml};
+
+        let yaml = format!(
+            "on: push\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: owner/action@{GHA_SHA_PIN} # v1.0.0\n"
+        );
+        let uri = deps_core::test_util::test_uri("/test/.github/workflows/ci.yml");
+        let parse_result = parse_workflow_yaml(&yaml, &uri).expect("valid workflow");
+        let tag_index = std::sync::Arc::new(dashmap::DashMap::new());
+        if let Some(index) = index {
+            tag_index.insert(PackageName::new("owner/action"), std::sync::Arc::new(index));
+        }
+        let formatter = GithubActionsFormatter::new(tag_index);
+
+        let dependencies = deps_core::ParseResult::dependencies(&parse_result);
+        let dep = *dependencies.first().expect("one dependency");
+        let vuln_keys = deps_core::osv::vulnerability_keys(
+            &parse_result,
+            &HashMap::new(),
+            None,
+            &formatter,
+            EcosystemId::GithubActions,
+        );
+        let key = deps_core::osv::vuln_key_for(dep, Some(&vuln_keys), &formatter);
+        let dv = deps_core::osv::DependencyVulnerabilities::new(Capped::new(
+            vec![advisory("GHSA-aaaa-bbbb-cccc", fix)],
+            1,
+        ));
+        let mut vulnerabilities = deps_core::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(key.clone(), ScanOutcome::Vulnerable(dv.clone()));
+
+        let (targets, _skipped) = deps_engine::classify::osv::build_scan_targets(
+            &parse_result,
+            &HashMap::new(),
+            &HashMap::new(),
+            &formatter,
+            EcosystemId::GithubActions,
+        );
+        let osv_name_by_key = deps_engine::classify::osv::osv_name_by_key(&targets);
+        let candidate_tags = deps_engine::classify::osv::candidate_tag_sources(
+            &parse_result,
+            &vuln_keys,
+            &formatter,
+            EcosystemId::GithubActions,
+        );
+        let (resolved, _live) = deps_engine::classify::osv::collect_fix_target_resolutions(
+            &vulnerabilities,
+            &[key],
+            &osv_name_by_key,
+            &deps_core::osv::LatestStatusMap::new(),
+            &candidate_tags,
+            &formatter,
+        );
+        assert!(
+            resolved.is_empty(),
+            "a fix version without a release tag is rejected by the fix-target gate: {resolved:?}"
+        );
+
+        let analysis = test_analysis(cached_with("owner/action", "v1.2.0"), HashSet::new());
+        classify_vulnerable_dependency(
+            dep,
+            &dv,
+            None,
+            "owner/action",
+            &analysis,
+            &formatter,
+            EcosystemId::GithubActions,
+            &IgnoreRules::empty(),
+        )
+    }
+
+    fn gha_index(
+        coverage: deps_core::pagination::ListCoverage,
+    ) -> deps_core::lsp_helpers::TagIndex {
+        let sha = deps_core::lsp_helpers::CommitSha::parse(GHA_SHA_PIN).unwrap();
+        deps_core::lsp_helpers::TagIndex::from_tags([("v1.0.0", &sha)]).with_coverage(coverage)
+    }
+
+    /// #1779 end to end: the fix-target gate rejects a SHA pin's tagless fix version, yet the row
+    /// still says why — no release tag in a complete tag list — instead of a generic
+    /// no-verified-fix.
+    #[test]
+    fn test_gha_sha_pin_fix_without_release_tag_reports_no_release_tag() {
+        let item = classify_gha_sha_pin(
+            Some(gha_index(deps_core::pagination::ListCoverage::Complete)),
+            "v1.2.0",
+        );
+        assert!(
+            matches!(
+                &item.outcome,
+                Outcome::Unfixable(UnfixableReason::NoReleaseTagForFix { target })
+                    if target.as_str() == "v1.2.0"
+            ),
+            "got {:?}",
+            item.outcome
+        );
+        assert!(!item.advisory_ids.is_empty());
+    }
+
+    /// #1779 end to end: a truncated or never-fetched tag list cannot prove the tag absent.
+    #[test]
+    fn test_gha_sha_pin_fix_with_unavailable_tag_list_is_no_verified_fix() {
+        for index in [
+            Some(gha_index(deps_core::pagination::ListCoverage::Truncated)),
+            None,
+        ] {
+            let item = classify_gha_sha_pin(index, "v1.2.0");
+            assert!(
+                matches!(
+                    item.outcome,
+                    Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
+                ),
+                "got {:?}",
+                item.outcome
+            );
+        }
+    }
+
+    /// #1779 (G4): a fix version that does have a release tag still plans and applies, rewriting
+    /// the pin to that tag's commit.
+    #[test]
+    fn test_gha_sha_pin_fix_with_release_tag_is_applied() {
+        use deps_engine::setup::{GithubActionsFormatter, parse_workflow_yaml};
+
+        let yaml = format!(
+            "on: push\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: owner/action@{GHA_SHA_PIN} # v1.0.0\n"
+        );
+        let uri = deps_core::test_util::test_uri("/test/.github/workflows/ci.yml");
+        let parse_result = parse_workflow_yaml(&yaml, &uri).expect("valid workflow");
+        let new_sha = deps_core::lsp_helpers::CommitSha::parse(&"2".repeat(40)).unwrap();
+        let old_sha = deps_core::lsp_helpers::CommitSha::parse(GHA_SHA_PIN).unwrap();
+        let index = deps_core::lsp_helpers::TagIndex::from_tags([
+            ("v1.0.0", &old_sha),
+            ("v1.2.0", &new_sha),
+        ]);
+        let tag_index = std::sync::Arc::new(dashmap::DashMap::new());
+        tag_index.insert(PackageName::new("owner/action"), std::sync::Arc::new(index));
+        let formatter = GithubActionsFormatter::new(tag_index);
+
+        let dependencies = deps_core::ParseResult::dependencies(&parse_result);
+        let dep = *dependencies.first().expect("one dependency");
+        let dv = verified_dv("v1.2.0");
+        let analysis = test_analysis(cached_with("owner/action", "v1.2.0"), HashSet::new());
+        let item = classify_vulnerable_dependency(
+            dep,
+            &dv,
+            None,
+            "owner/action",
+            &analysis,
+            &formatter,
+            EcosystemId::GithubActions,
+            &IgnoreRules::empty(),
+        );
+        assert!(
+            matches!(
+                &item.outcome,
+                Outcome::Applied { edit, .. } if edit.new_text.contains(&"2".repeat(40))
+            ),
+            "got {:?}",
+            item.outcome
+        );
+    }
+
     /// Issue #1578 gap 2: an oversized requirement must be rejected as `Unfixable` before ever
     /// reaching `compile_bounded_requirement` — `PanicsIfCompiledFormatter` panics if that call is
     /// made, so this fails loudly (not just with the wrong outcome) if the gate is removed or
@@ -1695,7 +2087,11 @@ mod tests {
             "got {:?}",
             item.outcome
         );
-        assert_eq!(item.advisory_ids, ["RUSTSEC-2024-0001"], "#1618");
+        assert_eq!(
+            item.advisory_ids,
+            [deps_core::test_util::osv_id("RUSTSEC-2024-0001")],
+            "#1618"
+        );
         assert_eq!(
             item.target(),
             Some(&deps_core::ConcreteVersion::from("1.5.2")),

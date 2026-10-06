@@ -1615,10 +1615,12 @@ pub trait RequirementResolution: Send + Sync {
     /// [`CommentContradicted`](crate::lsp_helpers::PinResolution::CommentContradicted) pin has
     /// a comment that is provably wrong and must not stand in either (an implementor must not
     /// map it to `Unresolved`), and only
-    /// [`Unresolved`](crate::lsp_helpers::PinResolution::Unresolved) and
-    /// [`Unlisted`](crate::lsp_helpers::PinResolution::Unlisted) let the manifest text stand
-    /// in. An unlisted pin's text is not authoritative: its sibling tags are unknown, so a
-    /// clean vulnerability answer is not trusted (an implementor must not map it to
+    /// [`Unresolved`](crate::lsp_helpers::PinResolution::Unresolved),
+    /// [`Unlisted`](crate::lsp_helpers::PinResolution::Unlisted) and
+    /// [`NotYetIndexed`](crate::lsp_helpers::PinResolution::NotYetIndexed) let the manifest
+    /// text stand in. An unlisted or not-yet-indexed pin's text is not authoritative: its
+    /// sibling tags are unknown (a truncated list, or a cold or failed tag fetch), so a clean
+    /// vulnerability answer is not trusted (an implementor must not map either to
     /// `Unresolved`).
     ///
     /// Default: [`Unresolved`](crate::lsp_helpers::PinResolution::Unresolved) — every
@@ -1626,6 +1628,22 @@ pub trait RequirementResolution: Send + Sync {
     fn resolved_pin_version(&self, dep: &dyn Dependency) -> crate::lsp_helpers::PinResolution {
         let _ = dep;
         crate::lsp_helpers::PinResolution::Unresolved
+    }
+
+    /// Whether `dep`, when it is a commit pin, can be rewritten to the release `version`
+    /// (#1779), so a vulnerability fix can tell "no release tag for this fix version" apart
+    /// from "the tag list is not available".
+    ///
+    /// Default: [`CommitRewrite::NotACommitPin`](crate::lsp_helpers::CommitRewrite::NotACommitPin) — every ecosystem whose rewrite does not go
+    /// through a tag index. An ecosystem whose `format_version_replacing_for` echoes the
+    /// declared literal back when no release commit is found MUST override this.
+    fn commit_rewrite_for(
+        &self,
+        dep: &dyn Dependency,
+        version: &ConcreteVersion,
+    ) -> crate::lsp_helpers::CommitRewrite {
+        let _ = (dep, version);
+        crate::lsp_helpers::CommitRewrite::NotACommitPin
     }
 
     /// Whether [`Self::resolved_pin_version`] may only start returning a non-`Unresolved` value
