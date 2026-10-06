@@ -14,11 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `ShaPinLookup::into_status` replaced by `status()`; `ShaPinLookup::Indexed` gains `position: TagPosition`; `ClosingDelimiters` moves to `lsp_helpers` (re-exported by deps-github-actions) (#1764)
 
 ### Added
+- **deps-core, all ecosystems**: `DepsError::HostBlockedByPolicy` shows a policy-specific message when a registry host resolves to a blocked address class at connect time (#PR)
+- **deps-swift**: follows `Link rel="next"` pages of the SE-0292 release list (#PR)
+- **deps-swift**: `publishedAt` freshness for the newest registry releases (#PR)
+- **deps-swift**: `SWIFTPM_NETRC_DATA` and `~/.netrc` registry credentials, bound to user-declared registries only (#PR)
+- **deps-core**: shared `netrc` parser following SwiftPM's grammar, and `pagination::next_page`/`NextPage` for validated `Link rel="next"` targets (#PR)
 - **deps-core**: `PinResolution`, `TagIndex::pin_resolution`, `PartialTagPolicy`, `tag_pin_is_up_to_date` and `tag_has_precedence` shared by the git-tag ecosystems (#1751)
 - **deps-github-actions**: `Correct version comment to <tag>` quickfix for a SHA pin whose trailing comment names another tag (#1751)
 - **deps-cli**: `--fail-on other` token for uncategorized findings (offline/lock-file/registry notices, `sha-comment-mismatch`) (#1747)
 - **deps-swift**: SE-0292 registry client resolves `.package(id:)` dependencies through `registries.json` (project and user tiers), binding the environment credential to user-declared registry URLs only (#1763)
-- **deps-core**: `secret::basic_auth_header`, `CachedResponse::link` with `HttpCache::get_cached_{trusted_origin,pinned}_response`, `ListCoverage::from_link_header` and `DepsError::PaginatedListUnsupported` (#1763)
+- **deps-core**: `secret::basic_auth_header`, `CachedResponse::link` with `HttpCache::get_cached_{trusted_origin,pinned}_response`, `ListCoverage::from_link_header` (#1763)
 - **deps-core**: shared `lsp_helpers::sha_comment` module (SHA-pin trailing-comment read, check and rewrite) used by GitHub Actions and GitLab CI (#1764)
 - **deps-core, deps-github-actions**: `Ecosystem::tag_index_refreshes` and `GithubActionsRegistry::subscribe_tag_refreshes` publish tag-index refresh events (#1764)
 

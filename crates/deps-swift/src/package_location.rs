@@ -69,8 +69,18 @@ impl<'a> RegistryIdentity<'a> {
     }
 
     /// The lowercase `scope.name` identity, as sent on the wire and written in `Package.resolved`.
-    pub(crate) fn canonical(&self) -> String {
-        self.to_string().to_ascii_lowercase()
+    pub(crate) fn canonical(&self) -> CanonicalIdentity {
+        CanonicalIdentity(self.to_string().to_ascii_lowercase())
+    }
+}
+
+/// A lowercase `scope.name` identity, usable as a map key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CanonicalIdentity(String);
+
+impl CanonicalIdentity {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -158,7 +168,7 @@ mod tests {
     fn test_scope_key_and_canonical_fold_case() {
         let id = RegistryIdentity::parse("Apple.Swift-NIO").unwrap();
         assert_eq!(id.scope_key().as_str(), "apple");
-        assert_eq!(id.canonical(), "apple.swift-nio");
+        assert_eq!(id.canonical().as_str(), "apple.swift-nio");
         assert_eq!(Some(id.scope_key()), RegistryScope::parse("APPLE"));
     }
 

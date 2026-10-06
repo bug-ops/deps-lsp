@@ -57,22 +57,21 @@ reach any registry other than the one SwiftPM would use.
 ### Out of Scope
 
 > [!danger] Explicit Exclusions
-> - **Following `Link: rel="next"` pages.** A paginated response is detected and turned into an
->   actionable fetch failure (FR-030, FR-032, FR-034). Fetching further pages is follow-up work.
+> - **Following `Link: rel="next"` pages.** Shipped in the #1754 follow-up (FR-034, FR-035).
 > - **An actionable error for connect-time policy blocks** (`DepsError::HostBlockedByPolicy`).
->   This affects every ecosystem, so it is a separate follow-up. Its message must distinguish
->   `HostClass::never_a_registry` classes, which no setting unblocks, from classes that
->   `registries.workspace_registries` gates. Until then, a project-tier hostname that resolves to a
->   blocked class shows the generic transient fetch failure.
+>   Shipped in the #1758 follow-up (FR-036).
 > - **Path-suffix watched-config matching** (watch `.swiftpm/configuration/registries.json` and
 >   nothing else). This is a general watcher change touching `deps-core` `EcosystemRegistry` and
 >   `deps-lsp` `server.rs`, so it is a separate follow-up. In the meantime Swift watches the
 >   basename `registries.json` (FR-041); the only cost is an extra reparse when an unrelated file
 >   with that name changes.
-> - **netrc (`~/.netrc`, `SWIFTPM_NETRC_DATA`) and macOS Keychain credentials.** Follow-up issue.
->   Only `SWIFTPM_REGISTRY_TOKEN` and `SWIFTPM_REGISTRY_LOGIN`/`SWIFTPM_REGISTRY_PASSWORD` are read.
-> - **`publishedAt` freshness** (needs one release-metadata request per version). Follow-up, P4.
-> - **SCM-to-registry swizzling** (`--use-registry-identity-for-scm`, `--replace-scm-with-registry`).
+> - **macOS Keychain credentials.** Follow-up issue. `~/.netrc` and `SWIFTPM_NETRC_DATA` shipped in
+>   the #1755 follow-up (FR-038).
+> - **`publishedAt` freshness.** Shipped in the #1756 follow-up (FR-037).
+> - **SCM-to-registry swizzling** (`--use-registry-identity-for-scm`, `--replace-scm-with-registry`),
+>   #1757.
+> - **Marking the registry `Authorization` header sensitive** (`HeaderValue::set_sensitive`), a
+>   cross-ecosystem follow-up.
 > - **Name completion for `id:` literals.** SE-0292 has no search endpoint.
 > - **Centralizing the credential-provenance predicate (#1459).** Shaped for reuse here (FR-016),
 >   extracted later.
@@ -121,10 +120,11 @@ THEN a blocked_registries diagnostic is emitted at parse time and no request is 
 ### US-004: Paginated registry never produces false data
 ```
 GIVEN a registry whose first page sends Link: <...?page=2>; rel="next"
-THEN the dependency shows the actionable fetch failure "registry paginates its release list;
-     pagination is not supported yet"
- AND no latest version, no "up to date" mark and no unsatisfiable or outdated diagnostic is derived
-     from the partial page
+THEN the pages are followed and merged into one release list (FR-034)
+ AND WHEN the pages cannot be followed to the last one, the dependency shows an actionable fetch
+     failure ("registry returned an unusable next-page link", "registry release list exceeds the
+     page limit" or "registry release list took too long to fetch"), and no latest version, no
+     "up to date" mark and no unsatisfiable or outdated diagnostic is derived from a partial list
 ```
 
 ## 3. Trust Model
@@ -214,7 +214,7 @@ A `WorkspaceDeclared` URL is blocked in one of two ways:
 - at parse time, by its literal host, through `PolicyGate::Enforce`. This produces a
   `blocked_registries` diagnostic;
 - at connect time, when DNS resolves the name to a class the policy blocks. Today this surfaces as
-  the generic transient fetch failure; an actionable message is a follow-up (Out of Scope).
+  the policy-specific `HostBlockedByPolicy` message (FR-036).
 
 Known limitation, shared with Cargo's trusted tier: a 401/403 on revalidation of a `Trusted`
 authenticated entry serves the stale body. The FR-015 eviction from spec 043 applies to
@@ -258,8 +258,12 @@ authenticated entry serves the stale body. The FR-015 eviction from spec 043 app
 | FR-022 | THE SYSTEM SHALL map 404 and 410 to `PackageNotFound { registry: "Swift package registry" }` and keep every other non-2xx as `HttpStatus` | must |
 | FR-023 | THE SYSTEM SHALL parse `releases` with `parse_json_checked`, skip non-semver keys, set `yanked = problem.is_some()`, and order newest-first through `github::semver_tags_newest_first`. `SwiftRegistry::reports_yanked()` SHALL return `true`, with its comment updated to state that the GitHub path yields only `Available` | must |
 | FR-030 | `CachedResponse` SHALL gain `link: Option<String>`, captured together with `ETag`/`Last-Modified` on 200 responses (including the cache-disabled path) and kept on 304. `HttpCache` SHALL add `get_cached_trusted_origin_response` and `get_cached_pinned_response`, both returning `CachedResponse`. The existing byte-returning methods SHALL delegate to the same internal path and map to `.body`, with no behavior change | must |
-| FR-032 | `deps_core::pagination` SHALL provide `ListCoverage::from_link_header(Option<&str>)`, returning `Truncated` iff an RFC 8288 link-value carries a `rel` token equal to `next`, compared case-insensitively, quoted or unquoted, possibly among several tokens. The link target is never dereferenced | must |
-| FR-034 | WHEN a release-list response's coverage is `Truncated` THE SYSTEM SHALL discard the page and fail the fetch with the new `DepsError::PaginatedListUnsupported { package, registry: &'static str }`. Its `fetch_failure()` SHALL be `Actionable` with the fixed message "registry paginates its release list; pagination is not supported yet". `get_latest_matching_from` SHALL fail the same way. No `Registry` trait, engine or diagnostics change is made | must |
+| FR-032 | `deps_core::pagination` SHALL provide `ListCoverage::from_link_header(Option<&str>)`, returning `Truncated` iff an RFC 8288 link-value carries a `rel` token equal to `next`, compared case-insensitively, quoted or unquoted, possibly among several tokens. `from_link_header` never dereferences the target; only `next_page` resolves it, and only inside the registry's base URL | must |
+| FR-034 | THE SYSTEM SHALL follow `Link rel="next"` pages of a release list through `deps_core::pagination::next_page(current, link, trusted) -> NextPage { Last, Next(Url), Rejected }`, which rejects an ambiguous (several distinct targets), empty, unparsable, userinfo-bearing or out-of-prefix target. The next URL SHALL have the same path as the first page, SHALL not repeat an earlier page, and every page SHALL use the same transport and headers as the first. Pages merge by release key, a `problem` on any page marking the release yanked. `get_latest_matching_from` uses the merged list | must |
+| FR-035 | WHEN the pages cannot be followed to the last one THE SYSTEM SHALL discard everything fetched and fail with `DepsError::PaginatedListIncomplete { package, registry, reason: PaginationStop }`, with `reason` one of `PageCap` (more than 10 pages, more than 10,000 merged releases, or more than 32 MiB of body bytes), `InvalidNextLink` or `TimeBudget` (15 s for the whole list, only once at least one page was merged; a slow first page is an ordinary transient failure). Its `fetch_failure()` SHALL be `Actionable` with a fixed message. The outcome is remembered per client and package for 90 s so a repeat call fails fast | must |
+| FR-036 | WHEN a request fails because the connect-time resolver guard blocked the resolved address THE SYSTEM SHALL return `DepsError::HostBlockedByPolicy { url, class }` instead of a transport error, in every ecosystem. Its `fetch_failure()` SHALL be `Actionable` with a fixed message that names the class and, for `HostClass::never_a_registry` classes, says "never a registry under any policy", otherwise "blocked by registries.workspace_registries policy"; it SHALL contain no remedy. Chains (PyPI, NuGet, Go) keep it when they halt (`DepsError::into_chain_halt`); a Go `\|` chain never lets a later hop's miss overwrite it | must |
+| FR-037 | WHEN freshness is enabled THE SYSTEM SHALL fetch `GET {base}/{scope}/{name}/{version}` for the newest 8 non-yanked releases and set `published_at` from `publishedAt`, over the same transport and credential rules. Requests are limited to 4 in flight per registry client and share one 2 s deadline. A `publishedAt` answer (200, or 410 meaning none) is memoized for the process lifetime; any other failure is memoized for 90 s, and only for requests that had started. A missing date never fails the list | must |
+| FR-038 | THE SYSTEM SHALL read credentials from the first existing source in the order `SWIFTPM_REGISTRY_*` environment variables, `SWIFTPM_NETRC_DATA`, `~/.netrc` (`SwiftCredentialSource`). A netrc credential is bound by the registry URL's host (port ignored) and only to `Trusted` URLs, formatted through the same table as the environment credential. `deps_core::netrc` follows SwiftPM's grammar; `SWIFTPM_NETRC_DATA` uses first-match, case-sensitive hosts and honors `default`; `~/.netrc` uses last-match, case-insensitive hosts, is re-read when its mtime changes, treats an absent, unreadable or invalid file as no credential, and ignores its `default` entry on macOS. Keychain is not read | must |
 | FR-040 | `Package.resolved` v2/v3 `kind` SHALL decode into `PinKind { RemoteSourceControl (default when missing), LocalSourceControl (alias "fileSystem"), Registry, Unrecognized (serde other) }`. `Registry` maps to `ResolvedSource::Registry { url: "", checksum: "" }` (SwiftPM writes `location: ""`), `LocalSourceControl` to `Path`, and `Unrecognized` is skipped with a debug log. Previously an unknown kind became Git | must |
 | FR-041 | Swift SHALL declare the basename `registries.json` in both `watched_config_filenames()` and `routing_affecting_watched_configs()`, with a `TODO` pointing at the path-suffix follow-up (Out of Scope). No `deps-core` or `deps-lsp` watcher change is made | must |
 | FR-042 | `deps-engine` `register_ecosystems` SHALL construct Swift with `SwiftEcosystem::with_context` and add `EcosystemId::Swift` to `workspace_registry_ecosystems` | must |
@@ -269,7 +273,7 @@ authenticated entry serves the stale body. The FR-015 eviction from spec 043 app
 
 | ID | Category | Requirement |
 |----|----------|-------------|
-| NFR-001 | Security | Credential-shaped values live only in `SwiftEnvCredential` (fields `Redacted`) and `SwiftRegistryAuth`. They never appear in logs, `Debug` output, hover, diagnostics or cache keys |
+| NFR-001 | Security | Credential-shaped values live only in `SwiftCredential` (fields `Redacted`), `Netrc` and `NetrcLogin` (`Redacted`), and `SwiftRegistryAuth`. They never appear in logs, `Debug` output, hover, diagnostics or cache keys |
 | NFR-002 | Security | An `id:` package name is never sent to GitHub, OSV, deps.dev or any registry other than the one resolved by FR-006 |
 | NFR-003 | Reliability | Manifests without `id:` dependencies, machines without `registries.json`, and every non-Swift ecosystem behave byte-identically to today, apart from the FR-040 unknown-kind change. The `deps-core` additions (FR-015, FR-030, FR-032, FR-034) are additive; NuGet's `Basic` header bytes stay identical after its migration to `basic_auth_header` |
 | NFR-004 | Performance | `parse_manifest` keeps the no-real-`.await` invariant. Config reads go through `MtimeFileCache` |
@@ -289,15 +293,17 @@ authenticated entry serves the stale body. The FR-015 eviction from spec 043 app
 | `TierFile` | deps-swift | `Absent \| Parsed(Arc<RawRegistries>) \| Unusable(RegistriesConfigError)` |
 | `RegistriesConfigError` | deps-swift | `Unreadable \| Malformed { line, column } \| UnsupportedVersion(u32) \| InvalidScopeKey \| SecurityNotAnObject \| InvalidXdgConfigHome`. Payload-free, because serde messages can echo values |
 | `SwiftRegistriesConfig` | deps-swift | Merged view: `resolve_source_for`, `blocked_class_for`, `rejected_reason_for`, `resolved_registry_for(scope) -> Option<&ResolvedSwiftRegistry>` |
-| `SwiftEnvCredential` | deps-swift | `Token(Redacted) \| Login { username: Redacted, password: Redacted }` |
+| `SwiftCredential` | deps-swift | `Token(Redacted) \| Login { username: Redacted, password: Redacted }` |
 | `SwiftRegistryAuth` | deps-swift | Pre-formatted header, see FR-015 |
 | `ResolvedSwiftRegistry` | deps-swift | `{ url: SwiftRegistryUrl, auth: Option<SwiftRegistryAuth> }` |
-| `SwiftParseContext` | deps-swift | `{ policy, cache: Arc<SwiftRegistriesCache>, user_config: UserConfigPath, credential: Option<Arc<SwiftEnvCredential>> }` |
-| `PackageRegistryClient` | deps-swift | SE-0292 client: `list_releases(&RegistryIdentity) -> Result<Vec<SwiftVersion>>`. A `Truncated` page becomes `Err` (FR-034) |
+| `SwiftParseContext` | deps-swift | `{ policy, cache: Arc<SwiftRegistriesCache>, user_config: UserConfigPath, credential: Option<Arc<SwiftCredentialSource>> }` |
+| `SwiftCredentialSource` | deps-swift | `Environment(SwiftCredential) \| NetrcData(Arc<Netrc>) \| NetrcFile { path, default_entry, .. }` (FR-038) |
+| `PackageRegistryClient` | deps-swift | SE-0292 client: `list_releases(&RegistryIdentity, PublishedAtLookup) -> Result<Vec<SwiftVersion>>`. Follows pages (FR-034) and fails with `PaginatedListIncomplete` when it cannot (FR-035) |
 | `PinKind` | deps-swift | See FR-040 |
 | `CachedResponse.link` | deps-core | See FR-030 |
 | `ListCoverage::from_link_header` | deps-core | See FR-032 |
-| `DepsError::PaginatedListUnsupported` | deps-core | See FR-034; `Actionable` with a fixed message |
+| `DepsError::PaginatedListIncomplete` | deps-core | See FR-035; `Actionable` with a fixed message |
+| `DepsError::HostBlockedByPolicy` | deps-core | See FR-036; `Actionable` with a fixed message |
 | `secret::basic_auth_header` | deps-core | `(username, password) -> Redacted`, moved from `NuGetAuth::new` |
 
 ## 7. Edge Cases
@@ -312,17 +318,19 @@ authenticated entry serves the stale body. The FR-015 eviction from spec 043 app
 | `.package(id: "Acme.Net")` with key `"acme"` | Matches (FR-006); request path `/acme/net` |
 | Project entry `http://...`, `https://u:p@...`, or `https://h/x?y` | `CustomRegistry { redacted raw }` plus a `rejected_registries` diagnostic |
 | Project entry `https://10.0.0.5` under `public_only` | `blocked_registries` diagnostic, no request |
-| Project entry hostname resolving to RFC1918 under `public_only` | Refused by the pinned guard; generic transient fetch failure (actionable message is a follow-up) |
+| Project entry hostname resolving to RFC1918 under `public_only` | Refused by the pinned guard; `HostBlockedByPolicy` with the "blocked by registries.workspace_registries policy" message (FR-036) |
 | User entry hostname resolving to RFC1918 under `public_only` | Fetched (`Trusted` is exempt) |
 | User entry `https://127.0.0.1`, `https://169.254.169.254` or `https://localhost:8443` | Rejected at parse time (FR-008a): `CustomRegistry`, warning naming the class, no request |
-| User entry hostname that resolves to loopback or cloud metadata | Refused at connect time by the baseline guard; generic fetch failure |
+| User entry hostname that resolves to loopback or cloud metadata | Refused at connect time by the baseline guard; `HostBlockedByPolicy` with the "never a registry under any policy" message (FR-036) |
 | User tier lists a public `[default]` and a private scope, `SWIFTPM_REGISTRY_TOKEN` set | The token is sent to both (§3.3 warning) |
 | Project entry equal to a user URL | `Trusted`: exempt, credential attached |
 | Project entry on a trusted host with a different path | `WorkspaceDeclared`: gated, no credential |
 | User `authentication` lists a host but no user registry URL on it | No trust anchor; the entry only affects formatting |
 | Only `SWIFTPM_REGISTRY_LOGIN` set | No credential, plus a warning naming the variable |
 | Registry redirects cross-origin | Refused by the origin-pinned transport (error), never followed with credentials |
-| Response carries `Link: <..>; rel="next"` | Page discarded; actionable `PaginatedListUnsupported` fetch failure (FR-034) |
+| Response carries `Link: <..>; rel="next"` | The next page is followed and merged (FR-034); an unusable link, a cap or the time budget gives `PaginatedListIncomplete` (FR-035) |
+| `SWIFTPM_NETRC_DATA` or `~/.netrc` holds a machine for a trusted registry host | `Login` credential sent to that host only (FR-038) |
+| Release metadata has no `publishedAt`, or the request fails | The version list is unaffected; no date (FR-037) |
 | Response carries `Link` with only `rel="latest-version"` or `rel="canonical"` | Not truncated; the list is used |
 | Release has `problem` | Version marked yanked |
 | Same registry URL opened from two workspaces with different project files | One client; trust and credential depend only on `(URL, U, env)`, so no rebuild flapping |
@@ -341,12 +349,15 @@ authenticated entry serves the stale body. The FR-015 eviction from spec 043 app
 | SC-005 | Trust table: user entry; project entry equal to a user URL; project entry on the same host with another path; host only in `authentication`; a public user `[default]` plus a private scope both receive the credential | FR-008, FR-014, §3.3 |
 | SC-005a | `Trusted` literal hosts `127.0.0.1`, `[::1]`, `169.254.169.254`, `0.0.0.0`, `localhost` are rejected at parse time, with no `blocked_registries` occurrence; RFC1918 literals in the user tier are accepted | FR-008a |
 | SC-006 | Formatting table (5 rows) with user-tier type; a project-tier `authentication` entry has no effect on the header or digest | §3.4, FR-014 |
-| SC-007 | Env precedence and partial vars via the injected lookup; `debug_redaction_conformance!` for `SwiftEnvCredential` and `SwiftRegistryAuth` | FR-013, FR-015, NFR-001 |
+| SC-007 | Env precedence and partial vars via the injected lookup; `debug_redaction_conformance!` for `SwiftCredential` and `SwiftRegistryAuth` | FR-013, FR-015, NFR-001 |
 | SC-008 | Mockito: `match_header` on Accept; Authorization present only when `Trusted` and a credential is set; lowercase path; base with and without a trailing `/`; 404 and 410 give `PackageNotFound`; `problem` gives yanked; unsorted and non-semver input | FR-020..FR-023 |
 | SC-009 | Cross-origin redirect: the pinned and trusted-origin transports return an error | FR-021 |
 | SC-010 | Router: an unregistered `AlternateRegistry` returns `PackageNotFound` and a GitHub mock records 0 hits; `CustomRegistry` is never fetched | FR-011, NFR-002 |
 | SC-011 | Transport selection asserted in deps-swift through the pure FR-021 function (`Trusted` gives the trusted-origin transport, `WorkspaceDeclared` gives pinned), plus mockito round trips on both. The RFC1918 connect-time behavior of each transport stays covered by the existing deps-core synthetic-resolver tests (`TestLookup` is `cfg(test)`-private to deps-core) | FR-021 |
-| SC-012 | `from_link_header` grammar cases (quoted, unquoted, multi-token `rel="next last"`, mixed case, several link-values, `latest-version` only, absent header). `HttpCache` captures `link` on 200 and keeps it on 304. A mockito response with `rel="next"` yields `PaginatedListUnsupported` and its `fetch_failure()` is `Actionable` with the fixed message | FR-030, FR-032, FR-034 |
+| SC-012 | `from_link_header` and `next_page` grammar cases (quoted, unquoted, multi-token `rel="next last"`, mixed case, several link-values, `latest-version` only, absent header, several distinct targets, empty target, foreign origin, other path, userinfo). `HttpCache` captures `link` on 200 and keeps it on 304. Mockito: a 3-page merge, the page, count, byte and time caps, cycles (including late-page ones), a missing later page, Authorization on every page when `Trusted`, and the failure memo | FR-030, FR-032, FR-034, FR-035 |
+| SC-017 | `HostBlockedByPolicy` through `send_error` with a synthetic lookup (gated and never-a-registry class), an `HttpCache` round trip on a `localhost` name, stale-while-revalidate serving a warm entry, PyPI/NuGet/Go chain tests, the Go `\|` rule | FR-036 |
+| SC-018 | `publishedAt`: dates on the newest 8 non-yanked releases only, memoized across calls, failures never fail the list, a hanging request does not discard finished ones, requests without a permit are not memoized | FR-037 |
+| SC-019 | netrc grammar table (quotes, comments, account, drops, contiguity, IPv6 hosts), source precedence, `default` per platform, binding to `Trusted` only, mtime-driven re-read, unreadable file warns once, redaction conformance | FR-038 |
 | SC-013 | Lockfile: registry pin, `localSourceControl`, legacy `fileSystem`, missing kind, unknown kind skipped | FR-040 |
 | SC-014 | Swift's `watched_config_filenames()` and `routing_affecting_watched_configs()` both contain `registries.json` | FR-041 |
 | SC-015 | `is_url_source(AlternateRegistry)` is `false` (completion never rewrites an `id:` literal); ecosystem conformance; engine setup includes Swift | FR-042 |
@@ -357,16 +368,16 @@ authenticated entry serves the stale body. The FR-015 eviction from spec 043 app
 None blocking. Every critic finding from both rounds (S1..S5, M1..M9, N1..N7) is resolved in §3 and
 §4. The deferred items are listed under Out of Scope and become follow-up issues when #1691 closes:
 
-1. Follow `Link rel="next"` pages, plus the `latest-version` link. This replaces FR-034's failure
-   with real data.
-2. netrc and Keychain credentials.
-3. (P4) `publishedAt` freshness.
-4. SCM-to-registry swizzling.
-5. #1459: shared credential-provenance predicate across deps-cargo, deps-nuget and deps-swift.
-6. `DepsError::HostBlockedByPolicy`: an actionable, cross-ecosystem message for connect-time
-   policy blocks, branching on `never_a_registry`.
-7. Path-suffix watched-config entries, so that Swift watches only
+1. macOS Keychain credentials.
+2. SCM-to-registry swizzling (#1757).
+3. #1459: shared credential-provenance predicate across deps-cargo, deps-nuget and deps-swift.
+4. Path-suffix watched-config entries, so that Swift watches only
    `.swiftpm/configuration/registries.json`.
+5. Marking the registry `Authorization` header sensitive, across ecosystems.
+6. The `latest-version` link.
+
+Items for `Link rel="next"` pages (#1754), `publishedAt` (#1756), netrc (#1755, without Keychain) and
+`HostBlockedByPolicy` (#1758) shipped in the follow-up PR.
 
 ## 10. Agent Boundaries
 

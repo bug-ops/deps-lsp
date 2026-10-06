@@ -402,7 +402,7 @@ impl PypiRegistry {
                     // rather than propagating `other` unchanged, so the diagnostic/hover path
                     // (via `DepsError::fetch_failure`) can safely surface a fixed, safe hint
                     // instead of only this log line — see this method's own doc.
-                    return Err(DepsError::ChainResolutionHalted);
+                    return Err(other.into_chain_halt());
                 }
             }
         }
@@ -2290,6 +2290,43 @@ mod tests {
     /// chain does **not** try hop 1, even though hop 1 would have succeeded. This is the
     /// case-(b) "unreachable declared extra halts resolution for the whole file" trade-off,
     /// exercised directly at the chain-walk level.
+    ///
+    /// A hop whose host the connect-time resolver guard blocks halts the chain the same way, but
+    /// keeps its actionable [`DepsError::HostBlockedByPolicy`] message. The head client is built
+    /// directly against a `localhost` name, bypassing config validation.
+    #[tokio::test]
+    async fn test_get_versions_chained_policy_blocked_hop_halts_with_actionable_error() {
+        let mut hop1_server = mockito::Server::new_async().await;
+        let hop1_mock = hop1_server
+            .mock("GET", "/simple/pkg/")
+            .with_status(200)
+            .with_body(r#"{"versions": ["2.0.0"], "files": []}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let hop1 = Arc::new(PypiRegistry::with_base(
+            Arc::clone(&cache),
+            &index_url(&format!("{}/simple", hop1_server.url())),
+            Vec::new(),
+        ));
+        let port = hop1_server.socket_address().port();
+        let head = PypiRegistry::with_base(
+            Arc::clone(&cache),
+            &index_url(&format!("http://localhost:{port}/simple")),
+            vec![hop1],
+        );
+
+        let err = head.get_versions_chained("pkg").await.unwrap_err();
+        assert!(
+            matches!(err, DepsError::HostBlockedByPolicy { .. }),
+            "expected HostBlockedByPolicy, got: {err:?}"
+        );
+        hop1_mock.assert_async().await;
+    }
+
     #[tokio::test]
     async fn test_get_versions_chained_terminates_on_transport_error_never_tries_next_hop() {
         let mut hop0_server = mockito::Server::new_async().await;

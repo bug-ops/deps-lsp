@@ -36,7 +36,7 @@ use deps_core::{BlockedSourceClass, EcosystemId, RejectedSourceClass};
 use serde::Deserialize;
 use url::Url;
 
-use crate::auth::{SwiftEnvCredential, SwiftRegistryAuth, bind_credential};
+use crate::auth::{CredentialLookup, SwiftCredentialSource, SwiftRegistryAuth, bind_credential};
 use crate::package_location::RegistryScope;
 
 const REGISTRIES_FILE: &str = "registries.json";
@@ -503,6 +503,7 @@ impl RegistryRejectionClassifier for SwiftRegistryUrlError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwiftRegistryUrl {
     normalized: String,
+    parsed: Url,
     trust: RegistryTrust,
     host_key: RegistryHostKey,
 }
@@ -545,6 +546,7 @@ impl SwiftRegistryUrl {
         };
         Ok(Self {
             normalized,
+            parsed: shape,
             trust,
             host_key,
         })
@@ -554,6 +556,11 @@ impl SwiftRegistryUrl {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.normalized
+    }
+
+    /// The validated URL, for host-based lookups.
+    pub(crate) const fn url(&self) -> &Url {
+        &self.parsed
     }
 
     /// Whether this URL is user-declared or only workspace-declared.
@@ -571,8 +578,9 @@ impl SwiftRegistryUrl {
         let url = Url::parse(normalized).unwrap();
         Self {
             normalized: normalized.trim_end_matches('/').to_string(),
-            trust,
             host_key: RegistryHostKey::of(&url).unwrap(),
+            parsed: url,
+            trust,
         }
     }
 }
@@ -635,7 +643,7 @@ impl SwiftRegistriesConfig {
         project: TierFile,
         user: TierFile,
         policy: &RegistryAccessPolicy,
-        credential: Option<&SwiftEnvCredential>,
+        credential: CredentialLookup<'_>,
     ) -> Self {
         let tier = |file: TierFile| match file {
             TierFile::Absent => Some(None),
@@ -768,7 +776,7 @@ impl SwiftRegistriesConfig {
 }
 
 /// Shared by every Swift parse: the workspace policy, the file cache, the user-tier location and
-/// the environment credential.
+/// the credential source.
 ///
 /// `Default` is hermetic (no user tier, no credential); production uses
 /// [`Self::from_environment`].
@@ -777,7 +785,7 @@ pub struct SwiftParseContext {
     policy: Arc<RegistryAccessPolicy>,
     cache: Arc<SwiftRegistriesCache>,
     user_config: UserConfigPath,
-    credential: Option<Arc<SwiftEnvCredential>>,
+    credential: Option<Arc<SwiftCredentialSource>>,
 }
 
 impl Default for SwiftParseContext {
@@ -818,7 +826,7 @@ impl SwiftParseContext {
         policy: Arc<RegistryAccessPolicy>,
         cache: Arc<SwiftRegistriesCache>,
         user_config: UserConfigPath,
-        credential: Option<Arc<SwiftEnvCredential>>,
+        credential: Option<Arc<SwiftCredentialSource>>,
     ) -> Self {
         Self {
             policy,
@@ -828,8 +836,8 @@ impl SwiftParseContext {
         }
     }
 
-    /// Builds the production context: the user-tier path and credential are read from the
-    /// environment once, here.
+    /// Builds the production context: the user-tier path and the credential source are chosen
+    /// from the environment once, here.
     ///
     /// # Examples
     ///
@@ -847,7 +855,7 @@ impl SwiftParseContext {
             policy,
             Arc::default(),
             UserConfigPath::from_environment(),
-            SwiftEnvCredential::from_environment().map(Arc::new),
+            SwiftCredentialSource::from_environment(UserConfigPlatform::current()).map(Arc::new),
         )
     }
 
@@ -871,8 +879,13 @@ impl SwiftParseContext {
             ),
             UserConfigPath::NoUserTier => TierFile::Absent,
         };
-        let config =
-            SwiftRegistriesConfig::merge(project, user, &self.policy, self.credential.as_deref());
+        let merge = |credential: CredentialLookup<'_>| {
+            SwiftRegistriesConfig::merge(project, user, &self.policy, credential)
+        };
+        let config = match self.credential.as_deref() {
+            Some(source) => source.with_lookup(merge),
+            None => merge(CredentialLookup::None),
+        };
         self.cache.warn_invalid_entries(&config);
         config
     }
@@ -906,8 +919,10 @@ mod tests {
         format!(r#"{json}, "authentication": {{{authentication}}}}}"#)
     }
 
-    fn token(value: &str) -> Arc<SwiftEnvCredential> {
-        Arc::new(SwiftEnvCredential::Token(Redacted::new(value.to_string())))
+    fn token(value: &str) -> Arc<SwiftCredentialSource> {
+        Arc::new(SwiftCredentialSource::Environment(
+            crate::auth::SwiftCredential::Token(Redacted::new(value.to_string())),
+        ))
     }
 
     struct Fixture {
@@ -936,6 +951,12 @@ mod tests {
             std::fs::write(path, content).unwrap();
         }
 
+        fn set_mtime_secs_ahead(path: &Path, secs: u64) {
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(secs))
+                .unwrap();
+        }
+
         fn project(&self, content: &str) -> &Self {
             Self::write(&self.project_file(), content);
             self
@@ -953,7 +974,7 @@ mod tests {
         fn context(
             &self,
             access: WorkspaceRegistryAccess,
-            credential: Option<Arc<SwiftEnvCredential>>,
+            credential: Option<Arc<SwiftCredentialSource>>,
         ) -> SwiftParseContext {
             SwiftParseContext::new(
                 Arc::new(RegistryAccessPolicy::new(access)),
@@ -970,7 +991,7 @@ mod tests {
         fn config_with(
             &self,
             access: WorkspaceRegistryAccess,
-            credential: Option<Arc<SwiftEnvCredential>>,
+            credential: Option<Arc<SwiftCredentialSource>>,
         ) -> SwiftRegistriesConfig {
             self.context(access, credential)
                 .resolve(&self.manifest_uri())
@@ -1427,6 +1448,118 @@ mod tests {
         assert_eq!(a, digest(Some(token("a"))));
         assert_ne!(a, digest(Some(token("b"))));
         assert_ne!(a, digest(None));
+    }
+
+    fn netrc_file_source(
+        path: PathBuf,
+        default_entry: deps_core::netrc::DefaultEntry,
+    ) -> Arc<SwiftCredentialSource> {
+        Arc::new(SwiftCredentialSource::NetrcFile {
+            path,
+            default_entry,
+            cache: Arc::new(deps_core::mtime_cache::MtimeFileCache::new(8, "test netrc")),
+            unreadable_warned: Arc::default(),
+        })
+    }
+
+    #[test]
+    fn test_netrc_file_is_reread_when_it_changes_and_absent_or_invalid_means_no_credential() {
+        use deps_core::netrc::DefaultEntry;
+
+        let fx = Fixture::new();
+        fx.user(&registries(&[("[default]", PUBLIC), ("acme", PRIVATE)]));
+        let netrc_path = fx.dir.path().join("home/.netrc");
+        let source = netrc_file_source(netrc_path.clone(), DefaultEntry::Honor);
+        let header = |url: &str| {
+            find(
+                &fx.config_with(
+                    WorkspaceRegistryAccess::PublicOnly,
+                    Some(Arc::clone(&source)),
+                ),
+                url,
+            )
+            .auth
+            .map(|auth| auth.header_value().to_string())
+        };
+
+        assert_eq!(header(PRIVATE), None, "absent file");
+
+        Fixture::write(&netrc_path, "machine swift.acme.dev login u password p");
+        let first = find(
+            &fx.config_with(
+                WorkspaceRegistryAccess::PublicOnly,
+                Some(Arc::clone(&source)),
+            ),
+            PRIVATE,
+        );
+        assert_eq!(first.auth.as_ref().unwrap().header_value(), "Basic dTpw");
+        assert_eq!(header(PUBLIC), None, "no machine entry for the public host");
+
+        Fixture::write(
+            &netrc_path,
+            "machine swift.acme.dev login u password rotated",
+        );
+        Fixture::set_mtime_secs_ahead(&netrc_path, 10);
+        let second = find(
+            &fx.config_with(
+                WorkspaceRegistryAccess::PublicOnly,
+                Some(Arc::clone(&source)),
+            ),
+            PRIVATE,
+        );
+        assert_ne!(first.digest(), second.digest());
+
+        Fixture::write(&netrc_path, "machine swift.acme.dev login u");
+        Fixture::set_mtime_secs_ahead(&netrc_path, 20);
+        assert_eq!(header(PRIVATE), None, "invalid file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unreadable_netrc_file_warns_once() {
+        use deps_core::netrc::DefaultEntry;
+        use std::os::unix::fs::PermissionsExt;
+
+        let fx = Fixture::new();
+        fx.user(&registries(&[("acme", PRIVATE)]));
+        let netrc_path = fx.dir.path().join("home/.netrc");
+        Fixture::write(&netrc_path, "machine swift.acme.dev login u password p");
+        std::fs::set_permissions(&netrc_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&netrc_path).is_ok() {
+            return;
+        }
+        let source = netrc_file_source(netrc_path, DefaultEntry::Honor);
+        let logs = deps_core::test_util::capture_tracing_output(|| {
+            for _ in 0..3 {
+                let config = fx.config_with(
+                    WorkspaceRegistryAccess::PublicOnly,
+                    Some(Arc::clone(&source)),
+                );
+                assert!(find(&config, PRIVATE).auth.is_none());
+            }
+        });
+        assert_eq!(logs.matches("cannot be read").count(), 1, "{logs}");
+    }
+
+    #[test]
+    fn test_netrc_credential_never_reaches_a_workspace_declared_registry() {
+        use deps_core::netrc::DefaultEntry;
+
+        let fx = Fixture::new();
+        fx.user(&registries(&[("acme", PRIVATE)]));
+        fx.project(&registries(&[(
+            "other",
+            "https://swift.acme.dev/other-api",
+        )]));
+        let netrc_path = fx.dir.path().join("home/.netrc");
+        Fixture::write(&netrc_path, "default login d password d");
+        let source = netrc_file_source(netrc_path, DefaultEntry::Honor);
+        let config = fx.config_with(WorkspaceRegistryAccess::All, Some(source));
+
+        assert!(find(&config, PRIVATE).auth.is_some());
+        let declared = find(&config, "https://swift.acme.dev/other-api");
+        assert_eq!(declared.url.trust(), RegistryTrust::WorkspaceDeclared);
+        assert!(declared.auth.is_none());
     }
 
     // --- SC-005a / policy ---
