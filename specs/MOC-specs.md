@@ -27,6 +27,8 @@ status: moc
 | 047 | [[047-elixir-hex-ecosystem/spec\|New ecosystem: Elixir Hex (mix.exs dependency version hints)]] | specify | draft — research/new-ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, issue #642 |
 | 051 | [[051-disk-persistent-registry-cache/spec\|Disk-persistent registry cache]] | specify | draft — research/enhancement, P4, 9 open `[NEEDS CLARIFICATION]` items, tracked in issue #700 |
 | 077 | [[077-swift-registry-client/spec\|Swift Package Registry (SE-0292) client for .package(id:) dependencies]] | specify | shipped — SE-0292 registry client for `.package(id:)` (PR #1763, issue #1691); follow-up PR ships pagination (#1754), `publishedAt` (#1756), netrc (#1755) and `HostBlockedByPolicy` (#1758); opt-in macOS Keychain credentials (#1771, FR-044) and `Authorization` set_sensitive (#1772) ship in the typed-OSV follow-up PR; open follow-ups: #1757, #1459 |
+| 078 | [[078-pnpm-workspace-catalog-editing/spec\|Open pnpm-workspace.yaml as a dependency file: hints, diagnostics, code actions for catalog entries]] | specify | draft — enhancement, P3, 9 open `[NEEDS CLARIFICATION]` items, issue #1788 |
+| 079 | [[079-toml-span-native-depth-limit/spec\|Reconcile the TOML nesting pre-scan with toml-span 0.7.2's native depth limit]] | specify | draft — research, P4, 8 open `[NEEDS CLARIFICATION]` items; bump-gated on the toml-span 0.7.2 lock bump (pre-scan must stay until it lands), issue #1789 |
 
 ## Completed Specs
 
