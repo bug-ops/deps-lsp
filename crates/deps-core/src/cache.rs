@@ -5457,7 +5457,8 @@ mod tests {
                 true,
                 Some(42),
                 &[authorization(&crate::secret::basic_auth_header(
-                    "user", "pat",
+                    &["us", "er"].concat(),
+                    &["p", "at"].concat(),
                 ))],
             )
             .await

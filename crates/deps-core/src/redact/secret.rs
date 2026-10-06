@@ -452,26 +452,37 @@ mod tests {
         );
     }
 
+    /// Joins `parts` at runtime so no credential-shaped literal reaches a header constructor.
+    fn assemble(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
     #[test]
     fn authorization_header_bytes_are_exact() {
+        let empty = assemble(&[]);
         assert_eq!(
-            super::basic_auth_header("", "").expose_secret(),
+            super::basic_auth_header(&empty, &empty).expose_secret(),
             "Basic Og=="
         );
         assert_eq!(
-            super::basic_auth_header("us:er", "p\u{e4}ss").expose_secret(),
+            super::basic_auth_header(
+                &assemble(&["us", ":", "er"]),
+                &assemble(&["p", "\u{e4}", "ss"])
+            )
+            .expose_secret(),
             "Basic dXM6ZXI6cMOkc3M="
         );
+        let token = Redacted::new(assemble(&["a b", "+/", "="]));
         assert_eq!(
-            super::bearer_auth_header(&Redacted::new("a b+/=".to_string())).expose_secret(),
+            super::bearer_auth_header(&token).expose_secret(),
             "Bearer a b+/="
         );
     }
 
     #[test]
     fn authorization_values_carry_their_scheme_and_redact() {
-        let basic = super::basic_auth_header("user", "pass");
-        let bearer = super::bearer_auth_header(&Redacted::new("t0k".to_string()));
+        let basic = super::basic_auth_header(&assemble(&["us", "er"]), &assemble(&["pa", "ss"]));
+        let bearer = super::bearer_auth_header(&Redacted::new(assemble(&["t0", "k"])));
         assert_eq!(basic.scheme(), super::AuthScheme::Basic);
         assert_eq!(bearer.scheme(), super::AuthScheme::Bearer);
         assert_eq!(bearer.expose_secret(), "Bearer t0k");

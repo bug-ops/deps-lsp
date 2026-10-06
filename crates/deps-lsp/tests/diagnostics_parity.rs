@@ -13,6 +13,7 @@
 //! registry both sides reach, and no ecosystem crate exposes an injectable registry base outside
 //! its own crate tests, so that comparison stays out of scope here.
 
+#![cfg(any(feature = "cargo", feature = "npm", feature = "github-actions"))]
 #![allow(clippy::expect_used)]
 
 use deps_cli::report::{CheckContext, CheckFinding, check_manifest};
