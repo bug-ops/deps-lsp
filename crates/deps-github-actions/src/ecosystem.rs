@@ -595,6 +595,7 @@ fn sha_comment_mismatch_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lsp-responses")]
     use crate::SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE;
     use std::collections::HashMap;
 
