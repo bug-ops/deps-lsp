@@ -8,7 +8,7 @@
 
 use bytes::Bytes;
 use dashmap::DashSet;
-use deps_core::cache::{CredentialHeader, HttpCache, RequestHeader};
+use deps_core::cache::{HttpCache, RequestHeader};
 use deps_core::error::{DepsError, RateLimitEvidence, Result};
 use deps_core::secret::ApiToken;
 use serde::Deserialize;
@@ -272,9 +272,7 @@ impl GitlabApiClient {
         let auth_id =
             deps_core::secret::auth_digest(host.origin(), token.map(ApiToken::expose_secret));
         let headers: Vec<RequestHeader<'_>> = token
-            .map(|t| {
-                RequestHeader::Credential(CredentialHeader::GitlabPrivateToken, t.as_redacted())
-            })
+            .map(|t| RequestHeader::GitlabPrivateToken(t.as_redacted()))
             .into_iter()
             .collect();
 

@@ -61,6 +61,11 @@ url = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# Path-only (no version): used solely by the FR-005 parity test, and deps-cli never depends on
+# deps-lsp, so there is no cycle and nothing to resolve on publish. No default features: the
+# ecosystem set both sides of the parity test register is the one deps-lsp's own features enable
+# on the shared `deps-engine`, so `cargo hack --each-feature` legs stay minimal.
+deps-cli = { path = "../deps-cli", default-features = false }
 deps-core = { workspace = true, features = ["test-util"] }
 # `features = ["lsp-responses"]` explicit on each (issue #1083): these are unconditional dev
 # dependencies, compiled for every `cargo-hack --each-feature` slice of this crate regardless

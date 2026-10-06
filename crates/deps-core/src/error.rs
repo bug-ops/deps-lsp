@@ -417,6 +417,9 @@ pub enum PaginationStop {
     InvalidNextLink,
     /// Fetching all pages did not finish within the overall time budget.
     TimeBudget,
+    /// No complete, consistent release list is available: the registry cannot be asked and no
+    /// earlier full list exists to serve in its place.
+    NoConsistentSnapshot,
 }
 
 impl std::fmt::Display for PaginationStop {
@@ -425,6 +428,7 @@ impl std::fmt::Display for PaginationStop {
             Self::PageCap => "registry release list exceeds the page limit",
             Self::InvalidNextLink => "registry returned an unusable next-page link",
             Self::TimeBudget => "registry release list took too long to fetch",
+            Self::NoConsistentSnapshot => "no consistent registry release list is available",
         })
     }
 }
@@ -682,7 +686,8 @@ impl DepsError {
                 } else {
                     format!(
                         "registry host resolves to a {class} address, blocked by \
-                         registries.workspace_registries policy"
+                         registries.workspace_registries policy{}",
+                        class.private_host_hint_suffix()
                     )
                 })
             }
@@ -1439,11 +1444,11 @@ mod tests {
         };
         assert_eq!(
             blocked(HostClass::PrivateV4).fetch_failure(),
-            FetchFailure::Actionable(
+            FetchFailure::Actionable(format!(
                 "registry host resolves to a private (RFC1918) address, blocked by \
-                 registries.workspace_registries policy"
-                    .into()
-            )
+                     registries.workspace_registries policy{}",
+                HostClass::PrivateV4.private_host_hint_suffix()
+            ))
         );
         assert_eq!(
             blocked(HostClass::Loopback).fetch_failure(),

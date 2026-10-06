@@ -8,9 +8,9 @@
 
 use crate::cache_policy::CACHE_EVICTION_PERCENTAGE;
 use crate::error::{DepsError, RateLimitEvidence, Result};
-use crate::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+use crate::net_policy::{AccessSnapshot, RegistryAccessPolicy, Target, WorkspaceRegistryAccess};
 use crate::redact::RedactedUrl;
-use crate::secret::Redacted;
+use crate::secret::{AuthorizationValue, Redacted};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use reqwest::{Client, Response, StatusCode, Url, header};
@@ -409,25 +409,33 @@ impl CacheTier {
 
 /// The tier a [`Transport`]'s redirect policy and DNS resolver both enforce.
 ///
-/// `WorkspaceDeclared` holds a [`WorkspaceRegistryAccess`] **value snapshot**, taken once at
+/// `WorkspaceDeclared` holds an [`AccessSnapshot`] (level and allowlist) **value snapshot**, taken once at
 /// [`Transport::workspace`] construction time — not a live `Arc<RegistryAccessPolicy>` read on
 /// every [`Self::tier_allows`] call. [`Transport::workspace`] takes this same snapshot for its
 /// paired [`CacheTier::WorkspaceDeclared`], and [`HttpCache::set_registry_policy`] rebuilds the
 /// whole `Transport` (both snapshots included) on every actual policy transition, so a
 /// request's cache key and its guard always come from one consistent construction-time value,
 /// with no read-skew window between them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum AddrGuard {
     Baseline,
-    WorkspaceDeclared(WorkspaceRegistryAccess),
+    WorkspaceDeclared(AccessSnapshot),
 }
 
 impl AddrGuard {
-    /// Whether a host classified as `class` may be reached under this guard's tier.
-    fn tier_allows(self, class: crate::net_policy::HostClass) -> bool {
+    /// Whether a redirect hop's declared `url` may be reached under this guard's tier.
+    fn permits_declared(&self, url: &Url) -> bool {
         match self {
             Self::Baseline => true,
-            Self::WorkspaceDeclared(policy) => policy.allows(class),
+            Self::WorkspaceDeclared(snapshot) => snapshot.permits_url(url),
+        }
+    }
+
+    /// Whether `ip`, resolved for `name`, may be connected to under this guard's tier.
+    fn permits_resolved(&self, name: &str, ip: std::net::IpAddr) -> bool {
+        match self {
+            Self::Baseline => true,
+            Self::WorkspaceDeclared(snapshot) => snapshot.permits(Target::Resolved { name, ip }),
         }
     }
 }
@@ -477,7 +485,7 @@ fn redirect_policy(guard: AddrGuard) -> reqwest::redirect::Policy {
             .is_some_and(|previous| is_https_downgrade(previous, attempt.url()));
         if downgraded
             || hop_targets_blocked_host(attempt.url())
-            || !guard.tier_allows(crate::net_policy::classify_host(attempt.url()))
+            || !guard.permits_declared(attempt.url())
         {
             attempt.stop()
         } else {
@@ -588,7 +596,7 @@ enum ResolveGuardError {
 fn validate_resolved_addrs(
     host: &str,
     addrs: Vec<std::net::SocketAddr>,
-    guard: AddrGuard,
+    guard: &AddrGuard,
 ) -> std::result::Result<Vec<std::net::SocketAddr>, ResolveGuardError> {
     if addrs.is_empty() {
         tracing::warn!(host, "DNS resolution returned no addresses");
@@ -598,7 +606,7 @@ fn validate_resolved_addrs(
     }
     for addr in &addrs {
         let class = crate::net_policy::classify_addr(addr.ip());
-        if class.never_a_registry() || !guard.tier_allows(class) {
+        if class.never_a_registry() || !guard.permits_resolved(host, addr.ip()) {
             tracing::warn!(host, addr = %addr.ip(), %class, "blocking DNS-resolved address");
             return Err(ResolveGuardError::Blocked {
                 host: host.to_string(),
@@ -706,7 +714,7 @@ impl BlockedAddrResolver {
 impl reqwest::dns::Resolve for BlockedAddrResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
-        let guard = self.guard;
+        let guard = self.guard.clone();
         #[cfg(test)]
         let lookup = self.lookup.clone();
         Box::pin(async move {
@@ -719,50 +727,51 @@ impl reqwest::dns::Resolve for BlockedAddrResolver {
             let addrs: Vec<std::net::SocketAddr> =
                 tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
 
-            let addrs = validate_resolved_addrs(&host, addrs, guard)?;
+            let addrs = validate_resolved_addrs(&host, addrs, &guard)?;
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
     }
 }
 
-/// Request headers that carry a credential.
+/// What a cached read does when revalidating a stored entry fails.
 ///
-/// A credential header name exists only inside [`RequestHeader::Credential`], so a caller
-/// cannot send `Authorization` or `PRIVATE-TOKEN` as a plain header: the shared request
-/// builder marks every such value sensitive so the HTTP stack never prints it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CredentialHeader {
-    /// `Authorization`, carrying a pre-formatted `Bearer`/`Basic` value.
-    Authorization,
-    /// GitLab's `PRIVATE-TOKEN`, carrying the raw token.
-    GitlabPrivateToken,
-}
-
-impl CredentialHeader {
-    const fn name(self) -> header::HeaderName {
-        match self {
-            Self::Authorization => header::AUTHORIZATION,
-            Self::GitlabPrivateToken => header::HeaderName::from_static("private-token"),
-        }
-    }
+/// A caller that merges several cached responses into one answer (a paginated list) cannot
+/// accept a silently stale part: the merged result would mix generations.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::cache::RevalidationFailure;
+///
+/// assert_eq!(RevalidationFailure::default(), RevalidationFailure::ServeStale);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RevalidationFailure {
+    /// Serve the stored entry and log the failure (stale-while-revalidate).
+    #[default]
+    ServeStale,
+    /// Return the revalidation error and keep the stored entry.
+    Fail,
 }
 
 /// An extra header an [`HttpCache`] request carries.
 ///
 /// Every header this workspace sends beyond the conditional-request validators is either a
 /// fixed content-negotiation `Accept` value or a credential; the type admits nothing else, so
-/// a credential cannot reach a request without being marked sensitive.
+/// a credential cannot reach a request without being marked sensitive. An `Authorization`
+/// value is an [`AuthorizationValue`], which only the shared `Basic`/`Bearer` constructors
+/// build.
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_core::cache::{CredentialHeader, RequestHeader};
-/// use deps_core::secret::Redacted;
+/// use deps_core::cache::RequestHeader;
+/// use deps_core::secret::{Redacted, bearer_auth_header};
 ///
-/// let token = Redacted::new("Bearer secret-token".to_string());
+/// let token = bearer_auth_header(&Redacted::new("secret-token".to_string()));
 /// let headers = [
 ///     RequestHeader::Accept("application/json"),
-///     RequestHeader::Credential(CredentialHeader::Authorization, &token),
+///     RequestHeader::Authorization(&token),
 /// ];
 /// assert!(!format!("{headers:?}").contains("secret-token"));
 /// ```
@@ -770,8 +779,28 @@ impl CredentialHeader {
 pub enum RequestHeader<'a> {
     /// A fixed `Accept` value.
     Accept(&'static str),
-    /// A credential header; the value is sent marked sensitive.
-    Credential(CredentialHeader, &'a Redacted),
+    /// `Authorization`; the value is sent marked sensitive.
+    Authorization(&'a AuthorizationValue),
+    /// GitLab's `PRIVATE-TOKEN`, carrying the raw token; sent marked sensitive.
+    GitlabPrivateToken(&'a Redacted),
+}
+
+/// Adds `name: secret` to `request`, marked sensitive.
+///
+/// A value that is not a valid header value is passed through raw so `RequestBuilder::send`
+/// fails exactly as it would for any malformed header, with no value in the error.
+fn sensitive_header(
+    request: reqwest::RequestBuilder,
+    name: header::HeaderName,
+    secret: &str,
+) -> reqwest::RequestBuilder {
+    match header::HeaderValue::from_str(secret) {
+        Ok(mut value) => {
+            value.set_sensitive(true);
+            request.header(name, value)
+        }
+        Err(_) => request.header(name, secret),
+    }
 }
 
 /// Attaches `headers` to `request`, marking every credential value sensitive.
@@ -786,15 +815,14 @@ fn apply_request_headers(
     for header in headers {
         request = match header {
             RequestHeader::Accept(value) => request.header(header::ACCEPT, *value),
-            RequestHeader::Credential(kind, secret) => {
-                match header::HeaderValue::from_str(secret.expose_secret()) {
-                    Ok(mut value) => {
-                        value.set_sensitive(true);
-                        request.header(kind.name(), value)
-                    }
-                    Err(_) => request.header(kind.name(), secret.expose_secret()),
-                }
+            RequestHeader::Authorization(value) => {
+                sensitive_header(request, header::AUTHORIZATION, value.expose_secret())
             }
+            RequestHeader::GitlabPrivateToken(token) => sensitive_header(
+                request,
+                header::HeaderName::from_static("private-token"),
+                token.expose_secret(),
+            ),
         };
     }
     request
@@ -850,7 +878,10 @@ fn build_client_inner(
 /// resolver — so a client whose redirect policy and resolver enforce different tiers cannot be
 /// built by this function.
 fn build_guarded_client(guard: AddrGuard) -> Client {
-    build_client_inner(redirect_policy(guard), BlockedAddrResolver::new(guard))
+    build_client_inner(
+        redirect_policy(guard.clone()),
+        BlockedAddrResolver::new(guard),
+    )
 }
 
 /// Test-only variant of [`build_guarded_client`] that substitutes a synthetic DNS lookup for
@@ -860,7 +891,7 @@ fn build_guarded_client(guard: AddrGuard) -> Client {
 #[cfg(test)]
 fn build_guarded_client_with_lookup(guard: AddrGuard, lookup: TestLookup) -> Client {
     build_client_inner(
-        redirect_policy(guard),
+        redirect_policy(guard.clone()),
         BlockedAddrResolver::with_lookup(guard, lookup),
     )
 }
@@ -894,10 +925,11 @@ impl Transport {
     /// tier — see [`AddrGuard::WorkspaceDeclared`]'s docs for why this is a value snapshot, not
     /// a live `Arc` read, and why the guard and the tier must never snapshot independently.
     fn workspace(policy: &Arc<RegistryAccessPolicy>) -> Self {
-        let snapshot = policy.get();
+        let snapshot = policy.snapshot();
+        let tier = CacheTier::WorkspaceDeclared(snapshot.level);
         Self {
             client: build_guarded_client(AddrGuard::WorkspaceDeclared(snapshot)),
-            tier: CacheTier::WorkspaceDeclared(snapshot),
+            tier,
         }
     }
 
@@ -928,17 +960,17 @@ impl Transport {
     /// unaffected — this is a distinct constructor, not a modification of that one.
     fn origin_pinned_guarded(
         trusted_origin: &str,
-        policy: &Arc<RegistryAccessPolicy>,
+        snapshot: AccessSnapshot,
         authenticated: bool,
     ) -> Self {
-        let snapshot = policy.get();
+        let digest = pinned_digest(trusted_origin, snapshot.level);
         Self {
             client: build_client_inner(
                 trusted_origin_redirect_policy(trusted_origin),
                 BlockedAddrResolver::new(AddrGuard::WorkspaceDeclared(snapshot)),
             ),
             tier: CacheTier::Pinned {
-                digest: pinned_digest(trusted_origin, snapshot),
+                digest,
                 authenticated,
             },
         }
@@ -1356,7 +1388,8 @@ impl HttpCache {
     /// use, keyed by `(trusted_origin, CacheTier::Pinned { .. })` so an authenticated and
     /// unauthenticated transport for the same origin are pooled separately.
     fn transport_for_pinned(&self, trusted_origin: &str, authenticated: bool) -> Transport {
-        let digest = pinned_digest(trusted_origin, self.policy.get());
+        let snapshot = self.policy.snapshot();
+        let digest = pinned_digest(trusted_origin, snapshot.level);
         let key = (
             trusted_origin.to_string(),
             CacheTier::Pinned {
@@ -1371,7 +1404,7 @@ impl HttpCache {
         self.trusted_clients
             .entry(key)
             .or_insert_with(|| {
-                Transport::origin_pinned_guarded(trusted_origin, &self.policy, authenticated)
+                Transport::origin_pinned_guarded(trusted_origin, snapshot, authenticated)
             })
             .clone()
     }
@@ -1600,17 +1633,17 @@ impl HttpCache {
     /// # Examples
     ///
     /// ```no_run
-    /// use deps_core::cache::{CredentialHeader, HttpCache, RequestHeader};
-    /// use deps_core::secret::Redacted;
+    /// use deps_core::cache::{HttpCache, RequestHeader};
+    /// use deps_core::secret::{Redacted, bearer_auth_header};
     ///
     /// # async fn example() -> deps_core::error::Result<()> {
     /// let cache = HttpCache::new();
-    /// let token = Redacted::new("Bearer secret-token".to_string());
+    /// let token = bearer_auth_header(&Redacted::new("secret-token".to_string()));
     /// let data = cache
     ///     .get_cached_trusted_origin_with_headers(
     ///         "https://index.mycorp.dev/se/rd/serde",
     ///         "https://index.mycorp.dev/",
-    ///         &[RequestHeader::Credential(CredentialHeader::Authorization, &token)],
+    ///         &[RequestHeader::Authorization(&token)],
     ///     )
     ///     .await?;
     /// println!("Fetched {} bytes", data.len());
@@ -1623,9 +1656,15 @@ impl HttpCache {
         trusted_origin: &str,
         extra_headers: &[RequestHeader<'_>],
     ) -> Result<Bytes> {
-        self.get_cached_trusted_origin_response(url, trusted_origin, None, extra_headers)
-            .await
-            .map(|response| response.body)
+        self.get_cached_trusted_origin_response(
+            url,
+            trusted_origin,
+            None,
+            extra_headers,
+            RevalidationFailure::ServeStale,
+        )
+        .await
+        .map(|response| response.body)
     }
 
     /// Like [`Self::get_cached_trusted_origin_with_headers`], but returns the whole
@@ -1637,22 +1676,28 @@ impl HttpCache {
     /// same partition, so a body fetched under one credential state is never served under
     /// another.
     ///
+    /// `on_revalidation_failure` decides whether a failed revalidation of a stored entry
+    /// serves that entry or fails the call.
+    ///
     /// # Errors
     ///
-    /// Same as [`Self::get_cached_trusted_origin`].
+    /// Same as [`Self::get_cached_trusted_origin`], plus the revalidation error under
+    /// [`RevalidationFailure::Fail`].
     pub async fn get_cached_trusted_origin_response(
         &self,
         url: &str,
         trusted_origin: &str,
         partition: Option<CredentialPartition>,
         extra_headers: &[RequestHeader<'_>],
+        on_revalidation_failure: RevalidationFailure,
     ) -> Result<CachedResponse> {
         let transport = self.transport_for_origin(trusted_origin);
-        self.get_cached_with_headers_via(
+        self.get_cached_with_headers_via_policy(
             url,
             extra_headers,
             &transport,
             partition.map(CredentialPartition::get),
+            on_revalidation_failure,
         )
         .await
     }
@@ -1700,18 +1745,29 @@ impl HttpCache {
         auth_id: Option<u64>,
         extra_headers: &[RequestHeader<'_>],
     ) -> Result<Bytes> {
-        self.get_cached_pinned_response(url, trusted_origin, authenticated, auth_id, extra_headers)
-            .await
-            .map(|response| response.body)
+        self.get_cached_pinned_response(
+            url,
+            trusted_origin,
+            authenticated,
+            auth_id,
+            extra_headers,
+            RevalidationFailure::ServeStale,
+        )
+        .await
+        .map(|response| response.body)
     }
 
     /// Like [`Self::get_cached_pinned_with_headers`], but returns the whole
     /// [`CachedResponse`] (body plus `ETag`, `Last-Modified` and `Link`) instead of the body
     /// alone.
     ///
+    /// `on_revalidation_failure` decides whether a failed revalidation of a stored entry
+    /// serves that entry or fails the call.
+    ///
     /// # Errors
     ///
-    /// Same as [`Self::get_cached`].
+    /// Same as [`Self::get_cached`], plus the revalidation error under
+    /// [`RevalidationFailure::Fail`].
     pub async fn get_cached_pinned_response(
         &self,
         url: &str,
@@ -1719,10 +1775,17 @@ impl HttpCache {
         authenticated: bool,
         auth_id: Option<u64>,
         extra_headers: &[RequestHeader<'_>],
+        on_revalidation_failure: RevalidationFailure,
     ) -> Result<CachedResponse> {
         let transport = self.transport_for_pinned(trusted_origin, authenticated);
-        self.get_cached_with_headers_via(url, extra_headers, &transport, auth_id)
-            .await
+        self.get_cached_with_headers_via_policy(
+            url,
+            extra_headers,
+            &transport,
+            auth_id,
+            on_revalidation_failure,
+        )
+        .await
     }
 
     /// Like [`Self::get_cached`], but for Cargo's workspace-declared-registry requests: routes
@@ -1858,18 +1921,39 @@ impl HttpCache {
             .retain(|(_, tier), _| !matches!(tier, CacheTier::Pinned { .. }));
     }
 
-    /// `auth_id` (FR-014) is meaningful only under [`CacheTier::Pinned`] and
-    /// [`CacheTier::Baseline`] — every other tier ignores it (see [`Self::cache_key`]'s docs).
-    #[tracing::instrument(
-        skip(self, extra_headers, transport, auth_id),
-        fields(url = %RedactedUrl::new(url), cache = tracing::field::Empty)
-    )]
+    /// [`Self::get_cached_with_headers_via_policy`] that serves a stale entry when its
+    /// revalidation fails.
     async fn get_cached_with_headers_via(
         &self,
         url: &str,
         extra_headers: &[RequestHeader<'_>],
         transport: &Transport,
         auth_id: Option<u64>,
+    ) -> Result<CachedResponse> {
+        self.get_cached_with_headers_via_policy(
+            url,
+            extra_headers,
+            transport,
+            auth_id,
+            RevalidationFailure::ServeStale,
+        )
+        .await
+    }
+
+    /// `auth_id` (FR-014) is meaningful only under [`CacheTier::Pinned`] and
+    /// [`CacheTier::Baseline`] — every other tier ignores it (see [`Self::cache_key`]'s docs).
+    #[tracing::instrument(
+        name = "get_cached_with_headers_via",
+        skip(self, extra_headers, transport, auth_id, on_revalidation_failure),
+        fields(url = %RedactedUrl::new(url), cache = tracing::field::Empty)
+    )]
+    async fn get_cached_with_headers_via_policy(
+        &self,
+        url: &str,
+        extra_headers: &[RequestHeader<'_>],
+        transport: &Transport,
+        auth_id: Option<u64>,
+        on_revalidation_failure: RevalidationFailure,
     ) -> Result<CachedResponse> {
         if self.entries.len() >= MAX_CACHE_ENTRIES
             || self.total_bytes.load(Ordering::Relaxed) >= MAX_CACHE_BYTES
@@ -1991,6 +2075,10 @@ impl HttpCache {
                             cause,
                             "evicting authenticated cache entry after revalidation failure"
                         );
+                        return Err(e);
+                    }
+                    if on_revalidation_failure == RevalidationFailure::Fail {
+                        tracing::Span::current().record("cache", "revalidation-failed");
                         return Err(e);
                     }
                     tracing::Span::current().record("cache", "stale-fallback");
@@ -2536,15 +2624,28 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
+    use crate::net_policy::PrivateRegistryAllowlist;
+    use crate::secret::bearer_auth_header;
 
-    fn authorization(token: &Redacted) -> RequestHeader<'_> {
-        RequestHeader::Credential(CredentialHeader::Authorization, token)
+    fn bearer(token: &str) -> AuthorizationValue {
+        bearer_auth_header(&Redacted::new(token.to_string()))
+    }
+
+    fn workspace_guard(level: WorkspaceRegistryAccess, allowlist: &[&str]) -> AddrGuard {
+        AddrGuard::WorkspaceDeclared(AccessSnapshot {
+            level,
+            allowlist: Arc::new(PrivateRegistryAllowlist::for_test(allowlist)),
+        })
+    }
+
+    fn authorization(token: &AuthorizationValue) -> RequestHeader<'_> {
+        RequestHeader::Authorization(token)
     }
 
     #[test]
     fn test_apply_request_headers_marks_authorization_sensitive_on_built_request() {
         let client = Client::new();
-        let token = Redacted::new("Bearer secret-token".to_string());
+        let token = bearer("secret-token");
         let request = apply_request_headers(
             client.get("https://example.com/"),
             &[
@@ -2574,10 +2675,7 @@ mod tests {
         let token = Redacted::new("glpat-secret".to_string());
         let request = apply_request_headers(
             client.get("https://example.com/"),
-            &[RequestHeader::Credential(
-                CredentialHeader::GitlabPrivateToken,
-                &token,
-            )],
+            &[RequestHeader::GitlabPrivateToken(&token)],
         )
         .build()
         .unwrap();
@@ -2590,7 +2688,7 @@ mod tests {
     #[test]
     fn test_apply_request_headers_invalid_credential_value_fails_the_build() {
         let client = Client::new();
-        let token = Redacted::new("Bearer bad\nvalue".to_string());
+        let token = bearer("bad\nvalue");
         let result =
             apply_request_headers(client.get("https://example.com/"), &[authorization(&token)])
                 .build();
@@ -2686,7 +2784,7 @@ mod tests {
     fn test_validate_resolved_addrs_blocks_cloud_metadata() {
         let addrs = vec!["169.254.169.254:0".parse().unwrap()];
         assert_matches!(
-            validate_resolved_addrs("evil.example", addrs, AddrGuard::Baseline),
+            validate_resolved_addrs("evil.example", addrs, &AddrGuard::Baseline),
             Err(ResolveGuardError::Blocked { .. })
         );
     }
@@ -2700,7 +2798,7 @@ mod tests {
             "169.254.169.254:0".parse().unwrap(),
         ];
         assert_matches!(
-            validate_resolved_addrs("evil.example", addrs, AddrGuard::Baseline),
+            validate_resolved_addrs("evil.example", addrs, &AddrGuard::Baseline),
             Err(ResolveGuardError::Blocked { .. })
         );
     }
@@ -2709,7 +2807,8 @@ mod tests {
     fn test_validate_resolved_addrs_allows_global() {
         let addrs = vec!["1.1.1.1:0".parse().unwrap()];
         assert_eq!(
-            validate_resolved_addrs("index.crates.io", addrs.clone(), AddrGuard::Baseline).unwrap(),
+            validate_resolved_addrs("index.crates.io", addrs.clone(), &AddrGuard::Baseline)
+                .unwrap(),
             addrs
         );
     }
@@ -2719,7 +2818,7 @@ mod tests {
     #[test]
     fn test_validate_resolved_addrs_fails_closed_on_empty() {
         assert_matches!(
-            validate_resolved_addrs("evil.example", vec![], AddrGuard::Baseline),
+            validate_resolved_addrs("evil.example", vec![], &AddrGuard::Baseline),
             Err(ResolveGuardError::NoAddresses { .. })
         );
     }
@@ -2728,7 +2827,7 @@ mod tests {
     fn test_validate_resolved_addrs_unwraps_mapped_v4() {
         let addrs = vec!["[::ffff:169.254.169.254]:0".parse().unwrap()];
         assert_matches!(
-            validate_resolved_addrs("evil.example", addrs, AddrGuard::Baseline),
+            validate_resolved_addrs("evil.example", addrs, &AddrGuard::Baseline),
             Err(ResolveGuardError::Blocked { .. })
         );
     }
@@ -2740,7 +2839,7 @@ mod tests {
         for addr_str in ["10.0.0.1:0", "100.64.0.1:0", "[fc00::1]:0"] {
             let addrs = vec![addr_str.parse().unwrap()];
             assert!(
-                validate_resolved_addrs("corp.example", addrs, AddrGuard::Baseline).is_ok(),
+                validate_resolved_addrs("corp.example", addrs, &AddrGuard::Baseline).is_ok(),
                 "{addr_str} must be allowed under Baseline"
             );
         }
@@ -2750,12 +2849,12 @@ mod tests {
     // unique-local address is blocked, while a `Global` address is still allowed.
     #[test]
     fn test_validate_resolved_addrs_workspace_public_only_blocks_private_ranges() {
-        let guard = AddrGuard::WorkspaceDeclared(WorkspaceRegistryAccess::PublicOnly);
+        let guard = workspace_guard(WorkspaceRegistryAccess::PublicOnly, &[]);
         for addr_str in ["10.0.0.1:0", "100.64.0.1:0", "[fc00::1]:0"] {
             let addrs = vec![addr_str.parse().unwrap()];
             assert!(
                 matches!(
-                    validate_resolved_addrs("evil.example", addrs, guard),
+                    validate_resolved_addrs("evil.example", addrs, &guard),
                     Err(ResolveGuardError::Blocked { .. })
                 ),
                 "{addr_str} must be blocked under WorkspaceDeclared(PublicOnly)"
@@ -2763,24 +2862,60 @@ mod tests {
         }
 
         let global = vec!["1.1.1.1:0".parse().unwrap()];
-        assert!(validate_resolved_addrs("index.crates.io", global, guard).is_ok());
+        assert!(validate_resolved_addrs("index.crates.io", global, &guard).is_ok());
     }
 
     // Test-plan item 2: `WorkspaceDeclared(All)` admits a private-range address.
     #[test]
     fn test_validate_resolved_addrs_workspace_all_allows_private_ranges() {
-        let guard = AddrGuard::WorkspaceDeclared(WorkspaceRegistryAccess::All);
+        let guard = workspace_guard(WorkspaceRegistryAccess::All, &["10.0.0.0/8"]);
         let addrs = vec!["10.0.0.1:0".parse().unwrap()];
-        assert!(validate_resolved_addrs("corp.example", addrs, guard).is_ok());
+        assert!(validate_resolved_addrs("corp.example", addrs, &guard).is_ok());
+        let outside = vec!["192.168.0.1:0".parse().unwrap()];
+        assert_matches!(
+            validate_resolved_addrs("corp.example", outside, &guard),
+            Err(ResolveGuardError::Blocked { .. })
+        );
+    }
+
+    #[test]
+    fn test_validate_resolved_addrs_workspace_all_without_allowlist_blocks_private_ranges() {
+        let guard = workspace_guard(WorkspaceRegistryAccess::All, &[]);
+        let addrs = vec!["10.0.0.1:0".parse().unwrap()];
+        assert_matches!(
+            validate_resolved_addrs("corp.example", addrs, &guard),
+            Err(ResolveGuardError::Blocked { .. })
+        );
+    }
+
+    #[test]
+    fn test_validate_resolved_addrs_hostname_entry_vouches_only_for_itself() {
+        let guard = workspace_guard(WorkspaceRegistryAccess::All, &["registry.corp.example"]);
+        let addrs = vec!["10.0.0.1:0".parse().unwrap()];
+        assert!(validate_resolved_addrs("registry.corp.example", addrs.clone(), &guard).is_ok());
+        assert_matches!(
+            validate_resolved_addrs("rebinder.example", addrs, &guard),
+            Err(ResolveGuardError::Blocked { .. })
+        );
+    }
+
+    #[test]
+    fn test_validate_resolved_addrs_never_a_registry_blocked_under_matching_allowlist() {
+        let guard = workspace_guard(WorkspaceRegistryAccess::All, &["169.254.0.0/16"]);
+        let addrs = vec!["169.254.169.254:0".parse().unwrap()];
+        assert_matches!(
+            validate_resolved_addrs("corp.example", addrs, &guard),
+            Err(ResolveGuardError::Blocked { .. })
+        );
     }
 
     // Test-plan item 2: `WorkspaceDeclared(Off)` rejects even a `Global` address.
     #[test]
     fn test_validate_resolved_addrs_workspace_off_rejects_global() {
-        let guard = AddrGuard::WorkspaceDeclared(WorkspaceRegistryAccess::Off);
+        let guard = workspace_guard(WorkspaceRegistryAccess::Off, &[]);
         let addrs = vec!["1.1.1.1:0".parse().unwrap()];
         assert_matches!(
-            validate_resolved_addrs("index.crates.io", addrs, guard),
+            validate_resolved_addrs("index.crates.io", addrs, &guard),
             Err(ResolveGuardError::Blocked { .. })
         );
     }
@@ -2793,7 +2928,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_guarded_client_with_lookup_blocks_private_range_under_workspace_tier() {
         let lookup = TestLookup(Arc::new(|_host: &str| vec!["10.0.0.1:0".parse().unwrap()]));
-        let guard = AddrGuard::WorkspaceDeclared(WorkspaceRegistryAccess::PublicOnly);
+        let guard = workspace_guard(WorkspaceRegistryAccess::PublicOnly, &[]);
         let client = build_guarded_client_with_lookup(guard, lookup);
         let result = client.get("https://corp.example/").send().await;
         let err = result.expect_err(
@@ -2808,7 +2943,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_error_maps_gated_class_to_host_blocked_by_policy() {
         let lookup = TestLookup(Arc::new(|_host: &str| vec!["10.0.0.1:0".parse().unwrap()]));
-        let guard = AddrGuard::WorkspaceDeclared(WorkspaceRegistryAccess::PublicOnly);
+        let guard = workspace_guard(WorkspaceRegistryAccess::PublicOnly, &[]);
         let client = build_guarded_client_with_lookup(guard, lookup);
         let url = "https://corp.example/index";
         let error = client.get(url).send().await.unwrap_err();
@@ -3337,13 +3472,38 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/api/data", server.url());
-        let token = Redacted::new("Bearer secret-token".to_string());
+        let token = bearer("secret-token");
         let result: Bytes = cache
             .get_cached_trusted_origin_with_headers(&url, &trusted_origin, &[authorization(&token)])
             .await
             .unwrap();
 
         assert_eq!(result.as_ref(), b"authenticated data");
+    }
+
+    #[tokio::test]
+    async fn test_gitlab_private_token_header_is_sent_verbatim() {
+        let mut server = mockito::Server::new_async().await;
+        let trusted_origin = format!("{}/", server.url());
+        let m = server
+            .mock("GET", "/api/data")
+            .match_header("private-token", "glpat-secret")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_body("ok")
+            .create_async()
+            .await;
+        let token = Redacted::new("glpat-secret".to_string());
+        let url = format!("{}/api/data", server.url());
+        HttpCache::new()
+            .get_cached_trusted_origin_with_headers(
+                &url,
+                &trusted_origin,
+                &[RequestHeader::GitlabPrivateToken(&token)],
+            )
+            .await
+            .unwrap();
+        m.assert_async().await;
     }
 
     // A credential header must never survive a cross-origin redirect hop — proven by the
@@ -3376,9 +3536,7 @@ mod tests {
             .get_cached_trusted_origin_with_headers(
                 &source_url,
                 &trusted_origin,
-                &[authorization(&Redacted::new(
-                    "Bearer secret-token".to_string(),
-                ))],
+                &[authorization(&bearer("secret-token"))],
             )
             .await;
 
@@ -3563,7 +3721,13 @@ mod tests {
             .create_async()
             .await;
         let response = cache
-            .get_cached_trusted_origin_response(&url, &origin, None, &[])
+            .get_cached_trusted_origin_response(
+                &url,
+                &origin,
+                None,
+                &[],
+                RevalidationFailure::ServeStale,
+            )
             .await
             .unwrap();
         assert_eq!(response.link.as_deref(), Some(NEXT_LINK));
@@ -3576,7 +3740,13 @@ mod tests {
             .create_async()
             .await;
         let response = cache
-            .get_cached_trusted_origin_response(&url, &origin, None, &[])
+            .get_cached_trusted_origin_response(
+                &url,
+                &origin,
+                None,
+                &[],
+                RevalidationFailure::ServeStale,
+            )
             .await
             .unwrap();
         assert_eq!(response.body.as_ref(), b"page one");
@@ -3654,7 +3824,13 @@ mod tests {
             Some(CredentialPartition::new(2)),
         ] {
             cache
-                .get_cached_trusted_origin_response(&url, &origin, partition, &[])
+                .get_cached_trusted_origin_response(
+                    &url,
+                    &origin,
+                    partition,
+                    &[],
+                    RevalidationFailure::ServeStale,
+                )
                 .await
                 .unwrap();
         }
@@ -3678,13 +3854,95 @@ mod tests {
             .create_async()
             .await;
         let response = cache
-            .get_cached_trusted_origin_response(&url, &origin, None, &[])
+            .get_cached_trusted_origin_response(
+                &url,
+                &origin,
+                None,
+                &[],
+                RevalidationFailure::ServeStale,
+            )
             .await
             .unwrap();
         assert_eq!(
             crate::pagination::ListCoverage::from_link_header(response.link.as_deref()),
             crate::pagination::ListCoverage::Truncated
         );
+    }
+
+    #[tokio::test]
+    async fn test_revalidation_failure_fail_returns_the_error_and_keeps_the_entry() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/api/data", server.url());
+        let origin = format!("{}/", server.url());
+        let cache = HttpCache::new();
+
+        let first = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_header("etag", "\"abc\"")
+            .with_body("page one")
+            .create_async()
+            .await;
+        cache
+            .get_cached_trusted_origin_response(&url, &origin, None, &[], RevalidationFailure::Fail)
+            .await
+            .unwrap();
+        first.remove_async().await;
+
+        let _broken = server
+            .mock("GET", "/api/data")
+            .with_status(500)
+            .expect_at_least(2)
+            .create_async()
+            .await;
+        let err = cache
+            .get_cached_trusted_origin_response(&url, &origin, None, &[], RevalidationFailure::Fail)
+            .await
+            .unwrap_err();
+        assert_matches!(err, DepsError::HttpStatus { status: 500, .. });
+        assert_eq!(cache.len(), 1, "the stored entry is kept");
+
+        let stale = cache
+            .get_cached_trusted_origin_response(
+                &url,
+                &origin,
+                None,
+                &[],
+                RevalidationFailure::ServeStale,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.body.as_ref(), b"page one");
+    }
+
+    #[tokio::test]
+    async fn test_pinned_revalidation_failure_fail_covers_not_found() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/api/data", server.url());
+        let origin = format!("{}/", server.url());
+        let cache = HttpCache::new();
+
+        let first = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_body("page one")
+            .create_async()
+            .await;
+        cache
+            .get_cached_pinned_response(&url, &origin, false, None, &[], RevalidationFailure::Fail)
+            .await
+            .unwrap();
+        first.remove_async().await;
+        let _gone = server
+            .mock("GET", "/api/data")
+            .with_status(404)
+            .create_async()
+            .await;
+        let err = cache
+            .get_cached_pinned_response(&url, &origin, false, None, &[], RevalidationFailure::Fail)
+            .await
+            .unwrap_err();
+        assert!(err.is_not_found(), "{err:?}");
     }
 
     #[tokio::test]
@@ -3703,7 +3961,14 @@ mod tests {
             .create_async()
             .await;
         let response = cache
-            .get_cached_pinned_response(&url, &origin, false, None, &[])
+            .get_cached_pinned_response(
+                &url,
+                &origin,
+                false,
+                None,
+                &[],
+                RevalidationFailure::ServeStale,
+            )
             .await
             .unwrap();
         assert_eq!(response.link.as_deref(), Some(NEXT_LINK));
@@ -4135,7 +4400,7 @@ mod tests {
             .await;
 
         let cache = HttpCache::new();
-        let token = Redacted::new("Bearer token123".to_string());
+        let token = bearer("token123");
         let headers = [authorization(&token)];
         let result: Bytes = cache.get_cached_with_headers(&url, &headers).await.unwrap();
 
@@ -5191,8 +5456,8 @@ mod tests {
                 &trusted_origin,
                 true,
                 Some(42),
-                &[authorization(&Redacted::new(
-                    "Basic dXNlcjpwYXQ=".to_string(),
+                &[authorization(&crate::secret::basic_auth_header(
+                    "user", "pat",
                 ))],
             )
             .await

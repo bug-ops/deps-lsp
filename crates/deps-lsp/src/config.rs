@@ -8,6 +8,7 @@ pub use deps_core::policy_config::{
 // Not re-exported: `PolicyConfigDiff`'s only consumer here is `reparse_scope` below.
 use deps_core::policy_config::PolicyConfigDiff;
 use serde::Deserialize;
+use tower_lsp_server::ls_types::Uri;
 
 /// Root configuration for the deps-lsp server.
 ///
@@ -371,20 +372,99 @@ pub(crate) enum ReparseScope {
     All,
     /// Reparse only open documents whose ecosystem is one of these.
     Ecosystems(Vec<deps_core::EcosystemId>),
+    /// Reparse only open documents a changed watched config file actually governs: an
+    /// ecosystem match plus the file's [`deps_core::ConfigOwner`] covering the document (#1793).
+    ConfigOwners(Vec<(deps_core::EcosystemId, deps_core::ConfigOwner)>),
+}
+
+/// Resolves symlinks in `path`'s directory so two spellings of one location (a symlinked
+/// workspace, `/var` vs `/private/var`) compare equal; a directory that cannot be resolved
+/// keeps its lexical form.
+pub(crate) fn canonical_file_path(path: &std::path::Path) -> std::path::PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) => {
+            std::fs::canonicalize(dir).map_or_else(|_| path.to_path_buf(), |dir| dir.join(name))
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// `owner` with its directory resolved the way [`canonical_file_path`] resolves documents', so
+/// [`deps_core::ConfigOwner::covers`] compares like with like.
+pub(crate) fn canonical_owner(owner: &deps_core::ConfigOwner) -> deps_core::ConfigOwner {
+    let dir = std::fs::canonicalize(owner.dir()).unwrap_or_else(|_| owner.dir().to_path_buf());
+    deps_core::ConfigOwner::new(dir, owner.reach())
+}
+
+/// The members of `candidates` that fall within `scope`.
+///
+/// Documents are first narrowed by ecosystem, which is cheap; only then, for a
+/// [`ReparseScope::ConfigOwners`] scope, are their paths resolved on the blocking pool, so no
+/// filesystem call runs on the runtime or under a `DashMap` shard lock. A failed blocking task
+/// falls back to every document of a matching ecosystem: reparsing too much is the safe side.
+pub(crate) async fn uris_in_scope(
+    scope: &ReparseScope,
+    candidates: Vec<(Uri, deps_core::EcosystemId)>,
+) -> std::collections::HashSet<Uri> {
+    let candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|(_, ecosystem)| scope.may_match(*ecosystem))
+        .collect();
+    if !matches!(scope, ReparseScope::ConfigOwners(_)) {
+        return candidates.into_iter().map(|(uri, _)| uri).collect();
+    }
+    let fallback: std::collections::HashSet<Uri> =
+        candidates.iter().map(|(uri, _)| uri.clone()).collect();
+    let scope = scope.clone();
+    tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .filter(|(uri, ecosystem)| scope.matches(*ecosystem, uri))
+            .map(|(uri, _)| uri)
+            .collect()
+    })
+    .await
+    .unwrap_or(fallback)
 }
 
 impl ReparseScope {
-    /// Whether a document of this ecosystem falls within scope.
-    pub(crate) fn matches(&self, ecosystem: deps_core::EcosystemId) -> bool {
+    /// Whether any document of `ecosystem` could fall within scope; the cheap pre-filter for
+    /// [`uris_in_scope`].
+    pub(crate) fn may_match(&self, ecosystem: deps_core::EcosystemId) -> bool {
         match self {
             Self::All => true,
             Self::Ecosystems(ids) => ids.contains(&ecosystem),
+            Self::ConfigOwners(owners) => owners.iter().any(|(id, _)| *id == ecosystem),
+        }
+    }
+
+    /// Whether the open document `uri` of this ecosystem falls within scope. A `uri` that is
+    /// not a local file path never matches a [`Self::ConfigOwners`] scope.
+    ///
+    /// Resolves symlinks for a `ConfigOwners` scope, so it performs blocking filesystem
+    /// calls; async callers go through [`uris_in_scope`].
+    pub(crate) fn matches(&self, ecosystem: deps_core::EcosystemId, uri: &Uri) -> bool {
+        match self {
+            Self::All => true,
+            Self::Ecosystems(ids) => ids.contains(&ecosystem),
+            Self::ConfigOwners(owners) => {
+                let Some(manifest) = crate::lsp_types_interop::from_lsp_uri(uri)
+                    .and_then(|url| deps_core::lockfile::resolve_manifest_file_path(&url))
+                else {
+                    return false;
+                };
+                let manifest = canonical_file_path(&manifest);
+                owners
+                    .iter()
+                    .any(|(id, owner)| *id == ecosystem && owner.covers(&manifest))
+            }
         }
     }
 
     /// Unions two scopes together (issue #592: coalescing a burst of config changes must
     /// not lose an earlier change's scope to a later, narrower one). `All` absorbs
-    /// anything; two `Ecosystems` sets are deduplicated-merged.
+    /// anything; two scopes of the same kind are deduplicated-merged; mixing
+    /// `ConfigOwners` with `Ecosystems` widens to `Ecosystems` over both sides' ecosystems.
     pub(crate) fn union(self, other: Self) -> Self {
         match (self, other) {
             (Self::All, _) | (_, Self::All) => Self::All,
@@ -396,6 +476,18 @@ impl ReparseScope {
                 }
                 Self::Ecosystems(a)
             }
+            (Self::ConfigOwners(mut a), Self::ConfigOwners(b)) => {
+                for owner in b {
+                    if !a.contains(&owner) {
+                        a.push(owner);
+                    }
+                }
+                Self::ConfigOwners(a)
+            }
+            (Self::Ecosystems(ids), Self::ConfigOwners(owners))
+            | (Self::ConfigOwners(owners), Self::Ecosystems(ids)) => Self::Ecosystems(ids).union(
+                Self::Ecosystems(owners.into_iter().map(|(id, _)| id).collect()),
+            ),
         }
     }
 }
@@ -1237,6 +1329,131 @@ mod tests {
         use super::*;
         use deps_core::EcosystemId;
 
+        fn any_uri() -> Uri {
+            doc_uri("/t/Cargo.toml")
+        }
+
+        fn doc_uri(path: &str) -> Uri {
+            crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(path))
+        }
+
+        fn owner(dir: &str, reach: impl Into<deps_core::OwnerReach>) -> deps_core::ConfigOwner {
+            let dir = deps_core::test_util::test_uri(dir)
+                .to_file_path()
+                .expect("test uri is a file path");
+            deps_core::ConfigOwner::new(dir, reach)
+        }
+
+        #[test]
+        fn test_config_owners_scope_covers_only_documents_under_owner() {
+            let scope = ReparseScope::ConfigOwners(vec![(
+                EcosystemId::Swift,
+                owner("/ws/other", deps_core::ConfigReach::OwnerDirectory),
+            )]);
+            assert!(scope.matches(EcosystemId::Swift, &doc_uri("/ws/other/Package.swift")));
+            assert!(!scope.matches(EcosystemId::Swift, &doc_uri("/ws/Package.swift")));
+            assert!(!scope.matches(EcosystemId::Swift, &doc_uri("/ws/other/sub/Package.swift")));
+            assert!(!scope.matches(EcosystemId::Npm, &doc_uri("/ws/other/package.json")));
+        }
+
+        /// #1793: a watcher path spelled through a symlink must still cover a document whose
+        /// key spells the real path, once the owner is canonicalized.
+        #[cfg(unix)]
+        #[test]
+        fn test_symlinked_owner_spelling_still_covers_real_path_document() {
+            let temp = tempfile::tempdir().unwrap();
+            let real = temp.path().join("real");
+            std::fs::create_dir_all(real.join("pkg")).unwrap();
+            let link = temp.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+
+            let spelled = deps_core::ConfigOwner::new(link, deps_core::ConfigReach::Subtree);
+            let doc = crate::lsp_types_interop::to_lsp_uri(
+                &url::Url::from_file_path(real.join("pkg/package.json")).unwrap(),
+            );
+            let lexical = ReparseScope::ConfigOwners(vec![(EcosystemId::Npm, spelled.clone())]);
+            let canonical =
+                ReparseScope::ConfigOwners(vec![(EcosystemId::Npm, canonical_owner(&spelled))]);
+
+            assert!(canonical.matches(EcosystemId::Npm, &doc));
+            assert!(
+                !lexical.matches(EcosystemId::Npm, &doc),
+                "premise: only the canonicalized owner bridges the two spellings"
+            );
+        }
+
+        #[test]
+        fn test_all_documents_owner_covers_documents_outside_its_directory() {
+            let scope = ReparseScope::ConfigOwners(vec![(
+                EcosystemId::Npm,
+                owner("/home/me", deps_core::OwnerReach::AllDocuments),
+            )]);
+            assert!(scope.matches(EcosystemId::Npm, &doc_uri("/work/pkg/package.json")));
+            assert!(!scope.matches(EcosystemId::Swift, &doc_uri("/work/Package.swift")));
+        }
+
+        /// #1793: a `$HOME`-level `.npmrc` is user-tier config, so its change must reparse an
+        /// open document that lives outside `$HOME`.
+        #[cfg(feature = "npm")]
+        #[test]
+        fn test_home_level_npmrc_scope_reparses_document_outside_home() {
+            let state = crate::document::ServerState::new();
+            let home = deps_core::test_util::test_uri("/home/me")
+                .to_file_path()
+                .unwrap();
+            let npmrc = home.join(".npmrc");
+
+            let owners: Vec<_> = state
+                .ecosystem_registry
+                .for_watched_config_in(&npmrc, Some(&deps_core::UserHome::new(home)))
+                .into_iter()
+                .map(|m| (m.ecosystem.ecosystem_id(), m.owner))
+                .collect();
+            assert!(!owners.is_empty(), "premise: npm watches .npmrc");
+            let scope = ReparseScope::ConfigOwners(owners);
+
+            assert!(scope.matches(EcosystemId::Npm, &doc_uri("/work/app/package.json")));
+            assert!(scope.matches(EcosystemId::Npm, &doc_uri("/home/me/app/package.json")));
+        }
+
+        #[test]
+        fn test_subtree_owner_covers_descendants() {
+            let scope = ReparseScope::ConfigOwners(vec![(
+                EcosystemId::Npm,
+                owner("/ws", deps_core::ConfigReach::Subtree),
+            )]);
+            assert!(scope.matches(EcosystemId::Npm, &doc_uri("/ws/pkg/package.json")));
+            assert!(!scope.matches(EcosystemId::Npm, &doc_uri("/other/package.json")));
+        }
+
+        #[test]
+        fn test_config_owners_union_with_ecosystems_widens_to_both_ecosystems() {
+            let owners = ReparseScope::ConfigOwners(vec![(
+                EcosystemId::Swift,
+                owner("/ws", deps_core::ConfigReach::OwnerDirectory),
+            )]);
+            let merged = owners.union(ReparseScope::Ecosystems(vec![EcosystemId::Npm]));
+            assert_eq!(
+                merged,
+                ReparseScope::Ecosystems(vec![EcosystemId::Npm, EcosystemId::Swift])
+            );
+        }
+
+        #[test]
+        fn test_config_owners_union_dedups_and_all_absorbs() {
+            let o = (
+                EcosystemId::Swift,
+                owner("/ws", deps_core::ConfigReach::OwnerDirectory),
+            );
+            let merged = ReparseScope::ConfigOwners(vec![o.clone()])
+                .union(ReparseScope::ConfigOwners(vec![o.clone()]));
+            assert_eq!(merged, ReparseScope::ConfigOwners(vec![o.clone()]));
+            assert_eq!(
+                ReparseScope::ConfigOwners(vec![o]).union(ReparseScope::All),
+                ReparseScope::All
+            );
+        }
+
         /// A small, test-local stand-in for the real ecosystem list `reparse_scope` now
         /// takes as a parameter (issue #592 security M1) — these tests exercise
         /// `reparse_scope`'s diff/union *logic*, not the production ecosystem set, which is
@@ -1280,9 +1497,9 @@ mod tests {
                 ReparseScope::Ecosystems(TEST_WORKSPACE_REGISTRY_ECOSYSTEMS.to_vec())
             );
             for id in TEST_WORKSPACE_REGISTRY_ECOSYSTEMS {
-                assert!(scope.matches(*id));
+                assert!(scope.matches(*id, &any_uri()));
             }
-            assert!(!scope.matches(EcosystemId::Bundler));
+            assert!(!scope.matches(EcosystemId::Bundler, &any_uri()));
         }
 
         /// The scope must come from the caller-supplied list, not a value baked into
@@ -1297,7 +1514,7 @@ mod tests {
             let scope =
                 reparse_scope(&old, &new, &[EcosystemId::Swift]).expect("must trigger a reparse");
             assert_eq!(scope, ReparseScope::Ecosystems(vec![EcosystemId::Swift]));
-            assert!(!scope.matches(EcosystemId::Cargo));
+            assert!(!scope.matches(EcosystemId::Cargo, &any_uri()));
         }
 
         #[test]
@@ -1313,8 +1530,8 @@ mod tests {
                 scope,
                 ReparseScope::Ecosystems(NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS.to_vec())
             );
-            assert!(scope.matches(EcosystemId::NuGet));
-            assert!(!scope.matches(EcosystemId::Cargo));
+            assert!(scope.matches(EcosystemId::NuGet, &any_uri()));
+            assert!(!scope.matches(EcosystemId::Cargo, &any_uri()));
         }
 
         #[test]
@@ -1330,8 +1547,8 @@ mod tests {
                 scope,
                 ReparseScope::Ecosystems(SWIFT_KEYCHAIN_CREDENTIALS_ECOSYSTEMS.to_vec())
             );
-            assert!(scope.matches(EcosystemId::Swift));
-            assert!(!scope.matches(EcosystemId::Cargo));
+            assert!(scope.matches(EcosystemId::Swift, &any_uri()));
+            assert!(!scope.matches(EcosystemId::Cargo, &any_uri()));
         }
 
         #[test]
@@ -1346,9 +1563,9 @@ mod tests {
                 scope,
                 ReparseScope::Ecosystems(GITLAB_INSTANCE_HOST_ECOSYSTEMS.to_vec())
             );
-            assert!(scope.matches(EcosystemId::GitlabCi));
-            assert!(!scope.matches(EcosystemId::Cargo));
-            assert!(!scope.matches(EcosystemId::NuGet));
+            assert!(scope.matches(EcosystemId::GitlabCi, &any_uri()));
+            assert!(!scope.matches(EcosystemId::Cargo, &any_uri()));
+            assert!(!scope.matches(EcosystemId::NuGet, &any_uri()));
         }
 
         #[test]
@@ -1362,9 +1579,9 @@ mod tests {
             let scope = reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS)
                 .expect("must trigger a reparse");
             for id in TEST_WORKSPACE_REGISTRY_ECOSYSTEMS {
-                assert!(scope.matches(*id), "must still cover {id}");
+                assert!(scope.matches(*id, &any_uri()), "must still cover {id}");
             }
-            assert!(scope.matches(EcosystemId::NuGet));
+            assert!(scope.matches(EcosystemId::NuGet, &any_uri()));
         }
 
         #[test]
@@ -1390,7 +1607,7 @@ mod tests {
 
         #[test]
         fn test_scope_matches_all_matches_any_ecosystem() {
-            assert!(ReparseScope::All.matches(EcosystemId::Cargo));
+            assert!(ReparseScope::All.matches(EcosystemId::Cargo, &any_uri()));
         }
     }
 }

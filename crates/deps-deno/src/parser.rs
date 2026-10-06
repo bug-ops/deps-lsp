@@ -921,7 +921,12 @@ mod tests {
         let json = r#"{"imports": {"secret": "npm:@acme-corp/secretpkg@^1.0.0"}}"#;
 
         let ctx = DenoParseContext::new(
-            Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)),
+            Arc::new(RegistryAccessPolicy::with_allowlist(
+                WorkspaceRegistryAccess::All,
+                Arc::new(deps_core::net_policy::PrivateRegistryAllowlist::for_test(
+                    &["npm.acme.internal"],
+                )),
+            )),
             Arc::new(deps_npm::config::NpmConfigCache::new()),
         );
         let result = parse_deno_json_with_context(json, &uri, &ctx).unwrap();

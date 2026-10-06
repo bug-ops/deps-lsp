@@ -59,7 +59,7 @@ are therefore never bound to a settings value; they come from your process envir
 | Setting | What a repository can do with it |
 |---|---|
 | `registries.gitlab_instance_host` | Redirect GitLab host resolution (unauthenticated requests only). `GITLAB_TOKEN` is not sent to it unless you also export the same host as `GITLAB_TOKEN_HOST` |
-| `registries.workspace_registries` | Set `"all"`, lifting the private/loopback/cloud-metadata network guard for workspace-declared registry URLs (unauthenticated, blind requests to internal hosts). Treat a repository's editor settings as trusted only if you would trust its code |
+| `registries.workspace_registries` | Set `"all"`. Alone this reaches no private host: the private hosts and CIDR ranges in your `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` environment variable are the effective control. Once you export that variable, any repository you open can send unauthenticated, blind GET requests to the listed hosts, on any port. Loopback, link-local, cloud-metadata, unspecified and reserved hosts are never reachable |
 | `registries.nuget_user_profile_sources` | Add user-profile NuGet sources as routing hops; credentials stay bound to the URL declared in your own user-level `NuGet.Config` |
 | `registries.swift_keychain_credentials` | Trigger a macOS Keychain access prompt; the credential goes only to registries declared in your user-level `registries.json` |
 | `diagnostics.vulnerabilities_enabled`, `network.offline` | Hide vulnerability findings or all registry data in the editor |
@@ -67,6 +67,29 @@ are therefore never bound to a settings value; they come from your process envir
 > **Warning:** If your editor lets a repository's settings change the server's environment or
 > binary (for example Zed's `lsp.<id>.binary`), that is already code execution under the
 > editor's own trust prompt, which this server cannot guard against.
+
+### Private registry allowlist
+
+`registries.workspace_registries = "all"` allows public hosts plus the hosts listed in the
+`DEPS_LSP_PRIVATE_REGISTRY_HOSTS` environment variable (read by both `deps-lsp` and `deps-cli`;
+there is no settings or config-file field for it). It is a comma-separated list of CIDR ranges
+(`10.0.0.0/8`), bare IPs and exact lowercase host names (`registry.corp.internal`, punycode for
+non-ASCII), for example `DEPS_LSP_PRIVATE_REGISTRY_HOSTS=10.20.0.0/16,registry.corp.internal`.
+
+- The setting is repository-controllable, so the variable, not the setting, is the effective
+  control. List registry hosts or narrow CIDRs only; never a broad range.
+- An allowlisted host is reachable on **any port**.
+- Prefixes shorter than `/8` (IPv4) or `/16` (IPv6), ports, paths, wildcards, brackets, zone ids
+  and userinfo are rejected. Because of the `/16` minimum, a unique-local (`fc00::/7`) range must be
+  listed as a `/48` or longer prefix (for example `fd12:3456:789a::/48`), not as `fc00::/7`.
+- A CIDR cannot name a host by its DNS name. A declared `*.internal`, `*.local` or single-label
+  host (`https://nexus/`) is accepted when the list contains at least one CIDR, and then only
+  connects if it resolves into a listed CIDR; list the host name itself to vouch for it regardless
+  of the address it resolves to. One bad entry invalidates the whole variable (nothing is allowed) and the
+  server warns once without echoing the value. Unset, empty, `0` and `false` mean no private host.
+- With `"all"` but no valid variable the server behaves like `"public_only"` and shows a warning
+  once per change.
+- The GitHub Action needs the variable in the step's `env:`.
 
 `GITLAB_TOKEN` is sent only to `gitlab.com`, or to the single host named by the
 `GITLAB_TOKEN_HOST` environment variable when set (for example `GITLAB_TOKEN_HOST=gitlab.mycorp.dev`).

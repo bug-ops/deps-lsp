@@ -11,21 +11,13 @@
 //! doc comment for exactly what is (and is not) proved without a request-counting test
 //! double (spec 062 review S6).
 //!
-//! // TODO(#1803): FR-005 automated parity test vs deps-lsp handlers::diagnostics (T025)
-//!
-//! A live cross-tool parity check against `deps-lsp`'s own diagnostics path (FR-005/SC-001)
-//! is deferred to manual verification (`.claude/rules/continuous-improvement.md`) and a
-//! follow-up automated test that drives a real `deps-lsp` `ServerState` — see this PR's
-//! handoff notes for why: `deps-lsp`'s `generate_diagnostics_internal` is `pub(crate)` and
-//! `handle_diagnostics` needs a live `tower_lsp_server::Client`, both nontrivial to construct
-//! from an external crate's test suite. **Structural non-drift is not, in fact, guaranteed
-//! "today" without qualification** (correction, spec 062 review C2): both adapters call the
-//! same `deps_engine::classify::*` functions and the identical `Ecosystem::generate_diagnostics`,
-//! but C2 proved the *inputs* fed into that shared call can still diverge per adapter (this
-//! crate was dropping `fetch_result.licenses` entirely before that fix landed) — sharing the
-//! classification function does not, by itself, prove every adapter assembles its inputs
-//! identically. The live parity test above is what would actually close that gap; until it
-//! exists, non-drift rests on manual review of each `VersionData` assembly site matching.
+//! The FR-005/SC-001 cross-tool parity check (spec 062 T025, #1803) lives in
+//! `deps-lsp`'s `tests/diagnostics_parity.rs`: it drives a real `ServerState` through
+//! `handle_diagnostics` and this crate's `check_manifest` on the same fixtures and compares
+//! the diagnostic sets. It is needed because both adapters call the same
+//! `deps_engine::classify::*` functions and `Ecosystem::generate_diagnostics`, yet the
+//! *inputs* fed into that shared call can still diverge per adapter (spec 062 review C2: this
+//! crate once dropped `fetch_result.licenses` entirely).
 
 // `allow-expect-in-tests` only recognizes `#[test]` bodies, not the plain helper functions
 // (`offline_context`/`run_pipeline`) every test here calls.
@@ -34,6 +26,7 @@
 use deps_cli::exit::{EXIT_CLEAN, ExecutionOutcome, exit_code};
 use deps_cli::report::{CheckContext, CheckReport, FailOnPolicy, check_manifest};
 use deps_cli::{format, walk};
+use deps_core::net_policy::AllowlistOutcome;
 use deps_core::osv::OsvClient;
 use deps_core::policy_config::{LicensePolicyConfig, PolicyConfig};
 use deps_core::{EcosystemRegistry, HttpCache, NetworkMode};
@@ -45,7 +38,7 @@ use std::time::Duration;
 /// the same construction `main.rs` performs, minus config-file loading.
 fn offline_context() -> (EcosystemRegistry, CheckContext) {
     let policy = PolicyConfig::default();
-    let runtime = EcosystemRuntime::from_policy(&policy);
+    let runtime = EcosystemRuntime::from_policy(&policy, &AllowlistOutcome::Unset);
     let cache = Arc::new(HttpCache::with_policy(Arc::clone(&runtime.policy)));
     cache.set_offline(NetworkMode::Offline);
     assert!(
@@ -696,7 +689,7 @@ fn live_context(license_policy: LicensePolicyConfig) -> (EcosystemRegistry, Chec
         license_policy,
         ..PolicyConfig::default()
     };
-    let runtime = EcosystemRuntime::from_policy(&policy);
+    let runtime = EcosystemRuntime::from_policy(&policy, &AllowlistOutcome::Unset);
     let cache = Arc::new(HttpCache::with_policy(Arc::clone(&runtime.policy)));
     let registry = EcosystemRegistry::new();
     let _ = register_ecosystems(&registry, Arc::clone(&cache), &runtime);

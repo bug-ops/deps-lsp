@@ -1,13 +1,13 @@
 use crate::config::DepsConfig;
 use crate::document::keychain_refresh::{KeychainRefreshLifecycle, KeychainRefreshSubscription};
+use crate::document::republish::{self, RepublishLifecycle};
 use crate::document::tag_refresh::{TagRefreshLifecycle, TagRefreshSubscriptions};
 use crate::document::{
     CLIENT_REFRESH_TIMEOUT, ChangeTaskTriggerGates, RefreshKind, ResolvedVersionMove, ServerState,
     change_task_triggers, handle_document_change, handle_document_open, refresh_with_timeout,
-    reload_resolved_versions, republish_diagnostics_for_open_documents,
-    rescan_after_resolved_version_change, run_license_prefetch, spawn_supervised,
-    trigger_gossip_prefetch_for_open_documents, trigger_osv_rescan_for_open_documents,
-    trigger_typosquat_prefetch_for_open_documents,
+    reload_resolved_versions, rescan_after_resolved_version_change, run_license_prefetch,
+    spawn_supervised, trigger_gossip_prefetch_for_open_documents,
+    trigger_osv_rescan_for_open_documents, trigger_typosquat_prefetch_for_open_documents,
 };
 use crate::file_watcher;
 use crate::handlers::{
@@ -153,9 +153,12 @@ impl ConfigSideEffects {
     /// Derives every resolved value [`Backend::apply_resolved_config`] needs from a
     /// [`DepsConfig`], sharing `RegistriesConfig::resolve` (#1058 T009) with
     /// `deps_engine::setup::EcosystemRuntime::from_policy`.
-    fn from_config(config: &DepsConfig) -> Self {
+    fn from_config(
+        config: &DepsConfig,
+        private_registries: &deps_core::net_policy::AllowlistOutcome,
+    ) -> Self {
         Self {
-            registries: config.policy.registries.resolve(),
+            registries: config.policy.registries.resolve(private_registries),
             network: deps_core::NetworkMode::from_offline_flag(config.policy.network.offline),
             cache: deps_core::CacheMode::from_enabled_flag(config.policy.cache.enabled),
             cold_start_min_interval: std::time::Duration::from_millis(
@@ -180,12 +183,77 @@ pub struct Backend {
     client_capabilities: Arc<RwLock<Option<tower_lsp_server::ls_types::ClientCapabilities>>>,
     tag_refresh: std::sync::Mutex<TagRefreshLifecycle>,
     keychain_refresh: std::sync::Mutex<KeychainRefreshLifecycle>,
+    republish: std::sync::Mutex<RepublishLifecycle>,
+    /// Serializes config applies (#1799): notifications run concurrently, and two overlapping
+    /// `parse -> swap -> mirror onto ServerState` sequences could leave one config's mirrored
+    /// flags next to the other's `DepsConfig`.
+    config_apply: tokio::sync::Mutex<()>,
+}
+
+/// What a changed watched config file means for open documents.
+struct WatchedConfigChange {
+    ecosystem_ids: Vec<deps_core::EcosystemId>,
+    scope: crate::config::ReparseScope,
+    refetch: crate::document::RefetchPolicy,
+}
+
+/// Looks up the ecosystems watching `path` and derives the reparse scope and refetch policy;
+/// `None` when nothing watches it. Blocking: owner resolution reads the filesystem.
+fn resolve_watched_config(
+    registry: &deps_core::EcosystemRegistry,
+    path: &std::path::Path,
+) -> Option<WatchedConfigChange> {
+    let matches = registry.for_watched_config(path);
+    if matches.is_empty() {
+        return None;
+    }
+    let ecosystem_ids = matches.iter().map(|m| m.ecosystem.ecosystem_id()).collect();
+    let owners = matches
+        .iter()
+        .map(|m| {
+            (
+                m.ecosystem.ecosystem_id(),
+                crate::config::canonical_owner(&m.owner),
+            )
+        })
+        .collect();
+    // A routing-only change (e.g. `.npmrc`) needs a full refetch, not a diff (issue #1232 S1).
+    let refetch = if matches.iter().any(|m| match m.effect {
+        deps_core::WatchedConfigEffect::ChangesRouting => true,
+        deps_core::WatchedConfigEffect::RewritesRequirements => false,
+    }) {
+        crate::document::RefetchPolicy::AllDependencies
+    } else {
+        crate::document::RefetchPolicy::Diff
+    };
+    Some(WatchedConfigChange {
+        ecosystem_ids,
+        scope: crate::config::ReparseScope::ConfigOwners(owners),
+        refetch,
+    })
+}
+
+/// User-visible notices a config apply defers until the epoch has settled, so no `.await` on a
+/// slow client ever happens while diagnostics generation is blocked on the apply.
+#[derive(Debug, Default)]
+struct ConfigNotices {
+    #[cfg(feature = "gitlab-ci")]
+    gitlab_instance_host: Option<String>,
+    /// Set only on the transition into a `workspace_registries` setting that does not do what
+    /// it says (e.g. `"all"` without an allowlist).
+    registries_effect: Option<deps_core::policy_config::WorkspaceRegistriesEffect>,
 }
 
 impl Backend {
     /// Creates a new backend bound to the given LSP client handle.
     pub fn new(client: Client) -> Self {
-        let state = Arc::new(ServerState::new());
+        Self::with_state(client, ServerState::new())
+    }
+
+    /// Creates a backend over a pre-built [`ServerState`], the seam for tests that need a
+    /// specific private-registry allowlist without touching the process environment.
+    pub fn with_state(client: Client, state: ServerState) -> Self {
+        let state = Arc::new(state);
         // Subscribed here, before any document can open, so no tag-index refresh is missed
         // between construction and the listeners starting (#1716).
         let tag_refresh =
@@ -197,6 +265,8 @@ impl Backend {
             state,
             tag_refresh: std::sync::Mutex::new(tag_refresh),
             keychain_refresh: std::sync::Mutex::new(keychain_refresh),
+            republish: std::sync::Mutex::new(RepublishLifecycle::Subscribed(())),
+            config_apply: tokio::sync::Mutex::new(()),
             config: Arc::new(RwLock::new(DepsConfig::default())),
             client_capabilities: Arc::new(RwLock::new(None)),
         }
@@ -208,10 +278,14 @@ impl Backend {
         &self.client
     }
 
-    /// Applies the ten config-derived side effects shared by `initialize` and
-    /// `did_change_configuration`: registry/cache/network/license/typosquat/gossip flags,
-    /// plus the GitLab-host validation warning, in the order both call sites rely on.
-    async fn apply_resolved_config(&self, effects: ConfigSideEffects) {
+    /// Applies the config-derived side effects shared by `initialize` and
+    /// `did_change_configuration`: registry/cache/network/license/typosquat/gossip flags, in
+    /// the order both call sites rely on.
+    ///
+    /// Synchronous on purpose: it runs inside the config-apply epoch (#1799), so it must never
+    /// wait on the client. What needs the client is returned as [`ConfigNotices`] for
+    /// [`Self::show_config_notices`] to deliver once the epoch has settled.
+    fn apply_resolved_config(&self, effects: ConfigSideEffects) -> ConfigNotices {
         self.state
             .cache
             .set_registry_policy(effects.registries.workspace_registries);
@@ -221,11 +295,13 @@ impl Backend {
         self.state
             .keychain_credentials
             .set(effects.registries.swift_keychain_credentials);
-        #[cfg(feature = "gitlab-ci")]
-        if let Some(raw) = &effects.registries.gitlab_instance_host {
-            warn_if_gitlab_instance_host_invalid(&self.client, raw, &self.state.registry_policy)
-                .await;
-        }
+        let notices = ConfigNotices {
+            #[cfg(feature = "gitlab-ci")]
+            gitlab_instance_host: effects.registries.gitlab_instance_host.clone(),
+            registries_effect: self
+                .state
+                .note_registries_effect(effects.registries.workspace_registries_effect),
+        };
         *self
             .state
             .gitlab_instance_host
@@ -248,6 +324,24 @@ impl Backend {
         self.state.set_gossip_checks(effects.gossip_checks);
         // Issue #1517 critique S5: same rationale, for the OSV latest-check's effective state.
         self.state.set_osv_checks(effects.osv_checks);
+        notices
+    }
+
+    /// Delivers the notices [`Self::apply_resolved_config`] deferred.
+    async fn show_config_notices(&self, notices: ConfigNotices) {
+        #[cfg(feature = "gitlab-ci")]
+        if let Some(raw) = &notices.gitlab_instance_host {
+            warn_if_gitlab_instance_host_invalid(&self.client, raw, &self.state.registry_policy)
+                .await;
+        }
+        if let Some(message) = notices
+            .registries_effect
+            .and_then(deps_core::policy_config::WorkspaceRegistriesEffect::user_message)
+        {
+            self.client
+                .show_message(MessageType::WARNING, format!("deps-lsp: {message}"))
+                .await;
+        }
     }
 
     /// Spawns the cross-document tag-refresh listeners (#1716); a repeated call is a no-op.
@@ -267,6 +361,23 @@ impl Backend {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         lifecycle.start(|subscription| subscription.spawn(&self.state, &self.client, &self.config));
+    }
+
+    /// Spawns the diagnostics republish worker (#1799); a repeated call is a no-op.
+    fn start_republish_worker(&self) {
+        let mut lifecycle = self
+            .republish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.start(|()| republish::spawn(&self.state, &self.client, &self.config));
+    }
+
+    /// Aborts the republish worker so it does not outlive the server.
+    fn stop_republish_worker(&self) {
+        self.republish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop();
     }
 
     /// Aborts the Keychain listener so it does not outlive the server.
@@ -433,15 +544,11 @@ impl Backend {
         }
         let (resolved_versions, resolved_version_candidates) = load.into_maps();
 
-        // Snapshot before the loop and drop the guard: re-reading `self.config` per URI
-        // inside the loop would hold this guard across a nested read of the same
-        // write-preferring `RwLock`, and a writer queued in between would block it forever.
-        let snapshot = {
-            let config = self.config.read().await;
-            diagnostics::DiagnosticsSnapshot::from_config(&config)
-        };
-
         for uri in affected_uris {
+            // Captured per URI, and never held across an await: the snapshot owns its values,
+            // so no config read guard outlives the call.
+            let snapshot =
+                diagnostics::DiagnosticsSnapshot::capture(&self.state, &uri, &self.config).await;
             // Detected before the overwrite below (issue #1395): a lock-file-only change
             // has no `DependencyDiff` to gate the OSV rescan on the way a manifest edit
             // does, so this compares each dependency occurrence's resolved-in-use version,
@@ -538,6 +645,7 @@ impl Backend {
                 // close.
                 let state = Arc::clone(&self.state);
                 let client = self.client.clone();
+                let config = Arc::clone(&self.config);
                 let ecosystem_impl = Arc::clone(&ecosystem_impl);
                 let rescan_uri = uri.clone();
                 let log_uri = uri.clone();
@@ -585,7 +693,7 @@ impl Backend {
                             &state,
                             &client,
                             &rescan_uri,
-                            &snapshot,
+                            &config,
                             dep_count,
                         )
                         .await;
@@ -608,7 +716,7 @@ impl Backend {
                 &self.state,
                 &self.client,
                 &uri,
-                &snapshot,
+                &self.config,
                 dep_count,
             )
             .await;
@@ -619,16 +727,18 @@ impl Backend {
         self.state.spawn_refresh_requests(&self.client);
     }
 
-    /// Fully reparses every open document of `ecosystem_ids` (issue #590/#1232) under
-    /// `refetch` — callers pass `AllDependencies` for a routing-only watched-config change
-    /// (e.g. `.npmrc`), since a plain diff would treat it as a no-op.
+    /// Fully reparses every open document in `scope` (issue #590/#1232) under `refetch` —
+    /// callers pass `AllDependencies` for a routing-only watched-config change (e.g. `.npmrc`),
+    /// since a plain diff would treat it as a no-op. `scope` is the changed file's
+    /// [`crate::config::ReparseScope::ConfigOwners`], so a config that governs only one
+    /// directory never reparses an unrelated package (#1793).
     async fn handle_watched_config_change(
         &self,
-        ecosystem_ids: Vec<deps_core::EcosystemId>,
+        scope: crate::config::ReparseScope,
         refetch: crate::document::RefetchPolicy,
     ) {
         crate::document::reparse::reparse_open_documents(
-            crate::config::ReparseScope::Ecosystems(ecosystem_ids),
+            scope,
             refetch,
             "watched config file change",
             Arc::clone(&self.state),
@@ -775,13 +885,23 @@ impl LanguageServer for Backend {
             && let Some(config) = parse_config(init_options)
         {
             tracing::debug!("loaded configuration: {:?}", config);
-            let effects = ConfigSideEffects::from_config(&config);
-            self.apply_resolved_config(effects).await;
-            *self.config.write().await = config;
+            let effects = ConfigSideEffects::from_config(&config, self.state.private_registries());
+            // Notices are shown before the lock is released so overlapping applies cannot
+            // deliver them out of order.
+            let _serialized = self.config_apply.lock().await;
+            let notices = {
+                let mut guard = self.config.write().await;
+                let _epoch = self.state.begin_config_apply(&guard);
+                let notices = self.apply_resolved_config(effects);
+                *guard = config;
+                notices
+            };
+            self.show_config_notices(notices).await;
         }
 
         self.start_tag_refresh_listeners();
         self.start_keychain_refresh_listener();
+        self.start_republish_worker();
 
         Ok(InitializeResult {
             capabilities: Self::server_capabilities(),
@@ -921,13 +1041,14 @@ impl LanguageServer for Backend {
 
         tracing::info!("configuration updated via workspace/didChangeConfiguration");
 
+        // Held from the `was_*` reads below through the swap and the mirror writes, so a
+        // concurrent notification can neither interleave its own apply nor observe a
+        // half-applied one (#1799).
+        let serialized = self.config_apply.lock().await;
+
         // Captured before `config` is moved into the write guard below (`DepsConfig` has no
-        // `Clone`): `apply_resolved_config` runs after the swap and may itself await (the
-        // optional GitLab-host warning), so a reader could briefly observe the new
-        // `self.config` while these shared handles (M4) still reflect the old values —
-        // harmless, since each assignment `apply_resolved_config` makes is independently
-        // consistent and no caller depends on them landing atomically together.
-        let effects = ConfigSideEffects::from_config(&config);
+        // `Clone`).
+        let effects = ConfigSideEffects::from_config(&config, self.state.private_registries());
         // Issue #1437 M1: read *before* the flag is overwritten below, so the enable
         // transition can be detected. `fetch_timeout_secs` bounds the trigger's own
         // pre-fetch spawn (an internal tuning value, read once here like every other
@@ -955,20 +1076,23 @@ impl LanguageServer for Backend {
         // Diff old vs new for parse-affecting changes (#592) under one write-guard
         // acquisition: `DepsConfig` has no `Clone`, so the diff must read the
         // not-yet-overwritten guard before `config` is moved into it.
-        let scope = {
+        //
+        // The swap and the mirror writes sit inside one epoch (#1799), and the mirror writes
+        // must land before either refresh notification below, or the refresh re-renders
+        // diagnostics under the stale flag values (critic M5).
+        let (scope, notices) = {
             let mut guard = self.config.write().await;
+            let _epoch = self.state.begin_config_apply(&guard);
             let scope = crate::config::reparse_scope(
                 &guard,
                 &config,
                 &self.state.workspace_registry_ecosystems,
             );
             *guard = config;
-            scope
+            (scope, self.apply_resolved_config(effects))
         };
-
-        // Must land before either refresh notification below, or the refresh re-renders
-        // diagnostics under the stale flag values (critic M5).
-        self.apply_resolved_config(effects).await;
+        self.show_config_notices(notices).await;
+        drop(serialized);
         // Issue #1437 M1: an already-open document otherwise only picks up the signal on
         // its next edit or reopen — trigger it immediately on the disabled->enabled
         // transition specifically (not on every `did_change_configuration`, which would
@@ -1003,6 +1127,7 @@ impl LanguageServer for Backend {
             .await;
         }
 
+        let pull_capable = self.diagnostic_refresh_supported().await;
         match scope {
             Some(scope) => {
                 // Union into the pending scope and bump the generation before spawning a
@@ -1014,7 +1139,7 @@ impl LanguageServer for Backend {
                 spawn_supervised(
                     async move {
                         tokio::time::sleep(crate::document::reparse::RECONFIGURE_DEBOUNCE).await;
-                        let superseded = state.config_generation() != generation;
+                        let superseded = state.reparse_generation() != generation;
                         // Security M3: a superseded worker normally defers to the newer one,
                         // but under a continuous burst every worker would see itself
                         // superseded forever, starving the reparse indefinitely. Once the
@@ -1030,15 +1155,27 @@ impl LanguageServer for Backend {
                         let Some(scope) = state.take_pending_reparse() else {
                             return;
                         };
+                        let reparsed = scope.clone();
                         crate::document::reparse::reparse_open_documents(
                             scope,
                             crate::document::RefetchPolicy::AllDependencies,
                             "workspace/didChangeConfiguration",
-                            state,
-                            client,
-                            config,
+                            Arc::clone(&state),
+                            client.clone(),
+                            Arc::clone(&config),
                         )
                         .await;
+                        // The reparse republishes its own documents; a push-only client's
+                        // others would otherwise keep the old severities (#1799).
+                        if !pull_capable {
+                            crate::document::republish::republish_documents(
+                                &state,
+                                &client,
+                                &config,
+                                Some(&reparsed),
+                            )
+                            .await;
+                        }
                     },
                     |e| {
                         tracing::error!(
@@ -1053,14 +1190,10 @@ impl LanguageServer for Backend {
                 // the new config for free on demand; a pull-capable client is told to
                 // re-request diagnostics (timeout-bounded, #493), a push-only one gets them
                 // republished (#1794).
-                if self.diagnostic_refresh_supported().await {
+                if pull_capable {
                     refresh_with_timeout(RefreshKind::Diagnostics, &self.client).await;
                 } else {
-                    republish_diagnostics_for_open_documents(
-                        &self.state,
-                        &self.client,
-                        Arc::clone(&self.config),
-                    );
+                    self.state.request_republish();
                 }
             }
         }
@@ -1071,6 +1204,7 @@ impl LanguageServer for Backend {
         tracing::info!("shutting down deps-lsp server");
         self.stop_tag_refresh_listeners();
         self.stop_keychain_refresh_listener();
+        self.stop_republish_worker();
         std::future::ready(Ok(()))
     }
 
@@ -1173,19 +1307,27 @@ impl LanguageServer for Backend {
                 continue;
             }
 
-            let ecosystems = self.state.ecosystem_registry.for_watched_config(&path);
-            if !ecosystems.is_empty() {
-                let ecosystem_ids: Vec<deps_core::EcosystemId> =
-                    ecosystems.iter().map(|(e, _)| e.ecosystem_id()).collect();
-                // A routing-only change (e.g. `.npmrc`) needs a full refetch, not a diff (issue #1232 S1).
-                let refetch = if ecosystems.iter().any(|(_, effect)| match effect {
-                    deps_core::WatchedConfigEffect::ChangesRouting => true,
-                    deps_core::WatchedConfigEffect::RewritesRequirements => false,
-                }) {
-                    crate::document::RefetchPolicy::AllDependencies
-                } else {
-                    crate::document::RefetchPolicy::Diff
-                };
+            // Routing and owner resolution touch the filesystem (home lookup, symlink walks), so
+            // the whole lookup runs on the blocking pool, never on the notification handler.
+            let registry = Arc::clone(&self.state.ecosystem_registry);
+            let lookup_path = path.clone();
+            let resolved = tokio::task::spawn_blocking(move || {
+                resolve_watched_config(&registry, &lookup_path)
+            })
+            .await;
+            let resolved = match resolved {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    tracing::error!("watched-config lookup for {filename} failed: {e}");
+                    continue;
+                }
+            };
+            if let Some(WatchedConfigChange {
+                ecosystem_ids,
+                scope,
+                refetch,
+            }) = resolved
+            {
                 tracing::info!(
                     "Watched config file changed: {} (ecosystems: {:?}, refetch: {:?})",
                     filename,
@@ -1196,8 +1338,7 @@ impl LanguageServer for Backend {
                 // No cache invalidation here (unlike the lock-file branch above): every
                 // `MtimeFileCache`-backed config cache invalidates itself by mtime on its
                 // next `get_or_parse`, which the reparse below triggers.
-                self.handle_watched_config_change(ecosystem_ids, refetch)
-                    .await;
+                self.handle_watched_config_change(scope, refetch).await;
                 continue;
             }
 
@@ -2290,6 +2431,73 @@ mod tests {
         );
     }
 
+    /// Issue #1793: an `.npmrc` governs its own directory subtree, so one below a manifest
+    /// (a non-ancestor) must not reparse it, while one in an ancestor directory must.
+    #[cfg(feature = "npm")]
+    #[tokio::test]
+    async fn test_npmrc_reparses_only_manifests_in_its_subtree_1793() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        use crate::document::DocumentState;
+        use deps_core::{EcosystemId, PackageName, PackageVersions};
+        use tower_lsp_server::ls_types::{FileChangeType, FileEvent};
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+
+        let url = deps_core::test_util::test_uri("/test/ws/pkg/package.json");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+        let ecosystem = backend
+            .state
+            .ecosystem_registry
+            .get(EcosystemId::Npm)
+            .unwrap();
+        let content = r#"{"dependencies": {"@acme-corp/secretpkg": "^1.0.0"}}"#.to_string();
+        let parse = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let mut doc = DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse);
+        doc.set_version(Some(1));
+        doc.update_cached_versions(HashMap::from([(
+            PackageName::new("@acme-corp/secretpkg"),
+            PackageVersions::latest_only("1.0.0"),
+        )]));
+        backend.state.update_document(uri.clone(), doc);
+
+        let fire = |path: &'static str| {
+            let changed =
+                crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(path));
+            backend.did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: changed,
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+        };
+        let cached_is_empty = || {
+            backend
+                .state
+                .get_document(&uri)
+                .is_some_and(|d| d.signals.cached_versions.is_empty())
+        };
+
+        fire("/test/ws/pkg/sub/.npmrc").await;
+        tokio::time::sleep(crate::document::reparse::RECONFIGURE_DEBOUNCE * 4).await;
+        assert!(
+            !cached_is_empty(),
+            "an .npmrc below the manifest's directory must not reparse it"
+        );
+
+        fire("/test/ws/.npmrc").await;
+        let cleared = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !cached_is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            cleared.is_ok(),
+            "an .npmrc in an ancestor directory must reparse the manifest"
+        );
+    }
+
     /// Issue #1759: only the project-tier `.swiftpm/configuration/registries.json` is a
     /// watched Swift config; a `registries.json` anywhere else must not trigger a reparse.
     /// A reparse is observed the same way as in `test_npmrc_routing_only_change_forces_refetch_1232_s1`:
@@ -2367,6 +2575,110 @@ let package = Package(
         assert!(
             cleared.is_ok(),
             "the project-tier registries.json change must force a refetch"
+        );
+    }
+
+    /// Issue #1793: a nested package's project-tier `registries.json` governs only that
+    /// package. Changing it must reparse the nested `Package.swift` and leave the root
+    /// package alone, while the root-level one reparses the root (and not the nested package,
+    /// whose own project tier has no ancestor walk).
+    #[cfg(feature = "swift")]
+    #[tokio::test]
+    async fn test_swift_nested_registries_json_reparses_only_its_own_package_1793() {
+        use crate::document::DocumentState;
+        use deps_core::{EcosystemId, PackageName, PackageVersions};
+        use tower_lsp_server::ls_types::{FileChangeType, FileEvent};
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+        let ecosystem = backend
+            .state
+            .ecosystem_registry
+            .get(EcosystemId::Swift)
+            .unwrap();
+        let content = r#"// swift-tools-version: 5.9
+import PackageDescription
+let package = Package(
+    name: "App",
+    dependencies: [
+        .package(url: "https://github.com/acme/pkg", from: "1.0.0"),
+    ]
+)
+"#
+        .to_string();
+
+        let open = async |path: &str| {
+            let url = deps_core::test_util::test_uri(path);
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let parse = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let mut doc =
+                DocumentState::new_from_parse_result(EcosystemId::Swift, content.clone(), parse);
+            doc.set_version(Some(1));
+            doc.update_cached_versions(HashMap::from([(
+                PackageName::new("acme/pkg"),
+                PackageVersions::latest_only("1.0.0"),
+            )]));
+            backend.state.update_document(uri.clone(), doc);
+            uri
+        };
+        let root = open("/test/swiftapp/Package.swift").await;
+        let nested = open("/test/swiftapp/other/Package.swift").await;
+
+        let fire = |path: &'static str| {
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(path));
+            backend.did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri,
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+        };
+        let cached_is_empty = |uri: &Uri| {
+            backend
+                .state
+                .get_document(uri)
+                .is_some_and(|d| d.signals.cached_versions.is_empty())
+        };
+        let wait_cleared = |uri: &Uri| {
+            let uri = uri.clone();
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !cached_is_empty(&uri) {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+            }
+        };
+
+        fire("/test/swiftapp/other/.swiftpm/configuration/registries.json").await;
+        assert!(
+            wait_cleared(&nested).await.is_ok(),
+            "the nested package must be reparsed by its own registries.json"
+        );
+        tokio::time::sleep(crate::document::reparse::RECONFIGURE_DEBOUNCE * 4).await;
+        assert!(
+            !cached_is_empty(&root),
+            "the root package must not be reparsed by a nested package's registries.json"
+        );
+
+        backend.state.update_document(nested.clone(), {
+            let mut doc = backend.state.get_document_clone(&nested).unwrap();
+            doc.update_cached_versions(HashMap::from([(
+                PackageName::new("acme/pkg"),
+                PackageVersions::latest_only("1.0.0"),
+            )]));
+            doc
+        });
+        fire("/test/swiftapp/.swiftpm/configuration/registries.json").await;
+        assert!(
+            wait_cleared(&root).await.is_ok(),
+            "the root package must be reparsed by the root registries.json"
+        );
+        tokio::time::sleep(crate::document::reparse::RECONFIGURE_DEBOUNCE * 4).await;
+        assert!(
+            !cached_is_empty(&nested),
+            "the root registries.json must not reparse the nested package"
         );
     }
 
@@ -3908,7 +4220,141 @@ let package = Package(
 
     mod did_change_configuration_tests {
         use super::*;
+        use deps_core::net_policy::AllowlistOutcome;
         use tower_lsp_server::ls_types::DidChangeConfigurationParams;
+
+        fn all_registries_settings() -> DidChangeConfigurationParams {
+            DidChangeConfigurationParams {
+                settings: serde_json::json!({ "registries": { "workspace_registries": "all" } }),
+            }
+        }
+
+        /// A service whose allowlist is explicitly unset, so the test cannot be affected by
+        /// `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` in the runner's environment.
+        fn unset_allowlist_service() -> (
+            tower_lsp_server::LspService<Backend>,
+            tower_lsp_server::ClientSocket,
+        ) {
+            tower_lsp_server::LspService::build(|client| {
+                Backend::with_state(
+                    client,
+                    ServerState::with_private_registries(AllowlistOutcome::Unset),
+                )
+            })
+            .finish()
+        }
+
+        fn private_url(host: &str) -> url::Url {
+            url::Url::parse(&format!("https://{host}/index")).unwrap()
+        }
+
+        /// #1798: the repository-controllable setting alone must never reach a private host.
+        #[tokio::test]
+        async fn test_all_setting_without_allowlist_cannot_reach_private_hosts() {
+            let (service, _socket) = unset_allowlist_service();
+            let backend = service.inner();
+
+            backend
+                .did_change_configuration(all_registries_settings())
+                .await;
+
+            let policy = &backend.state.registry_policy;
+            assert_eq!(
+                policy.get(),
+                deps_core::net_policy::WorkspaceRegistryAccess::All
+            );
+            assert!(!policy.permits_url(&private_url("10.0.0.1")));
+            assert!(policy.permits_url(&private_url("index.crates.io")));
+        }
+
+        /// #1798: with the environment allowlist, `"all"` reaches exactly the listed hosts, and a
+        /// later settings change cannot widen or narrow the allowlist itself.
+        #[tokio::test]
+        async fn test_all_setting_reaches_only_allowlisted_hosts() {
+            let state =
+                ServerState::with_private_registries(AllowlistOutcome::for_test(&["10.0.0.0/8"]));
+            let (service, _socket) =
+                tower_lsp_server::LspService::build(|client| Backend::with_state(client, state))
+                    .finish();
+            let backend = service.inner();
+
+            backend
+                .did_change_configuration(all_registries_settings())
+                .await;
+            let policy = &backend.state.registry_policy;
+            assert!(policy.permits_url(&private_url("10.1.2.3")));
+            assert!(!policy.permits_url(&private_url("192.168.0.1")));
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "registries": { "workspace_registries": "off" } }),
+                })
+                .await;
+            assert!(!policy.permits_url(&private_url("10.1.2.3")));
+            backend
+                .did_change_configuration(all_registries_settings())
+                .await;
+            assert!(policy.permits_url(&private_url("10.1.2.3")));
+            assert!(!policy.permits_url(&private_url("192.168.0.1")));
+        }
+
+        /// #1798: the user is warned once on the transition into an ineffective `"all"`, not on
+        /// every later change that leaves it ineffective, and again after it was left and re-entered.
+        #[cfg(all(not(windows), any(feature = "cargo", feature = "github-actions")))]
+        #[tokio::test]
+        async fn test_ineffective_all_setting_warns_once_per_transition() {
+            use futures::StreamExt as _;
+
+            let (service, mut socket) = unset_allowlist_service();
+            let backend = service.inner();
+
+            for _ in 0..2 {
+                backend
+                    .did_change_configuration(all_registries_settings())
+                    .await;
+            }
+            let first = next_client_message(&mut socket).await;
+            assert!(show_message_text(&first).contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), socket.next())
+                    .await
+                    .is_err(),
+                "an unchanged ineffective setting must not warn again"
+            );
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({}),
+                })
+                .await;
+            backend
+                .did_change_configuration(all_registries_settings())
+                .await;
+            let again = next_client_message(&mut socket).await;
+            assert!(show_message_text(&again).contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"));
+        }
+
+        /// #1798: an effective `"all"` (non-empty allowlist) shows no warning.
+        #[cfg(all(not(windows), any(feature = "cargo", feature = "github-actions")))]
+        #[tokio::test]
+        async fn test_effective_all_setting_does_not_warn() {
+            use futures::StreamExt as _;
+
+            let state =
+                ServerState::with_private_registries(AllowlistOutcome::for_test(&["10.0.0.0/8"]));
+            let (service, mut socket) =
+                tower_lsp_server::LspService::build(|client| Backend::with_state(client, state))
+                    .finish();
+            service
+                .inner()
+                .did_change_configuration(all_registries_settings())
+                .await;
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), socket.next())
+                    .await
+                    .is_err()
+            );
+        }
 
         #[tokio::test]
         async fn test_did_change_configuration_applies_valid_payload() {
@@ -4142,6 +4588,40 @@ let package = Package(
             assert!(backend.state.typosquat_checks().is_active());
         }
 
+        /// #1799: notifications run concurrently, so two overlapping applies must never leave
+        /// one config's mirrored `ServerState` flags next to the other's `DepsConfig`.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_concurrent_did_change_configuration_keeps_mirrors_consistent() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            for round in 0..20 {
+                let changes = (0..16).map(|i| {
+                    let on = i % 2 == 0;
+                    backend.did_change_configuration(DidChangeConfigurationParams {
+                        settings: serde_json::json!({
+                            "typosquat": { "enabled": on },
+                            "network": { "offline": on },
+                        }),
+                    })
+                });
+                futures::future::join_all(changes).await;
+
+                let config = backend.config.read().await;
+                assert_eq!(
+                    backend.state.typosquat_checks(),
+                    config.policy.typosquat_checks(),
+                    "round {round}: typosquat mirror diverged from the final config"
+                );
+                assert_eq!(
+                    backend.state.cache.is_offline(),
+                    config.policy.network.offline,
+                    "round {round}: offline mirror diverged from the final config"
+                );
+                assert!(backend.state.config_epoch().is_settled());
+            }
+        }
+
         /// Issue #1456, spec 072, mirroring
         /// `test_did_change_configuration_applies_valid_typosquat_config`.
         #[tokio::test]
@@ -4372,21 +4852,24 @@ let package = Package(
 
             assert_eq!(handle.get(), KeychainCredentials::Disabled);
             let initial = handle.generation();
-            backend
-                .apply_resolved_config(ConfigSideEffects::from_config(&enabled))
-                .await;
+            backend.apply_resolved_config(ConfigSideEffects::from_config(
+                &enabled,
+                backend.state.private_registries(),
+            ));
             assert_eq!(handle.get(), KeychainCredentials::Enabled);
             let after_enable = handle.generation();
             assert_ne!(after_enable, initial);
 
-            backend
-                .apply_resolved_config(ConfigSideEffects::from_config(&enabled))
-                .await;
+            backend.apply_resolved_config(ConfigSideEffects::from_config(
+                &enabled,
+                backend.state.private_registries(),
+            ));
             assert_eq!(handle.generation(), after_enable);
 
-            backend
-                .apply_resolved_config(ConfigSideEffects::from_config(&DepsConfig::default()))
-                .await;
+            backend.apply_resolved_config(ConfigSideEffects::from_config(
+                &DepsConfig::default(),
+                backend.state.private_registries(),
+            ));
             assert_eq!(handle.get(), KeychainCredentials::Disabled);
             assert_ne!(handle.generation(), after_enable);
         }

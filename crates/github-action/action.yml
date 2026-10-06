@@ -26,7 +26,10 @@ inputs:
       diagnostics.*_enabled sections reset to safe defaults), so passing a
       path from inside the checked-out repository re-opens the credential-
       exfiltration risk that hardening exists to prevent, particularly for
-      pull_request_target workflows scanning a fork.
+      pull_request_target workflows scanning a fork. A config that sets
+      registries.workspace_registries = "all" reaches private hosts only if
+      they are listed in the DEPS_LSP_PRIVATE_REGISTRY_HOSTS environment
+      variable of the step.
     required: false
     default: ''
 outputs:

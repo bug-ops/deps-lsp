@@ -3,7 +3,7 @@
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, WatchedConfig,
+    ConfigReach, Ecosystem, ParseResult as ParseResultTrait, Registry, Result, WatchedConfig,
     WatchedConfigEffect, is_safe_registry_url,
     lsp_helpers::{EcosystemFormatter, warn_rejected_value},
 };
@@ -143,6 +143,7 @@ impl deps_core::ecosystem::private::Sealed for SwiftEcosystem {}
 const WATCHED_CONFIGS: [WatchedConfig; 1] = [WatchedConfig::new(
     crate::config::PROJECT_REGISTRIES_SUFFIX,
     WatchedConfigEffect::ChangesRouting,
+    ConfigReach::OwnerDirectory,
 )];
 
 impl Ecosystem for SwiftEcosystem {
@@ -369,6 +370,7 @@ mod tests {
             panic!("swift watches exactly the project registries.json");
         };
         assert_eq!(config.effect(), WatchedConfigEffect::ChangesRouting);
+        assert_eq!(config.reach(), ConfigReach::OwnerDirectory);
         assert!(config.matches(std::path::Path::new(
             "/p/.swiftpm/configuration/registries.json"
         )));

@@ -647,6 +647,7 @@ dependencies = [
  "deps-core-macros",
  "futures",
  "insta",
+ "ipnet",
  "jsonc-parser",
  "libc",
  "mockito",
@@ -823,6 +824,7 @@ version = "2.0.0"
 dependencies = [
  "criterion",
  "dashmap",
+ "deps-cli",
  "deps-core",
  "deps-deno",
  "deps-engine",

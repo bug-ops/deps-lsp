@@ -409,13 +409,7 @@ impl RequirementResolution for GithubActionsFormatter {
                 let Some(written) = gha_dep.version_req.as_ref().map(VersionReq::as_str) else {
                     return PinResolution::Unresolved;
                 };
-                if concrete_pin_version(written, EcosystemId::GithubActions).is_some() {
-                    index.exact_tag_resolution(written)
-                } else if is_partial_semver_shaped(written) {
-                    index.floating_tag_resolution(written)
-                } else {
-                    PinResolution::Unresolved
-                }
+                index.tag_pin_resolution(written, EcosystemId::GithubActions)
             }
             Some(PinStyle::Branch) | None => PinResolution::Unresolved,
         }

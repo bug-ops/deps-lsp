@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
@@ -882,6 +882,203 @@ pub enum WatchedConfigEffect {
     ChangesRouting,
 }
 
+/// Which manifests a [`WatchedConfig`] file declares it can affect, relative to the directory that
+/// owns it.
+///
+/// Exhaustive on purpose: a caller scoping a reparse must decide what each reach means, and a
+/// new variant must fail to compile there (issue #1793). The resolved [`OwnerReach`] adds the
+/// one reach a config cannot declare.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::ConfigReach;
+///
+/// assert_ne!(ConfigReach::Subtree, ConfigReach::OwnerDirectory);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigReach {
+    /// The ecosystem walks ancestor directories looking for this file, so it affects every
+    /// manifest in the owner directory and below (bounded by
+    /// [`crate::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH`]).
+    Subtree,
+    /// The ecosystem reads this file only next to the manifest, with no ancestor walk, so it
+    /// affects manifests in the owner directory itself.
+    OwnerDirectory,
+}
+
+/// How far a changed config file's influence reaches once its owner directory is known: a
+/// [`ConfigReach`] plus [`Self::AllDocuments`], which only [`ConfigOwner::for_user_home`]
+/// produces.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::{ConfigReach, OwnerReach};
+///
+/// assert_eq!(OwnerReach::from(ConfigReach::Subtree), OwnerReach::Subtree);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OwnerReach {
+    /// See [`ConfigReach::Subtree`].
+    Subtree,
+    /// See [`ConfigReach::OwnerDirectory`].
+    OwnerDirectory,
+    /// A user-level file (the config sits in the user's home directory): the ecosystem reads it
+    /// for every manifest wherever the manifest lives, so it affects every open document of the
+    /// ecosystem.
+    AllDocuments,
+}
+
+impl From<ConfigReach> for OwnerReach {
+    fn from(reach: ConfigReach) -> Self {
+        match reach {
+            ConfigReach::Subtree => Self::Subtree,
+            ConfigReach::OwnerDirectory => Self::OwnerDirectory,
+        }
+    }
+}
+
+/// The user's home directory, resolved once so classifying a changed config never touches the
+/// filesystem.
+///
+/// [`Self::current`] resolves the process's home directory on first use;
+/// [`EcosystemRegistry::new`](crate::EcosystemRegistry::new) triggers it at startup.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+/// use deps_core::UserHome;
+///
+/// let home = UserHome::new(PathBuf::from("/home/me"));
+/// assert_eq!(home.path().to_str(), Some("/home/me"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserHome {
+    raw: PathBuf,
+    canonical: Option<PathBuf>,
+}
+
+impl UserHome {
+    /// A home directory compared as given, with no filesystem access.
+    #[must_use]
+    pub const fn new(raw: PathBuf) -> Self {
+        Self {
+            raw,
+            canonical: None,
+        }
+    }
+
+    /// A home directory that also matches its canonical (symlink-free) spelling.
+    ///
+    /// Blocks on the filesystem once; call it at startup, not per event.
+    #[must_use]
+    pub fn resolve(raw: PathBuf) -> Self {
+        let canonical = std::fs::canonicalize(&raw).ok();
+        Self { raw, canonical }
+    }
+
+    /// The process's home directory, resolved on first use and cached; `None` when the platform
+    /// reports none.
+    #[must_use]
+    pub fn current() -> Option<&'static Self> {
+        static HOME: std::sync::OnceLock<Option<UserHome>> = std::sync::OnceLock::new();
+        HOME.get_or_init(|| std::env::home_dir().map(Self::resolve))
+            .as_ref()
+    }
+
+    /// The home directory as given.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.raw
+    }
+
+    fn is(&self, dir: &Path) -> bool {
+        self.raw == dir || self.canonical.as_deref() == Some(dir)
+    }
+}
+
+/// The directory that owns a changed [`WatchedConfig`] file, plus how far its influence reaches.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::{Path, PathBuf};
+/// use deps_core::{ConfigOwner, ConfigReach, UserHome};
+///
+/// let owner = ConfigOwner::new(PathBuf::from("/work"), ConfigReach::Subtree);
+/// assert!(owner.covers(Path::new("/work/pkg/package.json")));
+/// assert!(!owner.covers(Path::new("/other/package.json")));
+///
+/// let local = ConfigOwner::new(PathBuf::from("/work"), ConfigReach::OwnerDirectory);
+/// assert!(local.covers(Path::new("/work/Package.swift")));
+/// assert!(!local.covers(Path::new("/work/pkg/Package.swift")));
+///
+/// let home = UserHome::new(PathBuf::from("/work"));
+/// let user = local.for_user_home(Some(&home));
+/// assert!(user.covers(Path::new("/elsewhere/Package.swift")));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConfigOwner {
+    dir: PathBuf,
+    reach: OwnerReach,
+}
+
+impl ConfigOwner {
+    /// Creates an owner for the config file's containing directory `dir`.
+    #[must_use]
+    pub fn new(dir: PathBuf, reach: impl Into<OwnerReach>) -> Self {
+        Self {
+            dir,
+            reach: reach.into(),
+        }
+    }
+
+    /// The directory owning the config file.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// How far the config file's influence reaches.
+    #[must_use]
+    pub const fn reach(&self) -> OwnerReach {
+        self.reach
+    }
+
+    /// Whether the manifest file at `manifest` resolves through this owner's config file.
+    ///
+    /// Both paths must be normalized the same way (e.g. both canonical).
+    #[must_use]
+    pub fn covers(&self, manifest: &Path) -> bool {
+        let Some(manifest_dir) = manifest.parent() else {
+            return false;
+        };
+        match self.reach {
+            OwnerReach::Subtree => {
+                crate::fs_probe::config_ancestors(manifest_dir).any(|dir| dir == self.dir)
+            }
+            OwnerReach::OwnerDirectory => manifest_dir == self.dir,
+            OwnerReach::AllDocuments => true,
+        }
+    }
+
+    /// This owner widened to [`OwnerReach::AllDocuments`] when its directory is `home` (the file
+    /// is then the user-level tier), else unchanged. Does no filesystem access.
+    #[must_use]
+    pub fn for_user_home(self, home: Option<&UserHome>) -> Self {
+        if home.is_some_and(|home| home.is(&self.dir)) {
+            Self {
+                reach: OwnerReach::AllDocuments,
+                ..self
+            }
+        } else {
+            self
+        }
+    }
+}
+
 /// A non-lockfile config file an ecosystem resolves during manifest parsing, identified by
 /// the trailing path components it must end with.
 ///
@@ -893,9 +1090,10 @@ pub enum WatchedConfigEffect {
 ///
 /// ```
 /// use std::path::Path;
-/// use deps_core::{WatchedConfig, WatchedConfigEffect};
+/// use deps_core::{ConfigReach, WatchedConfig, WatchedConfigEffect};
 ///
-/// const NPMRC: WatchedConfig = WatchedConfig::new(".npmrc", WatchedConfigEffect::ChangesRouting);
+/// const NPMRC: WatchedConfig =
+///     WatchedConfig::new(".npmrc", WatchedConfigEffect::ChangesRouting, ConfigReach::Subtree);
 ///
 /// assert!(NPMRC.matches(Path::new("/work/app/.npmrc")));
 /// assert!(!NPMRC.matches(Path::new("/work/app/x.npmrc")));
@@ -905,6 +1103,7 @@ pub enum WatchedConfigEffect {
 pub struct WatchedConfig {
     path_suffix: &'static str,
     effect: WatchedConfigEffect,
+    reach: ConfigReach,
 }
 
 const fn assert_plain_relative_suffix(suffix: &str) {
@@ -952,18 +1151,61 @@ impl WatchedConfig {
     /// contains `*`, `?`, `[`, `\` or a `..` component.
     ///
     /// ```compile_fail
-    /// use deps_core::{WatchedConfig, WatchedConfigEffect};
+    /// use deps_core::{ConfigReach, WatchedConfig, WatchedConfigEffect};
     ///
-    /// const BAD: WatchedConfig =
-    ///     WatchedConfig::new("../.npmrc", WatchedConfigEffect::ChangesRouting);
+    /// const BAD: WatchedConfig = WatchedConfig::new(
+    ///     "../.npmrc",
+    ///     WatchedConfigEffect::ChangesRouting,
+    ///     ConfigReach::Subtree,
+    /// );
     /// ```
     #[must_use]
-    pub const fn new(path_suffix: &'static str, effect: WatchedConfigEffect) -> Self {
+    pub const fn new(
+        path_suffix: &'static str,
+        effect: WatchedConfigEffect,
+        reach: ConfigReach,
+    ) -> Self {
         assert_plain_relative_suffix(path_suffix);
         Self {
             path_suffix,
             effect,
+            reach,
         }
+    }
+
+    /// Which manifests a change to this file can affect.
+    #[must_use]
+    pub const fn reach(&self) -> ConfigReach {
+        self.reach
+    }
+
+    /// The directory owning `changed`, i.e. `changed` with this config's suffix components
+    /// removed; `None` when `changed` is not this config file.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    /// use deps_core::{ConfigReach, WatchedConfig, WatchedConfigEffect};
+    ///
+    /// const SWIFT: WatchedConfig = WatchedConfig::new(
+    ///     ".swiftpm/configuration/registries.json",
+    ///     WatchedConfigEffect::ChangesRouting,
+    ///     ConfigReach::OwnerDirectory,
+    /// );
+    ///
+    /// let changed = Path::new("/p/.swiftpm/configuration/registries.json");
+    /// assert_eq!(SWIFT.owner_dir(changed), Some(Path::new("/p")));
+    /// assert_eq!(SWIFT.owner_dir(Path::new("/p/docs/registries.json")), None);
+    /// ```
+    #[must_use]
+    pub fn owner_dir<'a>(&self, changed: &'a Path) -> Option<&'a Path> {
+        if !self.matches(changed) {
+            return None;
+        }
+        changed
+            .ancestors()
+            .nth(Path::new(self.path_suffix).components().count())
     }
 
     /// The trailing path the watched file must end with.
@@ -1983,6 +2225,60 @@ mod tests {
     use super::*;
 
     use std::assert_matches;
+
+    fn owner(dir: &str, reach: ConfigReach) -> ConfigOwner {
+        ConfigOwner::new(PathBuf::from(dir), reach)
+    }
+
+    #[test]
+    fn test_config_owner_subtree_covers_owner_dir_and_descendants_only() {
+        let owner = owner("/work", ConfigReach::Subtree);
+        assert!(owner.covers(Path::new("/work/package.json")));
+        assert!(owner.covers(Path::new("/work/pkg/deep/package.json")));
+        assert!(!owner.covers(Path::new("/work2/package.json")));
+        assert!(!owner.covers(Path::new("/other/work/package.json")));
+        assert!(!owner.covers(Path::new("/package.json")));
+    }
+
+    #[test]
+    fn test_config_owner_subtree_respects_ancestor_depth_cap() {
+        let owner = owner("/r", ConfigReach::Subtree);
+        let within: PathBuf =
+            std::iter::repeat_n("d", crate::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH - 1)
+                .fold(PathBuf::from("/r"), |p, c| p.join(c))
+                .join("package.json");
+        assert!(owner.covers(&within));
+        let beyond = within.parent().unwrap().join("d").join("package.json");
+        assert!(!owner.covers(&beyond));
+    }
+
+    #[test]
+    fn test_config_owner_owner_directory_covers_only_the_directory_itself() {
+        let owner = owner("/work", ConfigReach::OwnerDirectory);
+        assert!(owner.covers(Path::new("/work/Package.swift")));
+        assert!(!owner.covers(Path::new("/work/other/Package.swift")));
+        assert!(!owner.covers(Path::new("/Package.swift")));
+    }
+
+    #[test]
+    fn test_config_owner_rootless_manifest_is_not_covered() {
+        assert!(!owner("/", ConfigReach::Subtree).covers(Path::new("")));
+    }
+
+    #[test]
+    fn test_watched_config_owner_dir_strips_every_suffix_component() {
+        const NPMRC: WatchedConfig = WatchedConfig::new(
+            ".npmrc",
+            WatchedConfigEffect::ChangesRouting,
+            ConfigReach::Subtree,
+        );
+        assert_eq!(
+            NPMRC.owner_dir(Path::new("/a/b/.npmrc")),
+            Some(Path::new("/a/b"))
+        );
+        assert_eq!(NPMRC.owner_dir(Path::new("/a/b/x.npmrc")), None);
+        assert_eq!(NPMRC.reach(), ConfigReach::Subtree);
+    }
 
     #[test]
     fn test_ecosystem_id_roundtrip() {

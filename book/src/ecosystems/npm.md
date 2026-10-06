@@ -75,7 +75,14 @@ Cargo's `$CARGO_HOME`-is-trusted split, npm's project and user `.npmrc` tiers
 are policy-*symmetric*: phase 1 has no credential provenance to protect, so
 there is no tier that is "the user's own configuration" in the way
 `$CARGO_HOME` is for Cargo. Setting `registries.workspace_registries` to
-`"all"` for npm's benefit also widens it for Cargo, and vice versa.
+`"all"` for npm's benefit also widens it for Cargo, and vice versa; either way only the hosts in
+`DEPS_LSP_PRIVATE_REGISTRY_HOSTS` become reachable (see
+[Configuration](../configuration.md#private-registry-allowlist)).
+
+A change to a `.npmrc` or `pnpm-workspace.yaml` reparses only the open manifests in that file's
+directory and below, the ones the ancestor walk can reach. A change to the user-level `~/.npmrc`
+(a `.npmrc` directly in your home directory) reparses every open npm and Deno document, wherever
+it lives.
 
 **Known limitations**:
 - Package-*name* completion (typing a brand-new dependency) always searches

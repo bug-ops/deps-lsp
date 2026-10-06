@@ -345,8 +345,12 @@ every `/96` subnet within it, not only the zero subnet).
 outright — the only complete boundary), `PublicOnly` (default — allow only `HostClass::Global`,
 blocking an IP literal in a metadata/RFC1918 range while still allowing a legitimate corporate
 `https://index.mycorp.dev`, since a DNS name can't be classified as internal without resolving
-it), or `All` (allow every class — the escape hatch for a workspace that legitimately points at
-an RFC1918/loopback registry). This string-based host classification is deliberately
+it), or `All` (allow `Global` plus the hosts and CIDR ranges in the process-wide
+`PrivateRegistryAllowlist`, read only from the `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` environment
+variable — never from settings, so a repository cannot widen it; with an empty allowlist `All`
+behaves like `PublicOnly`, and the `never_a_registry` classes stay blocked under every value).
+One `permits` decision, over a level-plus-allowlist snapshot, serves parse time, redirect hops and
+connect time. This string-based host classification is deliberately
 DNS-resolution-free (an attacker-controlled hostname that merely *resolves* to a blocked range
 isn't caught by `classify_host` itself); the DNS-rebinding TOCTOU that would otherwise open is
 closed separately, at actual connect time, by a `BlockedAddrResolver` wired into every HTTP

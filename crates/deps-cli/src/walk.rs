@@ -1069,6 +1069,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         let runtime = deps_engine::setup::EcosystemRuntime::from_policy(
             &deps_core::policy_config::PolicyConfig::default(),
+            &deps_core::net_policy::AllowlistOutcome::Unset,
         );
         deps_engine::setup::register_ecosystems(
             &registry,

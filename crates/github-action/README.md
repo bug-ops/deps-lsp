@@ -95,6 +95,12 @@ runs; neither `sarif-file` nor `exit-code` is set in that case.
 | `cooldown` | Overrides `freshness.cooldown_secs` (e.g. `3d`) | unset |
 | `config` | Path to a **fully-trusted** `deps.toml` config file — see warning below | unset (`deps-cli`'s own hardened auto-discovery of `./deps.toml`) |
 
+> [!NOTE]
+> A `config` that sets `registries.workspace_registries = "all"` reaches private hosts only if
+> they are listed in the `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` environment variable; set it in the
+> step's `env:` (for example `env: { DEPS_LSP_PRIVATE_REGISTRY_HOSTS: "10.20.0.0/16" }`). A listed
+> host is reachable on any port, so list registry hosts or narrow CIDRs only.
+
 > [!WARNING]
 > `deps-cli` treats an *explicit* `--config` path as fully trusted — unlike an
 > auto-discovered `deps.toml`, which has its `registries`/`network`/`diagnostics.*_enabled`

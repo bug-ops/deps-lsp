@@ -239,7 +239,8 @@ pub mod yaml_walk;
 pub use tower_lsp_server;
 
 pub use cache::{
-    BodyLimit, CacheMode, CachedResponse, CredentialHeader, HttpCache, NetworkMode, RequestHeader,
+    BodyLimit, CacheMode, CachedResponse, HttpCache, NetworkMode, RequestHeader,
+    RevalidationFailure,
 };
 pub use dependency_cap::{DependencyBudget, MAX_DEPENDENCIES_PER_DOCUMENT};
 pub use deps_dev::{
@@ -247,12 +248,12 @@ pub use deps_dev::{
     GossipRiskLevel, ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal, TyposquatSignal,
 };
 pub use ecosystem::{
-    BlockedRegistryOccurrence, BlockedSourceClass, Dependency, Ecosystem, EcosystemConfig,
-    EcosystemId, LicenseSource, ParseResult, RegistryOccurrence, RejectedRegistryOccurrence,
-    RejectedSourceClass, TagIndexRefreshes, WatchedConfig, WatchedConfigEffect,
-    parse_manifest_blocking, parse_manifest_now,
+    BlockedRegistryOccurrence, BlockedSourceClass, ConfigOwner, ConfigReach, Dependency, Ecosystem,
+    EcosystemConfig, EcosystemId, LicenseSource, OwnerReach, ParseResult, RegistryOccurrence,
+    RejectedRegistryOccurrence, RejectedSourceClass, TagIndexRefreshes, UserHome, WatchedConfig,
+    WatchedConfigEffect, parse_manifest_blocking, parse_manifest_now,
 };
-pub use ecosystem_registry::EcosystemRegistry;
+pub use ecosystem_registry::{EcosystemRegistry, WatchedConfigMatch};
 pub use edit::{
     EcosystemReparse, EditSpan, ManifestEdit, ManifestReparse, PlannedUpdate, UnplannableReason,
     UpdateCandidate, UpdateKind, VulnFixSkip, apply_edits, classify_update,

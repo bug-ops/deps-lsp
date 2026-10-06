@@ -10,6 +10,7 @@
 //! - `resolved`: Lock-file and in-use dependency version resolution
 //! - `loader`: Disk-based document loading for cold start support
 
+pub(crate) mod config_epoch;
 mod diff;
 mod fetch;
 mod gossip_prefetch;
@@ -41,6 +42,7 @@ mod typosquat;
 ))]
 mod osv_snapshot_tests;
 pub(crate) mod reparse;
+pub(crate) mod republish;
 mod resolved;
 mod state;
 pub(crate) mod tag_refresh;
@@ -48,14 +50,15 @@ pub(crate) mod tag_refresh;
 pub(crate) use diff::reload_resolved_versions;
 pub(crate) use lifecycle::{
     ChangeTaskTriggerGates, ResolvedVersionMove, change_task_triggers,
-    republish_diagnostics_for_open_documents, trigger_gossip_prefetch_for_open_documents,
-    trigger_osv_rescan_for_open_documents, trigger_typosquat_prefetch_for_open_documents,
+    trigger_gossip_prefetch_for_open_documents, trigger_osv_rescan_for_open_documents,
+    trigger_typosquat_prefetch_for_open_documents,
 };
 pub use lifecycle::{ensure_document_loaded, handle_document_change, handle_document_open};
 pub use loader::load_document_from_disk;
 pub(crate) use osv_scan::{rescan_after_resolved_version_change, run_license_prefetch};
 pub(crate) use resolved::RefetchPolicy;
 pub(crate) use state::{
-    CLIENT_REFRESH_TIMEOUT, PrefetchVisibility, RefreshKind, refresh_with_timeout, spawn_supervised,
+    CLIENT_REFRESH_TIMEOUT, DocStamp, PrefetchVisibility, PublishTicket, RefreshKind,
+    refresh_with_timeout, spawn_supervised,
 };
 pub use state::{ColdStartLimiter, DocumentState, LoadingState, PackageSignals, ServerState};

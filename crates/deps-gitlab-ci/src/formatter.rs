@@ -10,7 +10,7 @@ use deps_core::lsp_helpers::{
     warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
-use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName};
+use deps_core::{ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName};
 use std::sync::Arc;
 
 use crate::host::is_valid_gitlab_coordinate;
@@ -174,6 +174,23 @@ impl GitlabCiFormatter {
                 .map(|index| Arc::clone(&index)),
             EndpointKind::Releases => None,
         }
+    }
+
+    /// What the project's Tags list proves about a `project:` include pinned to a tag (#1801),
+    /// classified like a GitHub Actions tag pin ([`TagIndex::tag_pin_resolution`]).
+    /// [`PinResolution::Unresolved`] for a `component:` include (its Releases list never proves
+    /// a tag absent, see [`Self::tag_list_index`]), a ref-less include and a cold cache.
+    fn tag_pin_resolution(&self, gl_dep: &GitlabCiDependency) -> PinResolution {
+        let (Some(index), Some(written)) = (
+            self.tag_list_index(gl_dep),
+            gl_dep
+                .version_req
+                .as_ref()
+                .map(deps_core::VersionReq::as_str),
+        ) else {
+            return PinResolution::Unresolved;
+        };
+        index.tag_pin_resolution(written, EcosystemId::GitlabCi)
     }
 
     /// Caps an up-to-date exact-tag pin the complete tag list proves unpublished (`ref:
@@ -467,6 +484,9 @@ impl RequirementResolution for GitlabCiFormatter {
         let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
             return PinResolution::Unresolved;
         };
+        if gl_dep.pin == Some(PinStyle::Tag) {
+            return self.tag_pin_resolution(gl_dep);
+        }
         let Some(sha) = gl_dep.pinned_sha() else {
             return PinResolution::Unresolved;
         };
@@ -1672,6 +1692,44 @@ mod tests {
         let d = tag_dep_1753("2.0.0-rc1", Component);
         assert_eq!(status_1723(&fmt, &d), RequirementStatus::UpToDate);
         assert!(fmt.tag_list_index(&d).is_none());
+    }
+
+    /// #1801: a `project:` tag pin resolves like a GitHub Actions one: an exact tag to its
+    /// release, a floating major to the release on its commit, a missing full release to
+    /// `Unpublished`, and free text to `Unresolved`.
+    #[test]
+    fn test_tag_pin_resolves_through_the_tags_index() {
+        use crate::types::IncludeKind::Project;
+
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[("v1", LATEST_SHA_1723)]);
+        let resolve = |tag: &str| fmt.resolved_pin_version(&tag_dep_1753(tag, Project));
+        let PinResolution::Resolved { pin, .. } = resolve("v1.0.0") else {
+            panic!("exact tag resolves");
+        };
+        assert_eq!(pin.version().as_str(), "v1.0.0");
+        let PinResolution::Resolved { pin, .. } = resolve("v1") else {
+            panic!("floating major resolves");
+        };
+        assert_eq!(pin.version().as_str(), "v1.1.0");
+        assert_eq!(resolve("v40.0.0"), PinResolution::Unpublished);
+        assert_eq!(resolve("main"), PinResolution::Unresolved);
+    }
+
+    /// #1801: a cold cache and a `component:` include (Releases list) never resolve a tag pin.
+    #[test]
+    fn test_tag_pin_is_unresolved_without_a_tags_index() {
+        use crate::types::IncludeKind::{Component, Project};
+
+        let cold = formatter();
+        assert_eq!(
+            cold.resolved_pin_version(&tag_dep_1753("v1.0.0", Project)),
+            PinResolution::Unresolved
+        );
+        let releases = fmt_with_index_1723(EndpointKind::Releases, &[]);
+        assert_eq!(
+            releases.resolved_pin_version(&tag_dep_1753("v1.0.0", Component)),
+            PinResolution::Unresolved
+        );
     }
 
     /// #1762: a truncated index that maps the comment's full version to another commit

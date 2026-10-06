@@ -13,11 +13,12 @@ use deps_core::lsp_helpers::sha_comment_mismatch_hover_line;
 use deps_core::lsp_helpers::{PackageNaming, PackageRendering};
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
-    Ecosystem, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
+    Dependency, Ecosystem, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
     diagnostic::{Diagnostic, DiagnosticKind, GitTagsPlatform, Severity},
     lsp_helpers::{
         CommentCheck, EcosystemFormatter, MAX_DIAGNOSTIC_VALUE_CHARS, UnknownRefTarget,
         sanitize_and_truncate_for_diagnostic, sha_comment_mismatch_diagnostic,
+        unknown_ref_diagnostics,
     },
 };
 use std::any::Any;
@@ -365,7 +366,7 @@ impl Ecosystem for GitlabCiEcosystem {
             diagnostics.extend(unknown_ref_diagnostics(
                 parse_result,
                 severities.unknown_ref,
-                &self.formatter,
+                |dep| tag_pin_target(&self.formatter, dep),
             ));
             if severities.mutable_ref_pin_enabled {
                 diagnostics.extend(mutable_ref_pin_diagnostics(
@@ -820,23 +821,15 @@ pub(crate) fn unknown_ref_target<'a>(
     Some(UnknownRefTarget::new(index, written, gl_dep.version_range?))
 }
 
-/// One unknown-ref diagnostic (#1766) per `project:` include whose `ref:` is a full release
-/// the complete Tags list lacks; silent for a partial shape (it may be a branch), a
-/// `component:` include (a version without a release is not a missing tag), and a cold, empty
-/// or truncated list.
-fn unknown_ref_diagnostics(
-    parse_result: &dyn ParseResultTrait,
-    severity: Severity,
+/// [`unknown_ref_target`] for a type-erased dependency of this ecosystem.
+fn tag_pin_target<'a>(
     formatter: &GitlabCiFormatter,
-) -> Vec<Diagnostic> {
-    parse_result
-        .dependencies()
-        .into_iter()
-        .filter_map(|dep| {
-            let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
-            unknown_ref_target(formatter, gl_dep)?.diagnostic(&gl_dep.name, severity)
-        })
-        .collect()
+    dep: &'a dyn Dependency,
+) -> Option<UnknownRefTarget<'a>> {
+    unknown_ref_target(
+        formatter,
+        dep.as_any().downcast_ref::<GitlabCiDependency>()?,
+    )
 }
 
 #[cfg(test)]

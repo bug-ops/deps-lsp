@@ -1,7 +1,29 @@
 use dashmap::DashMap;
 use std::sync::Arc;
 
-use crate::{Ecosystem, EcosystemId, WatchedConfigEffect};
+use crate::{ConfigOwner, Ecosystem, EcosystemId, UserHome, WatchedConfigEffect};
+
+/// One ecosystem's interest in a changed config file, from
+/// [`EcosystemRegistry::for_watched_config`].
+#[derive(Clone)]
+pub struct WatchedConfigMatch {
+    /// The ecosystem that resolves the changed file during manifest parsing.
+    pub ecosystem: Arc<dyn Ecosystem>,
+    /// What the change does to that ecosystem's parsed documents.
+    pub effect: WatchedConfigEffect,
+    /// The directory owning the changed file and how far it reaches.
+    pub owner: ConfigOwner,
+}
+
+impl std::fmt::Debug for WatchedConfigMatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatchedConfigMatch")
+            .field("ecosystem", &self.ecosystem.ecosystem_id())
+            .field("effect", &self.effect)
+            .field("owner", &self.owner)
+            .finish()
+    }
+}
 
 /// Registry for all available ecosystems.
 ///
@@ -69,6 +91,8 @@ impl EcosystemRegistry {
     /// assert_eq!(registry.ecosystem_ids().len(), 0);
     /// ```
     pub fn new() -> Self {
+        // Resolve the home directory now, so classifying a changed config never blocks later.
+        let _ = UserHome::current();
         Self {
             ecosystems: DashMap::new(),
             filename_map: DashMap::new(),
@@ -454,6 +478,9 @@ impl EcosystemRegistry {
     /// ecosystem can watch the same config file (e.g. both npm and Deno resolve `.npmrc`),
     /// and a single-winner lookup would leave the other silently unreparsed on save (#1232).
     ///
+    /// Each match also carries the [`ConfigOwner`] (owning directory and reach), so a caller can
+    /// reparse only the manifests the changed file actually affects (#1793).
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -463,20 +490,46 @@ impl EcosystemRegistry {
     /// let registry = EcosystemRegistry::new();
     /// // registry.register(npm_ecosystem);
     ///
-    /// for (ecosystem, effect) in registry.for_watched_config(Path::new("/app/.npmrc")) {
-    ///     println!(".npmrc handled by: {} ({effect:?})", ecosystem.display_name());
+    /// for m in registry.for_watched_config(Path::new("/app/.npmrc")) {
+    ///     println!(".npmrc handled by: {} ({:?})", m.ecosystem.display_name(), m.effect);
     /// }
     /// ```
-    pub fn for_watched_config(
+    pub fn for_watched_config(&self, path: &std::path::Path) -> Vec<WatchedConfigMatch> {
+        self.for_watched_config_in(path, UserHome::current())
+    }
+
+    /// [`Self::for_watched_config`] with an explicit home directory: a match whose owner is
+    /// `home` is the user-level tier and gets [`crate::OwnerReach::AllDocuments`], since the
+    /// ecosystem reads it for manifests outside the home directory too.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::{Path, PathBuf};
+    /// use deps_core::{EcosystemRegistry, UserHome};
+    ///
+    /// let registry = EcosystemRegistry::new();
+    /// let home = UserHome::new(PathBuf::from("/home/me"));
+    /// assert!(registry
+    ///     .for_watched_config_in(Path::new("/home/me/.npmrc"), Some(&home))
+    ///     .is_empty());
+    /// ```
+    pub fn for_watched_config_in(
         &self,
         path: &std::path::Path,
-    ) -> Vec<(Arc<dyn Ecosystem>, WatchedConfigEffect)> {
+        home: Option<&UserHome>,
+    ) -> Vec<WatchedConfigMatch> {
         let mut matched = Vec::new();
         for entry in self.ecosystems.iter() {
             let ecosystem = entry.value();
             for config in ecosystem.watched_configs() {
-                if config.matches(path) {
-                    matched.push((Arc::clone(ecosystem), config.effect()));
+                if let Some(dir) = config.owner_dir(path) {
+                    matched.push(WatchedConfigMatch {
+                        ecosystem: Arc::clone(ecosystem),
+                        effect: config.effect(),
+                        owner: ConfigOwner::new(dir.to_path_buf(), config.reach())
+                            .for_user_home(home),
+                    });
                 }
             }
         }
@@ -628,7 +681,10 @@ mod tests {
     #[cfg(feature = "lsp-responses")]
     use crate::completion::Completions;
     use crate::test_util::StubFormatter;
-    use crate::{ParseResult, Registry, WatchedConfig, lsp_helpers::EcosystemFormatter};
+    use crate::{
+        ConfigReach, OwnerReach, ParseResult, Registry, UserHome, WatchedConfig,
+        lsp_helpers::EcosystemFormatter,
+    };
 
     struct MockEcosystem {
         id: &'static str,
@@ -642,8 +698,13 @@ mod tests {
     const PNPM_WORKSPACE: WatchedConfig = WatchedConfig::new(
         "pnpm-workspace.yaml",
         WatchedConfigEffect::RewritesRequirements,
+        ConfigReach::Subtree,
     );
-    const NPMRC: WatchedConfig = WatchedConfig::new(".npmrc", WatchedConfigEffect::ChangesRouting);
+    const NPMRC: WatchedConfig = WatchedConfig::new(
+        ".npmrc",
+        WatchedConfigEffect::ChangesRouting,
+        ConfigReach::Subtree,
+    );
 
     impl crate::ecosystem::private::Sealed for MockEcosystem {}
 
@@ -1506,12 +1567,17 @@ mod tests {
 
         let retrieved = registry.for_watched_config(Path::new("/app/pnpm-workspace.yaml"));
         assert_eq!(retrieved.len(), 1);
-        assert_eq!(retrieved[0].0.id(), "npm");
-        assert_eq!(retrieved[0].1, WatchedConfigEffect::RewritesRequirements);
+        assert_eq!(retrieved[0].ecosystem.id(), "npm");
+        assert_eq!(
+            retrieved[0].effect,
+            WatchedConfigEffect::RewritesRequirements
+        );
+        assert_eq!(retrieved[0].owner.dir(), Path::new("/app"));
+        assert_eq!(retrieved[0].owner.reach(), OwnerReach::Subtree);
         let retrieved = registry.for_watched_config(Path::new("/app/.npmrc"));
         assert_eq!(retrieved.len(), 1);
-        assert_eq!(retrieved[0].0.id(), "npm");
-        assert_eq!(retrieved[0].1, WatchedConfigEffect::ChangesRouting);
+        assert_eq!(retrieved[0].ecosystem.id(), "npm");
+        assert_eq!(retrieved[0].effect, WatchedConfigEffect::ChangesRouting);
 
         // A lockfile is not a watched config, and vice versa.
         assert!(
@@ -1555,7 +1621,7 @@ mod tests {
         let mut ids: Vec<&str> = registry
             .for_watched_config(Path::new("/app/.npmrc"))
             .iter()
-            .map(|(e, _)| e.id())
+            .map(|m| m.ecosystem.id())
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, ["deno", "npm"]);
@@ -1563,7 +1629,37 @@ mod tests {
         // pnpm-workspace.yaml is still npm-only.
         let retrieved = registry.for_watched_config(Path::new("/app/pnpm-workspace.yaml"));
         assert_eq!(retrieved.len(), 1);
-        assert_eq!(retrieved[0].0.id(), "npm");
+        assert_eq!(retrieved[0].ecosystem.id(), "npm");
+    }
+
+    #[test]
+    fn test_for_watched_config_in_home_widens_to_all_documents() {
+        let registry = EcosystemRegistry::new();
+        registry.register(Arc::new(MockEcosystem {
+            id: "npm",
+            ecosystem: EcosystemId::Npm,
+            display_name: "npm",
+            filenames: &["package.json"],
+            lockfiles: &[],
+            watched_configs: &[NPMRC],
+        }));
+        let home = UserHome::new(std::path::PathBuf::from("/home/me"));
+        let home = Some(&home);
+
+        let user = registry.for_watched_config_in(Path::new("/home/me/.npmrc"), home);
+        assert_eq!(user[0].owner.reach(), OwnerReach::AllDocuments);
+        assert!(user[0].owner.covers(Path::new("/srv/project/package.json")));
+
+        let project = registry.for_watched_config_in(Path::new("/home/me/work/.npmrc"), home);
+        assert_eq!(project[0].owner.reach(), OwnerReach::Subtree);
+        assert!(
+            !project[0]
+                .owner
+                .covers(Path::new("/srv/project/package.json"))
+        );
+
+        let no_home = registry.for_watched_config_in(Path::new("/home/me/.npmrc"), None);
+        assert_eq!(no_home[0].owner.reach(), OwnerReach::Subtree);
     }
 
     #[test]
@@ -1571,6 +1667,7 @@ mod tests {
         const SWIFT_PROJECT: WatchedConfig = WatchedConfig::new(
             ".swiftpm/configuration/registries.json",
             WatchedConfigEffect::ChangesRouting,
+            ConfigReach::OwnerDirectory,
         );
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockEcosystem {
@@ -1582,12 +1679,11 @@ mod tests {
             watched_configs: &[SWIFT_PROJECT],
         }));
 
-        assert_eq!(
-            registry
-                .for_watched_config(Path::new("/p/.swiftpm/configuration/registries.json"))
-                .len(),
-            1
-        );
+        let matched =
+            registry.for_watched_config(Path::new("/p/.swiftpm/configuration/registries.json"));
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].owner.dir(), Path::new("/p"));
+        assert_eq!(matched[0].owner.reach(), OwnerReach::OwnerDirectory);
         assert!(
             registry
                 .for_watched_config(Path::new("/p/docs/registries.json"))
@@ -1610,6 +1706,7 @@ mod tests {
         const SWIFT_PROJECT: WatchedConfig = WatchedConfig::new(
             ".swiftpm/configuration/registries.json",
             WatchedConfigEffect::ChangesRouting,
+            ConfigReach::OwnerDirectory,
         );
         assert!(SWIFT_PROJECT.matches(Path::new(
             r"C:\work\app\.swiftpm\configuration\registries.json"

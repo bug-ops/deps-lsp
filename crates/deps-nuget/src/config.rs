@@ -276,8 +276,8 @@ pub use deps_core::config_trust::ConfigTier;
 /// A thin wrapper over [`deps_core::secret::Redacted`] rather than a bare type alias:
 /// `Debug` prints `NuGetAuth(***)`, not `Redacted(***)`, so a panic message or log line
 /// still names which credential leaked its type.
-#[derive(Clone, PartialEq, Eq)]
-pub struct NuGetAuth(deps_core::secret::Redacted);
+#[derive(Clone)]
+pub struct NuGetAuth(deps_core::secret::AuthorizationValue);
 
 impl NuGetAuth {
     /// Formats `username`/`password` into a `Basic` header value. `pub(crate)`: only
@@ -296,9 +296,9 @@ impl NuGetAuth {
         self.0.expose_secret()
     }
 
-    /// The pre-formatted header value as a [`deps_core::secret::Redacted`], for attaching to a
-    /// request as a sensitive `Authorization` header.
-    pub(crate) const fn as_redacted(&self) -> &deps_core::secret::Redacted {
+    /// The pre-formatted header value, for attaching to a request as a sensitive
+    /// `Authorization` header.
+    pub(crate) const fn as_authorization(&self) -> &deps_core::secret::AuthorizationValue {
         &self.0
     }
 }

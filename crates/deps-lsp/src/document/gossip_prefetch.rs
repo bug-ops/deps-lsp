@@ -291,12 +291,8 @@ async fn run_gossip_mismatch_refetch(
             continue;
         }
 
-        let snapshot = {
-            let cfg = config.read().await;
-            diagnostics::DiagnosticsSnapshot::from_config(&cfg)
-        };
         let dep_count = diagnostics::document_dependency_count(&state, &doc_uri);
-        diagnostics::publish_document_diagnostics(&state, &client, &doc_uri, &snapshot, dep_count)
+        diagnostics::publish_document_diagnostics(&state, &client, &doc_uri, &config, dep_count)
             .await;
     }
 }

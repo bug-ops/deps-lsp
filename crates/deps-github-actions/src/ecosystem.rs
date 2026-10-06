@@ -8,9 +8,9 @@ use deps_core::hover::Hover;
 #[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::ShaPinning;
 use deps_core::{
-    Ecosystem, PackageName, ParseResult as ParseResultTrait, Registry, Result,
+    Dependency, Ecosystem, PackageName, ParseResult as ParseResultTrait, Registry, Result,
     diagnostic::{Diagnostic, DiagnosticKind, GitTagsPlatform, Severity},
-    lsp_helpers::EcosystemFormatter,
+    lsp_helpers::{EcosystemFormatter, unknown_ref_diagnostics},
 };
 use std::any::Any;
 use std::sync::Arc;
@@ -252,7 +252,7 @@ impl Ecosystem for GithubActionsEcosystem {
             diagnostics.extend(unknown_ref_diagnostics(
                 parse_result,
                 severities.unknown_ref,
-                &self.formatter,
+                |dep| tag_pin_target(&self.formatter, dep),
             ));
             diagnostics
         })
@@ -632,25 +632,15 @@ pub(crate) fn unknown_ref_target<'a>(
     ))
 }
 
-/// Builds one unknown-ref [`Diagnostic`] (#1766) per tag-pinned step whose ref is a full
-/// release that the repository's complete tag list lacks (`actions/checkout@4.3.1` beside tag
-/// `v4.3.1`).
-///
-/// A partial shape (`@v1`, `@v40`, `@v3-node20`) may be a branch, so it is never reported even
-/// though its status is capped; emits nothing on a cold, empty or truncated index.
-fn unknown_ref_diagnostics(
-    parse_result: &dyn ParseResultTrait,
-    severity: Severity,
+/// [`unknown_ref_target`] for a type-erased dependency of this ecosystem.
+fn tag_pin_target<'a>(
     formatter: &GithubActionsFormatter,
-) -> Vec<Diagnostic> {
-    parse_result
-        .dependencies()
-        .into_iter()
-        .filter_map(|dep| {
-            let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-            unknown_ref_target(formatter, gha_dep)?.diagnostic(&gha_dep.name, severity)
-        })
-        .collect()
+    dep: &'a dyn Dependency,
+) -> Option<UnknownRefTarget<'a>> {
+    unknown_ref_target(
+        formatter,
+        dep.as_any().downcast_ref::<GithubActionsDependency>()?,
+    )
 }
 
 #[cfg(test)]

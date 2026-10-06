@@ -5,9 +5,9 @@
 //! through the connect-address-guarded pinned transport, unauthenticated.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -15,11 +15,11 @@ use dashmap::DashMap;
 use deps_core::HOVER_RECENT_VERSIONS;
 use deps_core::cache::{CachedResponse, CredentialPartition};
 use deps_core::error::PaginationStop;
-use deps_core::github::semver_tags_newest_first;
+use deps_core::github::{normalize_tag, semver_tags_newest_first};
 use deps_core::keychain_credentials::{KeychainGeneration, KeychainSnapshot};
 use deps_core::pagination::{NextPage, next_page};
 use deps_core::policy_config::KeychainCredentials;
-use deps_core::{CredentialHeader, DepsError, HttpCache, RequestHeader, Result, not_found_or};
+use deps_core::{DepsError, HttpCache, RequestHeader, Result, RevalidationFailure, not_found_or};
 use serde::Deserialize;
 use url::Url;
 
@@ -58,6 +58,18 @@ const PAGINATION_FAILURE_TTL: Duration = Duration::from_secs(90);
 
 /// Entries after which the pagination-failure memo is cleared.
 const MAX_PAGINATION_FAILURES: usize = 4096;
+
+/// Most packages the last-good release-list memo holds before evicting the oldest.
+const MAX_LAST_GOOD_ENTRIES: usize = 1024;
+
+/// Most bytes (release keys plus per-entry overhead) the last-good memo holds in total.
+const MAX_LAST_GOOD_BYTES: usize = 8 * 1024 * 1024;
+
+/// Longest release key the memo keeps; a longer one is never a real version.
+const MAX_MEMO_KEY_BYTES: usize = 128;
+
+/// Bytes charged per memoized release on top of its key.
+const MEMO_RELEASE_OVERHEAD: usize = 32;
 
 /// Display name of an SE-0292 registry in error messages.
 pub(crate) const REGISTRY: &str = "Swift package registry";
@@ -99,12 +111,140 @@ pub(crate) enum PublishedAtLookup {
     Fetch,
 }
 
+/// One release kept by the last-good memo.
+struct MemoRelease {
+    raw: String,
+    yanked: bool,
+}
+
+/// One complete release list: only the parsable semver releases, with bounded keys.
+struct ReleaseRound {
+    /// Order in which the round started; a newer round supersedes an older one.
+    seq: u64,
+    releases: Vec<MemoRelease>,
+    bytes: usize,
+}
+
+impl ReleaseRound {
+    fn from_releases(seq: u64, releases: BTreeMap<String, Release>) -> Self {
+        let releases: Vec<MemoRelease> = releases
+            .into_iter()
+            .filter(|(key, _)| {
+                key.len() <= MAX_MEMO_KEY_BYTES
+                    && semver::Version::parse(normalize_tag(key)).is_ok()
+            })
+            .map(|(raw, release)| MemoRelease {
+                raw,
+                yanked: release.problem.is_some(),
+            })
+            .collect();
+        let bytes = releases
+            .iter()
+            .map(|release| release.raw.len() + MEMO_RELEASE_OVERHEAD)
+            .sum();
+        Self {
+            seq,
+            releases,
+            bytes,
+        }
+    }
+}
+
+/// The newest complete release list per package, bounded in entries and bytes; the oldest
+/// entry is evicted first.
+#[derive(Default)]
+struct LastGood {
+    rounds: HashMap<CanonicalIdentity, Arc<ReleaseRound>>,
+    order: VecDeque<CanonicalIdentity>,
+    bytes: usize,
+    /// Rounds that started before this sequence number began under a state the memo was
+    /// cleared for, so they are never stored.
+    watermark: u64,
+}
+
+impl LastGood {
+    fn get(&self, package: &CanonicalIdentity) -> Option<Arc<ReleaseRound>> {
+        self.rounds.get(package).map(Arc::clone)
+    }
+
+    /// Stores `round` unless it started before the last clear, a newer round is already held,
+    /// or it alone exceeds the byte cap.
+    fn insert(&mut self, package: &CanonicalIdentity, round: &Arc<ReleaseRound>) {
+        if round.seq < self.watermark
+            || round.bytes > MAX_LAST_GOOD_BYTES
+            || self
+                .rounds
+                .get(package)
+                .is_some_and(|held| held.seq >= round.seq)
+        {
+            return;
+        }
+        self.remove(package);
+        self.bytes += round.bytes;
+        self.order.push_back(package.clone());
+        self.rounds.insert(package.clone(), Arc::clone(round));
+        while self.bytes > MAX_LAST_GOOD_BYTES || self.rounds.len() > MAX_LAST_GOOD_ENTRIES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.rounds.remove(&oldest) {
+                self.bytes -= evicted.bytes;
+            }
+        }
+    }
+
+    fn remove(&mut self, package: &CanonicalIdentity) {
+        if let Some(removed) = self.rounds.remove(package) {
+            self.bytes -= removed.bytes;
+            self.order.retain(|queued| queued != package);
+        }
+    }
+
+    /// Drops every entry and refuses rounds whose sequence is below `watermark`.
+    fn clear(&mut self, watermark: u64) {
+        *self = Self {
+            watermark,
+            ..Self::default()
+        };
+    }
+}
+
+fn incomplete_list(package: &CanonicalIdentity, reason: PaginationStop) -> DepsError {
+    DepsError::PaginatedListIncomplete {
+        package: package.as_str().into(),
+        registry: REGISTRY,
+        reason,
+    }
+}
+
+/// Whether a failed round may be answered with the last complete list: an incomplete list or
+/// a transient failure, never "package not found", a credential rejection (401/403) or an
+/// actionable policy block.
+fn may_fall_back_to_last_good(err: &DepsError) -> bool {
+    match err {
+        DepsError::PaginatedListIncomplete { .. } => true,
+        DepsError::HttpStatus {
+            status: 401 | 403, ..
+        }
+        | DepsError::RateLimited {
+            source_status: Some(401 | 403),
+            ..
+        } => false,
+        _ => {
+            !err.is_not_found() && matches!(err.fetch_failure(), deps_core::FetchFailure::Transient)
+        }
+    }
+}
+
 /// A client for one SE-0292 registry.
 pub(crate) struct PackageRegistryClient {
     cache: Arc<HttpCache>,
     registry: ResolvedSwiftRegistry,
     digest: u64,
     pagination_failures: DashMap<CanonicalIdentity, (PaginationStop, Instant)>,
+    /// The latest release list that was fetched completely, one whole round per package.
+    last_good: Mutex<LastGood>,
+    round_seq: AtomicU64,
     published_at: PublishedAtCache,
     credential_state: Mutex<Option<CredentialState>>,
 }
@@ -144,6 +284,8 @@ impl PackageRegistryClient {
             registry,
             digest,
             pagination_failures: DashMap::new(),
+            last_good: Mutex::new(LastGood::default()),
+            round_seq: AtomicU64::new(0),
             published_at: PublishedAtCache::new(),
             credential_state: Mutex::new(None),
         }
@@ -161,6 +303,9 @@ impl PackageRegistryClient {
         if previous.is_some_and(|previous| previous != state) {
             self.cache
                 .evict_url_prefix(&format!("{}/", self.registry.url.as_str()));
+            self.last_good()
+                .clear(self.round_seq.load(Ordering::Relaxed));
+            self.pagination_failures.clear();
         }
     }
 
@@ -170,11 +315,16 @@ impl PackageRegistryClient {
     /// read misses and fails closed instead of serving a body fetched under a credential the
     /// setting has since withdrawn.
     fn offline_partition(&self, current: KeychainSnapshot) -> CredentialPartition {
+        self.offline_state(current).partition(self.digest)
+    }
+
+    /// The state an offline read answers under, see [`Self::offline_partition`].
+    fn offline_state(&self, current: KeychainSnapshot) -> CredentialState {
         let last = *self
             .credential_state
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let state = match last {
+        match last {
             Some(state)
                 if state.generation == current.generation
                     && current.setting == KeychainCredentials::Enabled =>
@@ -185,8 +335,26 @@ impl PackageRegistryClient {
                 presence: CredentialPresence::Anonymous,
                 generation: current.generation,
             },
+        }
+    }
+
+    /// Whether the last-good list was fetched under the state an offline read answers under, so
+    /// a withdrawn or changed Keychain credential never answers from the memo.
+    fn last_good_matches_offline_state(&self) -> bool {
+        let Some(RegistryAuth::Keychain(credential)) = &self.registry.auth else {
+            return true;
         };
-        state.partition(self.digest)
+        let last = *self
+            .credential_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        last == Some(self.offline_state(credential.snapshot()))
+    }
+
+    fn last_good(&self) -> std::sync::MutexGuard<'_, LastGood> {
+        self.last_good
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The trust and credential digest this client was built from.
@@ -205,7 +373,12 @@ impl PackageRegistryClient {
 
     /// Fetches one page of a release list over this registry's transport, with its credential
     /// when `Trusted`.
-    async fn fetch_page(&self, url: &str, origin: &str) -> Result<CachedResponse> {
+    async fn fetch_page(
+        &self,
+        url: &str,
+        origin: &str,
+        on_failure: RevalidationFailure,
+    ) -> Result<CachedResponse> {
         let mut headers = vec![RequestHeader::Accept(ACCEPT)];
         match transport_for(self.registry.url.trust()) {
             TransportKind::TrustedOrigin => {
@@ -233,18 +406,15 @@ impl PackageRegistryClient {
                     None => (None, None),
                 };
                 if let Some(auth) = auth.as_deref() {
-                    headers.push(RequestHeader::Credential(
-                        CredentialHeader::Authorization,
-                        auth.as_redacted(),
-                    ));
+                    headers.push(RequestHeader::Authorization(auth.as_authorization()));
                 }
                 self.cache
-                    .get_cached_trusted_origin_response(url, origin, auth_id, &headers)
+                    .get_cached_trusted_origin_response(url, origin, auth_id, &headers, on_failure)
                     .await
             }
             TransportKind::Pinned => {
                 self.cache
-                    .get_cached_pinned_response(url, origin, false, None, &headers)
+                    .get_cached_pinned_response(url, origin, false, None, &headers, on_failure)
                     .await
             }
         }
@@ -266,10 +436,26 @@ impl PackageRegistryClient {
         );
     }
 
+    /// Answers with the last complete list when it fits `limits`, else with `err`.
+    fn serve_memo_or(
+        &self,
+        package: &CanonicalIdentity,
+        limits: ListLimits,
+        err: DepsError,
+    ) -> Result<Arc<ReleaseRound>> {
+        let memo = self.last_good().get(package);
+        match memo {
+            Some(memo) if memo.releases.len() <= limits.releases => Ok(memo),
+            _ => Err(err),
+        }
+    }
+
     /// Follows `Link: rel="next"` pages from the first releases URL and merges them.
     ///
-    /// Every page is revalidated on every call, so a merged list can only be torn when one
-    /// page's revalidation fails and that page is served stale (#1802).
+    /// Pages are fetched through the cache, which revalidates each one. A page whose
+    /// revalidation fails fails the round rather than being served stale, so a round never mixes
+    /// generations; only a round that reaches the last page is stored as the last-good list (see
+    /// [`Self::release_round`]).
     ///
     /// Exceeding any of the [`ListLimits`] fails the whole list.
     async fn fetch_all_releases(
@@ -295,7 +481,7 @@ impl PackageRegistryClient {
         let mut body_bytes = 0usize;
         for page_number in 1..=limits.pages {
             let response = self
-                .fetch_page(current.as_str(), &origin)
+                .fetch_page(current.as_str(), &origin, RevalidationFailure::Fail)
                 .await
                 .map_err(|e| match (page_number, e.is_not_found()) {
                     (1, _) => not_found_or(e, package.as_str(), REGISTRY, &[410]),
@@ -354,8 +540,12 @@ impl PackageRegistryClient {
         url.path_segments_mut()
             .map_err(|()| DepsError::InvalidUri(releases_url))?
             .push(raw_version.as_str());
-        self.fetch_page(url.as_str(), &format!("{}/", self.registry.url.as_str()))
-            .await
+        self.fetch_page(
+            url.as_str(),
+            &format!("{}/", self.registry.url.as_str()),
+            RevalidationFailure::ServeStale,
+        )
+        .await
     }
 
     /// Fills `published_at` of the newest non-yanked releases from the memoized per-release
@@ -412,27 +602,19 @@ impl PackageRegistryClient {
         identity: &RegistryIdentity<'_>,
         lookup: PublishedAtLookup,
     ) -> Result<Vec<SwiftVersion>> {
-        let package = identity.canonical();
-        if let Some(reason) = self.recent_pagination_failure(&package) {
-            return Err(DepsError::PaginatedListIncomplete {
-                package: package.as_str().into(),
-                registry: REGISTRY,
-                reason,
-            });
-        }
         self.list_releases_within(identity, lookup, ListLimits::DEFAULT)
             .await
     }
 
-    async fn list_releases_within(
+    /// One bounded fetch of the whole release list, under the overall time budget.
+    async fn fetch_round(
         &self,
         identity: &RegistryIdentity<'_>,
-        lookup: PublishedAtLookup,
         limits: ListLimits,
-    ) -> Result<Vec<SwiftVersion>> {
+    ) -> Result<BTreeMap<String, Release>> {
         let package = identity.canonical();
         let merged_pages = AtomicUsize::new(0);
-        let fetched = tokio::time::timeout(
+        tokio::time::timeout(
             limits.budget,
             self.fetch_all_releases(identity, limits, &merged_pages),
         )
@@ -444,29 +626,78 @@ impl PackageRegistryClient {
                     "registry did not answer within the time budget".into(),
                 ))
             } else {
-                Err(DepsError::PaginatedListIncomplete {
-                    package: package.as_str().into(),
-                    registry: REGISTRY,
-                    reason: PaginationStop::TimeBudget,
-                })
+                Err(incomplete_list(&package, PaginationStop::TimeBudget))
             }
-        });
-        let releases = fetched.inspect_err(|e| {
-            if let DepsError::PaginatedListIncomplete { reason, .. } = e {
-                self.remember_pagination_failure(&package, *reason);
+        })
+    }
+
+    /// The release list to answer with: a fresh complete round, else the last complete one.
+    ///
+    /// The last-good list is consulted before the recent-failure short-circuit, so a package
+    /// does not flip between a list and an error within the failure window. Offline, no
+    /// request is made and cached pages are never assembled: they may be a mix of rounds.
+    async fn release_round(
+        &self,
+        identity: &RegistryIdentity<'_>,
+        limits: ListLimits,
+    ) -> Result<Arc<ReleaseRound>> {
+        let package = identity.canonical();
+        if self.cache.is_offline() {
+            let no_snapshot = incomplete_list(&package, PaginationStop::NoConsistentSnapshot);
+            if !self.last_good_matches_offline_state() {
+                return Err(no_snapshot);
             }
-        })?;
+            return self.serve_memo_or(&package, limits, no_snapshot);
+        }
+        if let Some(reason) = self.recent_pagination_failure(&package) {
+            return self.serve_memo_or(&package, limits, incomplete_list(&package, reason));
+        }
+        let seq = self.round_seq.fetch_add(1, Ordering::Relaxed);
+        match self.fetch_round(identity, limits).await {
+            Ok(releases) => {
+                let round = Arc::new(ReleaseRound::from_releases(seq, releases));
+                self.last_good().insert(&package, &round);
+                Ok(round)
+            }
+            Err(err) if may_fall_back_to_last_good(&err) => {
+                // Armed even when the memo answers, so an outage is not re-fetched on every call.
+                let incomplete_reason = match &err {
+                    DepsError::PaginatedListIncomplete { reason, .. } => Some(*reason),
+                    _ => None,
+                };
+                let served = self.serve_memo_or(&package, limits, err);
+                let backoff = incomplete_reason.or_else(|| {
+                    served
+                        .is_ok()
+                        .then_some(PaginationStop::NoConsistentSnapshot)
+                });
+                if let Some(reason) = backoff {
+                    self.remember_pagination_failure(&package, reason);
+                }
+                served
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn list_releases_within(
+        &self,
+        identity: &RegistryIdentity<'_>,
+        lookup: PublishedAtLookup,
+        limits: ListLimits,
+    ) -> Result<Vec<SwiftVersion>> {
+        let round = self.release_round(identity, limits).await?;
         let mut raw_by_version = HashMap::new();
         let mut versions = semver_tags_newest_first(
-            releases,
-            |(key, _)| key.as_str(),
-            |(key, release), normalized, parsed| {
+            round.releases.iter(),
+            |release| release.raw.as_str(),
+            |release, normalized, parsed| {
                 raw_by_version
                     .entry(normalized.to_string())
-                    .or_insert(ReleaseVersion::new(key));
+                    .or_insert_with(|| ReleaseVersion::new(release.raw.clone()));
                 Some(SwiftVersion {
                     version: normalized.into(),
-                    yanked: release.problem.is_some(),
+                    yanked: release.yanked,
                     published_at: None,
                     prerelease: !parsed.pre.is_empty(),
                 })
@@ -1010,6 +1241,454 @@ mod tests {
             .unwrap_err();
         assert!(!err.is_not_found(), "{err:?}");
         assert_matches!(err, DepsError::PaginatedListIncomplete { .. });
+    }
+
+    /// A client whose first complete round (`1.0.0` on page 1, `2.0.0` on page 2) is already in
+    /// the last-good memo; the page mocks are returned so a test can swap them out.
+    async fn client_with_a_good_round(
+        server: &mut mockito::ServerGuard,
+    ) -> (PackageRegistryClient, mockito::Mock, mockito::Mock) {
+        let base = server.url();
+        let p1 = mock_page(
+            server,
+            "/acme/net",
+            Some(next_link(&format!("{base}/acme/net?page=2"))),
+            r#""1.0.0": {}"#,
+        )
+        .await;
+        let p2 = mock_page(server, "/acme/net?page=2", None, r#""2.0.0": {}"#).await;
+        let c = client(&base, RegistryTrust::Trusted, None);
+        let versions = c
+            .list_releases(&identity(), PublishedAtLookup::Skip)
+            .await
+            .unwrap();
+        assert_eq!(versions_of(&versions).len(), 2);
+        (c, p1, p2)
+    }
+
+    fn two_versions() -> Vec<(String, bool)> {
+        vec![("2.0.0".to_string(), false), ("1.0.0".to_string(), false)]
+    }
+
+    #[tokio::test]
+    async fn test_a_timed_out_round_serves_the_last_good_list_and_arms_the_backoff() {
+        let mut server = mockito::Server::new_async().await;
+        let (c, _p1, p2) = client_with_a_good_round(&mut server).await;
+        p2.remove_async().await;
+        let _slow = server
+            .mock("GET", "/acme/net?page=2")
+            .with_chunked_body(|writer| {
+                std::thread::sleep(Duration::from_millis(600));
+                writer.write_all(br#"{"releases": {"3.0.0": {}}}"#)
+            })
+            .create_async()
+            .await;
+        let limits = limits_with(|limits| limits.budget = Duration::from_millis(300));
+        for _ in 0..2 {
+            let versions = c
+                .list_releases_within(&identity(), PublishedAtLookup::Skip, limits)
+                .await
+                .unwrap();
+            assert_eq!(versions_of(&versions), two_versions());
+        }
+        assert!(
+            c.recent_pagination_failure(&identity().canonical())
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_last_good_list_is_served_inside_the_failure_window() {
+        let mut server = mockito::Server::new_async().await;
+        let (c, _p1, _p2) = client_with_a_good_round(&mut server).await;
+        c.remember_pagination_failure(&identity().canonical(), PaginationStop::PageCap);
+        let versions = c
+            .list_releases(&identity(), PublishedAtLookup::Skip)
+            .await
+            .unwrap();
+        assert_eq!(versions_of(&versions), two_versions());
+    }
+
+    #[tokio::test]
+    async fn test_an_unusable_next_link_after_a_good_round_serves_the_last_good_list() {
+        let mut server = mockito::Server::new_async().await;
+        let (c, p1, _p2) = client_with_a_good_round(&mut server).await;
+        p1.remove_async().await;
+        let _bad = mock_page(
+            &mut server,
+            "/acme/net",
+            Some(next_link("https://evil.example/acme/net?page=2")),
+            r#""9.0.0": {}"#,
+        )
+        .await;
+        let versions = c
+            .list_releases(&identity(), PublishedAtLookup::Skip)
+            .await
+            .unwrap();
+        assert_eq!(versions_of(&versions), two_versions());
+        assert!(
+            c.recent_pagination_failure(&identity().canonical())
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_last_good_list_over_the_release_limit_is_not_served() {
+        let mut server = mockito::Server::new_async().await;
+        let (c, p1, _p2) = client_with_a_good_round(&mut server).await;
+        p1.remove_async().await;
+        let _bad = server
+            .mock("GET", "/acme/net")
+            .with_status(500)
+            .create_async()
+            .await;
+        let limits = limits_with(|limits| limits.releases = 1);
+        let err = c
+            .list_releases_within(&identity(), PublishedAtLookup::Skip, limits)
+            .await
+            .unwrap_err();
+        assert_matches!(err.fetch_failure(), deps_core::FetchFailure::Transient);
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_revalidation_of_a_later_page_serves_the_last_good_list() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let (c, p1, p2) = client_with_a_good_round(&mut server).await;
+        p1.remove_async().await;
+        p2.remove_async().await;
+        let _p1 = mock_page(
+            &mut server,
+            "/acme/net",
+            Some(next_link(&format!("{base}/acme/net?page=2"))),
+            r#""1.0.0": {}, "3.0.0": {}"#,
+        )
+        .await;
+        let _p2 = server
+            .mock("GET", "/acme/net?page=2")
+            .with_status(500)
+            .create_async()
+            .await;
+        let versions = c
+            .list_releases(&identity(), PublishedAtLookup::Skip)
+            .await
+            .unwrap();
+        assert_eq!(
+            versions_of(&versions),
+            two_versions(),
+            "no tear: not 3.0.0 + stale page 2"
+        );
+        assert!(
+            c.recent_pagination_failure(&identity().canonical())
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_cold_round_with_a_failing_later_page_is_an_error_not_a_stale_mix() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let first_page = mock_page(
+            &mut server,
+            "/acme/net",
+            Some(next_link(&format!("{base}/acme/net?page=2"))),
+            r#""1.0.0": {}"#,
+        )
+        .await;
+        let ok_page2 = mock_page(&mut server, "/acme/net?page=2", None, r#""2.0.0": {}"#).await;
+        let c = client(&base, RegistryTrust::Trusted, None);
+        // Warm the cache for page 2 only, then break it and change page 1.
+        c.fetch_page(
+            &format!("{base}/acme/net?page=2"),
+            &format!("{base}/"),
+            RevalidationFailure::ServeStale,
+        )
+        .await
+        .unwrap();
+        ok_page2.remove_async().await;
+        first_page.remove_async().await;
+        let _p1 = mock_page(
+            &mut server,
+            "/acme/net",
+            Some(next_link(&format!("{base}/acme/net?page=2"))),
+            r#""1.0.0": {}, "3.0.0": {}"#,
+        )
+        .await;
+        let _broken = server
+            .mock("GET", "/acme/net?page=2")
+            .with_status(500)
+            .create_async()
+            .await;
+        let err = c
+            .list_releases(&identity(), PublishedAtLookup::Skip)
+            .await
+            .unwrap_err();
+        assert_matches!(err.fetch_failure(), deps_core::FetchFailure::Transient);
+    }
+
+    #[tokio::test]
+    async fn test_a_removed_package_is_not_answered_from_the_last_good_list() {
+        let mut server = mockito::Server::new_async().await;
+        let (c, p1, _p2) = client_with_a_good_round(&mut server).await;
+        p1.remove_async().await;
+        let _gone = server
+            .mock("GET", "/acme/net")
+            .with_status(404)
+            .create_async()
+            .await;
+        let err = c
+            .list_releases(&identity(), PublishedAtLookup::Skip)
+            .await
+            .unwrap_err();
+        assert!(err.is_not_found(), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_offline_serves_the_last_good_list_without_a_request() {
+        let mut server = mockito::Server::new_async().await;
+        let (c, p1, p2) = client_with_a_good_round(&mut server).await;
+        p1.remove_async().await;
+        p2.remove_async().await;
+        c.cache.set_offline(deps_core::NetworkMode::Offline);
+        let versions = c
+            .list_releases(&identity(), PublishedAtLookup::Skip)
+            .await
+            .unwrap();
+        assert_eq!(versions_of(&versions), two_versions());
+    }
+
+    #[tokio::test]
+    async fn test_offline_without_a_last_good_list_fails_closed_even_with_cached_pages() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let _p1 = mock_page(
+            &mut server,
+            "/acme/net",
+            Some(next_link(&format!("{base}/acme/net?page=2"))),
+            r#""1.0.0": {}"#,
+        )
+        .await;
+        let _p2 = server
+            .mock("GET", "/acme/net?page=2")
+            .with_status(500)
+            .create_async()
+            .await;
+        let c = client(&base, RegistryTrust::Trusted, None);
+        // Warm the cache with page 1 only; the round itself never completes.
+        c.fetch_page(
+            &format!("{base}/acme/net"),
+            &format!("{base}/"),
+            RevalidationFailure::ServeStale,
+        )
+        .await
+        .unwrap();
+        c.cache.set_offline(deps_core::NetworkMode::Offline);
+        assert_matches!(
+            c.list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap_err(),
+            DepsError::PaginatedListIncomplete {
+                reason: PaginationStop::NoConsistentSnapshot,
+                ..
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_rounds_each_return_one_whole_round() {
+        let mut server = mockito::Server::new_async().await;
+        let (c, _p1, _p2) = client_with_a_good_round(&mut server).await;
+        let id = identity();
+        let (a, b) = tokio::join!(
+            c.list_releases(&id, PublishedAtLookup::Skip),
+            c.list_releases(&id, PublishedAtLookup::Skip),
+        );
+        assert_eq!(versions_of(&a.unwrap()), two_versions());
+        assert_eq!(versions_of(&b.unwrap()), two_versions());
+    }
+
+    fn round_of(seq: u64, keys: &[&str]) -> Arc<ReleaseRound> {
+        let releases = keys
+            .iter()
+            .map(|key| ((*key).to_string(), Release { problem: None }))
+            .collect();
+        Arc::new(ReleaseRound::from_releases(seq, releases))
+    }
+
+    fn package(name: &str) -> CanonicalIdentity {
+        RegistryIdentity::parse(name).unwrap().canonical()
+    }
+
+    #[test]
+    fn test_a_round_keeps_only_bounded_semver_keys() {
+        let long = format!("1.0.0-{}", "a".repeat(MAX_MEMO_KEY_BYTES));
+        let round = round_of(0, &["1.0.0", "latest", "v2.0.0", &long]);
+        let kept: Vec<&str> = round.releases.iter().map(|r| r.raw.as_str()).collect();
+        assert_eq!(kept, ["1.0.0", "v2.0.0"]);
+        assert_eq!(
+            round.bytes,
+            "1.0.0".len() + "v2.0.0".len() + 2 * MEMO_RELEASE_OVERHEAD
+        );
+    }
+
+    #[test]
+    fn test_the_memo_evicts_the_oldest_entry_not_everything_at_the_entry_cap() {
+        let mut memo = LastGood::default();
+        for n in 0..=MAX_LAST_GOOD_ENTRIES {
+            memo.insert(&package(&format!("Acme.P{n}")), &round_of(0, &["1.0.0"]));
+        }
+        assert_eq!(memo.rounds.len(), MAX_LAST_GOOD_ENTRIES);
+        assert!(memo.get(&package("Acme.P0")).is_none(), "oldest evicted");
+        assert!(memo.get(&package("Acme.P1")).is_some());
+        assert!(
+            memo.get(&package(&format!("Acme.P{MAX_LAST_GOOD_ENTRIES}")))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_the_memo_stays_within_its_byte_cap_and_skips_an_oversized_round() {
+        let mut memo = LastGood::default();
+        let keys: Vec<String> = (0..2000).map(|n| format!("1.0.{n}")).collect();
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let big = round_of(0, &key_refs);
+        let per_round = big.bytes;
+        for n in 0..(MAX_LAST_GOOD_BYTES / per_round + 3) {
+            memo.insert(&package(&format!("Acme.B{n}")), &big);
+            assert!(memo.bytes <= MAX_LAST_GOOD_BYTES);
+        }
+        assert!(memo.get(&package("Acme.B0")).is_none(), "oldest evicted");
+        assert!(memo.rounds.len() > 1, "single-entry eviction, not clear()");
+
+        let mut memo = LastGood::default();
+        let oversized = Arc::new(ReleaseRound {
+            seq: 0,
+            releases: Vec::new(),
+            bytes: MAX_LAST_GOOD_BYTES + 1,
+        });
+        memo.insert(&package("Acme.Huge"), &oversized);
+        assert!(memo.get(&package("Acme.Huge")).is_none());
+        assert_eq!(memo.bytes, 0);
+    }
+
+    #[test]
+    fn test_an_older_round_never_replaces_a_newer_one() {
+        let mut memo = LastGood::default();
+        let id = package("Acme.Net");
+        memo.insert(&id, &round_of(5, &["2.0.0"]));
+        memo.insert(&id, &round_of(3, &["1.0.0"]));
+        assert_eq!(memo.get(&id).unwrap().releases[0].raw, "2.0.0");
+        memo.insert(&id, &round_of(9, &["3.0.0"]));
+        assert_eq!(memo.get(&id).unwrap().releases[0].raw, "3.0.0");
+        assert_eq!(memo.rounds.len(), 1);
+        assert_eq!(memo.order.len(), 1);
+    }
+
+    #[test]
+    fn test_only_incomplete_and_transient_failures_fall_back_to_the_memo() {
+        assert!(may_fall_back_to_last_good(&DepsError::CacheError(
+            "x".into()
+        )));
+        assert!(may_fall_back_to_last_good(&incomplete_list(
+            &package("Acme.Net"),
+            PaginationStop::PageCap
+        )));
+        assert!(!may_fall_back_to_last_good(
+            &DepsError::ChainResolutionHalted
+        ));
+        assert!(!may_fall_back_to_last_good(&DepsError::rate_limited(
+            "limit",
+            deps_core::error::RateLimitEvidence::Inferred
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_a_credential_rejection_is_not_answered_from_the_last_good_list() {
+        for status in [401, 403] {
+            let mut server = mockito::Server::new_async().await;
+            let (c, p1, _p2) = client_with_a_good_round(&mut server).await;
+            p1.remove_async().await;
+            let _rejected = server
+                .mock("GET", "/acme/net")
+                .with_status(status)
+                .create_async()
+                .await;
+            let err = c
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap_err();
+            assert_matches!(err, DepsError::HttpStatus { .. }, "{status}");
+        }
+    }
+
+    #[test]
+    fn test_a_round_that_started_before_a_clear_is_never_stored() {
+        let mut memo = LastGood::default();
+        let id = package("Acme.Net");
+        memo.clear(4);
+        memo.insert(&id, &round_of(3, &["1.0.0"]));
+        assert!(memo.get(&id).is_none(), "started before the clear");
+        memo.insert(&id, &round_of(4, &["2.0.0"]));
+        assert_eq!(memo.get(&id).unwrap().releases[0].raw, "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_an_in_flight_round_cannot_repopulate_the_memo_after_a_credential_change() {
+        let server = mockito::Server::new_async().await;
+        let c = client(&server.url(), RegistryTrust::Trusted, None);
+        let initial = deps_core::keychain_credentials::KeychainGeneration::INITIAL;
+        let state = |presence, generation| CredentialState {
+            presence,
+            generation,
+        };
+        c.note_credential_state(state(CredentialPresence::Credentialed, initial));
+        let in_flight_seq = c.round_seq.fetch_add(1, Ordering::Relaxed);
+        c.note_credential_state(state(CredentialPresence::Anonymous, initial.next()));
+        c.last_good().insert(
+            &identity().canonical(),
+            &round_of(in_flight_seq, &["1.0.0"]),
+        );
+        assert!(c.last_good().get(&identity().canonical()).is_none());
+        let next_seq = c.round_seq.fetch_add(1, Ordering::Relaxed);
+        c.last_good()
+            .insert(&identity().canonical(), &round_of(next_seq, &["2.0.0"]));
+        assert!(c.last_good().get(&identity().canonical()).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_a_credential_state_change_drops_the_last_good_list() {
+        let mut server = mockito::Server::new_async().await;
+        let (c, _p1, _p2) = client_with_a_good_round(&mut server).await;
+        let state = |presence, generation| CredentialState {
+            presence,
+            generation,
+        };
+        let initial = deps_core::keychain_credentials::KeychainGeneration::INITIAL;
+        c.note_credential_state(state(CredentialPresence::Anonymous, initial));
+        assert!(c.last_good().get(&identity().canonical()).is_some());
+        c.note_credential_state(state(CredentialPresence::Credentialed, initial.next()));
+        assert!(c.last_good().get(&identity().canonical()).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_an_outage_served_from_the_memo_is_not_refetched_on_every_call() {
+        let mut server = mockito::Server::new_async().await;
+        let (c, p1, _p2) = client_with_a_good_round(&mut server).await;
+        p1.remove_async().await;
+        let broken = server
+            .mock("GET", "/acme/net")
+            .with_status(500)
+            .expect(1)
+            .create_async()
+            .await;
+        for _ in 0..3 {
+            let versions = c
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap();
+            assert_eq!(versions_of(&versions), two_versions());
+        }
+        broken.assert_async().await;
     }
 
     fn many_releases() -> String {

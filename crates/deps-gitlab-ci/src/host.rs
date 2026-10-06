@@ -335,7 +335,13 @@ mod tests {
     use super::*;
 
     fn policy(access: WorkspaceRegistryAccess) -> RegistryAccessPolicy {
-        RegistryAccessPolicy::new(access)
+        RegistryAccessPolicy::with_allowlist(access, private_allowlist())
+    }
+
+    fn private_allowlist() -> Arc<deps_core::net_policy::PrivateRegistryAllowlist> {
+        Arc::new(deps_core::net_policy::PrivateRegistryAllowlist::for_test(
+            &["10.0.0.0/8"],
+        ))
     }
 
     #[test]
@@ -534,7 +540,7 @@ mod tests {
     /// on policy too, not just the raw string.
     #[test]
     fn test_gitlab_instance_host_memo_invalidates_on_policy_tightening() {
-        let policy = Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::All));
+        let policy = Arc::new(policy(WorkspaceRegistryAccess::All));
         let raw = Arc::new(RwLock::new(Some("10.0.0.1".to_string())));
         let handle = GitlabInstanceHost::new(raw, Arc::clone(&policy));
         assert!(

@@ -177,6 +177,68 @@ impl<'a> UnknownRefTarget<'a> {
     }
 }
 
+/// One unknown-ref [`Diagnostic`] (#1766) per dependency of `parse_result` whose
+/// [`UnknownRefTarget`] proves its ref unpublished.
+///
+/// `target` is the ecosystem's only decision: which dependencies are tag pins and which tag
+/// list serves them (`None` for a SHA or branch pin, a pin without a position, and a cold index
+/// or one served by an endpoint that cannot prove a tag absent). Silent for a partial shape and
+/// for an index that cannot prove absence, see [`unknown_ref_diagnostic_for`].
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use deps_core::diagnostic::Severity;
+/// use deps_core::lsp_helpers::{CommitSha, TagIndex, UnknownRefTarget, unknown_ref_diagnostics};
+/// use deps_core::parser::DependencySource;
+/// use deps_core::position::Range;
+/// use deps_core::{Dependency, PackageName, ParseResult, VersionReq};
+///
+/// struct Step(PackageName);
+/// impl Dependency for Step {
+///     fn name(&self) -> &PackageName { &self.0 }
+///     fn name_range(&self) -> Range { Range::default() }
+///     fn version_requirement(&self) -> Option<&VersionReq> { None }
+///     fn version_range(&self) -> Option<Range> { None }
+///     fn source(&self) -> DependencySource { DependencySource::Registry }
+///     fn as_any(&self) -> &dyn std::any::Any { self }
+/// }
+///
+/// struct Workflow(url::Url, Vec<Step>);
+/// impl ParseResult for Workflow {
+///     fn dependencies(&self) -> Vec<&dyn Dependency> {
+///         self.1.iter().map(|s| s as &dyn Dependency).collect()
+///     }
+///     fn workspace_root(&self) -> Option<&std::path::Path> { None }
+///     fn uri(&self) -> &url::Url { &self.0 }
+///     fn as_any(&self) -> &dyn std::any::Any { self }
+/// }
+///
+/// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+/// let index = Arc::new(TagIndex::from_tags([("v4.3.1", &sha)]));
+/// let workflow = Workflow(
+///     url::Url::parse("file:///ci.yml").unwrap(),
+///     vec![Step(PackageName::new("actions/checkout"))],
+/// );
+/// let found = unknown_ref_diagnostics(&workflow, Severity::Warning, |_dep| {
+///     Some(UnknownRefTarget::new(Arc::clone(&index), "4.3.1", Range::default()))
+/// });
+/// assert_eq!(found.len(), 1);
+/// ```
+#[must_use]
+pub fn unknown_ref_diagnostics(
+    parse_result: &dyn ParseResult,
+    severity: Severity,
+    target: impl for<'a> Fn(&'a dyn Dependency) -> Option<UnknownRefTarget<'a>>,
+) -> Vec<Diagnostic> {
+    parse_result
+        .dependencies()
+        .into_iter()
+        .filter_map(|dep| target(dep)?.diagnostic(dep.name(), severity))
+        .collect()
+}
+
 /// Builds the "Change ref to published tag" quickfix (#1781) for a tag pin `written` spanning
 /// `version_range` that `index` proves unpublished.
 ///
@@ -251,6 +313,81 @@ mod tests {
             written,
             Severity::Error,
         )
+    }
+
+    struct StubDep(PackageName);
+
+    impl Dependency for StubDep {
+        fn name(&self) -> &PackageName {
+            &self.0
+        }
+        fn name_range(&self) -> Range {
+            Range::default()
+        }
+        fn version_requirement(&self) -> Option<&crate::VersionReq> {
+            None
+        }
+        fn version_range(&self) -> Option<Range> {
+            None
+        }
+        fn source(&self) -> crate::parser::DependencySource {
+            crate::parser::DependencySource::Registry
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct StubParse {
+        uri: url::Url,
+        deps: Vec<StubDep>,
+    }
+
+    impl ParseResult for StubParse {
+        fn dependencies(&self) -> Vec<&dyn Dependency> {
+            self.deps.iter().map(|d| d as &dyn Dependency).collect()
+        }
+        fn workspace_root(&self) -> Option<&std::path::Path> {
+            None
+        }
+        fn uri(&self) -> &url::Url {
+            &self.uri
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn helper_reports_only_pins_the_callback_serves_and_the_index_disproves() {
+        let sha = super::super::CommitSha::parse(&"a".repeat(40)).unwrap();
+        let index = Arc::new(TagIndex::from_tags([("v4.3.1", &sha)]));
+        let parse = StubParse {
+            uri: url::Url::parse("file:///ci.yml").unwrap(),
+            deps: ["missing", "listed", "branch", "unserved"]
+                .map(|n| StubDep(PackageName::new(n)))
+                .into(),
+        };
+        let found = unknown_ref_diagnostics(&parse, Severity::Warning, |dep| {
+            let written = match dep.name().as_str() {
+                "missing" => "4.3.2",
+                "listed" => "v4.3.1",
+                "branch" => "v40",
+                _ => return None,
+            };
+            Some(UnknownRefTarget::new(
+                Arc::clone(&index),
+                written,
+                Range::new(Position::new(3, 1), Position::new(3, 6)),
+            ))
+        });
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message(),
+            "`4.3.2` is not a published tag of missing"
+        );
+        assert_eq!(found[0].severity, Some(Severity::Warning));
+        assert_eq!(found[0].range.start.line, 3);
     }
 
     #[test]

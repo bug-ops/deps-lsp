@@ -91,7 +91,7 @@ that sharing means in practice. Three values:
 |-------|----------|
 | `"public_only"` (default) | Only a publicly-routable host is fetched — blocks loopback, link-local, RFC1918/CGNAT, unique-local-v6, and cloud-metadata-range hosts (e.g. `169.254.169.254`) declared by a workspace file. A corporate `https://index.mycorp.dev`-style registry still works, since a DNS name cannot be classified as internal without resolving it — see the residual-risk note below. |
 | `"off"` | No workspace-declared index is ever fetched — the only complete boundary. Applies to the alias path as well as `[source]`. |
-| `"all"` | Every workspace-declared index is fetched, matching this LSP's behavior before this setting existed — the escape hatch for a workspace that legitimately points at an RFC1918 registry. It does not allow loopback, link-local, cloud-metadata, unspecified or reserved addresses, which are refused at connect time under every value. |
+| `"all"` | Public hosts plus the private hosts and CIDR ranges listed in the `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` environment variable (see [Configuration](../configuration.md#private-registry-allowlist)) — the escape hatch for a workspace that legitimately points at an RFC1918 registry. Without that variable it behaves like `"public_only"`: the setting is repository-controllable, so the variable is the effective control, and a listed host is reachable on any port. It never allows loopback, link-local, cloud-metadata, unspecified or reserved addresses, which are refused under every value. |
 
 **Hosts that resolve to a blocked address.** The check above looks at the declared host name. A
 name that resolves, when the connection is made, to a blocked address class (for example a public
@@ -99,7 +99,8 @@ name that points at `10.0.0.5`) is refused too, in every ecosystem, and the depe
 policy-specific message instead of a generic fetch failure. The message names the address class
 only, never the address. For the classes `"all"` does not allow, it says the host "is never a
 registry under any policy"; for the others it says the host is "blocked by
-registries.workspace_registries policy". Cached data for a registry is still served while
+registries.workspace_registries policy" and adds that private hosts need `"all"` and
+`DEPS_LSP_PRIVATE_REGISTRY_HOSTS`. Cached data for a registry is still served while
 revalidation is blocked, since no connection is made.
 
 `$CARGO_HOME/config.toml`-configured registries are **never** policy-checked, under

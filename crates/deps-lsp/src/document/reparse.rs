@@ -56,16 +56,19 @@ pub(crate) async fn reparse_open_documents(
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
 ) {
-    let affected: Vec<(Uri, String, Option<i32>)> = state
+    let candidates: Vec<(Uri, deps_core::EcosystemId)> = state
         .documents
         .iter()
-        .filter(|entry| scope.matches(entry.value().ecosystem))
-        .map(|entry| {
-            (
-                entry.key().clone(),
-                entry.value().content.clone(),
-                entry.value().version,
-            )
+        .map(|entry| (entry.key().clone(), entry.value().ecosystem))
+        .collect();
+    let in_scope = crate::config::uris_in_scope(&scope, candidates).await;
+    let affected: Vec<(Uri, String, Option<i32>)> = in_scope
+        .iter()
+        .filter_map(|uri| {
+            state
+                .documents
+                .get(uri)
+                .map(|entry| (uri.clone(), entry.content.clone(), entry.version))
         })
         .collect();
 

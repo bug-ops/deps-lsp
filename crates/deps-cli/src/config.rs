@@ -202,8 +202,9 @@ pub enum ConfigError {
 ///
 /// - **F1**: `registries.gitlab_instance_host` redirects GitLab host resolution (it no longer
 ///   carries `GITLAB_TOKEN`, which is bound to the `GITLAB_TOKEN_HOST` environment variable),
-///   and `registries.workspace_registries = "all"` lifts `net_policy`'s SSRF gate for
-///   loopback/RFC1918/cloud-metadata hosts.
+///   and `registries.workspace_registries = "all"` lifts `net_policy`'s SSRF gate for the
+///   private hosts listed in `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` (the variable, not this
+///   setting, is the effective control, for explicit and auto-discovered configs alike).
 /// - **F1-follow-up**: `diagnostics.{mutable_ref_pin,vulnerabilities}_enabled = false` or
 ///   `network.offline = true` silently disable the exact check that would have caught a
 ///   vulnerability the same PR introduces — defeating `check`'s CI-gating purpose without

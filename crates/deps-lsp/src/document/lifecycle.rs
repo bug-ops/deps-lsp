@@ -140,10 +140,8 @@ pub async fn handle_document_open(
     // suppresses the network call itself (FR-011; issue #1517 critique S3 — an explicit
     // offline condition must degrade phase A/B the same way disabling the feature already
     // does, not attempt the network call and fail transiently instead).
-    let diagnostics_snapshot = {
-        let cfg = config.read().await;
-        diagnostics::DiagnosticsSnapshot::from_config(&cfg)
-    };
+    let diagnostics_snapshot =
+        diagnostics::DiagnosticsSnapshot::capture(&state, &uri, &config).await;
 
     // Spawn background task to fetch versions. Captured before `tokio::spawn` so this
     // task's own span (and everything it spawns in turn) nests under whichever request
@@ -509,7 +507,7 @@ async fn run_document_open_background_task(
     await_license_prefetch(license_task).await;
 
     // Publish diagnostics (may be slower, runs after hints are already visible)
-    diagnostics::publish_document_diagnostics_live(&state, &client, &uri, &config, dep_count).await;
+    diagnostics::publish_document_diagnostics(&state, &client, &uri, &config, dep_count).await;
 }
 
 /// Parses the freshly-edited manifest content and diffs its dependencies against the
@@ -856,10 +854,8 @@ pub(crate) async fn handle_document_change_guarded(
 
     // Read before any OSV request is built (FR-011; issue #1517 critique S3 — see the
     // open-path's identical read for why offline is folded in here too).
-    let diagnostics_snapshot = {
-        let cfg = config.read().await;
-        diagnostics::DiagnosticsSnapshot::from_config(&cfg)
-    };
+    let diagnostics_snapshot =
+        diagnostics::DiagnosticsSnapshot::capture(&state, &uri, &config).await;
 
     let needs_osv_rescan = diff.needs_osv_rescan();
     let deps_to_fetch = match refetch {
@@ -1335,8 +1331,7 @@ async fn run_document_change_task(
 
         await_license_prefetch(license_task).await;
 
-        diagnostics::publish_document_diagnostics_live(&state, &client, &uri, &live_config, 0)
-            .await;
+        diagnostics::publish_document_diagnostics(&state, &client, &uri, &live_config, 0).await;
         return;
     }
 
@@ -1438,8 +1433,7 @@ async fn run_document_change_task(
 
     await_license_prefetch(license_task).await;
 
-    diagnostics::publish_document_diagnostics_live(&state, &client, &uri, &live_config, dep_count)
-        .await;
+    diagnostics::publish_document_diagnostics(&state, &client, &uri, &live_config, dep_count).await;
 }
 
 /// Awaits the concurrently-spawned OSV phase-A scan, if one was started, and — when it
@@ -1509,10 +1503,9 @@ async fn await_license_prefetch(task: Option<JoinHandle<()>>) {
 /// the caller was already about to make. They differ only in which `prefetch` future they run
 /// and the `label` identifying them in the panic log.
 ///
-/// `config` is re-read for the *republish* only, right before `publish_document_diagnostics`:
-/// the pre-fetch can take up to ~10s, and reusing a spawn-time `DiagnosticsSnapshot` for that
-/// call would show the user's severity/freshness/offline settings as they were when the
-/// pre-fetch *started*, not as they are by the time it actually publishes.
+/// `publish_document_diagnostics` snapshots the live `config` itself when it publishes: the
+/// pre-fetch can take up to ~10s, and a spawn-time snapshot would show the user's
+/// severity/freshness/offline settings as they were when the pre-fetch *started*.
 ///
 /// Supervised via [`spawn_supervised`] (issue #1455 batch item 1, following #1399's precedent
 /// for detached background work) so a panic surfaces in the logs instead of vanishing
@@ -1539,13 +1532,9 @@ where
         async move {
             let changed = prefetch.await;
             if changed {
-                let snapshot = {
-                    let cfg = config.read().await;
-                    diagnostics::DiagnosticsSnapshot::from_config(&cfg)
-                };
                 let dep_count = diagnostics::document_dependency_count(&state, &uri);
                 diagnostics::publish_document_diagnostics(
-                    &state, &client, &uri, &snapshot, dep_count,
+                    &state, &client, &uri, &config, dep_count,
                 )
                 .await;
             }
@@ -1761,12 +1750,8 @@ pub(crate) async fn trigger_osv_rescan_for_open_documents(
                 .await;
                 state.spawn_refresh_requests(&client);
                 let dep_count = diagnostics::document_dependency_count(&state, &uri);
-                let snapshot = {
-                    let cfg = config.read().await;
-                    diagnostics::DiagnosticsSnapshot::from_config(&cfg)
-                };
                 diagnostics::publish_document_diagnostics(
-                    &state, &client, &uri, &snapshot, dep_count,
+                    &state, &client, &uri, &config, dep_count,
                 )
                 .await;
             }
@@ -1779,59 +1764,6 @@ pub(crate) async fn trigger_osv_rescan_for_open_documents(
             },
         );
     }
-}
-
-/// Republishes diagnostics for every currently open document under the current config
-/// (issue #1794) — for a `workspace/didChangeConfiguration` that changes no parse-affecting
-/// setting, so no reparse runs, and whose client cannot be told to pull via
-/// `workspace/diagnostic/refresh`: a push-only client would otherwise keep the old
-/// diagnostics (or severities) until the next edit or reopen.
-///
-/// A single detached [`spawn_supervised`] task, since generating diagnostics for a
-/// still-loading document can wait up to its loading ceiling.
-pub(crate) fn republish_diagnostics_for_open_documents(
-    state: &Arc<ServerState>,
-    client: &Client,
-    config: Arc<RwLock<DepsConfig>>,
-) {
-    let state = Arc::clone(state);
-    let client = client.clone();
-    spawn_supervised(
-        async move {
-            let snapshot = {
-                let cfg = config.read().await;
-                diagnostics::DiagnosticsSnapshot::from_config(&cfg)
-            };
-            let uris: Vec<Uri> = state
-                .documents
-                .iter()
-                .map(|entry| entry.key().clone())
-                .collect();
-            for uri in uris {
-                // A loading document's own fetch task publishes when it finishes.
-                if state
-                    .with_document(&uri, |doc| {
-                        doc.loading_state() == deps_core::LoadingState::Loading
-                    })
-                    .unwrap_or(true)
-                {
-                    continue;
-                }
-                let dep_count = diagnostics::document_dependency_count(&state, &uri);
-                diagnostics::publish_document_diagnostics(
-                    &state, &client, &uri, &snapshot, dep_count,
-                )
-                .await;
-            }
-        }
-        .instrument(tracing::Span::current()),
-        |e| {
-            tracing::error!(
-                "diagnostics republish after configuration change panicked ({e}); open \
-                 documents may show stale diagnostics until their next edit or reopen"
-            );
-        },
-    );
 }
 
 /// Ensures a document is loaded in state.

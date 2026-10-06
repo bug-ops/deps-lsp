@@ -225,7 +225,7 @@ async fn run_listener(
             let config = Arc::clone(&config);
             let ecosystem = Arc::clone(&ecosystem);
             async move {
-                let snapshot = DiagnosticsSnapshot::from_config(&*config.read().await);
+                let snapshot = DiagnosticsSnapshot::capture(&state, &uri, &config).await;
                 rescan_then_republish(
                     &state,
                     &uri,
@@ -239,7 +239,7 @@ async fn run_listener(
                     async {
                         let dep_count = diagnostics::document_dependency_count(&state, &uri);
                         diagnostics::publish_document_diagnostics(
-                            &state, &client, &uri, &snapshot, dep_count,
+                            &state, &client, &uri, &config, dep_count,
                         )
                         .await;
                     },
