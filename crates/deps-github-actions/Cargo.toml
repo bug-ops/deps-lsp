@@ -20,13 +20,12 @@ workspace = true
 # `deps-engine` (see its own `lsp-responses` feature doc). `deps-lsp` requests it
 # explicitly, directly or via `deps-engine`'s own `lsp-responses`; `deps-cli` never does,
 # keeping `tower-lsp-server` out of its dependency tree.
-lsp-responses = ["dep:serde_json", "dep:tower-lsp-server", "deps-core/lsp-responses"]
+lsp-responses = ["dep:tower-lsp-server", "deps-core/lsp-responses"]
 
 [dependencies]
 dashmap = { workspace = true }
 deps-core = { workspace = true }
 semver = { workspace = true }
-serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["macros", "sync"] }
 tower-lsp-server = { workspace = true, optional = true }
 tracing = { workspace = true }
