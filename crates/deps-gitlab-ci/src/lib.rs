@@ -32,7 +32,8 @@
 //!
 //! A SHA pin may carry a trailing `# vX` comment naming its tag. The pin's range spans the
 //! SHA and the comment, an update rewrites both, and a comment that does not name the pinned
-//! commit's tag is reported as `sha-comment-mismatch`.
+//! commit's tag is reported as `sha-comment-mismatch`. A `project:` tag `ref:` that is a full
+//! release no tag of the complete Tags list matches is reported as `unknown-ref`.
 //!
 //! `include: - template: ...` and `include: - remote: ...` are recognized and skipped
 //! (spec FR-003) — not version-pinnable. `image:`/`services:` Docker tags are out of scope

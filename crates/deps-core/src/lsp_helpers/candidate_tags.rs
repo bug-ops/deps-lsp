@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use super::in_use_version::queryable_siblings;
 use super::{InUseVersions, SiblingScope, TagIndex};
+use crate::pagination::ListCoverage;
 use crate::{ConcreteVersion, EcosystemId};
 
 mod private {
@@ -25,6 +26,12 @@ mod private {
 pub trait TaggedVersions: private::Sealed {
     /// The sibling tags, lowest version first. Never includes the target's own version.
     fn siblings(&self) -> &[ConcreteVersion];
+
+    /// Whether [`Self::siblings`] was read from a complete tag list.
+    ///
+    /// A [`ListCoverage::Truncated`] list may be missing sibling tags, so a clean OSV answer
+    /// for the target is not authoritative.
+    fn sibling_coverage(&self) -> ListCoverage;
 }
 
 impl private::Sealed for InUseVersions {}
@@ -32,6 +39,10 @@ impl private::Sealed for InUseVersions {}
 impl TaggedVersions for InUseVersions {
     fn siblings(&self) -> &[ConcreteVersion] {
         Self::siblings(self)
+    }
+
+    fn sibling_coverage(&self) -> ListCoverage {
+        Self::sibling_coverage(self)
     }
 }
 
@@ -53,14 +64,26 @@ impl TaggedVersions for InUseVersions {
 /// assert!(siblings.siblings().is_empty());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CandidateSiblings(Vec<ConcreteVersion>);
+pub struct CandidateSiblings(Vec<ConcreteVersion>, ListCoverage);
 
 impl CandidateSiblings {
     /// Builds a value without a tag index, for tests of consumers in other crates.
+    ///
+    /// The sibling list is reported complete.
     #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub const fn for_test(siblings: Vec<ConcreteVersion>) -> Self {
-        Self(siblings)
+        Self(siblings, ListCoverage::Complete)
+    }
+
+    /// Like [`Self::for_test`], with an explicit sibling coverage.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub const fn for_test_with_coverage(
+        siblings: Vec<ConcreteVersion>,
+        coverage: ListCoverage,
+    ) -> Self {
+        Self(siblings, coverage)
     }
 }
 
@@ -69,6 +92,10 @@ impl private::Sealed for CandidateSiblings {}
 impl TaggedVersions for CandidateSiblings {
     fn siblings(&self) -> &[ConcreteVersion] {
         &self.0
+    }
+
+    fn sibling_coverage(&self) -> ListCoverage {
+        self.1
     }
 }
 
@@ -105,7 +132,6 @@ pub enum CandidateTagSource {
     NotYetIndexed,
 }
 
-// TODO(#1769): decide phase A and phase B together whether a truncated index must fail closed.
 impl CandidateTagSource {
     /// A source for a dependency pinned to a commit: every release tag on the candidate's
     /// commit is a sibling, across majors.
@@ -159,9 +185,9 @@ impl CandidateTagSource {
     /// error, not an empty list. Each sibling passes the same queryability gate as an in-use
     /// version for `ecosystem`.
     ///
-    /// A candidate found in a [`crate::pagination::ListCoverage::Truncated`] index gets the
-    /// siblings that were listed, which may be incomplete; phase A's pin resolution has the same
-    /// limitation (#1769).
+    /// A candidate found in a [`ListCoverage::Truncated`] index gets the siblings that were
+    /// listed, which may be incomplete; the returned [`CandidateSiblings`] says so through
+    /// [`TaggedVersions::sibling_coverage`], and the scan then fails closed on a clean answer.
     ///
     /// # Errors
     ///
@@ -199,7 +225,7 @@ impl CandidateTagSource {
         ecosystem: EcosystemId,
     ) -> Result<CandidateSiblings, CandidateSiblingsUnknown> {
         match self {
-            Self::NotTagBased => Ok(CandidateSiblings(Vec::new())),
+            Self::NotTagBased => Ok(CandidateSiblings(Vec::new(), ListCoverage::Complete)),
             Self::NotYetIndexed => Err(CandidateSiblingsUnknown),
             Self::Indexed { index, scope } => {
                 let tag = index
@@ -208,7 +234,10 @@ impl CandidateTagSource {
                 let pin = index
                     .resolved_release(tag, *scope)
                     .ok_or(CandidateSiblingsUnknown)?;
-                Ok(CandidateSiblings(queryable_siblings(&pin, ecosystem)))
+                Ok(CandidateSiblings(
+                    queryable_siblings(&pin, ecosystem),
+                    index.coverage(),
+                ))
             }
         }
     }
@@ -319,6 +348,19 @@ mod tests {
             };
             assert_eq!(gha(&source, "v9.9.9"), Err(()), "{coverage:?}");
         }
+    }
+
+    /// `TagIndex::release_commit` prefers an exact key even against a conflicting twin; the
+    /// vulnerability-fix path stays safe only because verifying that fix target as a candidate
+    /// reads `release_tag`, which refuses the ambiguity, so no SHA rewrite is ever planned.
+    #[test]
+    fn conflicting_twin_spellings_leave_the_fix_target_unverifiable() {
+        let source = indexed(&[("4.1.3", 'b'), ("v4.1.3", 'a')], SiblingScope::SameMajor);
+        let CandidateTagSource::Indexed { index, .. } = &source else {
+            unreachable!("indexed() builds an Indexed source");
+        };
+        assert!(index.release_commit("4.1.3").is_some());
+        assert_eq!(gha(&source, "4.1.3"), Err(()));
     }
 
     #[test]

@@ -220,6 +220,7 @@ pub use redact::secret;
 /// [`selection::SelectionContext`]/[`selection::StabilityFloor`]: manifest-scoped
 /// selection state (#1444).
 pub mod selection;
+pub mod tag_index_refresh;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 pub mod version_matcher;
@@ -312,6 +313,7 @@ pub use registry::{
 pub use selection::{
     InvalidStabilityOccurrence, SelectionContext, StabilityFloor, UnknownStability,
 };
+pub use tag_index_refresh::{TagIndexKey, TagIndexRefreshSender};
 pub use version_matcher::{
     Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,
     normalize_and_parse_version, normalize_operator_spacing,

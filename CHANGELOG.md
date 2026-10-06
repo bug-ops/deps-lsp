@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `TagIndex::pin_resolution` and `ShaPinLookup::resolve` take the pin's comment tag; `PinResolution`, `ShaPinLookup` and `CommentMismatch` gain a comment-contradicted variant; `ShaPinComment::new` takes the tag range (#1770)
 - **deps-gitlab-ci**: `PinStyle::Sha` carries the pinned `CommitSha`; `sha_pin_replacement_for` takes a `CommentSlot`; `GitlabCiDependency` gains `comment_slot` (#1770)
 - **deps-cli**: `Category::ShaCommentMismatch` added for `--fail-on sha-comment-mismatch` (#1770)
+- **deps-core**: `PinResolution::Resolved` gains `sibling_coverage` and `Unlisted` is added; `ShaPinLookup::status` becomes `status_or_text`; `proves_ahead_tag_absent` becomes `unpublished_tag_ref` (#1783)
+- **deps-core**: sibling-tag coverage added to `InUseVersions`, `CandidateSiblings` and `ScanTarget`; `via_sibling_tags` added to `CandidateVulnerable` and `LatestVerdict::Flagged`; `unknown_ref` added to the diagnostic severities (#1783)
+- **deps-cli**: `Category::UnknownRef`, `PlannedUpdateItem::osv_sibling_match` and `UpdateItemDocument::matched_tags` added (#1783)
+- **deps-core**: `DiagnosticsConfig::unknown_ref_severity` added, so struct-literal construction no longer compiles (#1783)
 - **deps-lsp**: `ServerState.osv_latest_check_enabled`, `is_osv_latest_check_enabled` and `set_osv_latest_check_enabled` are replaced by `osv_checks`/`set_osv_checks` over the typed `OsvChecks` (#1774, #1776)
 - **deps-core**: `HttpCache` extra-header parameters take `RequestHeader` instead of `(HeaderName, &str)` (#1772, #1776)
 - **deps-core**: `PolicyConfigDiff` and `RegistryRuntimeSettings` gain a Swift Keychain field, and `RegistriesConfig` gains `swift_keychain_credentials` (#1771, #1776)
@@ -44,10 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gitlab-ci**: `Correct version comment to <tag>` quickfix for SHA pins (#1770)
 - **deps-core**: shared `lsp_helpers::sha_comment` module (SHA-pin trailing-comment read, check and rewrite) used by GitHub Actions and GitLab CI (#1764)
 - **deps-core, deps-github-actions**: `Ecosystem::tag_index_refreshes` and `GithubActionsRegistry::subscribe_tag_refreshes` publish tag-index refresh events (#1764)
+- **deps-core, deps-gitlab-ci, deps-lsp**: GitLab CI publishes tag-index refresh events, rescanning other open documents (#1783)
+- **deps-github-actions, deps-gitlab-ci, deps-cli**: `unknown-ref` diagnostic, `diagnostics.unknown_ref_severity` and `--fail-on unknown-ref` for tag pins no published tag matches (#1783)
+- **deps-core, deps-cli**: flagged latest candidates name the sibling release tags they match in hover, diagnostics and `update` (#1783)
 
 ### Changed
 - **deps-core, deps-lsp, deps-cli**: one typed `OsvChecks` gate (`Active`/`Inactive`) for every OSV call site instead of repeated `vulnerabilities_enabled && !offline` conditions and OSV booleans (#1775, #1774, #1776)
 - **deps-github-actions, deps-gitlab-ci**: a tag pin ahead of the latest release is reported up to date instead of offering a downgrade (#1751)
+- **deps-core, deps-github-actions, deps-gitlab-ci**: a truncated tag list fails closed instead of reading a pin as up to date or an OSV answer as clean (#1783)
+- **deps-github-actions, deps-gitlab-ci**: a full-release tag pin no published tag matches reads unresolved instead of up to date (#1783)
 - **deps-cli**: `update --security-only` Unfixable rows (`Yanked`, `UnsupportedRequirementShape`, `OversizedRequirement`) now report their `advisory_ids` (#1747)
 - **deps-composer**: OR-branch bounds are computed once when `ComposerMatcher` is built, as in `deps-npm`; behavior unchanged (#1747)
 - **deps-swift**: `Package.resolved` pins map by `kind` (`registry` to a registry source, unknown kinds skipped instead of read as Git) and `SwiftRegistry` routes by dependency source, failing closed for unresolved `id:` sources (#1763)
@@ -55,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-engine, deps-github-actions**: OSV latest, candidate and fix-target checks cover the sibling release tags of the candidate commit and fail closed when they are unknown (#1775)
+- **deps-github-actions, deps-gitlab-ci**: a vulnerability fix version `4.1.3` now rewrites a SHA pin to tag `v4.1.3` (#1783)
 - **deps-cli**: SARIF advisory rule description no longer carries a per-result sibling-tag note (#1775)
 - **deps-swift**: reparse only for the project `.swiftpm/configuration/registries.json`, not any file named `registries.json` (#1775)
 - **deps-github-actions**: pre-release tag pins (`@v2-beta`, `@v3.0.0-rc.1`) are reported outdated against a newer release (#1751)
@@ -473,7 +483,7 @@ CI catch-net once B3 actually lands) is in effect.
 - **deps-core**: `net_policy`'s credential-redaction fallback (`redact_authority_suffix`/`redact_colon_credential`) now keeps scanning past an already-masked `@`-shaped or colon-only credential instead of stopping at the first match, closing three leak gaps with no `O(n²)` regression (resolves #870, #873, #874) (#881); #875 remains open as a separate, narrower residual gap.
 - **deps-core, deps-github-actions, deps-gitlab-ci**: workflow/GitLab CI YAML `uses:`/`ref:`/`project:`/`include:` references after a block scalar (`|`/`>`) containing a non-ASCII character no longer vanish from hover/diagnostics/completion/code lens — upstream `yaml-rust2`'s `Marker::index()` desyncs from a true byte offset inside such block scalars; resolution now uses `Marker::line()`/`col()` instead (resolves #879) (#883)
 - **deps-core**: `net_policy::redact_userinfo` now anchors on the first (not nearest) `://` preceding a credential, so a credential behind multiple stacked scheme separators is no longer left unredacted (resolves #871) (#877)
-- **deps-core**: fixed a `net_policy::redact_userinfo` scan-anchor bug that let a later `://`/`@`/`?`/`#` boundary hide a leaked credential in tracing/error output (resolves #862) (#TBD); residual known gaps tracked separately as #870, #873, #874, #875 (a gate for #875 was tried and reverted — it traded a P4 cosmetic over-redaction for a real credential-leak regression).
+- **deps-core**: fixed a `net_policy::redact_userinfo` scan-anchor bug that let a later `://`/`@`/`?`/`#` boundary hide a leaked credential in tracing/error output (resolves #862) (#1783); residual known gaps tracked separately as #870, #873, #874, #875 (a gate for #875 was tried and reverted — it traded a P4 cosmetic over-redaction for a real credential-leak regression).
 - **deps-core**: `net_policy::redact_userinfo`/`url_for_tracing` now redact a second, independent colon-shaped credential sitting after an already-masked userinfo `@` instead of leaving it untouched (resolves #869) (#872)
 - **deps-core**: `net_policy::url_for_tracing` now truncates the query string/fragment before redacting, so a credential-shaped `@` inside the query can no longer swallow the `?`/`#` boundary and leak the rest of the query unredacted (resolves #866) (#872)
 - **deps-core**: `net_policy::redact_userinfo` now fully redacts an `@` embedded inside a password for opaque-path (`scheme:/path`) values, closing a partial credential leak (resolves #859) (#865)

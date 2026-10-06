@@ -47,6 +47,7 @@ enum PlannedQuery {
         name: deps_core::osv::OsvQueryName,
         version: deps_core::osv::OsvVersion,
         siblings: Vec<deps_core::osv::OsvVersion>,
+        sibling_coverage: deps_core::pagination::ListCoverage,
     },
     Skip(deps_core::osv::SkipReason),
 }
@@ -77,6 +78,7 @@ impl OsvScanPlan {
                         .iter()
                         .map(|s| s.version().clone())
                         .collect(),
+                    sibling_coverage: target.sibling_coverage(),
                 },
             )
         });
@@ -2716,6 +2718,22 @@ mod tests {
             tags: &[(&str, &CommitSha)],
             canonical_commit_url: &str,
         ) {
+            land_tags_with_coverage(
+                ecosystem,
+                name,
+                tags,
+                canonical_commit_url,
+                deps_core::pagination::ListCoverage::Complete,
+            );
+        }
+
+        fn land_tags_with_coverage(
+            ecosystem: &Arc<dyn Ecosystem>,
+            name: &str,
+            tags: &[(&str, &CommitSha)],
+            canonical_commit_url: &str,
+            coverage: deps_core::pagination::ListCoverage,
+        ) {
             let registry = ecosystem.registry();
             registry
                 .as_any()
@@ -2730,9 +2748,81 @@ mod tests {
                                 deps_core::github::CanonicalRepoName::from_commit_url(
                                     canonical_commit_url,
                                 ),
-                            ),
+                            )
+                            .with_coverage(coverage),
                     ),
                 );
+        }
+
+        /// #1769: a refetch that only flips the tag list from complete to truncated changes the
+        /// scan plan's sibling coverage, so the rescan runs and the stale clean answer is
+        /// downgraded instead of surviving.
+        #[tokio::test]
+        async fn coverage_only_refresh_to_truncated_rescans_and_downgrades_clean() {
+            use deps_core::pagination::ListCoverage;
+
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let _batch = server
+                .mock("POST", "/v1/querybatch")
+                .with_status(200)
+                .with_body(r#"{"results":[{}]}"#)
+                .expect_at_least(1)
+                .create_async()
+                .await;
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+            let (state, uri, ecosystem) = open_gha_document(
+                server.url(),
+                "steps:\n  - uses: azure/setup-kubectl@v4.1.2\n",
+            )
+            .await;
+            let commit = CommitSha::parse(&"a".repeat(40)).unwrap();
+            let canonical = "https://api.github.com/repos/Azure/setup-kubectl/commits/abc";
+            land_tags(
+                &ecosystem,
+                "azure/setup-kubectl",
+                &[("v4.1.2", &commit)],
+                canonical,
+            );
+
+            scan_and_commit(&state, &uri, &ecosystem).await;
+            let key = deps_core::test_util::vuln_key("azure/setup-kubectl");
+            assert_matches!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .signals
+                    .vulnerabilities
+                    .get(&key),
+                Some(deps_core::osv::ScanOutcome::Clean)
+            );
+
+            land_tags_with_coverage(
+                &ecosystem,
+                "azure/setup-kubectl",
+                &[("v4.1.2", &commit)],
+                canonical,
+                ListCoverage::Truncated,
+            );
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_matches!(
+                doc.signals.vulnerabilities.get(&key),
+                Some(deps_core::osv::ScanOutcome::Skipped(
+                    deps_core::osv::SkipReason::SiblingTagsUnknown
+                )),
+                "{:?}",
+                doc.signals.vulnerabilities
+            );
+            assert_matches!(
+                doc.signals.osv_scan_plan.0.get(&key),
+                Some(PlannedQuery::Query {
+                    sibling_coverage: ListCoverage::Truncated,
+                    ..
+                })
+            );
         }
 
         /// #1694: a hit under the written name lands before any tags do, and is re-queried

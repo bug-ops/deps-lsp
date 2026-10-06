@@ -219,7 +219,8 @@ impl Ecosystem for GithubActionsEcosystem {
     /// diagnostic, since `DiagnosticSeverity` has no suppression value.
     ///
     /// Also appends the SHA-comment-mismatch diagnostic (issue #1722), which is not gated on
-    /// `mutable_ref_pin_enabled`: it only fires for a provable mismatch.
+    /// `mutable_ref_pin_enabled`: it only fires for a provable mismatch, and the unknown-ref
+    /// diagnostic (#1766) for a tag pin that is a full release no published tag matches.
     fn generate_diagnostics<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -248,6 +249,11 @@ impl Ecosystem for GithubActionsEcosystem {
             diagnostics.extend(sha_comment_mismatch_diagnostics(
                 parse_result,
                 severities.sha_comment_mismatch,
+                &self.formatter,
+            ));
+            diagnostics.extend(unknown_ref_diagnostics(
+                parse_result,
+                severities.unknown_ref,
                 &self.formatter,
             ));
             diagnostics
@@ -368,8 +374,9 @@ impl Ecosystem for GithubActionsEcosystem {
 
             use deps_core::lsp_helpers::{PinResolution, RequirementResolution};
             let resolved_tag = match self.formatter.resolved_pin_version(dep) {
-                PinResolution::Resolved(pin) => Some(pin.version().as_str().to_string()),
+                PinResolution::Resolved { pin, .. } => Some(pin.version().as_str().to_string()),
                 PinResolution::Unresolved
+                | PinResolution::Unlisted
                 | PinResolution::Untagged
                 | PinResolution::CommentContradicted => None,
             };
@@ -590,6 +597,38 @@ fn sha_comment_mismatch_diagnostics(
                 &mismatch,
                 severity,
             ))
+        })
+        .collect()
+}
+
+/// Builds one unknown-ref [`Diagnostic`] (#1766) per tag-pinned step whose ref is a full
+/// release that the repository's complete tag list lacks (`actions/checkout@4.3.1` beside tag
+/// `v4.3.1`).
+///
+/// A partial shape (`@v1`, `@v40`, `@v3-node20`) may be a branch, so it is never reported even
+/// though its status is capped; emits nothing on a cold, empty or truncated index.
+fn unknown_ref_diagnostics(
+    parse_result: &dyn ParseResultTrait,
+    severity: Severity,
+    formatter: &GithubActionsFormatter,
+) -> Vec<Diagnostic> {
+    parse_result
+        .dependencies()
+        .into_iter()
+        .filter_map(|dep| {
+            let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+            if gha_dep.pin != Some(PinStyle::Tag) {
+                return None;
+            }
+            let written = gha_dep.version_req.as_ref()?.as_str();
+            let index = formatter.tag_index.get(&gha_dep.name)?;
+            deps_core::lsp_helpers::unknown_ref_diagnostic_for(
+                &index,
+                &gha_dep.name,
+                written,
+                gha_dep.version_range?,
+                severity,
+            )
         })
         .collect()
 }
@@ -2668,10 +2707,11 @@ mod tests {
             assert!(comment_fix_at(&cold, &content, 1).is_none());
         }
 
-        async fn sha_comment_diagnostics(
+        async fn diagnostics_with_code(
             eco: &GithubActionsEcosystem,
             content: &str,
             severities: deps_core::lsp_helpers::DiagnosticSeverities,
+            code: &str,
         ) -> Vec<Diagnostic> {
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
@@ -2690,8 +2730,108 @@ mod tests {
             )
             .await
             .into_iter()
-            .filter(|d| d.code() == Some(SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE))
+            .filter(|d| d.code() == Some(code))
             .collect()
+        }
+
+        async fn unknown_ref_diagnostics_for(
+            eco: &GithubActionsEcosystem,
+            content: &str,
+            severities: deps_core::lsp_helpers::DiagnosticSeverities,
+        ) -> Vec<Diagnostic> {
+            diagnostics_with_code(
+                eco,
+                content,
+                severities,
+                deps_core::lsp_helpers::UNKNOWN_REF_DIAGNOSTIC_CODE,
+            )
+            .await
+        }
+
+        /// #1766: only a full release the complete tag list lacks is reported, at the configured
+        /// severity; partial shapes (possible branch pins, `@v40` included) never are.
+        #[tokio::test]
+        async fn test_unknown_ref_diagnostic_only_for_unpublished_full_release() {
+            let (eco, name, [a, ..]) = mismatch_fixture();
+            let content = format!(
+                "steps:\n\
+                 \x20 - uses: {name}@2.87.22\n\
+                 \x20 - uses: {name}@v2.87.99\n\
+                 \x20 - uses: {name}@v2.87.22\n\
+                 \x20 - uses: {name}@v1\n\
+                 \x20 - uses: {name}@v40\n\
+                 \x20 - uses: {name}@v3.4.0-working\n\
+                 \x20 - uses: {name}@v3-node20\n\
+                 \x20 - uses: {name}@{a}\n"
+            );
+
+            let found = unknown_ref_diagnostics_for(
+                &eco,
+                &content,
+                deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            )
+            .await;
+            let lines: Vec<u32> = found.iter().map(|d| d.range.start.line).collect();
+            assert_eq!(lines, [1, 2], "{found:?}");
+            assert!(found.iter().all(|d| d.severity == Some(Severity::Warning)));
+            assert_eq!(
+                found[0].message(),
+                "`2.87.22` is not a published tag of owner/action"
+            );
+            assert_eq!(found[0].range.start.character, 23);
+            assert_eq!(found[0].range.end.character, 30);
+
+            let hint = unknown_ref_diagnostics_for(
+                &eco,
+                &content,
+                deps_core::lsp_helpers::DiagnosticSeverities::default()
+                    .with_unknown_ref(Severity::Hint),
+            )
+            .await;
+            assert!(hint.iter().all(|d| d.severity == Some(Severity::Hint)));
+        }
+
+        /// #1766: a cold, empty or truncated tag list proves nothing, so nothing is reported.
+        #[tokio::test]
+        async fn test_unknown_ref_diagnostic_silent_without_a_complete_tag_list() {
+            let content = "steps:\n  - uses: owner/action@2.87.22\n";
+            let severities = deps_core::lsp_helpers::DiagnosticSeverities::default();
+
+            let cold = GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+            assert!(
+                unknown_ref_diagnostics_for(&cold, content, severities)
+                    .await
+                    .is_empty()
+            );
+
+            let (eco, ..) = mismatch_fixture();
+            let sha = deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap();
+            eco.formatter.tag_index.insert(
+                deps_core::PackageName::new("owner/action"),
+                Arc::new(
+                    TagIndex::from_tags([("v2.87.20", &sha)])
+                        .with_coverage(deps_core::pagination::ListCoverage::Truncated),
+                ),
+            );
+            assert!(
+                unknown_ref_diagnostics_for(&eco, content, severities)
+                    .await
+                    .is_empty()
+            );
+        }
+
+        async fn sha_comment_diagnostics(
+            eco: &GithubActionsEcosystem,
+            content: &str,
+            severities: deps_core::lsp_helpers::DiagnosticSeverities,
+        ) -> Vec<Diagnostic> {
+            diagnostics_with_code(
+                eco,
+                content,
+                severities,
+                SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE,
+            )
+            .await
         }
 
         /// #1722: exactly the provable mismatches are reported, at the configured severity,

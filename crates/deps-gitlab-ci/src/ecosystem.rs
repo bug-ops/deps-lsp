@@ -18,6 +18,7 @@ use deps_core::{
     lsp_helpers::{
         CommentCheck, EcosystemFormatter, MAX_DIAGNOSTIC_VALUE_CHARS,
         sanitize_and_truncate_for_diagnostic, sha_comment_mismatch_diagnostic,
+        unknown_ref_diagnostic_for,
     },
 };
 use std::any::Any;
@@ -255,6 +256,12 @@ impl Ecosystem for GitlabCiEcosystem {
         self.registry.clone() as Arc<dyn Registry>
     }
 
+    /// Emits a project's name whenever a tags or releases fetch first populates its tag index
+    /// or observably changes it; see [`GitlabCiRegistry::subscribe_tag_refreshes`].
+    fn tag_index_refreshes(&self) -> Option<deps_core::TagIndexRefreshes> {
+        Some(self.registry.subscribe_tag_refreshes())
+    }
+
     fn formatter(&self) -> &dyn EcosystemFormatter {
         &self.formatter
     }
@@ -356,6 +363,11 @@ impl Ecosystem for GitlabCiEcosystem {
             diagnostics.extend(sha_comment_mismatch_diagnostics(
                 parse_result,
                 severities.sha_comment_mismatch,
+                &self.formatter,
+            ));
+            diagnostics.extend(unknown_ref_diagnostics(
+                parse_result,
+                severities.unknown_ref,
                 &self.formatter,
             ));
             if severities.mutable_ref_pin_enabled {
@@ -783,6 +795,36 @@ fn sha_comment_mismatch_diagnostics(
         .collect()
 }
 
+/// One unknown-ref diagnostic (#1766) per `project:` include whose `ref:` is a full release
+/// the complete Tags list lacks; silent for a partial shape (it may be a branch), a
+/// `component:` include (a version without a release is not a missing tag), and a cold, empty
+/// or truncated list.
+fn unknown_ref_diagnostics(
+    parse_result: &dyn ParseResultTrait,
+    severity: Severity,
+    formatter: &GitlabCiFormatter,
+) -> Vec<Diagnostic> {
+    parse_result
+        .dependencies()
+        .into_iter()
+        .filter_map(|dep| {
+            let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
+            if gl_dep.pin != Some(PinStyle::Tag) {
+                return None;
+            }
+            let written = gl_dep.version_req.as_ref()?.as_str();
+            let index = formatter.tag_list_index(gl_dep)?;
+            unknown_ref_diagnostic_for(
+                &index,
+                &gl_dep.name,
+                written,
+                gl_dep.version_range?,
+                severity,
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 // Fixtures are single-line ASCII literals with hand-computed byte offsets.
 #[allow(clippy::string_slice)]
@@ -790,6 +832,12 @@ mod tests {
     use super::*;
     use crate::types::EndpointKind;
     use dashmap::DashMap;
+
+    #[test]
+    fn test_ecosystem_exposes_tag_index_refreshes() {
+        let ecosystem = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
+        assert!(ecosystem.tag_index_refreshes().is_some());
+    }
 
     /// Spec 076 FR-025/SC-018 (T005): GitLab CI has no compiled requirement model at all —
     /// `fallback_edit_excludes_newer`'s check a0 (`OriginalUncompilable`) rejects it before
@@ -1974,6 +2022,7 @@ mod tests {
                 Arc::new(DashMap::new());
             let sha = "a".repeat(40);
             crate::registry::populate_tag_index_entries(
+                &deps_core::TagIndexRefreshSender::new(),
                 &tag_index,
                 (
                     EndpointKind::Tags,
@@ -3471,6 +3520,14 @@ mod tests {
             }
 
             async fn diagnostics(&self) -> Vec<Diagnostic> {
+                self.diagnostics_with(deps_core::lsp_helpers::DiagnosticSeverities::default())
+                    .await
+            }
+
+            async fn diagnostics_with(
+                &self,
+                severities: deps_core::lsp_helpers::DiagnosticSeverities,
+            ) -> Vec<Diagnostic> {
                 let resolved = std::collections::HashMap::new();
                 self.eco
                     .generate_diagnostics(
@@ -3478,7 +3535,7 @@ mod tests {
                         deps_core::VersionData::new(&self.cached, &resolved),
                         &self.uri,
                         deps_core::FreshnessSettings::default(),
-                        deps_core::lsp_helpers::DiagnosticSeverities::default(),
+                        severities,
                     )
                     .await
             }
@@ -3726,6 +3783,70 @@ mod tests {
                 "{}",
                 hover.markdown()
             );
+        }
+
+        /// #1766: a `project:` tag pin that is a full release the complete Tags list lacks is
+        /// reported; a partial shape (possibly a branch) and a listed tag are not.
+        #[tokio::test]
+        async fn test_unknown_ref_diagnostic_for_unpublished_full_release_only() {
+            let codes = |ref_text: &str| {
+                let content = project_pin(ref_text);
+                async move {
+                    let fixture =
+                        CommentFixture::new(&content, &v117_v120_tags(), "v1.120.0").await;
+                    fixture
+                        .diagnostics()
+                        .await
+                        .into_iter()
+                        .filter(|d| {
+                            d.code() == Some(deps_core::lsp_helpers::UNKNOWN_REF_DIAGNOSTIC_CODE)
+                        })
+                        .collect::<Vec<_>>()
+                }
+            };
+
+            let missing = codes("v1.119.0").await;
+            assert_eq!(missing.len(), 1, "{missing:?}");
+            assert_eq!(missing[0].severity, Some(Severity::Warning));
+            assert!(
+                missing[0]
+                    .message()
+                    .contains("`v1.119.0` is not a published tag")
+            );
+            assert_eq!(missing[0].range.start.line, 2);
+
+            for silent in ["v1.120.0", "v1", "v40", "v1.119.0-working", "main"] {
+                assert!(codes(silent).await.is_empty(), "{silent}");
+            }
+        }
+
+        /// #1766: a `component:` include is resolved through the Releases endpoint, which never
+        /// proves a tag missing, so a version without a release is not reported.
+        #[tokio::test]
+        async fn test_unknown_ref_not_reported_for_component_include() {
+            let content = "include:\n  - component: gitlab.com/org/proj/comp@1.119.0\n";
+            let fixture = CommentFixture::new(content, &v117_v120_tags(), "v1.120.0").await;
+            assert!(fixture.diagnostics().await.iter().all(|d| {
+                d.code() != Some(deps_core::lsp_helpers::UNKNOWN_REF_DIAGNOSTIC_CODE)
+            }));
+        }
+
+        /// #1766: `diagnostics.unknown_ref_severity` sets the diagnostic's severity.
+        #[tokio::test]
+        async fn test_unknown_ref_severity_override() {
+            let content = project_pin("v1.119.0");
+            let fixture = CommentFixture::new(&content, &v117_v120_tags(), "v1.120.0").await;
+            let found: Vec<_> = fixture
+                .diagnostics_with(
+                    deps_core::lsp_helpers::DiagnosticSeverities::default()
+                        .with_unknown_ref(Severity::Error),
+                )
+                .await
+                .into_iter()
+                .filter(|d| d.code() == Some(deps_core::lsp_helpers::UNKNOWN_REF_DIAGNOSTIC_CODE))
+                .collect();
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].severity, Some(Severity::Error));
         }
 
         #[tokio::test]

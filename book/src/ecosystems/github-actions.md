@@ -64,13 +64,18 @@ it to the latest release (effectively a downgrade).
 A pin whose SHA is absent from the loaded tag index is reported outdated even when it carries a
 version comment, since the comment cannot make a non-release commit the latest release. The
 "absent" verdict is only drawn from a complete tag list: a repository with more tags than the
-fetch cap (30 pages of 100) yields a truncated index, and a SHA missing from it stays
-unverifiable (comment trusted, no mismatch diagnostic) instead of being called outdated. The one
-exception is a comment naming a full version (`# v4.2.0`) that the truncated index maps to a
-different commit: that comment is provably wrong, so it is not trusted, the status is unresolved
-and the `sha-comment-mismatch` diagnostic fires. Tags are matched by version, so `# 4.2.0`,
-`# V4.2.0` and `# v4.2.0+build` are contradicted by the tag `v4.2.0` as well. A comment naming a
-version the truncated index does not list stays unverifiable.
+fetch cap (30 pages of 100) yields a truncated index, and a SHA missing from it is never called
+outdated nor proven current: the comment may still stand in for its status, but only short of up to
+date (an up-to-date comment, whatever its shape, reads unresolved), and no mismatch diagnostic is
+raised. The one exception is a comment naming a full version (`# v4.2.0`) that the truncated index
+maps to a different commit: that comment is provably wrong, so it is not trusted, the status is
+unresolved and the `sha-comment-mismatch` diagnostic fires. Tags are matched by version, so
+`# 4.2.0`, `# V4.2.0` and `# v4.2.0+build` are contradicted by the tag `v4.2.0` as well. A comment
+naming a version the truncated index does not list stays unverifiable, with the same cap on its
+status. An exact tag pin (`@v4.8.0`) missing from a truncated index is capped the same way,
+and so is a floating partial pin (`@v1`) the list does not contain: a truncated list proves a tag
+is present, never that it is absent, so such a pin reads unresolved where a complete index would
+read it by the usual moving-line rule.
 
 A SHA pin whose commit is tagged only by a floating tag below the latest release (`v1` or `1.1`
 while the latest is `v1.1.0` on another commit) is reported outdated (issue #1730). A tag at or
@@ -120,6 +125,35 @@ release is reported up to date, unless the tag index is complete and has no such
 typo or a deleted tag): that pin is unresolved, never outdated, so no downgrade is offered. A
 branch named like a version and ahead of the latest release reads the same way. Refs that are not on a version line (`@v1.x`, `@v3-node20`) are
 never reported outdated. SHA pins are matched case-insensitively and shown in lowercase.
+
+### Unpublished refs and the `unknown-ref` diagnostic (issue #1766)
+
+Tag refs are exact, so `@4.3.1` names nothing in a repository that only tags `v4.3.1`. When the
+repository's tag list is complete, a tag pin whose exact text matches no tag is an unpublished
+ref, and what it means depends on its shape:
+
+- A **full release** (`@4.3.1`, `@v4.3.10`, `@v5.0.0-rc.1`: a plain `major.minor.patch` core, or
+  one with a recognized pre-release label such as `rc` or `beta`) cannot plausibly be a branch. It
+  is unresolved instead of up to date at any position, and the `unknown-ref` diagnostic reports
+  `` `4.3.1` is not a published tag of actions/checkout ``. Severity defaults to warning and is set
+  with `diagnostics.unknown_ref_severity`; there is no on/off toggle. An outdated full release stays
+  outdated, since the update target is valid either way.
+- **Any other tag-shaped ref** (`@v1`, `@v5.x`, `@v3-node20`, `@v40`, `@v3.4.0-working`) may be a
+  branch: `ruby/setup-ruby@v1`, `pnpm/action-setup@v3`,
+  `aws-actions/configure-aws-credentials@v3-node20` and `codecov/codecov-action@v5.x` are
+  documented branch pins. They keep the rule above (unresolved only when ahead of the latest
+  release) and are never reported by `unknown-ref`, so a ref such as `@v40` gets an unresolved
+  status but no diagnostic.
+
+Nothing is reported while the tag index is cold, empty or truncated. `deps-cli check
+--fail-on unknown-ref` fails on the diagnostic regardless of its severity; it is not part of the
+default `--fail-on` set.
+
+In the editor the verdict is only as fresh as the last tags fetch of that repository. Every
+document open or edit that uses it re-requests the tags (a conditional request, so an unchanged
+list is cheap) and refreshes the diagnostics, so a pin bumped to a tag published after the last
+fetch can show the warning until the next open or edit of a workflow using that repository.
+`deps-cli` always fetches fresh.
 
 ### Updating quoted and flow-style pins (issue #1724)
 
@@ -172,7 +206,10 @@ without a version and matches their affected ranges locally against the pinned v
   diagnostic name it (`matched release tag v4.9.0`). For a SHA pin all release tags on the commit
   count; for an exact tag pin (`@v4.8.0`) only the releases of the same major version do, and
   for a floating tag (`@v4`) only the releases that extend the written tag. Pre-release tags are
-  never checked as siblings. A sibling-only advisory whose fix is not newer than the pinned
+  never checked as siblings. When a tag list was truncated (more than 3000 tags), the sibling
+  list may be incomplete: a clean answer for such a pin is shown as not fully checked in hover
+  rather than as clean (no diagnostic is raised), and `deps-cli update` refuses a `latest` it
+  cannot verify the same way. A sibling-only advisory whose fix is not newer than the pinned
   version is not offered as a fix. The same sibling check applies to the latest version, to
   upgrade candidates and to a recommended fix target; while a candidate's sibling tags are
   unknown (tag index not loaded yet) it is shown as "not checked", never as clean.

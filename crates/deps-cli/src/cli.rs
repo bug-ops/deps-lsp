@@ -70,12 +70,13 @@ pub struct CheckArgs {
     pub format: OutputFormat,
 
     /// Comma-separated categories that make the run exit with code 1: `outdated`, `yanked`,
-    /// `vulnerable`, `unsatisfiable`, `mutable-ref`, `sha-comment-mismatch`, `license`,
-    /// `deprecated`, `other`.
+    /// `vulnerable`, `unsatisfiable`, `mutable-ref`, `sha-comment-mismatch`, `unknown-ref`,
+    /// `license`, `deprecated`, `other`.
     /// Defaults to `vulnerable,yanked,unsatisfiable` when omitted (FR-010); an explicit
     /// value replaces that default. `sha-comment-mismatch` selects SHA pins whose version
-    /// comment is not confirmed by the repository's tag index. `other` covers every finding
-    /// matching none of the eight specific categories, including informational notices:
+    /// comment is not confirmed by the repository's tag index. `unknown-ref` selects tag pins
+    /// whose ref is a full release that no published tag of the repository matches. `other`
+    /// covers every finding matching none of the nine specific categories, including informational notices:
     /// offline, skipped lookups for manifests without a lock file, unresolved GitLab hosts,
     /// dependency-ceiling and registry-fetch failures. It therefore fails any manifest
     /// without a lock file and every `--offline` run.

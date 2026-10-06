@@ -11,7 +11,7 @@ use deps_core::lsp_helpers::{CommitSha, TagIndex};
 use deps_core::pagination::ListCoverage;
 use deps_core::rate_limit::{DEFAULT_COOLDOWN_SECS, RateLimitGate};
 use deps_core::registry::{CapResult, KeyShape, register_capped};
-use deps_core::{EcosystemId, PackageName, PublishTime};
+use deps_core::{EcosystemId, PackageName, PublishTime, TagIndexRefreshSender, TagIndexRefreshes};
 use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -41,7 +41,12 @@ const MAX_TAG_INDEX_ENTRIES: usize = 256;
 /// "index straight from the raw response" fix for the same class of bug. Still gated on
 /// [`deps_core::lsp_helpers::is_full_sha`] (security S-3): the SHA is later spliced
 /// verbatim into a manifest text edit and a hover string.
+///
+/// Announces the project through `refreshes` when the index first appears or observably
+/// changes (the payload is the project name, not the endpoint: a rescan triggered for the
+/// other endpoint's unchanged index is harmless).
 pub(crate) fn populate_tag_index_entries<'a>(
+    refreshes: &TagIndexRefreshSender,
     index: &DashMap<(EndpointKind, PackageName), Arc<TagIndex>>,
     key: (EndpointKind, PackageName),
     entries: impl Iterator<Item = (&'a str, &'a str)>,
@@ -52,10 +57,7 @@ pub(crate) fn populate_tag_index_entries<'a>(
         .collect();
     let built =
         TagIndex::from_tags(valid.iter().map(|(name, sha)| (*name, sha))).with_coverage(coverage);
-    if !index.contains_key(&key) {
-        deps_core::cache_policy::evict_arbitrary_if_full(index, MAX_TAG_INDEX_ENTRIES);
-    }
-    index.insert(key, Arc::new(built));
+    refreshes.replace(index, key, built, MAX_TAG_INDEX_ENTRIES);
 }
 
 /// Converts a fetched tags page into a newest-first, semver-filtered version list.
@@ -143,6 +145,7 @@ pub struct GitlabCiRegistry {
     /// must not disable lookups against `gitlab.com` or any other host.
     rate_limits: Arc<DashMap<String, Arc<RateLimitGate>>>,
     tag_index: Arc<DashMap<(EndpointKind, PackageName), Arc<TagIndex>>>,
+    tag_refreshes: TagIndexRefreshSender,
 }
 
 impl GitlabCiRegistry {
@@ -154,7 +157,16 @@ impl GitlabCiRegistry {
             routes: Arc::new(DashMap::new()),
             rate_limits: Arc::new(DashMap::new()),
             tag_index: Arc::new(DashMap::new()),
+            tag_refreshes: TagIndexRefreshSender::new(),
         }
+    }
+
+    /// Subscribes to tag-index refresh events: the project's [`PackageName`] is sent when a
+    /// tags or releases fetch first populates its index or observably changes it
+    /// ([`TagIndex::observably_differs`]), after the index has been replaced.
+    #[must_use]
+    pub fn subscribe_tag_refreshes(&self) -> TagIndexRefreshes {
+        self.tag_refreshes.subscribe()
     }
 
     /// Shares this registry's [`TagIndex`] map with [`crate::formatter::GitlabCiFormatter`].
@@ -322,6 +334,7 @@ impl GitlabCiRegistry {
                 // response, not `tags_to_versions`' semver-filtered output — see
                 // `populate_tag_index_entries`'s doc.
                 populate_tag_index_entries(
+                    &self.tag_refreshes,
                     &self.tag_index,
                     (EndpointKind::Tags, name.clone()),
                     tags.items
@@ -349,6 +362,7 @@ impl GitlabCiRegistry {
                 // `tags_to_versions`), so this is not affected by C1 — kept symmetric with
                 // the Tags arm anyway, and keyed by `EndpointKind::Releases` (S2 fix).
                 populate_tag_index_entries(
+                    &self.tag_refreshes,
                     &self.tag_index,
                     (EndpointKind::Releases, name.clone()),
                     releases
@@ -851,6 +865,39 @@ mod tests {
             index.tag_to_sha.get("cargo-deny"),
             Some(&CommitSha::parse(&sha).unwrap())
         );
+    }
+
+    /// #1765: a tags fetch announces the project on first populate and stays silent on an
+    /// identical refetch.
+    #[tokio::test]
+    async fn test_fetch_route_tags_emits_refresh_once_for_identical_index() {
+        let mut server = mockito::Server::new_async().await;
+        let sha = "a".repeat(40);
+        let _tags_mock = server
+            .mock("GET", "/api/v4/projects/org%2Fproj/repository/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name":"v1.0.0","commit":{{"id":"{sha}"}}}}]"#
+            ))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let registry = GitlabCiRegistry::new(test_client());
+        let mut refreshes = registry.subscribe_tag_refreshes();
+        let host_bare = server.url();
+        let gitlab_route = route(&host_bare, EndpointKind::Tags);
+        let name = PackageName::new(format!(
+            "{}/org/proj",
+            crate::host::GitlabHost::for_test(&host_bare).host()
+        ));
+
+        registry.fetch_route(&name, &gitlab_route).await.unwrap();
+        assert_eq!(refreshes.try_recv().ok(), Some(name.clone()));
+
+        registry.fetch_route(&name, &gitlab_route).await.unwrap();
+        assert!(refreshes.try_recv().is_err());
     }
 
     /// #1722: a fetch that hits the page cap must mark the index `Truncated`.
