@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gitlab-ci**: `PinStyle::Sha` carries a `ShaPinTail` (#1764)
 - **deps-core**: `ShaPinLookup::into_status` replaced by `status()`; `ShaPinLookup::Indexed` gains `position: TagPosition`; `ClosingDelimiters` moves to `lsp_helpers` (re-exported by deps-github-actions) (#1764)
 - **deps-core**: `Ecosystem::watched_config_filenames`/`routing_affecting_watched_configs` replaced by `watched_configs() -> &[WatchedConfig]`; `EcosystemRegistry::for_watched_config` takes a `&Path` and returns `(ecosystem, effect)` pairs; watched configs match by path suffix and no longer accept `*` wildcards (#1775)
-- **deps-engine**: `build_latest_check_targets`, `build_candidate_check_targets` and `collect_fix_target_resolutions` take a `candidate_tags` parameter; `ScanTarget::with_siblings` is generic over the sealed `TaggedVersions`; new `SkipReason::SiblingTagsUnknown` and `RequirementResolution::candidate_tag_source` hook (deps-core)
+- **deps-engine**: `build_latest_check_targets`, `build_candidate_check_targets` and `collect_fix_target_resolutions` take a `candidate_tags` parameter; `ScanTarget::with_siblings` is generic over the sealed `TaggedVersions`; new `SkipReason::SiblingTagsUnknown` and `RequirementResolution::candidate_tag_source` hook (deps-core) (#1775)
 - **deps-cli**: `CheckFinding.advisory_severity` replaced by `advisory: Option<AdvisoryFacts>`; a SARIF advisory rule has no `fullDescription` when the scan did not fetch the advisory (#1775)
 
 ### Added
