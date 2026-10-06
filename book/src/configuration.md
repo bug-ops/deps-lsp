@@ -37,6 +37,7 @@ control, see [Conventions](cross-ecosystem/conventions.md).
 | `freshness` | `cooldown_secs` | `259200` | Cooldown window in seconds (3 days), clamped to 0-30 days |
 | `registries` | `workspace_registries` | `"public_only"` | Which workspace-declared registry index hosts are ever fetched, across every ecosystem (Cargo's `.cargo/config.toml`/`[source]`, npm's `.npmrc`, PyPI's `--index-url`/Poetry/uv sources, Go's `$GOENV` `GOPROXY`, NuGet's `NuGet.Config`, Swift's `registries.json`) — `"public_only"`, `"off"`, or `"all"`; see [Cargo Custom/Private Registries](ecosystems/cargo.md#customprivate-registries), [npm Custom/Private Registries](ecosystems/npm.md#customprivate-registries), [PyPI Custom/Private Indexes](ecosystems/pypi.md#customprivate-indexes), [Go GOPROXY/GOPRIVATE Support](ecosystems/go.md#goproxygoprivate-support), [NuGet Private/Custom Feeds](ecosystems/nuget.md#privatecustom-feeds), and [Swift Package Registries](ecosystems/swift.md#package-registries-se-0292). |
 | `registries` | `nuget_user_profile_sources` | `false` | Whether a NuGet user-profile-tier `NuGet.Config` source with no repo-declared counterpart becomes a routing hop (`AlternateRegistry`-sourced — OSV/deps.dev/hover-trust suppressed for it), instead of only ever supplying credentials for a matching repo-declared source; see [NuGet Private/Custom Feeds](ecosystems/nuget.md#privatecustom-feeds) |
+| `registries` | `swift_keychain_credentials` | `"disabled"` | `"enabled"` also reads macOS Keychain credentials for user-declared Swift SE-0292 registries (may show a macOS access prompt; ignored by `deps-cli`); see [Swift macOS Keychain credentials](ecosystems/swift.md#macos-keychain-credentials) |
 | `registries` | `gitlab_instance_host` | `""` | The self-hosted GitLab instance host that a `project:` include and a `$CI_SERVER_FQDN`-relative `component:` include resolve against, and the *only* host an optional `GITLAB_TOKEN` is ever sent to — replacing, not joined with, `gitlab.com`. Unset (`""`) means neither form is version-resolved; see [GitLab CI/CD Self-Hosted Instances](ecosystems/gitlab-ci.md#self-hosted-instances) |
 | `network` | `offline` | `false` | Block every outbound registry/OSV/GitHub request; already-cached data still serves, uncached dependencies show an offline marker |
 | `supply_chain` | `enabled` | `true` | Show the [OpenSSF Scorecard/build-provenance hover line](cross-ecosystem/yanked-and-vulnerabilities.md#supply-chain-trust-signal-issue-543), backed by deps.dev requests; `false` disables the requests and the section entirely |
@@ -89,7 +90,8 @@ control, see [Conventions](cross-ecosystem/conventions.md).
   "registries": {
     "workspace_registries": "public_only",
     "nuget_user_profile_sources": false,
-    "gitlab_instance_host": ""
+    "gitlab_instance_host": "",
+    "swift_keychain_credentials": "disabled"
   },
   "network": {
     "offline": false

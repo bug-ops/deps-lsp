@@ -38,12 +38,12 @@ pub async fn handle_inlay_hints(
     }
 
     // Snapshot config before the document lookup (Copy value, no lock held across the call)
-    let (loading_config, network, osv_checks_enabled) = {
+    let (loading_config, network, osv_checks) = {
         let full_config = full_config.read().await;
         (
             full_config.loading_indicator.clone(),
             full_config.policy.network.mode(),
-            full_config.policy.osv_checks_enabled(),
+            full_config.policy.osv_checks(),
         )
     };
 
@@ -59,7 +59,7 @@ pub async fn handle_inlay_hints(
             .signals
             .snapshot()
             .with_resolved_version_candidates()
-            .with_latest_status(osv_checks_enabled)
+            .with_latest_status(osv_checks)
             .finish();
         Some((
             ecosystem,

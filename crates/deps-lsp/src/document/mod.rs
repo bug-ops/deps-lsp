@@ -13,7 +13,9 @@
 mod diff;
 mod fetch;
 mod gossip_prefetch;
+pub(crate) mod keychain_refresh;
 mod lifecycle;
+pub(crate) mod listener_lifecycle;
 mod loader;
 mod osv_scan;
 mod prefetch_support;

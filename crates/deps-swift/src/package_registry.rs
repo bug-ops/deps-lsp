@@ -4,9 +4,10 @@
 //! guarded transport and may carry the environment credential; a `WorkspaceDeclared` one goes
 //! through the connect-address-guarded pinned transport, unauthenticated.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -14,12 +15,13 @@ use deps_core::HOVER_RECENT_VERSIONS;
 use deps_core::cache::CachedResponse;
 use deps_core::error::PaginationStop;
 use deps_core::github::semver_tags_newest_first;
+use deps_core::keychain_credentials::KeychainGeneration;
 use deps_core::pagination::{NextPage, next_page};
-use deps_core::{DepsError, HttpCache, Result, not_found_or};
-use reqwest::header;
+use deps_core::{CredentialHeader, DepsError, HttpCache, RequestHeader, Result, not_found_or};
 use serde::Deserialize;
 use url::Url;
 
+use crate::auth::{KeychainAuthorization, RegistryAuth};
 use crate::config::{RegistryTrust, ResolvedSwiftRegistry};
 use crate::package_location::{CanonicalIdentity, RegistryIdentity};
 use crate::published_at::{PublishedAtCache, ReleaseVersion};
@@ -102,6 +104,23 @@ pub(crate) struct PackageRegistryClient {
     digest: u64,
     pagination_failures: DashMap<CanonicalIdentity, (PaginationStop, Instant)>,
     published_at: PublishedAtCache,
+    credential_state: Mutex<Option<CredentialState>>,
+}
+
+/// Whether a request carried a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialPresence {
+    Anonymous,
+    Credentialed,
+}
+
+/// What the cached responses of a Keychain-bound registry were fetched under: a response
+/// obtained anonymously (lookup pending, refused, not found) must not answer a later
+/// credentialed request, nor the reverse after the setting changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CredentialState {
+    presence: CredentialPresence,
+    generation: KeychainGeneration,
 }
 
 impl PackageRegistryClient {
@@ -113,6 +132,21 @@ impl PackageRegistryClient {
             digest,
             pagination_failures: DashMap::new(),
             published_at: PublishedAtCache::new(),
+            credential_state: Mutex::new(None),
+        }
+    }
+
+    /// Records what the next request is sent under and drops this registry's cached responses
+    /// when that differs from the previous request's.
+    fn note_credential_state(&self, state: CredentialState) {
+        let previous = self
+            .credential_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(state);
+        if previous.is_some_and(|previous| previous != state) {
+            self.cache
+                .evict_url_prefix(&format!("{}/", self.registry.url.as_str()));
         }
     }
 
@@ -133,11 +167,32 @@ impl PackageRegistryClient {
     /// Fetches one page of a release list over this registry's transport, with its credential
     /// when `Trusted`.
     async fn fetch_page(&self, url: &str, origin: &str) -> Result<CachedResponse> {
-        let mut headers = vec![(header::ACCEPT, ACCEPT)];
+        let mut headers = vec![RequestHeader::Accept(ACCEPT)];
         match transport_for(self.registry.url.trust()) {
             TransportKind::TrustedOrigin => {
-                if let Some(auth) = &self.registry.auth {
-                    headers.push((header::AUTHORIZATION, auth.header_value()));
+                // Offline, no request is sent, so `security` must not run (it could prompt).
+                let auth = match &self.registry.auth {
+                    Some(RegistryAuth::Header(auth)) => Some(Cow::Borrowed(auth)),
+                    Some(RegistryAuth::Keychain(credential)) if !self.cache.is_offline() => {
+                        let KeychainAuthorization { auth, generation } =
+                            credential.authorization().await;
+                        self.note_credential_state(CredentialState {
+                            presence: if auth.is_some() {
+                                CredentialPresence::Credentialed
+                            } else {
+                                CredentialPresence::Anonymous
+                            },
+                            generation,
+                        });
+                        auth.map(Cow::Owned)
+                    }
+                    Some(RegistryAuth::Keychain(_)) | None => None,
+                };
+                if let Some(auth) = auth.as_deref() {
+                    headers.push(RequestHeader::Credential(
+                        CredentialHeader::Authorization,
+                        auth.as_redacted(),
+                    ));
                 }
                 self.cache
                     .get_cached_trusted_origin_response(url, origin, &headers)
@@ -1196,6 +1251,258 @@ mod tests {
                 "{trust:?}"
             );
             escaped.assert_async().await;
+        }
+    }
+
+    mod keychain {
+        use super::*;
+        use crate::auth::{CredentialLookup, KeychainBinding};
+        use crate::keychain::BackendError;
+        use crate::keychain::KeychainStore;
+        use crate::keychain::fake::Fake;
+        use deps_core::keychain_credentials::KeychainCredentialsHandle;
+        use deps_core::policy_config::KeychainCredentials;
+
+        fn keychain_client(
+            base: &str,
+            fake: &Fake,
+        ) -> (PackageRegistryClient, Arc<KeychainCredentialsHandle>) {
+            let handle = Arc::new(KeychainCredentialsHandle::new(KeychainCredentials::Enabled));
+            let store = Arc::new(KeychainStore::new(fake.clone(), handle.resolved_sender()));
+            let binding = KeychainBinding::new(store, Arc::clone(&handle));
+            let url = SwiftRegistryUrl::for_test(base, RegistryTrust::Trusted);
+            let user_tier = UserTier::for_test(&[base], std::collections::HashMap::new());
+            let auth = crate::auth::bind_credential(
+                &url,
+                &user_tier,
+                CredentialLookup::Keychain(&binding),
+            );
+            let client = PackageRegistryClient::new(
+                Arc::new(HttpCache::new()),
+                ResolvedSwiftRegistry { url, auth },
+            );
+            (client, handle)
+        }
+
+        #[tokio::test]
+        async fn test_found_credential_is_sent_as_basic_authorization() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/api/acme/net")
+                .match_header("authorization", "Basic dXNlcjpodW50ZXIy")
+                .with_status(200)
+                .with_body(RELEASES)
+                .create_async()
+                .await;
+            let fake = Fake::found();
+            let (client, _handle) = keychain_client(&format!("{}/api", server.url()), &fake);
+            client
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap();
+            mock.assert_async().await;
+        }
+
+        #[tokio::test]
+        async fn test_not_found_sends_no_credential() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/api/acme/net")
+                .match_header("authorization", mockito::Matcher::Missing)
+                .with_status(200)
+                .with_body(RELEASES)
+                .create_async()
+                .await;
+            let fake = Fake::new(Err(BackendError::NotFound), Ok("unused"));
+            let (client, _handle) = keychain_client(&format!("{}/api", server.url()), &fake);
+            client
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap();
+            mock.assert_async().await;
+        }
+
+        #[tokio::test]
+        async fn test_a_401_never_triggers_another_lookup() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/api/acme/net")
+                .with_status(401)
+                .expect_at_least(2)
+                .create_async()
+                .await;
+            let fake = Fake::found();
+            let (client, _handle) = keychain_client(&format!("{}/api", server.url()), &fake);
+            for _ in 0..2 {
+                assert!(
+                    client
+                        .list_releases(&identity(), PublishedAtLookup::Skip)
+                        .await
+                        .is_err()
+                );
+            }
+            mock.assert_async().await;
+            assert_eq!(fake.secret_calls(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_refused_and_transient_send_no_credential() {
+            for reply in [BackendError::Refused, BackendError::Transient] {
+                let mut server = mockito::Server::new_async().await;
+                let mock = server
+                    .mock("GET", "/api/acme/net")
+                    .match_header("authorization", mockito::Matcher::Missing)
+                    .with_status(200)
+                    .with_body(RELEASES)
+                    .create_async()
+                    .await;
+                let fake = Fake::new(Ok("user"), Err(reply));
+                let (client, _handle) = keychain_client(&format!("{}/api", server.url()), &fake);
+                client
+                    .list_releases(&identity(), PublishedAtLookup::Skip)
+                    .await
+                    .unwrap();
+                mock.assert_async().await;
+            }
+        }
+
+        const ANON_RELEASES: &str =
+            r#"{"releases": {"1.0.0": {"url": "https://r/acme/net/1.0.0"}}}"#;
+        const BASIC: &str = "Basic dXNlcjpodW50ZXIy";
+
+        fn versions_of(versions: &[SwiftVersion]) -> Vec<String> {
+            versions
+                .iter()
+                .map(|v| v.version.as_str().to_string())
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn test_an_anonymous_response_never_answers_the_credentialed_request() {
+            let mut server = mockito::Server::new_async().await;
+            let anonymous = server
+                .mock("GET", "/api/acme/net")
+                .match_header("authorization", mockito::Matcher::Missing)
+                .with_status(200)
+                .with_header("etag", "\"v1\"")
+                .with_body(ANON_RELEASES)
+                .create_async()
+                .await;
+            let stale_revalidation = server
+                .mock("GET", "/api/acme/net")
+                .match_header("authorization", BASIC)
+                .match_header("if-none-match", "\"v1\"")
+                .with_status(304)
+                .expect(0)
+                .create_async()
+                .await;
+            let credentialed = server
+                .mock("GET", "/api/acme/net")
+                .match_header("authorization", BASIC)
+                .match_header("if-none-match", mockito::Matcher::Missing)
+                .with_status(200)
+                .with_body(RELEASES)
+                .create_async()
+                .await;
+            let fake = Fake::new(Ok("user"), Err(BackendError::Transient));
+            let (client, _handle) = keychain_client(&format!("{}/api", server.url()), &fake);
+
+            let first = client
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap();
+            assert_eq!(versions_of(&first), ["1.0.0"]);
+
+            fake.set_secret(Ok("hunter2"));
+            let second = client
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap();
+            assert!(versions_of(&second).contains(&"2.0.0".to_string()));
+            anonymous.assert_async().await;
+            credentialed.assert_async().await;
+            stale_revalidation.assert_async().await;
+        }
+
+        #[tokio::test]
+        async fn test_a_credentialed_response_is_not_served_after_the_setting_is_disabled() {
+            let mut server = mockito::Server::new_async().await;
+            let credentialed = server
+                .mock("GET", "/api/acme/net")
+                .match_header("authorization", BASIC)
+                .with_status(200)
+                .with_header("etag", "\"v2\"")
+                .with_body(RELEASES)
+                .create_async()
+                .await;
+            let stale_revalidation = server
+                .mock("GET", "/api/acme/net")
+                .match_header("authorization", mockito::Matcher::Missing)
+                .match_header("if-none-match", "\"v2\"")
+                .with_status(304)
+                .expect(0)
+                .create_async()
+                .await;
+            let anonymous = server
+                .mock("GET", "/api/acme/net")
+                .match_header("authorization", mockito::Matcher::Missing)
+                .match_header("if-none-match", mockito::Matcher::Missing)
+                .with_status(200)
+                .with_body(ANON_RELEASES)
+                .create_async()
+                .await;
+            let fake = Fake::found();
+            let (client, handle) = keychain_client(&format!("{}/api", server.url()), &fake);
+
+            let first = client
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap();
+            assert!(versions_of(&first).contains(&"2.0.0".to_string()));
+
+            handle.set(KeychainCredentials::Disabled);
+            let second = client
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap();
+            assert_eq!(versions_of(&second), ["1.0.0"]);
+            credentialed.assert_async().await;
+            anonymous.assert_async().await;
+            stale_revalidation.assert_async().await;
+        }
+
+        #[tokio::test]
+        async fn test_offline_never_runs_the_keychain_lookup() {
+            let fake = Fake::found();
+            let (client, _handle) = keychain_client("https://r.example/api", &fake);
+            client.cache.set_offline(deps_core::NetworkMode::Offline);
+            let result = client
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await;
+            assert!(result.is_err());
+            assert_eq!(fake.find_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(fake.secret_calls(), 0);
+        }
+
+        #[tokio::test]
+        async fn test_disabling_the_setting_stops_sending_the_credential() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/api/acme/net")
+                .match_header("authorization", mockito::Matcher::Missing)
+                .with_status(200)
+                .with_body(RELEASES)
+                .create_async()
+                .await;
+            let fake = Fake::found();
+            let (client, handle) = keychain_client(&format!("{}/api", server.url()), &fake);
+            handle.set(KeychainCredentials::Disabled);
+            client
+                .list_releases(&identity(), PublishedAtLookup::Skip)
+                .await
+                .unwrap();
+            mock.assert_async().await;
+            assert_eq!(fake.secret_calls(), 0);
         }
     }
 }

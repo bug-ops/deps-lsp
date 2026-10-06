@@ -16,8 +16,8 @@ use deps_core::parser::DependencySource;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
-    DepsError, EcosystemId, FreshnessSettings, HttpCache, Result, lsp_helpers::warn_rejected_value,
-    not_found_or as core_not_found_or, registry::register_capped,
+    DepsError, EcosystemId, FreshnessSettings, HttpCache, RequestHeader, Result,
+    lsp_helpers::warn_rejected_value, not_found_or as core_not_found_or, registry::register_capped,
 };
 use pep440_rs::{Version, VersionSpecifiers};
 use serde::Deserialize;
@@ -457,7 +457,7 @@ impl PypiRegistry {
             });
         }
         let url = simple_api_url(&self.simple_base, &normalized);
-        let headers = [(reqwest::header::ACCEPT, SIMPLE_API_ACCEPT)];
+        let headers = [RequestHeader::Accept(SIMPLE_API_ACCEPT)];
         let data = match self.tier {
             PypiRegistryTier::Public => self.cache.get_cached_with_headers(&url, &headers).await,
             PypiRegistryTier::WorkspaceDeclared => {

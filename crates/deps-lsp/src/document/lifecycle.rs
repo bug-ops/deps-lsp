@@ -26,6 +26,7 @@ use deps_core::FetchFailure;
 use deps_core::PackageName;
 use deps_core::Result;
 use deps_core::VersionReq;
+use deps_core::policy_config::OsvChecks;
 use deps_engine::classify::fetch::{fetch_latest_versions_parallel, prepare_fetch};
 use deps_engine::classify::resolved::{
     cached_versions_from_lockfile, dependency_version_map, load_resolved_versions,
@@ -139,12 +140,9 @@ pub async fn handle_document_open(
     // suppresses the network call itself (FR-011; issue #1517 critique S3 — an explicit
     // offline condition must degrade phase A/B the same way disabling the feature already
     // does, not attempt the network call and fail transiently instead).
-    let (diagnostics_snapshot, osv_checks_enabled) = {
+    let diagnostics_snapshot = {
         let cfg = config.read().await;
-        (
-            diagnostics::DiagnosticsSnapshot::from_config(&cfg),
-            cfg.policy.osv_checks_enabled(),
-        )
+        diagnostics::DiagnosticsSnapshot::from_config(&cfg)
     };
 
     // Spawn background task to fetch versions. Captured before `tokio::spawn` so this
@@ -159,7 +157,6 @@ pub async fn handle_document_open(
             client.clone(),
             Arc::clone(&config),
             diagnostics_snapshot,
-            osv_checks_enabled,
         )
         .instrument(span),
     );
@@ -187,7 +184,6 @@ async fn run_document_open_background_task(
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
     diagnostics_snapshot: diagnostics::DiagnosticsSnapshot,
-    osv_checks_enabled: bool,
 ) {
     tracing::debug!("background task started");
 
@@ -261,7 +257,7 @@ async fn run_document_open_background_task(
         &ecosystem,
         diagnostics_snapshot.fetch_timeout_secs,
         PrefetchGates {
-            run_osv: osv_checks_enabled,
+            run_osv: diagnostics_snapshot.osv_checks().is_active(),
             run_license: true,
         },
     );
@@ -869,12 +865,9 @@ pub(crate) async fn handle_document_change_guarded(
 
     // Read before any OSV request is built (FR-011; issue #1517 critique S3 — see the
     // open-path's identical read for why offline is folded in here too).
-    let (diagnostics_snapshot, osv_checks_enabled) = {
+    let diagnostics_snapshot = {
         let cfg = config.read().await;
-        (
-            diagnostics::DiagnosticsSnapshot::from_config(&cfg),
-            cfg.policy.osv_checks_enabled(),
-        )
+        diagnostics::DiagnosticsSnapshot::from_config(&cfg)
     };
 
     let needs_osv_rescan = diff.needs_osv_rescan();
@@ -904,7 +897,6 @@ pub(crate) async fn handle_document_change_guarded(
             client,
             ChangeTaskConfig {
                 diagnostics: diagnostics_snapshot,
-                osv_checks_enabled,
                 refetch,
             },
             Arc::clone(&config),
@@ -929,7 +921,6 @@ pub(crate) async fn handle_document_change_guarded(
 /// `max_concurrent_fetches` under a second name.
 struct ChangeTaskConfig {
     diagnostics: diagnostics::DiagnosticsSnapshot,
-    osv_checks_enabled: bool,
     refetch: RefetchPolicy,
 }
 
@@ -968,7 +959,7 @@ pub(crate) struct ResolvedVersionMove {
 /// [`super::osv_scan::run_license_prefetch`] itself, rather than being duplicated at
 /// every call site that used to check it before deciding whether to trigger a refresh.
 pub(crate) struct ChangeTaskTriggerGates {
-    pub(crate) osv_checks_enabled: bool,
+    pub(crate) osv_checks: OsvChecks,
     pub(crate) requires_dedicated_fetch: bool,
 }
 
@@ -992,7 +983,7 @@ pub(crate) fn change_task_triggers(
     gates: ChangeTaskTriggerGates,
 ) -> (bool, bool) {
     let any_resolved_move = mv.diff_needs_rescan || mv.resolved_changed;
-    let needs_osv_rescan = gates.osv_checks_enabled && any_resolved_move;
+    let needs_osv_rescan = gates.osv_checks.is_active() && any_resolved_move;
     let needs_license_refresh = any_resolved_move && gates.requires_dedicated_fetch;
     (needs_osv_rescan, needs_license_refresh)
 }
@@ -1009,10 +1000,10 @@ pub(crate) fn change_task_triggers(
 #[must_use]
 pub(crate) const fn osv_phase_a_should_run(
     needs_osv_rescan: bool,
-    osv_checks_enabled: bool,
+    osv_checks: OsvChecks,
     deps_to_fetch_is_empty: bool,
 ) -> bool {
-    needs_osv_rescan || (osv_checks_enabled && !deps_to_fetch_is_empty)
+    needs_osv_rescan || (osv_checks.is_active() && !deps_to_fetch_is_empty)
 }
 
 /// Which of [`spawn_osv_and_license_prefetch`]'s two independent spawns should run — named
@@ -1228,7 +1219,7 @@ async fn run_document_change_task(
             resolved_changed,
         },
         ChangeTaskTriggerGates {
-            osv_checks_enabled: config.osv_checks_enabled,
+            osv_checks: config.diagnostics.osv_checks(),
             requires_dedicated_fetch: ecosystem.license_source().requires_dedicated_fetch(),
         },
     );
@@ -1261,7 +1252,7 @@ async fn run_document_change_task(
     // always runs both.
     let should_run_osv_phase_a = osv_phase_a_should_run(
         needs_osv_rescan,
-        config.osv_checks_enabled,
+        config.diagnostics.osv_checks(),
         deps_to_fetch.is_empty(),
     );
     let (osv_task, license_task) = spawn_osv_and_license_prefetch(
@@ -1941,6 +1932,13 @@ mod tests {
     #[cfg(feature = "cargo")]
     use std::time::Duration;
 
+    fn both_osv_checks() -> [OsvChecks; 2] {
+        [
+            OsvChecks::resolve(false, deps_core::NetworkMode::Online),
+            OsvChecks::resolve(true, deps_core::NetworkMode::Online),
+        ]
+    }
+
     /// Issue #1407 R1: exhaustive truth table over `change_task_triggers`'s four
     /// boolean inputs, so a future edit can't silently reintroduce the regression
     /// this fix closed (a trigger nested inside the "lock file resolved something"
@@ -1954,7 +1952,7 @@ mod tests {
     fn change_task_triggers_truth_table() {
         for diff_needs_rescan in [false, true] {
             for resolved_changed in [false, true] {
-                for osv_checks_enabled in [false, true] {
+                for osv_checks in both_osv_checks() {
                     for requires_dedicated_fetch in [false, true] {
                         let (osv, license) = change_task_triggers(
                             ResolvedVersionMove {
@@ -1962,22 +1960,22 @@ mod tests {
                                 resolved_changed,
                             },
                             ChangeTaskTriggerGates {
-                                osv_checks_enabled,
+                                osv_checks,
                                 requires_dedicated_fetch,
                             },
                         );
                         let any_resolved_move = diff_needs_rescan || resolved_changed;
                         assert_eq!(
                             osv,
-                            osv_checks_enabled && any_resolved_move,
+                            osv_checks.is_active() && any_resolved_move,
                             "osv mismatch for diff={diff_needs_rescan} resolved={resolved_changed} \
-                             osv_checks_enabled={osv_checks_enabled} tier3={requires_dedicated_fetch}"
+                             osv_checks={osv_checks:?} tier3={requires_dedicated_fetch}"
                         );
                         assert_eq!(
                             license,
                             any_resolved_move && requires_dedicated_fetch,
                             "license mismatch for diff={diff_needs_rescan} resolved={resolved_changed} \
-                             osv_checks_enabled={osv_checks_enabled} tier3={requires_dedicated_fetch}"
+                             osv_checks={osv_checks:?} tier3={requires_dedicated_fetch}"
                         );
                     }
                 }
@@ -1993,19 +1991,19 @@ mod tests {
     #[test]
     fn osv_phase_a_should_run_truth_table() {
         for needs_osv_rescan in [false, true] {
-            for osv_checks_enabled in [false, true] {
+            for osv_checks in both_osv_checks() {
                 for deps_to_fetch_is_empty in [false, true] {
                     let actual = osv_phase_a_should_run(
                         needs_osv_rescan,
-                        osv_checks_enabled,
+                        osv_checks,
                         deps_to_fetch_is_empty,
                     );
                     let expected =
-                        needs_osv_rescan || (osv_checks_enabled && !deps_to_fetch_is_empty);
+                        needs_osv_rescan || (osv_checks.is_active() && !deps_to_fetch_is_empty);
                     assert_eq!(
                         actual, expected,
                         "mismatch for needs_osv_rescan={needs_osv_rescan} \
-                         osv_checks_enabled={osv_checks_enabled} \
+                         osv_checks={osv_checks:?} \
                          deps_to_fetch_is_empty={deps_to_fetch_is_empty}"
                     );
                 }
@@ -2022,7 +2020,7 @@ mod tests {
     fn osv_phase_a_should_run_true_for_all_dependencies_refetch_with_no_manifest_diff() {
         assert!(osv_phase_a_should_run(
             false, // needs_osv_rescan: no dependency add/version-change/lock-file move
-            true,  // vulnerabilities checking is enabled
+            OsvChecks::resolve(true, deps_core::NetworkMode::Online),
             false, // deps_to_fetch is non-empty (AllDependencies refetch)
         ));
     }
@@ -2118,7 +2116,7 @@ mod tests {
                 resolved_changed: false, // no lock file was resolved at all
             },
             ChangeTaskTriggerGates {
-                osv_checks_enabled: false,      // off (R1 case (c))
+                osv_checks: OsvChecks::resolve(false, deps_core::NetworkMode::Online),
                 requires_dedicated_fetch: true, // a tier-3 ecosystem
             },
         );
@@ -2278,9 +2276,11 @@ mod tests {
         let diags = diagnostics::generate_diagnostics_internal(
             Arc::clone(&state),
             &uri,
-            deps_core::FreshnessSettings::default(),
-            deps_core::DiagnosticSeverities::default(),
-            deps_core::NetworkMode::Online,
+            &diagnostics::DiagnosticsSnapshot::for_test(
+                deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
+                deps_core::NetworkMode::Online,
+            ),
             diagnostics::loading_ceiling(
                 crate::config::CacheConfig::default().fetch_timeout_secs,
                 cap,
@@ -2343,9 +2343,11 @@ mod tests {
         let diags = diagnostics::generate_diagnostics_internal(
             Arc::clone(&state),
             &uri,
-            deps_core::FreshnessSettings::default(),
-            deps_core::DiagnosticSeverities::default(),
-            deps_core::NetworkMode::Online,
+            &diagnostics::DiagnosticsSnapshot::for_test(
+                deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
+                deps_core::NetworkMode::Online,
+            ),
             diagnostics::loading_ceiling(
                 crate::config::CacheConfig::default().fetch_timeout_secs,
                 cap,
@@ -2519,9 +2521,11 @@ mod tests {
             let diags = diagnostics::generate_diagnostics_internal(
                 Arc::clone(&state),
                 &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-                deps_core::NetworkMode::Online,
+                &diagnostics::DiagnosticsSnapshot::for_test(
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::DiagnosticSeverities::default(),
+                    deps_core::NetworkMode::Online,
+                ),
                 diagnostics::loading_ceiling(
                     crate::config::CacheConfig::default().fetch_timeout_secs,
                     1,
@@ -2622,9 +2626,11 @@ mod tests {
             let diags = diagnostics::generate_diagnostics_internal(
                 Arc::clone(&state),
                 &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-                deps_core::NetworkMode::Online,
+                &diagnostics::DiagnosticsSnapshot::for_test(
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::DiagnosticSeverities::default(),
+                    deps_core::NetworkMode::Online,
+                ),
                 diagnostics::loading_ceiling(
                     crate::config::CacheConfig::default().fetch_timeout_secs,
                     1,

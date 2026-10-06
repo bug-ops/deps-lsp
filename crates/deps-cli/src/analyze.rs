@@ -526,7 +526,7 @@ pub async fn analyze_manifest(
     // `scope.vulnerabilities` (code review finding 6): `update`'s default mode never reads
     // `ManifestAnalysis::vulnerabilities`, so it declares this scope out entirely rather than
     // paying for a scan nothing consumes.
-    let run_osv_scan = scope.vulnerabilities && ctx.policy.osv_checks_enabled();
+    let run_osv_scan = scope.vulnerabilities && ctx.policy.osv_checks().is_active();
     let osv_scan = async {
         if run_osv_scan {
             let (targets, skipped) = build_scan_targets(
@@ -557,7 +557,7 @@ pub async fn analyze_manifest(
     // `update`'s default mode never reads `ManifestAnalysis::vulnerabilities`, but it always
     // needs to know whether the `latest` it's about to write is itself safe. Still gated on
     // the same `vulnerabilities_enabled`/`!offline` policy every other OSV call respects.
-    let run_latest_check = ctx.policy.osv_checks_enabled();
+    let run_latest_check = ctx.policy.osv_checks().is_active();
 
     // Spec 075 FR-010: the fallback-candidate OSV round only fires when
     // `scope.cooldown_fallback` is set AND at least one dependency's `cooldown_disposition`

@@ -260,9 +260,9 @@ pub(crate) enum RescanOutcome {
 /// re-checks it once the fetch actually lands, so the diagnostic stays wrong for the rest of
 /// the session.
 ///
-/// No-op while [`ServerState::is_osv_latest_check_enabled`] (vulnerabilities enabled and not
-/// offline) is `false`, read live so a setting change during the preceding fetch is honored
-/// (#1704).
+/// No-op while [`ServerState::osv_checks`] (vulnerabilities enabled and not offline) is
+/// [`deps_core::policy_config::OsvState::Inactive`], read live so a setting change during the
+/// preceding fetch is honored (#1704).
 ///
 /// Cheap no-op in the overwhelmingly common case: returns immediately unless both (a) this
 /// ecosystem's formatter opts into
@@ -283,7 +283,7 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
     ecosystem: &Arc<dyn Ecosystem>,
     fetch_timeout_secs: u64,
 ) -> RescanOutcome {
-    if !state.is_osv_latest_check_enabled()
+    if !state.osv_checks().is_active()
         || !ecosystem
             .formatter()
             .resolved_pin_version_depends_on_registry_fetch()
@@ -1870,7 +1870,7 @@ mod tests {
         }
 
         /// #1704: with vulnerabilities disabled or the server offline (both fold into
-        /// `is_osv_latest_check_enabled`, see the `did_change_configuration` tests in
+        /// `osv_checks`, see the `did_change_configuration` tests in
         /// `server.rs`) a warm `TagIndex` must not trigger an OSV request or replace the stale
         /// skip.
         #[tokio::test]
@@ -1890,7 +1890,10 @@ mod tests {
                 Arc::new(deps_core::HttpCache::new()),
                 server.url(),
             ));
-            state.set_osv_latest_check_enabled(false);
+            state.set_osv_checks(deps_core::policy_config::OsvChecks::resolve(
+                false,
+                deps_core::NetworkMode::Online,
+            ));
             let state = Arc::new(state);
             let (client, _config) =
                 crate::test_utils::test_helpers::create_test_client_and_config();

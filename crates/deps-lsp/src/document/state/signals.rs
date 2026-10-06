@@ -10,6 +10,7 @@
 
 use deps_core::lsp_helpers::EcosystemFormatter;
 use deps_core::osv::{CandidateStatusMap, LatestStatusMap, VulnerabilityMap};
+use deps_core::policy_config::{OsvChecks, OsvState};
 use deps_core::{
     ConcreteVersion, DependencyOutcomes, GossipFindings, PackageName, PackageVersions,
     TyposquatSignal, VersionData,
@@ -382,10 +383,9 @@ impl SignalsSnapshotBuilder<'_> {
         self
     }
 
-    /// Attaches [`PackageSignals::latest_status`] (issue #1517) when `enabled` is `true`,
-    /// leaving it `None` otherwise. Callers pass `policy.diagnostics.vulnerabilities_enabled
-    /// && !policy.network.offline` (critique S3) — checking never actually runs while
-    /// offline either (`document::lifecycle`'s phase-A spawn gate matches), so both
+    /// Attaches [`PackageSignals::latest_status`] (issue #1517) when `osv_checks` is
+    /// [`OsvState::Active`], leaving it `None` otherwise (critique S3) — checking never actually
+    /// runs while offline either (`document::lifecycle`'s phase-A spawn gate matches), so both
     /// conditions must degrade the same way here.
     ///
     /// Unlike [`Self::with_vulnerabilities`]'s unconditional attach, this **must** be gated:
@@ -399,21 +399,25 @@ impl SignalsSnapshotBuilder<'_> {
     /// "feature disabled"/"offline" into "permanently unverified," blocking every update
     /// recommendation forever instead of falling back to not-applicable.
     #[must_use]
-    pub(crate) fn with_latest_status(mut self, enabled: bool) -> Self {
-        if enabled {
-            self.latest_status = Some(self.signals.latest_status.clone());
+    pub(crate) fn with_latest_status(mut self, osv_checks: OsvChecks) -> Self {
+        match osv_checks.state() {
+            OsvState::Active => self.latest_status = Some(self.signals.latest_status.clone()),
+            OsvState::Inactive => {}
         }
         self
     }
 
-    /// Attaches [`PackageSignals::candidate_status`] (issue #1524) when `enabled` is `true`,
-    /// leaving it `None` otherwise — mirrors [`Self::with_latest_status`]'s exact gating
-    /// rationale (an absent map means [`deps_core::lsp_helpers::LatestVerdict::NotApplicable`],
+    /// Attaches [`PackageSignals::candidate_status`] (issue #1524) when `osv_checks` is
+    /// [`OsvState::Active`], leaving it `None` otherwise — mirrors [`Self::with_latest_status`]'s
+    /// exact gating rationale (an absent map means [`deps_core::lsp_helpers::LatestVerdict::NotApplicable`],
     /// a present-but-empty one means [`deps_core::lsp_helpers::LatestVerdict::Unverified`]).
     #[must_use]
-    pub(crate) fn with_candidate_status(mut self, enabled: bool) -> Self {
-        if enabled {
-            self.candidate_status = Some(self.signals.candidate_status.clone());
+    pub(crate) fn with_candidate_status(mut self, osv_checks: OsvChecks) -> Self {
+        match osv_checks.state() {
+            OsvState::Active => {
+                self.candidate_status = Some(self.signals.candidate_status.clone());
+            }
+            OsvState::Inactive => {}
         }
         self
     }

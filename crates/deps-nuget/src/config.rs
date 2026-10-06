@@ -295,6 +295,12 @@ impl NuGetAuth {
     pub(crate) fn header_value(&self) -> &str {
         self.0.expose_secret()
     }
+
+    /// The pre-formatted header value as a [`deps_core::secret::Redacted`], for attaching to a
+    /// request as a sensitive `Authorization` header.
+    pub(crate) const fn as_redacted(&self) -> &deps_core::secret::Redacted {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for NuGetAuth {

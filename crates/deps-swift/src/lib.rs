@@ -21,6 +21,7 @@ mod auth;
 pub mod config;
 pub mod ecosystem;
 pub mod formatter;
+mod keychain;
 pub mod lockfile;
 mod package_location;
 mod package_registry;

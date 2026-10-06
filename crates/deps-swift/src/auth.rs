@@ -10,12 +10,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use deps_core::keychain_credentials::{
+    KeychainCredentialsHandle, KeychainGeneration, KeychainSnapshot,
+};
 use deps_core::mtime_cache::{DEFAULT_MAX_CACHED_FILES, MtimeFileCache};
 use deps_core::netrc::{DefaultEntry, Netrc, NetrcFlavor, NetrcLogin};
+use deps_core::policy_config::KeychainCredentials;
 use deps_core::secret::{Redacted, basic_auth_header};
 use zeroize::Zeroizing;
 
 use crate::config::{SwiftAuthType, SwiftRegistryUrl, UserConfigPlatform, UserTier};
+use crate::keychain::{KeychainOutcome, KeychainServer, KeychainStore};
 
 const TOKEN_VAR: &str = "SWIFTPM_REGISTRY_TOKEN";
 const LOGIN_VAR: &str = "SWIFTPM_REGISTRY_LOGIN";
@@ -143,6 +148,11 @@ impl SwiftRegistryAuth {
     pub(crate) fn header_value(&self) -> &str {
         self.0.expose_secret()
     }
+
+    /// The header value as a [`Redacted`], for attaching to a request as a sensitive header.
+    pub(crate) const fn as_redacted(&self) -> &Redacted {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for SwiftRegistryAuth {
@@ -157,6 +167,111 @@ impl std::fmt::Display for SwiftRegistryAuth {
     }
 }
 
+/// The process-wide Keychain store and the live setting that gates it.
+#[derive(Debug, Clone)]
+pub(crate) struct KeychainBinding {
+    store: Arc<KeychainStore>,
+    handle: Arc<KeychainCredentialsHandle>,
+}
+
+impl KeychainBinding {
+    pub(crate) const fn new(
+        store: Arc<KeychainStore>,
+        handle: Arc<KeychainCredentialsHandle>,
+    ) -> Self {
+        Self { store, handle }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.handle.get() == KeychainCredentials::Enabled
+    }
+
+    /// Moves the store to the handle's current generation, purging memoized secrets after a
+    /// toggle.
+    pub(crate) fn sync_generation(&self) {
+        self.store.advance_generation(self.handle.generation());
+    }
+}
+
+/// What a Keychain lookup produced for one request, with the setting generation it was made
+/// under (a changed generation means any response cached under the old credential is stale).
+#[derive(Debug, Clone)]
+pub(crate) struct KeychainAuthorization {
+    pub(crate) auth: Option<SwiftRegistryAuth>,
+    pub(crate) generation: KeychainGeneration,
+}
+
+/// A registry credential to be read from the Keychain at fetch time, never at parse time.
+///
+/// `Debug` shows only the (non-secret) server and authentication type.
+#[derive(Clone)]
+pub(crate) struct KeychainCredential {
+    binding: KeychainBinding,
+    server: KeychainServer,
+    auth_type: Option<SwiftAuthType>,
+}
+
+impl KeychainCredential {
+    /// The `Authorization` value for this registry, or `None` when the setting is off or the
+    /// lookup did not find a credential (not found, refused, or still pending). Only a memo
+    /// miss starts a lookup, so a 401 never re-prompts.
+    pub(crate) async fn authorization(&self) -> KeychainAuthorization {
+        let KeychainSnapshot {
+            setting,
+            generation,
+        } = self.binding.handle.snapshot();
+        let auth = match setting {
+            KeychainCredentials::Disabled => None,
+            KeychainCredentials::Enabled => {
+                match self.binding.store.resolve(&self.server, generation).await {
+                    KeychainOutcome::Found(credential) => Some(credential.format(self.auth_type)),
+                    KeychainOutcome::NotFound
+                    | KeychainOutcome::Refused
+                    | KeychainOutcome::Transient => None,
+                }
+            }
+        };
+        KeychainAuthorization { auth, generation }
+    }
+
+    /// Hashes what identifies this credential's source, never a secret.
+    pub(crate) fn hash_identity(&self, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+
+        self.server.hash(hasher);
+        self.auth_type.hash(hasher);
+    }
+}
+
+impl std::fmt::Debug for KeychainCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeychainCredential")
+            .field("server", &self.server)
+            .field("auth_type", &self.auth_type)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The credential bound to one registry: a ready header, or a Keychain item read on demand.
+#[derive(Debug, Clone)]
+pub(crate) enum RegistryAuth {
+    /// A pre-formatted `Authorization` value.
+    Header(SwiftRegistryAuth),
+    /// Resolved through [`KeychainCredential::authorization`] when a request is made.
+    Keychain(KeychainCredential),
+}
+
+#[cfg(test)]
+impl RegistryAuth {
+    /// The header value of a `Header` credential; test-only convenience.
+    pub(crate) fn header_value(&self) -> &str {
+        match self {
+            Self::Header(auth) => auth.header_value(),
+            Self::Keychain(_) => panic!("keychain credentials have no header before fetch"),
+        }
+    }
+}
+
 /// Where [`bind_credential`] finds a credential for a registry URL.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CredentialLookup<'a> {
@@ -166,6 +281,8 @@ pub(crate) enum CredentialLookup<'a> {
     Shared(&'a SwiftCredential),
     /// A netrc: the credential depends on the registry's host.
     PerHost(&'a Netrc),
+    /// The macOS Keychain, read on demand per registry host.
+    Keychain(&'a KeychainBinding),
 }
 
 #[cfg(test)]
@@ -180,8 +297,9 @@ impl<'a> CredentialLookup<'a> {
 ///
 /// SwiftPM's providers are exclusive, so the first one that exists wins: the
 /// `SWIFTPM_REGISTRY_*` environment variables, then `SWIFTPM_NETRC_DATA`, then `~/.netrc`.
-/// macOS Keychain is not supported. `~/.netrc` is read on macOS too, which SwiftPM does not do
-/// by default; there its `default` entry is ignored.
+/// The macOS Keychain, when enabled, sits between `SWIFTPM_NETRC_DATA` and `~/.netrc` and
+/// replaces the latter (`SwiftParseContext` selects it). `~/.netrc` is read on macOS too, which
+/// SwiftPM does not do by default; there its `default` entry is ignored.
 ///
 /// # Examples
 ///
@@ -264,6 +382,15 @@ impl SwiftCredentialSource {
         })
     }
 
+    /// Whether SwiftPM would pick this source ahead of the Keychain (environment and
+    /// `SWIFTPM_NETRC_DATA` come first; `~/.netrc` comes after).
+    pub(crate) const fn precedes_keychain(&self) -> bool {
+        match self {
+            Self::Environment(_) | Self::NetrcData(_) => true,
+            Self::NetrcFile { .. } => false,
+        }
+    }
+
     /// Runs `f` with the credential lookup this source currently provides.
     pub(crate) fn with_lookup<R>(&self, f: impl FnOnce(CredentialLookup<'_>) -> R) -> R {
         match self {
@@ -311,11 +438,12 @@ pub(crate) fn bind_credential(
     url: &SwiftRegistryUrl,
     user_tier: &UserTier,
     lookup: CredentialLookup<'_>,
-) -> Option<SwiftRegistryAuth> {
+) -> Option<RegistryAuth> {
     use crate::config::RegistryTrust;
 
+    let auth_type = user_tier.auth_type_for(url.host_key());
     let format_for_registry =
-        |credential: &SwiftCredential| credential.format(user_tier.auth_type_for(url.host_key()));
+        |credential: &SwiftCredential| RegistryAuth::Header(credential.format(auth_type));
     match (url.trust(), lookup) {
         (RegistryTrust::Trusted, CredentialLookup::Shared(credential)) => {
             Some(format_for_registry(credential))
@@ -323,6 +451,14 @@ pub(crate) fn bind_credential(
         (RegistryTrust::Trusted, CredentialLookup::PerHost(netrc)) => {
             let login = netrc.login_for(url.url())?;
             Some(format_for_registry(&SwiftCredential::from_netrc(login)))
+        }
+        (RegistryTrust::Trusted, CredentialLookup::Keychain(binding)) => {
+            let server = KeychainServer::from_url(url.url())?;
+            Some(RegistryAuth::Keychain(KeychainCredential {
+                binding: binding.clone(),
+                server,
+                auth_type,
+            }))
         }
         (RegistryTrust::Trusted, CredentialLookup::None)
         | (RegistryTrust::WorkspaceDeclared, _) => None,
