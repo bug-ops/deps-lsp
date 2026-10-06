@@ -36,15 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-swift**: `ResolvedSwiftRegistry.auth` is no longer public (#1771, #1776)
 - **deps-gitlab-ci**: `GITLAB_TOKEN` is sent to `gitlab.com` or to the host in the `GITLAB_TOKEN_HOST` environment variable, no longer to `registries.gitlab_instance_host`; `token_host_origin` is removed and `GitlabApiClient::new` drops its instance-host parameter (#1797)
 - **deps-core**: `PinResolution::Unpublished` added for a full-release tag pin absent from a complete tag index (#1797)
-- **deps-lsp, deps-cli**: `workspace_registries = "all"` reaches only private hosts listed in `DEPS_LSP_PRIVATE_REGISTRY_HOSTS`, also with `--config` and in the GitHub Action `env:` (#PR)
-- **deps-core, deps-engine**: `WorkspaceRegistryAccess::All` is bounded by `PrivateRegistryAllowlist`; `resolve` and `from_policy` take `&AllowlistOutcome` (#PR)
-- **deps-core**: `CredentialHeader` removed; `RequestHeader` gains `Authorization(&AuthorizationValue)`; `basic_auth_header` and `bearer_auth_header` return `AuthorizationValue` (#PR)
-- **deps-core**: `get_cached_trusted_origin_response` and `get_cached_pinned_response` take a `RevalidationFailure` (#PR)
-- **deps-core**: `WatchedConfig::new` takes a `ConfigReach`; `for_watched_config` returns `WatchedConfigMatch` (#PR)
-- **deps-core, deps-github-actions, deps-gitlab-ci**: per-crate `unknown_ref_diagnostics` replaced by `lsp_helpers::unknown_ref_diagnostics` (#PR)
+- **deps-lsp, deps-cli**: `workspace_registries = "all"` reaches only private hosts listed in `DEPS_LSP_PRIVATE_REGISTRY_HOSTS`, also with `--config` and in the GitHub Action `env:` (#1808)
+- **deps-core, deps-engine**: `WorkspaceRegistryAccess::All` is bounded by `PrivateRegistryAllowlist`; `resolve` and `from_policy` take `&AllowlistOutcome` (#1808)
+- **deps-core**: `CredentialHeader` removed; `RequestHeader` gains `Authorization(&AuthorizationValue)`; `basic_auth_header` and `bearer_auth_header` return `AuthorizationValue` (#1808)
+- **deps-core**: `get_cached_trusted_origin_response` and `get_cached_pinned_response` take a `RevalidationFailure` (#1808)
+- **deps-core**: `WatchedConfig::new` takes a `ConfigReach`; `for_watched_config` returns `WatchedConfigMatch` (#1808)
+- **deps-core, deps-github-actions, deps-gitlab-ci**: per-crate `unknown_ref_diagnostics` replaced by `lsp_helpers::unknown_ref_diagnostics` (#1808)
 
 ### Security
-- **deps-core, deps-lsp, deps-cli**: repository settings can no longer reach private registry hosts without the `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` allowlist (#PR)
+- **deps-core, deps-lsp, deps-cli**: repository settings can no longer reach private registry hosts without the `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` allowlist (#1808)
 - **deps-core, all registry ecosystems**: registry credential headers (`Authorization`, `PRIVATE-TOKEN`) are marked sensitive so they stay out of HTTP-stack debug output (#1772, #1776)
 - **deps-lsp**: repository editor settings can no longer redirect `GITLAB_TOKEN` through `registries.gitlab_instance_host`; the configuration docs now list the trust impact of every repository-settable field (#1797)
 
@@ -107,12 +107,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: push-only clients get diagnostics republished after a `didChangeConfiguration` that changes no parse-affecting setting (#1797)
 - **deps-core, deps-github-actions**: a tag pin no published tag matches reports vulnerability data as not checked instead of clean (#1797)
 - **deps-lsp**: the build-script commit stamp follows new commits on the same branch and works in linked worktrees (#1797)
-- **deps-lsp**: config applies are serialized and diagnostics publishes are epoch-checked, so the latest configuration wins (#PR)
-- **deps-lsp**: the build script no longer reruns on sibling-worktree `git pack-refs` (#PR)
-- **deps-lsp**: a changed watched config reparses only the open documents it governs (#PR)
-- **deps-swift**: the registry release list is never a mix of page generations (#PR)
-- **deps-gitlab-ci**: a `project:` tag pin resolves through the Tags index like a GitHub Actions tag pin (#PR)
-- **deps-lsp, deps-cli**: automated CLI/LSP diagnostics parity test (#PR)
+- **deps-lsp**: config applies are serialized and diagnostics publishes are epoch-checked, so the latest configuration wins (#1808)
+- **deps-lsp**: the build script no longer reruns on sibling-worktree `git pack-refs` (#1808)
+- **deps-lsp**: a changed watched config reparses only the open documents it governs (#1808)
+- **deps-swift**: the registry release list is never a mix of page generations (#1808)
+- **deps-gitlab-ci**: a `project:` tag pin resolves through the Tags index like a GitHub Actions tag pin (#1808)
+- **deps-lsp, deps-cli**: automated CLI/LSP diagnostics parity test (#1808)
 
 ## [2.0.0] - 2026-09-29
 
