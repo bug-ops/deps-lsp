@@ -56,6 +56,7 @@ bytes = { workspace = true }
 dashmap = { workspace = true }
 deps-core-macros = { workspace = true }
 futures = { workspace = true }
+ipnet = { workspace = true }
 jsonc-parser = { workspace = true }
 reqwest = { workspace = true, features = ["json", "gzip"] }
 semver = { workspace = true }

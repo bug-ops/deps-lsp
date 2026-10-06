@@ -4,7 +4,10 @@
 //! plumbing instead of forking it. `deps-github-actions` now imports these instead of
 //! defining them locally.
 
-use super::{BoundedVersionReq, CommentTag, LineOffsetTable, RequirementStatus};
+use super::{
+    BoundedVersionReq, CommentTag, LineOffsetTable, RequirementStatus, concrete_pin_version,
+};
+use crate::EcosystemId;
 use crate::pagination::ListCoverage;
 use crate::position::Range;
 use yaml_rust2::parser::Tag;
@@ -950,6 +953,40 @@ impl TagIndex {
                 pin,
                 sibling_coverage: self.coverage,
             })
+    }
+
+    /// What the index proves about a pin written as the tag `written` of `ecosystem`: an exact
+    /// release ([`Self::exact_tag_resolution`]) when `written` is concrete under
+    /// [`concrete_pin_version`], a floating major/minor ([`Self::floating_tag_resolution`]) when
+    /// it is a partial semver shape, and [`PinResolution::Unresolved`] for any other text (a
+    /// branch name, a date, free text).
+    ///
+    /// The one classification both git-tags ecosystems (GitHub Actions, GitLab CI) share, so a
+    /// tag pin resolves the same way in each.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::EcosystemId;
+    /// use deps_core::lsp_helpers::{CommitSha, PinResolution, TagIndex};
+    ///
+    /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let index = TagIndex::from_tags([("v4", &sha), ("v4.8.0", &sha)]);
+    /// let resolve = |written| index.tag_pin_resolution(written, EcosystemId::GitlabCi);
+    /// assert!(matches!(resolve("v4.8.0"), PinResolution::Resolved { .. }));
+    /// assert_eq!(resolve("v4.9.0"), PinResolution::Unpublished);
+    /// assert!(matches!(resolve("v4"), PinResolution::Resolved { .. }));
+    /// assert_eq!(resolve("main"), PinResolution::Unresolved);
+    /// ```
+    #[must_use]
+    pub fn tag_pin_resolution(&self, written: &str, ecosystem: EcosystemId) -> PinResolution {
+        if concrete_pin_version(written, ecosystem).is_some() {
+            self.exact_tag_resolution(written)
+        } else if is_partial_semver_shaped(written) {
+            self.floating_tag_resolution(written)
+        } else {
+            PinResolution::Unresolved
+        }
     }
 
     /// Caps an up-to-date status read from the text of a tag pin `written` that this index

@@ -121,7 +121,7 @@ pub use sha_comment::{
 pub use unknown_ref::build_unknown_ref_fix_action;
 pub use unknown_ref::{
     UNKNOWN_REF_DIAGNOSTIC_CODE, UnknownRefTarget, dependency_at_position, unknown_ref_diagnostic,
-    unknown_ref_diagnostic_for,
+    unknown_ref_diagnostic_for, unknown_ref_diagnostics,
 };
 
 /// Maximum number of recent versions hover's "Recent versions" section renders.

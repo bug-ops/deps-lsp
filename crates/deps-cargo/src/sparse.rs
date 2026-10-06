@@ -30,8 +30,8 @@
 use crate::config::{AuthToken, IndexTrust, RegistryIndex};
 use crate::types::CargoVersion;
 use deps_core::{
-    CredentialHeader, DepsError, HttpCache, RequestHeader, Result,
-    lsp_helpers::warn_rejected_value, net_policy::RedactedUrl,
+    DepsError, HttpCache, RequestHeader, Result, lsp_helpers::warn_rejected_value,
+    net_policy::RedactedUrl,
 };
 use semver::{Version, VersionReq};
 use serde::Deserialize;
@@ -228,7 +228,7 @@ pub struct SparseIndexClient {
     /// whatever it is given, over an origin-pinned transport
     /// ([`deps_core::HttpCache::get_cached_trusted_origin_with_headers`]) so the header cannot
     /// survive a cross-origin redirect.
-    auth_header: Option<deps_core::secret::Redacted>,
+    auth_header: Option<deps_core::secret::AuthorizationValue>,
     /// The [`IndexTrust`] tier `index` was validated under (issue #455, C2): governs which
     /// transport [`Self::fetch`] routes through — a `WorkspaceDeclared` index always goes
     /// through [`deps_core::HttpCache::get_cached_workspace`], regardless of whether `auth` is
@@ -265,7 +265,7 @@ impl SparseIndexClient {
         registry_display_name: &'static str,
     ) -> Self {
         let auth_header =
-            auth.map(|token| deps_core::secret::bearer_auth_header(token.expose_secret()));
+            auth.map(|token| deps_core::secret::bearer_auth_header(token.as_redacted()));
         Self {
             trust: index.trust(),
             base_url: index.as_str().to_string(),
@@ -381,10 +381,7 @@ impl SparseIndexClient {
                     .get_cached_trusted_origin_with_headers(
                         url,
                         &self.base_url,
-                        &[RequestHeader::Credential(
-                            CredentialHeader::Authorization,
-                            header_value,
-                        )],
+                        &[RequestHeader::Authorization(header_value)],
                     )
                     .await
             }

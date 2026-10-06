@@ -1,3 +1,4 @@
+use super::config_epoch::{ConfigApplyGuard, ConfigEpoch, ConfigEpochCell};
 use dashmap::DashMap;
 use deps_core::HttpCache;
 use deps_core::lockfile::LockFileCache;
@@ -157,6 +158,21 @@ impl ResolvedGeneration {
         self == Self::INITIAL
     }
 }
+
+/// Identity of the document state a diagnostics generation read (#1799): changes whenever the
+/// client version, the parse result (a reparse rebuilds the state) or the resolved versions do,
+/// so a publish that raced such a change is detected and regenerated instead of landing last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DocStamp {
+    version: Option<i32>,
+    resolved: ResolvedGeneration,
+    parsed_at: Instant,
+}
+
+/// Orders diagnostics generation attempts by when they started (see
+/// [`ServerState::claim_publish`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PublishTicket(u64);
 
 /// State for a single open document.
 ///
@@ -1011,6 +1027,12 @@ pub struct ServerState {
     /// `Backend::initialize`/`did_change_configuration` updating this value here takes effect
     /// on every parse from then on, with no need to reconstruct either ecosystem.
     pub registry_policy: Arc<RegistryAccessPolicy>,
+    /// The process-wide private-registry allowlist read at construction; immutable, and the
+    /// only way `registries.workspace_registries = "all"` reaches a private host.
+    private_registries: deps_core::net_policy::AllowlistOutcome,
+    /// What the setting last resolved to, so the user is told once per transition into a
+    /// setting that does not do what it says rather than on every config change.
+    registries_effect: std::sync::Mutex<deps_core::policy_config::WorkspaceRegistriesEffect>,
     /// Live-updatable `registries.nuget_user_profile_sources` setting (issue #561, FR-006) —
     /// the same handle `crate::register_ecosystems` hands to `NuGetEcosystem`'s
     /// `NuGetParseContext`, bundled inside `EcosystemRuntime`. See that struct's docs.
@@ -1145,7 +1167,18 @@ pub struct ServerState {
     pending_reparse: std::sync::Mutex<Option<PendingReparse>>,
     /// Generation counter bumped by [`Self::queue_reparse`], letting a debounce worker
     /// detect it was superseded by a newer config change before draining `pending_reparse`.
-    config_generation: AtomicU64,
+    reparse_generation: AtomicU64,
+    /// Epoch bracketing every config apply, so a diagnostics generation that overlapped one is
+    /// detected and redone (#1799). Bumped only through [`Self::begin_config_apply`].
+    config_epoch: ConfigEpochCell,
+    /// Wakes the single republish worker (#1799); the permit `notify_one` retains means a burst
+    /// of requests coalesces into at most one extra pass and none is ever lost.
+    republish: tokio::sync::Notify,
+    /// Source of [`PublishTicket`]s, one per diagnostics generation attempt.
+    publish_tickets: AtomicU64,
+    /// Newest ticket that published per document, so a generation that started earlier but
+    /// finishes later (and so may have read older signals) never overwrites a newer publish.
+    published: DashMap<Uri, PublishTicket>,
     /// Server-global source for [`PackageSignals::resolved_versions_generation`] (issue
     /// #1395 critic M10), drawn via [`Self::next_resolved_versions_generation`]. A
     /// per-document-instance counter that restarts at 0 on every `DocumentState` rebuild
@@ -1170,15 +1203,28 @@ struct PendingReparse {
 }
 
 impl ServerState {
-    /// Creates a new server state with default configuration.
+    /// Creates a new server state with default configuration, reading the private-registry
+    /// allowlist from `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` once.
     pub fn new() -> Self {
+        Self::with_private_registries(deps_core::net_policy::PrivateRegistryAllowlist::from_env())
+    }
+
+    /// Creates a new server state whose private-registry reach is bounded by `private_registries`.
+    ///
+    /// The outcome is fixed for the server's lifetime: no setting can widen it, which is what
+    /// keeps a repository-supplied `registries.workspace_registries = "all"` from reaching
+    /// private hosts. Also the test seam for a state with a specific allowlist, since tests
+    /// must not mutate the process environment.
+    pub fn with_private_registries(
+        private_registries: deps_core::net_policy::AllowlistOutcome,
+    ) -> Self {
         // `EcosystemRuntime::from_policy` (issue #1058 T009) replaces this constructor's own
         // hand-built `EcosystemRuntime::new(...)` call; `PolicyConfig::default()` reproduces
         // the exact same defaults (`RegistryAccessPolicy`'s own `Default` resolves to the same
         // `WorkspaceRegistryAccess::PublicOnly` as `PolicyConfig::default()`'s
         // `registries.workspace_registries`).
         let default_policy = PolicyConfig::default();
-        let runtime = crate::EcosystemRuntime::from_policy(&default_policy);
+        let runtime = crate::EcosystemRuntime::from_policy(&default_policy, &private_registries);
         let registry_policy = Arc::clone(&runtime.policy);
         let nuget_user_profile_sources = Arc::clone(&runtime.nuget_user_profile_sources);
         let keychain_credentials = Arc::clone(&runtime.keychain_credentials);
@@ -1217,6 +1263,10 @@ impl ServerState {
             lockfile_cache,
             ecosystem_registry,
             registry_policy,
+            private_registries,
+            registries_effect: std::sync::Mutex::new(
+                deps_core::policy_config::WorkspaceRegistriesEffect::AsConfigured,
+            ),
             nuget_user_profile_sources,
             keychain_credentials,
             gitlab_instance_host,
@@ -1235,7 +1285,11 @@ impl ServerState {
             diagnostic_refresh_supported: AtomicBool::new(false),
             fetch_permits: Arc::new(tokio::sync::Semaphore::new(FETCH_PERMITS)),
             pending_reparse: std::sync::Mutex::new(None),
-            config_generation: AtomicU64::new(0),
+            reparse_generation: AtomicU64::new(0),
+            config_epoch: ConfigEpochCell::default(),
+            republish: tokio::sync::Notify::new(),
+            publish_tickets: AtomicU64::new(0),
+            published: DashMap::new(),
             resolved_versions_generation_source: AtomicU64::new(0),
         }
     }
@@ -1415,14 +1469,74 @@ impl ServerState {
                 },
             });
         }
-        self.config_generation.fetch_add(1, Ordering::SeqCst) + 1
+        self.reparse_generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// Current reparse-coalescing generation (issue #592), read by a debounce worker to
     /// detect whether it was superseded by a newer config change before draining
     /// `pending_reparse`.
-    pub(crate) fn config_generation(&self) -> u64 {
-        self.config_generation.load(Ordering::SeqCst)
+    pub(crate) fn reparse_generation(&self) -> u64 {
+        self.reparse_generation.load(Ordering::SeqCst)
+    }
+
+    /// The private-registry allowlist outcome this server was started with.
+    pub(crate) const fn private_registries(&self) -> &deps_core::net_policy::AllowlistOutcome {
+        &self.private_registries
+    }
+
+    /// Records the latest resolved effect and returns it only when it differs from the
+    /// previous one and carries a user-facing message, so the warning fires on transition.
+    pub(crate) fn note_registries_effect(
+        &self,
+        effect: deps_core::policy_config::WorkspaceRegistriesEffect,
+    ) -> Option<deps_core::policy_config::WorkspaceRegistriesEffect> {
+        let mut last = self
+            .registries_effect
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = *last != effect;
+        *last = effect;
+        (changed && effect.user_message().is_some()).then_some(effect)
+    }
+
+    /// The [`DocStamp`] of `uri`'s current state, or `None` when it is not open.
+    pub(crate) fn document_stamp(&self, uri: &Uri) -> Option<DocStamp> {
+        self.with_document(uri, |doc| DocStamp {
+            version: doc.version,
+            resolved: doc.signals.resolved_versions_generation,
+            parsed_at: doc.parsed_at,
+        })
+    }
+
+    /// The current config epoch, possibly mid-apply; see [`ConfigEpoch`].
+    pub(crate) fn config_epoch(&self) -> ConfigEpoch {
+        self.config_epoch.current()
+    }
+
+    /// Waits for any in-flight config apply to finish and returns the settled epoch (#1799).
+    pub(crate) async fn settled_config_epoch(&self) -> ConfigEpoch {
+        self.config_epoch.settled().await
+    }
+
+    /// Marks a config apply as in flight until the returned guard drops (#1799).
+    ///
+    /// Taking the config write guard as a witness ties the bump to the one place that already
+    /// serializes appliers, so nothing else can move the epoch.
+    pub(crate) fn begin_config_apply(
+        &self,
+        _config_write: &tokio::sync::RwLockWriteGuard<'_, crate::config::DepsConfig>,
+    ) -> ConfigApplyGuard<'_> {
+        self.config_epoch.begin_apply()
+    }
+
+    /// Asks the republish worker to republish every loaded document's diagnostics (#1799).
+    pub(crate) fn request_republish(&self) {
+        self.republish.notify_one();
+    }
+
+    /// Resolves once a republish was requested since the last wake.
+    pub(crate) async fn republish_requested(&self) {
+        self.republish.notified().await;
     }
 
     /// Draws the next server-global `PackageSignals::resolved_versions_generation` value
@@ -1594,7 +1708,45 @@ impl ServerState {
     /// Returns `None` if no document exists at the given URI.
     #[tracing::instrument(skip_all, fields(uri = ?uri))]
     pub fn remove_document(&self, uri: &Uri) -> Option<(Uri, DocumentState)> {
-        self.documents.remove(uri)
+        // Documents first, then the claim: [`Self::claim_publish`] re-checks the document after
+        // inserting, so a generation racing this close cannot leave an entry behind.
+        let removed = self.documents.remove(uri);
+        self.published.remove(uri);
+        removed
+    }
+
+    /// Draws the ticket for a new diagnostics generation attempt; later tickets started later.
+    pub(crate) fn next_publish_ticket(&self) -> PublishTicket {
+        PublishTicket(self.publish_tickets.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    /// Whether any generation has published `uri`'s diagnostics since it was last removed.
+    #[cfg(test)]
+    pub(crate) fn has_published(&self, uri: &Uri) -> bool {
+        self.published.contains_key(uri)
+    }
+
+    /// Claims the right to publish `uri`'s diagnostics for `ticket`; `false` when a generation
+    /// that started later already published, so this older one must stay silent.
+    pub(crate) fn claim_publish(&self, uri: &Uri, ticket: PublishTicket) -> bool {
+        let mut claimed = false;
+        self.published
+            .entry(uri.clone())
+            .and_modify(|newest| {
+                if *newest < ticket {
+                    *newest = ticket;
+                    claimed = true;
+                }
+            })
+            .or_insert_with(|| {
+                claimed = true;
+                ticket
+            });
+        if claimed && !self.documents.contains_key(uri) {
+            // A closed document keeps no claim, or the map would grow with every closed URI.
+            self.published.remove_if(uri, |_, newest| *newest == ticket);
+        }
+        claimed
     }
 
     /// Spawns a background task for a document, supervising it for panics.
@@ -2295,11 +2447,11 @@ mod tests {
         #[test]
         fn test_queue_reparse_bumps_generation() {
             let state = ServerState::new();
-            assert_eq!(state.config_generation(), 0);
+            assert_eq!(state.reparse_generation(), 0);
 
             let gen1 = state.queue_reparse(ReparseScope::Ecosystems(vec![EcosystemId::Cargo]));
             assert_eq!(gen1, 1);
-            assert_eq!(state.config_generation(), 1);
+            assert_eq!(state.reparse_generation(), 1);
 
             let gen2 = state.queue_reparse(ReparseScope::Ecosystems(vec![EcosystemId::Npm]));
             assert_eq!(gen2, 2);
@@ -2315,10 +2467,20 @@ mod tests {
                 .take_pending_reparse()
                 .expect("a pending scope must exist after two queue_reparse calls");
             assert!(
-                scope.matches(EcosystemId::Cargo),
+                scope.matches(
+                    EcosystemId::Cargo,
+                    &crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                        "/t/Cargo.toml"
+                    ))
+                ),
                 "earlier change's scope must survive"
             );
-            assert!(scope.matches(EcosystemId::Npm));
+            assert!(scope.matches(
+                EcosystemId::Npm,
+                &crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                    "/t/Cargo.toml"
+                ))
+            ));
         }
 
         #[test]

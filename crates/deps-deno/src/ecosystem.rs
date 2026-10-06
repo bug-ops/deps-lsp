@@ -8,7 +8,7 @@
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, WatchedConfig,
+    ConfigReach, Ecosystem, ParseResult as ParseResultTrait, Registry, Result, WatchedConfig,
     WatchedConfigEffect, lsp_helpers::EcosystemFormatter,
 };
 use std::any::Any;
@@ -167,6 +167,7 @@ impl deps_core::ecosystem::private::Sealed for DenoEcosystem {}
 const WATCHED_CONFIGS: [WatchedConfig; 1] = [WatchedConfig::new(
     ".npmrc",
     WatchedConfigEffect::ChangesRouting,
+    ConfigReach::Subtree,
 )];
 
 impl Ecosystem for DenoEcosystem {
@@ -303,6 +304,16 @@ mod tests {
 
     fn pkg(s: &str) -> deps_core::PackageName {
         deps_core::PackageName::new(s)
+    }
+
+    #[test]
+    fn test_npmrc_is_watched_with_subtree_reach() {
+        let ecosystem = DenoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let [config] = ecosystem.watched_configs() else {
+            panic!("deno watches exactly .npmrc");
+        };
+        assert_eq!(config.path_suffix(), ".npmrc");
+        assert_eq!(config.reach(), ConfigReach::Subtree);
     }
 
     /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against Deno's REAL

@@ -65,10 +65,15 @@ impl AuthToken {
         Self(deps_core::secret::Redacted::new(token))
     }
 
-    /// The raw token value, for building an `Authorization` header. Never logged, printed,
-    /// or otherwise surfaced — callers must not pass this to anything but a header value.
+    /// The raw token value, for asserting on it in tests.
+    #[cfg(test)]
     pub(crate) fn expose_secret(&self) -> &str {
         self.0.expose_secret()
+    }
+
+    /// The wrapped secret, for building a `Bearer` `Authorization` value.
+    pub(crate) const fn as_redacted(&self) -> &deps_core::secret::Redacted {
+        &self.0
     }
 }
 
@@ -1133,7 +1138,12 @@ mod tests {
     }
 
     fn all_policy() -> RegistryAccessPolicy {
-        RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)
+        RegistryAccessPolicy::with_allowlist(
+            WorkspaceRegistryAccess::All,
+            Arc::new(deps_core::net_policy::PrivateRegistryAllowlist::for_test(
+                &["10.0.0.0/8"],
+            )),
+        )
     }
 
     fn off_policy() -> RegistryAccessPolicy {
@@ -1350,7 +1360,10 @@ token = "secret-token"
         let result = parse_cargo_home_registries_raw(content);
         let (raw_index, token) = result.get("my-corp").unwrap();
         assert_eq!(raw_index, "sparse+https://index.mycorp.dev");
-        assert_eq!(token.as_ref().unwrap().expose_secret(), "secret-token");
+        assert_eq!(
+            token.as_ref().unwrap().as_redacted().expose_secret(),
+            "secret-token"
+        );
     }
 
     #[test]
@@ -1488,7 +1501,10 @@ token = "secret-token"
 
         let entry = config.get("my-corp").unwrap();
         assert_eq!(entry.index.as_str(), "https://real.example/");
-        assert_eq!(entry.auth.as_ref().unwrap().expose_secret(), "real-token");
+        assert_eq!(
+            entry.auth.as_ref().unwrap().as_redacted().expose_secret(),
+            "real-token"
+        );
         assert_eq!(entry.provenance, Provenance::CargoHome);
     }
 
@@ -1655,7 +1671,10 @@ token = "secret-token"
         let (config, _) = resolve_with_env(&aliases, &[], None, &cache, &policy, &env);
         let entry = config.get("env-only-corp").unwrap();
         assert_eq!(entry.index.as_str(), "https://env.example/");
-        assert_eq!(entry.auth.as_ref().unwrap().expose_secret(), "env-token");
+        assert_eq!(
+            entry.auth.as_ref().unwrap().as_redacted().expose_secret(),
+            "env-token"
+        );
         assert_eq!(entry.provenance, Provenance::CargoHome);
     }
 
@@ -1870,12 +1889,12 @@ token = "secret-token"
         std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
         std::fs::write(
             root.path().join(".cargo/config.toml"),
-            "[registries.metadata]\nindex = \"https://169.254.169.254\"\n",
+            "[registries.metadata]\nindex = \"https://10.0.0.1\"\n",
         )
         .unwrap();
 
         let cache = ConfigFileCache::new();
-        let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::All);
+        let policy = all_policy();
         let workspace_paths = vec![root.path().join(".cargo/config.toml")];
         let aliases: HashSet<String> = std::iter::once("metadata".to_string()).collect();
 

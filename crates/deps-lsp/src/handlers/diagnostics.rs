@@ -1,7 +1,10 @@
 //! Diagnostics handler using ecosystem trait delegation.
 
 use crate::config::{DepsConfig, DiagnosticsConfig};
-use crate::document::{PrefetchVisibility, ServerState, ensure_document_loaded};
+use crate::document::config_epoch::ConfigEpoch;
+use crate::document::{
+    DocStamp, PrefetchVisibility, PublishTicket, ServerState, ensure_document_loaded,
+};
 use deps_core::policy_config::OsvChecks;
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,14 +84,15 @@ pub(crate) fn document_dependency_count(state: &ServerState, uri: &Uri) -> usize
 }
 
 /// Config values needed to generate and publish diagnostics, snapshotted from `DepsConfig`
-/// once per background task/request so the caller never has to hold the config lock itself
-/// (mirrors `document::lifecycle::ChangeTaskConfig`'s own snapshot-once rationale). Shared by
-/// every diagnostics call site (issue #1399): the three push-path sites —
-/// `document::lifecycle`'s open- and change-path background refreshes and `server.rs`'s
-/// lockfile-change refresh — build one via [`publish_document_diagnostics`], and the
-/// pull-diagnostics path ([`handle_diagnostics`]) builds one directly (overriding only
-/// `severities`, see that function's doc). Replaces five near-identical copies of the same
-/// generate(-then-publish) sequence.
+/// once per generation so the caller never has to hold the config lock itself (mirrors
+/// `document::lifecycle::ChangeTaskConfig`'s own snapshot-once rationale). Shared by every
+/// diagnostics call site (issue #1399): the push-path sites publish through
+/// [`publish_document_diagnostics`], and the pull-diagnostics path ([`handle_diagnostics`])
+/// builds one directly (overriding only `severities`, see that function's doc).
+///
+/// Built only by [`Self::capture`] (#1799), which records the [`ConfigEpoch`] and the
+/// [`DocStamp`] the generation reads, so [`publish_document_diagnostics`] can tell whether a
+/// config apply or a document change overlapped it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DiagnosticsSnapshot {
     pub(crate) freshness: deps_core::FreshnessSettings,
@@ -96,18 +100,36 @@ pub(crate) struct DiagnosticsSnapshot {
     network: deps_core::NetworkMode,
     pub(crate) fetch_timeout_secs: u64,
     pub(crate) max_concurrent_fetches: usize,
+    epoch: ConfigEpoch,
+    stamp: Option<DocStamp>,
 }
 
 impl DiagnosticsSnapshot {
-    /// Builds a snapshot from the currently loaded [`DepsConfig`].
-    pub(crate) fn from_config(config: &DepsConfig) -> Self {
+    /// Snapshots the live [`DepsConfig`] for `uri`, first waiting for any in-flight config
+    /// apply so the epoch recorded here is a settled one (#1799).
+    pub(crate) async fn capture(
+        state: &ServerState,
+        uri: &Uri,
+        config: &RwLock<DepsConfig>,
+    ) -> Self {
+        let epoch = state.settled_config_epoch().await;
+        let stamp = state.document_stamp(uri);
+        let config = config.read().await;
         Self {
             freshness: config.policy.freshness.to_freshness(),
             severities: config.policy.diagnostics.to_severities(),
             network: config.policy.network.mode(),
             fetch_timeout_secs: config.policy.cache.fetch_timeout_secs,
             max_concurrent_fetches: config.policy.cache.max_concurrent_fetches,
+            epoch,
+            stamp,
         }
+    }
+
+    /// Whether neither a config apply nor a change to `uri`'s document state happened since
+    /// this snapshot was captured.
+    fn is_current(&self, state: &ServerState, uri: &Uri) -> bool {
+        state.config_epoch() == self.epoch && state.document_stamp(uri) == self.stamp
     }
 
     /// Replaces the severities (the pull path's caller-captured `DiagnosticsConfig`).
@@ -129,7 +151,7 @@ impl DiagnosticsSnapshot {
 
     /// Builds a snapshot from explicit values, for tests that drive diagnostics generation.
     #[cfg(all(test, any(feature = "cargo", feature = "npm")))]
-    pub(crate) const fn for_test(
+    pub(crate) fn for_test(
         freshness: deps_core::FreshnessSettings,
         severities: deps_core::DiagnosticSeverities,
         network: deps_core::NetworkMode,
@@ -140,48 +162,155 @@ impl DiagnosticsSnapshot {
             network,
             fetch_timeout_secs: 0,
             max_concurrent_fetches: 1,
+            epoch: ConfigEpoch::default(),
+            stamp: None,
         }
     }
 }
 
-/// Generates diagnostics for `uri` from `snapshot` and publishes them to `client` — the
-/// generate-then-publish sequence every push-path diagnostics refresh needs (issue #1399):
-/// `document::lifecycle`'s open- and change-path background tasks, and `server.rs`'s
-/// lockfile-change refresh. Not used by the pull-diagnostics path ([`handle_diagnostics`]),
-/// which returns its diagnostics to the caller instead of publishing them.
-///
-/// `dep_count` is not part of `snapshot` because it varies per call site: a manifest-wide
-/// count for a fresh open or a lockfile-change refresh, or a fetch-batch size for a
-/// change-path refresh that only fetched a subset of dependencies — see [`loading_ceiling`]'s
-/// doc for why this matters.
-pub(crate) async fn publish_document_diagnostics(
-    state: &Arc<ServerState>,
-    client: &Client,
-    uri: &Uri,
-    snapshot: &DiagnosticsSnapshot,
-    dep_count: usize,
-) {
-    let ceiling = loading_ceiling(
-        snapshot.fetch_timeout_secs,
-        dep_count,
-        snapshot.max_concurrent_fetches,
-    );
-    let diags = generate_diagnostics_internal(Arc::clone(state), uri, snapshot, ceiling).await;
-    client.publish_diagnostics(uri.clone(), diags, None).await;
-}
+/// How many times [`publish_document_diagnostics`] regenerates after an overlapping config
+/// apply or document change before it publishes what it has, bounding starvation under a
+/// continuous burst.
+const MAX_PUBLISH_ATTEMPTS: u32 = 8;
 
-/// Like [`publish_document_diagnostics`], but builds the snapshot from the live `config` at
-/// publish time, so a `didChangeConfiguration` that landed while a background task was
-/// fetching is reflected instead of overwritten by the task's spawn-time values (#1794).
-pub(crate) async fn publish_document_diagnostics_live(
+/// Generates diagnostics for `uri` under the live `config` and publishes them to `client` —
+/// the one publish path for every push-path diagnostics refresh (issue #1399, #1799).
+///
+/// A generation that overlapped a config apply ([`ServerState::config_epoch`]) or a change to
+/// the document's own state ([`DocStamp`]) is regenerated rather than published or dropped:
+/// publishing it would let an older config land after a newer one, and dropping it would leave
+/// a document whose own fetch-completion publish was the only one pending with no diagnostics.
+/// The currency check, the claim on the document's publish order and the send all happen under
+/// one config read guard, so no config apply can slip in between them.
+///
+/// `dep_count` varies per call site: a manifest-wide count for a fresh open or a lockfile-change
+/// refresh, or a fetch-batch size for a change-path refresh that only fetched a subset of
+/// dependencies — see [`loading_ceiling`]'s doc for why this matters.
+pub(crate) async fn publish_document_diagnostics(
     state: &Arc<ServerState>,
     client: &Client,
     uri: &Uri,
     config: &RwLock<DepsConfig>,
     dep_count: usize,
 ) {
-    let snapshot = DiagnosticsSnapshot::from_config(&*config.read().await);
-    publish_document_diagnostics(state, client, uri, &snapshot, dep_count).await;
+    publish_with(state, client, uri, config, |snapshot| async move {
+        let ceiling = loading_ceiling(
+            snapshot.fetch_timeout_secs,
+            dep_count,
+            snapshot.max_concurrent_fetches,
+        );
+        generate_diagnostics_internal(Arc::clone(state), uri, &snapshot, ceiling).await
+    })
+    .await;
+}
+
+/// [`publish_document_diagnostics`] over an injectable generator, so the retry and ordering
+/// rules are testable without a registry-backed document.
+async fn publish_with<F, Fut>(
+    state: &ServerState,
+    client: &Client,
+    uri: &Uri,
+    config: &RwLock<DepsConfig>,
+    generate: F,
+) where
+    F: FnMut(DiagnosticsSnapshot) -> Fut,
+    Fut: std::future::Future<Output = Vec<Diagnostic>>,
+{
+    let generated = generate_until_current(state, uri, config, generate).await;
+    if !generated.current {
+        tracing::debug!(
+            ?uri,
+            "diagnostics kept racing config/document changes; publishing the latest \
+             generation and asking for a republish"
+        );
+        state.request_republish();
+    }
+    // A regeneration that meets a document another task just set to `Loading` returns an empty
+    // set; publishing it would blank diagnostics the loading document's own fetch task is about
+    // to replace.
+    if generated.retried
+        && state
+            .with_document(uri, |doc| {
+                doc.loading_state() == deps_core::LoadingState::Loading
+            })
+            .unwrap_or(false)
+    {
+        return;
+    }
+    if !state.claim_publish(uri, generated.ticket) {
+        tracing::debug!(?uri, "a later diagnostics generation already published");
+        return;
+    }
+    // The config read guard is still held here so no apply can start before the send is queued.
+    // A client that stops draining must not wedge config applies (and, behind a queued writer,
+    // every other config reader), so the send is bounded.
+    let sent = send_bounded(
+        client.publish_diagnostics(uri.clone(), generated.value, None),
+        PUBLISH_SEND_TIMEOUT,
+    )
+    .await;
+    if !sent {
+        tracing::warn!(
+            ?uri,
+            "client did not accept publishDiagnostics in time; dropped it"
+        );
+    }
+}
+
+/// Longest a diagnostics publish may hold the config read guard waiting on the client.
+const PUBLISH_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs `send`, giving up after `limit`; `true` when it completed.
+async fn send_bounded(send: impl std::future::Future<Output = ()>, limit: Duration) -> bool {
+    tokio::time::timeout(limit, send).await.is_ok()
+}
+
+/// The outcome of [`generate_until_current`]. Holds the config read guard the currency check
+/// ran under, so the caller sends before any config apply can start.
+struct Generated<'a, T> {
+    value: T,
+    /// Whether `value` was generated from state no config apply or document change overtook;
+    /// `false` only after [`MAX_PUBLISH_ATTEMPTS`] consecutive overlaps.
+    current: bool,
+    /// Whether this is not the first generation attempt.
+    retried: bool,
+    ticket: PublishTicket,
+    _config: tokio::sync::RwLockReadGuard<'a, DepsConfig>,
+}
+
+/// Runs `generate` on a fresh [`DiagnosticsSnapshot`] until one run finishes without a config
+/// apply or document change having overtaken it, or [`MAX_PUBLISH_ATTEMPTS`] runs were spent.
+///
+/// The ticket is drawn immediately before `generate` is first polled, with no yield before the
+/// document's signals are read, so ticket order is signal-read order.
+async fn generate_until_current<'a, T, F, Fut>(
+    state: &ServerState,
+    uri: &Uri,
+    config: &'a RwLock<DepsConfig>,
+    mut generate: F,
+) -> Generated<'a, T>
+where
+    F: FnMut(DiagnosticsSnapshot) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let mut attempt = 1;
+    loop {
+        let snapshot = DiagnosticsSnapshot::capture(state, uri, config).await;
+        let ticket = state.next_publish_ticket();
+        let value = generate(snapshot).await;
+        let guard = config.read().await;
+        let current = snapshot.is_current(state, uri);
+        if current || attempt == MAX_PUBLISH_ATTEMPTS {
+            return Generated {
+                value,
+                current,
+                retried: attempt > 1,
+                ticket,
+                _config: guard,
+            };
+        }
+        attempt += 1;
+    }
 }
 
 /// Handles diagnostic requests using trait-based delegation.
@@ -213,11 +342,9 @@ pub async fn handle_diagnostics(
     // since this is the one diagnostics call site that must keep observing whichever config
     // its caller captured before a concurrent `workspace/didChangeConfiguration` write; every
     // other field is unaffected by that race, so it still comes from `DiagnosticsSnapshot`.
-    let snapshot = {
-        let full_config = full_config.read().await;
-        DiagnosticsSnapshot::from_config(&full_config)
-    }
-    .with_severities(config.to_severities());
+    let snapshot = DiagnosticsSnapshot::capture(&state, uri, &full_config)
+        .await
+        .with_severities(config.to_severities());
 
     let dep_count = document_dependency_count(&state, uri);
     let ceiling = loading_ceiling(
@@ -378,24 +505,34 @@ mod tests {
 
     /// #1774: the pull path overrides severities after the snapshot is built, so the OSV gate
     /// must follow the override and the snapshot's own network mode, never a stale copy.
-    #[test]
-    fn snapshot_osv_checks_follows_severities_override_and_network() {
+    #[tokio::test]
+    async fn snapshot_osv_checks_follows_severities_override_and_network() {
+        let state = ServerState::new();
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+            "/test/Cargo.toml",
+        ));
         let mut offline_config = DepsConfig::default();
         offline_config.policy.network.offline = true;
+        let offline_config = RwLock::new(offline_config);
+        let online_config = RwLock::new(DepsConfig::default());
         let mut diagnostics = DiagnosticsConfig::default();
         diagnostics.vulnerabilities_enabled = true;
         let enabled = diagnostics.to_severities();
-        let offline = DiagnosticsSnapshot::from_config(&offline_config).with_severities(enabled);
+        let offline = DiagnosticsSnapshot::capture(&state, &uri, &offline_config)
+            .await
+            .with_severities(enabled);
         assert!(!offline.osv_checks().is_active());
 
         diagnostics.vulnerabilities_enabled = false;
         let disabled = diagnostics.to_severities();
-        let online =
-            DiagnosticsSnapshot::from_config(&DepsConfig::default()).with_severities(disabled);
+        let online = DiagnosticsSnapshot::capture(&state, &uri, &online_config)
+            .await
+            .with_severities(disabled);
         assert!(!online.osv_checks().is_active());
 
-        let online =
-            DiagnosticsSnapshot::from_config(&DepsConfig::default()).with_severities(enabled);
+        let online = DiagnosticsSnapshot::capture(&state, &uri, &online_config)
+            .await
+            .with_severities(enabled);
         assert!(online.osv_checks().is_active());
     }
 
@@ -730,6 +867,264 @@ mod tests {
             )),
             "a stale `doc.signals.typosquats` entry must not render while offline, got: {result:?}"
         );
+    }
+
+    fn epoch_test_uri() -> Uri {
+        crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test/Cargo.toml"))
+    }
+
+    /// Runs an empty config apply: the epoch goes odd and then to a new even value.
+    async fn apply_empty_config_change(state: &ServerState, config: &RwLock<DepsConfig>) {
+        let guard = config.write().await;
+        drop(state.begin_config_apply(&guard));
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_stale_after_a_config_apply() {
+        let state = ServerState::new();
+        let config = RwLock::new(DepsConfig::default());
+        let uri = epoch_test_uri();
+
+        let snapshot = DiagnosticsSnapshot::capture(&state, &uri, &config).await;
+        assert!(snapshot.is_current(&state, &uri));
+
+        apply_empty_config_change(&state, &config).await;
+        assert!(!snapshot.is_current(&state, &uri));
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_stale_after_the_document_changes() {
+        use crate::document::DocumentState;
+
+        let state = ServerState::new();
+        let config = RwLock::new(DepsConfig::default());
+        let uri = epoch_test_uri();
+        let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+        doc.set_version(Some(1));
+        state.update_document(uri.clone(), doc.clone());
+
+        let snapshot = DiagnosticsSnapshot::capture(&state, &uri, &config).await;
+        assert!(snapshot.is_current(&state, &uri));
+
+        doc.set_version(Some(2));
+        state.update_document(uri.clone(), doc);
+        assert!(!snapshot.is_current(&state, &uri));
+    }
+
+    #[tokio::test]
+    async fn capture_waits_for_an_in_flight_config_apply() {
+        let state = Arc::new(ServerState::new());
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+        let uri = epoch_test_uri();
+
+        let guard = config.write().await;
+        let apply = state.begin_config_apply(&guard);
+        drop(guard);
+        let capture = tokio::spawn({
+            let (state, config, uri) = (Arc::clone(&state), Arc::clone(&config), uri.clone());
+            async move { DiagnosticsSnapshot::capture(&state, &uri, &config).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !capture.is_finished(),
+            "capture must not read config while an apply is in flight"
+        );
+
+        drop(apply);
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), capture)
+            .await
+            .expect("capture must resume once the apply settles")
+            .expect("capture task");
+        assert!(snapshot.is_current(&state, &uri));
+    }
+
+    #[tokio::test]
+    async fn generation_is_redone_when_a_config_apply_overtakes_it() {
+        let state = ServerState::new();
+        let config = RwLock::new(DepsConfig::default());
+        let uri = epoch_test_uri();
+        let calls = std::sync::atomic::AtomicU32::new(0);
+
+        let generated = generate_until_current(&state, &uri, &config, |_snapshot| {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (state, config) = (&state, &config);
+            async move {
+                if call == 0 {
+                    apply_empty_config_change(state, config).await;
+                }
+                call
+            }
+        })
+        .await;
+
+        assert_eq!(generated.value, 1, "the second generation is the one kept");
+        assert!(generated.current);
+    }
+
+    #[tokio::test]
+    async fn exhausted_retries_request_a_republish_from_the_worker() {
+        let state = ServerState::new();
+        let (client, _) = create_test_client_and_config();
+        let config = RwLock::new(DepsConfig::default());
+        let uri = epoch_test_uri();
+
+        publish_with(&state, &client, &uri, &config, |_snapshot| {
+            let (state, config) = (&state, &config);
+            async move {
+                apply_empty_config_change(state, config).await;
+                Vec::new()
+            }
+        })
+        .await;
+
+        tokio::time::timeout(Duration::from_millis(200), state.republish_requested())
+            .await
+            .expect("an exhausted publish must wake the republish worker");
+    }
+
+    #[tokio::test]
+    async fn settled_generation_does_not_request_a_republish() {
+        let state = ServerState::new();
+        let (client, _) = create_test_client_and_config();
+        let config = RwLock::new(DepsConfig::default());
+        let uri = epoch_test_uri();
+        open_empty_document(&state, &uri);
+
+        publish_with(&state, &client, &uri, &config, |_snapshot| async {
+            Vec::new()
+        })
+        .await;
+
+        assert!(state.has_published(&uri));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), state.republish_requested())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_that_meets_a_loading_document_stays_silent() {
+        use crate::document::DocumentState;
+
+        let state = ServerState::new();
+        let (client, _) = create_test_client_and_config();
+        let config = RwLock::new(DepsConfig::default());
+        let uri = epoch_test_uri();
+        let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+        doc.set_loading();
+        state.update_document(uri.clone(), doc);
+        let calls = std::sync::atomic::AtomicU32::new(0);
+
+        publish_with(&state, &client, &uri, &config, |_snapshot| {
+            let first = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let (state, config) = (&state, &config);
+            async move {
+                if first {
+                    apply_empty_config_change(state, config).await;
+                }
+                Vec::new()
+            }
+        })
+        .await;
+
+        assert!(
+            !state.has_published(&uri),
+            "an empty set from a retry must not replace a loading document's diagnostics"
+        );
+    }
+
+    #[tokio::test]
+    async fn older_generation_cannot_publish_after_a_newer_one() {
+        let state = ServerState::new();
+        let uri = epoch_test_uri();
+        open_empty_document(&state, &uri);
+        let older = state.next_publish_ticket();
+        let newer = state.next_publish_ticket();
+
+        assert!(state.claim_publish(&uri, newer));
+        assert!(!state.claim_publish(&uri, older));
+        assert!(state.claim_publish(&uri, state.next_publish_ticket()));
+    }
+
+    /// N3: a generation still in flight when its document closes must not leave a claim behind.
+    #[tokio::test]
+    async fn claim_for_a_closed_document_is_not_retained() {
+        let state = ServerState::new();
+        let uri = epoch_test_uri();
+        open_empty_document(&state, &uri);
+        assert!(state.claim_publish(&uri, state.next_publish_ticket()));
+        assert!(state.has_published(&uri));
+
+        let in_flight = state.next_publish_ticket();
+        state.remove_document(&uri);
+        assert!(!state.has_published(&uri));
+        assert!(state.claim_publish(&uri, in_flight));
+        assert!(
+            !state.has_published(&uri),
+            "a late claim must not re-insert after the document was removed"
+        );
+    }
+
+    /// I1: a client that never drains the send must not hold the config guard forever.
+    #[tokio::test]
+    async fn stuck_send_is_abandoned_after_the_limit() {
+        let sent = send_bounded(std::future::pending::<()>(), Duration::from_millis(50)).await;
+        assert!(!sent);
+        assert!(send_bounded(async {}, Duration::from_millis(50)).await);
+    }
+
+    /// I1: while the (bounded) send runs, the config guard is held, so an apply queues behind it
+    /// instead of slipping in between the currency check and the send.
+    #[tokio::test]
+    async fn config_apply_waits_for_the_publish_guard() {
+        let config = RwLock::new(DepsConfig::default());
+        let state = ServerState::new();
+        let uri = epoch_test_uri();
+        let generated = generate_until_current(&state, &uri, &config, |_snapshot| async {}).await;
+        assert!(generated.current);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), config.write())
+                .await
+                .is_err()
+        );
+        drop(generated);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), config.write())
+                .await
+                .is_ok()
+        );
+    }
+
+    fn open_empty_document(state: &ServerState, uri: &Uri) {
+        state.update_document(
+            uri.clone(),
+            crate::document::DocumentState::new_without_parse_result(
+                EcosystemId::Cargo,
+                String::new(),
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_stops_retrying_after_the_attempt_cap() {
+        let state = ServerState::new();
+        let config = RwLock::new(DepsConfig::default());
+        let uri = epoch_test_uri();
+        let calls = std::sync::atomic::AtomicU32::new(0);
+
+        let generated = generate_until_current(&state, &uri, &config, |_snapshot| {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (state, config) = (&state, &config);
+            async move {
+                apply_empty_config_change(state, config).await;
+                call
+            }
+        })
+        .await;
+
+        assert_eq!(generated.value, MAX_PUBLISH_ATTEMPTS - 1);
+        assert!(!generated.current);
     }
 
     #[tokio::test]

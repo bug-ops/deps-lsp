@@ -22,9 +22,41 @@
 
 use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::EcosystemId;
+
+macro_rules! min_v4_prefix {
+    () => {
+        8
+    };
+}
+macro_rules! min_v6_prefix {
+    () => {
+        16
+    };
+}
+pub(crate) use {min_v4_prefix, min_v6_prefix};
+
+mod allowlist;
+
+macro_rules! private_host_hint {
+    () => {
+        "private hosts need registries.workspace_registries = \"all\" and \
+         DEPS_LSP_PRIVATE_REGISTRY_HOSTS"
+    };
+}
+
+/// Hint appended to a user-facing "blocked by policy" message so a user who already set
+/// `"all"` learns that the environment variable is the effective control.
+pub const PRIVATE_HOST_HINT: &str = private_host_hint!();
+
+pub(crate) use allowlist::{AccessSnapshot, Target};
+pub use allowlist::{
+    AllowlistOutcome, EntryRejection, PRIVATE_REGISTRY_HOSTS_ENV, PrivateRegistryAllowlist,
+    PrivateRegistryAllowlistError,
+};
 
 /// Classification of a URL's host, for [`RegistryAccessPolicy`] to evaluate against
 /// [`WorkspaceRegistryAccess`].
@@ -79,6 +111,37 @@ pub enum HostClass {
 }
 
 impl HostClass {
+    /// Whether listing the host in `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` can make a blocked host of
+    /// this class reachable: only the private-network classes, never
+    /// [`Self::never_a_registry`] ones (and not a public host).
+    #[must_use]
+    pub const fn allowlist_can_help(self) -> bool {
+        matches!(
+            self,
+            Self::PrivateV4 | Self::Cgnat | Self::UniqueLocalV6 | Self::InternalName
+        )
+    }
+
+    /// `"; <PRIVATE_HOST_HINT>"` when [`Self::allowlist_can_help`], else the empty string, so a
+    /// blocked-host message only points at the variable when it can actually help.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::HostClass;
+    ///
+    /// assert!(HostClass::PrivateV4.private_host_hint_suffix().contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"));
+    /// assert_eq!(HostClass::CloudMetadata.private_host_hint_suffix(), "");
+    /// ```
+    #[must_use]
+    pub const fn private_host_hint_suffix(self) -> &'static str {
+        if self.allowlist_can_help() {
+            concat!("; ", private_host_hint!())
+        } else {
+            ""
+        }
+    }
+
     /// Whether this class is one no legitimate registry index (or a redirect from one) could
     /// ever legitimately target.
     ///
@@ -384,25 +447,19 @@ pub enum WorkspaceRegistryAccess {
     /// this variant's name is honest about — see the module docs).
     #[default]
     PublicOnly,
-    /// Allow every class at parse time — the escape hatch for a workspace that legitimately
-    /// points at an RFC1918 registry. It does not unblock the
-    /// [`HostClass::never_a_registry`] classes (loopback, link-local, metadata, unspecified,
-    /// reserved) at connect time: the resolver guard rejects those under every policy.
+    /// Allow public hosts plus the hosts and CIDR ranges in the process-wide
+    /// [`PrivateRegistryAllowlist`] (`DEPS_LSP_PRIVATE_REGISTRY_HOSTS`) — the escape hatch for a
+    /// workspace that legitimately points at an RFC1918 registry.
+    ///
+    /// The `registries.workspace_registries` setting that selects this level is
+    /// repository-controllable, so the allowlist (environment-only, never deserialized from
+    /// settings) is the effective control: with an empty allowlist this behaves exactly like
+    /// [`Self::PublicOnly`]. It never unblocks the [`HostClass::never_a_registry`] classes
+    /// (loopback, link-local, metadata, unspecified, reserved) under any allowlist.
     All,
 }
 
 impl WorkspaceRegistryAccess {
-    /// Whether a workspace-declared URL classified as `class` may be fetched under this
-    /// policy.
-    #[must_use]
-    pub const fn allows(self, class: HostClass) -> bool {
-        match self {
-            Self::Off => false,
-            Self::PublicOnly => matches!(class, HostClass::Global),
-            Self::All => true,
-        }
-    }
-
     /// Numeric encoding for [`RegistryAccessPolicy`]'s lock-free storage, and — via
     /// `crate::cache`'s workspace-tier cache-key computation — for the digit distinguishing
     /// one policy era's workspace cache entries from another's.
@@ -444,19 +501,73 @@ impl WorkspaceRegistryAccess {
 /// assert_eq!(policy.get(), WorkspaceRegistryAccess::PublicOnly);
 /// ```
 #[derive(Debug)]
-pub struct RegistryAccessPolicy(AtomicU8);
+pub struct RegistryAccessPolicy {
+    level: AtomicU8,
+    allowlist: Arc<PrivateRegistryAllowlist>,
+}
 
 impl RegistryAccessPolicy {
-    /// Creates a handle initialized to `initial`.
+    /// Creates a handle initialized to `initial` with an empty [`PrivateRegistryAllowlist`], so
+    /// [`WorkspaceRegistryAccess::All`] behaves like [`WorkspaceRegistryAccess::PublicOnly`].
     #[must_use]
     pub fn new(initial: WorkspaceRegistryAccess) -> Self {
-        Self(AtomicU8::new(initial.to_u8()))
+        Self::with_allowlist(initial, Arc::new(PrivateRegistryAllowlist::empty()))
+    }
+
+    /// Creates a handle initialized to `initial` whose private-host reach is bounded by
+    /// `allowlist`.
+    ///
+    /// The allowlist is fixed for the lifetime of the handle: [`Self::set`] (and so
+    /// [`crate::cache::HttpCache::set_registry_policy`]) can change only the level, never widen
+    /// the set of reachable private hosts.
+    #[must_use]
+    pub fn with_allowlist(
+        initial: WorkspaceRegistryAccess,
+        allowlist: Arc<PrivateRegistryAllowlist>,
+    ) -> Self {
+        Self {
+            level: AtomicU8::new(initial.to_u8()),
+            allowlist,
+        }
     }
 
     /// The current policy.
     #[must_use]
     pub fn get(&self) -> WorkspaceRegistryAccess {
-        WorkspaceRegistryAccess::from_u8(self.0.load(Ordering::Relaxed))
+        WorkspaceRegistryAccess::from_u8(self.level.load(Ordering::Relaxed))
+    }
+
+    /// The process-wide allowlist bounding [`WorkspaceRegistryAccess::All`].
+    #[must_use]
+    pub fn allowlist(&self) -> &Arc<PrivateRegistryAllowlist> {
+        &self.allowlist
+    }
+
+    /// A value copy of the current level and the allowlist, for a guard that must not observe a
+    /// later [`Self::set`].
+    pub(crate) fn snapshot(&self) -> AccessSnapshot {
+        AccessSnapshot {
+            level: self.get(),
+            allowlist: Arc::clone(&self.allowlist),
+        }
+    }
+
+    /// Whether a workspace-declared `url` may be fetched under the current level and allowlist.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+    ///
+    /// let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::All);
+    /// let private = url::Url::parse("https://10.0.0.1/index").unwrap();
+    /// let public = url::Url::parse("https://index.crates.io/").unwrap();
+    /// assert!(!policy.permits_url(&private));
+    /// assert!(policy.permits_url(&public));
+    /// ```
+    #[must_use]
+    pub fn permits_url(&self, url: &url::Url) -> bool {
+        self.snapshot().permits_url(url)
     }
 
     /// Updates the current policy, effective for every parse after this call returns.
@@ -477,7 +588,7 @@ impl RegistryAccessPolicy {
     /// [`crate::cache::HttpCache::set_registry_policy`] instead, which updates this handle and
     /// rebuilds the transport together.
     pub fn set(&self, value: WorkspaceRegistryAccess) {
-        self.0.store(value.to_u8(), Ordering::Relaxed);
+        self.level.store(value.to_u8(), Ordering::Relaxed);
     }
 }
 
@@ -516,7 +627,10 @@ pub enum IndexUrlError {
     #[error("registry index URL must not carry userinfo")]
     UserInfoPresent,
     /// The candidate's host is blocked by the current [`WorkspaceRegistryAccess`] policy.
-    #[error("registry index host class {class} blocked by registries.workspace_registries policy")]
+    #[error(
+        "registry index host class {class} blocked by registries.workspace_registries policy{}",
+        class.private_host_hint_suffix()
+    )]
     BlockedHost {
         /// The blocked host's classification.
         class: HostClass,
@@ -682,17 +796,17 @@ pub fn validate_index_url(
     if !url.username().is_empty() || url.password().is_some() {
         return Err(IndexUrlError::UserInfoPresent);
     }
-    if let PolicyGate::Enforce(policy) = gate {
+    if let PolicyGate::Enforce(policy) = gate
+        && !policy.permits_url(&url)
+    {
         let class = classify_host(&url);
-        if !policy.get().allows(class) {
-            tracing::warn!(
-                url = %RedactedUrl::new(raw_for_log),
-                ?class,
-                %ecosystem,
-                "workspace-declared registry index host blocked by registries.workspace_registries policy"
-            );
-            return Err(IndexUrlError::BlockedHost { class });
-        }
+        tracing::warn!(
+            url = %RedactedUrl::new(raw_for_log),
+            ?class,
+            %ecosystem,
+            "workspace-declared registry index host blocked by registries.workspace_registries policy"
+        );
+        return Err(IndexUrlError::BlockedHost { class });
     }
     Ok(url)
 }
@@ -1650,27 +1764,50 @@ mod tests {
     }
 
     #[test]
-    fn test_workspace_registry_access_off_blocks_everything() {
-        let policy = WorkspaceRegistryAccess::Off;
-        assert!(!policy.allows(HostClass::Global));
-        assert!(!policy.allows(HostClass::PrivateV4));
-        assert!(!policy.allows(HostClass::Loopback));
+    fn test_blocked_host_message_points_at_allowlist_only_when_it_can_help() {
+        let message = |class| IndexUrlError::BlockedHost { class }.to_string();
+        for class in [
+            HostClass::PrivateV4,
+            HostClass::Cgnat,
+            HostClass::UniqueLocalV6,
+            HostClass::InternalName,
+        ] {
+            assert!(
+                message(class).contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"),
+                "{class}"
+            );
+        }
+        for class in [
+            HostClass::Loopback,
+            HostClass::LinkLocal,
+            HostClass::CloudMetadata,
+            HostClass::Unspecified,
+            HostClass::Reserved,
+            HostClass::Global,
+        ] {
+            assert!(
+                !message(class).contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"),
+                "{class}"
+            );
+        }
     }
 
     #[test]
-    fn test_workspace_registry_access_public_only_allows_global_only() {
-        let policy = WorkspaceRegistryAccess::PublicOnly;
-        assert!(policy.allows(HostClass::Global));
-        assert!(!policy.allows(HostClass::PrivateV4));
-        assert!(!policy.allows(HostClass::CloudMetadata));
+    fn test_registry_access_policy_set_cannot_widen_allowlist() {
+        let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::PublicOnly);
+        policy.set(WorkspaceRegistryAccess::All);
+        assert!(policy.allowlist().is_empty());
+        assert!(!policy.permits_url(&url::Url::parse("https://10.0.0.1/").unwrap()));
     }
 
     #[test]
-    fn test_workspace_registry_access_all_allows_everything() {
-        let policy = WorkspaceRegistryAccess::All;
-        assert!(policy.allows(HostClass::Global));
-        assert!(policy.allows(HostClass::PrivateV4));
-        assert!(policy.allows(HostClass::Loopback));
+    fn test_registry_access_policy_with_allowlist_permits_listed_private_host() {
+        let policy = RegistryAccessPolicy::with_allowlist(
+            WorkspaceRegistryAccess::All,
+            Arc::new(PrivateRegistryAllowlist::for_test(&["10.0.0.0/8"])),
+        );
+        assert!(policy.permits_url(&url::Url::parse("https://10.0.0.1/").unwrap()));
+        assert!(!policy.permits_url(&url::Url::parse("https://192.168.0.1/").unwrap()));
     }
 
     #[test]

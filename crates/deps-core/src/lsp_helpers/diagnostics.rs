@@ -1793,10 +1793,11 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
         occurrence.range,
         format!(
             "registry index \"{}\" blocked by registries.workspace_registries policy \
-             (host class: {}; declaration: {})",
+             (host class: {}; declaration: {}){}",
             sanitize_and_truncate_for_diagnostic(&redacted_value, MAX_DIAGNOSTIC_VALUE_CHARS),
             occurrence.class,
             sanitize_and_truncate_for_diagnostic(&redacted_key, MAX_DIAGNOSTIC_VALUE_CHARS),
+            occurrence.class.private_host_hint_suffix(),
         ),
     )
     .with_severity(Severity::Information)
@@ -4041,6 +4042,28 @@ mod tests {
         assert!(
             !blocked_diagnostic.message().contains("CloudMetadata"),
             "message must use the Display form, not the Debug identifier"
+        );
+    }
+
+    #[test]
+    fn test_blocked_registry_diagnostic_names_allowlist_only_for_fixable_classes() {
+        let diagnostic = |class| {
+            build_blocked_registry_diagnostic(&BlockedRegistryOccurrence {
+                range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+                class,
+                raw_value: "https://10.0.0.1/index".to_string(),
+                declaration_key: "top-level".to_string(),
+            })
+        };
+        assert!(
+            diagnostic(crate::net_policy::HostClass::PrivateV4)
+                .message()
+                .contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS")
+        );
+        assert!(
+            !diagnostic(crate::net_policy::HostClass::CloudMetadata)
+                .message()
+                .contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS")
         );
     }
 

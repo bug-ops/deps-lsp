@@ -17,8 +17,9 @@ use deps_cli::report::{CheckContext, CheckReport, FailOnPolicy, check_manifest};
 use deps_cli::update::ignore::IgnoreRules;
 use deps_cli::update::{self, UpdatePlan};
 use deps_cli::{format, walk};
+use deps_core::net_policy::PrivateRegistryAllowlist;
 use deps_core::osv::OsvClient;
-use deps_core::policy_config::PolicyConfig;
+use deps_core::policy_config::{PolicyConfig, WorkspaceRegistriesEffect};
 use deps_core::{EcosystemRegistry, HttpCache, NetworkMode};
 use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
 use std::path::{Path, PathBuf};
@@ -101,13 +102,20 @@ struct RuntimeHandles {
 }
 
 fn build_runtime_handles(policy: &PolicyConfig) -> RuntimeHandles {
+    let allowlist = PrivateRegistryAllowlist::from_env();
+    if let Some(message) =
+        WorkspaceRegistriesEffect::of(policy.registries.workspace_registries, &allowlist)
+            .user_message()
+    {
+        eprintln!("deps-cli: {message}");
+    }
     // Shared with `ecosystem_runtime` below (impl-critic #4 follow-up to #1212's S3 fix) so
     // Composer's classification-time `composer.lock` read and this run's own in-use-version
     // resolution hit the same mtime-keyed cache instance, instead of each parsing the lock
     // file independently — the same double-parse `deps-lsp`'s `ServerState` avoids.
     let lockfile_cache = Arc::new(deps_core::lockfile::LockFileCache::new());
-    let ecosystem_runtime =
-        EcosystemRuntime::from_policy(policy).with_lockfile_cache(Arc::clone(&lockfile_cache));
+    let ecosystem_runtime = EcosystemRuntime::from_policy(policy, &allowlist)
+        .with_lockfile_cache(Arc::clone(&lockfile_cache));
     let cache = Arc::new(HttpCache::with_policy(Arc::clone(
         &ecosystem_runtime.policy,
     )));

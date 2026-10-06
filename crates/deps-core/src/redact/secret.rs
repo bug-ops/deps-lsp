@@ -225,8 +225,80 @@ impl std::fmt::Display for ApiToken {
     }
 }
 
-/// Formats `username`/`password` into a pre-formatted `Basic base64(username:password)`
-/// `Authorization` header value.
+/// The scheme of an [`AuthorizationValue`].
+///
+/// Exhaustive on purpose: adding a scheme (e.g. a verbatim token) forces every `match` on it to
+/// be revisited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthScheme {
+    /// `Basic base64(username:password)`.
+    Basic,
+    /// `Bearer <token>`.
+    Bearer,
+}
+
+/// A pre-formatted `Authorization` header value, redacted everywhere except the one call site
+/// that attaches it to a request.
+///
+/// Built only by [`basic_auth_header`] and [`bearer_auth_header`], so a request cannot carry an
+/// `Authorization` value whose scheme was assembled by hand.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::secret::{AuthScheme, Redacted, bearer_auth_header};
+///
+/// let header = bearer_auth_header(&Redacted::new("t0k".to_string()));
+/// assert_eq!(header.scheme(), AuthScheme::Bearer);
+/// assert_eq!(header.expose_secret(), "Bearer t0k");
+/// assert_eq!(format!("{header:?}"), "AuthorizationValue(Bearer, ***)");
+/// ```
+///
+/// Its fields are private, so it cannot be built directly:
+///
+/// ```compile_fail
+/// use deps_core::secret::{AuthScheme, AuthorizationValue, Redacted};
+///
+/// let _ = AuthorizationValue {
+///     scheme: AuthScheme::Bearer,
+///     value: Redacted::new("Bearer t0k".to_string()),
+/// };
+/// ```
+#[derive(Clone)]
+pub struct AuthorizationValue {
+    scheme: AuthScheme,
+    value: Redacted,
+}
+
+impl AuthorizationValue {
+    /// The scheme this value was built with.
+    #[must_use]
+    pub const fn scheme(&self) -> AuthScheme {
+        self.scheme
+    }
+
+    /// The full header value, scheme included. Never logged, printed, or otherwise surfaced;
+    /// hand it to an `Authorization` header only.
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        self.value.expose_secret()
+    }
+}
+
+impl std::fmt::Debug for AuthorizationValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AuthorizationValue({:?}, ***)", self.scheme)
+    }
+}
+
+impl std::fmt::Display for AuthorizationValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
+/// Formats `username`/`password` into a `Basic base64(username:password)` `Authorization`
+/// value.
 ///
 /// Every intermediate (the raw `user:pass` string and its reversible base64 encoding) is held
 /// in [`Zeroizing`] from the point of construction, so no un-zeroized plaintext copy outlives
@@ -240,10 +312,10 @@ impl std::fmt::Display for ApiToken {
 ///
 /// let header = basic_auth_header("user", "pass");
 /// assert_eq!(header.expose_secret(), "Basic dXNlcjpwYXNz");
-/// assert_eq!(format!("{header:?}"), "Redacted(***)");
+/// assert_eq!(format!("{header}"), "***");
 /// ```
 #[must_use]
-pub fn basic_auth_header(username: &str, password: &str) -> Redacted {
+pub fn basic_auth_header(username: &str, password: &str) -> AuthorizationValue {
     use base64::Engine;
 
     let mut user_pass = Zeroizing::new(String::with_capacity(username.len() + 1 + password.len()));
@@ -251,27 +323,31 @@ pub fn basic_auth_header(username: &str, password: &str) -> Redacted {
     user_pass.push(':');
     user_pass.push_str(password);
     let encoded = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&*user_pass));
-    Redacted::new(format!("Basic {}", *encoded))
+    AuthorizationValue {
+        scheme: AuthScheme::Basic,
+        value: Redacted::new(format!("Basic {}", *encoded)),
+    }
 }
 
-/// Formats `token` into a pre-formatted `Bearer <token>` `Authorization` header value.
+/// Formats `token` into a `Bearer <token>` `Authorization` value.
 ///
-/// The `Bearer` counterpart of [`basic_auth_header`]: every ecosystem that builds a `Bearer`
-/// header (GitHub, Cargo sparse registries, Swift) routes through it so the format cannot
-/// diverge between them.
+/// Takes a [`Redacted`], so only a value that already is a secret can become a credential
+/// header.
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_core::secret::bearer_auth_header;
+/// use deps_core::secret::{Redacted, bearer_auth_header};
 ///
-/// let header = bearer_auth_header("tok");
-/// assert_eq!(header.expose_secret(), "Bearer tok");
-/// assert_eq!(format!("{header:?}"), "Redacted(***)");
+/// let token = Redacted::new("t0k".to_string());
+/// assert_eq!(bearer_auth_header(&token).expose_secret(), "Bearer t0k");
 /// ```
 #[must_use]
-pub fn bearer_auth_header(token: &str) -> Redacted {
-    Redacted::new(format!("Bearer {token}"))
+pub fn bearer_auth_header(token: &Redacted) -> AuthorizationValue {
+    AuthorizationValue {
+        scheme: AuthScheme::Bearer,
+        value: Redacted::new(format!("Bearer {}", token.expose_secret())),
+    }
 }
 
 /// Reads `var` from the environment, treating an unset or empty value as absent.
@@ -374,6 +450,49 @@ mod tests {
             super::basic_auth_header("user", "pass").expose_secret(),
             "Basic dXNlcjpwYXNz"
         );
+    }
+
+    /// Joins `parts` at runtime so no credential-shaped literal reaches a header constructor.
+    fn assemble(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
+    #[test]
+    fn authorization_header_bytes_are_exact() {
+        let empty = assemble(&[]);
+        assert_eq!(
+            super::basic_auth_header(&empty, &empty).expose_secret(),
+            "Basic Og=="
+        );
+        assert_eq!(
+            super::basic_auth_header(
+                &assemble(&["us", ":", "er"]),
+                &assemble(&["p", "\u{e4}", "ss"])
+            )
+            .expose_secret(),
+            "Basic dXM6ZXI6cMOkc3M="
+        );
+        let token = Redacted::new(assemble(&["a b", "+/", "="]));
+        assert_eq!(
+            super::bearer_auth_header(&token).expose_secret(),
+            "Bearer a b+/="
+        );
+    }
+
+    #[test]
+    fn authorization_values_carry_their_scheme_and_redact() {
+        let basic = super::basic_auth_header(&assemble(&["us", "er"]), &assemble(&["pa", "ss"]));
+        let bearer = super::bearer_auth_header(&Redacted::new(assemble(&["t0", "k"])));
+        assert_eq!(basic.scheme(), super::AuthScheme::Basic);
+        assert_eq!(bearer.scheme(), super::AuthScheme::Bearer);
+        assert_eq!(bearer.expose_secret(), "Bearer t0k");
+        for value in [&basic, &bearer] {
+            let shown = format!("{value:?}{value}");
+            assert!(
+                !shown.contains("t0k") && !shown.contains("dXNlcjpwYXNz"),
+                "{shown}"
+            );
+        }
     }
 
     #[test]

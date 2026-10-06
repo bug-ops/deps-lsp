@@ -150,6 +150,10 @@ tag order, so a pre-release above the latest release (`v2.0.0-rc1` against lates
 to date either way. As in GitHub Actions, a non-release commit newer than the latest release that
 carries only a floating tag is reported outdated (tracked in #1725).
 
+A `project:` tag pin resolves through the project's Tags list exactly like a GitHub Actions tag
+pin (an exact release, a floating partial version, or unresolved), so hover and sibling-tag checks
+see the same version in both ecosystems. A `component:` version stays unresolved here.
+
 An exact `project:` tag pin that is ahead of the latest tag is reported up to date, unless the
 loaded tag list is complete and has no such tag (`ref: v40.0.0`, a typo or a deleted tag): that
 pin is unresolved, never outdated, so no downgrade is offered. A branch named like a version

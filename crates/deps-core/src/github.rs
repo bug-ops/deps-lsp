@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::EcosystemId;
-use crate::cache::{CredentialHeader, HttpCache, RequestHeader};
+use crate::cache::{HttpCache, RequestHeader};
 
 /// Base URL for the GitHub REST API.
 pub const GITHUB_API: &str = "https://api.github.com";
@@ -228,7 +228,7 @@ pub fn classify_tags_fetch_error(
 #[derive(Clone)]
 pub struct GithubTagsClient {
     cache: Arc<HttpCache>,
-    auth_token: Option<crate::secret::ApiToken>,
+    auth_token: Option<crate::secret::AuthorizationValue>,
     has_token: bool,
     api_base: String,
     /// `{api_base}/`, precomputed once so [`Self::fetch_authenticated`] never re-`format!`s
@@ -258,7 +258,7 @@ impl GithubTagsClient {
         let has_token = token.is_some();
         let auth_token = token.map(|token| {
             tracing::info!("GITHUB_TOKEN detected, using authenticated GitHub API requests");
-            crate::secret::bearer_auth_header(&token).into()
+            crate::secret::bearer_auth_header(&crate::secret::Redacted::new(String::clone(&token)))
         });
 
         Self {
@@ -279,8 +279,11 @@ impl GithubTagsClient {
     #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn for_test(cache: Arc<HttpCache>, api_base: impl Into<String>, has_token: bool) -> Self {
-        let auth_token =
-            has_token.then(|| crate::secret::ApiToken::new("Bearer test-token".to_string()));
+        let auth_token = has_token.then(|| {
+            crate::secret::bearer_auth_header(&crate::secret::Redacted::new(
+                "test-token".to_string(),
+            ))
+        });
         let api_base = api_base.into();
         Self {
             cache,
@@ -313,9 +316,7 @@ impl GithubTagsClient {
     pub(crate) fn headers(&self) -> Vec<RequestHeader<'_>> {
         self.auth_token
             .iter()
-            .map(|token| {
-                RequestHeader::Credential(CredentialHeader::Authorization, token.as_redacted())
-            })
+            .map(RequestHeader::Authorization)
             .collect()
     }
 
@@ -1406,17 +1407,19 @@ mod tests {
         // embedding it) accidentally printing a raw `GITHUB_TOKEN` value: exercises the
         // header shape `GithubTagsClient::headers` hands to the cache, not just a bare
         // `ApiToken`.
-        let token = crate::secret::ApiToken::new("Bearer super-secret-value".to_string());
-        let headers = [RequestHeader::Credential(
-            CredentialHeader::Authorization,
-            token.as_redacted(),
-        )];
+        let token = crate::secret::bearer_auth_header(&crate::secret::Redacted::new(
+            "super-secret-value".to_string(),
+        ));
+        let headers = [RequestHeader::Authorization(&token)];
         let debug_output = format!("{headers:?}");
         assert!(
             !debug_output.contains("super-secret-value"),
             "{debug_output}"
         );
-        assert!(debug_output.contains("Redacted(***)"), "{debug_output}");
+        assert!(
+            debug_output.contains("AuthorizationValue(Bearer, ***)"),
+            "{debug_output}"
+        );
     }
 
     // --- fetch_authenticated: wire-level behavior ---

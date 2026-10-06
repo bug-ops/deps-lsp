@@ -1097,7 +1097,12 @@ mod tests {
             credential: Option<Arc<SwiftCredentialSource>>,
         ) -> SwiftParseContext {
             SwiftParseContext::new(
-                Arc::new(RegistryAccessPolicy::new(access)),
+                Arc::new(RegistryAccessPolicy::with_allowlist(
+                    access,
+                    Arc::new(deps_core::net_policy::PrivateRegistryAllowlist::for_test(
+                        &["10.0.0.0/8"],
+                    )),
+                )),
                 Arc::default(),
                 UserConfigPath::Path(self.user_file()),
                 credential,

@@ -1487,6 +1487,9 @@ impl RegistriesConfig {
 pub struct RegistryRuntimeSettings {
     /// Resolved workspace-registry access policy — see [`WorkspaceRegistriesSetting::to_policy`].
     pub workspace_registries: crate::net_policy::WorkspaceRegistryAccess,
+    /// Whether `"all"` is actually backed by a private-registry allowlist — see
+    /// [`WorkspaceRegistriesEffect`]. Used only to warn the user.
+    pub workspace_registries_effect: WorkspaceRegistriesEffect,
     /// See [`RegistriesConfig::nuget_user_profile_sources`].
     pub nuget_user_profile_sources: UserProfileSources,
     /// See [`RegistriesConfig::swift_keychain_credentials`].
@@ -1503,6 +1506,10 @@ impl std::fmt::Debug for RegistryRuntimeSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RegistryRuntimeSettings")
             .field("workspace_registries", &self.workspace_registries)
+            .field(
+                "workspace_registries_effect",
+                &self.workspace_registries_effect,
+            )
             .field(
                 "nuget_user_profile_sources",
                 &self.nuget_user_profile_sources,
@@ -1522,24 +1529,103 @@ impl std::fmt::Debug for RegistryRuntimeSettings {
     }
 }
 
-impl RegistriesConfig {
-    /// Derives the three live-updatable settings this section resolves into.
+/// What `registries.workspace_registries = "all"` actually grants, given the process-wide
+/// `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` allowlist.
+///
+/// The setting is repository-controllable, so `"all"` alone reaches no private host; this
+/// records the mismatch so a caller can tell the user once, on transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkspaceRegistriesEffect {
+    /// The setting does what it says: it is not `"all"`, or the allowlist is non-empty.
+    #[default]
+    AsConfigured,
+    /// `"all"` with no allowlist: behaves like `"public_only"`.
+    AllWithoutAllowlist,
+    /// `"all"` while the allowlist variable was set but rejected: behaves like `"public_only"`.
+    AllWithInvalidAllowlist,
+}
+
+impl WorkspaceRegistriesEffect {
+    /// A user-facing explanation for a setting that does not do what it says, shared by every
+    /// adapter; `None` for [`Self::AsConfigured`].
     ///
     /// # Examples
     ///
     /// ```
-    /// use deps_core::net_policy::WorkspaceRegistryAccess;
+    /// use deps_core::policy_config::WorkspaceRegistriesEffect;
+    ///
+    /// assert!(WorkspaceRegistriesEffect::AsConfigured.user_message().is_none());
+    /// assert!(WorkspaceRegistriesEffect::AllWithoutAllowlist
+    ///     .user_message()
+    ///     .is_some_and(|m| m.contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS")));
+    /// ```
+    #[must_use]
+    pub const fn user_message(self) -> Option<&'static str> {
+        match self {
+            Self::AsConfigured => None,
+            Self::AllWithoutAllowlist => Some(
+                "registries.workspace_registries = \"all\" has no effect on private hosts: \
+                 DEPS_LSP_PRIVATE_REGISTRY_HOSTS is not set, so it behaves like \"public_only\". \
+                 The setting is repository-controllable; the environment variable is the \
+                 effective control. Once exported, any repository you open can send \
+                 unauthenticated GET requests to the listed hosts on any port, so list \
+                 registry hosts or narrow CIDRs only.",
+            ),
+            Self::AllWithInvalidAllowlist => Some(concat!(
+                "registries.workspace_registries = \"all\" has no effect on private hosts: ",
+                "DEPS_LSP_PRIVATE_REGISTRY_HOSTS is set but invalid (entries must be bare ",
+                "CIDR ranges, IPs or lowercase host names without ports, paths or ",
+                "wildcards, and prefixes of at least /",
+                crate::net_policy::min_v4_prefix!(),
+                " for IPv4 or /",
+                crate::net_policy::min_v6_prefix!(),
+                " for IPv6), so it behaves like \"public_only\"."
+            )),
+        }
+    }
+
+    /// The effect of `setting` under `allowlist`.
+    #[must_use]
+    pub fn of(
+        setting: WorkspaceRegistriesSetting,
+        allowlist: &crate::net_policy::AllowlistOutcome,
+    ) -> Self {
+        use crate::net_policy::AllowlistOutcome;
+        use WorkspaceRegistriesSetting::{All, Off, PublicOnly};
+        match (setting, allowlist) {
+            (Off | PublicOnly, _) | (All, AllowlistOutcome::Parsed(_)) => Self::AsConfigured,
+            (All, AllowlistOutcome::Unset) => Self::AllWithoutAllowlist,
+            (All, AllowlistOutcome::Invalid(_)) => Self::AllWithInvalidAllowlist,
+        }
+    }
+}
+
+impl RegistriesConfig {
+    /// Derives the three live-updatable settings this section resolves into, under the
+    /// process-wide private-registry `allowlist`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::{AllowlistOutcome, WorkspaceRegistryAccess};
     /// use deps_core::policy_config::RegistriesConfig;
     ///
     /// let config = RegistriesConfig::new().with_gitlab_instance_host("gitlab.corp");
-    /// let resolved = config.resolve();
+    /// let resolved = config.resolve(&AllowlistOutcome::Unset);
     /// assert_eq!(resolved.workspace_registries, WorkspaceRegistryAccess::PublicOnly);
     /// assert_eq!(resolved.gitlab_instance_host.as_deref(), Some("gitlab.corp"));
     /// ```
     #[must_use]
-    pub fn resolve(&self) -> RegistryRuntimeSettings {
+    pub fn resolve(
+        &self,
+        allowlist: &crate::net_policy::AllowlistOutcome,
+    ) -> RegistryRuntimeSettings {
         RegistryRuntimeSettings {
             workspace_registries: self.workspace_registries.to_policy(),
+            workspace_registries_effect: WorkspaceRegistriesEffect::of(
+                self.workspace_registries,
+                allowlist,
+            ),
             nuget_user_profile_sources: self.nuget_user_profile_sources,
             swift_keychain_credentials: self.swift_keychain_credentials,
             gitlab_instance_host: (!self.gitlab_instance_host.is_empty())
@@ -1589,9 +1675,11 @@ pub enum WorkspaceRegistriesSetting {
     /// Allow only a host classified as public (spec `deps_core::net_policy::HostClass::Global`).
     #[default]
     PublicOnly,
-    /// Allow every workspace-declared index, including loopback/RFC1918/metadata-range
-    /// hosts — today's pre-#443 behavior, the escape hatch for a workspace that legitimately
-    /// points at one.
+    /// Allow public hosts plus the private hosts listed in the process-wide
+    /// `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` allowlist — the escape hatch for a workspace that
+    /// legitimately points at an RFC1918 registry. Without that variable this behaves like
+    /// [`Self::PublicOnly`]: the setting is repository-controllable, so the variable is the
+    /// effective control.
     All,
 }
 
@@ -1923,6 +2011,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net_policy::AllowlistOutcome;
 
     #[test]
     fn test_checks_gate_requires_feature_enabled_and_online() {
@@ -2063,11 +2152,41 @@ mod tests {
 
     #[test]
     fn test_registries_config_resolve_normalizes_empty_gitlab_instance_host_to_none() {
-        let resolved = RegistriesConfig::default().resolve();
+        let resolved = RegistriesConfig::default().resolve(&AllowlistOutcome::Unset);
         assert_eq!(resolved.gitlab_instance_host, None);
         assert_eq!(
             resolved.nuget_user_profile_sources,
             UserProfileSources::Disabled
+        );
+    }
+
+    #[test]
+    fn test_workspace_registries_effect_matrix() {
+        use WorkspaceRegistriesSetting::{All, Off, PublicOnly};
+
+        let unset = AllowlistOutcome::Unset;
+        let parsed = AllowlistOutcome::for_test(&["10.0.0.0/8"]);
+        let invalid = AllowlistOutcome::invalid_for_test();
+
+        for setting in [Off, PublicOnly] {
+            for outcome in [&unset, &parsed, &invalid] {
+                assert_eq!(
+                    WorkspaceRegistriesEffect::of(setting, outcome),
+                    WorkspaceRegistriesEffect::AsConfigured
+                );
+            }
+        }
+        assert_eq!(
+            WorkspaceRegistriesEffect::of(All, &unset),
+            WorkspaceRegistriesEffect::AllWithoutAllowlist
+        );
+        assert_eq!(
+            WorkspaceRegistriesEffect::of(All, &parsed),
+            WorkspaceRegistriesEffect::AsConfigured
+        );
+        assert_eq!(
+            WorkspaceRegistriesEffect::of(All, &invalid),
+            WorkspaceRegistriesEffect::AllWithInvalidAllowlist
         );
     }
 
@@ -2082,8 +2201,12 @@ mod tests {
             gitlab_instance_host: "gitlab.corp".to_string(),
         };
 
-        let resolved = config.resolve();
+        let resolved = config.resolve(&AllowlistOutcome::for_test(&["10.0.0.0/8"]));
         assert_eq!(resolved.workspace_registries, WorkspaceRegistryAccess::All);
+        assert_eq!(
+            resolved.workspace_registries_effect,
+            WorkspaceRegistriesEffect::AsConfigured
+        );
         assert_eq!(
             resolved.nuget_user_profile_sources,
             UserProfileSources::Enabled
@@ -2351,6 +2474,7 @@ mod tests {
         1,
         RegistryRuntimeSettings {
             workspace_registries: crate::net_policy::WorkspaceRegistryAccess::PublicOnly,
+            workspace_registries_effect: WorkspaceRegistriesEffect::AsConfigured,
             nuget_user_profile_sources: UserProfileSources::Disabled,
             swift_keychain_credentials: KeychainCredentials::Disabled,
             gitlab_instance_host: Some(crate::conformance::CREDENTIAL_PROBE_URL.to_string()),

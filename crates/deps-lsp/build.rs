@@ -28,24 +28,58 @@ fn rerun_if_exists(path: &str) {
     }
 }
 
-/// Watches `path`, or, when it does not exist yet (a branch held only in `packed-refs`), its
-/// nearest existing ancestor directory, whose mtime changes when git writes the loose ref.
-fn rerun_if_exists_or_ancestor(path: &str) {
+/// Where the commit HEAD resolves to is stored, which decides what must be watched.
+enum RefLocation {
+    /// A loose ref file; it wins over `packed-refs`, so it is the only ref file that matters.
+    Loose(String),
+    /// The branch exists only in `packed-refs`; a loose ref will appear under `dir`.
+    PackedOnly {
+        dir: String,
+        packed_refs: Option<String>,
+    },
+    /// HEAD points directly at a commit, so `HEAD` itself is the only input.
+    Detached,
+}
+
+/// Returns `path` when it exists, otherwise its nearest existing ancestor.
+fn nearest_existing(path: &str) -> Option<String> {
     let mut candidate = Path::new(path);
     while !candidate.exists() {
         match candidate.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => candidate = parent,
-            _ => return,
+            _ => return None,
         }
     }
-    if let Some(watched) = candidate.to_str() {
-        println!("cargo:rerun-if-changed={watched}");
+    candidate.to_str().map(str::to_string)
+}
+
+fn locate_ref() -> RefLocation {
+    let Some(reference) = git(&["rev-parse", "--symbolic-full-name", "HEAD"])
+        .filter(|reference| reference.starts_with("refs/"))
+    else {
+        return RefLocation::Detached;
+    };
+    let Some(path) = git(&["rev-parse", "--git-path", &reference]) else {
+        return RefLocation::Detached;
+    };
+    if Path::new(&path).is_file() {
+        return RefLocation::Loose(path);
+    }
+    match nearest_existing(&path) {
+        Some(dir) => RefLocation::PackedOnly {
+            dir,
+            packed_refs: git(&["rev-parse", "--git-path", "packed-refs"]),
+        },
+        None => RefLocation::Detached,
     }
 }
 
-/// Watches the files that change when HEAD moves: `HEAD` itself (branch switch), the loose ref
-/// it points at (new commit on the branch, or the directory it will appear in when the branch
-/// is packed) and `packed-refs` (after `git gc`/pack-refs).
+/// Watches the files that change when HEAD moves: `HEAD` itself (branch switch) plus either the
+/// loose ref it points at or, for a branch held only in `packed-refs`, that file and the
+/// directory the loose ref will appear in.
+///
+/// Watching `packed-refs` while a loose ref exists would rebuild on every `git pack-refs` run
+/// from a sibling worktree even though this branch's commit did not move.
 ///
 /// Paths come from `git rev-parse --git-path`, so linked worktrees (where `.git` is a file)
 /// resolve correctly.
@@ -53,14 +87,15 @@ fn emit_rerun_directives() {
     if let Some(head) = git(&["rev-parse", "--git-path", "HEAD"]) {
         rerun_if_exists(&head);
     }
-    if let Some(reference) = git(&["rev-parse", "--symbolic-full-name", "HEAD"])
-        && reference.starts_with("refs/")
-        && let Some(path) = git(&["rev-parse", "--git-path", &reference])
-    {
-        rerun_if_exists_or_ancestor(&path);
-    }
-    if let Some(packed) = git(&["rev-parse", "--git-path", "packed-refs"]) {
-        rerun_if_exists(&packed);
+    match locate_ref() {
+        RefLocation::Loose(path) => println!("cargo:rerun-if-changed={path}"),
+        RefLocation::PackedOnly { dir, packed_refs } => {
+            println!("cargo:rerun-if-changed={dir}");
+            if let Some(packed) = packed_refs {
+                rerun_if_exists(&packed);
+            }
+        }
+        RefLocation::Detached => {}
     }
 }
 

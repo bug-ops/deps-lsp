@@ -8,7 +8,7 @@ use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
 use deps_core::hover::Hover;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, WatchedConfig,
+    ConfigReach, Ecosystem, ParseResult as ParseResultTrait, Registry, Result, WatchedConfig,
     WatchedConfigEffect,
     diagnostic::{Diagnostic, DiagnosticKind, Severity},
     lsp_helpers::{DiagnosticSeverities, EcosystemFormatter},
@@ -114,8 +114,13 @@ const WATCHED_CONFIGS: [WatchedConfig; 2] = [
     WatchedConfig::new(
         "pnpm-workspace.yaml",
         WatchedConfigEffect::RewritesRequirements,
+        ConfigReach::Subtree,
     ),
-    WatchedConfig::new(".npmrc", WatchedConfigEffect::ChangesRouting),
+    WatchedConfig::new(
+        ".npmrc",
+        WatchedConfigEffect::ChangesRouting,
+        ConfigReach::Subtree,
+    ),
 ];
 
 impl Ecosystem for NpmEcosystem {
@@ -508,7 +513,10 @@ mod tests {
         let configs: Vec<_> = ecosystem
             .watched_configs()
             .iter()
-            .map(|c| (c.path_suffix(), c.effect()))
+            .map(|c| {
+                assert_eq!(c.reach(), ConfigReach::Subtree);
+                (c.path_suffix(), c.effect())
+            })
             .collect();
         assert_eq!(
             configs,

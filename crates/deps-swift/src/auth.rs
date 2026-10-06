@@ -16,7 +16,7 @@ use deps_core::keychain_credentials::{
 use deps_core::mtime_cache::{DEFAULT_MAX_CACHED_FILES, MtimeFileCache};
 use deps_core::netrc::{DefaultEntry, Netrc, NetrcFlavor, NetrcLogin};
 use deps_core::policy_config::KeychainCredentials;
-use deps_core::secret::{Redacted, basic_auth_header, bearer_auth_header};
+use deps_core::secret::{AuthorizationValue, Redacted, basic_auth_header, bearer_auth_header};
 use zeroize::Zeroizing;
 
 use crate::config::{SwiftAuthType, SwiftRegistryUrl, UserConfigPlatform, UserTier};
@@ -129,7 +129,7 @@ impl SwiftCredential {
 }
 
 fn bearer(secret: &Redacted) -> SwiftRegistryAuth {
-    SwiftRegistryAuth(bearer_auth_header(secret.expose_secret()))
+    SwiftRegistryAuth(bearer_auth_header(secret))
 }
 
 fn basic(username: &str, password: &Redacted) -> SwiftRegistryAuth {
@@ -141,7 +141,7 @@ fn basic(username: &str, password: &Redacted) -> SwiftRegistryAuth {
 /// Redacted in `Debug` and `Display`, and deliberately not `Hash`: a ready-to-send credential
 /// must not be usable inside a hash key, nor comparable. Only `bind_credential` constructs one.
 #[derive(Clone)]
-pub struct SwiftRegistryAuth(Redacted);
+pub struct SwiftRegistryAuth(AuthorizationValue);
 
 impl SwiftRegistryAuth {
     /// The header value. Never log it; hand it to an `Authorization` header only.
@@ -149,8 +149,8 @@ impl SwiftRegistryAuth {
         self.0.expose_secret()
     }
 
-    /// The header value as a [`Redacted`], for attaching to a request as a sensitive header.
-    pub(crate) const fn as_redacted(&self) -> &Redacted {
+    /// The header value, for attaching to a request as a sensitive header.
+    pub(crate) const fn as_authorization(&self) -> &AuthorizationValue {
         &self.0
     }
 }

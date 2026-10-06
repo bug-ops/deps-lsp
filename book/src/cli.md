@@ -235,6 +235,13 @@ typosquat diagnostic is `deps-lsp` only, and a non-default `[typosquat]` section
 > `--config` — the operator's own choice, not the scanned repository's — is trusted in
 > full.
 
+> **Note:** `registries.workspace_registries = "all"` reaches private hosts only if they are listed
+> in the `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` environment variable (see
+> [Configuration](configuration.md#private-registry-allowlist)), also with an explicit `--config`.
+> An allowlisted host is reachable on any port, so list registry hosts or narrow CIDRs only. In the
+> GitHub Action, set it in the step's `env:`. Without the variable, `"all"` behaves like
+> `"public_only"` and `deps-cli` prints a warning on stderr.
+
 > **Note:** `registries.swift_keychain_credentials` is not supported in `deps-cli`, which cannot
 > answer a macOS Keychain access prompt: an explicit `--config` with it enabled prints a warning
 > and runs with it disabled. See [Swift macOS Keychain credentials](ecosystems/swift.md#macos-keychain-credentials).

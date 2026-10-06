@@ -71,10 +71,13 @@ back to the other tier's `[default]`.
 
 On Unix, a `.swiftpm` that is a regular file (or any other stat failure besides "not found") also
 makes the project tier unusable, which fails closed; Windows reports "not found" for that path, so
-the project tier is simply absent there. The user-level file is not watched: edits to it
-(and to `SWIFTPM_REGISTRY_*` variables, read once at startup) take effect on the next manifest
-parse, not immediately; only a change to the project's
-`.swiftpm/configuration/registries.json` triggers a reparse (an unrelated `registries.json` elsewhere in the workspace does not).
+the project tier is simply absent there. The user-level file is watched only where its path ends in `.swiftpm/configuration/registries.json`
+(the `~/.swiftpm` form on Linux): a change there reparses every open Swift document. The macOS
+(`~/Library/org.swift.swiftpm/...`) and `$XDG_CONFIG_HOME` forms are not watched, and edits to
+them (and to `SWIFTPM_REGISTRY_*` variables, read once at startup) take effect on the next manifest
+parse. A change to a project's `.swiftpm/configuration/registries.json` reparses only the open
+`Package.swift` in the same directory; an unrelated `registries.json` elsewhere in the workspace,
+or a nested package's file, does not.
 
 ### Trust and credentials
 
@@ -208,9 +211,15 @@ A `401` never triggers a new lookup, and without a found item no credential is s
   returned an unusable next-page link", "registry release list exceeds the page limit" or
   "registry release list took too long to fetch"; no latest version or up-to-date mark is derived
   from a partial list.
-  The failure is remembered for 90 seconds. Every page is revalidated on every request, so a merged
-  list can be inconsistent only when one page's revalidation fails and that page is served
-  from cache.
+  The failure is remembered for 90 seconds. Every page is revalidated on every request, and a page
+  whose revalidation fails fails the whole round instead of being served from cache, so a list
+  never mixes page generations. The last complete list of this process is kept per package and
+  served on a page failure, a timeout or offline mode (and during the 90-second window); with none
+  yet, or when it exceeds the release limit, the error above is shown and cached pages are never
+  assembled into a list. After a single registry blip the package is served from the last
+  complete list for up to 90 seconds, so recovery becomes visible with that delay. The one
+  remaining limit is a registry that changes between the page fetches of a single round. The kept
+  list resets when the client is rebuilt (a trust or credential change).
 - **Publication dates.** With freshness enabled, the newest 8 non-yanked releases get their
   `publishedAt` from one metadata request each (`GET {base}/{scope}/{name}/{version}`), at most 4
   at a time and within one 2-second budget per lookup. Dates are remembered for the life of the
