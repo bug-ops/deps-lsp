@@ -657,7 +657,7 @@ fn unknown_ref_diagnostics(
 mod tests {
     use super::*;
     #[cfg(feature = "lsp-responses")]
-    use crate::{MUTABLE_REF_PIN_DIAGNOSTIC_CODE, SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE};
+    use crate::SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE;
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -743,7 +743,7 @@ mod tests {
     // --- issue #473: mutable-ref-pin diagnostic + "Pin to commit SHA" code action ---
 
     fn mutable_ref_pin_code() -> String {
-        MUTABLE_REF_PIN_DIAGNOSTIC_CODE.into()
+        deps_core::diagnostic::GITHUB_ACTIONS_MUTABLE_REF_PIN_DIAGNOSTIC_CODE.into()
     }
 
     async fn diagnostics_for(content: &str) -> Vec<Diagnostic> {

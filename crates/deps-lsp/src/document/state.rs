@@ -1354,7 +1354,7 @@ impl ServerState {
     }
 
     /// Test-only: opens or closes the typosquat gate on an otherwise default (online) policy.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "npm"))]
     pub(crate) fn set_typosquat_enabled(&self, enabled: bool) {
         let policy = PolicyConfig {
             typosquat: deps_core::policy_config::TyposquatConfig::new().with_enabled(enabled),
@@ -1364,7 +1364,7 @@ impl ServerState {
     }
 
     /// Test-only: opens or closes the GOSSIP gate on an otherwise default (online) policy.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "npm"))]
     pub(crate) fn set_gossip_enabled(&self, enabled: bool) {
         let policy = PolicyConfig {
             gossip: deps_core::policy_config::GossipConfig::new().with_enabled(enabled),
