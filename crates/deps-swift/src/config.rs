@@ -1084,6 +1084,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_swiftpm_dir_that_is_a_regular_file_makes_the_tier_unusable() {
         let fx = Fixture::new();

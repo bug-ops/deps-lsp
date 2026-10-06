@@ -69,8 +69,9 @@ keys are ignored). A tier that exists but is unusable (unreadable, not a regular
 or failing that decode) leaves every `id:` dependency unresolved with a warning; it never falls
 back to the other tier's `[default]`.
 
-A `.swiftpm` that is a regular file (or any other stat failure besides "not found") also makes
-the project tier unusable, which fails closed. The user-level file is not watched: edits to it
+On Unix, a `.swiftpm` that is a regular file (or any other stat failure besides "not found") also
+makes the project tier unusable, which fails closed; Windows reports "not found" for that path, so
+the project tier is simply absent there. The user-level file is not watched: edits to it
 (and to `SWIFTPM_REGISTRY_*` variables, read once at startup) take effect on the next manifest
 parse, not immediately; only a `registries.json` change inside the workspace triggers a reparse.
 
