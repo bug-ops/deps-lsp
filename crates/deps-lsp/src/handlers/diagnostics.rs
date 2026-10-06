@@ -2,6 +2,7 @@
 
 use crate::config::{DepsConfig, DiagnosticsConfig};
 use crate::document::{PrefetchVisibility, ServerState, ensure_document_loaded};
+use deps_core::policy_config::OsvChecks;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -91,8 +92,8 @@ pub(crate) fn document_dependency_count(state: &ServerState, uri: &Uri) -> usize
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DiagnosticsSnapshot {
     pub(crate) freshness: deps_core::FreshnessSettings,
-    pub(crate) severities: deps_core::DiagnosticSeverities,
-    pub(crate) network: deps_core::NetworkMode,
+    severities: deps_core::DiagnosticSeverities,
+    network: deps_core::NetworkMode,
     pub(crate) fetch_timeout_secs: u64,
     pub(crate) max_concurrent_fetches: usize,
 }
@@ -106,6 +107,39 @@ impl DiagnosticsSnapshot {
             network: config.policy.network.mode(),
             fetch_timeout_secs: config.policy.cache.fetch_timeout_secs,
             max_concurrent_fetches: config.policy.cache.max_concurrent_fetches,
+        }
+    }
+
+    /// Replaces the severities (the pull path's caller-captured `DiagnosticsConfig`).
+    ///
+    /// [`Self::osv_checks`] is computed from the severities, so it follows the override.
+    #[must_use]
+    pub(crate) const fn with_severities(
+        mut self,
+        severities: deps_core::DiagnosticSeverities,
+    ) -> Self {
+        self.severities = severities;
+        self
+    }
+
+    /// The OSV gate for this snapshot's severities and network mode.
+    pub(crate) const fn osv_checks(&self) -> OsvChecks {
+        OsvChecks::resolve(self.severities.vulnerabilities_enabled, self.network)
+    }
+
+    /// Builds a snapshot from explicit values, for tests that drive diagnostics generation.
+    #[cfg(all(test, any(feature = "cargo", feature = "npm")))]
+    pub(crate) const fn for_test(
+        freshness: deps_core::FreshnessSettings,
+        severities: deps_core::DiagnosticSeverities,
+        network: deps_core::NetworkMode,
+    ) -> Self {
+        Self {
+            freshness,
+            severities,
+            network,
+            fetch_timeout_secs: 0,
+            max_concurrent_fetches: 1,
         }
     }
 }
@@ -132,15 +166,7 @@ pub(crate) async fn publish_document_diagnostics(
         dep_count,
         snapshot.max_concurrent_fetches,
     );
-    let diags = generate_diagnostics_internal(
-        Arc::clone(state),
-        uri,
-        snapshot.freshness,
-        snapshot.severities,
-        snapshot.network,
-        ceiling,
-    )
-    .await;
+    let diags = generate_diagnostics_internal(Arc::clone(state), uri, snapshot, ceiling).await;
     client.publish_diagnostics(uri.clone(), diags, None).await;
 }
 
@@ -173,11 +199,11 @@ pub async fn handle_diagnostics(
     // since this is the one diagnostics call site that must keep observing whichever config
     // its caller captured before a concurrent `workspace/didChangeConfiguration` write; every
     // other field is unaffected by that race, so it still comes from `DiagnosticsSnapshot`.
-    let mut snapshot = {
+    let snapshot = {
         let full_config = full_config.read().await;
         DiagnosticsSnapshot::from_config(&full_config)
-    };
-    snapshot.severities = config.to_severities();
+    }
+    .with_severities(config.to_severities());
 
     let dep_count = document_dependency_count(&state, uri);
     let ceiling = loading_ceiling(
@@ -186,15 +212,7 @@ pub async fn handle_diagnostics(
         snapshot.max_concurrent_fetches,
     );
 
-    generate_diagnostics_internal(
-        state,
-        uri,
-        snapshot.freshness,
-        snapshot.severities,
-        snapshot.network,
-        ceiling,
-    )
-    .await
+    generate_diagnostics_internal(state, uri, &snapshot, ceiling).await
 }
 
 /// Internal diagnostic generation without cold start support.
@@ -216,11 +234,13 @@ pub async fn handle_diagnostics(
 pub(crate) async fn generate_diagnostics_internal(
     state: Arc<ServerState>,
     uri: &Uri,
-    freshness: deps_core::FreshnessSettings,
-    severities: deps_core::DiagnosticSeverities,
-    network: deps_core::NetworkMode,
+    snapshot: &DiagnosticsSnapshot,
     loading_ceiling: Duration,
 ) -> Vec<Diagnostic> {
+    let freshness = snapshot.freshness;
+    let severities = snapshot.severities;
+    let network = snapshot.network;
+    let snapshot_osv_checks = snapshot.osv_checks();
     // Skip diagnostics while versions are loading, up to `loading_ceiling` (#632): if the
     // background fetch task panicked without reaching `set_loaded`/`set_failed`, `loading_state`
     // would stay `Loading` forever and permanently suppress diagnostics. Past the ceiling, force
@@ -285,10 +305,7 @@ pub(crate) async fn generate_diagnostics_internal(
             .snapshot()
             .with_resolved_version_candidates()
             .with_vulnerabilities()
-            .with_latest_status(deps_core::policy_config::osv_checks_active(
-                severities.vulnerabilities_enabled,
-                network,
-            ))
+            .with_latest_status(snapshot_osv_checks)
             .with_outcomes()
             .with_license_prefetch()
             .with_typosquat_prefetch(typosquat_visibility)
@@ -344,6 +361,29 @@ mod tests {
     use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
     use deps_core::EcosystemId;
+
+    /// #1774: the pull path overrides severities after the snapshot is built, so the OSV gate
+    /// must follow the override and the snapshot's own network mode, never a stale copy.
+    #[test]
+    fn snapshot_osv_checks_follows_severities_override_and_network() {
+        let mut offline_config = DepsConfig::default();
+        offline_config.policy.network.offline = true;
+        let mut diagnostics = DiagnosticsConfig::default();
+        diagnostics.vulnerabilities_enabled = true;
+        let enabled = diagnostics.to_severities();
+        let offline = DiagnosticsSnapshot::from_config(&offline_config).with_severities(enabled);
+        assert!(!offline.osv_checks().is_active());
+
+        diagnostics.vulnerabilities_enabled = false;
+        let disabled = diagnostics.to_severities();
+        let online =
+            DiagnosticsSnapshot::from_config(&DepsConfig::default()).with_severities(disabled);
+        assert!(!online.osv_checks().is_active());
+
+        let online =
+            DiagnosticsSnapshot::from_config(&DepsConfig::default()).with_severities(enabled);
+        assert!(online.osv_checks().is_active());
+    }
 
     /// Resolves a real `crossenv`/`cross-env` typosquat signal through a mocked deps.dev
     /// server, for tests that need a genuine signal without hand-constructing
@@ -518,9 +558,11 @@ mod tests {
             generate_diagnostics_internal(
                 Arc::clone(&state),
                 &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-                deps_core::NetworkMode::Online,
+                &DiagnosticsSnapshot::for_test(
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::DiagnosticSeverities::default(),
+                    deps_core::NetworkMode::Online,
+                ),
                 MIN_LOADING_CEILING,
             ),
         )
@@ -591,9 +633,11 @@ mod tests {
         let result = generate_diagnostics_internal(
             Arc::clone(&state),
             &uri,
-            deps_core::FreshnessSettings::default(),
-            deps_core::DiagnosticSeverities::default(),
-            deps_core::NetworkMode::Online,
+            &DiagnosticsSnapshot::for_test(
+                deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
+                deps_core::NetworkMode::Online,
+            ),
             MIN_LOADING_CEILING,
         )
         .await;
@@ -655,9 +699,11 @@ mod tests {
         let result = generate_diagnostics_internal(
             Arc::clone(&state),
             &uri,
-            deps_core::FreshnessSettings::default(),
-            deps_core::DiagnosticSeverities::default(),
-            deps_core::NetworkMode::Offline,
+            &DiagnosticsSnapshot::for_test(
+                deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
+                deps_core::NetworkMode::Offline,
+            ),
             MIN_LOADING_CEILING,
         )
         .await;
@@ -1107,9 +1153,11 @@ serde = "1.0.0"
             let result = generate_diagnostics_internal(
                 Arc::clone(&state),
                 &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-                deps_core::NetworkMode::Online,
+                &DiagnosticsSnapshot::for_test(
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::DiagnosticSeverities::default(),
+                    deps_core::NetworkMode::Online,
+                ),
                 std::time::Duration::from_millis(1),
             )
             .await;
@@ -1164,9 +1212,11 @@ serde = "1.0.0"
             let result = generate_diagnostics_internal(
                 Arc::clone(&state),
                 &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-                deps_core::NetworkMode::Online,
+                &DiagnosticsSnapshot::for_test(
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::DiagnosticSeverities::default(),
+                    deps_core::NetworkMode::Online,
+                ),
                 std::time::Duration::from_millis(1),
             )
             .await;
@@ -1221,9 +1271,11 @@ serde = "1.0.0"
             let result = generate_diagnostics_internal(
                 Arc::clone(&state),
                 &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-                deps_core::NetworkMode::Online,
+                &DiagnosticsSnapshot::for_test(
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::DiagnosticSeverities::default(),
+                    deps_core::NetworkMode::Online,
+                ),
                 std::time::Duration::from_secs(60),
             )
             .await;
@@ -2040,9 +2092,11 @@ dependencies = ["requests>=2.0.0"]
             let result = generate_diagnostics_internal(
                 Arc::clone(&state),
                 &uri,
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-                deps_core::NetworkMode::Online,
+                &DiagnosticsSnapshot::for_test(
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::DiagnosticSeverities::default(),
+                    deps_core::NetworkMode::Online,
+                ),
                 std::time::Duration::from_secs(60),
             )
             .await;

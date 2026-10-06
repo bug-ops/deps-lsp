@@ -233,6 +233,10 @@ typosquat diagnostic is `deps-lsp` only, and a non-default `[typosquat]` section
 > `--config` — the operator's own choice, not the scanned repository's — is trusted in
 > full.
 
+> **Note:** `registries.swift_keychain_credentials` is not supported in `deps-cli`, which cannot
+> answer a macOS Keychain access prompt: an explicit `--config` with it enabled prints a warning
+> and runs with it disabled. See [Swift macOS Keychain credentials](ecosystems/swift.md#macos-keychain-credentials).
+
 ## `update` usage
 
 `deps-cli update <MANIFEST>` reads exactly one manifest, plans a set of version-requirement

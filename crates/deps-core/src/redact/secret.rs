@@ -199,6 +199,12 @@ impl ApiToken {
     pub fn expose_secret(&self) -> &str {
         self.0.expose_secret()
     }
+
+    /// The wrapped secret, for attaching to a request as a sensitive credential header.
+    #[must_use]
+    pub const fn as_redacted(&self) -> &Redacted {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for ApiToken {

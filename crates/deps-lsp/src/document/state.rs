@@ -3,6 +3,7 @@ use deps_core::HttpCache;
 use deps_core::lockfile::LockFileCache;
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
+use deps_core::policy_config::{OsvChecks, OsvChecksCell};
 use deps_core::{
     ConcreteVersion, DependencyOutcomes, DepsDevClient, EcosystemId, EcosystemRegistry,
     GossipFindings, LicensePolicy, PackageName, PackageVersions, ParseResult, TyposquatSignal,
@@ -1012,6 +1013,10 @@ pub struct ServerState {
     /// the same handle `crate::register_ecosystems` hands to `NuGetEcosystem`'s
     /// `NuGetParseContext`, bundled inside `EcosystemRuntime`. See that struct's docs.
     pub nuget_user_profile_sources: Arc<AtomicBool>,
+    /// Live-updatable `registries.swift_keychain_credentials` setting (#1771) — the same handle
+    /// `crate::register_ecosystems` hands to `SwiftParseContext::with_keychain`, bundled inside
+    /// `EcosystemRuntime`, and the source of the "credential resolved" event.
+    pub keychain_credentials: Arc<deps_core::keychain_credentials::KeychainCredentialsHandle>,
     /// Live-updatable `registries.gitlab_instance_host` setting (issue #466, spec
     /// FR-005a/FR-011a) — the same raw-string handle `crate::register_ecosystems` hands to
     /// `GitlabCiEcosystem::with_context`, bundled inside `EcosystemRuntime`. See that
@@ -1056,7 +1061,7 @@ pub struct ServerState {
     /// `typosquat_enabled`'s rationale but tracking a derived, two-flag condition rather than
     /// a single config field. Used only to detect the disabled/offline -> enabled transition
     /// (critique S5): `Backend::did_change_configuration` compares this against the freshly
-    /// resolved value and, on a `false` -> `true` edge, triggers an immediate rescan for every
+    /// resolved value and, on an `Inactive` -> `Active` edge, triggers an immediate rescan for every
     /// open document (`document::lifecycle::trigger_osv_rescan_for_open_documents`) — without
     /// it, `PackageSignals::latest_status` would stay permanently empty (`Unverified` for
     /// every outdated dependency) until each document's next edit or reopen, since toggling
@@ -1068,7 +1073,7 @@ pub struct ServerState {
     /// read as a disabled->enabled transition on the very first `did_change_configuration` a
     /// client sends without ever having called `Backend::initialize` with
     /// `initializationOptions` first.
-    pub osv_latest_check_enabled: AtomicBool,
+    osv_checks: OsvChecksCell,
     /// Ecosystem ids `crate::register_ecosystems` actually threaded the live
     /// `registry_policy` handle into (issue #592 security M1) — the single source of truth
     /// `config::reparse_scope`'s caller uses to scope a `registries.workspace_registries`
@@ -1174,6 +1179,7 @@ impl ServerState {
         );
         let registry_policy = Arc::clone(&runtime.policy);
         let nuget_user_profile_sources = Arc::clone(&runtime.nuget_user_profile_sources);
+        let keychain_credentials = Arc::clone(&runtime.keychain_credentials);
         let gitlab_instance_host = Arc::clone(&runtime.gitlab_instance_host);
         // `HttpCache::with_policy` (not `HttpCache::new`) so this server's one long-lived cache
         // shares the same policy handle `register_ecosystems` hands to `CargoEcosystem` below —
@@ -1210,11 +1216,12 @@ impl ServerState {
             ecosystem_registry,
             registry_policy,
             nuget_user_profile_sources,
+            keychain_credentials,
             gitlab_instance_host,
             license_policy: RwLock::new(Arc::new(LicensePolicy::default())),
             typosquat_enabled: AtomicBool::new(false),
             gossip_enabled: AtomicBool::new(false),
-            osv_latest_check_enabled: AtomicBool::new(true),
+            osv_checks: OsvChecksCell::default(),
             workspace_registry_ecosystems,
             cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
@@ -1345,20 +1352,18 @@ impl ServerState {
         self.gossip_enabled.store(enabled, Ordering::Relaxed);
     }
 
-    /// Returns whether the OSV latest-check is currently effectively enabled (issue #1517
-    /// critique S5). See [`Self::osv_latest_check_enabled`]'s field doc.
-    pub fn is_osv_latest_check_enabled(&self) -> bool {
-        self.osv_latest_check_enabled.load(Ordering::Relaxed)
+    /// Returns the OSV gate as of the last applied config (issue #1517 critique S5). See
+    /// [`Self::osv_checks`]'s field doc.
+    pub fn osv_checks(&self) -> OsvChecks {
+        self.osv_checks.get()
     }
 
     /// Replaces the tracked effective OSV latest-check state (issue #1517 critique S5).
     ///
     /// Mirrors [`Self::set_typosquat_enabled`]'s exact rationale; called from
-    /// `Backend::apply_resolved_config` with `vulnerabilities_enabled && !offline` already
-    /// combined by the caller.
-    pub fn set_osv_latest_check_enabled(&self, enabled: bool) {
-        self.osv_latest_check_enabled
-            .store(enabled, Ordering::Relaxed);
+    /// `Backend::apply_resolved_config` with the gate resolved by the caller.
+    pub fn set_osv_checks(&self, checks: OsvChecks) {
+        self.osv_checks.set(checks);
     }
 
     /// Unions `scope` into the pending coalesced reparse and bumps the generation counter

@@ -98,7 +98,8 @@ non-default port, like SwiftPM (`swift.acme.dev:8443` does not match a portless 
 SwiftPM, an explicit default port (`:443`) is treated as absent.
 
 When the variables are unset, credentials come from the content of `SWIFTPM_NETRC_DATA`, else from
-`~/.netrc` (the first source that exists wins, as in SwiftPM; macOS Keychain is not read). A netrc
+`~/.netrc` (the first source that exists wins, as in SwiftPM). On macOS, the opt-in
+[Keychain source](#macos-keychain-credentials) sits between `SWIFTPM_NETRC_DATA` and `~/.netrc`. A netrc
 is matched by the registry's host, ignoring the port, and is sent as `Basic` unless the
 user-level `authentication` entry says `token` (or the login is `token`). `SWIFTPM_NETRC_DATA`
 is parsed once at startup, first matching machine wins and host names compare case-sensitively;
@@ -127,9 +128,75 @@ here where SwiftPM `main` would authenticate; add that exact URL to your user-le
 authentication type is also taken from the user tier only, and workspace-declared URLs are
 policy-gated, which SwiftPM does not do.
 
-On macOS SwiftPM reads credentials from the Keychain and not from `~/.netrc` (unless forced);
-`deps-swift` has no Keychain support and does read `~/.netrc` there, but ignores its `default`
-entry. Keychain-only credentials are therefore not available.
+On macOS SwiftPM reads credentials from the Keychain and not from `~/.netrc` (unless forced).
+`deps-swift` reads `~/.netrc` there by default, ignoring its `default` entry; set
+`registries.swift_keychain_credentials` to also read the Keychain, as described next.
+
+### macOS Keychain credentials
+
+Set `registries.swift_keychain_credentials` to `"enabled"` (default `"disabled"`) to let
+`deps-swift` look up a registry credential in the macOS login Keychain, the way SwiftPM does:
+
+```json
+{ "registries": { "swift_keychain_credentials": "enabled" } }
+```
+
+Credential sources have the order `SWIFTPM_REGISTRY_*` environment variables,
+`SWIFTPM_NETRC_DATA`, Keychain, `~/.netrc`, and, like SwiftPM, only the first source that applies
+is used. With the setting enabled on macOS, `~/.netrc` is therefore never read, and a Keychain
+miss for a host does not fall back to the netrc: a registry whose credential lives only in
+`~/.netrc` loses it until you disable the setting. The setting has no effect on other platforms (a warning
+is logged and `~/.netrc` is used), and an enabled setting never sends a credential to a
+workspace-declared registry: the Keychain is consulted only for user-declared (trusted) registry
+URLs, with the same header format rules as the other sources.
+
+**What happens at the first request.** The lookup runs `/usr/bin/security find-internet-password`
+for the registry's host (and port, only when the URL names one). Reading the secret can make macOS
+show an access prompt, and the lookup waits up to 10 minutes for you to answer it; lookups are
+serialized, so only one prompt is open at a time, and a server queued behind another's prompt does
+not spend its own 10 minutes while it waits. Offline mode (`network.offline`) never runs
+`security`. The registry
+request is not sent until the lookup finishes, but the surrounding version fetch has its own,
+much shorter timeout, so the dependency shows a fetch failure while the prompt is open. Once you
+approve and the answer arrives after that fetch gave up, open Swift documents are refreshed
+automatically and the credential is used; no editor action is needed.
+
+Answer the prompt with "Allow", not "Always Allow". The server remembers the secret for the life
+of the process, so "Allow" prompts once per server start. "Always Allow" adds `/usr/bin/security`
+(not `deps-lsp`) to the item's access list, after which any process running as your user can read
+the secret silently with `security find-internet-password -w`. Because a cloned repository's
+workspace settings can enable this setting (see the caveats below), expect the prompt only for
+registries you declared yourself.
+
+**What is remembered.** Per registry host, for the life of the process unless noted:
+
+| Outcome | Kept |
+|---|---|
+| Item found | until exit; disabling the setting drops it immediately and aborts a pending lookup |
+| No item | 5 minutes, then looked up again |
+| Access refused (any `security` failure other than not found and interaction-not-allowed) | until the setting is toggled off and on, or the server restarts |
+| Timeout, or exit 36 (interaction not allowed, for example a locked keychain without UI) | not remembered; retried on the next fetch |
+
+A `401` never triggers a new lookup, and without a found item no credential is sent.
+
+**Caveats.**
+
+- With several Keychain items for one host, `security` returns the first match, while SwiftPM
+  picks the most recently modified item; the two tools can choose different credentials.
+- When a registry switches between sending a Keychain credential and none (lookup resolving to found, or any change of the setting), its cached release lists are dropped, so an anonymous response is not served afterwards; this is skipped offline, so the warm offline cache survives.
+- A `didChangeConfiguration` payload without a `registries` section resets every `registries`
+  setting, including this one, to its default (`"disabled"`), as for the other settings.
+- The secret is read with `security ... -g`, so non-ASCII secrets are decoded correctly.
+- Without a URL port, the lookup omits `-P`, so an item stored for any port of that host matches.
+- The item's account name is passed to `security` as an argument and is visible to other processes
+  of your user in the process list; the secret is never passed as an argument and never logged.
+- Editor workspace settings (`.zed/settings.json`, `.vscode/settings.json`) in a cloned repository
+  can enable this setting and therefore trigger the access prompt. The credential still goes only
+  to registries declared in your user-level `registries.json`, never to hosts the repository
+  declares.
+- `deps-cli` does not support the setting: it exits before a prompt can be answered, so it ignores
+  the setting with a warning on stderr. Use the environment variables, `SWIFTPM_NETRC_DATA` or
+  `~/.netrc` there.
 
 ### Limitations
 

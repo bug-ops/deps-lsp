@@ -372,6 +372,10 @@ or differently-authenticated request), `auth_digest` computes a salted hash of t
 secret — salted with a per-process random value, so the digest can't be reconstructed offline
 even if it were to appear in a log line.
 
+Credential request headers (`Authorization`, `PRIVATE-TOKEN`) are built only through
+`HttpCache`'s typed `RequestHeader`/`CredentialHeader` parameters, which mark the header value
+sensitive, so it is redacted from the HTTP stack's own debug output as well.
+
 ## Release-freshness signal
 
 `freshness` (`deps-core::freshness`) implements the release-cooldown window described in

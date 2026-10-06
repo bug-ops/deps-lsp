@@ -8,6 +8,7 @@ use deps_core::EcosystemId;
 use deps_core::completion::{
     COMPLETION_SEARCH_TIMEOUT, CompletionOrigin, is_valid_completion_prefix_len,
 };
+use deps_core::policy_config::{OsvChecks, OsvState};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -48,14 +49,14 @@ pub async fn handle_completion(
     );
 
     // Acquires the config RwLock before the DashMap shard guard, never the reverse
-    // (matches hover.rs/diagnostics.rs). `osv_checks_enabled` feeds the OSV
+    // (matches hover.rs/diagnostics.rs). `osv_checks` feeds the OSV
     // latest-verdict gate below (issue #1517 critique S1/S3) — the same gate every other
     // renderer reads before deciding whether `latest_status` applies at all.
-    let (freshness, osv_checks_enabled) = {
+    let (freshness, osv_checks) = {
         let config = config.read().await;
         (
             config.policy.freshness.to_freshness(),
-            config.policy.osv_checks_enabled(),
+            config.policy.osv_checks(),
         )
     };
 
@@ -203,14 +204,7 @@ pub async fn handle_completion(
     // scope (spec 072 N6b), so the OSV verdict gate every other renderer applies runs here as
     // a post-process step instead — demoting/flagging every item that is not
     // `Verified`/`NotApplicable`, not only whichever one is displayed as "latest".
-    apply_osv_latest_verdict_to_completions(
-        &state,
-        uri,
-        position,
-        osv_checks_enabled,
-        origin,
-        &mut items,
-    );
+    apply_osv_latest_verdict_to_completions(&state, uri, position, osv_checks, origin, &mut items);
 
     tracing::info!("completion: returning {} items", items.len());
 
@@ -248,7 +242,7 @@ pub async fn handle_completion(
 /// functions every other renderer calls) closes both: an absent/stale entry resolves to
 /// [`deps_core::lsp_helpers::LatestVerdict::Unverified`] (fail closed), not "untouched".
 ///
-/// `osv_checks_enabled` (`policy.osv_checks_enabled()`,
+/// `osv_checks` (`policy.osv_checks()`,
 /// resolved by the caller) selects whether `Some(&doc.signals.latest_status)`/`Some(&doc.signals.
 /// candidate_status)` or `None` is passed to `latest_verdict`/`candidate_verdict` — mirrors
 /// `SignalsSnapshotBuilder::with_latest_status`'s same gate (issue #1517 design point 7):
@@ -282,7 +276,7 @@ fn apply_osv_latest_verdict_to_completions(
     state: &ServerState,
     uri: &Uri,
     position: Position,
-    osv_checks_enabled: bool,
+    osv_checks: OsvChecks,
     origin: CompletionOrigin,
     items: &mut [CompletionItem],
 ) {
@@ -297,7 +291,7 @@ fn apply_osv_latest_verdict_to_completions(
     // (untouched), never `Unverified`. Checking it this early, alongside `origin`, means a
     // later lookup miss can safely fail closed unconditionally, without needing to re-check
     // this flag at that point too.
-    if items.is_empty() || origin != CompletionOrigin::Version || !osv_checks_enabled {
+    if items.is_empty() || origin != CompletionOrigin::Version || !osv_checks.is_active() {
         return;
     }
 
@@ -359,8 +353,13 @@ fn apply_osv_latest_verdict_to_completions(
                 doc.ecosystem,
             );
             let normalized_name = formatter.normalize_package_name(dep.name());
-            let latest_status = osv_checks_enabled.then_some(&doc.signals.latest_status);
-            let candidate_status = osv_checks_enabled.then_some(&doc.signals.candidate_status);
+            let (latest_status, candidate_status) = match osv_checks.state() {
+                OsvState::Active => (
+                    Some(&doc.signals.latest_status),
+                    Some(&doc.signals.candidate_status),
+                ),
+                OsvState::Inactive => (None, None),
+            };
 
             // The item identified as "latest" is checked against `latest_status` (#1517, phase
             // B's single "latest" check); every other item against `candidate_status` (#1524,
@@ -613,6 +612,16 @@ fn create_package_completion_item(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(
+        feature = "cargo",
+        feature = "pypi",
+        feature = "maven",
+        feature = "composer"
+    ))]
+    fn test_osv_checks(enabled: bool) -> OsvChecks {
+        OsvChecks::resolve(enabled, deps_core::NetworkMode::Online)
+    }
+
     use super::*;
     use crate::document::DocumentState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
@@ -1007,7 +1016,7 @@ mod tests {
             &state,
             &uri,
             Position::new(1, 9),
-            true,
+            test_osv_checks(true),
             CompletionOrigin::Version,
             &mut items,
         );
@@ -1087,7 +1096,7 @@ mod tests {
             &state,
             &uri,
             Position::new(1, 9),
-            true,
+            test_osv_checks(true),
             CompletionOrigin::Version,
             &mut items,
         );
@@ -1156,7 +1165,7 @@ mod tests {
             &state,
             &uri,
             Position::new(1, 9),
-            true,
+            test_osv_checks(true),
             CompletionOrigin::Version,
             &mut items,
         );
@@ -1239,7 +1248,7 @@ mod tests {
             &state,
             &uri,
             Position::new(1, 9),
-            true,
+            test_osv_checks(true),
             CompletionOrigin::Version,
             &mut items,
         );
@@ -1301,7 +1310,7 @@ mod tests {
             &state,
             &uri,
             Position::new(1, 9),
-            false,
+            test_osv_checks(false),
             CompletionOrigin::Version,
             &mut items,
         );
@@ -1355,7 +1364,7 @@ mod tests {
             &state,
             &uri,
             Position::new(0, 0),
-            false,
+            test_osv_checks(false),
             CompletionOrigin::Version,
             &mut items,
         );
@@ -1453,7 +1462,7 @@ mod tests {
             &state,
             &uri,
             Position::new(1, 24),
-            true,
+            test_osv_checks(true),
             CompletionOrigin::Version,
             &mut items,
         );
@@ -1558,7 +1567,7 @@ mod tests {
             &state,
             &uri,
             Position::new(0, 3),
-            true,
+            test_osv_checks(true),
             CompletionOrigin::PackageName,
             &mut items,
         );
@@ -1676,7 +1685,7 @@ mod tests {
             &state,
             &uri,
             position,
-            true,
+            test_osv_checks(true),
             CompletionOrigin::Version,
             &mut items,
         );
@@ -1768,7 +1777,7 @@ mod tests {
             &state,
             &uri,
             position,
-            true,
+            test_osv_checks(true),
             CompletionOrigin::Version,
             &mut items,
         );
@@ -1858,7 +1867,7 @@ mod tests {
             &state,
             &uri,
             position,
-            true,
+            test_osv_checks(true),
             CompletionOrigin::Version,
             &mut items,
         );

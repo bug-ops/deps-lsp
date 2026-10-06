@@ -65,13 +65,14 @@ reach any registry other than the one SwiftPM would use.
 >   `deps-lsp` `server.rs`, so it is a separate follow-up. In the meantime Swift watches the
 >   basename `registries.json` (FR-041); the only cost is an extra reparse when an unrelated file
 >   with that name changes.
-> - **macOS Keychain credentials.** Follow-up issue. `~/.netrc` and `SWIFTPM_NETRC_DATA` shipped in
->   the #1755 follow-up (FR-038).
+> - **macOS Keychain credentials.** Shipped as the opt-in `registries.swift_keychain_credentials`
+>   setting (#1771, FR-044). `~/.netrc` and `SWIFTPM_NETRC_DATA` shipped in the #1755 follow-up
+>   (FR-038).
 > - **`publishedAt` freshness.** Shipped in the #1756 follow-up (FR-037).
 > - **SCM-to-registry swizzling** (`--use-registry-identity-for-scm`, `--replace-scm-with-registry`),
 >   #1757.
-> - **Marking the registry `Authorization` header sensitive** (`HeaderValue::set_sensitive`), a
->   cross-ecosystem follow-up.
+> - **Marking the registry `Authorization` header sensitive** (`HeaderValue::set_sensitive`).
+>   Shipped cross-ecosystem in #1772 through `deps_core::RequestHeader`.
 > - **Name completion for `id:` literals.** SE-0292 has no search endpoint.
 > - **Centralizing the credential-provenance predicate (#1459).** Shaped for reuse here (FR-016),
 >   extracted later.
@@ -263,11 +264,12 @@ authenticated entry serves the stale body. The FR-015 eviction from spec 043 app
 | FR-035 | WHEN the pages cannot be followed to the last one THE SYSTEM SHALL discard everything fetched and fail with `DepsError::PaginatedListIncomplete { package, registry, reason: PaginationStop }`, with `reason` one of `PageCap` (more than 10 pages, more than 10,000 merged releases, or more than 32 MiB of body bytes), `InvalidNextLink` or `TimeBudget` (15 s for the whole list, only once at least one page was merged; a slow first page is an ordinary transient failure). Its `fetch_failure()` SHALL be `Actionable` with a fixed message. The outcome is remembered per client and package for 90 s so a repeat call fails fast | must |
 | FR-036 | WHEN a request fails because the connect-time resolver guard blocked the resolved address THE SYSTEM SHALL return `DepsError::HostBlockedByPolicy { url, class }` instead of a transport error, in every ecosystem. Its `fetch_failure()` SHALL be `Actionable` with a fixed message that names the class and, for `HostClass::never_a_registry` classes, says "never a registry under any policy", otherwise "blocked by registries.workspace_registries policy"; it SHALL contain no remedy. Chains (PyPI, NuGet, Go) keep it when they halt (`DepsError::into_chain_halt`); a Go `\|` chain never lets a later hop's miss overwrite it | must |
 | FR-037 | WHEN freshness is enabled THE SYSTEM SHALL fetch `GET {base}/{scope}/{name}/{version}` for the newest 8 non-yanked releases and set `published_at` from `publishedAt`, over the same transport and credential rules. Requests are limited to 4 in flight per registry client and share one 2 s deadline. A `publishedAt` answer (200, or 410 meaning none) is memoized for the process lifetime; any other failure is memoized for 90 s, and only for requests that had started. A missing date never fails the list | must |
-| FR-038 | THE SYSTEM SHALL read credentials from the first existing source in the order `SWIFTPM_REGISTRY_*` environment variables, `SWIFTPM_NETRC_DATA`, `~/.netrc` (`SwiftCredentialSource`). A netrc credential is bound by the registry URL's host (port ignored) and only to `Trusted` URLs, formatted through the same table as the environment credential. `deps_core::netrc` follows SwiftPM's grammar; `SWIFTPM_NETRC_DATA` uses first-match, case-sensitive hosts and honors `default`; `~/.netrc` uses last-match, case-insensitive hosts, is re-read when its mtime changes, treats an absent, unreadable or invalid file as no credential, and ignores its `default` entry on macOS. Keychain is not read | must |
+| FR-038 | THE SYSTEM SHALL read credentials from the first existing source in the order `SWIFTPM_REGISTRY_*` environment variables, `SWIFTPM_NETRC_DATA`, `~/.netrc` (`SwiftCredentialSource`), with the opt-in Keychain source of FR-044 between `SWIFTPM_NETRC_DATA` and `~/.netrc`. A netrc credential is bound by the registry URL's host (port ignored) and only to `Trusted` URLs, formatted through the same table as the environment credential. `deps_core::netrc` follows SwiftPM's grammar; `SWIFTPM_NETRC_DATA` uses first-match, case-sensitive hosts and honors `default`; `~/.netrc` uses last-match, case-insensitive hosts, is re-read when its mtime changes, treats an absent, unreadable or invalid file as no credential, and ignores its `default` entry on macOS | must |
 | FR-040 | `Package.resolved` v2/v3 `kind` SHALL decode into `PinKind { RemoteSourceControl (default when missing), LocalSourceControl (alias "fileSystem"), Registry, Unrecognized (serde other) }`. `Registry` maps to `ResolvedSource::Registry { url: "", checksum: "" }` (SwiftPM writes `location: ""`), `LocalSourceControl` to `Path`, and `Unrecognized` is skipped with a debug log. Previously an unknown kind became Git | must |
 | FR-041 (superseded by #1759: `WatchedConfig` path suffix `.swiftpm/configuration/registries.json`) | Swift SHALL declare the basename `registries.json` in both `watched_config_filenames()` and `routing_affecting_watched_configs()`, with a `TODO` pointing at the path-suffix follow-up (Out of Scope). No `deps-core` or `deps-lsp` watcher change is made | must |
 | FR-042 | `deps-engine` `register_ecosystems` SHALL construct Swift with `SwiftEcosystem::with_context` and add `EcosystemId::Swift` to `workspace_registry_ecosystems` | must |
 | FR-043 | The parser SHALL drop `TODO(#1691)` and store `CustomRegistry.url` as the canonical scope | must |
+| FR-044 | WHEN `registries.swift_keychain_credentials` is `enabled` on macOS, no environment or `SWIFTPM_NETRC_DATA` credential applies and the registry is `Trusted` (user-declared) THE SYSTEM SHALL look the credential up in the Keychain through `/usr/bin/security find-internet-password -s <host> -r htps [-P <port>]` (`-P` only for an explicit URL port), then read the account and the secret (`-g`, parsed from stderr, because `-w` prints non-ASCII secrets as bare hex), and format it through the same table as the environment credential (`user == "token"` heuristic included). The lookup SHALL run at fetch time in a detached single-flight task per host with one 10-minute budget, never at parse time, serialized so only one prompt is open at a time (the budget starts when the lookup gets the dialog slot), and never in offline mode. A switch between with-credential and without-credential for a registry (lookup to found, any setting change) SHALL drop its cached release lists, except offline. Outcomes SHALL be memoized per host: found for the process lifetime, not found for 5 minutes, refused (any `security` exit other than 44 and 36) until the setting is toggled, timeout and exit 36 never; a `security` spawn failure counts as refused. The first applicable source wins as in SwiftPM, so an enabled Keychain means `~/.netrc` is not read and a Keychain miss does not fall through to it. WHEN no outcome is `Found` THE SYSTEM SHALL send no credential, and a `401` SHALL NOT start a new lookup. WHEN the answer arrives after the waiting request gave up THE SYSTEM SHALL re-parse open Swift documents once so the credential is used. Disabling the setting SHALL drop memoized secrets immediately and abort in-flight lookups; a `didChangeConfiguration` payload without `registries` resets it to `disabled`. The secret SHALL never be logged or passed as an argument; the account name is passed with `-a`. `deps-cli` SHALL force the setting to `disabled` with a warning. Where several items match, `security` returns the first, whereas SwiftPM picks the most recently modified | must |
 
 ## 5. Non-Functional Requirements
 
@@ -360,6 +362,7 @@ authenticated entry serves the stale body. The FR-015 eviction from spec 043 app
 | SC-019 | netrc grammar table (quotes, comments, account, drops, contiguity, IPv6 hosts), source precedence, `default` per platform, binding to `Trusted` only, mtime-driven re-read, unreadable file warns once, redaction conformance | FR-038 |
 | SC-013 | Lockfile: registry pin, `localSourceControl`, legacy `fileSystem`, missing kind, unknown kind skipped | FR-040 |
 | SC-014 (superseded by #1759: `watched_configs()`) | Swift's `watched_config_filenames()` and `routing_affecting_watched_configs()` both contain `registries.json` | FR-041 |
+| SC-017 | Fake `security` backend: found, not found (memoized 5 min), refused (memoized until toggle), timeout (not memoized), toggle purge, workspace-declared registry never receives the credential, precedence env > `SWIFTPM_NETRC_DATA` > Keychain > `~/.netrc`; live macOS throwaway item for a `.invalid` host found without a prompt. The access prompt (deny, cancel, locked keychain) is untested | FR-044 |
 | SC-015 | `is_url_source(AlternateRegistry)` is `false` (completion never rewrites an `id:` literal); ecosystem conformance; engine setup includes Swift | FR-042 |
 | SC-016 | Live: project `[default]` = `https://tuist.dev/api/registry/swift`; `apple.swift-nio` and `Apple.Swift-NIO` from `2.0.0` show the latest 2.x; removing the config produces no request in the log | US-001, Registry Integration Gate |
 
@@ -368,15 +371,13 @@ authenticated entry serves the stale body. The FR-015 eviction from spec 043 app
 None blocking. Every critic finding from both rounds (S1..S5, M1..M9, N1..N7) is resolved in §3 and
 §4. The deferred items are listed under Out of Scope and become follow-up issues when #1691 closes:
 
-1. macOS Keychain credentials.
-2. SCM-to-registry swizzling (#1757).
-3. #1459: shared credential-provenance predicate across deps-cargo, deps-nuget and deps-swift.
-4. Path-suffix watched-config entries, so that Swift watches only
+1. SCM-to-registry swizzling (#1757).
+2. #1459: shared credential-provenance predicate across deps-cargo, deps-nuget and deps-swift.
+3. Path-suffix watched-config entries, so that Swift watches only
    `.swiftpm/configuration/registries.json`.
-5. Marking the registry `Authorization` header sensitive, across ecosystems.
-6. The `latest-version` link.
+4. The `latest-version` link.
 
-Items for `Link rel="next"` pages (#1754), `publishedAt` (#1756), netrc (#1755, without Keychain) and
+Items for `Link rel="next"` pages (#1754), `publishedAt` (#1756), netrc (#1755) and
 `HostBlockedByPolicy` (#1758) shipped in the follow-up PR.
 
 ## 10. Agent Boundaries

@@ -29,8 +29,11 @@ answer, and both call it.
 [`EcosystemRuntime`](https://bug-ops.github.io/deps-lsp/deps_engine/setup/struct.EcosystemRuntime.html)
 bundles the live-updatable settings a running instance threads into every ecosystem that
 needs them: the `registries.workspace_registries` reachability policy, NuGet's
-`registries.nuget_user_profile_sources` flag, GitLab's `registries.gitlab_instance_host`, and
-a shared lock-file memoization cache. `register_ecosystems` takes one `EcosystemRuntime` and
+`registries.nuget_user_profile_sources` flag, GitLab's `registries.gitlab_instance_host`,
+Swift's `registries.swift_keychain_credentials` opt-in (`EcosystemRuntime::keychain_credentials`,
+set with `with_keychain_credentials`; a change reparses open Swift documents, and a credential
+that resolves after its request gave up triggers one more reparse), and a shared lock-file
+memoization cache. `register_ecosystems` takes one `EcosystemRuntime` and
 returns a fully populated `deps_core::EcosystemRegistry` — every feature-enabled
 `deps-<ecosystem>` crate's `Ecosystem` implementation constructed with its registry client and
 formatter, ready to route manifests to. This is the ~110-line function (moved verbatim from

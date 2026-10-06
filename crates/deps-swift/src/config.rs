@@ -23,6 +23,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
@@ -36,7 +37,13 @@ use deps_core::{BlockedSourceClass, EcosystemId, RejectedSourceClass};
 use serde::Deserialize;
 use url::Url;
 
-use crate::auth::{CredentialLookup, SwiftCredentialSource, SwiftRegistryAuth, bind_credential};
+use deps_core::keychain_credentials::KeychainCredentialsHandle;
+use deps_core::policy_config::KeychainCredentials;
+
+use crate::auth::{
+    CredentialLookup, KeychainBinding, RegistryAuth, SwiftCredentialSource, bind_credential,
+};
+use crate::keychain::KeychainStore;
 use crate::package_location::RegistryScope;
 
 const REGISTRIES_FILE: &str = "registries.json";
@@ -77,7 +84,7 @@ pub(crate) enum RegistriesConfigError {
 }
 
 /// The `authentication.<host>.type` of a registry host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SwiftAuthType {
     /// `Authorization: Basic base64(user:password)`.
@@ -593,8 +600,9 @@ impl SwiftRegistryUrl {
 pub struct ResolvedSwiftRegistry {
     /// The validated base URL.
     pub url: SwiftRegistryUrl,
-    /// The pre-formatted `Authorization` value, present only for a `Trusted` URL.
-    pub auth: Option<SwiftRegistryAuth>,
+    /// The credential, present only for a `Trusted` URL: a ready `Authorization` value, or a
+    /// Keychain item read when a request is made.
+    pub(crate) auth: Option<RegistryAuth>,
 }
 
 impl ResolvedSwiftRegistry {
@@ -606,10 +614,17 @@ impl ResolvedSwiftRegistry {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         deps_core::secret::digest_salt().hash(&mut hasher);
         self.url.trust.hash(&mut hasher);
-        self.auth
-            .as_ref()
-            .map(SwiftRegistryAuth::header_value)
-            .hash(&mut hasher);
+        match &self.auth {
+            None => 0u8.hash(&mut hasher),
+            Some(RegistryAuth::Header(auth)) => {
+                1u8.hash(&mut hasher);
+                auth.header_value().hash(&mut hasher);
+            }
+            Some(RegistryAuth::Keychain(credential)) => {
+                2u8.hash(&mut hasher);
+                credential.hash_identity(&mut hasher);
+            }
+        }
         hasher.finish()
     }
 }
@@ -789,6 +804,18 @@ pub struct SwiftParseContext {
     cache: Arc<SwiftRegistriesCache>,
     user_config: UserConfigPath,
     credential: Option<Arc<SwiftCredentialSource>>,
+    keychain: Option<KeychainWiring>,
+}
+
+/// The opt-in Keychain source: the process-wide store, the live setting, and the platform it
+/// may run on.
+#[derive(Debug, Clone)]
+enum KeychainWiring {
+    Supported(KeychainBinding),
+    Unsupported {
+        handle: Arc<KeychainCredentialsHandle>,
+        warned: Arc<AtomicBool>,
+    },
 }
 
 impl Default for SwiftParseContext {
@@ -836,6 +863,87 @@ impl SwiftParseContext {
             cache,
             user_config,
             credential,
+            keychain: None,
+        }
+    }
+
+    /// Adds the opt-in macOS Keychain credential source, gated by `handle` and owning the one
+    /// process-wide store; clones of this context share that store and its memo.
+    ///
+    /// The Keychain is read only on macOS, ahead of `~/.netrc` and behind the environment and
+    /// `SWIFTPM_NETRC_DATA`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::keychain_credentials::KeychainCredentialsHandle;
+    /// use deps_core::net_policy::RegistryAccessPolicy;
+    /// use deps_swift::SwiftParseContext;
+    /// use std::sync::Arc;
+    ///
+    /// let context = SwiftParseContext::from_environment(Arc::new(RegistryAccessPolicy::default()))
+    ///     .with_keychain(Arc::new(KeychainCredentialsHandle::default()));
+    /// assert!(format!("{context:?}").contains("keychain"));
+    /// ```
+    #[must_use]
+    pub fn with_keychain(self, handle: Arc<KeychainCredentialsHandle>) -> Self {
+        self.with_keychain_for(handle, UserConfigPlatform::current())
+    }
+
+    /// Wires the Keychain source for `platform`; off macOS no store is created and an enabled
+    /// setting only warns once.
+    pub(crate) fn with_keychain_for(
+        self,
+        handle: Arc<KeychainCredentialsHandle>,
+        platform: UserConfigPlatform,
+    ) -> Self {
+        match platform {
+            UserConfigPlatform::MacOs => {
+                let store = KeychainStore::system(handle.resolved_sender());
+                self.with_keychain_store(handle, Arc::new(store))
+            }
+            UserConfigPlatform::Other => Self {
+                keychain: Some(KeychainWiring::Unsupported {
+                    handle,
+                    warned: Arc::default(),
+                }),
+                ..self
+            },
+        }
+    }
+
+    pub(crate) fn with_keychain_store(
+        mut self,
+        handle: Arc<KeychainCredentialsHandle>,
+        store: Arc<KeychainStore>,
+    ) -> Self {
+        handle.register_observer(Arc::downgrade(&store) as _);
+        self.keychain = Some(KeychainWiring::Supported(KeychainBinding::new(
+            store, handle,
+        )));
+        self
+    }
+
+    /// The Keychain binding to use for `source`, when the setting is on, this platform has a
+    /// Keychain, and no source SwiftPM prefers is configured.
+    fn active_keychain(&self, source: Option<&SwiftCredentialSource>) -> Option<&KeychainBinding> {
+        match self.keychain.as_ref()? {
+            KeychainWiring::Supported(binding) => {
+                binding.sync_generation();
+                (binding.is_enabled()
+                    && !source.is_some_and(SwiftCredentialSource::precedes_keychain))
+                .then_some(binding)
+            }
+            KeychainWiring::Unsupported { handle, warned } => {
+                if handle.get() == KeychainCredentials::Enabled
+                    && !warned.swap(true, Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        "registries.swift_keychain_credentials is only supported on macOS; ignoring it"
+                    );
+                }
+                None
+            }
         }
     }
 
@@ -885,9 +993,11 @@ impl SwiftParseContext {
         let merge = |credential: CredentialLookup<'_>| {
             SwiftRegistriesConfig::merge(project, user, &self.policy, credential)
         };
-        let config = match self.credential.as_deref() {
-            Some(source) => source.with_lookup(merge),
-            None => merge(CredentialLookup::None),
+        let source = self.credential.as_deref();
+        let config = match (self.active_keychain(source), source) {
+            (Some(binding), _) => merge(CredentialLookup::Keychain(binding)),
+            (None, Some(source)) => source.with_lookup(merge),
+            (None, None) => merge(CredentialLookup::None),
         };
         self.cache.warn_invalid_entries(&config);
         config
@@ -1756,5 +1866,237 @@ mod tests {
             config.resolve_source_for(&scope("acme")),
             alternate(PRIVATE)
         );
+    }
+
+    // --- opt-in Keychain credential source (#1771) ---
+
+    mod keychain_source {
+        use super::*;
+        use crate::auth::RegistryAuth;
+        use crate::keychain::fake::Fake;
+        use deps_core::keychain_credentials::KeychainCredentialsHandle;
+        use deps_core::policy_config::KeychainCredentials;
+
+        struct Wired {
+            context: SwiftParseContext,
+            handle: Arc<KeychainCredentialsHandle>,
+            fake: Fake,
+            store: Arc<KeychainStore>,
+        }
+
+        fn wired(
+            fx: &Fixture,
+            platform: UserConfigPlatform,
+            setting: KeychainCredentials,
+            source: Option<Arc<SwiftCredentialSource>>,
+        ) -> Wired {
+            let handle = Arc::new(KeychainCredentialsHandle::new(setting));
+            let fake = Fake::found();
+            let store = Arc::new(KeychainStore::new(fake.clone(), handle.resolved_sender()));
+            let base = fx.context(WorkspaceRegistryAccess::All, source);
+            let context = match platform {
+                UserConfigPlatform::MacOs => {
+                    base.with_keychain_store(Arc::clone(&handle), Arc::clone(&store))
+                }
+                UserConfigPlatform::Other => base.with_keychain_for(Arc::clone(&handle), platform),
+            };
+            Wired {
+                context,
+                handle,
+                fake,
+                store,
+            }
+        }
+
+        fn auth_of(wired: &Wired, fx: &Fixture, url: &str) -> Option<RegistryAuth> {
+            find(&wired.context.resolve(&fx.manifest_uri()), url).auth
+        }
+
+        fn user_declared_fixture() -> Fixture {
+            let fx = Fixture::new();
+            fx.user(&registries(&[("acme", PRIVATE)]));
+            fx
+        }
+
+        #[test]
+        fn test_enabled_on_macos_binds_a_deferred_keychain_credential_without_any_lookup() {
+            let fx = user_declared_fixture();
+            let wired = wired(
+                &fx,
+                UserConfigPlatform::MacOs,
+                KeychainCredentials::Enabled,
+                None,
+            );
+            assert_matches!(
+                auth_of(&wired, &fx, PRIVATE),
+                Some(RegistryAuth::Keychain(_))
+            );
+            assert_eq!(wired.fake.find_calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn test_disabled_or_non_macos_never_selects_the_keychain() {
+            let fx = user_declared_fixture();
+            for (platform, setting) in [
+                (UserConfigPlatform::MacOs, KeychainCredentials::Disabled),
+                (UserConfigPlatform::Other, KeychainCredentials::Enabled),
+            ] {
+                let wired = wired(&fx, platform, setting, None);
+                assert!(
+                    auth_of(&wired, &fx, PRIVATE).is_none(),
+                    "{platform:?} {setting:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_environment_and_netrc_data_take_precedence_over_the_keychain() {
+            let fx = user_declared_fixture();
+            let wired = wired(
+                &fx,
+                UserConfigPlatform::MacOs,
+                KeychainCredentials::Enabled,
+                Some(token("env-token")),
+            );
+            let auth = auth_of(&wired, &fx, PRIVATE).unwrap();
+            assert_eq!(auth.header_value(), "Bearer env-token");
+
+            let netrc = deps_core::netrc::Netrc::parse(
+                "machine swift.acme.dev login u password p",
+                deps_core::netrc::NetrcFlavor::InMemory,
+            )
+            .unwrap();
+            let data = Arc::new(SwiftCredentialSource::NetrcData(Arc::new(netrc)));
+            let wired = self::wired(
+                &fx,
+                UserConfigPlatform::MacOs,
+                KeychainCredentials::Enabled,
+                Some(data),
+            );
+            assert_matches!(auth_of(&wired, &fx, PRIVATE), Some(RegistryAuth::Header(_)));
+        }
+
+        #[test]
+        fn test_keychain_replaces_the_netrc_file() {
+            let fx = user_declared_fixture();
+            let netrc_path = fx.dir.path().join("home/.netrc");
+            Fixture::write(&netrc_path, "default login d password d");
+            let file = netrc_file_source(netrc_path, deps_core::netrc::DefaultEntry::Honor);
+
+            let on = wired(
+                &fx,
+                UserConfigPlatform::MacOs,
+                KeychainCredentials::Enabled,
+                Some(Arc::clone(&file)),
+            );
+            assert_matches!(auth_of(&on, &fx, PRIVATE), Some(RegistryAuth::Keychain(_)));
+
+            let off = wired(
+                &fx,
+                UserConfigPlatform::MacOs,
+                KeychainCredentials::Disabled,
+                Some(file),
+            );
+            assert_matches!(auth_of(&off, &fx, PRIVATE), Some(RegistryAuth::Header(_)));
+        }
+
+        #[test]
+        fn test_keychain_credential_never_reaches_a_workspace_declared_registry() {
+            let fx = user_declared_fixture();
+            fx.project(&registries(&[(
+                "other",
+                "https://swift.acme.dev/other-api",
+            )]));
+            let wired = wired(
+                &fx,
+                UserConfigPlatform::MacOs,
+                KeychainCredentials::Enabled,
+                None,
+            );
+            assert!(auth_of(&wired, &fx, PRIVATE).is_some());
+            assert!(auth_of(&wired, &fx, "https://swift.acme.dev/other-api").is_none());
+        }
+
+        #[test]
+        fn test_digest_tells_keychain_from_no_credential_and_from_another_host() {
+            let fx = Fixture::new();
+            fx.user(&registries(&[
+                ("a", PRIVATE),
+                ("b", "https://swift.other.dev/api"),
+            ]));
+            let on = wired(
+                &fx,
+                UserConfigPlatform::MacOs,
+                KeychainCredentials::Enabled,
+                None,
+            );
+            let config = on.context.resolve(&fx.manifest_uri());
+            let a = find(&config, PRIVATE).digest();
+            assert_eq!(
+                a,
+                find(&on.context.resolve(&fx.manifest_uri()), PRIVATE).digest()
+            );
+            assert_ne!(a, find(&config, "https://swift.other.dev/api").digest());
+            on.handle.set(KeychainCredentials::Disabled);
+            let off = find(&on.context.resolve(&fx.manifest_uri()), PRIVATE).digest();
+            assert_ne!(a, off);
+        }
+
+        #[test]
+        fn test_debug_of_a_keychain_bound_registry_shows_no_secret() {
+            let fx = user_declared_fixture();
+            let wired = wired(
+                &fx,
+                UserConfigPlatform::MacOs,
+                KeychainCredentials::Enabled,
+                None,
+            );
+            let rendered = format!("{:?}", auth_of(&wired, &fx, PRIVATE));
+            assert!(rendered.contains("KeychainCredential"));
+            assert!(!rendered.contains("hunter2"));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn test_disabling_purges_found_secrets_immediately_with_no_swift_document() {
+            let fx = user_declared_fixture();
+            let wired = wired(
+                &fx,
+                UserConfigPlatform::MacOs,
+                KeychainCredentials::Enabled,
+                None,
+            );
+            let Some(RegistryAuth::Keychain(credential)) = auth_of(&wired, &fx, PRIVATE) else {
+                panic!("expected a keychain credential");
+            };
+            assert!(credential.authorization().await.auth.is_some());
+            assert_eq!(wired.store.memoized_entries(), 1);
+
+            wired.handle.set(KeychainCredentials::Disabled);
+            assert_eq!(wired.store.memoized_entries(), 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn test_toggling_the_setting_purges_the_memo_on_the_next_resolve() {
+            let fx = user_declared_fixture();
+            let wired = wired(
+                &fx,
+                UserConfigPlatform::MacOs,
+                KeychainCredentials::Enabled,
+                None,
+            );
+            let Some(RegistryAuth::Keychain(credential)) = auth_of(&wired, &fx, PRIVATE) else {
+                panic!("expected a keychain credential");
+            };
+            assert!(credential.authorization().await.auth.is_some());
+            assert!(credential.authorization().await.auth.is_some());
+            assert_eq!(wired.fake.secret_calls(), 1);
+
+            wired.handle.set(KeychainCredentials::Disabled);
+            assert!(credential.authorization().await.auth.is_none());
+            wired.handle.set(KeychainCredentials::Enabled);
+            auth_of(&wired, &fx, PRIVATE);
+            assert!(credential.authorization().await.auth.is_some());
+            assert_eq!(wired.fake.secret_calls(), 2);
+        }
     }
 }

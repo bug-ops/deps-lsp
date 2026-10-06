@@ -4,7 +4,9 @@
 //! `DepsConfig` composes — so `deps-cli` never parses a second, independently-maintained
 //! copy of the policy schema (constitution principle 1).
 
-use deps_core::policy_config::{DiagnosticsConfig, PolicyConfig};
+use deps_core::policy_config::{
+    DiagnosticsConfig, KeychainCredentials, PolicyConfig, RegistriesConfig,
+};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -229,7 +231,7 @@ pub fn load(explicit_path: Option<&Path>, default_dir: &Path) -> Result<CliConfi
         Err(source) => return Err(ConfigError::Io { path, source }),
     };
 
-    let config = parse(&content, &path)?;
+    let mut config = parse(&content, &path)?;
     // Spec 074 FR-008: this loop now runs for both an auto-discovered and an explicit
     // `--config` file — only `safe_auto_discovered_config`'s field-reset below stays scoped
     // to the auto-discovered (`!required`) branch; `ignored_sections` itself already
@@ -250,7 +252,22 @@ pub fn load(explicit_path: Option<&Path>, default_dir: &Path) -> Result<CliConfi
     if !required {
         return Ok(safe_auto_discovered_config(config));
     }
+    disable_unsupported_keychain(&mut config.policy.registries, &path);
     Ok(config)
+}
+
+/// Forces `registries.swift_keychain_credentials` back to `Disabled` with a warning: `deps-cli`
+/// exits as soon as it finishes and cannot answer a macOS Keychain access prompt, so the
+/// setting would only stall a fetch (#1771). `load` is the single choke point feeding every
+/// consumer of the policy.
+fn disable_unsupported_keychain(registries: &mut RegistriesConfig, path: &Path) {
+    if registries.swift_keychain_credentials == KeychainCredentials::Enabled {
+        eprintln!(
+            "deps-cli: warning: {path}'s registries.swift_keychain_credentials is not supported in deps-cli and is ignored; use SWIFTPM_REGISTRY_TOKEN, SWIFTPM_NETRC_DATA or ~/.netrc instead",
+            path = crate::sanitize::sanitize_path_for_display(path).display(),
+        );
+        registries.swift_keychain_credentials = KeychainCredentials::Disabled;
+    }
 }
 
 /// Reduces a [`CliConfig`] loaded from an *auto-discovered* `deps.toml` to only the fields
@@ -362,6 +379,8 @@ fn ignored_sections(policy: &PolicyConfig, required: bool) -> Vec<&'static str> 
         if policy.registries.workspace_registries != default.registries.workspace_registries
             || policy.registries.nuget_user_profile_sources
                 != default.registries.nuget_user_profile_sources
+            || policy.registries.swift_keychain_credentials
+                != default.registries.swift_keychain_credentials
             || policy.registries.gitlab_instance_host != default.registries.gitlab_instance_host
         {
             sections.push("registries");
@@ -873,6 +892,45 @@ b = 2
         assert_eq!(
             config.policy.registries.gitlab_instance_host,
             "gitlab.mycorp.dev"
+        );
+    }
+
+    /// The Keychain opt-in cannot be honored by a one-shot CLI that cannot answer the prompt, so
+    /// an explicit config is warned about and forced back to `Disabled`; the rest of its
+    /// `registries` section is untouched.
+    #[test]
+    fn test_load_explicit_config_forces_keychain_credentials_disabled() {
+        let file = write_temp_toml(
+            r#"
+            [registries]
+            gitlab_instance_host = "gitlab.mycorp.dev"
+            swift_keychain_credentials = "enabled"
+            "#,
+        );
+        let config = load(Some(file.path()), Path::new("."))
+            .expect("explicit config with the keychain setting must load");
+        assert_eq!(
+            config.policy.registries.swift_keychain_credentials,
+            KeychainCredentials::Disabled
+        );
+        assert_eq!(
+            config.policy.registries.gitlab_instance_host,
+            "gitlab.mycorp.dev"
+        );
+    }
+
+    #[test]
+    fn test_load_auto_discovered_keychain_setting_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(DEFAULT_CONFIG_FILENAME),
+            "[registries]\nswift_keychain_credentials = \"enabled\"\n",
+        )
+        .unwrap();
+        let config = load(None, dir.path()).unwrap();
+        assert_eq!(
+            config.policy.registries.swift_keychain_credentials,
+            KeychainCredentials::Disabled
         );
     }
 

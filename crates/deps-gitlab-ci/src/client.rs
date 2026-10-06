@@ -8,21 +8,13 @@
 
 use bytes::Bytes;
 use dashmap::DashSet;
-use deps_core::cache::HttpCache;
+use deps_core::cache::{CredentialHeader, HttpCache, RequestHeader};
 use deps_core::error::{DepsError, RateLimitEvidence, Result};
 use deps_core::secret::{ApiToken, token_from_env};
-use reqwest::header::HeaderName;
 use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::host::{GitlabHost, GitlabInstanceHost, token_host_origin};
-
-/// GitLab's credential header — a distinct scheme from GitHub's `Authorization: Bearer`
-/// (NFR-006); this crate and `deps_core::github` deliberately do not share an auth-scheme
-/// abstraction for it (spec plan §1 "Ask First" item).
-fn private_token_header() -> HeaderName {
-    HeaderName::from_static("private-token")
-}
 
 /// Maximum number of pages fetched per (host, project, endpoint) combination.
 ///
@@ -286,24 +278,22 @@ impl GitlabApiClient {
         // (security review, #466).
         let is_token_host =
             token_host_origin(&self.instance_host).is_some_and(|origin| origin == host.origin());
-        let token_value = if is_token_host {
-            self.token.as_ref().map(ApiToken::expose_secret)
+        let token = if is_token_host {
+            self.token.as_ref()
         } else {
             None
         };
-        let auth_id = deps_core::secret::auth_digest(host.origin(), token_value);
-        let headers: Vec<(HeaderName, &str)> = token_value
-            .map(|t| vec![(private_token_header(), t)])
-            .unwrap_or_default();
+        let auth_id =
+            deps_core::secret::auth_digest(host.origin(), token.map(ApiToken::expose_secret));
+        let headers: Vec<RequestHeader<'_>> = token
+            .map(|t| {
+                RequestHeader::Credential(CredentialHeader::GitlabPrivateToken, t.as_redacted())
+            })
+            .into_iter()
+            .collect();
 
         self.cache
-            .get_cached_pinned_with_headers(
-                url,
-                host.origin(),
-                token_value.is_some(),
-                auth_id,
-                &headers,
-            )
+            .get_cached_pinned_with_headers(url, host.origin(), token.is_some(), auth_id, &headers)
             .await
     }
 }

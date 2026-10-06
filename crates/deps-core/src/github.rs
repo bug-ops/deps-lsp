@@ -14,7 +14,6 @@ use crate::freshness::PublishTime;
 use crate::lsp_helpers::{is_dot_segment, warn_rejected_value};
 use bytes::Bytes;
 use dashmap::DashMap;
-use reqwest::header::{AUTHORIZATION, HeaderName};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::future::Future;
@@ -23,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::EcosystemId;
-use crate::cache::HttpCache;
+use crate::cache::{CredentialHeader, HttpCache, RequestHeader};
 
 /// Base URL for the GitHub REST API.
 pub const GITHUB_API: &str = "https://api.github.com";
@@ -229,7 +228,7 @@ pub fn classify_tags_fetch_error(
 #[derive(Clone)]
 pub struct GithubTagsClient {
     cache: Arc<HttpCache>,
-    auth_headers: Vec<(HeaderName, crate::secret::ApiToken)>,
+    auth_token: Option<crate::secret::ApiToken>,
     has_token: bool,
     api_base: String,
     /// `{api_base}/`, precomputed once so [`Self::fetch_authenticated`] never re-`format!`s
@@ -257,19 +256,14 @@ impl GithubTagsClient {
     pub fn new(cache: Arc<HttpCache>) -> Self {
         let token = crate::secret::token_from_env("GITHUB_TOKEN");
         let has_token = token.is_some();
-        let auth_headers = token
-            .map(|token| {
-                tracing::info!("GITHUB_TOKEN detected, using authenticated GitHub API requests");
-                vec![(
-                    AUTHORIZATION,
-                    crate::secret::ApiToken::new(format!("Bearer {}", *token)),
-                )]
-            })
-            .unwrap_or_default();
+        let auth_token = token.map(|token| {
+            tracing::info!("GITHUB_TOKEN detected, using authenticated GitHub API requests");
+            crate::secret::ApiToken::new(format!("Bearer {}", *token))
+        });
 
         Self {
             cache,
-            auth_headers,
+            auth_token,
             has_token,
             trusted_origin: format!("{GITHUB_API}/"),
             api_base: GITHUB_API.to_string(),
@@ -285,18 +279,12 @@ impl GithubTagsClient {
     #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn for_test(cache: Arc<HttpCache>, api_base: impl Into<String>, has_token: bool) -> Self {
-        let auth_headers = if has_token {
-            vec![(
-                AUTHORIZATION,
-                crate::secret::ApiToken::new("Bearer test-token".to_string()),
-            )]
-        } else {
-            Vec::new()
-        };
+        let auth_token =
+            has_token.then(|| crate::secret::ApiToken::new("Bearer test-token".to_string()));
         let api_base = api_base.into();
         Self {
             cache,
-            auth_headers,
+            auth_token,
             has_token,
             trusted_origin: format!("{api_base}/"),
             api_base,
@@ -316,17 +304,18 @@ impl GithubTagsClient {
         &self.api_base
     }
 
-    /// Borrowed auth-header pairs to send on each request; empty when no token is set.
+    /// Auth headers to send on each request; empty when no token is set.
     ///
-    /// `pub(crate)` rather than `pub`: this is the one place [`crate::secret::ApiToken`]'s redaction
-    /// boundary is crossed back into a plain `&str`, so it must not hand the raw token to
-    /// another crate. Ecosystem crates needing an authenticated GitHub request go through
-    /// [`Self::fetch_authenticated`] instead, which applies these headers internally.
+    /// `pub(crate)` rather than `pub`: ecosystem crates needing an authenticated GitHub
+    /// request go through [`Self::fetch_authenticated`] instead, which applies these headers
+    /// internally.
     #[must_use]
-    pub(crate) fn headers(&self) -> Vec<(HeaderName, &str)> {
-        self.auth_headers
+    pub(crate) fn headers(&self) -> Vec<RequestHeader<'_>> {
+        self.auth_token
             .iter()
-            .map(|(k, v)| (k.clone(), v.expose_secret()))
+            .map(|token| {
+                RequestHeader::Credential(CredentialHeader::Authorization, token.as_redacted())
+            })
             .collect()
     }
 
@@ -1415,16 +1404,19 @@ mod tests {
     fn test_api_token_debug_redacts_when_embedded_in_header_vec() {
         // Guards against a future `#[derive(Debug)]` on `GithubTagsClient` (or a struct
         // embedding it) accidentally printing a raw `GITHUB_TOKEN` value: exercises the
-        // exact shape `GithubTagsClient::auth_headers` stores, `Vec<(HeaderName,
-        // ApiToken)>`, not just a bare `ApiToken`.
+        // header shape `GithubTagsClient::headers` hands to the cache, not just a bare
+        // `ApiToken`.
         let token = crate::secret::ApiToken::new("Bearer super-secret-value".to_string());
-        let headers = vec![(AUTHORIZATION, token)];
+        let headers = [RequestHeader::Credential(
+            CredentialHeader::Authorization,
+            token.as_redacted(),
+        )];
         let debug_output = format!("{headers:?}");
         assert!(
             !debug_output.contains("super-secret-value"),
             "{debug_output}"
         );
-        assert!(debug_output.contains("ApiToken(***)"), "{debug_output}");
+        assert!(debug_output.contains("Redacted(***)"), "{debug_output}");
     }
 
     // --- fetch_authenticated: wire-level behavior ---

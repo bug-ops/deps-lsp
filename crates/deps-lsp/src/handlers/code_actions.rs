@@ -29,12 +29,9 @@ pub async fn handle_code_actions(
         return vec![];
     }
 
-    let (network, osv_checks_enabled) = {
+    let (network, osv_checks) = {
         let config = config.read().await;
-        (
-            config.policy.network.mode(),
-            config.policy.osv_checks_enabled(),
-        )
+        (config.policy.network.mode(), config.policy.osv_checks())
     };
 
     // Release the DashMap shard `Ref` before awaiting `generate_code_actions`'s registry
@@ -49,8 +46,8 @@ pub async fn handle_code_actions(
                 .snapshot()
                 .with_resolved_version_candidates()
                 .with_vulnerabilities()
-                .with_latest_status(osv_checks_enabled)
-                .with_candidate_status(osv_checks_enabled)
+                .with_latest_status(osv_checks)
+                .with_candidate_status(osv_checks)
                 .with_outcomes()
                 .finish();
             Some((

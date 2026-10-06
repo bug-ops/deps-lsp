@@ -30,7 +30,8 @@
 use crate::config::{AuthToken, IndexTrust, RegistryIndex};
 use crate::types::CargoVersion;
 use deps_core::{
-    DepsError, HttpCache, Result, lsp_helpers::warn_rejected_value, net_policy::RedactedUrl,
+    CredentialHeader, DepsError, HttpCache, RequestHeader, Result,
+    lsp_helpers::warn_rejected_value, net_policy::RedactedUrl,
 };
 use semver::{Version, VersionReq};
 use serde::Deserialize;
@@ -381,7 +382,10 @@ impl SparseIndexClient {
                     .get_cached_trusted_origin_with_headers(
                         url,
                         &self.base_url,
-                        &[(reqwest::header::AUTHORIZATION, header_value.expose_secret())],
+                        &[RequestHeader::Credential(
+                            CredentialHeader::Authorization,
+                            header_value,
+                        )],
                     )
                     .await
             }

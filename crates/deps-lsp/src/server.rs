@@ -1,4 +1,5 @@
 use crate::config::DepsConfig;
+use crate::document::keychain_refresh::{KeychainRefreshLifecycle, KeychainRefreshSubscription};
 use crate::document::tag_refresh::{TagRefreshLifecycle, TagRefreshSubscriptions};
 use crate::document::{
     CLIENT_REFRESH_TIMEOUT, ChangeTaskTriggerGates, RefreshKind, ResolvedVersionMove, ServerState,
@@ -11,6 +12,7 @@ use crate::file_watcher;
 use crate::handlers::{
     code_actions, code_lens, completion, diagnostics, document_link, hover, inlay_hints,
 };
+use deps_core::policy_config::{OsvChecks, OsvState};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -144,7 +146,7 @@ struct ConfigSideEffects {
     /// Issue #1517 critique S5: `vulnerabilities_enabled && !offline`, the same effective
     /// condition `document::lifecycle`'s phase-A spawn gate and every renderer's
     /// `with_latest_status` attach already check (critique S3).
-    osv_latest_check_enabled: bool,
+    osv_checks: OsvChecks,
 }
 
 impl ConfigSideEffects {
@@ -162,7 +164,7 @@ impl ConfigSideEffects {
             license_policy: config.policy.license_policy.to_policy(),
             typosquat_enabled: config.policy.typosquat.enabled,
             gossip_enabled: config.policy.gossip.enabled,
-            osv_latest_check_enabled: config.policy.osv_checks_enabled(),
+            osv_checks: config.policy.osv_checks(),
         }
     }
 }
@@ -177,6 +179,7 @@ pub struct Backend {
     config: Arc<RwLock<DepsConfig>>,
     client_capabilities: Arc<RwLock<Option<tower_lsp_server::ls_types::ClientCapabilities>>>,
     tag_refresh: std::sync::Mutex<TagRefreshLifecycle>,
+    keychain_refresh: std::sync::Mutex<KeychainRefreshLifecycle>,
 }
 
 impl Backend {
@@ -187,10 +190,13 @@ impl Backend {
         // between construction and the listeners starting (#1716).
         let tag_refresh =
             TagRefreshLifecycle::Subscribed(TagRefreshSubscriptions::subscribe(&state));
+        let keychain_refresh =
+            KeychainRefreshLifecycle::Subscribed(KeychainRefreshSubscription::subscribe(&state));
         Self {
             client,
             state,
             tag_refresh: std::sync::Mutex::new(tag_refresh),
+            keychain_refresh: std::sync::Mutex::new(keychain_refresh),
             config: Arc::new(RwLock::new(DepsConfig::default())),
             client_capabilities: Arc::new(RwLock::new(None)),
         }
@@ -213,6 +219,9 @@ impl Backend {
             effects.registries.nuget_user_profile_sources,
             std::sync::atomic::Ordering::Relaxed,
         );
+        self.state
+            .keychain_credentials
+            .set(effects.registries.swift_keychain_credentials);
         #[cfg(feature = "gitlab-ci")]
         if let Some(raw) = &effects.registries.gitlab_instance_host {
             warn_if_gitlab_instance_host_invalid(&self.client, raw, &self.state.registry_policy)
@@ -239,8 +248,7 @@ impl Backend {
         // Issue #1456, spec 072: same rationale, for GOSSIP's opt-in flag.
         self.state.set_gossip_enabled(effects.gossip_enabled);
         // Issue #1517 critique S5: same rationale, for the OSV latest-check's effective state.
-        self.state
-            .set_osv_latest_check_enabled(effects.osv_latest_check_enabled);
+        self.state.set_osv_checks(effects.osv_checks);
     }
 
     /// Spawns the cross-document tag-refresh listeners (#1716); a repeated call is a no-op.
@@ -251,6 +259,23 @@ impl Backend {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         lifecycle
             .start(|subscriptions| subscriptions.spawn(&self.state, &self.client, &self.config));
+    }
+
+    /// Spawns the Keychain credential-resolved listener (#1771); a repeated call is a no-op.
+    fn start_keychain_refresh_listener(&self) {
+        let mut lifecycle = self
+            .keychain_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.start(|subscription| subscription.spawn(&self.state, &self.client, &self.config));
+    }
+
+    /// Aborts the Keychain listener so it does not outlive the server.
+    fn stop_keychain_refresh_listener(&self) {
+        self.keychain_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop();
     }
 
     /// Aborts the tag-refresh listeners so none outlives the server.
@@ -412,12 +437,9 @@ impl Backend {
         // Snapshot before the loop and drop the guard: re-reading `self.config` per URI
         // inside the loop would hold this guard across a nested read of the same
         // write-preferring `RwLock`, and a writer queued in between would block it forever.
-        let (snapshot, osv_checks_enabled) = {
+        let snapshot = {
             let config = self.config.read().await;
-            (
-                diagnostics::DiagnosticsSnapshot::from_config(&config),
-                config.policy.osv_checks_enabled(),
-            )
+            diagnostics::DiagnosticsSnapshot::from_config(&config)
         };
 
         for uri in affected_uris {
@@ -468,7 +490,7 @@ impl Backend {
                     resolved_changed,
                 },
                 ChangeTaskTriggerGates {
-                    osv_checks_enabled,
+                    osv_checks: snapshot.osv_checks(),
                     requires_dedicated_fetch: ecosystem_impl
                         .license_source()
                         .requires_dedicated_fetch(),
@@ -760,6 +782,7 @@ impl LanguageServer for Backend {
         }
 
         self.start_tag_refresh_listeners();
+        self.start_keychain_refresh_listener();
 
         Ok(InitializeResult {
             capabilities: Self::server_capabilities(),
@@ -874,12 +897,15 @@ impl LanguageServer for Backend {
     ///
     /// Issue #592: beyond applying the new config, a field that affects parse-time
     /// decisions (currently `registries.workspace_registries`,
-    /// `registries.nuget_user_profile_sources`, `registries.gitlab_instance_host` — see
-    /// `config::reparse_scope`) also
+    /// `registries.nuget_user_profile_sources`, `registries.gitlab_instance_host`,
+    /// `registries.swift_keychain_credentials` — see `config::reparse_scope`) also
     /// re-parses every open document its `config::ReparseScope` covers, forcing a full
     /// re-fetch (`document::RefetchPolicy::AllDependencies`) since the routing changed, not
     /// the manifest content. A burst of config changes is coalesced into one debounced
     /// reparse (`ServerState::queue_reparse`) rather than firing once per notification.
+    /// A payload without a `registries` section resets `registries.swift_keychain_credentials`
+    /// to `Disabled` (replace-whole-config), which drops memoized Keychain secrets and aborts
+    /// a pending lookup.
     #[tracing::instrument(skip(self, params))]
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         if params.settings.is_null() {
@@ -923,8 +949,8 @@ impl LanguageServer for Backend {
         // parse-affecting change (`config::reparse_scope`), so without this trigger an
         // already-open document's `latest_status` would stay stuck at whatever it held before
         // the toggle until its next edit or reopen.
-        let osv_latest_check_enabled = effects.osv_latest_check_enabled;
-        let was_osv_latest_check_enabled = self.state.is_osv_latest_check_enabled();
+        let osv_checks = effects.osv_checks;
+        let was_osv_checks = self.state.osv_checks();
         let osv_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
 
         // Diff old vs new for parse-affecting changes (#592) under one write-guard
@@ -968,7 +994,10 @@ impl LanguageServer for Backend {
             .await;
         }
         // Issue #1517 critique S5: same rationale, for the OSV latest-check's effective state.
-        if osv_latest_check_enabled && !was_osv_latest_check_enabled {
+        if matches!(
+            (osv_checks.state(), was_osv_checks.state()),
+            (OsvState::Active, OsvState::Inactive)
+        ) {
             trigger_osv_rescan_for_open_documents(
                 &self.state,
                 &self.client,
@@ -1039,6 +1068,7 @@ impl LanguageServer for Backend {
     fn shutdown(&self) -> impl std::future::Future<Output = Result<()>> + Send {
         tracing::info!("shutting down deps-lsp server");
         self.stop_tag_refresh_listeners();
+        self.stop_keychain_refresh_listener();
         std::future::ready(Ok(()))
     }
 
@@ -3990,18 +4020,18 @@ let package = Package(
             );
         }
 
-        /// Issue #1517 critique S5: `osv_latest_check_enabled` must start `true` (the
+        /// Issue #1517 critique S5: `osv_checks` must start `Active` (the
         /// opt-out feature's own default, unlike typosquat/gossip's opt-in `false`), track a
         /// disable, and track a re-enable — the transition
         /// `did_change_configuration` actually watches for before triggering
         /// `trigger_osv_rescan_for_open_documents`.
         #[tokio::test]
-        async fn test_did_change_configuration_tracks_osv_latest_check_enabled_transitions() {
+        async fn test_did_change_configuration_tracks_osv_checks_transitions() {
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
 
             assert!(
-                backend.state.is_osv_latest_check_enabled(),
+                backend.state.osv_checks().is_active(),
                 "must start true, matching DepsConfig::default()'s own \
                  vulnerabilities_enabled: true / offline: false"
             );
@@ -4013,7 +4043,7 @@ let package = Package(
                     }),
                 })
                 .await;
-            assert!(!backend.state.is_osv_latest_check_enabled());
+            assert!(!backend.state.osv_checks().is_active());
 
             backend
                 .did_change_configuration(DidChangeConfigurationParams {
@@ -4022,13 +4052,13 @@ let package = Package(
                     }),
                 })
                 .await;
-            assert!(backend.state.is_osv_latest_check_enabled());
+            assert!(backend.state.osv_checks().is_active());
         }
 
         /// Same transition, driven by `network.offline` instead of `vulnerabilities_enabled` —
         /// both flags must degrade the effective state identically (issue #1517 critique S3).
         #[tokio::test]
-        async fn test_did_change_configuration_tracks_osv_latest_check_enabled_via_offline() {
+        async fn test_did_change_configuration_tracks_osv_checks_via_offline() {
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
 
@@ -4037,14 +4067,14 @@ let package = Package(
                     settings: serde_json::json!({ "network": { "offline": true } }),
                 })
                 .await;
-            assert!(!backend.state.is_osv_latest_check_enabled());
+            assert!(!backend.state.osv_checks().is_active());
 
             backend
                 .did_change_configuration(DidChangeConfigurationParams {
                     settings: serde_json::json!({ "network": { "offline": false } }),
                 })
                 .await;
-            assert!(backend.state.is_osv_latest_check_enabled());
+            assert!(backend.state.osv_checks().is_active());
         }
 
         /// Issue #1437, mirroring `initialize_tests::test_initialize_applies_valid_typosquat_config`:
@@ -4277,6 +4307,41 @@ let package = Package(
                 backend.config.read().await.policy.freshness.cooldown_secs,
                 42
             );
+        }
+
+        /// #1771: applying a resolved config drives the live Keychain handle. A repeated apply of
+        /// the same value leaves the generation alone, and a payload without a `registries`
+        /// section (replace-whole-config semantics) resets the setting to `Disabled`, which is a
+        /// real change that bumps the generation and so drops memoized credentials.
+        #[tokio::test]
+        async fn test_apply_resolved_config_drives_the_keychain_handle_and_generation() {
+            use deps_core::policy_config::KeychainCredentials;
+
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+            let handle = Arc::clone(&backend.state.keychain_credentials);
+            let mut enabled = DepsConfig::default();
+            enabled.policy.registries.swift_keychain_credentials = KeychainCredentials::Enabled;
+
+            assert_eq!(handle.get(), KeychainCredentials::Disabled);
+            let initial = handle.generation();
+            backend
+                .apply_resolved_config(ConfigSideEffects::from_config(&enabled))
+                .await;
+            assert_eq!(handle.get(), KeychainCredentials::Enabled);
+            let after_enable = handle.generation();
+            assert_ne!(after_enable, initial);
+
+            backend
+                .apply_resolved_config(ConfigSideEffects::from_config(&enabled))
+                .await;
+            assert_eq!(handle.generation(), after_enable);
+
+            backend
+                .apply_resolved_config(ConfigSideEffects::from_config(&DepsConfig::default()))
+                .await;
+            assert_eq!(handle.get(), KeychainCredentials::Disabled);
+            assert_ne!(handle.generation(), after_enable);
         }
 
         /// Issue #592 S1 regression: two rapid `didChangeConfiguration` notifications, each

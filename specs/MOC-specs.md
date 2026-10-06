@@ -26,7 +26,7 @@ status: moc
 | 044 | [[044-precommit-hooks-ecosystem/spec\|New ecosystem: pre-commit hooks (.pre-commit-config.yaml repo/rev pins)]] | specify | draft — research/new ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, tracked in issue #575 |
 | 047 | [[047-elixir-hex-ecosystem/spec\|New ecosystem: Elixir Hex (mix.exs dependency version hints)]] | specify | draft — research/new-ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, issue #642 |
 | 051 | [[051-disk-persistent-registry-cache/spec\|Disk-persistent registry cache]] | specify | draft — research/enhancement, P4, 9 open `[NEEDS CLARIFICATION]` items, tracked in issue #700 |
-| 077 | [[077-swift-registry-client/spec\|Swift Package Registry (SE-0292) client for .package(id:) dependencies]] | specify | shipped — SE-0292 registry client for `.package(id:)` (PR #1763, issue #1691); follow-up PR ships pagination (#1754), `publishedAt` (#1756), netrc (#1755) and `HostBlockedByPolicy` (#1758); open follow-ups: Keychain credentials, #1757, #1759, #1459, `Authorization` set_sensitive |
+| 077 | [[077-swift-registry-client/spec\|Swift Package Registry (SE-0292) client for .package(id:) dependencies]] | specify | shipped — SE-0292 registry client for `.package(id:)` (PR #1763, issue #1691); follow-up PR ships pagination (#1754), `publishedAt` (#1756), netrc (#1755) and `HostBlockedByPolicy` (#1758); opt-in macOS Keychain credentials (#1771, FR-044) and `Authorization` set_sensitive (#1772) ship in the typed-OSV follow-up PR; open follow-ups: #1757, #1459 |
 
 ## Completed Specs
 

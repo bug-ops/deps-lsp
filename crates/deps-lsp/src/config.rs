@@ -404,6 +404,10 @@ impl ReparseScope {
 const NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS: &[deps_core::EcosystemId] =
     &[deps_core::EcosystemId::NuGet];
 
+/// The only ecosystem `registries.swift_keychain_credentials` affects.
+pub(crate) const SWIFT_KEYCHAIN_CREDENTIALS_ECOSYSTEMS: &[deps_core::EcosystemId] =
+    &[deps_core::EcosystemId::Swift];
+
 /// The only ecosystem `registries.gitlab_instance_host` affects.
 ///
 /// Same single-ecosystem-scoped shape as [`NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS`], not a
@@ -478,6 +482,7 @@ pub(crate) fn reparse_scope(
     let PolicyConfigDiff {
         workspace_registries_changed,
         nuget_user_profile_sources_changed,
+        swift_keychain_credentials_changed,
         gitlab_instance_host_changed,
     } = PolicyConfig::diff(&old.policy, new_policy);
 
@@ -489,19 +494,25 @@ pub(crate) fn reparse_scope(
         });
     };
 
-    if workspace_registries_changed {
+    if workspace_registries_changed.is_changed() {
         union_in(
             &mut scope,
             ReparseScope::Ecosystems(workspace_registry_ecosystems.to_vec()),
         );
     }
-    if nuget_user_profile_sources_changed {
+    if nuget_user_profile_sources_changed.is_changed() {
         union_in(
             &mut scope,
             ReparseScope::Ecosystems(NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS.to_vec()),
         );
     }
-    if gitlab_instance_host_changed {
+    if swift_keychain_credentials_changed.is_changed() {
+        union_in(
+            &mut scope,
+            ReparseScope::Ecosystems(SWIFT_KEYCHAIN_CREDENTIALS_ECOSYSTEMS.to_vec()),
+        );
+    }
+    if gitlab_instance_host_changed.is_changed() {
         union_in(
             &mut scope,
             ReparseScope::Ecosystems(GITLAB_INSTANCE_HOST_ECOSYSTEMS.to_vec()),
@@ -1302,6 +1313,23 @@ mod tests {
                 ReparseScope::Ecosystems(NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS.to_vec())
             );
             assert!(scope.matches(EcosystemId::NuGet));
+            assert!(!scope.matches(EcosystemId::Cargo));
+        }
+
+        #[test]
+        fn test_swift_keychain_credentials_change_scopes_to_swift_only() {
+            let old = DepsConfig::default();
+            let mut new = DepsConfig::default();
+            new.policy.registries.swift_keychain_credentials =
+                deps_core::policy_config::KeychainCredentials::Enabled;
+
+            let scope = reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS)
+                .expect("must trigger a reparse");
+            assert_eq!(
+                scope,
+                ReparseScope::Ecosystems(SWIFT_KEYCHAIN_CREDENTIALS_ECOSYSTEMS.to_vec())
+            );
+            assert!(scope.matches(EcosystemId::Swift));
             assert!(!scope.matches(EcosystemId::Cargo));
         }
 

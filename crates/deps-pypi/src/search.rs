@@ -25,7 +25,7 @@ use std::borrow::Cow;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
-use deps_core::{BodyLimit, DepsError, HttpCache, Result};
+use deps_core::{BodyLimit, DepsError, HttpCache, RequestHeader, Result};
 use serde::Deserialize;
 
 use crate::registry::{REGISTRY, SIMPLE_API_ACCEPT};
@@ -362,7 +362,7 @@ async fn fetch_and_parse_index(cache: &HttpCache, index_url: &str) -> Option<Pac
     let body = match cache
         .get_transport_only_with_headers_limited_trusted_origin(
             index_url,
-            &[(reqwest::header::ACCEPT, SIMPLE_API_ACCEPT)],
+            &[RequestHeader::Accept(SIMPLE_API_ACCEPT)],
             SIMPLE_INDEX_MAX_BYTES,
             PYPI_TRUSTED_ORIGIN,
         )
@@ -895,7 +895,7 @@ mod tests {
         let body = cache
             .get_transport_only_with_headers_limited_trusted_origin(
                 SIMPLE_INDEX_URL,
-                &[(reqwest::header::ACCEPT, SIMPLE_API_ACCEPT)],
+                &[RequestHeader::Accept(SIMPLE_API_ACCEPT)],
                 SIMPLE_INDEX_MAX_BYTES,
                 PYPI_TRUSTED_ORIGIN,
             )

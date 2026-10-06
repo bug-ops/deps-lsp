@@ -12,8 +12,8 @@ use dashmap::DashMap;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
-    DepsError, EcosystemId, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result, SafePathSegment,
-    SegmentedPathName, not_found_or as core_not_found_or,
+    DepsError, EcosystemId, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, RequestHeader, Result,
+    SafePathSegment, SegmentedPathName, not_found_or as core_not_found_or,
     parser::DependencySource,
     registry::{KeyShape, register_capped},
 };
@@ -350,7 +350,7 @@ impl NpmRegistry {
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<NpmVersion>> {
         let url = versions_url(&self.registry_base, safe_name_segments(name)?);
-        let headers = [(reqwest::header::ACCEPT, ABBREVIATED_ACCEPT)];
+        let headers = [RequestHeader::Accept(ABBREVIATED_ACCEPT)];
         let data = match self.tier {
             NpmRegistryTier::Public => self.cache.get_cached_with_headers(&url, &headers).await,
             NpmRegistryTier::WorkspaceDeclared => {
@@ -464,10 +464,9 @@ impl NpmRegistry {
             return HashMap::new();
         };
         let url = versions_url(&self.registry_base, segments);
-        let fetch = self.cache.get_transport_only_with_headers(
-            &url,
-            &[(reqwest::header::ACCEPT, "application/json")],
-        );
+        let fetch = self
+            .cache
+            .get_transport_only_with_headers(&url, &[RequestHeader::Accept("application/json")]);
         let body = match tokio::time::timeout(PUBLISH_TIMES_FETCH_TIMEOUT, fetch).await {
             Ok(Ok(body)) => body,
             Ok(Err(e)) => {

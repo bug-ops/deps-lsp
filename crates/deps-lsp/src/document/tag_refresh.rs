@@ -22,6 +22,7 @@ use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::Uri;
 use tracing::Instrument;
 
+use super::listener_lifecycle::{AbortOnStop, ListenerLifecycle};
 use super::osv_scan::{RescanOutcome, rescan_osv_if_tag_index_now_warm};
 use super::state::{ServerState, spawn_supervised};
 use crate::config::DepsConfig;
@@ -326,31 +327,14 @@ impl TagRefreshTasks {
     }
 }
 
+impl AbortOnStop for TagRefreshTasks {
+    fn abort(self) {
+        Self::abort(self);
+    }
+}
+
 /// Lifecycle of the tag-refresh listeners owned by the backend.
-#[derive(Debug)]
-pub(crate) enum TagRefreshLifecycle {
-    Subscribed(TagRefreshSubscriptions),
-    Running(TagRefreshTasks),
-    Stopped,
-}
-
-impl TagRefreshLifecycle {
-    /// Spawns the listeners from `Subscribed`; in any other state this is a no-op, so a
-    /// repeated start neither orphans running listeners nor starts a second set.
-    pub(crate) fn start(&mut self, spawn: impl FnOnce(TagRefreshSubscriptions) -> TagRefreshTasks) {
-        match std::mem::replace(self, Self::Stopped) {
-            Self::Subscribed(subscriptions) => *self = Self::Running(spawn(subscriptions)),
-            other => *self = other,
-        }
-    }
-
-    /// Aborts running listeners and moves to `Stopped`, which no later `start` can leave.
-    pub(crate) fn stop(&mut self) {
-        if let Self::Running(tasks) = std::mem::replace(self, Self::Stopped) {
-            tasks.abort();
-        }
-    }
-}
+pub(crate) type TagRefreshLifecycle = ListenerLifecycle<TagRefreshSubscriptions, TagRefreshTasks>;
 
 #[cfg(test)]
 mod lifecycle_tests {
@@ -550,7 +534,10 @@ mod tests {
     async fn sweep_visits_documents_while_the_osv_latest_check_is_disabled() {
         let state = ServerState::new();
         open_document(&state, "/a/.github/workflows/a.yml", &workflow("o/one")).await;
-        state.set_osv_latest_check_enabled(false);
+        state.set_osv_checks(deps_core::policy_config::OsvChecks::resolve(
+            false,
+            deps_core::NetworkMode::Online,
+        ));
         let seen = Arc::default();
 
         let visited = sweep(
@@ -612,7 +599,10 @@ mod tests {
     async fn republish_happens_while_offline_or_vulnerabilities_are_disabled() {
         let state = ServerState::new();
         let uri = open_document(&state, "/a/.github/workflows/a.yml", &workflow("o/one")).await;
-        state.set_osv_latest_check_enabled(false);
+        state.set_osv_checks(deps_core::policy_config::OsvChecks::resolve(
+            false,
+            deps_core::NetworkMode::Online,
+        ));
         assert_eq!(
             republish_count(&state, &uri, RescanOutcome::Unchanged).await,
             1

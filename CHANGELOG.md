@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: sibling-tag coverage added to `InUseVersions`, `CandidateSiblings` and `ScanTarget`; `via_sibling_tags` added to `CandidateVulnerable` and `LatestVerdict::Flagged`; `unknown_ref` added to the diagnostic severities (#1783)
 - **deps-cli**: `Category::UnknownRef`, `PlannedUpdateItem::osv_sibling_match` and `UpdateItemDocument::matched_tags` added (#1783)
 - **deps-core**: `DiagnosticsConfig::unknown_ref_severity` added, so struct-literal construction no longer compiles (#1783)
+- **deps-lsp**: `ServerState.osv_latest_check_enabled`, `is_osv_latest_check_enabled` and `set_osv_latest_check_enabled` are replaced by `osv_checks`/`set_osv_checks` over the typed `OsvChecks` (#1774, #1776)
+- **deps-core**: `HttpCache` extra-header parameters take `RequestHeader` instead of `(HeaderName, &str)` (#1772, #1776)
+- **deps-core**: `PolicyConfigDiff` and `RegistryRuntimeSettings` gain a Swift Keychain field, and `RegistriesConfig` gains `swift_keychain_credentials` (#1771, #1776)
+- **deps-core**: `PolicyConfigDiff` `*_changed` fields are the typed `SettingChange` instead of `bool` (#1771, #1776)
+- **deps-swift**: `ResolvedSwiftRegistry.auth` is no longer public (#1771, #1776)
+
+### Security
+- **deps-core, all registry ecosystems**: registry credential headers (`Authorization`, `PRIVATE-TOKEN`) are marked sensitive so they stay out of HTTP-stack debug output (#1772, #1776)
 
 ### Added
 - **deps-core, all ecosystems**: `DepsError::HostBlockedByPolicy` shows a policy-specific message when a registry host resolves to a blocked address class at connect time (#1773)
@@ -29,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-swift**: `publishedAt` freshness for the newest registry releases (#1773)
 - **deps-swift**: `SWIFTPM_NETRC_DATA` and `~/.netrc` registry credentials, bound to user-declared registries only (#1773)
 - **deps-core**: shared `netrc` parser following SwiftPM's grammar, and `pagination::next_page`/`NextPage` for validated `Link rel="next"` targets (#1773)
+- **deps-swift, deps-core**: `registries.swift_keychain_credentials` opt-in macOS Keychain credentials for SE-0292 registries (user-declared registries only, ignored by deps-cli) (#1771, #1776)
 - **deps-core**: `PinResolution`, `TagIndex::pin_resolution`, `PartialTagPolicy`, `tag_pin_is_up_to_date` and `tag_has_precedence` shared by the git-tag ecosystems (#1751)
 - **deps-github-actions**: `Correct version comment to <tag>` quickfix for a SHA pin whose trailing comment names another tag (#1751)
 - **deps-cli**: `--fail-on other` token for uncategorized findings (offline/lock-file/registry notices, `unresolved-gitlab-host`) (#1747)
@@ -44,7 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cli**: flagged latest candidates name the sibling release tags they match in hover, diagnostics and `update` (#1783)
 
 ### Changed
-- **deps-core, deps-lsp, deps-cli**: one `osv_checks_enabled` gate for every OSV call site instead of repeated `vulnerabilities_enabled && !offline` conditions (#1775)
+- **deps-core, deps-lsp, deps-cli**: one typed `OsvChecks` gate (`Active`/`Inactive`) for every OSV call site instead of repeated `vulnerabilities_enabled && !offline` conditions and OSV booleans (#1775, #1774, #1776)
 - **deps-github-actions, deps-gitlab-ci**: a tag pin ahead of the latest release is reported up to date instead of offering a downgrade (#1751)
 - **deps-core, deps-github-actions, deps-gitlab-ci**: a truncated tag list fails closed instead of reading a pin as up to date or an OSV answer as clean (#1783)
 - **deps-github-actions, deps-gitlab-ci**: a full-release tag pin no published tag matches reads unresolved instead of up to date (#1783)

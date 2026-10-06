@@ -10,6 +10,7 @@ use crate::cache_policy::CACHE_EVICTION_PERCENTAGE;
 use crate::error::{DepsError, RateLimitEvidence, Result};
 use crate::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
 use crate::redact::RedactedUrl;
+use crate::secret::Redacted;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use reqwest::{Client, Response, StatusCode, Url, header};
@@ -724,6 +725,81 @@ impl reqwest::dns::Resolve for BlockedAddrResolver {
     }
 }
 
+/// Request headers that carry a credential.
+///
+/// A credential header name exists only inside [`RequestHeader::Credential`], so a caller
+/// cannot send `Authorization` or `PRIVATE-TOKEN` as a plain header: the shared request
+/// builder marks every such value sensitive so the HTTP stack never prints it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialHeader {
+    /// `Authorization`, carrying a pre-formatted `Bearer`/`Basic` value.
+    Authorization,
+    /// GitLab's `PRIVATE-TOKEN`, carrying the raw token.
+    GitlabPrivateToken,
+}
+
+impl CredentialHeader {
+    const fn name(self) -> header::HeaderName {
+        match self {
+            Self::Authorization => header::AUTHORIZATION,
+            Self::GitlabPrivateToken => header::HeaderName::from_static("private-token"),
+        }
+    }
+}
+
+/// An extra header an [`HttpCache`] request carries.
+///
+/// Every header this workspace sends beyond the conditional-request validators is either a
+/// fixed content-negotiation `Accept` value or a credential; the type admits nothing else, so
+/// a credential cannot reach a request without being marked sensitive.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::cache::{CredentialHeader, RequestHeader};
+/// use deps_core::secret::Redacted;
+///
+/// let token = Redacted::new("Bearer secret-token".to_string());
+/// let headers = [
+///     RequestHeader::Accept("application/json"),
+///     RequestHeader::Credential(CredentialHeader::Authorization, &token),
+/// ];
+/// assert!(!format!("{headers:?}").contains("secret-token"));
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub enum RequestHeader<'a> {
+    /// A fixed `Accept` value.
+    Accept(&'static str),
+    /// A credential header; the value is sent marked sensitive.
+    Credential(CredentialHeader, &'a Redacted),
+}
+
+/// Attaches `headers` to `request`, marking every credential value sensitive.
+///
+/// A credential value that is not a valid header value is passed through raw so
+/// `RequestBuilder::send` fails exactly as it would for any malformed header, with no value
+/// in the error.
+fn apply_request_headers(
+    mut request: reqwest::RequestBuilder,
+    headers: &[RequestHeader<'_>],
+) -> reqwest::RequestBuilder {
+    for header in headers {
+        request = match header {
+            RequestHeader::Accept(value) => request.header(header::ACCEPT, *value),
+            RequestHeader::Credential(kind, secret) => {
+                match header::HeaderValue::from_str(secret.expose_secret()) {
+                    Ok(mut value) => {
+                        value.set_sensitive(true);
+                        request.header(kind.name(), value)
+                    }
+                    Err(_) => request.header(kind.name(), secret.expose_secret()),
+                }
+            }
+        };
+    }
+    request
+}
+
 /// Maps a failed `send()` to a [`DepsError`], surfacing a connect-time resolver-guard block as
 /// [`DepsError::HostBlockedByPolicy`] instead of a generic transport error.
 ///
@@ -1418,7 +1494,7 @@ impl HttpCache {
     pub async fn get_cached_with_headers(
         &self,
         url: &str,
-        extra_headers: &[(header::HeaderName, &str)],
+        extra_headers: &[RequestHeader<'_>],
     ) -> Result<Bytes> {
         self.get_cached_with_headers_via(url, extra_headers, &self.baseline, None)
             .await
@@ -1478,16 +1554,17 @@ impl HttpCache {
     /// # Examples
     ///
     /// ```no_run
-    /// use deps_core::cache::HttpCache;
-    /// use reqwest::header;
+    /// use deps_core::cache::{CredentialHeader, HttpCache, RequestHeader};
+    /// use deps_core::secret::Redacted;
     ///
     /// # async fn example() -> deps_core::error::Result<()> {
     /// let cache = HttpCache::new();
+    /// let token = Redacted::new("Bearer secret-token".to_string());
     /// let data = cache
     ///     .get_cached_trusted_origin_with_headers(
     ///         "https://index.mycorp.dev/se/rd/serde",
     ///         "https://index.mycorp.dev/",
-    ///         &[(header::AUTHORIZATION, "Bearer secret-token")],
+    ///         &[RequestHeader::Credential(CredentialHeader::Authorization, &token)],
     ///     )
     ///     .await?;
     /// println!("Fetched {} bytes", data.len());
@@ -1498,7 +1575,7 @@ impl HttpCache {
         &self,
         url: &str,
         trusted_origin: &str,
-        extra_headers: &[(header::HeaderName, &str)],
+        extra_headers: &[RequestHeader<'_>],
     ) -> Result<Bytes> {
         self.get_cached_trusted_origin_response(url, trusted_origin, extra_headers)
             .await
@@ -1516,7 +1593,7 @@ impl HttpCache {
         &self,
         url: &str,
         trusted_origin: &str,
-        extra_headers: &[(header::HeaderName, &str)],
+        extra_headers: &[RequestHeader<'_>],
     ) -> Result<CachedResponse> {
         let transport = self.transport_for_origin(trusted_origin);
         self.get_cached_with_headers_via(url, extra_headers, &transport, None)
@@ -1564,7 +1641,7 @@ impl HttpCache {
         trusted_origin: &str,
         authenticated: bool,
         auth_id: Option<u64>,
-        extra_headers: &[(header::HeaderName, &str)],
+        extra_headers: &[RequestHeader<'_>],
     ) -> Result<Bytes> {
         self.get_cached_pinned_response(url, trusted_origin, authenticated, auth_id, extra_headers)
             .await
@@ -1584,7 +1661,7 @@ impl HttpCache {
         trusted_origin: &str,
         authenticated: bool,
         auth_id: Option<u64>,
-        extra_headers: &[(header::HeaderName, &str)],
+        extra_headers: &[RequestHeader<'_>],
     ) -> Result<CachedResponse> {
         let transport = self.transport_for_pinned(trusted_origin, authenticated);
         self.get_cached_with_headers_via(url, extra_headers, &transport, auth_id)
@@ -1661,7 +1738,7 @@ impl HttpCache {
     pub async fn get_cached_workspace_with_headers(
         &self,
         url: &str,
-        extra_headers: &[(header::HeaderName, &str)],
+        extra_headers: &[RequestHeader<'_>],
     ) -> Result<Bytes> {
         #[expect(
             clippy::expect_used,
@@ -1733,7 +1810,7 @@ impl HttpCache {
     async fn get_cached_with_headers_via(
         &self,
         url: &str,
-        extra_headers: &[(header::HeaderName, &str)],
+        extra_headers: &[RequestHeader<'_>],
         transport: &Transport,
         auth_id: Option<u64>,
     ) -> Result<CachedResponse> {
@@ -1891,17 +1968,13 @@ impl HttpCache {
         &self,
         url: &str,
         cached: &CachedResponse,
-        extra_headers: &[(header::HeaderName, &str)],
+        extra_headers: &[RequestHeader<'_>],
         client: &Client,
         cache_key: &str,
     ) -> Result<Option<CachedResponse>> {
         self.ensure_online(url)?;
         ensure_https(url)?;
-        let mut request = client.get(url);
-
-        for (name, value) in extra_headers {
-            request = request.header(name, *value);
-        }
+        let mut request = apply_request_headers(client.get(url), extra_headers);
         if let Some(etag) = &cached.etag {
             request = request.header(header::IF_NONE_MATCH, etag);
         }
@@ -1948,7 +2021,7 @@ impl HttpCache {
     async fn fetch_and_store_with_headers(
         &self,
         url: &str,
-        extra_headers: &[(header::HeaderName, &str)],
+        extra_headers: &[RequestHeader<'_>],
         client: &Client,
         cache_key: &str,
     ) -> Result<CachedResponse> {
@@ -1964,10 +2037,7 @@ impl HttpCache {
             RedactedUrl::new(url)
         );
 
-        let mut request = client.get(url);
-        for (name, value) in extra_headers {
-            request = request.header(name, *value);
-        }
+        let request = apply_request_headers(client.get(url), extra_headers);
 
         let response = request.send().await.map_err(|e| send_error(url, e))?;
 
@@ -2114,7 +2184,7 @@ impl HttpCache {
     pub async fn get_transport_only_with_headers(
         &self,
         url: &str,
-        extra_headers: &[(header::HeaderName, &str)],
+        extra_headers: &[RequestHeader<'_>],
     ) -> Result<Bytes> {
         self.get_transport_only_with_headers_limited(url, extra_headers, BodyLimit::DEFAULT)
             .await
@@ -2135,7 +2205,7 @@ impl HttpCache {
     pub async fn get_transport_only_with_headers_limited(
         &self,
         url: &str,
-        extra_headers: &[(header::HeaderName, &str)],
+        extra_headers: &[RequestHeader<'_>],
         limit: BodyLimit,
     ) -> Result<Bytes> {
         self.transport_only_via(url, extra_headers, limit, &self.baseline.client)
@@ -2156,7 +2226,7 @@ impl HttpCache {
     pub async fn get_transport_only_with_headers_limited_trusted_origin(
         &self,
         url: &str,
-        extra_headers: &[(header::HeaderName, &str)],
+        extra_headers: &[RequestHeader<'_>],
         limit: BodyLimit,
         trusted_origin: &str,
     ) -> Result<Bytes> {
@@ -2177,7 +2247,7 @@ impl HttpCache {
     async fn transport_only_via(
         &self,
         url: &str,
-        extra_headers: &[(header::HeaderName, &str)],
+        extra_headers: &[RequestHeader<'_>],
         limit: BodyLimit,
         client: &Client,
     ) -> Result<Bytes> {
@@ -2190,17 +2260,14 @@ impl HttpCache {
     async fn transport_only_response_via(
         &self,
         url: &str,
-        extra_headers: &[(header::HeaderName, &str)],
+        extra_headers: &[RequestHeader<'_>],
         limit: BodyLimit,
         client: &Client,
     ) -> Result<CachedResponse> {
         self.ensure_online(url)?;
         ensure_https(url)?;
 
-        let mut request = client.get(url);
-        for (name, value) in extra_headers {
-            request = request.header(name, *value);
-        }
+        let request = apply_request_headers(client.get(url), extra_headers);
 
         let response = request.send().await.map_err(|e| send_error(url, e))?;
 
@@ -2402,9 +2469,71 @@ impl Default for HttpCache {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
-    use std::assert_matches;
+    fn authorization(token: &Redacted) -> RequestHeader<'_> {
+        RequestHeader::Credential(CredentialHeader::Authorization, token)
+    }
+
+    #[test]
+    fn test_apply_request_headers_marks_authorization_sensitive_on_built_request() {
+        let client = Client::new();
+        let token = Redacted::new("Bearer secret-token".to_string());
+        let request = apply_request_headers(
+            client.get("https://example.com/"),
+            &[
+                RequestHeader::Accept("application/json"),
+                authorization(&token),
+            ],
+        )
+        .build()
+        .unwrap();
+
+        let auth = request.headers().get(header::AUTHORIZATION).unwrap();
+        assert!(auth.is_sensitive());
+        assert_eq!(auth, "Bearer secret-token");
+        assert!(
+            !request
+                .headers()
+                .get(header::ACCEPT)
+                .unwrap()
+                .is_sensitive()
+        );
+        assert!(!format!("{:?}", request.headers()).contains("secret-token"));
+    }
+
+    #[test]
+    fn test_apply_request_headers_marks_private_token_sensitive_on_built_request() {
+        let client = Client::new();
+        let token = Redacted::new("glpat-secret".to_string());
+        let request = apply_request_headers(
+            client.get("https://example.com/"),
+            &[RequestHeader::Credential(
+                CredentialHeader::GitlabPrivateToken,
+                &token,
+            )],
+        )
+        .build()
+        .unwrap();
+
+        let value = request.headers().get("private-token").unwrap();
+        assert!(value.is_sensitive());
+        assert!(!format!("{:?}", request.headers()).contains("glpat-secret"));
+    }
+
+    #[test]
+    fn test_apply_request_headers_invalid_credential_value_fails_the_build() {
+        let client = Client::new();
+        let token = Redacted::new("Bearer bad\nvalue".to_string());
+        let result =
+            apply_request_headers(client.get("https://example.com/"), &[authorization(&token)])
+                .build();
+
+        let error = result.unwrap_err();
+        assert!(!error.to_string().contains("bad"), "{error}");
+    }
 
     // Guards the non-loopback path of `ensure_https`: every other test in this
     // module reaches it only through loopback `mockito` URLs, so without this
@@ -3144,12 +3273,9 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/api/data", server.url());
+        let token = Redacted::new("Bearer secret-token".to_string());
         let result: Bytes = cache
-            .get_cached_trusted_origin_with_headers(
-                &url,
-                &trusted_origin,
-                &[(header::AUTHORIZATION, "Bearer secret-token")],
-            )
+            .get_cached_trusted_origin_with_headers(&url, &trusted_origin, &[authorization(&token)])
             .await
             .unwrap();
 
@@ -3186,7 +3312,9 @@ mod tests {
             .get_cached_trusted_origin_with_headers(
                 &source_url,
                 &trusted_origin,
-                &[(header::AUTHORIZATION, "Bearer secret-token")],
+                &[authorization(&Redacted::new(
+                    "Bearer secret-token".to_string(),
+                ))],
             )
             .await;
 
@@ -3891,7 +4019,8 @@ mod tests {
             .await;
 
         let cache = HttpCache::new();
-        let headers = [(header::AUTHORIZATION, "Bearer token123")];
+        let token = Redacted::new("Bearer token123".to_string());
+        let headers = [authorization(&token)];
         let result: Bytes = cache.get_cached_with_headers(&url, &headers).await.unwrap();
 
         assert_eq!(result.as_ref(), b"authed data");
@@ -3919,7 +4048,7 @@ mod tests {
             .await;
 
         let cache = HttpCache::new();
-        let headers = [(header::ACCEPT, "application/vnd.npm.install-v1+json")];
+        let headers = [RequestHeader::Accept("application/vnd.npm.install-v1+json")];
         let result: Bytes = cache
             .get_cached_workspace_with_headers(&url, &headers)
             .await
@@ -4312,7 +4441,7 @@ mod tests {
             .await;
 
         let cache = HttpCache::new();
-        let headers = [(header::ACCEPT, "application/json")];
+        let headers = [RequestHeader::Accept("application/json")];
         let result: Bytes = cache
             .get_transport_only_with_headers(&url, &headers)
             .await
@@ -4946,7 +5075,9 @@ mod tests {
                 &trusted_origin,
                 true,
                 Some(42),
-                &[(header::AUTHORIZATION, "Basic dXNlcjpwYXQ=")],
+                &[authorization(&Redacted::new(
+                    "Basic dXNlcjpwYXQ=".to_string(),
+                ))],
             )
             .await
             .unwrap();

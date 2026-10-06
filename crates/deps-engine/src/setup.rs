@@ -43,6 +43,12 @@ pub struct EcosystemRuntime {
     /// in-use-version resolution) can share that exact instance instead of Composer
     /// classification parsing the same `composer.lock` independently.
     pub lockfile_cache: Arc<deps_core::lockfile::LockFileCache>,
+    /// `registries.swift_keychain_credentials` (#1771) — the live opt-in for reading SE-0292
+    /// registry credentials from the macOS Keychain, plus the channel on which a credential
+    /// that resolved after its caller gave up announces itself. Like [`Self::lockfile_cache`],
+    /// not a [`Self::new`] parameter: set it with [`Self::with_keychain_credentials`] (or
+    /// derive it with [`Self::from_policy`]).
+    pub keychain_credentials: Arc<deps_core::keychain_credentials::KeychainCredentialsHandle>,
 }
 
 impl EcosystemRuntime {
@@ -82,7 +88,32 @@ impl EcosystemRuntime {
             nuget_user_profile_sources,
             gitlab_instance_host,
             lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            keychain_credentials: Arc::default(),
         }
+    }
+
+    /// Overrides [`Self::keychain_credentials`]'s default (a handle at `Disabled`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::keychain_credentials::KeychainCredentialsHandle;
+    /// use deps_core::policy_config::{KeychainCredentials, PolicyConfig};
+    /// use deps_engine::setup::EcosystemRuntime;
+    /// use std::sync::Arc;
+    ///
+    /// let handle = Arc::new(KeychainCredentialsHandle::new(KeychainCredentials::Enabled));
+    /// let runtime = EcosystemRuntime::from_policy(&PolicyConfig::default())
+    ///     .with_keychain_credentials(Arc::clone(&handle));
+    /// assert!(Arc::ptr_eq(&runtime.keychain_credentials, &handle));
+    /// ```
+    #[must_use]
+    pub fn with_keychain_credentials(
+        mut self,
+        keychain_credentials: Arc<deps_core::keychain_credentials::KeychainCredentialsHandle>,
+    ) -> Self {
+        self.keychain_credentials = keychain_credentials;
+        self
     }
 
     /// Overrides [`Self::lockfile_cache`]'s default (a fresh, private cache) with an existing
@@ -144,6 +175,11 @@ impl EcosystemRuntime {
             Arc::new(AtomicBool::new(resolved.nuget_user_profile_sources)),
             Arc::new(std::sync::RwLock::new(resolved.gitlab_instance_host)),
         )
+        .with_keychain_credentials(Arc::new(
+            deps_core::keychain_credentials::KeychainCredentialsHandle::new(
+                resolved.swift_keychain_credentials,
+            ),
+        ))
     }
 }
 
@@ -614,7 +650,8 @@ pub fn register_ecosystems(
     // `registries.json` and registry credential from the environment.
     #[cfg(feature = "swift")]
     {
-        let swift_context = deps_swift::SwiftParseContext::from_environment(Arc::clone(&policy));
+        let swift_context = deps_swift::SwiftParseContext::from_environment(Arc::clone(&policy))
+            .with_keychain(Arc::clone(&runtime.keychain_credentials));
         registry.register(Arc::new(SwiftEcosystem::with_context(
             Arc::new(SwiftRegistry::new(Arc::clone(&cache))),
             swift_context,

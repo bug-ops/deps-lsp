@@ -165,6 +165,7 @@ pub mod interpolation;
 pub mod interval;
 pub mod json_ast;
 pub mod json_helpers;
+pub mod keychain_credentials;
 pub mod licenses;
 pub mod lockfile;
 pub mod lsp_helpers;
@@ -237,7 +238,9 @@ pub mod yaml_walk;
 #[cfg(feature = "lsp-responses")]
 pub use tower_lsp_server;
 
-pub use cache::{BodyLimit, CacheMode, CachedResponse, HttpCache, NetworkMode};
+pub use cache::{
+    BodyLimit, CacheMode, CachedResponse, CredentialHeader, HttpCache, NetworkMode, RequestHeader,
+};
 pub use dependency_cap::{DependencyBudget, MAX_DEPENDENCIES_PER_DOCUMENT};
 pub use deps_dev::{
     DepsDevClient, FetchCompleteness, GossipCooldown, GossipFindings, GossipLowUsage,

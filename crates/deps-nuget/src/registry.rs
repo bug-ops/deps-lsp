@@ -16,8 +16,8 @@ use deps_core::parser::DependencySource;
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::registry::{KeyShape, register_capped_with_occupied};
 use deps_core::{
-    DepsError, EcosystemId, FreshnessSettings, HOVER_RECENT_VERSIONS, HttpCache, PublishTime,
-    Result, SafePathSegment,
+    CredentialHeader, DepsError, EcosystemId, FreshnessSettings, HOVER_RECENT_VERSIONS, HttpCache,
+    PublishTime, RequestHeader, Result, SafePathSegment,
 };
 use serde::Deserialize;
 use std::any::Any;
@@ -544,7 +544,10 @@ impl NuGetRegistry {
                     trusted_prefix,
                     true,
                     self.own_auth_id,
-                    &[(reqwest::header::AUTHORIZATION, auth.header_value())],
+                    &[RequestHeader::Credential(
+                        CredentialHeader::Authorization,
+                        auth.as_redacted(),
+                    )],
                 )
                 .await;
         }

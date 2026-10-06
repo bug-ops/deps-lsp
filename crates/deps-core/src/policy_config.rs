@@ -111,32 +111,163 @@ pub struct PolicyConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PolicyConfigDiff {
     /// Whether [`RegistriesConfig::workspace_registries`] changed.
-    pub workspace_registries_changed: bool,
+    pub workspace_registries_changed: SettingChange,
     /// Whether [`RegistriesConfig::nuget_user_profile_sources`] changed.
-    pub nuget_user_profile_sources_changed: bool,
+    pub nuget_user_profile_sources_changed: SettingChange,
+    /// Whether [`RegistriesConfig::swift_keychain_credentials`] changed.
+    pub swift_keychain_credentials_changed: SettingChange,
     /// Whether [`RegistriesConfig::gitlab_instance_host`] changed.
-    pub gitlab_instance_host_changed: bool,
+    pub gitlab_instance_host_changed: SettingChange,
 }
 
-/// The single definition of the OSV gate: scanning enabled and the network reachable.
+/// Whether one setting differs between two config snapshots.
 ///
-/// [`PolicyConfig::osv_checks_enabled`] is the entry point for code that holds a policy; this
-/// function exists for snapshot-based call sites that carry the two inputs separately (e.g.
-/// diagnostics generation, which must observe a caller-captured severities snapshot).
+/// A two-variant enum rather than a `bool`, so a diff field cannot be confused with an unrelated
+/// flag and every consumer states which case it handles.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::policy_config::SettingChange;
+///
+/// assert_eq!(SettingChange::of(&1, &2), SettingChange::Changed);
+/// assert!(!SettingChange::of(&1, &1).is_changed());
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SettingChange {
+    /// The two snapshots agree.
+    #[default]
+    Unchanged,
+    /// The two snapshots differ.
+    Changed,
+}
+
+impl SettingChange {
+    /// `Changed` iff `old != new`.
+    #[must_use]
+    pub fn of<T: PartialEq>(old: &T, new: &T) -> Self {
+        if old == new {
+            Self::Unchanged
+        } else {
+            Self::Changed
+        }
+    }
+
+    /// Whether this is [`Self::Changed`].
+    #[must_use]
+    pub const fn is_changed(self) -> bool {
+        matches!(self, Self::Changed)
+    }
+}
+
+/// The two states of the OSV gate, for exhaustive `match`es on an [`OsvChecks`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsvState {
+    /// OSV checks may run.
+    Active,
+    /// OSV checks are disabled or the network is unreachable.
+    Inactive,
+}
+
+/// The result of the OSV gate: scanning enabled and the network reachable.
+///
+/// Opaque: the only constructors are [`OsvChecks::resolve`] and [`PolicyConfig::osv_checks`]
+/// (plus the cell this module owns), so every OSV call site agrees on the
+/// `vulnerabilities_enabled && online` rule. Construction outside the gate is impossible:
+/// the field is private and there is no constructor from [`OsvState`]. Callers inspect the
+/// value through [`OsvChecks::state`], an exhaustive enum, or [`OsvChecks::is_active`].
 ///
 /// # Examples
 ///
 /// ```
 /// use deps_core::NetworkMode;
-/// use deps_core::policy_config::osv_checks_active;
+/// use deps_core::policy_config::OsvChecks;
 ///
-/// assert!(osv_checks_active(true, NetworkMode::Online));
-/// assert!(!osv_checks_active(true, NetworkMode::Offline));
-/// assert!(!osv_checks_active(false, NetworkMode::Online));
+/// assert!(OsvChecks::resolve(true, NetworkMode::Online).is_active());
+/// assert!(!OsvChecks::resolve(true, NetworkMode::Offline).is_active());
+/// assert!(!OsvChecks::resolve(false, NetworkMode::Online).is_active());
 /// ```
-#[must_use]
-pub const fn osv_checks_active(vulnerabilities_enabled: bool, network: crate::NetworkMode) -> bool {
-    vulnerabilities_enabled && network.is_online()
+///
+/// Forging an active value does not compile:
+///
+/// ```compile_fail
+/// use deps_core::policy_config::{OsvChecks, OsvState};
+///
+/// let forged = OsvChecks(OsvState::Active);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OsvChecks(OsvState);
+
+impl OsvChecks {
+    /// The single definition of the OSV gate.
+    ///
+    /// [`PolicyConfig::osv_checks`] is the entry point for code that holds a policy; this
+    /// function serves snapshot-based call sites that carry the two inputs separately (e.g.
+    /// diagnostics generation, which must observe a caller-captured severities snapshot).
+    #[must_use]
+    pub const fn resolve(vulnerabilities_enabled: bool, network: crate::NetworkMode) -> Self {
+        Self::from_active(vulnerabilities_enabled && network.is_online())
+    }
+
+    const fn from_active(active: bool) -> Self {
+        Self(if active {
+            OsvState::Active
+        } else {
+            OsvState::Inactive
+        })
+    }
+
+    /// The gate state, for exhaustive `match`es.
+    #[must_use]
+    pub const fn state(self) -> OsvState {
+        self.0
+    }
+
+    /// Whether checks may run, for leaf conditions where a `match` adds nothing.
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        match self.0 {
+            OsvState::Active => true,
+            OsvState::Inactive => false,
+        }
+    }
+}
+
+/// Lock-free live storage for an [`OsvChecks`] value shared across tasks.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::NetworkMode;
+/// use deps_core::policy_config::{OsvChecks, OsvChecksCell};
+///
+/// let cell = OsvChecksCell::default();
+/// assert!(cell.get().is_active());
+/// cell.set(OsvChecks::resolve(false, NetworkMode::Online));
+/// assert!(!cell.get().is_active());
+/// ```
+#[derive(Debug)]
+pub struct OsvChecksCell(std::sync::atomic::AtomicBool);
+
+impl Default for OsvChecksCell {
+    /// Starts active, matching the default policy.
+    fn default() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(true))
+    }
+}
+
+impl OsvChecksCell {
+    /// Reads the current gate result.
+    #[must_use]
+    pub fn get(&self) -> OsvChecks {
+        OsvChecks::from_active(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Stores a new gate result.
+    pub fn set(&self, checks: OsvChecks) {
+        self.0
+            .store(checks.is_active(), std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl PolicyConfig {
@@ -152,18 +283,18 @@ impl PolicyConfig {
     /// use deps_core::policy_config::PolicyConfig;
     ///
     /// let mut policy = PolicyConfig::default();
-    /// assert!(policy.osv_checks_enabled());
+    /// assert!(policy.osv_checks().is_active());
     ///
     /// policy.network.offline = true;
-    /// assert!(!policy.osv_checks_enabled());
+    /// assert!(!policy.osv_checks().is_active());
     ///
     /// policy.network.offline = false;
     /// policy.diagnostics.vulnerabilities_enabled = false;
-    /// assert!(!policy.osv_checks_enabled());
+    /// assert!(!policy.osv_checks().is_active());
     /// ```
     #[must_use]
-    pub fn osv_checks_enabled(&self) -> bool {
-        osv_checks_active(
+    pub fn osv_checks(&self) -> OsvChecks {
+        OsvChecks::resolve(
             self.diagnostics.vulnerabilities_enabled,
             self.network.mode(),
         )
@@ -193,9 +324,9 @@ impl PolicyConfig {
     /// new.registries.nuget_user_profile_sources = true;
     ///
     /// let diff = PolicyConfig::diff(&old, &new);
-    /// assert!(diff.nuget_user_profile_sources_changed);
-    /// assert!(!diff.workspace_registries_changed);
-    /// assert!(!diff.gitlab_instance_host_changed);
+    /// assert!(diff.nuget_user_profile_sources_changed.is_changed());
+    /// assert!(!diff.workspace_registries_changed.is_changed());
+    /// assert!(!diff.gitlab_instance_host_changed.is_changed());
     /// ```
     #[must_use]
     pub fn diff(old: &Self, new: &Self) -> PolicyConfigDiff {
@@ -245,19 +376,33 @@ impl PolicyConfig {
         let RegistriesConfig {
             workspace_registries: new_workspace_registries,
             nuget_user_profile_sources: new_nuget_user_profile_sources,
+            swift_keychain_credentials: new_swift_keychain_credentials,
             gitlab_instance_host: new_gitlab_instance_host,
         } = new_registries;
         let RegistriesConfig {
             workspace_registries: old_workspace_registries,
             nuget_user_profile_sources: old_nuget_user_profile_sources,
+            swift_keychain_credentials: old_swift_keychain_credentials,
             gitlab_instance_host: old_gitlab_instance_host,
         } = &old.registries;
 
         PolicyConfigDiff {
-            workspace_registries_changed: old_workspace_registries != new_workspace_registries,
-            nuget_user_profile_sources_changed: old_nuget_user_profile_sources
-                != new_nuget_user_profile_sources,
-            gitlab_instance_host_changed: old_gitlab_instance_host != new_gitlab_instance_host,
+            workspace_registries_changed: SettingChange::of(
+                old_workspace_registries,
+                new_workspace_registries,
+            ),
+            nuget_user_profile_sources_changed: SettingChange::of(
+                old_nuget_user_profile_sources,
+                new_nuget_user_profile_sources,
+            ),
+            swift_keychain_credentials_changed: SettingChange::of(
+                old_swift_keychain_credentials,
+                new_swift_keychain_credentials,
+            ),
+            gitlab_instance_host_changed: SettingChange::of(
+                old_gitlab_instance_host,
+                new_gitlab_instance_host,
+            ),
         }
     }
 }
@@ -920,6 +1065,31 @@ where
     Ok(clamped)
 }
 
+/// Whether SE-0292 registry credentials may be read from the macOS Keychain.
+///
+/// Reading goes through `/usr/bin/security`, which can show an access prompt, so it is opt-in.
+/// Ignored (with a warning) off macOS and in `deps-cli`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::policy_config::KeychainCredentials;
+///
+/// assert_eq!(KeychainCredentials::default(), KeychainCredentials::Disabled);
+/// let setting: KeychainCredentials = serde_json::from_str("\"enabled\"").unwrap();
+/// assert_eq!(setting, KeychainCredentials::Enabled);
+/// ```
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KeychainCredentials {
+    /// Never read the Keychain.
+    #[default]
+    Disabled,
+    /// Read the Keychain for user-declared SE-0292 registries, after the environment and
+    /// `SWIFTPM_NETRC_DATA` and instead of `~/.netrc`.
+    Enabled,
+}
+
 /// Cross-ecosystem workspace-declared registry settings (spec #443/plan-1b §1.7, renamed
 /// from `cargo.workspace_registries` by `032-npm-npmrc-registry-support` FR-008/C2).
 ///
@@ -969,6 +1139,13 @@ pub struct RegistriesConfig {
     #[serde(default)]
     #[raw]
     pub nuget_user_profile_sources: bool,
+    /// Issue #1771: whether SE-0292 registry credentials may be read from the macOS Keychain
+    /// (through `/usr/bin/security`, which can show an access prompt). Opt-in; only
+    /// user-declared registries receive a Keychain credential, and only on macOS.
+    /// `#[serde(default)]`: additive-safe, same rationale as `nuget_user_profile_sources`.
+    #[serde(default)]
+    #[raw]
+    pub swift_keychain_credentials: KeychainCredentials,
     /// Issue #466, spec FR-005a/FR-011a: the GitLab instance host that `project:` includes
     /// and `$CI_SERVER_FQDN`-relative `component:` includes resolve against, and — replacing,
     /// not joined with, `gitlab.com` — the *only* host `GITLAB_TOKEN` may be sent to.
@@ -1016,6 +1193,7 @@ impl RegistriesConfig {
         Self {
             workspace_registries: WorkspaceRegistriesSetting::PublicOnly,
             nuget_user_profile_sources: false,
+            swift_keychain_credentials: KeychainCredentials::Disabled,
             gitlab_instance_host: String::new(),
         }
     }
@@ -1037,6 +1215,16 @@ impl RegistriesConfig {
         nuget_user_profile_sources: bool,
     ) -> Self {
         self.nuget_user_profile_sources = nuget_user_profile_sources;
+        self
+    }
+
+    /// Overrides [`Self::swift_keychain_credentials`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_swift_keychain_credentials(
+        mut self,
+        swift_keychain_credentials: KeychainCredentials,
+    ) -> Self {
+        self.swift_keychain_credentials = swift_keychain_credentials;
         self
     }
 
@@ -1063,6 +1251,8 @@ pub struct RegistryRuntimeSettings {
     pub workspace_registries: crate::net_policy::WorkspaceRegistryAccess,
     /// See [`RegistriesConfig::nuget_user_profile_sources`].
     pub nuget_user_profile_sources: bool,
+    /// See [`RegistriesConfig::swift_keychain_credentials`].
+    pub swift_keychain_credentials: KeychainCredentials,
     /// See [`RegistriesConfig::gitlab_instance_host`] — normalized from an empty string to
     /// `None`.
     pub gitlab_instance_host: Option<String>,
@@ -1078,6 +1268,10 @@ impl std::fmt::Debug for RegistryRuntimeSettings {
             .field(
                 "nuget_user_profile_sources",
                 &self.nuget_user_profile_sources,
+            )
+            .field(
+                "swift_keychain_credentials",
+                &self.swift_keychain_credentials,
             )
             .field(
                 "gitlab_instance_host",
@@ -1109,6 +1303,7 @@ impl RegistriesConfig {
         RegistryRuntimeSettings {
             workspace_registries: self.workspace_registries.to_policy(),
             nuget_user_profile_sources: self.nuget_user_profile_sources,
+            swift_keychain_credentials: self.swift_keychain_credentials,
             gitlab_instance_host: (!self.gitlab_instance_host.is_empty())
                 .then(|| self.gitlab_instance_host.clone()),
         }
@@ -1578,12 +1773,17 @@ mod tests {
         let config = RegistriesConfig {
             workspace_registries: WorkspaceRegistriesSetting::All,
             nuget_user_profile_sources: true,
+            swift_keychain_credentials: KeychainCredentials::Enabled,
             gitlab_instance_host: "gitlab.corp".to_string(),
         };
 
         let resolved = config.resolve();
         assert_eq!(resolved.workspace_registries, WorkspaceRegistryAccess::All);
         assert!(resolved.nuget_user_profile_sources);
+        assert_eq!(
+            resolved.swift_keychain_credentials,
+            KeychainCredentials::Enabled
+        );
         assert_eq!(
             resolved.gitlab_instance_host.as_deref(),
             Some("gitlab.corp")
@@ -1754,9 +1954,9 @@ mod tests {
         new.registries.workspace_registries = WorkspaceRegistriesSetting::Off;
 
         let diff = PolicyConfig::diff(&old, &new);
-        assert!(diff.workspace_registries_changed);
-        assert!(!diff.nuget_user_profile_sources_changed);
-        assert!(!diff.gitlab_instance_host_changed);
+        assert!(diff.workspace_registries_changed.is_changed());
+        assert!(!diff.nuget_user_profile_sources_changed.is_changed());
+        assert!(!diff.gitlab_instance_host_changed.is_changed());
     }
 
     #[test]
@@ -1766,9 +1966,45 @@ mod tests {
         new.registries.nuget_user_profile_sources = true;
 
         let diff = PolicyConfig::diff(&old, &new);
-        assert!(!diff.workspace_registries_changed);
-        assert!(diff.nuget_user_profile_sources_changed);
-        assert!(!diff.gitlab_instance_host_changed);
+        assert!(!diff.workspace_registries_changed.is_changed());
+        assert!(diff.nuget_user_profile_sources_changed.is_changed());
+        assert!(!diff.gitlab_instance_host_changed.is_changed());
+    }
+
+    #[test]
+    fn test_policy_config_diff_swift_keychain_credentials_change() {
+        let old = PolicyConfig::default();
+        let mut new = PolicyConfig::default();
+        new.registries.swift_keychain_credentials = KeychainCredentials::Enabled;
+
+        let diff = PolicyConfig::diff(&old, &new);
+        assert!(diff.swift_keychain_credentials_changed.is_changed());
+        assert!(!diff.nuget_user_profile_sources_changed.is_changed());
+        assert!(!diff.workspace_registries_changed.is_changed());
+        assert!(!diff.gitlab_instance_host_changed.is_changed());
+        assert!(
+            !PolicyConfig::diff(&new, &new)
+                .swift_keychain_credentials_changed
+                .is_changed()
+        );
+    }
+
+    #[test]
+    fn test_registries_config_parses_keychain_setting_and_rejects_unknown_value() {
+        let config: RegistriesConfig =
+            serde_json::from_str(r#"{"swift_keychain_credentials": "enabled"}"#).unwrap();
+        assert_eq!(
+            config.swift_keychain_credentials,
+            KeychainCredentials::Enabled
+        );
+        assert_eq!(
+            RegistriesConfig::default().swift_keychain_credentials,
+            KeychainCredentials::Disabled
+        );
+        assert!(
+            serde_json::from_str::<RegistriesConfig>(r#"{"swift_keychain_credentials": "yes"}"#)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1778,9 +2014,9 @@ mod tests {
         new.registries.gitlab_instance_host = "gitlab.corp".to_string();
 
         let diff = PolicyConfig::diff(&old, &new);
-        assert!(!diff.workspace_registries_changed);
-        assert!(!diff.nuget_user_profile_sources_changed);
-        assert!(diff.gitlab_instance_host_changed);
+        assert!(!diff.workspace_registries_changed.is_changed());
+        assert!(!diff.nuget_user_profile_sources_changed.is_changed());
+        assert!(diff.gitlab_instance_host_changed.is_changed());
     }
 
     /// A non-registries change (issue #1064) must not surface in the diff at all — this is the
@@ -1808,6 +2044,7 @@ mod tests {
         RegistryRuntimeSettings {
             workspace_registries: crate::net_policy::WorkspaceRegistryAccess::PublicOnly,
             nuget_user_profile_sources: false,
+            swift_keychain_credentials: KeychainCredentials::Disabled,
             gitlab_instance_host: Some(crate::conformance::CREDENTIAL_PROBE_URL.to_string()),
         },
     );
