@@ -39,9 +39,10 @@ pub use formatter::GithubActionsFormatter;
 pub use parser::parse_workflow_yaml;
 pub use registry::GithubActionsRegistry;
 pub use types::{
-    ClosingDelimiters, GithubActionsDependency, GithubActionsParseResult, GithubActionsVersion,
-    PinStyle, ShaComment,
+    GithubActionsDependency, GithubActionsParseResult, GithubActionsVersion, PinStyle, ShaComment,
 };
+
+pub use deps_core::lsp_helpers::ClosingDelimiters;
 
 /// Stable [`tower_lsp_server::ls_types::Diagnostic::code`] for the mutable-ref-pin
 /// diagnostic (issue #473).
@@ -56,12 +57,8 @@ pub use types::{
 pub const MUTABLE_REF_PIN_DIAGNOSTIC_CODE: &str = "mutable-ref-pin";
 
 /// Stable [`tower_lsp_server::ls_types::Diagnostic::code`] for the SHA-comment-mismatch
-/// diagnostic (issue #1722).
-///
-/// Flags a SHA-pinned `uses:` step whose trailing `# vX.Y.Z` comment names a tag that is
-/// provably not the pinned commit's tag (the pin points at a commit that is either another
-/// release or no release at all), a supply-chain signal distinct from the outdated check.
-pub const SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE: &str = "sha-comment-mismatch";
+/// diagnostic (issue #1722), shared with every ecosystem through `deps-core`.
+pub use deps_core::lsp_helpers::SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE;
 
 /// Whether `name` matches the `owner/repo` GitHub identifier shape this crate accepts:
 /// `[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+`, with neither segment being exactly `.`/`..` (see

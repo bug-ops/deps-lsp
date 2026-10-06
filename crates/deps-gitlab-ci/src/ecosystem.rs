@@ -8,13 +8,16 @@ use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
 use deps_core::hover::Hover;
 #[cfg(feature = "lsp-responses")]
+use deps_core::lsp_helpers::sha_comment_mismatch_hover_line;
+#[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::{PackageNaming, PackageRendering};
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
     Ecosystem, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
     diagnostic::{Diagnostic, Severity},
     lsp_helpers::{
-        EcosystemFormatter, MAX_DIAGNOSTIC_VALUE_CHARS, sanitize_and_truncate_for_diagnostic,
+        CommentCheck, CommitSha, EcosystemFormatter, MAX_DIAGNOSTIC_VALUE_CHARS,
+        sanitize_and_truncate_for_diagnostic, sha_comment_mismatch_diagnostic,
     },
 };
 use std::any::Any;
@@ -73,7 +76,7 @@ fn is_registry_confirmed_tag(gl_dep: &GitlabCiDependency, formatter: &GitlabCiFo
                     .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()))
                     .is_some_and(|index| index.tag_to_sha.contains_key(ref_text))
             }),
-        Some(PinStyle::Sha | PinStyle::Latest | PinStyle::Partial) | None => false,
+        Some(PinStyle::Sha { .. } | PinStyle::Latest | PinStyle::Partial) | None => false,
     }
 }
 
@@ -300,6 +303,14 @@ impl Ecosystem for GitlabCiEcosystem {
                 return Completions::default();
             }
 
+            if dep
+                .as_any()
+                .downcast_ref::<GitlabCiDependency>()
+                .is_some_and(|gl_dep| position_in_sha_comment(gl_dep, request.position.into()))
+            {
+                return Completions::default();
+            }
+
             deps_core::completion::complete_versions_generic_from(
                 self.registry.as_ref(),
                 &self.formatter,
@@ -341,6 +352,11 @@ impl Ecosystem for GitlabCiEcosystem {
                 deps_core::PublishTime::now(),
             );
             diagnostics.extend(unresolved_host_diagnostics(parse_result));
+            diagnostics.extend(sha_comment_mismatch_diagnostics(
+                parse_result,
+                severities.sha_comment_mismatch,
+                &self.formatter,
+            ));
             if severities.mutable_ref_pin_enabled {
                 diagnostics.extend(mutable_ref_pin_diagnostics(
                     parse_result,
@@ -449,7 +465,7 @@ impl Ecosystem for GitlabCiEcosystem {
                 hover.rewrite_markdown(|md| splice_project_line(md, &url));
             }
 
-            if gl_dep.pin == Some(PinStyle::Sha)
+            if matches!(gl_dep.pin, Some(PinStyle::Sha { .. }))
                 && let Some(sha) = gl_dep
                     .version_req
                     .as_ref()
@@ -461,6 +477,17 @@ impl Ecosystem for GitlabCiEcosystem {
                 hover.rewrite_markdown(|md| {
                     deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, &sha)
                 });
+            }
+
+            if let Some(CommentCheck::Mismatch(mismatch)) = self.formatter.sha_comment_check(gl_dep)
+                && let Some(comment) = gl_dep.sha_comment()
+                && let Some(sha) = gl_dep
+                    .version_req
+                    .as_ref()
+                    .and_then(|req| CommitSha::parse(req.as_str()))
+            {
+                let line = sha_comment_mismatch_hover_line(&sha, &comment.tag, &mismatch);
+                hover.rewrite_markdown(|md| deps_core::lsp_helpers::splice_hover_line(md, &line));
             }
 
             // FR-007 (H1, #466 review): a `component:` `Latest`/`Partial` pin names no
@@ -655,7 +682,7 @@ fn mutable_ref_pin_diagnostics(
             let diagnosable = match pin {
                 PinStyle::Tag | PinStyle::Latest | PinStyle::Partial => true,
                 PinStyle::Branch => is_registry_confirmed_tag(gl_dep, formatter),
-                PinStyle::Sha => false,
+                PinStyle::Sha { .. } => false,
             };
             if !diagnosable {
                 return None;
@@ -708,6 +735,50 @@ fn mutable_ref_pin_diagnostics(
                     .with_severity(severity)
                     .with_code(MUTABLE_REF_PIN_DIAGNOSTIC_CODE),
             )
+        })
+        .collect()
+}
+
+/// Whether `position` lies in the trailing `# vX` comment of a SHA pin, whose version range
+/// extends through the comment: a version item accepted there would replace part of the
+/// comment (#1182).
+#[cfg(feature = "lsp-responses")]
+fn position_in_sha_comment(
+    gl_dep: &GitlabCiDependency,
+    position: deps_core::position::Position,
+) -> bool {
+    gl_dep.sha_comment().is_some()
+        && gl_dep
+            .version_range
+            .is_some_and(|range| deps_core::lsp_helpers::position_past_sha(range, position))
+}
+
+/// One SHA-comment-mismatch diagnostic per SHA pin whose trailing `# tag` comment provably
+/// names a different commit than the pinned SHA; silent for a confirmed, absent or
+/// unverifiable (cold or truncated index) comment.
+fn sha_comment_mismatch_diagnostics(
+    parse_result: &dyn ParseResultTrait,
+    severity: Severity,
+    formatter: &GitlabCiFormatter,
+) -> Vec<Diagnostic> {
+    parse_result
+        .dependencies()
+        .into_iter()
+        .filter_map(|dep| {
+            let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
+            let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gl_dep)? else {
+                return None;
+            };
+            let comment = gl_dep.sha_comment()?;
+            let sha = CommitSha::parse(gl_dep.version_req.as_ref()?.as_str())?;
+            Some(sha_comment_mismatch_diagnostic(
+                gl_dep.version_range?,
+                &gl_dep.name,
+                &sha,
+                &comment.tag,
+                &mismatch,
+                severity,
+            ))
         })
         .collect()
 }
@@ -1593,7 +1664,7 @@ mod tests {
                 "component sha",
                 make_dep(
                     IncludeKind::Component,
-                    PinStyle::Sha,
+                    PinStyle::sha_without_comment(),
                     resolved_source.clone(),
                 ),
                 false,
@@ -3197,7 +3268,7 @@ mod tests {
 
         /// #1723: SHA pins absent from the populated index must be reported consistently by
         /// diagnostics, inlay hints, update-all and hover (`component:` and `project:`
-        /// includes alike), and the rewrite is the latest tag's full SHA, never a bare tag. A
+        /// includes alike), and the rewrite is the latest tag's full SHA plus its `# tag` comment, never a bare tag. A
         /// control pin on latest's commit gets none of them.
         #[tokio::test]
         async fn test_sha_pin_surfaces_agree() {
@@ -3269,7 +3340,8 @@ mod tests {
             let mut edit_lines: Vec<u32> = edits.iter().map(|e| e.range.start.line).collect();
             edit_lines.sort_unstable();
             assert_eq!(edit_lines, outdated_lines, "{edits:?}");
-            assert!(edits.iter().all(|e| e.new_text == latest_sha), "{edits:?}");
+            let rewritten = format!("{latest_sha} # v1.1.0");
+            assert!(edits.iter().all(|e| e.new_text == rewritten), "{edits:?}");
 
             let hints = eco
                 .generate_inlay_hints(
@@ -3308,6 +3380,407 @@ mod tests {
                     hover.markdown()
                 );
             }
+        }
+
+        const SHA_V117: &str = "44790937bcbf6120698250cc41c9b4fb811c2a03";
+        const SHA_V120: &str = "78790114c4d7196c97b2b1a1263a0d725835640d";
+        const SHA_OTHER: &str = "9999999999999999999999999999999999999999";
+
+        /// A parsed manifest wired to a `TagIndex` per dependency and a `latest` version.
+        struct CommentFixture {
+            eco: GitlabCiEcosystem,
+            uri: Url,
+            content: String,
+            parse_result: Box<dyn ParseResultTrait>,
+            cached: std::collections::HashMap<PackageName, deps_core::PackageVersions>,
+        }
+
+        impl CommentFixture {
+            async fn new(content: &str, tags: &[(&str, &str)], latest: &str) -> Self {
+                let eco = GitlabCiEcosystem::with_context(
+                    Arc::new(HttpCache::new()),
+                    Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+                    Arc::new(RwLock::new(Some("gitlab.com".to_string()))),
+                );
+                let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+                let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+                let commits: Vec<(&str, CommitSha)> = tags
+                    .iter()
+                    .map(|(tag, sha)| (*tag, CommitSha::parse(sha).unwrap()))
+                    .collect();
+                let mut cached = std::collections::HashMap::new();
+                for dep in deps_core::ParseResult::dependencies(parse_result.as_ref()) {
+                    let kind = dep
+                        .as_any()
+                        .downcast_ref::<GitlabCiDependency>()
+                        .unwrap()
+                        .kind;
+                    let index = TagIndex::from_tags(commits.iter().map(|(t, s)| (*t, s)));
+                    eco.formatter
+                        .tag_index
+                        .insert((kind.endpoint(), dep.name().clone()), Arc::new(index));
+                    cached.insert(
+                        dep.name().clone(),
+                        deps_core::PackageVersions::latest_only(latest),
+                    );
+                }
+                Self {
+                    eco,
+                    uri,
+                    content: content.to_string(),
+                    parse_result,
+                    cached,
+                }
+            }
+
+            fn update_all(&self) -> Vec<TextEdit> {
+                let resolved = std::collections::HashMap::new();
+                deps_core::lsp_helpers::collect_update_all_edits(
+                    self.parse_result.as_ref(),
+                    &self.content,
+                    deps_core::VersionData::new(&self.cached, &resolved),
+                    &self.eco.formatter,
+                )
+            }
+
+            async fn diagnostics(&self) -> Vec<Diagnostic> {
+                let resolved = std::collections::HashMap::new();
+                self.eco
+                    .generate_diagnostics(
+                        self.parse_result.as_ref(),
+                        deps_core::VersionData::new(&self.cached, &resolved),
+                        &self.uri,
+                        deps_core::FreshnessSettings::default(),
+                        deps_core::lsp_helpers::DiagnosticSeverities::default(),
+                    )
+                    .await
+            }
+        }
+
+        /// Applies one single-line ASCII edit to `content`.
+        #[allow(clippy::string_slice)] // single-line ASCII fixtures
+        fn apply_edit(content: &str, edit: &TextEdit) -> String {
+            let mut out = String::new();
+            for (number, line) in content.split_inclusive('\n').enumerate() {
+                if number == edit.range.start.line as usize {
+                    let (start, end) = (
+                        edit.range.start.character as usize,
+                        edit.range.end.character as usize,
+                    );
+                    out.push_str(&line[..start]);
+                    out.push_str(&edit.new_text);
+                    out.push_str(&line[end..]);
+                } else {
+                    out.push_str(line);
+                }
+            }
+            out
+        }
+
+        fn project_pin(ref_text: &str) -> String {
+            format!("include:\n  - project: gitlab-org/cli\n    ref: {ref_text}\n")
+        }
+
+        fn v117_v120_tags() -> [(&'static str, &'static str); 2] {
+            [("v1.117.0", SHA_V117), ("v1.120.0", SHA_V120)]
+        }
+
+        /// #1743: updating a commented SHA `ref:` to `v1.120.0` rewrites the SHA and the trailing
+        /// comment in one edit, and the result is stable (not outdated again). The code action
+        /// builds its text through the same `replacement_text` path as update-all, but also
+        /// fetches the registry live, so only update-all is unit-tested here.
+        #[tokio::test]
+        async fn test_sha_pin_update_rewrites_trailing_comment_1743() {
+            let content = project_pin(&format!("{SHA_V117} # v1.117.0"));
+            let fixture = CommentFixture::new(&content, &v117_v120_tags(), "v1.120.0").await;
+            let expected = format!("{SHA_V120} # v1.120.0");
+
+            let edits = fixture.update_all();
+            assert_eq!(edits.len(), 1, "{edits:?}");
+            assert_eq!(edits[0].new_text, expected);
+            let updated = apply_edit(&content, &edits[0]);
+            assert_eq!(updated, project_pin(&expected));
+
+            let settled = CommentFixture::new(&updated, &v117_v120_tags(), "v1.120.0").await;
+            assert!(settled.update_all().is_empty());
+            assert!(
+                settled
+                    .diagnostics()
+                    .await
+                    .iter()
+                    .all(|d| !d.message().contains("Newer version available"))
+            );
+        }
+
+        #[tokio::test]
+        async fn test_sha_pin_update_keeps_quoted_closing_delimiter() {
+            let content = project_pin(&format!("\"{SHA_V117}\" # v1.117.0"));
+            let fixture = CommentFixture::new(&content, &v117_v120_tags(), "v1.120.0").await;
+            let edits = fixture.update_all();
+            assert_eq!(edits.len(), 1, "{edits:?}");
+            assert_eq!(
+                apply_edit(&content, &edits[0]),
+                project_pin(&format!("\"{SHA_V120}\" # v1.120.0"))
+            );
+        }
+
+        #[tokio::test]
+        async fn test_component_sha_pin_update_rewrites_trailing_comment() {
+            let content =
+                format!("include:\n  - component: gitlab.com/org/proj/comp@{SHA_V117} # 1.117.0\n");
+            let fixture = CommentFixture::new(
+                &content,
+                &[("1.117.0", SHA_V117), ("1.120.0", SHA_V120)],
+                "1.120.0",
+            )
+            .await;
+            let edits = fixture.update_all();
+            assert_eq!(edits.len(), 1, "{edits:?}");
+            assert_eq!(
+                apply_edit(&content, &edits[0]),
+                format!("include:\n  - component: gitlab.com/org/proj/comp@{SHA_V120} # 1.120.0\n")
+            );
+        }
+
+        /// A commentless plain pin gains the new tag's comment, as GitHub Actions pins do.
+        #[tokio::test]
+        async fn test_commentless_sha_pin_update_appends_comment() {
+            let content = project_pin(SHA_V117);
+            let fixture = CommentFixture::new(&content, &v117_v120_tags(), "v1.120.0").await;
+            let edits = fixture.update_all();
+            assert_eq!(edits.len(), 1, "{edits:?}");
+            assert_eq!(
+                apply_edit(&content, &edits[0]),
+                project_pin(&format!("{SHA_V120} # v1.120.0"))
+            );
+        }
+
+        /// A ref followed by flow content cannot take a comment: only the SHA is rewritten.
+        #[tokio::test]
+        async fn test_sha_pin_update_in_flow_mapping_never_appends_comment() {
+            let content =
+                format!("include:\n  - {{project: gitlab-org/cli, ref: {SHA_V117}, rules: []}}\n");
+            let fixture = CommentFixture::new(&content, &v117_v120_tags(), "v1.120.0").await;
+            let edits = fixture.update_all();
+            assert_eq!(edits.len(), 1, "{edits:?}");
+            assert_eq!(edits[0].new_text, SHA_V120);
+        }
+
+        /// A release name that is not version-shaped is never written as a comment, so the
+        /// comments cannot pile up (`# stable # stable`) across repeated updates.
+        #[tokio::test]
+        async fn test_sha_pin_update_to_non_version_release_writes_no_comment() {
+            let tags = [("v1.0.0", SHA_V117), ("stable", SHA_V120)];
+            for ref_text in [format!("{SHA_V117} # v1.0.0"), SHA_V117.to_string()] {
+                let content = project_pin(&ref_text);
+                let fixture = CommentFixture::new(&content, &tags, "stable").await;
+                let edits = fixture.update_all();
+                assert_eq!(edits.len(), 1, "{ref_text}: {edits:?}");
+                assert_eq!(edits[0].new_text, SHA_V120, "{ref_text}");
+                let updated = apply_edit(&content, &edits[0]);
+                assert_eq!(updated, project_pin(SHA_V120));
+
+                let settled = CommentFixture::new(&updated, &tags, "stable").await;
+                assert!(settled.update_all().is_empty(), "{ref_text}");
+            }
+        }
+
+        /// Words after the tag stay inside a comment when the new release name is not a
+        /// comment tag: `# v1.0.0 pinned for CVE` becomes `# pinned for CVE`, never
+        /// `# stable # stable` or a bare `pinned for CVE` that would break the YAML.
+        #[tokio::test]
+        async fn test_sha_pin_update_to_non_version_release_keeps_trailing_words_in_comment() {
+            let tags = [("v1.0.0", SHA_V117), ("stable", SHA_V120)];
+            for (ref_text, expected) in [
+                (
+                    format!("{SHA_V117} # v1.0.0 pinned for CVE"),
+                    format!("{SHA_V120} # pinned for CVE"),
+                ),
+                (
+                    format!("\"{SHA_V117}\" # v1.0.0 pinned for CVE"),
+                    format!("\"{SHA_V120}\" # pinned for CVE"),
+                ),
+            ] {
+                let content = project_pin(&ref_text);
+                let fixture = CommentFixture::new(&content, &tags, "stable").await;
+                let edits = fixture.update_all();
+                assert_eq!(edits.len(), 1, "{ref_text}: {edits:?}");
+                let updated = apply_edit(&content, &edits[0]);
+                assert_eq!(updated, project_pin(&expected), "{ref_text}");
+                assert!(!updated.contains("# stable"), "{updated}");
+
+                let settled = CommentFixture::new(&updated, &tags, "stable").await;
+                assert!(settled.update_all().is_empty(), "{ref_text}");
+            }
+        }
+
+        /// The latest tag is absent from the index: the rewrite falls back to the pin's own
+        /// literal text, so the update never deletes the comment.
+        #[tokio::test]
+        async fn test_sha_pin_update_on_index_miss_keeps_comment() {
+            let content = project_pin(&format!("{SHA_V117} # v1.117.0"));
+            let fixture =
+                CommentFixture::new(&content, &[("v1.117.0", SHA_V117)], "v1.120.0").await;
+            assert!(fixture.update_all().is_empty());
+        }
+
+        /// A hand-written comment naming a different tag than the pinned commit's is flagged by
+        /// both the `sha-comment-mismatch` diagnostic and a hover warning.
+        #[tokio::test]
+        async fn test_sha_comment_mismatch_diagnostic_and_hover() {
+            let tags = [("v1.117.0", SHA_V117), ("v1.100.0", SHA_OTHER)];
+            let content = project_pin(&format!("{SHA_V117} # v1.100.0"));
+            let fixture = CommentFixture::new(&content, &tags, "v1.117.0").await;
+            let mismatches: Vec<_> = fixture
+                .diagnostics()
+                .await
+                .into_iter()
+                .filter(|d| {
+                    d.code() == Some(deps_core::lsp_helpers::SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE)
+                })
+                .collect();
+            assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+            assert!(mismatches[0].message().contains("v1.117.0"));
+            assert_eq!(mismatches[0].range.start.line, 2);
+
+            let resolved = std::collections::HashMap::new();
+            let hover = fixture
+                .eco
+                .generate_hover(
+                    fixture.parse_result.as_ref(),
+                    Position::new(2, 30),
+                    deps_core::VersionData::new(&fixture.cached, &resolved)
+                        .with_network(deps_core::NetworkMode::Offline),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await
+                .expect("hover");
+            assert!(
+                hover.markdown().contains("comment says"),
+                "{}",
+                hover.markdown()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_matching_sha_comment_is_not_flagged() {
+            let content = project_pin(&format!("{SHA_V117} # v1.117.0"));
+            let fixture = CommentFixture::new(&content, &v117_v120_tags(), "v1.120.0").await;
+            assert!(
+                fixture.diagnostics().await.iter().all(|d| d.code()
+                    != Some(deps_core::lsp_helpers::SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE))
+            );
+        }
+
+        /// On a cold index the comment is trusted for the outdated verdict, and never flagged.
+        #[tokio::test]
+        async fn test_cold_index_trusts_sha_comment() {
+            let outdated = project_pin(&format!("{SHA_V117} # v1.117.0"));
+            let fixture = CommentFixture::new(&outdated, &[], "v1.120.0").await;
+            let diagnostics = fixture.diagnostics().await;
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message().contains("Newer version available")),
+                "{diagnostics:?}"
+            );
+            assert!(
+                diagnostics.iter().all(|d| d.code()
+                    != Some(deps_core::lsp_helpers::SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE))
+            );
+
+            let current = project_pin(&format!("{SHA_V120} # v1.120.0"));
+            let fixture = CommentFixture::new(&current, &[], "v1.120.0").await;
+            assert!(
+                fixture
+                    .diagnostics()
+                    .await
+                    .iter()
+                    .all(|d| !d.message().contains("Newer version available"))
+            );
+        }
+
+        /// #1182: completion stays available while the cursor is in the SHA of a commented pin,
+        /// and is withheld inside the trailing comment (project `ref:` and component `@sha`).
+        #[tokio::test]
+        async fn test_position_in_sha_comment_for_commented_pins() {
+            let sha = "a".repeat(40);
+            let eco = GitlabCiEcosystem::with_context(
+                Arc::new(HttpCache::new()),
+                Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+                Arc::new(RwLock::new(Some("gitlab.com".to_string()))),
+            );
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let manifests = [
+                (
+                    format!("include:\n  - project: org/proj\n    ref: {sha} # v1.0.0\n"),
+                    2_u32,
+                    9_u32,
+                ),
+                (
+                    format!("include:\n  - component: gitlab.com/org/proj/comp@{sha} # 1.0.0\n"),
+                    1,
+                    40,
+                ),
+            ];
+            for (content, line, sha_start) in manifests {
+                let parsed = eco.parse_manifest(&content, &uri).await.unwrap();
+                let dep = deps_core::ParseResult::dependencies(parsed.as_ref()).remove(0);
+                let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>().unwrap();
+                let at = |column: u32| {
+                    position_in_sha_comment(
+                        gl_dep,
+                        deps_core::position::Position::new(line, column),
+                    )
+                };
+                assert!(!at(sha_start + 10), "{content}");
+                assert!(!at(sha_start + 40), "{content}: cursor right after the SHA");
+                assert!(at(sha_start + 43), "{content}");
+                assert!(at(sha_start + 47), "{content}");
+            }
+        }
+
+        #[tokio::test]
+        async fn test_position_in_sha_comment_false_for_commentless_pin() {
+            let sha = "a".repeat(40);
+            let eco = GitlabCiEcosystem::with_context(
+                Arc::new(HttpCache::new()),
+                Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+                Arc::new(RwLock::new(Some("gitlab.com".to_string()))),
+            );
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = format!("include:\n  - project: org/proj\n    ref: {sha}\n");
+            let parsed = eco.parse_manifest(&content, &uri).await.unwrap();
+            let dep = deps_core::ParseResult::dependencies(parsed.as_ref()).remove(0);
+            let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>().unwrap();
+            assert!(!position_in_sha_comment(
+                gl_dep,
+                deps_core::position::Position::new(2, 49)
+            ));
+        }
+
+        /// #1182: the completion guard also covers a quoted pin, whose range ends after the
+        /// closing quote and trailing comment.
+        #[tokio::test]
+        async fn test_position_in_sha_comment_for_quoted_pin() {
+            let sha = "a".repeat(40);
+            let eco = GitlabCiEcosystem::with_context(
+                Arc::new(HttpCache::new()),
+                Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+                Arc::new(RwLock::new(Some("gitlab.com".to_string()))),
+            );
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = format!("include:\n  - project: org/proj\n    ref: \"{sha}\" # v1.0.0\n");
+            let parsed = eco.parse_manifest(&content, &uri).await.unwrap();
+            let dep = deps_core::ParseResult::dependencies(parsed.as_ref()).remove(0);
+            let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>().unwrap();
+            let at = |column: u32| {
+                position_in_sha_comment(gl_dep, deps_core::position::Position::new(2, column))
+            };
+            assert!(!at(10 + 10));
+            assert!(!at(10 + 40), "cursor right after the SHA");
+            assert!(at(10 + 43));
+            assert!(at(10 + 47));
         }
     }
 }

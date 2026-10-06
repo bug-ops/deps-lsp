@@ -2,17 +2,18 @@
 
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, CommitSha, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, PartialTagPolicy, PinResolution, RequirementResolution, RequirementStatus,
-    ShaPinLookup, SourcePolicy, TagIndex, match_v_prefix_style,
-    requirement_contains_template_placeholder, tag_pin_is_up_to_date, warn_rejected_value,
+    BoundedVersionReq, CommentCheck, CommitSha, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
+    PackageNaming, PackageRendering, PartialTagPolicy, PinResolution, RequirementResolution,
+    RequirementStatus, ShaPinComment, ShaPinLookup, SourcePolicy, TagIndex, match_v_prefix_style,
+    requirement_contains_template_placeholder, sha_pin_rewrite, tag_pin_is_up_to_date,
+    warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName};
 use std::sync::Arc;
 
 use crate::host::is_valid_gitlab_coordinate;
-use crate::types::{EndpointKind, GitlabCiDependency, GitlabRoute, PinStyle};
+use crate::types::{EndpointKind, GitlabCiDependency, GitlabRoute, IncludeKind, PinStyle};
 
 /// Formatter for GitLab CI ecosystem LSP responses.
 pub struct GitlabCiFormatter {
@@ -66,11 +67,10 @@ impl GitlabCiFormatter {
     /// S2) — always <code>[GitlabCiDependency::kind].endpoint()</code> at call sites, never
     /// guessed.
     ///
-    /// Unlike `deps_github_actions`'s counterpart, the replacement is the bare SHA — no
-    /// `# {tag}` trailing comment: GitLab CI's `PinStyle::Sha` has no comment-tag
-    /// convention for a `ref:`/`component:` pin to preserve (`crate::types::PinStyle`),
-    /// so appending one would be new, unparsed-back behavior rather than mirroring an
-    /// existing one.
+    /// The replacement is the bare SHA — no `# {tag}` trailing comment. This backs the
+    /// "Pin to commit SHA" quickfix, which turns a tag pin into a SHA pin; rewriting an
+    /// existing SHA pin (and its comment) goes through
+    /// [`PackageRendering::format_version_replacing_for`] instead.
     ///
     /// # Examples
     ///
@@ -107,10 +107,53 @@ impl GitlabCiFormatter {
         name: &PackageName,
         tag: &str,
     ) -> Option<String> {
+        self.commit_for_tag(endpoint, name, tag)
+            .map(|sha| sha.to_string())
+    }
+
+    /// The commit `tag` points at for `name` under `endpoint`, if the shared index knows it.
+    fn commit_for_tag(
+        &self,
+        endpoint: EndpointKind,
+        name: &PackageName,
+        tag: &str,
+    ) -> Option<CommitSha> {
         self.tag_index
             .get(&(endpoint, name.clone()))
             .and_then(|index| index.tag_to_sha.get(tag).cloned())
-            .map(|sha| sha.to_string())
+    }
+
+    /// Whether a SHA pin's trailing `# tag` comment agrees with the repository's tag index;
+    /// `None` when `gl_dep` is not a full-SHA pin.
+    pub(crate) fn sha_comment_check(&self, gl_dep: &GitlabCiDependency) -> Option<CommentCheck> {
+        let Some(PinStyle::Sha { tail }) = &gl_dep.pin else {
+            return None;
+        };
+        let sha = CommitSha::parse(gl_dep.version_req.as_ref()?.as_str())?;
+        let index = self
+            .tag_index
+            .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()));
+        Some(CommentCheck::evaluate(
+            index.as_deref().map(AsRef::as_ref),
+            &sha,
+            tail.comment(),
+        ))
+    }
+
+    /// The status a SHA pin's own comment implies, for an index that cannot vouch for the SHA:
+    /// the comment is classified with the grammar of the include's own kind, like a pin
+    /// written as that tag.
+    fn comment_status(
+        gl_dep: &GitlabCiDependency,
+        comment: &ShaPinComment,
+        latest: &ConcreteVersion,
+    ) -> RequirementStatus {
+        let tag = comment.tag.as_str();
+        let pin = match gl_dep.kind {
+            IncludeKind::Project => crate::parser::classify_project_pin(tag),
+            IncludeKind::Component => crate::component::classify_component_pin_style(tag),
+        };
+        status_for_pin(&pin, tag, latest.as_str())
     }
 
     /// #1723: ground-truth status of a full-SHA pin against the route's [`TagIndex`], keyed
@@ -119,8 +162,9 @@ impl GitlabCiFormatter {
     ///
     /// A SHA absent from a populated index is `Outdated`: `latest` comes from the same fetch,
     /// so the pin is provably not `latest`'s commit. An indexed SHA is up to date when it is
-    /// `latest`'s commit, or its tag is a version tag that is itself up to date; a non-version
-    /// tag never counts as up to date by text.
+    /// `latest`'s commit, or its tag is not [`deps_core::lsp_helpers::TagPosition::BelowLatest`]
+    /// relative to `latest` (a prerelease newer than `latest` counts as up to date, as for a
+    /// `PinStyle::Tag` pin); a non-version tag never counts as up to date by text.
     fn sha_pin_status_from_tag_index(
         &self,
         gl_dep: &GitlabCiDependency,
@@ -131,8 +175,7 @@ impl GitlabCiFormatter {
         let index = self
             .tag_index
             .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()));
-        ShaPinLookup::resolve(index.as_deref().map(AsRef::as_ref), &sha, latest)
-            .into_status(|tag| self.is_bounded_requirement_up_to_date(tag, latest))
+        ShaPinLookup::resolve(index.as_deref().map(AsRef::as_ref), &sha, latest).status()
     }
 }
 
@@ -183,9 +226,12 @@ impl PackageRendering for GitlabCiFormatter {
         };
         match &gl_dep.pin {
             Some(PinStyle::Partial | PinStyle::Latest | PinStyle::Branch) => current.to_string(),
-            Some(PinStyle::Sha) => self
-                .sha_pin_replacement_for(gl_dep.kind.endpoint(), &gl_dep.name, version.as_str())
-                .unwrap_or_else(|| current.to_string()),
+            Some(PinStyle::Sha { tail }) => self
+                .commit_for_tag(gl_dep.kind.endpoint(), &gl_dep.name, version.as_str())
+                .map_or_else(
+                    || gl_dep.version_literal().unwrap_or(current).to_string(),
+                    |sha| sha_pin_rewrite(tail, &sha, version),
+                ),
             Some(PinStyle::Tag) | None => match_v_prefix_style(current, version.as_str()),
         }
     }
@@ -237,7 +283,7 @@ impl RequirementResolution for GitlabCiFormatter {
     fn bounded_requirement_is_unresolved(&self, requirement: BoundedVersionReq<'_>) -> bool {
         matches!(
             crate::component::classify_component_pin_style(requirement.as_str()),
-            PinStyle::Sha | PinStyle::Branch
+            PinStyle::Sha { .. } | PinStyle::Branch
         )
     }
 
@@ -307,10 +353,13 @@ impl RequirementResolution for GitlabCiFormatter {
         let Some(pin) = gl_dep.pin.as_ref() else {
             return self.classify_requirement_status(requirement, latest);
         };
-        if *pin == PinStyle::Sha
-            && let Some(status) = self.sha_pin_status_from_tag_index(gl_dep, requirement, latest)
-        {
-            return status;
+        if let PinStyle::Sha { tail } = pin {
+            if let Some(status) = self.sha_pin_status_from_tag_index(gl_dep, requirement, latest) {
+                return status;
+            }
+            if let Some(comment) = tail.comment() {
+                return Self::comment_status(gl_dep, comment, latest);
+            }
         }
         status_for_pin(pin, requirement.as_str(), latest.as_str())
     }
@@ -334,7 +383,7 @@ impl RequirementResolution for GitlabCiFormatter {
         let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
             return PinResolution::Unresolved;
         };
-        if gl_dep.pin != Some(PinStyle::Sha) {
+        if !matches!(gl_dep.pin, Some(PinStyle::Sha { .. })) {
             return PinResolution::Unresolved;
         }
         let Some(sha) = gl_dep
@@ -422,7 +471,7 @@ fn status_for_pin(pin: &PinStyle, requirement: &str, latest: &str) -> Requiremen
         return RequirementStatus::Unresolved;
     }
     match pin {
-        PinStyle::Sha | PinStyle::Branch => RequirementStatus::Unresolved,
+        PinStyle::Sha { .. } | PinStyle::Branch => RequirementStatus::Unresolved,
         PinStyle::Latest => RequirementStatus::UpToDate,
         PinStyle::Tag => {
             if tag_pin_is_up_to_date(requirement, latest, PartialTagPolicy::Exact) {
@@ -900,7 +949,7 @@ mod tests {
         );
 
         let mut d = dep(
-            Some(PinStyle::Sha),
+            Some(PinStyle::sha_without_comment()),
             "gitlab.com/org/proj",
             DependencySource::AlternateRegistry {
                 index: "gitlab:abc".into(),
@@ -941,7 +990,7 @@ mod tests {
                 Arc::new(TagIndex::from_tags(tags.iter().map(|t| (*t, &commit)))),
             );
             let mut d = dep(
-                Some(PinStyle::Sha),
+                Some(PinStyle::sha_without_comment()),
                 "gitlab.com/org/proj",
                 DependencySource::AlternateRegistry {
                     index: "gitlab:abc".into(),
@@ -979,7 +1028,7 @@ mod tests {
         );
 
         let mut d = dep(
-            Some(PinStyle::Sha),
+            Some(PinStyle::sha_without_comment()),
             "gitlab.com/org/proj",
             DependencySource::AlternateRegistry {
                 index: "gitlab:abc".into(),
@@ -1002,7 +1051,7 @@ mod tests {
         let sha = "c".repeat(40);
         let fmt = formatter();
         let mut d = dep(
-            Some(PinStyle::Sha),
+            Some(PinStyle::sha_without_comment()),
             "gitlab.com/org/proj",
             DependencySource::AlternateRegistry {
                 index: "gitlab:abc".into(),
@@ -1096,7 +1145,7 @@ mod tests {
 
     fn sha_dep_1723(sha: &str) -> GitlabCiDependency {
         let mut d = dep(
-            Some(PinStyle::Sha),
+            Some(PinStyle::sha_without_comment()),
             "gitlab.com/org/proj",
             DependencySource::AlternateRegistry {
                 index: "gitlab:abc".into(),
@@ -1180,14 +1229,103 @@ mod tests {
         assert_eq!(status_1723(&fmt, &d), RequirementStatus::Unresolved);
     }
 
-    /// A SHA whose only tag is a partial `v1.1` on a non-latest commit reads by that tag's own
-    /// range, so it counts as up to date against `v1.1.0` (moving-tag trade-off, as in GitHub
-    /// Actions).
+    /// #1730: a SHA whose only tag is a floating `v1.1` on a non-latest commit is outdated
+    /// against `v1.1.0`: the partial tag names a different commit than the release.
     #[test]
-    fn test_sha_pin_with_partial_tag_on_older_commit_reads_by_tag_range() {
+    fn test_sha_pin_with_only_outdated_floating_tag_is_outdated() {
         let fmt = fmt_with_index_1723(EndpointKind::Tags, &[("v1.1", MISSING_SHA_1723)]);
         let d = sha_dep_1723(MISSING_SHA_1723);
-        assert_eq!(status_1723(&fmt, &d), RequirementStatus::UpToDate);
+        assert_eq!(status_1723(&fmt, &d), RequirementStatus::Outdated);
+    }
+
+    /// #1730: a SHA tagged only with a prerelease above `latest` reads as up to date, the same
+    /// as a `PinStyle::Tag` pin written as that prerelease.
+    #[test]
+    fn test_sha_pin_tagged_above_latest_is_up_to_date() {
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[("v2.0.0-rc1", MISSING_SHA_1723)]);
+        let d = sha_dep_1723(MISSING_SHA_1723);
+        assert_eq!(
+            fmt.requirement_status_for(
+                &d,
+                d.version_req.as_ref().unwrap(),
+                &ConcreteVersion::new("1.9.0")
+            ),
+            RequirementStatus::UpToDate
+        );
+
+        let tag_pin = dep(
+            Some(PinStyle::Tag),
+            "gitlab.com/org/proj",
+            DependencySource::Registry,
+        );
+        assert_eq!(
+            fmt.requirement_status_for(
+                &tag_pin,
+                &VersionReq::new("v2.0.0-rc1"),
+                &ConcreteVersion::new("1.9.0")
+            ),
+            RequirementStatus::UpToDate
+        );
+    }
+
+    fn commented_sha_dep(comment: &str, kind: crate::types::IncludeKind) -> GitlabCiDependency {
+        use deps_core::lsp_helpers::{ClosingDelimiters, CommentTag, ShaPinComment, ShaPinTail};
+
+        let mut d = sha_dep_1723(MISSING_SHA_1723);
+        d.kind = kind;
+        d.pin = Some(PinStyle::Sha {
+            tail: ShaPinTail::Commented(ShaPinComment::new(
+                CommentTag::parse(comment).unwrap(),
+                ClosingDelimiters::default(),
+            )),
+        });
+        d
+    }
+
+    /// An index that cannot vouch for the SHA trusts the comment, classified with the grammar
+    /// of the include's own kind.
+    #[test]
+    fn test_cold_index_sha_pin_status_follows_comment() {
+        use crate::types::IncludeKind;
+
+        let fmt = formatter();
+        for (comment, kind, expected) in [
+            ("v1.1.0", IncludeKind::Project, RequirementStatus::UpToDate),
+            ("v1.0.0", IncludeKind::Project, RequirementStatus::Outdated),
+            ("1.1.0", IncludeKind::Component, RequirementStatus::UpToDate),
+            ("1.0", IncludeKind::Component, RequirementStatus::Outdated),
+        ] {
+            let d = commented_sha_dep(comment, kind);
+            assert_eq!(status_1723(&fmt, &d), expected, "{comment} {kind:?}");
+        }
+    }
+
+    /// A populated index overrides the comment: the SHA is provably not `latest`'s commit.
+    #[test]
+    fn test_populated_index_overrides_sha_comment() {
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[]);
+        let d = commented_sha_dep("v1.1.0", crate::types::IncludeKind::Project);
+        assert_eq!(status_1723(&fmt, &d), RequirementStatus::Outdated);
+    }
+
+    /// An index miss rewrites a commented pin to its own literal text, never deleting the
+    /// comment; a hit rewrites the SHA and the comment.
+    #[test]
+    fn test_format_version_replacing_for_commented_sha_pin() {
+        let mut d = commented_sha_dep("v1.0.0", crate::types::IncludeKind::Project);
+        let literal = format!("{MISSING_SHA_1723} # v1.0.0");
+        d.version_literal = Some(literal.clone());
+        let current = d.version_req.as_ref().unwrap().as_str().to_string();
+
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[]);
+        assert_eq!(
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v9.9.9"), &current),
+            literal
+        );
+        assert_eq!(
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v1.1.0"), &current),
+            format!("{LATEST_SHA_1723} # v1.1.0")
+        );
     }
 
     #[test]

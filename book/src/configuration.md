@@ -30,7 +30,7 @@ control, see [Conventions](cross-ecosystem/conventions.md).
 | `diagnostics` | `unsatisfiable_severity` | `"warning"` | Severity for the [unsatisfiable-requirement diagnostic](cross-ecosystem/version-diagnostics.md#unsatisfiable-version-requirement) |
 | `diagnostics` | `deprecated_severity` | `"warning"` | Severity for the [package-deprecation diagnostic](cross-ecosystem/version-diagnostics.md#package-deprecation-diagnostics-issue-205) |
 | `diagnostics` | `mutable_ref_pin_severity` | `"hint"` | Severity for the [mutable-ref-pin diagnostic](cross-ecosystem/ci-pinning.md#mutable-ref-pin-diagnostic-issue-473-634) (GitHub Actions/GitLab CI) |
-| `diagnostics` | `sha_comment_mismatch_severity` | `"warning"` | Severity for the [SHA-comment-mismatch diagnostic](ecosystems/github-actions.md#comment-mismatch-diagnostic-issue-1722) (GitHub Actions SHA pin whose `# tag` comment is not that commit's tag) |
+| `diagnostics` | `sha_comment_mismatch_severity` | `"warning"` | Severity for the [SHA-comment-mismatch diagnostic](ecosystems/github-actions.md#comment-mismatch-diagnostic-issue-1722) (GitHub Actions or GitLab CI/CD SHA pin whose `# tag` comment is not that commit's tag) |
 | `diagnostics` | `mutable_ref_pin_enabled` | `true` | Turns the mutable-ref-pin diagnostic and its bulk code lens off entirely — unlike the other diagnostics, severity alone cannot silence it |
 | `diagnostics` | `vulnerabilities_enabled` | `true` | Whether OSV.dev-backed vulnerability diagnostics run at all |
 | `freshness` | `enabled` | `true` | Flag a "latest" version still inside its cooldown window |

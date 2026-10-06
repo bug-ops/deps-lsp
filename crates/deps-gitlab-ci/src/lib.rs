@@ -30,6 +30,10 @@
 //! | `component: host/org/proj/name@1.2` (partial semver) | [`types::PinStyle::Partial`] | `/releases` |
 //! | `component: host/org/proj/name@some-branch` | [`types::PinStyle::Branch`] | not resolved |
 //!
+//! A SHA pin may carry a trailing `# vX` comment naming its tag. The pin's range spans the
+//! SHA and the comment, an update rewrites both, and a comment that does not name the pinned
+//! commit's tag is reported as `sha-comment-mismatch`.
+//!
 //! `include: - template: ...` and `include: - remote: ...` are recognized and skipped
 //! (spec FR-003) — not version-pinnable. `image:`/`services:` Docker tags are out of scope
 //! entirely (spec FR-016) and never parsed.

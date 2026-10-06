@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Breaking
 - **deps-core**: `CommitSha::parse` stores lowercase and drops `Borrow<str>`; `TagIndex::resolved_pin`/`tag_for_sha`/`splice_resolved_line` and `ShaPinLookup::resolve` (now infallible) take `&CommitSha`; `resolved_pin_version` returns `PinResolution` (#1751)
 - **deps-github-actions**: `PinStyle::Sha` carries `sha: CommitSha` and `comment: Option<ShaComment>`; `GithubActionsDependency` loses `version_literal` and `closing_delimiters`; `sha_pin_raw_sha` removed (#1751)
+- **deps-gitlab-ci**: `PinStyle::Sha` carries a `ShaPinTail` (#1764)
+- **deps-core**: `ShaPinLookup::into_status` replaced by `status()`; `ShaPinLookup::Indexed` gains `position: TagPosition`; `ClosingDelimiters` moves to `lsp_helpers` (re-exported by deps-github-actions) (#1764)
 
 ### Added
 - **deps-core**: `PinResolution`, `TagIndex::pin_resolution`, `PartialTagPolicy`, `tag_pin_is_up_to_date` and `tag_has_precedence` shared by the git-tag ecosystems (#1751)
@@ -17,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: `--fail-on other` token for uncategorized findings (offline/lock-file/registry notices, `sha-comment-mismatch`) (#1747)
 - **deps-swift**: SE-0292 registry client resolves `.package(id:)` dependencies through `registries.json` (project and user tiers), binding the environment credential to user-declared registry URLs only (#1763)
 - **deps-core**: `secret::basic_auth_header`, `CachedResponse::link` with `HttpCache::get_cached_{trusted_origin,pinned}_response`, `ListCoverage::from_link_header` and `DepsError::PaginatedListUnsupported` (#1763)
+- **deps-core**: shared `lsp_helpers::sha_comment` module (SHA-pin trailing-comment read, check and rewrite) used by GitHub Actions and GitLab CI (#1764)
+- **deps-core, deps-github-actions**: `Ecosystem::tag_index_refreshes` and `GithubActionsRegistry::subscribe_tag_refreshes` publish tag-index refresh events (#1764)
 
 ### Changed
 - **deps-github-actions, deps-gitlab-ci**: a tag pin ahead of the latest release is reported up to date instead of offering a downgrade (#1751)
@@ -27,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **deps-github-actions**: pre-release tag pins (`@v2-beta`, `@v3.0.0-rc.1`) are reported outdated against a newer release (#1751)
 - **deps-core**: OSV, hover and diagnostics no longer take the version from a SHA pin's comment once the tag index shows the commit has no matching release tag (#1751)
+- **deps-gitlab-ci**: SHA pins read and rewrite the trailing `# vX` comment and report `sha-comment-mismatch` (#1764)
+- **deps-github-actions, deps-gitlab-ci**: a SHA pin tagged only by an outdated floating tag (`v1`, `1.1`) is reported outdated (#1764)
+- **deps-lsp**: GitHub Actions rescans other open documents after a tag-index refresh (#1764)
 - **deps**: bump yanked `yoke-derive` to 0.8.4 so cargo-deny passes (#1746)
 - **workspace**: allow `clippy::assert_is_empty` (new in Rust 1.99) to keep CI clippy green (#1746)
 - **deps-lsp**: lock-file-change OSV rescan is now also suppressed in offline mode, matching the phase A gate (#1747)

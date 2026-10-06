@@ -239,6 +239,15 @@ pub(crate) async fn rescan_after_resolved_version_change(
     .await;
 }
 
+/// Whether [`rescan_osv_if_tag_index_now_warm`] ran the OSV pipeline and committed a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RescanOutcome {
+    /// The gate was closed, the scan plan was unchanged, or phase A had nothing to report.
+    Unchanged,
+    /// The pipeline ran again; the caller should republish diagnostics.
+    Rescanned,
+}
+
 /// Re-runs the OSV phase A/B pipeline once more and commits its result, when needed, right
 /// after a registry fetch this document just awaited (#1556 critic S2).
 ///
@@ -273,13 +282,13 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
     client: &tower_lsp_server::Client,
     ecosystem: &Arc<dyn Ecosystem>,
     fetch_timeout_secs: u64,
-) {
+) -> RescanOutcome {
     if !state.is_osv_latest_check_enabled()
         || !ecosystem
             .formatter()
             .resolved_pin_version_depends_on_registry_fetch()
     {
-        return;
+        return RescanOutcome::Unchanged;
     }
 
     let plan_changed = state.get_document(uri).is_some_and(|doc| {
@@ -288,7 +297,7 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
         })
     });
     if !plan_changed {
-        return;
+        return RescanOutcome::Unchanged;
     }
     tracing::debug!("OSV scan plan changed after registry fetch, rescanning");
 
@@ -300,7 +309,7 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
     )
     .await
     else {
-        return;
+        return RescanOutcome::Unchanged;
     };
 
     run_osv_phase_b_and_commit(
@@ -313,6 +322,7 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
     )
     .await;
     state.spawn_refresh_requests(client);
+    RescanOutcome::Rescanned
 }
 
 /// Background pre-fetch of each dependency's license, for whichever ecosystems

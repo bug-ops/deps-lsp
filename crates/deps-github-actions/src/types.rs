@@ -1,11 +1,11 @@
 //! GitHub Actions dependency and version types.
 
-use deps_core::lsp_helpers::CommitSha;
+use deps_core::lsp_helpers::{
+    ClosingDelimiters, CommentSlot, CommitSha, ShaPinComment, ShaPinTail,
+};
 use deps_core::parser::DependencySource;
 use deps_core::position::Range;
-use std::fmt;
 use url::Url;
-use yaml_rust2::scanner::TScalarStyle;
 
 /// How a `uses:` step's ref is pinned, driving requirement synthesis and edit shape.
 ///
@@ -28,110 +28,6 @@ pub enum PinStyle {
     },
     /// A branch ref, e.g. `@main`.
     Branch,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Delimiter {
-    DoubleQuote,
-    SingleQuote,
-    Space,
-    Tab,
-    CloseBrace,
-}
-
-impl Delimiter {
-    const fn as_char(self) -> char {
-        match self {
-            Self::DoubleQuote => '"',
-            Self::SingleQuote => '\'',
-            Self::Space => ' ',
-            Self::Tab => '\t',
-            Self::CloseBrace => '}',
-        }
-    }
-
-    const fn blank(c: char) -> Option<Self> {
-        match c {
-            ' ' => Some(Self::Space),
-            '\t' => Some(Self::Tab),
-            _ => None,
-        }
-    }
-}
-
-/// The closing quote and flow-mapping `}` between a full-SHA ref and its `# tag` comment.
-///
-/// For instance the closing `"` of `uses: "a/b@<sha>" # v4`, or the `}` of
-/// `{uses: a/b@<sha>} # v4`. Blanks before the `}` (`{ uses: a/b@<sha> } # v4`) are kept.
-///
-/// Non-empty only for a [`ShaComment`] that was read past those delimiters; every SHA-comment
-/// rewrite re-emits them verbatim so the surrounding quote or flow mapping stays balanced. At most
-/// one `}` is accepted: further closers end an outer collection, where a trailing comment cannot
-/// be attributed to this ref. Restricted by construction to ASCII characters, so its byte length
-/// equals its column width.
-///
-/// # Examples
-///
-/// ```
-/// use deps_github_actions::ClosingDelimiters;
-///
-/// let none = ClosingDelimiters::default();
-/// assert!(none.is_empty());
-/// assert_eq!(none.byte_len(), 0);
-/// assert_eq!(none.to_string(), "");
-/// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ClosingDelimiters(Vec<Delimiter>);
-
-impl ClosingDelimiters {
-    /// Parses the delimiters at the start of `tail` (the source text after the ref).
-    ///
-    /// A quoted scalar requires its own closing quote first; then blanks followed by one
-    /// flow-mapping `}` may follow. Blanks not followed by `}` are not consumed, and block
-    /// scalars or any other tail shape yield an empty value.
-    pub(crate) fn parse(tail: &str, style: TScalarStyle) -> Self {
-        let opening = match style {
-            TScalarStyle::Plain => None,
-            TScalarStyle::SingleQuoted => Some(Delimiter::SingleQuote),
-            TScalarStyle::DoubleQuoted => Some(Delimiter::DoubleQuote),
-            TScalarStyle::Literal | TScalarStyle::Folded => return Self::default(),
-        };
-        let mut chars = tail.chars();
-        let mut delimiters = Vec::new();
-        if let Some(quote) = opening {
-            if chars.next() != Some(quote.as_char()) {
-                return Self::default();
-            }
-            delimiters.push(quote);
-        }
-        let rest = chars.as_str();
-        let blanks: Vec<Delimiter> = rest.chars().map_while(Delimiter::blank).collect();
-        if rest.chars().nth(blanks.len()) == Some(Delimiter::CloseBrace.as_char()) {
-            delimiters.extend(blanks);
-            delimiters.push(Delimiter::CloseBrace);
-        }
-        Self(delimiters)
-    }
-
-    /// Whether no delimiter sits between the ref and its comment.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// Length in bytes (equal to the column width, all delimiters being ASCII).
-    #[must_use]
-    pub fn byte_len(&self) -> usize {
-        self.0.len()
-    }
-}
-
-impl fmt::Display for ClosingDelimiters {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0
-            .iter()
-            .try_for_each(|d| fmt::Write::write_char(f, d.as_char()))
-    }
 }
 
 /// The trailing `# <tag>` comment of a SHA-pinned `uses:` step.
@@ -159,23 +55,16 @@ impl fmt::Display for ClosingDelimiters {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShaComment {
-    tag: String,
+    comment: ShaPinComment,
     tag_range: Range,
-    closers: ClosingDelimiters,
     literal: String,
 }
 
 impl ShaComment {
-    pub(crate) const fn new(
-        tag: String,
-        tag_range: Range,
-        closers: ClosingDelimiters,
-        literal: String,
-    ) -> Self {
+    pub(crate) const fn new(comment: ShaPinComment, tag_range: Range, literal: String) -> Self {
         Self {
-            tag,
+            comment,
             tag_range,
-            closers,
             literal,
         }
     }
@@ -183,7 +72,7 @@ impl ShaComment {
     /// The tag named by the comment (`v4.2.0`), without the `#`.
     #[must_use]
     pub fn tag(&self) -> &str {
-        &self.tag
+        self.comment.tag.as_str()
     }
 
     /// LSP range of the tag token alone, excluding the `#` and surrounding blanks.
@@ -195,7 +84,13 @@ impl ShaComment {
     /// The closing quote/flow closers between the SHA and the comment.
     #[must_use]
     pub const fn closing_delimiters(&self) -> &ClosingDelimiters {
-        &self.closers
+        &self.comment.closing
+    }
+
+    /// The shared comment payload ([`deps_core::lsp_helpers::sha_pin_rewrite`]'s input).
+    #[must_use]
+    pub const fn pin_comment(&self) -> &ShaPinComment {
+        &self.comment
     }
 
     /// The raw `<sha>{closers} # <tag>` text the dependency's `version_range` spans.
@@ -213,9 +108,13 @@ impl PinStyle {
         let sha = CommitSha::parse(sha).expect("test SHA must be 40 hex characters");
         let comment = comment_tag.map(|tag| {
             ShaComment::new(
-                tag.to_string(),
+                ShaPinComment::new(
+                    deps_core::lsp_helpers::CommentTag::parse(tag)
+                        .expect("test tag must be comment-shaped"),
+                    ClosingDelimiters::default(),
+                )
+                .with_remainder(deps_core::lsp_helpers::CommentRemainder::Empty),
                 Range::default(),
-                ClosingDelimiters::default(),
                 format!("{sha} # {tag}"),
             )
         });
@@ -242,7 +141,8 @@ pub struct GithubActionsDependency {
     pub version_req: Option<deps_core::VersionReq>,
     /// LSP range of the ref text — for a [`PinStyle::Sha`] with a `comment`, this
     /// extends through the comment token (`<40hex> # v4.2.0`), including any
-    /// [`ClosingDelimiters`] in between (`<40hex>" # v4.2.0`). `None` for a
+    /// [`ClosingDelimiters`] in between
+    /// (`<40hex>" # v4.2.0`). `None` for a
     /// non-resolvable source or a bare `uses: owner/repo` with no `@` at all.
     pub version_range: Option<Range>,
     /// How the ref is pinned; `None` for a non-resolvable source.
@@ -292,6 +192,26 @@ impl GithubActionsDependency {
                 None
             }
         }
+    }
+
+    /// What follows a SHA pin's SHA, as the shared rewrite rule needs it; `None` for any
+    /// other pin style.
+    ///
+    /// A commentless pin is [`CommentSlot::Appendable`] only for a plain scalar that is last
+    /// on its line (a `# tag` after a quoted value or flow content would corrupt the YAML,
+    /// #473/#633).
+    #[must_use]
+    pub fn sha_pin_tail(&self) -> Option<ShaPinTail> {
+        let Some(PinStyle::Sha { comment, .. }) = &self.pin else {
+            return None;
+        };
+        Some(match comment {
+            Some(comment) => ShaPinTail::Commented(comment.comment.clone()),
+            None if self.is_plain_scalar && self.is_last_on_line => {
+                ShaPinTail::Bare(CommentSlot::Appendable)
+            }
+            None => ShaPinTail::Bare(CommentSlot::Unavailable),
+        })
     }
 }
 
@@ -384,37 +304,6 @@ mod tests {
 
     fn range() -> Range {
         Range::new(Position::new(0, 0), Position::new(0, 10))
-    }
-
-    #[test]
-    fn test_closing_delimiters_parse() {
-        use TScalarStyle::{DoubleQuoted, Folded, Literal, Plain, SingleQuoted};
-        let cases = [
-            (" # v4", Plain, ""),
-            ("\" # v4", DoubleQuoted, "\""),
-            ("' # v4", SingleQuoted, "'"),
-            ("} # v4", Plain, "}"),
-            ("\"} # v4", DoubleQuoted, "\"}"),
-            ("}} # v4", Plain, "}"),
-            ("}}", Plain, "}"),
-            ("\"}} # v4", DoubleQuoted, "\"}"),
-            (" } # v4", Plain, " }"),
-            ("\t } # v4", Plain, "\t }"),
-            ("\" } # v4", DoubleQuoted, "\" }"),
-            ("   # v4", Plain, ""),
-            ("\"  # v4", DoubleQuoted, "\""),
-            (" # v4", DoubleQuoted, ""),
-            ("' # v4", DoubleQuoted, ""),
-            ("\"} # v4", Plain, ""),
-            ("} # v4", Literal, ""),
-            ("} # v4", Folded, ""),
-        ];
-        for (tail, style, expected) in cases {
-            let parsed = ClosingDelimiters::parse(tail, style);
-            assert_eq!(parsed.to_string(), expected, "{tail:?} as {style:?}");
-            assert_eq!(parsed.byte_len(), expected.len(), "{tail:?}");
-            assert_eq!(parsed.is_empty(), expected.is_empty(), "{tail:?}");
-        }
     }
 
     #[test]

@@ -41,6 +41,7 @@ mod osv_snapshot_tests;
 pub(crate) mod reparse;
 mod resolved;
 mod state;
+pub(crate) mod tag_refresh;
 
 pub(crate) use diff::reload_resolved_versions;
 pub(crate) use lifecycle::{

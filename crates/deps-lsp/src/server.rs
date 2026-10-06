@@ -1,4 +1,5 @@
 use crate::config::DepsConfig;
+use crate::document::tag_refresh::{TagRefreshLifecycle, TagRefreshSubscriptions};
 use crate::document::{
     CLIENT_REFRESH_TIMEOUT, ChangeTaskTriggerGates, RefreshKind, ResolvedVersionMove, ServerState,
     change_task_triggers, handle_document_change, handle_document_open, refresh_with_timeout,
@@ -176,14 +177,21 @@ pub struct Backend {
     state: Arc<ServerState>,
     config: Arc<RwLock<DepsConfig>>,
     client_capabilities: Arc<RwLock<Option<tower_lsp_server::ls_types::ClientCapabilities>>>,
+    tag_refresh: std::sync::Mutex<TagRefreshLifecycle>,
 }
 
 impl Backend {
     /// Creates a new backend bound to the given LSP client handle.
     pub fn new(client: Client) -> Self {
+        let state = Arc::new(ServerState::new());
+        // Subscribed here, before any document can open, so no tag-index refresh is missed
+        // between construction and the listeners starting (#1716).
+        let tag_refresh =
+            TagRefreshLifecycle::Subscribed(TagRefreshSubscriptions::subscribe(&state));
         Self {
             client,
-            state: Arc::new(ServerState::new()),
+            state,
+            tag_refresh: std::sync::Mutex::new(tag_refresh),
             config: Arc::new(RwLock::new(DepsConfig::default())),
             client_capabilities: Arc::new(RwLock::new(None)),
         }
@@ -234,6 +242,25 @@ impl Backend {
         // Issue #1517 critique S5: same rationale, for the OSV latest-check's effective state.
         self.state
             .set_osv_latest_check_enabled(effects.osv_latest_check_enabled);
+    }
+
+    /// Spawns the cross-document tag-refresh listeners (#1716); a repeated call is a no-op.
+    fn start_tag_refresh_listeners(&self) {
+        let mut lifecycle = self
+            .tag_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle
+            .start(|subscriptions| subscriptions.spawn(&self.state, &self.client, &self.config));
+    }
+
+    /// Aborts the tag-refresh listeners so none outlives the server.
+    fn stop_tag_refresh_listeners(&self) {
+        let mut lifecycle = self
+            .tag_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.stop();
     }
 
     /// Handles opening a document using unified ecosystem registry.
@@ -733,6 +760,8 @@ impl LanguageServer for Backend {
             *self.config.write().await = config;
         }
 
+        self.start_tag_refresh_listeners();
+
         Ok(InitializeResult {
             capabilities: Self::server_capabilities(),
             server_info: Some(ServerInfo {
@@ -1010,6 +1039,7 @@ impl LanguageServer for Backend {
     #[tracing::instrument(skip(self))]
     fn shutdown(&self) -> impl std::future::Future<Output = Result<()>> + Send {
         tracing::info!("shutting down deps-lsp server");
+        self.stop_tag_refresh_listeners();
         std::future::ready(Ok(()))
     }
 
