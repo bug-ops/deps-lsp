@@ -112,19 +112,36 @@ include:
   comment is never deleted when the tag index has no answer.
 - A comment naming a tag that is not the pinned commit's tag raises `sha-comment-mismatch`
   (severity `diagnostics.sha_comment_mismatch_severity`) and a hover warning. Nothing is reported
-  while the tag index is cold.
+  while the tag index is cold, or while a truncated tag list lacks the SHA. The exception is a
+  comment naming a full version (`# v1.117.0`) that the truncated list maps to another commit:
+  that comment is provably wrong, so it is not trusted, the status is unresolved and the
+  mismatch is reported.
+- The `Correct version comment to <tag>` quickfix rewrites only the comment's tag to the tag the
+  pinned commit carries. It is offered only when the comment names another tag of that commit,
+  not for an unknown SHA, a confirmed comment or a pin without one.
 - A non-version update target (a release named `stable`) writes no `# tag`; trailing words in the
   old comment are kept.
 - Version completion is withheld inside the comment.
 - A comment on an alias site (`ref: *pin # v1.0.0`) is never read: the comment can go stale after
   the anchor is updated, with no mismatch diagnostic and no rewrite.
-- The "Pin to commit SHA" quickfix on a tag pin writes a bare SHA without `# tag`.
+- The "Pin to commit SHA" quickfix, the bulk "Pin All to SHA" lens and the `~latest`/partial
+  `component:` pin quickfix write `<sha> # <tag>` for a plain, last-on-line literal ref
+  (`ref: v1.0.0`, `component: .../comp@1.0.0`). A quoted ref (`ref: "v1.0.0"`), a flow-style
+  entry (`{project: org/proj, ref: v1.0.0, file: ci.yml}`) and a ref with more content after it
+  get the bare SHA, since a comment cannot follow them; neighbouring keys are kept. An aliased
+  ref is not edited at all.
 
 A SHA pin tagged only by a floating tag below the latest release (`v1.1` while the latest is
 `v1.1.0` on another commit) is reported outdated. SHA pins and tag pins are compared by the same
 tag order, so a pre-release above the latest release (`v2.0.0-rc1` against latest `1.9.0`) is up
 to date either way. As in GitHub Actions, a non-release commit newer than the latest release that
 carries only a floating tag is reported outdated (tracked in #1725).
+
+An exact `project:` tag pin that is ahead of the latest tag is reported up to date, unless the
+loaded tag list is complete and has no such tag (`ref: v40.0.0`, a typo or a deleted tag): that
+pin is unresolved, never outdated, so no downgrade is offered. A branch named like a version
+reads the same way. This applies to `project:` includes only: a `component:` version names a
+release, and a tag may exist without one, so the releases list never proves a version absent.
 
 **Self-hosted instances.** `include: - project:` carries **no host segment in GitLab's
 own syntax at all** — the instance is always implicit. Set

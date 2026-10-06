@@ -102,11 +102,13 @@ pub use in_use_version::{
 };
 #[cfg(feature = "lsp-responses")]
 pub use inlay_hints::generate_inlay_hints;
+#[cfg(feature = "lsp-responses")]
+pub use sha_comment::build_sha_comment_fix_action;
 pub use sha_comment::{
     ClosingDelimiters, CommentCheck, CommentMismatch, CommentRemainder, CommentSlot, CommentTag,
     SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE, ShaPinComment, ShaPinTail, ShaPinTailRead,
-    position_past_sha, read_sha_pin_tail, ref_is_last_on_line, sha_comment_mismatch_diagnostic,
-    sha_comment_mismatch_hover_line, sha_pin_rewrite,
+    comment_slot_after, position_past_sha, read_sha_pin_tail, ref_is_last_on_line,
+    sha_comment_mismatch_diagnostic, sha_comment_mismatch_hover_line, sha_pin_rewrite,
 };
 
 /// Maximum number of recent versions hover's "Recent versions" section renders.

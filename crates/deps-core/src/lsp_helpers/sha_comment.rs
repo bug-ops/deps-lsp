@@ -13,14 +13,19 @@ use yaml_rust2::scanner::TScalarStyle;
 
 use super::git_ref::SHA_LEN;
 use super::{
-    CommitSha, LineOffsetTable, MAX_DIAGNOSTIC_VALUE_CHARS, PinResolution, TagIndex, extends_tag,
-    is_partial_semver_shaped, markdown_code_span, position_in_range, redact_name_for_diagnostic,
-    sanitize_and_truncate_for_diagnostic, short_sha,
+    CommitSha, LineOffsetTable, MAX_DIAGNOSTIC_VALUE_CHARS, PinResolution, TagIndex,
+    byte_span_to_range, extends_tag, is_partial_semver_shaped, markdown_code_span,
+    position_in_range, redact_name_for_diagnostic, sanitize_and_truncate_for_diagnostic, short_sha,
 };
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::github::normalize_tag;
 use crate::position::{Position, Range};
 use crate::{ConcreteVersion, PackageName};
+
+#[cfg(feature = "lsp-responses")]
+use super::single_file_edit;
+#[cfg(feature = "lsp-responses")]
+use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, WorkspaceEdit};
 
 /// Stable [`Diagnostic::code`] of the SHA-comment-mismatch diagnostic (issue #1722), shared
 /// by every ecosystem that emits it.
@@ -65,6 +70,18 @@ impl CommentTag {
             .chars()
             .any(|c| c.is_whitespace() || c.is_control() || c == '#');
         (safe && is_partial_semver_shaped(text)).then(|| Self(text.to_string()))
+    }
+
+    /// Whether the tag is a full `major.minor.patch` version (`v4.2.0`, `4.2.0-rc.1`), as
+    /// opposed to a moving alias such as `v4` or `v4.2`.
+    ///
+    /// Only a full version is a claim about one commit; an alias legitimately drifts, so it can
+    /// never be contradicted by the tag index. The index matches such a comment by version, so
+    /// `# 4.3.1` is checked against the tag `v4.3.1` (a listed tag is required; a version the
+    /// index does not list stays unverifiable).
+    #[must_use]
+    pub(crate) fn is_full_version(&self) -> bool {
+        semver::Version::parse(normalize_tag(&self.0)).is_ok()
     }
 
     fn is_printable_ascii(&self) -> bool {
@@ -214,6 +231,8 @@ pub enum CommentRemainder {
 pub struct ShaPinComment {
     /// The tag the comment names.
     pub tag: CommentTag,
+    /// LSP range of the tag token alone, excluding the `#` and surrounding blanks.
+    pub tag_range: Range,
     /// The closing quote/flow `}` between the SHA and the `#`.
     pub closing: ClosingDelimiters,
     /// What follows the tag token; the pin's range ends at the token, so a rewrite that
@@ -222,12 +241,28 @@ pub struct ShaPinComment {
 }
 
 impl ShaPinComment {
-    /// A comment naming `tag` after `closing`, assumed to be followed by more text (the
-    /// conservative choice, see [`CommentRemainder::Text`]).
+    /// A comment naming `tag` at `tag_range` after `closing`, assumed to be followed by more
+    /// text (the conservative choice, see [`CommentRemainder::Text`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{ClosingDelimiters, CommentTag, ShaPinComment};
+    /// use deps_core::position::{Position, Range};
+    ///
+    /// let range = Range::new(Position::new(0, 47), Position::new(0, 53));
+    /// let comment = ShaPinComment::new(
+    ///     CommentTag::parse("v4.2.0").unwrap(),
+    ///     ClosingDelimiters::default(),
+    ///     range,
+    /// );
+    /// assert_eq!(comment.tag_range, range);
+    /// ```
     #[must_use]
-    pub const fn new(tag: CommentTag, closing: ClosingDelimiters) -> Self {
+    pub const fn new(tag: CommentTag, closing: ClosingDelimiters, tag_range: Range) -> Self {
         Self {
             tag,
+            tag_range,
             closing,
             remainder: CommentRemainder::Text,
         }
@@ -414,6 +449,48 @@ fn comment_remainder(rest: &str, token_end: usize, window: WindowCoverage) -> Co
     }
 }
 
+fn comment_slot(is_plain_scalar: bool, is_last_on_line: bool) -> CommentSlot {
+    if is_plain_scalar && is_last_on_line {
+        CommentSlot::Appendable
+    } else {
+        CommentSlot::Unavailable
+    }
+}
+
+/// Whether a `# tag` comment may be appended after a ref ending at `ref_end` on its
+/// 1-indexed `line`: [`CommentSlot::Appendable`] only for a plain scalar that is last on its
+/// line.
+///
+/// The same rule [`read_sha_pin_tail`] applies to a SHA pin without a comment, exposed for a
+/// ref that is not yet a SHA (a tag a quickfix is about to convert to one).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{CommentSlot, LineOffsetTable, comment_slot_after};
+///
+/// let content = "ref: v4\n";
+/// let table = LineOffsetTable::new(content);
+/// assert_eq!(comment_slot_after(content, &table, 7, 1, true), CommentSlot::Appendable);
+/// assert_eq!(comment_slot_after(content, &table, 7, 1, false), CommentSlot::Unavailable);
+/// let flow = "{ref: v4, x: 1}\n";
+/// let table = LineOffsetTable::new(flow);
+/// assert_eq!(comment_slot_after(flow, &table, 8, 1, true), CommentSlot::Unavailable);
+/// ```
+#[must_use]
+pub fn comment_slot_after(
+    content: &str,
+    line_table: &LineOffsetTable,
+    ref_end: usize,
+    line: usize,
+    is_plain_scalar: bool,
+) -> CommentSlot {
+    comment_slot(
+        is_plain_scalar,
+        ref_is_last_on_line(content, line_table, ref_end, line),
+    )
+}
+
 /// Reads what follows a full SHA ending at `ref_end` on its 1-indexed `line`.
 ///
 /// A comment is read only when nothing but closing delimiters sits between the SHA and the
@@ -460,19 +537,19 @@ pub fn read_sha_pin_tail(
         })
     };
     match comment {
-        Some((tag, token_end)) => ShaPinTailRead {
-            tail: ShaPinTail::Commented(
-                ShaPinComment::new(tag, closing)
-                    .with_remainder(comment_remainder(rest, token_end, window)),
-            ),
-            range_end: ref_end + token_end,
-        },
+        Some((tag, token_end)) => {
+            let end = ref_end + token_end;
+            let tag_range = byte_span_to_range(content, line_table, end - tag.as_str().len(), end);
+            ShaPinTailRead {
+                tail: ShaPinTail::Commented(
+                    ShaPinComment::new(tag, closing, tag_range)
+                        .with_remainder(comment_remainder(rest, token_end, window)),
+                ),
+                range_end: end,
+            }
+        }
         None => ShaPinTailRead {
-            tail: ShaPinTail::Bare(if is_plain_scalar && is_last {
-                CommentSlot::Appendable
-            } else {
-                CommentSlot::Unavailable
-            }),
+            tail: ShaPinTail::Bare(comment_slot(is_plain_scalar, is_last)),
             range_end: ref_end,
         },
     }
@@ -550,6 +627,9 @@ pub enum CommentMismatch {
         /// The tag that does point at the SHA.
         actual: ConcreteVersion,
     },
+    /// The index is truncated and lacks the SHA, but maps the comment's full-version tag to a
+    /// different commit.
+    CommentNamesOtherCommit,
 }
 
 /// Whether a `# comment` names `actual`: equal ignoring the `v`/`V` prefix, or a shorter
@@ -567,7 +647,8 @@ impl CommentCheck {
     /// Partial-precision comments (`# v4` over `v4.3.1`) agree when the SHA's most specific
     /// tag extends the comment; `tag_to_sha["v4"]` is not compared for that case since moving
     /// majors legitimately drift. A cold or empty index, or a SHA absent from a truncated
-    /// one, is [`Self::Unverifiable`] rather than a mismatch.
+    /// one, is [`Self::Unverifiable`] rather than a mismatch, unless the truncated index maps
+    /// a full-version comment to another commit ([`CommentMismatch::CommentNamesOtherCommit`]).
     ///
     /// # Examples
     ///
@@ -575,10 +656,17 @@ impl CommentCheck {
     /// use deps_core::lsp_helpers::{
     ///     CommentCheck, CommentTag, ClosingDelimiters, CommitSha, ShaPinComment, TagIndex,
     /// };
+    /// use deps_core::position::Range;
     ///
     /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
     /// let index = TagIndex::from_tags([("v4.2.0", &sha)]);
-    /// let comment = |tag| ShaPinComment::new(CommentTag::parse(tag).unwrap(), ClosingDelimiters::default());
+    /// let comment = |tag| {
+    ///     ShaPinComment::new(
+    ///         CommentTag::parse(tag).unwrap(),
+    ///         ClosingDelimiters::default(),
+    ///         Range::default(),
+    ///     )
+    /// };
     /// assert_eq!(
     ///     CommentCheck::evaluate(Some(&index), &sha, Some(&comment("v4"))),
     ///     CommentCheck::Confirmed
@@ -609,7 +697,7 @@ impl CommentCheck {
         {
             return Self::Confirmed;
         }
-        match index.pin_resolution(sha) {
+        match index.pin_resolution(sha, Some(&comment.tag)) {
             PinResolution::Resolved(pin)
                 if comment_names_tag(commented, pin.version().as_str()) =>
             {
@@ -619,6 +707,9 @@ impl CommentCheck {
                 actual: pin.version().clone(),
             }),
             PinResolution::Untagged => Self::Mismatch(CommentMismatch::ShaNotInIndex),
+            PinResolution::CommentContradicted => {
+                Self::Mismatch(CommentMismatch::CommentNamesOtherCommit)
+            }
             PinResolution::Unresolved => Self::Unverifiable,
         }
     }
@@ -675,6 +766,9 @@ pub fn sha_comment_mismatch_diagnostic(
             "{name}: SHA {sha} is not the commit of any release tag; the comment \
              names `{comment}`"
         ),
+        CommentMismatch::CommentNamesOtherCommit => {
+            format!("{name}: SHA {sha} is not the commit of `{comment}` named in the comment")
+        }
     };
     Diagnostic::new(range, message)
         .with_severity(severity)
@@ -711,7 +805,84 @@ pub fn sha_comment_mismatch_hover_line(
         CommentMismatch::ShaNotInIndex => format!(
             "**Warning**: SHA {sha} is not the commit of any release tag; comment says {comment}"
         ),
+        CommentMismatch::CommentNamesOtherCommit => {
+            format!("**Warning**: SHA {sha} is not the commit of {comment} named in the comment")
+        }
     }
+}
+
+/// Builds the "Correct version comment" quickfix (#1734) for the SHA pin spanning
+/// `version_range` whose trailing `# tag` comment names a different tag than the one the
+/// pinned commit carries.
+///
+/// The edit replaces only the comment's tag token with the registry-confirmed tag, so the
+/// written SHA casing, closing delimiters, and spacing are untouched. `None` unless `mismatch`
+/// is [`CommentMismatch::ShaIsOtherTag`]: [`CommentMismatch::ShaNotInIndex`] and
+/// [`CommentMismatch::CommentNamesOtherCommit`] name no tag to offer.
+///
+/// The tag text comes from the registry's tag list, so it is offered only when the parser would
+/// read it back as a comment tag and sanitization leaves it unchanged (no invisible or bidi
+/// characters, within the length cap). A comment token with trailing punctuation (`v4-beta,`)
+/// is left alone: the corrected token would no longer parse as a comment tag, hiding the
+/// warning without confirming the pin.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::ConcreteVersion;
+/// use deps_core::lsp_helpers::{
+///     ClosingDelimiters, CommentMismatch, CommentTag, ShaPinComment, build_sha_comment_fix_action,
+/// };
+/// use deps_core::position::{Position, Range};
+///
+/// let uri = url::Url::parse("file:///repo/ci.yml").unwrap();
+/// let tag_range = Range::new(Position::new(0, 47), Position::new(0, 49));
+/// let comment = ShaPinComment::new(
+///     CommentTag::parse("v3").unwrap(),
+///     ClosingDelimiters::default(),
+///     tag_range,
+/// );
+/// let range = Range::new(Position::new(0, 6), Position::new(0, 49));
+/// let mismatch = CommentMismatch::ShaIsOtherTag { actual: ConcreteVersion::new("v4.2.0") };
+/// let action = build_sha_comment_fix_action(&uri, range, &comment, &mismatch).unwrap();
+/// assert_eq!(action.title, "Correct version comment to `v4.2.0`");
+/// assert!(build_sha_comment_fix_action(&uri, range, &comment, &CommentMismatch::ShaNotInIndex).is_none());
+/// ```
+#[cfg(feature = "lsp-responses")]
+#[must_use]
+pub fn build_sha_comment_fix_action(
+    uri: &url::Url,
+    version_range: Range,
+    comment: &ShaPinComment,
+    mismatch: &CommentMismatch,
+) -> Option<CodeAction> {
+    let CommentMismatch::ShaIsOtherTag { actual } = mismatch else {
+        return None;
+    };
+    let actual = actual.as_str();
+    if !is_partial_semver_shaped(actual)
+        || sanitize_for_message(actual) != actual
+        || comment
+            .tag
+            .as_str()
+            .ends_with(|c: char| c.is_ascii_punctuation())
+    {
+        return None;
+    }
+    let changes = single_file_edit(uri, comment.tag_range, actual.to_string());
+    Some(CodeAction {
+        title: format!("Correct version comment to `{actual}`"),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        data: Some(serde_json::json!({
+            "diagnostic_codes": [SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE],
+            "diagnostic_range": tower_lsp_server::ls_types::Range::from(version_range),
+        })),
+        ..Default::default()
+    })
 }
 
 /// Whether `position` lies inside a SHA pin's `range` but past the end of the SHA itself.
@@ -760,6 +931,7 @@ mod tests {
         ShaPinComment::new(
             CommentTag::parse(tag).unwrap(),
             ClosingDelimiters::parse(closing, style),
+            Range::default(),
         )
         .with_remainder(CommentRemainder::Empty)
     }
@@ -783,6 +955,118 @@ mod tests {
         ] {
             assert!(CommentTag::parse(bad).is_none(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn test_comment_tag_is_full_version() {
+        for full in ["v4.2.0", "V4.2.0", "4.2.0", "v4.2.0-rc.1", "v1.0.0+build"] {
+            assert!(CommentTag::parse(full).unwrap().is_full_version(), "{full}");
+        }
+        for alias in ["v4", "v4.2", "v4-beta", "v2.1-rc"] {
+            assert!(
+                !CommentTag::parse(alias).unwrap().is_full_version(),
+                "{alias}"
+            );
+        }
+    }
+
+    fn truncated_index_1762() -> TagIndex {
+        TagIndex::from_tags([("v4.2.0", &sha('b'))]).with_coverage(ListCoverage::Truncated)
+    }
+
+    #[test]
+    fn test_comment_check_truncated_index_contradicted_comment_is_mismatch() {
+        let index = truncated_index_1762();
+        let check = |tag: &str| {
+            CommentCheck::evaluate(
+                Some(&index),
+                &sha('a'),
+                Some(&comment(tag, "", TScalarStyle::Plain)),
+            )
+        };
+        assert_eq!(
+            check("v4.2.0"),
+            CommentCheck::Mismatch(CommentMismatch::CommentNamesOtherCommit)
+        );
+        for variant in ["4.2.0", "V4.2.0", "v4.2.0+build"] {
+            assert_eq!(
+                check(variant),
+                CommentCheck::Mismatch(CommentMismatch::CommentNamesOtherCommit),
+                "{variant}"
+            );
+        }
+        for benign in ["v4", "v9.9.9"] {
+            assert_eq!(check(benign), CommentCheck::Unverifiable, "{benign}");
+        }
+        assert_eq!(
+            CommentCheck::evaluate(
+                Some(&index),
+                &sha('b'),
+                Some(&comment("v4.2.0", "", TScalarStyle::Plain))
+            ),
+            CommentCheck::Confirmed
+        );
+    }
+
+    #[test]
+    fn test_comment_names_other_commit_message_and_hover() {
+        let name = PackageName::new("a/b");
+        let tag = CommentTag::parse("v4.2.0").unwrap();
+        let diagnostic = sha_comment_mismatch_diagnostic(
+            Range::default(),
+            &name,
+            &sha('a'),
+            &tag,
+            &CommentMismatch::CommentNamesOtherCommit,
+            Severity::Warning,
+        );
+        assert_eq!(
+            diagnostic.code(),
+            Some(SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE)
+        );
+        assert!(diagnostic.message().contains("`v4.2.0`"));
+        assert!(
+            diagnostic
+                .message()
+                .contains("is not the commit of `v4.2.0`")
+        );
+        let hover = sha_comment_mismatch_hover_line(
+            &sha('a'),
+            &tag,
+            &CommentMismatch::CommentNamesOtherCommit,
+        );
+        assert!(hover.starts_with("**Warning**"));
+        assert!(hover.contains("v4.2.0"));
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_build_sha_comment_fix_action_offers_only_a_clean_other_tag() {
+        let uri = url::Url::parse("file:///repo/ci.yml").unwrap();
+        let range = Range::new(Position::new(0, 6), Position::new(0, 60));
+        let other = |tag: &str| CommentMismatch::ShaIsOtherTag {
+            actual: ConcreteVersion::new(tag),
+        };
+        let stale = comment("v3", "", TScalarStyle::Plain);
+        let action = build_sha_comment_fix_action(&uri, range, &stale, &other("v4.2.0")).unwrap();
+        assert_eq!(action.title, "Correct version comment to `v4.2.0`");
+        for refused in [
+            CommentMismatch::ShaNotInIndex,
+            CommentMismatch::CommentNamesOtherCommit,
+            other("stable"),
+            other("v4\u{202e}"),
+        ] {
+            assert!(
+                build_sha_comment_fix_action(&uri, range, &stale, &refused).is_none(),
+                "{refused:?}"
+            );
+        }
+        let punctuated = ShaPinComment::new(
+            CommentTag::parse("v4-beta,").unwrap(),
+            ClosingDelimiters::default(),
+            Range::default(),
+        );
+        assert!(build_sha_comment_fix_action(&uri, range, &punctuated, &other("v4.2.0")).is_none());
     }
 
     #[test]
@@ -818,12 +1102,53 @@ mod tests {
         let read = read(&content, TScalarStyle::Plain, true, 5 + 40);
         assert_eq!(
             read.tail,
-            ShaPinTail::Commented(comment("v4.2.0", "", TScalarStyle::Plain))
+            ShaPinTail::Commented(ShaPinComment {
+                tag_range: Range::new(Position::new(0, 48), Position::new(0, 54)),
+                ..comment("v4.2.0", "", TScalarStyle::Plain)
+            })
         );
         assert_eq!(
             content.get(5..read.range_end).unwrap(),
             format!("{s} # v4.2.0")
         );
+    }
+
+    #[test]
+    fn test_read_tail_tag_range_counts_utf16_units() {
+        let s = "a".repeat(40);
+        let content = format!("😀: {s} # v4.2.0\n");
+        let read = read(&content, TScalarStyle::Plain, true, 4 + 2 + 40);
+        assert_eq!(
+            read.tail.comment().unwrap().tag_range,
+            Range::new(Position::new(0, 47), Position::new(0, 53))
+        );
+    }
+
+    #[test]
+    fn test_comment_slot_after_matches_read_tail_slot() {
+        let s = "a".repeat(40);
+        for (content, style, plain, ref_end) in [
+            (format!("ref: {s}\n"), TScalarStyle::Plain, true, 45),
+            (
+                format!("ref: \"{s}\"\n"),
+                TScalarStyle::DoubleQuoted,
+                false,
+                46,
+            ),
+            (
+                format!("{{ref: {s}, x: 1}}\n"),
+                TScalarStyle::Plain,
+                true,
+                46,
+            ),
+        ] {
+            let table = LineOffsetTable::new(&content);
+            assert_eq!(
+                ShaPinTail::Bare(comment_slot_after(&content, &table, ref_end, 1, plain)),
+                read(&content, style, plain, ref_end).tail,
+                "{content:?}"
+            );
+        }
     }
 
     #[test]
@@ -844,7 +1169,10 @@ mod tests {
         let read_double = read(&double, TScalarStyle::DoubleQuoted, false, 6 + 40);
         assert_eq!(
             read_double.tail,
-            ShaPinTail::Commented(comment("v4", "\"", TScalarStyle::DoubleQuoted))
+            ShaPinTail::Commented(ShaPinComment {
+                tag_range: Range::new(Position::new(0, 50), Position::new(0, 52)),
+                ..comment("v4", "\"", TScalarStyle::DoubleQuoted)
+            })
         );
         assert_eq!(
             double.get(6..read_double.range_end).unwrap(),

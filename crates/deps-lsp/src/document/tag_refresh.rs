@@ -3,9 +3,13 @@
 //! A floating tag pin (`@v4`) is rescanned after a registry fetch only for the document whose
 //! fetch refreshed the tag index. An ecosystem that exposes
 //! [`Ecosystem::tag_index_refreshes`] emits the repository name on every refresh, from any
-//! source (lifecycle fetch, completion), and the listener here re-evaluates the OSV scan-plan
-//! predicate ([`rescan_osv_if_tag_index_now_warm`]) for every other open document that uses
-//! that repository.
+//! source (lifecycle fetch, completion), and the listener here, for every other open document
+//! that uses that repository, re-evaluates the OSV scan-plan predicate
+//! ([`rescan_osv_if_tag_index_now_warm`], which applies the vulnerability/offline gate itself)
+//! and then republishes the document's diagnostics whatever the rescan did, since a refreshed
+//! tag index changes diagnostics that never depended on OSV (a SHA pin's comment check, a tag
+//! pin's status). A sweep that leaves a republished document without a refresh requests one
+//! inlay hint and code lens refresh.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -74,28 +78,26 @@ fn affected_documents(
         .collect()
 }
 
-/// Runs `rescan` over every affected document with bounded concurrency, returning how many
-/// reported [`RescanOutcome::Rescanned`].
+/// Runs `rescan` over every affected document with bounded concurrency, returning whether any
+/// republished document (not panicked, not mid-load or closed) still needs a hint and code
+/// lens refresh, i.e. reported [`RescanOutcome::Unchanged`]: a [`RescanOutcome::Rescanned`]
+/// document already requested its own.
 ///
-/// Skipped entirely while the OSV latest-check is disabled or the server is offline, the same
-/// gate [`rescan_osv_if_tag_index_now_warm`] applies per document, checked live so a setting
-/// change is honored.
+/// Not gated on the OSV latest-check: the per-document job decides what the gate skips, so
+/// diagnostics are republished even with vulnerabilities disabled or while offline.
 async fn sweep<F, Fut>(
     state: &ServerState,
     ecosystem: EcosystemId,
     refreshed: &RefreshedRepos,
     rescan: F,
-) -> usize
+) -> bool
 where
     F: Fn(Uri) -> Fut,
     Fut: Future<Output = RescanOutcome> + Send + 'static,
 {
-    if !state.is_osv_latest_check_enabled() {
-        return 0;
-    }
     let uris = affected_documents(state, ecosystem, refreshed);
     if uris.is_empty() {
-        return 0;
+        return false;
     }
     tracing::debug!(
         documents = uris.len(),
@@ -106,17 +108,20 @@ where
     // dropping the set (listener abort on shutdown) aborts the in-flight rescans.
     let mut in_flight = JoinSet::new();
     let mut pending = uris.into_iter();
-    let mut rescanned = 0;
+    let mut needs_refresh = false;
     loop {
         while in_flight.len() < RESCAN_CONCURRENCY
             && let Some(uri) = pending.next()
         {
-            in_flight.spawn(rescan(uri));
+            let job = rescan(uri.clone());
+            in_flight.spawn(async move { (uri, job.await) });
         }
         match in_flight.join_next().await {
-            None => return rescanned,
-            Some(Ok(RescanOutcome::Rescanned)) => rescanned += 1,
-            Some(Ok(RescanOutcome::Unchanged)) => {}
+            None => return needs_refresh,
+            Some(Ok((uri, RescanOutcome::Unchanged))) if is_publishable(state, &uri) => {
+                needs_refresh = true;
+            }
+            Some(Ok(_)) => {}
             Some(Err(e)) if e.is_panic() => {
                 tracing::error!(
                     "tag-refresh rescan panicked ({e}); that document is rescanned on its own \
@@ -129,7 +134,8 @@ where
 }
 
 /// Drains `refreshes`, coalescing events over [`COALESCE_WINDOW`], and calls `rescan` for the
-/// affected documents of each batch. Returns when the channel closes.
+/// affected documents of each batch, then `after_sweep` once when the batch left at least one
+/// republished document without a hint and code lens refresh. Returns when the channel closes.
 ///
 /// A document whose own fetch is in flight (including the one whose fetch caused the event)
 /// may be scanned twice, and the older scan's commit can land last. That is accepted: the
@@ -140,6 +146,7 @@ async fn drain_refreshes<F, Fut>(
     ecosystem: EcosystemId,
     mut refreshes: TagIndexRefreshes,
     rescan: F,
+    after_sweep: impl Fn(),
 ) where
     F: Fn(Uri) -> Fut + Send + Sync,
     Fut: Future<Output = RescanOutcome> + Send + 'static,
@@ -163,15 +170,43 @@ async fn drain_refreshes<F, Fut>(
                 }
             }
         }
-        sweep(state, ecosystem, &pending, &rescan).await;
+        if sweep(state, ecosystem, &pending, &rescan).await {
+            after_sweep();
+        }
         if closed {
             return;
         }
     }
 }
 
-/// Listener for one ecosystem: rescans affected documents and republishes their diagnostics
-/// (the rescan itself already requests inlay hint and code lens refreshes).
+/// Whether `uri` is open and not mid-load.
+///
+/// A document still loading yields no diagnostics, so publishing for it would wipe the ones
+/// already shown; it publishes after its own load completes.
+fn is_publishable(state: &ServerState, uri: &Uri) -> bool {
+    state
+        .with_document(uri, |doc| {
+            doc.loading_state() != crate::document::LoadingState::Loading
+        })
+        .unwrap_or(false)
+}
+
+/// Awaits `rescan`, then `publish` unless the document is mid-load, whatever the rescan did.
+async fn rescan_then_republish(
+    state: &ServerState,
+    uri: &Uri,
+    rescan: impl Future<Output = RescanOutcome>,
+    publish: impl Future<Output = ()>,
+) -> RescanOutcome {
+    let outcome = rescan.await;
+    if is_publishable(state, uri) {
+        publish.await;
+    }
+    outcome
+}
+
+/// Listener for one ecosystem: rescans affected documents, republishes their diagnostics and,
+/// once per sweep, requests inlay hint and code lens refreshes.
 async fn run_listener(
     state: Arc<ServerState>,
     client: Client,
@@ -179,31 +214,40 @@ async fn run_listener(
     ecosystem: Arc<dyn Ecosystem>,
     refreshes: TagIndexRefreshes,
 ) {
-    drain_refreshes(&state, ecosystem.ecosystem_id(), refreshes, |uri| {
-        let state = Arc::clone(&state);
-        let client = client.clone();
-        let config = Arc::clone(&config);
-        let ecosystem = Arc::clone(&ecosystem);
-        async move {
-            let snapshot = DiagnosticsSnapshot::from_config(&*config.read().await);
-            let outcome = rescan_osv_if_tag_index_now_warm(
-                &uri,
-                &state,
-                &client,
-                &ecosystem,
-                snapshot.fetch_timeout_secs,
-            )
-            .await;
-            if outcome == RescanOutcome::Rescanned {
-                let dep_count = diagnostics::document_dependency_count(&state, &uri);
-                diagnostics::publish_document_diagnostics(
-                    &state, &client, &uri, &snapshot, dep_count,
+    drain_refreshes(
+        &state,
+        ecosystem.ecosystem_id(),
+        refreshes,
+        |uri| {
+            let state = Arc::clone(&state);
+            let client = client.clone();
+            let config = Arc::clone(&config);
+            let ecosystem = Arc::clone(&ecosystem);
+            async move {
+                let snapshot = DiagnosticsSnapshot::from_config(&*config.read().await);
+                rescan_then_republish(
+                    &state,
+                    &uri,
+                    rescan_osv_if_tag_index_now_warm(
+                        &uri,
+                        &state,
+                        &client,
+                        &ecosystem,
+                        snapshot.fetch_timeout_secs,
+                    ),
+                    async {
+                        let dep_count = diagnostics::document_dependency_count(&state, &uri);
+                        diagnostics::publish_document_diagnostics(
+                            &state, &client, &uri, &snapshot, dep_count,
+                        )
+                        .await;
+                    },
                 )
-                .await;
+                .await
             }
-            outcome
-        }
-    })
+        },
+        || state.spawn_refresh_requests(&client),
+    )
     .await;
 }
 
@@ -420,15 +464,15 @@ mod tests {
         .await;
         let seen = Arc::default();
 
-        let rescanned = sweep(
+        let needs_refresh = sweep(
             &state,
             EcosystemId::GithubActions,
             &RefreshedRepos::Only(HashSet::from([PackageName::new("o/shared")])),
-            counting_rescan(&seen, RescanOutcome::Rescanned),
+            counting_rescan(&seen, RescanOutcome::Unchanged),
         )
         .await;
 
-        assert_eq!(rescanned, 1);
+        assert!(needs_refresh);
         assert_eq!(*seen.lock().unwrap(), vec![peer]);
     }
 
@@ -467,22 +511,136 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty());
     }
 
+    /// #1761: the OSV gate lives inside the per-document rescan, so a sweep still visits every
+    /// affected document with vulnerabilities disabled.
     #[tokio::test]
-    async fn sweep_respects_the_osv_latest_check_gate() {
+    async fn sweep_visits_documents_while_the_osv_latest_check_is_disabled() {
         let state = ServerState::new();
         open_document(&state, "/a/.github/workflows/a.yml", &workflow("o/one")).await;
         state.set_osv_latest_check_enabled(false);
         let seen = Arc::default();
 
-        sweep(
+        let visited = sweep(
             &state,
             EcosystemId::GithubActions,
             &RefreshedRepos::All,
-            counting_rescan(&seen, RescanOutcome::Rescanned),
+            counting_rescan(&seen, RescanOutcome::Unchanged),
         )
         .await;
 
-        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(visited);
+    }
+
+    async fn run(state: &ServerState, outcome: RescanOutcome) -> bool {
+        sweep(
+            state,
+            EcosystemId::GithubActions,
+            &RefreshedRepos::All,
+            counting_rescan(&Arc::default(), outcome),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn sweep_counts_neither_rescanned_nor_loading_documents_as_needing_a_refresh() {
+        let state = ServerState::new();
+        let a = open_document(&state, "/a/.github/workflows/a.yml", &workflow("o/one")).await;
+        let b = open_document(&state, "/b/.github/workflows/b.yml", &workflow("o/two")).await;
+
+        assert!(!run(&state, RescanOutcome::Rescanned).await);
+        assert!(run(&state, RescanOutcome::Unchanged).await);
+        state.documents.get_mut(&a).unwrap().set_loading();
+        assert!(run(&state, RescanOutcome::Unchanged).await);
+        state.documents.get_mut(&b).unwrap().set_loading();
+        assert!(!run(&state, RescanOutcome::Unchanged).await);
+    }
+
+    async fn republish_count(state: &ServerState, uri: &Uri, outcome: RescanOutcome) -> usize {
+        let published = AtomicUsize::new(0);
+        let returned = rescan_then_republish(state, uri, std::future::ready(outcome), async {
+            published.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(returned, outcome);
+        published.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn republish_happens_for_unchanged_and_rescanned_outcomes() {
+        let state = ServerState::new();
+        let uri = open_document(&state, "/a/.github/workflows/a.yml", &workflow("o/one")).await;
+        for outcome in [RescanOutcome::Unchanged, RescanOutcome::Rescanned] {
+            assert_eq!(republish_count(&state, &uri, outcome).await, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn republish_happens_while_offline_or_vulnerabilities_are_disabled() {
+        let state = ServerState::new();
+        let uri = open_document(&state, "/a/.github/workflows/a.yml", &workflow("o/one")).await;
+        state.set_osv_latest_check_enabled(false);
+        assert_eq!(
+            republish_count(&state, &uri, RescanOutcome::Unchanged).await,
+            1
+        );
+    }
+
+    /// M1: publishing for a loading document would wipe its diagnostics.
+    #[tokio::test]
+    async fn republish_skips_a_loading_or_closed_document() {
+        let state = ServerState::new();
+        let uri = open_document(&state, "/a/.github/workflows/a.yml", &workflow("o/one")).await;
+        state.documents.get_mut(&uri).unwrap().set_loading();
+        assert_eq!(
+            republish_count(&state, &uri, RescanOutcome::Unchanged).await,
+            0
+        );
+
+        let closed = deps_core::test_util::test_uri("/never/.github/workflows/x.yml");
+        let closed = crate::lsp_types_interop::to_lsp_uri(&closed);
+        assert_eq!(
+            republish_count(&state, &closed, RescanOutcome::Rescanned).await,
+            0
+        );
+    }
+
+    /// Drains one batch of refresh events for `repos`, returning how many `after_sweep` calls it made.
+    async fn drain_refresh_calls(state: &ServerState, repos: &[&str]) -> usize {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let refreshes = AtomicUsize::new(0);
+        for repo in repos {
+            tx.send(PackageName::new(*repo)).unwrap();
+        }
+        drop(tx);
+        drain_refreshes(
+            state,
+            EcosystemId::GithubActions,
+            rx,
+            counting_rescan(&Arc::default(), RescanOutcome::Unchanged),
+            || {
+                refreshes.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        refreshes.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_requests_one_refresh_per_sweep_that_touched_a_document() {
+        let state = ServerState::new();
+        open_document(&state, "/a/.github/workflows/a.yml", &workflow("o/shared")).await;
+        open_document(&state, "/b/.github/workflows/b.yml", &workflow("o/shared")).await;
+
+        assert_eq!(
+            drain_refresh_calls(&state, &["o/shared", "o/unrelated"]).await,
+            1
+        );
+        assert_eq!(
+            drain_refresh_calls(&state, &["o/unrelated"]).await,
+            0,
+            "no document, no refresh"
+        );
     }
 
     #[tokio::test]
@@ -541,6 +699,7 @@ mod tests {
             EcosystemId::GithubActions,
             rx,
             counting_rescan(&seen, RescanOutcome::Unchanged),
+            || {},
         )
         .await;
 
@@ -564,6 +723,7 @@ mod tests {
             EcosystemId::GithubActions,
             rx,
             counting_rescan(&seen, RescanOutcome::Unchanged),
+            || {},
         )
         .await;
 
@@ -585,6 +745,7 @@ mod tests {
                     EcosystemId::GithubActions,
                     rx,
                     counting_rescan(&seen, RescanOutcome::Unchanged),
+                    || {},
                 )
                 .await;
             }
@@ -719,7 +880,7 @@ mod tests {
         open_document(&state, "/b/.github/workflows/b.yml", &workflow("o/two")).await;
         let calls = Arc::new(AtomicUsize::new(0));
 
-        let rescanned = sweep(
+        let needs_refresh = sweep(
             &state,
             EcosystemId::GithubActions,
             &RefreshedRepos::All,
@@ -730,14 +891,14 @@ mod tests {
                         calls.fetch_add(1, Ordering::SeqCst) != 0,
                         "injected rescan panic"
                     );
-                    RescanOutcome::Rescanned
+                    RescanOutcome::Unchanged
                 }
             },
         )
         .await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(rescanned, 1);
+        assert!(needs_refresh);
     }
 
     #[tokio::test(start_paused = true)]
@@ -748,13 +909,19 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
 
         let calls_in_rescan = Arc::clone(&calls);
-        let drain = drain_refreshes(&state, EcosystemId::GithubActions, rx, move |_uri| {
-            let calls = Arc::clone(&calls_in_rescan);
-            async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                panic!("injected rescan panic");
-            }
-        });
+        let drain = drain_refreshes(
+            &state,
+            EcosystemId::GithubActions,
+            rx,
+            move |_uri| {
+                let calls = Arc::clone(&calls_in_rescan);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    panic!("injected rescan panic");
+                }
+            },
+            || {},
+        );
         let producer = async {
             tx.send(PackageName::new("o/shared")).unwrap();
             tokio::time::sleep(COALESCE_WINDOW * 4).await;

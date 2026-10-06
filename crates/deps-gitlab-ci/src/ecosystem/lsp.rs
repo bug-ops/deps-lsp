@@ -13,7 +13,7 @@ use std::time::Duration;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit, WorkspaceEdit};
 
 use deps_core::PackageName;
-use deps_core::lsp_helpers::truncate_for_diagnostic;
+use deps_core::lsp_helpers::{CommentCheck, ShaPinTail, sha_pin_rewrite, truncate_for_diagnostic};
 
 use super::{
     GitlabCiDependency, GitlabCiFormatter, GitlabCiRegistry, MAX_DIAGNOSTIC_VALUE_CHARS,
@@ -49,7 +49,12 @@ impl deps_core::lsp_helpers::ShaPinning for GitlabCiFormatter {
             .version_req
             .as_ref()
             .map(deps_core::VersionReq::as_str)?;
-        let new_text = self.sha_pin_replacement_for(gl_dep.kind.endpoint(), &gl_dep.name, tag)?;
+        let new_text = self.sha_pin_replacement_for(
+            gl_dep.kind.endpoint(),
+            &gl_dep.name,
+            tag,
+            gl_dep.comment_slot,
+        )?;
         Some(deps_core::lsp_helpers::ResolvedShaPin {
             display_name: gl_dep.name.as_str().to_string(),
             version_range,
@@ -96,6 +101,34 @@ pub(super) fn build_sha_pin_action(
         uri,
         formatter,
         MUTABLE_REF_PIN_DIAGNOSTIC_CODE,
+    )
+}
+
+/// Builds the "Correct version comment" quickfix (#1734) for the SHA pin at `position` whose
+/// trailing `# tag` comment names a different tag than the one the pinned commit carries.
+///
+/// Locates the pin and its [`CommentCheck`] mismatch, then delegates to the shared
+/// [`deps_core::lsp_helpers::build_sha_comment_fix_action`], which offers a fix only for a
+/// comment naming another tag of the pinned commit.
+pub(super) fn build_sha_comment_fix_action(
+    parse_result: &dyn ParseResultTrait,
+    position: Position,
+    uri: &Url,
+    formatter: &GitlabCiFormatter,
+) -> Option<CodeAction> {
+    let dep = parse_result
+        .dependencies()
+        .into_iter()
+        .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
+    let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
+    let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gl_dep)? else {
+        return None;
+    };
+    deps_core::lsp_helpers::build_sha_comment_fix_action(
+        uri,
+        gl_dep.version_range?,
+        gl_dep.sha_comment()?,
+        &mismatch,
     )
 }
 
@@ -166,7 +199,11 @@ pub(super) async fn build_dynamic_component_pin_action(
         }
     };
 
-    let changes = deps_core::single_file_edit(uri, version_range, resolved.sha?.to_string());
+    let changes = deps_core::single_file_edit(
+        uri,
+        version_range,
+        dynamic_pin_replacement(gl_dep, &resolved)?,
+    );
 
     Some(CodeAction {
         title: format!(
@@ -184,6 +221,20 @@ pub(super) async fn build_dynamic_component_pin_action(
         })),
         ..Default::default()
     })
+}
+
+/// The text a `component:` `Latest`/`Partial` pin is rewritten to once `resolved` is known:
+/// the release's SHA with the release name as a trailing comment where the ref can take one.
+/// `None` when the release's SHA is unknown.
+fn dynamic_pin_replacement(
+    gl_dep: &GitlabCiDependency,
+    resolved: &crate::types::GitlabCiVersion,
+) -> Option<String> {
+    Some(sha_pin_rewrite(
+        &ShaPinTail::Bare(gl_dep.comment_slot),
+        resolved.sha.as_ref()?,
+        &resolved.version,
+    ))
 }
 
 /// Builds one [`TextEdit`] per mutable-ref dependency in `parse_result` resolvable to a
@@ -242,10 +293,9 @@ pub(super) fn bulk_sha_pin_text_edit_for(
             // `reconstitute_component_releases`); only a winner with a known SHA is safe
             // to splice into a `TextEdit` — `CommitSha` already guarantees full-SHA shape,
             // so no separate `is_full_sha` recheck is needed here.
-            let sha = resolved.sha?;
             Some(TextEdit {
                 range: version_range.into(),
-                new_text: sha.to_string(),
+                new_text: dynamic_pin_replacement(gl_dep, &resolved)?,
             })
         }
     }

@@ -1,7 +1,7 @@
 //! GitHub Actions dependency and version types.
 
 use deps_core::lsp_helpers::{
-    ClosingDelimiters, CommentSlot, CommitSha, ShaPinComment, ShaPinTail,
+    ClosingDelimiters, CommentSlot, CommentTag, CommitSha, ShaPinComment, ShaPinTail,
 };
 use deps_core::parser::DependencySource;
 use deps_core::position::Range;
@@ -56,17 +56,12 @@ pub enum PinStyle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShaComment {
     comment: ShaPinComment,
-    tag_range: Range,
     literal: String,
 }
 
 impl ShaComment {
-    pub(crate) const fn new(comment: ShaPinComment, tag_range: Range, literal: String) -> Self {
-        Self {
-            comment,
-            tag_range,
-            literal,
-        }
+    pub(crate) const fn new(comment: ShaPinComment, literal: String) -> Self {
+        Self { comment, literal }
     }
 
     /// The tag named by the comment (`v4.2.0`), without the `#`.
@@ -75,10 +70,16 @@ impl ShaComment {
         self.comment.tag.as_str()
     }
 
+    /// The tag named by the comment, as the validated shared type.
+    #[must_use]
+    pub const fn comment_tag(&self) -> &CommentTag {
+        &self.comment.tag
+    }
+
     /// LSP range of the tag token alone, excluding the `#` and surrounding blanks.
     #[must_use]
     pub const fn tag_range(&self) -> Range {
-        self.tag_range
+        self.comment.tag_range
     }
 
     /// The closing quote/flow closers between the SHA and the comment.
@@ -112,9 +113,9 @@ impl PinStyle {
                     deps_core::lsp_helpers::CommentTag::parse(tag)
                         .expect("test tag must be comment-shaped"),
                     ClosingDelimiters::default(),
+                    Range::default(),
                 )
                 .with_remainder(deps_core::lsp_helpers::CommentRemainder::Empty),
-                Range::default(),
                 format!("{sha} # {tag}"),
             )
         });
