@@ -30,6 +30,9 @@ status: moc
 | 078 | [[078-pnpm-workspace-catalog-editing/spec\|Open pnpm-workspace.yaml as a dependency file: hints, diagnostics, code actions for catalog entries]] | specify | draft — enhancement, P3, 9 open `[NEEDS CLARIFICATION]` items, issue #1788 |
 | 079 | [[079-toml-span-native-depth-limit/spec\|Reconcile the TOML nesting pre-scan with toml-span 0.7.2's native depth limit]] | specify | draft — research, P4, 8 open `[NEEDS CLARIFICATION]` items; bump-gated on the toml-span 0.7.2 lock bump (pre-scan must stay until it lands), issue #1789 |
 | 080 | [[080-gradle-deps-dev-maven-system-routing/spec\|Route Gradle through the deps.dev Maven system for supply-chain signal parity]] | specify | draft — research/parity, P4, 6 open `[NEEDS CLARIFICATION]` items |
+| 081 | [[081-wall-clock-test-assertions/spec\|Replace wall-clock bounds in linear-time tests with a load-independent check]] | specify | draft — testing-infra, P3, 7 open `[NEEDS CLARIFICATION]` items |
+| 082 | [[082-interactive-registry-await-failure-memo/spec\|Fail-fast interactive registry awaits: failure memo and bounded concurrency for hover and code actions]] | specify | bug/cross-ecosystem, P2 — draft, 7 open `[NEEDS CLARIFICATION]` items |
+| 083 | [[083-deps-cli-walk-hidden-file-manifests/spec\|deps-cli check never discovers a root-level .gitlab-ci.yml during a directory walk (hidden-file manifests skipped, CI gate fails open)]] | specify | bug, P1 — draft, 7 open `[NEEDS CLARIFICATION]` items |
 
 ## Completed Specs
 
