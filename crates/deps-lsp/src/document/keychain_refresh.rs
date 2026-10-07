@@ -79,6 +79,7 @@ pub(crate) type KeychainRefreshLifecycle =
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -144,10 +145,10 @@ mod tests {
         };
         lifecycle.start(spawn(&starts));
         lifecycle.start(spawn(&starts));
-        assert!(matches!(lifecycle, KeychainRefreshLifecycle::Running(_)));
+        assert_matches!(lifecycle, KeychainRefreshLifecycle::Running(_));
         lifecycle.stop();
         lifecycle.start(spawn(&starts));
-        assert!(matches!(lifecycle, KeychainRefreshLifecycle::Stopped));
+        assert_matches!(lifecycle, KeychainRefreshLifecycle::Stopped);
         assert_eq!(starts.load(Ordering::SeqCst), 1);
     }
 }

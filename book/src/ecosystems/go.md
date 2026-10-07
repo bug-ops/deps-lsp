@@ -109,6 +109,10 @@ dropped entry — a "skip on any failure" the user wrote is never silently
 narrowed to "skip only when not found" just because the hop in between
 turned out invalid.
 
+**Proxies.** Guarded traffic, including the `$GOENV` `GOPROXY` chain, connects directly and bypasses the
+system proxy by default; set `DEPS_LSP_WORKSPACE_REGISTRY_PROXY=proxy` to route it through
+the proxy (see [Proxies and guarded registry traffic](../configuration.md#proxies-and-guarded-registry-traffic)).
+
 **Reachability policy**: governed by the same `registries.workspace_registries`
 setting documented in [Cargo](cargo.md#customprivate-registries), including its
 [connect-time message](cargo.md#customprivate-registries) for a host that resolves to a blocked

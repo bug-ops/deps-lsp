@@ -43,6 +43,8 @@ deps-pypi = { version = "2.0.0", path ="crates/deps-pypi" }
 deps-swift = { version = "2.0.0", path ="crates/deps-swift" }
 dirs = "7.0.0"
 futures = "0.3"
+http = "1"
+hyper-util = "0.1"
 ignore = "0.4"
 insta = "1.48"
 ipnet = "2.12"

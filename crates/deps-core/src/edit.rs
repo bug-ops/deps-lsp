@@ -1055,7 +1055,6 @@ pub fn resolve_recommended_fix(
 /// `pub(crate)`: `deps-cli update --security-only` (#1329) used to call this directly to
 /// distinguish "no verified fix target" from [`plan_vulnerability_fix`]'s other `None` cause,
 /// but now matches on [`VulnFixSkip`] directly (#1350), so this no longer needs to be `pub`.
-// TODO(#1806): carry advisory ids as `OsvId` instead of `&str`.
 #[must_use]
 pub(crate) fn fix_target_is_verified(
     dv: &crate::osv::DependencyVulnerabilities,
@@ -1075,16 +1074,12 @@ pub(crate) fn fix_target_is_verified(
             if version != version_native || !advisory_ids.is_complete() {
                 return false;
             }
-            let known_ids: HashSet<&str> = dv
-                .advisories
-                .items()
-                .iter()
-                .map(|a| a.id().as_str())
-                .collect();
+            let known_ids: HashSet<&crate::osv::OsvId> =
+                dv.advisories.items().iter().map(|a| a.id()).collect();
             advisory_ids
                 .items()
                 .iter()
-                .all(|id| known_ids.contains(id.as_str()) && !fix.advisory_ids.contains(id))
+                .all(|id| known_ids.contains(id) && !fix.advisory_ids.contains(id))
         }
         UpgradeStatus::NotChecked
         | UpgradeStatus::CandidateUnverified { .. }
@@ -1647,6 +1642,7 @@ mod tests {
         use crate::lsp_helpers::PackageVersions;
         use crate::lsp_helpers::test_support::{MOCK_FORMATTER, MockDep, MockParseResult, pkg};
         use crate::{EcosystemId, PackageName};
+        use std::assert_matches;
         use std::collections::HashMap;
 
         fn dep(name: &str, req: &str, version_range: crate::position::Range) -> MockDep {
@@ -1711,13 +1707,13 @@ mod tests {
 
             let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
             assert_eq!(candidates.len(), 1);
-            assert!(matches!(
+            assert_matches!(
                 candidates[0],
                 UpdateCandidate::Unplannable {
                     reason: UnplannableReason::NonLiteralSpan,
                     ..
                 }
-            ));
+            );
             assert!(
                 collect_update_edits(&pr, content, versions, &MOCK_FORMATTER).is_empty(),
                 "an unplannable candidate must never reach collect_update_edits's writable subset"
@@ -1758,13 +1754,13 @@ mod tests {
 
             let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
             assert_eq!(candidates.len(), 1, "{candidates:?}");
-            assert!(matches!(
+            assert_matches!(
                 candidates[0],
                 UpdateCandidate::Unplannable {
                     reason: UnplannableReason::LatestFlaggedByOsv,
                     ..
                 }
-            ));
+            );
             assert!(
                 collect_update_edits(&pr, content, versions, &MOCK_FORMATTER).is_empty(),
                 "a flagged latest must never reach collect_update_edits's writable subset"
@@ -1787,13 +1783,13 @@ mod tests {
 
             let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
             assert_eq!(candidates.len(), 1, "{candidates:?}");
-            assert!(matches!(
+            assert_matches!(
                 candidates[0],
                 UpdateCandidate::Unplannable {
                     reason: UnplannableReason::LatestUnverified,
                     ..
                 }
-            ));
+            );
         }
 
         #[test]
@@ -1838,13 +1834,13 @@ mod tests {
 
             let candidates = collect_update_candidates(&pr, content, versions, &NoOpFormatter);
             assert_eq!(candidates.len(), 1);
-            assert!(matches!(
+            assert_matches!(
                 candidates[0],
                 UpdateCandidate::Unplannable {
                     reason: UnplannableReason::NoOpRewrite,
                     ..
                 }
-            ));
+            );
         }
 
         #[test]
@@ -1861,13 +1857,13 @@ mod tests {
 
             let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
             assert_eq!(candidates.len(), 1);
-            assert!(matches!(
+            assert_matches!(
                 candidates[0],
                 UpdateCandidate::Unplannable {
                     reason: UnplannableReason::UnsafeLatestVersion,
                     ..
                 }
-            ));
+            );
         }
 
         #[test]

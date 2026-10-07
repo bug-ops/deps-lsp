@@ -812,6 +812,7 @@ mod tests {
     #[cfg(feature = "lsp-responses")]
     mod lsp_tests {
         use super::*;
+        use std::assert_matches;
 
         // #794: `complete_package_names_for_field` (defined above in `impl MavenEcosystem`)
         // guards on the exact same `is_valid_completion_prefix_len` predicate
@@ -1124,8 +1125,9 @@ mod tests {
                 Position::new(0, cursor),
                 &NoopParseResult,
             );
-            assert!(
-                matches!(t, MavenXmlContext::SelfClosingVersion { .. }),
+            assert_matches!(
+                t,
+                MavenXmlContext::SelfClosingVersion { .. },
                 "expected SelfClosingVersion, got {t:?}"
             );
             assert_eq!(v, "<version/>");
@@ -1443,8 +1445,9 @@ mod tests {
                 Position::new(line_idx, cursor_col),
                 &parse_result,
             );
-            assert!(
-                matches!(ctx, MavenXmlContext::SelfClosingVersion { .. }),
+            assert_matches!(
+                ctx,
+                MavenXmlContext::SelfClosingVersion { .. },
                 "expected SelfClosingVersion, got {ctx:?}"
             );
 
@@ -2402,8 +2405,9 @@ mod tests {
 
             let (ctx, _, _) =
                 MavenEcosystem::detect_xml_context(xml, position, parse_result.as_ref());
-            assert!(
-                matches!(ctx, MavenXmlContext::SelfClosingVersion { .. }),
+            assert_matches!(
+                ctx,
+                MavenXmlContext::SelfClosingVersion { .. },
                 "expected SelfClosingVersion, got {ctx:?}"
             );
             assert!(

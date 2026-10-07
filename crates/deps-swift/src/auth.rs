@@ -350,7 +350,7 @@ impl SwiftCredentialSource {
     pub fn from_environment(platform: UserConfigPlatform) -> Option<Self> {
         Self::from_lookup(
             deps_core::secret::token_from_env,
-            dirs::home_dir().as_deref(),
+            deps_core::UserHome::current().map(deps_core::UserHome::path),
             platform,
         )
     }
@@ -475,6 +475,7 @@ pub(crate) fn bind_credential(
 mod tests {
     use super::*;
     use crate::config::RegistryTrust;
+    use std::assert_matches;
     use std::collections::HashMap;
 
     fn lookup<'a>(
@@ -591,15 +592,15 @@ mod tests {
         };
 
         let all = [(TOKEN_VAR, "t"), (NETRC_DATA_VAR, NETRC)];
-        assert!(matches!(
+        assert_matches!(
             pick(&all, Some(home)),
             Some(SwiftCredentialSource::Environment(_))
-        ));
+        );
         let data = [(NETRC_DATA_VAR, NETRC)];
-        assert!(matches!(
+        assert_matches!(
             pick(&data, Some(home)),
             Some(SwiftCredentialSource::NetrcData(_))
-        ));
+        );
         match pick(&[], Some(home)) {
             Some(SwiftCredentialSource::NetrcFile { path, .. }) => {
                 assert_eq!(path, home.join(".netrc"));
@@ -618,10 +619,7 @@ mod tests {
                 Some(Path::new("home")),
                 UserConfigPlatform::Other,
             );
-            assert!(matches!(
-                source,
-                Some(SwiftCredentialSource::NetrcFile { .. })
-            ));
+            assert_matches!(source, Some(SwiftCredentialSource::NetrcFile { .. }));
         });
         assert!(logs.contains(NETRC_DATA_VAR), "{logs}");
         assert!(!logs.contains("secret-user"), "{logs}");

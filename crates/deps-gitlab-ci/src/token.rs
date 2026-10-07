@@ -7,7 +7,7 @@
 use deps_core::net_policy::{IndexUrlError, RedactedUrl};
 use deps_core::secret::ApiToken;
 
-use crate::host::{GITLAB_COM_ORIGIN, GitlabHost};
+use crate::host::GitlabHost;
 
 /// Environment variable holding the `GITLAB_TOKEN` credential.
 pub const GITLAB_TOKEN_ENV: &str = "GITLAB_TOKEN";
@@ -16,7 +16,7 @@ pub const GITLAB_TOKEN_ENV: &str = "GITLAB_TOKEN";
 /// (a bare hostname, like `registries.gitlab_instance_host`). Unset means `gitlab.com`.
 pub const GITLAB_TOKEN_HOST_ENV: &str = "GITLAB_TOKEN_HOST";
 
-/// A `GITLAB_TOKEN` together with the only origin it may be attached to.
+/// A `GITLAB_TOKEN` together with the only host it may be attached to.
 ///
 /// Built once from the environment by [`Self::from_env`]; nothing a workspace file or editor
 /// setting supplies can alter it.
@@ -24,12 +24,12 @@ pub const GITLAB_TOKEN_HOST_ENV: &str = "GITLAB_TOKEN_HOST";
 pub(crate) enum TokenBinding {
     /// No `GITLAB_TOKEN` is configured.
     Absent,
-    /// The token may be sent to `origin` and nowhere else.
+    /// The token may be sent to `host` and nowhere else.
     Bound {
         /// The credential.
         token: ApiToken,
-        /// The ASCII-serialized origin the credential is bound to.
-        origin: String,
+        /// The host the credential is bound to.
+        host: GitlabHost,
     },
     /// A token is configured but `GITLAB_TOKEN_HOST` is invalid; the token is never sent, and
     /// never falls back to `gitlab.com`.
@@ -67,7 +67,7 @@ impl TokenBinding {
         let Some(raw) = host else {
             return Self::Bound {
                 token,
-                origin: GITLAB_COM_ORIGIN.to_string(),
+                host: GitlabHost::gitlab_com(),
             };
         };
         let parsed = if raw.ends_with('.') {
@@ -76,10 +76,7 @@ impl TokenBinding {
             GitlabHost::parse_trusted(raw)
         };
         match parsed {
-            Ok(host) => Self::Bound {
-                token,
-                origin: host.origin().to_string(),
-            },
+            Ok(host) => Self::Bound { token, host },
             Err(error) => {
                 tracing::warn!(
                     %error,
@@ -91,26 +88,31 @@ impl TokenBinding {
         }
     }
 
-    /// The token, only when `host` is the bound origin.
+    /// The token, only when `host` is the bound host.
     pub(crate) fn token_for(&self, host: &GitlabHost) -> Option<&ApiToken> {
-        self.token_for_origin(host.origin())
+        match self {
+            Self::Absent | Self::Disabled => None,
+            Self::Bound { token, host: bound } => (bound == host).then_some(token),
+        }
     }
 
     /// The token, only when `origin` is the bound origin.
     pub(crate) fn token_for_origin(&self, origin: &str) -> Option<&ApiToken> {
         match self {
             Self::Absent | Self::Disabled => None,
-            Self::Bound {
-                token,
-                origin: bound,
-            } => (bound == origin).then_some(token),
+            Self::Bound { token, host } => (host.origin() == origin).then_some(token),
         }
     }
 
     /// The origin the token is bound to, when one is usable.
     pub(crate) fn bound_origin(&self) -> Option<&str> {
+        self.bound_host().map(GitlabHost::origin)
+    }
+
+    /// The host the token is bound to, when one is usable.
+    pub(crate) const fn bound_host(&self) -> Option<&GitlabHost> {
         match self {
-            Self::Bound { origin, .. } => Some(origin),
+            Self::Bound { host, .. } => Some(host),
             Self::Absent | Self::Disabled => None,
         }
     }
@@ -120,7 +122,7 @@ impl TokenBinding {
     pub(crate) fn for_test(token: &str, origin: &str) -> Self {
         Self::Bound {
             token: ApiToken::new(token.to_string()),
-            origin: origin.trim_end_matches('/').to_string(),
+            host: GitlabHost::for_test(origin),
         }
     }
 }
@@ -129,6 +131,7 @@ impl TokenBinding {
 mod tests {
     use super::*;
     use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+    use std::assert_matches;
 
     fn host(raw: &str) -> GitlabHost {
         GitlabHost::parse(
@@ -166,7 +169,7 @@ mod tests {
     fn invalid_host_disables_token_and_never_falls_back_to_gitlab_com() {
         for bad in ["user:pw@x", "x/y", "https://x", "x:443"] {
             let binding = TokenBinding::from_values(token(), Some(bad));
-            assert!(matches!(binding, TokenBinding::Disabled), "{bad}");
+            assert_matches!(binding, TokenBinding::Disabled, "{bad}");
             assert!(binding.token_for(&host("gitlab.com")).is_none(), "{bad}");
             assert!(binding.bound_origin().is_none());
         }
@@ -175,10 +178,7 @@ mod tests {
     #[test]
     fn no_token_is_absent_regardless_of_host() {
         for h in [None, Some("gitlab.corp"), Some("x/y")] {
-            assert!(matches!(
-                TokenBinding::from_values(None, h),
-                TokenBinding::Absent
-            ));
+            assert_matches!(TokenBinding::from_values(None, h), TokenBinding::Absent);
         }
     }
 
@@ -204,13 +204,13 @@ mod tests {
     #[test]
     fn trailing_dot_host_fails_closed() {
         let binding = TokenBinding::from_values(token(), Some("gitlab.corp."));
-        assert!(matches!(binding, TokenBinding::Disabled));
+        assert_matches!(binding, TokenBinding::Disabled);
     }
 
     #[test]
     fn idn_host_requires_punycode() {
         let unicode = TokenBinding::from_values(token(), Some("b\u{fc}cher.example"));
-        assert!(matches!(unicode, TokenBinding::Disabled));
+        assert_matches!(unicode, TokenBinding::Disabled);
         let punycode = TokenBinding::from_values(token(), Some("xn--bcher-kva.example"));
         assert_eq!(
             punycode.bound_origin(),
@@ -250,13 +250,10 @@ mod tests {
         };
         assert_eq!(
             TokenBinding::from_lookup(empty_host).bound_origin(),
-            Some(GITLAB_COM_ORIGIN)
+            Some(crate::host::GITLAB_COM_ORIGIN)
         );
         let empty_token = |name: &str| (name == "GITLAB_TOKEN").then(String::new);
-        assert!(matches!(
-            TokenBinding::from_lookup(empty_token),
-            TokenBinding::Absent
-        ));
+        assert_matches!(TokenBinding::from_lookup(empty_token), TokenBinding::Absent);
     }
 
     #[test]

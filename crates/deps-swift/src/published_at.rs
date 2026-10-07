@@ -210,6 +210,7 @@ impl PublishedAtCache {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use std::assert_matches;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn response(body: &str) -> CachedResponse {
@@ -239,32 +240,30 @@ mod tests {
         let dated = PublishedAtMemo::classify(Ok(response(
             r#"{"publishedAt": "2025-03-04T05:06:07.250Z"}"#,
         )));
-        assert!(matches!(dated, PublishedAtMemo::Known(Some(_))));
+        assert_matches!(dated, PublishedAtMemo::Known(Some(_)));
 
         for body in [
             r"{}",
             r#"{"publishedAt": null}"#,
             r#"{"publishedAt": "soon"}"#,
         ] {
-            assert!(
-                matches!(
-                    PublishedAtMemo::classify(Ok(response(body))),
-                    PublishedAtMemo::Known(None)
-                ),
+            assert_matches!(
+                PublishedAtMemo::classify(Ok(response(body))),
+                PublishedAtMemo::Known(None),
                 "{body}"
             );
         }
-        assert!(matches!(
+        assert_matches!(
             PublishedAtMemo::classify(Err(status(410))),
             PublishedAtMemo::Known(None)
-        ));
+        );
         for failed in [
             PublishedAtMemo::classify(Err(status(404))),
             PublishedAtMemo::classify(Err(status(503))),
             PublishedAtMemo::classify(Err(DepsError::CacheError("timeout".into()))),
             PublishedAtMemo::classify(Ok(response("not json"))),
         ] {
-            assert!(matches!(failed, PublishedAtMemo::Failed { .. }));
+            assert_matches!(failed, PublishedAtMemo::Failed { .. });
         }
     }
 

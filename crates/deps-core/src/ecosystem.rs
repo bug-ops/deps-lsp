@@ -370,6 +370,9 @@ pub struct BlockedRegistryOccurrence {
     /// The blocked host's classification.
     #[raw]
     pub class: crate::net_policy::HostClass,
+    /// The rule that refused the host.
+    #[raw]
+    pub policy: crate::net_policy::BlockingPolicy,
     /// The exact `registry`/`registry-index` alias or URL the dependency declared, so two
     /// different blocked aliases render as two distinguishable diagnostic messages, not one
     /// byte-identical warning.
@@ -412,6 +415,9 @@ pub struct BlockedSourceClass {
     /// The blocked host's classification.
     #[raw]
     pub class: crate::net_policy::HostClass,
+    /// The rule that refused the host.
+    #[raw]
+    pub policy: crate::net_policy::BlockingPolicy,
     /// The exact declared value (URL/alias) that resolved to a blocked host.
     #[redact(url)]
     pub raw_value: String,
@@ -429,12 +435,13 @@ impl BlockedSourceClass {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::net_policy::HostClass;
+    /// use deps_core::net_policy::{BlockingPolicy, HostClass};
     /// use deps_core::BlockedSourceClass;
     /// use deps_core::position::{Position, Range};
     ///
     /// let class = BlockedSourceClass {
     ///     class: HostClass::Loopback,
+    ///     policy: BlockingPolicy::Floor,
     ///     raw_value: "https://internal.example/index".to_string(),
     ///     declaration_key: "primary".to_string(),
     /// };
@@ -447,6 +454,7 @@ impl BlockedSourceClass {
         BlockedRegistryOccurrence {
             range,
             class: self.class,
+            policy: self.policy,
             raw_value: self.raw_value,
             declaration_key: self.declaration_key,
         }
@@ -2899,6 +2907,7 @@ mod tests {
         BlockedRegistryOccurrence {
             range: Range::default(),
             class: crate::net_policy::HostClass::Loopback,
+            policy: crate::net_policy::BlockingPolicy::Floor,
             raw_value: crate::conformance::CREDENTIAL_PROBE_URL.to_string(),
             declaration_key: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
         },
@@ -2909,6 +2918,7 @@ mod tests {
         2,
         BlockedSourceClass {
             class: crate::net_policy::HostClass::Loopback,
+            policy: crate::net_policy::BlockingPolicy::Floor,
             raw_value: crate::conformance::CREDENTIAL_PROBE_URL.to_string(),
             declaration_key: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
         },

@@ -1027,9 +1027,10 @@ pub struct ServerState {
     /// `Backend::initialize`/`did_change_configuration` updating this value here takes effect
     /// on every parse from then on, with no need to reconstruct either ecosystem.
     pub registry_policy: Arc<RegistryAccessPolicy>,
-    /// The process-wide private-registry allowlist read at construction; immutable, and the
-    /// only way `registries.workspace_registries = "all"` reaches a private host.
-    private_registries: deps_core::net_policy::AllowlistOutcome,
+    /// The process-wide private-registry allowlist, guarded-egress opt-in and system proxy read
+    /// at construction; immutable, and the only way `registries.workspace_registries = "all"`
+    /// reaches a private host.
+    registry_environment: deps_core::net_policy::RegistryEnvironment,
     /// What the setting last resolved to, so the user is told once per transition into a
     /// setting that does not do what it says rather than on every config change.
     registries_effect: std::sync::Mutex<deps_core::policy_config::WorkspaceRegistriesEffect>,
@@ -1063,7 +1064,7 @@ pub struct ServerState {
     /// Defaults to an empty policy (a no-op for `apply_license_policy_rule`) until
     /// `Backend::initialize`/`did_change_configuration` first parses
     /// `initializationOptions.license_policy`.
-    pub license_policy: RwLock<Arc<LicensePolicy>>,
+    license_policy: RwLock<Arc<LicensePolicy>>,
     /// Live-updatable `policy.typosquat.enabled` setting (issue #1437), mirroring
     /// `license_policy`'s own rationale: read unconditionally by
     /// `handlers::diagnostics::generate_diagnostics_internal` on every diagnostics
@@ -1203,20 +1204,28 @@ struct PendingReparse {
 }
 
 impl ServerState {
-    /// Creates a new server state with default configuration, reading the private-registry
-    /// allowlist from `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` once.
+    /// Creates a new server state with default configuration, reading the registry environment
+    /// (private-registry allowlist, guarded-egress opt-in, system proxy) from the process once.
     pub fn new() -> Self {
-        Self::with_private_registries(deps_core::net_policy::PrivateRegistryAllowlist::from_env())
+        Self::from_env_source(&deps_core::net_policy::ProcessEnv)
     }
 
-    /// Creates a new server state whose private-registry reach is bounded by `private_registries`.
+    /// Creates a new server state whose registry environment is read from `source`.
     ///
-    /// The outcome is fixed for the server's lifetime: no setting can widen it, which is what
-    /// keeps a repository-supplied `registries.workspace_registries = "all"` from reaching
-    /// private hosts. Also the test seam for a state with a specific allowlist, since tests
-    /// must not mutate the process environment.
-    pub fn with_private_registries(
-        private_registries: deps_core::net_policy::AllowlistOutcome,
+    /// The test seam for a state with a specific allowlist or egress, since tests must not
+    /// mutate the process environment.
+    pub fn from_env_source(source: &impl deps_core::net_policy::EnvSource) -> Self {
+        Self::with_registry_environment(deps_core::net_policy::RegistryEnvironment::read(source))
+    }
+
+    /// Creates a new server state whose private-registry reach and egress are bounded by
+    /// `registry_environment`.
+    ///
+    /// The environment is fixed for the server's lifetime: no setting can widen it, which is
+    /// what keeps a repository-supplied `registries.workspace_registries = "all"` from reaching
+    /// private hosts.
+    pub fn with_registry_environment(
+        registry_environment: deps_core::net_policy::RegistryEnvironment,
     ) -> Self {
         // `EcosystemRuntime::from_policy` (issue #1058 T009) replaces this constructor's own
         // hand-built `EcosystemRuntime::new(...)` call; `PolicyConfig::default()` reproduces
@@ -1224,7 +1233,7 @@ impl ServerState {
         // `WorkspaceRegistryAccess::PublicOnly` as `PolicyConfig::default()`'s
         // `registries.workspace_registries`).
         let default_policy = PolicyConfig::default();
-        let runtime = crate::EcosystemRuntime::from_policy(&default_policy, &private_registries);
+        let runtime = crate::EcosystemRuntime::from_policy(&default_policy, &registry_environment);
         let registry_policy = Arc::clone(&runtime.policy);
         let nuget_user_profile_sources = Arc::clone(&runtime.nuget_user_profile_sources);
         let keychain_credentials = Arc::clone(&runtime.keychain_credentials);
@@ -1263,7 +1272,7 @@ impl ServerState {
             lockfile_cache,
             ecosystem_registry,
             registry_policy,
-            private_registries,
+            registry_environment,
             registries_effect: std::sync::Mutex::new(
                 deps_core::policy_config::WorkspaceRegistriesEffect::AsConfigured,
             ),
@@ -1481,7 +1490,12 @@ impl ServerState {
 
     /// The private-registry allowlist outcome this server was started with.
     pub(crate) const fn private_registries(&self) -> &deps_core::net_policy::AllowlistOutcome {
-        &self.private_registries
+        self.registry_environment.allowlist()
+    }
+
+    /// The startup notice for a system proxy that workspace-declared registries bypass.
+    pub(crate) fn egress_notice(&self) -> Option<deps_core::net_policy::EgressNotice> {
+        self.registry_environment.egress_notice()
     }
 
     /// Records the latest resolved effect and returns it only when it differs from the

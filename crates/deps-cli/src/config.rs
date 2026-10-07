@@ -466,6 +466,7 @@ pub fn apply_overrides(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::io::Write as _;
 
     fn write_temp_toml(content: &str) -> tempfile::NamedTempFile {
@@ -552,7 +553,7 @@ mod tests {
     fn test_load_missing_explicit_path_is_an_error() {
         let missing = PathBuf::from("/nonexistent/path/to/deps.toml");
         let result = load(Some(&missing), Path::new("."));
-        assert!(matches!(result, Err(ConfigError::Io { .. })));
+        assert_matches!(result, Err(ConfigError::Io { .. }));
     }
 
     #[test]
@@ -575,7 +576,7 @@ mod tests {
     fn test_load_malformed_toml_is_an_error() {
         let file = write_temp_toml("this is not [ valid toml");
         let result = load(Some(file.path()), Path::new("."));
-        assert!(matches!(result, Err(ConfigError::Toml { .. })));
+        assert_matches!(result, Err(ConfigError::Toml { .. }));
     }
 
     /// #1403: a deeply nested `deps.toml` (auto-discovered from an untrusted checkout) must be
@@ -641,7 +642,7 @@ b = 2
     fn test_load_unknown_top_level_key_is_rejected() {
         let file = write_temp_toml("totally_unknown_key = true\n");
         let result = load(Some(file.path()), Path::new("."));
-        assert!(matches!(result, Err(ConfigError::Deserialize { .. })));
+        assert_matches!(result, Err(ConfigError::Deserialize { .. }));
     }
 
     /// #1240 round 2: an unknown top-level key whose *name* is credential-shaped must not leak
@@ -1033,7 +1034,7 @@ b = 2
             "#,
         );
         let result = load(Some(file.path()), Path::new("."));
-        assert!(matches!(result, Err(ConfigError::Deserialize { .. })));
+        assert_matches!(result, Err(ConfigError::Deserialize { .. }));
     }
 
     #[test]

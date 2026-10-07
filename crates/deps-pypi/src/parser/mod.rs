@@ -865,6 +865,7 @@ mod pep508_name_tests {
 #[cfg(test)]
 mod truncate_for_log_tests {
     use super::truncate_for_log;
+    use std::assert_matches;
 
     /// Mirrors [`deps_core::net_policy::MAX_PARSE_ERROR_LOG_BYTES`] — the value
     /// [`truncate_for_log`] delegates to — rather than hardcoding a second `200` in this
@@ -877,8 +878,7 @@ mod truncate_for_log_tests {
         // credential-free URL must still borrow — the redaction gate firing is not itself
         // proof the text changed.
         for benign in ["requests==2.31.0", "https://pypi.org/simple"] {
-            assert!(
-                matches!(truncate_for_log(benign), std::borrow::Cow::Borrowed(b) if b == benign),
+            assert_matches!(truncate_for_log(benign), std::borrow::Cow::Borrowed(b) if b == benign,
                 "{benign:?} has no credential to redact and must be borrowed unchanged"
             );
         }
@@ -908,8 +908,7 @@ mod truncate_for_log_tests {
             "duplicate key: `name`",
             "https://pypi.org/simple",
         ] {
-            assert!(
-                matches!(truncate_for_log(benign), std::borrow::Cow::Borrowed(b) if b == benign),
+            assert_matches!(truncate_for_log(benign), std::borrow::Cow::Borrowed(b) if b == benign,
                 "{benign:?} has no credential shape and must survive unredacted"
             );
         }

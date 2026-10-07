@@ -905,6 +905,7 @@ mod tests {
     #[cfg(feature = "lsp-responses")]
     mod lsp_tests {
         use super::*;
+        use std::assert_matches;
 
         use crate::types::NuGetDependency;
 
@@ -1772,8 +1773,9 @@ mod tests {
                 .find(|d| d.name().as_str() == "MyCompany.Internal")
                 .expect("dependency must be present");
             let source = dep.source();
-            assert!(
-                matches!(source, DependencySource::AlternateRegistry { .. }),
+            assert_matches!(
+                source,
+                DependencySource::AlternateRegistry { .. },
                 "expected AlternateRegistry, got {source:?}"
             );
             let name = dep.name().clone();

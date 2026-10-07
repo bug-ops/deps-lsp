@@ -2471,11 +2471,79 @@ pub(super) struct OsvBatchResult {
     pub(super) next_page_token: Option<String>,
 }
 
+/// Advisory id of a batch-response stub: validated at the wire boundary (#1805), so an
+/// unvalidated string can never reach a `/v1/vulns/{id}` request path or a cache key.
+/// Cap on how much of an untrusted OSV stub id is echoed into a log line.
+const MAX_LOGGED_ID_CHARS: usize = 64;
+
+#[derive(Debug, Deserialize)]
+#[serde(from = "String")]
+pub(super) enum StubId {
+    Valid(OsvId),
+    Invalid,
+}
+
+impl From<String> for StubId {
+    fn from(raw: String) -> Self {
+        OsvId::parse(&raw).map_or_else(
+            || {
+                let shown: String = raw.chars().take(MAX_LOGGED_ID_CHARS).collect();
+                tracing::warn!(id = ?shown, "OSV batch stub has a malformed id, not querying it");
+                Self::Invalid
+            },
+            Self::Valid,
+        )
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct OsvVulnStub {
-    pub(super) id: String,
+    pub(super) id: StubId,
     #[serde(default)]
     pub(super) modified: String,
+}
+
+/// A batch-response stub with a validated id and the `modified` stamp that keys cache freshness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct VulnStub {
+    pub(super) id: OsvId,
+    pub(super) modified: String,
+}
+
+/// The stubs OSV returned for one query: those with a valid id, plus a count of those whose
+/// id failed [`OsvId::parse`]. An invalid stub is never fetched, but [`Self::total`] still
+/// counts it, so a result that contained one can never be read as clean (#1805).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct BatchStubs {
+    pub(super) valid: Vec<VulnStub>,
+    pub(super) invalid: usize,
+}
+
+impl BatchStubs {
+    /// Total number of stubs OSV reported, valid or not.
+    pub(super) const fn total(&self) -> usize {
+        self.valid.len() + self.invalid
+    }
+
+    pub(super) const fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+}
+
+impl FromIterator<OsvVulnStub> for BatchStubs {
+    fn from_iter<I: IntoIterator<Item = OsvVulnStub>>(iter: I) -> Self {
+        let mut stubs = Self::default();
+        for stub in iter {
+            match stub.id {
+                StubId::Valid(id) => stubs.valid.push(VulnStub {
+                    id,
+                    modified: stub.modified,
+                }),
+                StubId::Invalid => stubs.invalid += 1,
+            }
+        }
+        stubs
+    }
 }
 
 /// Response shape of `POST /v1/query` — deliberately distinct from the batch

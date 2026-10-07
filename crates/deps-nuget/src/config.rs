@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use deps_core::config_trust::{self, EnvVarSyntax};
 use deps_core::net_policy::{
-    BlockedHostReason, HostClass, IndexUrlError, RedactedUrl, RegistryAccessPolicy,
+    BlockedHost, BlockedHostReason, IndexUrlError, RedactedUrl, RegistryAccessPolicy,
     RegistryRejectionClassifier, RegistryRejectionReason, RegistryUrlKind, RejectionOutcome,
     ValidatedRegistryUrl,
 };
@@ -134,9 +134,9 @@ pub enum NuGetFeedUrlError {
 }
 
 impl BlockedHostReason for NuGetFeedUrlError {
-    fn blocked_host_class(&self) -> Option<HostClass> {
+    fn blocked_host(&self) -> Option<BlockedHost> {
         match self {
-            Self::Url(e) => e.blocked_host_class(),
+            Self::Url(e) => e.blocked_host(),
             Self::HasCredentials
             | Self::UndefinedEnvVar
             | Self::Disabled
@@ -701,11 +701,11 @@ impl NuGetConfig {
     /// Mirrors [`Self::resolve_source_for`]'s exact branching (mapping first, plain chain
     /// otherwise), but reports every source `package` would have used that is blocked by the
     /// current `registries.workspace_registries` policy — each as a [`BlockedSourceClass`]
-    /// carrying the blocked [`HostClass`], the raw declared value, and a declaration key
+    /// carrying the blocked [`deps_core::net_policy::HostClass`], the raw declared value, and a declaration key
     /// identifying *which* declared `<add key>` source produced it (#925: so the block
     /// surfaces as a diagnostic instead of only a `tracing::warn!`). Empty for every other
     /// outcome: no mapping match, or no source among the candidates is invalid specifically for
-    /// [`HostClass`] policy reasons (#944 M6/S1: the presence of a separate *usable* hop no
+    /// [`deps_core::net_policy::HostClass`] policy reasons (#944 M6/S1: the presence of a separate *usable* hop no
     /// longer suppresses this — see below).
     ///
     /// The plain-chain branch reports **every** blocked source found, not just the first (#965):
@@ -756,13 +756,14 @@ impl NuGetConfig {
                 .iter()
                 .find_map(|key| {
                     let entry = resolve_mapping_source_key(key, &self.sources)?;
-                    let (class, raw_value) = entry
+                    let (BlockedHost { class, policy }, raw_value) = entry
                         .value
                         .as_ref()
                         .err()
-                        .and_then(InvalidEntry::blocked_class)?;
+                        .and_then(InvalidEntry::blocked_host)?;
                     Some(BlockedSourceClass {
                         class,
+                        policy,
                         raw_value,
                         declaration_key: format!("source:{}", entry.key),
                     })
@@ -788,13 +789,14 @@ impl NuGetConfig {
         self.sources
             .iter()
             .filter_map(|entry| {
-                let (class, raw_value) = entry
+                let (BlockedHost { class, policy }, raw_value) = entry
                     .value
                     .as_ref()
                     .err()
-                    .and_then(InvalidEntry::blocked_class)?;
+                    .and_then(InvalidEntry::blocked_host)?;
                 Some(BlockedSourceClass {
                     class,
+                    policy,
                     raw_value,
                     declaration_key: format!("source:{}", entry.key),
                 })
@@ -1585,7 +1587,7 @@ fn user_profile_config_candidates(home: Option<&Path>) -> Vec<PathBuf> {
     candidates
 }
 
-/// [`discover_user_profile_config`], but taking `home` explicitly instead of [`dirs::home_dir`]
+/// [`discover_user_profile_config`], but taking `home` explicitly instead of [`deps_core::UserHome::current`]
 /// — lets tests inject a fixture home directory, mirroring `deps_npm::config::resolve_with_home`.
 fn discover_user_profile_config_with_home(home: Option<PathBuf>) -> Option<PathBuf> {
     user_profile_config_candidates(home.as_deref())
@@ -1597,7 +1599,9 @@ fn discover_user_profile_config_with_home(home: Option<PathBuf>) -> Option<PathB
 /// [`NuGetParseContext`] construction, never per manifest parse.
 #[must_use]
 fn discover_user_profile_config() -> Option<PathBuf> {
-    discover_user_profile_config_with_home(dirs::home_dir())
+    discover_user_profile_config_with_home(
+        deps_core::UserHome::current().map(|home| home.path().to_path_buf()),
+    )
 }
 
 /// Test-only convenience: [`NuGetEcosystem::parse_manifest`] calls [`resolve_with_context`]
@@ -2260,7 +2264,7 @@ fn expand_env_vars(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::net_policy::WorkspaceRegistryAccess;
+    use deps_core::net_policy::{BlockingPolicy, HostClass, WorkspaceRegistryAccess};
     use std::assert_matches;
 
     fn all_policy() -> RegistryAccessPolicy {
@@ -3547,7 +3551,8 @@ mod tests {
         );
         assert_eq!(
             NuGetFeedUrlError::Url(IndexUrlError::BlockedHost {
-                class: HostClass::Loopback
+                class: HostClass::Loopback,
+                policy: BlockingPolicy::Floor,
             })
             .rejection_reason(),
             RejectionOutcome::HandledByBlockedHostPath,

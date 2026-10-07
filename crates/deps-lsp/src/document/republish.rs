@@ -114,7 +114,7 @@ mod tests {
     use deps_core::EcosystemId;
 
     fn hermetic_state() -> ServerState {
-        ServerState::with_private_registries(deps_core::net_policy::AllowlistOutcome::Unset)
+        ServerState::from_env_source(&deps_core::net_policy::MapEnv::new())
     }
 
     fn doc_uri(path: &str) -> Uri {

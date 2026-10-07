@@ -362,7 +362,7 @@ fn resolve_alternate_registries(
     let mut resolved_by_raw_value: HashMap<String, RegistryIndex> = HashMap::new();
     // Raw values blocked specifically by policy (spec #443/plan-1b §1.7), so the rewrite
     // pass below can surface an informational diagnostic on the exact dependency line.
-    let mut blocked_by_raw_value: HashMap<String, deps_core::net_policy::HostClass> =
+    let mut blocked_by_raw_value: HashMap<String, deps_core::net_policy::BlockedHost> =
         HashMap::new();
     // Raw values that failed the literal-`registry-index`-URL parse attempt for a reason
     // other than a blocked host (#1453) — an invalid URL, a non-https scheme, or embedded
@@ -387,8 +387,11 @@ fn resolve_alternate_registries(
                 resolved_by_raw_value.insert(value.clone(), index.clone());
                 newly_resolved.push((index, None));
             }
-            Err(RegistryIndexError::BlockedHost { class }) => {
-                blocked_by_raw_value.insert(value.clone(), class);
+            Err(RegistryIndexError::BlockedHost { class, policy }) => {
+                blocked_by_raw_value.insert(
+                    value.clone(),
+                    deps_core::net_policy::BlockedHost { class, policy },
+                );
             }
             Err(error) => {
                 // `value` may just as well be a genuine alias (e.g. "my-corp"), which never
@@ -422,8 +425,8 @@ fn resolve_alternate_registries(
         if let Some(entry) = config.get(alias) {
             resolved_by_raw_value.insert(alias.clone(), entry.index.clone());
             newly_resolved.push((entry.index.clone(), entry.auth.clone()));
-        } else if let Some(class) = config.blocked_class(alias) {
-            blocked_by_raw_value.insert(alias.clone(), class);
+        } else if let Some(host) = config.blocked_class(alias) {
+            blocked_by_raw_value.insert(alias.clone(), host);
         } else if let Some(reason) = config.rejected_reason(alias) {
             // The alias matched a `.cargo/config.toml`/`$CARGO_HOME` `[registries.<name>]
             // index = ...` entry, but that entry's own index value failed validation
@@ -485,10 +488,11 @@ fn resolve_alternate_registries(
                     index: index.as_str().to_string(),
                     mirrors_crates_io: false,
                 };
-            } else if let Some(class) = blocked_by_raw_value.get(url) {
+            } else if let Some(host) = blocked_by_raw_value.get(url) {
                 blocked_registries.push(deps_core::BlockedRegistryOccurrence {
                     range: dep.name_range,
-                    class: *class,
+                    class: host.class,
+                    policy: host.policy,
                     raw_value: url.clone(),
                     declaration_key: url.clone(),
                 });
@@ -973,8 +977,9 @@ b = 2
 
         let uri = non_file_uri("https://attacker.example", &manifest_path);
         let result = parse_cargo_toml("[dependencies]\nserde = \"1.0\"", &uri);
-        assert!(
-            matches!(result, Err(DepsError::InvalidUri(_))),
+        assert_matches!(
+            result,
+            Err(DepsError::InvalidUri(_)),
             "expected InvalidUri, got {result:?}"
         );
     }
@@ -1009,8 +1014,9 @@ b = 2
 
         let uri = non_file_uri("file://attacker.example", &manifest_path);
         let result = parse_cargo_toml("[dependencies]\nserde = \"1.0\"", &uri);
-        assert!(
-            matches!(result, Err(DepsError::InvalidUri(_))),
+        assert_matches!(
+            result,
+            Err(DepsError::InvalidUri(_)),
             "expected InvalidUri, got {result:?}"
         );
     }
@@ -1328,11 +1334,10 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
         let result = parse_cargo_toml_with_context(toml, &test_url(), &ctx).unwrap();
 
         assert_eq!(result.dependencies.len(), 1);
-        assert!(
-            matches!(
+        assert_matches!(
                 &result.dependencies[0].source,
                 DependencySource::CustomRegistry { url } if url == "https://169.254.169.254/index"
-            ),
+            ,
             "a blocked index must stay unresolved, not silently become AlternateRegistry"
         );
         assert_eq!(result.blocked_registries.len(), 1);
@@ -1611,12 +1616,11 @@ internal-crate = { version = "1.0", registry-index = "sparse+https://user:hunter
         let log = deps_core::test_util::capture_tracing_output(|| {
             let result = parse_cargo_toml(toml, &test_url()).unwrap();
             assert_eq!(result.dependencies.len(), 1);
-            assert!(
-                matches!(
+            assert_matches!(
                     &result.dependencies[0].source,
                     DependencySource::CustomRegistry { url }
                         if url == "sparse+https://user:hunter2@index.crates.io/?token=super-secret-value"
-                ),
+                ,
                 "a userinfo-bearing index must stay unresolved"
             );
             assert_eq!(result.rejected_registries.len(), 1);
@@ -1651,12 +1655,11 @@ internal-crate = { version = "1.0", registry = "sparse+https://user:hunter2@inde
         let log = deps_core::test_util::capture_tracing_output(|| {
             let result = parse_cargo_toml(toml, &test_url()).unwrap();
             assert_eq!(result.dependencies.len(), 1);
-            assert!(
-                matches!(
+            assert_matches!(
                     &result.dependencies[0].source,
                     DependencySource::CustomRegistry { url }
                         if url == "sparse+https://user:hunter2@index.crates.io/?token=super-secret-value"
-                ),
+                ,
                 "an unconfigured alias must stay unresolved"
             );
             assert!(result.rejected_registries.is_empty());

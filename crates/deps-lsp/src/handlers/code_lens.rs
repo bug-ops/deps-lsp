@@ -6,7 +6,7 @@
 //! not here — it needs the raw `Vec<TextEdit>`, not the wrapped `CodeLens`.
 
 use crate::config::DepsConfig;
-use crate::document::{ServerState, ensure_document_loaded};
+use crate::document::{PrefetchVisibility, ServerState, ensure_document_loaded};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -55,6 +55,8 @@ pub async fn handle_code_lens(
             config.policy.osv_checks(),
         )
     };
+    let vulnerability_visibility =
+        PrefetchVisibility::from_enabled(severities.vulnerabilities_enabled);
 
     // Release the DashMap shard `Ref` before awaiting (#333): `with_document` only hands
     // `extract` a borrowed `&DocumentState` synchronously, so it can't leak across the await below.
@@ -73,7 +75,7 @@ pub async fn handle_code_lens(
             let snapshot = doc
                 .signals
                 .snapshot()
-                .with_vulnerabilities()
+                .with_vulnerabilities(vulnerability_visibility)
                 .with_latest_status(osv_checks)
                 .finish();
             Some((

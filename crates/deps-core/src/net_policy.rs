@@ -40,6 +40,7 @@ macro_rules! min_v6_prefix {
 pub(crate) use {min_v4_prefix, min_v6_prefix};
 
 mod allowlist;
+mod egress;
 
 macro_rules! private_host_hint {
     () => {
@@ -56,6 +57,12 @@ pub(crate) use allowlist::{AccessSnapshot, Target};
 pub use allowlist::{
     AllowlistOutcome, EntryRejection, PRIVATE_REGISTRY_HOSTS_ENV, PrivateRegistryAllowlist,
     PrivateRegistryAllowlistError,
+};
+#[cfg(any(test, feature = "test-util"))]
+pub use egress::MapEnv;
+pub use egress::{
+    EgressNotice, EnvSource, GuardedEgress, ProcessEnv, ProxyEndpoint, RegistryEnvironment,
+    SystemProxy, WORKSPACE_REGISTRY_PROXY_ENV, normalize_host,
 };
 
 /// Classification of a URL's host, for [`RegistryAccessPolicy`] to evaluate against
@@ -120,26 +127,6 @@ impl HostClass {
             self,
             Self::PrivateV4 | Self::Cgnat | Self::UniqueLocalV6 | Self::InternalName
         )
-    }
-
-    /// `"; <PRIVATE_HOST_HINT>"` when [`Self::allowlist_can_help`], else the empty string, so a
-    /// blocked-host message only points at the variable when it can actually help.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_core::net_policy::HostClass;
-    ///
-    /// assert!(HostClass::PrivateV4.private_host_hint_suffix().contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"));
-    /// assert_eq!(HostClass::CloudMetadata.private_host_hint_suffix(), "");
-    /// ```
-    #[must_use]
-    pub const fn private_host_hint_suffix(self) -> &'static str {
-        if self.allowlist_can_help() {
-            concat!("; ", private_host_hint!())
-        } else {
-            ""
-        }
     }
 
     /// Whether this class is one no legitimate registry index (or a redirect from one) could
@@ -413,6 +400,65 @@ pub fn is_trusted_prefix(candidate: &url::Url, trusted: &url::Url) -> bool {
     candidate.origin() == trusted.origin() && path_under_prefix(candidate.path(), trusted.path())
 }
 
+/// A parsed URL prefix that confines a credentialed request and every redirect hop it follows.
+///
+/// Parsed once, so a malformed prefix is a typed error at the call site instead of a transport
+/// that silently rejects every hop. [`Self::permits`] is [`is_trusted_prefix`] against the
+/// stored URL.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::TrustedPrefix;
+/// use url::Url;
+///
+/// let prefix = TrustedPrefix::parse("https://artifacts.corp/cargo/index").unwrap();
+/// assert!(prefix.permits(&Url::parse("https://artifacts.corp/cargo/index/se/rd/serde").unwrap()));
+/// assert!(!prefix.permits(&Url::parse("https://artifacts.corp/cargo/indexEVIL").unwrap()));
+/// assert!(TrustedPrefix::parse("not a url").is_err());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TrustedPrefix(url::Url);
+
+/// Why a string is not a valid [`TrustedPrefix`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TrustedPrefixError {
+    /// The string is not an absolute URL.
+    #[error("trusted prefix is not a valid URL: {0}")]
+    Unparseable(#[source] url::ParseError),
+}
+
+impl TrustedPrefix {
+    /// Parses `prefix` into a trusted prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedPrefixError::Unparseable`] when `prefix` is not an absolute URL.
+    pub fn parse(prefix: &str) -> Result<Self, TrustedPrefixError> {
+        url::Url::parse(prefix)
+            .map(Self)
+            .map_err(TrustedPrefixError::Unparseable)
+    }
+
+    /// Wraps an already parsed URL.
+    #[must_use]
+    pub const fn from_url(url: url::Url) -> Self {
+        Self(url)
+    }
+
+    /// Whether `candidate` lies under this prefix (see [`is_trusted_prefix`]).
+    #[must_use]
+    pub fn permits(&self, candidate: &url::Url) -> bool {
+        is_trusted_prefix(candidate, &self.0)
+    }
+
+    /// The prefix in its serialized, normalized form.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 /// Whether `path` equals `prefix`, or continues immediately after a `/` following it —
 /// [`is_trusted_prefix`]'s path-segment-boundary check, extracted so both branches (exact
 /// match and proper-child match) are independently readable. A trailing `/` on `prefix` is
@@ -482,6 +528,77 @@ impl WorkspaceRegistryAccess {
     }
 }
 
+/// Which rule refused a host: the policy-independent floor, or the workspace-registry setting.
+///
+/// Carried by every blocked-host error so the message names the control that actually decided it
+/// and points at the private-host allowlist only when changing that control can help.
+///
+/// Exhaustive on purpose: a new source of blocking forces every `match` on it to be revisited.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::{BlockingPolicy, HostClass, WorkspaceRegistryAccess};
+///
+/// let all = BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::All);
+/// assert!(all.hint_suffix(HostClass::PrivateV4).contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"));
+/// let off = BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::Off);
+/// assert_eq!(off.hint_suffix(HostClass::PrivateV4), "");
+/// assert_eq!(BlockingPolicy::Floor.hint_suffix(HostClass::Loopback), "");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlockingPolicy {
+    /// A [`HostClass::never_a_registry`] class, refused under every setting.
+    Floor,
+    /// Refused by the `registries.workspace_registries` level.
+    WorkspaceRegistries(WorkspaceRegistryAccess),
+}
+
+impl BlockingPolicy {
+    /// The policy that refused a host of `class` while the workspace-registry level was `level`.
+    #[must_use]
+    pub const fn for_block(class: HostClass, level: WorkspaceRegistryAccess) -> Self {
+        if class.never_a_registry() {
+            Self::Floor
+        } else {
+            Self::WorkspaceRegistries(level)
+        }
+    }
+
+    /// `"; <PRIVATE_HOST_HINT>"` when listing the host in `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` can
+    /// change the outcome, else the empty string.
+    ///
+    /// The allowlist cannot help under the floor, nor at [`WorkspaceRegistryAccess::Off`], which
+    /// refuses every workspace-declared host.
+    #[must_use]
+    pub const fn hint_suffix(self, class: HostClass) -> &'static str {
+        match self {
+            Self::Floor | Self::WorkspaceRegistries(WorkspaceRegistryAccess::Off) => "",
+            Self::WorkspaceRegistries(
+                WorkspaceRegistryAccess::PublicOnly | WorkspaceRegistryAccess::All,
+            ) => {
+                if class.allowlist_can_help() {
+                    concat!("; ", private_host_hint!())
+                } else {
+                    ""
+                }
+            }
+        }
+    }
+
+    /// The clause explaining the refusal of a host of `class`, hint included.
+    #[must_use]
+    pub fn describe(self, class: HostClass) -> String {
+        match self {
+            Self::Floor => "is never a registry host".to_string(),
+            Self::WorkspaceRegistries(_) => format!(
+                "blocked by registries.workspace_registries policy{}",
+                self.hint_suffix(class)
+            ),
+        }
+    }
+}
+
 /// Live-updatable, `Arc`-shareable handle to the current [`WorkspaceRegistryAccess`] setting.
 ///
 /// Backed by an `AtomicU8` rather than a lock: the manifest parse path that reads this is a
@@ -504,6 +621,7 @@ impl WorkspaceRegistryAccess {
 pub struct RegistryAccessPolicy {
     level: AtomicU8,
     allowlist: Arc<PrivateRegistryAllowlist>,
+    egress: GuardedEgress,
 }
 
 impl RegistryAccessPolicy {
@@ -520,6 +638,14 @@ impl RegistryAccessPolicy {
     /// The allowlist is fixed for the lifetime of the handle: [`Self::set`] (and so
     /// [`crate::cache::HttpCache::set_registry_policy`]) can change only the level, never widen
     /// the set of reachable private hosts.
+    ///
+    /// Use this when the allowlist is supplied directly (an embedder, or a test with
+    /// [`PrivateRegistryAllowlist::for_test`]) and no process environment is involved: egress is
+    /// always [`GuardedEgress::Direct`]. A process that reads its settings from the environment
+    /// (the LSP server and the CLI) uses [`Self::with_environment`] instead, which takes the
+    /// allowlist and the egress opt-in from one [`RegistryEnvironment`] so the two cannot
+    /// disagree. The two stay separate because a test allowlist has no environment to read it
+    /// from and must not pick up the ambient `DEPS_LSP_*` variables.
     #[must_use]
     pub fn with_allowlist(
         initial: WorkspaceRegistryAccess,
@@ -528,7 +654,31 @@ impl RegistryAccessPolicy {
         Self {
             level: AtomicU8::new(initial.to_u8()),
             allowlist,
+            egress: GuardedEgress::Direct,
         }
+    }
+
+    /// Creates a handle initialized to `initial` whose allowlist and egress come from
+    /// `environment`.
+    ///
+    /// Both are fixed for the lifetime of the handle, like the allowlist of
+    /// [`Self::with_allowlist`].
+    #[must_use]
+    pub fn with_environment(
+        initial: WorkspaceRegistryAccess,
+        environment: &RegistryEnvironment,
+    ) -> Self {
+        Self {
+            level: AtomicU8::new(initial.to_u8()),
+            allowlist: environment.allowlist().allowlist(),
+            egress: environment.egress(),
+        }
+    }
+
+    /// How traffic to workspace-declared hosts leaves the process.
+    #[must_use]
+    pub const fn egress(&self) -> GuardedEgress {
+        self.egress
     }
 
     /// The current policy.
@@ -574,10 +724,10 @@ impl RegistryAccessPolicy {
     ///
     /// A tightening (e.g. `All` -> `PublicOnly`/`Off`) only gates *future* parses: it does not
     /// purge state a looser policy already produced, such as `deps-cargo`'s
-    /// `CargoRegistry::alternates` map — an already-registered alternate-registry client for a
-    /// now-blocked host stays reachable until its owning document is next re-parsed (today,
-    /// `workspace/didChangeConfiguration` does not trigger a re-parse of open documents). This
-    /// is pre-existing behavior, unrelated to this type's own storage, and unchanged by it.
+    /// `CargoRegistry::alternates` map. `workspace/didChangeConfiguration` reparses every
+    /// covered document after a `workspace_registries` change (#592), so an already-registered
+    /// alternate-registry client for a now-blocked host is replaced when its owning document is
+    /// reparsed, and diagnostics for blocked registries are rebuilt with the new level.
     ///
     /// # Warning
     ///
@@ -627,13 +777,12 @@ pub enum IndexUrlError {
     #[error("registry index URL must not carry userinfo")]
     UserInfoPresent,
     /// The candidate's host is blocked by the current [`WorkspaceRegistryAccess`] policy.
-    #[error(
-        "registry index host class {class} blocked by registries.workspace_registries policy{}",
-        class.private_host_hint_suffix()
-    )]
+    #[error("registry index host class {class} {}", policy.describe(*class))]
     BlockedHost {
         /// The blocked host's classification.
         class: HostClass,
+        /// The rule that refused the host.
+        policy: BlockingPolicy,
     },
 }
 
@@ -806,7 +955,10 @@ pub fn validate_index_url(
             %ecosystem,
             "workspace-declared registry index host blocked by registries.workspace_registries policy"
         );
-        return Err(IndexUrlError::BlockedHost { class });
+        return Err(IndexUrlError::BlockedHost {
+            class,
+            policy: BlockingPolicy::for_block(class, policy.get()),
+        });
     }
     Ok(url)
 }
@@ -1086,18 +1238,40 @@ impl<K: TrustedConstantRegistryUrl> ValidatedRegistryUrl<K> {
     }
 }
 
+/// A policy-blocked host: its class and the rule that refused it.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::{BlockedHost, BlockingPolicy, HostClass};
+///
+/// let blocked = BlockedHost { class: HostClass::Loopback, policy: BlockingPolicy::Floor };
+/// assert_eq!(blocked.class, HostClass::Loopback);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockedHost {
+    /// The blocked host's classification.
+    pub class: HostClass,
+    /// The rule that refused it.
+    pub policy: BlockingPolicy,
+}
+
 /// Whether an ecosystem's own validation-failure reason names a policy-blocked host — the
-/// shared half of [`InvalidEntry::blocked_class`].
+/// shared half of [`InvalidEntry::blocked_host`].
 pub trait BlockedHostReason {
-    /// `Some(class)` iff `self` is the blocked-host variant, naming the blocked [`HostClass`].
-    fn blocked_host_class(&self) -> Option<HostClass>;
+    /// `Some(host)` iff `self` is the blocked-host variant, naming the blocked [`HostClass`] and
+    /// the [`BlockingPolicy`] that refused it.
+    fn blocked_host(&self) -> Option<BlockedHost>;
 }
 
 impl BlockedHostReason for IndexUrlError {
-    fn blocked_host_class(&self) -> Option<HostClass> {
+    fn blocked_host(&self) -> Option<BlockedHost> {
         match self {
-            Self::BlockedHost { class } => Some(*class),
-            _ => None,
+            Self::BlockedHost { class, policy } => Some(BlockedHost {
+                class: *class,
+                policy: *policy,
+            }),
+            Self::InvalidUrl(_) | Self::NotHttps(_) | Self::UserInfoPresent => None,
         }
     }
 }
@@ -1324,40 +1498,46 @@ impl<E> InvalidEntry<E> {
 }
 
 impl<E: BlockedHostReason> InvalidEntry<E> {
-    /// `Some((class, raw))` iff this entry was rejected specifically for a policy-blocked host —
+    /// `Some((host, raw))` iff this entry was rejected specifically for a policy-blocked host —
     /// the shared half of each ecosystem's own `blocked_class`/`blocked_class_for`.
     ///
     /// # Examples
     ///
     /// ```
-    /// use deps_core::net_policy::{HostClass, IndexUrlError, InvalidEntry, RedactedUrl};
+    /// use deps_core::net_policy::{
+    ///     BlockedHost, BlockingPolicy, HostClass, IndexUrlError, InvalidEntry, RedactedUrl,
+    /// };
     ///
     /// let blocked = InvalidEntry::new(
     ///     RedactedUrl::new("https://127.0.0.1:9999"),
     ///     IndexUrlError::BlockedHost {
     ///         class: HostClass::Loopback,
+    ///         policy: BlockingPolicy::Floor,
     ///     },
     /// );
     /// assert_eq!(
-    ///     blocked.blocked_class(),
-    ///     Some((HostClass::Loopback, "https://127.0.0.1:9999".to_string()))
+    ///     blocked.blocked_host(),
+    ///     Some((
+    ///         BlockedHost { class: HostClass::Loopback, policy: BlockingPolicy::Floor },
+    ///         "https://127.0.0.1:9999".to_string()
+    ///     ))
     /// );
     ///
     /// let other = InvalidEntry::new(RedactedUrl::new("not-a-url"), IndexUrlError::UserInfoPresent);
-    /// assert_eq!(other.blocked_class(), None);
+    /// assert_eq!(other.blocked_host(), None);
     /// ```
     #[must_use]
-    pub fn blocked_class(&self) -> Option<(HostClass, String)> {
+    pub fn blocked_host(&self) -> Option<(BlockedHost, String)> {
         self.reason
-            .blocked_host_class()
-            .map(|class| (class, self.raw.to_string()))
+            .blocked_host()
+            .map(|host| (host, self.raw.to_string()))
     }
 }
 
 impl<E: RegistryRejectionClassifier> InvalidEntry<E> {
     /// `Some((reason, raw))` iff this entry was rejected for a reason other than a
     /// policy-blocked host (#1438) — the shared half of an ecosystem's own
-    /// `rejected_reason_for` helper, mirroring [`Self::blocked_class`].
+    /// `rejected_reason_for` helper, mirroring [`Self::blocked_host`].
     ///
     /// # Examples
     ///
@@ -1373,11 +1553,14 @@ impl<E: RegistryRejectionClassifier> InvalidEntry<E> {
     ///     Some((RegistryRejectionReason::UserInfoPresent, "https://example.com".to_string()))
     /// );
     ///
-    /// // The blocked-host case is already covered by `Self::blocked_class` — this method
+    /// // The blocked-host case is already covered by `Self::blocked_host` — this method
     /// // returns `None` for it, so the two mechanisms never double-report.
     /// let blocked = InvalidEntry::new(
     ///     RedactedUrl::new("https://127.0.0.1"),
-    ///     IndexUrlError::BlockedHost { class: HostClass::Loopback },
+    ///     IndexUrlError::BlockedHost {
+    ///         class: HostClass::Loopback,
+    ///         policy: deps_core::net_policy::BlockingPolicy::Floor,
+    ///     },
     /// );
     /// assert!(blocked.rejection_reason().is_none());
     /// ```
@@ -1430,7 +1613,8 @@ mod tests {
         );
         assert_eq!(
             IndexUrlError::BlockedHost {
-                class: HostClass::Loopback
+                class: HostClass::Loopback,
+                policy: BlockingPolicy::Floor,
             }
             .rejection_reason(),
             RejectionOutcome::HandledByBlockedHostPath,
@@ -1765,31 +1949,69 @@ mod tests {
 
     #[test]
     fn test_blocked_host_message_points_at_allowlist_only_when_it_can_help() {
-        let message = |class| IndexUrlError::BlockedHost { class }.to_string();
-        for class in [
+        let message = |class, level| {
+            IndexUrlError::BlockedHost {
+                class,
+                policy: BlockingPolicy::for_block(class, level),
+            }
+            .to_string()
+        };
+        let helpable = [
             HostClass::PrivateV4,
             HostClass::Cgnat,
             HostClass::UniqueLocalV6,
             HostClass::InternalName,
-        ] {
-            assert!(
-                message(class).contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"),
-                "{class}"
-            );
-        }
-        for class in [
+        ];
+        let unhelpable = [
             HostClass::Loopback,
             HostClass::LinkLocal,
             HostClass::CloudMetadata,
             HostClass::Unspecified,
             HostClass::Reserved,
             HostClass::Global,
+        ];
+        for level in [
+            WorkspaceRegistryAccess::PublicOnly,
+            WorkspaceRegistryAccess::All,
         ] {
+            for class in helpable {
+                assert!(
+                    message(class, level).contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"),
+                    "{class} {level:?}"
+                );
+            }
+        }
+        for level in [
+            WorkspaceRegistryAccess::Off,
+            WorkspaceRegistryAccess::PublicOnly,
+            WorkspaceRegistryAccess::All,
+        ] {
+            for class in unhelpable {
+                assert!(
+                    !message(class, level).contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"),
+                    "{class} {level:?}"
+                );
+            }
+        }
+        for class in helpable {
             assert!(
-                !message(class).contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"),
-                "{class}"
+                !message(class, WorkspaceRegistryAccess::Off)
+                    .contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"),
+                "{class} at Off the allowlist cannot help"
             );
         }
+    }
+
+    #[test]
+    fn test_blocking_policy_for_block_uses_the_floor_for_never_a_registry_classes() {
+        assert_eq!(
+            BlockingPolicy::for_block(HostClass::Loopback, WorkspaceRegistryAccess::All),
+            BlockingPolicy::Floor
+        );
+        assert_eq!(
+            BlockingPolicy::for_block(HostClass::PrivateV4, WorkspaceRegistryAccess::Off),
+            BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::Off)
+        );
     }
 
     #[test]
@@ -2109,25 +2331,32 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_entry_blocked_class_some_for_blocked_host() {
+    fn test_invalid_entry_blocked_host_some_for_blocked_host() {
         let entry = InvalidEntry::new(
             RedactedUrl::new("https://127.0.0.1:9999"),
             IndexUrlError::BlockedHost {
                 class: HostClass::Loopback,
+                policy: BlockingPolicy::Floor,
             },
         );
         assert_eq!(
-            entry.blocked_class(),
-            Some((HostClass::Loopback, "https://127.0.0.1:9999".to_string()))
+            entry.blocked_host(),
+            Some((
+                BlockedHost {
+                    class: HostClass::Loopback,
+                    policy: BlockingPolicy::Floor,
+                },
+                "https://127.0.0.1:9999".to_string()
+            ))
         );
     }
 
     #[test]
-    fn test_invalid_entry_blocked_class_none_for_other_reason() {
+    fn test_invalid_entry_blocked_host_none_for_other_reason() {
         let entry = InvalidEntry::new(
             RedactedUrl::new("not-a-url"),
             IndexUrlError::InvalidUrl(RedactedUrl::new("not-a-url")),
         );
-        assert_eq!(entry.blocked_class(), None);
+        assert_eq!(entry.blocked_host(), None);
     }
 }

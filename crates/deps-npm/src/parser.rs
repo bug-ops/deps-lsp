@@ -2169,10 +2169,7 @@ mod tests {
             Some("pkg@file:../{unbalanced".into())
         );
         assert_eq!(dev_weird.version_req, Some("^2.0.0".into()));
-        assert!(matches!(
-            after_weird.section,
-            NpmDependencySection::Dependencies
-        ));
+        assert_matches!(after_weird.section, NpmDependencySection::Dependencies);
         assert_eq!(after_weird.version_req, Some("^1.0.0".into()));
         assert!(after_weird.version_range.is_some());
 
@@ -2203,10 +2200,7 @@ mod tests {
         let express = &result.dependencies[0];
         assert_eq!(express.name, "express");
         assert_eq!(express.version_req, Some("^4.18.2".into()));
-        assert!(matches!(
-            express.section,
-            NpmDependencySection::Dependencies
-        ));
+        assert_matches!(express.section, NpmDependencySection::Dependencies);
         assert_ne!(express.name_range, Range::default());
         assert!(express.version_range.is_some());
     }
@@ -2234,10 +2228,7 @@ mod tests {
         let express = &result.dependencies[0];
         assert_eq!(express.name, "express");
         assert_eq!(express.version_req, Some("^4.18.2".into()));
-        assert!(matches!(
-            express.section,
-            NpmDependencySection::Dependencies
-        ));
+        assert_matches!(express.section, NpmDependencySection::Dependencies);
         assert_ne!(express.name_range, Range::default());
         assert!(express.version_range.is_some());
     }
@@ -2261,10 +2252,7 @@ mod tests {
         let express = &result.dependencies[0];
         assert_eq!(express.name, "express");
         assert_eq!(express.version_req, Some("^4.18.2".into()));
-        assert!(matches!(
-            express.section,
-            NpmDependencySection::Dependencies
-        ));
+        assert_matches!(express.section, NpmDependencySection::Dependencies);
         assert_eq!(express.name_range.start.line, 5);
         assert!(express.version_range.is_some());
     }

@@ -346,8 +346,21 @@ pub(crate) enum PrefetchVisibility {
     /// Attach an empty map instead of the document's real one — the feature is
     /// disabled, offline, or otherwise not currently applicable, but a previously
     /// populated map must not keep rendering (issue #1437 security review N1, issue
-    /// #1456 spec 072's identical rationale for GOSSIP).
+    /// #1456 spec 072's identical rationale for GOSSIP). Vulnerabilities suppress on
+    /// `vulnerabilities_enabled = false` only; offline keeps rendering cached advisories
+    /// (issue #1819, see [`SignalsSnapshotBuilder::with_vulnerabilities`]).
     Suppress,
+}
+
+impl PrefetchVisibility {
+    /// [`Self::Render`] when `enabled`, [`Self::Suppress`] otherwise.
+    pub(crate) const fn from_enabled(enabled: bool) -> Self {
+        if enabled {
+            Self::Render
+        } else {
+            Self::Suppress
+        }
+    }
 }
 
 /// Builder for [`SignalsSnapshot`], returned by [`PackageSignals::snapshot`]. Each
@@ -376,10 +389,20 @@ impl SignalsSnapshotBuilder<'_> {
         self
     }
 
-    /// Attaches [`PackageSignals::vulnerabilities`].
+    /// Attaches [`PackageSignals::vulnerabilities`], or an empty map when `visibility` is
+    /// [`PrefetchVisibility::Suppress`] (issue #1819) — the same `Some(&empty)` a cold start
+    /// with `diagnostics.vulnerabilities_enabled = false` produces, so a toggle at runtime
+    /// hides advisories that were already fetched.
+    ///
+    /// Callers derive `visibility` from `vulnerabilities_enabled` alone, never from
+    /// [`OsvChecks`]: going offline stops fetching but must keep showing cached advisories,
+    /// unlike typosquat/GOSSIP, whose `is_active()` gates also suppress offline.
     #[must_use]
-    pub(crate) fn with_vulnerabilities(mut self) -> Self {
-        self.vulnerabilities = Some(self.signals.vulnerabilities.clone());
+    pub(crate) fn with_vulnerabilities(mut self, visibility: PrefetchVisibility) -> Self {
+        self.vulnerabilities = Some(match visibility {
+            PrefetchVisibility::Render => self.signals.vulnerabilities.clone(),
+            PrefetchVisibility::Suppress => VulnerabilityMap::new(),
+        });
         self
     }
 
@@ -388,7 +411,7 @@ impl SignalsSnapshotBuilder<'_> {
     /// runs while offline either (`document::lifecycle`'s phase-A spawn gate matches), so both
     /// conditions must degrade the same way here.
     ///
-    /// Unlike [`Self::with_vulnerabilities`]'s unconditional attach, this **must** be gated:
+    /// Unlike [`Self::with_vulnerabilities`]'s attach, which is gated only on visibility, this **must** be gated on [`OsvChecks`]:
     /// an absent [`deps_core::osv::LatestStatusMap`] means [`deps_core::lsp_helpers::LatestVerdict::NotApplicable`]
     /// (OSV checking doesn't apply at all — the pre-#1517 permissive behavior, correct when the
     /// operator disabled vulnerability checking entirely, or is working offline), while a
@@ -484,7 +507,7 @@ impl SignalsSnapshotBuilder<'_> {
 ///
 /// Replaces each handler's own hand-cloned tuple of raw maps plus hand-chained
 /// `deps_core::VersionData::with_*` calls: a handler now opts into exactly the
-/// dimensions it uses (e.g. `.with_vulnerabilities()`), and every dimension it doesn't
+/// dimensions it uses (e.g. `.with_outcomes()`), and every dimension it doesn't
 /// request simply isn't cloned.
 pub(crate) struct SignalsSnapshot {
     cached: HashMap<PackageName, PackageVersions>,
@@ -710,7 +733,7 @@ mod tests {
         let snapshot = signals
             .snapshot()
             .with_resolved_version_candidates()
-            .with_vulnerabilities()
+            .with_vulnerabilities(PrefetchVisibility::Render)
             .with_outcomes()
             .with_license_prefetch()
             .finish();
@@ -722,6 +745,20 @@ mod tests {
             Some(true)
         );
         assert_eq!(data.license_prefetch.map(HashMap::len), Some(2));
+    }
+
+    #[test]
+    fn snapshot_suppressed_vulnerabilities_is_some_empty_not_none() {
+        let snapshot = fixture()
+            .snapshot()
+            .with_vulnerabilities(PrefetchVisibility::Suppress)
+            .finish();
+        assert!(
+            snapshot
+                .version_data()
+                .vulnerabilities
+                .is_some_and(HashMap::is_empty)
+        );
     }
 
     #[test]

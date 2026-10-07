@@ -1,11 +1,11 @@
 //! Diagnostics handler using ecosystem trait delegation.
 
-use crate::config::{DepsConfig, DiagnosticsConfig};
+use crate::config::DepsConfig;
 use crate::document::config_epoch::ConfigEpoch;
 use crate::document::{
     DocStamp, PrefetchVisibility, PublishTicket, ServerState, ensure_document_loaded,
 };
-use deps_core::policy_config::OsvChecks;
+use deps_core::policy_config::{GossipChecks, OsvChecks, TyposquatChecks};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -93,11 +93,19 @@ pub(crate) fn document_dependency_count(state: &ServerState, uri: &Uri) -> usize
 /// Built only by [`Self::capture`] (#1799), which records the [`ConfigEpoch`] and the
 /// [`DocStamp`] the generation reads, so [`publish_document_diagnostics`] can tell whether a
 /// config apply or a document change overlapped it.
-#[derive(Debug, Clone, Copy)]
+///
+/// Every config-derived gate a generation consults (typosquat, GOSSIP, license policy,
+/// vulnerability visibility) is copied out of the same `DepsConfig` read guard (#1815), so a
+/// generation reads exactly one config by construction; the `ServerState` mirrors of these
+/// gates serve only the prefetch spawners.
+#[derive(Debug, Clone)]
 pub(crate) struct DiagnosticsSnapshot {
     pub(crate) freshness: deps_core::FreshnessSettings,
     severities: deps_core::DiagnosticSeverities,
     network: deps_core::NetworkMode,
+    typosquat: TyposquatChecks,
+    gossip: GossipChecks,
+    license_policy: Arc<deps_core::LicensePolicy>,
     pub(crate) fetch_timeout_secs: u64,
     pub(crate) max_concurrent_fetches: usize,
     epoch: ConfigEpoch,
@@ -119,6 +127,9 @@ impl DiagnosticsSnapshot {
             freshness: config.policy.freshness.to_freshness(),
             severities: config.policy.diagnostics.to_severities(),
             network: config.policy.network.mode(),
+            typosquat: config.policy.typosquat_checks(),
+            gossip: config.policy.gossip_checks(),
+            license_policy: Arc::new(config.policy.license_policy.to_policy()),
             fetch_timeout_secs: config.policy.cache.fetch_timeout_secs,
             max_concurrent_fetches: config.policy.cache.max_concurrent_fetches,
             epoch,
@@ -132,9 +143,10 @@ impl DiagnosticsSnapshot {
         state.config_epoch() == self.epoch && state.document_stamp(uri) == self.stamp
     }
 
-    /// Replaces the severities (the pull path's caller-captured `DiagnosticsConfig`).
+    /// Replaces the severities, for tests.
     ///
     /// [`Self::osv_checks`] is computed from the severities, so it follows the override.
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn with_severities(
         mut self,
@@ -149,17 +161,44 @@ impl DiagnosticsSnapshot {
         OsvChecks::resolve(self.severities.vulnerabilities_enabled, self.network)
     }
 
-    /// Builds a snapshot from explicit values, for tests that drive diagnostics generation.
+    /// Whether already-fetched advisories render, from `vulnerabilities_enabled` alone
+    /// (#1819): offline keeps showing cached advisories, unlike [`Self::osv_checks`].
+    const fn vulnerability_visibility(&self) -> PrefetchVisibility {
+        PrefetchVisibility::from_enabled(self.severities.vulnerabilities_enabled)
+    }
+
+    /// Replaces the typosquat gate, for tests.
+    #[cfg(all(test, feature = "npm"))]
+    #[must_use]
+    pub(crate) const fn with_typosquat_checks(mut self, checks: TyposquatChecks) -> Self {
+        self.typosquat = checks;
+        self
+    }
+
+    /// Replaces the license policy, for tests.
+    #[cfg(all(test, feature = "cargo"))]
+    #[must_use]
+    pub(crate) fn with_license_policy(mut self, policy: deps_core::LicensePolicy) -> Self {
+        self.license_policy = Arc::new(policy);
+        self
+    }
+
+    /// Builds a snapshot from explicit values (inactive typosquat/GOSSIP gates, empty license
+    /// policy), for tests that drive diagnostics generation.
     #[cfg(all(test, any(feature = "cargo", feature = "npm")))]
     pub(crate) fn for_test(
         freshness: deps_core::FreshnessSettings,
         severities: deps_core::DiagnosticSeverities,
         network: deps_core::NetworkMode,
     ) -> Self {
+        let inactive = deps_core::policy_config::PolicyConfig::default();
         Self {
             freshness,
             severities,
             network,
+            typosquat: inactive.typosquat_checks(),
+            gossip: inactive.gossip_checks(),
+            license_policy: Arc::new(deps_core::LicensePolicy::default()),
             fetch_timeout_secs: 0,
             max_concurrent_fetches: 1,
             epoch: ConfigEpoch::default(),
@@ -297,7 +336,7 @@ where
     loop {
         let snapshot = DiagnosticsSnapshot::capture(state, uri, config).await;
         let ticket = state.next_publish_ticket();
-        let value = generate(snapshot).await;
+        let value = generate(snapshot.clone()).await;
         let guard = config.read().await;
         let current = snapshot.is_current(state, uri);
         if current || attempt == MAX_PUBLISH_ATTEMPTS {
@@ -315,13 +354,12 @@ where
 
 /// Handles diagnostic requests using trait-based delegation.
 #[tracing::instrument(
-    skip(state, config, client, full_config),
+    skip(state, client, full_config),
     fields(uri = ?uri, ecosystem = tracing::field::Empty)
 )]
 pub async fn handle_diagnostics(
     state: Arc<ServerState>,
     uri: &Uri,
-    config: &DiagnosticsConfig,
     client: Client,
     full_config: Arc<RwLock<DepsConfig>>,
 ) -> Vec<Diagnostic> {
@@ -336,15 +374,9 @@ pub async fn handle_diagnostics(
         tracing::Span::current().record("ecosystem", ecosystem_id.id());
     }
 
-    // Snapshot before generating diagnostics (Copy value, no lock held across the call).
-    // Severities come from `config` — the caller's own pre-race `DiagnosticsConfig` snapshot
-    // (issue #227 C1 regression coverage) — rather than a fresh read off `full_config` here,
-    // since this is the one diagnostics call site that must keep observing whichever config
-    // its caller captured before a concurrent `workspace/didChangeConfiguration` write; every
-    // other field is unaffected by that race, so it still comes from `DiagnosticsSnapshot`.
-    let snapshot = DiagnosticsSnapshot::capture(&state, uri, &full_config)
-        .await
-        .with_severities(config.to_severities());
+    // Captured once, so severities, gates and the license policy all come from one config
+    // read (#1815); the pull path has no separately captured severities to mix in.
+    let snapshot = DiagnosticsSnapshot::capture(&state, uri, &full_config).await;
 
     let dep_count = document_dependency_count(&state, uri);
     let ceiling = loading_ceiling(
@@ -370,8 +402,9 @@ pub async fn handle_diagnostics(
 /// is safe hover-only because hover has exactly one producer per request, but diagnostics
 /// has multiple producers all replacing the same client-visible `publish_diagnostics` set,
 /// so a caller-scoped policy meant the license diagnostic flickered in and out on every
-/// edit and was invisible to push-only clients. The policy is now read unconditionally from
-/// [`ServerState::license_policy`] instead, so no call site needs a signature change.
+/// edit and was invisible to push-only clients. The policy now travels in the
+/// [`DiagnosticsSnapshot`] (#1815), captured with every other gate from one config read, so no
+/// call site needs a signature change.
 pub(crate) async fn generate_diagnostics_internal(
     state: Arc<ServerState>,
     uri: &Uri,
@@ -382,6 +415,7 @@ pub(crate) async fn generate_diagnostics_internal(
     let severities = snapshot.severities;
     let network = snapshot.network;
     let snapshot_osv_checks = snapshot.osv_checks();
+    let vulnerability_visibility = snapshot.vulnerability_visibility();
     // Skip diagnostics while versions are loading, up to `loading_ceiling` (#632): if the
     // background fetch task panicked without reaching `set_loaded`/`set_failed`, `loading_state`
     // would stay `Loading` forever and permanently suppress diagnostics. Past the ceiling, force
@@ -431,34 +465,28 @@ pub(crate) async fn generate_diagnostics_internal(
         // concurrent flag flip as the pre-refactor read site (right after releasing this
         // same lock), and tighter than reading before entering the closure would be.
         let online = network.is_online();
-        let typosquat_visibility = if state.typosquat_checks().is_active() && online {
-            PrefetchVisibility::Render
-        } else {
-            PrefetchVisibility::Suppress
-        };
-        let gossip_visibility = if state.gossip_checks().is_active() && online {
-            PrefetchVisibility::Render
-        } else {
-            PrefetchVisibility::Suppress
-        };
-        let snapshot = doc
+        let typosquat_visibility =
+            PrefetchVisibility::from_enabled(snapshot.typosquat.is_active() && online);
+        let gossip_visibility =
+            PrefetchVisibility::from_enabled(snapshot.gossip.is_active() && online);
+        let signals = doc
             .signals
             .snapshot()
             .with_resolved_version_candidates()
-            .with_vulnerabilities()
+            .with_vulnerabilities(vulnerability_visibility)
             .with_latest_status(snapshot_osv_checks)
             .with_outcomes()
             .with_license_prefetch()
             .with_typosquat_prefetch(typosquat_visibility)
             .with_gossip_prefetch(gossip_visibility)
             .finish();
-        Some((ecosystem, doc.ecosystem, parse_result, snapshot))
+        Some((ecosystem, doc.ecosystem, parse_result, signals))
     }) else {
         tracing::warn!("Document not found for diagnostics: {:?}", uri);
         return vec![];
     };
 
-    let Some((ecosystem, ecosystem_id, parse_result, snapshot)) = extracted else {
+    let Some((ecosystem, ecosystem_id, parse_result, signals)) = extracted else {
         return vec![];
     };
 
@@ -472,13 +500,12 @@ pub(crate) async fn generate_diagnostics_internal(
         return vec![];
     };
 
-    let policy = state.license_policy();
-    let version_data = snapshot
+    let version_data = signals
         .version_data()
         .with_ecosystem(ecosystem_id)
         .with_network(network)
         .with_license_source(ecosystem.license_source())
-        .with_license_policy(&policy);
+        .with_license_policy(&snapshot.license_policy);
 
     let domain_diagnostics = ecosystem
         .generate_diagnostics(
@@ -607,6 +634,16 @@ mod tests {
         outcome.signals
     }
 
+    /// The typosquat gate of an otherwise default (online) policy.
+    #[cfg(feature = "npm")]
+    fn typosquat_checks(enabled: bool) -> TyposquatChecks {
+        deps_core::policy_config::PolicyConfig {
+            typosquat: deps_core::policy_config::TyposquatConfig::new().with_enabled(enabled),
+            ..deps_core::policy_config::PolicyConfig::default()
+        }
+        .typosquat_checks()
+    }
+
     #[test]
     fn test_loading_ceiling_small_manifest_hits_floor() {
         // A small manifest under default concurrency stays well under
@@ -671,7 +708,6 @@ mod tests {
         // guard is needed here.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
-        state.set_typosquat_enabled(true);
         let url = deps_core::test_util::test_uri("/test/package.json");
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
@@ -713,7 +749,8 @@ mod tests {
                     deps_core::FreshnessSettings::default(),
                     deps_core::DiagnosticSeverities::default(),
                     deps_core::NetworkMode::Online,
-                ),
+                )
+                .with_typosquat_checks(typosquat_checks(true)),
                 MIN_LOADING_CEILING,
             ),
         )
@@ -749,7 +786,6 @@ mod tests {
 
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
-        state.set_typosquat_enabled(true);
         let url = deps_core::test_util::test_uri("/test/package.json");
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
@@ -778,9 +814,6 @@ mod tests {
         doc_state.merge_typosquats(typosquats);
         state.update_document(uri.clone(), doc_state);
 
-        // Disabled *after* the (simulated-stale) signal already landed in `doc.signals.typosquats`.
-        state.set_typosquat_enabled(false);
-
         let result = generate_diagnostics_internal(
             Arc::clone(&state),
             &uri,
@@ -788,7 +821,8 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
                 deps_core::DiagnosticSeverities::default(),
                 deps_core::NetworkMode::Online,
-            ),
+            )
+            .with_typosquat_checks(typosquat_checks(false)),
             MIN_LOADING_CEILING,
         )
         .await;
@@ -816,7 +850,6 @@ mod tests {
 
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
-        state.set_typosquat_enabled(true);
         let url = deps_core::test_util::test_uri("/test/package.json");
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
@@ -854,7 +887,8 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
                 deps_core::DiagnosticSeverities::default(),
                 deps_core::NetworkMode::Offline,
-            ),
+            )
+            .with_typosquat_checks(typosquat_checks(true)),
             MIN_LOADING_CEILING,
         )
         .await;
@@ -867,6 +901,172 @@ mod tests {
             )),
             "a stale `doc.signals.typosquats` entry must not render while offline, got: {result:?}"
         );
+    }
+
+    /// Issue #1819: the advisory toggle and offline mode over a document with an already
+    /// fetched advisory.
+    #[cfg(feature = "cargo")]
+    mod vulnerability_toggle {
+        use super::*;
+        use crate::document::DocumentState;
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, ScanOutcome, UpgradeStatus,
+            VulnSeverity, VulnerabilityMap,
+        };
+
+        const ADVISORY_ID: &str = "RUSTSEC-2020-0071";
+
+        async fn state_with_advisory() -> (Arc<ServerState>, Uri) {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
+            let content = "[dependencies]\nserde = \"0.9.0\"\n".to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &url)
+                .await
+                .expect("failed to parse manifest");
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            let mut cached = std::collections::HashMap::new();
+            cached.insert(
+                deps_core::PackageName::from("serde"),
+                deps_core::PackageVersions::latest_only("0.9.0"),
+            );
+            doc_state.update_cached_versions(cached);
+            let mut vulnerabilities = VulnerabilityMap::new();
+            vulnerabilities.insert(
+                deps_core::test_util::vuln_key("serde"),
+                ScanOutcome::Vulnerable(
+                    DependencyVulnerabilities::new(Capped::new(
+                        vec![Arc::new(
+                            Advisory::new(
+                                ADVISORY_ID.to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::High,
+                            )
+                            .expect("valid osv id")
+                            .with_fixed_versions(vec![OsvVersion::new("1.0.5")]),
+                        )],
+                        1,
+                    ))
+                    .with_fix_target_status(UpgradeStatus::CandidateClean {
+                        version: deps_core::ConcreteVersion::new("1.0.5"),
+                    }),
+                ),
+            );
+            doc_state.signals.vulnerabilities = vulnerabilities;
+            doc_state.set_loaded();
+            state.update_document(uri.clone(), doc_state);
+            (state, uri)
+        }
+
+        async fn advisory_rendered(
+            state: &Arc<ServerState>,
+            uri: &Uri,
+            vulnerabilities_enabled: bool,
+            network: deps_core::NetworkMode,
+        ) -> bool {
+            let mut diagnostics = DiagnosticsConfig::default();
+            diagnostics.vulnerabilities_enabled = vulnerabilities_enabled;
+            let result = generate_diagnostics_internal(
+                Arc::clone(state),
+                uri,
+                &DiagnosticsSnapshot::for_test(
+                    deps_core::FreshnessSettings::default(),
+                    diagnostics.to_severities(),
+                    network,
+                ),
+                MIN_LOADING_CEILING,
+            )
+            .await;
+            result.iter().any(|d| {
+                matches!(
+                    &d.code,
+                    Some(tower_lsp_server::ls_types::NumberOrString::String(code))
+                        if code == ADVISORY_ID
+                )
+            })
+        }
+
+        #[tokio::test]
+        async fn disabling_hides_cached_advisories_and_re_enabling_shows_them() {
+            let (state, uri) = state_with_advisory().await;
+            let online = deps_core::NetworkMode::Online;
+            assert!(advisory_rendered(&state, &uri, true, online).await);
+            assert!(!advisory_rendered(&state, &uri, false, online).await);
+            assert!(advisory_rendered(&state, &uri, true, online).await);
+        }
+
+        /// The pull path reads one config: toggling it between requests changes the advisory
+        /// set, never a mix of the old severities and the new gates (#1815).
+        #[tokio::test]
+        async fn pull_path_follows_the_config_it_captured() {
+            let (state, uri) = state_with_advisory().await;
+            let (client, config) = crate::test_utils::test_helpers::create_test_client_and_config();
+            for enabled in [true, false, true] {
+                config
+                    .write()
+                    .await
+                    .policy
+                    .diagnostics
+                    .vulnerabilities_enabled = enabled;
+                let result = handle_diagnostics(
+                    Arc::clone(&state),
+                    &uri,
+                    client.clone(),
+                    Arc::clone(&config),
+                )
+                .await;
+                let shown = result.iter().any(|d| {
+                    matches!(
+                        &d.code,
+                        Some(tower_lsp_server::ls_types::NumberOrString::String(code))
+                            if code == ADVISORY_ID
+                    )
+                });
+                assert_eq!(shown, enabled);
+            }
+        }
+
+        #[tokio::test]
+        async fn offline_keeps_rendering_cached_advisories() {
+            let (state, uri) = state_with_advisory().await;
+            assert!(advisory_rendered(&state, &uri, true, deps_core::NetworkMode::Offline).await);
+            assert!(!advisory_rendered(&state, &uri, false, deps_core::NetworkMode::Offline).await);
+        }
+    }
+
+    /// Issue #1815: a generation reads the config gates from its snapshot, never from the
+    /// `ServerState` mirrors, which a later config apply may already have moved.
+    #[tokio::test]
+    async fn capture_ignores_the_state_mirrors() {
+        let state = ServerState::new();
+        state.set_license_policy(deps_core::LicensePolicy::new(
+            Vec::new(),
+            vec!["GPL-3.0".to_string()],
+        ));
+        let uri = epoch_test_uri();
+        let snapshot =
+            DiagnosticsSnapshot::capture(&state, &uri, &RwLock::new(DepsConfig::default())).await;
+        assert!(snapshot.license_policy.is_empty());
+        assert!(!snapshot.typosquat.is_active());
+        assert!(!snapshot.gossip.is_active());
+    }
+
+    #[tokio::test]
+    async fn capture_copies_the_gates_of_the_config_it_read() {
+        let state = ServerState::new();
+        let mut config = DepsConfig::default();
+        config.policy.license_policy = deps_core::policy_config::LicensePolicyConfig::new()
+            .with_deny(vec!["GPL-3.0".to_string()]);
+        let snapshot =
+            DiagnosticsSnapshot::capture(&state, &epoch_test_uri(), &RwLock::new(config)).await;
+        assert!(!snapshot.license_policy.is_empty());
     }
 
     fn epoch_test_uri() -> Uri {
@@ -1132,10 +1332,9 @@ mod tests {
         let state = Arc::new(ServerState::new());
         let url = deps_core::test_util::test_uri("/test/Cargo.toml");
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-        let config = DiagnosticsConfig::default();
 
         let (client, full_config) = create_test_client_and_config();
-        let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+        let result = handle_diagnostics(state, &uri, client, full_config).await;
         assert!(result.is_empty());
     }
 
@@ -1176,13 +1375,12 @@ mod tests {
         let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
         state.update_document(uri.clone(), doc);
 
-        let config = DiagnosticsConfig::default();
         let (client, full_config) = create_test_client_and_config();
 
         let handler_task = tokio::spawn({
             let state = Arc::clone(&state);
             let uri = uri.clone();
-            async move { handle_diagnostics(state, &uri, &config, client, full_config).await }
+            async move { handle_diagnostics(state, &uri, client, full_config).await }
         });
 
         // Block until `generate_diagnostics` has actually started (barrier) before racing
@@ -1252,7 +1450,8 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            full_config.write().await.policy.diagnostics = config;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
 
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].severity, Some(DiagnosticSeverity::ERROR));
@@ -1265,7 +1464,6 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::default();
 
             let ecosystem = state
                 .ecosystem_registry
@@ -1285,7 +1483,7 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
 
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].severity, Some(DiagnosticSeverity::WARNING));
@@ -1329,7 +1527,8 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            full_config.write().await.policy.diagnostics = config;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
 
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].severity, Some(DiagnosticSeverity::ERROR));
@@ -1343,7 +1542,6 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::default();
 
             let ecosystem = state
                 .ecosystem_registry
@@ -1374,7 +1572,7 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
 
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].severity, Some(DiagnosticSeverity::HINT));
@@ -1413,7 +1611,8 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            full_config.write().await.policy.diagnostics = config;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
 
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].severity, Some(DiagnosticSeverity::ERROR));
@@ -1480,7 +1679,6 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::default();
 
             let ecosystem = state
                 .ecosystem_registry
@@ -1501,7 +1699,7 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let _result = handle_diagnostics(state, &uri, client, full_config).await;
         }
 
         #[tokio::test]
@@ -1509,14 +1707,13 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::default();
 
             let doc_state =
                 DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
             assert!(result.is_empty());
         }
 
@@ -1707,7 +1904,6 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::default();
 
             let ecosystem = state
                 .ecosystem_registry
@@ -1733,7 +1929,7 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
 
             assert_eq!(result.len(), 1, "expected exactly one diagnostic");
             assert_eq!(
@@ -1760,7 +1956,6 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::default();
 
             let ecosystem = state
                 .ecosystem_registry
@@ -1783,7 +1978,7 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
             assert!(
                 !result
                     .iter()
@@ -1801,7 +1996,6 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::default();
 
             let ecosystem = state
                 .ecosystem_registry
@@ -1836,7 +2030,7 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
 
             assert_eq!(result.len(), 2, "expected one warning and one hint");
             assert!(
@@ -1864,7 +2058,6 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::default();
 
             let ecosystem = state
                 .ecosystem_registry
@@ -1894,7 +2087,7 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
 
             assert_eq!(result.len(), 1, "expected exactly one diagnostic");
             assert_eq!(
@@ -1921,7 +2114,6 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/package.json");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::default();
 
             let ecosystem = state
                 .ecosystem_registry
@@ -1939,7 +2131,7 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let _result = handle_diagnostics(state, &uri, client, full_config).await;
         }
 
         /// #436 S1 regression: after #436 narrowed npm's fix to only suppress the
@@ -1962,7 +2154,6 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/package.json");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::default();
 
             let ecosystem = state
                 .ecosystem_registry
@@ -2003,7 +2194,7 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
 
             assert_eq!(
                 result.len(),
@@ -2035,7 +2226,6 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/package.json");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::default();
 
             let ecosystem = state
                 .ecosystem_registry
@@ -2072,7 +2262,7 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
 
             assert!(
                 result.is_empty(),
@@ -2101,7 +2291,6 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/deno.json");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::default();
 
             let ecosystem = state
                 .ecosystem_registry
@@ -2136,7 +2325,7 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
 
             assert!(
                 result.is_empty(),
@@ -2155,7 +2344,6 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/deno.json");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::default();
 
             let ecosystem = state
                 .ecosystem_registry
@@ -2186,7 +2374,7 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
 
             assert_eq!(
                 result.len(),
@@ -2215,7 +2403,6 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/deno.json");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::default();
 
             let ecosystem = state
                 .ecosystem_registry
@@ -2250,7 +2437,7 @@ serde = "1.0.0"
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
 
             assert_eq!(
                 result.len(),
@@ -2278,7 +2465,6 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/pyproject.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let config = DiagnosticsConfig::default();
 
             let ecosystem = state
                 .ecosystem_registry
@@ -2299,7 +2485,7 @@ dependencies = ["requests>=2.0.0"]
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
-            let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let _result = handle_diagnostics(state, &uri, client, full_config).await;
         }
     }
 
@@ -2376,9 +2562,8 @@ dependencies = ["requests>=2.0.0"]
         #[tokio::test]
         async fn empty_policy_produces_no_diagnostics() {
             let (state, uri, client, full_config) = setup("GPL-3.0", Vec::new(), Vec::new()).await;
-            let config = DiagnosticsConfig::default();
 
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
             assert!(result.is_empty());
         }
 
@@ -2386,9 +2571,8 @@ dependencies = ["requests>=2.0.0"]
         async fn denied_license_produces_error_diagnostic() {
             let (state, uri, client, full_config) =
                 setup("GPL-3.0", Vec::new(), vec!["GPL-3.0".to_string()]).await;
-            let config = DiagnosticsConfig::default();
 
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
 
             assert_eq!(
                 result.len(),
@@ -2409,9 +2593,8 @@ dependencies = ["requests>=2.0.0"]
         async fn not_allowed_license_produces_warning_diagnostic() {
             let (state, uri, client, full_config) =
                 setup("ISC", vec!["MIT".to_string()], Vec::new()).await;
-            let config = DiagnosticsConfig::default();
 
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
 
             assert_eq!(
                 result.len(),
@@ -2429,9 +2612,8 @@ dependencies = ["requests>=2.0.0"]
         async fn compliant_license_produces_no_diagnostic() {
             let (state, uri, client, full_config) =
                 setup("MIT", vec!["MIT".to_string()], vec!["GPL-3.0".to_string()]).await;
-            let config = DiagnosticsConfig::default();
 
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
             assert!(result.is_empty(), "got: {result:?}");
         }
 
@@ -2460,9 +2642,8 @@ dependencies = ["requests>=2.0.0"]
             let policy_config = LicensePolicyConfig::new().with_allow(vec!["MIT".to_string()]);
             state.set_license_policy(policy_config.to_policy());
             full_config.write().await.policy.license_policy = policy_config;
-            let config = DiagnosticsConfig::default();
 
-            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            let result = handle_diagnostics(state, &uri, client, full_config).await;
             assert!(result.is_empty(), "got: {result:?}");
         }
 
@@ -2470,7 +2651,7 @@ dependencies = ["requests>=2.0.0"]
         /// called directly by every background-refresh call site in `document::lifecycle`/
         /// `server.rs` with no `Option<&LicensePolicy>` parameter — must evaluate the same
         /// policy as the pull path (`handle_diagnostics`), both reading
-        /// `ServerState::license_policy`. Before this fix, only `handle_diagnostics` ever
+        /// the policy from the `DiagnosticsSnapshot`. Before this fix, only `handle_diagnostics` ever
         /// saw a configured policy.
         #[tokio::test]
         async fn push_path_also_evaluates_license_policy() {
@@ -2493,11 +2674,6 @@ dependencies = ["requests>=2.0.0"]
             doc_state.update_licenses(licenses);
             state.update_document(uri.clone(), doc_state);
 
-            state.set_license_policy(deps_core::LicensePolicy::new(
-                Vec::new(),
-                vec!["GPL-3.0".to_string()],
-            ));
-
             let result = generate_diagnostics_internal(
                 Arc::clone(&state),
                 &uri,
@@ -2505,7 +2681,11 @@ dependencies = ["requests>=2.0.0"]
                     deps_core::FreshnessSettings::default(),
                     deps_core::DiagnosticSeverities::default(),
                     deps_core::NetworkMode::Online,
-                ),
+                )
+                .with_license_policy(deps_core::LicensePolicy::new(
+                    Vec::new(),
+                    vec!["GPL-3.0".to_string()],
+                )),
                 std::time::Duration::from_secs(60),
             )
             .await;

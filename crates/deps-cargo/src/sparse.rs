@@ -30,8 +30,10 @@
 use crate::config::{AuthToken, IndexTrust, RegistryIndex};
 use crate::types::CargoVersion;
 use deps_core::{
-    DepsError, HttpCache, RequestHeader, Result, lsp_helpers::warn_rejected_value,
-    net_policy::RedactedUrl,
+    DepsError, HttpCache, Result,
+    cache::{CredentialHeader, RequestAuth},
+    lsp_helpers::warn_rejected_value,
+    net_policy::{RedactedUrl, TrustedPrefix},
 };
 use semver::{Version, VersionReq};
 use serde::Deserialize;
@@ -218,15 +220,15 @@ fn parse_index_json(data: &[u8]) -> Result<Vec<CargoVersion>> {
 pub struct SparseIndexClient {
     base_url: String,
     cache: Arc<HttpCache>,
-    /// Pre-formatted `Bearer <token>` `Authorization` header value, when a credential is
-    /// present. Formatted once in [`Self::with_auth`] and held [`deps_core::secret::Redacted`]
+    /// Pre-formatted verbatim-token `Authorization` header value (no `Bearer` prefix, as Cargo
+    /// sends it), when a credential is present. Formatted once in [`Self::with_auth`] and held [`deps_core::secret::Redacted`]
     /// from that point on (issue #672) — mirrors [`deps_core::github::GithubTagsClient::new`]
     /// and `deps_nuget::config::NuGetAuth::new`'s format-once-at-construction pattern, rather
     /// than re-formatting a fresh unzeroized copy on every [`Self::fetch`] call. See
     /// [`crate::config::ResolvedRegistryEntry::auth`] for the security invariant on how the
     /// source token is populated — this client has no opinion on that; it just attaches
     /// whatever it is given, over an origin-pinned transport
-    /// ([`deps_core::HttpCache::get_cached_trusted_origin_with_headers`]) so the header cannot
+    /// ([`deps_core::HttpCache::get_cached_trusted_origin`]) so the header cannot
     /// survive a cross-origin redirect.
     auth_header: Option<deps_core::secret::AuthorizationValue>,
     /// The [`IndexTrust`] tier `index` was validated under (issue #455, C2): governs which
@@ -256,7 +258,7 @@ impl SparseIndexClient {
     }
 
     /// Creates a new sparse-index client for `index`, attaching `auth` (if any) to
-    /// every request as a `Bearer` `Authorization` header, and using
+    /// every request as a verbatim `Authorization` header, and using
     /// `registry_display_name` in not-found error messages.
     pub fn with_auth(
         index: RegistryIndex,
@@ -265,7 +267,7 @@ impl SparseIndexClient {
         registry_display_name: &'static str,
     ) -> Self {
         let auth_header =
-            auth.map(|token| deps_core::secret::bearer_auth_header(token.as_redacted()));
+            auth.map(|token| deps_core::secret::cargo_token_header(token.as_redacted()));
         Self {
             trust: index.trust(),
             base_url: index.as_str().to_string(),
@@ -359,7 +361,7 @@ impl SparseIndexClient {
 
     /// Routes the request through the transport matching [`Self::auth_header`] and [`Self::trust`]
     /// — the sole call site deciding between [`deps_core::HttpCache::get_cached`],
-    /// [`deps_core::HttpCache::get_cached_trusted_origin_with_headers`], and (issue #455)
+    /// [`deps_core::HttpCache::get_cached_trusted_origin`], and (issue #455)
     /// [`deps_core::HttpCache::get_cached_workspace`], so the two
     /// [`Self::get_versions`]/pagination-free shape of this client never duplicates that
     /// branch.
@@ -377,12 +379,16 @@ impl SparseIndexClient {
     async fn fetch(&self, url: &str) -> Result<bytes::Bytes> {
         match (&self.auth_header, self.trust) {
             (Some(header_value), IndexTrust::Trusted) => {
+                let prefix = TrustedPrefix::parse(&self.base_url).map_err(|_| {
+                    DepsError::CacheError(format!(
+                        "refusing authenticated request to unparseable index {}",
+                        RedactedUrl::new(&self.base_url)
+                    ))
+                })?;
+                let auth =
+                    RequestAuth::credential(CredentialHeader::Authorization(header_value), &prefix);
                 self.cache
-                    .get_cached_trusted_origin_with_headers(
-                        url,
-                        &self.base_url,
-                        &[RequestHeader::Authorization(header_value)],
-                    )
+                    .get_cached_trusted_origin(url, &prefix, auth, None)
                     .await
             }
             (None, IndexTrust::Trusted) => self.cache.get_cached(url).await,
@@ -787,7 +793,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock("GET", "/se/rd/serde")
-            .match_header("authorization", "Bearer secret-token")
+            .match_header("authorization", "secret-token")
             .with_status(200)
             .with_body(r#"{"name":"serde","vers":"1.0.0","yanked":false,"features":{},"deps":[]}"#)
             .create_async()

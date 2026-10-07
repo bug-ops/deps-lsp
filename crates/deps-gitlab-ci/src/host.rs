@@ -11,8 +11,8 @@
 
 use deps_core::EcosystemId;
 use deps_core::net_policy::{
-    HostClass, IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy,
-    WorkspaceRegistryAccess, validate_index_url,
+    BlockingPolicy, HostClass, IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy,
+    TrustedPrefix, WorkspaceRegistryAccess, validate_index_url,
 };
 use std::sync::{Arc, RwLock};
 
@@ -38,6 +38,7 @@ pub const GITLAB_COM_ORIGIN: &str = "https://gitlab.com";
 pub struct GitlabHost {
     host: String,
     origin: String,
+    prefix: TrustedPrefix,
 }
 
 impl GitlabHost {
@@ -89,10 +90,24 @@ impl GitlabHost {
         if url.host_str() != Some(raw_lowercased.as_str()) {
             return Err(IndexUrlError::InvalidUrl(RedactedUrl::new(raw)));
         }
+        let origin = url.origin().ascii_serialization();
+        let prefix = TrustedPrefix::parse(&format!("{origin}/"))
+            .map_err(|_| IndexUrlError::InvalidUrl(RedactedUrl::new(raw)))?;
         Ok(Self {
             host: raw_lowercased,
-            origin: url.origin().ascii_serialization(),
+            origin,
+            prefix,
         })
+    }
+
+    /// The public `gitlab.com` instance.
+    #[must_use]
+    pub fn gitlab_com() -> Self {
+        #[expect(
+            clippy::expect_used,
+            reason = "`gitlab.com` is a constant that always passes structural validation"
+        )]
+        Self::parse_trusted("gitlab.com").expect("gitlab.com is a valid GitLab host")
     }
 
     /// The verified, lowercased host string (no scheme, no path).
@@ -110,13 +125,24 @@ impl GitlabHost {
     #[cfg(test)]
     #[must_use]
     pub fn for_test(base_url: &str) -> Self {
+        let origin = base_url.trim_end_matches('/').to_string();
         Self {
             host: base_url
                 .trim_start_matches("http://")
                 .trim_start_matches("https://")
                 .to_string(),
-            origin: base_url.trim_end_matches('/').to_string(),
+            prefix: TrustedPrefix::parse(&format!("{origin}/"))
+                .or_else(|_| TrustedPrefix::parse(&format!("https://{origin}/")))
+                .unwrap(),
+            origin,
         }
+    }
+
+    /// The `{origin}/` prefix confining requests to this host and every redirect hop they
+    /// follow, computed once at construction.
+    #[must_use]
+    pub const fn trusted_prefix(&self) -> &TrustedPrefix {
+        &self.prefix
     }
 
     /// The normalized, ASCII-serialized origin (`https://{host}`), computed once at
@@ -207,6 +233,8 @@ pub(crate) enum InstanceHostOutcome {
         raw: String,
         /// The blocked host's classification.
         class: HostClass,
+        /// The rule that refused the host.
+        policy: BlockingPolicy,
     },
     /// Configured and validated successfully.
     Valid(GitlabHost),
@@ -300,7 +328,7 @@ impl GitlabInstanceHost {
 
         let outcome = match GitlabHost::parse(&raw, &self.policy) {
             Ok(host) => InstanceHostOutcome::Valid(host),
-            Err(IndexUrlError::BlockedHost { class }) => {
+            Err(IndexUrlError::BlockedHost { class, policy }) => {
                 tracing::warn!(
                     %class,
                     "registries.gitlab_instance_host is blocked by the current \
@@ -310,6 +338,7 @@ impl GitlabInstanceHost {
                 InstanceHostOutcome::Blocked {
                     raw: raw.clone(),
                     class,
+                    policy,
                 }
             }
             Err(e) => {
@@ -489,6 +518,7 @@ mod tests {
             InstanceHostOutcome::Blocked {
                 raw: "127.0.0.1".to_string(),
                 class: HostClass::Loopback,
+                policy: BlockingPolicy::Floor,
             }
         );
 

@@ -27,7 +27,14 @@ pub async fn handle_hover(
     }
 
     // Acquires the config RwLock before the DashMap shard guard, never the reverse (matches diagnostics.rs).
-    let (freshness, network, supply_chain_enabled, gossip_checks, osv_checks) = {
+    let (
+        freshness,
+        network,
+        supply_chain_enabled,
+        gossip_checks,
+        osv_checks,
+        vulnerability_visibility,
+    ) = {
         let config = config.read().await;
         (
             config.policy.freshness.to_freshness(),
@@ -35,6 +42,7 @@ pub async fn handle_hover(
             config.policy.supply_chain.enabled,
             config.policy.gossip_checks(),
             config.policy.osv_checks(),
+            PrefetchVisibility::from_enabled(config.policy.diagnostics.vulnerabilities_enabled),
         )
     };
 
@@ -57,7 +65,7 @@ pub async fn handle_hover(
                 .signals
                 .snapshot()
                 .with_resolved_version_candidates()
-                .with_vulnerabilities()
+                .with_vulnerabilities(vulnerability_visibility)
                 .with_latest_status(osv_checks)
                 .with_outcomes()
                 .with_license_prefetch()
@@ -120,6 +128,57 @@ mod tests {
 
         let result = handle_hover(state, params, client, config).await;
         assert!(result.is_none());
+    }
+
+    /// Issue #1819: the advisory section follows `vulnerabilities_enabled` at runtime, and
+    /// offline keeps rendering cached advisories.
+    #[cfg(feature = "cargo")]
+    mod advisory_toggle {
+        use super::*;
+        use crate::test_utils::test_helpers::{ADVISORY_ID, advisory_state, set_advisory_gates};
+
+        async fn advisory_shown(
+            state: &Arc<ServerState>,
+            uri: &tower_lsp_server::ls_types::Uri,
+            client: &tower_lsp_server::Client,
+            config: &Arc<RwLock<DepsConfig>>,
+        ) -> bool {
+            let params = HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(1, 2),
+                },
+                work_done_progress_params: Default::default(),
+            };
+            let hover = handle_hover(
+                Arc::clone(state),
+                params,
+                client.clone(),
+                Arc::clone(config),
+            )
+            .await;
+            hover.is_some_and(|hover| format!("{:?}", hover.contents).contains(ADVISORY_ID))
+        }
+
+        #[tokio::test]
+        async fn hover_follows_the_vulnerability_toggle() {
+            let (state, uri) = advisory_state().await;
+            let (client, config) = create_test_client_and_config();
+            for (enabled, offline, shown) in [
+                (true, false, true),
+                (false, false, false),
+                (true, false, true),
+                (true, true, true),
+                (false, true, false),
+            ] {
+                set_advisory_gates(&config, enabled, offline).await;
+                assert_eq!(
+                    advisory_shown(&state, &uri, &client, &config).await,
+                    shown,
+                    "vulnerabilities_enabled={enabled}, offline={offline}"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "cargo")]

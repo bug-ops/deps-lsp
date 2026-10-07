@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use deps_core::net_policy::AllowlistOutcome;
+use deps_core::net_policy::RegistryEnvironment;
 use deps_core::policy_config::{AtomicToggle, PolicyConfig, UserProfileSources};
 use deps_core::{EcosystemRegistry, HttpCache};
 
@@ -98,13 +98,13 @@ impl EcosystemRuntime {
     ///
     /// ```
     /// use deps_core::keychain_credentials::KeychainCredentialsHandle;
-    /// use deps_core::net_policy::AllowlistOutcome;
+    /// use deps_core::net_policy::{ProcessEnv, RegistryEnvironment};
     /// use deps_core::policy_config::{KeychainCredentials, PolicyConfig};
     /// use deps_engine::setup::EcosystemRuntime;
     /// use std::sync::Arc;
     ///
     /// let handle = Arc::new(KeychainCredentialsHandle::new(KeychainCredentials::Enabled));
-    /// let runtime = EcosystemRuntime::from_policy(&PolicyConfig::default(), &AllowlistOutcome::Unset)
+    /// let runtime = EcosystemRuntime::from_policy(&PolicyConfig::default(), &RegistryEnvironment::read(&ProcessEnv))
     ///     .with_keychain_credentials(Arc::clone(&handle));
     /// assert!(Arc::ptr_eq(&runtime.keychain_credentials, &handle));
     /// ```
@@ -125,14 +125,14 @@ impl EcosystemRuntime {
     ///
     /// ```
     /// use deps_core::lockfile::LockFileCache;
-    /// use deps_core::net_policy::AllowlistOutcome;
+    /// use deps_core::net_policy::{ProcessEnv, RegistryEnvironment};
     /// use deps_core::policy_config::PolicyConfig;
     /// use deps_engine::setup::EcosystemRuntime;
     /// use std::sync::Arc;
     ///
     /// let shared = Arc::new(LockFileCache::new());
     /// let runtime =
-    ///     EcosystemRuntime::from_policy(&PolicyConfig::default(), &AllowlistOutcome::Unset).with_lockfile_cache(Arc::clone(&shared));
+    ///     EcosystemRuntime::from_policy(&PolicyConfig::default(), &RegistryEnvironment::read(&ProcessEnv)).with_lockfile_cache(Arc::clone(&shared));
     /// assert!(Arc::ptr_eq(&runtime.lockfile_cache, &shared));
     /// ```
     #[must_use]
@@ -161,21 +161,23 @@ impl EcosystemRuntime {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::net_policy::AllowlistOutcome;
+    /// use deps_core::net_policy::{ProcessEnv, RegistryEnvironment};
     /// use deps_core::policy_config::{PolicyConfig, UserProfileSources};
     /// use deps_engine::setup::EcosystemRuntime;
     ///
-    /// let runtime = EcosystemRuntime::from_policy(&PolicyConfig::default(), &AllowlistOutcome::Unset);
+    /// let runtime = EcosystemRuntime::from_policy(&PolicyConfig::default(), &RegistryEnvironment::read(&ProcessEnv));
     /// assert_eq!(runtime.nuget_user_profile_sources.get(), UserProfileSources::Disabled);
     /// ```
     #[must_use]
-    pub fn from_policy(policy: &PolicyConfig, allowlist: &AllowlistOutcome) -> Self {
-        let resolved = policy.registries.resolve(allowlist);
+    pub fn from_policy(policy: &PolicyConfig, environment: &RegistryEnvironment) -> Self {
+        let resolved = policy.registries.resolve(environment.allowlist());
         Self::new(
-            Arc::new(deps_core::net_policy::RegistryAccessPolicy::with_allowlist(
-                resolved.workspace_registries,
-                allowlist.allowlist(),
-            )),
+            Arc::new(
+                deps_core::net_policy::RegistryAccessPolicy::with_environment(
+                    resolved.workspace_registries,
+                    environment,
+                ),
+            ),
             Arc::new(AtomicToggle::new(resolved.nuget_user_profile_sources)),
             Arc::new(std::sync::RwLock::new(resolved.gitlab_instance_host)),
         )
@@ -506,7 +508,7 @@ ecosystem!(
 /// # Examples
 ///
 /// ```
-/// use deps_core::net_policy::AllowlistOutcome;
+/// use deps_core::net_policy::{ProcessEnv, RegistryEnvironment};
 /// use deps_core::policy_config::PolicyConfig;
 /// use deps_core::{EcosystemRegistry, HttpCache};
 /// use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
@@ -514,7 +516,7 @@ ecosystem!(
 ///
 /// let registry = EcosystemRegistry::new();
 /// let cache = Arc::new(HttpCache::new());
-/// let runtime = EcosystemRuntime::from_policy(&PolicyConfig::default(), &AllowlistOutcome::Unset);
+/// let runtime = EcosystemRuntime::from_policy(&PolicyConfig::default(), &RegistryEnvironment::read(&ProcessEnv));
 /// let workspace_registry_ecosystems = register_ecosystems(&registry, cache, &runtime);
 ///
 /// // Every id this call reports as policy-consuming is actually registered.
@@ -707,6 +709,9 @@ pub fn register_ecosystems(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::net_policy::{
+        GuardedEgress, MapEnv, PRIVATE_REGISTRY_HOSTS_ENV, WORKSPACE_REGISTRY_PROXY_ENV,
+    };
 
     fn test_runtime() -> EcosystemRuntime {
         EcosystemRuntime::new(
@@ -735,11 +740,16 @@ mod tests {
             ..PolicyConfig::default()
         };
 
-        let runtime =
-            EcosystemRuntime::from_policy(&policy, &AllowlistOutcome::for_test(&["10.0.0.0/8"]));
+        let environment = RegistryEnvironment::read(
+            &MapEnv::new()
+                .with_var(PRIVATE_REGISTRY_HOSTS_ENV, "10.0.0.0/8")
+                .with_var(WORKSPACE_REGISTRY_PROXY_ENV, "proxy"),
+        );
+        let runtime = EcosystemRuntime::from_policy(&policy, &environment);
 
         assert_eq!(runtime.policy.get(), WorkspaceRegistryAccess::All);
         assert!(!runtime.policy.allowlist().is_empty());
+        assert_eq!(runtime.policy.egress(), GuardedEgress::Proxy);
         assert_eq!(
             runtime.nuget_user_profile_sources.get(),
             UserProfileSources::Enabled

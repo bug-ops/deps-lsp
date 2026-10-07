@@ -63,13 +63,11 @@ impl PackageNaming for PypiFormatter {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
 
-        if valid {
-            Ok(())
-        } else {
-            Err(InvalidPackageName::new(
+        valid.ok_or_else(|| {
+            InvalidPackageName::new(
                 "must match PEP 508 name pattern ^([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9])$",
-            ))
-        }
+            )
+        })
     }
 }
 

@@ -3065,7 +3065,7 @@ mod tests {
     #[test]
     fn test_sibling_tags_alias_winner_keeps_siblings() {
         let pin = resolved_pin_for(&["v1.2.3", "v1.2.4", "v1.2.3.1"]).unwrap();
-        assert!(matches!(pin, ResolvedPin::Alias { .. }));
+        assert_matches!(pin, ResolvedPin::Alias { .. });
         assert_eq!(pin.version().as_str(), "v1.2.3");
         assert_eq!(sibling_names(&pin), ["v1.2.4"]);
     }
@@ -3095,7 +3095,7 @@ mod tests {
         let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
         let index = TagIndex::from_tags([("v4.8.0", &sha), ("v4.8.0.1", &sha), ("4.8.0", &sha)]);
         let pin = index.resolved_exact_tag("v4.8.0").unwrap();
-        assert!(matches!(pin, ResolvedPin::Alias { .. }));
+        assert_matches!(pin, ResolvedPin::Alias { .. });
         assert!(pin.siblings().is_empty());
     }
 
@@ -3207,7 +3207,7 @@ mod tests {
         ] {
             let pin = resolved_pin_for(&tags).unwrap();
             assert_eq!(pin.version().as_str(), expected, "{tags:?}");
-            assert!(matches!(pin, ResolvedPin::MostSpecific { .. }), "{tags:?}");
+            assert_matches!(pin, ResolvedPin::MostSpecific { .. }, "{tags:?}");
         }
     }
 

@@ -38,7 +38,7 @@ use deps_core::EcosystemId;
 #[cfg(test)]
 use deps_core::net_policy::HostClass;
 use deps_core::net_policy::{
-    RedactedUrl, RegistryAccessPolicy, RegistryUrlKind, ValidatedRegistryUrl,
+    BlockedHost, RedactedUrl, RegistryAccessPolicy, RegistryUrlKind, ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{BlockedSourceClass, RejectedSourceClass};
@@ -459,37 +459,38 @@ impl PypiIndexConfig {
     #[must_use]
     pub fn blocked_class_for(&self, named_source: Option<&str>) -> Option<BlockedSourceClass> {
         if let Some(name) = named_source {
-            let (class, raw_value) = self
+            let (BlockedHost { class, policy }, raw_value) = self
                 .named_sources
                 .get(name)?
                 .as_ref()
                 .err()
-                .and_then(InvalidEntry::blocked_class)?;
+                .and_then(InvalidEntry::blocked_host)?;
             return Some(BlockedSourceClass {
                 class,
+                policy,
                 raw_value,
                 declaration_key: format!("named:{name}"),
             });
         }
         if let Some(result) = &self.primary {
-            let (class, raw_value) = result
-                .as_ref()
-                .err()
-                .and_then(InvalidEntry::blocked_class)?;
+            let (BlockedHost { class, policy }, raw_value) =
+                result.as_ref().err().and_then(InvalidEntry::blocked_host)?;
             return Some(BlockedSourceClass {
                 class,
+                policy,
                 raw_value,
                 declaration_key: "primary".to_string(),
             });
         }
-        let (class, raw_value) = self
+        let (BlockedHost { class, policy }, raw_value) = self
             .tail_hop
             .as_ref()?
             .as_ref()
             .err()
-            .and_then(InvalidEntry::blocked_class)?;
+            .and_then(InvalidEntry::blocked_host)?;
         Some(BlockedSourceClass {
             class,
+            policy,
             raw_value,
             declaration_key: "uv-tail".to_string(),
         })

@@ -357,6 +357,7 @@ mod tests {
             blocked: vec![BlockedRegistryOccurrence {
                 range,
                 class: HostClass::CloudMetadata,
+                policy: crate::net_policy::BlockingPolicy::Floor,
                 raw_value: "https://169.254.169.254".to_string(),
                 declaration_key: "top-level".to_string(),
             }],

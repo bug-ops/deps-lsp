@@ -171,7 +171,7 @@ async fn test_authenticated_alternate_registry_sends_authorization_header() {
     let mut server = mockito::Server::new_async().await;
     let mock = server
         .mock("GET", "/in/te/internal-crate")
-        .match_header("authorization", "Bearer secret-token")
+        .match_header("authorization", "secret-token")
         .with_status(200)
         .with_body(SPARSE_ENTRY)
         .create_async()

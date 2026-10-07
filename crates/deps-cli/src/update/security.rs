@@ -623,6 +623,7 @@ mod tests {
         VersionReq,
     };
     use std::any::Any;
+    use std::assert_matches;
     use std::collections::{HashMap, HashSet};
 
     struct MockDep {
@@ -1001,7 +1002,7 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(item.outcome, Outcome::Applied { .. }));
+        assert_matches!(item.outcome, Outcome::Applied { .. });
         assert_eq!(
             item.target(),
             Some(&deps_core::ConcreteVersion::from("1.0.2"))
@@ -1033,10 +1034,7 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(
-            item.outcome,
-            Outcome::RequiresLockfileUpdate { .. }
-        ));
+        assert_matches!(item.outcome, Outcome::RequiresLockfileUpdate { .. });
     }
 
     #[test]
@@ -1062,10 +1060,7 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(
-            item.outcome,
-            Outcome::RequiresLockfileUpdate { .. }
-        ));
+        assert_matches!(item.outcome, Outcome::RequiresLockfileUpdate { .. });
     }
 
     /// S1 (significant, US-003): a requirement the ecosystem's own comparator confirms
@@ -1089,10 +1084,7 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(
-            item.outcome,
-            Outcome::RequiresLockfileUpdate { .. }
-        ));
+        assert_matches!(item.outcome, Outcome::RequiresLockfileUpdate { .. });
         assert_eq!(
             item.target(),
             Some(&deps_core::ConcreteVersion::from("1.0.2"))
@@ -1117,10 +1109,7 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(
-            item.outcome,
-            Outcome::RequiresLockfileUpdate { .. }
-        ));
+        assert_matches!(item.outcome, Outcome::RequiresLockfileUpdate { .. });
     }
 
     /// #1566 S1 regression: a requirement shape (e.g. Cargo's compound `">=1.2, <1.5"`) whose
@@ -1143,11 +1132,9 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(
-            matches!(
-                item.outcome,
-                Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape { .. })
-            ),
+        assert_matches!(
+            item.outcome,
+            Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape { .. }),
             "expected Unfixable(UnsupportedRequirementShape), got {:?}",
             item.outcome
         );
@@ -1190,8 +1177,9 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(
-            matches!(item.outcome, Outcome::RequiresLockfileUpdate { .. }),
+        assert_matches!(
+            item.outcome,
+            Outcome::RequiresLockfileUpdate { .. },
             "expected RequiresLockfileUpdate, got {:?}",
             item.outcome
         );
@@ -1216,8 +1204,9 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(
-            matches!(item.outcome, Outcome::RequiresLockfileUpdate { .. }),
+        assert_matches!(
+            item.outcome,
+            Outcome::RequiresLockfileUpdate { .. },
             "expected RequiresLockfileUpdate, got {:?}",
             item.outcome
         );
@@ -1270,19 +1259,18 @@ mod tests {
             &IgnoreRules::empty(),
         );
 
-        assert!(
-            matches!(rewrite_item.outcome, Outcome::Applied { .. }),
+        assert_matches!(
+            rewrite_item.outcome,
+            Outcome::Applied { .. },
             "serde's requirement (\"0.9\") does not yet admit 1.0.2, so it must be rewritten"
         );
         assert_eq!(
             rewrite_item.target(),
             Some(&deps_core::ConcreteVersion::from("1.0.2"))
         );
-        assert!(
-            matches!(
-                lockfile_item.outcome,
-                Outcome::RequiresLockfileUpdate { .. }
-            ),
+        assert_matches!(
+            lockfile_item.outcome,
+            Outcome::RequiresLockfileUpdate { .. },
             "tokio's requirement (\"1\") already admits 1.0.2 per spec.md's US-003 fixture, so \
              it must be reported, not rewritten"
         );
@@ -1314,10 +1302,10 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(
+        assert_matches!(
             item.outcome,
             Outcome::Unfixable(UnfixableReason::FetchFailedOrAbsent)
-        ));
+        );
     }
 
     /// FR-011: no `PackageVersions` entry at all is `Unfixable`, even without a `fetch_failed`
@@ -1341,10 +1329,10 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(
+        assert_matches!(
             item.outcome,
             Outcome::Unfixable(UnfixableReason::FetchFailedOrAbsent)
-        ));
+        );
     }
 
     #[test]
@@ -1376,10 +1364,10 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(
+        assert_matches!(
             item.outcome,
             Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
-        ));
+        );
     }
 
     #[test]
@@ -1405,10 +1393,10 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(
+        assert_matches!(
             item.outcome,
             Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
-        ));
+        );
     }
 
     /// #1782: a `NoVerifiedFix` row carries no sibling note unless its verdict holds through
@@ -1435,10 +1423,10 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(
+        assert_matches!(
             item.outcome,
             Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
-        ));
+        );
         assert!(item.osv_sibling_match.is_none());
         assert!(sibling_match_note(&dv, &formatter).is_none());
     }
@@ -1476,10 +1464,10 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(
+        assert_matches!(
             item.outcome,
             Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
-        ));
+        );
         let note = item.osv_sibling_match.expect("sibling note attached");
         assert!(note.to_string().contains("v4.9.0"), "got: {note}");
     }
@@ -1516,11 +1504,9 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(
-            matches!(
-                item.outcome,
-                Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
-            ),
+        assert_matches!(
+            item.outcome,
+            Outcome::Unfixable(UnfixableReason::NoVerifiedFix),
             "got {:?}",
             item.outcome
         );
@@ -1560,11 +1546,9 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(
-            matches!(
-                item.outcome,
-                Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
-            ),
+        assert_matches!(
+            item.outcome,
+            Outcome::Unfixable(UnfixableReason::NoVerifiedFix),
             "got {:?}",
             item.outcome
         );
@@ -1598,10 +1582,10 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(
+        assert_matches!(
             item.outcome,
             Outcome::Unfixable(UnfixableReason::Yanked { .. })
-        ));
+        );
         assert_eq!(
             item.target(),
             Some(&deps_core::ConcreteVersion::from("1.0.2")),
@@ -1648,10 +1632,10 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(
+        assert_matches!(
             item.outcome,
             Outcome::Unfixable(UnfixableReason::Yanked { .. })
-        ));
+        );
     }
 
     /// SC-005: the yank filter must compare via the ecosystem's *native* version spelling,
@@ -1692,11 +1676,9 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(
-            matches!(
-                item.outcome,
-                Outcome::Unfixable(UnfixableReason::Yanked { .. })
-            ),
+        assert_matches!(
+            item.outcome,
+            Outcome::Unfixable(UnfixableReason::Yanked { .. }),
             "the yanked native-form entry (v1.0.2) must match the converted native-form fix \
              target, not the raw OSV wire form (1.0.2), which was never in the yanked list"
         );
@@ -1724,7 +1706,7 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(item.outcome, Outcome::Applied { .. }));
+        assert_matches!(item.outcome, Outcome::Applied { .. });
     }
 
     /// FR-008: a matching `[update].ignore` rule is reported as overridden, never suppressed.
@@ -1754,7 +1736,7 @@ mod tests {
             EcosystemId::Cargo,
             &ignore_rules,
         );
-        assert!(matches!(item.outcome, Outcome::Applied { .. }));
+        assert_matches!(item.outcome, Outcome::Applied { .. });
         assert!(
             item.ignore_rule_overridden,
             "a matching rule must be reported as overridden, not silently applied"
@@ -1816,11 +1798,9 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(
-            matches!(
-                item.outcome,
-                Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape { .. })
-            ),
+        assert_matches!(
+            item.outcome,
+            Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape { .. }),
             "real Cargo semver matcher must confirm 1.5.2 is excluded by \">=1.2, <1.5\", got {:?}",
             item.outcome
         );
@@ -1844,12 +1824,11 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(
-            matches!(
+        assert_matches!(
                 &item.outcome,
                 Outcome::Unfixable(UnfixableReason::NoReleaseTagForFix { target })
                     if target.as_str() == "1.5.2"
-            ),
+            ,
             "got {:?}",
             item.outcome
         );
@@ -1873,11 +1852,9 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(
-            matches!(
-                item.outcome,
-                Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
-            ),
+        assert_matches!(
+            item.outcome,
+            Outcome::Unfixable(UnfixableReason::NoVerifiedFix),
             "got {:?}",
             item.outcome
         );
@@ -1980,12 +1957,11 @@ mod tests {
             Some(gha_index(deps_core::pagination::ListCoverage::Complete)),
             "v1.2.0",
         );
-        assert!(
-            matches!(
+        assert_matches!(
                 &item.outcome,
                 Outcome::Unfixable(UnfixableReason::NoReleaseTagForFix { target })
                     if target.as_str() == "v1.2.0"
-            ),
+            ,
             "got {:?}",
             item.outcome
         );
@@ -2000,11 +1976,9 @@ mod tests {
             None,
         ] {
             let item = classify_gha_sha_pin(index, "v1.2.0");
-            assert!(
-                matches!(
-                    item.outcome,
-                    Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
-                ),
+            assert_matches!(
+                item.outcome,
+                Outcome::Unfixable(UnfixableReason::NoVerifiedFix),
                 "got {:?}",
                 item.outcome
             );
@@ -2046,11 +2020,10 @@ mod tests {
             EcosystemId::GithubActions,
             &IgnoreRules::empty(),
         );
-        assert!(
-            matches!(
+        assert_matches!(
                 &item.outcome,
                 Outcome::Applied { edit, .. } if edit.new_text.contains(&"2".repeat(40))
-            ),
+            ,
             "got {:?}",
             item.outcome
         );
@@ -2079,11 +2052,9 @@ mod tests {
         // #1578 S1: `OversizedRequirement`, not `UnsupportedRequirementShape` — the matcher
         // (which would have panicked) never ran, so this is a size-based fail-closed guard, not
         // a confirmed exclusion.
-        assert!(
-            matches!(
-                item.outcome,
-                Outcome::Unfixable(UnfixableReason::OversizedRequirement { .. })
-            ),
+        assert_matches!(
+            item.outcome,
+            Outcome::Unfixable(UnfixableReason::OversizedRequirement { .. }),
             "got {:?}",
             item.outcome
         );
@@ -2124,11 +2095,9 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(
-            matches!(
-                item.outcome,
-                Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape { .. })
-            ),
+        assert_matches!(
+            item.outcome,
+            Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape { .. }),
             "expected the matcher to run at the exact cap and confirm exclusion, got {:?}",
             item.outcome
         );

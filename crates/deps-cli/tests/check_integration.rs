@@ -26,7 +26,7 @@
 use deps_cli::exit::{EXIT_CLEAN, ExecutionOutcome, exit_code};
 use deps_cli::report::{CheckContext, CheckReport, FailOnPolicy, check_manifest};
 use deps_cli::{format, walk};
-use deps_core::net_policy::AllowlistOutcome;
+use deps_core::net_policy::{MapEnv, RegistryEnvironment};
 use deps_core::osv::OsvClient;
 use deps_core::policy_config::{LicensePolicyConfig, PolicyConfig};
 use deps_core::{EcosystemRegistry, HttpCache, NetworkMode};
@@ -38,7 +38,8 @@ use std::time::Duration;
 /// the same construction `main.rs` performs, minus config-file loading.
 fn offline_context() -> (EcosystemRegistry, CheckContext) {
     let policy = PolicyConfig::default();
-    let runtime = EcosystemRuntime::from_policy(&policy, &AllowlistOutcome::Unset);
+    let runtime =
+        EcosystemRuntime::from_policy(&policy, &RegistryEnvironment::read(&MapEnv::new()));
     let cache = Arc::new(HttpCache::with_policy(Arc::clone(&runtime.policy)));
     cache.set_offline(NetworkMode::Offline);
     assert!(
@@ -689,7 +690,8 @@ fn live_context(license_policy: LicensePolicyConfig) -> (EcosystemRegistry, Chec
         license_policy,
         ..PolicyConfig::default()
     };
-    let runtime = EcosystemRuntime::from_policy(&policy, &AllowlistOutcome::Unset);
+    let runtime =
+        EcosystemRuntime::from_policy(&policy, &RegistryEnvironment::read(&MapEnv::new()));
     let cache = Arc::new(HttpCache::with_policy(Arc::clone(&runtime.policy)));
     let registry = EcosystemRegistry::new();
     let _ = register_ecosystems(&registry, Arc::clone(&cache), &runtime);

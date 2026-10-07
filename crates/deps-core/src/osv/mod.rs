@@ -35,7 +35,10 @@ pub use types::{
     VersionMatching, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap, vuln_key_for,
     vulnerability_keys,
 };
-use types::{OsvBatchRequest, OsvBatchResponse, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord};
+use types::{
+    BatchStubs, OsvBatchRequest, OsvBatchResponse, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord,
+    VulnStub,
+};
 
 use crate::ConcreteVersion;
 use crate::cache::HttpCache;
@@ -188,7 +191,7 @@ impl QueryCacheKey {
 }
 
 struct QueryCacheEntry {
-    vuln_ids: Vec<(String, String)>,
+    stubs: BatchStubs,
     fetched_at: Instant,
 }
 
@@ -238,12 +241,11 @@ impl InFlightRecord {
 pub struct OsvClient {
     cache: Arc<HttpCache>,
     query_cache: DashMap<QueryCacheKey, QueryCacheEntry>,
-    // TODO(#1806): key by `OsvId` instead of `String`.
-    record_cache: DashMap<String, RecordCacheEntry>,
+    record_cache: DashMap<OsvId, RecordCacheEntry>,
     /// Raw records keyed by advisory id, validated by `modified` — lets a
     /// [`VersionMatching::LocalUnversioned`] scan of another version of the same package match
     /// locally without refetching.
-    raw_record_cache: DashMap<String, RawRecordCacheEntry>,
+    raw_record_cache: DashMap<OsvId, RawRecordCacheEntry>,
     /// Client-wide bound (permits = [`RECORD_FETCH_CONCURRENCY`]) on concurrent
     /// `/v1/vulns/{id}`/`/v1/query` requests — see [`RECORD_FETCH_CONCURRENCY`]'s doc for why
     /// this must be a field shared via `Arc` rather than a per-call `buffer_unordered` bound
@@ -257,7 +259,7 @@ pub struct OsvClient {
     /// can describe several unrelated packages (see the `scan_filters_affected_entries_to_the_queried_package`
     /// test). See [`InFlightRecord`] for how eviction avoids both stranding a live waiter and
     /// leaking an entry no caller is left to clean up (issue #1539).
-    record_in_flight: DashMap<String, Arc<InFlightRecord>>,
+    record_in_flight: DashMap<OsvId, Arc<InFlightRecord>>,
     /// Overridable in test builds only, so `mockito` can stand in for
     /// `https://api.osv.dev` — mirrors [`crate::cache::ensure_https`]'s existing
     /// `#[cfg(test)]` relaxation for the same reason, and [`crate::deps_dev::DepsDevClient`]'s
@@ -326,7 +328,7 @@ impl OsvClient {
         format!("{}/v1/query", self.api_base())
     }
 
-    fn vuln_record_url(&self, id: &str) -> String {
+    fn vuln_record_url(&self, id: &OsvId) -> String {
         format!("{}/v1/vulns/{id}", self.api_base())
     }
 
@@ -511,7 +513,7 @@ impl OsvClient {
         };
 
         let mut to_query: Vec<ScanTarget> = Vec::new();
-        let mut cached_stubs: Vec<(ScanTarget, Vec<(String, String)>)> = Vec::new();
+        let mut cached_stubs: Vec<(ScanTarget, BatchStubs)> = Vec::new();
         let mut seen: HashSet<&VulnKey> = HashSet::with_capacity(targets.len());
         for t in targets {
             // Duplicate keys share one result; querying them twice would only waste requests.
@@ -543,18 +545,18 @@ impl OsvClient {
                 .query_cache
                 .get(&QueryCacheKey::for_target(osv_eco, t))
                 .and_then(|entry| {
-                    (entry.fetched_at.elapsed() < QUERY_CACHE_TTL).then(|| entry.vuln_ids.clone())
+                    (entry.fetched_at.elapsed() < QUERY_CACHE_TTL).then(|| entry.stubs.clone())
                 });
             match (cached_ids, osv_eco.version_matching()) {
-                (Some(vuln_ids), VersionMatching::ServerSide) => {
+                (Some(stubs), VersionMatching::ServerSide) => {
                     outcomes.insert(
                         t.key.clone(),
-                        self.build_outcome(osv_eco, t.osv_name.name(), &vuln_ids, deadline)
+                        self.build_outcome(osv_eco, t.osv_name.name(), &stubs, deadline)
                             .await,
                     );
                 }
-                (Some(vuln_ids), VersionMatching::LocalUnversioned) => {
-                    cached_stubs.push((t.clone(), vuln_ids));
+                (Some(stubs), VersionMatching::LocalUnversioned) => {
+                    cached_stubs.push((t.clone(), stubs));
                 }
                 (None, _) => to_query.push(t.clone()),
             }
@@ -666,26 +668,22 @@ impl OsvClient {
             return;
         }
 
-        let mut local_stubs: Vec<(ScanTarget, Vec<(String, String)>)> = Vec::new();
+        let mut local_stubs: Vec<(ScanTarget, BatchStubs)> = Vec::new();
         for (target, result) in chunk.iter().zip(parsed.results) {
             if result.next_page_token.is_some() {
                 truncated.push(target.clone());
                 continue;
             }
-            let vuln_ids: Vec<(String, String)> = result
-                .vulns
-                .into_iter()
-                .map(|v| (v.id, v.modified))
-                .collect();
-            self.store_query_cache(osv_eco, target, &vuln_ids);
+            let stubs: BatchStubs = result.vulns.into_iter().collect();
+            self.store_query_cache(osv_eco, target, &stubs);
             match osv_eco.version_matching() {
                 VersionMatching::ServerSide => {
                     let outcome = self
-                        .build_outcome(osv_eco, target.osv_name.name(), &vuln_ids, deadline)
+                        .build_outcome(osv_eco, target.osv_name.name(), &stubs, deadline)
                         .await;
                     outcomes.insert(target.key.clone(), outcome);
                 }
-                VersionMatching::LocalUnversioned => local_stubs.push((target.clone(), vuln_ids)),
+                VersionMatching::LocalUnversioned => local_stubs.push((target.clone(), stubs)),
             }
         }
         self.resolve_local_stubs(osv_eco, local_stubs, outcomes, deadline)
@@ -697,7 +695,7 @@ impl OsvClient {
     async fn resolve_local_stubs(
         &self,
         osv_eco: OsvEcosystem,
-        pending: Vec<(ScanTarget, Vec<(String, String)>)>,
+        pending: Vec<(ScanTarget, BatchStubs)>,
         outcomes: &mut VulnerabilityMap,
         deadline: Instant,
     ) {
@@ -726,7 +724,7 @@ impl OsvClient {
         &self,
         osv_eco: OsvEcosystem,
         target: &ScanTarget,
-        stubs: &[(String, String)],
+        stubs: &BatchStubs,
         deadline: Instant,
     ) -> ScanOutcome {
         use futures::stream::{self, StreamExt};
@@ -734,18 +732,22 @@ impl OsvClient {
         if stubs.is_empty() {
             return ScanOutcome::Clean;
         }
-        if stubs.len() > MAX_ADVISORY_RECORDS {
+        if stubs.total() > MAX_ADVISORY_RECORDS {
             return ScanOutcome::Skipped(SkipReason::Truncated);
         }
+        // An unfetchable stub can never be matched, so the result cannot be called clean.
+        if stubs.invalid > 0 {
+            return ScanOutcome::Skipped(SkipReason::QueryFailed);
+        }
 
-        let fetched: Vec<Option<Arc<OsvVulnRecord>>> =
-            stream::iter(stubs.iter().cloned())
-                .map(|(id, modified)| async move {
-                    self.fetch_raw_record(&id, &modified, deadline).await
-                })
-                .buffer_unordered(RECORD_FETCH_CONCURRENCY)
-                .collect()
-                .await;
+        let fetched: Vec<Option<Arc<OsvVulnRecord>>> = stream::iter(stubs.valid.iter().cloned())
+            .map(|stub| async move {
+                self.fetch_raw_record(&stub.id, &stub.modified, deadline)
+                    .await
+            })
+            .buffer_unordered(RECORD_FETCH_CONCURRENCY)
+            .collect()
+            .await;
         let Some(records) = fetched
             .into_iter()
             .map(|r| r.map(|r| (*r).clone()))
@@ -928,14 +930,18 @@ impl OsvClient {
     ) -> ScanOutcome {
         let total = records.len();
         let mut advisories = Vec::with_capacity(total.min(MAX_ADVISORY_RECORDS));
-        let mut vuln_ids = Vec::with_capacity(total);
+        let mut stubs = BatchStubs::default();
 
         for record in records {
             let Some(advisory) = record.into_advisory(target.osv_name.name(), osv_eco) else {
+                stubs.invalid += 1;
                 continue;
             };
             let advisory = Arc::new(advisory);
-            vuln_ids.push((advisory.id().as_str().to_owned(), advisory.modified.clone()));
+            stubs.valid.push(VulnStub {
+                id: advisory.id().clone(),
+                modified: advisory.modified.clone(),
+            });
             self.store_record_cache(&advisory);
             if advisories.len() < MAX_ADVISORY_RECORDS {
                 advisories.push(advisory);
@@ -944,7 +950,7 @@ impl OsvClient {
 
         // An affected-only subset must never stand in for an unversioned package's full stub list.
         match osv_eco.version_matching() {
-            VersionMatching::ServerSide => self.store_query_cache(osv_eco, target, &vuln_ids),
+            VersionMatching::ServerSide => self.store_query_cache(osv_eco, target, &stubs),
             VersionMatching::LocalUnversioned => {}
         }
 
@@ -959,32 +965,33 @@ impl OsvClient {
         }
     }
 
-    /// Builds a [`ScanOutcome`] from a list of `(id, modified)` stubs,
-    /// fetching up to [`MAX_ADVISORY_RECORDS`] full records.
+    /// Builds a [`ScanOutcome`] from batch `stubs`, fetching up to [`MAX_ADVISORY_RECORDS`]
+    /// full records. Stubs with an invalid id are never fetched but count toward
+    /// [`Capped::total`] (#1805).
     async fn build_outcome(
         &self,
         osv_eco: OsvEcosystem,
         osv_name: &OsvPackageName,
-        vuln_ids: &[(String, String)],
+        stubs: &BatchStubs,
         deadline: Instant,
     ) -> ScanOutcome {
-        if vuln_ids.is_empty() {
+        if stubs.is_empty() {
             return ScanOutcome::Clean;
         }
 
         #[expect(
             clippy::indexing_slicing,
-            reason = "the slice upper bound is min(vuln_ids.len(), MAX_ADVISORY_RECORDS), \
-                      always <= vuln_ids.len()"
+            reason = "the slice upper bound is min(valid.len(), MAX_ADVISORY_RECORDS), \
+                      always <= valid.len()"
         )]
-        let to_fetch = &vuln_ids[..vuln_ids.len().min(MAX_ADVISORY_RECORDS)];
+        let to_fetch = &stubs.valid[..stubs.valid.len().min(MAX_ADVISORY_RECORDS)];
         let advisories = self
             .fetch_records(osv_eco, osv_name, to_fetch, deadline)
             .await;
 
         ScanOutcome::Vulnerable(DependencyVulnerabilities {
             sibling_matches: None,
-            advisories: Capped::new(advisories, vuln_ids.len()),
+            advisories: Capped::new(advisories, stubs.total()),
             fix_target_status: UpgradeStatus::NotChecked,
         })
     }
@@ -998,13 +1005,13 @@ impl OsvClient {
         &self,
         osv_eco: OsvEcosystem,
         osv_name: &OsvPackageName,
-        ids: &[(String, String)],
+        stubs: &[VulnStub],
         deadline: Instant,
     ) -> Vec<Arc<Advisory>> {
         use futures::stream::{self, StreamExt};
 
-        stream::iter(ids.iter().cloned())
-            .map(|(id, modified)| async move {
+        stream::iter(stubs.iter().cloned())
+            .map(|VulnStub { id, modified }| async move {
                 let cached = self.record_cache.get(&id).and_then(|entry| {
                     (entry.modified == modified).then(|| Arc::clone(&entry.advisory))
                 });
@@ -1029,7 +1036,7 @@ impl OsvClient {
     /// stub's, else via [`Self::fetch_record_single_flight`]. Failed fetches are never cached.
     async fn fetch_raw_record(
         &self,
-        id: &str,
+        id: &OsvId,
         modified: &str,
         deadline: Instant,
     ) -> Option<Arc<OsvVulnRecord>> {
@@ -1040,7 +1047,7 @@ impl OsvClient {
             return cached;
         }
         let record = self.fetch_record_single_flight(id, deadline).await?;
-        self.store_raw_record_cache(&record);
+        self.store_raw_record_cache(id, &record);
         Some(record)
     }
 
@@ -1064,12 +1071,12 @@ impl OsvClient {
     /// its own deadline, rather than inheriting a poisoned result.
     async fn fetch_record_single_flight(
         &self,
-        id: &str,
+        id: &OsvId,
         deadline: Instant,
     ) -> Option<Arc<OsvVulnRecord>> {
         let entry = Arc::clone(
             self.record_in_flight
-                .entry(id.to_string())
+                .entry(id.clone())
                 .or_insert_with(|| Arc::new(InFlightRecord::new()))
                 .value(),
         );
@@ -1108,7 +1115,7 @@ impl OsvClient {
                 result
             }
             Err(_) => {
-                tracing::warn!(id, "OSV record fetch wait exceeded scan deadline");
+                tracing::warn!(%id, "OSV record fetch wait exceeded scan deadline");
 
                 // Evicting unconditionally on this caller's own timeout would remove the entry
                 // out from under a *different* caller still legitimately driving the same cell to
@@ -1142,7 +1149,7 @@ impl OsvClient {
     /// with registry responses for its byte budget for no benefit (critique
     /// M2 — nothing ever reads that copy back).
     #[tracing::instrument(skip(self), fields(url = tracing::field::Empty))]
-    async fn fetch_single_record(&self, id: &str) -> Option<OsvVulnRecord> {
+    async fn fetch_single_record(&self, id: &OsvId) -> Option<OsvVulnRecord> {
         let url = self.vuln_record_url(id);
         tracing::Span::current().record(
             "url",
@@ -1152,7 +1159,7 @@ impl OsvClient {
             Ok(bytes) => match crate::parser::parse_json_checked::<OsvVulnRecord>(&bytes) {
                 Ok(record) => Some(record),
                 Err(e) => {
-                    tracing::warn!(id, error = %e, "failed to parse OSV vulnerability record");
+                    tracing::warn!(%id, error = %e, "failed to parse OSV vulnerability record");
                     None
                 }
             },
@@ -1160,7 +1167,7 @@ impl OsvClient {
             Err(e) => {
                 let (status, cause) = e.safe_tracing_summary();
                 tracing::warn!(
-                    id,
+                    %id,
                     status = ?status,
                     cause,
                     "failed to fetch OSV vulnerability record"
@@ -1211,7 +1218,7 @@ impl OsvClient {
         }
     }
 
-    fn store_raw_record_cache(&self, record: &Arc<OsvVulnRecord>) {
+    fn store_raw_record_cache(&self, id: &OsvId, record: &Arc<OsvVulnRecord>) {
         if self.raw_record_cache.len() >= MAX_CACHE_ENTRIES {
             crate::cache_policy::evict_oldest_batch(
                 &self.raw_record_cache,
@@ -1220,7 +1227,7 @@ impl OsvClient {
             );
         }
         self.raw_record_cache.insert(
-            record.id.clone(),
+            id.clone(),
             RawRecordCacheEntry {
                 record: Arc::clone(record),
                 fetched_at: Instant::now(),
@@ -1228,12 +1235,7 @@ impl OsvClient {
         );
     }
 
-    fn store_query_cache(
-        &self,
-        osv_eco: OsvEcosystem,
-        target: &ScanTarget,
-        vuln_ids: &[(String, String)],
-    ) {
+    fn store_query_cache(&self, osv_eco: OsvEcosystem, target: &ScanTarget, stubs: &BatchStubs) {
         if self.query_cache.len() >= MAX_CACHE_ENTRIES {
             crate::cache_policy::evict_oldest_batch(&self.query_cache, MAX_CACHE_ENTRIES, |e| {
                 e.fetched_at
@@ -1242,7 +1244,7 @@ impl OsvClient {
         self.query_cache.insert(
             QueryCacheKey::for_target(osv_eco, target),
             QueryCacheEntry {
-                vuln_ids: vuln_ids.to_vec(),
+                stubs: stubs.clone(),
                 fetched_at: Instant::now(),
             },
         );
@@ -1255,7 +1257,7 @@ impl OsvClient {
             });
         }
         self.record_cache.insert(
-            advisory.id().as_str().to_owned(),
+            advisory.id().clone(),
             RecordCacheEntry {
                 advisory: Arc::clone(advisory),
                 modified: advisory.modified.clone(),
@@ -3353,12 +3355,16 @@ mod tests {
             client.store_query_cache(
                 OsvEcosystem::Npm,
                 &target(&format!("pkg-{i}"), "1.0.0"),
-                &[],
+                &BatchStubs::default(),
             );
         }
         assert_eq!(client.query_cache.len(), MAX_CACHE_ENTRIES);
 
-        client.store_query_cache(OsvEcosystem::Npm, &target("overflow", "1.0.0"), &[]);
+        client.store_query_cache(
+            OsvEcosystem::Npm,
+            &target("overflow", "1.0.0"),
+            &BatchStubs::default(),
+        );
 
         assert!(
             client.query_cache.len() <= MAX_CACHE_ENTRIES,
@@ -3409,7 +3415,7 @@ mod tests {
         client.query_cache.insert(
             QueryCacheKey::for_target(OsvEcosystem::Npm, &t),
             QueryCacheEntry {
-                vuln_ids: vec![],
+                stubs: BatchStubs::default(),
                 fetched_at: Instant::now()
                     .checked_sub(QUERY_CACHE_TTL + Duration::from_secs(1))
                     .expect("test clock has more than QUERY_CACHE_TTL of headroom"),
@@ -3434,7 +3440,7 @@ mod tests {
         let (mut server, client) = mock_client().await;
 
         client.record_cache.insert(
-            "ADV-1".to_string(),
+            crate::test_util::osv_id("ADV-1"),
             RecordCacheEntry {
                 advisory: Arc::new(
                     Advisory::new(
@@ -3480,6 +3486,127 @@ mod tests {
             Some("updated summary")
         );
         record.assert_async().await;
+    }
+
+    /// #1805: a stub id that fails `OsvId::parse` is never requested, but still counts toward
+    /// `total`, so the dependency is never reported clean.
+    #[tokio::test]
+    async fn invalid_stub_id_is_not_fetched_but_counted() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(
+                r#"{"results":[{"vulns":[{"id":"../x","modified":"2023-01-01T00:00:00Z"},{"id":"ADV-1","modified":"2023-01-01T00:00:00Z"}]}]}"#,
+            )
+            .create_async()
+            .await;
+        let invalid_fetch = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/v1/vulns/\.\.".to_owned()),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+        let _valid_fetch = server
+            .mock("GET", "/v1/vulns/ADV-1")
+            .with_status(200)
+            .with_body(r#"{"id":"ADV-1","modified":"2023-01-01T00:00:00Z"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let outcomes = client
+            .scan(EcosystemId::Npm, &[target("pkg", "1.0.0")], TEST_TIMEOUT)
+            .await;
+
+        let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get(&crate::test_util::vuln_key("pkg"))
+        else {
+            panic!("expected Vulnerable outcome, got {outcomes:?}");
+        };
+        assert_eq!(dv.advisories.total(), 2);
+        assert_eq!(dv.advisories.items().len(), 1);
+        invalid_fetch.assert_async().await;
+    }
+
+    /// #1805: a batch holding only an invalid stub id is never clean, and is served the same way
+    /// from the query cache on the next scan.
+    #[tokio::test]
+    async fn only_invalid_stub_id_never_reads_as_clean() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(r#"{"results":[{"vulns":[{"id":"a/b","modified":""}]}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let any_fetch = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let targets = [target("pkg", "1.0.0")];
+
+        for _ in 0..2 {
+            let outcomes = client.scan(EcosystemId::Npm, &targets, TEST_TIMEOUT).await;
+            let Some(ScanOutcome::Vulnerable(dv)) =
+                outcomes.get(&crate::test_util::vuln_key("pkg"))
+            else {
+                panic!("expected Vulnerable outcome, got {outcomes:?}");
+            };
+            assert_eq!(dv.advisories.total(), 1);
+            assert!(dv.advisories.items().is_empty());
+        }
+        any_fetch.assert_async().await;
+    }
+
+    /// #1805: an unversioned (local-matching) result set with an invalid stub id cannot be
+    /// matched in full, so it fails closed instead of reading as clean.
+    #[tokio::test]
+    async fn local_unversioned_invalid_stub_id_fails_closed() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(r#"{"results":[{"vulns":[{"id":"../x","modified":""}]}]}"#)
+            .create_async()
+            .await;
+        let any_fetch = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let outcomes = client
+            .scan(
+                EcosystemId::GithubActions,
+                &[target("actions/checkout", "1.0.0")],
+                TEST_TIMEOUT,
+            )
+            .await;
+
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("actions/checkout")),
+            Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
+        );
+        any_fetch.assert_async().await;
+    }
+
+    #[test]
+    fn batch_stubs_split_valid_and_invalid_ids() {
+        let stubs: types::BatchStubs = serde_json::from_str::<types::OsvBatchResult>(
+            r#"{"vulns":[{"id":"ADV-1","modified":"m"},{"id":"..","modified":"m"},{"id":"x y"}]}"#,
+        )
+        .unwrap()
+        .vulns
+        .into_iter()
+        .collect();
+
+        assert_eq!(stubs.valid.len(), 1);
+        assert_eq!(stubs.invalid, 2);
+        assert_eq!(stubs.total(), 3);
     }
 
     /// #1682: an unversioned GHA result set is shared across versions of one action, and the
@@ -3579,7 +3706,13 @@ mod tests {
             .map(|i| {
                 (
                     target(&format!("actions/a{i}"), "1.0.0"),
-                    vec![(format!("ADV-{i}"), "2023-01-01T00:00:00Z".to_string())],
+                    BatchStubs {
+                        valid: vec![VulnStub {
+                            id: crate::test_util::osv_id(&format!("ADV-{i}")),
+                            modified: "2023-01-01T00:00:00Z".to_string(),
+                        }],
+                        invalid: 0,
+                    },
                 )
             })
             .collect();
@@ -3627,7 +3760,7 @@ mod tests {
         ] {
             assert!(
                 client
-                    .fetch_raw_record("ADV-1", modified, deadline)
+                    .fetch_raw_record(&crate::test_util::osv_id("ADV-1"), modified, deadline)
                     .await
                     .is_some()
             );
@@ -3640,10 +3773,14 @@ mod tests {
     fn raw_record_cache_evicts_oldest_when_max_entries_reached() {
         let client = OsvClient::new(Arc::new(HttpCache::new()));
         for i in 0..=MAX_CACHE_ENTRIES {
-            client.store_raw_record_cache(&Arc::new(OsvVulnRecord {
-                id: format!("ADV-{i}"),
-                ..OsvVulnRecord::default()
-            }));
+            let id = format!("ADV-{i}");
+            client.store_raw_record_cache(
+                &crate::test_util::osv_id(&id),
+                &Arc::new(OsvVulnRecord {
+                    id,
+                    ..OsvVulnRecord::default()
+                }),
+            );
         }
         assert!(
             client.raw_record_cache.len() <= MAX_CACHE_ENTRIES,
@@ -3748,7 +3885,10 @@ mod tests {
                 let client = Arc::clone(&client);
                 tokio::spawn(async move {
                     client
-                        .fetch_record_single_flight(&format!("ADVISORY-{i}"), deadline)
+                        .fetch_record_single_flight(
+                            &crate::test_util::osv_id(&format!("ADVISORY-{i}")),
+                            deadline,
+                        )
                         .await
                 })
             })
@@ -3787,9 +3927,11 @@ mod tests {
         let handles: Vec<_> = (0..20)
             .map(|_| {
                 let client = Arc::clone(&client);
-                tokio::spawn(
-                    async move { client.fetch_record_single_flight("SAME-ID", deadline).await },
-                )
+                tokio::spawn(async move {
+                    client
+                        .fetch_record_single_flight(&crate::test_util::osv_id("SAME-ID"), deadline)
+                        .await
+                })
             })
             .collect();
 
@@ -3831,7 +3973,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(50);
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            client.fetch_record_single_flight("UNREACHABLE-ID", deadline),
+            client
+                .fetch_record_single_flight(&crate::test_util::osv_id("UNREACHABLE-ID"), deadline),
         )
         .await
         .expect("the wait must fail at the deadline, not hang until a permit frees up");
@@ -3862,7 +4005,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(50);
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            client.fetch_record_single_flight("SOLO-ID", deadline),
+            client.fetch_record_single_flight(&crate::test_util::osv_id("SOLO-ID"), deadline),
         )
         .await
         .expect("a solo caller must fail at its own deadline, not hang");
@@ -3872,7 +4015,9 @@ mod tests {
             "a solo caller's own timeout must fail closed"
         );
         assert!(
-            !client.record_in_flight.contains_key("SOLO-ID"),
+            !client
+                .record_in_flight
+                .contains_key(&crate::test_util::osv_id("SOLO-ID")),
             "a solo caller's timeout must evict its own record_in_flight entry, not leak it \
              for the rest of the client's lifetime"
         );
@@ -3911,7 +4056,10 @@ mod tests {
             let client = Arc::clone(&client);
             async move {
                 client
-                    .fetch_record_single_flight("SHARED-ID", short_deadline)
+                    .fetch_record_single_flight(
+                        &crate::test_util::osv_id("SHARED-ID"),
+                        short_deadline,
+                    )
                     .await
             }
         });
@@ -3922,7 +4070,10 @@ mod tests {
             let client = Arc::clone(&client);
             async move {
                 client
-                    .fetch_record_single_flight("SHARED-ID", long_deadline)
+                    .fetch_record_single_flight(
+                        &crate::test_util::osv_id("SHARED-ID"),
+                        long_deadline,
+                    )
                     .await
             }
         });
@@ -3986,7 +4137,10 @@ mod tests {
             let client = Arc::clone(&client);
             async move {
                 client
-                    .fetch_record_single_flight("SHARED-ID", short_deadline)
+                    .fetch_record_single_flight(
+                        &crate::test_util::osv_id("SHARED-ID"),
+                        short_deadline,
+                    )
                     .await
             }
         });
@@ -3996,7 +4150,10 @@ mod tests {
             let client = Arc::clone(&client);
             async move {
                 client
-                    .fetch_record_single_flight("SHARED-ID", long_deadline)
+                    .fetch_record_single_flight(
+                        &crate::test_util::osv_id("SHARED-ID"),
+                        long_deadline,
+                    )
                     .await
             }
         });
@@ -4009,7 +4166,10 @@ mod tests {
             let client = Arc::clone(&client);
             async move {
                 client
-                    .fetch_record_single_flight("SHARED-ID", long_deadline)
+                    .fetch_record_single_flight(
+                        &crate::test_util::osv_id("SHARED-ID"),
+                        long_deadline,
+                    )
                     .await
             }
         });

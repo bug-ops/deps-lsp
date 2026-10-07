@@ -3102,6 +3102,7 @@ anyhow = "1.0"
     #[cfg(feature = "cargo")]
     mod cargo_tests {
         use super::*;
+        use std::assert_matches;
 
         #[test]
         fn test_ecosystem_registry_lookup() {
@@ -3484,11 +3485,9 @@ serde = "1.0"
                 .expect("background task must not panic");
 
             let doc = state.get_document(&uri).expect("document should be stored");
-            assert!(
-                matches!(
-                    doc.loading_state(),
-                    deps_core::LoadingState::Loaded | deps_core::LoadingState::Failed
-                ),
+            assert_matches!(
+                doc.loading_state(),
+                deps_core::LoadingState::Loaded | deps_core::LoadingState::Failed,
                 "document loading must reach a terminal state, proving the pipeline ran \
                  past the refresh call sites to commit OSV results and diagnostics: {:?}",
                 doc.loading_state()
@@ -3549,11 +3548,9 @@ tokio = "1.0"
                 .expect("background task must not panic");
 
             let doc = state.get_document(&uri).expect("document should be stored");
-            assert!(
-                matches!(
-                    doc.loading_state(),
-                    deps_core::LoadingState::Loaded | deps_core::LoadingState::Failed
-                ),
+            assert_matches!(
+                doc.loading_state(),
+                deps_core::LoadingState::Loaded | deps_core::LoadingState::Failed,
                 "document loading must reach a terminal state, proving the pipeline ran \
                  past the refresh call sites to commit OSV results and diagnostics: {:?}",
                 doc.loading_state()

@@ -1556,6 +1556,7 @@ mod tests {
     use deps_core::position::{Position, Range};
     use deps_core::{Dependency, EcosystemId, PackageVersions, ParseResult};
     use std::any::Any;
+    use std::assert_matches;
     use std::collections::{HashMap, HashSet};
 
     const STUB_FORMATTER: deps_core::test_util::StubFormatter =
@@ -1769,13 +1770,13 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert!(matches!(
+        assert_matches!(
             plan.items[0].outcome,
             Outcome::Skipped {
                 reason: SkipReason::WithinFreshnessCooldown,
                 ..
             }
-        ));
+        );
         assert_eq!(
             crate::exit::update_exit_code(&plan),
             crate::exit::EXIT_CLEAN,
@@ -1816,7 +1817,7 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert!(matches!(plan.items[0].outcome, Outcome::Applied { .. }));
+        assert_matches!(plan.items[0].outcome, Outcome::Applied { .. });
     }
 
     /// Issue #1521 item 1: `update`'s output must attribute a GOSSIP-cooldown-excluded newer
@@ -1848,7 +1849,7 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert!(matches!(plan.items[0].outcome, Outcome::Applied { .. }));
+        assert_matches!(plan.items[0].outcome, Outcome::Applied { .. });
         assert_eq!(
             plan.items[0].gossip_excluded_version,
             Some(deps_core::ConcreteVersion::new("2.0.0"))
@@ -1901,14 +1902,12 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::WithinFreshnessCooldown,
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::WithinFreshnessCooldown,
+                ..
+            },
             "the local cooldown skip must win the outcome decision"
         );
         assert_eq!(
@@ -2024,16 +2023,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::NotSafelyEditable(
-                        deps_core::edit::UnplannableReason::LatestFlaggedByOsv
-                    ),
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::NotSafelyEditable(
+                    deps_core::edit::UnplannableReason::LatestFlaggedByOsv
+                ),
+                ..
+            },
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -2145,16 +2142,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::NotSafelyEditable(
-                        deps_core::edit::UnplannableReason::LatestFlaggedByOsv
-                    ),
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::NotSafelyEditable(
+                    deps_core::edit::UnplannableReason::LatestFlaggedByOsv
+                ),
+                ..
+            },
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -2214,16 +2209,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::NotSafelyEditable(
-                        deps_core::edit::UnplannableReason::LatestUnverified
-                    ),
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::NotSafelyEditable(
+                    deps_core::edit::UnplannableReason::LatestUnverified
+                ),
+                ..
+            },
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -2274,14 +2267,12 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::WithinFreshnessCooldown,
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::WithinFreshnessCooldown,
+                ..
+            },
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -2322,16 +2313,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::NotSafelyEditable(
-                        deps_core::edit::UnplannableReason::LatestUnverified
-                    ),
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::NotSafelyEditable(
+                    deps_core::edit::UnplannableReason::LatestUnverified
+                ),
+                ..
+            },
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -2376,15 +2365,15 @@ mod tests {
         );
 
         let serde_item = plan.items.iter().find(|i| i.name == "serde").unwrap();
-        assert!(matches!(serde_item.outcome, Outcome::Applied { .. }));
+        assert_matches!(serde_item.outcome, Outcome::Applied { .. });
         let tokio_item = plan.items.iter().find(|i| i.name == "tokio").unwrap();
-        assert!(matches!(
+        assert_matches!(
             tokio_item.outcome,
             Outcome::Skipped {
                 reason: SkipReason::NotRequested,
                 ..
             }
-        ));
+        );
     }
 
     /// US-004 default-mode half: an `update_types`-scoped ignore rule skips a major bump.
@@ -2412,13 +2401,13 @@ mod tests {
             plan_updates_no_cooldown(&analysis, content, &STUB_FORMATTER, &[], &ignore_rules);
 
         assert_eq!(plan.items.len(), 1);
-        assert!(matches!(
+        assert_matches!(
             plan.items[0].outcome,
             Outcome::Skipped {
                 reason: SkipReason::IgnoreRule,
                 ..
             }
-        ));
+        );
     }
 
     /// Code review finding 1: an `Unplannable` candidate (here, a `NonLiteralSpan` — the
@@ -2451,14 +2440,12 @@ mod tests {
             plan_updates_no_cooldown(&analysis, content, &STUB_FORMATTER, &[], &ignore_rules);
 
         assert_eq!(plan.items.len(), 1);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::IgnoreRule,
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::IgnoreRule,
+                ..
+            },
             "got {:?}",
             plan.items[0].outcome
         );
@@ -2489,7 +2476,7 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert!(matches!(
+        assert_matches!(
             plan.items[0].outcome,
             Outcome::Skipped {
                 reason: SkipReason::NotSafelyEditable(
@@ -2497,7 +2484,7 @@ mod tests {
                 ),
                 ..
             }
-        ));
+        );
     }
 
     /// FR-007 edge case: with no `--config` (empty ignore rules), an `Unknown`-kind update is
@@ -2525,7 +2512,7 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert!(matches!(plan.items[0].outcome, Outcome::Applied { .. }));
+        assert_matches!(plan.items[0].outcome, Outcome::Applied { .. });
     }
 
     #[test]
@@ -2577,7 +2564,7 @@ mod tests {
             "serde = \"1.0.0\"\n",
             crate::format::DryRun::No,
         );
-        assert!(matches!(result, Err(ApplyError::StaleManifest { .. })));
+        assert_matches!(result, Err(ApplyError::StaleManifest { .. }));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "serde = \"1.0.1\"\n"
@@ -2753,14 +2740,14 @@ mod tests {
             ),
         ];
         dedup_applied_items(&mut items);
-        assert!(matches!(items[0].outcome, Outcome::Applied { .. }));
-        assert!(matches!(
+        assert_matches!(items[0].outcome, Outcome::Applied { .. });
+        assert_matches!(
             items[1].outcome,
             Outcome::Skipped {
                 reason: SkipReason::OverlapsAnotherEdit,
                 ..
             }
-        ));
+        );
         assert_eq!(
             items[1].target(),
             Some(&ConcreteVersion::from("1.2.0")),
@@ -3097,14 +3084,12 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::WithinFreshnessCooldown,
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::WithinFreshnessCooldown,
+                ..
+            },
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -3164,14 +3149,12 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::WithinFreshnessCooldown,
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::WithinFreshnessCooldown,
+                ..
+            },
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -3210,14 +3193,12 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::WithinFreshnessCooldown,
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::WithinFreshnessCooldown,
+                ..
+            },
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -3247,14 +3228,12 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::WithinFreshnessCooldown,
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::WithinFreshnessCooldown,
+                ..
+            },
             "1.4.0 is a downgrade below the unlisted declared pin 1.5.0 and must never be \
              applied: {:?}",
             plan.items[0]
@@ -3323,8 +3302,9 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert!(
-            matches!(plan.items[0].outcome, Outcome::Applied { .. }),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Applied { .. },
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -3384,16 +3364,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::NotSafelyEditable(
-                        deps_core::edit::UnplannableReason::LatestUnverified
-                    ),
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::NotSafelyEditable(
+                    deps_core::edit::UnplannableReason::LatestUnverified
+                ),
+                ..
+            },
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -3430,14 +3408,12 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::WithinFreshnessCooldown,
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::WithinFreshnessCooldown,
+                ..
+            },
             "a divergence between the fallback view's own planned target (1.9.0) and \
              `cooldown_disposition`'s independently computed pick (1.1.0) must never be \
              silently written: {:?}",
@@ -3487,16 +3463,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::NotSafelyEditable(
-                        deps_core::edit::UnplannableReason::LatestFlaggedByOsv
-                    ),
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::NotSafelyEditable(
+                    deps_core::edit::UnplannableReason::LatestFlaggedByOsv
+                ),
+                ..
+            },
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -3549,16 +3523,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::NotSafelyEditable(
-                        deps_core::edit::UnplannableReason::LatestUnverified
-                    ),
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::NotSafelyEditable(
+                    deps_core::edit::UnplannableReason::LatestUnverified
+                ),
+                ..
+            },
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -3609,16 +3581,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::NotSafelyEditable(
-                        deps_core::edit::UnplannableReason::LatestFlaggedByOsv
-                    ),
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::NotSafelyEditable(
+                    deps_core::edit::UnplannableReason::LatestFlaggedByOsv
+                ),
+                ..
+            },
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -3654,14 +3624,12 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::WithinFreshnessCooldown,
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::WithinFreshnessCooldown,
+                ..
+            },
             "a fallback blocked by a non-OSV structural reason is a routine cooldown skip, not \
              an exit-1 safety refusal: {:?}",
             plan.items[0].outcome
@@ -3722,14 +3690,12 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::IgnoreRule,
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::IgnoreRule,
+                ..
+            },
             "an ignored package's row-7 fallback must not be applied: {:?}",
             plan.items[0].outcome
         );
@@ -3768,14 +3734,12 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::IgnoreRule,
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::IgnoreRule,
+                ..
+            },
             "an ignored package's row-9 fallback must not be applied: {:?}",
             plan.items[0].outcome
         );
@@ -3825,14 +3789,12 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::IgnoreRule,
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::IgnoreRule,
+                ..
+            },
             "an ignored package's row-10 blocked fallback must exit clean, not policy-violation: {:?}",
             plan.items[0].outcome
         );
@@ -3901,14 +3863,12 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert!(
-            matches!(
-                plan.items[0].outcome,
-                Outcome::Skipped {
-                    reason: SkipReason::WithinFreshnessCooldown,
-                    ..
-                }
-            ),
+        assert_matches!(
+            plan.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::WithinFreshnessCooldown,
+                ..
+            },
             "the GOSSIP-Active cooldown for the raw name 'Django' must be detected even though \
              normalize_package_name lowercases it to 'django': {:?}",
             plan.items[0].outcome
@@ -4021,8 +3981,8 @@ mod tests {
             Some(&ConcreteVersion::from("9.1.0")),
             "beta must get its own fallback, not alpha's: {beta:?}"
         );
-        assert!(matches!(alpha.outcome, Outcome::Applied { .. }));
-        assert!(matches!(beta.outcome, Outcome::Applied { .. }));
+        assert_matches!(alpha.outcome, Outcome::Applied { .. });
+        assert_matches!(beta.outcome, Outcome::Applied { .. });
     }
 
     /// Code review (severity upgrade over the earlier "attribution only, never a wrong write"
@@ -4081,14 +4041,12 @@ mod tests {
 
         assert_eq!(plan.items.len(), 2, "{:?}", plan.items);
         for item in &plan.items {
-            assert!(
-                matches!(
-                    item.outcome,
-                    Outcome::Skipped {
-                        reason: SkipReason::WithinFreshnessCooldown,
-                        ..
-                    }
-                ),
+            assert_matches!(
+                item.outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::WithinFreshnessCooldown,
+                    ..
+                },
                 "an unresolvable collision must fail closed, never approve a downgrade or a \
                  swapped write: {item:?}"
             );
@@ -4166,14 +4124,12 @@ mod tests {
 
         assert_eq!(plan.items.len(), 2, "{:?}", plan.items);
         for item in &plan.items {
-            assert!(
-                matches!(
-                    item.outcome,
-                    Outcome::Skipped {
-                        reason: SkipReason::WithinFreshnessCooldown,
-                        ..
-                    }
-                ),
+            assert_matches!(
+                item.outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::WithinFreshnessCooldown,
+                    ..
+                },
                 "a collision must fail closed uniformly for both occurrences, never `Applied` \
                  and never attributing one occurrence's structural defect to the other: {item:?}"
             );
@@ -4182,5 +4138,41 @@ mod tests {
             crate::exit::update_exit_code(&plan),
             crate::exit::EXIT_CLEAN
         );
+    }
+
+    /// #1820: a tag pin spelled without the `v` prefix that no published tag matches is rewritten
+    /// to the published spelling, and the written text equals the printed target.
+    #[test]
+    fn test_plan_updates_unpublished_unprefixed_tag_pin_writes_published_spelling() {
+        use deps_core::lsp_helpers::{CommitSha, TagIndex};
+        use deps_engine::setup::{GithubActionsFormatter, parse_workflow_yaml};
+
+        let content = "on: push\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@4.2.2\n";
+        let uri = deps_core::test_util::test_uri("/test/.github/workflows/ci.yml");
+        let parse_result = parse_workflow_yaml(content, &uri).expect("valid workflow");
+        let commit = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let tag_index = std::sync::Arc::new(dashmap::DashMap::new());
+        tag_index.insert(
+            PackageName::new("actions/checkout"),
+            std::sync::Arc::new(TagIndex::from_tags([
+                ("v4.2.2", &commit),
+                ("v7.0.1", &commit),
+            ])),
+        );
+        let formatter = GithubActionsFormatter::new(tag_index);
+        let mut analysis = test_analysis(vec![], cached("actions/checkout", "v7.0.1"));
+        analysis.parse_result = Box::new(parse_result);
+        analysis.uri = uri;
+        analysis.ecosystem_id = EcosystemId::GithubActions;
+
+        let plan =
+            plan_updates_no_cooldown(&analysis, content, &formatter, &[], &IgnoreRules::empty());
+
+        assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
+        let Outcome::Applied { edit, target } = &plan.items[0].outcome else {
+            panic!("expected Applied, got {:?}", plan.items[0].outcome);
+        };
+        assert_eq!(target.as_str(), "v7.0.1");
+        assert_eq!(edit.new_text, "v7.0.1");
     }
 }

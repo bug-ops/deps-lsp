@@ -157,6 +157,7 @@ pub enum SegmentedPathName<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn test_new_rejects_bare_dot_dot() {
@@ -194,10 +195,7 @@ mod tests {
     #[test]
     fn test_checked_or_reject_rejects_dot_segment() {
         let err = SafePathSegment::checked_or_reject("..", "@a/..", "ctx", "npm").unwrap_err();
-        assert!(matches!(
-            err,
-            crate::error::DepsError::PackageNotFound { .. }
-        ));
+        assert_matches!(err, crate::error::DepsError::PackageNotFound { .. });
     }
 
     /// The reported name must be the full, possibly compound identifier the caller passed in

@@ -91,6 +91,44 @@ non-ASCII), for example `DEPS_LSP_PRIVATE_REGISTRY_HOSTS=10.20.0.0/16,registry.c
   once per change.
 - The GitHub Action needs the variable in the step's `env:`.
 
+When a registry host is blocked by the access policy, the hint that suggests
+`workspace_registries = "all"` and `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` is not shown at `"off"` or for a host refused under every policy (loopback, link-local,
+cloud-metadata), where the allowlist cannot help.
+
+### Proxies and guarded registry traffic
+
+Registry requests that the access policy guards (hosts declared by the workspace, pinned
+registries, and operator-owned sources such as the `$GOENV` `GOPROXY`, your user `~/.npmrc` and
+your user-profile `NuGet.Config`) connect **directly** by default and bypass the system and
+`HTTP(S)_PROXY` proxy. The connect-time SSRF guard checks the address a host actually resolves to,
+and a proxy would hide that address from it. Public default registries (crates.io, npm, PyPI and
+so on) keep using your proxy.
+
+If a system proxy is detected, the server says so once at startup: `deps-lsp` logs a warning and
+shows a `window/showMessage` warning, and `deps-cli` prints one line on stderr. To route guarded
+traffic through the proxy as well, set:
+
+```bash
+DEPS_LSP_WORKSPACE_REGISTRY_PROXY=proxy
+```
+
+Any other value, including unset, keeps the direct default. The variable is read from the
+environment only, never from settings, so a repository cannot change it. With it set, a proxy
+whose own host is `localhost` or a private name works on every tier.
+
+Routing through a proxy is weaker than the direct default:
+
+- **Weaker check.** The server cannot see the address the proxy connects to. It resolves the target
+  host itself and checks that answer against the policy first, but DNS can rebind between this local
+  check and the proxy's own lookup.
+- **Local DNS is required.** On a network whose local DNS cannot resolve external names, every
+  guarded request fails at that check (fail closed), even though the proxy could have reached the host.
+- **Same-host redirects only.** Cross-host redirects are stopped, so a registry that redirects to a
+  CDN host fails to resolve versions.
+
+Blocked or unreachable guarded hosts fail after a **10 second connect timeout**. In the GitHub
+Action, set the variable in the step's `env:`.
+
 `GITLAB_TOKEN` is sent only to `gitlab.com`, or to the single host named by the
 `GITLAB_TOKEN_HOST` environment variable when set (for example `GITLAB_TOKEN_HOST=gitlab.mycorp.dev`).
 An invalid `GITLAB_TOKEN_HOST` disables the token entirely. See

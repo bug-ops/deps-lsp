@@ -28,9 +28,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 use deps_core::net_policy::{
-    BlockedHostReason, HostClass, IndexUrlError, InvalidEntry, PolicyGate, RedactedUrl,
-    RegistryAccessPolicy, RegistryRejectionClassifier, RejectionOutcome, classify_host,
-    validate_index_url,
+    BlockedHost, BlockedHostReason, HostClass, IndexUrlError, InvalidEntry, PolicyGate,
+    RedactedUrl, RegistryAccessPolicy, RegistryRejectionClassifier, RejectionOutcome,
+    TrustedPrefix, classify_host, validate_index_url,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{BlockedSourceClass, EcosystemId, RejectedSourceClass};
@@ -389,7 +389,7 @@ impl UserConfigPath {
     pub fn from_environment() -> Self {
         Self::resolve(
             UserConfigPlatform::current(),
-            dirs::home_dir().as_deref(),
+            deps_core::UserHome::current().map(deps_core::UserHome::path),
             std::env::var_os("XDG_CONFIG_HOME").as_deref(),
         )
     }
@@ -459,9 +459,9 @@ pub enum SwiftRegistryUrlError {
 }
 
 impl BlockedHostReason for SwiftRegistryUrlError {
-    fn blocked_host_class(&self) -> Option<HostClass> {
+    fn blocked_host(&self) -> Option<BlockedHost> {
         match self {
-            Self::Url(e) => e.blocked_host_class(),
+            Self::Url(e) => e.blocked_host(),
             Self::NeverARegistryHost(_) => None,
         }
     }
@@ -514,6 +514,7 @@ impl RegistryRejectionClassifier for SwiftRegistryUrlError {
 pub struct SwiftRegistryUrl {
     normalized: String,
     parsed: Url,
+    prefix: TrustedPrefix,
     trust: RegistryTrust,
     host_key: RegistryHostKey,
 }
@@ -554,9 +555,12 @@ impl SwiftRegistryUrl {
             validate_shape(raw, PolicyGate::Enforce(policy))?;
             RegistryTrust::WorkspaceDeclared
         };
+        let prefix = TrustedPrefix::parse(&format!("{normalized}/"))
+            .map_err(|_| IndexUrlError::InvalidUrl(RedactedUrl::new(raw)))?;
         Ok(Self {
             normalized,
             parsed: shape,
+            prefix,
             trust,
             host_key,
         })
@@ -566,6 +570,12 @@ impl SwiftRegistryUrl {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.normalized
+    }
+
+    /// The `{url}/` prefix confining this registry's credentialed requests and redirect hops.
+    #[must_use]
+    pub const fn trusted_prefix(&self) -> &TrustedPrefix {
+        &self.prefix
     }
 
     /// The validated URL, for host-based lookups.
@@ -586,8 +596,10 @@ impl SwiftRegistryUrl {
     #[cfg(test)]
     pub(crate) fn for_test(normalized: &str, trust: RegistryTrust) -> Self {
         let url = Url::parse(normalized).unwrap();
+        let normalized = normalized.trim_end_matches('/').to_string();
         Self {
-            normalized: normalized.trim_end_matches('/').to_string(),
+            prefix: TrustedPrefix::parse(&format!("{normalized}/")).unwrap(),
+            normalized,
             host_key: RegistryHostKey::of(&url).unwrap(),
             parsed: url,
             trust,
@@ -735,9 +747,11 @@ impl SwiftRegistriesConfig {
     /// a blocked host.
     pub(crate) fn blocked_class_for(&self, scope: &RegistryScope) -> Option<BlockedSourceClass> {
         let (declaration, entry) = self.applicable(scope)?;
-        let (class, raw_value) = entry.as_ref().err().and_then(InvalidEntry::blocked_class)?;
+        let (BlockedHost { class, policy }, raw_value) =
+            entry.as_ref().err().and_then(InvalidEntry::blocked_host)?;
         Some(BlockedSourceClass {
             class,
+            policy,
             raw_value,
             declaration_key: declaration.key(),
         })
@@ -1014,7 +1028,9 @@ impl SwiftParseContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::net_policy::{RegistryRejectionReason, WorkspaceRegistryAccess};
+    use deps_core::net_policy::{
+        BlockedHost, BlockingPolicy, RegistryRejectionReason, WorkspaceRegistryAccess,
+    };
     use deps_core::secret::Redacted;
     use std::assert_matches;
 
@@ -1202,10 +1218,10 @@ mod tests {
             fx.config().resolve_source_for(&scope("acme")),
             custom("acme")
         );
-        assert!(matches!(
+        assert_matches!(
             SwiftRegistriesCache::new().read(&fx.project_file()),
             TierFile::Absent
-        ));
+        );
     }
 
     #[test]
@@ -1842,11 +1858,19 @@ mod tests {
             silent.rejection_reason(),
             RejectionOutcome::IntentionallySilent
         );
-        assert_eq!(silent.blocked_host_class(), None);
+        assert_eq!(silent.blocked_host(), None);
+        let policy = BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::PublicOnly);
         let blocked = SwiftRegistryUrlError::Url(IndexUrlError::BlockedHost {
             class: HostClass::PrivateV4,
+            policy,
         });
-        assert_eq!(blocked.blocked_host_class(), Some(HostClass::PrivateV4));
+        assert_eq!(
+            blocked.blocked_host(),
+            Some(BlockedHost {
+                class: HostClass::PrivateV4,
+                policy,
+            })
+        );
         assert_eq!(
             blocked.rejection_reason(),
             RejectionOutcome::HandledByBlockedHostPath

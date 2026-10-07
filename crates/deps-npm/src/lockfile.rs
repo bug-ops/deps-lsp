@@ -484,6 +484,7 @@ fn parse_git_source(url: &str) -> ResolvedSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     /// #1240: a duplicate mapping key whose name is credential-shaped must not leak the
     /// credential into the parse error's `Display` text, which reaches `tracing::warn!`.
@@ -1285,7 +1286,7 @@ importers:
         let parser = NpmLockParser;
         let result = parser.parse_lockfile(&lockfile_path).await;
 
-        assert!(matches!(result, Err(DepsError::ParseError { .. })));
+        assert_matches!(result, Err(DepsError::ParseError { .. }));
     }
 
     #[tokio::test]

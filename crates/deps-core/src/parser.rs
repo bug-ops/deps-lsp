@@ -1315,6 +1315,7 @@ pub enum LoadingState {
 )]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn test_check_toml_nesting_depth_empty_content() {
@@ -1595,10 +1596,10 @@ cpu_load = 3.14
             "]".repeat(bracket_count)
         );
         let err = parse_toml_checked(&content).unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             err,
             CheckedTomlError::NestingTooDeep { depth } if depth == bracket_count
-        ));
+        );
         assert_eq!(
             err.to_string(),
             format!(
@@ -1611,7 +1612,7 @@ cpu_load = 3.14
     fn test_parse_toml_checked_syntax_error_matches_raw_toml_span_error() {
         let content = "a = ";
         let err = parse_toml_checked(content).unwrap_err();
-        assert!(matches!(err, CheckedTomlError::Syntax(_)));
+        assert_matches!(err, CheckedTomlError::Syntax(_));
         assert_eq!(
             err.to_string(),
             toml_span::parse(content).unwrap_err().to_string()

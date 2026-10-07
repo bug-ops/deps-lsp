@@ -1380,11 +1380,9 @@ mod tests {
         let content = "requests==2.31.0\n--index-url https://pypi.mycorp.example/simple\n";
         let result = parse_with_policy(content, &all_policy());
         assert_eq!(result.dependencies.len(), 1);
-        assert!(
-            matches!(
-                result.dependencies[0].source,
-                PypiDependencySource::AlternateRegistry { .. }
-            ),
+        assert_matches!(
+            result.dependencies[0].source,
+            PypiDependencySource::AlternateRegistry { .. },
             "dependency declared before a late --index-url must still resolve through it, \
              got {:?}",
             result.dependencies[0].source
@@ -1463,11 +1461,9 @@ mod tests {
         let content = "\u{feff}--index-url https://pypi.mycorp.example/simple\nrequests==2.31.0\n";
         let result = parse_with_policy(content, &all_policy());
         assert_eq!(result.dependencies.len(), 1);
-        assert!(
-            matches!(
-                result.dependencies[0].source,
-                PypiDependencySource::AlternateRegistry { .. }
-            ),
+        assert_matches!(
+            result.dependencies[0].source,
+            PypiDependencySource::AlternateRegistry { .. },
             "BOM must not defeat --index-url capture, got {:?}",
             result.dependencies[0].source
         );
@@ -1505,11 +1501,9 @@ mod tests {
         let content = "--index-url https://pypi.mycorp.example/simple --trusted-host pypi.mycorp.example\nrequests==2.31.0\n";
         let result = parse_with_policy(content, &all_policy());
         assert_eq!(result.dependencies.len(), 1);
-        assert!(
-            matches!(
-                result.dependencies[0].source,
-                PypiDependencySource::AlternateRegistry { .. }
-            ),
+        assert_matches!(
+            result.dependencies[0].source,
+            PypiDependencySource::AlternateRegistry { .. },
             "a mangled URL would still validate as *some* URL but registers a different \
              chain than the clean one — got {:?}",
             result.dependencies[0].source

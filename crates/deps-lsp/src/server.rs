@@ -899,6 +899,13 @@ impl LanguageServer for Backend {
             self.show_config_notices(notices).await;
         }
 
+        if let Some(notice) = self.state.egress_notice() {
+            tracing::warn!("{notice}");
+            self.client
+                .show_message(MessageType::WARNING, format!("deps-lsp: {notice}"))
+                .await;
+        }
+
         self.start_tag_refresh_listeners();
         self.start_keychain_refresh_listener();
         self.start_republish_worker();
@@ -1469,13 +1476,9 @@ impl LanguageServer for Backend {
         let uri = crate::lsp_types_interop::canonicalize_uri(&params.text_document.uri);
         tracing::info!("diagnostic request for: {:?}", uri);
 
-        // Clone config before async call to release lock early
-        let diagnostics_config = { self.config.read().await.policy.diagnostics.clone() };
-
         let items = diagnostics::handle_diagnostics(
             Arc::clone(&self.state),
             &uri,
-            &diagnostics_config,
             self.client.clone(),
             Arc::clone(&self.config),
         )
@@ -4220,7 +4223,7 @@ let package = Package(
 
     mod did_change_configuration_tests {
         use super::*;
-        use deps_core::net_policy::AllowlistOutcome;
+        use deps_core::net_policy::{MapEnv, PRIVATE_REGISTRY_HOSTS_ENV};
         use tower_lsp_server::ls_types::DidChangeConfigurationParams;
 
         fn all_registries_settings() -> DidChangeConfigurationParams {
@@ -4236,10 +4239,7 @@ let package = Package(
             tower_lsp_server::ClientSocket,
         ) {
             tower_lsp_server::LspService::build(|client| {
-                Backend::with_state(
-                    client,
-                    ServerState::with_private_registries(AllowlistOutcome::Unset),
-                )
+                Backend::with_state(client, ServerState::from_env_source(&MapEnv::new()))
             })
             .finish()
         }
@@ -4271,8 +4271,9 @@ let package = Package(
         /// later settings change cannot widen or narrow the allowlist itself.
         #[tokio::test]
         async fn test_all_setting_reaches_only_allowlisted_hosts() {
-            let state =
-                ServerState::with_private_registries(AllowlistOutcome::for_test(&["10.0.0.0/8"]));
+            let state = ServerState::from_env_source(
+                &MapEnv::new().with_var(PRIVATE_REGISTRY_HOSTS_ENV, "10.0.0.0/8"),
+            );
             let (service, _socket) =
                 tower_lsp_server::LspService::build(|client| Backend::with_state(client, state))
                     .finish();
@@ -4296,6 +4297,70 @@ let package = Package(
                 .await;
             assert!(policy.permits_url(&private_url("10.1.2.3")));
             assert!(!policy.permits_url(&private_url("192.168.0.1")));
+        }
+
+        /// #1811: the allowlist and the egress opt-in read from the environment source reach the
+        /// live registry policy handle.
+        #[test]
+        fn test_environment_source_reaches_the_registry_policy() {
+            use deps_core::net_policy::{GuardedEgress, WORKSPACE_REGISTRY_PROXY_ENV};
+
+            let state = ServerState::from_env_source(
+                &MapEnv::new()
+                    .with_var(PRIVATE_REGISTRY_HOSTS_ENV, "10.0.0.0/8")
+                    .with_var(WORKSPACE_REGISTRY_PROXY_ENV, "proxy"),
+            );
+            assert!(!state.registry_policy.allowlist().is_empty());
+            assert_eq!(state.registry_policy.egress(), GuardedEgress::Proxy);
+            assert_eq!(
+                ServerState::from_env_source(&MapEnv::new())
+                    .registry_policy
+                    .egress(),
+                GuardedEgress::Direct
+            );
+        }
+
+        /// #1816: a system proxy that guarded registries bypass is announced once at
+        /// `initialize`, naming the opt-in variable; opting in silences it.
+        #[cfg(all(not(windows), any(feature = "cargo", feature = "github-actions")))]
+        #[tokio::test]
+        async fn test_initialize_announces_bypassed_system_proxy() {
+            use deps_core::net_policy::{SystemProxy, WORKSPACE_REGISTRY_PROXY_ENV};
+            use futures::StreamExt as _;
+
+            let proxied = || {
+                MapEnv::new()
+                    .with_proxy(SystemProxy::for_test(Some("http://proxy.corp:3128"), None))
+            };
+            let service_for = |source: MapEnv| {
+                tower_lsp_server::LspService::build(move |client| {
+                    Backend::with_state(client, ServerState::from_env_source(&source))
+                })
+                .finish()
+            };
+
+            let (service, mut socket) = service_for(proxied());
+            service
+                .inner()
+                .initialize(InitializeParams::default())
+                .await
+                .unwrap();
+            let message = next_client_message(&mut socket).await;
+            assert!(show_message_text(&message).contains(WORKSPACE_REGISTRY_PROXY_ENV));
+
+            let (service, mut socket) =
+                service_for(proxied().with_var(WORKSPACE_REGISTRY_PROXY_ENV, "proxy"));
+            service
+                .inner()
+                .initialize(InitializeParams::default())
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), socket.next())
+                    .await
+                    .is_err(),
+                "an opted-in proxy must not warn"
+            );
         }
 
         /// #1798: the user is warned once on the transition into an ineffective `"all"`, not on
@@ -4340,8 +4405,9 @@ let package = Package(
         async fn test_effective_all_setting_does_not_warn() {
             use futures::StreamExt as _;
 
-            let state =
-                ServerState::with_private_registries(AllowlistOutcome::for_test(&["10.0.0.0/8"]));
+            let state = ServerState::from_env_source(
+                &MapEnv::new().with_var(PRIVATE_REGISTRY_HOSTS_ENV, "10.0.0.0/8"),
+            );
             let (service, mut socket) =
                 tower_lsp_server::LspService::build(|client| Backend::with_state(client, state))
                     .finish();
@@ -4792,8 +4858,6 @@ let package = Package(
                 }
             });
 
-            let diagnostics_config_snapshot =
-                { backend.config.read().await.policy.diagnostics.clone() };
             let diagnostics_task = tokio::spawn({
                 let state = Arc::clone(&backend.state);
                 let config = Arc::clone(&backend.config);
@@ -4802,14 +4866,7 @@ let package = Package(
                 let barrier = Arc::clone(&barrier);
                 async move {
                     barrier.wait().await;
-                    diagnostics::handle_diagnostics(
-                        state,
-                        &uri,
-                        &diagnostics_config_snapshot,
-                        client,
-                        config,
-                    )
-                    .await
+                    diagnostics::handle_diagnostics(state, &uri, client, config).await
                 }
             });
 

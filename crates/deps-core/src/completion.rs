@@ -5993,9 +5993,8 @@ mod tests {
             character: 41,
         };
         let context = detect_completion_context(&parse_result, position, content);
-        assert!(
-            matches!(context, CompletionContext::Feature { ref package_name, ref prefix }
-                if package_name == "serde" && prefix == "der"),
+        assert_matches!(context, CompletionContext::Feature { ref package_name, ref prefix }
+                if package_name == "serde" && prefix == "der",
             "Expected Feature context with prefix 'der', got {context:?}"
         );
     }
@@ -6038,9 +6037,8 @@ mod tests {
             character: 13,
         };
         let context = detect_completion_context(&parse_result, position, content);
-        assert!(
-            matches!(context, CompletionContext::Feature { ref package_name, ref prefix }
-                if package_name == "tokio" && prefix.is_empty()),
+        assert_matches!(context, CompletionContext::Feature { ref package_name, ref prefix }
+                if package_name == "tokio" && prefix.is_empty(),
             "Expected Feature context with empty prefix, got {context:?}"
         );
     }
@@ -6083,9 +6081,8 @@ mod tests {
             character: 24,
         };
         let context = detect_completion_context(&parse_result, position, content);
-        assert!(
-            matches!(context, CompletionContext::Feature { ref package_name, ref prefix }
-                if package_name == "tokio" && prefix == "rt-"),
+        assert_matches!(context, CompletionContext::Feature { ref package_name, ref prefix }
+                if package_name == "tokio" && prefix == "rt-",
             "Expected Feature context with prefix 'rt-', got {context:?}"
         );
     }

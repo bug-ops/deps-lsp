@@ -334,6 +334,18 @@ jobs:
         # Cargo.toml, not a crate this repo's dependency hygiene applies to.
         run: cargo machete crates
 
+      - name: Guard against assert!(matches!(..)) in tests
+        # `assert_matches!` (std, 1.96) prints the value's Debug on failure; the
+        # multi-line form (rustfmt splits long calls) is why this uses a -z PCRE.
+        # Doc-comment lines are exempt.
+        run: |
+          hits=$(grep -rPzl --include='*.rs' --exclude-dir=deps-zed '(?m)^(?!\s*//)[^\n]*assert!\(\s*matches!\(' crates | tr '\0' '\n')
+          if [ -n "$hits" ]; then
+            echo "::error::use assert_matches! (import it with use std::assert_matches;) instead of assert!(matches!(..)); debug_assert!(matches!(..)) and production code are flagged too:"
+            echo "$hits"
+            exit 1
+          fi
+
       - name: Check documentation
         run: cargo doc --workspace --no-deps --all-features
         env:

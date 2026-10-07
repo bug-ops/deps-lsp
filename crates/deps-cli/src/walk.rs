@@ -1069,7 +1069,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         let runtime = deps_engine::setup::EcosystemRuntime::from_policy(
             &deps_core::policy_config::PolicyConfig::default(),
-            &deps_core::net_policy::AllowlistOutcome::Unset,
+            &deps_core::net_policy::RegistryEnvironment::read(&deps_core::net_policy::MapEnv::new()),
         );
         deps_engine::setup::register_ecosystems(
             &registry,
@@ -1532,7 +1532,7 @@ mod tests {
         assert!(outcome.ignored_manifests().is_empty());
         assert_eq!(outcome.broken_manifest_symlinks().len(), 1);
         assert!(
-            !outcome.broken_manifest_symlinks()[0].as_os_str().is_empty(),
+            !outcome.broken_manifest_symlinks()[0].is_empty(),
             "must never report an empty display path"
         );
         assert_eq!(

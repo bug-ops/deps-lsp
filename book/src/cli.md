@@ -155,6 +155,16 @@ and cannot target one of these findings alone.
 | `1` | Policy violation — at least one finding matched `--fail-on` |
 | `2` | Execution error — a registry was unreachable, a `deps.toml`/manifest failed to parse, or a walked path was unreadable |
 
+An unreachable registry (DNS failure, connect timeout after 10 seconds, refused connection) is an
+execution error: `deps-cli check` exits `2` and reports "Registry lookup failed". A registry that the
+access policy blocks, for example a private address without an allowlist entry, is different: it is a
+policy decision, reported as an informational `other` finding naming the policy and the
+[allowlist hint](configuration.md#private-registry-allowlist), and the run exits `0` unless you add
+`--fail-on other`. Guarded registry hosts bypass the system proxy unless
+`DEPS_LSP_WORKSPACE_REGISTRY_PROXY=proxy` is set (see
+[Proxies and guarded registry traffic](configuration.md#proxies-and-guarded-registry-traffic));
+`deps-cli` prints one stderr line at startup when it detects a system proxy.
+
 A real policy violation (`1`) always takes precedence over an unrelated execution error
 elsewhere in the run — one malformed manifest in a large workspace never hides a genuine
 `--fail-on` hit behind a less specific `2`.

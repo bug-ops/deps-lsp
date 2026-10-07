@@ -276,6 +276,7 @@ impl Ecosystem for SwiftEcosystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     /// Spec 076 FR-026/SC-018/SC-015 (T005): `fallback_edit_excludes_newer` against Swift's
     /// REAL formatter and a real `EcosystemReparse`. The edited SPAN is only the quoted
@@ -487,10 +488,10 @@ mod tests {
             .unwrap();
         let dependency = &parsed.dependencies()[0];
         let source = dependency.source();
-        assert!(matches!(
+        assert_matches!(
             source,
             deps_core::parser::DependencySource::AlternateRegistry { .. }
-        ));
+        );
 
         let versions = deps_core::Registry::get_versions_from(
             registry.as_ref(),

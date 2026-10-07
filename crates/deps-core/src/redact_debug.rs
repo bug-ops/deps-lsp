@@ -82,6 +82,7 @@ pub fn __redact_key_field(value: &(impl AsRef<str> + ?Sized)) -> std::borrow::Co
 #[cfg(test)]
 mod tests {
     use super::RedactingDebug;
+    use std::assert_matches;
 
     #[derive(RedactingDebug)]
     #[expect(
@@ -135,10 +136,10 @@ mod tests {
     #[test]
     fn redact_key_field_returns_borrowed_cow_for_non_credential_key() {
         let key = String::from("source:Blocked");
-        assert!(matches!(
+        assert_matches!(
             super::__redact_key_field(&key),
             std::borrow::Cow::Borrowed(_)
-        ));
+        );
     }
 
     #[test]

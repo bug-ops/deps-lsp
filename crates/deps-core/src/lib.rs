@@ -239,8 +239,8 @@ pub mod yaml_walk;
 pub use tower_lsp_server;
 
 pub use cache::{
-    BodyLimit, CacheMode, CachedResponse, HttpCache, NetworkMode, RequestHeader,
-    RevalidationFailure,
+    BodyLimit, CacheMode, CachedResponse, CredentialHeader, HttpCache, NetworkMode, RequestAuth,
+    RequestHeader, RevalidationFailure,
 };
 pub use dependency_cap::{DependencyBudget, MAX_DEPENDENCIES_PER_DOCUMENT};
 pub use deps_dev::{

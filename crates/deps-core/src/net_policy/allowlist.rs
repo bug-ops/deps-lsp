@@ -154,7 +154,12 @@ impl PrivateRegistryAllowlist {
     /// stays empty.
     #[must_use]
     pub fn from_env() -> AllowlistOutcome {
-        let outcome = Self::from_os_value(std::env::var_os(PRIVATE_REGISTRY_HOSTS_ENV).as_deref());
+        Self::outcome_of(std::env::var_os(PRIVATE_REGISTRY_HOSTS_ENV).as_deref())
+    }
+
+    /// [`Self::from_env`] over an already-read raw value.
+    pub(crate) fn outcome_of(value: Option<&std::ffi::OsStr>) -> AllowlistOutcome {
+        let outcome = Self::from_os_value(value);
         if let AllowlistOutcome::Invalid(error) = &outcome {
             tracing::warn!(%error, "ignoring invalid private registry allowlist; no private host is reachable");
         }
@@ -357,6 +362,7 @@ const fn test_loopback(class: HostClass) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     fn parsed(value: &str) -> PrivateRegistryAllowlist {
         match PrivateRegistryAllowlist::from_value(value) {
@@ -487,10 +493,10 @@ mod tests {
         {
             use std::os::unix::ffi::OsStrExt;
             let raw = std::ffi::OsStr::from_bytes(&[0xff, 0xfe]);
-            assert!(matches!(
+            assert_matches!(
                 PrivateRegistryAllowlist::from_os_value(Some(raw)),
                 AllowlistOutcome::Invalid(_)
-            ));
+            );
         }
     }
 
@@ -582,10 +588,10 @@ mod tests {
 
     #[test]
     fn non_ascii_and_uppercase_idn_hosts_are_rejected_punycode_accepted() {
-        assert!(matches!(
+        assert_matches!(
             rejection("münchen.example"),
             EntryRejection::Malformed | EntryRejection::NotNormalized
-        ));
+        );
         assert!(parsed("xn--mnchen-3ya.example").contains_name("xn--mnchen-3ya.example"));
     }
 
