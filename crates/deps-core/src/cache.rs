@@ -1001,6 +1001,28 @@ impl<'a> RequestAuth<'a> {
         }
     }
 
+    /// Fails closed unless a credentialed request's `url` lies under `prefix`.
+    ///
+    /// The redirect policy confines every hop to `prefix`'s origin, which includes its scheme,
+    /// so a request that starts under an `https` prefix can never be redirected onto plain
+    /// `http` with the credential attached. That only holds when the initial URL is itself
+    /// under the prefix, so the credential is withheld otherwise.
+    fn ensure_within(&self, url: &str, prefix: &TrustedPrefix) -> Result<()> {
+        match self {
+            Self::Anonymous { .. } => Ok(()),
+            Self::Credential { .. } => {
+                if Url::parse(url).is_ok_and(|parsed| prefix.permits(&parsed)) {
+                    Ok(())
+                } else {
+                    Err(DepsError::CacheError(format!(
+                        "refusing to send a credential to {} outside its trusted prefix",
+                        RedactedUrl::new(url)
+                    )))
+                }
+            }
+        }
+    }
+
     fn rate_limit(&self) -> RateLimitRevocation {
         match *self {
             Self::Anonymous { .. } => RateLimitRevocation::default(),
@@ -2083,6 +2105,7 @@ impl HttpCache {
         accept: Option<&'static str>,
         on_revalidation_failure: RevalidationFailure,
     ) -> Result<CachedResponse> {
+        auth.ensure_within(url, trusted_origin)?;
         let transport = self.transport_for_origin(trusted_origin.as_str());
         let headers = wire_headers(&accept_headers(accept), &auth);
         self.get_cached_via(
@@ -2164,6 +2187,7 @@ impl HttpCache {
         accept: Option<&'static str>,
         on_revalidation_failure: RevalidationFailure,
     ) -> Result<CachedResponse> {
+        auth.ensure_within(url, trusted_origin)?;
         let transport = self.transport_for_pinned(trusted_origin.as_str());
         let headers = wire_headers(&accept_headers(accept), &auth);
         self.get_cached_via(
@@ -6250,7 +6274,7 @@ mod tests {
         );
     }
 
-    async fn warm_credentialed_trusted_origin(
+    async fn warm_entry_under(
         server: &mut mockito::ServerGuard,
         cache: &HttpCache,
         auth: RequestAuth<'_>,
@@ -6277,7 +6301,7 @@ mod tests {
     async fn test_trusted_origin_credentialed_401_revalidation_evicts() {
         let mut server = mockito::Server::new_async().await;
         let cache = HttpCache::new();
-        let (origin, url) = warm_credentialed_trusted_origin(&mut server, &cache, cred_in(7)).await;
+        let (origin, url) = warm_entry_under(&mut server, &cache, cred_in(7)).await;
         server.reset();
         let _revoked = server
             .mock("GET", "/api/data")
@@ -6298,8 +6322,7 @@ mod tests {
     async fn test_trusted_origin_anonymous_401_revalidation_serves_stale() {
         let mut server = mockito::Server::new_async().await;
         let cache = HttpCache::new();
-        let (origin, url) =
-            warm_credentialed_trusted_origin(&mut server, &cache, RequestAuth::ANONYMOUS).await;
+        let (origin, url) = warm_entry_under(&mut server, &cache, RequestAuth::ANONYMOUS).await;
         server.reset();
         let _denied = server
             .mock("GET", "/api/data")
@@ -6323,7 +6346,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let cache = HttpCache::new();
         let auth = || cred_in(7).with_rate_limit(RateLimitRevocation::Throttles);
-        let (origin, url) = warm_credentialed_trusted_origin(&mut server, &cache, auth()).await;
+        let (origin, url) = warm_entry_under(&mut server, &cache, auth()).await;
         server.reset();
         let _limited = server
             .mock("GET", "/api/data")
@@ -6346,7 +6369,7 @@ mod tests {
     async fn test_trusted_origin_credentialed_plain_403_evicts() {
         let mut server = mockito::Server::new_async().await;
         let cache = HttpCache::new();
-        let (origin, url) = warm_credentialed_trusted_origin(&mut server, &cache, cred_in(7)).await;
+        let (origin, url) = warm_entry_under(&mut server, &cache, cred_in(7)).await;
         server.reset();
         let _forbidden = server
             .mock("GET", "/api/data")
@@ -6368,7 +6391,7 @@ mod tests {
     async fn test_removed_credential_never_serves_credentialed_body_anonymously() {
         let mut server = mockito::Server::new_async().await;
         let cache = HttpCache::new();
-        let (origin, url) = warm_credentialed_trusted_origin(&mut server, &cache, cred_in(7)).await;
+        let (origin, url) = warm_entry_under(&mut server, &cache, cred_in(7)).await;
         server.reset();
         let _unauthorized = server
             .mock("GET", "/api/data")
@@ -6389,7 +6412,7 @@ mod tests {
     async fn test_peek_credentialed_serves_the_entry_without_a_request_online_or_offline() {
         let mut server = mockito::Server::new_async().await;
         let cache = HttpCache::new();
-        let (_, url) = warm_credentialed_trusted_origin(&mut server, &cache, cred_in(7)).await;
+        let (_, url) = warm_entry_under(&mut server, &cache, cred_in(7)).await;
         server.reset();
         let untouched = server
             .mock("GET", "/api/data")
@@ -6414,7 +6437,7 @@ mod tests {
     async fn test_peek_credentialed_misses_other_partitions_and_anonymous_entries() {
         let mut server = mockito::Server::new_async().await;
         let cache = HttpCache::new();
-        let (_, url) = warm_credentialed_trusted_origin(&mut server, &cache, cred_in(7)).await;
+        let (_, url) = warm_entry_under(&mut server, &cache, cred_in(7)).await;
         let anonymous_url = format!("{}/api/other", server.url());
         let _other = server
             .mock("GET", "/api/other")
@@ -6446,7 +6469,7 @@ mod tests {
             let mut server = mockito::Server::new_async().await;
             let cache = HttpCache::new();
             let auth = || cred_in(7).with_rate_limit(rule);
-            let (origin, url) = warm_credentialed_trusted_origin(&mut server, &cache, auth()).await;
+            let (origin, url) = warm_entry_under(&mut server, &cache, auth()).await;
             server.reset();
             let _limited = server
                 .mock("GET", "/api/data")
@@ -7081,5 +7104,74 @@ mod tests {
 
         assert_matches!(result, Err(DepsError::HttpStatus { status: 302, .. }));
         landed.assert_async().await;
+    }
+
+    /// CodeQL cleartext-transmission audit: a credential is withheld, on both APIs, from a URL
+    /// that is not under the trusted prefix (a different host, scheme or sibling path), so a
+    /// request can never start outside the origin the redirect policy confines it to.
+    #[tokio::test]
+    async fn test_credential_is_refused_for_a_url_outside_the_trusted_prefix() {
+        let mut server = mockito::Server::new_async().await;
+        let hit = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let cache = HttpCache::new();
+        let origin = prefix(&format!("{}/api/", server.url()));
+        for url in [
+            format!("{}/apiX/data", server.url()),
+            format!("{}/other", server.url()),
+            "https://elsewhere.test/api/data".to_string(),
+            "http://elsewhere.test/api/data".to_string(),
+            "not a url".to_string(),
+        ] {
+            let trusted = cache
+                .get_cached_trusted_origin(&url, &origin, cred_in(7), None)
+                .await;
+            let pinned = cache
+                .get_cached_pinned(&url, &origin, cred_in(7), None)
+                .await;
+            assert_matches!(trusted, Err(DepsError::CacheError(_)), "{url}");
+            assert_matches!(pinned, Err(DepsError::CacheError(_)), "{url}");
+        }
+        hit.assert_async().await;
+    }
+
+    /// The same URLs stay reachable anonymously: the guard concerns credentials only.
+    #[tokio::test]
+    async fn test_anonymous_request_outside_the_prefix_is_not_refused_by_the_credential_guard() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/other")
+            .with_status(200)
+            .with_body("ok")
+            .create_async()
+            .await;
+        let cache = HttpCache::new();
+        let origin = prefix(&format!("{}/api/", server.url()));
+
+        let body = cache
+            .get_cached_trusted_origin(
+                &format!("{}/other", server.url()),
+                &origin,
+                RequestAuth::ANONYMOUS,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(body.as_ref(), b"ok");
+    }
+
+    /// An `https` request under an `https` prefix is never followed onto plain `http`, with a
+    /// credential or without, on the trusted-origin redirect policy.
+    #[test]
+    fn test_trusted_origin_redirect_policy_origin_includes_the_scheme() {
+        let https = prefix("https://registry.test/api/");
+        let downgraded = Url::parse("http://registry.test/api/x").unwrap();
+        let same = Url::parse("https://registry.test/api/x").unwrap();
+        assert!(!https.permits(&downgraded));
+        assert!(https.permits(&same));
     }
 }

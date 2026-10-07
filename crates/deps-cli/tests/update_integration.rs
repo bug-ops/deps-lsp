@@ -30,6 +30,7 @@ use deps_cli::update::ApplyError;
 use deps_cli::update::{Outcome, PlannedUpdateItem, UpdatePlan, apply_plan};
 use deps_core::edit::ManifestEdit;
 use deps_core::position::{Position, Range};
+#[cfg(unix)]
 use std::assert_matches;
 
 fn exe() -> &'static str {
