@@ -22,7 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::EcosystemId;
-use crate::cache::{HttpCache, RequestHeader};
+use crate::cache::{CredentialHeader, HttpCache, RateLimitRevocation, RequestAuth};
+use crate::net_policy::TrustedPrefix;
 
 /// Base URL for the GitHub REST API.
 pub const GITHUB_API: &str = "https://api.github.com";
@@ -233,7 +234,17 @@ pub struct GithubTagsClient {
     api_base: String,
     /// `{api_base}/`, precomputed once so [`Self::fetch_authenticated`] never re-`format!`s
     /// it per request; the trailing slash is load-bearing (see that method's docs).
-    trusted_origin: String,
+    trusted_origin: TrustedPrefix,
+}
+
+/// `{base}/` as a [`TrustedPrefix`]; the trailing slash is load-bearing (see
+/// [`GithubTagsClient::fetch_authenticated`]).
+fn api_prefix(base: &str) -> TrustedPrefix {
+    #[expect(
+        clippy::expect_used,
+        reason = "`GITHUB_API` is a constant https URL and test bases are mock-server URLs"
+    )]
+    TrustedPrefix::parse(&format!("{base}/")).expect("GitHub API base is a valid URL")
 }
 
 impl GithubTagsClient {
@@ -265,7 +276,7 @@ impl GithubTagsClient {
             cache,
             auth_token,
             has_token,
-            trusted_origin: format!("{GITHUB_API}/"),
+            trusted_origin: api_prefix(GITHUB_API),
             api_base: GITHUB_API.to_string(),
         }
     }
@@ -289,7 +300,7 @@ impl GithubTagsClient {
             cache,
             auth_token,
             has_token,
-            trusted_origin: format!("{api_base}/"),
+            trusted_origin: api_prefix(&api_base),
             api_base,
         }
     }
@@ -307,17 +318,22 @@ impl GithubTagsClient {
         &self.api_base
     }
 
-    /// Auth headers to send on each request; empty when no token is set.
+    /// The request auth for each call: the bearer credential, or anonymous when no token is set.
     ///
     /// `pub(crate)` rather than `pub`: ecosystem crates needing an authenticated GitHub
     /// request go through [`Self::fetch_authenticated`] instead, which applies these headers
     /// internally.
     #[must_use]
-    pub(crate) fn headers(&self) -> Vec<RequestHeader<'_>> {
+    pub(crate) fn auth(&self) -> RequestAuth<'_> {
         self.auth_token
-            .iter()
-            .map(RequestHeader::Authorization)
-            .collect()
+            .as_ref()
+            .map_or(RequestAuth::ANONYMOUS, |token| {
+                RequestAuth::credential(
+                    CredentialHeader::Authorization(token),
+                    &self.trusted_origin,
+                )
+                .with_rate_limit(RateLimitRevocation::Throttles)
+            })
     }
 
     /// The shared HTTP cache this client fetches through.
@@ -337,10 +353,10 @@ impl GithubTagsClient {
     /// The single entry point for an authenticated request against the GitHub API: every
     /// caller needing this client's `Authorization` header — the tags API
     /// ([`Self::fetch_tags_page`]), `deps-swift`'s release-dates and search endpoints —
-    /// goes through here rather than combining [`Self::cache`] and `headers()`
+    /// goes through here rather than combining [`Self::cache`] and `auth()`
     /// itself, so the origin pin can't be forgotten at a new call site.
     ///
-    /// Fetches through [`HttpCache::get_cached_trusted_origin_with_headers`] rather than
+    /// Fetches through [`HttpCache::get_cached_trusted_origin`] rather than
     /// [`HttpCache::get_cached_with_headers`], pinning every redirect hop to `api_base` so
     /// the `Authorization` header can never follow a cross-origin redirect off the GitHub
     /// API — defense-in-depth alongside reqwest's own default header-stripping on
@@ -360,7 +376,7 @@ impl GithubTagsClient {
     )]
     pub async fn fetch_authenticated(&self, url: &str) -> Result<Bytes> {
         self.cache
-            .get_cached_trusted_origin_with_headers(url, &self.trusted_origin, &self.headers())
+            .get_cached_trusted_origin(url, &self.trusted_origin, self.auth(), None)
             .await
     }
 
@@ -947,6 +963,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "test-util")]
     use crate::test_util::{capture_tracing_output, capture_tracing_output_async};
+    use std::assert_matches;
 
     // --- semver_tags_newest_first ---
 
@@ -1359,13 +1376,13 @@ mod tests {
             status: 403,
         };
         let classified = classify_tags_fetch_error(e, "owner/repo", "GitHub", false);
-        assert!(matches!(
+        assert_matches!(
             classified,
             DepsError::RateLimited {
                 verified: RateLimitEvidence::Inferred,
                 ..
             }
-        ));
+        );
     }
 
     #[test]
@@ -1375,10 +1392,7 @@ mod tests {
             status: 403,
         };
         let classified = classify_tags_fetch_error(e, "owner/repo", "GitHub", true);
-        assert!(matches!(
-            classified,
-            DepsError::HttpStatus { status: 403, .. }
-        ));
+        assert_matches!(classified, DepsError::HttpStatus { status: 403, .. });
     }
 
     // --- GithubTagsClient ---
@@ -1388,7 +1402,7 @@ mod tests {
         let client = GithubTagsClient::for_test(Arc::new(HttpCache::new()), "http://example", true);
         assert!(client.has_token());
         assert_eq!(client.api_base(), "http://example");
-        assert_eq!(client.headers().len(), 1);
+        assert_matches!(client.auth(), RequestAuth::Credential { .. });
     }
 
     #[test]
@@ -1396,22 +1410,23 @@ mod tests {
         let client =
             GithubTagsClient::for_test(Arc::new(HttpCache::new()), "http://example", false);
         assert!(!client.has_token());
-        assert!(client.headers().is_empty());
+        assert_matches!(client.auth(), RequestAuth::Anonymous { partition: None });
     }
 
     // --- ApiToken redaction (bare-type coverage lives in `crate::secret`'s own tests) ---
 
     #[test]
-    fn test_api_token_debug_redacts_when_embedded_in_header_vec() {
+    fn test_api_token_debug_redacts_when_embedded_in_request_auth() {
         // Guards against a future `#[derive(Debug)]` on `GithubTagsClient` (or a struct
         // embedding it) accidentally printing a raw `GITHUB_TOKEN` value: exercises the
-        // header shape `GithubTagsClient::headers` hands to the cache, not just a bare
+        // auth shape `GithubTagsClient::auth` hands to the cache, not just a bare
         // `ApiToken`.
         let token = crate::secret::bearer_auth_header(&crate::secret::Redacted::new(
             "super-secret-value".to_string(),
         ));
-        let headers = [RequestHeader::Authorization(&token)];
-        let debug_output = format!("{headers:?}");
+        let prefix = TrustedPrefix::parse("https://api.github.com/").unwrap();
+        let auth = RequestAuth::credential(CredentialHeader::Authorization(&token), &prefix);
+        let debug_output = format!("{auth:?}");
         assert!(
             !debug_output.contains("super-secret-value"),
             "{debug_output}"

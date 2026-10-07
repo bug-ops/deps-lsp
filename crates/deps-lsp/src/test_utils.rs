@@ -20,6 +20,89 @@ pub(crate) mod test_helpers {
         (client, config)
     }
 
+    /// The advisory id of [`advisory_state`]'s document.
+    #[cfg(feature = "cargo")]
+    pub(crate) const ADVISORY_ID: &str = "RUSTSEC-2020-0071";
+
+    /// A server state holding one loaded Cargo document (`serde = "0.9.0"`, latest `1.0.5`) whose
+    /// dependency carries an already-fetched advisory fixed by `1.0.5`.
+    #[cfg(feature = "cargo")]
+    pub(crate) async fn advisory_state() -> (
+        Arc<crate::document::ServerState>,
+        tower_lsp_server::ls_types::Uri,
+    ) {
+        use crate::document::{DocumentState, ServerState};
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, ScanOutcome, UpgradeStatus,
+            VulnSeverity, VulnerabilityMap,
+        };
+
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let state = Arc::new(ServerState::new());
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
+        let content = "[dependencies]\nserde = \"0.9.0\"\n".to_string();
+        let parse_result = ecosystem
+            .parse_manifest(&content, &url)
+            .await
+            .expect("failed to parse manifest");
+        let mut doc_state = DocumentState::new_from_parse_result(
+            deps_core::EcosystemId::Cargo,
+            content,
+            parse_result,
+        );
+        let mut cached = std::collections::HashMap::new();
+        cached.insert(
+            deps_core::PackageName::from("serde"),
+            deps_core::PackageVersions::new(
+                "1.0.5".into(),
+                Arc::from(vec!["1.0.5".into(), "0.9.0".into()]),
+            ),
+        );
+        doc_state.update_cached_versions(cached);
+        let mut vulnerabilities = VulnerabilityMap::new();
+        vulnerabilities.insert(
+            deps_core::test_util::vuln_key("serde"),
+            ScanOutcome::Vulnerable(
+                DependencyVulnerabilities::new(Capped::new(
+                    vec![Arc::new(
+                        Advisory::new(
+                            ADVISORY_ID.to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec![OsvVersion::new("1.0.5")]),
+                    )],
+                    1,
+                ))
+                .with_fix_target_status(UpgradeStatus::CandidateClean {
+                    version: deps_core::ConcreteVersion::new("1.0.5"),
+                }),
+            ),
+        );
+        doc_state.signals.vulnerabilities = vulnerabilities;
+        doc_state.set_loaded();
+        state.update_document(uri.clone(), doc_state);
+        (state, uri)
+    }
+
+    /// Sets `vulnerabilities_enabled` and `offline` on a test server's config.
+    #[cfg(feature = "cargo")]
+    pub(crate) async fn set_advisory_gates(
+        config: &RwLock<DepsConfig>,
+        vulnerabilities_enabled: bool,
+        offline: bool,
+    ) {
+        let mut config = config.write().await;
+        config.policy.diagnostics.vulnerabilities_enabled = vulnerabilities_enabled;
+        config.policy.network.offline = offline;
+    }
+
     /// Prefixes a Windows drive letter onto a Unix-shaped path literal so it is a valid
     /// absolute path on Windows too, mirroring `deps_core::test_util::test_uri`'s pattern —
     /// `ls_types::Uri::from_file_path`/`url::Url::from_file_path`/`Url::to_file_path` all

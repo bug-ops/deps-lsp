@@ -227,21 +227,22 @@ impl std::fmt::Display for ApiToken {
 
 /// The scheme of an [`AuthorizationValue`].
 ///
-/// Exhaustive on purpose: adding a scheme (e.g. a verbatim token) forces every `match` on it to
-/// be revisited.
+/// Exhaustive on purpose: adding a scheme forces every `match` on it to be revisited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthScheme {
     /// `Basic base64(username:password)`.
     Basic,
     /// `Bearer <token>`.
     Bearer,
+    /// The token as is, with no scheme prefix.
+    Verbatim,
 }
 
 /// A pre-formatted `Authorization` header value, redacted everywhere except the one call site
 /// that attaches it to a request.
 ///
-/// Built only by [`basic_auth_header`] and [`bearer_auth_header`], so a request cannot carry an
-/// `Authorization` value whose scheme was assembled by hand.
+/// Built only by [`basic_auth_header`], [`bearer_auth_header`] and [`cargo_token_header`], so a
+/// request cannot carry an `Authorization` value whose scheme was assembled by hand.
 ///
 /// # Examples
 ///
@@ -347,6 +348,27 @@ pub fn bearer_auth_header(token: &Redacted) -> AuthorizationValue {
     AuthorizationValue {
         scheme: AuthScheme::Bearer,
         value: Redacted::new(format!("Bearer {}", token.expose_secret())),
+    }
+}
+
+/// Formats a Cargo registry `token` into the `Authorization` value Cargo itself sends: the token
+/// as is, with no `Bearer` prefix.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::secret::{AuthScheme, Redacted, cargo_token_header};
+///
+/// let header = cargo_token_header(&Redacted::new("t0k".to_string()));
+/// assert_eq!(header.scheme(), AuthScheme::Verbatim);
+/// assert_eq!(header.expose_secret(), "t0k");
+/// assert_eq!(format!("{header:?}"), "AuthorizationValue(Verbatim, ***)");
+/// ```
+#[must_use]
+pub fn cargo_token_header(token: &Redacted) -> AuthorizationValue {
+    AuthorizationValue {
+        scheme: AuthScheme::Verbatim,
+        value: Redacted::new(token.expose_secret().to_string()),
     }
 }
 
@@ -509,6 +531,14 @@ mod tests {
     fn non_empty_token_present_value_is_some() {
         let token = super::non_empty_token(Some("hunter2".to_string())).unwrap();
         assert_eq!(*token, "hunter2");
+    }
+
+    #[test]
+    fn cargo_token_header_is_verbatim_and_redacted() {
+        let header = super::cargo_token_header(&Redacted::new("Bearer-ish token".to_string()));
+        assert_eq!(header.scheme(), super::AuthScheme::Verbatim);
+        assert_eq!(header.expose_secret(), "Bearer-ish token");
+        assert!(!format!("{header:?}{header}").contains("token"));
     }
 
     #[test]

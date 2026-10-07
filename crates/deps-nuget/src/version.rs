@@ -84,9 +84,7 @@ impl ParsedVersion {
         let patch = parts.next().unwrap_or(0);
         let revision = parts.next().unwrap_or(0);
 
-        let pre = pre
-            .map(|p| p.split('.').map(PrereleaseSegment::parse).collect())
-            .unwrap_or_default();
+        let pre = pre.map_or_default(|p| p.split('.').map(PrereleaseSegment::parse).collect());
 
         Self {
             major,
@@ -373,6 +371,7 @@ pub fn resolve_float<'a>(versions: &'a [String], pattern: &str) -> Option<&'a st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn test_parse_range_accepts_well_formed_ranges() {
@@ -638,11 +637,9 @@ mod tests {
     #[test]
     fn test_parse_range_degenerate_bounded_range_is_empty() {
         for degenerate in ["[5.0,3.0]", "(3.0,3.0)", "[3.0,3.0)", "(3.0,3.0]"] {
-            assert!(
-                matches!(
-                    parse_range(degenerate),
-                    Some(deps_core::interval::VersionRange::Empty)
-                ),
+            assert_matches!(
+                parse_range(degenerate),
+                Some(deps_core::interval::VersionRange::Empty),
                 "expected {degenerate:?} to parse to Empty"
             );
             assert!(!satisfies("1.5.0", degenerate));

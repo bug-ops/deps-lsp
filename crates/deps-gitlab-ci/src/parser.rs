@@ -1177,9 +1177,11 @@ fn resolve_instance_host_ref(instance_host: &GitlabInstanceHost, raw: &str) -> H
         InstanceHostOutcome::Blocked {
             raw: configured_raw,
             class,
+            policy,
         } => HostRef::PolicyBlocked {
             raw: configured_raw,
             class,
+            policy,
             declaration_key: INSTANCE_HOST_DECLARATION_KEY.to_string(),
         },
         InstanceHostOutcome::Unset | InstanceHostOutcome::Invalid => {
@@ -1210,10 +1212,11 @@ fn resolve_component_host(
             );
             HostRef::CapacityRefused(host.origin().to_string())
         }
-        Err(deps_core::net_policy::IndexUrlError::BlockedHost { class }) => {
+        Err(deps_core::net_policy::IndexUrlError::BlockedHost { class, policy }) => {
             HostRef::PolicyBlocked {
                 raw: host_expr.to_string(),
                 class,
+                policy,
                 // #967 S3: one per distinct literal host string, unlike the instance-setting
                 // path's single shared key — two different `component:` hosts blocked by policy
                 // are two independently declared literals, not one config declaration.
@@ -1563,10 +1566,12 @@ pub fn parse_gitlab_ci_yaml(
             HostRef::PolicyBlocked {
                 raw,
                 class,
+                policy,
                 declaration_key,
             } => Some(deps_core::BlockedRegistryOccurrence {
                 range: dep.name_range,
                 class: *class,
+                policy: *policy,
                 raw_value: raw.clone(),
                 declaration_key: declaration_key.clone(),
             }),
@@ -1591,6 +1596,7 @@ mod tests {
     use deps_core::lsp_helpers::CommentSlot;
     use deps_core::net_policy::WorkspaceRegistryAccess;
     use deps_core::position::Range;
+    use std::assert_matches;
     use std::sync::{Arc, RwLock};
 
     fn test_uri() -> Url {
@@ -1642,12 +1648,9 @@ mod tests {
         assert_eq!(slice(content, dep.name_range), "org/proj");
         assert_eq!(slice(content, dep.version_range().unwrap()), "v1.0.0");
         assert_eq!(dep.pin, Some(PinStyle::Tag));
-        assert!(matches!(dep.host, HostRef::Literal(_)));
+        assert_matches!(dep.host, HostRef::Literal(_));
         assert_eq!(dep.name(), "gitlab.com/org/proj");
-        assert!(matches!(
-            dep.source(),
-            DependencySource::AlternateRegistry { .. }
-        ));
+        assert_matches!(dep.source(), DependencySource::AlternateRegistry { .. });
         assert_eq!(result.routes.len(), 1);
     }
 
@@ -1657,11 +1660,8 @@ mod tests {
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
         let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
         let dep = &result.dependencies[0];
-        assert!(matches!(dep.host, HostRef::Unresolved(_)));
-        assert!(matches!(
-            dep.source(),
-            DependencySource::CustomRegistry { .. }
-        ));
+        assert_matches!(dep.host, HostRef::Unresolved(_));
+        assert_matches!(dep.source(), DependencySource::CustomRegistry { .. });
         assert_eq!(dep.name(), "org/proj");
         assert!(result.routes.is_empty());
     }
@@ -1811,7 +1811,7 @@ mod tests {
         assert_eq!(slice(content, dep.version_range().unwrap()), "1.0.0");
         assert_eq!(dep.name(), "gitlab.com/org/proj/comp");
         assert_eq!(dep.project_path, "org/proj");
-        assert!(matches!(dep.host, HostRef::Literal(_)));
+        assert_matches!(dep.host, HostRef::Literal(_));
     }
 
     #[test]
@@ -1821,10 +1821,7 @@ mod tests {
         let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
         let dep = &result.dependencies[0];
         assert_eq!(dep.host, HostRef::Unresolved("$CI_SERVER_FQDN".to_string()));
-        assert!(matches!(
-            dep.source(),
-            DependencySource::CustomRegistry { .. }
-        ));
+        assert_matches!(dep.source(), DependencySource::CustomRegistry { .. });
     }
 
     #[test]
@@ -1846,14 +1843,11 @@ mod tests {
         let content = "include:\n  - component: 10.0.0.1/org/proj/comp@1.0.0\n";
         let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
         let dep = &result.dependencies[0];
-        assert!(matches!(
+        assert_matches!(
             &dep.host,
             HostRef::PolicyBlocked { raw, .. } if raw == "10.0.0.1"
-        ));
-        assert!(matches!(
-            dep.source(),
-            DependencySource::CustomRegistry { .. }
-        ));
+        );
+        assert_matches!(dep.source(), DependencySource::CustomRegistry { .. });
         assert_eq!(result.blocked_registries.len(), 1);
         let occurrence = &result.blocked_registries[0];
         assert_eq!(
@@ -1881,6 +1875,9 @@ mod tests {
             HostRef::PolicyBlocked {
                 raw: "10.0.0.1".to_string(),
                 class: deps_core::net_policy::HostClass::PrivateV4,
+                policy: deps_core::net_policy::BlockingPolicy::WorkspaceRegistries(
+                    deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly,
+                ),
                 declaration_key: INSTANCE_HOST_DECLARATION_KEY.to_string(),
             }
         );
@@ -1896,7 +1893,7 @@ mod tests {
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
         let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
         let dep = &result.dependencies[0];
-        assert!(matches!(dep.host, HostRef::PolicyBlocked { .. }));
+        assert_matches!(dep.host, HostRef::PolicyBlocked { .. });
         assert_eq!(dep.name(), "org/proj");
         assert_eq!(result.blocked_registries.len(), 1);
         // S1: the diagnostic must name the real configured host, not `$CI_SERVER_FQDN`.
@@ -2094,7 +2091,7 @@ mod tests {
         let (policy, instance_host) = ctx();
         let payload = format!("{}1", "- ".repeat(deps_core::MAX_YAML_NESTING_DEPTH + 1));
         let result = parse_gitlab_ci_yaml(&payload, &test_uri(), &policy, &instance_host);
-        assert!(matches!(result, Err(DepsError::ParseError { .. })));
+        assert_matches!(result, Err(DepsError::ParseError { .. }));
     }
 
     #[test]

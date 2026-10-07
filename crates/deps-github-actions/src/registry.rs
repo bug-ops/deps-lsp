@@ -947,16 +947,16 @@ mod tests {
         let err = registry.get_versions("owner/repo").await.unwrap_err();
         // Guards the variant itself (#478), not just the text: a regression keeping the old
         // error type but the same `Display` text would pass a contains() check but fail here.
-        assert!(
-            matches!(err, DepsError::RateLimited { .. }),
+        assert_matches!(
+            err,
+            DepsError::RateLimited { .. },
             "expected DepsError::RateLimited, got {err:?}"
         );
         assert!(err.to_string().contains("GITHUB_TOKEN"));
 
         // A rate-limited fetch must classify as `Actionable` with the same hint, never `Transient`.
         let failure = err.fetch_failure();
-        assert!(
-            matches!(&failure, deps_core::error::FetchFailure::Actionable(hint) if hint.contains("GITHUB_TOKEN")),
+        assert_matches!(&failure, deps_core::error::FetchFailure::Actionable(hint) if hint.contains("GITHUB_TOKEN"),
             "expected Actionable hint mentioning GITHUB_TOKEN, got {failure:?}"
         );
 

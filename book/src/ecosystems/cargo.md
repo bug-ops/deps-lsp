@@ -49,7 +49,7 @@ URLs are supported; `http://` and any URL carrying `user:pass@` are rejected.
 Cargo's `CARGO_REGISTRIES_<NAME>_INDEX`/`_TOKEN` environment variable overrides are
 also honored.
 
-**Authentication**: a bearer token is attached to requests against a registry
+**Authentication**: a registry token is attached to requests against a registry
 resolved from `$CARGO_HOME/config.toml` (or its own `CARGO_REGISTRIES_<NAME>_TOKEN`
 environment variable) only. A registry alias resolved from a workspace
 `.cargo/config.toml` — a file a cloned, untrusted repository fully controls — never
@@ -58,6 +58,9 @@ one in `$CARGO_HOME`. This is deliberate: it prevents a hostile repository from
 redirecting a familiar alias name (e.g. `"github"`) to an attacker-controlled host
 and harvesting whatever token the user's real, differently-scoped registry of that
 name would have used.
+
+The token is sent verbatim in the `Authorization` header, with no `Bearer` prefix, exactly as
+Cargo itself sends it.
 
 **Mirroring crates.io (`[source]` replace-with)**: a workspace's
 `[source.crates-io] replace-with = "<name>"` chain, terminating at a
@@ -92,6 +95,11 @@ that sharing means in practice. Three values:
 | `"public_only"` (default) | Only a publicly-routable host is fetched — blocks loopback, link-local, RFC1918/CGNAT, unique-local-v6, and cloud-metadata-range hosts (e.g. `169.254.169.254`) declared by a workspace file. A corporate `https://index.mycorp.dev`-style registry still works, since a DNS name cannot be classified as internal without resolving it — see the residual-risk note below. |
 | `"off"` | No workspace-declared index is ever fetched — the only complete boundary. Applies to the alias path as well as `[source]`. |
 | `"all"` | Public hosts plus the private hosts and CIDR ranges listed in the `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` environment variable (see [Configuration](../configuration.md#private-registry-allowlist)) — the escape hatch for a workspace that legitimately points at an RFC1918 registry. Without that variable it behaves like `"public_only"`: the setting is repository-controllable, so the variable is the effective control, and a listed host is reachable on any port. It never allows loopback, link-local, cloud-metadata, unspecified or reserved addresses, which are refused under every value. |
+
+**Proxies.** A workspace-declared registry connects directly and bypasses the system proxy by
+default, so the connect-time check sees the real address; see
+[Proxies and guarded registry traffic](../configuration.md#proxies-and-guarded-registry-traffic)
+for the opt-in variable.
 
 **Hosts that resolve to a blocked address.** The check above looks at the declared host name. A
 name that resolves, when the connection is made, to a blocked address class (for example a public

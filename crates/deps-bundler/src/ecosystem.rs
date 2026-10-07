@@ -333,6 +333,7 @@ gem 'rails', '~> 7.0'";
     #[cfg(feature = "lsp-responses")]
     mod lsp_tests {
         use super::*;
+        use std::assert_matches;
 
         use tower_lsp_server::ls_types::Position;
 
@@ -694,11 +695,9 @@ gem 'rails', '~> 7.0'";
                 position,
                 content,
             );
-            assert!(
-                matches!(
-                    context,
-                    deps_core::completion::CompletionContext::Version { .. }
-                ),
+            assert_matches!(
+                context,
+                deps_core::completion::CompletionContext::Version { .. },
                 "S1 regression: a cursor inside a multi-constraint dependency's version text must \
              still resolve to a Version completion context, got {context:?}"
             );

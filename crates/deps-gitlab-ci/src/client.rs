@@ -8,9 +8,8 @@
 
 use bytes::Bytes;
 use dashmap::DashSet;
-use deps_core::cache::{HttpCache, RequestHeader};
+use deps_core::cache::{CredentialHeader, HttpCache, RequestAuth};
 use deps_core::error::{DepsError, RateLimitEvidence, Result};
-use deps_core::secret::ApiToken;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -135,6 +134,15 @@ fn parse_gitlab_page<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<Vec<
             }
         }
     }
+}
+
+/// The transport tier a GitLab host is reached through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitlabRoute {
+    /// `gitlab.com` or the environment-bound token host: baseline trusted-origin tier.
+    OperatorTrusted,
+    /// Any other host: guarded pinned tier, never a credential.
+    WorkspaceDeclared,
 }
 
 /// Client for fetching repository tags and project releases from a per-call GitLab
@@ -263,28 +271,92 @@ impl GitlabApiClient {
         self.fetch_pinned(host, &url).await
     }
 
-    /// Fetches `url` through the origin-pinned, connect-address-guarded `CacheTier::Pinned`
-    /// transport — the only sanctioned way to send a credential to a workspace-declared
-    /// host (issue #561/#562 precedent) — attaching `PRIVATE-TOKEN` only when `host` is the
-    /// env-bound token host.
+    /// Fetches `url` through the origin-pinned transport [`Self::route_for`] picks, attaching
+    /// `PRIVATE-TOKEN` only when `host` is the env-bound token host.
     async fn fetch_pinned(&self, host: &GitlabHost, url: &str) -> Result<Bytes> {
-        let token = self.token.token_for(host);
-        let auth_id =
-            deps_core::secret::auth_digest(host.origin(), token.map(ApiToken::expose_secret));
-        let headers: Vec<RequestHeader<'_>> = token
-            .map(|t| RequestHeader::GitlabPrivateToken(t.as_redacted()))
-            .into_iter()
-            .collect();
+        let prefix = host.trusted_prefix();
+        match self.route_for(host) {
+            GitlabRoute::OperatorTrusted => {
+                let auth = self
+                    .token
+                    .token_for(host)
+                    .map_or(RequestAuth::ANONYMOUS, |t| {
+                        RequestAuth::credential(
+                            CredentialHeader::GitlabPrivateToken(t.as_redacted()),
+                            prefix,
+                        )
+                    });
+                self.cache
+                    .get_cached_trusted_origin(url, prefix, auth, None)
+                    .await
+            }
+            GitlabRoute::WorkspaceDeclared => {
+                self.cache
+                    .get_cached_pinned(url, prefix, RequestAuth::ANONYMOUS, None)
+                    .await
+            }
+        }
+    }
 
-        self.cache
-            .get_cached_pinned_with_headers(url, host.origin(), token.is_some(), auth_id, &headers)
-            .await
+    /// Which transport tier `host` is fetched through.
+    ///
+    /// `gitlab.com` and the `GITLAB_TOKEN_HOST`-bound host come from the operator's own
+    /// environment, so they use the baseline trusted-origin tier (system proxy, never-a-registry
+    /// floor); every other host is workspace-declared and uses the guarded pinned tier without a
+    /// credential.
+    fn route_for(&self, host: &GitlabHost) -> GitlabRoute {
+        if *host == GitlabHost::gitlab_com() || self.token.bound_host() == Some(host) {
+            GitlabRoute::OperatorTrusted
+        } else {
+            GitlabRoute::WorkspaceDeclared
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
+
+    // --- route_for ---
+
+    fn host(raw: &str) -> GitlabHost {
+        GitlabHost::parse_trusted(raw).unwrap()
+    }
+
+    #[test]
+    fn test_route_for_table() {
+        let cache = Arc::new(HttpCache::new());
+        let bound = GitlabApiClient::for_test(
+            Arc::clone(&cache),
+            TokenBinding::from_values(
+                Some(deps_core::secret::ApiToken::new("t".to_string())),
+                Some("gitlab.corp"),
+            ),
+        );
+        let unbound = GitlabApiClient::for_test(cache, TokenBinding::Absent);
+
+        assert_eq!(
+            unbound.route_for(&host("gitlab.com")),
+            GitlabRoute::OperatorTrusted
+        );
+        assert_eq!(
+            bound.route_for(&host("gitlab.com")),
+            GitlabRoute::OperatorTrusted
+        );
+        assert_eq!(
+            bound.route_for(&host("gitlab.corp")),
+            GitlabRoute::OperatorTrusted
+        );
+        assert_eq!(
+            bound.route_for(&host("gitlab.other")),
+            GitlabRoute::WorkspaceDeclared
+        );
+        assert_eq!(
+            unbound.route_for(&host("gitlab.corp")),
+            GitlabRoute::WorkspaceDeclared
+        );
+    }
 
     // --- parse_tags_page / parse_releases_page ---
 
@@ -318,7 +390,7 @@ mod tests {
         let json = r#"{"message":"404 Project Not Found"}"#;
         let result: Result<Vec<GitlabTag>> = parse_gitlab_page(json.as_bytes());
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), DepsError::ParseError { .. }));
+        assert_matches!(result.unwrap_err(), DepsError::ParseError { .. });
     }
 
     #[test]
@@ -448,6 +520,43 @@ mod tests {
         );
         client.fetch_tags_page(&host, "org/proj", 1).await.unwrap();
         mock.assert_async().await;
+    }
+
+    /// The token host is fetched on the baseline trusted-origin tier, where a confirmed rate
+    /// limit on a credentialed revalidation still evicts the entry (#1295) instead of serving
+    /// the stale body.
+    #[tokio::test]
+    async fn test_credentialed_gitlab_entry_is_evicted_on_a_confirmed_rate_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let _warm = server
+            .mock("GET", "/api/v4/projects/org%2Fproj/repository/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("etag", "\"abc\"")
+            .with_body("[]")
+            .create_async()
+            .await;
+        let host = test_host_for(&server.url());
+        let cache = Arc::new(HttpCache::new());
+        let client = GitlabApiClient::for_test(
+            Arc::clone(&cache),
+            TokenBinding::for_test("test-gitlab-token", host.origin()),
+        );
+        client.fetch_tags_page(&host, "org/proj", 1).await.unwrap();
+        assert_eq!(cache.len(), 1);
+        server.reset();
+        let _limited = server
+            .mock("GET", "/api/v4/projects/org%2Fproj/repository/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(403)
+            .with_header("x-ratelimit-remaining", "0")
+            .create_async()
+            .await;
+
+        let result = client.fetch_tags_page(&host, "org/proj", 1).await;
+
+        assert!(result.is_err(), "the stale body must not be served");
+        assert_eq!(cache.len(), 0);
     }
 
     #[tokio::test]

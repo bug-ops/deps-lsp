@@ -338,6 +338,7 @@ pub(crate) type TagRefreshLifecycle = ListenerLifecycle<TagRefreshSubscriptions,
 
 #[cfg(test)]
 mod lifecycle_tests {
+    use std::assert_matches;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -368,7 +369,7 @@ mod lifecycle_tests {
         });
 
         assert_eq!(starts.load(Ordering::SeqCst), 1);
-        assert!(matches!(lifecycle, TagRefreshLifecycle::Running(_)));
+        assert_matches!(lifecycle, TagRefreshLifecycle::Running(_));
         assert!(!handle.is_finished());
         lifecycle.stop();
         assert!(handle.await.unwrap_err().is_cancelled());
@@ -382,7 +383,7 @@ mod lifecycle_tests {
 
         lifecycle.stop();
 
-        assert!(matches!(lifecycle, TagRefreshLifecycle::Stopped));
+        assert_matches!(lifecycle, TagRefreshLifecycle::Stopped);
         assert!(handle.await.unwrap_err().is_cancelled());
     }
 
@@ -391,13 +392,14 @@ mod lifecycle_tests {
         let mut lifecycle = subscribed();
         lifecycle.stop();
         lifecycle.start(|_| unreachable!("a stopped lifecycle must not restart"));
-        assert!(matches!(lifecycle, TagRefreshLifecycle::Stopped));
+        assert_matches!(lifecycle, TagRefreshLifecycle::Stopped);
     }
 }
 
 #[cfg(test)]
 #[cfg(feature = "github-actions")]
 mod tests {
+    use std::assert_matches;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -819,10 +821,10 @@ mod tests {
         )
         .await;
         let cold = run_osv_scan_phase_a_for_test(&state, &uri, &ecosystem).await;
-        assert!(matches!(
+        assert_matches!(
             cold,
             Some(ScanOutcome::Skipped(SkipReason::NoConcreteVersion))
-        ));
+        );
 
         let mut index = TagIndex::default();
         index.insert_sha_pin(
@@ -859,10 +861,10 @@ mod tests {
         batch.assert_async().await;
         let key = deps_core::test_util::vuln_key("actions/checkout");
         let doc = state.get_document(&uri).unwrap();
-        assert!(matches!(
+        assert_matches!(
             doc.signals.vulnerabilities.get(&key),
             Some(ScanOutcome::Clean)
-        ));
+        );
     }
 
     /// Runs the cold OSV pipeline for `uri` and returns its `actions/checkout` outcome.

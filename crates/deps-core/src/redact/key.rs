@@ -431,6 +431,7 @@ pub fn is_credential_or_query_bearing(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     /// #993 M5 (impl-critic on the first credential-shape fix): the carve-out used to inspect
     /// only the *last* `@` found by the old `find_credential_at`-based scan, so a trailing
@@ -758,9 +759,9 @@ mod tests {
 
     #[test]
     fn sanitize_invisible_borrows_when_nothing_needs_sanitizing() {
-        assert!(matches!(
+        assert_matches!(
             sanitize_invisible("com.google.guava:guava"),
             std::borrow::Cow::Borrowed(_)
-        ));
+        );
     }
 }

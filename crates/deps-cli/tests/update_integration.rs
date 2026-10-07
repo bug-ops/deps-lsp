@@ -30,6 +30,8 @@ use deps_cli::update::ApplyError;
 use deps_cli::update::{Outcome, PlannedUpdateItem, UpdatePlan, apply_plan};
 use deps_core::edit::ManifestEdit;
 use deps_core::position::{Position, Range};
+#[cfg(unix)]
+use std::assert_matches;
 
 fn exe() -> &'static str {
     env!("CARGO_BIN_EXE_deps-cli")
@@ -262,8 +264,9 @@ fn test_apply_plan_refuses_a_symlinked_manifest_path() {
     );
     let result = apply_plan(&plan, &link, original, DryRun::No);
 
-    assert!(
-        matches!(result, Err(ApplyError::Write { .. })),
+    assert_matches!(
+        result,
+        Err(ApplyError::Write { .. }),
         "expected a write-refusal error, got {result:?}"
     );
     assert!(

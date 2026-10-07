@@ -798,6 +798,7 @@ pub(crate) mod fake {
 mod tests {
     use super::fake::Fake;
     use super::*;
+    use std::assert_matches;
 
     fn generation(steps: u32) -> KeychainGeneration {
         (0..steps).fold(KeychainGeneration::INITIAL, |generation, _| {
@@ -921,10 +922,10 @@ mod tests {
         let fake = Fake::new(Err(KeychainError::NotFound), Ok("x"));
         let store = store(&fake);
         let host = server("a.example");
-        assert!(matches!(
+        assert_matches!(
             store.resolve(&host, generation(0)).await,
             Err(KeychainError::NotFound)
-        ));
+        );
         tokio::time::advance(Duration::from_mins(4)).await;
         drop(store.resolve(&host, generation(0)).await);
         assert_eq!(fake.find_calls.load(Ordering::SeqCst), 1);
@@ -938,15 +939,15 @@ mod tests {
         let fake = Fake::new(Ok("user"), Err(KeychainError::Refused));
         let store = store(&fake);
         let host = server("a.example");
-        assert!(matches!(
+        assert_matches!(
             store.resolve(&host, generation(0)).await,
             Err(KeychainError::Refused)
-        ));
+        );
         tokio::time::advance(Duration::from_hours(48)).await;
-        assert!(matches!(
+        assert_matches!(
             store.resolve(&host, generation(0)).await,
             Err(KeychainError::Refused)
-        ));
+        );
         assert_eq!(fake.secret_calls(), 1);
 
         fake.set_secret(Ok("hunter2"));
@@ -962,14 +963,14 @@ mod tests {
         let fake = Fake::found().delayed(Duration::from_hours(1));
         let store = store(&fake);
         let host = server("a.example");
-        assert!(matches!(
+        assert_matches!(
             store.resolve(&host, generation(0)).await,
             Err(KeychainError::Transient)
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             store.resolve(&host, generation(0)).await,
             Err(KeychainError::Transient)
-        ));
+        );
         assert_eq!(fake.secret_calls(), 2);
     }
 
@@ -979,14 +980,14 @@ mod tests {
         fake.panic_on_secret = true;
         let store = store(&fake);
         let host = server("a.example");
-        assert!(matches!(
+        assert_matches!(
             store.resolve(&host, generation(0)).await,
             Err(KeychainError::Transient)
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             store.resolve(&host, generation(0)).await,
             Err(KeychainError::Transient)
-        ));
+        );
         assert_eq!(fake.secret_calls(), 2);
     }
 
@@ -1034,10 +1035,10 @@ mod tests {
             .expect("resolved after an abandoned wait")
             .expect("resolved channel open");
         drop(store.resolve(&host, generation(0)).await);
-        assert!(matches!(
+        assert_matches!(
             resolved.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
-        ));
+        );
         assert_eq!(
             password(&store.resolve(&host, generation(0)).await),
             "hunter2"
@@ -1051,10 +1052,10 @@ mod tests {
         let store = store(&fake);
         let mut resolved = store.subscribe_resolved();
         drop(store.resolve(&server("a.example"), generation(0)).await);
-        assert!(matches!(
+        assert_matches!(
             resolved.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
-        ));
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1070,10 +1071,10 @@ mod tests {
                 .is_err()
         );
         tokio::time::sleep(Duration::from_secs(60)).await;
-        assert!(matches!(
+        assert_matches!(
             resolved.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
-        ));
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1093,10 +1094,10 @@ mod tests {
         store.advance_generation(generation(1));
         tokio::time::sleep(Duration::from_secs(60)).await;
 
-        assert!(matches!(
+        assert_matches!(
             resolved.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
-        ));
+        );
         let waiting = store.lock().entries.is_empty();
         assert!(waiting, "stale lookup left an entry");
     }
@@ -1117,7 +1118,7 @@ mod tests {
             .await
             .expect("an aborted lookup releases its waiters at once")
             .unwrap();
-        assert!(matches!(outcome, Err(KeychainError::Transient)));
+        assert_matches!(outcome, Err(KeychainError::Transient));
     }
 
     #[tokio::test]
@@ -1189,10 +1190,10 @@ mod tests {
             .expect("lookup publishes a result");
         drop(waiter);
         resolved.try_recv().expect("announced on drop");
-        assert!(matches!(
+        assert_matches!(
             resolved.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
-        ));
+        );
     }
 
     #[tokio::test]
@@ -1200,14 +1201,14 @@ mod tests {
         let fake = Fake::new(Ok("user"), Err(KeychainError::Transient));
         let store = store(&fake);
         let host = server("a.example");
-        assert!(matches!(
+        assert_matches!(
             store.resolve(&host, generation(0)).await,
             Err(KeychainError::Transient)
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             store.resolve(&host, generation(0)).await,
             Err(KeychainError::Transient)
-        ));
+        );
         assert_eq!(fake.secret_calls(), 2);
         assert_eq!(store.memoized_entries(), 0);
     }
@@ -1234,15 +1235,16 @@ mod tests {
         let fake = Fake::found();
         let store = store(&fake);
         store.advance_generation(generation(3));
-        assert!(matches!(
+        assert_matches!(
             store.resolve(&server("a.example"), generation(2)).await,
             Err(KeychainError::Transient)
-        ));
+        );
         assert_eq!(fake.find_calls.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(unix)]
     mod security_cli {
+        use std::assert_matches;
         use std::os::unix::fs::PermissionsExt;
 
         use super::*;
@@ -1277,20 +1279,20 @@ esac"#,
         async fn exit_44_is_not_found_and_other_failures_are_refused() {
             let dir = tempfile::tempdir().unwrap();
             let store = KeychainStore::new(script_backend(&dir, "exit 44"), test_sender());
-            assert!(matches!(
+            assert_matches!(
                 Arc::new(store)
                     .resolve(&server("a.example"), generation(0))
                     .await,
                 Err(KeychainError::NotFound)
-            ));
+            );
             let dir = tempfile::tempdir().unwrap();
             let store = KeychainStore::new(script_backend(&dir, "exit 128"), test_sender());
-            assert!(matches!(
+            assert_matches!(
                 Arc::new(store)
                     .resolve(&server("a.example"), generation(0))
                     .await,
                 Err(KeychainError::Refused)
-            ));
+            );
         }
 
         #[tokio::test]
@@ -1303,12 +1305,12 @@ esac"#,
                 ),
                 test_sender(),
             );
-            assert!(matches!(
+            assert_matches!(
                 Arc::new(store)
                     .resolve(&server("a.example"), generation(0))
                     .await,
                 Err(KeychainError::Refused)
-            ));
+            );
         }
 
         #[tokio::test]
@@ -1317,22 +1319,22 @@ esac"#,
                 program: PathBuf::from("/nonexistent/security"),
             };
             let store = Arc::new(KeychainStore::new(backend, test_sender()));
-            assert!(matches!(
+            assert_matches!(
                 store.resolve(&server("a.example"), generation(0)).await,
                 Err(KeychainError::Refused)
-            ));
+            );
         }
 
         #[tokio::test]
         async fn unparsable_attributes_are_refused() {
             let dir = tempfile::tempdir().unwrap();
             let store = KeychainStore::new(script_backend(&dir, "echo garbage"), test_sender());
-            assert!(matches!(
+            assert_matches!(
                 Arc::new(store)
                     .resolve(&server("a.example"), generation(0))
                     .await,
                 Err(KeychainError::Refused)
-            ));
+            );
         }
     }
 

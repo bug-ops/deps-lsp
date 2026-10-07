@@ -1832,7 +1832,7 @@ dependencies:
         let http = &result.dependencies[0];
         assert_eq!(http.name.as_ref(), "http");
         assert_eq!(http.version_req, Some("^1.0.0".into()));
-        assert!(matches!(http.section, DependencySection::Dependencies));
+        assert_matches!(http.section, DependencySection::Dependencies);
     }
 
     #[test]

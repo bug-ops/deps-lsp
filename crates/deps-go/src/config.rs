@@ -34,7 +34,7 @@ use std::sync::{Arc, OnceLock};
 
 use deps_core::EcosystemId;
 use deps_core::net_policy::{
-    BlockedHostReason, HostClass, RedactedUrl, RegistryAccessPolicy, RegistryRejectionReason,
+    BlockedHost, BlockedHostReason, RedactedUrl, RegistryAccessPolicy, RegistryRejectionReason,
     RegistryUrlKind, ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
@@ -239,7 +239,7 @@ pub const GOPRIVATE_CHAIN_KEY: &str = "go-private:direct";
 #[derive(Debug, Clone)]
 struct GoProxyChainFailure {
     for_resolution: InvalidEntry,
-    first_blocked: Option<(HostClass, RedactedUrl)>,
+    first_blocked: Option<(BlockedHost, RedactedUrl)>,
 }
 
 /// Parses a raw `GOPROXY` value (FR-002) into either a non-empty [`GoProxyChain`], or — when
@@ -267,7 +267,7 @@ fn parse_goproxy(
     let mut hops: Vec<GoProxyHop> = Vec::new();
     let mut separators: Vec<ChainSeparator> = Vec::new();
     let mut first_invalid: Option<InvalidEntry> = None;
-    let mut first_blocked: Option<(HostClass, RedactedUrl)> = None;
+    let mut first_blocked: Option<(BlockedHost, RedactedUrl)> = None;
     // The separator(s) spanning every entry seen since the last surviving hop (or the start
     // of the chain) — `None` until the first separator is seen. When this spans one or more
     // dropped invalid entries, it accumulates via most-permissive-wins (`AnyError` beats
@@ -309,9 +309,9 @@ fn parse_goproxy(
                 }
                 Err(invalid) => {
                     if first_blocked.is_none()
-                        && let Some(class) = invalid.reason.blocked_host_class()
+                        && let Some(host) = invalid.reason.blocked_host()
                     {
-                        first_blocked = Some((class, invalid.raw.clone()));
+                        first_blocked = Some((host, invalid.raw.clone()));
                     }
                     if first_invalid.is_none() {
                         first_invalid = Some(invalid);
@@ -781,12 +781,12 @@ impl GoEnvConfig {
     /// `(class, raw)` pair per parse, regardless of how many `go.mod` dependencies it applies
     /// to.
     #[must_use]
-    pub fn blocked_class(&self) -> Option<(HostClass, String)> {
+    pub fn blocked_class(&self) -> Option<(BlockedHost, String)> {
         match &self.goproxy {
             Some(Err(failure)) => failure
                 .first_blocked
                 .as_ref()
-                .map(|(class, raw)| (*class, raw.to_string())),
+                .map(|(host, raw)| (*host, raw.to_string())),
             _ => None,
         }
     }
@@ -1072,7 +1072,7 @@ fn resolve_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::net_policy::WorkspaceRegistryAccess;
+    use deps_core::net_policy::{HostClass, WorkspaceRegistryAccess};
     use std::assert_matches;
 
     fn all_policy() -> RegistryAccessPolicy {
@@ -1560,8 +1560,8 @@ mod tests {
     #[test]
     fn test_blocked_class_some_when_goproxy_policy_blocked() {
         let config = GoEnvConfig::parse("GOPROXY=https://goproxy.mycorp.example", &off_policy());
-        let (class, raw) = config.blocked_class().expect("expected a blocked class");
-        assert_eq!(class, HostClass::Global);
+        let (host, raw) = config.blocked_class().expect("expected a blocked class");
+        assert_eq!(host.class, HostClass::Global);
         assert_eq!(raw, "https://goproxy.mycorp.example");
     }
 
@@ -1607,8 +1607,8 @@ mod tests {
                 url: "not-a-valid-url".to_string(),
             }
         );
-        let (class, raw) = config.blocked_class().expect("expected a blocked class");
-        assert_eq!(class, HostClass::Global);
+        let (host, raw) = config.blocked_class().expect("expected a blocked class");
+        assert_eq!(host.class, HostClass::Global);
         assert_eq!(raw, "https://goproxy.mycorp.example");
     }
 
@@ -1621,8 +1621,8 @@ mod tests {
             "GOPROXY=http://a.mycorp.example,https://b.mycorp.example",
             &off_policy(),
         );
-        let (class, raw) = config.blocked_class().expect("expected a blocked class");
-        assert_eq!(class, HostClass::Global);
+        let (host, raw) = config.blocked_class().expect("expected a blocked class");
+        assert_eq!(host.class, HostClass::Global);
         assert_eq!(raw, "https://b.mycorp.example");
     }
 

@@ -199,6 +199,10 @@ internationalized name) disables the token entirely, with a warning in the log, 
 falling back to `gitlab.com`. An empty `GITLAB_TOKEN_HOST` is treated as unset, so the token is
 bound to `gitlab.com`. A `401`/`403` from a host the token is not bound to shows a hint to set
 `GITLAB_TOKEN_HOST` if the instance is self-hosted.
+`gitlab.com` and the `GITLAB_TOKEN_HOST` host are operator-trusted and use the baseline policy
+tier: a public-looking name that resolves to a private address (split-horizon DNS, common for a
+self-hosted instance) is reachable there, and the system proxy applies. A private IP-literal host
+stays blocked.
 `registries.gitlab_instance_host` still drives host resolution, unauthenticated unless it names
 the same host as `GITLAB_TOKEN_HOST`. Every other literal host a `component:` include names is
 always fetched unauthenticated, subject to the same

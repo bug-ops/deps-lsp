@@ -744,6 +744,7 @@ macro_rules! impl_get_versions_with_passthrough {
 mod tests {
     use crate::ConcreteVersion;
     use crate::position::{Position, Range};
+    use std::assert_matches;
 
     #[derive(Debug, Clone)]
     struct TestDependency {
@@ -924,10 +925,7 @@ mod tests {
             Some("1.0.0")
         );
         assert!(dep.as_any().is::<TestDependency>());
-        assert!(matches!(
-            dep.source(),
-            crate::parser::DependencySource::Registry
-        ));
+        assert_matches!(dep.source(), crate::parser::DependencySource::Registry);
     }
 
     #[test]
@@ -946,10 +944,7 @@ mod tests {
             version_literal: Some("v1.0.0".into()),
         };
 
-        assert!(matches!(
-            dep.source(),
-            crate::parser::DependencySource::Git { .. }
-        ));
+        assert_matches!(dep.source(), crate::parser::DependencySource::Git { .. });
         assert_eq!(dep.version_literal(), Some("v1.0.0"));
     }
 
@@ -1080,6 +1075,7 @@ mod tests {
             blocked_registries: vec![BlockedRegistryOccurrence {
                 range: Range::default(),
                 class: HostClass::Loopback,
+                policy: crate::net_policy::BlockingPolicy::Floor,
                 raw_value: "registry".into(),
                 declaration_key: "key".into(),
             }],
@@ -1107,6 +1103,7 @@ mod tests {
             blocked_registries: vec![BlockedRegistryOccurrence {
                 range: Range::default(),
                 class: HostClass::Loopback,
+                policy: crate::net_policy::BlockingPolicy::Floor,
                 raw_value: "registry".into(),
                 declaration_key: "key".into(),
             }],

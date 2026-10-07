@@ -53,12 +53,12 @@ use std::sync::Arc;
 
 use deps_core::config_trust::{self, ConfigTier, EnvVarSyntax};
 use deps_core::net_policy::{
-    BlockedHostReason, HostClass, IndexUrlError, RedactedUrl, RegistryAccessPolicy,
+    BlockedHost, BlockedHostReason, IndexUrlError, RedactedUrl, RegistryAccessPolicy,
     RegistryRejectionClassifier, RegistryRejectionReason, RegistryUrlKind, RejectionOutcome,
     ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
-use deps_core::{BlockedSourceClass, EcosystemId, PackageName, RejectedSourceClass};
+use deps_core::{BlockedSourceClass, EcosystemId, PackageName, RejectedSourceClass, UserHome};
 
 /// Why a candidate `registry=`/`@scope:registry=` value failed [`NpmRegistryIndex::new`]'s
 /// validation, or why expansion of a `${VAR}` placeholder inside it failed (FR-007).
@@ -97,9 +97,9 @@ impl From<config_trust::EnvExpansionError> for NpmRegistryIndexError {
 }
 
 impl BlockedHostReason for NpmRegistryIndexError {
-    fn blocked_host_class(&self) -> Option<HostClass> {
+    fn blocked_host(&self) -> Option<BlockedHost> {
         match self {
-            Self::Url(e) => e.blocked_host_class(),
+            Self::Url(e) => e.blocked_host(),
             Self::UndefinedEnvVar(_) | Self::ExpansionNotAllowedInProjectTier => None,
         }
     }
@@ -236,24 +236,24 @@ impl NpmConfig {
         if let Some(scope) = scope_of(package_name.as_str())
             && let Some(result) = self.scoped_registries.get(scope)
         {
-            let (class, raw_value) = result
-                .as_ref()
-                .err()
-                .and_then(InvalidEntry::blocked_class)?;
+            let (BlockedHost { class, policy }, raw_value) =
+                result.as_ref().err().and_then(InvalidEntry::blocked_host)?;
             return Some(BlockedSourceClass {
                 class,
+                policy,
                 raw_value,
                 declaration_key: format!("scope:{scope}"),
             });
         }
-        let (class, raw_value) = self
+        let (BlockedHost { class, policy }, raw_value) = self
             .registry
             .as_ref()?
             .as_ref()
             .err()
-            .and_then(InvalidEntry::blocked_class)?;
+            .and_then(InvalidEntry::blocked_host)?;
         Some(BlockedSourceClass {
             class,
+            policy,
             raw_value,
             declaration_key: "top-level".to_string(),
         })
@@ -572,11 +572,16 @@ pub fn resolve(
     config_cache: &NpmConfigCache,
     policy: &RegistryAccessPolicy,
 ) -> NpmConfig {
-    resolve_with_home(manifest_dir, config_cache, policy, dirs::home_dir())
+    resolve_with_home(
+        manifest_dir,
+        config_cache,
+        policy,
+        UserHome::current().map(|home| home.path().to_path_buf()),
+    )
 }
 
 /// [`resolve`], but taking the user-tier home directory explicitly instead of
-/// [`dirs::home_dir`] — lets tests inject a fixture home directory.
+/// [`UserHome::current`] — lets tests inject a fixture home directory.
 fn resolve_with_home(
     manifest_dir: &Path,
     config_cache: &NpmConfigCache,
@@ -653,7 +658,7 @@ fn resolve_with_home(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::net_policy::WorkspaceRegistryAccess;
+    use deps_core::net_policy::{HostClass, WorkspaceRegistryAccess};
     use std::assert_matches;
     use std::time::SystemTime;
 

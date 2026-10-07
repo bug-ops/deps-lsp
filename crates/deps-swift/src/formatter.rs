@@ -98,13 +98,8 @@ impl PackageNaming for SwiftFormatter {
     /// URL.
     fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
         let bare_name_ok = !name.contains('/') && !name.is_empty() && !is_dot_segment(name);
-        if is_valid_owner_repo(name) || bare_name_ok || is_non_github_registry_url(name) {
-            Ok(())
-        } else {
-            Err(InvalidPackageName::new(
-                "name must be a GitHub 'owner/repo' identifier",
-            ))
-        }
+        (is_valid_owner_repo(name) || bare_name_ok || is_non_github_registry_url(name))
+            .ok_or_else(|| InvalidPackageName::new("name must be a GitHub 'owner/repo' identifier"))
     }
 }
 

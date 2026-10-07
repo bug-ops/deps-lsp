@@ -47,7 +47,6 @@ lsp-responses = ["dep:tower-lsp-server", "deps-core/lsp-responses"]
 [dependencies]
 dashmap = { workspace = true }
 deps-core = { workspace = true }
-dirs = { workspace = true }
 node-semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

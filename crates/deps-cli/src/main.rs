@@ -17,7 +17,7 @@ use deps_cli::report::{CheckContext, CheckReport, FailOnPolicy, check_manifest};
 use deps_cli::update::ignore::IgnoreRules;
 use deps_cli::update::{self, UpdatePlan};
 use deps_cli::{format, walk};
-use deps_core::net_policy::PrivateRegistryAllowlist;
+use deps_core::net_policy::{EnvSource, ProcessEnv, RegistryEnvironment};
 use deps_core::osv::OsvClient;
 use deps_core::policy_config::{PolicyConfig, WorkspaceRegistriesEffect};
 use deps_core::{EcosystemRegistry, HttpCache, NetworkMode};
@@ -101,12 +101,22 @@ struct RuntimeHandles {
     ecosystem_registry: EcosystemRegistry,
 }
 
-fn build_runtime_handles(policy: &PolicyConfig) -> RuntimeHandles {
-    let allowlist = PrivateRegistryAllowlist::from_env();
-    if let Some(message) =
-        WorkspaceRegistriesEffect::of(policy.registries.workspace_registries, &allowlist)
-            .user_message()
-    {
+/// The startup warnings about a registry setup that does not do what it says: an ineffective
+/// `workspace_registries` setting, then a system proxy that guarded registries bypass.
+fn startup_warnings(policy: &PolicyConfig, environment: &RegistryEnvironment) -> Vec<String> {
+    let effect = WorkspaceRegistriesEffect::of(
+        policy.registries.workspace_registries,
+        environment.allowlist(),
+    )
+    .user_message()
+    .map(str::to_owned);
+    let notice = environment.egress_notice().map(|notice| notice.to_string());
+    effect.into_iter().chain(notice).collect()
+}
+
+fn build_runtime_handles(policy: &PolicyConfig, source: &impl EnvSource) -> RuntimeHandles {
+    let environment = RegistryEnvironment::read(source);
+    for message in startup_warnings(policy, &environment) {
         eprintln!("deps-cli: {message}");
     }
     // Shared with `ecosystem_runtime` below (impl-critic #4 follow-up to #1212's S3 fix) so
@@ -114,7 +124,7 @@ fn build_runtime_handles(policy: &PolicyConfig) -> RuntimeHandles {
     // resolution hit the same mtime-keyed cache instance, instead of each parsing the lock
     // file independently — the same double-parse `deps-lsp`'s `ServerState` avoids.
     let lockfile_cache = Arc::new(deps_core::lockfile::LockFileCache::new());
-    let ecosystem_runtime = EcosystemRuntime::from_policy(policy, &allowlist)
+    let ecosystem_runtime = EcosystemRuntime::from_policy(policy, &environment)
         .with_lockfile_cache(Arc::clone(&lockfile_cache));
     let cache = Arc::new(HttpCache::with_policy(Arc::clone(
         &ecosystem_runtime.policy,
@@ -206,7 +216,7 @@ async fn run_check(
     symlink_policy: walk::SymlinkPolicy,
 ) -> (CheckReport, bool) {
     let policy = cli_config.policy;
-    let handles = build_runtime_handles(&policy);
+    let handles = build_runtime_handles(&policy, &ProcessEnv);
     let ctx = CheckContext {
         cache: Arc::clone(&handles.cache),
         osv: handles.osv,
@@ -474,7 +484,7 @@ async fn run_update(
     policy: PolicyConfig,
     ignore_config: Option<Vec<deps_cli::config::IgnoreRule>>,
 ) -> Result<UpdatePlan, String> {
-    let handles = build_runtime_handles(&policy);
+    let handles = build_runtime_handles(&policy, &ProcessEnv);
 
     let walk_outcome = walk::walk(
         std::slice::from_ref(&args.manifest),
@@ -675,6 +685,55 @@ async fn run_update(
     .map_err(|error| error.to_string())?;
 
     Ok(plan)
+}
+
+#[cfg(test)]
+mod startup_warnings_tests {
+    use super::startup_warnings;
+    use deps_core::net_policy::{
+        MapEnv, PRIVATE_REGISTRY_HOSTS_ENV, RegistryEnvironment, SystemProxy,
+        WORKSPACE_REGISTRY_PROXY_ENV,
+    };
+    use deps_core::policy_config::{PolicyConfig, RegistriesConfig, WorkspaceRegistriesSetting};
+
+    fn proxied() -> MapEnv {
+        MapEnv::new().with_proxy(SystemProxy::for_test(Some("http://proxy.corp:3128"), None))
+    }
+
+    fn warnings(policy: &PolicyConfig, source: &MapEnv) -> Vec<String> {
+        startup_warnings(policy, &RegistryEnvironment::read(source))
+    }
+
+    #[test]
+    fn system_proxy_without_opt_in_names_the_opt_in_variable() {
+        let warnings = warnings(&PolicyConfig::default(), &proxied());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(WORKSPACE_REGISTRY_PROXY_ENV));
+    }
+
+    #[test]
+    fn opt_in_or_missing_proxy_is_silent() {
+        let opted_in = proxied().with_var(WORKSPACE_REGISTRY_PROXY_ENV, "proxy");
+        assert!(warnings(&PolicyConfig::default(), &opted_in).is_empty());
+        assert!(warnings(&PolicyConfig::default(), &MapEnv::new()).is_empty());
+    }
+
+    #[test]
+    fn allowlist_wiring_reaches_the_effect_message() {
+        let policy = PolicyConfig {
+            registries: RegistriesConfig::new()
+                .with_workspace_registries(WorkspaceRegistriesSetting::All),
+            ..PolicyConfig::default()
+        };
+        let ineffective = warnings(&policy, &MapEnv::new());
+        assert!(
+            ineffective
+                .iter()
+                .any(|w| w.contains(PRIVATE_REGISTRY_HOSTS_ENV))
+        );
+        let listed = MapEnv::new().with_var(PRIVATE_REGISTRY_HOSTS_ENV, "10.0.0.0/8");
+        assert!(warnings(&policy, &listed).is_empty());
+    }
 }
 
 #[cfg(test)]

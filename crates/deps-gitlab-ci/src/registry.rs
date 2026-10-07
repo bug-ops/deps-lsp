@@ -548,6 +548,7 @@ mod tests {
     use super::*;
     use deps_core::Registry;
     use deps_core::parser::DependencySource;
+    use std::assert_matches;
 
     /// A client backed by an in-memory cache and no configured instance host — sufficient
     /// for every test in this module that never actually issues a live request (route-table
@@ -570,7 +571,7 @@ mod tests {
         let registry = GitlabCiRegistry::new(test_client());
         let name = PackageName::new("gitlab.com/org/proj");
         match registry.get_versions(&name).await {
-            Err(e) => assert!(matches!(e, DepsError::PackageNotFound { .. })),
+            Err(e) => assert_matches!(e, DepsError::PackageNotFound { .. }),
             Ok(_) => panic!("expected PackageNotFound"),
         }
     }
@@ -584,7 +585,7 @@ mod tests {
             .get_latest_matching(&name, &req, &deps_core::SelectionContext::none())
             .await
         {
-            Err(e) => assert!(matches!(e, DepsError::PackageNotFound { .. })),
+            Err(e) => assert_matches!(e, DepsError::PackageNotFound { .. }),
             Ok(_) => panic!("expected PackageNotFound"),
         }
     }
@@ -610,7 +611,7 @@ mod tests {
             .get_versions_from(&name, &source, deps_core::FreshnessSettings::default())
             .await
         {
-            Err(e) => assert!(matches!(e, DepsError::PackageNotFound { .. })),
+            Err(e) => assert_matches!(e, DepsError::PackageNotFound { .. }),
             Ok(_) => panic!("expected PackageNotFound"),
         }
 
@@ -619,7 +620,7 @@ mod tests {
             .get_latest_matching_from(&name, &source, &req, &deps_core::SelectionContext::none())
             .await
         {
-            Err(e) => assert!(matches!(e, DepsError::PackageNotFound { .. })),
+            Err(e) => assert_matches!(e, DepsError::PackageNotFound { .. }),
             Ok(_) => panic!("expected PackageNotFound"),
         }
     }
@@ -1126,7 +1127,7 @@ mod tests {
                 status: 404,
             },
         );
-        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        assert_matches!(err, DepsError::PackageNotFound { .. });
     }
 
     /// H3 (#466 review): a residual `400` (the client-level `order_by=version` fallback
@@ -1143,7 +1144,7 @@ mod tests {
                 status: 400,
             },
         );
-        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        assert_matches!(err, DepsError::PackageNotFound { .. });
     }
 
     /// #1790: a 401 from a host the token is not bound to gets the actionable
@@ -1171,14 +1172,14 @@ mod tests {
             }
             other => panic!("expected RateLimited, got {other:?}"),
         }
-        assert!(matches!(
+        assert_matches!(
             registry.map_error(
                 "https://gitlab.com",
                 "org/proj",
                 unauthorized("https://gitlab.com")
             ),
             DepsError::HttpStatus { status: 401, .. }
-        ));
+        );
     }
 
     #[test]
@@ -1192,13 +1193,13 @@ mod tests {
                 status: 429,
             },
         );
-        assert!(matches!(
+        assert_matches!(
             err,
             DepsError::RateLimited {
                 verified: RateLimitEvidence::Inferred,
                 ..
             }
-        ));
+        );
         assert!(registry.rate_limit_gate("https://gitlab.com").is_tripped());
     }
 
@@ -1247,14 +1248,12 @@ mod tests {
         // before ever building a request, it would fail some other way (a connection error),
         // not classify cleanly as a verified `RateLimited`.
         let err = registry.fetch_route(&name, &r).await.unwrap_err();
-        assert!(
-            matches!(
-                err,
-                DepsError::RateLimited {
-                    verified: RateLimitEvidence::Confirmed,
-                    ..
-                }
-            ),
+        assert_matches!(
+            err,
+            DepsError::RateLimited {
+                verified: RateLimitEvidence::Confirmed,
+                ..
+            },
             "expected the short-circuit to replay verified: RateLimitEvidence::Confirmed, got {err:?}"
         );
     }

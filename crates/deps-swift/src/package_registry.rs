@@ -4,7 +4,6 @@
 //! guarded transport and may carry the environment credential; a `WorkspaceDeclared` one goes
 //! through the connect-address-guarded pinned transport, unauthenticated.
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -13,13 +12,13 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use deps_core::HOVER_RECENT_VERSIONS;
-use deps_core::cache::{CachedResponse, CredentialPartition};
+use deps_core::cache::{CachedResponse, CredentialHeader, CredentialPartition, RequestAuth};
 use deps_core::error::PaginationStop;
 use deps_core::github::{normalize_tag, semver_tags_newest_first};
 use deps_core::keychain_credentials::{KeychainGeneration, KeychainSnapshot};
 use deps_core::pagination::{NextPage, next_page};
 use deps_core::policy_config::KeychainCredentials;
-use deps_core::{DepsError, HttpCache, RequestHeader, Result, RevalidationFailure, not_found_or};
+use deps_core::{DepsError, HttpCache, Result, RevalidationFailure, not_found_or};
 use serde::Deserialize;
 use url::Url;
 
@@ -309,16 +308,11 @@ impl PackageRegistryClient {
         }
     }
 
-    /// The partition an offline read uses: the last online state's, but only while that state is
-    /// still current (same generation, setting still enabled). Otherwise the anonymous state at
-    /// the current generation, whose partition no credentialed response was stored under, so the
-    /// read misses and fails closed instead of serving a body fetched under a credential the
-    /// setting has since withdrawn.
-    fn offline_partition(&self, current: KeychainSnapshot) -> CredentialPartition {
-        self.offline_state(current).partition(self.digest)
-    }
-
-    /// The state an offline read answers under, see [`Self::offline_partition`].
+    /// The state an offline read answers under: the last online state's, but only while that
+    /// state is still current (same generation, setting still enabled). Otherwise the anonymous
+    /// state at the current generation, whose partition no credentialed response was stored
+    /// under, so the read misses and fails closed instead of serving a body fetched under a
+    /// credential the setting has since withdrawn.
     fn offline_state(&self, current: KeychainSnapshot) -> CredentialState {
         let last = *self
             .credential_state
@@ -376,16 +370,19 @@ impl PackageRegistryClient {
     async fn fetch_page(
         &self,
         url: &str,
-        origin: &str,
         on_failure: RevalidationFailure,
     ) -> Result<CachedResponse> {
-        let mut headers = vec![RequestHeader::Accept(ACCEPT)];
+        let prefix = self.registry.url.trusted_prefix();
         match transport_for(self.registry.url.trust()) {
             TransportKind::TrustedOrigin => {
                 // Offline, no request is sent, so `security` must not run (it could prompt); the
                 // cache is then read under the last online state.
-                let (auth, auth_id) = match &self.registry.auth {
-                    Some(RegistryAuth::Header(auth)) => (Some(Cow::Borrowed(auth)), None),
+                let keychain_auth;
+                let auth = match &self.registry.auth {
+                    Some(RegistryAuth::Header(auth)) => RequestAuth::credential(
+                        CredentialHeader::Authorization(auth.as_authorization()),
+                        prefix,
+                    ),
                     Some(RegistryAuth::Keychain(credential)) if !self.cache.is_offline() => {
                         let KeychainAuthorization { auth, generation } =
                             credential.authorization().await;
@@ -398,23 +395,45 @@ impl PackageRegistryClient {
                             generation,
                         };
                         self.note_credential_state(state);
-                        (auth.map(Cow::Owned), Some(state.partition(self.digest)))
+                        let partition = state.partition(self.digest);
+                        keychain_auth = auth;
+                        match &keychain_auth {
+                            Some(auth) => RequestAuth::credential_in(
+                                CredentialHeader::Authorization(auth.as_authorization()),
+                                partition,
+                            ),
+                            None => RequestAuth::Anonymous {
+                                partition: Some(partition),
+                            },
+                        }
                     }
                     Some(RegistryAuth::Keychain(credential)) => {
-                        (None, Some(self.offline_partition(credential.snapshot())))
+                        let state = self.offline_state(credential.snapshot());
+                        let partition = state.partition(self.digest);
+                        match state.presence {
+                            CredentialPresence::Credentialed => {
+                                return self.cache.peek_credentialed_trusted_origin(url, partition);
+                            }
+                            CredentialPresence::Anonymous => RequestAuth::Anonymous {
+                                partition: Some(partition),
+                            },
+                        }
                     }
-                    None => (None, None),
+                    None => RequestAuth::ANONYMOUS,
                 };
-                if let Some(auth) = auth.as_deref() {
-                    headers.push(RequestHeader::Authorization(auth.as_authorization()));
-                }
                 self.cache
-                    .get_cached_trusted_origin_response(url, origin, auth_id, &headers, on_failure)
+                    .get_cached_trusted_origin_response(url, prefix, auth, Some(ACCEPT), on_failure)
                     .await
             }
             TransportKind::Pinned => {
                 self.cache
-                    .get_cached_pinned_response(url, origin, false, None, &headers, on_failure)
+                    .get_cached_pinned_response(
+                        url,
+                        prefix,
+                        RequestAuth::ANONYMOUS,
+                        Some(ACCEPT),
+                        on_failure,
+                    )
                     .await
             }
         }
@@ -481,7 +500,7 @@ impl PackageRegistryClient {
         let mut body_bytes = 0usize;
         for page_number in 1..=limits.pages {
             let response = self
-                .fetch_page(current.as_str(), &origin, RevalidationFailure::Fail)
+                .fetch_page(current.as_str(), RevalidationFailure::Fail)
                 .await
                 .map_err(|e| match (page_number, e.is_not_found()) {
                     (1, _) => not_found_or(e, package.as_str(), REGISTRY, &[410]),
@@ -540,12 +559,8 @@ impl PackageRegistryClient {
         url.path_segments_mut()
             .map_err(|()| DepsError::InvalidUri(releases_url))?
             .push(raw_version.as_str());
-        self.fetch_page(
-            url.as_str(),
-            &format!("{}/", self.registry.url.as_str()),
-            RevalidationFailure::ServeStale,
-        )
-        .await
+        self.fetch_page(url.as_str(), RevalidationFailure::ServeStale)
+            .await
     }
 
     /// Fills `published_at` of the newest non-yanked releases from the memoized per-release
@@ -1400,7 +1415,6 @@ mod tests {
         // Warm the cache for page 2 only, then break it and change page 1.
         c.fetch_page(
             &format!("{base}/acme/net?page=2"),
-            &format!("{base}/"),
             RevalidationFailure::ServeStale,
         )
         .await
@@ -1475,13 +1489,9 @@ mod tests {
             .await;
         let c = client(&base, RegistryTrust::Trusted, None);
         // Warm the cache with page 1 only; the round itself never completes.
-        c.fetch_page(
-            &format!("{base}/acme/net"),
-            &format!("{base}/"),
-            RevalidationFailure::ServeStale,
-        )
-        .await
-        .unwrap();
+        c.fetch_page(&format!("{base}/acme/net"), RevalidationFailure::ServeStale)
+            .await
+            .unwrap();
         c.cache.set_offline(deps_core::NetworkMode::Offline);
         assert_matches!(
             c.list_releases(&identity(), PublishedAtLookup::Skip)

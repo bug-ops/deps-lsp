@@ -300,6 +300,7 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 mod tests {
     use super::*;
     use deps_core::VersionData;
+    use std::assert_matches;
     use std::collections::HashMap;
 
     fn pkg(s: &str) -> deps_core::PackageName {
@@ -453,11 +454,9 @@ mod tests {
         let deps = parse_result.dependencies();
         let dep = deps.first().expect("one npm: dependency");
         let source = dep.source();
-        assert!(
-            matches!(
-                source,
-                deps_core::parser::DependencySource::AlternateRegistry { .. }
-            ),
+        assert_matches!(
+            source,
+            deps_core::parser::DependencySource::AlternateRegistry { .. },
             "expected AlternateRegistry classification, got {source:?}"
         );
 

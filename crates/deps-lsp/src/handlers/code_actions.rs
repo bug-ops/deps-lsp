@@ -1,7 +1,7 @@
 //! Code actions handler using ecosystem trait delegation.
 
 use crate::config::DepsConfig;
-use crate::document::{ServerState, ensure_document_loaded};
+use crate::document::{PrefetchVisibility, ServerState, ensure_document_loaded};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -29,9 +29,13 @@ pub async fn handle_code_actions(
         return vec![];
     }
 
-    let (network, osv_checks) = {
+    let (network, osv_checks, vulnerability_visibility) = {
         let config = config.read().await;
-        (config.policy.network.mode(), config.policy.osv_checks())
+        (
+            config.policy.network.mode(),
+            config.policy.osv_checks(),
+            PrefetchVisibility::from_enabled(config.policy.diagnostics.vulnerabilities_enabled),
+        )
     };
 
     // Release the DashMap shard `Ref` before awaiting `generate_code_actions`'s registry
@@ -45,7 +49,7 @@ pub async fn handle_code_actions(
                 .signals
                 .snapshot()
                 .with_resolved_version_candidates()
-                .with_vulnerabilities()
+                .with_vulnerabilities(vulnerability_visibility)
                 .with_latest_status(osv_checks)
                 .with_candidate_status(osv_checks)
                 .with_outcomes()
@@ -471,6 +475,68 @@ mod tests {
         let (client, config) = create_test_client_and_config();
         let result = handle_code_actions(state, params, client, config).await;
         assert!(result.is_empty());
+    }
+
+    /// Issue #1819: the advisory quickfix follows `vulnerabilities_enabled` at runtime, and
+    /// offline keeps offering it from cached advisories.
+    #[cfg(feature = "cargo")]
+    mod advisory_toggle {
+        use super::*;
+        use crate::test_utils::test_helpers::{
+            ADVISORY_ID, advisory_state, create_test_client_and_config, set_advisory_gates,
+        };
+        use tower_lsp_server::ls_types::{CodeActionContext, Diagnostic};
+
+        async fn advisory_shown(
+            state: &Arc<ServerState>,
+            uri: &tower_lsp_server::ls_types::Uri,
+            client: &Client,
+            config: &Arc<RwLock<DepsConfig>>,
+        ) -> bool {
+            let params = CodeActionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: Range::new(Position::new(1, 9), Position::new(1, 16)),
+                context: CodeActionContext {
+                    diagnostics: vec![Diagnostic {
+                        source: Some("deps-lsp".to_string()),
+                        code: Some(NumberOrString::String(ADVISORY_ID.to_string())),
+                        ..Default::default()
+                    }],
+                    only: Some(vec![CodeActionKind::QUICKFIX]),
+                    ..Default::default()
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+            !handle_code_actions(
+                Arc::clone(state),
+                params,
+                client.clone(),
+                Arc::clone(config),
+            )
+            .await
+            .is_empty()
+        }
+
+        #[tokio::test]
+        async fn code_actions_follow_the_vulnerability_toggle() {
+            let (state, uri) = advisory_state().await;
+            let (client, config) = create_test_client_and_config();
+            for (enabled, offline, shown) in [
+                (true, false, true),
+                (false, false, false),
+                (true, false, true),
+                (true, true, true),
+                (false, true, false),
+            ] {
+                set_advisory_gates(&config, enabled, offline).await;
+                assert_eq!(
+                    advisory_shown(&state, &uri, &client, &config).await,
+                    shown,
+                    "vulnerabilities_enabled={enabled}, offline={offline}"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "cargo")]

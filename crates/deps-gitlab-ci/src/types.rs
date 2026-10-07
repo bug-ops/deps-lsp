@@ -101,6 +101,8 @@ pub enum HostRef {
         raw: String,
         /// The blocked host's classification.
         class: deps_core::net_policy::HostClass,
+        /// The rule that refused the host.
+        policy: deps_core::net_policy::BlockingPolicy,
         /// Stable declaration id for [`deps_core::BlockedRegistryOccurrence::declaration_key`]
         /// grouping (#967 S3): `"gitlab_instance_host"` for the instance-setting-relative
         /// path — shared by every dependency resolving through that one setting, so they
@@ -129,11 +131,13 @@ impl std::fmt::Debug for HostRef {
             Self::PolicyBlocked {
                 raw,
                 class,
+                policy,
                 declaration_key,
             } => f
                 .debug_struct("PolicyBlocked")
                 .field("raw", &deps_core::net_policy::redact_declaration_key(raw))
                 .field("class", class)
+                .field("policy", policy)
                 .field(
                     "declaration_key",
                     &deps_core::net_policy::redact_declaration_key(declaration_key),
@@ -435,6 +439,7 @@ mod tests {
     use deps_core::position::Position;
     use deps_core::registry::Version;
     use deps_core::{Dependency, ParseResult};
+    use std::assert_matches;
 
     fn range() -> Range {
         Range::new(Position::new(0, 0), Position::new(0, 10))
@@ -474,10 +479,7 @@ mod tests {
             d.version_requirement().map(deps_core::VersionReq::as_str),
             Some("v1.0.0")
         );
-        assert!(matches!(
-            d.source(),
-            DependencySource::AlternateRegistry { .. }
-        ));
+        assert_matches!(d.source(), DependencySource::AlternateRegistry { .. });
     }
 
     deps_core::debug_redaction_conformance!(
@@ -506,6 +508,7 @@ mod tests {
         HostRef::PolicyBlocked {
             raw: deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string(),
             class: deps_core::net_policy::HostClass::Loopback,
+            policy: deps_core::net_policy::BlockingPolicy::Floor,
             declaration_key: deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string(),
         },
     );

@@ -3,11 +3,11 @@
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
     BoundedVersionReq, CandidateTagSource, CommentCheck, CommentSlot, CommitRewrite, CommitSha,
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    DiagnosticMessages, DiagnosticPolicy, GitPinView, OsvNaming, PackageNaming, PackageRendering,
     PartialTagPolicy, PinResolution, RequirementResolution, RequirementStatus, ShaPinComment,
-    ShaPinLookup, ShaPinTail, SourcePolicy, TagIndex, match_v_prefix_style,
-    requirement_contains_template_placeholder, sha_pin_rewrite, tag_pin_is_up_to_date,
-    warn_rejected_value,
+    ShaPinLookup, ShaPinTail, SourcePolicy, TagIndex, git_candidate_tag_source, git_commit_rewrite,
+    git_tag_replacement, requirement_contains_template_placeholder, resolve_git_pin,
+    sha_pin_rewrite, tag_pin_is_up_to_date, warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName};
@@ -176,21 +176,38 @@ impl GitlabCiFormatter {
         }
     }
 
-    /// What the project's Tags list proves about a `project:` include pinned to a tag (#1801),
-    /// classified like a GitHub Actions tag pin ([`TagIndex::tag_pin_resolution`]).
-    /// [`PinResolution::Unresolved`] for a `component:` include (its Releases list never proves
-    /// a tag absent, see [`Self::tag_list_index`]), a ref-less include and a cold cache.
-    fn tag_pin_resolution(&self, gl_dep: &GitlabCiDependency) -> PinResolution {
-        let (Some(index), Some(written)) = (
-            self.tag_list_index(gl_dep),
-            gl_dep
-                .version_req
-                .as_ref()
-                .map(deps_core::VersionReq::as_str),
-        ) else {
-            return PinResolution::Unresolved;
-        };
-        index.tag_pin_resolution(written, EcosystemId::GitlabCi)
+    /// The tag/release index of `gl_dep`'s repository for its own endpoint.
+    fn endpoint_index(&self, gl_dep: &GitlabCiDependency) -> Option<Arc<TagIndex>> {
+        self.tag_index
+            .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()))
+            .map(|index| Arc::clone(&index))
+    }
+
+    /// Projects `gl_dep`'s pin into the shared [`GitPinView`].
+    ///
+    /// A `component:` tag pin is [`GitPinView::Other`]: its Releases list never proves a tag
+    /// absent (see [`Self::tag_list_index`]), so no tag-pin conclusion may be drawn from it. A
+    /// ref-less include and every non-tag, non-SHA pin are also `Other`.
+    fn pin_view(gl_dep: &GitlabCiDependency) -> GitPinView<'_> {
+        match (&gl_dep.pin, gl_dep.kind.endpoint()) {
+            (Some(PinStyle::Sha { sha, tail }), _) => GitPinView::Sha {
+                sha,
+                comment: tail.comment().map(|comment| &comment.tag),
+            },
+            (Some(PinStyle::Tag), EndpointKind::Tags) => {
+                gl_dep
+                    .version_req
+                    .as_ref()
+                    .map_or(GitPinView::Other, |req| GitPinView::Tag {
+                        written: req.as_str(),
+                    })
+            }
+            (
+                Some(PinStyle::Tag | PinStyle::Branch | PinStyle::Latest | PinStyle::Partial)
+                | None,
+                _,
+            ) => GitPinView::Other,
+        }
     }
 
     /// Caps an up-to-date exact-tag pin the complete tag list proves unpublished (`ref:
@@ -270,13 +287,9 @@ impl PackageNaming for GitlabCiFormatter {
     /// (`host/org/proj[/comp]`) coordinate shapes — [`is_valid_gitlab_coordinate`] is a
     /// syntactic gate only, not a semantic classifier (see that function's doc).
     fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
-        if is_valid_gitlab_coordinate(name) {
-            Ok(())
-        } else {
-            Err(InvalidPackageName::new(
-                "name must be a GitLab project/component coordinate",
-            ))
-        }
+        is_valid_gitlab_coordinate(name).ok_or_else(|| {
+            InvalidPackageName::new("name must be a GitLab project/component coordinate")
+        })
     }
 }
 
@@ -314,7 +327,10 @@ impl PackageRendering for GitlabCiFormatter {
                     || gl_dep.version_literal().unwrap_or(current).to_string(),
                     |(tag, sha)| sha_pin_rewrite(tail, &sha, &tag),
                 ),
-            Some(PinStyle::Tag) | None => match_v_prefix_style(current, version.as_str()),
+            Some(PinStyle::Tag) | None => {
+                let index = self.endpoint_index(gl_dep);
+                git_tag_replacement(current, version, index.as_deref())
+            }
         }
     }
 
@@ -454,28 +470,13 @@ impl RequirementResolution for GitlabCiFormatter {
         let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
             return CommitRewrite::NotACommitPin;
         };
-        if !matches!(gl_dep.pin, Some(PinStyle::Sha { .. })) {
-            return CommitRewrite::NotACommitPin;
-        }
-        self.tag_index
-            .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()))
-            .map_or(CommitRewrite::IndexUnavailable, |index| {
-                index.commit_rewrite_to(version.as_str())
-            })
+        let index = self.endpoint_index(gl_dep);
+        git_commit_rewrite(Self::pin_view(gl_dep), index.as_deref(), version)
     }
 
-    /// #1556: mirrors `deps_github_actions::GithubActionsFormatter`'s identical override —
-    /// a `PinStyle::Sha` pin's exact version is knowable from the shared [`TagIndex`]'s
-    /// `sha_to_tag` even though the SHA text itself always fails
-    /// [`deps_core::lsp_helpers::concrete_pin_version`]'s shape check (no dots to parse).
-    ///
-    /// `version_req` is always the bare SHA text for this pin style and the validated commit
-    /// is read from [`PinStyle::Sha`] itself, so no shape re-check is needed. The trailing
-    /// comment only reaches the index through
-    /// [`TagIndex::pin_resolution`], which refuses a comment it can contradict.
-    ///
-    /// A SHA pin whose repository has no index yet (cold cache or failed tag fetch) is
-    /// [`PinResolution::NotYetIndexed`]: its sibling tags are unknown until a fetch succeeds.
+    /// Same decision as GitHub Actions' override, through [`resolve_git_pin`]: a SHA pin's
+    /// exact version is knowable from the shared [`TagIndex`]'s `sha_to_tag` (#1556), and a
+    /// cold cache is [`PinResolution::NotYetIndexed`] for a SHA or concrete tag pin (#1817).
     ///
     /// Keyed by `(endpoint, name)`, not `name` alone (validation finding S2) — same
     /// disambiguation `Self::resolved_tag_for_sha` applies, since a `project:` and
@@ -484,17 +485,12 @@ impl RequirementResolution for GitlabCiFormatter {
         let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
             return PinResolution::Unresolved;
         };
-        if gl_dep.pin == Some(PinStyle::Tag) {
-            return self.tag_pin_resolution(gl_dep);
-        }
-        let Some(sha) = gl_dep.pinned_sha() else {
-            return PinResolution::Unresolved;
-        };
-        self.tag_index
-            .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()))
-            .map_or(PinResolution::NotYetIndexed, |index| {
-                index.pin_resolution(sha, gl_dep.sha_comment().map(|comment| &comment.tag))
-            })
+        let index = self.endpoint_index(gl_dep);
+        resolve_git_pin(
+            Self::pin_view(gl_dep),
+            index.as_deref(),
+            EcosystemId::GitlabCi,
+        )
     }
 
     /// `tag_index` is populated as a side effect of [`GitlabCiRegistry`]'s own tags fetch,
@@ -505,25 +501,14 @@ impl RequirementResolution for GitlabCiFormatter {
         true
     }
 
-    /// Same rule as GitHub Actions' override: a SHA pin names its whole commit, any other pin
-    /// keeps the same-major rule. GitLab CI maps to no OSV ecosystem today, so this is not
-    /// consulted yet; stating it keeps the default `NotTagBased` from silently failing open once
-    /// GitLab CI gains OSV coverage.
+    /// Same rule as GitHub Actions' override. GitLab CI maps to no OSV ecosystem today, so this
+    /// is not consulted yet; stating it keeps the default `NotTagBased` from silently failing
+    /// open once GitLab CI gains OSV coverage.
     fn candidate_tag_source(&self, dep: &dyn Dependency) -> CandidateTagSource {
         let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
             return CandidateTagSource::NotTagBased;
         };
-        let Some(index) = self
-            .tag_index
-            .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()))
-        else {
-            return CandidateTagSource::NotYetIndexed;
-        };
-        if matches!(gl_dep.pin, Some(PinStyle::Sha { .. })) {
-            CandidateTagSource::commit_pin(Arc::clone(&index))
-        } else {
-            CandidateTagSource::tag_pin(Arc::clone(&index))
-        }
+        git_candidate_tag_source(Self::pin_view(gl_dep), self.endpoint_index(gl_dep))
     }
 }
 
@@ -645,6 +630,7 @@ mod tests {
     use deps_core::lsp_helpers::RequirementGate;
     use deps_core::lsp_helpers::{ResolvedPin, SiblingScope};
     use deps_core::position::{Position, Range};
+    use std::assert_matches;
 
     fn formatter() -> GitlabCiFormatter {
         GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()))
@@ -1246,26 +1232,23 @@ mod tests {
         );
     }
 
-    /// A `Tag`/`Branch`/`Partial`/`Latest` pin has no SHA to resolve — must stay `Unresolved`.
+    /// A `Branch`/`Partial`/`Latest` pin has no SHA to resolve - must stay `Unresolved`; a
+    /// concrete `Tag` pin on a cold cache is `NotYetIndexed` (#1817).
     #[test]
     fn test_resolved_pin_version_non_sha_pin_is_unresolved() {
         let fmt = formatter();
-        for pin in [
-            PinStyle::Tag,
-            PinStyle::Branch,
-            PinStyle::Latest,
-            PinStyle::Partial,
+        for (pin, expected) in [
+            (PinStyle::Tag, PinResolution::NotYetIndexed),
+            (PinStyle::Branch, PinResolution::Unresolved),
+            (PinStyle::Latest, PinResolution::Unresolved),
+            (PinStyle::Partial, PinResolution::Unresolved),
         ] {
             let d = dep(
                 Some(pin.clone()),
                 "gitlab.com/org/proj",
                 DependencySource::Registry,
             );
-            assert_eq!(
-                fmt.resolved_pin_version(&d),
-                PinResolution::Unresolved,
-                "{pin:?}"
-            );
+            assert_eq!(fmt.resolved_pin_version(&d), expected, "{pin:?}");
         }
     }
 
@@ -1345,30 +1328,30 @@ mod tests {
     fn test_candidate_tag_source_follows_index_presence_and_pin_style() {
         let cold = formatter();
         let d = sha_dep_1723(LATEST_SHA_1723);
-        assert!(matches!(
+        assert_matches!(
             cold.candidate_tag_source(&d),
             CandidateTagSource::NotYetIndexed
-        ));
+        );
 
         let warm = fmt_with_index_1723(d.kind.endpoint(), &[]);
-        assert!(matches!(
+        assert_matches!(
             warm.candidate_tag_source(&d),
             CandidateTagSource::Indexed {
                 scope: SiblingScope::WholeCommit,
                 ..
             }
-        ));
+        );
         let tag_dep = GitlabCiDependency {
             pin: Some(PinStyle::Tag),
             ..sha_dep_1723(LATEST_SHA_1723)
         };
-        assert!(matches!(
+        assert_matches!(
             warm.candidate_tag_source(&tag_dep),
             CandidateTagSource::Indexed {
                 scope: SiblingScope::SameMajor,
                 ..
             }
-        ));
+        );
     }
 
     fn status_1723(fmt: &GitlabCiFormatter, d: &GitlabCiDependency) -> RequirementStatus {
@@ -1715,7 +1698,8 @@ mod tests {
         assert_eq!(resolve("main"), PinResolution::Unresolved);
     }
 
-    /// #1801: a cold cache and a `component:` include (Releases list) never resolve a tag pin.
+    /// #1801/#1817: a cold cache leaves a concrete tag pin not yet indexed, and a `component:`
+    /// include (Releases list) never resolves a tag pin.
     #[test]
     fn test_tag_pin_is_unresolved_without_a_tags_index() {
         use crate::types::IncludeKind::{Component, Project};
@@ -1723,7 +1707,7 @@ mod tests {
         let cold = formatter();
         assert_eq!(
             cold.resolved_pin_version(&tag_dep_1753("v1.0.0", Project)),
-            PinResolution::Unresolved
+            PinResolution::NotYetIndexed
         );
         let releases = fmt_with_index_1723(EndpointKind::Releases, &[]);
         assert_eq!(
@@ -1892,6 +1876,169 @@ mod tests {
             fmt.format_version_replacing_for(&d, &ConcreteVersion::new("2.0.0"), "v1.0.0"),
             "v2.0.0"
         );
+    }
+
+    /// Registry stub returning a fixed, newest-first tag list.
+    #[cfg(feature = "lsp-responses")]
+    struct StaticTagRegistry(Vec<crate::types::GitlabCiVersion>);
+
+    #[cfg(feature = "lsp-responses")]
+    impl deps_core::Registry for StaticTagRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            _name: &'a PackageName,
+        ) -> deps_core::ecosystem::BoxFuture<
+            'a,
+            deps_core::error::Result<Vec<Box<dyn deps_core::Version>>>,
+        > {
+            Box::pin(async move {
+                Ok(self
+                    .0
+                    .iter()
+                    .cloned()
+                    .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                    .collect())
+            })
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a PackageName,
+            _req: &'a deps_core::VersionReq,
+            _selection_context: &'a deps_core::SelectionContext,
+        ) -> deps_core::ecosystem::BoxFuture<
+            'a,
+            deps_core::error::Result<Option<Box<dyn deps_core::Version>>>,
+        > {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn search_raw<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> deps_core::ecosystem::BoxFuture<
+            'a,
+            deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>>,
+        > {
+            Box::pin(async move { Ok(vec![]) })
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// #1820: the "update version" code action for `ref: 17.0.0`, where the project only
+    /// publishes `v`-prefixed tags, writes the published spelling.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_update_code_action_unpublished_unprefixed_tag_writes_published_spelling() {
+        use deps_core::VersionData;
+        use deps_core::lsp_helpers::CommitSha;
+
+        let content = "include:\n  - project: org/proj\n    ref: 17.0.0\n";
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let range = Range::new(Position::new(2, 9), Position::new(2, 15));
+        let mut d = dep(
+            Some(PinStyle::Tag),
+            "gitlab.com/org/proj",
+            DependencySource::AlternateRegistry {
+                index: "gitlab.com".into(),
+                mirrors_crates_io: false,
+            },
+        );
+        d.version_req = Some("17.0.0".into());
+        d.version_range = Some(range);
+        let parse_result = crate::types::GitlabCiParseResult {
+            dependencies: vec![d],
+            routes: vec![],
+            uri: uri.clone(),
+            dependency_truncation: None,
+            blocked_registries: Vec::new(),
+        };
+        let commit = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let tags = ["v19.4.1", "v17.0.0"];
+        let fmt = formatter();
+        fmt.tag_index.insert(
+            (EndpointKind::Tags, PackageName::new("gitlab.com/org/proj")),
+            Arc::new(TagIndex::from_tags(tags.iter().map(|tag| (*tag, &commit)))),
+        );
+        let registry = StaticTagRegistry(
+            tags.iter()
+                .map(|tag| {
+                    crate::types::GitlabCiVersion::new(ConcreteVersion::new(*tag), None, false)
+                })
+                .collect(),
+        );
+        let mut cached = std::collections::HashMap::new();
+        cached.insert(
+            PackageName::new("gitlab.com/org/proj"),
+            deps_core::PackageVersions::latest_only("v19.4.1"),
+        );
+        let resolved = std::collections::HashMap::new();
+
+        let actions = deps_core::lsp_helpers::generate_code_actions(
+            &parse_result,
+            Position::new(2, 11).into(),
+            &uri,
+            VersionData::new(&cached, &resolved),
+            content,
+            &registry,
+            &fmt,
+        )
+        .await;
+
+        let texts: Vec<(String, String)> = actions
+            .into_iter()
+            .filter_map(|action| {
+                let edits = action.edit?.changes?;
+                let text = edits.values().next()?.first()?.new_text.clone();
+                Some((action.title, text))
+            })
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|(title, text)| title.contains("v19.4.1") && text == "v19.4.1"),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().all(|(_, text)| text != "19.4.1"),
+            "no action may write an unpublished spelling: {texts:?}"
+        );
+    }
+
+    /// #1820: a `ref: 17.0.0` no published tag matches is rewritten to the published `v19.4.1`.
+    #[test]
+    fn test_replacement_text_unpublished_unprefixed_tag_writes_published_spelling() {
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[("v19.4.1", HEX_SHA_1723)]);
+        let d = dep(
+            Some(PinStyle::Tag),
+            "gitlab.com/org/proj",
+            DependencySource::Registry,
+        );
+        assert_eq!(
+            deps_core::edit::replacement_text(&fmt, &d, &ConcreteVersion::new("v19.4.1"), "17.0.0")
+                .as_deref(),
+            Some("v19.4.1")
+        );
+    }
+
+    /// #1817: a cold cache resolves a concrete tag pin like GitHub Actions does (sibling tags
+    /// unknown), while a floating tag pin stays unresolved.
+    #[test]
+    fn test_resolved_pin_version_cold_cache_concrete_tag_is_not_yet_indexed() {
+        let fmt = formatter();
+        let mut d = dep(
+            Some(PinStyle::Tag),
+            "gitlab.com/org/proj",
+            DependencySource::Registry,
+        );
+        d.version_req = Some("v4.8.0".into());
+        assert_eq!(fmt.resolved_pin_version(&d), PinResolution::NotYetIndexed);
+        d.version_req = Some("v4".into());
+        assert_eq!(fmt.resolved_pin_version(&d), PinResolution::Unresolved);
     }
 
     #[test]
@@ -2099,8 +2246,9 @@ mod tests {
             &formatter(),
         );
 
-        assert!(
-            matches!(planned, Err(VulnFixSkip::UnresolvedPlaceholder)),
+        assert_matches!(
+            planned,
+            Err(VulnFixSkip::UnresolvedPlaceholder),
             "expected UnresolvedPlaceholder (the central #1370 gate firing), got {planned:?}"
         );
     }

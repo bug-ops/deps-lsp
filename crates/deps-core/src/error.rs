@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::net_policy::HostClass;
+use crate::net_policy::{BlockingPolicy, HostClass};
 use crate::package::InvalidPackageName;
 use crate::redact::{RedactedName, RedactedUrl};
 
@@ -394,6 +394,8 @@ pub enum DepsError {
         url: RedactedUrl,
         /// The class of the blocked resolved address.
         class: HostClass,
+        /// The rule that refused the address.
+        policy: BlockingPolicy,
     },
 }
 
@@ -518,10 +520,11 @@ impl std::fmt::Debug for DepsError {
                 .field("registry", registry)
                 .field("reason", reason)
                 .finish(),
-            Self::HostBlockedByPolicy { url, class } => f
+            Self::HostBlockedByPolicy { url, class, policy } => f
                 .debug_struct("HostBlockedByPolicy")
                 .field("url", url)
                 .field("class", class)
+                .field("policy", policy)
                 .finish(),
         }
     }
@@ -677,18 +680,17 @@ impl DepsError {
             Self::PaginatedListIncomplete { reason, .. } => {
                 FetchFailure::Actionable(format!("{reason}; not showing a partial list"))
             }
-            Self::HostBlockedByPolicy { class, .. } => {
-                FetchFailure::Actionable(if class.never_a_registry() {
-                    format!(
+            Self::HostBlockedByPolicy { class, policy, .. } => {
+                FetchFailure::Actionable(match policy {
+                    BlockingPolicy::Floor => format!(
                         "registry host resolves to a {class} address, which is never a registry \
                          under any policy"
-                    )
-                } else {
-                    format!(
+                    ),
+                    BlockingPolicy::WorkspaceRegistries(_) => format!(
                         "registry host resolves to a {class} address, blocked by \
                          registries.workspace_registries policy{}",
-                        class.private_host_hint_suffix()
-                    )
+                        policy.hint_suffix(*class)
+                    ),
                 })
             }
             // Deliberately `Transient`, not `Actionable` (#1295 critic S5, reverted from an
@@ -883,6 +885,8 @@ pub type Result<T> = std::result::Result<T, DepsError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net_policy::WorkspaceRegistryAccess;
+    use std::assert_matches;
     use std::error::Error as StdError;
 
     #[test]
@@ -1441,14 +1445,25 @@ mod tests {
         let blocked = |class| DepsError::HostBlockedByPolicy {
             url: "https://10.0.0.5.nip.io/api?token=secret".into(),
             class,
+            policy: BlockingPolicy::for_block(class, WorkspaceRegistryAccess::PublicOnly),
         };
         assert_eq!(
             blocked(HostClass::PrivateV4).fetch_failure(),
             FetchFailure::Actionable(format!(
                 "registry host resolves to a private (RFC1918) address, blocked by \
                      registries.workspace_registries policy{}",
-                HostClass::PrivateV4.private_host_hint_suffix()
+                BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::PublicOnly)
+                    .hint_suffix(HostClass::PrivateV4)
             ))
+        );
+        let at_off = DepsError::HostBlockedByPolicy {
+            url: "https://corp.example/".into(),
+            class: HostClass::PrivateV4,
+            policy: BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::Off),
+        };
+        assert!(
+            !format!("{:?}", at_off.fetch_failure()).contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"),
+            "the allowlist cannot help at level Off"
         );
         assert_eq!(
             blocked(HostClass::Loopback).fetch_failure(),
@@ -1470,15 +1485,16 @@ mod tests {
         let blocked = DepsError::HostBlockedByPolicy {
             url: "https://corp.example/".into(),
             class: HostClass::PrivateV4,
+            policy: BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::PublicOnly),
         };
-        assert!(matches!(
+        assert_matches!(
             blocked.into_chain_halt(),
             DepsError::HostBlockedByPolicy { .. }
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             DepsError::CacheError("x".into()).into_chain_halt(),
             DepsError::ChainResolutionHalted
-        ));
+        );
     }
 
     /// Exhaustive companion to the doc-test on [`DepsError::fetch_failure`]: every variant

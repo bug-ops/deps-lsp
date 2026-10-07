@@ -211,6 +211,7 @@ pub async fn load_document_from_disk(uri: &Url) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -289,8 +290,9 @@ mod tests {
         // its test `test_from_lsp_uri_rejects_windows_drive_host_bypass`.
         let uri: Url = format!("untitled:{path_part}").parse().unwrap();
         let result = load_document_from_disk(&uri).await;
-        assert!(
-            matches!(result, Err(DepsError::InvalidUri(_))),
+        assert_matches!(
+            result,
+            Err(DepsError::InvalidUri(_)),
             "expected InvalidUri for untitled: scheme, got {result:?}"
         );
     }

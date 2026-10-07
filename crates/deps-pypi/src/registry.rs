@@ -2320,8 +2320,9 @@ mod tests {
         );
 
         let err = head.get_versions_chained("pkg").await.unwrap_err();
-        assert!(
-            matches!(err, DepsError::HostBlockedByPolicy { .. }),
+        assert_matches!(
+            err,
+            DepsError::HostBlockedByPolicy { .. },
             "expected HostBlockedByPolicy, got: {err:?}"
         );
         hop1_mock.assert_async().await;
@@ -2364,8 +2365,9 @@ mod tests {
         // anywhere else this error might be inspected), and not the raw underlying transport
         // error either (which `DepsError::fetch_failure` cannot safely classify as
         // `Actionable` — see `ChainResolutionHalted`'s own doc).
-        assert!(
-            matches!(err, DepsError::ChainResolutionHalted),
+        assert_matches!(
+            err,
+            DepsError::ChainResolutionHalted,
             "expected ChainResolutionHalted, got: {err:?}"
         );
         // NFR-003(3): this must reach hover/diagnostics as a distinguishable, safe hint via

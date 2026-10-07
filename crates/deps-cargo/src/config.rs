@@ -41,7 +41,7 @@ use std::sync::Arc;
 use toml_span::value::Table;
 
 use deps_core::net_policy::{
-    HostClass, PolicyGate, RedactedUrl, RegistryAccessPolicy, RegistryRejectionClassifier,
+    BlockedHost, PolicyGate, RedactedUrl, RegistryAccessPolicy, RegistryRejectionClassifier,
     RegistryRejectionReason, validate_index_url,
 };
 use deps_core::{DEFAULT_MAX_CACHED_FILES, EcosystemId, MtimeFileCache};
@@ -71,7 +71,7 @@ impl AuthToken {
         self.0.expose_secret()
     }
 
-    /// The wrapped secret, for building a `Bearer` `Authorization` value.
+    /// The wrapped secret, for building the `Authorization` value.
     pub(crate) const fn as_redacted(&self) -> &deps_core::secret::Redacted {
         &self.0
     }
@@ -310,7 +310,7 @@ enum UnresolvedIndex {
     /// host (spec #443, plan-1b §1.7) — as opposed to "no matching config entry" or any
     /// other validation failure. Surfaced by `crate::parser::resolve_alternate_registries`
     /// as a positional diagnostic on the offending dependency's line.
-    Blocked(HostClass),
+    Blocked(BlockedHost),
     /// The `.cargo/config.toml` `[registries.<name>] index = ...` entry failed validation
     /// for a reason other than a policy-blocked host (#1453, mirrors [`Self::Blocked`]) —
     /// an invalid URL, a non-https scheme, or embedded userinfo. Surfaced the same way
@@ -328,9 +328,9 @@ impl CargoConfig {
     /// The host class that blocked `alias`'s resolution, if that (and specifically that) is
     /// why it did not resolve.
     #[must_use]
-    pub(crate) fn blocked_class(&self, alias: &str) -> Option<HostClass> {
+    pub(crate) fn blocked_class(&self, alias: &str) -> Option<BlockedHost> {
         match self.unresolved.get(alias) {
-            Some(UnresolvedIndex::Blocked(class)) => Some(*class),
+            Some(UnresolvedIndex::Blocked(host)) => Some(*host),
             Some(UnresolvedIndex::Rejected(_)) | None => None,
         }
     }
@@ -828,8 +828,11 @@ fn resolve_registries(
                         },
                     );
                 }
-                Err(RegistryIndexError::BlockedHost { class }) => {
-                    unresolved.insert(alias.clone(), UnresolvedIndex::Blocked(class));
+                Err(RegistryIndexError::BlockedHost { class, policy }) => {
+                    unresolved.insert(
+                        alias.clone(),
+                        UnresolvedIndex::Blocked(BlockedHost { class, policy }),
+                    );
                 }
                 Err(error) => {
                     if let Some(reason) = error.rejection_reason().into_reason() {

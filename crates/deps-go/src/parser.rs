@@ -266,10 +266,11 @@ pub fn parse_go_mod_with_context(
             dep.source,
             deps_core::parser::DependencySource::CustomRegistry { .. }
         );
-        if let (Some((class, raw)), true) = (&blocked_class, fell_back_to_custom_registry) {
+        if let (Some((host, raw)), true) = (&blocked_class, fell_back_to_custom_registry) {
             blocked_registries.push(deps_core::BlockedRegistryOccurrence {
                 range: dep.module_path_range,
-                class: *class,
+                class: host.class,
+                policy: host.policy,
                 raw_value: raw.clone(),
                 declaration_key: GOPROXY_BLOCKED_DECLARATION_KEY.to_string(),
             });

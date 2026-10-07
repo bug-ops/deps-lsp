@@ -391,6 +391,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::sync::Arc;
 
     use super::*;
@@ -549,7 +550,7 @@ mod tests {
         let outcome = memo
             .get_or_fetch(1u32, || async { CallOutcome::Degraded(0u32) })
             .await;
-        assert!(matches!(outcome, CallOutcome::Degraded(0)));
+        assert_matches!(outcome, CallOutcome::Degraded(0));
         assert!(memo.memo().get_fresh(&1u32).is_some());
 
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -580,8 +581,9 @@ mod tests {
         let outcome = memo
             .get_or_fetch(1u32, || async { CallOutcome::Definitive(0u32) })
             .await;
-        assert!(
-            matches!(outcome, CallOutcome::Degraded(0)),
+        assert_matches!(
+            outcome,
+            CallOutcome::Degraded(0),
             "exhaustion must degrade to CallOutcome::Degraded(V::default()), never panic or hang"
         );
     }

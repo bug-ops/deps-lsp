@@ -42,8 +42,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `get_cached_trusted_origin_response` and `get_cached_pinned_response` take a `RevalidationFailure` (#1808)
 - **deps-core**: `WatchedConfig::new` takes a `ConfigReach`; `for_watched_config` returns `WatchedConfigMatch` (#1808)
 - **deps-core, deps-github-actions, deps-gitlab-ci**: per-crate `unknown_ref_diagnostics` replaced by `lsp_helpers::unknown_ref_diagnostics` (#1808)
+- **deps-core, all registry ecosystems**: guarded registry traffic bypasses the system proxy by default; opt in with `DEPS_LSP_WORKSPACE_REGISTRY_PROXY=proxy`, operator-owned sources follow until #1822 (#1823)
+- **deps-core**: `HttpCache` trusted-origin and pinned APIs take `&TrustedPrefix` and `RequestAuth`; `RequestHeader` carries `Accept` only (#1814, #1823)
+- **deps-core**: `BlockedHost`, `HostBlockedByPolicy` and the occurrence types carry the registry-access `policy`; `HostClass::private_host_hint_suffix` and `blocked_host_class` are removed (#1809, #1823)
+- **deps-core, deps-engine, deps-lsp, deps-cli**: `EcosystemRuntime::from_policy` takes a `&RegistryEnvironment`, and `ServerState::with_private_registries` is replaced by `with_registry_environment`/`from_env_source` (#1811, #1823)
+- **deps-cargo**: a registry token is sent verbatim in `Authorization`, without a `Bearer` prefix, as Cargo does (#1810, #1823)
+- **deps-gitlab-ci**: `gitlab.com` and the `GITLAB_TOKEN_HOST` host are operator-trusted, so a public-looking name that resolves to a private address (split-horizon DNS) is reachable there; IP-literal private hosts stay blocked (#1816, #1823)
+- **deps-github-actions, deps-gitlab-ci**: a GitLab tag pin with a cold tag cache resolves to `NotYetIndexed` instead of `Unresolved`; the duplicated pin-resolution overrides move to `deps_core::lsp_helpers::git_pin` (#1817, #1823)
+- **deps-lsp**: `DiagnosticsSnapshot` is `Clone` instead of `Copy` and carries the typosquat, gossip and license-policy gates (#1815, #1823)
 
 ### Security
+- **deps-core, all registry ecosystems**: the connect-time SSRF guard now holds when a system or HTTP(S) proxy is configured; a proxy named `localhost` or a private name works, and blocked egress fails after a 10 s connect timeout (#1816, #1823)
+- **deps-core, deps-lsp, deps-cli**: a system proxy is reported once at startup (log plus `window/showMessage` in `deps-lsp`, one stderr line in `deps-cli`) with the opt-in variable (#1816, #1823)
+- **deps-core**: a response cached under a credential is never served to an anonymous request, and a removed credential never reads the credentialed entry (#1814, #1823)
+- **deps-core**: an OSV stub id that is not a valid `OsvId` is never requested and never reads as clean (#1805, #1823)
 - **deps-core, deps-lsp, deps-cli**: repository settings can no longer reach private registry hosts without the `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` allowlist (#1808)
 - **deps-core, all registry ecosystems**: registry credential headers (`Authorization`, `PRIVATE-TOKEN`) are marked sensitive so they stay out of HTTP-stack debug output (#1772, #1776)
 - **deps-lsp**: repository editor settings can no longer redirect `GITLAB_TOKEN` through `registries.gitlab_instance_host`; the configuration docs now list the trust impact of every repository-settable field (#1797)
@@ -72,6 +84,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cli**: flagged latest candidates name the sibling release tags they match in hover, diagnostics and `update` (#1783)
 
 ### Changed
+- **deps-npm, deps-nuget, deps-swift**: the home directory comes from `UserHome` instead of the `dirs` crate, and tests use `assert_matches!` with a CI guard against `assert!(matches!(..))` (#1818, #1823)
+- **deps**: lock bump to `zeroize` 1.9.1 and `either` 1.19.0 (#1813, #1823)
 - **deps-lsp**: typosquat and gossip prefetch also fires on an offline to online transition (#1807)
 - **deps-core, deps-lsp, deps-cli**: inlay-hint tooltips and `update --security-only` NoVerifiedFix rows name the matched sibling tags (#1807)
 - **deps-core, deps-lsp, deps-cli**: one typed `OsvChecks` gate (`Active`/`Inactive`) for every OSV call site instead of repeated `vulnerabilities_enabled && !offline` conditions and OSV booleans (#1775, #1774, #1776)
@@ -86,6 +100,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SECURITY.md**: supported versions table lists 2.0.x as supported and older lines as unsupported (#1797)
 
 ### Fixed
+- **deps-lsp**: turning `vulnerabilities_enabled` off at runtime now hides advisory diagnostics, hover, code lenses and code actions, while offline still shows cached advisories (#1819, #1823)
+- **deps-lsp**: diagnostics read the typosquat, gossip and license-policy gates from one configuration snapshot (#1815, #1823)
+- **deps-github-actions, deps-gitlab-ci**: updating an unpublished unprefixed tag ref (`7.0.1`) writes the published spelling (`v7.0.1`) in `update` and code actions (#1820, #1823)
+- **deps-core**: a GitHub 403 rate-limit response no longer evicts the cached entry (#1814, #1823)
+- **deps-cargo, deps-swift, deps-gitlab-ci**: a credentialed 401/403 rate-limit response now evicts the cached entry; GitHub keeps serving stale on `X-RateLimit-Remaining: 0` (#1814, #1823)
+- **deps-core, deps-engine, deps-cli**: the private-registry allowlist hint is no longer shown when `workspace_registries` is `"off"` or the host is refused under every policy (#1809, #1823)
+- **deps-core**: OSV advisory caches and fix-target verification are keyed by `OsvId` instead of `String` (#1806, #1823)
+- **deps-cargo**: Cargo registry-derived diagnostics are covered by the CLI/LSP parity test (#1811, #1823)
 - **deps-github-actions, deps-gitlab-ci**: a cold or failed tag fetch reports sibling tags unknown instead of a clean OSV result (#1807)
 - **deps-cli**: `update --security-only` reports a SHA pin whose fix version has no release tag as unfixable, and a missing tag list as no verified fix (#1807)
 - **deps-swift**: an offline request no longer serves a response fetched under a Keychain credential that was since disabled (#1807)

@@ -150,6 +150,10 @@ source down to zero — with or without an invalid entry left to name — is an
 explicit fail-closed state, never a silent fallback to `api.nuget.org` (the
 same issue #248/#502/#513 regression class Cargo/npm/PyPI already closed).
 
+**Proxies.** Guarded traffic, including user-profile `NuGet.Config` feeds, connects directly and bypasses the
+system proxy by default; set `DEPS_LSP_WORKSPACE_REGISTRY_PROXY=proxy` to route it through
+the proxy (see [Proxies and guarded registry traffic](../configuration.md#proxies-and-guarded-registry-traffic)).
+
 **Reachability policy**: governed by the same `registries.workspace_registries`
 setting documented in [Cargo](cargo.md#customprivate-registries), including its
 [connect-time message](cargo.md#customprivate-registries) for a host that resolves to a blocked

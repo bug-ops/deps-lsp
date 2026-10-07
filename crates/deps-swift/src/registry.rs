@@ -580,6 +580,7 @@ impl deps_core::Registry for SwiftRegistry {
 mod tests {
     use super::*;
     use deps_core::test_util::capture_tracing_output_async;
+    use std::assert_matches;
 
     #[test]
     fn test_parse_tags_response() {
@@ -927,7 +928,7 @@ mod tests {
         .await
         .map(|_| ())
         .unwrap_err();
-        assert!(matches!(err, DepsError::PackageNotFound { .. }), "{err:?}");
+        assert_matches!(err, DepsError::PackageNotFound { .. }, "{err:?}");
 
         let req = deps_core::VersionReq::new("^1.0.0");
         let err = Registry::get_latest_matching_from(
@@ -940,7 +941,7 @@ mod tests {
         .await
         .map(|_| ())
         .unwrap_err();
-        assert!(matches!(err, DepsError::PackageNotFound { .. }), "{err:?}");
+        assert_matches!(err, DepsError::PackageNotFound { .. }, "{err:?}");
         never.assert_async().await;
     }
 
@@ -962,7 +963,7 @@ mod tests {
         .await
         .map(|_| ())
         .unwrap_err();
-        assert!(matches!(err, DepsError::PackageNotFound { .. }), "{err:?}");
+        assert_matches!(err, DepsError::PackageNotFound { .. }, "{err:?}");
         never.assert_async().await;
     }
 
@@ -1143,14 +1144,12 @@ mod tests {
 
         let registry = mock_registry(&server.url(), false);
         let err = registry.get_versions("owner/repo").await.unwrap_err();
-        assert!(
-            matches!(
-                err,
-                deps_core::DepsError::RateLimited {
-                    verified: deps_core::RateLimitEvidence::Confirmed,
-                    ..
-                }
-            ),
+        assert_matches!(
+            err,
+            deps_core::DepsError::RateLimited {
+                verified: deps_core::RateLimitEvidence::Confirmed,
+                ..
+            },
             "expected verified RateLimited, got {err:?}"
         );
     }
@@ -1171,14 +1170,12 @@ mod tests {
 
         let registry = mock_registry(&server.url(), false);
         let err = registry.get_versions("owner/repo").await.unwrap_err();
-        assert!(
-            matches!(
-                err,
-                deps_core::DepsError::RateLimited {
-                    verified: deps_core::RateLimitEvidence::Inferred,
-                    ..
-                }
-            ),
+        assert_matches!(
+            err,
+            deps_core::DepsError::RateLimited {
+                verified: deps_core::RateLimitEvidence::Inferred,
+                ..
+            },
             "expected unverified RateLimited, got {err:?}"
         );
     }

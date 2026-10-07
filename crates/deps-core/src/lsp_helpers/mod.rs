@@ -24,6 +24,7 @@ mod code_actions;
 mod code_lenses;
 mod diagnostics;
 mod formatter;
+mod git_pin;
 mod git_ref;
 #[cfg(feature = "lsp-responses")]
 mod hover;
@@ -86,6 +87,9 @@ pub use formatter::{
     RequirementResolution, RequirementRewriteShape, SourcePolicy, bare_meaning,
     classify_requirement_rewrite_shape, format_version_replacing_by_shape, requirement_is_compound,
     up_to_date_for_comparators_via_compiled_matcher, up_to_date_via_compiled_matcher,
+};
+pub use git_pin::{
+    GitPinView, git_candidate_tag_source, git_commit_rewrite, git_tag_replacement, resolve_git_pin,
 };
 pub use git_ref::{
     CommitRewrite, CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, PartialTagPolicy,
@@ -4284,6 +4288,7 @@ mod tests {
     use crate::lsp_helpers::test_support::*;
     use crate::osv::SkipReason;
     use crate::{DependencySource, PackageName, VersionReq};
+    use std::assert_matches;
 
     // --- gossip_cooldown_for (issue #1456, spec 072 FR-008/FR-011, S2 tri-state) ---
 
@@ -4309,10 +4314,10 @@ mod tests {
     #[test]
     fn gossip_cooldown_for_none_prefetch_is_unavailable() {
         let name = PackageName::new("vite");
-        assert!(matches!(
+        assert_matches!(
             gossip_cooldown_for(None, &name, "8.3.1", PublishTime::now()),
             GossipCooldownLookup::Unavailable
-        ));
+        );
     }
 
     #[test]
@@ -4345,7 +4350,7 @@ mod tests {
             "8.4.0",
             PublishTime::from_unix_secs(1_000),
         );
-        assert!(matches!(lookup, GossipCooldownLookup::Unavailable));
+        assert_matches!(lookup, GossipCooldownLookup::Unavailable);
     }
 
     #[test]
@@ -4364,7 +4369,7 @@ mod tests {
             "8.3.1",
             PublishTime::from_unix_secs(2_000),
         );
-        assert!(matches!(lookup, GossipCooldownLookup::NotActive));
+        assert_matches!(lookup, GossipCooldownLookup::NotActive);
     }
 
     /// Spec 075 FR-005 (R-S3), inverting the earlier `..._is_not_active` expectation: GOSSIP
@@ -4383,7 +4388,7 @@ mod tests {
         );
 
         let lookup = gossip_cooldown_for(Some(&prefetch), &name, "8.3.1", PublishTime::now());
-        assert!(matches!(lookup, GossipCooldownLookup::Unavailable));
+        assert_matches!(lookup, GossipCooldownLookup::Unavailable);
     }
 
     #[test]
@@ -4393,10 +4398,10 @@ mod tests {
         let mut prefetch = HashMap::new();
         prefetch.insert(other, gossip_findings_fixture("1.3.0", 2_000));
 
-        assert!(matches!(
+        assert_matches!(
             gossip_cooldown_for(Some(&prefetch), &name, "8.3.1", PublishTime::now()),
             GossipCooldownLookup::Unavailable
-        ));
+        );
     }
 
     // --- cooldown_disposition (spec 075 FR-004/NFR-002) ---
@@ -4427,14 +4432,12 @@ mod tests {
             None,
             now,
         );
-        assert!(
-            matches!(
-                disposition,
-                CooldownDisposition::Blocked {
-                    fallback: Some(_),
-                    ..
-                }
-            ),
+        assert_matches!(
+            disposition,
+            CooldownDisposition::Blocked {
+                fallback: Some(_),
+                ..
+            },
             "got: {disposition:?}"
         );
 
@@ -4450,11 +4453,9 @@ mod tests {
             None,
             now,
         );
-        assert!(
-            matches!(
-                disposition,
-                CooldownDisposition::Blocked { fallback: None, .. }
-            ),
+        assert_matches!(
+            disposition,
+            CooldownDisposition::Blocked { fallback: None, .. },
             "a fallback that no longer clears cooldown at read time must not be surfaced: {disposition:?}"
         );
     }

@@ -1,14 +1,14 @@
 //! GitHub Actions ecosystem formatter.
 
 use dashmap::DashMap;
-use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
     BoundedVersionReq, CandidateTagSource, CommentCheck, CommentSlot, CommitRewrite, CommitSha,
-    DiagnosticMessages, DiagnosticPolicy, OsvNameAvailability, OsvNaming, PackageNaming,
-    PackageRendering, PartialTagPolicy, PinResolution, RequirementResolution, RequirementStatus,
-    ShaPinLookup, ShaPinTail, SourcePolicy, TagIndex, concrete_pin_version,
-    is_partial_semver_shaped, match_v_prefix_style, requirement_contains_template_placeholder,
-    sha_pin_rewrite, tag_has_precedence, tag_pin_is_up_to_date,
+    DiagnosticMessages, DiagnosticPolicy, GitPinView, OsvNameAvailability, OsvNaming,
+    PackageNaming, PackageRendering, PartialTagPolicy, PinResolution, RequirementResolution,
+    RequirementStatus, ShaPinLookup, ShaPinTail, SourcePolicy, TagIndex, concrete_pin_version,
+    git_candidate_tag_source, git_commit_rewrite, git_tag_replacement, is_partial_semver_shaped,
+    requirement_contains_template_placeholder, resolve_git_pin, sha_pin_rewrite,
+    tag_has_precedence, tag_pin_is_up_to_date,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
@@ -147,7 +147,10 @@ impl deps_core::lsp_helpers::ShaPinning for GithubActionsFormatter {
             return None;
         }
         let version_range = gha_dep.version_range?;
-        let tag = gha_dep.version_req.as_ref().map(VersionReq::as_str)?;
+        let tag = gha_dep
+            .version_req
+            .as_ref()
+            .map(deps_core::VersionReq::as_str)?;
         let new_text = self.sha_pin_replacement_for(&gha_dep.name, tag)?;
         Some(deps_core::lsp_helpers::ResolvedShaPin {
             display_name: gha_dep.name.as_str().to_string(),
@@ -233,7 +236,10 @@ impl PackageRendering for GithubActionsFormatter {
             return self.format_version_for_text_edit(version);
         };
         match &gha_dep.pin {
-            Some(PinStyle::Tag) => match_v_prefix_style(current, version.as_str()),
+            Some(PinStyle::Tag) => {
+                let index = self.tag_index.get(dep.name());
+                git_tag_replacement(current, version, index.as_deref().map(AsRef::as_ref))
+            }
             Some(PinStyle::Sha { .. }) => gha_dep
                 .sha_pin_tail()
                 .zip(self.release_commit_for(dep.name(), version.as_str()))
@@ -357,18 +363,11 @@ impl RequirementResolution for GithubActionsFormatter {
     }
 
     fn commit_rewrite_for(&self, dep: &dyn Dependency, version: &ConcreteVersion) -> CommitRewrite {
-        let is_sha_pin = dep
-            .as_any()
-            .downcast_ref::<GithubActionsDependency>()
-            .is_some_and(|gha_dep| matches!(gha_dep.pin, Some(PinStyle::Sha { .. })));
-        if !is_sha_pin {
+        let Some(pin) = Self::pin_view(dep) else {
             return CommitRewrite::NotACommitPin;
-        }
-        self.tag_index
-            .get(dep.name())
-            .map_or(CommitRewrite::IndexUnavailable, |index| {
-                index.commit_rewrite_to(version.as_str())
-            })
+        };
+        let index = self.tag_index.get(dep.name());
+        git_commit_rewrite(pin, index.as_deref().map(AsRef::as_ref), version)
     }
 
     /// #1556: a SHA pin's registry-confirmed tag (`TagIndex.sha_to_tag`) is a real,
@@ -395,24 +394,15 @@ impl RequirementResolution for GithubActionsFormatter {
     /// An exact full-semver tag pin (`@v4.8.0`) keeps itself as the primary and gains the other
     /// releases of its major line on the same commit as siblings (#1709).
     fn resolved_pin_version(&self, dep: &dyn Dependency) -> PinResolution {
-        let Some(gha_dep) = dep.as_any().downcast_ref::<GithubActionsDependency>() else {
+        let Some(pin) = Self::pin_view(dep) else {
             return PinResolution::Unresolved;
         };
-        let Some(index) = self.tag_index.get(dep.name()) else {
-            return Self::cold_cache_resolution(gha_dep);
-        };
-        match &gha_dep.pin {
-            Some(PinStyle::Sha { sha, comment }) => {
-                index.pin_resolution(sha, comment.as_ref().map(ShaComment::comment_tag))
-            }
-            Some(PinStyle::Tag) => {
-                let Some(written) = gha_dep.version_req.as_ref().map(VersionReq::as_str) else {
-                    return PinResolution::Unresolved;
-                };
-                index.tag_pin_resolution(written, EcosystemId::GithubActions)
-            }
-            Some(PinStyle::Branch) | None => PinResolution::Unresolved,
-        }
+        let index = self.tag_index.get(dep.name());
+        resolve_git_pin(
+            pin,
+            index.as_deref().map(AsRef::as_ref),
+            EcosystemId::GithubActions,
+        )
     }
 
     /// `tag_index` is populated as a side effect of [`GithubActionsRegistry`]'s own tags
@@ -426,37 +416,36 @@ impl RequirementResolution for GithubActionsFormatter {
     /// A SHA pin names its whole commit, so a candidate's siblings span every major; any other
     /// pin keeps the exact-tag same-major rule. Absent index entry: not yet fetched.
     fn candidate_tag_source(&self, dep: &dyn Dependency) -> CandidateTagSource {
-        let Some(index) = self.tag_index.get(dep.name()) else {
-            return CandidateTagSource::NotYetIndexed;
+        let Some(pin) = Self::pin_view(dep) else {
+            return CandidateTagSource::NotTagBased;
         };
-        let is_sha_pin = dep
-            .as_any()
-            .downcast_ref::<GithubActionsDependency>()
-            .is_some_and(|gha_dep| matches!(gha_dep.pin, Some(PinStyle::Sha { .. })));
-        if is_sha_pin {
-            CandidateTagSource::commit_pin(Arc::clone(&index))
-        } else {
-            CandidateTagSource::tag_pin(Arc::clone(&index))
-        }
+        let index = self
+            .tag_index
+            .get(dep.name())
+            .map(|index| Arc::clone(&index));
+        git_candidate_tag_source(pin, index)
     }
 }
 
 impl GithubActionsFormatter {
-    /// What a cold (or failed) tag fetch means for `gha_dep`: only a SHA pin or a concrete tag
-    /// pin has sibling release tags to miss, so only those are [`PinResolution::NotYetIndexed`];
-    /// branch, floating-tag and unpinned refs have none and stay [`PinResolution::Unresolved`].
-    fn cold_cache_resolution(gha_dep: &GithubActionsDependency) -> PinResolution {
-        match &gha_dep.pin {
-            Some(PinStyle::Sha { .. }) => PinResolution::NotYetIndexed,
-            Some(PinStyle::Tag)
-                if gha_dep.version_req.as_ref().is_some_and(|req| {
-                    concrete_pin_version(req.as_str(), EcosystemId::GithubActions).is_some()
-                }) =>
-            {
-                PinResolution::NotYetIndexed
-            }
-            Some(PinStyle::Tag | PinStyle::Branch) | None => PinResolution::Unresolved,
-        }
+    /// Projects `dep`'s pin into the shared [`GitPinView`]; `None` when `dep` is not a GitHub
+    /// Actions dependency. A tag pin without declared ref text, a branch and an unpinned ref
+    /// are [`GitPinView::Other`].
+    fn pin_view(dep: &dyn Dependency) -> Option<GitPinView<'_>> {
+        let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+        Some(match &gha_dep.pin {
+            Some(PinStyle::Sha { sha, comment }) => GitPinView::Sha {
+                sha,
+                comment: comment.as_ref().map(ShaComment::comment_tag),
+            },
+            Some(PinStyle::Tag) => gha_dep
+                .version_req
+                .as_ref()
+                .map_or(GitPinView::Other, |req| GitPinView::Tag {
+                    written: req.as_str(),
+                }),
+            Some(PinStyle::Branch) | None => GitPinView::Other,
+        })
     }
 
     /// The commit `gha_dep` is pinned to: the raw SHA of a full-SHA pin, or the commit a
@@ -638,7 +627,7 @@ mod tests {
     use deps_core::osv::SiblingCoverage;
     use deps_core::pagination::ListCoverage;
     use deps_core::parser::DependencySource;
-    use deps_core::{Position, Range};
+    use deps_core::{Position, Range, VersionReq};
     use std::assert_matches;
 
     fn formatter() -> GithubActionsFormatter {
@@ -1912,29 +1901,29 @@ mod tests {
             Some(PinStyle::sha_for_test(&sha, Some("v4.8.0"))),
             "actions/checkout",
         );
-        assert!(matches!(
+        assert_matches!(
             fmt.candidate_tag_source(&tag_dep),
             CandidateTagSource::NotYetIndexed
-        ));
+        );
 
         fmt.tag_index.insert(
             PackageName::new("actions/checkout"),
             Arc::new(TagIndex::from_tags([("v4.8.0", &commit)])),
         );
-        assert!(matches!(
+        assert_matches!(
             fmt.candidate_tag_source(&tag_dep),
             CandidateTagSource::Indexed {
                 scope: SiblingScope::SameMajor,
                 ..
             }
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             fmt.candidate_tag_source(&sha_dep),
             CandidateTagSource::Indexed {
                 scope: SiblingScope::WholeCommit,
                 ..
             }
-        ));
+        );
     }
 
     // --- #1556: resolved_pin_version ---
@@ -2830,6 +2819,190 @@ mod tests {
         assert_eq!(
             fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v5.0.0"), "4"),
             "5.0.0"
+        );
+    }
+
+    /// Registry stub returning a fixed, newest-first tag list.
+    #[cfg(feature = "lsp-responses")]
+    struct StaticTagRegistry(Vec<crate::types::GithubActionsVersion>);
+
+    #[cfg(feature = "lsp-responses")]
+    impl deps_core::Registry for StaticTagRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            _name: &'a PackageName,
+        ) -> deps_core::ecosystem::BoxFuture<
+            'a,
+            deps_core::error::Result<Vec<Box<dyn deps_core::Version>>>,
+        > {
+            Box::pin(async move {
+                Ok(self
+                    .0
+                    .iter()
+                    .cloned()
+                    .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                    .collect())
+            })
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a PackageName,
+            _req: &'a VersionReq,
+            _selection_context: &'a deps_core::SelectionContext,
+        ) -> deps_core::ecosystem::BoxFuture<
+            'a,
+            deps_core::error::Result<Option<Box<dyn deps_core::Version>>>,
+        > {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn search_raw<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> deps_core::ecosystem::BoxFuture<
+            'a,
+            deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>>,
+        > {
+            Box::pin(async move { Ok(vec![]) })
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Edit texts of every code action offered at the version of the only dependency in
+    /// `content`, over a stub registry listing `tags` (newest first) and a seeded tag index.
+    #[cfg(feature = "lsp-responses")]
+    async fn update_action_texts(content: &str, tags: &[&str]) -> Vec<(String, String)> {
+        use deps_core::VersionData;
+
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+        let fmt = formatter();
+        let commit = CommitSha::parse(&"a".repeat(40)).unwrap();
+        fmt.tag_index.insert(
+            PackageName::new("actions/checkout"),
+            Arc::new(TagIndex::from_tags(tags.iter().map(|tag| (*tag, &commit)))),
+        );
+        let registry = StaticTagRegistry(
+            tags.iter()
+                .map(|tag| crate::types::GithubActionsVersion {
+                    version: ConcreteVersion::new(*tag),
+                    sha: commit.clone(),
+                    prerelease: false,
+                    published_at: None,
+                })
+                .collect(),
+        );
+        let mut cached = std::collections::HashMap::new();
+        cached.insert(
+            PackageName::new("actions/checkout"),
+            deps_core::PackageVersions::latest_only(tags[0]),
+        );
+        let resolved = std::collections::HashMap::new();
+        let range = deps_core::ParseResult::dependencies(&parse_result)[0]
+            .version_range()
+            .unwrap();
+        let actions = deps_core::lsp_helpers::generate_code_actions(
+            &parse_result,
+            range.start.into(),
+            &uri,
+            VersionData::new(&cached, &resolved),
+            content,
+            &registry,
+            &fmt,
+        )
+        .await;
+        actions
+            .into_iter()
+            .filter_map(|action| {
+                let edits = action.edit?.changes?;
+                let text = edits.values().next()?.first()?.new_text.clone();
+                Some((action.title, text))
+            })
+            .collect()
+    }
+
+    /// #1820: the "update version" code action for an unprefixed tag pin whose only published
+    /// spelling is `v`-prefixed writes that spelling, the same text `deps-cli update` writes.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_update_code_action_unpublished_unprefixed_tag_writes_published_spelling() {
+        let content = "steps:\n  - uses: actions/checkout@4.2.2\n";
+        let actions = update_action_texts(content, &["v7.0.1", "v4.2.2"]).await;
+        assert!(
+            actions
+                .iter()
+                .any(|(title, text)| title.contains("v7.0.1") && text == "v7.0.1"),
+            "{actions:?}"
+        );
+        assert!(
+            actions.iter().all(|(_, text)| text != "7.0.1"),
+            "no action may write an unpublished spelling: {actions:?}"
+        );
+    }
+
+    /// A v-prefixed pin updates to the v-prefixed tag, and a repository that publishes both
+    /// spellings keeps the user's unprefixed style.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_update_code_action_keeps_published_style() {
+        let prefixed = update_action_texts(
+            "steps:\n  - uses: actions/checkout@v4.2.2\n",
+            &["v7.0.1", "v4.2.2"],
+        )
+        .await;
+        assert!(
+            prefixed.iter().any(|(_, text)| text == "v7.0.1"),
+            "{prefixed:?}"
+        );
+        let both = update_action_texts(
+            "steps:\n  - uses: actions/checkout@4.2.2\n",
+            &["v7.0.1", "7.0.1", "4.2.2"],
+        )
+        .await;
+        assert!(both.iter().any(|(_, text)| text == "7.0.1"), "{both:?}");
+    }
+
+    /// #1820: an unprefixed tag pin no published tag matches is rewritten to the published
+    /// spelling through the sole production rewrite path, so the result never stays unknown.
+    #[test]
+    fn test_replacement_text_unpublished_unprefixed_tag_writes_published_spelling() {
+        let fmt = formatter();
+        seed_index(
+            &fmt,
+            "actions/checkout",
+            &[("v4.2.2", 'a'), ("v7.0.1", 'b')],
+        );
+        let d = dep(Some(PinStyle::Tag), "actions/checkout");
+        let latest = ConcreteVersion::new("v7.0.1");
+        assert_eq!(
+            deps_core::edit::replacement_text(&fmt, &d, &latest, "4.2.2").as_deref(),
+            Some("v7.0.1")
+        );
+        assert_eq!(
+            deps_core::edit::replacement_text(&fmt, &d, &latest, "v4.2.2").as_deref(),
+            Some("v7.0.1")
+        );
+    }
+
+    /// A repository publishing both spellings keeps the user's unprefixed style.
+    #[test]
+    fn test_replacement_text_published_unprefixed_style_is_preserved() {
+        let fmt = formatter();
+        seed_index(
+            &fmt,
+            "actions/checkout",
+            &[("4.2.2", 'a'), ("7.0.1", 'b'), ("v7.0.1", 'b')],
+        );
+        let d = dep(Some(PinStyle::Tag), "actions/checkout");
+        assert_eq!(
+            deps_core::edit::replacement_text(&fmt, &d, &ConcreteVersion::new("v7.0.1"), "4.2.2")
+                .as_deref(),
+            Some("7.0.1")
         );
     }
 

@@ -46,7 +46,7 @@ fn nearest_existing(path: &str) -> Option<String> {
     let mut candidate = Path::new(path);
     while !candidate.exists() {
         match candidate.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => candidate = parent,
+            Some(parent) if !parent.is_empty() => candidate = parent,
             _ => return None,
         }
     }

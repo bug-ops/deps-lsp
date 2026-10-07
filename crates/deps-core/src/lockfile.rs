@@ -941,6 +941,7 @@ impl Default for LockFileCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     /// Builds a URI whose path component is `manifest_path`'s real, absolute path, with the
     /// `file://` prefix `Url::from_file_path` would produce replaced by `prefix` (e.g.
@@ -1782,8 +1783,9 @@ mod tests {
 
         let err = cache.get_or_parse(&provider, &lock_path).await.unwrap_err();
 
-        assert!(
-            matches!(err, DepsError::Io(_)),
+        assert_matches!(
+            err,
+            DepsError::Io(_),
             "expected an Io error for a missing lock file, got: {err:?}"
         );
         assert_eq!(
@@ -1816,8 +1818,9 @@ mod tests {
 
         let err = cache.get_or_parse(&provider, &lock_path).await.unwrap_err();
 
-        assert!(
-            matches!(err, DepsError::Io(_)),
+        assert_matches!(
+            err,
+            DepsError::Io(_),
             "expected an Io error once the cached file is deleted, got: {err:?}"
         );
     }

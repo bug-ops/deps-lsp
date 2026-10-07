@@ -284,6 +284,7 @@ impl CandidateTagSource {
 mod tests {
     use super::*;
     use crate::lsp_helpers::CommitSha;
+    use std::assert_matches;
 
     fn sha(c: char) -> CommitSha {
         CommitSha::parse(&c.to_string().repeat(40)).unwrap()
@@ -389,21 +390,21 @@ mod tests {
         let tags = [("v1.0.0", 'a')];
         let same = indexed(&tags, SiblingScope::SameMajor);
         let whole = indexed(&tags, SiblingScope::WholeCommit);
-        assert!(matches!(
+        assert_matches!(
             same.clone().merge(CandidateTagSource::NotYetIndexed),
             CandidateTagSource::NotYetIndexed
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             same.clone().merge(whole),
             CandidateTagSource::Indexed {
                 scope: SiblingScope::WholeCommit,
                 ..
             }
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             CandidateTagSource::NotTagBased.merge(same),
             CandidateTagSource::Indexed { .. }
-        ));
+        );
         assert!(
             !CandidateTagSource::NotTagBased
                 .merge(CandidateTagSource::NotTagBased)

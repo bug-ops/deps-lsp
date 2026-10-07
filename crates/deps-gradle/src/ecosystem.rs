@@ -492,6 +492,7 @@ dependencies {
     #[cfg(feature = "lsp-responses")]
     mod lsp_tests {
         use super::*;
+        use std::assert_matches;
 
         /// #1191: [`dsl_declaration_scope`] must recognize every call shape
         /// `crate::parser::groovy`/`crate::parser::kotlin`'s own regexes accept (direct,
@@ -512,8 +513,9 @@ dependencies {
             for line in within_cases {
                 let open_pos = line.len() - 1;
                 let scope = dsl_declaration_scope(line, 0, open_pos, line.len());
-                assert!(
-                    matches!(scope, deps_core::completion::DeclarationScope::Within(_)),
+                assert_matches!(
+                    scope,
+                    deps_core::completion::DeclarationScope::Within(_),
                     "{line:?} must resolve to Within, got {scope:?}"
                 );
             }

@@ -30,7 +30,6 @@ lsp-responses = ["dep:tower-lsp-server", "deps-core/lsp-responses"]
 [dependencies]
 dashmap = { workspace = true }
 deps-core = { workspace = true }
-dirs = { workspace = true }
 futures = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }

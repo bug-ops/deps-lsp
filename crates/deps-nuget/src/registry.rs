@@ -10,14 +10,14 @@ use crate::config::{NuGetAuth, NuGetSourceChain, ResolvedHop};
 use crate::types::{NuGetVersion, PackageInfo};
 use crate::version::compare_versions;
 use dashmap::DashMap;
-use deps_core::net_policy::{PolicyGate, RegistryAccessPolicy, is_trusted_prefix};
+use deps_core::net_policy::{PolicyGate, RegistryAccessPolicy, TrustedPrefix, is_trusted_prefix};
 use deps_core::parser::DependencySource;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::registry::{KeyShape, register_capped_with_occupied};
 use deps_core::{
-    DepsError, EcosystemId, FreshnessSettings, HOVER_RECENT_VERSIONS, HttpCache, PublishTime,
-    RequestHeader, Result, SafePathSegment,
+    CredentialHeader, DepsError, EcosystemId, FreshnessSettings, HOVER_RECENT_VERSIONS, HttpCache,
+    PublishTime, RequestAuth, Result, SafePathSegment,
 };
 use serde::Deserialize;
 use std::any::Any;
@@ -430,10 +430,6 @@ pub struct NuGetRegistry {
     /// empty string can never equal a real request's origin), computed once at construction.
     /// The declared source origin C1 pins both comparison sides to (§3.1).
     declared_origin: String,
-    /// This hop's own [`deps_core::secret::auth_digest`] — the per-request `auth_id`
-    /// [`Self::fetch`] passes to `HttpCache::get_cached_pinned_with_headers`. `None` when
-    /// [`Self::auth`] is `None`.
-    own_auth_id: Option<u64>,
     /// Meaningful only on a chain's *head* client (the one `root.alternates` maps a
     /// [`NuGetSourceChain::key`] to) — the chain-wide [`chain_auth_digest`] `register_alternate`
     /// last registered it under, used purely for O(1) rotation detection. `0` on every other
@@ -460,7 +456,6 @@ impl NuGetRegistry {
             fallback_chain: Vec::new(),
             auth: None,
             declared_origin,
-            own_auth_id: None,
             chain_auth_digest: 0,
         }
     }
@@ -488,10 +483,6 @@ impl NuGetRegistry {
         fallback_chain: Vec<Arc<Self>>,
     ) -> Self {
         let declared_origin = origin_of(hop.url.as_str()).unwrap_or_default();
-        let own_auth_id = deps_core::secret::auth_digest(
-            &declared_origin,
-            hop.auth.as_ref().map(NuGetAuth::header_value),
-        );
         Self {
             cache,
             service_index_url: hop.url.as_str().to_string(),
@@ -502,7 +493,6 @@ impl NuGetRegistry {
             fallback_chain,
             auth: hop.auth.clone(),
             declared_origin,
-            own_auth_id,
             chain_auth_digest: 0,
         }
     }
@@ -529,6 +519,11 @@ impl NuGetRegistry {
     ///
     /// Whatever the underlying `HttpCache` fetch returns.
     async fn fetch(&self, url: &str, trusted_prefix: &str) -> Result<bytes::Bytes> {
+        let prefix = TrustedPrefix::parse(trusted_prefix).map_err(|_| {
+            DepsError::InvalidUri(
+                deps_core::net_policy::RedactedUrl::new(trusted_prefix).to_string(),
+            )
+        })?;
         let can_authenticate = url::Url::parse(&self.declared_origin).is_ok_and(|declared| {
             url::Url::parse(url).is_ok_and(|u| is_trusted_prefix(&u, &declared))
                 && url::Url::parse(trusted_prefix).is_ok_and(|t| is_trusted_prefix(&t, &declared))
@@ -537,27 +532,22 @@ impl NuGetRegistry {
         if let Some(auth) = self.auth.as_ref()
             && can_authenticate
         {
-            return self
-                .cache
-                .get_cached_pinned_with_headers(
-                    url,
-                    trusted_prefix,
-                    true,
-                    self.own_auth_id,
-                    &[RequestHeader::Authorization(auth.as_authorization())],
-                )
-                .await;
+            let auth = RequestAuth::credential(
+                CredentialHeader::Authorization(auth.as_authorization()),
+                &prefix,
+            );
+            return self.cache.get_cached_pinned(url, &prefix, auth, None).await;
         }
 
         if self.tier == NuGetRegistryTier::WorkspaceDeclared {
             return self
                 .cache
-                .get_cached_pinned(url, trusted_prefix, false, None)
+                .get_cached_pinned(url, &prefix, RequestAuth::ANONYMOUS, None)
                 .await;
         }
 
         self.cache
-            .get_cached_trusted_origin(url, trusted_prefix)
+            .get_cached_trusted_origin(url, &prefix, RequestAuth::ANONYMOUS, None)
             .await
     }
 
@@ -2807,6 +2797,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fetch_invalid_prefix_error_does_not_expose_userinfo() {
+        let policy = Arc::new(RegistryAccessPolicy::default());
+        let client = workspace_client("https://nuget.example.test", &policy);
+
+        let err = client
+            .fetch("https://nuget.example.test/x", "http://user:s3cret@[bad")
+            .await
+            .unwrap_err();
+
+        assert_matches!(err, deps_core::DepsError::InvalidUri(_));
+        assert!(!format!("{err} {err:?}").contains("s3cret"));
+    }
+
+    #[tokio::test]
     async fn test_get_versions_chained_falls_through_on_package_not_found() {
         let mut hop0 = mockito::Server::new_async().await;
         let hop0_index = hop0
@@ -2936,8 +2940,9 @@ mod tests {
         };
 
         let err = head.get_versions_chained("pkg").await.unwrap_err();
-        assert!(
-            matches!(err, DepsError::HostBlockedByPolicy { .. }),
+        assert_matches!(
+            err,
+            DepsError::HostBlockedByPolicy { .. },
             "expected HostBlockedByPolicy, got: {err:?}"
         );
         hop1_flat.assert_async().await;
@@ -2977,8 +2982,9 @@ mod tests {
         };
 
         let err = head.get_versions_chained("pkg").await.unwrap_err();
-        assert!(
-            matches!(err, DepsError::ChainResolutionHalted),
+        assert_matches!(
+            err,
+            DepsError::ChainResolutionHalted,
             "expected ChainResolutionHalted, got: {err:?}"
         );
         hop1_flat.assert_async().await;
@@ -3471,11 +3477,6 @@ mod tests {
             Arc::clone(&policy),
             Vec::new(),
         );
-        assert_ne!(
-            client_a.own_auth_id, client_b.own_auth_id,
-            "two distinct credentials against the same feed URL must derive distinct auth_ids"
-        );
-
         let versions_a = client_a.get_versions("pkg").await.unwrap();
         let versions_b = client_b.get_versions("pkg").await.unwrap();
 
@@ -3493,7 +3494,7 @@ mod tests {
         );
 
         // Same-credential control: reusing credential A must hit the entries it already
-        // created, not grow the cache further (rules out an `own_auth_id` that varies
+        // created, not grow the cache further (rules out a partition that varies
         // per-instance even for an identical credential, which the distinctness assertion
         // above alone would not catch).
         let versions_a_again = client_a.get_versions("pkg").await.unwrap();

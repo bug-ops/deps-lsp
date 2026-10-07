@@ -56,6 +56,8 @@ bytes = { workspace = true }
 dashmap = { workspace = true }
 deps-core-macros = { workspace = true }
 futures = { workspace = true }
+http = { workspace = true }
+hyper-util = { workspace = true, features = ["client-proxy", "client-proxy-system"] }
 ipnet = { workspace = true }
 jsonc-parser = { workspace = true }
 reqwest = { workspace = true, features = ["json", "gzip"] }

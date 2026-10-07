@@ -675,6 +675,7 @@ impl OsvNaming for NpmFormatter {}
 mod tests {
     use super::*;
     use deps_core::lsp_helpers::RequirementGate;
+    use std::assert_matches;
 
     /// #1687: only pub treats `+build` as significant; SemVer ecosystems keep ignoring it.
     #[test]
@@ -958,19 +959,17 @@ mod tests {
             );
         }
         for requirement in ["=x.2.3", "=x.2", "=X.x.2"] {
-            assert!(
-                matches!(
-                    parse_range_safe(requirement),
-                    Err(RangeParseError::Panicked)
-                ),
+            assert_matches!(
+                parse_range_safe(requirement),
+                Err(RangeParseError::Panicked),
                 "requirement {requirement:?} (wildcard major, concrete trailing) must stay \
                  RangeParseError::Panicked for equals, unlike tilde"
             );
         }
-        assert!(matches!(
+        assert_matches!(
             parse_range_safe("not a range"),
             Err(RangeParseError::Malformed(_))
-        ));
+        );
         assert!(parse_range_safe("^1.0.0").is_ok());
         // `=` (Exact) tolerates a wildcard minor as long as the major is concrete — only a
         // wildcard *major* panics for this operator (unlike plain tilde's extra gap).
@@ -1103,11 +1102,9 @@ mod tests {
                     .is_none(),
                 "requirement {requirement:?} must not silently narrow to ~{{major}}.x's bound"
             );
-            assert!(
-                matches!(
-                    parse_range_safe(requirement),
-                    Err(RangeParseError::Panicked)
-                ),
+            assert_matches!(
+                parse_range_safe(requirement),
+                Err(RangeParseError::Panicked),
                 "requirement {requirement:?} must resolve to RangeParseError::Panicked"
             );
         }
@@ -1382,10 +1379,10 @@ mod tests {
             Err(RangeParseError::TooLong { .. })
         ));
         let over = format!("{at_cap} ");
-        assert!(matches!(
+        assert_matches!(
             parse_range_safe(&over),
             Err(RangeParseError::TooLong { max }) if max == MAX_REQUIREMENT_LEN
-        ));
+        );
     }
 
     #[test]

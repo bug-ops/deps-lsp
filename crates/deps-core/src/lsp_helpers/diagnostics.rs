@@ -1797,7 +1797,7 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
             sanitize_and_truncate_for_diagnostic(&redacted_value, MAX_DIAGNOSTIC_VALUE_CHARS),
             occurrence.class,
             sanitize_and_truncate_for_diagnostic(&redacted_key, MAX_DIAGNOSTIC_VALUE_CHARS),
-            occurrence.class.private_host_hint_suffix(),
+            occurrence.policy.hint_suffix(occurrence.class),
         ),
     )
     .with_severity(Severity::Information)
@@ -3999,6 +3999,7 @@ mod tests {
             blocked: vec![BlockedRegistryOccurrence {
                 range: name_range,
                 class: HostClass::CloudMetadata,
+                policy: crate::net_policy::BlockingPolicy::Floor,
                 raw_value: raw_value.to_string(),
                 declaration_key: declaration_key.to_string(),
             }],
@@ -4046,25 +4047,38 @@ mod tests {
     }
 
     #[test]
-    fn test_blocked_registry_diagnostic_names_allowlist_only_for_fixable_classes() {
-        let diagnostic = |class| {
+    fn test_blocked_registry_diagnostic_names_allowlist_only_when_it_can_help() {
+        use crate::net_policy::{BlockingPolicy, HostClass, WorkspaceRegistryAccess};
+
+        let mentions_allowlist = |class, policy| {
             build_blocked_registry_diagnostic(&BlockedRegistryOccurrence {
                 range: Range::new(Position::new(0, 0), Position::new(0, 1)),
                 class,
+                policy,
                 raw_value: "https://10.0.0.1/index".to_string(),
                 declaration_key: "top-level".to_string(),
             })
+            .message()
+            .contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS")
         };
-        assert!(
-            diagnostic(crate::net_policy::HostClass::PrivateV4)
-                .message()
-                .contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS")
-        );
-        assert!(
-            !diagnostic(crate::net_policy::HostClass::CloudMetadata)
-                .message()
-                .contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS")
-        );
+        for level in [
+            WorkspaceRegistryAccess::PublicOnly,
+            WorkspaceRegistryAccess::All,
+        ] {
+            let policy = BlockingPolicy::WorkspaceRegistries(level);
+            assert!(
+                mentions_allowlist(HostClass::PrivateV4, policy),
+                "{level:?}"
+            );
+        }
+        assert!(!mentions_allowlist(
+            HostClass::PrivateV4,
+            BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::Off)
+        ));
+        assert!(!mentions_allowlist(
+            HostClass::CloudMetadata,
+            BlockingPolicy::Floor
+        ));
     }
 
     /// #936: `raw_value` can carry a query-string credential (userinfo is rejected earlier
@@ -4326,12 +4340,14 @@ mod tests {
                 BlockedRegistryOccurrence {
                     range: first_range,
                     class: HostClass::CloudMetadata,
+                    policy: crate::net_policy::BlockingPolicy::Floor,
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
                 },
                 BlockedRegistryOccurrence {
                     range: second_range,
                     class: HostClass::CloudMetadata,
+                    policy: crate::net_policy::BlockingPolicy::Floor,
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
                 },
@@ -4340,6 +4356,7 @@ mod tests {
                 BlockedRegistryOccurrence {
                     range: third_range,
                     class: HostClass::CloudMetadata,
+                    policy: crate::net_policy::BlockingPolicy::Floor,
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "scope:@myorg".to_string(),
                 },
@@ -4472,12 +4489,14 @@ mod tests {
                 BlockedRegistryOccurrence {
                     range: first_range,
                     class: HostClass::CloudMetadata,
+                    policy: crate::net_policy::BlockingPolicy::Floor,
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
                 },
                 BlockedRegistryOccurrence {
                     range: second_range,
                     class: HostClass::CloudMetadata,
+                    policy: crate::net_policy::BlockingPolicy::Floor,
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
                 },
@@ -4566,6 +4585,7 @@ mod tests {
             .map(|&range| BlockedRegistryOccurrence {
                 range,
                 class: HostClass::CloudMetadata,
+                policy: crate::net_policy::BlockingPolicy::Floor,
                 raw_value: "https://169.254.169.254/index".to_string(),
                 declaration_key: "top-level".to_string(),
             })
@@ -4698,6 +4718,7 @@ mod tests {
             blocked: vec![BlockedRegistryOccurrence {
                 range: name_range,
                 class: HostClass::InternalName,
+                policy: crate::net_policy::BlockingPolicy::Floor,
                 raw_value: long_alias.clone(),
                 declaration_key: long_alias.clone(),
             }],

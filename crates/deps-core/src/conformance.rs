@@ -48,6 +48,7 @@
 //! (dot-segment/traversal class). See that const's doc for the sink split.
 
 use std::any::Any;
+use std::assert_matches;
 
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::CompletionItem;
@@ -664,11 +665,9 @@ pub async fn assert_completion_source_gate(
     // `detect_completion_context` no longer recognizes) would also yield zero items and zero
     // registry calls — passing this test vacuously without the `can_resolve_source` gate ever
     // being reached. Pinning the context first proves the call below actually exercises it.
-    assert!(
-        matches!(
-            crate::completion::detect_completion_context(parse_result.as_ref(), position, content),
-            crate::completion::CompletionContext::Version { .. }
-        ),
+    assert_matches!(
+        crate::completion::detect_completion_context(parse_result.as_ref(), position, content),
+        crate::completion::CompletionContext::Version { .. },
         "fixture's dependency-version position must resolve to a Version completion context, \
          or this test cannot be exercising the #1136 gate at all"
     );
@@ -944,11 +943,9 @@ pub async fn assert_unresolved_requirements_never_rewritten(
             // now fires unconditionally on that before either the `bounded_requirement_already_resolves_to`
             // short-circuit or a formatter-level no-op guard could ever be reached — those two
             // are no longer reachable alternate causes for this fixture shape.
-            assert!(
-                matches!(
-                    planned,
-                    Err(crate::edit::VulnFixSkip::UnresolvedPlaceholder)
-                ),
+            assert_matches!(
+                planned,
+                Err(crate::edit::VulnFixSkip::UnresolvedPlaceholder),
                 "plan_vulnerability_fix must skip an unresolved requirement {current:?} \
                  (dependency {:?}) targeting {target} via UnresolvedPlaceholder, got {planned:?}",
                 dep.name().as_str()

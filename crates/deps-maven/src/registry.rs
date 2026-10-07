@@ -1303,8 +1303,9 @@ mod tests {
     /// genuine 404.
     fn assert_rejected_as_not_found(result: Result<Vec<String>>) {
         let err = result.expect_err("rejected coordinate must be Err");
-        assert!(
-            matches!(err, DepsError::PackageNotFound { .. }),
+        assert_matches!(
+            err,
+            DepsError::PackageNotFound { .. },
             "expected PackageNotFound, got {err:?}"
         );
         assert!(err.is_not_found());
