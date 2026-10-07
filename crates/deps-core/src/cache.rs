@@ -7123,7 +7123,7 @@ mod tests {
             format!("{}/apiX/data", server.url()),
             format!("{}/other", server.url()),
             "https://elsewhere.test/api/data".to_string(),
-            "http://elsewhere.test/api/data".to_string(),
+            "https://elsewhere.test/api/data".replacen("https", "http", 1),
             "not a url".to_string(),
         ] {
             let trusted = cache
