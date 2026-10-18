@@ -1,9 +1,10 @@
 //! Fail-fast gate for the interactive (hover, code action) registry await.
 //!
 //! [`REGISTRY_FETCH_BUDGET`](super::REGISTRY_FETCH_BUDGET) bounds one interactive
-//! `get_versions_from` await, but a bound alone has no memory: against a registry that never answers, every request re-pays the
-//! whole budget and four of them occupy every `buffer_unordered(4)` LSP dispatch slot
-//! (#1830). [`InteractiveFetchGate`] adds the memory and the concurrency cap:
+//! `get_versions_from` await, but a bound alone has no memory: against a registry that never
+//! answers, every request re-pays the whole budget and four of them occupy every
+//! `buffer_unordered(4)` LSP dispatch slot (#1830). [`InteractiveFetchGate`] adds the memory and
+//! the concurrency cap:
 //!
 //! - a short-lived, source-qualified failure memo, seeded from the background fetch's
 //!   [`DependencyOutcomes`] and written by interactive awaits that fail or time out;
