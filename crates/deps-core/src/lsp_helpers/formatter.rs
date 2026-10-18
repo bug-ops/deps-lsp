@@ -79,7 +79,7 @@ pub trait PackageNaming: Send + Sync {
 /// [`format_version_replacing_for`](Self::format_version_replacing_for) need not guard against
 /// an unexpanded placeholder themselves: [`crate::edit::replacement_text`] is the only
 /// production path that calls into either method, and it never does so once
-/// [`RequirementResolution::bounded_requirement_is_placeholder`](super::RequirementResolution::bounded_requirement_is_placeholder)
+/// [`RequirementResolution::bounded_requirement_is_placeholder`]
 /// says `true` for the requirement being replaced.
 pub trait PackageRendering: Send + Sync {
     /// Format version string for code action text edit.
@@ -169,7 +169,7 @@ pub trait PackageRendering: Send + Sync {
     /// classified any non-`Registry` source (the link only hides once a dependency is
     /// actually classified as `Git`/`Path`/`Url`/... elsewhere). Only `deps-cargo`'s
     /// `CargoFormatter` still overrides this directly, because it also overrides
-    /// [`SourcePolicy::source_is_public_registry_content`](crate::lsp_helpers::SourcePolicy::source_is_public_registry_content)
+    /// [`SourcePolicy::source_is_public_registry_content`]
     /// to treat a crates.io-mirroring `AlternateRegistry` as linkable content too — a
     /// distinction this default cannot express without `SourcePolicy` as a supertrait of
     /// this trait, which would force every isolated `PackageRendering`-only implementor
@@ -910,7 +910,7 @@ fn caret_admits_up_to_date(latest: &str, requirement: &str) -> Option<bool> {
     Some(caret_upper_bound(lower, effective_req_parts).is_none_or(|upper| candidate < upper))
 }
 
-/// The shared default verdict behind [`RequirementResolution::is_requirement_up_to_date`].
+/// The shared default verdict behind `RequirementResolution::is_requirement_up_to_date`.
 fn up_to_date_via_heuristic<F: RequirementResolution + ?Sized>(
     formatter: &F,
     requirement: BoundedVersionReq<'_>,

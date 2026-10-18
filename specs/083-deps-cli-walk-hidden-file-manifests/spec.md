@@ -12,7 +12,7 @@ tags:
   - ci-gate
   - gitlab-ci
 created: 2026-10-07
-status: draft
+status: shipped
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
@@ -24,10 +24,10 @@ related:
 
 > [!info] Metadata
 > **Author**: continuous-improvement cycle (spec session, 2026-10-07)
-> **Branch**: N/A (no implementation branch yet; suggested `fix/hidden-file-manifest-walk`)
+> **Branch**: `fix/1829-triage-batch`
 > **Priority**: P1
 > **Category**: bug (label: `bug`)
-> **Issue**: [NEEDS CLARIFICATION: GitHub issue number not supplied with the finding]
+> **Issue**: #1829 (shipped in PR #1842)
 > **Class**: same fail-open class as #1108 and #1109 (a CI security gate silently reports zero findings)
 
 ## 1. Overview
@@ -125,7 +125,7 @@ AND .env is not
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | WHEN a directory walk visits a regular file whose basename starts with `.` and is claimed by a registered ecosystem's routing THE SYSTEM SHALL route it exactly as it routes a non-hidden manifest of the same ecosystem. | must |
+| FR-001 | WHEN a directory walk visits a non-directory entry whose basename starts with `.` and equals an entry of a registered ecosystem's `manifest_filenames()` (exact, case-sensitive match) THE SYSTEM SHALL route it exactly as it routes a non-hidden manifest of the same ecosystem. A dot-prefixed basename that only matches `manifest_patterns()` or `manifest_extensions()` (for example `.dev.requirements.txt` under PyPI's `*.requirements.txt`) is not admitted; it stays skipped like any unclaimed hidden file. | must |
 | FR-002 | THE SYSTEM SHALL decide which hidden files are eligible by querying the live `EcosystemRegistry` (the same way `hidden_ecosystem_directories` does for directories), and SHALL NOT contain a hardcoded hidden-filename list. | must |
 | FR-003 | WHEN a walk root contains `.gitlab-ci.yml` directly THE SYSTEM SHALL discover it (the reported repro). | must |
 | FR-004 | WHEN `.gitlab-ci.yml` exists in a nested directory (not hidden, not pruned) THE SYSTEM SHALL discover it. | must |
@@ -139,9 +139,11 @@ AND .env is not
 | FR-012 | THE SYSTEM SHALL leave `.gitlab/ci/*.yml` discovery (hidden-directory path) behavior unchanged, with no manifest reported twice. | must |
 | FR-013 | WHEN the same walk is used by `deps-cli update` THE SYSTEM SHALL behave identically (one shared `walk::walk`). | should |
 
-> [!question] Eligibility scope: filename only, or full routing?
-> The finding speaks of hidden-file `manifest_filenames()` entries. `manifest_patterns()` and `manifest_extensions()`
-> can also match a dot-prefixed basename (for example a file named `.csproj`, or `.x.csproj`). See Open Question 1.
+> [!success] Eligibility scope (resolved)
+> Exact `manifest_filenames()` entries only (Open Question 1, option b). `manifest_patterns()` and
+> `manifest_extensions()` can also match a dot-prefixed basename (`.x.csproj`, `.dev.requirements.txt`), but admitting
+> them would need a second matcher that can drift from `route_file`. Those names stay skipped; routing itself is
+> unchanged.
 
 ## 4. Non-Functional Requirements
 
@@ -173,7 +175,7 @@ No new persisted data.
 | `.gitlab-ci.yml` in a nested directory | Discovered with a relative display path. |
 | `.gitlab-ci.yml` inside `.git/` | Never reached (`.git` is pruned). |
 | `.gitlab-ci.yml` inside `node_modules/` or `vendor/` | Still pruned; the existing pruned-directory-manifest warning applies unchanged (a manifest directly at the root of a pruned directory is reported via `ignored_manifests`). |
-| `.gitlab-ci.yml` inside a non-ecosystem hidden directory (for example `.cache/.gitlab-ci.yml`) | Not discovered. The hidden directory is still skipped (FR-005). [NEEDS CLARIFICATION: confirm this is the wanted behavior; see Open Question 4.] |
+| `.gitlab-ci.yml` inside a non-ecosystem hidden directory (for example `.cache/.gitlab-ci.yml`) | Not discovered. The hidden directory is still skipped (FR-005); confirmed as wanted (Open Question 4). |
 | `.gitlab-ci.yml` inside `.gitlab/` or `.github/` sub-walk | Discovered once, not twice (FR-012). |
 | `.gitlab-ci.yml` listed in `.gitignore`, `GitignorePolicy::Ignore` | Still discovered (FR-009). |
 | `.gitlab-ci.yml` listed in `.gitignore`, `GitignorePolicy::Respect` | Excluded and reported via `ignored_manifests` (FR-008). |
@@ -217,20 +219,30 @@ No new persisted data.
 - Edit `crates/deps-zed` or any source outside the scope of this fix in the same commit.
 - Fix this in a `deps-cli check` session of the continuous-improvement cycle. Implementation goes through `/rust-team`.
 
-## 9. Open Questions
+## 9. Resolved Questions and Known Boundaries
 
-- [NEEDS CLARIFICATION 1: Eligibility scope. (a) Admit a hidden file iff `registry.for_filename(basename)` is `Some`, so exact names, patterns and extensions share the single routing truth (recommended: no second matcher to drift, mirrors `is_manifest_shaped_by_name`); or (b) only exact `manifest_filenames()` entries that start with `.` (literal reading of the finding). Option (a) also admits a hidden `.x.csproj`. Is that acceptable?]
-- [NEEDS CLARIFICATION 2: Mechanism. Candidate designs for the plan: (i) main walk with `hidden(false)` plus a `filter_entry` that rejects dot-prefixed directories (except the registry-derived ecosystem ones) and dot-prefixed files not eligible; (ii) keep `hidden(true)` and add a registry-derived second pass over hidden files only; (iii) `ignore::overrides` whitelist globs. (iii) looks unsuitable because a whitelist override makes every non-matching file ignored; this must be confirmed against the pinned `ignore` version before the plan commits. Which design, and should (i) also absorb `hidden_ecosystem_directories` so there is one mechanism?]
-- [NEEDS CLARIFICATION 3: Does the chosen design change entry counting against `MAX_WALKED_FILES` for repositories with many dot-entries (for example a large `.cache` now yielding entries under design (i) before the filter rejects them)? Needs a measurement, not an assumption.]
-- [NEEDS CLARIFICATION 4: Hidden file inside a non-ecosystem hidden directory (`.cache/.gitlab-ci.yml`, `.idea/...`) stays unscanned by FR-005. Confirm.]
-- [NEEDS CLARIFICATION 5: `detect_ignored_manifests` also takes a `hidden: bool` (the inverse-bool convention `DotDirs` replaced in #1135). Should it be converted to the same typed eligibility value in this fix, or left for a follow-up? Leaving it would make FR-008 incomplete.]
-- [NEEDS CLARIFICATION 6: The finding reports "exit 0" for the sole-manifest layout. At HEAD the sole-manifest layout exits 2 (the #1108 guard) and only the mixed layout exits 0. The spec follows the observed behavior. Should the issue text be corrected?]
-- [NEEDS CLARIFICATION 7: GitHub issue number to link in the MOC row and `Closes #N`.]
+All open questions were settled by the shipped implementation (PR #1842, issue #1829):
 
-> [!question] Verification note
-> Open Questions 2 and 3 assert behavior of the `ignore` crate from memory. Per the project's live-testing principle, the
-> plan phase must verify them against the pinned crate source (see the memory note on verifying security claims
-> empirically) before they are used as design constraints.
+1. **Eligibility scope**: exact `manifest_filenames()` entries that start with `.` (option b). No second matcher;
+   routing stays with `route_file`/`for_uri`. `.dev.requirements.txt` and `.x.csproj` are not admitted.
+2. **Mechanism**: design (i). The walks use `hidden(false)` plus a `filter_entry` predicate (`DotDirs::admits`) that
+   rejects dot-prefixed directories and admits a dot-prefixed non-directory only when its name is in the
+   registry-derived `HiddenManifestNames`. `hidden_ecosystem_directories` is kept as the separate `Descend` pass, so
+   nothing is reported twice (FR-012).
+3. **Entry counting**: rejected dot-entries are pruned in `filter_entry` before they are yielded, the same cost
+   profile as the old hidden filter; admitted hidden files count toward `MAX_WALKED_FILES` (FR-010). A measurement on a
+   tree with a very large `.cache` was not taken.
+4. **Hidden file in a non-ecosystem hidden directory** stays unscanned (FR-005).
+5. **`detect_ignored_manifests`** was converted to the same typed `DotDirs` policy (FR-008 holds).
+6. **Issue text**: the sole-manifest layout exits 2 and only the mixed layout exits 0, as this spec recorded.
+7. **Issue number**: #1829.
+
+Known boundaries, intentionally not changed:
+
+- On Windows, `ignore`'s hidden filter also dropped entries with `FILE_ATTRIBUTE_HIDDEN`; with `hidden(false)` the walk
+  is name-based only, so attribute-hidden non-dot entries are now walked there.
+- `ignore` re-admitted a dot-directory matched by a gitignore whitelist rule (`!.config/`) through its hidden filter.
+  The walk now rejects every dot-directory not named by an ecosystem, whatever an ignore rule says.
 
 ## 10. See Also
 

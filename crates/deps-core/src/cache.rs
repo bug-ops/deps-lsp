@@ -9,7 +9,7 @@
 use crate::cache_policy::CACHE_EVICTION_PERCENTAGE;
 use crate::error::{DepsError, RateLimitEvidence, Result};
 use crate::net_policy::{
-    AccessSnapshot, BlockingPolicy, GuardedEgress, RegistryAccessPolicy, SystemProxy, Target,
+    AccessSnapshot, BlockedHost, GuardedEgress, RegistryAccessPolicy, SystemProxy, Target,
     TrustedPrefix, WorkspaceRegistryAccess, normalize_host,
 };
 use crate::redact::RedactedUrl;
@@ -400,7 +400,7 @@ enum CacheTier {
 ///
 /// `WorkspaceDeclared` holds an [`AccessSnapshot`] (level and allowlist) **value snapshot**, taken once at
 /// [`Transport::workspace`] construction time — not a live `Arc<RegistryAccessPolicy>` read on
-/// every [`Self::tier_allows`] call. [`Transport::workspace`] takes this same snapshot for its
+/// every `AddrGuard::permits_declared` call. [`Transport::workspace`] takes this same snapshot for its
 /// paired [`CacheTier::WorkspaceDeclared`], and [`HttpCache::set_registry_policy`] rebuilds the
 /// whole `Transport` (both snapshots included) on every actual policy transition, so a
 /// request's cache key and its guard always come from one consistent construction-time value,
@@ -420,20 +420,21 @@ impl AddrGuard {
         }
     }
 
-    /// The rule that refuses a resolved address of `class` under this guard's tier: only the
-    /// floor applies at the baseline tier.
-    fn blocking_policy(&self, class: crate::net_policy::HostClass) -> BlockingPolicy {
+    /// Why `ip`, resolved for `name` as `class`, may not be connected to under this guard's tier,
+    /// or `None` when it may. The one place that both decides and labels the refusal, so a
+    /// blocked address can never lose its [`BlockedHost`]: only the floor applies at the
+    /// baseline tier, and the workspace tier adds the live policy snapshot.
+    fn refusal(
+        &self,
+        name: &str,
+        ip: std::net::IpAddr,
+        class: crate::net_policy::HostClass,
+    ) -> Option<BlockedHost> {
         match self {
-            Self::Baseline => BlockingPolicy::Floor,
-            Self::WorkspaceDeclared(snapshot) => BlockingPolicy::for_block(class, snapshot.level),
-        }
-    }
-
-    /// Whether `ip`, resolved for `name`, may be connected to under this guard's tier.
-    fn permits_resolved(&self, name: &str, ip: std::net::IpAddr) -> bool {
-        match self {
-            Self::Baseline => true,
-            Self::WorkspaceDeclared(snapshot) => snapshot.permits(Target::Resolved { name, ip }),
+            Self::Baseline => BlockedHost::floor(class),
+            Self::WorkspaceDeclared(snapshot) => (class.never_a_registry()
+                || !snapshot.permits(Target::Resolved { name, ip }))
+            .then(|| BlockedHost::new(class, snapshot.level)),
         }
     }
 }
@@ -478,7 +479,7 @@ impl RedirectScope {
 /// legitimate registry redirect target for *any* ecosystem, benefiting every one of the eleven
 /// crates sharing the baseline client, not only Cargo's workspace-declared indexes.
 ///
-/// `guard`'s own [`AddrGuard::tier_allows`] term additionally rejects a hop whose target class
+/// `guard`'s own `AddrGuard::permits_declared` term additionally rejects a hop whose target class
 /// the *tier* does not allow — under [`AddrGuard::Baseline`] this term is constant `false`, so
 /// every non-Cargo ecosystem (and Cargo's own `$CARGO_HOME`-provenance traffic) is
 /// bit-for-bit unaffected; under [`AddrGuard::WorkspaceDeclared`] it closes the redirect-hop
@@ -487,7 +488,7 @@ impl RedirectScope {
 ///
 /// This only classifies the redirect target's URL string, not its DNS-resolved address — that
 /// residual gap (issue #449, "D1" in PR #447's plan) is closed for the name-hop case by
-/// [`BlockedAddrResolver`], which [`build_guarded_client`] wires into every client this module
+/// [`BlockedAddrResolver`], which `build_client_inner` wires into every client this module
 /// builds: a redirect hop reuses the same `Client`, so its target's resolved address is
 /// validated too, for free (FR-007).
 ///
@@ -522,71 +523,23 @@ fn redirect_policy(guard: AddrGuard, scope: RedirectScope) -> reqwest::redirect:
 
 /// Redirect policy for a [`HttpCache::transport_for_origin`]-scoped client.
 ///
-/// Stops any hop unless [`crate::net_policy::is_trusted_prefix`] accepts it against
-/// `trusted_origin`, parsed once at [`Transport`] construction — origin equality (scheme,
-/// host, and port must match exactly) **and** the hop's path lying at or under
-/// `trusted_origin`'s own path, at a proper path-segment boundary.
+/// Stops any hop unless [`TrustedPrefix::permits`] accepts it — origin equality (scheme, host
+/// and port must match exactly) **and** the hop's path lying at or under the prefix's own path,
+/// at a proper path-segment boundary (see [`crate::net_policy::is_trusted_prefix`], which
+/// carries the issue #795 bypass shapes this closes: subdomain-suffix, userinfo, hyphen-suffix
+/// and same-origin sibling paths). The prefix arrives already parsed, so there is no
+/// "unparseable prefix" branch to fail closed on.
 ///
-/// Origin equality is the issue #795 fix: the pre-#795 behavior
-/// (`attempt.url().as_str().starts_with(&trusted_origin)`, a raw string-prefix test) is
-/// satisfied by `https://gitlab.mycorp.dev.evil.com/...`, `https://gitlab.mycorp.dev-evil.com/...`,
-/// and `https://gitlab.mycorp.dev@evil.com/...` alike, even though only the last of those
-/// three actually shares a host with `evil.com` — `Url::origin()` ignores userinfo and
-/// matches scheme+host+port exactly, closing all three shapes at once. This also still
-/// covers a downgrade to plain `http://`: an `http://` hop's origin can never equal an
-/// `https://`-scheme trusted origin, which every current caller passes — a separate scheme
-/// check (as [`redirect_policy`] has, for its no-trusted-origin case) would be dead code
-/// here.
-///
-/// The path-segment-boundary check is **not** subsumed by origin equality, and deliberately
-/// kept: a caller (NuGet's registration-hive/flat-container paging, or `deps-cargo`'s sparse
-/// index, whose `RegistryIndex::as_str()` carries no trailing-slash guarantee either way —
-/// issue #795 S1) pins to a specific *path* on a registry host that also serves other,
-/// less-trusted paths, not merely to the host itself. A plain `str::starts_with` on the raw
-/// path (this function's pre-S1-fix shape) is itself vulnerable to the same class of bug one
-/// level down: a trusted path of `/cargo/index` would wrongly accept the same-origin sibling
-/// `/cargo/index-public/steal` or `/cargo/indexEVIL`, since both start with the trusted
-/// string textually. [`crate::net_policy::is_trusted_prefix`] requires a hop's path to equal
-/// the trusted path or continue immediately after a `/` following it, closing that
-/// regardless of whether `trusted_origin`'s own path happens to end in `/`.
-///
-/// A `trusted_origin` that fails to parse matches no hop — every redirect is stopped
-/// (fail-closed) rather than treated as "no restriction" — logged once at construction time
-/// via `tracing::warn!` rather than silently, since a caller-side bug producing an
-/// unparseable `trusted_origin` would otherwise present only as every redirect on that
-/// transport mysteriously failing. This is reachable today: `deps-nuget`'s Public tier builds
-/// `trusted_prefix` from a service-index `@id` string that is never `Url`-validated (that
-/// validation only runs for [`crate::net_policy::validate_index_url`]'s
-/// `NuGetRegistryTier::WorkspaceDeclared` path), so a malformed `@id` reaches this parse.
-fn trusted_origin_redirect_policy(trusted_origin: &str) -> reqwest::redirect::Policy {
-    let trusted = match Url::parse(trusted_origin) {
-        Ok(url) => Some(url),
-        Err(error) => {
-            tracing::warn!(
-                trusted_origin = crate::redact::url_for_tracing(trusted_origin),
-                %error,
-                "trusted_origin failed to parse; every redirect hop on this transport will be rejected"
-            );
-            None
-        }
-    };
+/// Origin equality also covers a downgrade to plain `http://`: an `http://` hop's origin can
+/// never equal an `https://`-scheme trusted origin, which every current caller passes.
+fn trusted_origin_redirect_policy(prefix: TrustedPrefix) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
-        if is_trusted_origin(attempt.url(), trusted.as_ref()) {
+        if prefix.permits(attempt.url()) {
             reqwest::redirect::Policy::default().redirect(attempt)
         } else {
             attempt.stop()
         }
     })
-}
-
-/// The origin-and-path decision [`trusted_origin_redirect_policy`]'s closure makes on every
-/// redirect hop, extracted as a pure function so the bypass shapes from issue #795 can be
-/// regression-tested directly against it — `reqwest::redirect::Attempt`'s fields are private
-/// outside the `reqwest` crate, so the closure itself cannot be unit-tested without going
-/// through a real HTTP round trip. Delegates to [`crate::net_policy::is_trusted_prefix`],
-/// shared with `deps-nuget`'s registration-hive page `@id` pre-check (issue #795 S2).
-fn is_trusted_origin(hop_url: &Url, trusted: Option<&Url>) -> bool {
-    trusted.is_some_and(|t| crate::net_policy::is_trusted_prefix(hop_url, t))
 }
 
 /// Error returned by [`BlockedAddrResolver`] when a DNS resolution cannot be trusted for
@@ -605,12 +558,11 @@ enum ResolveGuardError {
     /// `addr`, resolved for `host`, falls into `class`, one of the
     /// [`crate::net_policy::HostClass::never_a_registry`] classes no legitimate registry index
     /// (or a redirect from one) could ever target.
-    #[error("resolved address {addr} for host {host} is {class}, blocked by net_policy")]
+    #[error("resolved address {addr} for host {host} is {}, blocked by net_policy", block.class())]
     Blocked {
         host: String,
         addr: std::net::IpAddr,
-        class: crate::net_policy::HostClass,
-        policy: BlockingPolicy,
+        block: BlockedHost,
     },
 }
 
@@ -643,13 +595,12 @@ fn validate_resolved_addrs(
     let addrs = require_addresses(host, addrs)?;
     for addr in &addrs {
         let class = crate::net_policy::classify_addr(addr.ip());
-        if class.never_a_registry() || !guard.permits_resolved(host, addr.ip()) {
+        if let Some(block) = guard.refusal(host, addr.ip(), class) {
             tracing::warn!(host, addr = %addr.ip(), %class, "blocking DNS-resolved address");
             return Err(ResolveGuardError::Blocked {
                 host: host.to_string(),
                 addr: addr.ip(),
-                class,
-                policy: guard.blocking_policy(class),
+                block,
             });
         }
     }
@@ -681,7 +632,7 @@ impl std::fmt::Debug for TestLookup {
 /// declared hostname, but `reqwest`'s connector resolves DNS independently, later, and an
 /// attacker who controls the hostname's DNS can rebind it to a blocked address in between.
 ///
-/// Wired into every client [`build_guarded_client`] returns, so all 11 ecosystem crates sharing
+/// Wired into every client `build_client_inner` builds, so all 11 ecosystem crates sharing
 /// the baseline client pool inherit it with zero per-crate plumbing (FR-006/NFR-002).
 ///
 /// # Scope
@@ -909,6 +860,7 @@ impl RateLimitRevocation {
             | DepsError::Offline { .. }
             | DepsError::ChainResolutionHalted
             | DepsError::PaginatedListIncomplete { .. }
+            | DepsError::CredentialOutsideTrustedPrefix { .. }
             | DepsError::HostBlockedByPolicy { .. } => false,
         }
     }
@@ -1014,10 +966,9 @@ impl<'a> RequestAuth<'a> {
                 if Url::parse(url).is_ok_and(|parsed| prefix.permits(&parsed)) {
                     Ok(())
                 } else {
-                    Err(DepsError::CacheError(format!(
-                        "refusing to send a credential to {} outside its trusted prefix",
-                        RedactedUrl::new(url)
-                    )))
+                    Err(DepsError::CredentialOutsideTrustedPrefix {
+                        url: RedactedUrl::new(url),
+                    })
                 }
             }
         }
@@ -1132,20 +1083,19 @@ fn apply_request_headers(
 /// Maps a failed `send()` to a [`DepsError`], surfacing a connect-time resolver-guard block as
 /// [`DepsError::HostBlockedByPolicy`] instead of a generic transport error.
 ///
-/// Walks the source chain before the error is sanitized, since [`SanitizedRegistryError`] drops
+/// Walks the source chain before the error is sanitized, since `SanitizedRegistryError` drops
 /// the chain. A [`ResolveGuardError::NoAddresses`] stays a transport error.
 fn send_error(url: &str, error: reqwest::Error) -> DepsError {
     let blocked =
         std::iter::successors(std::error::Error::source(&error), |source| source.source())
             .find_map(|source| match source.downcast_ref::<ResolveGuardError>() {
-                Some(ResolveGuardError::Blocked { class, policy, .. }) => Some((*class, *policy)),
+                Some(ResolveGuardError::Blocked { block, .. }) => Some(*block),
                 Some(ResolveGuardError::NoAddresses { .. }) | None => None,
             });
     match blocked {
-        Some((class, policy)) => DepsError::HostBlockedByPolicy {
+        Some(block) => DepsError::HostBlockedByPolicy {
             url: RedactedUrl::new(url),
-            class,
-            policy,
+            block,
         },
         None => DepsError::RegistryError {
             package: RedactedUrl::new(url),
@@ -1311,9 +1261,9 @@ impl Transport {
     /// [`AddrGuard::Baseline`] resolver, paired with [`trusted_origin_redirect_policy`] instead
     /// of [`redirect_policy`] — that policy pins by URL prefix, which already subsumes the
     /// blocked-host hop check.
-    fn origin_pinned(trusted_origin: &str) -> Self {
+    fn origin_pinned(trusted_origin: &TrustedPrefix) -> Self {
         Self::assemble(
-            trusted_origin_redirect_policy(trusted_origin),
+            trusted_origin_redirect_policy(trusted_origin.clone()),
             AddrGuard::Baseline,
             GuardedEgress::Direct,
             CacheTier::Baseline,
@@ -1329,13 +1279,13 @@ impl Transport {
     /// shipped [`Self::origin_pinned`] (public `api.nuget.org` path) is unaffected — this is a
     /// distinct constructor, not a modification of that one.
     fn origin_pinned_guarded(
-        trusted_origin: &str,
+        trusted_origin: &TrustedPrefix,
         snapshot: AccessSnapshot,
         egress: GuardedEgress,
     ) -> Self {
         let digest = pinned_digest(trusted_origin, snapshot.level);
         Self::assemble(
-            trusted_origin_redirect_policy(trusted_origin),
+            trusted_origin_redirect_policy(trusted_origin.clone()),
             AddrGuard::WorkspaceDeclared(snapshot),
             egress,
             CacheTier::Pinned { digest },
@@ -1415,10 +1365,9 @@ impl Transport {
 /// Maps a failed preflight resolution to the error a failed send would have produced.
 fn preflight_error(url: &str, error: Box<dyn std::error::Error + Send + Sync>) -> DepsError {
     match error.downcast_ref::<ResolveGuardError>() {
-        Some(ResolveGuardError::Blocked { class, policy, .. }) => DepsError::HostBlockedByPolicy {
+        Some(ResolveGuardError::Blocked { block, .. }) => DepsError::HostBlockedByPolicy {
             url: RedactedUrl::new(url),
-            class: *class,
-            policy: *policy,
+            block: *block,
         },
         Some(ResolveGuardError::NoAddresses { .. }) | None => DepsError::CacheError(format!(
             "DNS preflight for {} failed: {error}",
@@ -1431,7 +1380,7 @@ fn preflight_error(url: &str, error: Box<dyn std::error::Error + Send + Sync>) -
 /// a credential identity (see that variant's docs). Not cryptographically salted: unlike a
 /// caller's own credential-header digest (e.g. `deps_nuget`'s salted `auth_id`), this value is
 /// not attacker-observable secret material, only a pool/cache-key discriminant.
-fn pinned_digest(trusted_origin: &str, snapshot: WorkspaceRegistryAccess) -> u64 {
+fn pinned_digest(trusted_origin: &TrustedPrefix, snapshot: WorkspaceRegistryAccess) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     trusted_origin.hash(&mut hasher);
     snapshot.hash(&mut hasher);
@@ -1707,7 +1656,7 @@ pub struct HttpCache {
     /// `(origin, tier)` reuse one transport (and its connection pool) instead of rebuilding on
     /// every call. Deliberately **uncapped** — see [`Self::set_registry_policy`]'s docs for why
     /// a capacity cap was considered and dropped for this pool.
-    trusted_clients: DashMap<(String, CacheTier), Transport>,
+    trusted_clients: DashMap<(TrustedPrefix, CacheTier), Transport>,
     /// Live-updatable Cargo workspace-registry policy the `workspace` transport field below
     /// and cache-key namespace are derived from. Kept alongside that field (not just read once
     /// at construction) so [`Self::cache_key`] and [`Self::set_registry_policy`] both read the
@@ -1821,8 +1770,8 @@ impl HttpCache {
     /// already pooled — without ever taking `trusted_clients`' write-capable `entry` lock;
     /// `entry().or_insert_with()` only runs on a miss, so two callers racing on the same new
     /// origin still only ever build and store one [`Transport`] for it, not one each.
-    fn transport_for_origin(&self, trusted_origin: &str) -> Transport {
-        let key = (trusted_origin.to_string(), CacheTier::Baseline);
+    fn transport_for_origin(&self, trusted_origin: &TrustedPrefix) -> Transport {
+        let key = (trusted_origin.clone(), CacheTier::Baseline);
         if let Some(existing) = self.trusted_clients.get(&key) {
             return existing.clone();
         }
@@ -1838,10 +1787,10 @@ impl HttpCache {
     /// use, keyed by `(trusted_origin, CacheTier::Pinned { .. })` so an authenticated and
     /// unauthenticated transport for the same origin share one pool entry; the credential state
     /// lives in the request's [`RequestAuth`], not the transport.
-    fn transport_for_pinned(&self, trusted_origin: &str) -> Transport {
+    fn transport_for_pinned(&self, trusted_origin: &TrustedPrefix) -> Transport {
         let snapshot = self.policy.snapshot();
         let digest = pinned_digest(trusted_origin, snapshot.level);
-        let key = (trusted_origin.to_string(), CacheTier::Pinned { digest });
+        let key = (trusted_origin.clone(), CacheTier::Pinned { digest });
         if let Some(existing) = self.trusted_clients.get(&key) {
             return existing.clone();
         }
@@ -1899,7 +1848,7 @@ impl HttpCache {
     /// one-char variant tag (`A` credentialed, `U` anonymous) ahead of the partition, so the
     /// same [`CredentialPartition`] used with and without a credential yields two entries. A
     /// partition is encoded as a tag (`0`/`1`) before a fixed-width hex field rather than a `0`
-    /// sentinel: [`auth_digest`](crate::secret::auth_digest) is a non-cryptographic hash, so
+    /// sentinel: [`auth_digest`] is a non-cryptographic hash, so
     /// `Some(0)` is a legitimate digest (issue #1025). Every field is fixed width, so no tag or
     /// field can be confused with part of another field or `url`.
     fn cache_key<'a>(&self, url: &'a str, tier: CacheTier, auth: KeyAuth) -> Cow<'a, str> {
@@ -2106,7 +2055,7 @@ impl HttpCache {
         on_revalidation_failure: RevalidationFailure,
     ) -> Result<CachedResponse> {
         auth.ensure_within(url, trusted_origin)?;
-        let transport = self.transport_for_origin(trusted_origin.as_str());
+        let transport = self.transport_for_origin(trusted_origin);
         let headers = wire_headers(&accept_headers(accept), &auth);
         self.get_cached_via(
             url,
@@ -2188,7 +2137,7 @@ impl HttpCache {
         on_revalidation_failure: RevalidationFailure,
     ) -> Result<CachedResponse> {
         auth.ensure_within(url, trusted_origin)?;
-        let transport = self.transport_for_pinned(trusted_origin.as_str());
+        let transport = self.transport_for_pinned(trusted_origin);
         let headers = wire_headers(&accept_headers(accept), &auth);
         self.get_cached_via(
             url,
@@ -2636,7 +2585,7 @@ impl HttpCache {
         url: &str,
         body: &T,
         limit: BodyLimit,
-        trusted_origin: &str,
+        trusted_origin: &TrustedPrefix,
     ) -> Result<Bytes> {
         let transport = self.transport_for_origin(trusted_origin);
         self.post_json_via(url, body, limit, &transport).await
@@ -2763,7 +2712,7 @@ impl HttpCache {
         url: &str,
         extra_headers: &[RequestHeader],
         limit: BodyLimit,
-        trusted_origin: &str,
+        trusted_origin: &TrustedPrefix,
     ) -> Result<Bytes> {
         let transport = self.transport_for_origin(trusted_origin);
         self.transport_only_via(url, extra_headers, limit, &transport)
@@ -3027,6 +2976,45 @@ mod tests {
             level,
             allowlist: Arc::new(PrivateRegistryAllowlist::for_test(allowlist)),
         })
+    }
+
+    /// The resolved-address decision and its label come from one method: the floor tier
+    /// refuses exactly the never-a-registry classes, and the workspace tier refuses whatever
+    /// its snapshot refuses, labelled with the live level.
+    #[test]
+    fn test_addr_guard_refusal_decides_and_labels_in_one_place() {
+        use crate::net_policy::HostClass;
+        let ip = |raw: &str| -> std::net::IpAddr { raw.parse().unwrap() };
+
+        assert_eq!(
+            AddrGuard::Baseline.refusal("h", ip("127.0.0.1"), HostClass::Loopback),
+            BlockedHost::floor(HostClass::Loopback)
+        );
+        assert_eq!(
+            AddrGuard::Baseline.refusal("h", ip("10.0.0.1"), HostClass::PrivateV4),
+            None
+        );
+        assert_eq!(
+            AddrGuard::Baseline.refusal("h", ip("8.8.8.8"), HostClass::Global),
+            None
+        );
+
+        let public_only = workspace_guard(WorkspaceRegistryAccess::PublicOnly, &[]);
+        assert_eq!(
+            public_only.refusal("h", ip("10.0.0.1"), HostClass::PrivateV4),
+            Some(BlockedHost::new(
+                HostClass::PrivateV4,
+                WorkspaceRegistryAccess::PublicOnly
+            ))
+        );
+        assert_eq!(
+            public_only.refusal("h", ip("127.0.0.1"), HostClass::Loopback),
+            BlockedHost::floor(HostClass::Loopback)
+        );
+        assert_eq!(
+            public_only.refusal("h", ip("8.8.8.8"), HostClass::Global),
+            None
+        );
     }
 
     fn authorization(token: &AuthorizationValue) -> WireHeader<'_> {
@@ -3359,8 +3347,14 @@ mod tests {
         let url = "https://corp.example/index";
         let error = client.get(url).send().await.unwrap_err();
         match send_error(url, error) {
-            DepsError::HostBlockedByPolicy { class, .. } => {
-                assert_eq!(class, crate::net_policy::HostClass::PrivateV4);
+            DepsError::HostBlockedByPolicy { block, .. } => {
+                assert_eq!(block.class(), crate::net_policy::HostClass::PrivateV4);
+                assert_eq!(
+                    block.policy(),
+                    crate::net_policy::BlockingPolicy::WorkspaceRegistries(
+                        WorkspaceRegistryAccess::PublicOnly
+                    )
+                );
             }
             other => panic!("expected HostBlockedByPolicy, got {other:?}"),
         }
@@ -3375,15 +3369,14 @@ mod tests {
         let url = "https://rebound.example/index";
         let error = client.get(url).send().await.unwrap_err();
         let mapped = send_error(url, error);
+        let DepsError::HostBlockedByPolicy { block, .. } = mapped else {
+            panic!("expected HostBlockedByPolicy, got {mapped:?}");
+        };
         assert_matches!(
-            mapped,
-            DepsError::HostBlockedByPolicy {
-                class: crate::net_policy::HostClass::LinkLocal
-                    | crate::net_policy::HostClass::CloudMetadata,
-                ..
-            },
-            "{mapped:?}"
+            block.class(),
+            crate::net_policy::HostClass::LinkLocal | crate::net_policy::HostClass::CloudMetadata
         );
+        assert_eq!(block.policy(), crate::net_policy::BlockingPolicy::Floor);
     }
 
     #[tokio::test]
@@ -3406,14 +3399,10 @@ mod tests {
         let port = server.socket_address().port();
         let cache = HttpCache::new();
         let result: Result<Bytes> = cache.get_cached(&format!("http://localhost:{port}/")).await;
-        assert_matches!(
-            result,
-            Err(DepsError::HostBlockedByPolicy {
-                class: crate::net_policy::HostClass::Loopback,
-                ..
-            }),
-            "{result:?}"
-        );
+        let Err(DepsError::HostBlockedByPolicy { block, .. }) = result else {
+            panic!("expected HostBlockedByPolicy, got {result:?}");
+        };
+        assert_eq!(block.class(), crate::net_policy::HostClass::Loopback);
     }
 
     // Test-plan item 3, `Baseline` contrast: the same synthetic private-range lookup is not
@@ -3709,110 +3698,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.as_ref(), b"trusted data");
-    }
-
-    /// Issue #795: a raw `str::starts_with` prefix test (the pre-fix behavior) is satisfied
-    /// by a subdomain-suffix bypass — `gitlab.mycorp.dev.evil.com` starts with
-    /// `https://gitlab.mycorp.dev` as a string, even though its actual host is
-    /// `gitlab.mycorp.dev.evil.com`, entirely under attacker control. Parsed-origin equality
-    /// must reject it.
-    #[test]
-    fn test_is_trusted_origin_rejects_subdomain_suffix_bypass() {
-        let trusted = Url::parse("https://gitlab.mycorp.dev").unwrap();
-        let hop = Url::parse("https://gitlab.mycorp.dev.evil.com/steal").unwrap();
-        assert!(!is_trusted_origin(&hop, Some(&trusted)));
-    }
-
-    /// Issue #795: a userinfo bypass — `https://gitlab.mycorp.dev@evil.com/...` also starts
-    /// with the trusted origin as a string, but its host is `evil.com`; `gitlab.mycorp.dev`
-    /// is merely a (discarded) username. `Url::origin()` ignores userinfo entirely, so this
-    /// must be rejected.
-    #[test]
-    fn test_is_trusted_origin_rejects_userinfo_bypass() {
-        let trusted = Url::parse("https://gitlab.mycorp.dev").unwrap();
-        let hop = Url::parse("https://gitlab.mycorp.dev@evil.com/steal").unwrap();
-        assert!(!is_trusted_origin(&hop, Some(&trusted)));
-    }
-
-    /// Issue #795: a hyphen-suffix bypass — `gitlab.mycorp.dev-evil.com` again starts with
-    /// the trusted origin as a string while being an entirely distinct, attacker-controlled
-    /// host.
-    #[test]
-    fn test_is_trusted_origin_rejects_hyphen_suffix_bypass() {
-        let trusted = Url::parse("https://gitlab.mycorp.dev").unwrap();
-        let hop = Url::parse("https://gitlab.mycorp.dev-evil.com/steal").unwrap();
-        assert!(!is_trusted_origin(&hop, Some(&trusted)));
-    }
-
-    /// Companion to the three bypass-rejection tests above: the legitimate same-origin case
-    /// (a different path, same scheme/host/port) must still be accepted.
-    #[test]
-    fn test_is_trusted_origin_accepts_exact_origin_match() {
-        let trusted = Url::parse("https://gitlab.mycorp.dev").unwrap();
-        let hop = Url::parse("https://gitlab.mycorp.dev/api/v4/x").unwrap();
-        assert!(is_trusted_origin(&hop, Some(&trusted)));
-    }
-
-    /// A `trusted_origin` that fails to parse must fail closed — every hop is rejected,
-    /// never treated as "no restriction".
-    #[test]
-    fn test_is_trusted_origin_rejects_when_trusted_origin_unparseable() {
-        let hop = Url::parse("https://gitlab.mycorp.dev/api/v4/x").unwrap();
-        assert!(!is_trusted_origin(&hop, None));
-    }
-
-    /// Path-prefix scoping (NuGet's registration-hive/flat-container pinning) must survive
-    /// the #795 origin-equality fix: same origin, but a hop outside the trusted path, is
-    /// still rejected — this is what `test_get_cached_trusted_origin_rejects_sibling_path_prefix`
-    /// exercises end-to-end; this is the same property pinned at the unit level.
-    #[test]
-    fn test_is_trusted_origin_rejects_same_origin_sibling_path() {
-        let trusted = Url::parse("https://registry.example/v3/registration5-gz/").unwrap();
-        let hop = Url::parse("https://registry.example/v3/registration5-gzX/evil").unwrap();
-        assert!(!is_trusted_origin(&hop, Some(&trusted)));
-    }
-
-    /// Companion: same origin, hop path under the trusted path prefix, is still accepted.
-    #[test]
-    fn test_is_trusted_origin_accepts_same_origin_nested_path() {
-        let trusted = Url::parse("https://registry.example/v3/registration5-gz/").unwrap();
-        let hop =
-            Url::parse("https://registry.example/v3/registration5-gz/serde/page1.json").unwrap();
-        assert!(is_trusted_origin(&hop, Some(&trusted)));
-    }
-
-    /// Issue #795 S1: unlike the two trailing-slash tests above (which, with a trailing `/`
-    /// already present in the trusted path, would have passed even under the pre-S1-fix raw
-    /// `str::starts_with` check — they do not actually exercise the segment-boundary fix),
-    /// `RegistryIndex::as_str()` (`deps-cargo`'s sparse-index trusted origin) carries **no**
-    /// trailing-slash guarantee. This reproduces that exact shape and the critic's repro: a
-    /// same-origin sibling whose path merely shares a textual prefix must still be rejected.
-    #[test]
-    fn test_is_trusted_origin_rejects_same_origin_sibling_path_no_trailing_slash() {
-        let trusted = Url::parse("https://artifacts.corp/cargo/index").unwrap();
-        for sibling in [
-            "https://artifacts.corp/cargo/index-public/steal",
-            "https://artifacts.corp/cargo/indexEVIL",
-            "https://artifacts.corp/cargo/index.evil/x",
-        ] {
-            let hop = Url::parse(sibling).unwrap();
-            assert!(
-                !is_trusted_origin(&hop, Some(&trusted)),
-                "expected {sibling} to be rejected"
-            );
-        }
-    }
-
-    /// Companion: the trusted path itself, and a proper child path, are still accepted when
-    /// the trusted path carries no trailing slash — the real `deps-cargo` request shape
-    /// (`sparse_index_url` appends `/{crate_path}` to the trimmed base).
-    #[test]
-    fn test_is_trusted_origin_accepts_self_and_child_no_trailing_slash() {
-        let trusted = Url::parse("https://artifacts.corp/cargo/index").unwrap();
-        let itself = Url::parse("https://artifacts.corp/cargo/index").unwrap();
-        let child = Url::parse("https://artifacts.corp/cargo/index/se/rd/serde").unwrap();
-        assert!(is_trusted_origin(&itself, Some(&trusted)));
-        assert!(is_trusted_origin(&child, Some(&trusted)));
     }
 
     // Proves every hop is re-checked, not just the first: a same-origin hop is followed,
@@ -5227,7 +5112,12 @@ mod tests {
         let cache = HttpCache::new();
         let body = serde_json::json!({ "queries": [] });
         let result: Bytes = cache
-            .post_json_limited_trusted_origin(&url, &body, BodyLimit::new(1024), &trusted_origin)
+            .post_json_limited_trusted_origin(
+                &url,
+                &body,
+                BodyLimit::new(1024),
+                &prefix(&trusted_origin),
+            )
             .await
             .unwrap();
 
@@ -5254,7 +5144,12 @@ mod tests {
         let cache = HttpCache::new();
         let body = serde_json::json!({ "queries": [] });
         let result: Result<Bytes> = cache
-            .post_json_limited_trusted_origin(&url, &body, BodyLimit::new(8), &trusted_origin)
+            .post_json_limited_trusted_origin(
+                &url,
+                &body,
+                BodyLimit::new(8),
+                &prefix(&trusted_origin),
+            )
             .await;
 
         // Assert via `matches!` rather than debug-formatting `result` in a panic message
@@ -5285,7 +5180,88 @@ mod tests {
         let cache = HttpCache::new();
         let body = serde_json::json!({ "queries": [] });
         let result: Result<Bytes> = cache
-            .post_json_limited_trusted_origin(&url, &body, BodyLimit::DEFAULT, &trusted_origin)
+            .post_json_limited_trusted_origin(
+                &url,
+                &body,
+                BodyLimit::DEFAULT,
+                &prefix(&trusted_origin),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an untrusted redirect hop must not be followed"
+        );
+        evil_call.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_transport_only_limited_trusted_origin_success_returns_body() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/data")
+            .with_status(200)
+            .with_body("payload")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let body = cache
+            .get_transport_only_with_headers_limited_trusted_origin(
+                &format!("{}/data", server.url()),
+                &[],
+                BodyLimit::new(1024),
+                &prefix(&format!("{}/", server.url())),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(body.as_ref(), b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_get_transport_only_limited_trusted_origin_enforces_body_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/data")
+            .with_status(200)
+            .with_body("x".repeat(64))
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let result = cache
+            .get_transport_only_with_headers_limited_trusted_origin(
+                &format!("{}/data", server.url()),
+                &[],
+                BodyLimit::new(8),
+                &prefix(&format!("{}/", server.url())),
+            )
+            .await;
+
+        assert_matches!(result, Err(DepsError::ResponseTooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_get_transport_only_limited_trusted_origin_stops_cross_origin_redirect() {
+        let mut server = mockito::Server::new_async().await;
+        let mut evil = mockito::Server::new_async().await;
+        let _redirect = server
+            .mock("GET", "/data")
+            .with_status(302)
+            .with_header("location", &format!("{}/steal", evil.url()))
+            .create_async()
+            .await;
+        let evil_call = evil.mock("GET", "/steal").expect(0).create_async().await;
+
+        let cache = HttpCache::new();
+        let result = cache
+            .get_transport_only_with_headers_limited_trusted_origin(
+                &format!("{}/data", server.url()),
+                &[],
+                BodyLimit::DEFAULT,
+                &prefix(&format!("{}/", server.url())),
+            )
             .await;
 
         assert!(
@@ -6844,14 +6820,14 @@ mod tests {
         assert!(cache.workspace.read().unwrap().preflight.is_some());
         assert!(
             cache
-                .transport_for_pinned("https://registry.test/")
+                .transport_for_pinned(&prefix("https://registry.test/"))
                 .preflight
                 .is_some()
         );
         assert!(cache.baseline.preflight.is_none());
         assert!(
             HttpCache::new()
-                .transport_for_pinned("https://registry.test/")
+                .transport_for_pinned(&prefix("https://registry.test/"))
                 .preflight
                 .is_none()
         );
@@ -7020,8 +6996,10 @@ mod tests {
         let blocked = ResolveGuardError::Blocked {
             host: "h".into(),
             addr: "10.0.0.1".parse().unwrap(),
-            class: crate::net_policy::HostClass::PrivateV4,
-            policy: BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::PublicOnly),
+            block: crate::net_policy::BlockedHost::new(
+                crate::net_policy::HostClass::PrivateV4,
+                WorkspaceRegistryAccess::PublicOnly,
+            ),
         };
         assert_matches!(
             preflight_error("https://h.test/", Box::new(blocked)),
@@ -7046,7 +7024,7 @@ mod tests {
             lookup_for("proxy.test", "10.0.0.5:0"),
         );
         let transport = Transport::from_parts(
-            trusted_origin_redirect_policy("https://registry.test/"),
+            trusted_origin_redirect_policy(prefix("https://registry.test/")),
             resolver,
             GuardedEgress::Proxy,
             &route,
@@ -7132,8 +7110,16 @@ mod tests {
             let pinned = cache
                 .get_cached_pinned(&url, &origin, cred_in(7), None)
                 .await;
-            assert_matches!(trusted, Err(DepsError::CacheError(_)), "{url}");
-            assert_matches!(pinned, Err(DepsError::CacheError(_)), "{url}");
+            assert_matches!(
+                trusted,
+                Err(DepsError::CredentialOutsideTrustedPrefix { .. }),
+                "{url}"
+            );
+            assert_matches!(
+                pinned,
+                Err(DepsError::CredentialOutsideTrustedPrefix { .. }),
+                "{url}"
+            );
         }
         hit.assert_async().await;
     }

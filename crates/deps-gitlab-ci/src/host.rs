@@ -11,8 +11,8 @@
 
 use deps_core::EcosystemId;
 use deps_core::net_policy::{
-    BlockingPolicy, HostClass, IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy,
-    TrustedPrefix, WorkspaceRegistryAccess, validate_index_url,
+    BlockedHost, IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy, TrustedPrefix,
+    WorkspaceRegistryAccess, validate_index_url,
 };
 use std::sync::{Arc, RwLock};
 
@@ -231,10 +231,8 @@ pub(crate) enum InstanceHostOutcome {
         /// The configured raw value itself (#967 S1: a caller needs the real blocked
         /// string, not a placeholder, to name it accurately in a diagnostic).
         raw: String,
-        /// The blocked host's classification.
-        class: HostClass,
-        /// The rule that refused the host.
-        policy: BlockingPolicy,
+        /// The blocked host: its classification and the rule that refused it.
+        block: BlockedHost,
     },
     /// Configured and validated successfully.
     Valid(GitlabHost),
@@ -328,17 +326,16 @@ impl GitlabInstanceHost {
 
         let outcome = match GitlabHost::parse(&raw, &self.policy) {
             Ok(host) => InstanceHostOutcome::Valid(host),
-            Err(IndexUrlError::BlockedHost { class, policy }) => {
+            Err(IndexUrlError::BlockedHost { block }) => {
                 tracing::warn!(
-                    %class,
+                    class = %block.class(),
                     "registries.gitlab_instance_host is blocked by the current \
                      registries.workspace_registries policy; treating it as unset for host \
                      resolution"
                 );
                 InstanceHostOutcome::Blocked {
                     raw: raw.clone(),
-                    class,
-                    policy,
+                    block,
                 }
             }
             Err(e) => {
@@ -362,6 +359,7 @@ impl GitlabInstanceHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::net_policy::HostClass;
 
     fn policy(access: WorkspaceRegistryAccess) -> RegistryAccessPolicy {
         RegistryAccessPolicy::with_allowlist(access, private_allowlist())
@@ -517,8 +515,7 @@ mod tests {
             blocked.resolve(),
             InstanceHostOutcome::Blocked {
                 raw: "127.0.0.1".to_string(),
-                class: HostClass::Loopback,
-                policy: BlockingPolicy::Floor,
+                block: deps_core::net_policy::BlockedHost::floor(HostClass::Loopback).unwrap(),
             }
         );
 

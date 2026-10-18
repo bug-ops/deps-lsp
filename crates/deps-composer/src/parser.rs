@@ -618,7 +618,7 @@ fn classify_repositories(
 /// *with* an `only` filter was already classified by [`classify_repositories`] above.
 ///
 /// Known limitation (impl-critic minor, documented not fixed): a bare `artifact` repository
-/// triggers this the same as `vcs`/`path`, but [`crate::lockfile::parse_composer_lock`] only
+/// triggers this the same as `vcs`/`path`, but `crate::lockfile::parse_composer_lock` only
 /// maps a lock entry's `source.type` of `"git"`/`"path"` — an artifact-sourced package's lock
 /// entry has no `source` block at all (only `dist`), so [`apply_lockfile_classification`] can
 /// never actually reclassify one. Harmless (a wasted lockfile read, never a wrong answer), so
@@ -639,7 +639,7 @@ fn has_bare_non_registry_repository(repositories: &[ComposerRepository]) -> bool
 /// per-package `source.type` (#1212, see [`parse_composer_json_with_lockfile`]).
 ///
 /// Only `ResolvedSource::Path` is treated as a signal here — deliberately *not*
-/// `ResolvedSource::Git`, even though [`crate::lockfile::parse_composer_lock`] does map a
+/// `ResolvedSource::Git`, even though `crate::lockfile::parse_composer_lock` does map a
 /// lock entry's `"git"` `source.type` to it. `composer.lock` records a real git checkout's
 /// `source` block for essentially every ordinary Packagist-resolved package too (Packagist
 /// itself mirrors GitHub/GitLab/Bitbucket-hosted packages), so `source.type == "git"` alone

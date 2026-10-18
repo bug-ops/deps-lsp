@@ -49,7 +49,7 @@ fn safe_name(name: &str) -> Result<SafePathSegment<'_>> {
 pub struct PubDevRegistry {
     cache: Arc<HttpCache>,
     /// API base URL — [`PUB_DEV_API_BASE`] in production, overridden to a mockito server
-    /// URL in tests via [`Self::with_base`] (mirrors `deps-npm`'s
+    /// URL in tests via `Self::with_base` (mirrors `deps-npm`'s
     /// `NpmRegistry::with_public_base_for_test`).
     base: String,
 }

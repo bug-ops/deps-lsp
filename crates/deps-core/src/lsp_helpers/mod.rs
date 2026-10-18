@@ -2358,7 +2358,7 @@ pub fn latest_verdict(
 /// [`candidate_verdict`] (#1524) — factored out so the two never drift on what "clean" vs.
 /// "vulnerable" vs. "unverified"/"not applicable" means for a checked candidate.
 ///
-/// A [`SkipReason::NonRegistrySource`] structural entry is cached under `dep`'s plain
+/// A `SkipReason::NonRegistrySource` structural entry is cached under `dep`'s plain
 /// [`crate::osv::VulnKey`] (name, not source), so it survives untouched if `dep`'s source later
 /// changes from e.g. path/git to registry — until the next phase B run overwrites it. Since that
 /// window would otherwise read as the fail-open [`LatestVerdict::NotApplicable`] for a dependency
@@ -5098,19 +5098,23 @@ mod tests {
     /// lookup after the first on a given line O(1).
     #[test]
     fn test_byte_offset_to_position_non_ascii_line_cache_stays_fast_on_a_huge_single_line() {
-        let filler = "x".repeat(200 * 1024);
-        let content = format!("{filler}\u{2014}{filler}");
-        let table = LineOffsetTable::new(&content);
-        let step = (content.len() / 5000).max(1);
-        let start = std::time::Instant::now();
-        for offset in (0..content.len()).step_by(step) {
-            std::hint::black_box(table.byte_offset_to_position(&content, offset));
-        }
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(1),
-            "byte_offset_to_position took {:?} for ~5000 lookups on a huge non-ASCII line, \
-             expected well under 1s",
-            start.elapsed()
+        // Lookups scale with the line length, so a per-lookup walk from the line start shows
+        // up as quadratic growth rather than a constant factor.
+        crate::test_util::scaling::assert_scaling(
+            "byte_offset_to_position on a huge non-ASCII line",
+            crate::test_util::scaling::ExpectedGrowth::Linear,
+            200 * 1024,
+            |half_len| {
+                let filler = "x".repeat(half_len);
+                let content = format!("{filler}\u{2014}{filler}");
+                let table = LineOffsetTable::new(&content);
+                (content, table)
+            },
+            |(content, table)| {
+                for offset in (0..content.len()).step_by(80) {
+                    std::hint::black_box(table.byte_offset_to_position(content, offset));
+                }
+            },
         );
     }
 

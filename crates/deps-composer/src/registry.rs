@@ -191,7 +191,7 @@ fn compound_stability_flag(req_str: &str) -> Option<StabilityFloor> {
 /// Rungs 1-2 only ever see `req_str` as-typed when a caller passes the dependency's own
 /// declared requirement. Every LSP-facing "what is latest" call site (hover, completion,
 /// code actions, and `deps-engine`'s background fetch) instead calls
-/// [`crate::Registry::get_latest_matching`]/[`crate::Registry::select_latest_matching`] with
+/// `crate::Registry::get_latest_matching`/`crate::Registry::select_latest_matching` with
 /// [`deps_core::existence_wildcard_req`]'s `"*"` — an *existence* query ("does this package
 /// exist / what is its newest version"), not "what satisfies this dependency's own
 /// requirement" — so `req_str` is `"*"` at every production call site today, and rungs 1-2
@@ -478,7 +478,7 @@ fn expand_minified_versions(entries: Vec<MinifiedVersion>) -> Vec<ComposerVersio
     result
 }
 
-/// Derives a #205 [`Deprecation`](deps_core::Deprecation) payload from Packagist's
+/// Derives a #205 [`Deprecation`] payload from Packagist's
 /// `abandoned` field.
 ///
 /// Packagist's `abandoned` is either absent/`false`/`null` (not abandoned), bare `true`

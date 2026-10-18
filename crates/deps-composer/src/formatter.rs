@@ -315,7 +315,7 @@ fn hyphen_range_edges(normalized: &str) -> Option<HyphenRangeMatch<'_>> {
 
 /// Shared OR (`||`/`|`)/AND (whitespace or comma)-splitting tree-walker for Composer's
 /// requirement grammar, including its `v`-prefix and `@stability`-flag stripping — the
-/// traversal [`ComposerFormatter::version_satisfies_requirement`] and
+/// traversal `ComposerFormatter::version_satisfies_requirement` and
 /// `ComposerMatcher::explicitly_excludes` both need identically (PR #1589 had to fix the same
 /// `normalize_operator_spacing` spacing bug in both functions because they did not share this
 /// walker; #1591 extracted it). #1603: a comma is Composer's other AND separator
@@ -403,7 +403,7 @@ fn walk_requirement<L: RequirementLeaf>(leaf: &L, version: &str, requirement: &s
 
 /// A single non-combinator requirement clause's evaluation, plumbed into [`walk_requirement`].
 /// The OR/AND splitting and `v`-prefix/stability-flag normalization are identical for both
-/// [`ComposerFormatter::version_satisfies_requirement`]'s "does this admit `version`" question
+/// `ComposerFormatter::version_satisfies_requirement`'s "does this admit `version`" question
 /// ([`AdmitLeaf`]) and `ComposerMatcher::explicitly_excludes`'s "does this explicitly ban `version`"
 /// question ([`ExcludeLeaf`]) — only what a leaf decides, and how an AND-group folds its
 /// clauses' results, differ.
@@ -1180,7 +1180,7 @@ fn satisfies_caret(version: &str, req: &str) -> bool {
 /// word, but a version string's own qualifier suffix has always been classified leniently —
 /// this function preserves that unchanged behavior for `compare_versions`/
 /// `composer_version_stability`, while `registry.rs`'s config-facing paths go through
-/// [`StabilityFloor::from_str`] instead.
+/// `StabilityFloor::from_str` instead.
 fn qualifier_stability(word: &str) -> StabilityFloor {
     match word.to_ascii_lowercase().as_str() {
         "dev" => StabilityFloor::Dev,

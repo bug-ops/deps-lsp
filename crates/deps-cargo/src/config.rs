@@ -42,7 +42,7 @@ use toml_span::value::Table;
 
 use deps_core::net_policy::{
     BlockedHost, PolicyGate, RedactedUrl, RegistryAccessPolicy, RegistryRejectionClassifier,
-    RegistryRejectionReason, validate_index_url,
+    RegistryRejectionReason, TrustedPrefix, validate_index_url,
 };
 use deps_core::{DEFAULT_MAX_CACHED_FILES, EcosystemId, MtimeFileCache};
 
@@ -252,6 +252,12 @@ impl RegistryIndex {
     #[must_use]
     pub fn as_str(&self) -> &str {
         self.url.as_str()
+    }
+
+    /// This index as a [`TrustedPrefix`], reusing the already validated URL (no re-parse).
+    #[must_use]
+    pub(crate) fn trusted_prefix(&self) -> TrustedPrefix {
+        TrustedPrefix::from_url(self.url.clone())
     }
 
     /// The [`IndexTrust`] tier this index was validated under.
@@ -828,11 +834,8 @@ fn resolve_registries(
                         },
                     );
                 }
-                Err(RegistryIndexError::BlockedHost { class, policy }) => {
-                    unresolved.insert(
-                        alias.clone(),
-                        UnresolvedIndex::Blocked(BlockedHost { class, policy }),
-                    );
+                Err(RegistryIndexError::BlockedHost { block }) => {
+                    unresolved.insert(alias.clone(), UnresolvedIndex::Blocked(block));
                 }
                 Err(error) => {
                     if let Some(reason) = error.rejection_reason().into_reason() {
@@ -1135,6 +1138,23 @@ mod tests {
     use super::*;
     use deps_core::net_policy::WorkspaceRegistryAccess;
     use std::assert_matches;
+
+    #[test]
+    fn test_registry_index_trusted_prefix_matches_index_and_confines_to_its_path() {
+        let index = RegistryIndex::builtin("https://artifacts.corp/cargo/index");
+        let prefix = index.trusted_prefix();
+
+        assert_eq!(prefix.as_str(), index.as_str());
+        assert!(
+            prefix.permits(
+                &url::Url::parse("https://artifacts.corp/cargo/index/se/rd/serde").unwrap()
+            )
+        );
+        assert!(
+            !prefix
+                .permits(&url::Url::parse("https://artifacts.corp/cargo/index-public/x").unwrap())
+        );
+    }
 
     fn public_only_policy() -> RegistryAccessPolicy {
         RegistryAccessPolicy::new(WorkspaceRegistryAccess::PublicOnly)

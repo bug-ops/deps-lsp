@@ -141,7 +141,7 @@ impl ResolvedGeneration {
     ///
     /// Private (issue #1398 impl-critic S1): a `pub(crate)` constant would itself be exactly
     /// the mintable literal/default stand-in this type exists to forbid — any in-crate code
-    /// could pass `ResolvedGeneration::INITIAL` to [`Self::bump_resolved_generation`] the same
+    /// could pass `ResolvedGeneration::INITIAL` to `Self::bump_resolved_generation` the same
     /// way the old `u64` let a call site pass a bare `1`. A test that needs to assert on this
     /// value uses the test-only `is_initial` instead of naming the constant.
     const INITIAL: Self = Self(0);
@@ -1360,9 +1360,8 @@ impl ServerState {
 
     /// Returns the currently active license policy (issue #660/#661 critic C1).
     ///
-    /// Read by every diagnostics-generation call site — see [`Self::license_policy`]'s
-    /// field doc for why this replaced a caller-supplied `Option<&LicensePolicy>`
-    /// parameter.
+    /// Diagnostics generation reads the policy from its `DiagnosticsSnapshot` (#1815); this
+    /// mirror serves the pre-fetch spawners and the empty-to-non-empty activation check.
     pub fn license_policy(&self) -> Arc<LicensePolicy> {
         Arc::clone(
             &self
@@ -1375,10 +1374,8 @@ impl ServerState {
     /// Replaces the active license policy (issue #660/#661 critic C1).
     ///
     /// Called from `Backend::initialize`/`did_change_configuration` once the new
-    /// `DepsConfig` is parsed, so every subsequent diagnostics generation call —
-    /// including the four background-refresh push-path call sites in
-    /// `document::lifecycle` and the lockfile-change refresh in `server.rs` — picks up the
-    /// new policy without any of those call sites needing a signature change.
+    /// `DepsConfig` is parsed, so the pre-fetch spawners pick up the new policy without
+    /// any call site needing a signature change.
     pub fn set_license_policy(&self, policy: LicensePolicy) {
         *self
             .license_policy
@@ -1387,8 +1384,8 @@ impl ServerState {
     }
 
     /// Returns the typosquat-similarity gate as of the last applied config (issue #1437).
-    /// Read by every diagnostics-generation call site — see [`Self::typosquat_checks`]'s
-    /// field doc.
+    /// Diagnostics generation reads the gate from its `DiagnosticsSnapshot` (#1815); this
+    /// mirror serves the typosquat pre-fetch spawners.
     pub fn typosquat_checks(&self) -> TyposquatChecks {
         self.typosquat_checks.get()
     }
@@ -1396,15 +1393,16 @@ impl ServerState {
     /// Replaces the active typosquat gate (issue #1437).
     ///
     /// Called from `Backend::initialize`/`did_change_configuration` once the new
-    /// `DepsConfig` is parsed, so every subsequent diagnostics generation call picks up the
-    /// new setting without any call site needing a signature change (mirrors
+    /// `DepsConfig` is parsed, so the pre-fetch spawners pick up the new setting without
+    /// any call site needing a signature change (mirrors
     /// [`Self::set_license_policy`]).
     pub fn set_typosquat_checks(&self, checks: TyposquatChecks) {
         self.typosquat_checks.set(checks);
     }
 
-    /// Returns the GOSSIP gate as of the last applied config (issue #1456, spec 072). Read
-    /// by every diagnostics-generation call site — see [`Self::gossip_checks`]'s field doc.
+    /// Returns the GOSSIP gate as of the last applied config (issue #1456, spec 072). Diagnostics
+    /// generation reads the gate from its `DiagnosticsSnapshot` (#1815); this mirror serves
+    /// the GOSSIP pre-fetch spawners.
     pub fn gossip_checks(&self) -> GossipChecks {
         self.gossip_checks.get()
     }

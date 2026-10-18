@@ -34,7 +34,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::sync::Arc;
 
-/// Maximum number of `<licenses><license><name>` entries [`parse_pom_licenses`] retains
+/// Maximum number of `<licenses><license><name>` entries `parse_pom_licenses` retains
 /// from a single POM (issue #690; raised from an initial 8 to 64 per impl-critic S2).
 /// Generously above any real-world POM's actual license count (dual-licensing is the
 /// practical ceiling) and, more importantly, above what
@@ -51,7 +51,7 @@ use std::sync::Arc;
 const MAX_POM_LICENSE_ENTRIES: usize = 64;
 
 /// Hard cap, in bytes of `reader.buffer_position()`, on how far into a POM
-/// [`parse_pom_licenses`] will read (issue #690, impl-critic S1 — through three rounds of
+/// `parse_pom_licenses` will read (issue #690, impl-critic S1 — through three rounds of
 /// counterexamples). A cap on *retained* entries alone doesn't bound CPU, and every
 /// attempt to budget by counting a specific event shape instead (a `<name>` text node, a
 /// `<name>` `Event::Start`) turned out to be shape-dependent and bypassable: a truly empty

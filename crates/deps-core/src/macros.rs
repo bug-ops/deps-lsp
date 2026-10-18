@@ -1074,8 +1074,7 @@ mod tests {
             dependency_truncation: Some((5, 10)),
             blocked_registries: vec![BlockedRegistryOccurrence {
                 range: Range::default(),
-                class: HostClass::Loopback,
-                policy: crate::net_policy::BlockingPolicy::Floor,
+                block: crate::net_policy::BlockedHost::floor(HostClass::Loopback).unwrap(),
                 raw_value: "registry".into(),
                 declaration_key: "key".into(),
             }],
@@ -1102,8 +1101,7 @@ mod tests {
             dependency_truncation: Some((3, 7)),
             blocked_registries: vec![BlockedRegistryOccurrence {
                 range: Range::default(),
-                class: HostClass::Loopback,
-                policy: crate::net_policy::BlockingPolicy::Floor,
+                block: crate::net_policy::BlockedHost::floor(HostClass::Loopback).unwrap(),
                 raw_value: "registry".into(),
                 declaration_key: "key".into(),
             }],

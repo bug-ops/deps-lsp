@@ -295,7 +295,7 @@ static GROUP_BLOCK_START: LazyLock<Regex> =
 
 /// Matches any other `... do` block opener Bundler's DSL supports besides `group`/`source`
 /// (`platforms ... do`, `install_if ... do`, `git "..." do`, `path "..." do`, `env ... do`,
-/// etc.) — pushed onto [`OpenBlock::Other`] purely to keep [`BLOCK_END`] pops balanced
+/// etc.) — pushed onto `OpenBlock::Other` purely to keep [`BLOCK_END`] pops balanced
 /// against pushes. Critic finding S1: without this, one of these openers nested inside a
 /// `source ... do` block pops the *source* block early and every gem declared after it
 /// silently resolves against the file-level source instead.
@@ -314,7 +314,7 @@ static GENERIC_BLOCK_START: LazyLock<Regex> =
 /// COND ... end`, an expression-valued `if`), so the common single-line statement-modifier
 /// form (`gem "x" if RUBY_VERSION > "2.0"`, which starts with `gem`, not the keyword or an
 /// assignment to it) is correctly left unmatched, since that form has no matching `end` to
-/// balance. Pushed onto [`OpenBlock::Other`] for the same reason as [`GENERIC_BLOCK_START`] —
+/// balance. Pushed onto `OpenBlock::Other` for the same reason as [`GENERIC_BLOCK_START`] —
 /// code-review finding #1 (post-N1): without this, one of these constructs (most commonly `if
 /// RUBY_PLATFORM =~ ... / end`) nested inside a `source ... do` block still pops the *source*
 /// block early via its own bare `end`, reopening the same #980 leak class through a different

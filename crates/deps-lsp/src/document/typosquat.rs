@@ -20,7 +20,7 @@ use tower_lsp_server::ls_types::Uri;
 const TYPOSQUAT_PREFETCH_TIMEOUT_CEILING_SECS: u64 = 30;
 
 /// Whether a declared dependency's currently-resolved [`deps_core::parser::DependencySource`]
-/// is one [`deps_core::lsp_helpers::EcosystemFormatter::source_is_public_registry_content`]
+/// is one `deps_core::lsp_helpers::EcosystemFormatter::source_is_public_registry_content`
 /// classifies as eligible for the deps.dev typosquat check (issue #1462) — folded into
 /// [`declared_names`]'s comparison key alongside the package name itself. Only an
 /// [`Eligible`](Self::Eligible) dependency is ever actually sent to deps.dev

@@ -387,11 +387,8 @@ fn resolve_alternate_registries(
                 resolved_by_raw_value.insert(value.clone(), index.clone());
                 newly_resolved.push((index, None));
             }
-            Err(RegistryIndexError::BlockedHost { class, policy }) => {
-                blocked_by_raw_value.insert(
-                    value.clone(),
-                    deps_core::net_policy::BlockedHost { class, policy },
-                );
+            Err(RegistryIndexError::BlockedHost { block }) => {
+                blocked_by_raw_value.insert(value.clone(), block);
             }
             Err(error) => {
                 // `value` may just as well be a genuine alias (e.g. "my-corp"), which never
@@ -491,8 +488,7 @@ fn resolve_alternate_registries(
             } else if let Some(host) = blocked_by_raw_value.get(url) {
                 blocked_registries.push(deps_core::BlockedRegistryOccurrence {
                     range: dep.name_range,
-                    class: host.class,
-                    policy: host.policy,
+                    block: *host,
                     raw_value: url.clone(),
                     declaration_key: url.clone(),
                 });
@@ -1344,7 +1340,7 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
         let occurrence = &result.blocked_registries[0];
         assert_eq!(occurrence.range, result.dependencies[0].name_range);
         assert_eq!(
-            occurrence.class,
+            occurrence.block.class(),
             deps_core::net_policy::HostClass::CloudMetadata
         );
         assert_eq!(occurrence.raw_value, "https://169.254.169.254/index");
@@ -1388,7 +1384,7 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
         let occurrence = &result.blocked_registries[0];
         assert_eq!(occurrence.range, result.dependencies[0].name_range);
         assert_eq!(
-            occurrence.class,
+            occurrence.block.class(),
             deps_core::net_policy::HostClass::CloudMetadata
         );
         assert_eq!(occurrence.raw_value, "my-corp");

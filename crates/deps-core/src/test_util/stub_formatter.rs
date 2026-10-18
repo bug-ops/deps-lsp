@@ -2,7 +2,7 @@
 
 use crate::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementResolution, SourcePolicy,
+    PinResolution, RequirementResolution, SourcePolicy,
 };
 use crate::{ConcreteVersion, Dependency, PackageName};
 
@@ -84,6 +84,7 @@ pub struct StubFormatter {
     manifest_requirement_as_resolved_version: bool,
     alternate_registry_resolution: bool,
     go_style_osv_version_to_native: bool,
+    unpublished_pin_resolution: bool,
 }
 
 impl StubFormatter {
@@ -102,6 +103,7 @@ impl StubFormatter {
             manifest_requirement_as_resolved_version: false,
             alternate_registry_resolution: false,
             go_style_osv_version_to_native: false,
+            unpublished_pin_resolution: false,
         }
     }
 
@@ -154,6 +156,17 @@ impl StubFormatter {
     }
 }
 
+impl StubFormatter {
+    /// [`RequirementResolution::resolved_pin_version`] reports
+    /// [`PinResolution::Unpublished`] for every dependency, as a git-tag ecosystem does for a
+    /// full-release-shaped tag the registry never published.
+    #[must_use]
+    pub const fn with_unpublished_pin_resolution(mut self) -> Self {
+        self.unpublished_pin_resolution = true;
+        self
+    }
+}
+
 impl Default for StubFormatter {
     fn default() -> Self {
         Self::new()
@@ -188,6 +201,15 @@ impl RequirementResolution for StubFormatter {
     fn manifest_requirement_is_resolved_version(&self, dep: &dyn Dependency) -> bool {
         let _ = dep;
         self.manifest_requirement_as_resolved_version
+    }
+
+    fn resolved_pin_version(&self, dep: &dyn Dependency) -> PinResolution {
+        let _ = dep;
+        if self.unpublished_pin_resolution {
+            PinResolution::Unpublished
+        } else {
+            PinResolution::Unresolved
+        }
     }
 }
 

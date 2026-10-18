@@ -1766,6 +1766,58 @@ pub(crate) async fn trigger_osv_rescan_for_open_documents(
     }
 }
 
+/// The open documents whose ecosystem needs a dedicated tier-3 license fetch; the rest get
+/// license data on the hot path and have nothing to catch up on.
+fn open_tier3_license_documents(state: &Arc<ServerState>) -> Vec<(Uri, Arc<dyn Ecosystem>)> {
+    open_documents_with_ecosystem(state)
+        .into_iter()
+        .filter(|(_, ecosystem)| ecosystem.license_source().requires_dedicated_fetch())
+        .collect()
+}
+
+/// Starts the tier-3 license pre-fetch for every open document whose ecosystem needs a
+/// dedicated license fetch (issue #1831) — intended to be called once, from
+/// `Backend::did_change_configuration`, exactly when `license_policy` transitions from empty to
+/// non-empty. [`run_license_prefetch`] deliberately does nothing under an empty policy (#1407),
+/// so without this trigger an already-open document would keep its license-less state until its
+/// next edit or reopen. Fires-and-forgets one supervised task per document, like
+/// [`trigger_osv_rescan_for_open_documents`].
+pub(crate) async fn trigger_license_prefetch_for_open_documents(
+    state: &Arc<ServerState>,
+    client: &Client,
+    config: Arc<RwLock<DepsConfig>>,
+    fetch_timeout_secs: u64,
+) {
+    for (uri, ecosystem) in open_tier3_license_documents(state) {
+        let state = Arc::clone(state);
+        let client = client.clone();
+        let config = Arc::clone(&config);
+        spawn_supervised(
+            async move {
+                run_license_prefetch(
+                    uri.clone(),
+                    Arc::clone(&state),
+                    ecosystem,
+                    fetch_timeout_secs,
+                )
+                .await;
+                let dep_count = diagnostics::document_dependency_count(&state, &uri);
+                diagnostics::publish_document_diagnostics(
+                    &state, &client, &uri, &config, dep_count,
+                )
+                .await;
+            }
+            .instrument(tracing::Span::current()),
+            |e| {
+                tracing::error!(
+                    "license pre-fetch-on-policy-enable panicked ({e}); a document's license \
+                     data may be missing until its next edit or reopen"
+                );
+            },
+        );
+    }
+}
+
 /// Ensures a document is loaded in state.
 ///
 /// If the document is not already in state, loads it from disk,
@@ -1901,6 +1953,42 @@ mod tests {
     use std::collections::HashSet;
     #[cfg(feature = "cargo")]
     use std::time::Duration;
+
+    /// Issue #1831: the empty->non-empty license-policy catch-up must target only open
+    /// documents of tier-3 (dedicated-fetch) ecosystems, never e.g. Cargo.
+    #[cfg(all(feature = "cargo", feature = "dart"))]
+    #[tokio::test]
+    async fn open_tier3_license_documents_selects_only_dedicated_fetch_ecosystems() {
+        let state = Arc::new(ServerState::new());
+        for (path, content, id) in [
+            (
+                "/test/pubspec.yaml",
+                "dependencies:\n  http: ^1.0.0\n",
+                EcosystemId::Dart,
+            ),
+            (
+                "/test/Cargo.toml",
+                "[dependencies]\nserde = \"1\"\n",
+                EcosystemId::Cargo,
+            ),
+        ] {
+            let url = deps_core::test_util::test_uri(path);
+            let ecosystem = state.ecosystem_registry.for_uri(&url).expect("ecosystem");
+            let parse_result = ecosystem
+                .parse_manifest(content, &url)
+                .await
+                .expect("parse");
+            state.update_document(
+                crate::lsp_types_interop::to_lsp_uri(&url),
+                DocumentState::new_from_parse_result(id, content.to_string(), parse_result),
+            );
+        }
+
+        let selected = open_tier3_license_documents(&state);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].1.ecosystem_id(), EcosystemId::Dart);
+    }
 
     fn both_osv_checks() -> [OsvChecks; 2] {
         [

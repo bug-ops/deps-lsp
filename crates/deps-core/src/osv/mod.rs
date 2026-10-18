@@ -261,7 +261,7 @@ pub struct OsvClient {
     /// leaking an entry no caller is left to clean up (issue #1539).
     record_in_flight: DashMap<OsvId, Arc<InFlightRecord>>,
     /// Overridable in test builds only, so `mockito` can stand in for
-    /// `https://api.osv.dev` — mirrors [`crate::cache::ensure_https`]'s existing
+    /// `https://api.osv.dev` — mirrors `crate::cache::ensure_https`'s existing
     /// `#[cfg(test)]` relaxation for the same reason, and [`crate::deps_dev::DepsDevClient`]'s
     /// own `base_url` field.
     #[cfg(any(test, feature = "test-util"))]

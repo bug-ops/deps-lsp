@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::net_policy::{BlockingPolicy, HostClass};
+use crate::net_policy::{BlockedHost, BlockingPolicy};
 use crate::package::InvalidPackageName;
 use crate::redact::{RedactedName, RedactedUrl};
 
@@ -387,15 +387,24 @@ pub enum DepsError {
     /// refuses to connect to (DNS rebinding or a name that points at an internal address).
     /// Built only by `crate::cache`; carries no address, so [`Self::fetch_failure`] can classify
     /// it as [`FetchFailure::Actionable`] with a fixed message.
-    #[error("registry host of {url} resolves to a {class} address, blocked by network policy")]
+    #[error("registry host of {url} resolves to a {} address, blocked by network policy", block.class())]
     #[non_exhaustive]
     HostBlockedByPolicy {
         /// The request URL, stored redacted.
         url: RedactedUrl,
-        /// The class of the blocked resolved address.
-        class: HostClass,
-        /// The rule that refused the address.
-        policy: BlockingPolicy,
+        /// The blocked resolved address: its class and the rule that refused it.
+        block: BlockedHost,
+    },
+
+    /// A credentialed request targeted a URL outside the credential's trusted prefix, so the
+    /// credential was withheld (it would otherwise travel to a host the caller never trusted
+    /// with it). Built only by `crate::cache`; classified like a cache-layer failure
+    /// ([`FetchFailure::Transient`], halting a multi-hop chain).
+    #[error("refusing to send a credential to {url} outside its trusted prefix")]
+    #[non_exhaustive]
+    CredentialOutsideTrustedPrefix {
+        /// The request URL, stored redacted.
+        url: RedactedUrl,
     },
 }
 
@@ -520,11 +529,14 @@ impl std::fmt::Debug for DepsError {
                 .field("registry", registry)
                 .field("reason", reason)
                 .finish(),
-            Self::HostBlockedByPolicy { url, class, policy } => f
+            Self::HostBlockedByPolicy { url, block } => f
                 .debug_struct("HostBlockedByPolicy")
                 .field("url", url)
-                .field("class", class)
-                .field("policy", policy)
+                .field("block", block)
+                .finish(),
+            Self::CredentialOutsideTrustedPrefix { url } => f
+                .debug_struct("CredentialOutsideTrustedPrefix")
+                .field("url", url)
                 .finish(),
         }
     }
@@ -680,8 +692,9 @@ impl DepsError {
             Self::PaginatedListIncomplete { reason, .. } => {
                 FetchFailure::Actionable(format!("{reason}; not showing a partial list"))
             }
-            Self::HostBlockedByPolicy { class, policy, .. } => {
-                FetchFailure::Actionable(match policy {
+            Self::HostBlockedByPolicy { block, .. } => {
+                let class = block.class();
+                FetchFailure::Actionable(match block.policy() {
                     BlockingPolicy::Floor => format!(
                         "registry host resolves to a {class} address, which is never a registry \
                          under any policy"
@@ -689,7 +702,7 @@ impl DepsError {
                     BlockingPolicy::WorkspaceRegistries(_) => format!(
                         "registry host resolves to a {class} address, blocked by \
                          registries.workspace_registries policy{}",
-                        policy.hint_suffix(*class)
+                        block.hint_suffix()
                     ),
                 })
             }
@@ -716,6 +729,7 @@ impl DepsError {
             | Self::Json(_)
             | Self::UnsupportedEcosystem(_)
             | Self::AmbiguousEcosystem(_)
+            | Self::CredentialOutsideTrustedPrefix { .. }
             | Self::InvalidUri(_) => FetchFailure::Transient,
         }
     }
@@ -776,6 +790,7 @@ impl DepsError {
             | Self::UnsupportedEcosystem(_)
             | Self::AmbiguousEcosystem(_)
             | Self::InvalidUri(_)
+            | Self::CredentialOutsideTrustedPrefix { .. }
             | Self::Offline { .. }
             | Self::ChainResolutionHalted
             | Self::PaginatedListIncomplete { .. } => Self::ChainResolutionHalted,
@@ -832,6 +847,7 @@ impl DepsError {
             Self::ChainResolutionHalted => (None, "chain-resolution-halted"),
             Self::PaginatedListIncomplete { .. } => (None, "paginated-list-incomplete"),
             Self::HostBlockedByPolicy { .. } => (None, "host-blocked-by-policy"),
+            Self::CredentialOutsideTrustedPrefix { .. } => (None, "credential-scope"),
         }
     }
 }
@@ -885,7 +901,7 @@ pub type Result<T> = std::result::Result<T, DepsError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net_policy::WorkspaceRegistryAccess;
+    use crate::net_policy::{HostClass, WorkspaceRegistryAccess};
     use std::assert_matches;
     use std::error::Error as StdError;
 
@@ -1444,22 +1460,20 @@ mod tests {
     fn host_blocked_by_policy_message_distinguishes_never_a_registry_from_gated() {
         let blocked = |class| DepsError::HostBlockedByPolicy {
             url: "https://10.0.0.5.nip.io/api?token=secret".into(),
-            class,
-            policy: BlockingPolicy::for_block(class, WorkspaceRegistryAccess::PublicOnly),
+            block: BlockedHost::new(class, WorkspaceRegistryAccess::PublicOnly),
         };
         assert_eq!(
             blocked(HostClass::PrivateV4).fetch_failure(),
             FetchFailure::Actionable(format!(
                 "registry host resolves to a private (RFC1918) address, blocked by \
                      registries.workspace_registries policy{}",
-                BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::PublicOnly)
-                    .hint_suffix(HostClass::PrivateV4)
+                BlockedHost::new(HostClass::PrivateV4, WorkspaceRegistryAccess::PublicOnly)
+                    .hint_suffix()
             ))
         );
         let at_off = DepsError::HostBlockedByPolicy {
             url: "https://corp.example/".into(),
-            class: HostClass::PrivateV4,
-            policy: BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::Off),
+            block: BlockedHost::new(HostClass::PrivateV4, WorkspaceRegistryAccess::Off),
         };
         assert!(
             !format!("{:?}", at_off.fetch_failure()).contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"),
@@ -1481,11 +1495,29 @@ mod tests {
     }
 
     #[test]
+    fn credential_outside_trusted_prefix_is_transient_halts_chain_and_redacts_url() {
+        let err = DepsError::CredentialOutsideTrustedPrefix {
+            url: "https://elsewhere.test/api?token=secret".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "refusing to send a credential to {} outside its trusted prefix",
+                RedactedUrl::new("https://elsewhere.test/api?token=secret")
+            )
+        );
+        assert_eq!(err.fetch_failure(), FetchFailure::Transient);
+        assert_eq!(err.safe_tracing_summary(), (None, "credential-scope"));
+        assert!(!err.is_not_found());
+        assert!(!format!("{err} {err:?}").contains("secret"));
+        assert_matches!(err.into_chain_halt(), DepsError::ChainResolutionHalted);
+    }
+
+    #[test]
     fn into_chain_halt_keeps_policy_block_and_halts_everything_else() {
         let blocked = DepsError::HostBlockedByPolicy {
             url: "https://corp.example/".into(),
-            class: HostClass::PrivateV4,
-            policy: BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::PublicOnly),
+            block: BlockedHost::new(HostClass::PrivateV4, WorkspaceRegistryAccess::PublicOnly),
         };
         assert_matches!(
             blocked.into_chain_halt(),
@@ -1553,6 +1585,9 @@ mod tests {
             DepsError::UnsupportedEcosystem("unknown".into()),
             DepsError::AmbiguousEcosystem("file.txt".into()),
             DepsError::InvalidUri("not a uri".into()),
+            DepsError::CredentialOutsideTrustedPrefix {
+                url: "https://example.com/x".into(),
+            },
             DepsError::Offline {
                 url: "https://example.com".into(),
             },

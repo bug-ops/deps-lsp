@@ -1850,7 +1850,7 @@ mod tests {
             let occurrence = &blocked[0];
             assert_eq!(occurrence.range, dep.name_range());
             assert_eq!(
-                occurrence.class,
+                occurrence.block.class(),
                 deps_core::net_policy::HostClass::CloudMetadata
             );
             assert_eq!(

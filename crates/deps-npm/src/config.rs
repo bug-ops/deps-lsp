@@ -236,24 +236,21 @@ impl NpmConfig {
         if let Some(scope) = scope_of(package_name.as_str())
             && let Some(result) = self.scoped_registries.get(scope)
         {
-            let (BlockedHost { class, policy }, raw_value) =
-                result.as_ref().err().and_then(InvalidEntry::blocked_host)?;
+            let (block, raw_value) = result.as_ref().err().and_then(InvalidEntry::blocked_host)?;
             return Some(BlockedSourceClass {
-                class,
-                policy,
+                block,
                 raw_value,
                 declaration_key: format!("scope:{scope}"),
             });
         }
-        let (BlockedHost { class, policy }, raw_value) = self
+        let (block, raw_value) = self
             .registry
             .as_ref()?
             .as_ref()
             .err()
             .and_then(InvalidEntry::blocked_host)?;
         Some(BlockedSourceClass {
-            class,
-            policy,
+            block,
             raw_value,
             declaration_key: "top-level".to_string(),
         })
@@ -419,7 +416,7 @@ struct TieredRawValue {
 ///
 /// `tier` gates expansion itself (issue #1420, amending FR-007): a project-tier `raw`
 /// containing `${` is rejected outright, before
-/// [`config_trust::expand_env_vars`](deps_core::config_trust::expand_env_vars) ever runs, so a
+/// [`config_trust::expand_env_vars`] ever runs, so a
 /// hostile
 /// project-tier `.npmrc` can never have an environment variable's value substituted into a URL
 /// this function — or a caller fetching the [`NpmRegistryIndex`] it would have produced — ever
@@ -1301,7 +1298,7 @@ mod tests {
         let occurrence = config
             .blocked_class_for(&pkg("express"))
             .expect("blocked entry must be reported");
-        assert_eq!(occurrence.class, HostClass::CloudMetadata);
+        assert_eq!(occurrence.block.class(), HostClass::CloudMetadata);
         assert_eq!(occurrence.raw_value, "https://169.254.169.254/registry");
         assert_eq!(occurrence.declaration_key, "top-level");
     }
@@ -1332,7 +1329,7 @@ mod tests {
         let occurrence = config
             .blocked_class_for(&pkg("@myorg/internal-lib"))
             .expect("blocked scoped entry must be reported");
-        assert_eq!(occurrence.class, HostClass::CloudMetadata);
+        assert_eq!(occurrence.block.class(), HostClass::CloudMetadata);
         assert_eq!(occurrence.raw_value, "https://169.254.169.254/registry");
         assert_eq!(occurrence.declaration_key, "scope:@myorg");
         assert_eq!(config.blocked_class_for(&pkg("express")), None);

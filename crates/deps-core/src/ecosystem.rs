@@ -367,12 +367,9 @@ pub struct BlockedRegistryOccurrence {
     /// Range of the affected dependency's name in the manifest.
     #[raw]
     pub range: Range,
-    /// The blocked host's classification.
+    /// The blocked host: its classification and the rule that refused it.
     #[raw]
-    pub class: crate::net_policy::HostClass,
-    /// The rule that refused the host.
-    #[raw]
-    pub policy: crate::net_policy::BlockingPolicy,
+    pub block: crate::net_policy::BlockedHost,
     /// The exact `registry`/`registry-index` alias or URL the dependency declared, so two
     /// different blocked aliases render as two distinguishable diagnostic messages, not one
     /// byte-identical warning.
@@ -412,12 +409,9 @@ impl RegistryOccurrence for BlockedRegistryOccurrence {
 /// and `deps_pypi::config::PypiIndexConfig::blocked_class_for`.
 #[derive(Clone, PartialEq, Eq, crate::redact_debug::RedactingDebug)]
 pub struct BlockedSourceClass {
-    /// The blocked host's classification.
+    /// The blocked host: its classification and the rule that refused it.
     #[raw]
-    pub class: crate::net_policy::HostClass,
-    /// The rule that refused the host.
-    #[raw]
-    pub policy: crate::net_policy::BlockingPolicy,
+    pub block: crate::net_policy::BlockedHost,
     /// The exact declared value (URL/alias) that resolved to a blocked host.
     #[redact(url)]
     pub raw_value: String,
@@ -435,13 +429,12 @@ impl BlockedSourceClass {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::net_policy::{BlockingPolicy, HostClass};
+    /// use deps_core::net_policy::{BlockedHost, HostClass};
     /// use deps_core::BlockedSourceClass;
     /// use deps_core::position::{Position, Range};
     ///
     /// let class = BlockedSourceClass {
-    ///     class: HostClass::Loopback,
-    ///     policy: BlockingPolicy::Floor,
+    ///     block: BlockedHost::floor(HostClass::Loopback).unwrap(),
     ///     raw_value: "https://internal.example/index".to_string(),
     ///     declaration_key: "primary".to_string(),
     /// };
@@ -453,8 +446,7 @@ impl BlockedSourceClass {
     pub fn into_occurrence(self, range: Range) -> BlockedRegistryOccurrence {
         BlockedRegistryOccurrence {
             range,
-            class: self.class,
-            policy: self.policy,
+            block: self.block,
             raw_value: self.raw_value,
             declaration_key: self.declaration_key,
         }
@@ -2906,8 +2898,8 @@ mod tests {
         2,
         BlockedRegistryOccurrence {
             range: Range::default(),
-            class: crate::net_policy::HostClass::Loopback,
-            policy: crate::net_policy::BlockingPolicy::Floor,
+            block: crate::net_policy::BlockedHost::floor(crate::net_policy::HostClass::Loopback)
+                .unwrap(),
             raw_value: crate::conformance::CREDENTIAL_PROBE_URL.to_string(),
             declaration_key: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
         },
@@ -2917,8 +2909,8 @@ mod tests {
         test_blocked_source_class_debug_redacts_credentials,
         2,
         BlockedSourceClass {
-            class: crate::net_policy::HostClass::Loopback,
-            policy: crate::net_policy::BlockingPolicy::Floor,
+            block: crate::net_policy::BlockedHost::floor(crate::net_policy::HostClass::Loopback)
+                .unwrap(),
             raw_value: crate::conformance::CREDENTIAL_PROBE_URL.to_string(),
             declaration_key: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
         },

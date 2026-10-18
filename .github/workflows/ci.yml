@@ -351,6 +351,13 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+      - name: Check documentation of private items
+        # The gate above never renders private items, so a doc link to a renamed or
+        # module-private item went unnoticed (#765, #1828).
+        run: cargo doc --workspace --no-deps --all-features --document-private-items
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
       - name: Guard against test-util leaking into the release dependency tree
         # deps-core's `test-util` feature (see crates/deps-core/Cargo.toml) relaxes
         # ensure_https's HTTPS enforcement for loopback hosts and must never reach

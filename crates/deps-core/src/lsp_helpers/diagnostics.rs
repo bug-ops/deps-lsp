@@ -78,8 +78,8 @@ pub const MAX_DIAGNOSTIC_VALUE_CHARS: usize = 128;
 ///
 /// A config-global declaration (a single blocked npm top-level `registry=`, or one
 /// `NuGet.Config` `<add key>` source) can affect *every* dependency in the document — without
-/// this cap, [`push_collapsed_blocked_registries`] would build up to
-/// [`crate::MAX_DEPENDENCIES_PER_DOCUMENT`] `-` `1` `Location`s (each a cloned [`Uri`] plus a
+/// this cap, `push_collapsed_registry_diagnostics` would build up to
+/// [`crate::MAX_DEPENDENCIES_PER_DOCUMENT`] `-` `1` `Location`s (each a cloned `Uri` plus a
 /// message) into one diagnostic, republished on every keystroke, for a group whose size alone
 /// already says everything the individual entries would ("every other dependency is affected
 /// too").
@@ -1460,7 +1460,7 @@ fn offline_notice(
 /// `@v4` tag is the norm for GitHub Actions, not a transient state), which are structurally
 /// permanent for as long as the dependency is declared the way it is (every `deno.json`
 /// `jsr:` dependency is `UnmappableName` forever, for example) and would otherwise leave a
-/// standing, unresolvable Problems-panel entry. [`push_skip_reason_footer_hover_section`]
+/// standing, unresolvable Problems-panel entry. `push_skip_reason_footer_hover_section`
 /// has no such restriction: it renders per-dependency, on demand, not as a standing
 /// diagnostic, so it uses [`SkipReason::unchecked_reason`] directly for every
 /// non-`NonRegistrySource` variant.
@@ -1503,7 +1503,7 @@ const fn should_notify_in_diagnostics(reason: SkipReason) -> bool {
 /// an "Information" squiggle on nearly every dependency in a lockfile-less manifest. Every
 /// individual skipped dependency still survives via `related_information` (name + its own
 /// reason), capped at [`MAX_BLOCKED_REGISTRY_RELATED_INFO`] like
-/// [`push_collapsed_blocked_registries`]'s sibling cap, so the notice never grows
+/// `push_collapsed_registry_diagnostics`'s sibling cap, so the notice never grows
 /// unbounded with document size.
 ///
 /// Suppressed while `versions.offline`: [`offline_notice`] already covers that case with
@@ -1795,9 +1795,9 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
             "registry index \"{}\" blocked by registries.workspace_registries policy \
              (host class: {}; declaration: {}){}",
             sanitize_and_truncate_for_diagnostic(&redacted_value, MAX_DIAGNOSTIC_VALUE_CHARS),
-            occurrence.class,
+            occurrence.block.class(),
             sanitize_and_truncate_for_diagnostic(&redacted_key, MAX_DIAGNOSTIC_VALUE_CHARS),
-            occurrence.policy.hint_suffix(occurrence.class),
+            occurrence.block.hint_suffix(),
         ),
     )
     .with_severity(Severity::Information)
@@ -3998,8 +3998,7 @@ mod tests {
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
                 range: name_range,
-                class: HostClass::CloudMetadata,
-                policy: crate::net_policy::BlockingPolicy::Floor,
+                block: crate::net_policy::BlockedHost::floor(HostClass::CloudMetadata).unwrap(),
                 raw_value: raw_value.to_string(),
                 declaration_key: declaration_key.to_string(),
             }],
@@ -4048,13 +4047,12 @@ mod tests {
 
     #[test]
     fn test_blocked_registry_diagnostic_names_allowlist_only_when_it_can_help() {
-        use crate::net_policy::{BlockingPolicy, HostClass, WorkspaceRegistryAccess};
+        use crate::net_policy::{BlockedHost, HostClass, WorkspaceRegistryAccess};
 
-        let mentions_allowlist = |class, policy| {
+        let mentions_allowlist = |block| {
             build_blocked_registry_diagnostic(&BlockedRegistryOccurrence {
                 range: Range::new(Position::new(0, 0), Position::new(0, 1)),
-                class,
-                policy,
+                block,
                 raw_value: "https://10.0.0.1/index".to_string(),
                 declaration_key: "top-level".to_string(),
             })
@@ -4065,19 +4063,17 @@ mod tests {
             WorkspaceRegistryAccess::PublicOnly,
             WorkspaceRegistryAccess::All,
         ] {
-            let policy = BlockingPolicy::WorkspaceRegistries(level);
             assert!(
-                mentions_allowlist(HostClass::PrivateV4, policy),
+                mentions_allowlist(BlockedHost::new(HostClass::PrivateV4, level)),
                 "{level:?}"
             );
         }
-        assert!(!mentions_allowlist(
+        assert!(!mentions_allowlist(BlockedHost::new(
             HostClass::PrivateV4,
-            BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::Off)
-        ));
+            WorkspaceRegistryAccess::Off
+        )));
         assert!(!mentions_allowlist(
-            HostClass::CloudMetadata,
-            BlockingPolicy::Floor
+            BlockedHost::floor(HostClass::CloudMetadata).unwrap()
         ));
     }
 
@@ -4339,15 +4335,13 @@ mod tests {
                 // block, referenced by two dependencies. Must collapse to one diagnostic.
                 BlockedRegistryOccurrence {
                     range: first_range,
-                    class: HostClass::CloudMetadata,
-                    policy: crate::net_policy::BlockingPolicy::Floor,
+                    block: crate::net_policy::BlockedHost::floor(HostClass::CloudMetadata).unwrap(),
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
                 },
                 BlockedRegistryOccurrence {
                     range: second_range,
-                    class: HostClass::CloudMetadata,
-                    policy: crate::net_policy::BlockingPolicy::Floor,
+                    block: crate::net_policy::BlockedHost::floor(HostClass::CloudMetadata).unwrap(),
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
                 },
@@ -4355,8 +4349,7 @@ mod tests {
                 // same (class, raw_value) — must NOT be swallowed by the dedup above.
                 BlockedRegistryOccurrence {
                     range: third_range,
-                    class: HostClass::CloudMetadata,
-                    policy: crate::net_policy::BlockingPolicy::Floor,
+                    block: crate::net_policy::BlockedHost::floor(HostClass::CloudMetadata).unwrap(),
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "scope:@myorg".to_string(),
                 },
@@ -4488,15 +4481,13 @@ mod tests {
             blocked: vec![
                 BlockedRegistryOccurrence {
                     range: first_range,
-                    class: HostClass::CloudMetadata,
-                    policy: crate::net_policy::BlockingPolicy::Floor,
+                    block: crate::net_policy::BlockedHost::floor(HostClass::CloudMetadata).unwrap(),
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
                 },
                 BlockedRegistryOccurrence {
                     range: second_range,
-                    class: HostClass::CloudMetadata,
-                    policy: crate::net_policy::BlockingPolicy::Floor,
+                    block: crate::net_policy::BlockedHost::floor(HostClass::CloudMetadata).unwrap(),
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
                 },
@@ -4529,7 +4520,7 @@ mod tests {
         assert!(!related[0].message().contains("glpat-AAAABBBBCCCCDDDD"));
     }
 
-    /// #944 S2/M3 regression: `push_collapsed_blocked_registries` caps individually-named
+    /// #944 S2/M3 regression: `push_collapsed_registry_diagnostics` caps individually-named
     /// `related_information` siblings at [`MAX_BLOCKED_REGISTRY_RELATED_INFO`] (9) and folds
     /// everything beyond that into one trailing "and K more..." entry, instead of an unbounded
     /// fan-out. 12 dependencies sharing one declaration key -> 1 anchor + 11 siblings -> 9
@@ -4584,8 +4575,7 @@ mod tests {
             .iter()
             .map(|&range| BlockedRegistryOccurrence {
                 range,
-                class: HostClass::CloudMetadata,
-                policy: crate::net_policy::BlockingPolicy::Floor,
+                block: crate::net_policy::BlockedHost::floor(HostClass::CloudMetadata).unwrap(),
                 raw_value: "https://169.254.169.254/index".to_string(),
                 declaration_key: "top-level".to_string(),
             })
@@ -4717,8 +4707,10 @@ mod tests {
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
                 range: name_range,
-                class: HostClass::InternalName,
-                policy: crate::net_policy::BlockingPolicy::Floor,
+                block: crate::net_policy::BlockedHost::new(
+                    HostClass::InternalName,
+                    crate::net_policy::WorkspaceRegistryAccess::PublicOnly,
+                ),
                 raw_value: long_alias.clone(),
                 declaration_key: long_alias.clone(),
             }],
@@ -6025,7 +6017,7 @@ mod tests {
     /// Issue #1392 (critic M5): 10+ skipped dependencies must collapse into one notice
     /// with `related_information` capped at `MAX_BLOCKED_REGISTRY_RELATED_INFO` (9) named
     /// entries plus a trailing "+N more" entry, mirroring
-    /// `push_collapsed_blocked_registries`'s own cap.
+    /// `push_collapsed_registry_diagnostics`'s own cap.
     #[test]
     fn test_generate_diagnostics_from_cache_skip_reason_notice_caps_related_information() {
         use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};

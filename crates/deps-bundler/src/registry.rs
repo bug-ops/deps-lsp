@@ -50,7 +50,7 @@ pub struct RubyGemsRegistry {
     cache: Arc<HttpCache>,
     /// API base URL — `RUBYGEMS_API_BASE` (borrowed, keeping [`Self::new`] a `const fn`) in
     /// production, overridden to an owned mockito server URL in tests via
-    /// [`Self::with_base_for_test`] (mirrors `deps-npm`'s
+    /// `Self::with_base_for_test` (mirrors `deps-npm`'s
     /// `NpmRegistry::with_public_base_for_test`, #1038).
     api_base: Cow<'static, str>,
 }

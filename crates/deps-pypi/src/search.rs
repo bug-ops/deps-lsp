@@ -25,6 +25,7 @@ use std::borrow::Cow;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
+use deps_core::net_policy::TrustedPrefix;
 use deps_core::{BodyLimit, DepsError, HttpCache, RequestHeader, Result};
 use serde::Deserialize;
 
@@ -40,7 +41,13 @@ pub(crate) const SIMPLE_INDEX_URL: &str = "https://pypi.org/simple/";
 /// `reqwest`'s default up-to-10-hop policy. Only constrains *redirects*, not the
 /// initial request — `index_url` itself is always [`SIMPLE_INDEX_URL`] in
 /// production (or a test's own mock server URL), never user-controlled.
-const PYPI_TRUSTED_ORIGIN: &str = "https://pypi.org/";
+static PYPI_TRUSTED_ORIGIN: std::sync::LazyLock<TrustedPrefix> = std::sync::LazyLock::new(|| {
+    #[expect(
+        clippy::expect_used,
+        reason = "fixed, hardcoded URL literal that always parses"
+    )]
+    TrustedPrefix::parse("https://pypi.org/").expect("PyPI origin literal is a valid URL")
+});
 
 /// Upper bound on the index response body. Roughly 2x the ~43 MB decompressed size
 /// observed live (2026-08-31), bounded well under [`deps_core::cache::BodyLimit`]'s
@@ -135,8 +142,7 @@ fn backoff_for(attempts: u32) -> Duration {
 pub(crate) struct PackageIndex {
     /// Every entry's normalized name, concatenated in sorted order.
     blob: String,
-    /// `n + 1` byte offsets into `blob`; entry `i` spans `blob[offsets[i]..offsets[i
-    /// + 1]]`.
+    /// `n + 1` byte offsets into `blob`; entry `i` spans `blob[offsets[i]..offsets[i + 1]]`.
     offsets: Vec<u32>,
 }
 
@@ -364,7 +370,7 @@ async fn fetch_and_parse_index(cache: &HttpCache, index_url: &str) -> Option<Pac
             index_url,
             &[RequestHeader::Accept(SIMPLE_API_ACCEPT)],
             SIMPLE_INDEX_MAX_BYTES,
-            PYPI_TRUSTED_ORIGIN,
+            &PYPI_TRUSTED_ORIGIN,
         )
         .await
     {
@@ -897,7 +903,7 @@ mod tests {
                 SIMPLE_INDEX_URL,
                 &[RequestHeader::Accept(SIMPLE_API_ACCEPT)],
                 SIMPLE_INDEX_MAX_BYTES,
-                PYPI_TRUSTED_ORIGIN,
+                &PYPI_TRUSTED_ORIGIN,
             )
             .await
             .expect("live fetch of the real PyPI simple index");

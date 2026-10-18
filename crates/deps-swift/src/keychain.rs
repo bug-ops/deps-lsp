@@ -546,7 +546,7 @@ impl KeychainStore {
     ///
     /// Returns memoized outcomes immediately and otherwise joins (or starts) the server's
     /// single-flight lookup. Dropping the returned future abandons only the wait, never the
-    /// lookup. A `generation` older than the store's yields [`Err(KeychainError::Transient)`].
+    /// lookup. A `generation` older than the store's yields `Err(KeychainError::Transient)`.
     pub(crate) async fn resolve(
         self: &Arc<Self>,
         server: &KeychainServer,

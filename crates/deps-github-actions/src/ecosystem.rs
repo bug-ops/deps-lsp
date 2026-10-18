@@ -32,7 +32,7 @@ use lsp::{
 };
 
 /// Whether `gha_dep`'s ref is diagnosable as a tag — either because
-/// [`crate::parser::classify_uses_value`] already classified it as [`PinStyle::Tag`] from
+/// `crate::parser::classify_uses_value` already classified it as [`PinStyle::Tag`] from
 /// its text shape, or because `tag_index`'s live `/tags` fetch confirms the ref is a
 /// literal member of the repository's tag list even though it doesn't *look*
 /// tag-shaped (issue #551, e.g. `taiki-e/install-action@cargo-deny`).

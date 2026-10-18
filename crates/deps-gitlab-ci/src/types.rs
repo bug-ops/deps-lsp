@@ -99,10 +99,8 @@ pub enum HostRef {
         /// placeholder would name a string that appears nowhere in the user's file or
         /// config).
         raw: String,
-        /// The blocked host's classification.
-        class: deps_core::net_policy::HostClass,
-        /// The rule that refused the host.
-        policy: deps_core::net_policy::BlockingPolicy,
+        /// The blocked host: its classification and the rule that refused it.
+        block: deps_core::net_policy::BlockedHost,
         /// Stable declaration id for [`deps_core::BlockedRegistryOccurrence::declaration_key`]
         /// grouping (#967 S3): `"gitlab_instance_host"` for the instance-setting-relative
         /// path — shared by every dependency resolving through that one setting, so they
@@ -130,14 +128,12 @@ impl std::fmt::Debug for HostRef {
                 .finish(),
             Self::PolicyBlocked {
                 raw,
-                class,
-                policy,
+                block,
                 declaration_key,
             } => f
                 .debug_struct("PolicyBlocked")
                 .field("raw", &deps_core::net_policy::redact_declaration_key(raw))
-                .field("class", class)
-                .field("policy", policy)
+                .field("block", block)
                 .field(
                     "declaration_key",
                     &deps_core::net_policy::redact_declaration_key(declaration_key),
@@ -507,8 +503,10 @@ mod tests {
         2,
         HostRef::PolicyBlocked {
             raw: deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string(),
-            class: deps_core::net_policy::HostClass::Loopback,
-            policy: deps_core::net_policy::BlockingPolicy::Floor,
+            block: deps_core::net_policy::BlockedHost::floor(
+                deps_core::net_policy::HostClass::Loopback
+            )
+            .unwrap(),
             declaration_key: deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string(),
         },
     );

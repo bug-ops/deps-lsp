@@ -205,16 +205,26 @@ mod tests {
 
     #[test]
     fn large_disjoint_flood_stays_fast() {
-        let mut spans = MatchedSpans::default();
-        let start = std::time::Instant::now();
-        for i in 0..300_000 {
-            spans.insert(i * 2..i * 2 + 1);
-        }
-        for i in 0..300_000 {
-            assert!(spans.contains(&(i * 2..i * 2 + 1)));
-            assert!(!spans.contains(&(i * 2 + 1..i * 2 + 2)));
-        }
-        assert!(start.elapsed() < std::time::Duration::from_secs(20));
+        use crate::test_util::scaling::{ExpectedGrowth, assert_scaling};
+
+        let spans = assert_scaling(
+            "disjoint span flood",
+            // `MatchedSpans` is a `BTreeMap`: n log n, healthy ratio about 13 at this size.
+            ExpectedGrowth::Linearithmic,
+            300_000,
+            |count| count,
+            |&count| {
+                let mut spans = MatchedSpans::default();
+                for i in 0..count {
+                    spans.insert(i * 2..i * 2 + 1);
+                }
+                for i in 0..count {
+                    assert!(spans.contains(&(i * 2..i * 2 + 1)));
+                    assert!(!spans.contains(&(i * 2 + 1..i * 2 + 2)));
+                }
+                spans
+            },
+        );
         assert_eq!(spans.ends_by_start.len(), 300_000);
     }
 }

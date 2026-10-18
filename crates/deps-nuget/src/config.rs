@@ -756,14 +756,13 @@ impl NuGetConfig {
                 .iter()
                 .find_map(|key| {
                     let entry = resolve_mapping_source_key(key, &self.sources)?;
-                    let (BlockedHost { class, policy }, raw_value) = entry
+                    let (block, raw_value) = entry
                         .value
                         .as_ref()
                         .err()
                         .and_then(InvalidEntry::blocked_host)?;
                     Some(BlockedSourceClass {
-                        class,
-                        policy,
+                        block,
                         raw_value,
                         declaration_key: format!("source:{}", entry.key),
                     })
@@ -789,14 +788,13 @@ impl NuGetConfig {
         self.sources
             .iter()
             .filter_map(|entry| {
-                let (BlockedHost { class, policy }, raw_value) = entry
+                let (block, raw_value) = entry
                     .value
                     .as_ref()
                     .err()
                     .and_then(InvalidEntry::blocked_host)?;
                 Some(BlockedSourceClass {
-                    class,
-                    policy,
+                    block,
                     raw_value,
                     declaration_key: format!("source:{}", entry.key),
                 })
@@ -898,7 +896,7 @@ impl NuGetConfig {
     /// Mapping-branch-only fallback for [`Self::rejected_reason_for`] (issue #1504): recovers a
     /// reason for exactly the two [`NuGetFeedUrlError`] variants
     /// [`InvalidEntry::rejection_reason`] classifies as
-    /// [`RejectionOutcome::IntentionallySilent`](deps_core::net_policy::RejectionOutcome::IntentionallySilent)
+    /// [`RejectionOutcome::IntentionallySilent`]
     /// — see [`Self::rejected_reason_for`]'s own doc for why that silence does not apply when
     /// no key in the mapped group resolves to a usable hop. `None` for every other reason,
     /// since those already surface (or are deliberately excluded, for the blocked-host case)
@@ -2264,7 +2262,7 @@ fn expand_env_vars(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::net_policy::{BlockingPolicy, HostClass, WorkspaceRegistryAccess};
+    use deps_core::net_policy::{HostClass, WorkspaceRegistryAccess};
     use std::assert_matches;
 
     fn all_policy() -> RegistryAccessPolicy {
@@ -3028,7 +3026,7 @@ mod tests {
             config.blocked_class_for(&pkg("Any.Package")),
             "blocked entry must be reported",
         );
-        assert_eq!(occurrence.class, HostClass::CloudMetadata);
+        assert_eq!(occurrence.block.class(), HostClass::CloudMetadata);
         assert_eq!(
             occurrence.raw_value,
             "https://169.254.169.254/v3/index.json"
@@ -3069,7 +3067,7 @@ mod tests {
             config.blocked_class_for(&pkg("Any.Package")),
             "blocked entry must still be reported even though resolution fell back to Registry",
         );
-        assert_eq!(occurrence.class, HostClass::CloudMetadata);
+        assert_eq!(occurrence.block.class(), HostClass::CloudMetadata);
         assert_eq!(
             occurrence.raw_value,
             "https://169.254.169.254/v3/index.json"
@@ -3551,8 +3549,7 @@ mod tests {
         );
         assert_eq!(
             NuGetFeedUrlError::Url(IndexUrlError::BlockedHost {
-                class: HostClass::Loopback,
-                policy: BlockingPolicy::Floor,
+                block: deps_core::net_policy::BlockedHost::floor(HostClass::Loopback).unwrap(),
             })
             .rejection_reason(),
             RejectionOutcome::HandledByBlockedHostPath,
@@ -3703,7 +3700,7 @@ mod tests {
             "the Blocked key must still be reported even though another key in the same match \
              group is valid",
         );
-        assert_eq!(occurrence.class, HostClass::CloudMetadata);
+        assert_eq!(occurrence.block.class(), HostClass::CloudMetadata);
         assert_eq!(
             occurrence.raw_value,
             "https://169.254.169.254/v3/index.json"
@@ -3746,7 +3743,7 @@ mod tests {
             config.blocked_class_for(&pkg("MyCompany.Internal")),
             "blocked mapped source must be reported",
         );
-        assert_eq!(occurrence.class, HostClass::CloudMetadata);
+        assert_eq!(occurrence.block.class(), HostClass::CloudMetadata);
         assert_eq!(
             occurrence.raw_value,
             "https://169.254.169.254/v3/index.json"
@@ -3834,7 +3831,7 @@ mod tests {
             config.blocked_class_for(&pkg("Any.Package")),
             "the Blocked source must still be reported even though another source is valid",
         );
-        assert_eq!(occurrence.class, HostClass::CloudMetadata);
+        assert_eq!(occurrence.block.class(), HostClass::CloudMetadata);
         assert_eq!(
             occurrence.raw_value,
             "https://169.254.169.254/v3/index.json"
@@ -3876,7 +3873,7 @@ mod tests {
             "the Blocked source must be reported even though an earlier, differently invalid \
              source (Disabled) precedes it in declaration order",
         );
-        assert_eq!(occurrence.class, HostClass::CloudMetadata);
+        assert_eq!(occurrence.block.class(), HostClass::CloudMetadata);
         assert_eq!(
             occurrence.raw_value,
             "https://169.254.169.254/v3/index.json"
@@ -3912,9 +3909,9 @@ mod tests {
             "both independently blocked sources must be reported, not just the first"
         );
         assert_eq!(occurrences[0].declaration_key, "source:BlockedA");
-        assert_eq!(occurrences[0].class, HostClass::CloudMetadata);
+        assert_eq!(occurrences[0].block.class(), HostClass::CloudMetadata);
         assert_eq!(occurrences[1].declaration_key, "source:BlockedB");
-        assert_eq!(occurrences[1].class, HostClass::PrivateV4);
+        assert_eq!(occurrences[1].block.class(), HostClass::PrivateV4);
         assert_ne!(
             occurrences[0].declaration_key,
             occurrences[1].declaration_key
@@ -4302,7 +4299,7 @@ mod tests {
             config.blocked_class_for(&pkg("Any.Package")),
             "blocked mapped nuget.org source must be reported",
         );
-        assert_eq!(occurrence.class, HostClass::CloudMetadata);
+        assert_eq!(occurrence.block.class(), HostClass::CloudMetadata);
         assert_eq!(
             occurrence.raw_value,
             "https://169.254.169.254/v3/index.json"

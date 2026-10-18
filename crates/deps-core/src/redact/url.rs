@@ -2133,7 +2133,7 @@ fn mask_token_segments(redacted: &str) -> Cow<'_, str> {
 /// shape alone, from a genuine base64url-encoded token of the same length
 /// (`is_unprefixed_base64url_token`).
 ///
-/// Finally, [`sanitize_invisible`](super::sanitize_invisible) sweeps the redacted result for
+/// Finally, [`sanitize_invisible`] sweeps the redacted result for
 /// control/format characters — a manifest-controlled `raw` (e.g. a schemeless package name
 /// forwarded here via [`RedactedUrl`](super::RedactedUrl)) can carry a raw `\n`, `\r`, or ESC
 /// byte that survives every redaction pass above unchanged, since none of them are credential
@@ -2203,7 +2203,7 @@ pub(super) fn url_for_tracing_with_parsed(raw: &str, parsed: Option<url::Url>) -
 /// Parses `raw` as a URL, returning the parsed [`url::Url`] when it has an actual authority
 /// (`host()` is `Some`) — `None` otherwise, whether `raw` failed to parse at all or parsed with
 /// no host. Returning the parsed value rather than a plain `bool` lets a caller (e.g.
-/// [`redact_declaration_key`]) reuse this same parse for its own follow-up redaction call instead
+/// `redact_declaration_key`) reuse this same parse for its own follow-up redaction call instead
 /// of parsing `raw` a second time (#1317).
 ///
 /// This is not proof [`redact_userinfo`] takes any *particular* internal branch for `raw` — a
@@ -2222,7 +2222,7 @@ pub(super) fn url_for_tracing_with_parsed(raw: &str, parsed: Option<url::Url>) -
 /// they were never designed for: those scans treat any `word:word@`/`word:@` shape as a
 /// possible credential (#810's `key:value` carve-out), which would mangle an opaque label like
 /// `"scope:@myorg"` (`"***@myorg"`) or `"source:Blocked"` (`"source:***"`) into a false-positive
-/// redaction (#981). Kept `pub(super)`, not `pub`: [`redact_declaration_key`] (in the sibling
+/// redaction (#981). Kept `pub(super)`, not `pub`: `redact_declaration_key` (in the sibling
 /// `super::key` module) is the only remaining caller outside this module's own tests, and this
 /// predicate alone (without also checking for credential shape) is not a safe redaction gate on
 /// its own — see that function's doc for why.
