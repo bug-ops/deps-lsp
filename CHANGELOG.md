@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
+- **deps-core, deps-engine, deps-lsp, deps-cli**: `CacheConfig.fetch_timeout_secs: u64` becomes `fetch_timeout: FetchTimeout` (1-300 s) and `max_concurrent_fetches: usize` becomes `FetchConcurrency` (1-100), both in `policy_config`; `with_fetch_timeout_secs` is `with_fetch_timeout`, and `fetch_latest_versions_parallel`, `prefetch_tier3_licenses`, `fetch_tier3_licenses` and `plan_security_updates` take the newtypes; the config JSON is unchanged (#1839)
+- **deps-core**: `TagIndex::tag_to_sha` is private, read it with the new `TagIndex::sha_for_tag` and build an index with `TagIndex::from_tags` (#1839)
 - **deps-core**: `lsp_helpers::await_interactive_fetch` takes a required `AuxiliaryLookup` (new, `Decoration` or `PinResolution`) and bounds the await by its own 5 s budget; version lists use `await_interactive_versions` (#1845)
 - **deps-core and ecosystem crates**: a blocked host's class and policy travel as one `net_policy::BlockedHost` in the blocked-host errors and occurrences; `BlockingPolicy::for_block`/`hint_suffix`/`describe` move onto it (#1826, #1842)
 - **deps-core**: removed the unused `SystemProxy::current` and `RegistryEnvironment::proxy` (#1827, #1842)

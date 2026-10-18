@@ -186,7 +186,7 @@ mod tests {
             .get(&refreshed)
             .map(|entry| Arc::clone(&entry))
             .unwrap();
-        assert_eq!(current.tag_to_sha.get("v1"), Some(&sha('b')));
+        assert_eq!(current.sha_for_tag("v1"), Some(&sha('b')));
     }
 
     #[test]

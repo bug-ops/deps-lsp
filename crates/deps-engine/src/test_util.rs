@@ -133,6 +133,7 @@ impl ParseResult for StubParseResult {
 /// # Examples
 ///
 /// ```
+/// use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
 /// use deps_core::{ConcreteVersion, PackageName};
 /// use deps_engine::classify::license::fetch_tier3_licenses;
 /// use deps_engine::test_util::TestTier3Ecosystem;
@@ -142,7 +143,13 @@ impl ParseResult for StubParseResult {
 ///     let ecosystem = TestTier3Ecosystem::returning(vec!["MIT".to_string()]);
 ///     let targets = vec![(PackageName::new("pkg"), ConcreteVersion::from("1.0.0"))];
 ///
-///     let result = fetch_tier3_licenses(&ecosystem, targets, 10, 4).await;
+///     let result = fetch_tier3_licenses(
+///         &ecosystem,
+///         targets,
+///         FetchTimeout::try_from_secs(10).unwrap(),
+///         FetchConcurrency::try_new(4).unwrap(),
+///     )
+///     .await;
 ///
 ///     assert_eq!(
 ///         result.licenses.get(&PackageName::new("pkg")),

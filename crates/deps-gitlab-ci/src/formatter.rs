@@ -84,8 +84,7 @@ impl GitlabCiFormatter {
     /// use std::sync::Arc;
     ///
     /// let tag_index = Arc::new(DashMap::new());
-    /// let mut index = TagIndex::default();
-    /// index.tag_to_sha.insert("v1.0.0".to_string(), CommitSha::parse(&"a".repeat(40)).unwrap());
+    /// let index = TagIndex::from_tags([("v1.0.0", &CommitSha::parse(&"a".repeat(40)).unwrap())]);
     /// tag_index.insert(
     ///     (EndpointKind::Tags, PackageName::new("gitlab.com/org/proj")),
     ///     Arc::new(index),
@@ -129,7 +128,7 @@ impl GitlabCiFormatter {
     ) -> Option<CommitSha> {
         self.tag_index
             .get(&(endpoint, name.clone()))
-            .and_then(|index| index.tag_to_sha.get(tag).cloned())
+            .and_then(|index| index.sha_for_tag(tag).cloned())
     }
 
     /// The index's spelling of release `version` and its commit, tolerating a `v` prefix

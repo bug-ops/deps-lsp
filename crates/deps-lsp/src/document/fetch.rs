@@ -14,6 +14,8 @@ use crate::progress::RegistryProgress;
 use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::PackageName;
+use deps_core::policy_config::FetchConcurrency;
+use deps_core::policy_config::FetchTimeout;
 use deps_engine::classify::diff::{
     merge_deprecations_after_fetch, merge_no_comparable_versions_after_fetch,
 };
@@ -72,8 +74,8 @@ pub(crate) async fn fetch_registry_versions_for_change(
     resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
     deps_to_fetch: Vec<PackageName>,
     freshness_settings: deps_core::FreshnessSettings,
-    fetch_timeout_secs: u64,
-    max_concurrent_fetches: usize,
+    fetch_timeout: FetchTimeout,
+    max_concurrent_fetches: FetchConcurrency,
     refetch: RefetchPolicy,
 ) -> (
     Option<RegistryProgress>,
@@ -173,7 +175,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
         &in_use,
         progress_sender,
         freshness_settings,
-        fetch_timeout_secs,
+        fetch_timeout,
         max_concurrent_fetches,
         &selection_context,
         // See `lifecycle.rs`'s identical call site — deps-lsp's own GOSSIP surfacing (spec
@@ -383,8 +385,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            5,
-            10,
+            FetchTimeout::constant::<5>(),
+            FetchConcurrency::constant::<10>(),
             &deps_core::SelectionContext::none(),
             None,
         )
@@ -615,8 +617,8 @@ dependencies = ["requests>=2.0.0"]
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                FetchTimeout::constant::<5>(),
+                FetchConcurrency::constant::<10>(),
                 &deps_core::SelectionContext::none(),
                 None,
             )

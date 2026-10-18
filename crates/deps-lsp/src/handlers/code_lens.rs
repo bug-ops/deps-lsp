@@ -493,6 +493,8 @@ mod tests {
     ))]
     mod cross_ecosystem_tests {
         use super::*;
+        #[cfg(feature = "github-actions")]
+        use crate::test_utils::test_helpers::seed_gha_tag_index;
         use std::collections::HashMap;
         // Only `apply_single_edit` (below) names `TextEdit` directly; gradle-only skips it.
         #[cfg(any(
@@ -990,40 +992,6 @@ let package = Package(
 
                 assert_guard_skips(ecosystem.as_ref(), &uri, content, cached).await;
             }
-        }
-
-        /// Seeds `ecosystem`'s shared `TagIndex` for `name` with one `tag -> sha` entry,
-        /// downcasting through `Ecosystem::registry()`/`Registry::as_any()` — this test
-        /// module never drives a live registry fetch (`collect_update_all_edits` is pure
-        /// over `parse_result`/`content`/cached `VersionData`), so the index has to be
-        /// seeded directly for the SHA-pin `format_version_replacing_for` branch to have
-        /// anything to resolve.
-        #[cfg(feature = "github-actions")]
-        fn seed_gha_tag_index(
-            ecosystem: &dyn deps_core::Ecosystem,
-            name: &str,
-            tag: &str,
-            sha: &str,
-        ) {
-            let registry = ecosystem.registry();
-            let gha_registry = registry
-                .as_any()
-                .downcast_ref::<deps_github_actions::GithubActionsRegistry>()
-                .expect("github-actions ecosystem must back onto a GithubActionsRegistry");
-            let mut index = deps_core::lsp_helpers::TagIndex::default();
-            let commit_sha = deps_core::lsp_helpers::CommitSha::parse(sha)
-                .expect("test fixture must pass a valid 40-hex SHA");
-            index.tag_to_sha.insert(tag.to_string(), commit_sha.clone());
-            index.insert_sha_pin(
-                commit_sha,
-                deps_core::lsp_helpers::ResolvedPin::most_specific(
-                    deps_core::ConcreteVersion::new(tag),
-                ),
-            );
-            gha_registry.tag_index().insert(
-                deps_core::PackageName::new(name),
-                std::sync::Arc::new(index),
-            );
         }
 
         #[cfg(feature = "github-actions")]

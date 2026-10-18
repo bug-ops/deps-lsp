@@ -619,7 +619,7 @@ async fn run_update(
             &ctx.osv,
             &args.package,
             &ignore_rules,
-            ctx.policy.cache.fetch_timeout_secs,
+            ctx.policy.cache.fetch_timeout,
         )
         .await
     } else {

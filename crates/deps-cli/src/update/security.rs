@@ -2,6 +2,7 @@
 //! native-form yank filter, and the three-outcome classification (#1120, spec 068 FR-008
 //! through FR-015).
 
+use deps_core::policy_config::FetchTimeout;
 use std::time::Duration;
 
 use deps_core::Ecosystem;
@@ -47,6 +48,7 @@ const OSV_CHECK_TIMEOUT_CEILING_SECS: u64 = 30;
 /// use deps_cli::update::ignore::IgnoreRules;
 /// use deps_cli::update::security::plan_security_updates;
 /// use deps_core::osv::OsvClient;
+/// use deps_core::policy_config::FetchTimeout;
 /// use deps_core::{EcosystemId, HttpCache};
 /// use deps_engine::test_util::TestTier3Ecosystem;
 /// use std::collections::{HashMap, HashSet};
@@ -86,7 +88,7 @@ const OSV_CHECK_TIMEOUT_CEILING_SECS: u64 = 30;
 ///     &osv,
 ///     &[],
 ///     &IgnoreRules::empty(),
-///     30,
+///     FetchTimeout::try_from_secs(30).unwrap(),
 /// )
 /// .await;
 ///
@@ -99,7 +101,7 @@ pub async fn plan_security_updates(
     osv: &OsvClient,
     package_filter: &[String],
     ignore_rules: &IgnoreRules,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
 ) -> UpdatePlan {
     let formatter = ecosystem.formatter();
     let ecosystem_id = analysis.ecosystem_id;
@@ -179,7 +181,8 @@ pub async fn plan_security_updates(
         }
     }
     if !live_check_candidates.is_empty() {
-        let timeout = Duration::from_secs(fetch_timeout_secs.min(OSV_CHECK_TIMEOUT_CEILING_SECS));
+        let timeout =
+            Duration::from_secs(fetch_timeout.as_secs().min(OSV_CHECK_TIMEOUT_CEILING_SECS));
         let statuses = osv
             .check_candidates(ecosystem_id, &live_check_candidates, timeout)
             .await;

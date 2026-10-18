@@ -18,6 +18,7 @@ use deps_core::Registry;
 use deps_core::RemovalStatus;
 use deps_core::Version;
 use deps_core::VersionReq;
+use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -435,9 +436,9 @@ impl FetchResult {
 ///   name in the manifest, checked against the fetched version list for
 ///   yank status
 /// * `progress` - Optional progress tracker (will be updated after each fetch)
-/// * `timeout_secs` - Timeout for each individual package fetch (default: 10s)
-/// * `max_concurrent` - Maximum concurrent fetches (default: 20); clamped to `>= 1`
-///   internally, since `buffer_unordered(0)` would hang forever (issue #833)
+/// * `fetch_timeout` - Timeout for each individual package fetch (default: 5s)
+/// * `max_concurrent` - Maximum concurrent fetches (default: 20); a [`FetchConcurrency`] cannot
+///   be `0`, which would make `buffer_unordered` hang forever (issue #833)
 ///
 /// # Timeout Behavior
 ///
@@ -456,6 +457,7 @@ impl FetchResult {
 ///
 /// ```
 /// use deps_core::parser::DependencySource;
+/// use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
 /// use deps_core::{
 ///     ConcreteVersion, Metadata, PackageName, Registry, SelectionContext, Version, VersionReq,
 /// };
@@ -526,8 +528,8 @@ impl FetchResult {
 ///         &HashMap::new(),
 ///         None,
 ///         deps_core::freshness::FreshnessSettings::default(),
-///         5,
-///         10,
+///         FetchTimeout::try_from_secs(5).unwrap(),
+///         FetchConcurrency::try_new(10).unwrap(),
 ///         &SelectionContext::none(),
 ///         None,
 ///     )
@@ -551,16 +553,15 @@ pub async fn fetch_latest_versions_parallel(
     in_use: &HashMap<PackageName, Vec<ConcreteVersion>>,
     progress_sender: Option<ProgressSender>,
     freshness: deps_core::freshness::FreshnessSettings,
-    timeout_secs: u64,
-    max_concurrent: usize,
+    fetch_timeout: FetchTimeout,
+    max_concurrent: FetchConcurrency,
     selection_context: &deps_core::SelectionContext,
     gossip: Option<&HashMap<PackageName, deps_core::GossipFindings>>,
 ) -> FetchResult {
     use futures::stream::{self, StreamExt};
-    use std::time::Duration;
 
     let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let timeout = Duration::from_secs(timeout_secs);
+    let timeout = fetch_timeout.as_duration();
     let wildcard_req = deps_core::VersionReq::new("*");
     let check_yanked = registry.reports_yanked();
 
@@ -589,10 +590,7 @@ pub async fn fetch_latest_versions_parallel(
                 .await
             }
         })
-        // `.max(1)`: defence-in-depth against a direct-field-assignment caller bypassing
-        // `with_max_concurrent_fetches`'s clamp with `0` — `buffer_unordered(0)` never
-        // polls its source stream, hanging every fetch through this document forever (#833).
-        .buffer_unordered(max_concurrent.max(1))
+        .buffer_unordered(max_concurrent.get())
         .collect()
         .await;
 
@@ -1527,6 +1525,14 @@ pub fn apply_fetch_outcomes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn secs(seconds: u64) -> FetchTimeout {
+        FetchTimeout::try_from_secs(seconds).expect("test timeout inside the accepted range")
+    }
+
+    fn conc(count: usize) -> FetchConcurrency {
+        FetchConcurrency::try_new(count).expect("test concurrency inside the accepted range")
+    }
     use deps_core::SelectionContext;
     use deps_core::parser::DependencySource;
 
@@ -1874,8 +1880,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            1,
-            10,
+            secs(1),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -1956,8 +1962,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            1,
-            10,
+            secs(1),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -2058,8 +2064,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            5,
-            20,
+            secs(5),
+            conc(20),
             &SelectionContext::none(),
             None,
         )
@@ -2071,42 +2077,6 @@ mod tests {
             max <= 22,
             "Concurrency limit violated: {} concurrent requests (limit: 20)",
             max
-        );
-    }
-
-    /// Regression test for issue #833: `buffer_unordered(0)` never polls its source
-    /// stream and returns `Pending` forever, so a `max_concurrent` of `0` reaching this
-    /// call previously hung the fetch indefinitely instead of completing or erroring.
-    /// Wrapped in a short outer timeout so a regression fails fast instead of hanging
-    /// the test suite.
-    #[tokio::test]
-    async fn test_fetch_latest_versions_parallel_zero_max_concurrent_still_completes() {
-        use deps_core::Registry;
-        let registry: Arc<dyn Registry> = Arc::new(deps_core::test_util::MockRegistry::new());
-        let packages = vec![PackageName::new("some-package")];
-
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            fetch_latest_versions_parallel(
-                registry,
-                with_registry_source(packages),
-                &HashMap::new(),
-                None,
-                deps_core::freshness::FreshnessSettings::default(),
-                5,
-                0,
-                &SelectionContext::none(),
-                None,
-            ),
-        )
-        .await
-        .expect("fetch with max_concurrent=0 must not hang forever");
-
-        assert!(
-            result
-                .no_comparable_versions
-                .contains(&PackageName::new("some-package")),
-            "fetch must still run to completion when max_concurrent is 0"
         );
     }
 
@@ -2208,8 +2178,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            1,
-            10,
+            secs(1),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -2261,8 +2231,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            10,
-            10,
+            secs(10),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -2321,8 +2291,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            10,
-            10,
+            secs(10),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -2421,8 +2391,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            10,
-            10,
+            secs(10),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -2526,8 +2496,8 @@ mod tests {
             &HashMap::new(),
             None,
             FreshnessSettings::default(),
-            10,
-            10,
+            secs(10),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -2623,8 +2593,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            10,
-            10,
+            secs(10),
+            conc(10),
             &SelectionContext::with_minimum_stability(StabilityFloor::Beta),
             None,
         )
@@ -2714,8 +2684,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            10,
-            10,
+            secs(10),
+            conc(10),
             &SelectionContext::with_minimum_stability(StabilityFloor::Beta),
             None,
         )
@@ -2801,8 +2771,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            5,
-            10,
+            secs(5),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -2881,8 +2851,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            5,
-            10,
+            secs(5),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -2997,8 +2967,8 @@ mod tests {
                     &HashMap::new(),
                     None,
                     deps_core::freshness::FreshnessSettings::default(),
-                    5,
-                    10,
+                    secs(5),
+                    conc(10),
                     &SelectionContext::none(),
                     None,
                 )
@@ -3092,8 +3062,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            5,
-            10,
+            secs(5),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -3128,8 +3098,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            5,
-            10,
+            secs(5),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -3216,8 +3186,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            5,
-            10,
+            secs(5),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -3297,8 +3267,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            5,
-            10,
+            secs(5),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -3374,8 +3344,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            1,
-            10,
+            secs(1),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -3458,8 +3428,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            5,
-            10,
+            secs(5),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -3540,8 +3510,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            5,
-            10,
+            secs(5),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -3621,8 +3591,8 @@ mod tests {
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
-            1,
-            10,
+            secs(1),
+            conc(10),
             &SelectionContext::none(),
             None,
         )
@@ -3826,8 +3796,8 @@ mod tests {
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -3858,8 +3828,8 @@ mod tests {
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -3885,8 +3855,8 @@ mod tests {
                 &HashMap::new(),
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -3923,8 +3893,8 @@ mod tests {
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -3961,8 +3931,8 @@ mod tests {
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -3999,8 +3969,8 @@ mod tests {
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -4039,8 +4009,8 @@ mod tests {
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -4138,8 +4108,8 @@ mod tests {
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -4196,8 +4166,8 @@ mod tests {
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -4231,8 +4201,8 @@ mod tests {
                 &HashMap::new(),
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -4266,8 +4236,8 @@ mod tests {
                 &HashMap::new(),
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -4315,8 +4285,8 @@ mod tests {
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -4348,8 +4318,8 @@ mod tests {
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                1,
-                10,
+                secs(1),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -4459,8 +4429,8 @@ mod tests {
                 &HashMap::new(),
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -4485,8 +4455,8 @@ mod tests {
                 &HashMap::new(),
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -4659,8 +4629,8 @@ mod tests {
                 &in_use_map,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 Some(&gossip),
             )
@@ -5076,8 +5046,8 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::Enabled {
                     cooldown: deps_core::CooldownWindow::from_secs(cooldown_secs),
                 },
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 None,
             )
@@ -5630,8 +5600,8 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::Enabled {
                     cooldown: deps_core::CooldownWindow::from_secs(cooldown_secs),
                 },
-                5,
-                10,
+                secs(5),
+                conc(10),
                 &SelectionContext::none(),
                 Some(&gossip),
             )

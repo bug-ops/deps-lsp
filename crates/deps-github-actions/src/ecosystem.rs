@@ -57,7 +57,7 @@ fn is_registry_confirmed_tag(
             .is_some_and(|ref_text| {
                 tag_index
                     .get(&gha_dep.name)
-                    .is_some_and(|index| index.tag_to_sha.contains_key(ref_text))
+                    .is_some_and(|index| index.sha_for_tag(ref_text).is_some())
             }),
         Some(PinStyle::Sha { .. }) | None => false,
     }
@@ -943,19 +943,20 @@ mod tests {
              \x20 - uses: taiki-e/install-action@v2\n";
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
 
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "cargo-deny".to_string(),
-            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-        );
-        index.tag_to_sha.insert(
-            "nextest".to_string(),
-            deps_core::lsp_helpers::CommitSha::parse(&"b".repeat(40)).unwrap(),
-        );
-        index.tag_to_sha.insert(
-            "v2".to_string(),
-            deps_core::lsp_helpers::CommitSha::parse(&"c".repeat(40)).unwrap(),
-        );
+        let index = TagIndex::from_tags([
+            (
+                "cargo-deny",
+                &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            ),
+            (
+                "nextest",
+                &deps_core::lsp_helpers::CommitSha::parse(&"b".repeat(40)).unwrap(),
+            ),
+            (
+                "v2",
+                &deps_core::lsp_helpers::CommitSha::parse(&"c".repeat(40)).unwrap(),
+            ),
+        ]);
         eco.formatter.tag_index.insert(
             deps_core::PackageName::new("taiki-e/install-action"),
             Arc::new(index),
@@ -1070,11 +1071,10 @@ mod tests {
         let eco = GithubActionsEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "v4".to_string(),
-            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-        );
+        let index = TagIndex::from_tags([(
+            "v4",
+            &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+        )]);
         eco.formatter.tag_index.insert(
             deps_core::PackageName::new("actions/checkout"),
             Arc::new(index),
@@ -1443,11 +1443,10 @@ mod tests {
             let formatter = GithubActionsFormatter {
                 tag_index: Arc::new(dashmap::DashMap::new()),
             };
-            let mut index = TagIndex::default();
-            index.tag_to_sha.insert(
-                "v4".to_string(),
-                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-            );
+            let index = TagIndex::from_tags([(
+                "v4",
+                &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            )]);
             formatter.tag_index.insert(
                 deps_core::PackageName::new("actions/checkout"),
                 Arc::new(index),
@@ -1486,11 +1485,10 @@ mod tests {
             let formatter = GithubActionsFormatter {
                 tag_index: Arc::new(dashmap::DashMap::new()),
             };
-            let mut index = TagIndex::default();
-            index.tag_to_sha.insert(
-                "v4".to_string(),
-                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-            );
+            let index = TagIndex::from_tags([(
+                "v4",
+                &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            )]);
             formatter.tag_index.insert(
                 deps_core::PackageName::new("actions/checkout"),
                 Arc::new(index),
@@ -1535,11 +1533,10 @@ mod tests {
             let formatter = GithubActionsFormatter {
                 tag_index: Arc::new(dashmap::DashMap::new()),
             };
-            let mut index = TagIndex::default();
-            index.tag_to_sha.insert(
-                "main".to_string(),
-                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-            );
+            let index = TagIndex::from_tags([(
+                "main",
+                &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            )]);
             formatter.tag_index.insert(
                 deps_core::PackageName::new("some-org/some-action"),
                 Arc::new(index),
@@ -1567,11 +1564,10 @@ mod tests {
             let formatter = GithubActionsFormatter {
                 tag_index: Arc::new(dashmap::DashMap::new()),
             };
-            let mut index = TagIndex::default();
-            index.tag_to_sha.insert(
-                "v4".to_string(),
-                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-            );
+            let index = TagIndex::from_tags([(
+                "v4",
+                &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            )]);
             formatter.tag_index.insert(
                 deps_core::PackageName::new("actions/checkout"),
                 Arc::new(index),
@@ -1604,11 +1600,10 @@ mod tests {
             let formatter = GithubActionsFormatter {
                 tag_index: Arc::new(dashmap::DashMap::new()),
             };
-            let mut index = TagIndex::default();
-            index.tag_to_sha.insert(
-                "v4".to_string(),
-                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-            );
+            let index = TagIndex::from_tags([(
+                "v4",
+                &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            )]);
             formatter.tag_index.insert(
                 deps_core::PackageName::new("actions/checkout"),
                 Arc::new(index),
@@ -1690,11 +1685,10 @@ mod tests {
             let content = "steps:\n  - uses: actions/checkout@v4\n";
             let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
 
-            let mut index = TagIndex::default();
-            index.tag_to_sha.insert(
-                "v4".to_string(),
-                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-            );
+            let index = TagIndex::from_tags([(
+                "v4",
+                &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            )]);
             eco.formatter.tag_index.insert(
                 deps_core::PackageName::new("actions/checkout"),
                 Arc::new(index),
@@ -1958,11 +1952,10 @@ mod tests {
             let content = "steps:\n  - uses: \"actions/checkout@v4\"\n";
             let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
 
-            let mut index = TagIndex::default();
-            index.tag_to_sha.insert(
-                "v4".to_string(),
-                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-            );
+            let index = TagIndex::from_tags([(
+                "v4",
+                &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            )]);
             eco.formatter.tag_index.insert(
                 deps_core::PackageName::new("actions/checkout"),
                 Arc::new(index),
@@ -2012,11 +2005,10 @@ mod tests {
                 .unwrap();
             assert!(!gha_dep.is_last_on_line);
 
-            let mut index = TagIndex::default();
-            index.tag_to_sha.insert(
-                "v4".to_string(),
-                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-            );
+            let index = TagIndex::from_tags([(
+                "v4",
+                &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            )]);
             eco.formatter.tag_index.insert(
                 deps_core::PackageName::new("actions/checkout"),
                 Arc::new(index),
@@ -2147,11 +2139,10 @@ mod tests {
         // --- issue #633/#640: bulk "Pin all to SHA" collector + lens ---
 
         fn seed_tag(eco: &GithubActionsEcosystem, name: &str, tag: &str, sha: &str) {
-            let mut index = TagIndex::default();
-            index.tag_to_sha.insert(
-                tag.to_string(),
-                deps_core::lsp_helpers::CommitSha::parse(sha).unwrap(),
-            );
+            let index = TagIndex::from_tags([(
+                tag,
+                &deps_core::lsp_helpers::CommitSha::parse(sha).unwrap(),
+            )]);
             eco.formatter
                 .tag_index
                 .insert(deps_core::PackageName::new(name), Arc::new(index));
@@ -2223,18 +2214,17 @@ mod tests {
             let cache = Arc::new(deps_core::HttpCache::new());
             let eco = GithubActionsEcosystem::new(cache);
             let sha = "a".repeat(40);
-            let mut index = TagIndex::default();
+            // `latest` must be a known tag so `format_version_replacing_for` produces a real
+            // replacement, or a tag miss falls back to the unchanged literal and drops the edit.
+            let mut index = TagIndex::from_tags([(
+                "v4.3.1",
+                &deps_core::lsp_helpers::CommitSha::parse(&"b".repeat(40)).unwrap(),
+            )]);
             index.insert_sha_pin(
                 deps_core::lsp_helpers::CommitSha::parse(&sha).unwrap(),
                 deps_core::lsp_helpers::ResolvedPin::most_specific(
                     deps_core::ConcreteVersion::new("v4.0.0"),
                 ),
-            );
-            // Needed so `format_version_replacing_for` produces a real replacement for `latest`,
-            // or a `tag_to_sha` miss falls back to the unchanged literal and drops the edit.
-            index.tag_to_sha.insert(
-                "v4.3.1".to_string(),
-                deps_core::lsp_helpers::CommitSha::parse(&"b".repeat(40)).unwrap(),
             );
             eco.formatter.tag_index.insert(
                 deps_core::PackageName::new("actions/checkout"),

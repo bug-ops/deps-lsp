@@ -332,7 +332,7 @@ pub(super) fn bulk_sha_pin_text_edit_for(
 /// `releases_to_versions` already drops any release with no valid SHA before it ever
 /// reaches `versions.cached`); it guards a *lifetime* mismatch between two caches populated
 /// at different times: `TagIndex` is capacity-bounded and evictable, while `versions.cached`
-/// is not, so a `tag_to_sha` miss for a release still present in `versions.cached` is a live
+/// is not, so a `sha_for_tag` miss for a release still present in `versions.cached` is a live
 /// possibility, not a hypothetical one. Dropping such an entry would silently shift what
 /// `Latest`/`Partial` resolves to onto a *different* release — and since
 /// `resolve_component_pin`'s `max_by` returns the **last** maximum on a tie (two releases
@@ -363,7 +363,7 @@ pub(super) fn reconstitute_component_releases(
             .map(|version| {
                 let sha = tag_index
                     .as_ref()
-                    .and_then(|index| index.tag_to_sha.get(version.as_str()).cloned());
+                    .and_then(|index| index.sha_for_tag(version.as_str()).cloned());
                 let prerelease =
                     semver::Version::parse(deps_core::github::normalize_tag(version.as_str()))
                         .is_ok_and(|parsed| !parsed.pre.is_empty());

@@ -671,7 +671,7 @@ impl Backend {
                                         &rescan_uri,
                                         &state,
                                         &ecosystem_impl,
-                                        snapshot.fetch_timeout_secs,
+                                        snapshot.fetch_timeout,
                                     )
                                     .await;
                                 }
@@ -682,7 +682,7 @@ impl Backend {
                                         license_uri,
                                         license_state,
                                         license_ecosystem,
-                                        snapshot.fetch_timeout_secs,
+                                        snapshot.fetch_timeout,
                                     )
                                     .await;
                                 }
@@ -1058,7 +1058,7 @@ impl LanguageServer for Backend {
         // `Clone`).
         let effects = ConfigSideEffects::from_config(&config, self.state.private_registries());
         // Issue #1437 M1: read *before* the flag is overwritten below, so the enable
-        // transition can be detected. `fetch_timeout_secs` bounds the trigger's own
+        // transition can be detected. `fetch_timeout` bounds the trigger's own
         // pre-fetch spawn (an internal tuning value, read once here like every other
         // background task's timeout); the *republish* that follows a successful pre-fetch
         // re-reads `self.config` live instead (impl-critic M1) — by the time
@@ -1067,11 +1067,11 @@ impl LanguageServer for Backend {
         // needs no separate snapshot here.
         let typosquat_checks = effects.typosquat_checks;
         let was_typosquat_checks = self.state.typosquat_checks();
-        let typosquat_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
+        let typosquat_trigger_fetch_timeout = config.policy.cache.fetch_timeout;
         // Issue #1456, spec 072: same rationale, for GOSSIP's opt-in flag.
         let gossip_checks = effects.gossip_checks;
         let was_gossip_checks = self.state.gossip_checks();
-        let gossip_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
+        let gossip_trigger_fetch_timeout = config.policy.cache.fetch_timeout;
         // Issue #1517 critique S5: same rationale, for the OSV latest-check's effective
         // (`vulnerabilities_enabled && !offline`) state — neither flag alone is a
         // parse-affecting change (`config::reparse_scope`), so without this trigger an
@@ -1079,11 +1079,11 @@ impl LanguageServer for Backend {
         // the toggle until its next edit or reopen.
         let osv_checks = effects.osv_checks;
         let was_osv_checks = self.state.osv_checks();
-        let osv_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
+        let osv_trigger_fetch_timeout = config.policy.cache.fetch_timeout;
         // Issue #1831: tier-3 license pre-fetch is skipped under an empty policy (#1407), so
         // an already-open document needs a catch-up on the empty->non-empty transition.
         let previous_license_policy = self.state.license_policy();
-        let license_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
+        let license_trigger_fetch_timeout = config.policy.cache.fetch_timeout;
 
         // Diff old vs new for parse-affecting changes (#592) under one write-guard
         // acquisition: `DepsConfig` has no `Clone`, so the diff must read the
@@ -1118,7 +1118,7 @@ impl LanguageServer for Backend {
                 &self.state,
                 &self.client,
                 Arc::clone(&self.config),
-                typosquat_trigger_fetch_timeout_secs,
+                typosquat_trigger_fetch_timeout,
             )
             .await;
         }
@@ -1128,7 +1128,7 @@ impl LanguageServer for Backend {
                 &self.state,
                 &self.client,
                 Arc::clone(&self.config),
-                gossip_trigger_fetch_timeout_secs,
+                gossip_trigger_fetch_timeout,
             )
             .await;
         }
@@ -1138,7 +1138,7 @@ impl LanguageServer for Backend {
                 &self.state,
                 &self.client,
                 Arc::clone(&self.config),
-                osv_trigger_fetch_timeout_secs,
+                osv_trigger_fetch_timeout,
             )
             .await;
         }
@@ -1153,7 +1153,7 @@ impl LanguageServer for Backend {
                 &self.state,
                 &self.client,
                 Arc::clone(&self.config),
-                license_trigger_fetch_timeout_secs,
+                license_trigger_fetch_timeout,
             )
             .await;
         }
@@ -1840,6 +1840,8 @@ fn build_batch_workspace_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::policy_config::FetchConcurrency;
+    use deps_core::policy_config::FetchTimeout;
 
     use std::assert_matches;
     use tower_lsp_server::ls_types::Range;
@@ -3046,8 +3048,8 @@ let package = Package(
         let backend = service.inner();
         {
             let mut config = backend.config.write().await;
-            config.policy.cache.fetch_timeout_secs = 5;
-            config.policy.cache.max_concurrent_fetches = 1;
+            config.policy.cache.fetch_timeout = FetchTimeout::constant::<5>();
+            config.policy.cache.max_concurrent_fetches = FetchConcurrency::constant::<1>();
         }
 
         let ecosystem = backend
@@ -5556,8 +5558,8 @@ let package = Package(
     mod pin_all_to_sha_execute_command_tests {
         use super::*;
         use crate::document::DocumentState;
+        use crate::test_utils::test_helpers::seed_gha_tag_index;
         use deps_core::EcosystemId;
-        use std::sync::Arc;
 
         fn command_params(uri: &Uri) -> ExecuteCommandParams {
             ExecuteCommandParams {
@@ -5565,32 +5567,6 @@ let package = Package(
                 arguments: vec![serde_json::json!({ "uri": uri.as_str() })],
                 work_done_progress_params: Default::default(),
             }
-        }
-
-        /// Seeds `ecosystem`'s shared `TagIndex` for `name` with one `tag -> sha` entry —
-        /// same pattern `handlers::code_lens::cross_ecosystem_tests::seed_gha_tag_index`
-        /// uses, downcasting through `Ecosystem::registry()`/`Registry::as_any()` since
-        /// this module never drives a live registry fetch.
-        fn seed_gha_tag_index(
-            ecosystem: &dyn deps_core::Ecosystem,
-            name: &str,
-            tag: &str,
-            sha: &str,
-        ) {
-            let registry = ecosystem.registry();
-            let gha_registry = registry
-                .as_any()
-                .downcast_ref::<deps_github_actions::GithubActionsRegistry>()
-                .expect("github-actions ecosystem must back onto a GithubActionsRegistry");
-            let mut index = deps_core::lsp_helpers::TagIndex::default();
-            index.tag_to_sha.insert(
-                tag.to_string(),
-                deps_core::lsp_helpers::CommitSha::parse(sha)
-                    .expect("test fixture must pass a valid 40-hex SHA"),
-            );
-            gha_registry
-                .tag_index()
-                .insert(deps_core::PackageName::new(name), Arc::new(index));
         }
 
         /// Recomputes the bulk pin-all-to-SHA edit count directly, the same call
@@ -6019,11 +5995,10 @@ let package = Package(
         let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
             .name()
             .clone();
-        let mut index = deps_core::lsp_helpers::TagIndex::default();
-        index.tag_to_sha.insert(
-            "v1.0.0".to_string(),
-            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-        );
+        let index = deps_core::lsp_helpers::TagIndex::from_tags([(
+            "v1.0.0",
+            &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+        )]);
         gitlab_registry
             .tag_index()
             .insert((deps_gitlab_ci::EndpointKind::Tags, name), Arc::new(index));

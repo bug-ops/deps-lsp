@@ -855,7 +855,7 @@ mod tests {
             .get(&(EndpointKind::Tags, name))
             .expect("expected a TagIndex entry despite the tag failing the semver filter");
         assert_eq!(
-            index.tag_to_sha.get("cargo-deny"),
+            index.sha_for_tag("cargo-deny"),
             Some(&CommitSha::parse(&sha).unwrap())
         );
     }
@@ -970,8 +970,8 @@ mod tests {
         );
         // tag_to_sha has no such ambiguity (keyed by the workflow's own literal ref text) —
         // both names must still resolve to the shared SHA.
-        assert_eq!(index.tag_to_sha.get("v1"), Some(&expected_sha));
-        assert_eq!(index.tag_to_sha.get("v1.0.0"), Some(&expected_sha));
+        assert_eq!(index.sha_for_tag("v1"), Some(&expected_sha));
+        assert_eq!(index.sha_for_tag("v1.0.0"), Some(&expected_sha));
     }
 
     // --- validation finding S2: TagIndex must not collide across (endpoint, name) ---
@@ -1038,11 +1038,11 @@ mod tests {
             .get(&(EndpointKind::Releases, name))
             .expect("expected a Releases-endpoint TagIndex entry");
         assert_eq!(
-            project_index.tag_to_sha.get("v1.0.0"),
+            project_index.sha_for_tag("v1.0.0"),
             Some(&CommitSha::parse(&project_sha).unwrap())
         );
         assert_eq!(
-            component_index.tag_to_sha.get("v1.0.0"),
+            component_index.sha_for_tag("v1.0.0"),
             Some(&CommitSha::parse(&component_sha).unwrap())
         );
     }

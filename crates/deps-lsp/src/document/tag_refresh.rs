@@ -33,7 +33,7 @@ use crate::handlers::diagnostics::{self, DiagnosticsSnapshot};
 const COALESCE_WINDOW: Duration = Duration::from_millis(250);
 
 /// Upper bound on documents rescanned at once, so one slow OSV phase A (up to
-/// `fetch_timeout_secs`) cannot stall the others.
+/// `fetch_timeout`) cannot stall the others.
 const RESCAN_CONCURRENCY: usize = 4;
 
 /// Which repositories' tag indexes were refreshed within one coalescing window.
@@ -234,7 +234,7 @@ async fn run_listener(
                         &state,
                         &client,
                         &ecosystem,
-                        snapshot.fetch_timeout_secs,
+                        snapshot.fetch_timeout,
                     ),
                     async {
                         let dep_count = diagnostics::document_dependency_count(&state, &uri);
@@ -399,6 +399,7 @@ mod lifecycle_tests {
 #[cfg(test)]
 #[cfg(feature = "github-actions")]
 mod tests {
+    use deps_core::policy_config::FetchTimeout;
     use std::assert_matches;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -877,7 +878,7 @@ mod tests {
             uri.clone(),
             Arc::clone(state),
             Arc::clone(ecosystem),
-            5,
+            FetchTimeout::constant::<5>(),
         )
         .await?;
         crate::document::osv_scan::run_osv_phase_b_and_commit(
@@ -885,7 +886,7 @@ mod tests {
             state,
             ecosystem.ecosystem_id(),
             ecosystem.formatter(),
-            5,
+            FetchTimeout::constant::<5>(),
             phase_a,
         )
         .await;

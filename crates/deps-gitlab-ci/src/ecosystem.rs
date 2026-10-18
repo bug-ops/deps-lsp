@@ -77,7 +77,7 @@ fn is_registry_confirmed_tag(gl_dep: &GitlabCiDependency, formatter: &GitlabCiFo
                 formatter
                     .tag_index
                     .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()))
-                    .is_some_and(|index| index.tag_to_sha.contains_key(ref_text))
+                    .is_some_and(|index| index.sha_for_tag(ref_text).is_some())
             }),
         Some(PinStyle::Sha { .. } | PinStyle::Latest | PinStyle::Partial) | None => false,
     }
@@ -2084,11 +2084,8 @@ mod tests {
                     .unwrap();
 
             let formatter = test_formatter();
-            let mut index = TagIndex::default();
             let sha = "a".repeat(40);
-            index
-                .tag_to_sha
-                .insert("v1.0.0".to_string(), CommitSha::parse(&sha).unwrap());
+            let index = TagIndex::from_tags([("v1.0.0", &CommitSha::parse(&sha).unwrap())]);
             formatter.tag_index.insert(
                 (
                     EndpointKind::Tags,
@@ -2158,11 +2155,8 @@ mod tests {
                     .unwrap();
 
             let formatter = test_formatter();
-            let mut index = TagIndex::default();
-            index.tag_to_sha.insert(
-                "main".to_string(),
-                CommitSha::parse(&"a".repeat(40)).unwrap(),
-            );
+            let index =
+                TagIndex::from_tags([("main", &CommitSha::parse(&"a".repeat(40)).unwrap())]);
             formatter.tag_index.insert(
                 (
                     EndpointKind::Tags,
@@ -2198,10 +2192,7 @@ mod tests {
             let formatter = test_formatter();
             let sha1 = "1".repeat(40);
             let sha2 = "2".repeat(40);
-            let mut index1 = TagIndex::default();
-            index1
-                .tag_to_sha
-                .insert("v1.0.0".to_string(), CommitSha::parse(&sha1).unwrap());
+            let index1 = TagIndex::from_tags([("v1.0.0", &CommitSha::parse(&sha1).unwrap())]);
             formatter.tag_index.insert(
                 (
                     EndpointKind::Tags,
@@ -2209,10 +2200,7 @@ mod tests {
                 ),
                 Arc::new(index1),
             );
-            let mut index2 = TagIndex::default();
-            index2
-                .tag_to_sha
-                .insert("v2.0.0".to_string(), CommitSha::parse(&sha2).unwrap());
+            let index2 = TagIndex::from_tags([("v2.0.0", &CommitSha::parse(&sha2).unwrap())]);
             formatter.tag_index.insert(
                 (
                     EndpointKind::Tags,
@@ -2281,11 +2269,8 @@ mod tests {
             let formatter = test_formatter();
             let project_sha = "1".repeat(40);
             let component_sha = "2".repeat(40);
-            let mut project_index = TagIndex::default();
-            project_index.tag_to_sha.insert(
-                "v1.0.0".to_string(),
-                CommitSha::parse(&project_sha).unwrap(),
-            );
+            let project_index =
+                TagIndex::from_tags([("v1.0.0", &CommitSha::parse(&project_sha).unwrap())]);
             formatter.tag_index.insert(
                 (
                     EndpointKind::Tags,
@@ -2293,11 +2278,8 @@ mod tests {
                 ),
                 Arc::new(project_index),
             );
-            let mut component_index = TagIndex::default();
-            component_index.tag_to_sha.insert(
-                "1.0.0".to_string(),
-                CommitSha::parse(&component_sha).unwrap(),
-            );
+            let component_index =
+                TagIndex::from_tags([("1.0.0", &CommitSha::parse(&component_sha).unwrap())]);
             formatter.tag_index.insert(
                 (
                     EndpointKind::Releases,
@@ -2829,18 +2811,12 @@ mod tests {
             let deps = deps_core::ParseResult::dependencies(parse_result.as_ref());
             let sha1 = "1".repeat(40);
             let sha2 = "2".repeat(40);
-            let mut index1 = TagIndex::default();
-            index1
-                .tag_to_sha
-                .insert("v1.0.0".to_string(), CommitSha::parse(&sha1).unwrap());
+            let index1 = TagIndex::from_tags([("v1.0.0", &CommitSha::parse(&sha1).unwrap())]);
             eco.formatter.tag_index.insert(
                 (EndpointKind::Tags, deps[0].name().clone()),
                 Arc::new(index1),
             );
-            let mut index2 = TagIndex::default();
-            index2
-                .tag_to_sha
-                .insert("v2.0.0".to_string(), CommitSha::parse(&sha2).unwrap());
+            let index2 = TagIndex::from_tags([("v2.0.0", &CommitSha::parse(&sha2).unwrap())]);
             eco.formatter.tag_index.insert(
                 (EndpointKind::Tags, deps[1].name().clone()),
                 Arc::new(index2),
@@ -2914,10 +2890,7 @@ mod tests {
                 .clone();
 
             let sha = "a".repeat(40);
-            let mut index = TagIndex::default();
-            index
-                .tag_to_sha
-                .insert("2.0.0".to_string(), CommitSha::parse(&sha).unwrap());
+            let index = TagIndex::from_tags([("2.0.0", &CommitSha::parse(&sha).unwrap())]);
             eco.formatter
                 .tag_index
                 .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
@@ -2945,13 +2918,10 @@ mod tests {
 
             let sha_low = "1".repeat(40);
             let sha_high = "2".repeat(40);
-            let mut index = TagIndex::default();
-            index
-                .tag_to_sha
-                .insert("1.2.0".to_string(), CommitSha::parse(&sha_low).unwrap());
-            index
-                .tag_to_sha
-                .insert("1.2.5".to_string(), CommitSha::parse(&sha_high).unwrap());
+            let index = TagIndex::from_tags([
+                ("1.2.0", &CommitSha::parse(&sha_low).unwrap()),
+                ("1.2.5", &CommitSha::parse(&sha_high).unwrap()),
+            ]);
             eco.formatter
                 .tag_index
                 .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
@@ -2992,11 +2962,8 @@ mod tests {
                 .clone();
 
             // Only "1.0.0" has a TagIndex entry; "2.0.0" (the true winner) does not.
-            let mut index = TagIndex::default();
-            index.tag_to_sha.insert(
-                "1.0.0".to_string(),
-                CommitSha::parse(&"a".repeat(40)).unwrap(),
-            );
+            let index =
+                TagIndex::from_tags([("1.0.0", &CommitSha::parse(&"a".repeat(40)).unwrap())]);
             eco.formatter
                 .tag_index
                 .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
@@ -3036,13 +3003,10 @@ mod tests {
 
             let sha_first = "1".repeat(40);
             let sha_last = "2".repeat(40);
-            let mut index = TagIndex::default();
-            index
-                .tag_to_sha
-                .insert("1.2.0".to_string(), CommitSha::parse(&sha_first).unwrap());
-            index
-                .tag_to_sha
-                .insert("v1.2.0".to_string(), CommitSha::parse(&sha_last).unwrap());
+            let index = TagIndex::from_tags([
+                ("1.2.0", &CommitSha::parse(&sha_first).unwrap()),
+                ("v1.2.0", &CommitSha::parse(&sha_last).unwrap()),
+            ]);
             eco.formatter
                 .tag_index
                 .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
@@ -3082,10 +3046,7 @@ mod tests {
                 .name()
                 .clone();
             let sha = "a".repeat(40);
-            let mut index = TagIndex::default();
-            index
-                .tag_to_sha
-                .insert("v1.0.0".to_string(), CommitSha::parse(&sha).unwrap());
+            let index = TagIndex::from_tags([("v1.0.0", &CommitSha::parse(&sha).unwrap())]);
             eco.formatter
                 .tag_index
                 .insert((EndpointKind::Tags, name), Arc::new(index));

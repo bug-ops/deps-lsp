@@ -110,18 +110,16 @@ impl std::fmt::Display for CommitSha {
 /// SHA-pin edit's replacement text and by a hover override to resolve a tag or SHA's
 /// counterpart for display.
 ///
-/// Fields are `pub` (not `pub(crate)`) so a cross-crate integration test that exercises the
-/// shared `deps_core::collect_update_all_edits`/hover machinery — which never itself drives
-/// a live registry fetch — can seed a repository's entry directly.
-///
-/// No constructor beyond [`Default`] and [`Self::from_tags`] is provided: a caller may also
-/// build one via `TagIndex::default()` and populate [`Self::tag_to_sha`] directly and the
-/// SHA -> tag direction via [`Self::insert_sha_pin`].
+/// Both directions are filled together by [`Self::from_tags`], so the two maps cannot disagree
+/// about a tag a registry published. A cross-crate integration test that exercises the shared
+/// `deps_core::collect_update_all_edits`/hover machinery — which never itself drives a live
+/// registry fetch — seeds a repository's entry with [`Self::from_tags`]; [`Self::insert_sha_pin`]
+/// is the explicit seam for a test that must state a SHA's alias classification itself.
 #[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct TagIndex {
     /// Tag/release text (as published) -> the commit SHA it points at.
-    pub tag_to_sha: std::collections::HashMap<String, CommitSha>,
+    tag_to_sha: std::collections::HashMap<String, CommitSha>,
     /// Commit SHA -> the tag/release it corresponds to, classified at insertion time so a
     /// tag can never be read back without knowing whether it is a moving alias.
     sha_to_tag: std::collections::HashMap<CommitSha, ResolvedPin>,
@@ -571,7 +569,7 @@ impl TagIndex {
     /// then anything else; a release beats a pre-release of it, and remaining ties resolve
     /// to the smaller name. The chosen name is stored as [`ResolvedPin::Alias`] when another
     /// name on the same SHA still extends it, else as [`ResolvedPin::MostSpecific`].
-    /// [`Self::tag_to_sha`] has no such ambiguity (keyed by the caller's own literal ref
+    /// The tag -> SHA direction has no such ambiguity (keyed by the caller's own literal ref
     /// text), so it stays a plain first-wins index over `entries`' order.
     ///
     /// # Examples
@@ -584,7 +582,7 @@ impl TagIndex {
     /// // the SHA -> tag map must still prefer the more specific name.
     /// let index = TagIndex::from_tags([("v1", &sha), ("v0.1.0", &sha)]);
     /// assert_eq!(index.tag_for_sha(&sha), Some("v0.1.0"));
-    /// assert_eq!(index.tag_to_sha.get("v1"), Some(&sha));
+    /// assert_eq!(index.sha_for_tag("v1"), Some(&sha));
     /// ```
     #[must_use]
     pub fn from_tags<'a, I>(entries: I) -> Self
@@ -619,6 +617,24 @@ impl TagIndex {
             index.sha_to_tag.insert(sha.clone(), pin);
         }
         index
+    }
+
+    /// The commit SHA the tag or release text `tag` points at, keyed by the literal text as
+    /// published (`v4`, not a normalized spelling).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{CommitSha, TagIndex};
+    ///
+    /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let index = TagIndex::from_tags([("v4", &sha)]);
+    /// assert_eq!(index.sha_for_tag("v4"), Some(&sha));
+    /// assert_eq!(index.sha_for_tag("v5"), None);
+    /// ```
+    #[must_use]
+    pub fn sha_for_tag(&self, tag: &str) -> Option<&CommitSha> {
+        self.tag_to_sha.get(tag)
     }
 
     /// Resolves the exact tag `written` (`v4.8.0`) to a pin whose primary is that tag itself,

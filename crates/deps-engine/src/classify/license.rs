@@ -24,20 +24,21 @@ use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::resolve_in_use_version;
+use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
 use std::collections::HashMap;
 use std::time::Duration;
 
 /// Ceiling on the per-dependency tier-3 license fetch timeout, independent of the caller's
-/// configured `fetch_timeout_secs`: the shared `reqwest` client behind `deps-lsp`'s
+/// configured `fetch_timeout`: the shared `reqwest` client behind `deps-lsp`'s
 /// `HttpCache` already imposes its own client-wide 30s timeout, so a per-call timeout longer
 /// than that would never actually bind.
 const TIER3_LICENSE_PREFETCH_TIMEOUT_CEILING_SECS: u64 = 30;
 
 /// Floor on the per-dependency tier-3 license fetch timeout, independent of the caller's
-/// configured `fetch_timeout_secs` (issue #692 critic M2). `fetch_timeout_secs` is
+/// configured `fetch_timeout` (issue #692 critic M2). `fetch_timeout` is
 /// user-configurable down to a minimum of 1s, but `deps_gradle::license::fetch_license_from`
 /// may perform up to `deps_gradle::license::MAX_POM_FETCHES` **sequential** HTTPS round trips
-/// inside the single timeout this budget bounds — a low `fetch_timeout_secs` would otherwise
+/// inside the single timeout this budget bounds — a low `fetch_timeout` would otherwise
 /// silently starve exactly the parent-chained artifacts (e.g. Guava) issue #692 exists to
 /// resolve. A deliberate accuracy-over-latency tradeoff for every caller, `deps-cli` included
 /// (issue #1133 critic M3): a `deps-cli check --fetch-timeout-secs 1` run against an
@@ -240,6 +241,7 @@ pub fn tier3_license_targets(
 /// # Examples
 ///
 /// ```
+/// use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
 /// use deps_core::{HttpCache, LicensePolicy};
 /// use deps_engine::classify::license::prefetch_tier3_licenses;
 /// use deps_engine::setup::CargoEcosystem;
@@ -261,8 +263,8 @@ pub fn tier3_license_targets(
 ///         &HashMap::new(),
 ///         &HashMap::new(),
 ///         &license_policy,
-///         10,
-///         4,
+///         FetchTimeout::try_from_secs(10).unwrap(),
+///         FetchConcurrency::try_new(4).unwrap(),
 ///     )
 ///     .await;
 ///
@@ -275,8 +277,8 @@ pub async fn prefetch_tier3_licenses(
     resolved_versions: &HashMap<PackageName, ConcreteVersion>,
     resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
     license_policy: &deps_core::LicensePolicy,
-    fetch_timeout_secs: u64,
-    concurrency: usize,
+    fetch_timeout: FetchTimeout,
+    concurrency: FetchConcurrency,
 ) -> TierThreeLicenseFetch {
     if license_policy.is_empty() || !ecosystem.license_source().requires_dedicated_fetch() {
         return TierThreeLicenseFetch::default();
@@ -290,7 +292,7 @@ pub async fn prefetch_tier3_licenses(
         ecosystem.ecosystem_id(),
     );
 
-    fetch_tier3_licenses(ecosystem, targets, fetch_timeout_secs, concurrency).await
+    fetch_tier3_licenses(ecosystem, targets, fetch_timeout, concurrency).await
 }
 
 /// The network-dispatch half of [`prefetch_tier3_licenses`].
@@ -301,12 +303,12 @@ pub async fn prefetch_tier3_licenses(
 /// already-owned target list — mirroring [`crate::classify::osv::build_scan_targets`] (sync,
 /// guard-scoped) versus `OsvClient::scan` (async, called after the guard drops).
 ///
-/// `fetch_timeout_secs` is clamped to `TIER3_LICENSE_PREFETCH_TIMEOUT_FLOOR_SECS..=
+/// `fetch_timeout` is clamped to `TIER3_LICENSE_PREFETCH_TIMEOUT_FLOOR_SECS..=
 /// TIER3_LICENSE_PREFETCH_TIMEOUT_CEILING_SECS` (private constants; see their doc comments in
 /// this module's source) independently of the caller's own timeout semantics.
 ///
-/// `concurrency` (clamped to at least 1, mirroring `fetch_latest_versions_parallel`'s
-/// `buffer_unordered(0)`-hangs-forever defense, issue #833) bounds how many per-dependency
+/// `concurrency` (a [`FetchConcurrency`], never `0`, which would hang `buffer_unordered`,
+/// issue #833) bounds how many per-dependency
 /// fetches run at once — deliberately a caller-supplied parameter, not a hardcoded default
 /// (issue #1133 critic M3): `deps-lsp`'s background pre-fetch and `deps-cli`'s check-gate
 /// call have different latency budgets and no single constant serves both well.
@@ -321,6 +323,7 @@ pub async fn prefetch_tier3_licenses(
 /// # Examples
 ///
 /// ```
+/// use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
 /// use deps_core::{ConcreteVersion, PackageName};
 /// use deps_engine::classify::license::fetch_tier3_licenses;
 /// use deps_engine::test_util::TestTier3Ecosystem;
@@ -330,7 +333,13 @@ pub async fn prefetch_tier3_licenses(
 ///     let ecosystem = TestTier3Ecosystem::returning(vec!["MIT".to_string()]);
 ///     let targets = vec![(PackageName::new("pkg"), ConcreteVersion::from("1.0.0"))];
 ///
-///     let result = fetch_tier3_licenses(&ecosystem, targets, 10, 4).await;
+///     let result = fetch_tier3_licenses(
+///         &ecosystem,
+///         targets,
+///         FetchTimeout::try_from_secs(10).unwrap(),
+///         FetchConcurrency::try_new(4).unwrap(),
+///     )
+///     .await;
 ///
 ///     assert_eq!(
 ///         result.licenses.get(&PackageName::new("pkg")),
@@ -341,8 +350,8 @@ pub async fn prefetch_tier3_licenses(
 pub async fn fetch_tier3_licenses(
     ecosystem: &dyn Ecosystem,
     targets: Vec<(PackageName, ConcreteVersion)>,
-    fetch_timeout_secs: u64,
-    concurrency: usize,
+    fetch_timeout: FetchTimeout,
+    concurrency: FetchConcurrency,
 ) -> TierThreeLicenseFetch {
     use futures::stream::{self, StreamExt};
 
@@ -350,7 +359,7 @@ pub async fn fetch_tier3_licenses(
         return TierThreeLicenseFetch::default();
     }
 
-    let timeout_duration = Duration::from_secs(fetch_timeout_secs.clamp(
+    let timeout_duration = Duration::from_secs(fetch_timeout.as_secs().clamp(
         TIER3_LICENSE_PREFETCH_TIMEOUT_FLOOR_SECS,
         TIER3_LICENSE_PREFETCH_TIMEOUT_CEILING_SECS,
     ));
@@ -374,9 +383,7 @@ pub async fn fetch_tier3_licenses(
             });
             (name, found, timed_out)
         })
-        // `.max(1)`: same defense as `fetch_latest_versions_parallel` (#833) — a caller
-        // passing `0` must not hang this fetch forever.
-        .buffer_unordered(concurrency.max(1))
+        .buffer_unordered(concurrency.get())
         .collect()
         .await;
 
@@ -397,6 +404,14 @@ pub async fn fetch_tier3_licenses(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn secs(seconds: u64) -> FetchTimeout {
+        FetchTimeout::try_from_secs(seconds).expect("test timeout inside the accepted range")
+    }
+
+    fn conc(count: usize) -> FetchConcurrency {
+        FetchConcurrency::try_new(count).expect("test concurrency inside the accepted range")
+    }
     use crate::test_util::TestTier3Ecosystem;
     use deps_core::Dependency;
     use deps_core::VersionReq;
@@ -628,8 +643,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &non_empty_license_policy(),
-            10,
-            4,
+            secs(10),
+            conc(4),
         )
         .await;
 
@@ -656,8 +671,8 @@ mod tests {
             &resolved,
             &HashMap::new(),
             &deps_core::LicensePolicy::default(),
-            10,
-            4,
+            secs(10),
+            conc(4),
         )
         .await;
 
@@ -732,8 +747,8 @@ mod tests {
             &resolved,
             &HashMap::new(),
             &non_empty_license_policy(),
-            10,
-            4,
+            secs(10),
+            conc(4),
         )
         .await;
 
@@ -748,7 +763,7 @@ mod tests {
             ConcreteVersion::from("1.0.0"),
         )];
 
-        let result = fetch_tier3_licenses(&ecosystem, targets, 10, 4).await;
+        let result = fetch_tier3_licenses(&ecosystem, targets, secs(10), conc(4)).await;
 
         assert!(
             result.licenses.is_empty(),
@@ -763,7 +778,7 @@ mod tests {
         let ecosystem = TestTier3Ecosystem::returning(vec!["Apache-2.0".to_string()]);
         let targets = vec![(PackageName::new("pkg"), ConcreteVersion::from("2.0.0"))];
 
-        let result = fetch_tier3_licenses(&ecosystem, targets, 10, 4).await;
+        let result = fetch_tier3_licenses(&ecosystem, targets, secs(10), conc(4)).await;
 
         assert_eq!(
             result.licenses.get(&PackageName::new("pkg")),
@@ -778,7 +793,7 @@ mod tests {
     ///
     /// Uses `start_paused` virtual time (not a real sleep) so this test proves the *clamp*
     /// fired, not just that some timeout eventually did: advancing only 5 virtual seconds for
-    /// a `fetch_timeout_secs` of 1 must **not** yet resolve the future (proving the 1s
+    /// a `fetch_timeout` of 1 must **not** yet resolve the future (proving the 1s
     /// requested timeout was raised to the 10s floor, not used verbatim), while advancing
     /// past 10s does.
     #[tokio::test(start_paused = true)]
@@ -789,7 +804,7 @@ mod tests {
             ConcreteVersion::from("1.0.0"),
         )];
 
-        let mut fut = Box::pin(fetch_tier3_licenses(&ecosystem, targets, 1, 4));
+        let mut fut = Box::pin(fetch_tier3_licenses(&ecosystem, targets, secs(1), conc(4)));
 
         tokio::time::advance(Duration::from_secs(5)).await;
         assert!(
@@ -896,7 +911,7 @@ mod tests {
             })
             .collect();
 
-        fetch_tier3_licenses(&ecosystem, targets, 10, 3).await;
+        fetch_tier3_licenses(&ecosystem, targets, secs(10), conc(3)).await;
 
         assert!(
             max_seen.load(Ordering::SeqCst) <= 3,

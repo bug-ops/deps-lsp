@@ -7,13 +7,14 @@ use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
+use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower_lsp_server::ls_types::Uri;
 
 /// Ceiling on the OSV scan timeout, independent of the configured
-/// `fetch_timeout_secs`: the shared `reqwest` client behind `HttpCache`
+/// `fetch_timeout`: the shared `reqwest` client behind `HttpCache`
 /// already imposes its own client-wide 30s timeout (`cache/`), so a
 /// per-phase timeout longer than that would never actually bind.
 const OSV_SCAN_TIMEOUT_CEILING_SECS: u64 = 30;
@@ -153,7 +154,7 @@ pub(crate) async fn run_osv_scan_phase_a(
     uri: Uri,
     state: Arc<ServerState>,
     ecosystem: Arc<dyn Ecosystem>,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
 ) -> Option<OsvScanResult> {
     let ecosystem_id = ecosystem.ecosystem_id();
 
@@ -177,7 +178,7 @@ pub(crate) async fn run_osv_scan_phase_a(
 
     if !targets.is_empty() {
         let timeout_duration =
-            Duration::from_secs(fetch_timeout_secs.min(OSV_SCAN_TIMEOUT_CEILING_SECS));
+            Duration::from_secs(fetch_timeout.as_secs().min(OSV_SCAN_TIMEOUT_CEILING_SECS));
         let scanned = state
             .osv
             .scan(ecosystem_id, &targets, timeout_duration)
@@ -209,7 +210,7 @@ pub(crate) async fn rescan_after_resolved_version_change(
     uri: &Uri,
     state: &Arc<ServerState>,
     ecosystem: &Arc<dyn Ecosystem>,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
 ) {
     // Issue #1398 critic M2: this is the one OSV rescan that deliberately survives a
     // `did_close` (see `ResolvedGeneration`'s doc) — its caller (`server::handle_lockfile_change`)
@@ -223,7 +224,7 @@ pub(crate) async fn rescan_after_resolved_version_change(
         uri.clone(),
         Arc::clone(state),
         Arc::clone(ecosystem),
-        fetch_timeout_secs,
+        fetch_timeout,
     )
     .await
     else {
@@ -235,7 +236,7 @@ pub(crate) async fn rescan_after_resolved_version_change(
         state,
         ecosystem.ecosystem_id(),
         ecosystem.formatter(),
-        fetch_timeout_secs,
+        fetch_timeout,
         phase_a_result,
     )
     .await;
@@ -283,7 +284,7 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
     state: &Arc<ServerState>,
     client: &tower_lsp_server::Client,
     ecosystem: &Arc<dyn Ecosystem>,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
 ) -> RescanOutcome {
     if !state.osv_checks().is_active()
         || !ecosystem
@@ -307,7 +308,7 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
         uri.clone(),
         Arc::clone(state),
         Arc::clone(ecosystem),
-        fetch_timeout_secs,
+        fetch_timeout,
     )
     .await
     else {
@@ -319,7 +320,7 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
         state,
         ecosystem.ecosystem_id(),
         ecosystem.formatter(),
-        fetch_timeout_secs,
+        fetch_timeout,
         phase_a_result,
     )
     .await;
@@ -390,7 +391,7 @@ pub(crate) async fn run_license_prefetch(
     uri: Uri,
     state: Arc<ServerState>,
     ecosystem: Arc<dyn Ecosystem>,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
 ) {
     if !ecosystem.license_source().requires_dedicated_fetch() || state.license_policy().is_empty() {
         return;
@@ -428,7 +429,7 @@ pub(crate) async fn run_license_prefetch(
     let result = deps_engine::classify::license::fetch_tier3_licenses(
         ecosystem.as_ref(),
         targets,
-        fetch_timeout_secs,
+        fetch_timeout,
         LICENSE_PREFETCH_CONCURRENCY,
     )
     .await;
@@ -459,7 +460,7 @@ pub(crate) async fn run_license_prefetch(
 /// latency pressure to fan out aggressively. `deps-cli`'s check-gate call passes its own,
 /// larger `cache.max_concurrent_fetches` instead (issue #1133 critic M3) — this constant is
 /// `deps-lsp`'s own tuning choice, not a shared default.
-const LICENSE_PREFETCH_CONCURRENCY: usize = 8;
+const LICENSE_PREFETCH_CONCURRENCY: FetchConcurrency = FetchConcurrency::constant::<8>();
 
 /// Phase B: checks whether the version currently recommended as "latest" is itself affected
 /// for **every** dependency with a registry-cached latest (B.1, issue #1517 — previously
@@ -482,7 +483,7 @@ const LICENSE_PREFETCH_CONCURRENCY: usize = 8;
 /// new `DocumentState` is already installed, so an in-flight scan from stale
 /// content could otherwise commit advisories computed against content the
 /// document no longer has. B.1 and B.2 share one `phase_b_deadline` (#462
-/// critic S2/M1) rather than each getting a fresh `fetch_timeout_secs`
+/// critic S2/M1) rather than each getting a fresh `fetch_timeout`
 /// budget: B.2 is a second sequential network round-trip added *before* this
 /// guard, so giving it its own full budget would both double phase B's
 /// worst-case wall-clock time (contradicting NFR-002's singular "existing...
@@ -499,7 +500,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
     state: &Arc<ServerState>,
     ecosystem_id: EcosystemId,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
     mut result: OsvScanResult,
 ) {
     let vulnerable_keys: Vec<deps_core::osv::VulnKey> = result
@@ -509,8 +510,8 @@ pub(crate) async fn run_osv_phase_b_and_commit(
         .map(|(key, _)| key.clone())
         .collect();
 
-    let phase_b_deadline =
-        Instant::now() + Duration::from_secs(fetch_timeout_secs.min(OSV_SCAN_TIMEOUT_CEILING_SECS));
+    let phase_b_deadline = Instant::now()
+        + Duration::from_secs(fetch_timeout.as_secs().min(OSV_SCAN_TIMEOUT_CEILING_SECS));
 
     // B.1 (issue #1517): latest-check targets for every registry dependency with a
     // registry-cached latest, plus explicit structural skips — never only phase A's
@@ -844,6 +845,7 @@ mod tests {
     /// version-list response) should ever reach a network call.
     mod license_prefetch_tests {
         use super::*;
+        use deps_core::policy_config::FetchTimeout;
 
         /// Issue #697: exhaustive per-[`EcosystemId`] table, so a 15th ecosystem or a
         /// 5th [`deps_core::LicenseSource`] variant is a compile error here, mirroring
@@ -909,7 +911,13 @@ mod tests {
             // short-circuit first, `state.get_document(&uri)` inside would return
             // `None` and the function would still just return early, so this also
             // doubles as a "never panics on a missing document" check.
-            run_license_prefetch(uri, Arc::clone(&state), ecosystem, 5).await;
+            run_license_prefetch(
+                uri,
+                Arc::clone(&state),
+                ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             assert_eq!(state.document_count(), 0);
         }
@@ -945,7 +953,13 @@ mod tests {
             );
             state.update_document(uri.clone(), doc_state);
 
-            run_license_prefetch(uri.clone(), Arc::clone(&state), ecosystem, 5).await;
+            run_license_prefetch(
+                uri.clone(),
+                Arc::clone(&state),
+                ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
@@ -989,7 +1003,13 @@ mod tests {
 
             // `ecosystem` itself (not just a clone) is kept alive past this call so it can
             // still probe below on a missing license (#1283 S2).
-            run_license_prefetch(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5).await;
+            run_license_prefetch(
+                uri.clone(),
+                Arc::clone(&state),
+                Arc::clone(&ecosystem),
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             // Scoped so the `DashMap` shard-lock guard `get_document` returns is dropped
             // before the probe below ever awaits (`clippy::await_holding_invalid_type`).
@@ -1054,7 +1074,13 @@ mod tests {
             );
             state.update_document(uri.clone(), doc_state);
 
-            run_license_prefetch(uri.clone(), Arc::clone(&state), ecosystem, 5).await;
+            run_license_prefetch(
+                uri.clone(),
+                Arc::clone(&state),
+                ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
@@ -1105,7 +1131,13 @@ mod tests {
             );
             state.update_document(uri.clone(), doc_state);
 
-            run_license_prefetch(uri.clone(), Arc::clone(&state), ecosystem, 5).await;
+            run_license_prefetch(
+                uri.clone(),
+                Arc::clone(&state),
+                ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             let doc = state.get_document(&uri).unwrap();
             let license = doc
@@ -1150,7 +1182,13 @@ mod tests {
             );
             state.update_document(uri.clone(), doc_state);
 
-            run_license_prefetch(uri.clone(), Arc::clone(&state), ecosystem, 5).await;
+            run_license_prefetch(
+                uri.clone(),
+                Arc::clone(&state),
+                ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
@@ -1186,6 +1224,7 @@ mod tests {
         use deps_core::ecosystem::private::Sealed;
         use deps_core::lsp_helpers::EcosystemFormatter;
         use deps_core::parser::DependencySource;
+        use deps_core::policy_config::FetchTimeout;
         use deps_core::position::{Position, Range};
         use std::any::Any;
         use tokio::sync::Barrier;
@@ -1349,7 +1388,8 @@ mod tests {
                 let state = Arc::clone(&state);
                 let ecosystem = Arc::clone(&ecosystem);
                 tokio::spawn(async move {
-                    run_license_prefetch(uri, state, ecosystem, 5).await;
+                    run_license_prefetch(uri, state, ecosystem, FetchTimeout::constant::<5>())
+                        .await;
                 })
             };
 
@@ -1408,7 +1448,8 @@ mod tests {
                 let state = Arc::clone(&state);
                 let ecosystem = Arc::clone(&ecosystem);
                 tokio::spawn(async move {
-                    run_license_prefetch(uri, state, ecosystem, 5).await;
+                    run_license_prefetch(uri, state, ecosystem, FetchTimeout::constant::<5>())
+                        .await;
                 })
             };
 
@@ -1446,6 +1487,7 @@ mod tests {
         use super::super::super::state::DocumentState;
         use super::*;
         use deps_core::osv::{CandidateStatuses, OsvClient, UpgradeStatus};
+        use deps_core::policy_config::FetchTimeout;
         use std::assert_matches;
 
         /// End to end: a registry-sourced Cargo dependency pinned at a clean version, with a
@@ -1500,17 +1542,21 @@ mod tests {
             )]));
             state.update_document(uri.clone(), doc_state);
 
-            let phase_a_result =
-                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
-                    .await
-                    .expect("a registry dependency must produce a phase-A result");
+            let phase_a_result = run_osv_scan_phase_a(
+                uri.clone(),
+                Arc::clone(&state),
+                Arc::clone(&ecosystem),
+                FetchTimeout::constant::<5>(),
+            )
+            .await
+            .expect("a registry dependency must produce a phase-A result");
 
             run_osv_phase_b_and_commit(
                 &uri,
                 &state,
                 ecosystem.ecosystem_id(),
                 ecosystem.formatter(),
-                5,
+                FetchTimeout::constant::<5>(),
                 phase_a_result,
             )
             .await;
@@ -1564,6 +1610,7 @@ mod tests {
     mod generation_race_tests {
         use super::super::super::state::DocumentState;
         use super::*;
+        use deps_core::policy_config::FetchTimeout;
         use std::assert_matches;
 
         fn git_dep_content() -> &'static str {
@@ -1601,12 +1648,14 @@ mod tests {
 
             // Phase A of some concurrent scan (e.g. a lock-file-triggered rescan) snapshots
             // the document here, capturing the current generation.
-            let phase_a_result =
-                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
-                    .await
-                    .expect(
-                        "git-sourced dependency must still produce a NonRegistrySource skip result",
-                    );
+            let phase_a_result = run_osv_scan_phase_a(
+                uri.clone(),
+                Arc::clone(&state),
+                Arc::clone(&ecosystem),
+                FetchTimeout::constant::<5>(),
+            )
+            .await
+            .expect("git-sourced dependency must still produce a NonRegistrySource skip result");
 
             // An unrelated event (e.g. a debounced edit that touches no dependency, or a
             // lock-file reload for a document whose own dependencies are unaffected) races
@@ -1623,7 +1672,7 @@ mod tests {
                 &state,
                 ecosystem.ecosystem_id(),
                 ecosystem.formatter(),
-                5,
+                FetchTimeout::constant::<5>(),
                 phase_a_result,
             )
             .await;
@@ -1652,12 +1701,14 @@ mod tests {
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let ecosystem = setup(&state, &uri, &url).await;
 
-            let phase_a_result =
-                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
-                    .await
-                    .expect(
-                        "git-sourced dependency must still produce a NonRegistrySource skip result",
-                    );
+            let phase_a_result = run_osv_scan_phase_a(
+                uri.clone(),
+                Arc::clone(&state),
+                Arc::clone(&ecosystem),
+                FetchTimeout::constant::<5>(),
+            )
+            .await
+            .expect("git-sourced dependency must still produce a NonRegistrySource skip result");
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
@@ -1670,7 +1721,7 @@ mod tests {
                 &state,
                 ecosystem.ecosystem_id(),
                 ecosystem.formatter(),
-                5,
+                FetchTimeout::constant::<5>(),
                 phase_a_result,
             )
             .await;
@@ -1711,12 +1762,14 @@ mod tests {
                     state.next_resolved_versions_generation(),
                 );
             }
-            let r1_phase_a =
-                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
-                    .await
-                    .expect(
-                        "git-sourced dependency must still produce a NonRegistrySource skip result",
-                    );
+            let r1_phase_a = run_osv_scan_phase_a(
+                uri.clone(),
+                Arc::clone(&state),
+                Arc::clone(&ecosystem),
+                FetchTimeout::constant::<5>(),
+            )
+            .await
+            .expect("git-sourced dependency must still produce a NonRegistrySource skip result");
 
             // Document closed, then reopened — a brand new `DocumentState` instance for the
             // same URI, resolved at a different version (v2) by a rescan (S2) that already
@@ -1749,7 +1802,7 @@ mod tests {
                 &state,
                 ecosystem.ecosystem_id(),
                 ecosystem.formatter(),
-                5,
+                FetchTimeout::constant::<5>(),
                 r1_phase_a,
             )
             .await;
@@ -1774,6 +1827,7 @@ mod tests {
         use super::*;
         use deps_core::lsp_helpers::{CommitSha, TagIndex};
         use deps_core::osv::OsvClient;
+        use deps_core::policy_config::FetchTimeout;
         use deps_github_actions::{GithubActionsEcosystem, GithubActionsRegistry};
         use std::assert_matches;
 
@@ -1822,16 +1876,20 @@ mod tests {
 
             // Cold: `TagIndex` is empty, exactly as it is before this ecosystem's own tags
             // fetch has ever run.
-            let cold_phase_a =
-                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
-                    .await
-                    .expect("a SHA-pinned step must still produce a phase-A result");
+            let cold_phase_a = run_osv_scan_phase_a(
+                uri.clone(),
+                Arc::clone(&state),
+                Arc::clone(&ecosystem),
+                FetchTimeout::constant::<5>(),
+            )
+            .await
+            .expect("a SHA-pinned step must still produce a phase-A result");
             run_osv_phase_b_and_commit(
                 &uri,
                 &state,
                 ecosystem.ecosystem_id(),
                 ecosystem.formatter(),
-                5,
+                FetchTimeout::constant::<5>(),
                 cold_phase_a,
             )
             .await;
@@ -1871,7 +1929,14 @@ mod tests {
                 .tag_index()
                 .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             let doc = state.get_document(&uri).unwrap();
             assert_matches!(
@@ -1956,7 +2021,14 @@ mod tests {
                 .tag_index()
                 .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             batch.assert_async().await;
             let doc = state.get_document(&uri).unwrap();
@@ -2011,16 +2083,20 @@ mod tests {
                 ),
             );
 
-            let cold_phase_a =
-                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
-                    .await
-                    .expect("a tag-pinned step must produce a phase-A result");
+            let cold_phase_a = run_osv_scan_phase_a(
+                uri.clone(),
+                Arc::clone(&state),
+                Arc::clone(&ecosystem),
+                FetchTimeout::constant::<5>(),
+            )
+            .await
+            .expect("a tag-pinned step must produce a phase-A result");
             run_osv_phase_b_and_commit(
                 &uri,
                 &state,
                 ecosystem.ecosystem_id(),
                 ecosystem.formatter(),
-                5,
+                FetchTimeout::constant::<5>(),
                 cold_phase_a,
             )
             .await;
@@ -2052,7 +2128,14 @@ mod tests {
                 )),
             );
 
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             assert_matches!(
                 state
@@ -2130,16 +2213,20 @@ mod tests {
                 Arc::new(TagIndex::default().with_canonical_repo_name(canonical())),
             );
 
-            let cold_phase_a =
-                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
-                    .await
-                    .expect("a tag-pinned step must produce a phase-A result");
+            let cold_phase_a = run_osv_scan_phase_a(
+                uri.clone(),
+                Arc::clone(&state),
+                Arc::clone(&ecosystem),
+                FetchTimeout::constant::<5>(),
+            )
+            .await
+            .expect("a tag-pinned step must produce a phase-A result");
             run_osv_phase_b_and_commit(
                 &uri,
                 &state,
                 ecosystem.ecosystem_id(),
                 ecosystem.formatter(),
-                5,
+                FetchTimeout::constant::<5>(),
                 cold_phase_a,
             )
             .await;
@@ -2162,7 +2249,14 @@ mod tests {
                         .with_canonical_repo_name(canonical()),
                 ),
             );
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             let doc = state.get_document(&uri).unwrap();
             let Some(deps_core::osv::ScanOutcome::Vulnerable(dv)) =
@@ -2267,16 +2361,20 @@ mod tests {
                 ),
             );
 
-            let phase_a =
-                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
-                    .await
-                    .expect("a SHA-pinned step must still produce a phase-A result");
+            let phase_a = run_osv_scan_phase_a(
+                uri.clone(),
+                Arc::clone(&state),
+                Arc::clone(&ecosystem),
+                FetchTimeout::constant::<5>(),
+            )
+            .await
+            .expect("a SHA-pinned step must still produce a phase-A result");
             run_osv_phase_b_and_commit(
                 &uri,
                 &state,
                 ecosystem.ecosystem_id(),
                 ecosystem.formatter(),
-                5,
+                FetchTimeout::constant::<5>(),
                 phase_a,
             )
             .await;
@@ -2305,7 +2403,14 @@ mod tests {
                         ),
                 ),
             );
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             assert_matches!(
                 state
@@ -2362,7 +2467,14 @@ mod tests {
                     .insert(sentinel.clone(), deps_core::osv::ScanOutcome::Clean);
             }
 
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             assert!(
                 state
@@ -2397,7 +2509,14 @@ mod tests {
                 .vulnerabilities
                 .insert(sentinel.clone(), deps_core::osv::ScanOutcome::Clean);
 
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             assert!(
                 state
@@ -2457,7 +2576,14 @@ mod tests {
                 &[("v4", &new), ("v4.1.0", &old), ("v4.2.0", &new)],
                 canonical,
             );
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
             assert!(planned_version(&state).contains("4.2.0"));
 
             let sentinel = deps_core::test_util::vuln_key("sentinel");
@@ -2468,7 +2594,14 @@ mod tests {
                 .signals
                 .vulnerabilities
                 .insert(sentinel.clone(), deps_core::osv::ScanOutcome::Clean);
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             assert!(
                 state
@@ -2599,7 +2732,14 @@ mod tests {
                 .vulnerabilities
                 .insert(sentinel.clone(), deps_core::osv::ScanOutcome::Clean);
 
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             assert!(
                 state
@@ -2647,7 +2787,14 @@ mod tests {
                 edited.signals = signals;
                 state.update_document(uri.clone(), edited);
 
-                rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+                rescan_osv_if_tag_index_now_warm(
+                    &uri,
+                    &state,
+                    &client,
+                    &ecosystem,
+                    FetchTimeout::constant::<5>(),
+                )
+                .await;
 
                 let doc = state.get_document(&uri).unwrap();
                 assert!(
@@ -2719,16 +2866,20 @@ mod tests {
             uri: &Uri,
             ecosystem: &Arc<dyn Ecosystem>,
         ) {
-            let phase_a =
-                run_osv_scan_phase_a(uri.clone(), Arc::clone(state), Arc::clone(ecosystem), 5)
-                    .await
-                    .expect("a workflow step must produce a phase-A result");
+            let phase_a = run_osv_scan_phase_a(
+                uri.clone(),
+                Arc::clone(state),
+                Arc::clone(ecosystem),
+                FetchTimeout::constant::<5>(),
+            )
+            .await
+            .expect("a workflow step must produce a phase-A result");
             run_osv_phase_b_and_commit(
                 uri,
                 state,
                 ecosystem.ecosystem_id(),
                 ecosystem.formatter(),
-                5,
+                FetchTimeout::constant::<5>(),
                 phase_a,
             )
             .await;
@@ -2827,7 +2978,14 @@ mod tests {
                 canonical,
                 ListCoverage::Truncated,
             );
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             let doc = state.get_document(&uri).unwrap();
             assert_matches!(
@@ -2915,7 +3073,14 @@ mod tests {
                 &[("v4.1.2", &commit)],
                 "https://api.github.com/repos/Azure/setup-kubectl/commits/abc",
             );
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             {
                 let doc = state.get_document(&uri).unwrap();
@@ -2996,7 +3161,14 @@ mod tests {
                 &[("v4.1.2", &commit)],
                 "https://api.github.com/repos/Azure/setup-kubectl/commits/abc",
             );
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             let doc = state.get_document(&uri).unwrap();
             assert_matches!(
@@ -3057,7 +3229,14 @@ mod tests {
                     .insert(sentinel.clone(), deps_core::osv::ScanOutcome::Clean);
             }
 
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             assert!(
                 state
@@ -3110,7 +3289,14 @@ mod tests {
                 &[("v4", &commit), ("v4.2.2", &commit)],
                 "https://api.github.com/repos/actions/checkout/commits/abc",
             );
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             assert_matches!(
                 state
@@ -3148,16 +3334,20 @@ mod tests {
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             state.update_document(uri.clone(), doc_state);
 
-            let phase_a =
-                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
-                    .await
-                    .expect("a caret range with no lock file must still produce a phase-A result");
+            let phase_a = run_osv_scan_phase_a(
+                uri.clone(),
+                Arc::clone(&state),
+                Arc::clone(&ecosystem),
+                FetchTimeout::constant::<5>(),
+            )
+            .await
+            .expect("a caret range with no lock file must still produce a phase-A result");
             run_osv_phase_b_and_commit(
                 &uri,
                 &state,
                 ecosystem.ecosystem_id(),
                 ecosystem.formatter(),
-                5,
+                FetchTimeout::constant::<5>(),
                 phase_a,
             )
             .await;
@@ -3170,7 +3360,14 @@ mod tests {
                 .vulnerabilities
                 .len();
 
-            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+            rescan_osv_if_tag_index_now_warm(
+                &uri,
+                &state,
+                &client,
+                &ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
