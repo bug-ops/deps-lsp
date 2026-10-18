@@ -1396,3 +1396,135 @@ async fn slow_pin_resolutions_open_the_breaker_for_version_lists() {
     assert_degraded(&refused, NoLiveList::Unverified);
     assert_eq!(fixture.calls(), 2);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_truncated_leaders_failure_is_not_adopted_by_a_request_that_joined_it() {
+    let fixture = Fixture::new();
+
+    let ((), promoted, joiner) = tokio::join!(
+        fixture.cancelled_hover("serde", secs(6)),
+        fixture.enriched("serde", Versions::STALL),
+        async {
+            tokio::time::sleep(secs(7)).await;
+            fixture.enriched("serde", Versions::Succeed(secs(1))).await
+        },
+    );
+
+    assert_degraded(&promoted, NoLiveList::Unverified);
+    assert_eq!(
+        live_list(joiner).len(),
+        1,
+        "the joiner follows the truncated leader, then takes over and answers itself"
+    );
+    assert_eq!(fixture.calls(), 3);
+    assert_eq!(fixture.gate.in_flight_len(), 0);
+}
+
+fn breaker_endpoint(index: usize) -> EndpointKey {
+    EndpointKey {
+        ecosystem: EcosystemId::Cargo,
+        manifest: ManifestFingerprint::of(&manifest(&format!("/project-{index}/Cargo.toml"))),
+        source: SourceFingerprint::of(&DependencySource::Registry),
+    }
+}
+
+fn open_endpoint(breaker: &EndpointBreaker, endpoint: &EndpointKey, at: std::time::Instant) {
+    for package in ["a", "b"] {
+        breaker.report(
+            endpoint,
+            &PackageName::new(package),
+            AttemptEvidence::Slow,
+            None,
+            at,
+        );
+    }
+    assert_matches!(breaker.health(endpoint), Some(EndpointHealth::Open { .. }));
+}
+
+#[test]
+fn a_full_breaker_evicts_a_closed_endpoint_before_an_open_one() {
+    let breaker = EndpointBreaker::default();
+    let start = now();
+    let closed = breaker_endpoint(0);
+    breaker.report(
+        &closed,
+        &PackageName::new("a"),
+        AttemptEvidence::Answered,
+        None,
+        start,
+    );
+    for index in 1..BREAKER_CAP {
+        open_endpoint(
+            &breaker,
+            &breaker_endpoint(index),
+            start + Duration::from_millis(index as u64),
+        );
+    }
+    assert_eq!(breaker.len(), BREAKER_CAP);
+
+    let newcomer = breaker_endpoint(BREAKER_CAP);
+    breaker.report(
+        &newcomer,
+        &PackageName::new("a"),
+        AttemptEvidence::Answered,
+        None,
+        start + secs(1),
+    );
+
+    assert_eq!(breaker.len(), BREAKER_CAP);
+    assert_eq!(
+        breaker.health(&closed),
+        None,
+        "the closed endpoint made room"
+    );
+    assert!(breaker.health(&newcomer).is_some());
+    for index in 1..BREAKER_CAP {
+        assert_matches!(
+            breaker.health(&breaker_endpoint(index)),
+            Some(EndpointHealth::Open { .. }),
+            "open endpoint {index} must survive"
+        );
+    }
+}
+
+#[test]
+fn a_breaker_full_of_open_endpoints_does_not_track_a_newcomer() {
+    let breaker = EndpointBreaker::default();
+    let start = now();
+    for index in 0..BREAKER_CAP {
+        open_endpoint(&breaker, &breaker_endpoint(index), start);
+    }
+
+    let newcomer = breaker_endpoint(BREAKER_CAP);
+    breaker.report(
+        &newcomer,
+        &PackageName::new("a"),
+        AttemptEvidence::Answered,
+        None,
+        start + secs(1),
+    );
+
+    assert_eq!(breaker.len(), BREAKER_CAP);
+    assert_eq!(breaker.health(&newcomer), None);
+}
+
+#[test]
+fn an_expired_open_endpoint_is_evicted_to_make_room() {
+    let breaker = EndpointBreaker::default();
+    let start = now();
+    for index in 0..BREAKER_CAP {
+        open_endpoint(&breaker, &breaker_endpoint(index), start);
+    }
+
+    let newcomer = breaker_endpoint(BREAKER_CAP);
+    breaker.report(
+        &newcomer,
+        &PackageName::new("a"),
+        AttemptEvidence::Answered,
+        None,
+        start + BREAKER_OPEN_DURATION,
+    );
+
+    assert_eq!(breaker.len(), 1);
+    assert!(breaker.health(&newcomer).is_some());
+}

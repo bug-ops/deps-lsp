@@ -34,6 +34,7 @@ use std::time::Instant;
 use dashmap::DashMap;
 use tokio::sync::{Semaphore, watch};
 
+pub use self::attempt::InteractiveFetchError;
 use self::attempt::{Attempted, bounded_await_until};
 use self::breaker::EndpointBreaker;
 use self::flight::{FlightKey, FlightResult, ListShape};
@@ -139,7 +140,8 @@ pub enum AuxiliaryLookup {
     PinResolution,
 }
 
-/// Which interactive surface is awaiting, for log fields only.
+/// Which interactive surface is awaiting: a log field, and the switch deciding whether the
+/// endpoint breaker may refuse the request (hover) or only observes it (code action).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchContext {
     /// `textDocument/hover`.
@@ -318,7 +320,7 @@ impl InteractiveFetchGate {
         self.generation.load(Ordering::SeqCst)
     }
 
-    async fn live<T, E>(
+    async fn live<T, E: InteractiveFetchError>(
         &self,
         fetch: impl Future<Output = Result<T, E>>,
         key: &InteractiveFetchKey,
@@ -344,14 +346,18 @@ impl InteractiveFetchGate {
             )
             .await
         {
-            Attempted::Polled(result) => result,
+            Attempted::Polled(result, _) => result,
             Attempted::Refused => InteractiveFetch::Degraded(NoLiveList::Unverified),
         }
     }
 }
 
-/// Awaits `fetch` for hover or a code action, bounded by [`REGISTRY_FETCH_BUDGET`](super::REGISTRY_FETCH_BUDGET) and
-/// short-circuited by the request's [`InteractiveFetchGate`] when it carries one.
+/// Awaits an auxiliary lookup for hover or a code action under the gate.
+///
+/// The await is bounded by `kind`'s budget (5 s for either [`AuxiliaryLookup`]; a version list
+/// gets [`REGISTRY_FETCH_BUDGET`](super::REGISTRY_FETCH_BUDGET) through
+/// [`await_interactive_versions`]) and short-circuited by the request's
+/// [`InteractiveFetchGate`] when it carries one.
 ///
 /// Without a gate, an ecosystem, or while offline this is the plain bounded await (FR-013).
 /// With one, a package whose lookup is known to have failed — recorded by the background
@@ -399,7 +405,7 @@ impl InteractiveFetchGate {
 /// ));
 /// assert!(matches!(result, InteractiveFetch::Live(42)));
 /// ```
-pub async fn await_interactive_fetch<T, E>(
+pub async fn await_interactive_fetch<T, E: InteractiveFetchError>(
     fetch: impl Future<Output = Result<T, E>>,
     request: InteractiveFetchRequest<'_>,
     kind: AuxiliaryLookup,
@@ -490,7 +496,7 @@ pub async fn await_interactive_versions<R: Registry + ?Sized>(
     flight::await_shared(gate, key, fetch, &request, ListShape::of(freshness)).await
 }
 
-async fn plain_bounded_await<T, E>(
+async fn plain_bounded_await<T, E: InteractiveFetchError>(
     fetch: impl Future<Output = Result<T, E>>,
     request: &InteractiveFetchRequest<'_>,
     kind: LookupKind,

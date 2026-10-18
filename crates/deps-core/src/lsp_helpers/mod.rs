@@ -115,8 +115,9 @@ pub use in_use_version::{
 #[cfg(feature = "lsp-responses")]
 pub use inlay_hints::generate_inlay_hints;
 pub use interactive_fetch::{
-    AuxiliaryLookup, FetchContext, InteractiveFetch, InteractiveFetchGate, InteractiveFetchRequest,
-    NoLiveList, SharedVersions, await_interactive_fetch, await_interactive_versions,
+    AuxiliaryLookup, FetchContext, InteractiveFetch, InteractiveFetchError, InteractiveFetchGate,
+    InteractiveFetchRequest, NoLiveList, SharedVersions, await_interactive_fetch,
+    await_interactive_versions,
 };
 #[cfg(feature = "lsp-responses")]
 pub use sha_comment::build_sha_comment_fix_action;

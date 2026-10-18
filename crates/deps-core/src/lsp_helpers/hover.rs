@@ -231,6 +231,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // to `Registry::get_latest_matching`, which some registries (Go's `/@latest`) answer more
     // completely than the list endpoint. Bounded by `HOVER_FALLBACK_TIMEOUT`; any failure,
     // timeout, or `None` degrades gracefully to no `**Latest**` line.
+    // TODO(critic): route get_latest_matching_from through the interactive gate as an AuxiliaryLookup (memo + permit)
     let list_fallback_latest = if available_versions.as_ref().is_some_and(|v| !v.is_empty())
         && live_latest_idx.is_none()
     {

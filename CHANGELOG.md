@@ -116,9 +116,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `cache.rs` split into a `cache/` module tree (transport, auth, guard, redirect, resolver, fetch, store, tests) with unchanged public paths (#1840)
 - **deps-core**: concurrent hover and code-action version-list awaits for one package share a single registry poll through the new `lsp_helpers::await_interactive_versions` and `SharedVersions` (#1843)
 - **deps-core**: an endpoint circuit breaker makes hover skip a registry endpoint for 30 s once two distinct packages were slow, so a dead registry no longer costs every hover a full await (#1844)
-- **deps-nuget, deps-gitlab-ci**: the NuGet unlisted decoration and the GitLab CI component-pin resolution (hover and code action) go through the shared interactive gate, so a dead feed or host no longer costs every request its own 5 s await (#1845)
 
 ### Fixed
+- **deps-nuget, deps-gitlab-ci**: the NuGet unlisted decoration and the GitLab CI component-pin resolution (hover and code action) go through the shared interactive gate, so a dead feed or host no longer costs every request its own 5 s await (#1845)
 - **deps-core, deps-lsp**: hover and code actions answer from the degraded path after a registry lookup failed or timed out, and concurrent live fetches are bounded, so a dead registry no longer stalls every request for 10 s (#1830, #1846)
 - **deps-core, deps-engine, deps-cli**: the advisory fix target skips registry-deprecated versions within the target's compatibility line and never picks a gossip-excluded or cooling-down `latest` (#1832, #1846)
 - **deps-core, deps-gradle, deps-pypi, deps-github-actions, deps-go, deps-bundler**: the remaining wall-clock complexity guards use `assert_scaling`, with contributor guidance in the book (#1838, #1846)

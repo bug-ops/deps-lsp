@@ -20,7 +20,6 @@ use super::key::{BreakerEvidence, EndpointKey};
 use super::memo::INTERACTIVE_FAILURE_TTL;
 use super::{FetchContext, InteractiveFetchGate};
 use crate::PackageName;
-use crate::cache_policy::evict_expired_then_oldest_at;
 
 /// How long an opened breaker refuses requests before letting one probe through.
 pub(super) const BREAKER_OPEN_DURATION: Duration = INTERACTIVE_FAILURE_TTL;
@@ -213,14 +212,8 @@ impl EndpointBreaker {
         probe: Option<ProbeId>,
         now: Instant,
     ) {
-        if !self.endpoints.contains_key(endpoint) {
-            evict_expired_then_oldest_at(
-                &self.endpoints,
-                BREAKER_CAP,
-                now,
-                |state| state.touched,
-                |_| EVIDENCE_TTL,
-            );
+        if !self.endpoints.contains_key(endpoint) && !self.make_room(now) {
+            return;
         }
         match self.endpoints.entry(endpoint.clone()) {
             Entry::Occupied(mut entry) => {
@@ -237,6 +230,30 @@ impl EndpointBreaker {
                 });
             }
         }
+    }
+
+    /// Makes room for one more endpoint, returning whether there is any.
+    ///
+    /// Stale entries go first, then the oldest `Closed` one. An unexpired `Open` or `HalfOpen`
+    /// entry is never evicted: forgetting it would make a dead endpoint cost two more slow
+    /// awaits. When every slot holds one, the new endpoint is simply not tracked, which is the
+    /// same as `Closed` with no evidence.
+    fn make_room(&self, now: Instant) -> bool {
+        if self.endpoints.len() < BREAKER_CAP {
+            return true;
+        }
+        self.endpoints
+            .retain(|_, state| now.saturating_duration_since(state.touched) < EVIDENCE_TTL);
+        if self.endpoints.len() < BREAKER_CAP {
+            return true;
+        }
+        let oldest_closed = self
+            .endpoints
+            .iter()
+            .filter(|entry| matches!(entry.value().health, EndpointHealth::Closed { .. }))
+            .min_by_key(|entry| entry.value().touched)
+            .map(|entry| entry.key().clone());
+        oldest_closed.is_some_and(|key| self.endpoints.remove(&key).is_some())
     }
 
     pub(super) fn forget(&self, endpoint: &EndpointKey) {

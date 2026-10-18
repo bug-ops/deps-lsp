@@ -131,9 +131,41 @@ impl Drop for AttemptGuard<'_> {
     }
 }
 
+/// An error an interactive await may log, exposing only a URL- and credential-free cause.
+///
+/// `Display` and `Debug` of a registry error can embed the raw request URL, so a lookup never
+/// logs them; it logs this coarse classification instead.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::DepsError;
+/// use deps_core::lsp_helpers::InteractiveFetchError;
+///
+/// let error = DepsError::CacheError("poisoned lock".into());
+/// assert_eq!(error.log_cause(), (None, "cache"));
+/// ```
+pub trait InteractiveFetchError {
+    /// The HTTP status when there is one, plus a short stable cause label.
+    fn log_cause(&self) -> (Option<u16>, &'static str);
+}
+
+impl InteractiveFetchError for crate::DepsError {
+    fn log_cause(&self) -> (Option<u16>, &'static str) {
+        self.safe_tracing_summary()
+    }
+}
+
+/// For lookups that carry no error detail.
+impl InteractiveFetchError for () {
+    fn log_cause(&self) -> (Option<u16>, &'static str) {
+        (None, "unspecified")
+    }
+}
+
 /// Awaits `fetch` until `deadline`, mapping an error to [`NoLiveList::Failed`] and an elapse to
 /// [`NoLiveList::Unverified`].
-pub(super) async fn bounded_await_until<T, E>(
+pub(super) async fn bounded_await_until<T, E: InteractiveFetchError>(
     fetch: impl Future<Output = Result<T, E>>,
     deadline: Instant,
     request: &InteractiveFetchRequest<'_>,
@@ -142,10 +174,21 @@ pub(super) async fn bounded_await_until<T, E>(
     let budget = deadline.saturating_duration_since(Instant::now());
     match tokio::time::timeout_at(deadline, fetch).await {
         Ok(Ok(value)) => (InteractiveFetch::Live(value), AttemptEnd::Live),
-        Ok(Err(_)) => (
-            InteractiveFetch::Degraded(NoLiveList::Failed),
-            AttemptEnd::Err,
-        ),
+        Ok(Err(error)) => {
+            let (status, cause) = error.log_cause();
+            tracing::debug!(
+                package = %request.package.for_tracing(),
+                context = request.context.as_str(),
+                lookup = kind.as_str(),
+                ?status,
+                cause,
+                "interactive registry lookup failed"
+            );
+            (
+                InteractiveFetch::Degraded(NoLiveList::Failed),
+                AttemptEnd::Err,
+            )
+        }
         Err(_) => {
             tracing::warn!(
                 package = %request.package.for_tracing(),
@@ -164,7 +207,8 @@ pub(super) async fn bounded_await_until<T, E>(
 
 /// How [`InteractiveFetchGate::attempt`] ended.
 pub(super) enum Attempted<T> {
-    Polled(InteractiveFetch<T>),
+    /// The attempt ran; `budget` says whether a failure of it proves anything.
+    Polled(InteractiveFetch<T>, AttemptBudget),
     /// The endpoint's breaker is open: nothing was polled and nothing was written.
     Refused,
 }
@@ -175,7 +219,7 @@ impl InteractiveFetchGate {
     ///
     /// Only an attempt that began with a [`AttemptBudget::Full`] budget writes a failure; a
     /// truncated one leaves the memo alone. Success records follow the same rules at any budget.
-    pub(super) async fn attempt<T, E>(
+    pub(super) async fn attempt<T, E: InteractiveFetchError>(
         &self,
         fetch: impl Future<Output = Result<T, E>>,
         deadline: Instant,
@@ -230,6 +274,6 @@ impl InteractiveFetchGate {
                 self.memo.remove(key);
             }
         }
-        Attempted::Polled(result)
+        Attempted::Polled(result, budget)
     }
 }

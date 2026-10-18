@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use super::attempt::Attempted;
+use super::attempt::{AttemptBudget, Attempted, InteractiveFetchError};
 use super::key::{InteractiveFetchKey, LookupKind};
 use super::memo::Decision;
 use super::{
@@ -159,7 +159,7 @@ async fn follow(mut receiver: FlightReceiver, deadline: Instant) -> Followed {
 /// Awaits a version list for `request`, sharing one registry poll between concurrent callers.
 ///
 /// `fetch` is polled at most once, and only if this request becomes the leader.
-pub(super) async fn await_shared<E>(
+pub(super) async fn await_shared<E: InteractiveFetchError>(
     gate: &InteractiveFetchGate,
     key: InteractiveFetchKey,
     fetch: impl Future<Output = Result<SharedVersions, E>>,
@@ -211,9 +211,10 @@ pub(super) async fn await_shared<E>(
                         sender.send_replace(Slot::Ready(FlightResult::of(&result)));
                         return result;
                     }
-                    // Dropping the claim unanswered makes each follower take over, and the
-                    // open breaker refuses every hover among them without a poll.
-                    Led::Refused => return InteractiveFetch::Degraded(NoLiveList::Unverified),
+                    // Dropping the claim unanswered makes each follower take over with its
+                    // own deadline: an open breaker refuses every hover among them without a
+                    // poll, and a failure that proved nothing is not theirs to adopt.
+                    Led::Unanswered(result) => return result,
                 }
             }
         }
@@ -223,11 +224,12 @@ pub(super) async fn await_shared<E>(
 /// What a leader ended with.
 enum Led {
     Answered(InteractiveFetch<SharedVersions>),
-    /// The endpoint's breaker refused the poll.
-    Refused,
+    /// The leader's own result is not an answer for followers: the endpoint's breaker refused
+    /// the poll, or the attempt began with too little budget for its failure to mean anything.
+    Unanswered(InteractiveFetch<SharedVersions>),
 }
 
-async fn lead<E>(
+async fn lead<E: InteractiveFetchError>(
     gate: &InteractiveFetchGate,
     fetch: impl Future<Output = Result<SharedVersions, E>>,
     deadline: Instant,
@@ -246,7 +248,7 @@ async fn lead<E>(
     }
     if Instant::now() >= deadline {
         log_skipped(request, "deadline elapsed before the lookup could start");
-        return Led::Answered(InteractiveFetch::Degraded(NoLiveList::Unverified));
+        return Led::Unanswered(InteractiveFetch::Degraded(NoLiveList::Unverified));
     }
     match gate
         .attempt(
@@ -259,7 +261,12 @@ async fn lead<E>(
         )
         .await
     {
-        Attempted::Polled(result) => Led::Answered(result),
-        Attempted::Refused => Led::Refused,
+        Attempted::Polled(result @ InteractiveFetch::Degraded(_), AttemptBudget::Truncated) => {
+            Led::Unanswered(result)
+        }
+        Attempted::Polled(result, AttemptBudget::Full | AttemptBudget::Truncated) => {
+            Led::Answered(result)
+        }
+        Attempted::Refused => Led::Unanswered(InteractiveFetch::Degraded(NoLiveList::Unverified)),
     }
 }

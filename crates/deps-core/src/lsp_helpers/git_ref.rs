@@ -110,11 +110,12 @@ impl std::fmt::Display for CommitSha {
 /// SHA-pin edit's replacement text and by a hover override to resolve a tag or SHA's
 /// counterpart for display.
 ///
-/// Both directions are filled together by [`Self::from_tags`], so the two maps cannot disagree
-/// about a tag a registry published. A cross-crate integration test that exercises the shared
-/// `deps_core::collect_update_all_edits`/hover machinery — which never itself drives a live
-/// registry fetch — seeds a repository's entry with [`Self::from_tags`]; [`Self::insert_sha_pin`]
-/// is the explicit seam for a test that must state a SHA's alias classification itself.
+/// [`Self::from_tags`] fills both directions together, so an index built that way never
+/// disagrees with itself about a published tag. A cross-crate integration test that exercises
+/// the shared `deps_core::collect_update_all_edits`/hover machinery — which never itself drives
+/// a live registry fetch — seeds a repository's entry with it. [`Self::insert_sha_pin`] is the
+/// one explicit override: it writes the SHA -> tag direction alone, for a caller that must
+/// state a SHA's alias classification itself, and so can make the two directions differ.
 #[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct TagIndex {
@@ -2775,6 +2776,19 @@ mod tests {
                 "{written} vs {latest} ({policy:?})"
             );
         }
+    }
+
+    #[test]
+    fn test_sha_for_tag_unknown_tag_is_none_and_lookup_is_exact() {
+        let sha = sha_of('a');
+        let index = TagIndex::from_tags([("v4", &sha)]);
+
+        assert_eq!(index.sha_for_tag("v4"), Some(&sha));
+        assert_eq!(index.sha_for_tag("v5"), None);
+        assert_eq!(index.sha_for_tag("V4"), None, "no case or prefix folding");
+        assert_eq!(index.sha_for_tag("4"), None);
+        assert_eq!(index.sha_for_tag(""), None);
+        assert_eq!(TagIndex::default().sha_for_tag("v4"), None);
     }
 
     #[test]

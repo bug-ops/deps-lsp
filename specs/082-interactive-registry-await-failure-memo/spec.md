@@ -321,6 +321,18 @@ Conceptual only; representation is a plan-phase decision.
 > - A cancel-driven open on a healthy-but-slow endpoint needs two distinct packages cancelled
 >   after half the budget with no answer in 30 s; the user then sees basic cards, as they
 >   effectively did already.
+> - A fast local `Err` counts as an answer for the breaker, including errors that never reached
+>   the endpoint (the GitLab rate-limit gate, an invalid project path, a policy block). On a dead
+>   endpoint such packages refresh `last_answered` and keep the breaker closed for up to 30 s.
+> - On a dead GitLab host the first hover per component still costs a full version-list await
+>   plus a full `PinResolution` await, and so does the first code action, because the two lookup
+>   kinds keep separate failure memos over the same route.
+> - `HalfOpen` carries no age: it is safe only because every probe holder reports (or cancels).
+>   A future path that takes the probe without reporting would refuse hovers to that endpoint
+>   until a code action answers or the entry is evicted.
+> - Hover's `get_latest_matching_from` fallback (`HOVER_FALLBACK_TIMEOUT`) is a third ungated,
+>   permitless 5 s await that runs only after a live list; routing it through the gate as an
+>   auxiliary lookup is a follow-up (`TODO(critic)` in `hover.rs`).
 > - Scope (#1845): the default `generate_hover`/`generate_code_actions` path (FR-012) and the two
 >   ecosystem-specific awaits that used to keep their own ungated 5 s bounds. NuGet's unlisted
 >   decoration is an `AuxiliaryLookup::Decoration` and GitLab CI's component-pin resolution

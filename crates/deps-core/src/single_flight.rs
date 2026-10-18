@@ -68,3 +68,68 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::assert_matches;
+
+    use super::*;
+
+    type Flights = DashMap<&'static str, watch::Receiver<Slot<u32>>>;
+
+    #[test]
+    fn the_first_caller_leads_and_later_callers_follow_the_same_channel() {
+        let flights = Flights::new();
+
+        let sender = claim_or_follow(&flights, "key").expect("the first caller claims the key");
+        let receiver = claim_or_follow(&flights, "key").expect_err("a second caller follows");
+
+        assert_matches!(&*receiver.borrow(), Slot::Pending);
+        sender.send_replace(Slot::Ready(7));
+        assert_matches!(&*receiver.borrow(), Slot::Ready(7));
+    }
+
+    #[test]
+    fn distinct_keys_each_get_a_leader() {
+        let flights = Flights::new();
+
+        assert!(claim_or_follow(&flights, "a").is_ok());
+        assert!(claim_or_follow(&flights, "b").is_ok());
+        assert_eq!(flights.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_guard_and_sender_wakes_followers_and_frees_the_key() {
+        let flights = Flights::new();
+        let sender = claim_or_follow(&flights, "key").expect("leader");
+        let mut receiver = claim_or_follow(&flights, "key").expect_err("follower");
+        {
+            let _guard = InFlightGuard::new(&flights, "key");
+            drop(sender);
+        }
+
+        assert!(
+            receiver.changed().await.is_err(),
+            "a follower sees its leader vanish"
+        );
+        assert!(flights.is_empty(), "the claim was released");
+        assert!(
+            claim_or_follow(&flights, "key").is_ok(),
+            "a promoted follower can claim the key again"
+        );
+    }
+
+    #[test]
+    fn the_guard_releases_its_claim_on_drop_even_when_the_leader_panics() {
+        let flights = Flights::new();
+        let _sender = claim_or_follow(&flights, "key").expect("leader");
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = InFlightGuard::new(&flights, "key");
+            panic!("leader failed");
+        }));
+
+        assert!(outcome.is_err());
+        assert!(flights.is_empty());
+    }
+}
