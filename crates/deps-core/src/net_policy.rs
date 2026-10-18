@@ -457,6 +457,12 @@ impl TrustedPrefix {
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
+
+    /// The parsed prefix URL.
+    #[must_use]
+    pub const fn as_url(&self) -> &url::Url {
+        &self.0
+    }
 }
 
 /// Whether `path` equals `prefix`, or continues immediately after a `/` following it —
@@ -538,13 +544,17 @@ impl WorkspaceRegistryAccess {
 /// # Examples
 ///
 /// ```
-/// use deps_core::net_policy::{BlockingPolicy, HostClass, WorkspaceRegistryAccess};
+/// use deps_core::net_policy::{BlockedHost, BlockingPolicy, HostClass, WorkspaceRegistryAccess};
 ///
-/// let all = BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::All);
-/// assert!(all.hint_suffix(HostClass::PrivateV4).contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"));
-/// let off = BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::Off);
-/// assert_eq!(off.hint_suffix(HostClass::PrivateV4), "");
-/// assert_eq!(BlockingPolicy::Floor.hint_suffix(HostClass::Loopback), "");
+/// let all = BlockedHost::new(HostClass::PrivateV4, WorkspaceRegistryAccess::All);
+/// assert_eq!(
+///     all.policy(),
+///     BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::All)
+/// );
+/// assert!(all.hint_suffix().contains("DEPS_LSP_PRIVATE_REGISTRY_HOSTS"));
+/// let off = BlockedHost::new(HostClass::PrivateV4, WorkspaceRegistryAccess::Off);
+/// assert_eq!(off.hint_suffix(), "");
+/// assert_eq!(BlockedHost::new(HostClass::Loopback, WorkspaceRegistryAccess::All).policy(), BlockingPolicy::Floor);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BlockingPolicy {
@@ -552,51 +562,6 @@ pub enum BlockingPolicy {
     Floor,
     /// Refused by the `registries.workspace_registries` level.
     WorkspaceRegistries(WorkspaceRegistryAccess),
-}
-
-impl BlockingPolicy {
-    /// The policy that refused a host of `class` while the workspace-registry level was `level`.
-    #[must_use]
-    pub const fn for_block(class: HostClass, level: WorkspaceRegistryAccess) -> Self {
-        if class.never_a_registry() {
-            Self::Floor
-        } else {
-            Self::WorkspaceRegistries(level)
-        }
-    }
-
-    /// `"; <PRIVATE_HOST_HINT>"` when listing the host in `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` can
-    /// change the outcome, else the empty string.
-    ///
-    /// The allowlist cannot help under the floor, nor at [`WorkspaceRegistryAccess::Off`], which
-    /// refuses every workspace-declared host.
-    #[must_use]
-    pub const fn hint_suffix(self, class: HostClass) -> &'static str {
-        match self {
-            Self::Floor | Self::WorkspaceRegistries(WorkspaceRegistryAccess::Off) => "",
-            Self::WorkspaceRegistries(
-                WorkspaceRegistryAccess::PublicOnly | WorkspaceRegistryAccess::All,
-            ) => {
-                if class.allowlist_can_help() {
-                    concat!("; ", private_host_hint!())
-                } else {
-                    ""
-                }
-            }
-        }
-    }
-
-    /// The clause explaining the refusal of a host of `class`, hint included.
-    #[must_use]
-    pub fn describe(self, class: HostClass) -> String {
-        match self {
-            Self::Floor => "is never a registry host".to_string(),
-            Self::WorkspaceRegistries(_) => format!(
-                "blocked by registries.workspace_registries policy{}",
-                self.hint_suffix(class)
-            ),
-        }
-    }
 }
 
 /// Live-updatable, `Arc`-shareable handle to the current [`WorkspaceRegistryAccess`] setting.
@@ -777,12 +742,10 @@ pub enum IndexUrlError {
     #[error("registry index URL must not carry userinfo")]
     UserInfoPresent,
     /// The candidate's host is blocked by the current [`WorkspaceRegistryAccess`] policy.
-    #[error("registry index host class {class} {}", policy.describe(*class))]
+    #[error("registry index host class {} {}", block.class(), block.describe())]
     BlockedHost {
-        /// The blocked host's classification.
-        class: HostClass,
-        /// The rule that refused the host.
-        policy: BlockingPolicy,
+        /// The blocked host: its classification and the rule that refused it.
+        block: BlockedHost,
     },
 }
 
@@ -956,8 +919,7 @@ pub fn validate_index_url(
             "workspace-declared registry index host blocked by registries.workspace_registries policy"
         );
         return Err(IndexUrlError::BlockedHost {
-            class,
-            policy: BlockingPolicy::for_block(class, policy.get()),
+            block: BlockedHost::new(class, policy.get()),
         });
     }
     Ok(url)
@@ -1238,22 +1200,102 @@ impl<K: TrustedConstantRegistryUrl> ValidatedRegistryUrl<K> {
     }
 }
 
-/// A policy-blocked host: its class and the rule that refused it.
+/// A policy-blocked host: its class and the rule that refused it, as one value.
+///
+/// The invariant — [`BlockingPolicy::Floor`] if and only if [`HostClass::never_a_registry`] —
+/// holds by construction: the fields are private and [`Self::new`]/[`Self::floor`] are the only
+/// constructors, so a class paired with a policy that could not have refused it is
+/// unrepresentable.
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_core::net_policy::{BlockedHost, BlockingPolicy, HostClass};
+/// use deps_core::net_policy::{BlockedHost, BlockingPolicy, HostClass, WorkspaceRegistryAccess};
 ///
-/// let blocked = BlockedHost { class: HostClass::Loopback, policy: BlockingPolicy::Floor };
-/// assert_eq!(blocked.class, HostClass::Loopback);
+/// let blocked = BlockedHost::new(HostClass::Loopback, WorkspaceRegistryAccess::All);
+/// assert_eq!(blocked.class(), HostClass::Loopback);
+/// assert_eq!(blocked.policy(), BlockingPolicy::Floor);
+/// assert_eq!(blocked.describe(), "is never a registry host");
+/// assert_eq!(BlockedHost::floor(HostClass::Global), None);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockedHost {
+    class: HostClass,
+    policy: BlockingPolicy,
+}
+
+impl BlockedHost {
+    /// The block of a host of `class` while the workspace-registry level was `level`: the floor
+    /// for a [`HostClass::never_a_registry`] class, otherwise the level.
+    #[must_use]
+    pub const fn new(class: HostClass, level: WorkspaceRegistryAccess) -> Self {
+        let policy = if class.never_a_registry() {
+            BlockingPolicy::Floor
+        } else {
+            BlockingPolicy::WorkspaceRegistries(level)
+        };
+        Self { class, policy }
+    }
+
+    /// The policy-independent block of a host of `class`, or `None` when `class` is not one the
+    /// floor refuses.
+    #[must_use]
+    pub const fn floor(class: HostClass) -> Option<Self> {
+        if class.never_a_registry() {
+            Some(Self {
+                class,
+                policy: BlockingPolicy::Floor,
+            })
+        } else {
+            None
+        }
+    }
+
     /// The blocked host's classification.
-    pub class: HostClass,
-    /// The rule that refused it.
-    pub policy: BlockingPolicy,
+    #[must_use]
+    pub const fn class(self) -> HostClass {
+        self.class
+    }
+
+    /// The rule that refused the host.
+    #[must_use]
+    pub const fn policy(self) -> BlockingPolicy {
+        self.policy
+    }
+
+    /// `"; <PRIVATE_HOST_HINT>"` when listing the host in `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` can
+    /// change the outcome, else the empty string.
+    ///
+    /// The allowlist cannot help under the floor, nor at [`WorkspaceRegistryAccess::Off`], which
+    /// refuses every workspace-declared host.
+    #[must_use]
+    pub const fn hint_suffix(self) -> &'static str {
+        match self.policy {
+            BlockingPolicy::Floor
+            | BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::Off) => "",
+            BlockingPolicy::WorkspaceRegistries(
+                WorkspaceRegistryAccess::PublicOnly | WorkspaceRegistryAccess::All,
+            ) => {
+                if self.class.allowlist_can_help() {
+                    concat!("; ", private_host_hint!())
+                } else {
+                    ""
+                }
+            }
+        }
+    }
+
+    /// The clause explaining the refusal, hint included.
+    #[must_use]
+    pub fn describe(self) -> String {
+        match self.policy {
+            BlockingPolicy::Floor => "is never a registry host".to_string(),
+            BlockingPolicy::WorkspaceRegistries(_) => format!(
+                "blocked by registries.workspace_registries policy{}",
+                self.hint_suffix()
+            ),
+        }
+    }
 }
 
 /// Whether an ecosystem's own validation-failure reason names a policy-blocked host — the
@@ -1267,10 +1309,7 @@ pub trait BlockedHostReason {
 impl BlockedHostReason for IndexUrlError {
     fn blocked_host(&self) -> Option<BlockedHost> {
         match self {
-            Self::BlockedHost { class, policy } => Some(BlockedHost {
-                class: *class,
-                policy: *policy,
-            }),
+            Self::BlockedHost { block } => Some(*block),
             Self::InvalidUrl(_) | Self::NotHttps(_) | Self::UserInfoPresent => None,
         }
     }
@@ -1505,22 +1544,18 @@ impl<E: BlockedHostReason> InvalidEntry<E> {
     ///
     /// ```
     /// use deps_core::net_policy::{
-    ///     BlockedHost, BlockingPolicy, HostClass, IndexUrlError, InvalidEntry, RedactedUrl,
+    ///     BlockedHost, HostClass, IndexUrlError, InvalidEntry, RedactedUrl,
+    ///     WorkspaceRegistryAccess,
     /// };
     ///
+    /// let block = BlockedHost::new(HostClass::Loopback, WorkspaceRegistryAccess::All);
     /// let blocked = InvalidEntry::new(
     ///     RedactedUrl::new("https://127.0.0.1:9999"),
-    ///     IndexUrlError::BlockedHost {
-    ///         class: HostClass::Loopback,
-    ///         policy: BlockingPolicy::Floor,
-    ///     },
+    ///     IndexUrlError::BlockedHost { block },
     /// );
     /// assert_eq!(
     ///     blocked.blocked_host(),
-    ///     Some((
-    ///         BlockedHost { class: HostClass::Loopback, policy: BlockingPolicy::Floor },
-    ///         "https://127.0.0.1:9999".to_string()
-    ///     ))
+    ///     Some((block, "https://127.0.0.1:9999".to_string()))
     /// );
     ///
     /// let other = InvalidEntry::new(RedactedUrl::new("not-a-url"), IndexUrlError::UserInfoPresent);
@@ -1558,8 +1593,7 @@ impl<E: RegistryRejectionClassifier> InvalidEntry<E> {
     /// let blocked = InvalidEntry::new(
     ///     RedactedUrl::new("https://127.0.0.1"),
     ///     IndexUrlError::BlockedHost {
-    ///         class: HostClass::Loopback,
-    ///         policy: deps_core::net_policy::BlockingPolicy::Floor,
+    ///         block: deps_core::net_policy::BlockedHost::floor(HostClass::Loopback).unwrap(),
     ///     },
     /// );
     /// assert!(blocked.rejection_reason().is_none());
@@ -1613,14 +1647,46 @@ mod tests {
         );
         assert_eq!(
             IndexUrlError::BlockedHost {
-                class: HostClass::Loopback,
-                policy: BlockingPolicy::Floor,
+                block: BlockedHost::floor(HostClass::Loopback).unwrap(),
             }
             .rejection_reason(),
             RejectionOutcome::HandledByBlockedHostPath,
             "a policy-blocked host must classify as HandledByBlockedHostPath, not IntentionallySilent \
              or a generic Reject — it already has its own diagnostic path via BlockedHostReason"
         );
+    }
+
+    /// Issue #795: host-confusion shapes that a raw string-prefix test accepts —
+    /// subdomain-suffix, userinfo and hyphen-suffix hops — are rejected by
+    /// [`TrustedPrefix::permits`], while the same origin and a nested path stay accepted.
+    #[test]
+    fn test_trusted_prefix_permits_rejects_host_confusion_bypass_shapes() {
+        let prefix = TrustedPrefix::parse("https://gitlab.mycorp.dev").unwrap();
+        for hop in [
+            "https://gitlab.mycorp.dev.evil.com/steal",
+            "https://gitlab.mycorp.dev@evil.com/steal",
+            "https://gitlab.mycorp.dev-evil.com/steal",
+        ] {
+            assert!(
+                !prefix.permits(&url::Url::parse(hop).unwrap()),
+                "expected {hop} to be rejected"
+            );
+        }
+        let nested = TrustedPrefix::parse("https://registry.example/v3/registration5-gz/").unwrap();
+        for hop in [
+            "https://gitlab.mycorp.dev/api/v4/x",
+            "https://registry.example/v3/registration5-gz/serde/page1.json",
+        ] {
+            let prefix = if hop.contains("registry.example") {
+                &nested
+            } else {
+                &prefix
+            };
+            assert!(prefix.permits(&url::Url::parse(hop).unwrap()), "{hop}");
+        }
+        assert!(!nested.permits(
+            &url::Url::parse("https://registry.example/v3/registration5-gzX/evil").unwrap()
+        ));
     }
 
     /// Issue #795 S1: a trusted path with no trailing slash (the real `deps-cargo` sparse
@@ -1951,8 +2017,7 @@ mod tests {
     fn test_blocked_host_message_points_at_allowlist_only_when_it_can_help() {
         let message = |class, level| {
             IndexUrlError::BlockedHost {
-                class,
-                policy: BlockingPolicy::for_block(class, level),
+                block: BlockedHost::new(class, level),
             }
             .to_string()
         };
@@ -2003,15 +2068,32 @@ mod tests {
     }
 
     #[test]
-    fn test_blocking_policy_for_block_uses_the_floor_for_never_a_registry_classes() {
+    fn test_blocked_host_new_uses_the_floor_for_never_a_registry_classes() {
         assert_eq!(
-            BlockingPolicy::for_block(HostClass::Loopback, WorkspaceRegistryAccess::All),
+            BlockedHost::new(HostClass::Loopback, WorkspaceRegistryAccess::All).policy(),
             BlockingPolicy::Floor
         );
         assert_eq!(
-            BlockingPolicy::for_block(HostClass::PrivateV4, WorkspaceRegistryAccess::Off),
+            BlockedHost::new(HostClass::PrivateV4, WorkspaceRegistryAccess::Off).policy(),
             BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::Off)
         );
+    }
+
+    #[test]
+    fn test_blocked_host_floor_is_some_exactly_for_never_a_registry_classes() {
+        for class in [HostClass::Loopback, HostClass::PrivateV4, HostClass::Global] {
+            assert_eq!(
+                BlockedHost::floor(class).is_some(),
+                class.never_a_registry(),
+                "{class}"
+            );
+            if let Some(floor) = BlockedHost::floor(class) {
+                assert_eq!(
+                    floor,
+                    BlockedHost::new(class, WorkspaceRegistryAccess::PublicOnly)
+                );
+            }
+        }
     }
 
     #[test]
@@ -2332,22 +2414,14 @@ mod tests {
 
     #[test]
     fn test_invalid_entry_blocked_host_some_for_blocked_host() {
+        let block = BlockedHost::floor(HostClass::Loopback).unwrap();
         let entry = InvalidEntry::new(
             RedactedUrl::new("https://127.0.0.1:9999"),
-            IndexUrlError::BlockedHost {
-                class: HostClass::Loopback,
-                policy: BlockingPolicy::Floor,
-            },
+            IndexUrlError::BlockedHost { block },
         );
         assert_eq!(
             entry.blocked_host(),
-            Some((
-                BlockedHost {
-                    class: HostClass::Loopback,
-                    policy: BlockingPolicy::Floor,
-                },
-                "https://127.0.0.1:9999".to_string()
-            ))
+            Some((block, "https://127.0.0.1:9999".to_string()))
         );
     }
 

@@ -38,7 +38,7 @@ use deps_core::EcosystemId;
 #[cfg(test)]
 use deps_core::net_policy::HostClass;
 use deps_core::net_policy::{
-    BlockedHost, RedactedUrl, RegistryAccessPolicy, RegistryUrlKind, ValidatedRegistryUrl,
+    RedactedUrl, RegistryAccessPolicy, RegistryUrlKind, ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{BlockedSourceClass, RejectedSourceClass};
@@ -459,38 +459,34 @@ impl PypiIndexConfig {
     #[must_use]
     pub fn blocked_class_for(&self, named_source: Option<&str>) -> Option<BlockedSourceClass> {
         if let Some(name) = named_source {
-            let (BlockedHost { class, policy }, raw_value) = self
+            let (block, raw_value) = self
                 .named_sources
                 .get(name)?
                 .as_ref()
                 .err()
                 .and_then(InvalidEntry::blocked_host)?;
             return Some(BlockedSourceClass {
-                class,
-                policy,
+                block,
                 raw_value,
                 declaration_key: format!("named:{name}"),
             });
         }
         if let Some(result) = &self.primary {
-            let (BlockedHost { class, policy }, raw_value) =
-                result.as_ref().err().and_then(InvalidEntry::blocked_host)?;
+            let (block, raw_value) = result.as_ref().err().and_then(InvalidEntry::blocked_host)?;
             return Some(BlockedSourceClass {
-                class,
-                policy,
+                block,
                 raw_value,
                 declaration_key: "primary".to_string(),
             });
         }
-        let (BlockedHost { class, policy }, raw_value) = self
+        let (block, raw_value) = self
             .tail_hop
             .as_ref()?
             .as_ref()
             .err()
             .and_then(InvalidEntry::blocked_host)?;
         Some(BlockedSourceClass {
-            class,
-            policy,
+            block,
             raw_value,
             declaration_key: "uv-tail".to_string(),
         })
@@ -898,7 +894,7 @@ mod tests {
         let occurrence = config
             .blocked_class_for(None)
             .expect("blocked primary must be reported");
-        assert_eq!(occurrence.class, HostClass::Loopback);
+        assert_eq!(occurrence.block.class(), HostClass::Loopback);
         assert_eq!(occurrence.raw_value, "https://127.0.0.1:9999/simple");
         assert_eq!(occurrence.declaration_key, "primary");
     }
@@ -1023,7 +1019,7 @@ mod tests {
         let occurrence = config
             .blocked_class_for(Some("internal"))
             .expect("blocked named source must be reported");
-        assert_eq!(occurrence.class, HostClass::Loopback);
+        assert_eq!(occurrence.block.class(), HostClass::Loopback);
         assert_eq!(occurrence.raw_value, "https://127.0.0.1:9999/simple");
         assert_eq!(occurrence.declaration_key, "named:internal");
         assert_eq!(config.blocked_class_for(None), None);
@@ -1127,7 +1123,7 @@ mod tests {
         let occurrence = config
             .blocked_class_for(None)
             .expect("blocked uv default index must still be reported");
-        assert_eq!(occurrence.class, HostClass::Loopback);
+        assert_eq!(occurrence.block.class(), HostClass::Loopback);
         assert_eq!(occurrence.raw_value, "https://127.0.0.1:9999/simple");
         assert_eq!(occurrence.declaration_key, "uv-tail");
     }
@@ -1149,7 +1145,7 @@ mod tests {
         let occurrence = config
             .blocked_class_for(None)
             .expect("blocked uv default index must still be reported");
-        assert_eq!(occurrence.class, HostClass::Loopback);
+        assert_eq!(occurrence.block.class(), HostClass::Loopback);
         assert_eq!(occurrence.raw_value, "https://127.0.0.1:9999/simple");
         assert_eq!(occurrence.declaration_key, "uv-tail");
     }

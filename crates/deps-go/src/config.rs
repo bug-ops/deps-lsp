@@ -1561,7 +1561,7 @@ mod tests {
     fn test_blocked_class_some_when_goproxy_policy_blocked() {
         let config = GoEnvConfig::parse("GOPROXY=https://goproxy.mycorp.example", &off_policy());
         let (host, raw) = config.blocked_class().expect("expected a blocked class");
-        assert_eq!(host.class, HostClass::Global);
+        assert_eq!(host.class(), HostClass::Global);
         assert_eq!(raw, "https://goproxy.mycorp.example");
     }
 
@@ -1608,7 +1608,7 @@ mod tests {
             }
         );
         let (host, raw) = config.blocked_class().expect("expected a blocked class");
-        assert_eq!(host.class, HostClass::Global);
+        assert_eq!(host.class(), HostClass::Global);
         assert_eq!(raw, "https://goproxy.mycorp.example");
     }
 
@@ -1622,7 +1622,7 @@ mod tests {
             &off_policy(),
         );
         let (host, raw) = config.blocked_class().expect("expected a blocked class");
-        assert_eq!(host.class, HostClass::Global);
+        assert_eq!(host.class(), HostClass::Global);
         assert_eq!(raw, "https://b.mycorp.example");
     }
 

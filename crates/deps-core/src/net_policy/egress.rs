@@ -12,7 +12,6 @@
 //! same system configuration.
 
 use std::ffi::{OsStr, OsString};
-use std::sync::OnceLock;
 
 use hyper_util::client::proxy::matcher::Matcher;
 
@@ -116,13 +115,6 @@ impl SystemProxy {
         Self::from_matcher(&Matcher::from_system())
     }
 
-    /// The configuration read once at first use, for diagnostics that need no freshness.
-    #[must_use]
-    pub fn current() -> &'static Self {
-        static CURRENT: OnceLock<SystemProxy> = OnceLock::new();
-        CURRENT.get_or_init(Self::detect)
-    }
-
     // TODO(#1822): provenance-keyed egress for operator-owned sources ($GOENV GOPROXY, user
     // ~/.npmrc, user NuGet.Config). Re-run the DNS-named-proxy live test on every reqwest bump;
     // the probe assumes reqwest's system proxy resolves destinations exactly like this matcher.
@@ -171,6 +163,11 @@ impl SystemProxy {
 ///
 /// Implemented by [`ProcessEnv`] in production; the test-only `MapEnv` stands in for it so no
 /// settings or manifest data path can mint one.
+///
+/// The system proxy it reports feeds the startup egress notice only. Each transport still calls
+/// [`SystemProxy::detect`] when it is built, because its resolver exemption set must match what
+/// `reqwest` reads from the real process configuration at `Client::build`; an injected proxy
+/// would let the two skew.
 pub trait EnvSource: private::Sealed {
     /// The raw value of environment variable `name`.
     fn var_os(&self, name: &str) -> Option<OsString>;
@@ -301,12 +298,6 @@ impl RegistryEnvironment {
     #[must_use]
     pub const fn egress(&self) -> GuardedEgress {
         self.egress
-    }
-
-    /// The system proxy configuration seen at read time.
-    #[must_use]
-    pub const fn proxy(&self) -> &SystemProxy {
-        &self.proxy
     }
 
     /// A notice when egress is direct although a system proxy is configured: workspace-declared

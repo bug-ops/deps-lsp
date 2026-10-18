@@ -356,8 +356,7 @@ mod tests {
             uri: crate::test_util::test_uri("/project/manifest.toml"),
             blocked: vec![BlockedRegistryOccurrence {
                 range,
-                class: HostClass::CloudMetadata,
-                policy: crate::net_policy::BlockingPolicy::Floor,
+                block: crate::net_policy::BlockedHost::floor(HostClass::CloudMetadata).unwrap(),
                 raw_value: "https://169.254.169.254".to_string(),
                 declaration_key: "top-level".to_string(),
             }],

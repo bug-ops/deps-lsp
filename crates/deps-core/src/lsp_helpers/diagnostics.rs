@@ -1795,9 +1795,9 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
             "registry index \"{}\" blocked by registries.workspace_registries policy \
              (host class: {}; declaration: {}){}",
             sanitize_and_truncate_for_diagnostic(&redacted_value, MAX_DIAGNOSTIC_VALUE_CHARS),
-            occurrence.class,
+            occurrence.block.class(),
             sanitize_and_truncate_for_diagnostic(&redacted_key, MAX_DIAGNOSTIC_VALUE_CHARS),
-            occurrence.policy.hint_suffix(occurrence.class),
+            occurrence.block.hint_suffix(),
         ),
     )
     .with_severity(Severity::Information)
@@ -3998,8 +3998,7 @@ mod tests {
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
                 range: name_range,
-                class: HostClass::CloudMetadata,
-                policy: crate::net_policy::BlockingPolicy::Floor,
+                block: crate::net_policy::BlockedHost::floor(HostClass::CloudMetadata).unwrap(),
                 raw_value: raw_value.to_string(),
                 declaration_key: declaration_key.to_string(),
             }],
@@ -4048,13 +4047,12 @@ mod tests {
 
     #[test]
     fn test_blocked_registry_diagnostic_names_allowlist_only_when_it_can_help() {
-        use crate::net_policy::{BlockingPolicy, HostClass, WorkspaceRegistryAccess};
+        use crate::net_policy::{BlockedHost, HostClass, WorkspaceRegistryAccess};
 
-        let mentions_allowlist = |class, policy| {
+        let mentions_allowlist = |block| {
             build_blocked_registry_diagnostic(&BlockedRegistryOccurrence {
                 range: Range::new(Position::new(0, 0), Position::new(0, 1)),
-                class,
-                policy,
+                block,
                 raw_value: "https://10.0.0.1/index".to_string(),
                 declaration_key: "top-level".to_string(),
             })
@@ -4065,19 +4063,17 @@ mod tests {
             WorkspaceRegistryAccess::PublicOnly,
             WorkspaceRegistryAccess::All,
         ] {
-            let policy = BlockingPolicy::WorkspaceRegistries(level);
             assert!(
-                mentions_allowlist(HostClass::PrivateV4, policy),
+                mentions_allowlist(BlockedHost::new(HostClass::PrivateV4, level)),
                 "{level:?}"
             );
         }
-        assert!(!mentions_allowlist(
+        assert!(!mentions_allowlist(BlockedHost::new(
             HostClass::PrivateV4,
-            BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::Off)
-        ));
+            WorkspaceRegistryAccess::Off
+        )));
         assert!(!mentions_allowlist(
-            HostClass::CloudMetadata,
-            BlockingPolicy::Floor
+            BlockedHost::floor(HostClass::CloudMetadata).unwrap()
         ));
     }
 
@@ -4339,15 +4335,13 @@ mod tests {
                 // block, referenced by two dependencies. Must collapse to one diagnostic.
                 BlockedRegistryOccurrence {
                     range: first_range,
-                    class: HostClass::CloudMetadata,
-                    policy: crate::net_policy::BlockingPolicy::Floor,
+                    block: crate::net_policy::BlockedHost::floor(HostClass::CloudMetadata).unwrap(),
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
                 },
                 BlockedRegistryOccurrence {
                     range: second_range,
-                    class: HostClass::CloudMetadata,
-                    policy: crate::net_policy::BlockingPolicy::Floor,
+                    block: crate::net_policy::BlockedHost::floor(HostClass::CloudMetadata).unwrap(),
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
                 },
@@ -4355,8 +4349,7 @@ mod tests {
                 // same (class, raw_value) — must NOT be swallowed by the dedup above.
                 BlockedRegistryOccurrence {
                     range: third_range,
-                    class: HostClass::CloudMetadata,
-                    policy: crate::net_policy::BlockingPolicy::Floor,
+                    block: crate::net_policy::BlockedHost::floor(HostClass::CloudMetadata).unwrap(),
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "scope:@myorg".to_string(),
                 },
@@ -4488,15 +4481,13 @@ mod tests {
             blocked: vec![
                 BlockedRegistryOccurrence {
                     range: first_range,
-                    class: HostClass::CloudMetadata,
-                    policy: crate::net_policy::BlockingPolicy::Floor,
+                    block: crate::net_policy::BlockedHost::floor(HostClass::CloudMetadata).unwrap(),
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
                 },
                 BlockedRegistryOccurrence {
                     range: second_range,
-                    class: HostClass::CloudMetadata,
-                    policy: crate::net_policy::BlockingPolicy::Floor,
+                    block: crate::net_policy::BlockedHost::floor(HostClass::CloudMetadata).unwrap(),
                     raw_value: "https://169.254.169.254/index".to_string(),
                     declaration_key: "top-level".to_string(),
                 },
@@ -4584,8 +4575,7 @@ mod tests {
             .iter()
             .map(|&range| BlockedRegistryOccurrence {
                 range,
-                class: HostClass::CloudMetadata,
-                policy: crate::net_policy::BlockingPolicy::Floor,
+                block: crate::net_policy::BlockedHost::floor(HostClass::CloudMetadata).unwrap(),
                 raw_value: "https://169.254.169.254/index".to_string(),
                 declaration_key: "top-level".to_string(),
             })
@@ -4717,8 +4707,10 @@ mod tests {
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
             blocked: vec![BlockedRegistryOccurrence {
                 range: name_range,
-                class: HostClass::InternalName,
-                policy: crate::net_policy::BlockingPolicy::Floor,
+                block: crate::net_policy::BlockedHost::new(
+                    HostClass::InternalName,
+                    crate::net_policy::WorkspaceRegistryAccess::PublicOnly,
+                ),
                 raw_value: long_alias.clone(),
                 declaration_key: long_alias.clone(),
             }],

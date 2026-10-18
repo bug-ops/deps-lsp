@@ -1632,7 +1632,7 @@ mod tests {
         let occurrence = &result.blocked_registries[0];
         assert_eq!(occurrence.range, result.dependencies[0].name_range);
         assert_eq!(
-            occurrence.class,
+            occurrence.block.class(),
             deps_core::net_policy::HostClass::CloudMetadata
         );
         assert_eq!(occurrence.raw_value, "https://169.254.169.254");

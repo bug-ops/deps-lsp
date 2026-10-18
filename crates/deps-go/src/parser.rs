@@ -269,8 +269,7 @@ pub fn parse_go_mod_with_context(
         if let (Some((host, raw)), true) = (&blocked_class, fell_back_to_custom_registry) {
             blocked_registries.push(deps_core::BlockedRegistryOccurrence {
                 range: dep.module_path_range,
-                class: host.class,
-                policy: host.policy,
+                block: *host,
                 raw_value: raw.clone(),
                 declaration_key: GOPROXY_BLOCKED_DECLARATION_KEY.to_string(),
             });
@@ -1065,7 +1064,7 @@ exclude github.com/bad/module v0.1.0
         assert_eq!(blocked.len(), 1);
         let occurrence = &blocked[0];
         assert_eq!(occurrence.range, result.dependencies[0].module_path_range);
-        assert_eq!(occurrence.class, HostClass::Global);
+        assert_eq!(occurrence.block.class(), HostClass::Global);
         assert_eq!(occurrence.raw_value, "https://goproxy.mycorp.example");
         assert_eq!(occurrence.declaration_key, GOPROXY_BLOCKED_DECLARATION_KEY);
     }

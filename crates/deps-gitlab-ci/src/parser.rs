@@ -1176,12 +1176,10 @@ fn resolve_instance_host_ref(instance_host: &GitlabInstanceHost, raw: &str) -> H
         InstanceHostOutcome::Valid(host) => HostRef::Literal(host),
         InstanceHostOutcome::Blocked {
             raw: configured_raw,
-            class,
-            policy,
+            block,
         } => HostRef::PolicyBlocked {
             raw: configured_raw,
-            class,
-            policy,
+            block,
             declaration_key: INSTANCE_HOST_DECLARATION_KEY.to_string(),
         },
         InstanceHostOutcome::Unset | InstanceHostOutcome::Invalid => {
@@ -1212,11 +1210,10 @@ fn resolve_component_host(
             );
             HostRef::CapacityRefused(host.origin().to_string())
         }
-        Err(deps_core::net_policy::IndexUrlError::BlockedHost { class, policy }) => {
+        Err(deps_core::net_policy::IndexUrlError::BlockedHost { block }) => {
             HostRef::PolicyBlocked {
                 raw: host_expr.to_string(),
-                class,
-                policy,
+                block,
                 // #967 S3: one per distinct literal host string, unlike the instance-setting
                 // path's single shared key — two different `component:` hosts blocked by policy
                 // are two independently declared literals, not one config declaration.
@@ -1565,13 +1562,11 @@ pub fn parse_gitlab_ci_yaml(
         .filter_map(|dep| match &dep.host {
             HostRef::PolicyBlocked {
                 raw,
-                class,
-                policy,
+                block,
                 declaration_key,
             } => Some(deps_core::BlockedRegistryOccurrence {
                 range: dep.name_range,
-                class: *class,
-                policy: *policy,
+                block: *block,
                 raw_value: raw.clone(),
                 declaration_key: declaration_key.clone(),
             }),
@@ -1851,7 +1846,7 @@ mod tests {
         assert_eq!(result.blocked_registries.len(), 1);
         let occurrence = &result.blocked_registries[0];
         assert_eq!(
-            occurrence.class,
+            occurrence.block.class(),
             deps_core::net_policy::HostClass::PrivateV4
         );
         assert_eq!(occurrence.raw_value, "10.0.0.1");
@@ -1874,8 +1869,8 @@ mod tests {
             dep.host,
             HostRef::PolicyBlocked {
                 raw: "10.0.0.1".to_string(),
-                class: deps_core::net_policy::HostClass::PrivateV4,
-                policy: deps_core::net_policy::BlockingPolicy::WorkspaceRegistries(
+                block: deps_core::net_policy::BlockedHost::new(
+                    deps_core::net_policy::HostClass::PrivateV4,
                     deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly,
                 ),
                 declaration_key: INSTANCE_HOST_DECLARATION_KEY.to_string(),

@@ -447,7 +447,7 @@ fn choose_project_key(projects: &[RelatedProject]) -> Option<(String, bool)> {
 pub struct DepsDevClient {
     cache: Arc<HttpCache>,
     base_url: String,
-    trusted_origin: String,
+    trusted_origin: crate::net_policy::TrustedPrefix,
     /// The trust-signal memo, coalesced (issue #1454): a losing concurrent caller awaits the
     /// leader's result via [`memo::CoalescedMemo::get_or_fetch`] rather than returning `None`
     /// immediately.
@@ -602,7 +602,12 @@ impl DepsDevClient {
     }
 
     fn with_base_url(cache: Arc<HttpCache>, base_url: String) -> Self {
-        let trusted_origin = format!("{base_url}/");
+        #[expect(
+            clippy::expect_used,
+            reason = "`base_url` is the `DEPS_DEV_API` constant or a test server URL"
+        )]
+        let trusted_origin = crate::net_policy::TrustedPrefix::parse(&format!("{base_url}/"))
+            .expect("deps.dev base URL must be an absolute URL");
         Self {
             cache,
             base_url,

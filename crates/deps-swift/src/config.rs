@@ -747,11 +747,9 @@ impl SwiftRegistriesConfig {
     /// a blocked host.
     pub(crate) fn blocked_class_for(&self, scope: &RegistryScope) -> Option<BlockedSourceClass> {
         let (declaration, entry) = self.applicable(scope)?;
-        let (BlockedHost { class, policy }, raw_value) =
-            entry.as_ref().err().and_then(InvalidEntry::blocked_host)?;
+        let (block, raw_value) = entry.as_ref().err().and_then(InvalidEntry::blocked_host)?;
         Some(BlockedSourceClass {
-            class,
-            policy,
+            block,
             raw_value,
             declaration_key: declaration.key(),
         })
@@ -1028,9 +1026,7 @@ impl SwiftParseContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::net_policy::{
-        BlockedHost, BlockingPolicy, RegistryRejectionReason, WorkspaceRegistryAccess,
-    };
+    use deps_core::net_policy::{BlockedHost, RegistryRejectionReason, WorkspaceRegistryAccess};
     use deps_core::secret::Redacted;
     use std::assert_matches;
 
@@ -1762,7 +1758,7 @@ mod tests {
         let config = fx.config();
         let acme = scope("acme");
         let blocked = config.blocked_class_for(&acme).unwrap();
-        assert_eq!(blocked.class, HostClass::PrivateV4);
+        assert_eq!(blocked.block.class(), HostClass::PrivateV4);
         assert_eq!(blocked.declaration_key, "scope:acme");
         assert_matches!(
             config.resolve_source_for(&acme),
@@ -1859,18 +1855,9 @@ mod tests {
             RejectionOutcome::IntentionallySilent
         );
         assert_eq!(silent.blocked_host(), None);
-        let policy = BlockingPolicy::WorkspaceRegistries(WorkspaceRegistryAccess::PublicOnly);
-        let blocked = SwiftRegistryUrlError::Url(IndexUrlError::BlockedHost {
-            class: HostClass::PrivateV4,
-            policy,
-        });
-        assert_eq!(
-            blocked.blocked_host(),
-            Some(BlockedHost {
-                class: HostClass::PrivateV4,
-                policy,
-            })
-        );
+        let block = BlockedHost::new(HostClass::PrivateV4, WorkspaceRegistryAccess::PublicOnly);
+        let blocked = SwiftRegistryUrlError::Url(IndexUrlError::BlockedHost { block });
+        assert_eq!(blocked.blocked_host(), Some(block));
         assert_eq!(
             blocked.rejection_reason(),
             RejectionOutcome::HandledByBlockedHostPath

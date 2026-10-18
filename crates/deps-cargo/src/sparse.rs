@@ -218,7 +218,7 @@ fn parse_index_json(data: &[u8]) -> Result<Vec<CargoVersion>> {
 /// shares one parser and one crate-name safety gate.
 #[derive(Clone)]
 pub struct SparseIndexClient {
-    base_url: String,
+    base: TrustedPrefix,
     cache: Arc<HttpCache>,
     /// Pre-formatted verbatim-token `Authorization` header value (no `Bearer` prefix, as Cargo
     /// sends it), when a credential is present. Formatted once in [`Self::with_auth`] and held [`deps_core::secret::Redacted`]
@@ -250,7 +250,7 @@ impl SparseIndexClient {
     pub fn new(index: RegistryIndex, cache: Arc<HttpCache>) -> Self {
         Self {
             trust: index.trust(),
-            base_url: index.as_str().to_string(),
+            base: index.trusted_prefix(),
             cache,
             auth_header: None,
             registry_display_name: "sparse index",
@@ -270,7 +270,7 @@ impl SparseIndexClient {
             auth.map(|token| deps_core::secret::cargo_token_header(token.as_redacted()));
         Self {
             trust: index.trust(),
-            base_url: index.as_str().to_string(),
+            base: index.trusted_prefix(),
             cache,
             auth_header,
             registry_display_name,
@@ -327,7 +327,7 @@ impl SparseIndexClient {
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<CargoVersion>> {
         reject_unsafe_crate_name(name, self.registry_display_name)?;
-        let url = sparse_index_url(&self.base_url, name);
+        let url = sparse_index_url(self.base.as_str(), name);
         let data = self.fetch(&url).await?;
         parse_index_json(&data)
     }
@@ -379,22 +379,18 @@ impl SparseIndexClient {
     async fn fetch(&self, url: &str) -> Result<bytes::Bytes> {
         match (&self.auth_header, self.trust) {
             (Some(header_value), IndexTrust::Trusted) => {
-                let prefix = TrustedPrefix::parse(&self.base_url).map_err(|_| {
-                    DepsError::CacheError(format!(
-                        "refusing authenticated request to unparseable index {}",
-                        RedactedUrl::new(&self.base_url)
-                    ))
-                })?;
-                let auth =
-                    RequestAuth::credential(CredentialHeader::Authorization(header_value), &prefix);
+                let auth = RequestAuth::credential(
+                    CredentialHeader::Authorization(header_value),
+                    &self.base,
+                );
                 self.cache
-                    .get_cached_trusted_origin(url, &prefix, auth, None)
+                    .get_cached_trusted_origin(url, &self.base, auth, None)
                     .await
             }
             (None, IndexTrust::Trusted) => self.cache.get_cached(url).await,
             (None, IndexTrust::WorkspaceDeclared) => self.cache.get_cached_workspace(url).await,
             (Some(_), IndexTrust::WorkspaceDeclared) => {
-                let safe_base_url = RedactedUrl::new(&self.base_url);
+                let safe_base_url = RedactedUrl::new(self.base.as_str());
                 tracing::error!(
                     url = %safe_base_url,
                     "refusing to attach a credential to a workspace-declared registry index request"

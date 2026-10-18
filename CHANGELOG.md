@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
+- **deps-core, deps-cargo, deps-go, deps-npm, deps-nuget, deps-pypi, deps-swift, deps-gitlab-ci**: a blocked host's class and policy travel as one `net_policy::BlockedHost` (private fields, `BlockedHost::new`/`floor`) in `DepsError::HostBlockedByPolicy`, `IndexUrlError::BlockedHost`, `BlockedRegistryOccurrence`, `BlockedSourceClass` and the GitLab CI blocked-host types; `BlockingPolicy::for_block`/`hint_suffix`/`describe` move onto `BlockedHost` (#1826, #PR)
+- **deps-core**: removed the unused `SystemProxy::current` and `RegistryEnvironment::proxy` (#1827, #PR)
+- **deps-core**: a credential sent outside its trusted prefix is the new `DepsError::CredentialOutsideTrustedPrefix`, no longer `CacheError`; `HttpCache::post_json_limited_trusted_origin` and `get_transport_only_with_headers_limited_trusted_origin` take `&TrustedPrefix` (#1825, #1827, #PR)
 - **deps-core**: `Advisory.id` is a private `OsvId` read via `id()`, `Advisory::url()` returns `String`, and `is_valid_osv_id`/`validated_osv_url` are replaced by `OsvId::parse`/`osv_url`; advisory id fields and `SiblingMatches` use `OsvId` (#1807)
 - **deps-core**: `Diagnostic::new` takes an exhaustive `DiagnosticKind` and `Diagnostic::with_code` is removed; the diagnostic code is no longer sanitized (#1807)
 - **deps-cli**: `CheckFinding.category`/`.code` fields are replaced by `kind` with `category()`/`code()` methods; `advisory_ids` in `update` types and JSON are `OsvId` (wire format unchanged) (#1807)
@@ -102,6 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SECURITY.md**: supported versions table lists 2.0.x as supported and older lines as unsupported (#1797)
 
 ### Fixed
+- **deps-core, deps-cargo, deps-nuget**: `TrustedPrefix` stays parsed down to the transport and redirect policy; an unparseable NuGet `SearchQueryService` `@id` now makes `search` return an empty result instead of `InvalidUri` (#1825, #PR)
 - **deps-core, deps-gradle, deps-swift**: linear-time tests compare run time at two input sizes (`test_util::scaling::assert_scaling`) instead of asserting a wall-clock bound, so they no longer flake under load (#1824, #PR)
 - **all crates**: 49 broken intra-doc links on private items fixed, and CI renders private items (`--document-private-items`) with warnings denied (#1828, #PR)
 - **deps-cli**: `check` and `update` discover hidden manifest files such as `.gitlab-ci.yml` during a directory walk, including under `--respect-gitignore` (#1829, #PR)

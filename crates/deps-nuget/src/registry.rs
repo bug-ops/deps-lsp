@@ -10,7 +10,7 @@ use crate::config::{NuGetAuth, NuGetSourceChain, ResolvedHop};
 use crate::types::{NuGetVersion, PackageInfo};
 use crate::version::compare_versions;
 use dashmap::DashMap;
-use deps_core::net_policy::{PolicyGate, RegistryAccessPolicy, TrustedPrefix, is_trusted_prefix};
+use deps_core::net_policy::{PolicyGate, RegistryAccessPolicy, TrustedPrefix};
 use deps_core::parser::DependencySource;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
@@ -52,14 +52,20 @@ fn chain_auth_digest(hops: &[ResolvedHop]) -> u64 {
 /// (host case, default port, IDN) — a plain string `starts_with` against a feed-supplied,
 /// un-reparsed value is not sufficient, and would not defeat a suffix trick like
 /// `https://pkgs.dev.azure.com.evil.test/`. [`NuGetRegistry::fetch`]'s own origin-binding
-/// decision no longer compares these strings directly — it re-parses `declared_origin` and
-/// checks [`is_trusted_prefix`] instead (issue #795 S2 follow-up), the same predicate every
+/// decision no longer compares these strings directly — it parses `declared_origin` once and
+/// checks [`TrustedPrefix::permits`] instead (issue #795 S2 follow-up), the same predicate every
 /// other origin/prefix-trust decision in this codebase uses. A parse failure here is `None`,
 /// which callers treat as a mismatch — fail closed, never an error.
 fn origin_of(s: &str) -> Option<String> {
     url::Url::parse(s)
         .ok()
         .map(|u| format!("{}/", u.origin().ascii_serialization()))
+}
+
+/// The declared source origin of `service_index_url` as a [`TrustedPrefix`], or `None` when it
+/// does not parse (fail closed, see [`NuGetRegistry::declared_origin`]).
+fn declared_origin_of(service_index_url: &str) -> Option<TrustedPrefix> {
+    TrustedPrefix::parse(&origin_of(service_index_url)?).ok()
 }
 
 /// The real public NuGet service index — used both as the default root registry's own feed
@@ -181,21 +187,53 @@ where
     )
 }
 
-/// Resolved base URLs from the NuGet service index.
+/// One service-index resource: its base URL plus the [`TrustedPrefix`] that confines requests
+/// (and their redirects) to it, parsed once when the index is resolved instead of per request.
+#[derive(Debug, Clone)]
+struct IndexResource {
+    base: String,
+    prefix: TrustedPrefix,
+}
+
+impl IndexResource {
+    /// A resource whose requests live under `{base}/` (flat container, registration hive).
+    fn under_base(base: String) -> Option<Self> {
+        let prefix = TrustedPrefix::parse(&format!("{base}/")).ok()?;
+        Some(Self { base, prefix })
+    }
+
+    /// A resource pinned to its own origin: `search_url` appends a `?q=...` query to the base,
+    /// so `{base}/` would not be a prefix of the request URL (§3.9).
+    fn at_origin(base: String) -> Option<Self> {
+        let prefix = TrustedPrefix::parse(&origin_of(&base)?).ok()?;
+        Some(Self { base, prefix })
+    }
+
+    fn base(&self) -> &str {
+        &self.base
+    }
+
+    const fn prefix(&self) -> &TrustedPrefix {
+        &self.prefix
+    }
+}
+
+/// Resolved resources from the NuGet service index.
 #[derive(Debug, Clone)]
 struct ServiceIndex {
     /// `PackageBaseAddress/3.0.0` — flat-container version enumeration.
-    package_base_address: String,
+    package_base_address: IndexResource,
     /// `SearchQueryService/3.5.0` (preferred) or bare `SearchQueryService`. `Option`
     /// (FR-016): a private V3 feed (e.g. GitHub Packages) may omit this resource entirely —
-    /// `search` degrades to an empty result rather than failing.
-    search_query_service: Option<String>,
+    /// `search` degrades to an empty result rather than failing. An unparseable `@id` is
+    /// treated the same way.
+    search_query_service: Option<IndexResource>,
     /// `RegistrationsBaseUrl/3.6.0` (SemVer 2.0.0, preferred), falling back to `3.4.0`
     /// (SemVer 1) or the bare, undated resource. `Option`, not error-gated: a private V3
     /// feed (Azure Artifacts, BaGet, GitHub Packages) may omit this resource entirely, in
     /// which case freshness degrades to `published_at == None` everywhere rather than
-    /// failing `get_versions` for that feed.
-    registrations_base_url: Option<String>,
+    /// failing `get_versions` for that feed. An unparseable `@id` is treated the same way.
+    registrations_base_url: Option<IndexResource>,
 }
 
 fn pick_resource(resources: &[ServiceResource], type_preference: &[&str]) -> Option<String> {
@@ -261,11 +299,11 @@ impl ServiceIndex {
         );
 
         if tier != NuGetRegistryTier::WorkspaceDeclared {
-            return Ok(Self {
+            return Self::assemble(
                 package_base_address,
                 search_query_service,
                 registrations_base_url,
-            });
+            );
         }
 
         let gate = PolicyGate::Enforce(policy);
@@ -288,10 +326,58 @@ impl ServiceIndex {
             deps_core::net_policy::validate_index_url(u, u, EcosystemId::NuGet, gate).is_ok()
         });
 
-        Ok(Self {
+        Self::assemble(
             package_base_address,
             search_query_service,
             registrations_base_url,
+        )
+    }
+
+    /// Parses each picked `@id` into an [`IndexResource`]. An unparseable `PackageBaseAddress`
+    /// fails the feed (the cell stays empty, so every fetch retries and reports it); an
+    /// unparseable `SearchQueryService`/`RegistrationsBaseUrl` degrades to absent, like a feed
+    /// that never declared it.
+    fn assemble(
+        package_base_address: String,
+        search_query_service: Option<String>,
+        registrations_base_url: Option<String>,
+    ) -> Result<Self> {
+        let package_base_address = IndexResource::under_base(package_base_address.clone())
+            .ok_or_else(|| {
+                DepsError::InvalidUri(
+                    deps_core::net_policy::RedactedUrl::new(&package_base_address).to_string(),
+                )
+            })?;
+        let degrade = |resource: Option<IndexResource>, base: &Option<String>, kind: &str| {
+            if resource.is_none()
+                && let Some(base) = base
+            {
+                tracing::warn!(
+                    resource = kind,
+                    id = %deps_core::net_policy::RedactedUrl::new(base),
+                    "service index resource @id is not a valid URL; treating it as absent"
+                );
+            }
+            resource
+        };
+        let search = degrade(
+            search_query_service
+                .clone()
+                .and_then(IndexResource::at_origin),
+            &search_query_service,
+            "SearchQueryService",
+        );
+        let registrations = degrade(
+            registrations_base_url
+                .clone()
+                .and_then(IndexResource::under_base),
+            &registrations_base_url,
+            "RegistrationsBaseUrl",
+        );
+        Ok(Self {
+            package_base_address,
+            search_query_service: search,
+            registrations_base_url: registrations,
         })
     }
 }
@@ -426,10 +512,10 @@ pub struct NuGetRegistry {
     /// for a `Public`-tier instance. Attached to a request only when [`Self::fetch`]'s C1
     /// origin-binding rule holds for that specific request — never unconditionally.
     auth: Option<NuGetAuth>,
-    /// `origin_of(&self.service_index_url)` (or `""` on a parse failure — fail closed: an
-    /// empty string can never equal a real request's origin), computed once at construction.
+    /// `origin_of(&self.service_index_url)` parsed once at construction (`None` on a parse
+    /// failure — fail closed: no credential is attached and the service index is not fetched).
     /// The declared source origin C1 pins both comparison sides to (§3.1).
-    declared_origin: String,
+    declared_origin: Option<TrustedPrefix>,
     /// Meaningful only on a chain's *head* client (the one `root.alternates` maps a
     /// [`NuGetSourceChain::key`] to) — the chain-wide [`chain_auth_digest`] `register_alternate`
     /// last registered it under, used purely for O(1) rotation detection. `0` on every other
@@ -445,7 +531,7 @@ impl NuGetRegistry {
     }
 
     pub(crate) fn with_service_index_url(cache: Arc<HttpCache>, service_index_url: String) -> Self {
-        let declared_origin = origin_of(&service_index_url).unwrap_or_default();
+        let declared_origin = declared_origin_of(&service_index_url);
         Self {
             cache,
             service_index_url,
@@ -482,7 +568,7 @@ impl NuGetRegistry {
         policy: Arc<RegistryAccessPolicy>,
         fallback_chain: Vec<Arc<Self>>,
     ) -> Self {
-        let declared_origin = origin_of(hop.url.as_str()).unwrap_or_default();
+        let declared_origin = declared_origin_of(hop.url.as_str());
         Self {
             cache,
             service_index_url: hop.url.as_str().to_string(),
@@ -498,18 +584,19 @@ impl NuGetRegistry {
     }
 
     /// FR-011: routes every HTTP fetch for a `WorkspaceDeclared`-tier or credentialed source
-    /// through this single decision point (§3.9's four call sites). `trusted_prefix` is the
-    /// caller's already-validated prefix for this specific resource.
+    /// through this single decision point (§3.9's four call sites). `prefix` is the
+    /// caller's already-parsed prefix for this specific resource.
     ///
     /// Dispatches to:
     /// 1. The authenticated, origin-pinned transport — iff [`Self::auth`] is `Some` **and**
-    ///    both `url`'s origin and `trusted_prefix`'s origin equal [`Self::declared_origin`]
-    ///    (C1, §3.1), checked via the same [`is_trusted_prefix`] predicate the redirect-hop and
-    ///    registration-page pre-checks use (issue #795 S2 follow-up) — `declared_origin` always
-    ///    carries a root `/` path (see [`origin_of`]), so the check reduces to plain origin
-    ///    equality here, keeping this decision and the redirect/page-trust decisions from being
-    ///    able to silently disagree. A parse failure on either side of that comparison is a
-    ///    mismatch, never an error — fails closed to arm 2/3, unauthenticated.
+    ///    both `url`'s origin and `prefix`'s origin equal [`Self::declared_origin`]
+    ///    (C1, §3.1), checked via [`TrustedPrefix::permits`], the same predicate the
+    ///    redirect-hop and registration-page pre-checks use (issue #795 S2 follow-up) —
+    ///    `declared_origin` always carries a root `/` path (see [`origin_of`]), so the check
+    ///    reduces to plain origin equality here, keeping this decision and the redirect/page-trust
+    ///    decisions from being able to silently disagree. A missing declared origin or an
+    ///    unparseable `url` is a mismatch, never an error — fails closed to arm 2/3,
+    ///    unauthenticated.
     /// 2. The unauthenticated, origin-pinned workspace transport (#562) — when [`Self::tier`]
     ///    is [`NuGetRegistryTier::WorkspaceDeclared`] and arm 1 declined.
     /// 3. Today's public `get_cached_trusted_origin` path — otherwise, byte-identical to spec
@@ -518,15 +605,10 @@ impl NuGetRegistry {
     /// # Errors
     ///
     /// Whatever the underlying `HttpCache` fetch returns.
-    async fn fetch(&self, url: &str, trusted_prefix: &str) -> Result<bytes::Bytes> {
-        let prefix = TrustedPrefix::parse(trusted_prefix).map_err(|_| {
-            DepsError::InvalidUri(
-                deps_core::net_policy::RedactedUrl::new(trusted_prefix).to_string(),
-            )
-        })?;
-        let can_authenticate = url::Url::parse(&self.declared_origin).is_ok_and(|declared| {
-            url::Url::parse(url).is_ok_and(|u| is_trusted_prefix(&u, &declared))
-                && url::Url::parse(trusted_prefix).is_ok_and(|t| is_trusted_prefix(&t, &declared))
+    async fn fetch(&self, url: &str, prefix: &TrustedPrefix) -> Result<bytes::Bytes> {
+        let can_authenticate = self.declared_origin.as_ref().is_some_and(|declared| {
+            url::Url::parse(url).is_ok_and(|u| declared.permits(&u))
+                && declared.permits(prefix.as_url())
         });
 
         if let Some(auth) = self.auth.as_ref()
@@ -534,20 +616,20 @@ impl NuGetRegistry {
         {
             let auth = RequestAuth::credential(
                 CredentialHeader::Authorization(auth.as_authorization()),
-                &prefix,
+                prefix,
             );
-            return self.cache.get_cached_pinned(url, &prefix, auth, None).await;
+            return self.cache.get_cached_pinned(url, prefix, auth, None).await;
         }
 
         if self.tier == NuGetRegistryTier::WorkspaceDeclared {
             return self
                 .cache
-                .get_cached_pinned(url, &prefix, RequestAuth::ANONYMOUS, None)
+                .get_cached_pinned(url, prefix, RequestAuth::ANONYMOUS, None)
                 .await;
         }
 
         self.cache
-            .get_cached_trusted_origin(url, &prefix, RequestAuth::ANONYMOUS, None)
+            .get_cached_trusted_origin(url, prefix, RequestAuth::ANONYMOUS, None)
             .await
     }
 
@@ -699,11 +781,15 @@ impl NuGetRegistry {
     async fn service_index(&self) -> Result<&ServiceIndex> {
         self.service_index
             .get_or_try_init(|| async {
-                // FR-011, §3.9: `trusted_prefix` is the declared source origin itself — no
+                // FR-011, §3.9: the prefix is the declared source origin itself — no
                 // resource has been resolved yet to derive a narrower one from.
-                let data = self
-                    .fetch(&self.service_index_url, &self.declared_origin)
-                    .await?;
+                let declared = self.declared_origin.as_ref().ok_or_else(|| {
+                    DepsError::InvalidUri(
+                        deps_core::net_policy::RedactedUrl::new(&self.service_index_url)
+                            .to_string(),
+                    )
+                })?;
+                let data = self.fetch(&self.service_index_url, declared).await?;
                 let response: ServiceIndexResponse = deps_core::parse_json_checked(&data)?;
                 ServiceIndex::resolve(&response, self.tier, &self.policy)
             })
@@ -765,10 +851,10 @@ impl NuGetRegistry {
     ) -> Result<Vec<NuGetVersion>> {
         let name_segment = safe_name(name)?;
         let index = self.service_index().await?;
-        let flat_url = flat_container_url(&index.package_base_address, name_segment);
-        let flat_trusted_prefix = format!("{}/", index.package_base_address);
+        let flat_url = flat_container_url(index.package_base_address.base(), name_segment);
+        let flat_prefix = index.package_base_address.prefix();
         let registration_base = if freshness.is_enabled() {
-            index.registrations_base_url.clone()
+            index.registrations_base_url.as_ref()
         } else {
             None
         };
@@ -779,20 +865,16 @@ impl NuGetRegistry {
         // here used to document); registration-hive enrichment (publish times, hover-only
         // unlisted markers) is no longer skipped for alternate feeds.
         if let Some(base) = registration_base {
-            let registration_url = registration_index_url(&base, name_segment);
-            let registration_trusted_prefix = format!("{base}/");
+            let registration_url = registration_index_url(base.base(), name_segment);
             let (flat_result, registration_result) = tokio::join!(
-                self.fetch(&flat_url, &flat_trusted_prefix),
-                self.fetch(&registration_url, &registration_trusted_prefix),
+                self.fetch(&flat_url, flat_prefix),
+                self.fetch(&registration_url, base.prefix()),
             );
             let mut versions = parse_flat_container(&flat_result?)?;
             match registration_result {
                 Ok(registration_body) => {
                     let enrichment = self
-                        .registration_enrichment_from_index(
-                            &registration_body,
-                            &registration_trusted_prefix,
-                        )
+                        .registration_enrichment_from_index(&registration_body, base.prefix())
                         .await;
                     attach_publish_times(&mut versions, &enrichment.published);
                 }
@@ -806,7 +888,7 @@ impl NuGetRegistry {
             }
             Ok(versions)
         } else {
-            let data = self.fetch(&flat_url, &flat_trusted_prefix).await?;
+            let data = self.fetch(&flat_url, flat_prefix).await?;
             parse_flat_container(&data)
         }
     }
@@ -823,46 +905,24 @@ impl NuGetRegistry {
     /// packages need at most one, per the live measurements this plan is based on).
     ///
     /// Never fails the caller: a malformed index, an unreachable page, or a page `@id`
-    /// outside `trusted_prefix` all degrade to fewer (or zero) entries in the returned
+    /// outside `prefix` all degrade to fewer (or zero) entries in the returned
     /// [`RegistrationEnrichment`].
-    ///
-    /// `trusted_prefix` itself is never `Url`-validated ahead of this call for the default
-    /// Public tier (only [`NuGetRegistryTier::WorkspaceDeclared`] runs
-    /// [`deps_core::net_policy::validate_index_url`]), so a feed-supplied `registrations_base_url`
-    /// that fails to parse here is a deliberate fail-closed trade-off: every external page is
-    /// skipped rather than trusted on an unparsed prefix, at the cost of silently losing
-    /// registration-hive enrichment for an otherwise-tolerable feed quirk — logged via
-    /// `tracing::warn!` below so the loss is observable instead of a silent hover-content gap.
     async fn registration_enrichment_from_index(
         &self,
         index_body: &[u8],
-        trusted_prefix: &str,
+        prefix: &TrustedPrefix,
     ) -> RegistrationEnrichment {
         let mut enrichment = RegistrationEnrichment::default();
         let Ok(index) = deps_core::parse_json_checked::<RegistrationIndex>(index_body) else {
             return enrichment;
         };
 
-        // Parsed once, reused for every page `@id` below (issue #795 S2): a `page.id` outside
-        // `trusted_prefix` is checked via `is_trusted_prefix` (origin equality plus a
-        // path-segment-boundary prefix match), not a raw `str::starts_with` — the same fix
-        // `trusted_origin_redirect_policy` needed, since a raw prefix test on `page.id` would
-        // let a same-origin sibling page (e.g. `{trusted_prefix}EVIL/...`) slip past this
-        // pre-check even though `Self::fetch`'s own redirect-hop transport would still stop
-        // it downstream. `None` (fail-closed) trusts no external page, but — unlike returning
-        // early here — still lets inline `page.items` entries accumulate below, since those
-        // are part of the already-trusted index body itself and need no `page.id` check.
-        let trusted = url::Url::parse(trusted_prefix)
-            .inspect_err(|error| {
-                tracing::warn!(
-                    trusted_prefix = %deps_core::net_policy::RedactedUrl::new(trusted_prefix),
-                    %error,
-                    "registration trusted_prefix failed to parse; every external registration \
-                     page will be skipped for this package"
-                );
-            })
-            .ok();
-
+        // Every page `@id` below is checked via `TrustedPrefix::permits` (origin equality plus
+        // a path-segment-boundary prefix match, issue #795 S2), not a raw `str::starts_with`: a
+        // raw prefix test would let a same-origin sibling page (`{prefix}EVIL/...`) slip past
+        // this pre-check even though `Self::fetch`'s redirect-hop transport would still stop it
+        // downstream. Inline `page.items` entries are part of the already-trusted index body
+        // and need no `page.id` check.
         let mut collected = 0usize;
         let mut external_fetches = 0usize;
 
@@ -879,10 +939,8 @@ impl NuGetRegistry {
                     // A page `@id` outside the resolved registration base is skipped, not
                     // trusted — the feed chooses `@id` values. `Self::fetch`'s underlying
                     // transport additionally stops any redirect that would otherwise escape
-                    // `trusted_prefix` after this initial check passes (S2/M2).
-                    let is_trusted = trusted.as_ref().is_some_and(|trusted| {
-                        url::Url::parse(&page.id).is_ok_and(|id| is_trusted_prefix(&id, trusted))
-                    });
+                    // `prefix` after this initial check passes (S2/M2).
+                    let is_trusted = url::Url::parse(&page.id).is_ok_and(|id| prefix.permits(&id));
                     if !is_trusted {
                         continue;
                     }
@@ -890,7 +948,7 @@ impl NuGetRegistry {
                         break;
                     }
                     external_fetches += 1;
-                    let Ok(body) = self.fetch(&page.id, trusted_prefix).await else {
+                    let Ok(body) = self.fetch(&page.id, prefix).await else {
                         continue;
                     };
                     let Ok(parsed) = deps_core::parse_json_checked::<RegistrationPageBody>(&body)
@@ -936,16 +994,15 @@ impl NuGetRegistry {
         // other site, closing spec 035's NFR-003(3) residual risk.
         let name_segment = safe_name(name)?;
         let index = self.service_index().await?;
-        let Some(base) = index.registrations_base_url.clone() else {
+        let Some(base) = index.registrations_base_url.as_ref() else {
             return Ok(HashSet::new());
         };
-        let registration_url = registration_index_url(&base, name_segment);
-        let trusted_prefix = format!("{base}/");
-        let Ok(body) = self.fetch(&registration_url, &trusted_prefix).await else {
+        let registration_url = registration_index_url(base.base(), name_segment);
+        let Ok(body) = self.fetch(&registration_url, base.prefix()).await else {
             return Ok(HashSet::new());
         };
         Ok(self
-            .registration_enrichment_from_index(&body, &trusted_prefix)
+            .registration_enrichment_from_index(&body, base.prefix())
             .await
             .unlisted)
     }
@@ -974,17 +1031,12 @@ impl NuGetRegistry {
         let index = self.service_index().await?;
         // FR-016 (spec 035): a feed may omit `SearchQueryService` entirely (e.g. GitHub
         // Packages).
-        let Some(search_base) = index.search_query_service.as_deref() else {
+        let Some(search) = index.search_query_service.as_ref() else {
             return Ok(Vec::new());
         };
-        let url = search_url(search_base, query, limit);
-        // §3.9: the `SearchQueryService`'s own *origin*, not `{search_base}/` — `search_url`
-        // appends a `?q=...` query string to `search_base`, so `{search_base}/` would not be a
-        // prefix of `url` at all. Falls back to the un-origin-narrowed `search_base` itself on
-        // an (unreachable in practice) parse failure — still a specific, safe pin.
-        let trusted_prefix = origin_of(search_base).unwrap_or_else(|| search_base.to_string());
+        let url = search_url(search.base(), query, limit);
 
-        let data = self.fetch(&url, &trusted_prefix).await?;
+        let data = self.fetch(&url, search.prefix()).await?;
         parse_search_response(&data, limit)
     }
 }
@@ -1541,11 +1593,11 @@ mod tests {
         let index =
             ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
         assert_eq!(
-            index.package_base_address,
+            index.package_base_address.base(),
             "https://api.nuget.org/v3-flatcontainer"
         );
         assert_eq!(
-            index.search_query_service.as_deref(),
+            index.search_query_service.as_ref().map(IndexResource::base),
             Some("https://azuresearch-usnc.nuget.org/query")
         );
     }
@@ -1573,7 +1625,7 @@ mod tests {
         let index =
             ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
         assert_eq!(
-            index.search_query_service.as_deref(),
+            index.search_query_service.as_ref().map(IndexResource::base),
             Some("https://search")
         );
     }
@@ -1590,7 +1642,7 @@ mod tests {
         .unwrap();
         let index =
             ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
-        assert_eq!(index.package_base_address, "https://flat");
+        assert_eq!(index.package_base_address.base(), "https://flat");
     }
 
     /// R5: a malformed non-string `@type` scalar must degrade to "doesn't match", not fail
@@ -1607,7 +1659,7 @@ mod tests {
         .unwrap();
         let index =
             ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
-        assert_eq!(index.package_base_address, "https://flat");
+        assert_eq!(index.package_base_address.base(), "https://flat");
     }
 
     /// #662: a `@type` array with no string element at all (the
@@ -1631,7 +1683,7 @@ mod tests {
         assert_eq!(response.resources.len(), 3);
         let index =
             ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
-        assert_eq!(index.package_base_address, "https://flat");
+        assert_eq!(index.package_base_address.base(), "https://flat");
     }
 
     /// R5: a resource with a missing `@id` must be skipped, not crash resolution.
@@ -1647,7 +1699,7 @@ mod tests {
         .unwrap();
         let index =
             ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
-        assert_eq!(index.package_base_address, "https://flat");
+        assert_eq!(index.package_base_address.base(), "https://flat");
     }
 
     /// FR-016: a feed omitting `SearchQueryService` entirely must resolve — this is a real
@@ -2016,7 +2068,10 @@ mod tests {
         let index =
             ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
         assert_eq!(
-            index.registrations_base_url.as_deref(),
+            index
+                .registrations_base_url
+                .as_ref()
+                .map(IndexResource::base),
             Some("https://reg-semver2")
         );
     }
@@ -2034,7 +2089,10 @@ mod tests {
         let index =
             ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
         assert_eq!(
-            index.registrations_base_url.as_deref(),
+            index
+                .registrations_base_url
+                .as_ref()
+                .map(IndexResource::base),
             Some("https://reg-semver1")
         );
     }
@@ -2151,7 +2209,7 @@ mod tests {
             ],
         );
         let enrichment = registry
-            .registration_enrichment_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
+            .registration_enrichment_from_index(body.as_bytes(), &reg_prefix())
             .await;
         assert_eq!(
             enrichment.published.get("2.0.0").copied(),
@@ -2172,7 +2230,7 @@ mod tests {
             ],
         );
         let enrichment = registry
-            .registration_enrichment_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
+            .registration_enrichment_from_index(body.as_bytes(), &reg_prefix())
             .await;
         assert!(!enrichment.published.contains_key("1.0.0"));
         assert!(enrichment.published.contains_key("2.0.0"));
@@ -2192,7 +2250,7 @@ mod tests {
             ],
         );
         let enrichment = registry
-            .registration_enrichment_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
+            .registration_enrichment_from_index(body.as_bytes(), &reg_prefix())
             .await;
         assert!(enrichment.unlisted.contains("1.0.0"));
         assert!(!enrichment.unlisted.contains("2.0.0"));
@@ -2211,7 +2269,7 @@ mod tests {
             ],
         );
         let enrichment = registry
-            .registration_enrichment_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
+            .registration_enrichment_from_index(body.as_bytes(), &reg_prefix())
             .await;
         assert!(enrichment.unlisted.contains("1.0.0"));
         assert!(!enrichment.unlisted.contains("2.0.0"));
@@ -2227,7 +2285,7 @@ mod tests {
             &[("1.0.0", None), ("2.0.0", Some("2021-01-01T00:00:00Z"))],
         );
         let enrichment = registry
-            .registration_enrichment_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
+            .registration_enrichment_from_index(body.as_bytes(), &reg_prefix())
             .await;
         assert!(!enrichment.published.contains_key("1.0.0"));
         assert!(enrichment.published.contains_key("2.0.0"));
@@ -2239,7 +2297,7 @@ mod tests {
     async fn test_registration_enrichment_from_index_malformed_json_returns_empty() {
         let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
         let enrichment = registry
-            .registration_enrichment_from_index(b"not json", "https://api.nuget.org/v3/reg/")
+            .registration_enrichment_from_index(b"not json", &reg_prefix())
             .await;
         assert!(enrichment.published.is_empty());
         assert!(enrichment.unlisted.is_empty());
@@ -2255,7 +2313,7 @@ mod tests {
             {"@id": "https://evil.example/pkg/page/0.json", "count": 1}
         ]}"#;
         let enrichment = registry
-            .registration_enrichment_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
+            .registration_enrichment_from_index(body.as_bytes(), &reg_prefix())
             .await;
         assert!(enrichment.published.is_empty());
         assert!(enrichment.unlisted.is_empty());
@@ -2270,7 +2328,7 @@ mod tests {
             {"@id": "https://api.nuget.org.evil.test/v3/reg/pkg/page/0.json", "count": 1}
         ]}"#;
         let enrichment = registry
-            .registration_enrichment_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
+            .registration_enrichment_from_index(body.as_bytes(), &reg_prefix())
             .await;
         assert!(enrichment.published.is_empty());
         assert!(enrichment.unlisted.is_empty());
@@ -2770,6 +2828,10 @@ mod tests {
 
     // --- get_versions_chained: 3-way failure taxonomy (tester gap #1) ---
 
+    fn reg_prefix() -> TrustedPrefix {
+        TrustedPrefix::parse("https://api.nuget.org/v3/reg/").unwrap()
+    }
+
     fn all_policy() -> Arc<RegistryAccessPolicy> {
         Arc::new(RegistryAccessPolicy::new(
             deps_core::net_policy::WorkspaceRegistryAccess::All,
@@ -2796,18 +2858,35 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn test_fetch_invalid_prefix_error_does_not_expose_userinfo() {
-        let policy = Arc::new(RegistryAccessPolicy::default());
-        let client = workspace_client("https://nuget.example.test", &policy);
+    /// A `PackageBaseAddress` `@id` that is not a URL (here with userinfo) fails the feed at
+    /// resolution with `InvalidUri`, and never echoes the userinfo.
+    #[test]
+    fn test_service_index_resolve_unparseable_package_base_address_is_invalid_uri_without_userinfo()
+    {
+        let response: ServiceIndexResponse = serde_json::from_str(&service_index_body(
+            "http://user:s3cret@[bad",
+            "https://search.example/query",
+        ))
+        .unwrap();
 
-        let err = client
-            .fetch("https://nuget.example.test/x", "http://user:s3cret@[bad")
-            .await
+        let err = ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy())
             .unwrap_err();
 
         assert_matches!(err, deps_core::DepsError::InvalidUri(_));
         assert!(!format!("{err} {err:?}").contains("s3cret"));
+    }
+
+    /// An unparseable `SearchQueryService` `@id` degrades to absent (search returns empty).
+    #[test]
+    fn test_service_index_resolve_unparseable_search_query_service_degrades_to_none() {
+        let response: ServiceIndexResponse =
+            serde_json::from_str(&service_index_body("https://flat.example/v3", "not a url"))
+                .unwrap();
+
+        let index =
+            ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
+
+        assert!(index.search_query_service.is_none());
     }
 
     #[tokio::test]
