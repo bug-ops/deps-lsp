@@ -102,6 +102,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SECURITY.md**: supported versions table lists 2.0.x as supported and older lines as unsupported (#1797)
 
 ### Fixed
+- **deps-core, deps-gradle, deps-swift**: linear-time tests compare run time at two input sizes (`test_util::scaling::assert_scaling`) instead of asserting a wall-clock bound, so they no longer flake under load (#1824, #PR)
+- **all crates**: 49 broken intra-doc links on private items fixed, and CI renders private items (`--document-private-items`) with warnings denied (#1828, #PR)
 - **deps-cli**: `check` and `update` discover hidden manifest files such as `.gitlab-ci.yml` during a directory walk, including under `--respect-gitignore` (#1829, #PR)
 - **deps-lsp**: setting a non-empty `license_policy` at runtime starts the tier-3 license pre-fetch for already-open documents, and the licensing docs state the pre-fetch needs a policy (#1831, #PR)
 - **deps-cli**: `update` shows the declared tag for an unpublished pin (`4.2.2`, `V4.2.2`) instead of an empty `current` (#1833, #PR)

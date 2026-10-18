@@ -400,7 +400,7 @@ enum CacheTier {
 ///
 /// `WorkspaceDeclared` holds an [`AccessSnapshot`] (level and allowlist) **value snapshot**, taken once at
 /// [`Transport::workspace`] construction time — not a live `Arc<RegistryAccessPolicy>` read on
-/// every [`Self::tier_allows`] call. [`Transport::workspace`] takes this same snapshot for its
+/// every `AddrGuard::permits_declared` call. [`Transport::workspace`] takes this same snapshot for its
 /// paired [`CacheTier::WorkspaceDeclared`], and [`HttpCache::set_registry_policy`] rebuilds the
 /// whole `Transport` (both snapshots included) on every actual policy transition, so a
 /// request's cache key and its guard always come from one consistent construction-time value,
@@ -478,7 +478,7 @@ impl RedirectScope {
 /// legitimate registry redirect target for *any* ecosystem, benefiting every one of the eleven
 /// crates sharing the baseline client, not only Cargo's workspace-declared indexes.
 ///
-/// `guard`'s own [`AddrGuard::tier_allows`] term additionally rejects a hop whose target class
+/// `guard`'s own `AddrGuard::permits_declared` term additionally rejects a hop whose target class
 /// the *tier* does not allow — under [`AddrGuard::Baseline`] this term is constant `false`, so
 /// every non-Cargo ecosystem (and Cargo's own `$CARGO_HOME`-provenance traffic) is
 /// bit-for-bit unaffected; under [`AddrGuard::WorkspaceDeclared`] it closes the redirect-hop
@@ -487,7 +487,7 @@ impl RedirectScope {
 ///
 /// This only classifies the redirect target's URL string, not its DNS-resolved address — that
 /// residual gap (issue #449, "D1" in PR #447's plan) is closed for the name-hop case by
-/// [`BlockedAddrResolver`], which [`build_guarded_client`] wires into every client this module
+/// [`BlockedAddrResolver`], which `build_client_inner` wires into every client this module
 /// builds: a redirect hop reuses the same `Client`, so its target's resolved address is
 /// validated too, for free (FR-007).
 ///
@@ -554,10 +554,8 @@ fn redirect_policy(guard: AddrGuard, scope: RedirectScope) -> reqwest::redirect:
 /// (fail-closed) rather than treated as "no restriction" — logged once at construction time
 /// via `tracing::warn!` rather than silently, since a caller-side bug producing an
 /// unparseable `trusted_origin` would otherwise present only as every redirect on that
-/// transport mysteriously failing. This is reachable today: `deps-nuget`'s Public tier builds
-/// `trusted_prefix` from a service-index `@id` string that is never `Url`-validated (that
-/// validation only runs for [`crate::net_policy::validate_index_url`]'s
-/// `NuGetRegistryTier::WorkspaceDeclared` path), so a malformed `@id` reaches this parse.
+/// transport mysteriously failing. The branch is defense in depth: callers hand over an
+/// already-validated trusted prefix, so it is not expected to fire.
 fn trusted_origin_redirect_policy(trusted_origin: &str) -> reqwest::redirect::Policy {
     let trusted = match Url::parse(trusted_origin) {
         Ok(url) => Some(url),
@@ -681,7 +679,7 @@ impl std::fmt::Debug for TestLookup {
 /// declared hostname, but `reqwest`'s connector resolves DNS independently, later, and an
 /// attacker who controls the hostname's DNS can rebind it to a blocked address in between.
 ///
-/// Wired into every client [`build_guarded_client`] returns, so all 11 ecosystem crates sharing
+/// Wired into every client `build_client_inner` builds, so all 11 ecosystem crates sharing
 /// the baseline client pool inherit it with zero per-crate plumbing (FR-006/NFR-002).
 ///
 /// # Scope
@@ -1132,7 +1130,7 @@ fn apply_request_headers(
 /// Maps a failed `send()` to a [`DepsError`], surfacing a connect-time resolver-guard block as
 /// [`DepsError::HostBlockedByPolicy`] instead of a generic transport error.
 ///
-/// Walks the source chain before the error is sanitized, since [`SanitizedRegistryError`] drops
+/// Walks the source chain before the error is sanitized, since `SanitizedRegistryError` drops
 /// the chain. A [`ResolveGuardError::NoAddresses`] stays a transport error.
 fn send_error(url: &str, error: reqwest::Error) -> DepsError {
     let blocked =
@@ -1899,7 +1897,7 @@ impl HttpCache {
     /// one-char variant tag (`A` credentialed, `U` anonymous) ahead of the partition, so the
     /// same [`CredentialPartition`] used with and without a credential yields two entries. A
     /// partition is encoded as a tag (`0`/`1`) before a fixed-width hex field rather than a `0`
-    /// sentinel: [`auth_digest`](crate::secret::auth_digest) is a non-cryptographic hash, so
+    /// sentinel: [`auth_digest`] is a non-cryptographic hash, so
     /// `Some(0)` is a legitimate digest (issue #1025). Every field is fixed width, so no tag or
     /// field can be confused with part of another field or `url`.
     fn cache_key<'a>(&self, url: &'a str, tier: CacheTier, auth: KeyAuth) -> Cow<'a, str> {

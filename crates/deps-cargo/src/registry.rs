@@ -67,7 +67,7 @@ pub struct CratesIoRegistry {
     sparse: SparseIndexClient,
     cache: Arc<HttpCache>,
     /// Search API base URL — [`SEARCH_API_BASE`] in production, overridden to a mockito
-    /// server URL in tests via [`Self::with_base_for_test`] (mirrors `deps-dart`'s
+    /// server URL in tests via `Self::with_base_for_test` (mirrors `deps-dart`'s
     /// `PubDevRegistry::with_base`, #1052).
     search_base: String,
 }

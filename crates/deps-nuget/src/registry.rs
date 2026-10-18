@@ -75,7 +75,7 @@ const MAX_EXTERNAL_PAGE_FETCHES: usize = 2;
 /// Display name for NuGet used in not-found and API-response error messages.
 pub const REGISTRY: &str = "NuGet";
 
-/// Returns `true` when `url` (an already-[`NuGetFeedUrl`]-normalized string) is the real
+/// Returns `true` when `url` (an already-`NuGetFeedUrl`-normalized string) is the real
 /// public NuGet service index — never true for a source merely *named* `"nuget.org"` (issue
 /// #523, R3). Used to decide whether a `<packageSourceMapping>` group that resolves to exactly
 /// this one source should keep plain [`DependencySource::Registry`] (and so the

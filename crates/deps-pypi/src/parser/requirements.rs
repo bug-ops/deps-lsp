@@ -22,7 +22,7 @@ use url::Url;
 /// Pip option tokens recognized on an option line (a line whose first
 /// whitespace-delimited token starts with `-`). Matched by exact equality
 /// against the token's name — the part before an `=` for the long `--opt=value`
-/// spelling — see [`parse_requirements`] — so an unrecognized `-`-leading line
+/// spelling — see `parse_requirements` — so an unrecognized `-`-leading line
 /// (e.g. a markdown bullet `- item`) is not silently treated as an option.
 const KNOWN_OPTIONS: &[&str] = &[
     "-r",

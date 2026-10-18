@@ -898,7 +898,7 @@ impl NuGetConfig {
     /// Mapping-branch-only fallback for [`Self::rejected_reason_for`] (issue #1504): recovers a
     /// reason for exactly the two [`NuGetFeedUrlError`] variants
     /// [`InvalidEntry::rejection_reason`] classifies as
-    /// [`RejectionOutcome::IntentionallySilent`](deps_core::net_policy::RejectionOutcome::IntentionallySilent)
+    /// [`RejectionOutcome::IntentionallySilent`]
     /// — see [`Self::rejected_reason_for`]'s own doc for why that silence does not apply when
     /// no key in the mapped group resolves to a usable hop. `None` for every other reason,
     /// since those already surface (or are deliberately excluded, for the blocked-host case)

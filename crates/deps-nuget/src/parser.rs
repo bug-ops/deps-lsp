@@ -160,7 +160,7 @@ pub fn parse_packages_config(content: &str, doc_uri: &Url) -> Result<NuGetParseR
 /// concrete value until MSBuild expands them, so wherever this is true a `version`/`Version`
 /// string must degrade to "no requirement" rather than be treated as a real, checkable one —
 /// used by both this module's parse-time degrade guards and
-/// [`crate::formatter::NuGetFormatter::requirement_is_placeholder`] (whose default
+/// `crate::formatter::NuGetFormatter::requirement_is_placeholder` (whose default
 /// `requirement_is_unresolved` delegates to it, #1380), so the same reference is never
 /// partially recognized at one layer and not the other (#1355).
 ///

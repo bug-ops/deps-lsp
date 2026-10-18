@@ -25,9 +25,9 @@ pub(super) const VERSION_OPERATOR_CHARS: &[char] = &['[', '(', ']'];
 /// Which manifest position a Gradle completion request resolved to, or none.
 ///
 /// A crate-local, non-`&'static str` replacement for the hand-rolled context-type return of
-/// [`GradleEcosystem::detect_completion_context`] and its `detect_catalog_context`/
+/// `GradleEcosystem::detect_completion_context` and its `detect_catalog_context`/
 /// `detect_dsl_context` helpers (issue #819, same bug class as #793/#118): the dispatch
-/// match in [`Ecosystem::generate_completions`]'s override for this crate must be
+/// match in `Ecosystem::generate_completions`'s override for this crate must be
 /// exhaustive over this enum, so adding a new completable position forces a compile error
 /// at the match instead of silently falling through a `_ => vec![]` wildcard. `Package` and
 /// `Version` do map conceptually to
@@ -78,10 +78,10 @@ pub(super) fn byte_range(line: &str, line_idx: u32, start_byte: usize, end_byte:
 /// stays strict (default-deny on anything not positively recognized) while `Package`'s gate is
 /// default-allow (see [`PackageGate`]'s doc).
 ///
-/// Returns [`DeclarationScope::Outside`] when the resolved word is empty or not
+/// Returns `DeclarationScope::Outside` when the resolved word is empty or not
 /// [`crate::parser::is_dependency_configuration`] — e.g. `println("...")` or an unrecognized
 /// call — or when [`resolve_call_word`] finds a bare assignment with no call word at all.
-/// Otherwise returns [`DeclarationScope::Within`] spanning from `open_pos` (the current
+/// Otherwise returns `DeclarationScope::Within` spanning from `open_pos` (the current
 /// literal's own start, **not** the configuration word's start — impl-critic S2 on #1447: a
 /// span starting at the word extends across any earlier, already-closed vararg sibling this
 /// literal shares a call with, e.g. `implementation "a:b:1.0", "c:d:<cursor>` — so pass 2's

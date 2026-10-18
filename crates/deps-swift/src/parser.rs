@@ -2124,11 +2124,13 @@ let package = Package(
 
     #[test]
     fn test_path_flood_parses_in_bounded_time() {
-        let count = 200_000;
-        let content = ".package(path: \"p\"),\n".repeat(count);
-        let started = std::time::Instant::now();
-        let result = parse_package_swift(&content, &test_uri()).unwrap();
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        let result = deps_core::test_util::scaling::assert_scaling(
+            "path flood",
+            deps_core::test_util::scaling::ExpectedGrowth::Linear,
+            200_000,
+            |count| ".package(path: \"p\"),\n".repeat(count),
+            |content| parse_package_swift(content, &test_uri()).unwrap(),
+        );
         assert_eq!(
             result.dependencies.len(),
             deps_core::MAX_DEPENDENCIES_PER_DOCUMENT
@@ -2139,10 +2141,13 @@ let package = Package(
     #[test]
     fn test_overlapping_forms_flood_on_one_line_is_linear() {
         let unit = r#".package(url: "https://github.com/a/b.git", from: "1.0.0") .package(url: "https://github.com/a/b.git", .upToNextMajor(from: "1.0.0")) "#;
-        let content = unit.repeat(50_000);
-        let start = std::time::Instant::now();
-        let result = parse_package_swift(&content, &test_uri()).unwrap();
-        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        let result = deps_core::test_util::scaling::assert_scaling(
+            "overlapping forms flood",
+            deps_core::test_util::scaling::ExpectedGrowth::Linear,
+            50_000,
+            |repeats| unit.repeat(repeats),
+            |content| parse_package_swift(content, &test_uri()).unwrap(),
+        );
         assert_eq!(
             result.dependencies.len(),
             deps_core::MAX_DEPENDENCIES_PER_DOCUMENT

@@ -71,7 +71,7 @@ impl Registry for StubRegistry {
 
 /// The single dependency [`TestTier3Ecosystem::parse_manifest`] parses into: named
 /// `"dep-0"`, an explicit `=`-pinned requirement (concrete under every ecosystem's
-/// [`deps_core::lsp_helpers::in_use_version::concrete_pin_version`] policy, so
+/// `deps_core::lsp_helpers::in_use_version::concrete_pin_version` policy, so
 /// `resolve_in_use_version` succeeds with no lock file needed — see
 /// [`crate::classify::license::tier3_license_targets`]).
 struct StubDependency {

@@ -419,7 +419,7 @@ struct TieredRawValue {
 ///
 /// `tier` gates expansion itself (issue #1420, amending FR-007): a project-tier `raw`
 /// containing `${` is rejected outright, before
-/// [`config_trust::expand_env_vars`](deps_core::config_trust::expand_env_vars) ever runs, so a
+/// [`config_trust::expand_env_vars`] ever runs, so a
 /// hostile
 /// project-tier `.npmrc` can never have an environment variable's value substituted into a URL
 /// this function — or a caller fetching the [`NpmRegistryIndex`] it would have produced — ever

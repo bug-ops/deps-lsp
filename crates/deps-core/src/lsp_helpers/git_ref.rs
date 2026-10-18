@@ -3524,15 +3524,13 @@ mod tests {
     fn test_locate_value_span_bounded_scan_stays_fast_on_a_huge_line() {
         // Regression guard (security S-2): a several-megabyte single-line haystack must
         // resolve in milliseconds, not minutes, once the scan is bounded.
-        let filler = "y".repeat(6 * 1024 * 1024);
         let value = "not-present-in-filler@v4";
-        let content = format!("{filler}\n");
-        let start = std::time::Instant::now();
-        let result = locate_value_span(&content, 0, value, false);
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(1),
-            "locate_value_span took {:?}, expected a bounded scan to finish in well under 1s",
-            start.elapsed()
+        let result = crate::test_util::scaling::assert_scaling(
+            "locate_value_span on a huge line",
+            crate::test_util::scaling::ExpectedGrowth::Bounded,
+            6 * 1024 * 1024,
+            |len| format!("{}\n", "y".repeat(len)),
+            |content| locate_value_span(content, 0, value, false),
         );
         assert_eq!(result, None);
     }
@@ -3656,17 +3654,22 @@ mod tests {
     fn test_marker_byte_offset_ascii_fast_path_stays_linear_on_a_huge_single_line() {
         // Regression guard (S1, impl-critic, #879 follow-up): without `line_is_ascii`,
         // this was O(line length) per call, reintroducing the O(n^2) shape.
-        let filler = "x".repeat(6 * 1024 * 1024);
-        let table = LineOffsetTable::new(&filler);
-        let start = std::time::Instant::now();
-        for col in (0..filler.len()).step_by(filler.len() / 5000) {
-            assert_eq!(marker_byte_offset(&filler, &table, 1, col), col);
-        }
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(1),
-            "marker_byte_offset took {:?} for 5000 lookups on a huge ASCII line, expected well \
-             under 1s",
-            start.elapsed()
+        // Lookups scale with the line length, so a per-lookup O(line length) cost shows up as
+        // quadratic growth rather than a constant factor.
+        crate::test_util::scaling::assert_scaling(
+            "marker_byte_offset on a huge ASCII line",
+            crate::test_util::scaling::ExpectedGrowth::Linear,
+            6 * 1024 * 1024,
+            |len| {
+                let filler = "x".repeat(len);
+                let table = LineOffsetTable::new(&filler);
+                (filler, table)
+            },
+            |(filler, table)| {
+                for col in (0..filler.len()).step_by(1200) {
+                    assert_eq!(marker_byte_offset(filler, table, 1, col), col);
+                }
+            },
         );
     }
 
@@ -3675,19 +3678,22 @@ mod tests {
         // Regression guard for #882: without the per-line char-boundary cache, N lookups on
         // the same non-ASCII line cost O(N x line length) — ~500ms for 5000 lookups on a
         // several-hundred-KB line in a release build.
-        let filler = "x".repeat(200 * 1024);
-        let content = format!("{filler}\u{2014}{filler}");
-        let table = LineOffsetTable::new(&content);
-        let char_count = content.chars().count();
-        let start = std::time::Instant::now();
-        for col in (0..char_count).step_by((char_count / 5000).max(1)) {
-            let _ = marker_byte_offset(&content, &table, 1, col);
-        }
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(1),
-            "marker_byte_offset took {:?} for 5000 lookups on a huge non-ASCII line, expected \
-             well under 1s",
-            start.elapsed()
+        crate::test_util::scaling::assert_scaling(
+            "marker_byte_offset on a huge non-ASCII line",
+            crate::test_util::scaling::ExpectedGrowth::Linear,
+            200 * 1024,
+            |half_len| {
+                let filler = "x".repeat(half_len);
+                let content = format!("{filler}\u{2014}{filler}");
+                let table = LineOffsetTable::new(&content);
+                let char_count = content.chars().count();
+                (content, table, char_count)
+            },
+            |(content, table, char_count)| {
+                for col in (0..*char_count).step_by(80) {
+                    let _ = marker_byte_offset(content, table, 1, col);
+                }
+            },
         );
     }
 

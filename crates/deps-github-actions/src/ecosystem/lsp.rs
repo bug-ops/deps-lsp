@@ -23,7 +23,7 @@ pub(super) const VERSION_OPERATOR_CHARS: &[char] = &[];
 /// see `GithubActionsEcosystem::generate_completions`'s doc for why this check exists
 /// (issue #1182) and why it cannot be a check on the extracted completion prefix.
 ///
-/// Only a [`PinStyle::Sha`] with a `comment` has a `version_range` extending past the ref, so
+/// Only a `PinStyle::Sha` with a `comment` has a `version_range` extending past the ref, so
 /// only there is `position` compared against the SHA's own end column (range start plus SHA
 /// length). A position exactly at that column (still typing the SHA) is not past it.
 pub(super) fn position_past_sha_pin_own_ref(

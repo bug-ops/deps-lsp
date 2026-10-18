@@ -146,7 +146,7 @@ pub fn is_prerelease(version: &str) -> bool {
 }
 
 /// A parsed interval-notation version range (spec §2), produced once per dependency by
-/// [`parse_range`] and reused by [`crate::formatter::NuGetMatcher`] against every candidate
+/// [`parse_range`] and reused by `crate::formatter::NuGetMatcher` against every candidate
 /// version, instead of being re-parsed per candidate.
 ///
 /// The bracket-interval *grammar* (delimiter parsing, malformed-input rejection) is shared
@@ -233,7 +233,7 @@ pub fn satisfies(version: &str, range: &str) -> bool {
 }
 
 /// A parsed floating-version pattern (spec §2), produced once per dependency by
-/// [`parse_float`] and reused by [`crate::formatter::NuGetMatcher`] against every candidate
+/// [`parse_float`] and reused by `crate::formatter::NuGetMatcher` against every candidate
 /// version, instead of being re-parsed per candidate.
 pub(crate) enum FloatPattern {
     /// `*` (stable only) or `*-*` (including prerelease).

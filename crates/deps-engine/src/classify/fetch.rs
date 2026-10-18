@@ -541,7 +541,7 @@ impl FetchResult {
 /// ```
 #[allow(
     clippy::too_many_arguments,
-    reason = "internal (non-pub) call-site-controlled fetch tuning + ecosystem-context \
+    reason = "call-site-controlled fetch tuning + ecosystem-context \
               parameters; grouping into a config struct would only move, not reduce, the \
               per-call-site churn across this module's ~15 production and test call sites"
 )]

@@ -78,8 +78,8 @@ pub const MAX_DIAGNOSTIC_VALUE_CHARS: usize = 128;
 ///
 /// A config-global declaration (a single blocked npm top-level `registry=`, or one
 /// `NuGet.Config` `<add key>` source) can affect *every* dependency in the document — without
-/// this cap, [`push_collapsed_blocked_registries`] would build up to
-/// [`crate::MAX_DEPENDENCIES_PER_DOCUMENT`] `-` `1` `Location`s (each a cloned [`Uri`] plus a
+/// this cap, `push_collapsed_blocked_registries` would build up to
+/// [`crate::MAX_DEPENDENCIES_PER_DOCUMENT`] `-` `1` `Location`s (each a cloned `Uri` plus a
 /// message) into one diagnostic, republished on every keystroke, for a group whose size alone
 /// already says everything the individual entries would ("every other dependency is affected
 /// too").
@@ -1460,7 +1460,7 @@ fn offline_notice(
 /// `@v4` tag is the norm for GitHub Actions, not a transient state), which are structurally
 /// permanent for as long as the dependency is declared the way it is (every `deno.json`
 /// `jsr:` dependency is `UnmappableName` forever, for example) and would otherwise leave a
-/// standing, unresolvable Problems-panel entry. [`push_skip_reason_footer_hover_section`]
+/// standing, unresolvable Problems-panel entry. `push_skip_reason_footer_hover_section`
 /// has no such restriction: it renders per-dependency, on demand, not as a standing
 /// diagnostic, so it uses [`SkipReason::unchecked_reason`] directly for every
 /// non-`NonRegistrySource` variant.
@@ -1503,7 +1503,7 @@ const fn should_notify_in_diagnostics(reason: SkipReason) -> bool {
 /// an "Information" squiggle on nearly every dependency in a lockfile-less manifest. Every
 /// individual skipped dependency still survives via `related_information` (name + its own
 /// reason), capped at [`MAX_BLOCKED_REGISTRY_RELATED_INFO`] like
-/// [`push_collapsed_blocked_registries`]'s sibling cap, so the notice never grows
+/// `push_collapsed_blocked_registries`'s sibling cap, so the notice never grows
 /// unbounded with document size.
 ///
 /// Suppressed while `versions.offline`: [`offline_notice`] already covers that case with

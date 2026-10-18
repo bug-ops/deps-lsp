@@ -1002,7 +1002,7 @@ fn push_offline_footer_hover_section(
 }
 
 /// Appends a "vulnerability data not checked" footer for a non-offline
-/// [`SkipReason`] (issue #1392) — extends #483's offline-only footer to the far more
+/// `SkipReason` (issue #1392) — extends #483's offline-only footer to the far more
 /// common case where the OSV scan itself skipped this dependency (most often
 /// `NoConcreteVersion`: a semver-range requirement with no committed lock file),
 /// which otherwise renders nothing and is visually indistinguishable from a

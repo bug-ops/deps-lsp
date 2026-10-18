@@ -219,7 +219,7 @@ fn has_short_stability_alias(s: &str) -> bool {
 /// directly adjacent to a numeric run with no separator (e.g. `1.0.0RC1`, `1.0.0a1`,
 /// `1.0.0dev`) — `composer/semver`'s modifier grammar makes the `[._-]?` separator before the
 /// keyword optional for every recognized word (matching
-/// [`crate::formatter::qualifier_stability`]'s full word list), not just `alpha`/`beta`/
+/// `crate::formatter::qualifier_stability`'s full word list), not just `alpha`/`beta`/
 /// `rc`. The hyphenated forms are already caught by
 /// [`deps_core::has_default_prerelease_marker`]'s `-rc`/`-alpha`/`-beta`/`-dev` substring
 /// checks and [`has_short_stability_alias`]'s hyphenated `-a`/`-b`.

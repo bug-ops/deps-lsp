@@ -554,11 +554,16 @@ mod tests {
     #[test]
     fn test_versioned_and_versionless_flood_on_one_line_is_linear() {
         let filler = "implementation 'g:a:1'\n".repeat(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
-        let flood = "api 'g:a:1' api 'g:a' ".repeat(100_000);
-        let content = format!("dependencies {{\n{filler}{flood}\n}}\n");
-        let start = std::time::Instant::now();
-        let result = parse_groovy_dsl(&content, &make_uri()).unwrap();
-        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        let result = deps_core::test_util::scaling::assert_scaling(
+            "groovy versioned/versionless flood",
+            deps_core::test_util::scaling::ExpectedGrowth::Linear,
+            100_000,
+            |repeats| {
+                let flood = "api 'g:a:1' api 'g:a' ".repeat(repeats);
+                format!("dependencies {{\n{filler}{flood}\n}}\n")
+            },
+            |content| parse_groovy_dsl(content, &make_uri()).unwrap(),
+        );
         assert_eq!(
             result.dependencies.len(),
             deps_core::MAX_DEPENDENCIES_PER_DOCUMENT
