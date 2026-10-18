@@ -24,9 +24,9 @@ use super::hover_markdown::{FieldKind, HoverMarkdown};
 use super::{
     CooldownBlocker, CooldownPrecedence, DiagnosticMessages, EcosystemFormatter, FetchContext,
     HOVER_RECENT_VERSIONS, InteractiveFetchRequest, LatestVerdict, SiblingMatchNote, VersionData,
-    await_interactive_fetch, cached_package_versions_by_name, cooldown_precedence, escape_markdown,
-    in_use_version, latest_verdict, markdown_code_span, position_in_range, resolve_in_use_version,
-    resolve_scan_outcome,
+    await_interactive_versions, cached_package_versions_by_name, cooldown_precedence,
+    escape_markdown, in_use_version, latest_verdict, markdown_code_span, position_in_range,
+    resolve_in_use_version, resolve_scan_outcome,
 };
 use crate::github::normalize_tag;
 
@@ -159,8 +159,8 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // host) must degrade to the same basic card the `!resolvable` branch renders, not vanish
     // the whole hover response.
     let available_versions = if resolvable {
-        await_interactive_fetch(
-            registry.get_versions_from(dep.name(), &dep_source, freshness),
+        await_interactive_versions(
+            registry,
             InteractiveFetchRequest::new(
                 versions,
                 parse_result.uri(),
@@ -169,6 +169,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
                 &dep_source,
                 FetchContext::Hover,
             ),
+            freshness,
         )
         .await
         .into_live()

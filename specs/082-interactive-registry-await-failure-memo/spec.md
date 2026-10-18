@@ -196,7 +196,7 @@ Conceptual only; representation is a plan-phase decision.
 |--------|-------------|----------------|
 | Known failure (existing) | Per-package outcome recorded by the lifecycle fetch in `DependencyOutcomes` | normalized name, `FetchFailure` (`Actionable`, `Transient`, `NotAttempted`) |
 | Interactive failure memo (new, shape open, OQ-1) | Short-lived record that an interactive await for a package and source failed or timed out | package name, source key, failure class (typed), recorded-at instant, expiry |
-| In-flight interactive fetch (new, optional, FR-007) | Shared handle that lets concurrent requests for one package and source await a single fetch | package name, source key, shared future |
+| In-flight interactive fetch (new, optional, FR-007) | Shared handle that lets concurrent requests for one package and source await a single fetch | package name, source key, manifest, generation, list shape, shared version list |
 | Interactive concurrency bound (new, OQ-4) | Cap on simultaneously awaiting hover/code-action registry fetches | max in flight, overflow policy (degrade immediately) |
 
 ## 6. Edge Cases and Error Handling
@@ -272,7 +272,16 @@ Conceptual only; representation is a plan-phase decision.
 >   runs on configuration changes (after the apply) and after reparses that change registry
 >   routing (`RefetchPolicy::AllDependencies`); a requirements-only reparse keeps the memo. A
 >   live success records nothing unless the background outcomes still show a failure.
-> - **OQ-7** and **FR-007** are deferred to #1844 and #1843.
+> - **OQ-7** is deferred to #1844.
+> - **FR-007** (#1843): version-list awaits go through `await_interactive_versions`, which
+>   shares one registry poll per package, source, manifest and invalidation generation. The
+>   first request polls; the rest receive the same `Arc<[Box<dyn Version>]>`. Followers hold a
+>   dispatch permit like any waiter (FR-008), and a request that follows a leader that got no
+>   list returns `Unverified`, never `Failed`, as a memo replay does. A cancelled leader hands
+>   the flight to a follower, which polls itself. An attempt that starts with less than half of
+>   `REGISTRY_FETCH_BUDGET` left (a promoted follower) writes no failure record on an error or
+>   elapse. A freshness-disabled request (code actions) may follow a freshness-enabled flight
+>   (hover); the reverse costs a second request.
 >
 > **Accepted limitations**
 > - FR-006 "a later successful fetch" clears only seeded records. An interactive-failed record
@@ -284,6 +293,9 @@ Conceptual only; representation is a plan-phase decision.
 > - A hover cancelled by the client before it completes never memoizes (the future is dropped
 >   before the record is written), so on a cold document only the background outcome seeds a
 >   record.
+> - A code action that follows a hover's enriched flight inherits its latency; if that passes
+>   the 10 s budget it gets `Unverified` and drops its speculative fixes even though its own
+>   bare fetch might have answered in time.
 > - Scope: the default `generate_hover`/`generate_code_actions` path (FR-012). NuGet's and
 >   GitLab CI's ecosystem-specific hover/code-action overrides keep their own ungated 5 s
 >   awaits; follow-up #1845.

@@ -220,6 +220,7 @@ pub use redact::secret;
 /// [`selection::SelectionContext`]/[`selection::StabilityFloor`]: manifest-scoped
 /// selection state (#1444).
 pub mod selection;
+mod single_flight;
 pub mod tag_index_refresh;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;

@@ -8,10 +8,10 @@ use crate::{Dependency, ParseResult, Registry, VersionReq};
 use super::{
     DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, FetchContext, InteractiveFetch,
     InteractiveFetchRequest, LatestVerdict, LineOffsetTable, NoLiveList,
-    UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, await_interactive_fetch, cached_package_versions,
-    candidate_verdict, is_safe_version_string, latest_verdict, literal_span_matches,
-    requirement_is_unsatisfiable, resolve_latest_status, resolve_scan_outcome, single_file_edit,
-    slice_for_range, strip_whitespace, warn_rejected_value,
+    UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, await_interactive_versions,
+    cached_package_versions, candidate_verdict, is_safe_version_string, latest_verdict,
+    literal_span_matches, requirement_is_unsatisfiable, resolve_latest_status,
+    resolve_scan_outcome, single_file_edit, slice_for_range, strip_whitespace, warn_rejected_value,
 };
 
 /// The vulnerability-fix quickfix built by [`build_vulnerability_fix_action`],
@@ -543,12 +543,8 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     let dep_source = dep.source();
     let normalized_name = formatter.normalize_package_name(dep.name());
     let (registry_versions, fetch_unverified) = if formatter.can_resolve_source(&dep_source) {
-        match await_interactive_fetch(
-            registry.get_versions_from(
-                dep.name(),
-                &dep_source,
-                crate::freshness::FreshnessSettings::Disabled,
-            ),
+        match await_interactive_versions(
+            registry,
             InteractiveFetchRequest::new(
                 versions,
                 uri,
@@ -557,6 +553,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                 &dep_source,
                 FetchContext::CodeAction,
             ),
+            crate::freshness::FreshnessSettings::Disabled,
         )
         .await
         {
