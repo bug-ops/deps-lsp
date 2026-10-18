@@ -676,7 +676,7 @@ fn is_retryable_error(e: &DepsError) -> bool {
 /// can be unit-tested with a fake `fetch`/`stale` pair under `tokio::time::pause`,
 /// without a real HTTPS endpoint: `HttpCache` has no test-mode escape hatch for a
 /// mocked server across a crate boundary (its `ensure_https`, in
-/// `crates/deps-core/src/cache.rs`, only relaxes for `#[cfg(test)]` within `deps-core`'s
+/// `crates/deps-core/src/cache/guard.rs`, only relaxes for `#[cfg(test)]` within `deps-core`'s
 /// own compilation, which does not apply when `deps-maven` links it as a normal
 /// dependency).
 async fn search_with_retry<F, Fut, S>(mut fetch: F, stale: S) -> Result<Bytes>
@@ -2577,7 +2577,7 @@ mod tests {
     /// (`url = %base`), leaking a query-string credential the same way #756 S-A's "fetching
     /// fresh" log did in `deps-core::cache` — now redacted via
     /// [`deps_core::net_policy::RedactedUrl`]. Mirrors
-    /// `deps_core::cache::tests::test_fetch_and_store_fetching_fresh_log_redacts_query_string_token`'s
+    /// `deps_core::cache::tests::errors::test_fetch_and_store_fetching_fresh_log_redacts_query_string_token`'s
     /// pattern.
     #[tokio::test]
     async fn test_fetch_publish_times_failure_log_redacts_url_query_string() {

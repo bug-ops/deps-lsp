@@ -1768,7 +1768,7 @@ mod tests {
 
         /// #935/#936 sink-level regression test, mirroring the repo's precedent for this bug
         /// class (`deps-cargo/src/parser.rs`'s `test_parse_registry_index_env_collision_...`
-        /// tests, and cache.rs #756): pinning the type-level fix (`DependencySource`'s
+        /// tests, and cache/ #756): pinning the type-level fix (`DependencySource`'s
         /// hand-written `Debug`) alone leaves the actual `tracing::warn!(?source, ...)` call
         /// site in this function untested. Two `AlternateRegistry` sources, each carrying a
         /// distinct query-string credential, collide — this is the exact `tracing::warn!`

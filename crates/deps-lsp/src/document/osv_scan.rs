@@ -14,7 +14,7 @@ use tower_lsp_server::ls_types::Uri;
 
 /// Ceiling on the OSV scan timeout, independent of the configured
 /// `fetch_timeout_secs`: the shared `reqwest` client behind `HttpCache`
-/// already imposes its own client-wide 30s timeout (`cache.rs`), so a
+/// already imposes its own client-wide 30s timeout (`cache/`), so a
 /// per-phase timeout longer than that would never actually bind.
 const OSV_SCAN_TIMEOUT_CEILING_SECS: u64 = 30;
 

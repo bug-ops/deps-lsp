@@ -110,6 +110,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-github-actions, deps-gitlab-ci**: tag-to-SHA quickfixes write `<sha> # <tag>` through the shared rewrite rule, and a bare SHA when the ref is quoted, in a flow mapping or the tag is not version-shaped (#1770)
 - **deps**: lock-only bump of tokio 1.53.2, toml-span 0.7.2 and 30 transitive crates (#1797)
 - **SECURITY.md**: supported versions table lists 2.0.x as supported and older lines as unsupported (#1797)
+- **deps-core**: `cache.rs` split into a `cache/` module tree (transport, auth, guard, redirect, resolver, fetch, store, tests) with unchanged public paths (#1840)
 
 ### Fixed
 - **deps-core, deps-lsp**: hover and code actions answer from the degraded path after a registry lookup failed or timed out, and concurrent live fetches are bounded, so a dead registry no longer stalls every request for 10 s (#1830, #1846)
