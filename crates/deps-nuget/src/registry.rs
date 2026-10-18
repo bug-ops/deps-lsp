@@ -2949,7 +2949,8 @@ mod tests {
             .create_async()
             .await;
         // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
-        registry.auth = Some(NuGetAuth::new("user", "pat"));
+        let auth = NuGetAuth::new("user", "pat");
+        registry.auth = Some(auth);
         let prefix = TrustedPrefix::parse(&format!("{}/", server.url())).unwrap();
 
         registry
