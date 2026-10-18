@@ -159,6 +159,29 @@ impl LicensePolicy {
     pub fn is_empty(&self) -> bool {
         self.allow.is_empty() && self.deny.is_empty()
     }
+
+    /// Whether this policy went from empty to non-empty relative to `previous` — the edge on
+    /// which already-open documents need the tier-3 license pre-fetch they skipped under an
+    /// empty policy (issue #1831). Mirrors `Checks::activated_since`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::licenses::LicensePolicy;
+    ///
+    /// let empty = LicensePolicy::default();
+    /// let mit = LicensePolicy::new(vec!["MIT".to_string()], vec![]);
+    /// let apache = LicensePolicy::new(vec!["Apache-2.0".to_string()], vec![]);
+    ///
+    /// assert!(mit.activated_since(&empty));
+    /// assert!(!empty.activated_since(&mit));
+    /// assert!(!apache.activated_since(&mit));
+    /// assert!(!empty.activated_since(&empty));
+    /// ```
+    #[must_use]
+    pub fn activated_since(&self, previous: &Self) -> bool {
+        previous.is_empty() && !self.is_empty()
+    }
 }
 
 /// Why a dependency's license violates a [`LicensePolicy`].

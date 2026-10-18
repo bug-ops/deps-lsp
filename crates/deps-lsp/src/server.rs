@@ -1140,7 +1140,11 @@ impl LanguageServer for Backend {
         }
 
         // Issue #1831: same rationale, for the license policy's empty->non-empty transition.
-        if previous_license_policy.is_empty() && !self.state.license_policy().is_empty() {
+        if self
+            .state
+            .license_policy()
+            .activated_since(&previous_license_policy)
+        {
             trigger_license_prefetch_for_open_documents(
                 &self.state,
                 &self.client,

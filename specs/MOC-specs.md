@@ -32,7 +32,7 @@ status: moc
 | 080 | [[080-gradle-deps-dev-maven-system-routing/spec\|Route Gradle through the deps.dev Maven system for supply-chain signal parity]] | specify | draft — research/parity, P4, 6 open `[NEEDS CLARIFICATION]` items |
 | 081 | [[081-wall-clock-test-assertions/spec\|Replace wall-clock bounds in linear-time tests with a load-independent check]] | specify | draft — testing-infra, P3, 7 open `[NEEDS CLARIFICATION]` items |
 | 082 | [[082-interactive-registry-await-failure-memo/spec\|Fail-fast interactive registry awaits: failure memo and bounded concurrency for hover and code actions]] | specify | bug/cross-ecosystem, P2 — draft, 7 open `[NEEDS CLARIFICATION]` items |
-| 083 | [[083-deps-cli-walk-hidden-file-manifests/spec\|deps-cli check never discovers a root-level .gitlab-ci.yml during a directory walk (hidden-file manifests skipped, CI gate fails open)]] | specify | bug, P1 — draft, 7 open `[NEEDS CLARIFICATION]` items |
+| 083 | [[083-deps-cli-walk-hidden-file-manifests/spec\|deps-cli check never discovers a root-level .gitlab-ci.yml during a directory walk (hidden-file manifests skipped, CI gate fails open)]] | specify | shipped — bug, P1: `deps-cli` walk admits registry-named hidden manifest files (`.gitlab-ci.yml`) via a `filter_entry` predicate; exact `manifest_filenames()` match only (PR #PR, issue #1829) |
 
 ## Completed Specs
 

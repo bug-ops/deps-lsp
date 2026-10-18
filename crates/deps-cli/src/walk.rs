@@ -35,10 +35,9 @@ pub const MAX_WALKED_FILES: usize = 50_000;
 /// Not exhaustive; covers the common heavy dependency/build/VCS directories across this
 /// crate's 14 supported ecosystems. Most VCS and tool-cache directories here (`.git`, `.venv`,
 /// `.gradle`, `.dart_tool`, `.build`, `.bundle`, `.tox`, ...) are already dot-prefixed and
-/// excluded by `hidden(true)` wherever that's active; they're listed again so pruning stays
-/// uniform regardless of a given walk's own `hidden` setting (e.g. the ecosystem
-/// dot-directory sub-walk, or [`detect_ignored_manifests`]'s unfiltered detection walk, both
-/// of which run with `hidden` lifted for their own reasons).
+/// rejected by [`DotDirs::Skip`]; they're listed again so pruning stays uniform regardless of a
+/// given walk's [`DotDirs`] policy (e.g. the ecosystem dot-directory sub-walk, which
+/// descends into dot-prefixed entries).
 const PRUNED_DIRECTORIES: &[&str] = &[
     // Version control
     ".git",
@@ -334,7 +333,7 @@ pub enum SymlinkPolicy {
 /// `.ignore` files are never consulted, because in a CI security-gate invocation (`git
 /// checkout && deps-cli check .` against an untrusted fork PR) both are attacker-controlled
 /// input: a one-line addition anywhere in the tree would otherwise silently remove a manifest
-/// from the scan. `.git` itself is still never descended into (that is `hidden`-filtering, an
+/// from the scan. `.git` itself is still never descended into (that is `DotDirs` filtering, an
 /// unrelated concern — see above), and `.git/info/exclude` / the user's global gitignore are
 /// always honored regardless of this policy, since neither travels with a cloned/fetched PR and
 /// both are operator-, not attacker-, controlled. When [`GitignorePolicy::Respect`], standard
@@ -512,9 +511,9 @@ fn walk_with_limit(
         // not walked) rather than being routed.
         let canonical_root = std::fs::canonicalize(&absolute_root).ok();
 
-        // Always hidden-filtered: `hidden(true)` filters entries by their own basename as the
-        // walk descends, so `walk_root` itself is never excluded even if its name starts with
-        // `.` (e.g. a tempfile dir on macOS) — that previously caused a regression.
+        // `DotDirs::Skip` filters entries by their own basename as the walk descends, so
+        // `walk_root` itself is never excluded even if its name starts with `.` (e.g. a
+        // tempfile dir on macOS) — that previously caused a regression.
         if !walk_directory(
             &absolute_root,
             &absolute_root,
@@ -583,6 +582,7 @@ struct WalkOptions {
 /// Whether a walk skips or descends into dot-prefixed entries — replaces `walk_directory`'s
 /// former positional `hidden: bool` parameter (issue #1135), whose meaning is the inverse of
 /// what a reader expects: `ignore::WalkBuilder::hidden(true)` means "skip hidden entries".
+/// The walks here always pass `hidden(false)` and apply this policy in `filter_entry` instead.
 #[derive(Clone, Copy)]
 enum DotDirs {
     /// Dot-prefixed entries are filtered out of the walk.
@@ -602,13 +602,16 @@ impl DotDirs {
         if matches!(self, Self::Descend) || entry.depth() == 0 {
             return true;
         }
-        let Some(name) = entry.file_name().to_str() else {
-            return true;
-        };
-        if !name.starts_with('.') {
+        let file_name = entry.file_name();
+        // Byte-level dot test, like `ignore`'s own: a non-UTF-8 dot-prefixed name must be
+        // rejected here rather than slip through `to_str()`.
+        if !file_name.as_encoded_bytes().starts_with(b".") {
             return true;
         }
-        !entry.file_type().is_some_and(|t| t.is_dir()) && hidden_manifests.contains(name)
+        !entry.file_type().is_some_and(|t| t.is_dir())
+            && file_name
+                .to_str()
+                .is_some_and(|name| hidden_manifests.contains(name))
     }
 }
 
@@ -1759,9 +1762,9 @@ mod tests {
     /// dot-directory on purpose" — but `tempfile::tempdir()` itself creates dot-prefixed
     /// directories on macOS, so *every* test using a tempdir root silently hit that special
     /// case and disabled hidden-file filtering entirely, `.git` included. The fix removes that
-    /// special-casing; `hidden(true)` never filters `walk_root` itself regardless of its name
-    /// (only entries encountered *while descending*, by their own basename), so it was never
-    /// needed in the first place.
+    /// special-casing; `DotDirs::admits` never filters `walk_root` itself regardless of its
+    /// name (only entries encountered *while descending*, by their own basename), so it was
+    /// never needed in the first place.
     #[test]
     fn test_walk_never_descends_into_dot_git() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -1820,7 +1823,7 @@ mod tests {
 
     /// Regression test for issue #1165: pins the `DotDirs::Descend` wiring at the
     /// hidden-ecosystem sub-root call site (e.g. `.github`) in [`walk_with_limit`].
-    /// `hidden(true)` vs `hidden(false)` only differs on *nested* dot-prefixed entries — the
+    /// `DotDirs::Skip` vs `Descend` only differs on *nested* dot-prefixed entries — the
     /// sub-root itself is never filtered either way (depth 0) — so a manifest nested under a
     /// dot-prefixed directory inside `.github` is only discovered under `Descend`. If that call
     /// site were accidentally flipped to `DotDirs::Skip`, this manifest would be silently
@@ -1991,6 +1994,117 @@ mod tests {
             outcome.ignored_manifests(),
             vec![PathBuf::from(".gitlab-ci.yml")]
         );
+    }
+
+    /// Issue #1829 (tester G9): a nested `a/.gitlab-ci.yml` beside `a/.gitlab/ci/x.yml` is
+    /// found once each, with and without `GitignorePolicy::Respect` (whose detection pass
+    /// must not double-report either).
+    #[test]
+    fn test_walk_nested_hidden_manifest_and_gitlab_directory_each_reported_once() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let nested = dir.path().join("a");
+        fs::create_dir_all(nested.join(".gitlab").join("ci")).expect("mkdir");
+        fs::write(nested.join(".gitlab-ci.yml"), "stages: []\n").expect("write");
+        fs::write(
+            nested.join(".gitlab").join("ci").join("x.yml"),
+            "stages: []\n",
+        )
+        .expect("write");
+
+        for policy in [GitignorePolicy::Ignore, GitignorePolicy::Respect] {
+            let outcome = walk(
+                &[dir.path().to_path_buf()],
+                &test_registry(),
+                policy,
+                SymlinkPolicy::Skip,
+            );
+            // Only the root-level `.gitlab/` gets the dot-directory pass, so the nested
+            // `a/.gitlab/ci/x.yml` stays skipped; the nested hidden *file* is found.
+            assert_eq!(
+                displayed(&outcome),
+                vec![PathBuf::from("a").join(".gitlab-ci.yml")]
+            );
+            assert!(outcome.ignored_manifests().is_empty());
+        }
+    }
+
+    /// Issue #1829 (tester G6): a directory named like a hidden manifest is not a manifest and
+    /// is not descended into.
+    #[test]
+    fn test_walk_skips_directory_named_like_a_hidden_manifest() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::create_dir(dir.path().join(".gitlab-ci.yml")).expect("mkdir");
+        fs::write(
+            dir.path().join(".gitlab-ci.yml").join("Cargo.toml"),
+            "[package]\n",
+        )
+        .expect("write");
+
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
+
+        assert!(outcome.manifests().is_empty(), "{:?}", displayed(&outcome));
+    }
+
+    /// Issue #1829 (tester G5): a symlinked hidden manifest follows the same classification
+    /// as any other symlinked manifest — reported unfollowed by default, routed under
+    /// `--follow-symlinks`.
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_symlinked_hidden_manifest_follows_symlink_policy() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let real = dir.path().join("real.yml");
+        fs::write(&real, "stages: []\n").expect("write");
+        std::os::unix::fs::symlink(&real, dir.path().join(".gitlab-ci.yml"))
+            .expect("create symlink");
+
+        let skipped = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
+        assert!(skipped.manifests().is_empty());
+        assert_eq!(
+            skipped.ignored_manifests(),
+            vec![PathBuf::from(".gitlab-ci.yml")]
+        );
+
+        let followed = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Follow,
+        );
+        assert_eq!(displayed(&followed), vec![PathBuf::from(".gitlab-ci.yml")]);
+    }
+
+    /// Issue #1829 (impl-critic M1): a non-UTF-8 dot-prefixed directory is rejected like any
+    /// other dot directory. Skips where the filesystem refuses such names (macOS APFS).
+    #[cfg(unix)]
+    #[test]
+    fn test_walk_skips_non_utf8_dot_directory() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let hidden = dir.path().join(std::ffi::OsStr::from_bytes(b".\xff"));
+        if fs::create_dir(&hidden).is_err() {
+            return;
+        }
+        fs::write(hidden.join("Cargo.toml"), "[package]\n").expect("write");
+
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
+
+        assert!(outcome.manifests().is_empty(), "{:?}", displayed(&outcome));
     }
 
     /// Issue #1829: eligibility derives from the registry's `manifest_filenames()`, not a
@@ -2635,7 +2749,7 @@ mod tests {
     fn test_walk_follow_symlinks_still_enforces_max_walked_files() {
         let dir = tempfile::tempdir().expect("create temp dir");
         // Review finding M4: the noise source is a *hidden* (dot-prefixed) directory, so the
-        // default `hidden(true)` filter excludes it from ever being walked directly by its own
+        // default `DotDirs::Skip` filter excludes it from ever being walked directly by its own
         // name — the only way to reach its 5 files is by following `noise-link`, making the
         // symlink genuinely load-bearing for this test. `limit` is chosen to comfortably cover
         // the baseline tree (walk root + `Cargo.toml` + the `noise-link` entry itself = 3

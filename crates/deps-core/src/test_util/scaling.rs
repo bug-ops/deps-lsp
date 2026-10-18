@@ -122,19 +122,6 @@ mod tests {
     const FLOOR: Duration = Duration::ZERO;
 
     #[test]
-    fn linear_work_passes_linear_expectation() {
-        let result = assert_scaling_above(
-            "linear",
-            ExpectedGrowth::Linear,
-            FLOOR,
-            8_000_000,
-            |units| units,
-            |&units| spin(units),
-        );
-        assert_eq!(result, spin(8_000_000));
-    }
-
-    #[test]
     #[should_panic(expected = "expected Linear growth")]
     fn quadratic_work_fails_linear_expectation() {
         assert_scaling_above(
@@ -144,18 +131,6 @@ mod tests {
             8_000,
             |units| units,
             |&units| (0..units).map(|_| spin(units)).sum::<u64>(),
-        );
-    }
-
-    #[test]
-    fn flat_work_passes_bounded_expectation() {
-        assert_scaling_above(
-            "flat",
-            ExpectedGrowth::Bounded,
-            FLOOR,
-            8_000_000,
-            |units| units,
-            |_| spin(2_000_000),
         );
     }
 

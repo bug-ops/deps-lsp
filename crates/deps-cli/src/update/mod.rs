@@ -10,8 +10,9 @@ use deps_core::ConcreteVersion;
 use deps_core::PackageName;
 use deps_core::VersionReq;
 use deps_core::edit::{
-    EditSpan, ManifestEdit, ManifestReparse, PlannedUpdate, UnplannableReason, UpdateCandidate,
-    UpdateKind, apply_edits, classify_update, collect_update_candidates, dedup_overlapping_edits,
+    EditSpan, ManifestEdit, ManifestReparse, PlannedCurrent, PlannedUpdate, UnplannableReason,
+    UpdateCandidate, UpdateKind, apply_edits, classify_update, collect_update_candidates,
+    dedup_overlapping_edits,
 };
 use deps_core::lsp_helpers::{
     CooldownDisposition, EcosystemFormatter, FallbackEditVerdict, LatestVerdict, PackageVersions,
@@ -52,7 +53,7 @@ pub enum CurrentVersion {
     /// No in-use version could be resolved; falls back to the dependency's declared
     /// requirement text — `--security-only` mode (see `security`'s `security_current`), and
     /// default mode for a concrete pin the registry never published
-    /// ([`PlannedUpdate::declared`]).
+    /// ([`deps_core::edit::PlannedCurrent::Declared`]).
     Declared(VersionReq),
     /// Neither a resolved in-use version nor a declared requirement was available.
     Unknown,
@@ -64,10 +65,10 @@ impl CurrentVersion {
     /// `actions/checkout@4.2.2` must render as written, not as an empty column), else
     /// [`Self::Unknown`].
     pub(crate) fn from_planned(planned: &PlannedUpdate) -> Self {
-        match (&planned.current, &planned.declared) {
-            (Some(version), _) => Self::Resolved(version.clone()),
-            (None, Some(req)) => Self::Declared(req.clone()),
-            (None, None) => Self::Unknown,
+        match &planned.current {
+            PlannedCurrent::Resolved(version) => Self::Resolved(version.clone()),
+            PlannedCurrent::Declared(req) => Self::Declared(req.clone()),
+            PlannedCurrent::Unresolved => Self::Unknown,
         }
     }
 
@@ -1569,16 +1570,15 @@ mod tests {
         );
     }
 
-    /// Issue #1833: an unpublished tag pin (`current: None`, `declared: Some`) renders as
+    /// Issue #1833: an unpublished tag pin (`PlannedCurrent::Declared`) renders as
     /// written instead of an empty column; resolved wins over declared; neither stays empty.
     #[test]
     fn test_current_version_from_planned_prefers_resolved_then_declared() {
-        let planned = |current: Option<&str>, declared: Option<&str>| PlannedUpdate {
+        let planned = |current: PlannedCurrent| PlannedUpdate {
             name: "actions/checkout".to_string(),
             normalized_name: "actions/checkout".to_string(),
             name_range: Range::default(),
-            current: current.map(ConcreteVersion::from),
-            declared: declared.map(deps_core::VersionReq::new),
+            current,
             target: ConcreteVersion::from("v7.0.1"),
             edit: ManifestEdit {
                 range: Range::default(),
@@ -1586,19 +1586,77 @@ mod tests {
             },
         };
 
-        let resolved = CurrentVersion::from_planned(&planned(Some("v4.2.2"), None));
+        let resolved = CurrentVersion::from_planned(&planned(PlannedCurrent::Resolved(
+            ConcreteVersion::from("v4.2.2"),
+        )));
         assert_eq!(resolved.render_text(), "v4.2.2");
 
-        let declared = CurrentVersion::from_planned(&planned(None, Some("V4.2.2")));
+        let declared = CurrentVersion::from_planned(&planned(PlannedCurrent::Declared(
+            deps_core::VersionReq::new("V4.2.2"),
+        )));
         assert_eq!(declared.render_text(), "V4.2.2");
         assert_eq!(
             declared.update_kind_to(&ConcreteVersion::from("v7.0.1")),
             UpdateKind::Unknown
         );
 
-        let unknown = CurrentVersion::from_planned(&planned(None, None));
+        let unknown = CurrentVersion::from_planned(&planned(PlannedCurrent::Unresolved));
         assert_eq!(unknown, CurrentVersion::Unknown);
         assert_eq!(unknown.render_text(), "");
+    }
+
+    /// Issue #1833 (tester G3), planner level: an unpublished GitHub Actions tag pin reports
+    /// its declared tag as `current`, and `[update].ignore` still classifies it `Unknown`
+    /// (a `patch`-only rule skips it fail-closed; a resolved `4.2.2 -> 7.0.1` would be
+    /// `Major` and pass).
+    #[test]
+    fn test_plan_updates_unpublished_pin_reports_declared_current_and_stays_unknown() {
+        const UNPUBLISHED: deps_core::test_util::StubFormatter =
+            deps_core::test_util::StubFormatter::new()
+                .with_package_url_prefix("")
+                .with_unpublished_pin_resolution();
+        let content = "actions/checkout = \"4.2.2\"\n";
+        let make_analysis = || {
+            let mut analysis = test_analysis(
+                vec![test_dep(
+                    "actions/checkout",
+                    "4.2.2",
+                    Range::new(Position::new(0, 20), Position::new(0, 25)),
+                )],
+                cached("actions/checkout", "7.0.1"),
+            );
+            analysis.ecosystem_id = EcosystemId::GithubActions;
+            analysis
+        };
+
+        let plan = plan_updates_no_cooldown(
+            &make_analysis(),
+            content,
+            &UNPUBLISHED,
+            &[],
+            &IgnoreRules::empty(),
+        );
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].current.render_text(), "4.2.2");
+        assert_matches!(plan.items[0].outcome, Outcome::Applied { .. });
+
+        let patch_only = IgnoreRules::new(
+            vec![crate::config::IgnoreRule {
+                name: "actions/checkout".to_string(),
+                update_types: Some(vec![crate::config::UpdateTypeToken::Patch]),
+            }],
+            &UNPUBLISHED,
+        );
+        let ignored =
+            plan_updates_no_cooldown(&make_analysis(), content, &UNPUBLISHED, &[], &patch_only);
+        assert_eq!(ignored.items[0].current.render_text(), "4.2.2");
+        assert_matches!(
+            ignored.items[0].outcome,
+            Outcome::Skipped {
+                reason: SkipReason::IgnoreRule,
+                ..
+            }
+        );
     }
 
     struct TestDep {

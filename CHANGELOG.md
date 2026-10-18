@@ -50,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gitlab-ci**: `gitlab.com` and the `GITLAB_TOKEN_HOST` host are operator-trusted, so a public-looking name that resolves to a private address (split-horizon DNS) is reachable there; IP-literal private hosts stay blocked (#1816, #1823)
 - **deps-github-actions, deps-gitlab-ci**: a GitLab tag pin with a cold tag cache resolves to `NotYetIndexed` instead of `Unresolved`; the duplicated pin-resolution overrides move to `deps_core::lsp_helpers::git_pin` (#1817, #1823)
 - **deps-lsp**: `DiagnosticsSnapshot` is `Clone` instead of `Copy` and carries the typosquat, gossip and license-policy gates (#1815, #1823)
-- **deps-core, deps-cli**: `PlannedUpdate` gains `declared`, and `CurrentVersion::from(Option<ConcreteVersion>)` is replaced by `CurrentVersion::from_planned` (#1833, #PR)
+- **deps-core, deps-cli**: `PlannedUpdate.current` is the new `PlannedCurrent` enum (`Resolved`/`Declared`/`Unresolved`) instead of `Option<ConcreteVersion>`, and `CurrentVersion`'s `From<Option<ConcreteVersion>>` impl is removed (#1833, #PR)
 
 ### Security
 - **deps**: bump `rustls` to 0.23.46, fixing RUSTSEC-2026-0346, -0347, -0348, -0349 (#1837)
@@ -106,7 +106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **all crates**: 49 broken intra-doc links on private items fixed, and CI renders private items (`--document-private-items`) with warnings denied (#1828, #PR)
 - **deps-cli**: `check` and `update` discover hidden manifest files such as `.gitlab-ci.yml` during a directory walk, including under `--respect-gitignore` (#1829, #PR)
 - **deps-lsp**: setting a non-empty `license_policy` at runtime starts the tier-3 license pre-fetch for already-open documents, and the licensing docs state the pre-fetch needs a policy (#1831, #PR)
-- **deps-cli**: `update` shows the declared tag for an unpublished pin (`4.2.2`, `V4.2.2`) instead of an empty `current` (#1833, #PR)
+- **deps-cli**: `update` shows the declared version of a pin the registry never published (`4.2.2`, `V4.2.2`) instead of an empty `current` (#1833, #PR)
 - **deps-lsp**: turning `vulnerabilities_enabled` off at runtime now hides advisory diagnostics, hover, code lenses and code actions, while offline still shows cached advisories (#1819, #1823)
 - **deps-lsp**: diagnostics read the typosquat, gossip and license-policy gates from one configuration snapshot (#1815, #1823)
 - **deps-github-actions, deps-gitlab-ci**: updating an unpublished unprefixed tag ref (`7.0.1`) writes the published spelling (`v7.0.1`) in `update` and code actions (#1820, #1823)
