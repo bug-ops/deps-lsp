@@ -27,7 +27,7 @@ related:
 > **Branch**: `fix/1829-triage-batch`
 > **Priority**: P1
 > **Category**: bug (label: `bug`)
-> **Issue**: #1829 (shipped in PR #PR)
+> **Issue**: #1829 (shipped in PR #1842)
 > **Class**: same fail-open class as #1108 and #1109 (a CI security gate silently reports zero findings)
 
 ## 1. Overview
@@ -221,7 +221,7 @@ No new persisted data.
 
 ## 9. Resolved Questions and Known Boundaries
 
-All open questions were settled by the shipped implementation (PR #PR, issue #1829):
+All open questions were settled by the shipped implementation (PR #1842, issue #1829):
 
 1. **Eligibility scope**: exact `manifest_filenames()` entries that start with `.` (option b). No second matcher;
    routing stays with `route_file`/`for_uri`. `.dev.requirements.txt` and `.x.csproj` are not admitted.

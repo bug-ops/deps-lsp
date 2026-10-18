@@ -232,7 +232,7 @@ THEN the guidance points to the single shared mechanism and no new hard-coded Du
 - Edit files under `crates/deps-zed`.
 - Use a bare numeric, string or `bool`-flag type where a dedicated type can express the measure.
 
-> [!warning] Implementation status (issue #1824, PR #PR): partial
+> [!warning] Implementation status (issue #1824, PR #1842): partial
 > Option a (scaling ratio) is implemented for the 9 sites the issue lists (gradle groovy/kotlin, swift x2,
 > `matched_spans`, `lsp_helpers/mod.rs`, `git_ref.rs` x3) through `deps_core::test_util::scaling::assert_scaling`:
 > small and full runs interleaved, best of 3 per side, one re-measure before failing, a 100 ms noise floor, and

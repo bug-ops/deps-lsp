@@ -8,10 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
-- **deps-core and ecosystem crates**: a blocked host's class and policy travel as one `net_policy::BlockedHost` in the blocked-host errors and occurrences; `BlockingPolicy::for_block`/`hint_suffix`/`describe` move onto it (#1826, #PR)
-- **deps-core**: removed the unused `SystemProxy::current` and `RegistryEnvironment::proxy` (#1827, #PR)
-- **deps-core**: a credential sent outside its trusted prefix is the new `DepsError::CredentialOutsideTrustedPrefix`, no longer `CacheError`; `HttpCache::post_json_limited_trusted_origin` and `get_transport_only_with_headers_limited_trusted_origin` take `&TrustedPrefix` (#1825, #1827, #PR)
-- **deps-core, deps-cli**: `PlannedUpdate.current` is the new `PlannedCurrent` enum (`Resolved`/`Declared`/`Unresolved`) instead of `Option<ConcreteVersion>`, and `CurrentVersion`'s `From<Option<ConcreteVersion>>` impl is removed (#1833, #PR)
+- **deps-core and ecosystem crates**: a blocked host's class and policy travel as one `net_policy::BlockedHost` in the blocked-host errors and occurrences; `BlockingPolicy::for_block`/`hint_suffix`/`describe` move onto it (#1826, #1842)
+- **deps-core**: removed the unused `SystemProxy::current` and `RegistryEnvironment::proxy` (#1827, #1842)
+- **deps-core**: a credential sent outside its trusted prefix is the new `DepsError::CredentialOutsideTrustedPrefix`, no longer `CacheError`; `HttpCache::post_json_limited_trusted_origin` and `get_transport_only_with_headers_limited_trusted_origin` take `&TrustedPrefix` (#1825, #1827, #1842)
+- **deps-core, deps-cli**: `PlannedUpdate.current` is the new `PlannedCurrent` enum (`Resolved`/`Declared`/`Unresolved`) instead of `Option<ConcreteVersion>`, and `CurrentVersion`'s `From<Option<ConcreteVersion>>` impl is removed (#1833, #1842)
 - **deps-core**: `Advisory.id` is a private `OsvId` read via `id()`, `Advisory::url()` returns `String`, and `is_valid_osv_id`/`validated_osv_url` are replaced by `OsvId::parse`/`osv_url`; advisory id fields and `SiblingMatches` use `OsvId` (#1807)
 - **deps-core**: `Diagnostic::new` takes an exhaustive `DiagnosticKind` and `Diagnostic::with_code` is removed; the diagnostic code is no longer sanitized (#1807)
 - **deps-cli**: `CheckFinding.category`/`.code` fields are replaced by `kind` with `category()`/`code()` methods; `advisory_ids` in `update` types and JSON are `OsvId` (wire format unchanged) (#1807)
@@ -66,8 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: repository editor settings can no longer redirect `GITLAB_TOKEN` through `registries.gitlab_instance_host`; the configuration docs now list the trust impact of every repository-settable field (#1797)
 
 ### Added
-- **deps-core**: `licenses::LicensePolicy::activated_since` (#1831, #PR)
-- **deps-core**: `net_policy::TrustedPrefix::as_url` (#1825, #PR)
+- **deps-core**: `licenses::LicensePolicy::activated_since` (#1831, #1842)
+- **deps-core**: `net_policy::TrustedPrefix::as_url` (#1825, #1842)
 - **deps-github-actions, deps-gitlab-ci**: unknown-ref quick fix rewrites the ref to the published tag spelling when exactly one tag matches (#1807)
 - **deps-core**: `secret::bearer_auth_header`, `CredentialPartition` and `lsp_helpers::dependency_at_position` (#1807)
 - **deps-core, all ecosystems**: `DepsError::HostBlockedByPolicy` shows a policy-specific message when a registry host resolves to a blocked address class at connect time (#1773)
@@ -91,7 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cli**: flagged latest candidates name the sibling release tags they match in hover, diagnostics and `update` (#1783)
 
 ### Changed
-- **deps-core, deps-cargo, deps-nuget**: `TrustedPrefix` stays parsed down to the transport and redirect policy; in NuGet an unparseable `SearchQueryService` `@id` makes `search` return an empty result, and an unparseable `PackageBaseAddress` fails the whole service index, like a missing one (#1825, #PR)
+- **deps-core, deps-cargo, deps-nuget**: `TrustedPrefix` stays parsed down to the transport and redirect policy; in NuGet an unparseable `SearchQueryService` `@id` makes `search` return an empty result, and an unparseable `PackageBaseAddress` fails the whole service index, like a missing one (#1825, #1842)
 - **deps-npm, deps-nuget, deps-swift**: the home directory comes from `UserHome` instead of the `dirs` crate, and tests use `assert_matches!` with a CI guard against `assert!(matches!(..))` (#1818, #1823)
 - **deps**: lock bump to `zeroize` 1.9.1 and `either` 1.19.0 (#1813, #1823)
 - **deps-lsp**: typosquat and gossip prefetch also fires on an offline to online transition (#1807)
@@ -108,11 +108,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SECURITY.md**: supported versions table lists 2.0.x as supported and older lines as unsupported (#1797)
 
 ### Fixed
-- **deps-core, deps-gradle, deps-swift**: linear-time tests compare run time at two input sizes (`test_util::scaling::assert_scaling`) instead of asserting a wall-clock bound, so they no longer flake under load (#1824, #PR)
-- **all crates**: 49 broken intra-doc links on private items fixed, and CI renders private items (`--document-private-items`) with warnings denied (#1828, #PR)
-- **deps-cli**: `check` and `update` discover hidden manifest files such as `.gitlab-ci.yml` during a directory walk, including under `--respect-gitignore` (#1829, #PR)
-- **deps-lsp**: setting a non-empty `license_policy` at runtime starts the tier-3 license pre-fetch for already-open documents, and the licensing docs state the pre-fetch needs a policy (#1831, #PR)
-- **deps-cli**: `update` shows the declared version of a pin the registry never published (`4.2.2`, `V4.2.2`) instead of an empty `current` (#1833, #PR)
+- **deps-core, deps-gradle, deps-swift**: linear-time tests compare run time at two input sizes (`test_util::scaling::assert_scaling`) instead of asserting a wall-clock bound, so they no longer flake under load (#1824, #1842)
+- **all crates**: 49 broken intra-doc links on private items fixed, and CI renders private items (`--document-private-items`) with warnings denied (#1828, #1842)
+- **deps-cli**: `check` and `update` discover hidden manifest files such as `.gitlab-ci.yml` during a directory walk, including under `--respect-gitignore` (#1829, #1842)
+- **deps-lsp**: setting a non-empty `license_policy` at runtime starts the tier-3 license pre-fetch for already-open documents, and the licensing docs state the pre-fetch needs a policy (#1831, #1842)
+- **deps-cli**: `update` shows the declared version of a pin the registry never published (`4.2.2`, `V4.2.2`) instead of an empty `current` (#1833, #1842)
 - **deps-lsp**: turning `vulnerabilities_enabled` off at runtime now hides advisory diagnostics, hover, code lenses and code actions, while offline still shows cached advisories (#1819, #1823)
 - **deps-lsp**: diagnostics read the typosquat, gossip and license-policy gates from one configuration snapshot (#1815, #1823)
 - **deps-github-actions, deps-gitlab-ci**: updating an unpublished unprefixed tag ref (`7.0.1`) writes the published spelling (`v7.0.1`) in `update` and code actions (#1820, #1823)
