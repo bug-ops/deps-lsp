@@ -1,16 +1,17 @@
 use std::collections::HashSet;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, Range, WorkspaceEdit};
 
-use crate::edit::{replacement_text, requirement_is_placeholder_for};
+use crate::edit::{FixTargetContext, replacement_text, requirement_is_placeholder_for};
 use crate::osv::ScanOutcome;
 use crate::{Dependency, ParseResult, Registry, VersionReq};
 
 use super::{
-    DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, LatestVerdict, LineOffsetTable,
-    UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, await_versions_fetch, candidate_verdict,
-    is_safe_version_string, latest_verdict, literal_span_matches, requirement_is_unsatisfiable,
-    resolve_latest_status, resolve_scan_outcome, single_file_edit, slice_for_range,
-    strip_whitespace, warn_rejected_value,
+    DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, FetchContext, InteractiveFetch,
+    InteractiveFetchRequest, LatestVerdict, LineOffsetTable, NoLiveList,
+    UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, await_interactive_fetch, cached_package_versions,
+    candidate_verdict, is_safe_version_string, latest_verdict, literal_span_matches,
+    requirement_is_unsatisfiable, resolve_latest_status, resolve_scan_outcome, single_file_edit,
+    slice_for_range, strip_whitespace, warn_rejected_value,
 };
 
 /// The vulnerability-fix quickfix built by [`build_vulnerability_fix_action`],
@@ -38,13 +39,13 @@ struct VulnerabilityFixAction {
 /// Registry-independent by construction (FR-007, mirroring the rule already
 /// enforced in [`crate::lsp_helpers::generate_diagnostics_from_cache`]): computed entirely from
 /// `versions.vulnerabilities` and `version_req` (the caller's already-fetched
-/// `dep.version_requirement()`), never from a registry fetch — a *registry*
-/// outage still never hides this action. It is not OSV-independent, though:
-/// F's verification is computed in `deps-lsp`'s phase B and handed in via
-/// `dv.fix_target_status`, so an OSV outage (or a code-action request that
-/// races ahead of phase B completing) leaves that unresolved and suppresses
-/// this action — the intended fail-safe degradation, not a bug. Callers must
-/// still reconcile the result against a successful registry fetch when one
+/// `dep.version_requirement()`), never from a registry fetch. The caller still drops it
+/// when the interactive registry lookup is unverified (timeout, known failure, concurrency
+/// cap): only a registry error returned to the request itself keeps it. It is not
+/// OSV-independent, though: F's verification is computed in `deps-lsp`'s phase B and handed
+/// in via `dv.fix_target_status`, so an OSV outage (or a code-action request that races
+/// ahead of phase B completing) leaves that unresolved and suppresses this action — the
+/// intended fail-safe degradation, not a bug. Callers must still reconcile the result against a successful registry fetch when one
 /// is available — see the yank check in [`generate_code_actions`].
 fn build_vulnerability_fix_action(
     parse_result: &dyn ParseResult,
@@ -91,7 +92,11 @@ fn build_vulnerability_fix_action(
         version_range.into(),
         version_req,
         dv,
-        latest,
+        FixTargetContext::new(latest).with_registry(cached_package_versions(
+            versions.cached,
+            dep,
+            formatter,
+        )),
         formatter,
     )
     .ok()?;
@@ -201,7 +206,8 @@ struct UnsatisfiableFixAction {
 ///
 /// Mirrors [`build_vulnerability_fix_action`]'s shape: computed entirely from the cached
 /// `versions` snapshot and the dependency's declared requirement, before any registry
-/// fetch, so a registry outage never hides it (the same FR-007 rationale). Gated by
+/// fetch (the same FR-007 rationale); like that action, it is dropped by the caller when the
+/// interactive registry lookup is unverified. Gated by
 /// [`requirement_is_unsatisfiable`] evaluated against the identical inputs
 /// [`crate::lsp_helpers::generate_diagnostics_from_cache`] uses, so this action can never appear without —
 /// or be missing despite — the diagnostic it resolves.
@@ -239,11 +245,7 @@ fn build_unsatisfiable_fix_action(
         return None;
     }
 
-    let normalized_name = formatter.normalize_package_name(dep.name());
-    let package_versions = versions
-        .cached
-        .get(normalized_name.as_str())
-        .or_else(|| versions.cached.get(dep.name()))?;
+    let package_versions = cached_package_versions(versions.cached, dep, formatter)?;
 
     if !requirement_is_unsatisfiable(formatter, version_req, &package_versions.available) {
         return None;
@@ -395,9 +397,12 @@ fn build_replacement_action(
 ///    private `build_vulnerability_fix_action` helper just above. This action
 ///    is computed entirely from `versions` and the dependency's declared
 ///    requirement, deliberately *before* the `registry.get_versions` call
-///    below — a *registry* outage must never hide a known-vulnerable
-///    dependency's fix (FR-007), so this action is still returned even when
-///    the registry fetch that produces the plain list below fails. This does
+///    below — a registry *error* returned to this request must not hide a
+///    known-vulnerable dependency's fix (FR-007), so this action is still
+///    returned when the registry fetch that produces the plain list below
+///    fails. An *unverified* lookup (timeout, a failure already known from
+///    the background fetch or the interactive memo, or the concurrency cap)
+///    drops it: its yank check cannot run (#1830). This does
 ///    not extend to an *OSV* outage or unavailability: F's verification is an
 ///    OSV-derived precondition (`fix_target_status`), not a registry one, so
 ///    an OSV outage — or a code-action request racing ahead of phase B
@@ -536,29 +541,42 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     // dependency must never be looked up against this ecosystem's default registry client,
     // which would offer bogus "update to X" actions for an unrelated package.
     let dep_source = dep.source();
-    let (registry_versions, fetch_timed_out) = if formatter.can_resolve_source(&dep_source) {
-        await_versions_fetch(
+    let normalized_name = formatter.normalize_package_name(dep.name());
+    let (registry_versions, fetch_unverified) = if formatter.can_resolve_source(&dep_source) {
+        match await_interactive_fetch(
             registry.get_versions_from(
                 dep.name(),
                 &dep_source,
                 crate::freshness::FreshnessSettings::Disabled,
             ),
-            dep.name(),
-            "code action",
+            InteractiveFetchRequest::new(
+                versions,
+                uri,
+                dep.name(),
+                normalized_name.as_str(),
+                &dep_source,
+                FetchContext::CodeAction,
+            ),
         )
         .await
+        {
+            InteractiveFetch::Live(list) => (Some(list), false),
+            InteractiveFetch::Degraded(NoLiveList::Failed) => (None, false),
+            InteractiveFetch::Degraded(NoLiveList::Unverified) => (None, true),
+        }
     } else {
         (None, false)
     };
 
     // A fix target the registry reports as yanked is dropped entirely rather than offered —
     // the surviving diagnostics carry the finding either way. On a genuine registry outage
-    // (`registry_versions` is `None`, fetch not timed out) both actions still pass through
-    // unfiltered, unchanged from before #1204. A *timed-out* fetch is treated differently
-    // (`fetch_timed_out`, checked first below): the deadline, not the registry, decided to
-    // stop waiting, so a live answer confirming or denying the yank may well have been
-    // moments away — failing open here would let a slow registry silently suppress the very
-    // yank check this block exists for. Both speculative actions are dropped outright instead.
+    // (`NoLiveList::Failed`) both actions still pass through unfiltered, unchanged from before
+    // #1204. An *unverified* answer is treated differently (`fetch_unverified`, checked first
+    // below): a timeout, a failure only inferred from the background fetch, or the interactive
+    // concurrency cap means the registry never said no, so a live answer confirming or denying
+    // the yank may well have been moments away — failing open here would let a slow registry
+    // silently suppress the very yank check this block exists for. Both speculative actions
+    // are dropped outright instead.
     let is_yanked_target = |version_native: &str| {
         registry_versions.as_ref().is_some_and(|versions_list| {
             versions_list
@@ -567,8 +585,8 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                 .is_some_and(|v| v.removal_status().blocks_resolution())
         })
     };
-    let fix = fix.filter(|f| !fetch_timed_out && !is_yanked_target(&f.version_native));
-    let unsat_fix = unsat_fix.filter(|f| !fetch_timed_out && !is_yanked_target(&f.version_native));
+    let fix = fix.filter(|f| !fetch_unverified && !is_yanked_target(&f.version_native));
+    let unsat_fix = unsat_fix.filter(|f| !fetch_unverified && !is_yanked_target(&f.version_native));
 
     // Yank-filtering both actions before this collision check matters: PyPI's
     // `truncate_release_to_match` can map a yanked and a live version to identical rewritten
@@ -615,7 +633,6 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     // Issue #1517/#1524: computed once, shared by both the `item.is_latest` gate (via
     // `latest_verdict`) and every other display item's own gate (via `candidate_verdict`)
     // below.
-    let normalized_name = formatter.normalize_package_name(dep.name());
     let latest_vuln_keys = versions.ecosystem.map(|ecosystem| {
         crate::osv::vulnerability_keys(
             parse_result,
@@ -1792,6 +1809,121 @@ mod tests {
         );
     }
 
+    fn steer_fixture(
+        dep_name: &str,
+        verified_target: &str,
+    ) -> (
+        MockParseResult,
+        tower_lsp_server::ls_types::Range,
+        String,
+        crate::osv::VulnerabilityMap,
+    ) {
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
+        };
+
+        let (mut dep, version_range, content) = vulnerable_dep("1.0.0");
+        dep.name = PackageName::new(dep_name);
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            crate::test_util::vuln_key("pkg"),
+            ScanOutcome::Vulnerable(
+                DependencyVulnerabilities::new(Capped::new(
+                    vec![Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec![OsvVersion::new("4.18.0")]),
+                    )],
+                    1,
+                ))
+                .with_fix_target_status(UpgradeStatus::CandidateClean {
+                    version: ConcreteVersion::new(verified_target),
+                }),
+            ),
+        );
+        (parse_result, version_range, content, vulnerabilities)
+    }
+
+    fn deprecated_4_18_0() -> HashMap<PackageName, PackageVersions> {
+        let flagged: Arc<[(ConcreteVersion, RemovalStatus)]> = Arc::from(vec![(
+            ConcreteVersion::new("4.18.0"),
+            RemovalStatus::AdvisoryDeprecated,
+        )]);
+        let available: Arc<[ConcreteVersion]> = Arc::from(vec![
+            ConcreteVersion::new("4.18.1"),
+            ConcreteVersion::new("4.18.0"),
+        ]);
+        HashMap::from([(
+            PackageName::new("pkg"),
+            PackageVersions::new(ConcreteVersion::new("4.18.1"), available).with_yanked(flagged),
+        )])
+    }
+
+    async fn vulnerability_fix_titles(
+        dep_name: &str,
+        verified_target: &str,
+        formatter: &dyn EcosystemFormatter,
+    ) -> Vec<String> {
+        let (parse_result, version_range, content, vulnerabilities) =
+            steer_fixture(dep_name, verified_target);
+        let cached = deprecated_4_18_0();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &ErrorRegistry,
+            formatter,
+        )
+        .await;
+        quickfix_titles(&actions)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// #1832: a fix target the registry marks deprecated is steered to the next fresh release.
+    #[tokio::test]
+    async fn test_vulnerability_fix_steers_past_a_deprecated_target() {
+        assert_eq!(
+            vulnerability_fix_titles("pkg", "4.18.1", &IDENTITY_FORMATTER).await,
+            vec!["Update to 4.18.1 (fixes A1)"]
+        );
+    }
+
+    /// #1832: phase B verified the unsteered target, so the steered one is unverified and the
+    /// action is omitted rather than recommending a deprecated release.
+    #[tokio::test]
+    async fn test_vulnerability_fix_with_a_stale_unsteered_verification_fails_closed() {
+        assert!(
+            vulnerability_fix_titles("pkg", "4.18.0", &IDENTITY_FORMATTER)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// #1832 S6: a case-folding ecosystem's declared name misses the cache under its raw
+    /// spelling; the shared lookup still finds the normalized entry, so the action steers.
+    #[tokio::test]
+    async fn test_vulnerability_fix_steers_for_a_mixed_case_declared_name() {
+        let formatter = crate::test_util::StubFormatter::DEFAULT.with_lowercase_names();
+        assert_eq!(
+            vulnerability_fix_titles("Pkg", "4.18.1", &formatter).await,
+            vec!["Update to 4.18.1 (fixes A1)"]
+        );
+    }
+
     #[tokio::test]
     async fn test_generate_code_actions_vulnerability_fix_not_offered_on_patched_duplicate_occurrence()
      {
@@ -2236,6 +2368,119 @@ mod tests {
         // must not fail open.
         assert!(quickfix_titles(&actions).is_empty());
         assert!(actions.is_empty());
+    }
+
+    fn fixable_vulnerabilities() -> crate::osv::VulnerabilityMap {
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            crate::test_util::vuln_key("pkg"),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
+                advisories: Capped::new(
+                    vec![std::sync::Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
+                    )],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::CandidateClean {
+                    version: ConcreteVersion::new("1.2.0"),
+                },
+            }),
+        );
+        vulnerabilities
+    }
+
+    /// Runs `generate_code_actions` on the `pkg = "1.0.0"` fixture with the interactive-fetch
+    /// gate attached and returns the quick-fix titles.
+    async fn gated_fix_titles(
+        gate: &InteractiveFetchGate,
+        outcomes: &DependencyOutcomes,
+        registry: &CountingRegistry,
+    ) -> Vec<String> {
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let vulnerabilities = fixable_vulnerabilities();
+        let (cached, resolved) = (HashMap::new(), HashMap::new());
+        let versions = VersionData::new(&cached, &resolved)
+            .with_vulnerabilities(&vulnerabilities)
+            .with_ecosystem(crate::EcosystemId::Cargo)
+            .with_outcomes(outcomes)
+            .with_interactive_fetch_gate(gate);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            registry,
+            &MOCK_FORMATTER,
+        )
+        .await;
+        quickfix_titles(&actions)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// #1830: a failure inferred from the background fetch is unverified, so the speculative
+    /// fix is dropped — like a live timeout — without touching the registry.
+    #[tokio::test(start_paused = true)]
+    async fn test_generate_code_actions_seeded_failure_drops_fix_without_live_call() {
+        let gate = InteractiveFetchGate::new(std::num::NonZeroUsize::new(4).unwrap());
+        let outcomes =
+            DependencyOutcomes::new().with_fetch_failure("pkg", crate::FetchFailure::Transient);
+        let registry = CountingRegistry::new(CountingMode::Succeed);
+
+        let titles = gated_fix_titles(&gate, &outcomes, &registry).await;
+
+        assert!(titles.is_empty());
+        assert_eq!(registry.calls(), 0);
+    }
+
+    /// #1830: the request that receives a registry error stays fail-open (the fix survives,
+    /// as before #1204); the memoized replay is fail-closed, so the fix is dropped without a
+    /// live call.
+    #[tokio::test(start_paused = true)]
+    async fn test_generate_code_actions_interactive_error_keeps_fix_then_replays_unverified() {
+        let gate = InteractiveFetchGate::new(std::num::NonZeroUsize::new(4).unwrap());
+        let none = DependencyOutcomes::new();
+        let registry = CountingRegistry::new(CountingMode::Fail);
+
+        let first = gated_fix_titles(&gate, &none, &registry).await;
+        let second = gated_fix_titles(&gate, &none, &registry).await;
+
+        assert_eq!(first, vec!["Update to 1.2.0 (fixes A1)"]);
+        assert!(second.is_empty());
+        assert_eq!(registry.calls(), 1);
+    }
+
+    /// #1830: an elapse is unverified and memoized — the fix is dropped both times, the second
+    /// request without waiting out the budget again.
+    #[tokio::test(start_paused = true)]
+    async fn test_generate_code_actions_elapse_is_memoized_and_drops_fix() {
+        let gate = InteractiveFetchGate::new(std::num::NonZeroUsize::new(4).unwrap());
+        let none = DependencyOutcomes::new();
+        let registry = CountingRegistry::new(CountingMode::Stall);
+
+        let first = gated_fix_titles(&gate, &none, &registry).await;
+        let second = gated_fix_titles(&gate, &none, &registry).await;
+
+        assert!(first.is_empty() && second.is_empty());
+        assert_eq!(registry.calls(), 1);
     }
 
     #[tokio::test]

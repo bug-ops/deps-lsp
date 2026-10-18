@@ -1030,7 +1030,7 @@ pub fn parse_json_checked<T: serde::de::DeserializeOwned>(
 ///
 /// Covers the union of all source types across Cargo, npm, PyPI, Go,
 /// Dart, Bundler, Maven, and Gradle ecosystems.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DependencySource {
     /// Default package registry (crates.io, npm, PyPI, pub.dev, rubygems.org, Maven Central).

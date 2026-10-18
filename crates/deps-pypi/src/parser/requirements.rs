@@ -807,18 +807,16 @@ mod tests {
         // take on the order of seconds to parse (extrapolating the measured
         // quadratic growth); with the cap it is rejected in O(1) and the
         // rest of the file still parses normally.
-        let huge_extras = "a,".repeat(500_000); // ~1 MiB extras list
-        let oversized_requirement = format!("pkg[{huge_extras}]==1.0");
-        assert!(oversized_requirement.len() > super::super::MAX_REQUIREMENT_LEN);
-        let content = format!("{oversized_requirement}\ngood-pkg==2.0\n");
-
-        let start = std::time::Instant::now();
-        let result = parse(&content);
-        let elapsed = start.elapsed();
-
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "oversized extras line took too long to reject: {elapsed:?}"
+        let result = deps_core::test_util::scaling::assert_scaling(
+            "oversized extras line rejection",
+            deps_core::test_util::scaling::ExpectedGrowth::Linear,
+            500_000, // ~1 MiB extras list
+            |pairs| {
+                let oversized_requirement = format!("pkg[{}]==1.0", "a,".repeat(pairs));
+                assert!(oversized_requirement.len() > super::super::MAX_REQUIREMENT_LEN);
+                format!("{oversized_requirement}\ngood-pkg==2.0\n")
+            },
+            |content| parse(content),
         );
         // The oversized line is skipped entirely (never handed to
         // `pep508_rs`), but the rest of the file is unaffected.

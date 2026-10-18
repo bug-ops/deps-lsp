@@ -315,8 +315,13 @@ explicit choice.
   *annotate* a fresh version's age, never exclude it or substitute a fallback.
 - **`--security-only`** targets only dependencies OSV reports vulnerable, rewriting to the
   advisory's own recommended fix (never a plain "latest" pick), and independently
-  re-verifies that fix against OSV before writing it. Every vulnerable dependency is
-  classified into exactly one of three outcomes:
+  re-verifies that fix against OSV before writing it. When the registry marks that fix
+  version deprecated (npm, Composer, Deno `npm:`), the target moves to the next fresh
+  plain release on the same compatibility line (never across a major or onto a
+  GOSSIP-excluded release, and skipping the registry's latest release while it is inside the
+  default three-day cooldown), which is verified the same way; if that fails the dependency
+  is not rewritten to the deprecated version. Every vulnerable dependency is classified into
+  exactly one of three outcomes:
   - `applied` — the fix was written.
   - `requires-lockfile-update` — the declared requirement already admits the fix, so there
     is nothing to rewrite at the manifest level; a lock-file regeneration step (tracked by

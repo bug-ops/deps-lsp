@@ -173,6 +173,97 @@ impl crate::Registry for SlowRegistry {
     }
 }
 
+/// How [`CountingRegistry`] answers `get_versions`.
+#[derive(Clone, Copy)]
+pub(crate) enum CountingMode {
+    Succeed,
+    Fail,
+    /// Sleeps past `REGISTRY_FETCH_BUDGET` first (pair with `start_paused`).
+    Stall,
+}
+
+/// A registry that counts `get_versions` calls, for asserting the interactive-fetch gate
+/// (#1830) skips the live await. Answers like [`SlowRegistry`] (a non-empty `9.9.9` list) on
+/// `Succeed`, so a call that should not have happened is visible as a `**Latest**` line.
+pub(crate) struct CountingRegistry {
+    pub(crate) mode: CountingMode,
+    pub(crate) calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingRegistry {
+    pub(crate) const fn new(mode: CountingMode) -> Self {
+        Self {
+            mode,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl crate::Registry for CountingRegistry {
+    fn get_versions<'a>(
+        &'a self,
+        _name: &'a PackageName,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>> {
+        let mode = self.mode;
+        // Counted on first poll, not at construction: callers build the future before
+        // deciding whether to await it, and the gate must prevent the poll.
+        Box::pin(async move {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match mode {
+                CountingMode::Succeed => {}
+                CountingMode::Fail => {
+                    return Err(crate::error::DepsError::CacheError(
+                        "mock registry error".to_string(),
+                    ));
+                }
+                CountingMode::Stall => {
+                    tokio::time::sleep(REGISTRY_FETCH_BUDGET + std::time::Duration::from_secs(1))
+                        .await;
+                }
+            }
+            Ok(vec![Box::new(TestVersion {
+                version: ConcreteVersion::new("9.9.9"),
+                yanked: false,
+            }) as Box<dyn crate::Version>])
+        })
+    }
+
+    fn get_latest_matching<'a>(
+        &'a self,
+        _name: &'a PackageName,
+        _req: &'a VersionReq,
+        _selection_context: &'a crate::SelectionContext,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+    {
+        Box::pin(async move { Ok(None) })
+    }
+
+    fn select_latest_matching(
+        &self,
+        versions: &[Box<dyn crate::Version>],
+        _req: &crate::VersionReq,
+        _selection_context: &crate::SelectionContext,
+    ) -> Option<usize> {
+        versions.iter().position(|v| v.is_stable())
+    }
+
+    fn search_raw<'a>(
+        &'a self,
+        _query: &'a str,
+        _limit: usize,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// A registry whose `get_versions` always errs with `PackageNotFound`, for
 /// exercising a "package genuinely doesn't exist" code path — distinct from
 /// [`ErrorRegistry`], whose `CacheError` stands in for a transient/unanswerable

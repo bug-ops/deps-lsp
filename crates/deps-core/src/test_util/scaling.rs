@@ -7,6 +7,12 @@
 //! interleaved, so a load step between the two sizes lands on both, and a ratio over the limit
 //! is measured a second time before the check fails: a real quadratic regression exceeds the
 //! limit on every measurement, a transient load spike does not.
+//!
+//! The re-measure bounds false positives, not false negatives: a regression is missed only when
+//! its ratio stays under the limit on one of two measurements, and the limits sit well below a
+//! quadratic regression's ratio (`SIZE_FACTOR` times the healthy one). Detection is also bounded
+//! below by `NOISE_FLOOR`: a full-size run faster than that is never compared, so the input must
+//! be large enough that a quadratic regression takes longer than the floor.
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -23,7 +29,7 @@ const NOISE_FLOOR: Duration = Duration::from_millis(100);
 
 /// A `full / small` run-time ratio.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-pub struct TimeRatio(f64);
+struct TimeRatio(f64);
 
 impl TimeRatio {
     fn of(small: Duration, full: Duration) -> Self {
@@ -43,9 +49,10 @@ pub enum ExpectedGrowth {
     /// Time grows at most proportionally to input size. A quadratic regression grows
     /// `SIZE_FACTOR` times faster than that.
     Linear,
-    /// Time grows as `n log n` (a `BTreeMap`-backed structure): the healthy ratio sits above
-    /// `SIZE_FACTOR` (about 13 measured for `MatchedSpans`), so the limit is wider than
-    /// [`Self::Linear`]'s while a quadratic regression (about 100) still exceeds it.
+    /// Time grows as `n log n` (a `BTreeMap`-backed structure) with no fixed-cost part: the
+    /// healthy ratio sits above `SIZE_FACTOR` (about 13 measured for `MatchedSpans`), so the
+    /// limit is wider than [`Self::Linear`]'s while a quadratic regression (about 100) still
+    /// exceeds it.
     Linearithmic,
     /// Time stays roughly flat as the input grows (a bounded scan or a cached lookup).
     Bounded,

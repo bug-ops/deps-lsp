@@ -1042,7 +1042,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_resolved_requirement_still_returns_planned_edit() {
         use crate::types::GradleDependency;
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::parser::DependencySource;
         use deps_core::position::{Position, Range};
 
@@ -1059,9 +1059,15 @@ mod tests {
         };
 
         let dv = vuln_fix_dv("1.2.0");
-        let planned =
-            plan_vulnerability_fix(&dep, version_range, "1.0.0", &dv, None, &GradleFormatter)
-                .expect("a resolved requirement must still be rewritten to the fix version");
+        let planned = plan_vulnerability_fix(
+            &dep,
+            version_range,
+            "1.0.0",
+            &dv,
+            FixTargetContext::default(),
+            &GradleFormatter,
+        )
+        .expect("a resolved requirement must still be rewritten to the fix version");
         assert_eq!(planned.edit.new_text, "1.2.0");
     }
 
@@ -1072,7 +1078,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_generic_placeholder_through_real_parser_is_not_rewritten() {
         use deps_core::ParseResult;
-        use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
+        use deps_core::edit::{FixTargetContext, VulnFixSkip, plan_vulnerability_fix};
 
         let content = "dependencies {\n    implementation \"com.google.guava:guava:{{ guava_version }}\"\n}\n";
         let uri = deps_core::test_util::test_uri("/test/build.gradle");
@@ -1090,8 +1096,14 @@ mod tests {
         let version_range = dep.version_range().expect("templated version has a range");
 
         let dv = vuln_fix_dv("33.0.0-jre");
-        let planned =
-            plan_vulnerability_fix(*dep, version_range, current, &dv, None, &GradleFormatter);
+        let planned = plan_vulnerability_fix(
+            *dep,
+            version_range,
+            current,
+            &dv,
+            FixTargetContext::default(),
+            &GradleFormatter,
+        );
 
         assert_eq!(
             planned,

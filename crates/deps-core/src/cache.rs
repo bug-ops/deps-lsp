@@ -1369,10 +1369,17 @@ fn preflight_error(url: &str, error: Box<dyn std::error::Error + Send + Sync>) -
             url: RedactedUrl::new(url),
             block: *block,
         },
-        Some(ResolveGuardError::NoAddresses { .. }) | None => DepsError::CacheError(format!(
-            "DNS preflight for {} failed: {error}",
-            RedactedUrl::new(url)
-        )),
+        Some(ResolveGuardError::NoAddresses { .. }) => {
+            resolution_error(url, crate::error::ResolutionFailure::NoAddresses)
+        }
+        None => resolution_error(url, crate::error::ResolutionFailure::LookupFailed),
+    }
+}
+
+fn resolution_error(url: &str, failure: crate::error::ResolutionFailure) -> DepsError {
+    DepsError::RegistryError {
+        package: RedactedUrl::new(url),
+        source: failure.into(),
     }
 }
 
@@ -6987,12 +6994,16 @@ mod tests {
 
         let result = fetch_via(&transport).await;
 
-        assert_matches!(result, Err(DepsError::CacheError(message)) if message.contains("DNS preflight"));
+        assert_matches!(
+            result,
+            Err(DepsError::RegistryError { source, .. })
+                if source.resolution_failure() == Some(crate::error::ResolutionFailure::NoAddresses)
+        );
         assert!(seen.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn test_preflight_error_maps_blocked_to_policy_and_everything_else_to_cache_error() {
+    fn test_preflight_error_maps_blocked_to_policy_and_everything_else_to_registry_error() {
         let blocked = ResolveGuardError::Blocked {
             host: "h".into(),
             addr: "10.0.0.1".parse().unwrap(),
@@ -7008,8 +7019,12 @@ mod tests {
         let dns = std::io::Error::other("lookup failed");
         assert_matches!(
             preflight_error("https://h.test/", Box::new(dns)),
-            DepsError::CacheError(_)
+            DepsError::RegistryError { source, .. }
+                if source.resolution_failure() == Some(crate::error::ResolutionFailure::LookupFailed)
         );
+        let empty = ResolveGuardError::NoAddresses { host: "h".into() };
+        let error = preflight_error("https://h.test/", Box::new(empty));
+        assert_eq!(error.fetch_failure(), crate::FetchFailure::Transient);
     }
 
     /// G2: the pinned tier's preflight is enforced on the send path, not merely present.

@@ -23,7 +23,8 @@ use crate::{
 use super::{
     CooldownBlocker, CooldownDisposition, DiagnosticMessages, EcosystemFormatter, LatestVerdict,
     PackageVersions, RequirementGate, RequirementMatcher, RequirementStatus, VersionData,
-    cooldown_disposition, resolve_scan_outcome, version_range_is_synthetic_empty,
+    cached_package_versions_by_name, cooldown_disposition, resolve_scan_outcome,
+    version_range_is_synthetic_empty,
 };
 
 /// Stable [`Diagnostic::code`] set on the unsatisfiable-requirement diagnostic.
@@ -1287,10 +1288,11 @@ impl<'a> RuleContext<'a> {
     /// first and the declared name second. `None` routes the dependency into the
     /// unknown-package family (R5) and ends its evaluation.
     fn cached_versions(&self) -> Option<&'a PackageVersions> {
-        self.versions
-            .cached
-            .get(self.normalized_name)
-            .or_else(|| self.versions.cached.get(self.dep.name()))
+        cached_package_versions_by_name(
+            self.versions.cached,
+            self.normalized_name,
+            self.dep.name().as_str(),
+        )
     }
 }
 

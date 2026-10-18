@@ -61,4 +61,7 @@ pub(crate) use state::{
     CLIENT_REFRESH_TIMEOUT, DocStamp, PrefetchVisibility, PublishTicket, RefreshKind,
     refresh_with_timeout, spawn_supervised,
 };
-pub use state::{ColdStartLimiter, DocumentState, LoadingState, PackageSignals, ServerState};
+pub use state::{
+    ColdStartLimiter, DocumentState, LSP_DISPATCH_CONCURRENCY, LoadingState, PackageSignals,
+    ServerState,
+};

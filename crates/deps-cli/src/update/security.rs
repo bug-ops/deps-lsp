@@ -6,10 +6,12 @@ use std::time::Duration;
 
 use deps_core::Ecosystem;
 use deps_core::edit::{
-    VulnFixSkip, plan_verified_fix, resolve_recommended_fix, resolve_verified_fix,
+    FixTargetContext, VulnFixSkip, plan_verified_fix, resolve_recommended_fix, resolve_verified_fix,
 };
 use deps_core::lsp_helpers::CommitRewrite;
-use deps_core::lsp_helpers::{RequirementGate, resolve_in_use_version, resolve_scan_outcome};
+use deps_core::lsp_helpers::{
+    RequirementGate, cached_package_versions_by_name, resolve_in_use_version, resolve_scan_outcome,
+};
 use deps_core::osv::{OsvClient, OsvId, ScanOutcome};
 
 use crate::analyze::ManifestAnalysis;
@@ -146,6 +148,13 @@ pub async fn plan_security_updates(
         ecosystem_id,
     );
 
+    let fix_target_registry = deps_engine::classify::osv::fix_target_registry(
+        analysis.parse_result.as_ref(),
+        &vuln_key_by_range,
+        &analysis.cached_versions,
+        formatter,
+    );
+
     static EMPTY_LATEST_STATUS: std::sync::LazyLock<deps_core::osv::LatestStatusMap> =
         std::sync::LazyLock::new(deps_core::osv::LatestStatusMap::new);
     let latest_status = analysis
@@ -160,6 +169,7 @@ pub async fn plan_security_updates(
             latest_status,
             &candidate_tags,
             formatter,
+            &fix_target_registry,
         );
 
     let mut vulnerabilities = vulnerabilities.clone();
@@ -276,10 +286,11 @@ fn classify_vulnerable_dependency(
     // stricter than `deps-lsp` (`code_actions.rs:590-604`), which fails closed only on a
     // *timed-out* fetch and leaves a plain fetch failure unfiltered — the CLI's broader rule
     // is intentional (the safe direction) and must not be narrowed to match `deps-lsp`.
-    let cached = analysis
-        .cached_versions
-        .get(normalized_name)
-        .or_else(|| analysis.cached_versions.get(dep.name()));
+    let cached = cached_package_versions_by_name(
+        &analysis.cached_versions,
+        normalized_name,
+        dep.name().as_str(),
+    );
     if analysis.fetch_failed.contains(dep.name()) || cached.is_none() {
         return unfixable_item(
             dep,
@@ -297,13 +308,21 @@ fn classify_vulnerable_dependency(
     // *before* the version_requirement/version_range/yanked checks below, exactly like the
     // pre-#1350 code did, so an unverified fix target is never misreported as
     // `RequiresLockfileUpdate`/`Unfixable(Yanked)` instead of `Unfixable(NoVerifiedFix)`.
-    let (fix, version_native) = match resolve_verified_fix(dv, latest, formatter) {
+    let (fix, version_native) = match resolve_verified_fix(
+        dv,
+        FixTargetContext::new(latest).with_registry(cached),
+        formatter,
+    ) {
         Ok(pair) => pair,
         Err(_) => {
             // #1779: the live fix-target check already rejected a commit pin's fix version with
             // no release tag (its candidate tags cannot be resolved), so name that cause here
             // when a complete tag list proves it, instead of the generic no-verified-fix.
-            if let Ok((fix, version_native)) = resolve_recommended_fix(dv, latest, formatter) {
+            if let Ok((fix, version_native)) = resolve_recommended_fix(
+                dv,
+                FixTargetContext::new(latest).with_registry(cached),
+                formatter,
+            ) {
                 let target = deps_core::ConcreteVersion::new(version_native);
                 if formatter.commit_rewrite_for(dep, &target) == CommitRewrite::NoReleaseTag {
                     return unfixable_item(
@@ -1008,6 +1027,70 @@ mod tests {
         assert_eq!(
             item.target(),
             Some(&deps_core::ConcreteVersion::from("1.0.2"))
+        );
+    }
+
+    fn deprecated_4_18_0_cache() -> HashMap<PackageName, PackageVersions> {
+        let available: std::sync::Arc<[ConcreteVersion]> = std::sync::Arc::from(vec![
+            ConcreteVersion::new("4.18.1"),
+            ConcreteVersion::new("4.18.0"),
+        ]);
+        let flagged: std::sync::Arc<[(ConcreteVersion, deps_core::RemovalStatus)]> =
+            std::sync::Arc::from(vec![(
+                ConcreteVersion::new("4.18.0"),
+                deps_core::RemovalStatus::AdvisoryDeprecated,
+            )]);
+        HashMap::from([(
+            PackageName::new("serde"),
+            PackageVersions::new(ConcreteVersion::new("4.18.1"), available).with_yanked(flagged),
+        )])
+    }
+
+    fn classify_serde(verified_target: &str) -> PlannedUpdateItem {
+        let dep = dep("serde", "0.9");
+        let dv = deps_core::osv::DependencyVulnerabilities::new(Capped::new(
+            vec![advisory("RUSTSEC-2024-0001", "4.18.0")],
+            1,
+        ))
+        .with_fix_target_status(UpgradeStatus::CandidateClean {
+            version: ConcreteVersion::new(verified_target),
+        });
+        let analysis = test_analysis(deprecated_4_18_0_cache(), HashSet::new());
+        let formatter = TestFormatter {
+            requirement_already_admits_fix: false,
+            osv_native_differs: false,
+        };
+        classify_vulnerable_dependency(
+            &dep,
+            &dv,
+            None,
+            "serde",
+            &analysis,
+            &formatter,
+            EcosystemId::Cargo,
+            &IgnoreRules::empty(),
+        )
+    }
+
+    /// #1832: a fix target the registry marks deprecated is steered to the next release.
+    #[test]
+    fn test_classify_steers_past_a_deprecated_fix_target() {
+        let item = classify_serde("4.18.1");
+        assert_matches!(item.outcome, Outcome::Applied { .. });
+        assert_eq!(
+            item.target(),
+            Some(&deps_core::ConcreteVersion::from("4.18.1"))
+        );
+    }
+
+    /// #1832: a verification recorded for the deprecated version no longer matches the steered
+    /// target, so the dependency fails closed rather than being reported fixed.
+    #[test]
+    fn test_classify_cache_skew_after_steering_fails_closed() {
+        let item = classify_serde("4.18.0");
+        assert_matches!(
+            item.outcome,
+            Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
         );
     }
 
@@ -1924,6 +2007,7 @@ mod tests {
             &deps_core::osv::LatestStatusMap::new(),
             &candidate_tags,
             &formatter,
+            &deps_engine::classify::osv::FixTargetRegistry::default(),
         );
         assert!(
             resolved.is_empty(),

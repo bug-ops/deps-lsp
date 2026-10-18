@@ -64,11 +64,47 @@ pub fn evict_expired_then_oldest<K, V>(
 ) where
     K: Eq + std::hash::Hash + Clone,
 {
+    evict_expired_then_oldest_at(map, max_entries, Instant::now(), fetched_at, ttl);
+}
+
+/// [`evict_expired_then_oldest`] against a caller-supplied `now`.
+///
+/// For maps stamped with a clock other than `std::time::Instant::now()` — e.g. a
+/// `tokio::time::Instant` converted via `into_std()`, which under `start_paused` runs ahead of
+/// the real clock, so a `now` read from the real clock would never see an entry expire.
+///
+/// # Examples
+///
+/// ```
+/// use dashmap::DashMap;
+/// use deps_core::cache_policy::evict_expired_then_oldest_at;
+/// use std::time::{Duration, Instant};
+///
+/// let map: DashMap<u32, Instant> = DashMap::new();
+/// let base = Instant::now();
+/// map.insert(1, base);
+/// map.insert(2, base + Duration::from_secs(50));
+///
+/// // At `base + 61s` only entry 1 is past its 60 s TTL.
+/// let now = base + Duration::from_secs(61);
+/// evict_expired_then_oldest_at(&map, 2, now, |at| *at, |_| Duration::from_secs(60));
+///
+/// assert!(!map.contains_key(&1));
+/// assert!(map.contains_key(&2));
+/// ```
+pub fn evict_expired_then_oldest_at<K, V>(
+    map: &DashMap<K, V>,
+    max_entries: usize,
+    now: Instant,
+    fetched_at: impl Fn(&V) -> Instant,
+    ttl: impl Fn(&V) -> Duration,
+) where
+    K: Eq + std::hash::Hash + Clone,
+{
     if map.len() < max_entries {
         return;
     }
-    let now = Instant::now();
-    map.retain(|_, v| now.duration_since(fetched_at(v)) < ttl(v));
+    map.retain(|_, v| now.saturating_duration_since(fetched_at(v)) < ttl(v));
     if map.len() >= max_entries
         && let Some(oldest) = map
             .iter()

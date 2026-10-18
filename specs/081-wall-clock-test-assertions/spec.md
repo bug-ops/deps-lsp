@@ -13,7 +13,7 @@ tags:
   - deps-gradle
   - deps-swift
 created: 2026-10-07
-status: partial
+status: implemented
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
@@ -167,7 +167,7 @@ THEN the guidance points to the single shared mechanism and no new hard-coded Du
 
 | ID | Category | Requirement |
 |----|----------|-------------|
-| NFR-001 | Reliability | Over at least [NEEDS CLARIFICATION: N runs, see OQ-3] consecutive CI-like runs under induced load (for example a stress run alongside the full suite), the guards SHALL show zero false failures. |
+| NFR-001 | Reliability | Over at least 20 consecutive CI-like runs under induced load (for example a stress run alongside the full suite), the guards SHALL show zero false failures. |
 | NFR-002 | Sensitivity | The check SHALL distinguish linear from quadratic behavior at the adversarial input sizes the tests already use; it SHALL NOT be less sensitive than the current absolute bounds. |
 | NFR-003 | Speed | The guard tests SHALL NOT materially increase total suite time; if the mechanism repeats runs (option a), the added cost SHALL be bounded and stated. |
 | NFR-004 | Type safety | Any work counter, budget or measurement result SHALL be a dedicated type (newtype or enum), not a bare `u64`, `f64` or stringly-typed value; any ratio threshold SHALL be a named constant of a purpose-built type. No `unsafe` (`unsafe_code = "forbid"` stays in force). |
@@ -202,12 +202,12 @@ THEN the guidance points to the single shared mechanism and no new hard-coded Du
 
 | ID | Metric | Target |
 |----|--------|--------|
-| SC-001 | False failures of the in-scope guards across a stress run (full suite in parallel plus induced CPU load) | 0 over [NEEDS CLARIFICATION: N] runs |
+| SC-001 | False failures of the in-scope guards across a stress run (full suite in parallel plus induced CPU load) | 0 over 20 runs (OQ-3) |
 | SC-002 | Mutation check: each in-scope guard, run against a deliberately quadratic variant of its function | 100% fail |
 | SC-003 | In-scope tests still asserting an absolute `Duration` bound on a complexity guard | 0 |
 | SC-004 | Copies of the linear-time check mechanism outside the single shared location | 0 |
 | SC-005 | Release-build or non-dev dependency tree reachability of any test-only hook (`cargo tree -p deps-lsp -e features,no-dev` guard) | none |
-| SC-006 | Added wall time of the guard tests in the full nextest run | [NEEDS CLARIFICATION: budget, see OQ-3] |
+| SC-006 | Added wall time of the guard tests in the full nextest run | Measured and recorded in the mutation table (OQ-3) |
 
 ## 8. Agent Boundaries
 
@@ -232,31 +232,79 @@ THEN the guidance points to the single shared mechanism and no new hard-coded Du
 - Edit files under `crates/deps-zed`.
 - Use a bare numeric, string or `bool`-flag type where a dedicated type can express the measure.
 
-> [!warning] Implementation status (issue #1824, PR #1842): partial
-> Option a (scaling ratio) is implemented for the 9 sites the issue lists (gradle groovy/kotlin, swift x2,
-> `matched_spans`, `lsp_helpers/mod.rs`, `git_ref.rs` x3) through `deps_core::test_util::scaling::assert_scaling`:
-> small and full runs interleaved, best of 3 per side, one re-measure before failing, a 100 ms noise floor, and
-> `Linear`/`Linearithmic`/`Bounded` limits as a typed `TimeRatio`. Its decision logic has deterministic unit tests
-> with an injected clock; load-step runs (CPU burners added between the two phases) passed for `matched_spans`
-> and the swift overlapping-forms guard.
+> [!success] Implementation status (issue #1824 PR #1842, issue #1838)
+> Option a (scaling ratio) is implemented through `deps_core::test_util::scaling::assert_scaling`: small
+> (`full_units / 8`) and full runs interleaved, best of 3 per side, one re-measure before failing, a 100 ms
+> noise floor, and `Linear`/`Linearithmic`/`Bounded` limits (`TimeRatio` is private). PR #1842 converted the 9
+> sites of #1824; #1838 converts the remaining 18 complexity guards: `redact/url.rs` x10,
+> `lsp_helpers/mod.rs` (`byte_offset_to_position` minified line), `git_ref.rs` (fallback scans), deps-gradle
+> `ecosystem.rs`, deps-pypi `pyproject.rs`/`requirements.rs`, deps-github-actions `parser.rs`, deps-go
+> `config.rs`, deps-bundler `version.rs`. The convention is documented in
+> `book/src/contributing/step-11-tests.md` and the `scaling` module doc (FR-010).
 >
-> Still open and not claimed: the remaining ~21 wall-clock asserts (FR-005; `redact/url.rs` x10 and others), the
-> contributor-facing convention doc (FR-010), the mutation check that a deliberately quadratic variant of each
-> guard fails (SC-002), the `retries` question (OQ-5) and the open questions below. The spec is not closed;
-> a follow-up issue tracks the remainder.
+> SC-002 evidence counts only an `assert_scaling` ratio panic; a nextest slow-timeout kill (120 s) does not.
+> The mutation results and the detection window of each guard are recorded in the table below.
 
-## 9. Open Questions
+### SC-002 mutation results (issue #1838, 2026-10-18)
 
-> [!question] Open items (7)
-> Resolve before moving to `plan`.
+Each mutant is a temporary burner at the guarded function's entry,
+`for i in 0..n { for j in 0..n / K { black_box(i ^ j) } }` with `n` the input length (per-call
+`for j in 0..len / K` for the per-lookup guards), applied and reverted by edit; the diff of every mutated
+file afterwards shows only the guard-test hunks. Only an `assert_scaling` ratio panic counts. The healthy
+full-size time is estimated as the passing test's wall time divided by 3.4 (three small and three full
+samples), so it is an upper bound; "<0.05 s" means the whole healthy test ran under 0.2 s, i.e. mostly
+below the 100 ms noise floor, where the healthy run is not compared and only a regression that clears the
+floor can fail.
 
-- [NEEDS CLARIFICATION: OQ-1 Scope and classification. The finding lists 9 sites; a broader grep finds about 30 wall-clock assertions (10 of them in `redact/url.rs`). Which are true complexity guards versus latency or concurrency checks, and is the in-scope set the 9 named sites, all complexity guards repo-wide, or a phased subset (named sites first)? A live audit of each site (what is the input, what bound is asserted, what is the typical measured time) is needed before deciding.]
-- [NEEDS CLARIFICATION: OQ-2 Mechanism. Option a (scaling ratio), b (deterministic counter or step budget), c (serial nextest group with a generous bound), d (criterion/divan benchmark with a CI gate), or a per-cluster mix? Research view: b is the only fully deterministic option but cannot cover third-party-backed code; a needs no production change; c alone does not remove external runner noise and keeps a loose bound; d adds the most infrastructure. Confirm direction, and whether c is acceptable as a stop-gap alongside a longer-term a or b.]
-- [NEEDS CLARIFICATION: OQ-3 If option a is chosen: which input sizes and ratio threshold (for example time at 2N must be below some multiple of time at N), how many repetitions or what min-of-k policy, and what stress-run length and added-time budget define "no false failures" (NFR-001, SC-001, SC-006)? Must be validated empirically on ubuntu, macOS and under `llvm-cov`, since the quoted flake was observed only once and its load profile is unknown.]
-- [NEEDS CLARIFICATION: OQ-4 If option b is chosen: where can a counter or budget live without a production signature change or a leak into the non-dev tree (a `cfg(test)`-only field, a `test-util`-gated hook, or a generic instrumented-iterator seam)? Also, several guards depend on a truncation cap (`MAX_DEPENDENCIES_PER_DOCUMENT`); should the linearity assertion target the pre-cap scan work, the post-cap total, or both?]
-- [NEEDS CLARIFICATION: OQ-5 Retries. The `ci` profile uses `retries = 2`, which masks timing flakes. Should flaky-pass (retried) results of guard tests be surfaced, should the guards be pinned to `retries = 0` via a nextest override, or is that out of scope for this spec?]
-- [NEEDS CLARIFICATION: OQ-6 If option d is chosen: the CI `benchmark` job only builds benches today. Is a run-and-compare gate wanted, where does the baseline live (committed file, cache, artifact, external service), and what tolerance is acceptable on shared runners? Is a statistical gate even desirable given the same noise problem?]
-- [NEEDS CLARIFICATION: OQ-7 Where does the convention live (a section in contributor docs, `.claude/rules/`, a `deps-core` test-util module doc), and should a lint-style check (for example a CI grep for `elapsed() < Duration`/`elapsed < Duration` in test code outside an allowlist) prevent new hard-coded bounds from appearing (US-003)?]
+| Guard | Mutated function | K | Healthy full | Mutant full | Ratio | Ratio panic |
+|-------|------------------|---|--------------|-------------|-------|-------------|
+| url: contiguous slash run | `redact_userinfo` | 500 | <0.04 s | 1.56 s | 57x | yes |
+| url: many small undecided windows | `redact_userinfo` | 500 | <0.05 s | 1.57 s | 57x | yes |
+| url: colon-dense chain | `redact_userinfo` | 3000 | ~0.4 s | 4.41 s | 43x | yes |
+| url: colon-dense chain, trailing bracket | `redact_userinfo` | 3000 | ~0.4 s | 4.42 s | 43x | yes |
+| url: consecutive `[` run | `redact_userinfo` | 125 | <0.05 s | 1.54 s | 63x | yes |
+| url: alternating `[0` pairs | `redact_userinfo` | 500 | <0.05 s | 1.57 s | 58x | yes |
+| url: large slash chain | `redact_userinfo` | 500 | <0.05 s | 1.55 s | 60x | yes |
+| url: mask-site colon-dense streak | `redact_userinfo` | 3000 | ~0.25 s | 4.29 s | 50x | yes |
+| url: `/:` repeats after one `@` | `redact_userinfo` | 500 | <0.05 s | 1.58 s | 54x | yes |
+| url: drive-letter-dense run | `redact_userinfo` | 1500 | ~0.25 s | 4.80 s | 50x | yes |
+| `byte_offset_to_position` minified line | `byte_offset_to_position` (per call) | 4 | <0.01 s | 1.65 s | 70x | yes |
+| `locate_value_span` fallback scans (Bounded) | `locate_value_span` (per call) | 50 | ~0.05 s | 1.66 s | 6.6x (limit 4) | yes |
+| gradle `skip_vararg_siblings` | `skip_vararg_siblings` | 150 | ~0.3 s | 2.32 s | 32x | yes |
+| pypi pyproject oversized extras | `parse_content_with_policy` | 3300 | ~0.11 s | 1.56 s | 42x | yes |
+| pypi requirements oversized extras | `parse_requirements_with_policy` | 3300 | ~0.12 s | 1.56 s | 41x | yes |
+| github-actions `build_dependency` (Bounded) | `build_dependency` (per call) | 28 | ~0.04 s | 1.58 s | 7.9x (limit 4) | yes |
+| go glob many stars | `GlobPattern::matches` | 3300 | ~0.05 s | 1.56 s | 53x | yes |
+| bundler `compare_versions` | `compare_versions` | 530 | ~0.05 s | 1.46 s | 54x | yes |
+
+All 18 guards fail through the ratio panic, none through a slow-timeout kill, and every mutant full run is
+within 100 ms to 15 s and at least 5x the healthy time. The two `Bounded` guards model the pre-fix defect
+(a per-call cost that grows with the document), whose ratio (about 8) exceeds their limit of 4.
+
+Detection window: a regression is caught only if its full-size run clears the 100 ms noise floor and its
+ratio exceeds the limit. A mild super-linear regression whose full-size run stays under 100 ms is not
+detected (most healthy runs here are already under 50 ms); the input sizes were kept at the pre-existing
+ones (OQ-3, except `skip_vararg_siblings`, raised to 50,000 siblings) so a quadratic regression, the
+CWE-407 case the guards exist for, clears the floor by more than 10x.
+
+## 9. Resolved Questions
+
+- **OQ-1** Scope: all 18 remaining complexity guards are in scope. FR-011 exclusions (latency/timeout checks,
+  left unchanged): `deps-lsp/tests/common/mod.rs:672`, `deps-engine/src/classify/fetch.rs:1968`,
+  `deps-lsp/src/server.rs:5499` (`elapsed < CLIENT_REFRESH_TIMEOUT + 4s`).
+- **OQ-2** Mechanism: option a for every cluster; no production hook (FR-008 holds trivially).
+- **OQ-3** `full_units` is each test's existing input size, except `skip_vararg_siblings` (see the table):
+  its cap of 32 siblings made the old 5000-sibling input too small for a quadratic mutant to clear the
+  noise floor. NFR-001: 20 consecutive runs of the guards under `ncpu` busy loops with zero failures.
+  SC-006: the 18 converted guards run 0.01-1.4 s each in a debug build (heaviest: the colon-dense
+  redactor guards and `skip_vararg_siblings`), a few seconds in total and parallel under nextest. Result: 20 of 20 runs of the 27 guard
+  tests (these 18 plus the 9 from #1824) passed with `retries = 0` under `ncpu` busy loops (macOS).
+- **OQ-4** N/A (no counter option). Cap-dependent guards (`skip_vararg_siblings`, `locate_value_span`) scale
+  the input past the cap and assert `Linear`/`Bounded` accordingly.
+- **OQ-5** Keep `retries = 2`; a guard that needs the retry still shows as flaky in the nextest report.
+- **OQ-6** N/A (no benchmark gate).
+- **OQ-7** The convention lives in the `scaling` module doc and `book/src/contributing/step-11-tests.md`;
+  no CI grep guard.
 
 ## 10. See Also
 

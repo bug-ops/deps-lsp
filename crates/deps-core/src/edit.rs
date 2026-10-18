@@ -10,12 +10,12 @@
 //! and spec 063 applied to [`crate::Dependency`]/[`crate::lockfile::LockFileCache`].
 
 use crate::lsp_helpers::{
-    EcosystemFormatter, LineOffsetTable, RequirementGate, RequirementStatus, VersionData,
-    is_safe_version_string, literal_span_matches, requirement_is_oversized,
+    EcosystemFormatter, LineOffsetTable, PackageVersions, RequirementGate, RequirementStatus,
+    VersionData, is_safe_version_string, literal_span_matches, requirement_is_oversized,
     requirement_len_exceeds_cap, resolve_in_use_version, slice_for_range, strip_whitespace,
     warn_rejected_value,
 };
-use crate::{ConcreteVersion, Dependency, ParseResult, VersionReq};
+use crate::{ConcreteVersion, Dependency, ParseResult, RemovalStatus, VersionReq};
 
 /// Whether `current` — or `dep`'s own literal version span — is an unexpanded placeholder.
 ///
@@ -999,6 +999,59 @@ pub enum VulnFixSkip {
     OversizedRequirement,
 }
 
+/// Per-dependency inputs [`resolve_recommended_fix`] consults beyond the advisories
+/// themselves: the dependency's entry in the shared [`crate::osv::LatestStatusMap`] and a
+/// snapshot of its registry version data.
+///
+/// Bundled so adding a further input does not ripple through every fix-planning call site
+/// again (#1832). `Default` is "no extra context" — the pre-#1832 behaviour.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::edit::FixTargetContext;
+///
+/// let ctx = FixTargetContext::default();
+/// assert!(ctx.latest().is_none());
+/// assert!(ctx.registry().is_none());
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FixTargetContext<'a> {
+    latest: Option<&'a crate::osv::UpgradeStatus>,
+    registry: Option<&'a PackageVersions>,
+}
+
+impl<'a> FixTargetContext<'a> {
+    /// Context carrying only this dependency's `latest` upgrade status (issue #1517).
+    #[must_use]
+    pub const fn new(latest: Option<&'a crate::osv::UpgradeStatus>) -> Self {
+        Self {
+            latest,
+            registry: None,
+        }
+    }
+
+    /// Attaches the dependency's registry version data, used to steer past a deprecated
+    /// fix target (#1832).
+    #[must_use]
+    pub const fn with_registry(mut self, registry: Option<&'a PackageVersions>) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// This dependency's entry in the shared [`crate::osv::LatestStatusMap`].
+    #[must_use]
+    pub const fn latest(&self) -> Option<&'a crate::osv::UpgradeStatus> {
+        self.latest
+    }
+
+    /// This dependency's registry version data, when known.
+    #[must_use]
+    pub const fn registry(&self) -> Option<&'a PackageVersions> {
+        self.registry
+    }
+}
+
 /// Resolves and validates the OSV-recommended fix for `dv`.
 ///
 /// The common prefix every vulnerability-fix caller needs before it can decide what to do
@@ -1014,14 +1067,14 @@ pub enum VulnFixSkip {
 ///
 /// # Arguments
 ///
-/// * `latest` - This dependency's entry in the shared [`crate::osv::LatestStatusMap`] (issue
-///   #1517), forwarded verbatim to [`crate::osv::DependencyVulnerabilities::recommended_fix`] —
-///   see that method's doc for its effect.
+/// * `ctx` - Its [`FixTargetContext::latest`] (issue #1517) is forwarded verbatim to
+///   [`crate::osv::DependencyVulnerabilities::recommended_fix`] — see that method's doc for its
+///   effect.
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_core::edit::{VulnFixSkip, resolve_recommended_fix};
+/// use deps_core::edit::{FixTargetContext, VulnFixSkip, resolve_recommended_fix};
 /// use deps_core::lsp_helpers::{
 ///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
 ///     RequirementResolution, SourcePolicy,
@@ -1048,19 +1101,25 @@ pub enum VulnFixSkip {
 ///
 /// let dv = DependencyVulnerabilities::new(Capped::new(Vec::<Arc<Advisory>>::new(), 0));
 /// assert_eq!(
-///     resolve_recommended_fix(&dv, None, &MockFormatter),
+///     resolve_recommended_fix(&dv, FixTargetContext::default(), &MockFormatter),
 ///     Err(VulnFixSkip::NoRecommendedFix)
 /// );
 /// ```
 pub fn resolve_recommended_fix(
     dv: &crate::osv::DependencyVulnerabilities,
-    latest: Option<&crate::osv::UpgradeStatus>,
+    ctx: FixTargetContext<'_>,
     formatter: &dyn EcosystemFormatter,
 ) -> Result<(crate::osv::FixRecommendation, String), VulnFixSkip> {
-    let fix = dv
-        .recommended_fix(latest)
+    let mut fix = dv
+        .recommended_fix(ctx.latest())
         .ok_or(VulnFixSkip::NoRecommendedFix)?;
-    let version_native = formatter.osv_version_to_native(&fix.version).into_string();
+    let mut version_native = formatter.osv_version_to_native(&fix.version).into_string();
+    if let Some(steered) = ctx.registry().and_then(|registry| {
+        steer_past_deprecated(&version_native, registry, crate::PublishTime::now())
+    }) {
+        fix.version = formatter.osv_version(steered);
+        version_native = steered.as_str().to_owned();
+    }
     if !is_safe_version_string(&version_native) {
         warn_rejected_value(
             "is_safe_version_string",
@@ -1070,6 +1129,87 @@ pub fn resolve_recommended_fix(
         return Err(VulnFixSkip::UnsafeVersion);
     }
     Ok((fix, version_native))
+}
+
+/// Whether `version` is a bare `MAJOR.MINOR.PATCH` release (optionally `v`-prefixed) with no
+/// pre-release, build suffix or extra segment.
+fn is_plain_release(version: &str) -> bool {
+    let digits = version.strip_prefix(['v', 'V']).unwrap_or(version);
+    let mut segments = digits.split('.');
+    let numeric = |segment: Option<&str>| {
+        segment.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    };
+    numeric(segments.next())
+        && numeric(segments.next())
+        && numeric(segments.next())
+        && segments.next().is_none()
+}
+
+/// The compatibility line of `version`: its major, plus the minor for a `0.x` release, where
+/// every minor may break.
+fn compatibility_line(version: &str) -> Option<(u64, Option<u64>)> {
+    let digits = version.strip_prefix(['v', 'V']).unwrap_or(version);
+    let mut numbers = digits
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .next()?
+        .split('.')
+        .map(str::parse::<u64>);
+    let major = numbers.next()?.ok()?;
+    if major != 0 {
+        return Some((major, None));
+    }
+    Some((0, Some(numbers.next()?.ok()?)))
+}
+
+/// The smallest registry version above a deprecated fix target that is still a fresh,
+/// installable release on the target's own compatibility line, or `None` when the target
+/// should stay as it is (#1832).
+///
+/// A target the registry flags only as [`RemovalStatus::AdvisoryDeprecated`] is installable
+/// but a bad release to recommend (npm's `lodash@4.18.0`). The steer applies only then: a
+/// healthy target is kept, and a yanked one falls to the caller's existing drop path. The
+/// replacement is the minimum version strictly greater than the target that carries no
+/// registry flag, is a plain `MAJOR.MINOR.PATCH` release (unless the target itself has a
+/// suffix), shares the target's major (major and minor for `0.x`) and is no newer than the
+/// registry `latest`. It is never a version GOSSIP excluded, nor `latest` while that release
+/// is still inside the default release cooldown — the registry publish time is known for
+/// `latest` only.
+fn steer_past_deprecated<'v>(
+    target_native: &str,
+    registry: &'v PackageVersions,
+    now: crate::PublishTime,
+) -> Option<&'v ConcreteVersion> {
+    let target_deprecated = registry.yanked.iter().any(|(version, status)| {
+        version.as_str() == target_native && *status == RemovalStatus::AdvisoryDeprecated
+    });
+    if !target_deprecated {
+        return None;
+    }
+    let line = compatibility_line(target_native)?;
+    let flagged: std::collections::HashSet<&str> = registry
+        .yanked
+        .iter()
+        .map(|(version, _)| version.as_str())
+        .collect();
+    let target_is_plain = is_plain_release(target_native);
+    let latest_in_cooldown = registry.published_at.is_some_and(|published_at| {
+        crate::CooldownWindow::DEFAULT.contains(published_at.age_secs_from(now))
+    });
+    let cmp = crate::osv::compare_version_strings;
+    registry
+        .available
+        .iter()
+        .filter(|candidate| {
+            let version = candidate.as_str();
+            cmp(version, target_native).is_gt()
+                && cmp(version, registry.latest.as_str()).is_le()
+                && (!target_is_plain || is_plain_release(version))
+                && compatibility_line(version) == Some(line)
+                && !flagged.contains(version)
+                && registry.gossip_excluded_version.as_ref() != Some(*candidate)
+                && !(latest_in_cooldown && *candidate == &registry.latest)
+        })
+        .min_by(|a, b| cmp(a.as_str(), b.as_str()))
 }
 
 /// Whether `dv.fix_target_status` clears `fix`'s target version as an honest, presentable fix
@@ -1146,7 +1286,7 @@ pub(crate) fn fix_target_is_verified(
 /// # Examples
 ///
 /// ```
-/// use deps_core::edit::{VulnFixSkip, resolve_verified_fix};
+/// use deps_core::edit::{FixTargetContext, VulnFixSkip, resolve_verified_fix};
 /// use deps_core::lsp_helpers::{
 ///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
 ///     RequirementResolution, SourcePolicy,
@@ -1185,20 +1325,20 @@ pub(crate) fn fix_target_is_verified(
 /// // `fix_target_status` left at its `NotChecked` default — never live-checked yet.
 /// let unverified = DependencyVulnerabilities::new(Capped::new(vec![advisory.clone()], 1));
 /// assert_eq!(
-///     resolve_verified_fix(&unverified, None, &MockFormatter),
+///     resolve_verified_fix(&unverified, FixTargetContext::default(), &MockFormatter),
 ///     Err(VulnFixSkip::UnverifiedTarget)
 /// );
 ///
 /// let verified = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
 ///     .with_fix_target_status(UpgradeStatus::CandidateClean { version: ConcreteVersion::new("1.2.0") });
-/// assert!(resolve_verified_fix(&verified, None, &MockFormatter).is_ok());
+/// assert!(resolve_verified_fix(&verified, FixTargetContext::default(), &MockFormatter).is_ok());
 /// ```
 pub fn resolve_verified_fix(
     dv: &crate::osv::DependencyVulnerabilities,
-    latest: Option<&crate::osv::UpgradeStatus>,
+    ctx: FixTargetContext<'_>,
     formatter: &dyn EcosystemFormatter,
 ) -> Result<(crate::osv::FixRecommendation, String), VulnFixSkip> {
-    let (fix, version_native) = resolve_recommended_fix(dv, latest, formatter)?;
+    let (fix, version_native) = resolve_recommended_fix(dv, ctx, formatter)?;
     if !fix_target_is_verified(dv, &fix, &version_native) {
         return Err(VulnFixSkip::UnverifiedTarget);
     }
@@ -1247,7 +1387,7 @@ pub fn resolve_verified_fix(
 /// # Examples
 ///
 /// ```
-/// use deps_core::edit::plan_vulnerability_fix;
+/// use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
 /// use deps_core::lsp_helpers::{
 ///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
 ///     RequirementResolution, SourcePolicy,
@@ -1313,7 +1453,14 @@ pub fn resolve_verified_fix(
 ///     .with_fix_target_status(UpgradeStatus::CandidateClean { version: ConcreteVersion::new("1.2.0") });
 ///
 /// let planned =
-///     plan_vulnerability_fix(&dep, dep.version_range, "1.0.0", &dv, None, &MockFormatter);
+///     plan_vulnerability_fix(
+///         &dep,
+///         dep.version_range,
+///         "1.0.0",
+///         &dv,
+///         FixTargetContext::default(),
+///         &MockFormatter,
+///     );
 /// assert_eq!(planned.unwrap().edit.new_text, "1.2.0");
 /// ```
 ///
@@ -1326,10 +1473,10 @@ pub fn plan_vulnerability_fix(
     version_range: crate::position::Range,
     current: &str,
     dv: &crate::osv::DependencyVulnerabilities,
-    latest: Option<&crate::osv::UpgradeStatus>,
+    ctx: FixTargetContext<'_>,
     formatter: &dyn EcosystemFormatter,
 ) -> Result<PlannedUpdate, VulnFixSkip> {
-    let (_fix, version_native) = resolve_verified_fix(dv, latest, formatter)?;
+    let (_fix, version_native) = resolve_verified_fix(dv, ctx, formatter)?;
     plan_verified_fix(dep, version_range, current, &version_native, formatter)
 }
 
@@ -2082,6 +2229,258 @@ mod tests {
         }
     }
 
+    // --- #1832: steering a deprecated fix target to the next fresh release ---
+
+    mod steer_past_deprecated_tests {
+        use super::*;
+        use crate::RemovalStatus;
+        use crate::lsp_helpers::PackageVersions;
+        use crate::lsp_helpers::test_support::MOCK_FORMATTER;
+        use crate::osv::{Advisory, Capped, DependencyVulnerabilities, OsvVersion, VulnSeverity};
+        use std::sync::Arc;
+
+        fn dv_fixed_in(version: &str) -> DependencyVulnerabilities {
+            let advisory = Arc::new(
+                Advisory::new(
+                    "RUSTSEC-2024-0001".to_string(),
+                    "2024-01-01T00:00:00Z".to_string(),
+                    VulnSeverity::High,
+                )
+                .expect("valid osv id")
+                .with_fixed_versions(vec![OsvVersion::new(version)]),
+            );
+            DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+        }
+
+        fn registry(available: &[&str], flagged: &[(&str, RemovalStatus)]) -> PackageVersions {
+            let available: Vec<ConcreteVersion> =
+                available.iter().map(|v| ConcreteVersion::new(*v)).collect();
+            let yanked: Vec<(ConcreteVersion, RemovalStatus)> = flagged
+                .iter()
+                .map(|(v, s)| (ConcreteVersion::new(*v), *s))
+                .collect();
+            PackageVersions::new(available[0].clone(), Arc::from(available))
+                .with_yanked(Arc::from(yanked))
+        }
+
+        fn resolved(registry: Option<&PackageVersions>) -> String {
+            let ctx = FixTargetContext::default().with_registry(registry);
+            let (fix, native) =
+                resolve_recommended_fix(&dv_fixed_in("4.18.0"), ctx, &MOCK_FORMATTER)
+                    .expect("fix resolves");
+            assert_eq!(
+                fix.version.as_str(),
+                native,
+                "OSV spelling follows the target"
+            );
+            native
+        }
+
+        #[test]
+        fn deprecated_target_steers_to_next_release() {
+            let pv = registry(
+                &["4.18.1", "4.18.0", "4.17.21"],
+                &[("4.18.0", RemovalStatus::AdvisoryDeprecated)],
+            );
+            assert_eq!(resolved(Some(&pv)), "4.18.1");
+        }
+
+        #[test]
+        fn healthy_target_is_unchanged() {
+            let pv = registry(&["4.18.1", "4.18.0"], &[]);
+            assert_eq!(resolved(Some(&pv)), "4.18.0");
+        }
+
+        #[test]
+        fn missing_registry_is_unchanged() {
+            assert_eq!(resolved(None), "4.18.0");
+        }
+
+        #[test]
+        fn every_newer_version_flagged_keeps_target() {
+            let pv = registry(
+                &["4.18.2", "4.18.1", "4.18.0"],
+                &[
+                    ("4.18.0", RemovalStatus::AdvisoryDeprecated),
+                    ("4.18.1", RemovalStatus::AdvisoryDeprecated),
+                    ("4.18.2", RemovalStatus::Yanked),
+                ],
+            );
+            assert_eq!(resolved(Some(&pv)), "4.18.0");
+        }
+
+        #[test]
+        fn yanked_target_is_not_steered() {
+            let pv = registry(&["4.18.1", "4.18.0"], &[("4.18.0", RemovalStatus::Yanked)]);
+            assert_eq!(resolved(Some(&pv)), "4.18.0");
+        }
+
+        #[test]
+        fn prerelease_candidates_are_skipped() {
+            let pv = registry(
+                &["4.18.1", "4.18.1-next.0", "4.18.0"],
+                &[("4.18.0", RemovalStatus::AdvisoryDeprecated)],
+            );
+            assert_eq!(resolved(Some(&pv)), "4.18.1");
+            let only_pre = registry(
+                &["4.18.1-next.0", "4.18.0"],
+                &[("4.18.0", RemovalStatus::AdvisoryDeprecated)],
+            );
+            assert_eq!(resolved(Some(&only_pre)), "4.18.0");
+        }
+
+        #[test]
+        fn minimum_newer_release_wins() {
+            let pv = registry(
+                &["4.20.0", "4.19.0", "4.18.1", "4.18.0"],
+                &[("4.18.0", RemovalStatus::AdvisoryDeprecated)],
+            );
+            assert_eq!(resolved(Some(&pv)), "4.18.1");
+        }
+
+        #[test]
+        fn plain_release_check() {
+            assert!(is_plain_release("1.2.3"));
+            assert!(is_plain_release("v1.2.3"));
+            assert!(!is_plain_release("1.2.3-next.0"));
+            assert!(!is_plain_release("1.2.3rc1"));
+            assert!(!is_plain_release(""));
+            assert!(!is_plain_release("4.18.0.0"));
+            assert!(!is_plain_release("4.18"));
+            assert!(!is_plain_release("4..3"));
+        }
+
+        fn resolved_for(fixed: &str, registry: &PackageVersions) -> String {
+            let ctx = FixTargetContext::default().with_registry(Some(registry));
+            resolve_recommended_fix(&dv_fixed_in(fixed), ctx, &MOCK_FORMATTER)
+                .expect("fix resolves")
+                .1
+        }
+
+        fn deprecated<'a>(versions: &[&'a str]) -> Vec<(&'a str, RemovalStatus)> {
+            versions
+                .iter()
+                .map(|v| (*v, RemovalStatus::AdvisoryDeprecated))
+                .collect()
+        }
+
+        #[test]
+        fn gossip_excluded_version_is_never_chosen() {
+            let pv = registry(
+                &["4.18.2", "4.18.1", "4.18.0"],
+                &[("4.18.0", RemovalStatus::AdvisoryDeprecated)],
+            )
+            .with_gossip_excluded_version(ConcreteVersion::new("4.18.1"));
+            assert_eq!(resolved_for("4.18.0", &pv), "4.18.2");
+
+            let only_excluded = registry(
+                &["4.18.1", "4.18.0"],
+                &[("4.18.0", RemovalStatus::AdvisoryDeprecated)],
+            )
+            .with_gossip_excluded_version(ConcreteVersion::new("4.18.1"));
+            assert_eq!(resolved_for("4.18.0", &only_excluded), "4.18.0");
+        }
+
+        #[test]
+        fn latest_inside_the_cooldown_window_is_never_chosen() {
+            let flagged = [("4.18.0", RemovalStatus::AdvisoryDeprecated)];
+            let now = crate::PublishTime::now().as_unix_secs();
+            let fresh = registry(&["4.18.1", "4.18.0"], &flagged)
+                .with_published_at(crate::PublishTime::from_unix_secs(now - 3_600));
+            assert_eq!(resolved_for("4.18.0", &fresh), "4.18.0");
+
+            let aged = registry(&["4.18.1", "4.18.0"], &flagged)
+                .with_published_at(crate::PublishTime::from_unix_secs(now - 10 * 86_400));
+            assert_eq!(resolved_for("4.18.0", &aged), "4.18.1");
+        }
+
+        #[test]
+        fn large_flagged_lists_are_filtered_in_linear_time() {
+            use crate::test_util::scaling::{ExpectedGrowth, assert_scaling};
+
+            let resolved = assert_scaling(
+                "every newer version flagged",
+                ExpectedGrowth::Linear,
+                300_000,
+                |count| {
+                    let names: Vec<String> = (0..count).map(|i| format!("4.19.{i}")).collect();
+                    let mut flagged: Vec<(&str, RemovalStatus)> = names
+                        .iter()
+                        .map(|v| (v.as_str(), RemovalStatus::AdvisoryDeprecated))
+                        .collect();
+                    flagged.push(("4.18.0", RemovalStatus::AdvisoryDeprecated));
+                    let mut available: Vec<&str> = names.iter().map(String::as_str).collect();
+                    available.push("4.18.0");
+                    registry(&available, &flagged)
+                },
+                |pv| resolved_for("4.18.0", pv),
+            );
+            assert_eq!(resolved, "4.18.0");
+        }
+
+        #[test]
+        fn steer_never_crosses_the_targets_major_line() {
+            let pv = registry(
+                &["7.4.3", "4.4.19", "4.4.18"],
+                &deprecated(&["4.4.18", "4.4.19"]),
+            );
+            assert_eq!(resolved_for("4.4.18", &pv), "4.4.18");
+
+            let with_clean_patch = registry(
+                &["7.4.3", "4.4.20", "4.4.19", "4.4.18"],
+                &deprecated(&["4.4.18", "4.4.19"]),
+            );
+            assert_eq!(resolved_for("4.4.18", &with_clean_patch), "4.4.20");
+        }
+
+        #[test]
+        fn steer_for_a_zero_major_stays_on_the_minor_line() {
+            let pv = registry(
+                &["0.6.0", "0.5.2", "0.5.1"],
+                &deprecated(&["0.5.1", "0.5.2"]),
+            );
+            assert_eq!(resolved_for("0.5.1", &pv), "0.5.1");
+        }
+
+        #[test]
+        fn steer_never_exceeds_registry_latest() {
+            let available: Arc<[ConcreteVersion]> = Arc::from(
+                ["4.18.3", "4.18.2", "4.18.1", "4.18.0"]
+                    .map(ConcreteVersion::new)
+                    .to_vec(),
+            );
+            let pv = PackageVersions::new(ConcreteVersion::new("4.18.1"), available).with_yanked(
+                Arc::from(vec![(
+                    ConcreteVersion::new("4.18.0"),
+                    RemovalStatus::AdvisoryDeprecated,
+                )]),
+            );
+            assert_eq!(resolved_for("4.18.0", &pv), "4.18.1");
+
+            let latest_deprecated = PackageVersions::new(
+                ConcreteVersion::new("4.18.0"),
+                Arc::from(vec![
+                    ConcreteVersion::new("4.18.3"),
+                    ConcreteVersion::new("4.18.0"),
+                ]),
+            )
+            .with_yanked(Arc::from(vec![(
+                ConcreteVersion::new("4.18.0"),
+                RemovalStatus::AdvisoryDeprecated,
+            )]));
+            assert_eq!(resolved_for("4.18.0", &latest_deprecated), "4.18.0");
+        }
+
+        #[test]
+        fn four_segment_candidates_are_not_plain_releases() {
+            let pv = registry(
+                &["4.18.0.1", "4.18.0"],
+                &[("4.18.0", RemovalStatus::AdvisoryDeprecated)],
+            );
+            assert_eq!(resolved_for("4.18.0", &pv), "4.18.0");
+        }
+    }
+
     // --- plan_vulnerability_fix: #1344 requirement-already-admits-fix gate, #1347
     // requirement_is_unresolved hardening ---
 
@@ -2173,8 +2572,14 @@ mod tests {
             let d = dep("serde", "1", range(0, 8, 0, 9));
             let dv = verified_dv("1.0.2");
 
-            let planned =
-                plan_vulnerability_fix(&d, d.version_range, "1", &dv, None, &StrictSemverFormatter);
+            let planned = plan_vulnerability_fix(
+                &d,
+                d.version_range,
+                "1",
+                &dv,
+                FixTargetContext::default(),
+                &StrictSemverFormatter,
+            );
             assert_eq!(planned, Err(VulnFixSkip::RequirementAlreadyResolves));
         }
 
@@ -2298,7 +2703,7 @@ mod tests {
                 d.version_range,
                 "0.9",
                 &dv,
-                None,
+                FixTargetContext::default(),
                 &StrictSemverFormatter,
             )
             .expect("0.9 does not admit 1.0.2, so an edit must be planned");
@@ -2314,9 +2719,15 @@ mod tests {
             let d = dep("serde", "1", range(0, 8, 0, 9));
             let dv = verified_dv("1.0.2");
 
-            let planned =
-                plan_vulnerability_fix(&d, d.version_range, "1", &dv, None, &MOCK_FORMATTER)
-                    .unwrap();
+            let planned = plan_vulnerability_fix(
+                &d,
+                d.version_range,
+                "1",
+                &dv,
+                FixTargetContext::default(),
+                &MOCK_FORMATTER,
+            )
+            .unwrap();
             assert_eq!(planned.edit.new_text, "\"1.0.2\"");
         }
 
@@ -2329,8 +2740,14 @@ mod tests {
             // A space is not in `is_safe_version_string`'s allowlist.
             let dv = verified_dv("1.2.0 evil");
 
-            let planned =
-                plan_vulnerability_fix(&d, d.version_range, "0.9", &dv, None, &MOCK_FORMATTER);
+            let planned = plan_vulnerability_fix(
+                &d,
+                d.version_range,
+                "0.9",
+                &dv,
+                FixTargetContext::default(),
+                &MOCK_FORMATTER,
+            );
             assert_eq!(planned, Err(VulnFixSkip::UnsafeVersion));
         }
 
@@ -2350,7 +2767,7 @@ mod tests {
                 d.version_range,
                 "\"1.0.2\"",
                 &dv,
-                None,
+                FixTargetContext::default(),
                 &MOCK_FORMATTER,
             );
             assert_eq!(planned, Err(VulnFixSkip::NoOpRewrite));
@@ -2397,9 +2814,15 @@ mod tests {
                 });
 
             let d = dep("serde", "0.9", range(0, 8, 0, 11));
-            let planned =
-                plan_vulnerability_fix(&d, d.version_range, "0.9", &dv, None, &MOCK_FORMATTER)
-                    .expect("fix beyond the display cap must still be recommended and verified");
+            let planned = plan_vulnerability_fix(
+                &d,
+                d.version_range,
+                "0.9",
+                &dv,
+                FixTargetContext::default(),
+                &MOCK_FORMATTER,
+            )
+            .expect("fix beyond the display cap must still be recommended and verified");
             assert_eq!(planned.edit.new_text, "\"2.0.0\"");
             assert_eq!(planned.target.as_str(), "2.0.0");
         }
@@ -2476,9 +2899,15 @@ mod tests {
                 Some(true)
             );
 
-            let planned =
-                plan_vulnerability_fix(&d, d.version_range, "1.0.0", &dv, None, &FloorFormatter)
-                    .expect("a floor-shaped requirement must not suppress the fix");
+            let planned = plan_vulnerability_fix(
+                &d,
+                d.version_range,
+                "1.0.0",
+                &dv,
+                FixTargetContext::default(),
+                &FloorFormatter,
+            )
+            .expect("a floor-shaped requirement must not suppress the fix");
             assert_eq!(planned.edit.new_text, "1.0.2");
         }
 
@@ -2497,7 +2926,7 @@ mod tests {
                 action_dep.version_range,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 &dv,
-                None,
+                FixTargetContext::default(),
                 &ShaPinFormatter,
             );
 

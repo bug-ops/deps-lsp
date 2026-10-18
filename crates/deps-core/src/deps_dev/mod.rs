@@ -191,13 +191,11 @@ const GOSSIP_REFRESH_BACKOFF: Duration = Duration::from_mins(15);
 /// and `version` from `resolve_in_use_version` (whose lockfile `ConcreteVersion`
 /// branch is never charset-validated), so a joined-string key could let
 /// `("a\0b", "c")` and `("a", "b\0c")` collide and serve another package's
-/// trust signal. A derived `Hash`/`Eq` over four fields cannot collide by
-/// construction. `base` is included for the same reason
-/// `github::ReleaseDatesCache` keys on `(api_base, name)`: a mock-server hit
-/// in tests must never serve a real-API read from a shared client instance.
+/// trust signal. A derived `Hash`/`Eq` over three fields cannot collide by
+/// construction. The memo is owned by one client, which is bound to one origin, so the
+/// origin is not part of the key.
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct MemoKey {
-    base: String,
     system: DepsDevSystem,
     name: String,
     version: String,
@@ -210,7 +208,6 @@ struct MemoKey {
 /// project).
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct ProjectKeyMemo {
-    base: String,
     /// Already validated by [`is_valid_project_key`] before it reaches here.
     project_key: String,
 }
@@ -228,7 +225,6 @@ struct ProjectKeyMemo {
 /// [`ProjectKeyMemo`]'s precedent for a memo scoped narrower than [`MemoKey`].
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct SimilarityMemoKey {
-    base: String,
     system: DepsDevSystem,
     name: String,
 }
@@ -239,7 +235,6 @@ struct SimilarityMemoKey {
 /// about.
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct PopularityMemoKey {
-    base: String,
     system: DepsDevSystem,
     name: String,
 }
@@ -250,7 +245,6 @@ struct PopularityMemoKey {
 /// caller happens to ask about, so this is keyed package-level, not version-level.
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct GossipMemoKey {
-    base: String,
     system: DepsDevSystem,
     name: String,
 }
@@ -261,7 +255,6 @@ struct GossipMemoKey {
 /// cannot share [`GossipMemoKey`]'s package-level scope.
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct GossipVersionMemoKey {
-    base: String,
     system: DepsDevSystem,
     name: String,
     version: String,
@@ -446,7 +439,6 @@ fn choose_project_key(projects: &[RelatedProject]) -> Option<(String, bool)> {
 /// docs for the caching/failure-handling rationale.
 pub struct DepsDevClient {
     cache: Arc<HttpCache>,
-    base_url: String,
     trusted_origin: crate::net_policy::TrustedPrefix,
     /// The trust-signal memo, coalesced (issue #1454): a losing concurrent caller awaits the
     /// leader's result via [`memo::CoalescedMemo::get_or_fetch`] rather than returning `None`
@@ -590,7 +582,13 @@ impl DepsDevClient {
     /// deps.dev calls, pointed at the real deps.dev API.
     #[must_use]
     pub fn new(cache: Arc<HttpCache>) -> Self {
-        Self::with_base_url(cache, DEPS_DEV_API.to_string())
+        #[expect(
+            clippy::expect_used,
+            reason = "`DEPS_DEV_API` is a constant absolute URL, checked by a unit test"
+        )]
+        let trusted_origin = crate::net_policy::TrustedPrefix::parse(&format!("{DEPS_DEV_API}/"))
+            .expect("deps.dev base URL must be an absolute URL");
+        Self::with_trusted_origin(cache, trusted_origin)
     }
 
     /// Creates a client pointed at `base_url` instead of the real deps.dev
@@ -598,19 +596,27 @@ impl DepsDevClient {
     #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn for_test(cache: Arc<HttpCache>, base_url: impl Into<String>) -> Self {
-        Self::with_base_url(cache, base_url.into())
-    }
-
-    fn with_base_url(cache: Arc<HttpCache>, base_url: String) -> Self {
         #[expect(
             clippy::expect_used,
-            reason = "`base_url` is the `DEPS_DEV_API` constant or a test server URL"
+            reason = "test-only constructor: a test server URL is always absolute"
         )]
-        let trusted_origin = crate::net_policy::TrustedPrefix::parse(&format!("{base_url}/"))
-            .expect("deps.dev base URL must be an absolute URL");
+        let trusted_origin =
+            crate::net_policy::TrustedPrefix::parse(&format!("{}/", base_url.into()))
+                .expect("deps.dev base URL must be an absolute URL");
+        Self::with_trusted_origin(cache, trusted_origin)
+    }
+
+    /// The origin every request URL is built from, always ending in `/`.
+    fn origin(&self) -> &str {
+        self.trusted_origin.as_str()
+    }
+
+    fn with_trusted_origin(
+        cache: Arc<HttpCache>,
+        trusted_origin: crate::net_policy::TrustedPrefix,
+    ) -> Self {
         Self {
             cache,
-            base_url,
             trusted_origin,
             signals: CoalescedMemo::new(DEPS_DEV_TTLS),
             projects: TtlMemo::new(DEPS_DEV_TTLS),
@@ -642,7 +648,6 @@ impl DepsDevClient {
         version: &str,
     ) -> Option<SupplyChainTrustSignal> {
         let key = MemoKey {
-            base: self.base_url.clone(),
             system,
             name: name.to_string(),
             version: version.to_string(),
@@ -753,8 +758,8 @@ impl DepsDevClient {
         }
 
         let version_url = format!(
-            "{}/v3/systems/{}/packages/{}/versions/{}",
-            self.base_url,
+            "{}v3/systems/{}/packages/{}/versions/{}",
+            self.origin(),
             system.as_path_segment(),
             urlencoding::encode(name),
             urlencoding::encode(version),
@@ -809,7 +814,6 @@ impl DepsDevClient {
     /// [`Self::projects`]'s field doc.
     async fn fetch_scorecard(&self, project_key: &str) -> CallOutcome<Option<f32>> {
         let memo_key = ProjectKeyMemo {
-            base: self.base_url.clone(),
             project_key: project_key.to_string(),
         };
 
@@ -818,8 +822,8 @@ impl DepsDevClient {
         }
 
         let url = format!(
-            "{}/v3/projects/{}",
-            self.base_url,
+            "{}v3/projects/{}",
+            self.origin(),
             urlencoding::encode(project_key),
         );
 
@@ -939,7 +943,6 @@ impl DepsDevClient {
         }
 
         let key = SimilarityMemoKey {
-            base: self.base_url.clone(),
             system,
             name: name.to_string(),
         };
@@ -957,8 +960,8 @@ impl DepsDevClient {
         name: &str,
     ) -> CallOutcome<Vec<SimilarPackageCandidate>> {
         let url = format!(
-            "{}/v3alpha/systems/{}/packages/{}:similarlyNamedPackages",
-            self.base_url,
+            "{}v3alpha/systems/{}/packages/{}:similarlyNamedPackages",
+            self.origin(),
             system.as_path_segment(),
             urlencoding::encode(name),
         );
@@ -1003,7 +1006,6 @@ impl DepsDevClient {
         name: &str,
     ) -> (Option<u64>, FetchCompleteness) {
         let key = PopularityMemoKey {
-            base: self.base_url.clone(),
             system,
             name: name.to_string(),
         };
@@ -1027,8 +1029,8 @@ impl DepsDevClient {
         }
 
         let package_url = format!(
-            "{}/v3alpha/systems/{}/packages/{}",
-            self.base_url,
+            "{}v3alpha/systems/{}/packages/{}",
+            self.origin(),
             system.as_path_segment(),
             urlencoding::encode(name),
         );
@@ -1059,8 +1061,8 @@ impl DepsDevClient {
         }
 
         let dependents_url = format!(
-            "{}/v3alpha/systems/{}/packages/{}/versions/{}:dependents",
-            self.base_url,
+            "{}v3alpha/systems/{}/packages/{}/versions/{}:dependents",
+            self.origin(),
             system.as_path_segment(),
             urlencoding::encode(name),
             urlencoding::encode(&default_version),
@@ -1304,7 +1306,6 @@ impl DepsDevClient {
 
     fn gossip_key(&self, system: DepsDevSystem, name: &str) -> GossipMemoKey {
         GossipMemoKey {
-            base: self.base_url.clone(),
             system,
             name: name.to_string(),
         }
@@ -1324,7 +1325,7 @@ impl DepsDevClient {
         system: DepsDevSystem,
         names: &[String],
     ) -> HashMap<String, Option<GossipFindings>> {
-        let url = format!("{}/v3alpha/findingsbatch", self.base_url);
+        let url = format!("{}v3alpha/findingsbatch", self.origin());
         let system_upper = system.as_path_segment().to_uppercase();
         let requests: Vec<GossipBatchRequestWire<'_>> = names
             .iter()
@@ -1421,7 +1422,6 @@ impl DepsDevClient {
         version: &str,
     ) -> Option<GossipFindings> {
         let key = GossipVersionMemoKey {
-            base: self.base_url.clone(),
             system,
             name: name.to_string(),
             version: version.to_string(),
@@ -1475,8 +1475,8 @@ impl DepsDevClient {
         }
 
         let url = format!(
-            "{}/v3alpha/systems/{}/packages/{}/versions/{}:findings",
-            self.base_url,
+            "{}v3alpha/systems/{}/packages/{}/versions/{}:findings",
+            self.origin(),
             system.as_path_segment(),
             urlencoding::encode(name),
             urlencoding::encode(version),
@@ -1578,6 +1578,11 @@ enum CallFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_origin_parses_and_ends_in_a_slash() {
+        assert_eq!(client().origin(), "https://api.deps.dev/");
+    }
 
     fn client() -> DepsDevClient {
         DepsDevClient::new(Arc::new(HttpCache::new()))
@@ -2075,7 +2080,6 @@ mod tests {
         let client = client();
         client.signals.memo().insert(
             MemoKey {
-                base: "https://api.deps.dev".to_string(),
                 system: DepsDevSystem::Npm,
                 name: "a\0b".to_string(),
                 version: "c".to_string(),
@@ -2083,7 +2087,6 @@ mod tests {
             CallOutcome::Definitive(Some(SupplyChainTrustSignal::default())),
         );
         assert!(!client.signals.memo().contains_key(&MemoKey {
-            base: "https://api.deps.dev".to_string(),
             system: DepsDevSystem::Npm,
             name: "a".to_string(),
             version: "b\0c".to_string(),
@@ -2374,7 +2377,6 @@ mod tests {
         assert!(signal.scorecard.is_none());
 
         let key = MemoKey {
-            base: client.base_url.clone(),
             system: DepsDevSystem::Npm,
             name: "express".to_string(),
             version: "4.19.2".to_string(),
@@ -2437,7 +2439,6 @@ mod tests {
         assert!(signal.is_none());
 
         let key = MemoKey {
-            base: client.base_url.clone(),
             system: DepsDevSystem::Npm,
             name: "express".to_string(),
             version: "4.19.2".to_string(),
@@ -2467,7 +2468,6 @@ mod tests {
         assert!(signal.is_none());
 
         let key = MemoKey {
-            base: client.base_url.clone(),
             system: DepsDevSystem::Npm,
             name: "express".to_string(),
             version: "4.19.2".to_string(),
@@ -2492,7 +2492,6 @@ mod tests {
         for i in 0..MAX_MEMO_ENTRIES {
             client.signals.memo().insert(
                 MemoKey {
-                    base: "https://api.deps.dev".to_string(),
                     system: DepsDevSystem::Npm,
                     name: format!("pkg-{i}"),
                     version: "1.0.0".to_string(),
@@ -2504,7 +2503,6 @@ mod tests {
 
         client.signals.memo().insert(
             MemoKey {
-                base: "https://api.deps.dev".to_string(),
                 system: DepsDevSystem::Npm,
                 name: "overflow".to_string(),
                 version: "1.0.0".to_string(),
@@ -2545,7 +2543,6 @@ mod tests {
         for i in 0..MAX_MEMO_ENTRIES {
             client.projects.insert(
                 ProjectKeyMemo {
-                    base: "https://api.deps.dev".to_string(),
                     project_key: format!("github.com/org/repo-{i}"),
                 },
                 CallOutcome::Definitive(Some(8.0)),
@@ -2555,7 +2552,6 @@ mod tests {
 
         client.projects.insert(
             ProjectKeyMemo {
-                base: "https://api.deps.dev".to_string(),
                 project_key: "github.com/org/overflow".to_string(),
             },
             CallOutcome::Definitive(Some(8.0)),
@@ -2846,7 +2842,6 @@ mod tests {
         );
 
         let key = PopularityMemoKey {
-            base: client.base_url.clone(),
             system: DepsDevSystem::Npm,
             name: "racy".to_string(),
         };
@@ -3105,7 +3100,6 @@ mod tests {
         );
 
         let key = SimilarityMemoKey {
-            base: client.base_url.clone(),
             system: DepsDevSystem::Npm,
             name: "tiny".to_string(),
         };
@@ -3521,7 +3515,6 @@ mod tests {
         let entry_ttl = client
             .gossip
             .ttl_of(&GossipMemoKey {
-                base: client.base_url.clone(),
                 system: DepsDevSystem::Npm,
                 name: "vite".to_string(),
             })
@@ -3852,7 +3845,6 @@ mod tests {
         for i in 0..MAX_MEMO_ENTRIES {
             client.gossip_last_refresh_attempt.insert(
                 GossipMemoKey {
-                    base: "https://api.deps.dev".to_string(),
                     system: DepsDevSystem::Npm,
                     name: format!("pkg-{i}"),
                 },
@@ -3869,7 +3861,6 @@ mod tests {
         );
         client.gossip_last_refresh_attempt.insert(
             GossipMemoKey {
-                base: "https://api.deps.dev".to_string(),
                 system: DepsDevSystem::Npm,
                 name: "overflow".to_string(),
             },

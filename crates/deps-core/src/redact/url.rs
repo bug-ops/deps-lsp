@@ -2234,6 +2234,17 @@ pub(super) fn is_authority_bearing_url(raw: &str) -> Option<url::Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::scaling::{ExpectedGrowth, assert_scaling};
+
+    fn redact_userinfo_scaling(
+        label: &str,
+        full_units: usize,
+        build: impl Fn(usize) -> String,
+    ) -> String {
+        assert_scaling(label, ExpectedGrowth::Linear, full_units, build, |raw| {
+            redact_userinfo(raw)
+        })
+    }
 
     #[test]
     fn is_authority_bearing_url_true_for_real_urls_including_scheme_colon_slash_less_ones() {
@@ -3376,16 +3387,10 @@ mod tests {
     #[test]
     fn test_redact_userinfo_unparseable_contiguous_slash_run_is_linear_time() {
         let n = 400_000;
-        let raw = format!("a@b{}y", "/".repeat(n));
-        let start = std::time::Instant::now();
-        let redacted = redact_userinfo(&raw);
-        let elapsed = start.elapsed();
+        let redacted = redact_userinfo_scaling("contiguous slash run", n, |len| {
+            format!("a@b{}y", "/".repeat(len))
+        });
         assert_eq!(redacted, format!("***@b{}y", "/".repeat(n)));
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "took {elapsed:?} for a {n}-byte contiguous slash run — \
-             host_boundary_scheme_aware may have regressed to quadratic behavior"
-        );
     }
 
     /// #862 correctness-gate (round 7): a long run of many small, colon-free, `@`-free windows,
@@ -3395,20 +3400,13 @@ mod tests {
     /// which grows by one window each iteration, making this `O(n²)`.
     #[test]
     fn test_redact_userinfo_unparseable_many_small_undecided_windows_is_linear_time() {
-        let n = 200_000;
-        let raw = format!("{}a@b://ghp_TOKEN@evil", "/x".repeat(n));
-        let start = std::time::Instant::now();
-        let redacted = redact_userinfo(&raw);
-        let elapsed = start.elapsed();
+        let redacted = redact_userinfo_scaling("small undecided windows", 200_000, |n| {
+            format!("{}a@b://ghp_TOKEN@evil", "/x".repeat(n))
+        });
         assert!(
             !redacted.contains("ghp_TOKEN"),
             "redacted len={}",
             redacted.len()
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "took {elapsed:?} for n={n} small undecided windows — bounded_has_credential_colon \
-             may have regressed to scanning a growing accumulated span"
         );
     }
 
@@ -3422,20 +3420,13 @@ mod tests {
     /// comment for why both are sound.
     #[test]
     fn test_redact_further_credential_colon_dense_chain_is_linear_time() {
-        let k = 400_000;
-        let raw = format!("u:SECRET@h/{}z", "a:b/".repeat(k));
-        let start = std::time::Instant::now();
-        let redacted = redact_userinfo(&raw);
-        let elapsed = start.elapsed();
+        let redacted = redact_userinfo_scaling("colon-dense chain", 400_000, |k| {
+            format!("u:SECRET@h/{}z", "a:b/".repeat(k))
+        });
         assert!(
             !redacted.contains("SECRET"),
             "redacted len={}",
             redacted.len()
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "took {elapsed:?} for a {k}-segment colon-dense chain — redact_further_credential \
-             may have regressed to quadratic behavior"
         );
     }
 
@@ -3449,21 +3440,14 @@ mod tests {
     /// — see `redact_further_credential`'s and `colon_credential_match`'s own doc comments.
     #[test]
     fn test_redact_further_credential_colon_dense_chain_with_trailing_bracket_is_linear_time() {
-        let k = 400_000;
-        let raw = format!("u:SECRET@h/{}[::1]", "a:b/".repeat(k));
-        let start = std::time::Instant::now();
-        let redacted = redact_userinfo(&raw);
-        let elapsed = start.elapsed();
+        let redacted =
+            redact_userinfo_scaling("colon-dense chain with a trailing bracket", 400_000, |k| {
+                format!("u:SECRET@h/{}[::1]", "a:b/".repeat(k))
+            });
         assert!(
             !redacted.contains("SECRET"),
             "redacted len={}",
             redacted.len()
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "took {elapsed:?} for a {k}-segment colon-dense chain with a trailing bracket — \
-             colon_credential_match may have regressed to quadratic behavior on a bracket-present \
-             value"
         );
     }
 
@@ -3472,16 +3456,12 @@ mod tests {
     /// `remaining.find(':')` to rescan the shrinking-by-one remainder on every iteration —
     /// quadratic in the run length (measured: ~799ms release / ~800ms debug at n=200,000 before
     /// this fix; ~321-339us after, ~16ms including test-harness overhead in a debug build here).
-    /// 300ms keeps generous headroom above the fixed cost for slower CI runners while staying well
-    /// under the unfixed one, so this actually fails if the run-skip regresses (the previous 5s
-    /// bound did not: unfixed HEAD passes it too).
     #[test]
     fn test_redact_userinfo_consecutive_bracket_run_is_linear_time() {
         let n = 200_000;
-        let input = format!("a@{}", "[".repeat(n));
-        let start = std::time::Instant::now();
-        let redacted = redact_userinfo(&input);
-        let elapsed = start.elapsed();
+        let redacted = redact_userinfo_scaling("consecutive '[' run", n, |len| {
+            format!("a@{}", "[".repeat(len))
+        });
         // code-review: a future edit that stays fast but corrupts output would slip past a
         // timing-only assertion, so also pin down the expected shape — the lone `a` username has
         // no password to leak, but the mask must still fully cover it and leave every `[` alone.
@@ -3490,11 +3470,6 @@ mod tests {
             format!("***@{}", "[".repeat(n)),
             "redacted len={}",
             redacted.len()
-        );
-        assert!(
-            elapsed < std::time::Duration::from_millis(300),
-            "took {elapsed:?} for n={n} consecutive '[' — bracket_host_shape_end may have \
-             regressed to quadratic behavior"
         );
     }
 
@@ -3509,20 +3484,14 @@ mod tests {
     #[test]
     fn test_redact_userinfo_alternating_bracket_run_is_linear_time() {
         let n = 200_000;
-        let input = format!("a@{}", "[0".repeat(n));
-        let start = std::time::Instant::now();
-        let redacted = redact_userinfo(&input);
-        let elapsed = start.elapsed();
+        let redacted = redact_userinfo_scaling("alternating '[0' pairs", n, |len| {
+            format!("a@{}", "[0".repeat(len))
+        });
         assert_eq!(
             redacted,
             format!("***@{}", "[0".repeat(n)),
             "redacted len={}",
             redacted.len()
-        );
-        assert!(
-            elapsed < std::time::Duration::from_millis(300),
-            "took {elapsed:?} for n={n} alternating '[0' pairs — colon_credential_match_seeded \
-             may have regressed to quadratic behavior on the colon rescan"
         );
     }
 
@@ -3577,20 +3546,13 @@ mod tests {
     /// process with an unbounded stack.
     #[test]
     fn test_redact_authority_suffix_large_slash_chain_is_iterative_not_recursive() {
-        let n = 200_000;
-        let raw = format!("a@b{}user:hunter2@evil", "/x".repeat(n));
-        let start = std::time::Instant::now();
-        let redacted = redact_userinfo(&raw);
-        let elapsed = start.elapsed();
+        let redacted = redact_userinfo_scaling("large slash chain", 200_000, |n| {
+            format!("a@b{}user:hunter2@evil", "/x".repeat(n))
+        });
         assert!(
             !redacted.contains("hunter2"),
             "redacted len={}",
             redacted.len()
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(10),
-            "took {elapsed:?} for n={n} segments — may have regressed to recursive/quadratic \
-             behavior"
         );
     }
 
@@ -3623,20 +3585,13 @@ mod tests {
     /// per-iteration `remaining.find('[')` rescan) would produce.
     #[test]
     fn test_redact_authority_suffix_mask_site_colon_dense_streak_is_linear_time() {
-        let k = 400_000;
-        let raw = format!("x@{}oauth2:SECRET@y", "p:q/".repeat(k));
-        let start = std::time::Instant::now();
-        let redacted = redact_userinfo(&raw);
-        let elapsed = start.elapsed();
+        let redacted = redact_userinfo_scaling("colon-dense mask-site streak", 400_000, |k| {
+            format!("x@{}oauth2:SECRET@y", "p:q/".repeat(k))
+        });
         assert!(
             !redacted.contains("SECRET"),
             "redacted len={}",
             redacted.len()
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "took {elapsed:?} for a {k}-segment colon-dense mask-site streak — \
-             redact_span_colon_credential may have regressed to quadratic behavior"
         );
     }
 
@@ -3646,20 +3601,13 @@ mod tests {
     #[test]
     fn test_redact_authority_suffix_colon_dense_undecided_streak_after_single_at_sign_is_linear_time()
      {
-        let n = 200_000;
-        let raw = format!("a@{}", "/:".repeat(n));
-        let start = std::time::Instant::now();
-        let redacted = redact_userinfo(&raw);
-        let elapsed = start.elapsed();
+        let redacted = redact_userinfo_scaling("'/:' repeats after a single '@'", 200_000, |n| {
+            format!("a@{}", "/:".repeat(n))
+        });
         assert!(
             redacted.starts_with("***@"),
             "redacted len={}",
             redacted.len()
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "took {elapsed:?} for n={n} `/:`repeats after a single `@` — may have regressed to \
-             quadratic behavior"
         );
     }
 
@@ -4368,16 +4316,9 @@ mod tests {
     #[test]
     fn test_redact_userinfo_drive_letter_dense_streak_is_linear_time() {
         let k = 400_000;
-        let raw = format!("{}@x", "c:/".repeat(k));
-        let start = std::time::Instant::now();
-        let redacted = redact_userinfo(&raw);
-        let elapsed = start.elapsed();
-        assert_eq!(redacted, raw, "redacted len={}", redacted.len());
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "took {elapsed:?} for a {k}-segment drive-letter-dense run before a single `@` — \
-             segment_has_credential_colon may have regressed to quadratic behavior"
-        );
+        let build = |segments: usize| format!("{}@x", "c:/".repeat(segments));
+        let redacted = redact_userinfo_scaling("drive-letter-dense run", k, build);
+        assert_eq!(redacted, build(k), "redacted len={}", redacted.len());
     }
 
     /// #896 correctness companion: the drive-letter-dense repro shape itself (many `c:/`

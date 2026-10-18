@@ -13,7 +13,7 @@ tags:
   - cross-ecosystem
   - deps-core
 created: 2026-10-07
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
@@ -89,7 +89,8 @@ speculative fix actions where applicable), and a slow registry can never occupy 
 - Completion, code lens, and inlay hints: these already return from cached state or carry their own tighter
   budget (`COMPLETION_SEARCH_TIMEOUT = 2 s`) and were not observed to stall in the reproduction (codeLens
   stalled only because dispatch slots were taken, not because of its own await).
-- Changing `tower-lsp-server`'s `buffer_unordered(4)` dispatch width (third-party; not configurable here).
+- Changing the LSP dispatch width (`Server::concurrency_level`, default 4). It is set from the single
+  `LSP_DISPATCH_CONCURRENCY` constant in `deps-lsp`, which also sizes the interactive-await cap.
 - Any change to diagnostics text or the `FetchFailure` privacy contract (no raw, IP-bearing error text).
 
 ## 2. User Stories
@@ -255,41 +256,37 @@ Conceptual only; representation is a plan-phase decision.
 
 ## 9. Open Questions
 
-> [!question] Genuinely open design choices
-> Everything not listed here is fixed by the reproduction and by existing project rules.
-
-- [NEEDS CLARIFICATION: OQ-1 Memo location and shape. (a) Read-only: consult `VersionData::outcomes`
-  (already the per-document record) and add nothing new, which fixes the "background already failed" case but
-  not the cold-document case. (b) Add a per-package, source-qualified interactive failure memo with TTL inside
-  `deps-core` (shared across documents, survives reparse). (c) Both: outcomes first, memo for cold documents.
-  Recommended: (c), because the reproduction needs both the post-background case (step 2) and the cold
-  four-hover case (step 3).]
-- [NEEDS CLARIFICATION: OQ-2 Memo TTL, if a memo is added. Candidates: 30 s, 60 s, or a short backoff that
-  grows on repeated failure. Trade-off: recovery latency after a VPN reconnect versus retry traffic. Note
-  `deps-maven`'s `RECENT_FAILURE_TTL` is 2 s (search-scoped); the version-fetch case likely wants a longer
-  value. Recommended default: 30 s.]
-- [NEEDS CLARIFICATION: OQ-3 Shorter interactive budget. Should `REGISTRY_FETCH_BUDGET` (10 s) shrink for the
-  cold-document case (e.g. 2 to 3 s while the background fetch for that package is still pending), keeping 10 s
-  only as the ceiling? Cost: slow-but-working registries (large Gradle fallback chains, the case #1204 was
-  written for) would degrade more often. Memo (OQ-1) plus bounded concurrency (OQ-4) may make this
-  unnecessary.]
-- [NEEDS CLARIFICATION: OQ-4 Concurrency-bound mechanism and value. A `tokio::sync::Semaphore` (with
-  `try_acquire`, overflow degrades immediately) sized at 2 or 3 of the 4 dispatch slots, versus per-kind bounds
-  (hover and code action separate), versus relying on the memo alone. Needs a decision on the numeric bound and
-  on whether it is global or per-document. Interacts with the `server.rs` comments about the 4-slot dispatch.]
-- [NEEDS CLARIFICATION: OQ-5 Code-action policy on a memoized failure. Today a genuine fetch error fails open
-  (fix and unsatisfiable actions pass through unfiltered) while a timeout drops them. A memoized failure may
-  have originated as either. Options: (a) memoize the timed-out/errored distinction and replay the same
-  policy per request; (b) always drop speculative actions on any known failure; (c) always fail open on a
-  known failure. (a) preserves current semantics exactly; (b) is simplest and safest for the yank check.]
-- [NEEDS CLARIFICATION: OQ-6 Should an interactive budget elapse by itself populate the memo when the
-  background fetch for that package has not finished? If yes, a slow-but-eventually-successful registry could
-  be marked failed for one TTL; the background success must then clear it (FR-006) and the plan must say who
-  owns that clear.]
-- [NEEDS CLARIFICATION: OQ-7 Host-level circuit breaker. A per-package memo does not help the first hover on
-  each distinct package when the whole host (or proxy) is dead. Is a host-scoped breaker (open after N
-  consecutive failures to one registry host, using `net_policy::HostClass` / host identity) in scope here, or a
-  follow-up? Without it, N distinct first hovers still cost up to N bounded awaits, limited only by OQ-4.]
+> [!success] Resolutions (implemented, #1830)
+> - **OQ-1**: outcomes plus a memo scoped by ecosystem, package, dependency source and manifest
+>   (option c). The manifest scope keeps two projects with different `.npmrc` or Cargo registry
+>   configuration from sharing a record.
+> - **OQ-2**: TTL 30 s, cap 1024 entries. **OQ-3**: budget stays 10 s.
+> - **OQ-4**: global semaphore with `LSP_DISPATCH_CONCURRENCY - 1` permits; overflow degrades
+>   immediately and is not memoized.
+> - **OQ-5**: fail-closed. Every record served from the memo, seeded or interactive, yields
+>   `Unverified` (speculative code actions dropped). Only the request that itself receives a
+>   registry error stays fail-open (unchanged from #1204), unless the background fetch still
+>   reports the package as failing, in which case it is `Unverified` too.
+> - **OQ-6**: an interactive elapse is memoized. A seeded record self-clears once the background
+>   outcome clears. A generation counter discards awaits in flight across `invalidate_all`, which
+>   runs on configuration changes (after the apply) and after reparses that change registry
+>   routing (`RefetchPolicy::AllDependencies`); a requirements-only reparse keeps the memo. A
+>   live success records nothing unless the background outcomes still show a failure.
+> - **OQ-7** and **FR-007** are deferred to #1844 and #1843.
+>
+> **Accepted limitations**
+> - FR-006 "a later successful fetch" clears only seeded records. An interactive-failed record
+>   survives a background success until its TTL (at most 30 s), because "absent from outcomes"
+>   cannot distinguish "fetched fine" from "not fetched yet".
+> - When the concurrency cap is reached, a healthy package also degrades (`Unverified`, so its
+>   hover shows the basic card and its speculative code actions are dropped). This is by design
+>   and is not memoized: the next request after a permit frees up fetches normally.
+> - A hover cancelled by the client before it completes never memoizes (the future is dropped
+>   before the record is written), so on a cold document only the background outcome seeds a
+>   record.
+> - Scope: the default `generate_hover`/`generate_code_actions` path (FR-012). NuGet's and
+>   GitLab CI's ecosystem-specific hover/code-action overrides keep their own ungated 5 s
+>   awaits; follow-up #1845.
 
 ## 10. See Also
 
@@ -297,7 +294,7 @@ Conceptual only; representation is a plan-phase decision.
 - [[MOC-specs]] — all specifications
 - [[081-wall-clock-test-assertions/spec|Spec 081]] — paused-time tests instead of wall-clock bounds (testing convention this fix must follow)
 - [[051-disk-persistent-registry-cache/spec|Spec 051]] — persistent registry cache (a negative cache across restarts is out of scope here)
-- Code: `crates/deps-core/src/lsp_helpers/mod.rs` (`REGISTRY_FETCH_BUDGET`, `await_versions_fetch`,
+- Code: `crates/deps-core/src/lsp_helpers/mod.rs` (`REGISTRY_FETCH_BUDGET`, `await_interactive_fetch`,
   `DependencyOutcomes`), `lsp_helpers/hover.rs` (~line 158), `lsp_helpers/code_actions.rs` (~line 540),
   `crates/deps-core/src/error.rs` (`FetchFailure`), `crates/deps-lsp/src/server.rs` (~line 961, dispatch width)
 - Prior art: #1204 (the budget), `deps-maven` `RECENT_FAILURE_TTL` (search-failure memo), `deps_dev/memo.rs`

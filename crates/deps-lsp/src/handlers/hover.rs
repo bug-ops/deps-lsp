@@ -81,6 +81,7 @@ pub async fn handle_hover(
         .version_data()
         .with_ecosystem(ecosystem_id)
         .with_network(network)
+        .with_interactive_fetch_gate(&state.interactive_fetch)
         .with_license_source(ecosystem.license_source());
     // The only call site that sets `VersionData::trust` (see lsp_helpers::hover docs) —
     // makes the supply-chain trust signal hover-only by construction (FR-010).

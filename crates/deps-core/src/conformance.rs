@@ -53,6 +53,7 @@ use std::assert_matches;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::CompletionItem;
 
+use crate::edit::FixTargetContext;
 use crate::lockfile::LockFileProvider;
 use crate::lsp_helpers::{EcosystemFormatter, RequirementGate};
 use crate::{ConcreteVersion, Ecosystem, PackageName, VersionReq};
@@ -934,7 +935,7 @@ pub async fn assert_unresolved_requirements_never_rewritten(
                 dep.version_range().expect("checked above"),
                 current,
                 &dv,
-                None,
+                FixTargetContext::default(),
                 formatter,
             );
             // #1391: tightened to `UnresolvedPlaceholder` alone — the assertion above already

@@ -689,7 +689,7 @@ mod tests {
     /// also serves as a live regression test for that revert holding.
     #[test]
     fn test_plan_vulnerability_fix_still_offered_for_real_tag_pin() {
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
@@ -718,8 +718,14 @@ mod tests {
                 version: ConcreteVersion::new("2.0.0"),
             });
 
-        let planned =
-            plan_vulnerability_fix(&gl_dep, version_range, "1.0.0", &dv, None, &formatter());
+        let planned = plan_vulnerability_fix(
+            &gl_dep,
+            version_range,
+            "1.0.0",
+            &dv,
+            FixTargetContext::default(),
+            &formatter(),
+        );
 
         assert_eq!(
             planned
@@ -2199,7 +2205,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_var_placeholder_skips_via_no_op_rewrite() {
         use deps_core::ParseResult;
-        use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
+        use deps_core::edit::{FixTargetContext, VulnFixSkip, plan_vulnerability_fix};
         use deps_core::net_policy::RegistryAccessPolicy;
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
@@ -2242,7 +2248,7 @@ mod tests {
             dep.version_range().expect("ref has a version range"),
             current,
             &dv,
-            None,
+            FixTargetContext::default(),
             &formatter(),
         );
 

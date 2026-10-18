@@ -1613,6 +1613,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_credential_outside_its_prefix_is_not_answered_from_the_last_good_list() {
+        let prefix = deps_core::net_policy::TrustedPrefix::parse("https://registry.test/").unwrap();
+        let token = deps_core::secret::bearer_auth_header(&Redacted::new("t".to_string()));
+        let err = HttpCache::new()
+            .get_cached_trusted_origin_response(
+                "https://elsewhere.test/acme/net",
+                &prefix,
+                RequestAuth::credential(CredentialHeader::Authorization(&token), &prefix),
+                None,
+                RevalidationFailure::Fail,
+            )
+            .await
+            .unwrap_err();
+        assert_matches!(err, DepsError::CredentialOutsideTrustedPrefix { .. });
+        assert!(!may_fall_back_to_last_good(&err));
+    }
+
+    #[tokio::test]
     async fn test_a_credential_rejection_is_not_answered_from_the_last_good_list() {
         for status in [401, 403] {
             let mut server = mockito::Server::new_async().await;

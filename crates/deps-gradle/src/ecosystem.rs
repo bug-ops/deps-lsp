@@ -1263,24 +1263,22 @@ dependencies {
         /// to walk all the way back to the call word when the sibling count exceeds the cap.
         #[test]
         fn test_skip_vararg_siblings_bounded_for_crafted_input() {
-            let mut rest = String::from("implementation ");
-            for _ in 0..5_000 {
-                rest.push_str("\"a\", ");
-            }
-            let rest = rest.trim_end();
-
-            let start = std::time::Instant::now();
-            let (remaining, consumed) = skip_vararg_siblings(rest);
-            let elapsed = start.elapsed();
+            let (remaining_len, consumed) = deps_core::test_util::scaling::assert_scaling(
+                "skip_vararg_siblings on a crafted vararg line",
+                deps_core::test_util::scaling::ExpectedGrowth::Linear,
+                50_000,
+                |siblings| format!("implementation {}", "\"a\", ".repeat(siblings)),
+                |line| {
+                    let (remaining, consumed) = skip_vararg_siblings(line.trim_end());
+                    (remaining.len(), consumed)
+                },
+            );
 
             assert!(consumed, "at least one sibling comma must be consumed");
-            assert!(
-                elapsed < std::time::Duration::from_secs(1),
-                "must not hang on a crafted line with an unrealistic sibling count: took {elapsed:?}"
-            );
             assert_ne!(
-                remaining, "implementation",
-                "capped at MAX_VARARG_SIBLINGS, so 5000 siblings must not all be walked over"
+                remaining_len,
+                "implementation".len(),
+                "capped at MAX_VARARG_SIBLINGS, so the siblings must not all be walked over"
             );
         }
 

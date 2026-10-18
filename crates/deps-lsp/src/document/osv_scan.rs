@@ -520,7 +520,14 @@ pub(crate) async fn run_osv_phase_b_and_commit(
     //
     // B.1b (#1524): candidate-check rounds for the same snapshot, sharing this one
     // `vuln_keys`/`parse_result`/`cached_versions` read rather than a second document lookup.
-    let (targets, mut latest_status, candidate_rounds, mut candidate_status, candidate_tags) = {
+    let (
+        targets,
+        mut latest_status,
+        candidate_rounds,
+        mut candidate_status,
+        candidate_tags,
+        fix_target_registry,
+    ) = {
         let Some(doc) = state.get_document(uri) else {
             return;
         };
@@ -555,12 +562,21 @@ pub(crate) async fn run_osv_phase_b_and_commit(
                 &candidate_tags,
                 formatter,
             );
+        // Snapshotted in this same read: the guard is released before the awaits below, and a
+        // later re-read could pair a fresher cache with this scan's keys (#1832).
+        let fix_target_registry = deps_engine::classify::osv::fix_target_registry(
+            parse_result,
+            &vuln_keys,
+            &doc.signals.cached_versions,
+            formatter,
+        );
         (
             targets,
             latest_status,
             candidate_rounds,
             candidate_status,
             candidate_tags,
+            fix_target_registry,
         )
     };
 
@@ -586,6 +602,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
             &result.osv_name_by_key,
             &latest_status,
             &candidate_tags,
+            &fix_target_registry,
             ecosystem_id,
             formatter,
             &state.osv,
@@ -765,6 +782,7 @@ async fn run_osv_fix_target_verification(
     osv_name_by_key: &HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvQueryName>,
     latest_status: &deps_core::osv::LatestStatusMap,
     candidate_tags: &deps_engine::classify::osv::CandidateTagSources,
+    fix_target_registry: &deps_engine::classify::osv::FixTargetRegistry,
     ecosystem_id: EcosystemId,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     osv: &deps_core::osv::OsvClient,
@@ -780,6 +798,7 @@ async fn run_osv_fix_target_verification(
             latest_status,
             candidate_tags,
             formatter,
+            fix_target_registry,
         );
 
     for (key, status) in resolved {

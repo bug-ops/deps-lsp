@@ -22,10 +22,11 @@ use super::diagnostics::{MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_VALUE_CHARS};
 use super::diagnostics::{MAX_DIAGNOSTIC_PROSE_CHARS, MAX_VERSION_DIAGNOSTIC_CHARS};
 use super::hover_markdown::{FieldKind, HoverMarkdown};
 use super::{
-    CooldownBlocker, CooldownPrecedence, DiagnosticMessages, EcosystemFormatter,
-    HOVER_RECENT_VERSIONS, LatestVerdict, SiblingMatchNote, VersionData, await_versions_fetch,
-    cooldown_precedence, escape_markdown, in_use_version, latest_verdict, markdown_code_span,
-    position_in_range, resolve_in_use_version, resolve_scan_outcome,
+    CooldownBlocker, CooldownPrecedence, DiagnosticMessages, EcosystemFormatter, FetchContext,
+    HOVER_RECENT_VERSIONS, InteractiveFetchRequest, LatestVerdict, SiblingMatchNote, VersionData,
+    await_interactive_fetch, cached_package_versions_by_name, cooldown_precedence, escape_markdown,
+    in_use_version, latest_verdict, markdown_code_span, position_in_range, resolve_in_use_version,
+    resolve_scan_outcome,
 };
 use crate::github::normalize_tag;
 
@@ -72,6 +73,9 @@ fn version_age_secs(version: &dyn Version, now: PublishTime) -> Option<u64> {
 /// this is a fixed local bound rather than a configurable one — a few seconds is enough
 /// slack for the already-rare "list-based pick failed" path without meaningfully
 /// delaying the common case, which never reaches this fallback at all.
+///
+/// Runs only after the primary fetch returned a live list (the registry just answered), so it
+/// deliberately sits outside the interactive-fetch concurrency permit (#1830).
 const HOVER_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The `Cmd+.` update-footer markdown this function appends when a code action may exist
@@ -155,13 +159,19 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // host) must degrade to the same basic card the `!resolvable` branch renders, not vanish
     // the whole hover response.
     let available_versions = if resolvable {
-        await_versions_fetch(
+        await_interactive_fetch(
             registry.get_versions_from(dep.name(), &dep_source, freshness),
-            dep.name(),
-            "hover",
+            InteractiveFetchRequest::new(
+                versions,
+                parse_result.uri(),
+                dep.name(),
+                normalized_name.as_str(),
+                &dep_source,
+                FetchContext::Hover,
+            ),
         )
         .await
-        .0
+        .into_live()
     } else {
         None
     };
@@ -256,10 +266,11 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     };
     let cached_latest = resolvable
         .then(|| {
-            versions
-                .cached
-                .get(normalized_name.as_str())
-                .or_else(|| versions.cached.get(dep.name()))
+            cached_package_versions_by_name(
+                versions.cached,
+                normalized_name.as_str(),
+                dep.name().as_str(),
+            )
         })
         .flatten();
     // A non-empty live list with no stable entry tries `list_fallback_latest` (#373) first
@@ -3610,8 +3621,91 @@ mod tests {
         );
     }
 
-    /// #1209 C1 (impl-critic follow-up): `await_versions_fetch`'s timeout WARN
-    /// (`lsp_helpers::mod::await_versions_fetch`) used to interpolate the raw `dep.name()`
+    fn hover_content(hover: Option<&Hover>) -> String {
+        hover
+            .expect("hover must render the basic card")
+            .markdown()
+            .to_string()
+    }
+
+    /// #1830: a background `Transient` failure keeps hover off the registry entirely — three
+    /// sequential hovers render the basic card and never poll the fetch.
+    #[tokio::test(start_paused = true)]
+    async fn test_generate_hover_known_failure_skips_the_live_fetch() {
+        use std::collections::HashMap;
+
+        let parse_result = freshness_test_parse_result("serde");
+        let registry = CountingRegistry::new(CountingMode::Succeed);
+        let gate = InteractiveFetchGate::new(std::num::NonZeroUsize::new(4).unwrap());
+        let outcomes =
+            DependencyOutcomes::new().with_fetch_failure("serde", crate::FetchFailure::Transient);
+        let (cached, resolved) = (HashMap::new(), HashMap::new());
+
+        for _ in 0..3 {
+            let versions = VersionData::new(&cached, &resolved)
+                .with_ecosystem(crate::EcosystemId::Cargo)
+                .with_outcomes(&outcomes)
+                .with_interactive_fetch_gate(&gate);
+            let hover = generate_hover(
+                &parse_result,
+                Position::new(0, 2).into(),
+                versions,
+                &registry,
+                &MOCK_FORMATTER,
+                crate::freshness::FreshnessSettings::default(),
+                PublishTime::now(),
+            )
+            .await;
+            let content = hover_content(hover.as_ref());
+            assert!(content.contains("serde"), "basic card expected: {content}");
+            assert!(!content.contains("**Latest**"), "no live data: {content}");
+        }
+        assert_eq!(registry.calls(), 0);
+    }
+
+    /// #1830: a budget elapse is memoized, and the memo expires so a recovered registry is
+    /// queried again and its `Latest` renders.
+    #[tokio::test(start_paused = true)]
+    async fn test_generate_hover_elapse_is_memoized_then_recovers_after_ttl() {
+        use std::collections::HashMap;
+
+        let parse_result = freshness_test_parse_result("serde");
+        let stalled = CountingRegistry::new(CountingMode::Stall);
+        let recovered = CountingRegistry::new(CountingMode::Succeed);
+        let gate = InteractiveFetchGate::new(std::num::NonZeroUsize::new(4).unwrap());
+        let (cached, resolved) = (HashMap::new(), HashMap::new());
+        let hover_once = async |registry: &CountingRegistry| {
+            let versions = VersionData::new(&cached, &resolved)
+                .with_ecosystem(crate::EcosystemId::Cargo)
+                .with_interactive_fetch_gate(&gate);
+            generate_hover(
+                &parse_result,
+                Position::new(0, 2).into(),
+                versions,
+                registry,
+                &MOCK_FORMATTER,
+                crate::freshness::FreshnessSettings::default(),
+                PublishTime::now(),
+            )
+            .await
+        };
+
+        let first = hover_once(&stalled).await;
+        let second = hover_once(&stalled).await;
+
+        assert!(!hover_content(first.as_ref()).contains("**Latest**"));
+        assert!(!hover_content(second.as_ref()).contains("**Latest**"));
+        assert_eq!(stalled.calls(), 1, "the second hover must not re-await");
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let third = hover_once(&recovered).await;
+
+        assert!(hover_content(third.as_ref()).contains("**Latest**"));
+        assert_eq!(recovered.calls(), 1);
+    }
+
+    /// #1209 C1 (impl-critic follow-up): the interactive-fetch timeout WARN
+    /// (`lsp_helpers::interactive_fetch::bounded_await`) used to interpolate the raw `dep.name()`
     /// directly — this call site (`hover.rs`'s primary fetch, feeding `mod.rs`'s shared sink)
     /// arrived in #1210, after the original #1209 security audit, which is why it was missed.
     /// Now redacted via `dep.name().for_tracing()` at the call site. Asserts against the fully
@@ -3657,7 +3751,7 @@ mod tests {
     }
 
     /// #1209 C1: the "hover latest fallback" WARN (`hover.rs`'s own event, not the shared
-    /// `await_versions_fetch` sink) used to interpolate `dep.name()` raw. Now redacted via
+    /// `bounded_await` sink) used to interpolate `dep.name()` raw. Now redacted via
     /// `dep.name().for_tracing()`.
     #[tokio::test]
     async fn test_generate_hover_fallback_failure_log_redacts_credential_shaped_package_name() {

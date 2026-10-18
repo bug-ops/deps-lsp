@@ -738,7 +738,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_unresolved_interpolation_is_not_rewritten() {
         use deps_core::ParseResult;
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
@@ -774,7 +774,7 @@ mod tests {
             deps_core::position::Range::default(),
             current,
             &dv,
-            None,
+            FixTargetContext::default(),
             &SwiftFormatter,
         );
 
@@ -801,7 +801,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_generic_placeholder_through_real_parser_is_not_rewritten() {
         use deps_core::ParseResult;
-        use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
+        use deps_core::edit::{FixTargetContext, VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
@@ -836,7 +836,7 @@ mod tests {
             deps_core::position::Range::default(),
             current,
             &dv,
-            None,
+            FixTargetContext::default(),
             &SwiftFormatter,
         );
 

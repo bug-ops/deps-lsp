@@ -5,7 +5,8 @@ use crate::{ConcreteVersion, EcosystemConfig, ParseResult};
 use super::diagnostics::{MAX_VERSION_DIAGNOSTIC_CHARS, flagged_detail};
 use super::{
     EcosystemFormatter, LatestVerdict, RequirementGate, RequirementStatus, SiblingMatchNote,
-    VersionData, in_use_version, latest_verdict, sanitize_and_truncate_for_diagnostic,
+    VersionData, cached_package_versions_by_name, in_use_version, latest_verdict,
+    sanitize_and_truncate_for_diagnostic,
 };
 
 /// Sanitizes and caps a version-shaped string (`latest` or `resolved_version`) for
@@ -58,11 +59,12 @@ pub fn generate_inlay_hints(
         let version_range: tower_lsp_server::ls_types::Range = version_range.into();
 
         let normalized_name = formatter.normalize_package_name(dep.name());
-        let latest_version = versions
-            .cached
-            .get(normalized_name.as_str())
-            .or_else(|| versions.cached.get(dep.name()))
-            .map(|v| &v.latest);
+        let latest_version = cached_package_versions_by_name(
+            versions.cached,
+            normalized_name.as_str(),
+            dep.name().as_str(),
+        )
+        .map(|v| &v.latest);
         let resolved_version: Option<ConcreteVersion> =
             if formatter.manifest_requirement_is_resolved_version(dep) {
                 dep.version_requirement()

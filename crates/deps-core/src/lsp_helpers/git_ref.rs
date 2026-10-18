@@ -3540,27 +3540,28 @@ mod tests {
         // Regression for #885 (S2): each fallback-triggering call on one huge physical line
         // used to cost O(remaining-document-length) despite the cap. Simulates many
         // fallback-forcing lookups on one multi-megabyte single-line manifest.
-        let filler_segment = "z".repeat(64);
-        let mut content = String::new();
-        let mut offsets = Vec::new();
-        for _ in 0..2000 {
-            offsets.push(content.len());
-            content.push_str(&filler_segment);
-        }
-        content.push_str(&"w".repeat(8 * 1024 * 1024));
         let value = "actions/checkout@v4";
 
-        let start = std::time::Instant::now();
-        for &offset in &offsets {
-            let _ = locate_value_span(&content, offset, value, false);
-        }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_secs(1),
-            "{} locate_value_span fallback calls against an 8MB-tail single line took \
-             {elapsed:?}; expected the pre-bound window to make each call's cost \
-             independent of the trailing content size",
-            offsets.len()
+        crate::test_util::scaling::assert_scaling(
+            "locate_value_span fallback calls against a huge-tail single line",
+            crate::test_util::scaling::ExpectedGrowth::Bounded,
+            8 * 1024 * 1024,
+            |tail_len| {
+                let filler_segment = "z".repeat(64);
+                let mut content = String::new();
+                let mut offsets = Vec::new();
+                for _ in 0..2000 {
+                    offsets.push(content.len());
+                    content.push_str(&filler_segment);
+                }
+                content.push_str(&"w".repeat(tail_len));
+                (content, offsets)
+            },
+            |(content, offsets)| {
+                for &offset in offsets {
+                    std::hint::black_box(locate_value_span(content, offset, value, false));
+                }
+            },
         );
     }
 

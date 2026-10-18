@@ -2,6 +2,7 @@ use super::config_epoch::{ConfigApplyGuard, ConfigEpoch, ConfigEpochCell};
 use dashmap::DashMap;
 use deps_core::HttpCache;
 use deps_core::lockfile::LockFileCache;
+use deps_core::lsp_helpers::InteractiveFetchGate;
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
 use deps_core::policy_config::{
@@ -12,6 +13,7 @@ use deps_core::{
     GossipFindings, LicensePolicy, PackageName, PackageVersions, ParseResult, TyposquatSignal,
 };
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -24,6 +26,13 @@ mod signals;
 
 pub use signals::PackageSignals;
 pub(crate) use signals::PrefetchVisibility;
+
+/// How many LSP messages `tower-lsp-server` dispatches at once.
+///
+/// The single source for both `Server::concurrency_level` (`main.rs`) and the interactive
+/// registry-await cap ([`InteractiveFetchGate::new`]), so the "leave one dispatch slot free"
+/// invariant cannot drift if the width is ever changed (#1830).
+pub const LSP_DISPATCH_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
 /// Upper bound on how long a server-to-client request is allowed to wait for a
 /// reply before being abandoned (issue #493). Used both for the detached
@@ -1016,6 +1025,11 @@ pub struct ServerState {
     /// `VersionData::with_trust` — see that field's docs for why this is
     /// what makes the feature hover-only by construction (FR-010).
     pub deps_dev: Arc<DepsDevClient>,
+    /// Failure memo and concurrency cap for hover's and code actions' interactive registry
+    /// await (#1830), shared server-lifetime. Handed to `VersionData` by
+    /// `handlers/hover.rs` and `handlers/code_actions.rs`; emptied by
+    /// [`InteractiveFetchGate::invalidate_all`] on configuration changes and reparses.
+    pub interactive_fetch: InteractiveFetchGate,
     /// Lock file cache for parsed lock files
     pub lockfile_cache: Arc<LockFileCache>,
     /// Ecosystem registry for trait-based architecture
@@ -1269,6 +1283,7 @@ impl ServerState {
             cache,
             osv,
             deps_dev,
+            interactive_fetch: InteractiveFetchGate::new(LSP_DISPATCH_CONCURRENCY),
             lockfile_cache,
             ecosystem_registry,
             registry_policy,

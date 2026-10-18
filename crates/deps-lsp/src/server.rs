@@ -959,8 +959,8 @@ impl LanguageServer for Backend {
         // Lockfile patterns plus each ecosystem's non-lockfile watched config files (e.g.
         // npm's pnpm-workspace.yaml/.npmrc, #590) in one registration — both are just
         // glob-pattern watches to the client. Timeout-bounded (#493 S1): tower-lsp-server
-        // dispatches via `buffer_unordered(4)`, so a hanging client would permanently burn
-        // one of only 4 concurrent message slots.
+        // dispatches via `buffer_unordered(LSP_DISPATCH_CONCURRENCY)`, so a hanging client
+        // would permanently burn one of only 4 concurrent message slots.
         let mut patterns = self.state.ecosystem_registry.all_lockfile_patterns();
         patterns.extend(self.state.ecosystem_registry.all_watched_config_patterns());
         match tokio::time::timeout(
@@ -1101,7 +1101,11 @@ impl LanguageServer for Backend {
                 &self.state.workspace_registry_ecosystems,
             );
             *guard = config;
-            (scope, self.apply_resolved_config(effects))
+            let notices = self.apply_resolved_config(effects);
+            // After the apply: a hover started before it would otherwise record a failure
+            // under the old policy against the new generation (#1830).
+            self.state.interactive_fetch.invalidate_all();
+            (scope, notices)
         };
         self.show_config_notices(notices).await;
         drop(serialized);
@@ -4457,6 +4461,45 @@ let package = Package(
                 backend.config.read().await.policy.freshness.cooldown_secs,
                 60
             );
+        }
+
+        /// #1830: a configuration change (fixed proxy, token, network mode) empties the
+        /// interactive-fetch failure memo instead of waiting out its TTL.
+        #[tokio::test]
+        async fn test_did_change_configuration_empties_interactive_fetch_gate() {
+            use deps_core::lsp_helpers::{
+                FetchContext, InteractiveFetchRequest, await_interactive_fetch,
+            };
+            use deps_core::{DependencySource, PackageName, VersionData};
+            use std::collections::HashMap;
+
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+            let gate = &backend.state.interactive_fetch;
+            let (cached, resolved) = (HashMap::new(), HashMap::new());
+            let package = PackageName::new("serde");
+            let source = DependencySource::Registry;
+            let manifest = url::Url::parse("file:///project/Cargo.toml").unwrap();
+            let request = InteractiveFetchRequest::new(
+                VersionData::new(&cached, &resolved)
+                    .with_ecosystem(deps_core::EcosystemId::Cargo)
+                    .with_interactive_fetch_gate(gate),
+                &manifest,
+                &package,
+                "serde",
+                &source,
+                FetchContext::Hover,
+            );
+            await_interactive_fetch(async { Err::<(), ()>(()) }, request).await;
+            assert_eq!(gate.len(), 1);
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "freshness": { "cooldown_secs": 60 } }),
+                })
+                .await;
+
+            assert!(gate.is_empty());
         }
 
         /// C2 end-to-end: a section-wrapped payload must never wipe the previously
