@@ -249,6 +249,7 @@ impl FastFail {
     }
 }
 
+#[derive(Debug)]
 enum Decision {
     Live,
     Degrade(NoLiveList, FastFail),
@@ -526,6 +527,7 @@ async fn bounded_await<T, E>(
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
 
@@ -631,9 +633,10 @@ mod tests {
     }
 
     fn assert_degraded<T: std::fmt::Debug>(result: &InteractiveFetch<T>, expected: NoLiveList) {
-        assert!(
-            matches!(result, InteractiveFetch::Degraded(kind) if *kind == expected),
-            "expected Degraded({expected:?}), got {result:?}"
+        assert_matches!(
+            result,
+            InteractiveFetch::Degraded(kind) if *kind == expected,
+            "expected Degraded({expected:?})"
         );
     }
 
@@ -666,7 +669,7 @@ mod tests {
 
         let result = fixture.run("serde", &outcomes, Fetch::Succeed).await;
 
-        assert!(matches!(result, InteractiveFetch::Live(1)));
+        assert_matches!(result, InteractiveFetch::Live(1));
         assert_eq!(fixture.calls(), 1);
     }
 
@@ -681,7 +684,7 @@ mod tests {
             .run("serde", &DependencyOutcomes::new(), Fetch::Succeed)
             .await;
 
-        assert!(matches!(result, InteractiveFetch::Live(1)));
+        assert_matches!(result, InteractiveFetch::Live(1));
         assert_eq!(fixture.calls(), 1);
     }
 
@@ -692,11 +695,11 @@ mod tests {
         fixture.run("serde", &outcomes, Fetch::Succeed).await;
         tokio::time::advance(INTERACTIVE_FAILURE_TTL + Duration::from_secs(1)).await;
         let recovered = fixture.run("serde", &outcomes, Fetch::Succeed).await;
-        assert!(matches!(recovered, InteractiveFetch::Live(1)));
+        assert_matches!(recovered, InteractiveFetch::Live(1));
 
         let next = fixture.run("serde", &outcomes, Fetch::Succeed).await;
 
-        assert!(matches!(next, InteractiveFetch::Live(1)));
+        assert_matches!(next, InteractiveFetch::Live(1));
         assert_eq!(
             fixture.calls(),
             2,
@@ -713,7 +716,7 @@ mod tests {
 
         let result = fixture.run("serde", &none, Fetch::Succeed).await;
 
-        assert!(matches!(result, InteractiveFetch::Live(1)));
+        assert_matches!(result, InteractiveFetch::Live(1));
         assert!(fixture.gate.is_empty());
     }
 
@@ -740,10 +743,10 @@ mod tests {
 
         let decision = gate.decide(&key, true, generation, now());
 
-        assert!(matches!(
+        assert_matches!(
             decision,
             Decision::Degrade(NoLiveList::Unverified, FastFail::Seeded)
-        ));
+        );
         assert!(
             gate.is_empty(),
             "a seed read before the invalidation must not survive"
@@ -772,7 +775,7 @@ mod tests {
         tokio::time::advance(INTERACTIVE_FAILURE_TTL + Duration::from_secs(1)).await;
         let result = fixture.run("serde", &none, Fetch::Succeed).await;
 
-        assert!(matches!(result, InteractiveFetch::Live(1)));
+        assert_matches!(result, InteractiveFetch::Live(1));
         assert_eq!(fixture.calls(), 2);
     }
 
@@ -785,7 +788,7 @@ mod tests {
         tokio::time::advance(INTERACTIVE_FAILURE_TTL + Duration::from_secs(1)).await;
         let result = fixture.run("serde", &outcomes, Fetch::Succeed).await;
 
-        assert!(matches!(result, InteractiveFetch::Live(1)));
+        assert_matches!(result, InteractiveFetch::Live(1));
         assert_eq!(fixture.calls(), 1);
     }
 
@@ -833,7 +836,7 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, InteractiveFetch::Live(1)));
+        assert_matches!(result, InteractiveFetch::Live(1));
         assert_eq!(fixture.calls(), 2);
         assert_eq!(
             fixture.gate.len(),
@@ -863,7 +866,7 @@ mod tests {
 
         let default_source = fixture.run("serde", &none, Fetch::Succeed).await;
 
-        assert!(matches!(default_source, InteractiveFetch::Live(1)));
+        assert_matches!(default_source, InteractiveFetch::Live(1));
         assert_eq!(fixture.calls(), 2);
     }
 
@@ -901,7 +904,7 @@ mod tests {
         assert_degraded(&stalled, NoLiveList::Unverified);
         assert!(fixture.gate.is_empty());
         let retry = fixture.run("serde", &none, Fetch::Succeed).await;
-        assert!(matches!(retry, InteractiveFetch::Live(1)));
+        assert_matches!(retry, InteractiveFetch::Live(1));
         assert_eq!(fixture.calls(), 2);
     }
 
@@ -921,7 +924,7 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, InteractiveFetch::Live(1)));
+        assert_matches!(result, InteractiveFetch::Live(1));
         assert!(fixture.gate.is_empty());
     }
 
@@ -946,7 +949,7 @@ mod tests {
 
         let result = await_interactive_fetch(async { Ok::<_, ()>(1_u8) }, request).await;
 
-        assert!(matches!(result, InteractiveFetch::Live(1)));
+        assert_matches!(result, InteractiveFetch::Live(1));
     }
 
     #[tokio::test(start_paused = true)]

@@ -1349,7 +1349,6 @@ mod tests {
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
     use deps_core::position::{Position as DomainPosition, Range};
-    #[cfg(feature = "lsp-responses")]
     use std::collections::HashMap;
     #[cfg(feature = "lsp-responses")]
     use tower_lsp_server::ls_types::Position;
