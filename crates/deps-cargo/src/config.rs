@@ -1135,6 +1135,23 @@ pub fn referenced_aliases(dependencies: &[crate::types::CargoDependency]) -> Has
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_registry_index_trusted_prefix_matches_index_and_confines_to_its_path() {
+        let index = RegistryIndex::builtin("https://artifacts.corp/cargo/index");
+        let prefix = index.trusted_prefix();
+
+        assert_eq!(prefix.as_str(), index.as_str());
+        assert!(
+            prefix.permits(
+                &url::Url::parse("https://artifacts.corp/cargo/index/se/rd/serde").unwrap()
+            )
+        );
+        assert!(
+            !prefix
+                .permits(&url::Url::parse("https://artifacts.corp/cargo/index-public/x").unwrap())
+        );
+    }
+
     use super::*;
     use deps_core::net_policy::WorkspaceRegistryAccess;
     use std::assert_matches;

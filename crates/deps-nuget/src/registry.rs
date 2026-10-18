@@ -2876,6 +2876,90 @@ mod tests {
         assert!(!format!("{err} {err:?}").contains("s3cret"));
     }
 
+    /// An unparseable `RegistrationsBaseUrl` `@id` degrades to absent, like the search resource.
+    #[test]
+    fn test_service_index_resolve_unparseable_registrations_base_url_degrades_to_none() {
+        let response: ServiceIndexResponse =
+            serde_json::from_str(&service_index_body_with_registrations(
+                "https://flat.example/v3",
+                "https://search.example/query",
+                "not a url",
+            ))
+            .unwrap();
+
+        let index =
+            ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
+
+        assert!(index.registrations_base_url.is_none());
+        assert!(index.search_query_service.is_some());
+    }
+
+    /// Each resource's prefix confines requests as intended: flat and registration prefixes end
+    /// in `/` (children allowed, a `-evil` sibling rejected), the search prefix is its origin
+    /// only (the request URL carries a `?q=` query).
+    #[test]
+    fn test_service_index_resolve_resource_prefixes_confine_requests() {
+        let response: ServiceIndexResponse =
+            serde_json::from_str(&service_index_body_with_registrations(
+                "https://flat.example/v3-flatcontainer",
+                "https://search.example/query",
+                "https://reg.example/v3/reg",
+            ))
+            .unwrap();
+        let index =
+            ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
+        let url = |raw: &str| url::Url::parse(raw).unwrap();
+
+        let flat = index.package_base_address.prefix();
+        assert!(flat.as_str().ends_with('/'));
+        assert!(flat.permits(&url(
+            "https://flat.example/v3-flatcontainer/serde/index.json"
+        )));
+        assert!(!flat.permits(&url("https://flat.example/v3-flatcontainer-evil/x")));
+
+        let registrations = index.registrations_base_url.as_ref().unwrap().prefix();
+        assert!(registrations.as_str().ends_with('/'));
+        assert!(registrations.permits(&url("https://reg.example/v3/reg/serde/index.json")));
+        assert!(!registrations.permits(&url("https://reg.example/v3/reg-evil/x")));
+
+        let search = index.search_query_service.as_ref().unwrap().prefix();
+        assert!(search.permits(&url("https://search.example/query?q=serde&take=5")));
+        assert!(search.permits(&url("https://search.example/other")));
+        assert!(!search.permits(&url("https://other.example/query?q=serde")));
+    }
+
+    /// A service index URL that does not parse leaves no declared origin: the index is never
+    /// fetched (no network) and a credential is never attached to any request.
+    #[tokio::test]
+    async fn test_unparseable_service_index_url_is_invalid_uri_and_never_authenticates() {
+        let mut registry =
+            NuGetRegistry::with_service_index_url(Arc::new(HttpCache::new()), "not a url".into());
+        assert!(registry.declared_origin.is_none());
+        assert_matches!(
+            registry.service_index().await,
+            Err(deps_core::DepsError::InvalidUri(_))
+        );
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/data")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_body("ok")
+            .create_async()
+            .await;
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+        registry.auth = Some(NuGetAuth::new("user", "pat"));
+        let prefix = TrustedPrefix::parse(&format!("{}/", server.url())).unwrap();
+
+        registry
+            .fetch(&format!("{}/data", server.url()), &prefix)
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+    }
+
     /// An unparseable `SearchQueryService` `@id` degrades to absent (search returns empty).
     #[test]
     fn test_service_index_resolve_unparseable_search_query_service_degrades_to_none() {

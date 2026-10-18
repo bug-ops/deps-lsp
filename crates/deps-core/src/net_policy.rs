@@ -1204,8 +1204,9 @@ impl<K: TrustedConstantRegistryUrl> ValidatedRegistryUrl<K> {
 ///
 /// The invariant — [`BlockingPolicy::Floor`] if and only if [`HostClass::never_a_registry`] —
 /// holds by construction: the fields are private and [`Self::new`]/[`Self::floor`] are the only
-/// constructors, so a class paired with a policy that could not have refused it is
-/// unrepresentable.
+/// constructors. It does not say the level could actually refuse the class: `new` with
+/// [`HostClass::Global`] and `PublicOnly` is constructible, so callers build a block only for a
+/// host the guard decided to refuse.
 ///
 /// # Examples
 ///
@@ -2079,18 +2080,57 @@ mod tests {
         );
     }
 
+    /// Every [`HostClass`] variant. `ordinal` is an exhaustive match, so adding a variant
+    /// fails to compile here until the list and the match are both updated.
+    const ALL_HOST_CLASSES: [HostClass; 10] = [
+        HostClass::Loopback,
+        HostClass::LinkLocal,
+        HostClass::CloudMetadata,
+        HostClass::PrivateV4,
+        HostClass::Cgnat,
+        HostClass::UniqueLocalV6,
+        HostClass::Unspecified,
+        HostClass::InternalName,
+        HostClass::Reserved,
+        HostClass::Global,
+    ];
+
+    const fn ordinal(class: HostClass) -> usize {
+        match class {
+            HostClass::Loopback => 0,
+            HostClass::LinkLocal => 1,
+            HostClass::CloudMetadata => 2,
+            HostClass::PrivateV4 => 3,
+            HostClass::Cgnat => 4,
+            HostClass::UniqueLocalV6 => 5,
+            HostClass::Unspecified => 6,
+            HostClass::InternalName => 7,
+            HostClass::Reserved => 8,
+            HostClass::Global => 9,
+        }
+    }
+
     #[test]
-    fn test_blocked_host_floor_is_some_exactly_for_never_a_registry_classes() {
-        for class in [HostClass::Loopback, HostClass::PrivateV4, HostClass::Global] {
-            assert_eq!(
-                BlockedHost::floor(class).is_some(),
-                class.never_a_registry(),
-                "{class}"
-            );
-            if let Some(floor) = BlockedHost::floor(class) {
+    fn test_blocked_host_new_and_floor_agree_for_every_class_and_level() {
+        for (index, class) in ALL_HOST_CLASSES.into_iter().enumerate() {
+            assert_eq!(ordinal(class), index, "list order drifted for {class}");
+            for level in [
+                WorkspaceRegistryAccess::Off,
+                WorkspaceRegistryAccess::PublicOnly,
+                WorkspaceRegistryAccess::All,
+            ] {
+                let block = BlockedHost::new(class, level);
+                assert_eq!(block.class(), class);
+                let expected = if class.never_a_registry() {
+                    BlockingPolicy::Floor
+                } else {
+                    BlockingPolicy::WorkspaceRegistries(level)
+                };
+                assert_eq!(block.policy(), expected, "{class} at {level:?}");
                 assert_eq!(
-                    floor,
-                    BlockedHost::new(class, WorkspaceRegistryAccess::PublicOnly)
+                    BlockedHost::floor(class),
+                    class.never_a_registry().then_some(block),
+                    "{class} at {level:?}"
                 );
             }
         }

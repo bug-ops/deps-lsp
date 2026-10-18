@@ -420,20 +420,21 @@ impl AddrGuard {
         }
     }
 
-    /// The rule that refuses a resolved address of `class` under this guard's tier: only the
-    /// floor applies at the baseline tier.
-    fn refusal(&self, class: crate::net_policy::HostClass) -> Option<BlockedHost> {
+    /// Why `ip`, resolved for `name` as `class`, may not be connected to under this guard's tier,
+    /// or `None` when it may. The one place that both decides and labels the refusal, so a
+    /// blocked address can never lose its [`BlockedHost`]: only the floor applies at the
+    /// baseline tier, and the workspace tier adds the live policy snapshot.
+    fn refusal(
+        &self,
+        name: &str,
+        ip: std::net::IpAddr,
+        class: crate::net_policy::HostClass,
+    ) -> Option<BlockedHost> {
         match self {
             Self::Baseline => BlockedHost::floor(class),
-            Self::WorkspaceDeclared(snapshot) => Some(BlockedHost::new(class, snapshot.level)),
-        }
-    }
-
-    /// Whether `ip`, resolved for `name`, may be connected to under this guard's tier.
-    fn permits_resolved(&self, name: &str, ip: std::net::IpAddr) -> bool {
-        match self {
-            Self::Baseline => true,
-            Self::WorkspaceDeclared(snapshot) => snapshot.permits(Target::Resolved { name, ip }),
+            Self::WorkspaceDeclared(snapshot) => (class.never_a_registry()
+                || !snapshot.permits(Target::Resolved { name, ip }))
+            .then(|| BlockedHost::new(class, snapshot.level)),
         }
     }
 }
@@ -594,9 +595,7 @@ fn validate_resolved_addrs(
     let addrs = require_addresses(host, addrs)?;
     for addr in &addrs {
         let class = crate::net_policy::classify_addr(addr.ip());
-        if (class.never_a_registry() || !guard.permits_resolved(host, addr.ip()))
-            && let Some(block) = guard.refusal(class)
-        {
+        if let Some(block) = guard.refusal(host, addr.ip(), class) {
             tracing::warn!(host, addr = %addr.ip(), %class, "blocking DNS-resolved address");
             return Err(ResolveGuardError::Blocked {
                 host: host.to_string(),
@@ -2979,6 +2978,45 @@ mod tests {
         })
     }
 
+    /// The resolved-address decision and its label come from one method: the floor tier
+    /// refuses exactly the never-a-registry classes, and the workspace tier refuses whatever
+    /// its snapshot refuses, labelled with the live level.
+    #[test]
+    fn test_addr_guard_refusal_decides_and_labels_in_one_place() {
+        use crate::net_policy::HostClass;
+        let ip = |raw: &str| -> std::net::IpAddr { raw.parse().unwrap() };
+
+        assert_eq!(
+            AddrGuard::Baseline.refusal("h", ip("127.0.0.1"), HostClass::Loopback),
+            BlockedHost::floor(HostClass::Loopback)
+        );
+        assert_eq!(
+            AddrGuard::Baseline.refusal("h", ip("10.0.0.1"), HostClass::PrivateV4),
+            None
+        );
+        assert_eq!(
+            AddrGuard::Baseline.refusal("h", ip("8.8.8.8"), HostClass::Global),
+            None
+        );
+
+        let public_only = workspace_guard(WorkspaceRegistryAccess::PublicOnly, &[]);
+        assert_eq!(
+            public_only.refusal("h", ip("10.0.0.1"), HostClass::PrivateV4),
+            Some(BlockedHost::new(
+                HostClass::PrivateV4,
+                WorkspaceRegistryAccess::PublicOnly
+            ))
+        );
+        assert_eq!(
+            public_only.refusal("h", ip("127.0.0.1"), HostClass::Loopback),
+            BlockedHost::floor(HostClass::Loopback)
+        );
+        assert_eq!(
+            public_only.refusal("h", ip("8.8.8.8"), HostClass::Global),
+            None
+        );
+    }
+
     fn authorization(token: &AuthorizationValue) -> WireHeader<'_> {
         WireHeader::Credential(CredentialHeader::Authorization(token))
     }
@@ -5147,6 +5185,82 @@ mod tests {
                 &body,
                 BodyLimit::DEFAULT,
                 &prefix(&trusted_origin),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an untrusted redirect hop must not be followed"
+        );
+        evil_call.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_transport_only_limited_trusted_origin_success_returns_body() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/data")
+            .with_status(200)
+            .with_body("payload")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let body = cache
+            .get_transport_only_with_headers_limited_trusted_origin(
+                &format!("{}/data", server.url()),
+                &[],
+                BodyLimit::new(1024),
+                &prefix(&format!("{}/", server.url())),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(body.as_ref(), b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_get_transport_only_limited_trusted_origin_enforces_body_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/data")
+            .with_status(200)
+            .with_body("x".repeat(64))
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let result = cache
+            .get_transport_only_with_headers_limited_trusted_origin(
+                &format!("{}/data", server.url()),
+                &[],
+                BodyLimit::new(8),
+                &prefix(&format!("{}/", server.url())),
+            )
+            .await;
+
+        assert_matches!(result, Err(DepsError::ResponseTooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_get_transport_only_limited_trusted_origin_stops_cross_origin_redirect() {
+        let mut server = mockito::Server::new_async().await;
+        let mut evil = mockito::Server::new_async().await;
+        let _redirect = server
+            .mock("GET", "/data")
+            .with_status(302)
+            .with_header("location", &format!("{}/steal", evil.url()))
+            .create_async()
+            .await;
+        let evil_call = evil.mock("GET", "/steal").expect(0).create_async().await;
+
+        let cache = HttpCache::new();
+        let result = cache
+            .get_transport_only_with_headers_limited_trusted_origin(
+                &format!("{}/data", server.url()),
+                &[],
+                BodyLimit::DEFAULT,
+                &prefix(&format!("{}/", server.url())),
             )
             .await;
 
