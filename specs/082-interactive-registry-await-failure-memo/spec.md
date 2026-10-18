@@ -211,7 +211,7 @@ Conceptual only; representation is a plan-phase decision.
 | Code action on a dependency whose failure was a **timeout** | Semantics per OQ-5: today a timeout drops speculative fix/unsatisfiable actions (an unverified yank check must not fail open), whereas a genuine error lets them through |
 | Package count in the thousands, all failing | Memo capped (NFR-004); eviction never causes more than one extra bounded live fetch per package per TTL |
 | Four concurrent hovers on distinct, not-yet-known-failing packages | At most the bounded number hit the registry; the rest degrade immediately (FR-008); dispatch slots stay free (NFR-003) |
-| Dead proxy (`HTTPS_PROXY` unreachable) with default crates.io | Same as black-holed registry: every package fails; per-package memo plus background outcomes cover all of them after the first failure per package (host-level aggregation is OQ-7) |
+| Dead proxy (`HTTPS_PROXY` unreachable) with default crates.io | Same as black-holed registry: every package fails; per-package memo plus background outcomes cover each package after its first failure, and the endpoint breaker (OQ-7) refuses the rest of the hover sweep after two slow distinct packages |
 | Document closed and reopened, or manifest reparsed | Records tied to the document's outcomes clear with it; a memo scoped beyond one document expires by TTL or reload (FR-006) |
 | Config reload changes registry URL, token, or proxy | Records are invalidated (FR-006) so a fixed configuration takes effect without waiting out the TTL |
 
@@ -272,7 +272,18 @@ Conceptual only; representation is a plan-phase decision.
 >   runs on configuration changes (after the apply) and after reparses that change registry
 >   routing (`RefetchPolicy::AllDependencies`); a requirements-only reparse keeps the memo. A
 >   live success records nothing unless the background outcomes still show a failure.
-> - **OQ-7** is deferred to #1844.
+> - **OQ-7** (#1844): a per-endpoint circuit breaker. "Endpoint" is the registry as this manifest
+>   resolves it: ecosystem, manifest and dependency source, because `deps-core` cannot see the
+>   resolved host (`.npmrc`, source replacement, proxy). An attempt that waited at least half
+>   the budget before giving up or being cancelled by the editor is *slow*; one that answered
+>   (a list or an error) well inside the budget is an *answer*; the rest is inconclusive
+>   (a list that arrived within 1 s of the budget may be a stale-serve from a dead host).
+>   Two slow attempts for *distinct* packages within 30 s, with no answer from the endpoint in
+>   that window, open the breaker for 30 s. Hover awaits to an open endpoint return `Unverified`
+>   without polling and are not memoized; code actions are never refused (a false open would
+>   drop the fix actions of a whole manifest) but still report evidence. After 30 s the first
+>   hover is the single probe: a list closes the breaker, a slow or aborted probe re-arms it.
+>   `invalidate_all` resets it.
 > - **FR-007** (#1843): version-list awaits go through `await_interactive_versions`, which
 >   shares one registry poll per package, source, manifest and invalidation generation. The
 >   first request polls; the rest receive the same `Arc<[Box<dyn Version>]>`. Followers hold a
@@ -296,6 +307,20 @@ Conceptual only; representation is a plan-phase decision.
 > - A code action that follows a hover's enriched flight inherits its latency; if that passes
 >   the 10 s budget it gets `Unverified` and drops its speculative fixes even though its own
 >   bare fetch might have answered in time.
+> - The breaker needs two slow distinct packages, not one as the issue suggests, so a single slow
+>   large package on a healthy endpoint cannot open it. A dead endpoint therefore costs two
+>   awaits, then instant refusals; N manifests on one dead host cost 2N awaits, and a
+>   per-package source (`Git { url }`) degrades to plain memo behaviour.
+> - Endpoints that conflate routes (npm `@scope:registry`, `GOPRIVATE`, `extra-index-url`,
+>   multi-repository Maven, multi-feed NuGet) share one breaker, so a dead private route can
+>   refuse public packages for up to 30 s once two distinct packages were slow. Keying by the
+>   real host is deferred until `Registry` exposes it.
+> - Under hover-only refusal, code actions on a dead endpoint still pay an await per distinct
+>   package and hold dispatch permits meanwhile. A cancel after half the budget feeds the
+>   breaker (so it helps hovers) but never the memo.
+> - A cancel-driven open on a healthy-but-slow endpoint needs two distinct packages cancelled
+>   after half the budget with no answer in 30 s; the user then sees basic cards, as they
+>   effectively did already.
 > - Scope: the default `generate_hover`/`generate_code_actions` path (FR-012). NuGet's and
 >   GitLab CI's ecosystem-specific hover/code-action overrides keep their own ungated 5 s
 >   awaits; follow-up #1845.

@@ -18,6 +18,7 @@
 //! [`DependencyOutcomes`]: super::DependencyOutcomes
 
 mod attempt;
+mod breaker;
 mod flight;
 mod key;
 mod memo;
@@ -33,9 +34,10 @@ use std::time::Instant;
 use dashmap::DashMap;
 use tokio::sync::{Semaphore, watch};
 
-use self::attempt::bounded_await_until;
+use self::attempt::{Attempted, bounded_await_until};
+use self::breaker::EndpointBreaker;
 use self::flight::{FlightKey, FlightResult, ListShape};
-use self::key::{InteractiveFetchKey, ManifestFingerprint, SourceFingerprint};
+use self::key::{EndpointKey, InteractiveFetchKey, ManifestFingerprint, SourceFingerprint};
 use self::memo::{Decision, InteractiveRecord};
 use super::{REGISTRY_FETCH_BUDGET, VersionData};
 use crate::freshness::FreshnessSettings;
@@ -178,10 +180,12 @@ impl<'a> InteractiveFetchRequest<'a> {
             NetworkMode::Online => Some((
                 gate,
                 InteractiveFetchKey {
-                    ecosystem,
+                    endpoint: EndpointKey {
+                        ecosystem,
+                        manifest: ManifestFingerprint::of(self.manifest),
+                        source: SourceFingerprint::of(self.source),
+                    },
                     package: PackageName::new(self.normalized_name),
-                    manifest: ManifestFingerprint::of(self.manifest),
-                    source: SourceFingerprint::of(self.source),
                 },
             )),
         }
@@ -237,6 +241,7 @@ fn log_skipped(request: &InteractiveFetchRequest<'_>, reason: &str) {
 pub struct InteractiveFetchGate {
     memo: DashMap<InteractiveFetchKey, InteractiveRecord>,
     version_flights: DashMap<FlightKey, watch::Receiver<Slot<FlightResult>>>,
+    breaker: EndpointBreaker,
     permits: Semaphore,
     generation: AtomicU64,
 }
@@ -252,6 +257,7 @@ impl InteractiveFetchGate {
         Self {
             memo: DashMap::new(),
             version_flights: DashMap::new(),
+            breaker: EndpointBreaker::default(),
             permits: Semaphore::new(permits),
             generation: AtomicU64::new(0),
         }
@@ -260,11 +266,12 @@ impl InteractiveFetchGate {
     /// Forgets every record and discards the result of any await already in flight.
     ///
     /// Call when a configuration change (registry URL, token, proxy) or a reparse makes the
-    /// recorded failures untrustworthy (FR-006). Requests that start afterwards never join a
+    /// recorded failures and endpoint health untrustworthy (FR-006). Requests that start afterwards never join a
     /// flight begun before it.
     pub fn invalidate_all(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.memo.clear();
+        self.breaker.clear();
     }
 
     /// Number of live records.
@@ -298,15 +305,20 @@ impl InteractiveFetchGate {
             return InteractiveFetch::Degraded(NoLiveList::Unverified);
         };
         let deadline = tokio::time::Instant::now() + REGISTRY_FETCH_BUDGET;
-        self.attempt(
-            fetch,
-            deadline,
-            key,
-            request,
-            background_failure_known,
-            generation,
-        )
-        .await
+        match self
+            .attempt(
+                fetch,
+                deadline,
+                key,
+                request,
+                background_failure_known,
+                generation,
+            )
+            .await
+        {
+            Attempted::Polled(result) => result,
+            Attempted::Refused => InteractiveFetch::Degraded(NoLiveList::Unverified),
+        }
     }
 }
 
@@ -369,7 +381,6 @@ pub async fn await_interactive_fetch<T, E>(
             log_skipped(&request, reason.as_str());
             InteractiveFetch::Degraded(kind)
         }
-        // TODO(#1844): host-level breaker so N distinct first hovers on a dead host cost one await
         Decision::Live => {
             gate.live(fetch, &key, &request, background_failure_known, generation)
                 .await
@@ -448,10 +459,11 @@ async fn plain_bounded_await<T, E>(
     fetch: impl Future<Output = Result<T, E>>,
     request: &InteractiveFetchRequest<'_>,
 ) -> InteractiveFetch<T> {
-    bounded_await_until(
+    let (result, _) = bounded_await_until(
         fetch,
         tokio::time::Instant::now() + REGISTRY_FETCH_BUDGET,
         request,
     )
-    .await
+    .await;
+    result
 }

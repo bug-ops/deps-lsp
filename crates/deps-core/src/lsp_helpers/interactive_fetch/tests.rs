@@ -3,6 +3,12 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
+use super::attempt::{AttemptEnd, AttemptEvidence, evidence};
+use super::breaker::{
+    Admission, BREAKER_CAP, BREAKER_OPEN_DURATION, BreakerAdmission, EndpointBreaker,
+    EndpointHealth,
+};
+use super::key::{EndpointKey, ManifestFingerprint, SourceFingerprint};
 use super::memo::{Decision, FastFail, INTERACTIVE_FAILURE_TTL, INTERACTIVE_MEMO_CAP};
 use super::*;
 use crate::lsp_helpers::DependencyOutcomes;
@@ -468,6 +474,17 @@ impl Fixture {
         freshness: FreshnessSettings,
         behavior: Versions,
     ) -> InteractiveFetch<SharedVersions> {
+        self.versions_in(FetchContext::Hover, name, freshness, behavior)
+            .await
+    }
+
+    async fn versions_in(
+        &self,
+        context: FetchContext,
+        name: &str,
+        freshness: FreshnessSettings,
+        behavior: Versions,
+    ) -> InteractiveFetch<SharedVersions> {
         let package = PackageName::new(name);
         let source = DependencySource::Registry;
         let outcomes = DependencyOutcomes::new();
@@ -480,7 +497,7 @@ impl Fixture {
             &package,
             name,
             &source,
-            FetchContext::Hover,
+            context,
         );
         let (gate, key) = request.gated().unwrap();
         let fetch = async {
@@ -729,4 +746,484 @@ async fn public_entry_point_shares_the_registry_list() {
 
     let live = live_list(result);
     assert_eq!(live[0].version_string().as_str(), "2.0.0");
+}
+
+impl Fixture {
+    fn endpoint(&self) -> EndpointKey {
+        EndpointKey {
+            ecosystem: EcosystemId::Cargo,
+            manifest: ManifestFingerprint::of(&self.manifest),
+            source: SourceFingerprint::of(&DependencySource::Registry),
+        }
+    }
+
+    fn health(&self) -> Option<EndpointHealth> {
+        self.gate.breaker.health(&self.endpoint())
+    }
+
+    async fn code_action(
+        &self,
+        name: &str,
+        behavior: Versions,
+    ) -> InteractiveFetch<SharedVersions> {
+        self.versions_in(
+            FetchContext::CodeAction,
+            name,
+            FreshnessSettings::Disabled,
+            behavior,
+        )
+        .await
+    }
+
+    /// Hovers on `name`, dropping the await after `after` the way a cancelled request does.
+    async fn cancelled_hover(&self, name: &str, after: Duration) {
+        let outcome = tokio::time::timeout(after, self.enriched(name, Versions::STALL)).await;
+        assert!(outcome.is_err(), "the hover must still be waiting");
+    }
+
+    /// Two distinct packages that stall to the end of the budget: opens the breaker.
+    async fn open_the_breaker(&self) {
+        self.enriched("slow-a", Versions::STALL).await;
+        self.enriched("slow-b", Versions::STALL).await;
+        assert_matches!(self.health(), Some(EndpointHealth::Open { .. }));
+    }
+}
+
+fn is_open(health: Option<EndpointHealth>) -> bool {
+    matches!(health, Some(EndpointHealth::Open { .. }))
+}
+
+#[test]
+fn evidence_follows_the_unified_table() {
+    let budget = secs(10);
+    let just_under = |limit: Duration| limit.saturating_sub(Duration::from_millis(1));
+    let cases = [
+        (
+            AttemptEnd::Live,
+            just_under(secs(9)),
+            AttemptEvidence::Answered,
+        ),
+        (AttemptEnd::Live, secs(9), AttemptEvidence::Inconclusive),
+        (AttemptEnd::Live, secs(10), AttemptEvidence::Inconclusive),
+        (
+            AttemptEnd::Err,
+            just_under(secs(9)),
+            AttemptEvidence::Answered,
+        ),
+        (AttemptEnd::Err, secs(9), AttemptEvidence::Slow),
+        (AttemptEnd::Elapsed, secs(10), AttemptEvidence::Slow),
+        (AttemptEnd::Elapsed, secs(5), AttemptEvidence::Slow),
+        (
+            AttemptEnd::Elapsed,
+            just_under(secs(5)),
+            AttemptEvidence::Inconclusive,
+        ),
+        (AttemptEnd::Cancelled, secs(5), AttemptEvidence::Slow),
+        (
+            AttemptEnd::Cancelled,
+            just_under(secs(5)),
+            AttemptEvidence::Inconclusive,
+        ),
+        (
+            AttemptEnd::Cancelled,
+            Duration::ZERO,
+            AttemptEvidence::Inconclusive,
+        ),
+    ];
+    for (end, waited, expected) in cases {
+        assert_eq!(
+            evidence(end, waited, budget),
+            expected,
+            "{end:?} after {waited:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_single_slow_package_does_not_open_the_breaker() {
+    let fixture = Fixture::new();
+
+    fixture.enriched("slow-a", Versions::STALL).await;
+    let next = fixture.enriched("other", Versions::Succeed(secs(1))).await;
+
+    assert_eq!(live_list(next).len(), 1);
+    assert_eq!(fixture.calls(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_distinct_slow_packages_open_the_breaker_and_the_next_hover_makes_no_call() {
+    let fixture = Fixture::new();
+    fixture.open_the_breaker().await;
+
+    let refused = fixture.enriched("third", Versions::Succeed(secs(1))).await;
+
+    assert_degraded(&refused, NoLiveList::Unverified);
+    assert_eq!(fixture.calls(), 2);
+    assert_eq!(fixture.gate.len(), 2, "a refusal is not memoized");
+    assert_eq!(fixture.gate.in_flight_len(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_generic_path_is_refused_by_the_same_breaker() {
+    let fixture = Fixture::new();
+    let none = DependencyOutcomes::new();
+    fixture.run("slow-a", &none, Fetch::Stall).await;
+    fixture.run("slow-b", &none, Fetch::Stall).await;
+
+    let refused = fixture.run("third", &none, Fetch::Succeed).await;
+
+    assert_degraded(&refused, NoLiveList::Unverified);
+    assert_eq!(fixture.calls(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_answer_within_the_ttl_keeps_slow_packages_from_opening_the_breaker() {
+    let fixture = Fixture::new();
+
+    fixture.enriched("fast", Versions::Succeed(secs(6))).await;
+    fixture.enriched("slow-a", Versions::STALL).await;
+    fixture.enriched("slow-b", Versions::STALL).await;
+    let next = fixture.enriched("next", Versions::Succeed(secs(1))).await;
+
+    assert_matches!(
+        fixture.health(),
+        Some(EndpointHealth::Closed {
+            last_answered: Some(_),
+            suspect: None
+        })
+    );
+    assert_eq!(live_list(next).len(), 1);
+    assert_eq!(fixture.calls(), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_live_list_near_the_budget_is_not_an_answer() {
+    let fixture = Fixture::new();
+
+    fixture
+        .enriched(
+            "stale-served",
+            Versions::Succeed(Duration::from_millis(9500)),
+        )
+        .await;
+    assert_eq!(
+        fixture.health(),
+        Some(EndpointHealth::Closed {
+            last_answered: None,
+            suspect: None
+        })
+    );
+    fixture.enriched("slow-a", Versions::STALL).await;
+    fixture.enriched("slow-b", Versions::STALL).await;
+
+    assert!(is_open(fixture.health()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fast_error_answers_for_the_endpoint_and_a_late_one_is_slow() {
+    let fixture = Fixture::new();
+
+    fixture.enriched("fast", Versions::Fail(secs(3))).await;
+    assert_matches!(
+        fixture.health(),
+        Some(EndpointHealth::Closed {
+            last_answered: Some(_),
+            suspect: None
+        })
+    );
+
+    let late = Fixture::new();
+    late.enriched("late", Versions::Fail(Duration::from_millis(9500)))
+        .await;
+    assert_matches!(
+        late.health(),
+        Some(EndpointHealth::Closed {
+            last_answered: None,
+            suspect: Some(_)
+        })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_hovers_cancelled_after_half_the_budget_open_the_breaker() {
+    let fixture = Fixture::new();
+
+    fixture.cancelled_hover("cancelled-a", secs(6)).await;
+    fixture.cancelled_hover("cancelled-b", secs(6)).await;
+    let refused = fixture.enriched("third", Versions::Succeed(secs(1))).await;
+
+    assert!(is_open(fixture.health()));
+    assert_degraded(&refused, NoLiveList::Unverified);
+    assert_eq!(fixture.calls(), 2);
+    assert!(fixture.gate.is_empty(), "a cancel never writes the memo");
+}
+
+#[tokio::test(start_paused = true)]
+async fn hovers_cancelled_early_are_no_evidence() {
+    let fixture = Fixture::new();
+
+    fixture.cancelled_hover("cancelled-a", secs(2)).await;
+    fixture.cancelled_hover("cancelled-b", secs(2)).await;
+    let next = fixture.enriched("third", Versions::Succeed(secs(1))).await;
+
+    assert_eq!(live_list(next).len(), 1);
+    assert_eq!(fixture.calls(), 3);
+    assert!(fixture.gate.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_code_action_is_never_refused_and_its_answer_closes_the_breaker() {
+    let fixture = Fixture::new();
+    fixture.open_the_breaker().await;
+
+    let action = fixture.code_action("fix", Versions::Succeed(secs(1))).await;
+
+    assert_eq!(live_list(action).len(), 1);
+    assert_eq!(fixture.calls(), 3);
+    assert_matches!(fixture.health(), Some(EndpointHealth::Closed { .. }));
+    let hover = fixture.enriched("after", Versions::Succeed(secs(1))).await;
+    assert_eq!(live_list(hover).len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_code_action_that_stalls_still_counts_as_slow_evidence() {
+    let fixture = Fixture::new();
+
+    fixture.code_action("action-a", Versions::STALL).await;
+    fixture.enriched("slow-b", Versions::STALL).await;
+
+    assert!(is_open(fixture.health()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_probe_that_gets_a_list_closes_the_breaker_and_others_wait() {
+    let fixture = Fixture::new();
+    fixture.open_the_breaker().await;
+    tokio::time::advance(BREAKER_OPEN_DURATION).await;
+
+    let (probe, concurrent) = tokio::join!(
+        fixture.enriched("probe", Versions::Succeed(secs(6))),
+        async {
+            tokio::time::sleep(secs(1)).await;
+            fixture
+                .enriched("concurrent", Versions::Succeed(secs(1)))
+                .await
+        },
+    );
+
+    assert_eq!(live_list(probe).len(), 1);
+    assert_degraded(&concurrent, NoLiveList::Unverified);
+    assert_eq!(fixture.calls(), 3);
+    assert_matches!(
+        fixture.health(),
+        Some(EndpointHealth::Closed {
+            last_answered: Some(_),
+            ..
+        })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_probe_reopens_the_breaker() {
+    let fixture = Fixture::new();
+    fixture.open_the_breaker().await;
+    tokio::time::advance(BREAKER_OPEN_DURATION).await;
+
+    let probe = fixture.enriched("probe", Versions::STALL).await;
+    let refused = fixture.enriched("after", Versions::Succeed(secs(1))).await;
+
+    assert_degraded(&probe, NoLiveList::Unverified);
+    assert_degraded(&refused, NoLiveList::Unverified);
+    assert!(is_open(fixture.health()));
+    assert_eq!(fixture.calls(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_aborted_probe_lets_the_next_request_probe_again() {
+    let fixture = Fixture::new();
+    fixture.open_the_breaker().await;
+    tokio::time::advance(BREAKER_OPEN_DURATION).await;
+
+    fixture.cancelled_hover("probe", secs(2)).await;
+    let next = fixture.enriched("next", Versions::Succeed(secs(1))).await;
+
+    assert_eq!(live_list(next).len(), 1);
+    assert_eq!(fixture.calls(), 4);
+    assert_matches!(fixture.health(), Some(EndpointHealth::Closed { .. }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn hovers_for_one_package_on_an_open_breaker_are_all_refused() {
+    let fixture = Fixture::new();
+    fixture.open_the_breaker().await;
+
+    let (first, second) = tokio::join!(
+        fixture.enriched("third", Versions::Succeed(secs(1))),
+        fixture.enriched("third", Versions::Succeed(secs(1))),
+    );
+
+    assert_degraded(&first, NoLiveList::Unverified);
+    assert_degraded(&second, NoLiveList::Unverified);
+    assert_eq!(fixture.calls(), 2);
+    assert_eq!(fixture.gate.in_flight_len(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn invalidation_resets_the_breaker() {
+    let fixture = Fixture::new();
+    fixture.open_the_breaker().await;
+
+    fixture.gate.invalidate_all();
+    let next = fixture.enriched("third", Versions::Succeed(secs(1))).await;
+
+    assert_eq!(live_list(next).len(), 1);
+    assert_eq!(fixture.calls(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_that_outlives_an_invalidation_leaves_no_evidence() {
+    let fixture = Fixture::new();
+
+    let ((), ()) = tokio::join!(fixture.cancelled_hover("serde", secs(6)), async {
+        tokio::time::sleep(secs(1)).await;
+        fixture.gate.invalidate_all();
+    });
+
+    assert_eq!(fixture.gate.breaker.len(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_promoted_follower_with_most_of_the_budget_reports_its_elapse() {
+    let fixture = Fixture::new();
+
+    cancel_leader_then_follow(&fixture, secs(1), Versions::STALL).await;
+
+    assert_matches!(
+        fixture.health(),
+        Some(EndpointHealth::Closed {
+            suspect: Some(_),
+            ..
+        })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_promoted_follower_with_little_budget_left_reports_nothing() {
+    let fixture = Fixture::new();
+    let start = now();
+
+    cancel_leader_then_follow(&fixture, secs(6), Versions::STALL).await;
+
+    let Some(EndpointHealth::Closed {
+        suspect: Some(suspect),
+        ..
+    }) = fixture.health()
+    else {
+        panic!("the cancelled leader left a suspect");
+    };
+    assert_eq!(
+        suspect.at,
+        start + secs(6),
+        "the follower's truncated elapse at 10 s must not refresh the suspect"
+    );
+}
+
+#[test]
+fn a_stale_probe_settling_inconclusive_leaves_a_closed_breaker_closed() {
+    let breaker = EndpointBreaker::default();
+    let endpoint = Fixture::new().endpoint();
+    let (a, b) = (PackageName::new("a"), PackageName::new("b"));
+    let start = now();
+    breaker.report(&endpoint, &a, AttemptEvidence::Slow, None, start);
+    breaker.report(&endpoint, &b, AttemptEvidence::Slow, None, start);
+    let reopened = start + BREAKER_OPEN_DURATION;
+    let Admission::Probe(probe) = breaker.admit(&endpoint, BreakerAdmission::Enforce, reopened)
+    else {
+        panic!("an expired open breaker hands out the probe");
+    };
+    breaker.report(&endpoint, &a, AttemptEvidence::Answered, None, reopened);
+    let closed = breaker.health(&endpoint);
+
+    breaker.report(
+        &endpoint,
+        &b,
+        AttemptEvidence::Inconclusive,
+        Some(probe),
+        reopened,
+    );
+    breaker.report(&endpoint, &b, AttemptEvidence::Slow, Some(probe), reopened);
+
+    assert_eq!(breaker.health(&endpoint), closed);
+    assert_matches!(closed, Some(EndpointHealth::Closed { .. }));
+}
+
+#[test]
+fn the_same_package_twice_is_not_corroboration() {
+    let breaker = EndpointBreaker::default();
+    let endpoint = Fixture::new().endpoint();
+    let package = PackageName::new("a");
+    let start = now();
+
+    breaker.report(&endpoint, &package, AttemptEvidence::Slow, None, start);
+    breaker.report(
+        &endpoint,
+        &package,
+        AttemptEvidence::Slow,
+        None,
+        start + secs(1),
+    );
+
+    assert_matches!(
+        breaker.health(&endpoint),
+        Some(EndpointHealth::Closed {
+            suspect: Some(_),
+            ..
+        })
+    );
+}
+
+#[test]
+fn a_stale_suspect_is_not_corroboration() {
+    let breaker = EndpointBreaker::default();
+    let endpoint = Fixture::new().endpoint();
+    let start = now();
+
+    breaker.report(
+        &endpoint,
+        &PackageName::new("a"),
+        AttemptEvidence::Slow,
+        None,
+        start,
+    );
+    breaker.report(
+        &endpoint,
+        &PackageName::new("b"),
+        AttemptEvidence::Slow,
+        None,
+        start + BREAKER_OPEN_DURATION,
+    );
+
+    assert_matches!(
+        breaker.health(&endpoint),
+        Some(EndpointHealth::Closed { .. })
+    );
+}
+
+#[test]
+fn the_breaker_stays_within_its_cap() {
+    let breaker = EndpointBreaker::default();
+    let package = PackageName::new("a");
+    let start = now();
+    for index in 0..BREAKER_CAP + 50 {
+        let manifest = manifest(&format!("/project-{index}/Cargo.toml"));
+        let endpoint = EndpointKey {
+            ecosystem: EcosystemId::Cargo,
+            manifest: ManifestFingerprint::of(&manifest),
+            source: SourceFingerprint::of(&DependencySource::Registry),
+        };
+        let at = start + Duration::from_millis(index as u64);
+        breaker.report(&endpoint, &package, AttemptEvidence::Answered, None, at);
+    }
+
+    assert_eq!(breaker.len(), BREAKER_CAP);
 }

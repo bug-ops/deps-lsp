@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+use super::attempt::Attempted;
 use super::key::InteractiveFetchKey;
 use super::memo::Decision;
 use super::{
@@ -196,7 +197,7 @@ pub(super) async fn await_shared<E>(
             Ok(sender) => {
                 // Declared after `sender`, so the claim is released before followers wake.
                 let _claim = InFlightGuard::new(&gate.version_flights, flight.clone());
-                let result = lead(
+                match lead(
                     gate,
                     fetch.as_mut(),
                     deadline,
@@ -205,12 +206,26 @@ pub(super) async fn await_shared<E>(
                     background_failure_known,
                     generation,
                 )
-                .await;
-                sender.send_replace(Slot::Ready(FlightResult::of(&result)));
-                return result;
+                .await
+                {
+                    Led::Answered(result) => {
+                        sender.send_replace(Slot::Ready(FlightResult::of(&result)));
+                        return result;
+                    }
+                    // Dropping the claim unanswered makes each follower take over, and the
+                    // open breaker refuses every hover among them without a poll.
+                    Led::Refused => return InteractiveFetch::Degraded(NoLiveList::Unverified),
+                }
             }
         }
     }
+}
+
+/// What a leader ended with.
+enum Led {
+    Answered(InteractiveFetch<SharedVersions>),
+    /// The endpoint's breaker refused the poll.
+    Refused,
 }
 
 async fn lead<E>(
@@ -221,26 +236,31 @@ async fn lead<E>(
     request: &InteractiveFetchRequest<'_>,
     background_failure_known: bool,
     generation: u64,
-) -> InteractiveFetch<SharedVersions> {
+) -> Led {
     // A leader that finished between this request's first decision and its claim may have
     // written a record; polling again would be a wholly avoidable duplicate.
     if let Decision::Degrade(kind, reason) =
         gate.decide(key, background_failure_known, generation, now())
     {
         log_skipped(request, reason.as_str());
-        return InteractiveFetch::Degraded(kind);
+        return Led::Answered(InteractiveFetch::Degraded(kind));
     }
     if Instant::now() >= deadline {
         log_skipped(request, "deadline elapsed before the lookup could start");
-        return InteractiveFetch::Degraded(NoLiveList::Unverified);
+        return Led::Answered(InteractiveFetch::Degraded(NoLiveList::Unverified));
     }
-    gate.attempt(
-        fetch,
-        deadline,
-        key,
-        request,
-        background_failure_known,
-        generation,
-    )
-    .await
+    match gate
+        .attempt(
+            fetch,
+            deadline,
+            key,
+            request,
+            background_failure_known,
+            generation,
+        )
+        .await
+    {
+        Attempted::Polled(result) => Led::Answered(result),
+        Attempted::Refused => Led::Refused,
+    }
 }

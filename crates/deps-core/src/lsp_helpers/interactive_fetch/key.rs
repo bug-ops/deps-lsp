@@ -33,10 +33,17 @@ fn hash64(value: &impl Hash) -> u64 {
     hasher.finish()
 }
 
+/// The registry endpoint a lookup resolves against, as far as `deps-core` can tell: the
+/// manifest (per-project `.npmrc` or source replacement) and the dependency source.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct InteractiveFetchKey {
+pub(super) struct EndpointKey {
     pub(super) ecosystem: EcosystemId,
-    pub(super) package: PackageName,
     pub(super) manifest: ManifestFingerprint,
     pub(super) source: SourceFingerprint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct InteractiveFetchKey {
+    pub(super) endpoint: EndpointKey,
+    pub(super) package: PackageName,
 }
