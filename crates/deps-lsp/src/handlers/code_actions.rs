@@ -78,7 +78,8 @@ pub async fn handle_code_actions(
     let version_data = snapshot
         .version_data()
         .with_ecosystem(ecosystem_id)
-        .with_network(network);
+        .with_network(network)
+        .with_interactive_fetch_gate(&state.interactive_fetch);
     let mut actions = ecosystem
         .generate_code_actions(
             parse_result.as_ref(),

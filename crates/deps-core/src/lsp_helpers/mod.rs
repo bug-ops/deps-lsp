@@ -33,6 +33,7 @@ mod hover_markdown;
 mod in_use_version;
 #[cfg(feature = "lsp-responses")]
 mod inlay_hints;
+mod interactive_fetch;
 mod sha_comment;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -113,6 +114,10 @@ pub use in_use_version::{
 };
 #[cfg(feature = "lsp-responses")]
 pub use inlay_hints::generate_inlay_hints;
+pub use interactive_fetch::{
+    FetchContext, InteractiveFetch, InteractiveFetchGate, InteractiveFetchRequest, NoLiveList,
+    await_interactive_fetch,
+};
 #[cfg(feature = "lsp-responses")]
 pub use sha_comment::build_sha_comment_fix_action;
 pub use sha_comment::{
@@ -992,6 +997,49 @@ impl PackageVersions {
     }
 }
 
+/// Looks up `dep` in the registry cache under its normalized name first and its declared name
+/// second.
+///
+/// The single lookup every consumer of the cache shares (hover, code actions, diagnostics,
+/// inlay hints, the fix-target snapshot), so a case-folding ecosystem such as Composer cannot
+/// resolve a dependency on one path and miss it on another (#1832).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::PackageName;
+/// use deps_core::lsp_helpers::{PackageVersions, cached_package_versions_by_name};
+/// use std::collections::HashMap;
+///
+/// let mut cached: HashMap<PackageName, PackageVersions> = HashMap::new();
+/// cached.insert("monolog/monolog".into(), PackageVersions::latest_only("3.0.0"));
+///
+/// let hit = cached_package_versions_by_name(&cached, "monolog/monolog", "Monolog/Monolog");
+/// assert_eq!(hit.map(|v| v.latest.as_str()), Some("3.0.0"));
+/// ```
+#[must_use]
+pub fn cached_package_versions_by_name<'m>(
+    cached: &'m HashMap<PackageName, PackageVersions>,
+    normalized_name: &str,
+    declared_name: &str,
+) -> Option<&'m PackageVersions> {
+    cached
+        .get(normalized_name)
+        .or_else(|| cached.get(declared_name))
+}
+
+/// [`cached_package_versions_by_name`] for a caller that holds the dependency and its
+/// ecosystem formatter rather than a precomputed normalized name.
+#[must_use]
+pub fn cached_package_versions<'m>(
+    cached: &'m HashMap<PackageName, PackageVersions>,
+    dep: &dyn Dependency,
+    formatter: &dyn EcosystemFormatter,
+) -> Option<&'m PackageVersions> {
+    let normalized_name = formatter.normalize_package_name(dep.name());
+    cached_package_versions_by_name(cached, normalized_name.as_str(), dep.name().as_str())
+}
+
 /// Everything the lifecycle fetch learned about one package, keyed by its normalized name.
 ///
 /// All three channels can hold simultaneously for the same package — this is load-bearing,
@@ -1434,6 +1482,11 @@ pub struct VersionData<'a> {
     /// items) must consult [`candidate_verdict`] with this field for every version it is about
     /// to offer, not only the one [`Self::latest_status`] already covers.
     pub candidate_status: Option<&'a CandidateStatusMap>,
+    /// Failure memo and concurrency cap for hover's and code actions' interactive registry
+    /// await (#1830). `None` by default — and for every surface but `handlers/hover.rs` and
+    /// `handlers/code_actions.rs` (deps-lsp) — which keeps the plain
+    /// [`REGISTRY_FETCH_BUDGET`]-bounded await; see [`await_interactive_fetch`].
+    pub interactive_fetch: Option<&'a InteractiveFetchGate>,
 }
 
 impl<'a> VersionData<'a> {
@@ -1475,7 +1528,31 @@ impl<'a> VersionData<'a> {
             gossip_client: None,
             latest_status: None,
             candidate_status: None,
+            interactive_fetch: None,
         }
+    }
+
+    /// Attaches the interactive-fetch gate that lets hover and code actions skip a registry
+    /// await already known to fail (#1830).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionData;
+    /// use deps_core::lsp_helpers::InteractiveFetchGate;
+    /// use std::collections::HashMap;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let gate = InteractiveFetchGate::new(NonZeroUsize::new(4).unwrap());
+    /// let versions = VersionData::new(&cached, &resolved).with_interactive_fetch_gate(&gate);
+    /// assert!(versions.interactive_fetch.is_some());
+    /// ```
+    #[must_use]
+    pub const fn with_interactive_fetch_gate(mut self, gate: &'a InteractiveFetchGate) -> Self {
+        self.interactive_fetch = Some(gate);
+        self
     }
 
     /// Attaches the per-name lock-file candidates map, enabling the per-occurrence
@@ -1923,39 +2000,11 @@ pub const COMPLETION_SEARCH_TIMEOUT: Duration = Duration::from_secs(2);
 /// no per-ecosystem inner budget is required on top of it. On elapse, hover falls back
 /// to its existing `.ok()`-based basic-card degradation (the same path a genuine fetch
 /// error takes); code actions instead drop the speculative fix/unsat actions outright
-/// (see `await_versions_fetch`'s `timed_out` flag) rather than reusing that same
-/// fail-open path, since an unverified yank check must not be treated as "not yanked".
+/// (see [`NoLiveList::Unverified`]) rather than reusing that same fail-open path, since an
+/// unverified yank check must not be treated as "not yanked". [`await_interactive_fetch`]
+/// applies this budget and, with an [`InteractiveFetchGate`] attached, remembers the elapse so
+/// the next request does not pay it again (#1830).
 pub const REGISTRY_FETCH_BUDGET: Duration = Duration::from_secs(10);
-
-/// Awaits `fetch` bounded by [`REGISTRY_FETCH_BUDGET`], logging a `tracing::warn!` naming
-/// `package` and `context` if the budget elapses first.
-///
-/// Shared by hover and code-action generation to avoid duplicating this
-/// timeout/log/degrade shape at both call sites. Returns `(None, false)` for a
-/// fetch-level error exactly like the pre-#1204 `.ok()` degrade, and `(None, true)` on
-/// timeout — the `bool` lets a caller (code actions) tell the two apart when a fetch
-/// failure and a fetch timeout must not be treated the same way (impl-critic S1: a
-/// timeout is not a verified "not yanked" answer, so it must not fail open the way a
-/// genuine registry outage does).
-#[cfg(feature = "lsp-responses")]
-async fn await_versions_fetch<T, E>(
-    fetch: impl std::future::Future<Output = Result<T, E>>,
-    package: &PackageName,
-    context: &'static str,
-) -> (Option<T>, bool) {
-    match tokio::time::timeout(REGISTRY_FETCH_BUDGET, fetch).await {
-        Ok(result) => (result.ok(), false),
-        Err(_) => {
-            tracing::warn!(
-                package = %package.for_tracing(),
-                context,
-                timeout_secs = REGISTRY_FETCH_BUDGET.as_secs(),
-                "primary registry version fetch timed out"
-            );
-            (None, true)
-        }
-    }
-}
 
 /// Converts UTF-16 offset to byte offset in a string.
 ///
@@ -5066,27 +5115,29 @@ mod tests {
     /// (minified) manifest must stay near-instant. The pre-fix implementation rescanned
     /// the line from its start on every call, making repeated lookups over such a line
     /// O(n^2) in the line's length (~350ms for 8000 calls on an ~180KB line on the
-    /// reporter's machine); the ASCII fast path makes each call O(1), so this generous
-    /// wall-clock bound leaves wide margin without being flaky.
+    /// reporter's machine); the ASCII fast path makes each call O(1), so the run time stays
+    /// proportional to the number of lookups.
     #[test]
     fn test_byte_offset_to_position_minified_line_stays_fast() {
-        let mut content = String::from("{\"dependencies\":{");
-        for i in 0..8000 {
-            content.push_str(&format!("\"dep{i}\":\"1.0.{i}\","));
-        }
-        content.push_str("}}");
-
-        let table = LineOffsetTable::new(&content);
-        let step = (content.len() / 8000).max(1);
-        let start = std::time::Instant::now();
-        for offset in (0..content.len()).step_by(step) {
-            std::hint::black_box(table.byte_offset_to_position(&content, offset));
-        }
-        let elapsed = start.elapsed();
-
-        assert!(
-            elapsed < std::time::Duration::from_millis(100),
-            "8000 byte_offset_to_position calls on a minified line took {elapsed:?}, expected < 100ms"
+        crate::test_util::scaling::assert_scaling(
+            "byte_offset_to_position on a minified line",
+            crate::test_util::scaling::ExpectedGrowth::Linear,
+            8000,
+            |deps| {
+                let mut content = String::from("{\"dependencies\":{");
+                for i in 0..deps {
+                    content.push_str(&format!("\"dep{i}\":\"1.0.{i}\","));
+                }
+                content.push_str("}}");
+                let table = LineOffsetTable::new(&content);
+                let step = (content.len() / deps).max(1);
+                (content, table, step)
+            },
+            |(content, table, step)| {
+                for offset in (0..content.len()).step_by(*step) {
+                    std::hint::black_box(table.byte_offset_to_position(content, offset));
+                }
+            },
         );
     }
 

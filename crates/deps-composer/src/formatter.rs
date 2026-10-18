@@ -1349,7 +1349,6 @@ mod tests {
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
     use deps_core::position::{Position as DomainPosition, Range};
-    #[cfg(feature = "lsp-responses")]
     use std::collections::HashMap;
     #[cfg(feature = "lsp-responses")]
     use tower_lsp_server::ls_types::Position;
@@ -3608,7 +3607,7 @@ mod tests {
     /// is ever reached (#1391: that method no longer guards placeholders itself).
     #[test]
     fn test_plan_vulnerability_fix_self_version_is_not_rewritten() {
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::position::{Position, Range};
 
         let version_range = Range::new(Position::new(0, 20), Position::new(0, 33));
@@ -3628,7 +3627,7 @@ mod tests {
                 version_range,
                 "self.version",
                 &dv,
-                None,
+                FixTargetContext::default(),
                 &ComposerFormatter
             ),
             Err(deps_core::edit::VulnFixSkip::UnresolvedPlaceholder),
@@ -3640,7 +3639,7 @@ mod tests {
     /// alias to a literal fix version.
     #[test]
     fn test_plan_vulnerability_fix_inline_alias_is_not_rewritten() {
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::position::{Position, Range};
 
         let version_range = Range::new(Position::new(0, 20), Position::new(0, 38));
@@ -3660,7 +3659,7 @@ mod tests {
                 version_range,
                 "dev-main as 1.0.0",
                 &dv,
-                None,
+                FixTargetContext::default(),
                 &ComposerFormatter
             ),
             Err(deps_core::edit::VulnFixSkip::UnresolvedPlaceholder),
@@ -3674,7 +3673,7 @@ mod tests {
     /// rewriting (`"psr/log": "${PSR_LOG}"` -> `"psr/log": "3.0.2"`) before this guard.
     #[test]
     fn test_plan_vulnerability_fix_dollar_placeholder_is_not_rewritten() {
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::position::{Position, Range};
 
         let version_range = Range::new(Position::new(0, 20), Position::new(0, 30));
@@ -3694,7 +3693,7 @@ mod tests {
                 version_range,
                 "${PSR_LOG}",
                 &dv,
-                None,
+                FixTargetContext::default(),
                 &ComposerFormatter
             ),
             Err(deps_core::edit::VulnFixSkip::UnresolvedPlaceholder),
@@ -3709,7 +3708,7 @@ mod tests {
     /// would itself skip the edit as unnecessary, for an unrelated reason.
     #[test]
     fn test_plan_vulnerability_fix_resolved_requirement_still_returns_planned_edit() {
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::position::{Position, Range};
 
         let version_range = Range::new(Position::new(0, 20), Position::new(0, 25));
@@ -3723,10 +3722,75 @@ mod tests {
         };
 
         let dv = vuln_fix_dv("6.5.0");
-        let planned =
-            plan_vulnerability_fix(&dep, version_range, "6.0.0", &dv, None, &ComposerFormatter)
-                .expect("a resolved requirement must still be rewritten to the fix version");
+        let planned = plan_vulnerability_fix(
+            &dep,
+            version_range,
+            "6.0.0",
+            &dv,
+            FixTargetContext::default(),
+            &ComposerFormatter,
+        )
+        .expect("a resolved requirement must still be rewritten to the fix version");
         assert_eq!(planned.edit.new_text, "6.5.0");
+    }
+
+    /// #1832 S6: Packagist names are case-insensitive, so the cache holds `monolog/monolog`
+    /// while the manifest spells `Monolog/Monolog`; the shared lookup must still find it and
+    /// steer the deprecated fix target to the next release.
+    #[test]
+    fn test_plan_vulnerability_fix_steers_past_deprecated_for_a_mixed_case_name() {
+        use deps_core::RemovalStatus;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
+        use deps_core::lsp_helpers::{PackageVersions, cached_package_versions};
+        use deps_core::position::{Position, Range};
+        use std::sync::Arc;
+
+        let version_range = Range::new(Position::new(0, 20), Position::new(0, 25));
+        let dep = ComposerDependency {
+            name: "Monolog/Monolog".into(),
+            name_range: Range::default(),
+            version_req: Some("6.0.0".into()),
+            version_range: Some(version_range),
+            section: ComposerSection::Require,
+            source: deps_core::parser::DependencySource::Registry,
+        };
+        let available: Arc<[ConcreteVersion]> = Arc::from(vec![
+            ConcreteVersion::new("6.5.1"),
+            ConcreteVersion::new("6.5.0"),
+        ]);
+        let flagged: Arc<[(ConcreteVersion, RemovalStatus)]> = Arc::from(vec![(
+            ConcreteVersion::new("6.5.0"),
+            RemovalStatus::AdvisoryDeprecated,
+        )]);
+        let cached = HashMap::from([(
+            PackageName::new("monolog/monolog"),
+            PackageVersions::new(ConcreteVersion::new("6.5.1"), available).with_yanked(flagged),
+        )]);
+
+        let registry = cached_package_versions(&cached, &dep, &ComposerFormatter);
+        assert!(registry.is_some(), "the shared lookup is case-insensitive");
+        let planned = plan_vulnerability_fix(
+            &dep,
+            version_range,
+            "6.0.0",
+            &vuln_fix_dv_verified("6.5.0", "6.5.1"),
+            FixTargetContext::default().with_registry(registry),
+            &ComposerFormatter,
+        )
+        .expect("the steered target is verified and plans an edit");
+        assert_eq!(planned.edit.new_text, "6.5.1");
+    }
+
+    /// Like [`vuln_fix_dv`], but the verified target differs from the advisory's fixed version.
+    fn vuln_fix_dv_verified(
+        fixed_version: &str,
+        verified_target: &str,
+    ) -> deps_core::osv::DependencyVulnerabilities {
+        vuln_fix_dv(fixed_version).with_fix_target_status(
+            deps_core::osv::UpgradeStatus::CandidateClean {
+                version: ConcreteVersion::new(verified_target),
+            },
+        )
     }
 
     // --- #205 package-level deprecation ---

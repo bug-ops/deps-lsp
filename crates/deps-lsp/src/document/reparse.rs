@@ -99,6 +99,7 @@ pub(crate) async fn reparse_open_documents(
 
     if affected.is_empty() {
         tracing::debug!("no open documents affected by {reason}");
+        forget_routing_failures(&state, refetch);
         return;
     }
 
@@ -133,9 +134,23 @@ pub(crate) async fn reparse_open_documents(
         }
     }
 
+    forget_routing_failures(&state, refetch);
+
     // Detached, capability-gated, timeout-bounded (issue #493 precedent): see
     // `ServerState::spawn_refresh_requests` for rationale.
     state.spawn_refresh_requests(&client);
+}
+
+/// Empties the interactive-fetch failure memo once a routing change has been applied (#1830).
+///
+/// Only [`RefetchPolicy::AllDependencies`] means registry routing changed; a `Diff` reparse
+/// (e.g. a requirements-only config rewrite) leaves recorded failures valid, and keeping them
+/// avoids re-exposing the 10 s stall after every unrelated reparse.
+fn forget_routing_failures(state: &ServerState, refetch: RefetchPolicy) {
+    match refetch {
+        RefetchPolicy::AllDependencies => state.interactive_fetch.invalidate_all(),
+        RefetchPolicy::Diff => {}
+    }
 }
 
 #[cfg(test)]
@@ -146,6 +161,60 @@ mod tests {
     use crate::test_utils::test_helpers::create_test_client_and_config;
     #[cfg(feature = "cargo")]
     use deps_core::EcosystemId;
+
+    async fn seeded_gate_entries(state: &ServerState) -> usize {
+        use deps_core::lsp_helpers::{FetchContext, InteractiveFetchRequest};
+        use deps_core::{DependencySource, PackageName, VersionData};
+        use std::collections::HashMap;
+
+        let (cached, resolved) = (HashMap::new(), HashMap::new());
+        let package = PackageName::new("serde");
+        let source = DependencySource::Registry;
+        let manifest = url::Url::parse("file:///project/Cargo.toml").unwrap();
+        let request = InteractiveFetchRequest::new(
+            VersionData::new(&cached, &resolved)
+                .with_ecosystem(deps_core::EcosystemId::Cargo)
+                .with_interactive_fetch_gate(&state.interactive_fetch),
+            &manifest,
+            &package,
+            "serde",
+            &source,
+            FetchContext::Hover,
+        );
+        deps_core::lsp_helpers::await_interactive_fetch(async { Err::<(), ()>(()) }, request).await;
+        state.interactive_fetch.len()
+    }
+
+    /// #1830: a routing change empties the interactive failure memo; a requirements-only
+    /// (`Diff`) reparse keeps it.
+    #[tokio::test]
+    async fn test_reparse_empties_failure_memo_only_for_routing_changes() {
+        let state = Arc::new(ServerState::new());
+        let (client, config) = create_test_client_and_config();
+        assert_eq!(seeded_gate_entries(&state).await, 1);
+
+        reparse_open_documents(
+            ReparseScope::All,
+            RefetchPolicy::Diff,
+            "test",
+            Arc::clone(&state),
+            client.clone(),
+            Arc::clone(&config),
+        )
+        .await;
+        assert_eq!(state.interactive_fetch.len(), 1);
+
+        reparse_open_documents(
+            ReparseScope::All,
+            RefetchPolicy::AllDependencies,
+            "test",
+            Arc::clone(&state),
+            client,
+            config,
+        )
+        .await;
+        assert!(state.interactive_fetch.is_empty());
+    }
 
     /// A `scope` that matches no open document must be a quiet no-op.
     #[tokio::test]

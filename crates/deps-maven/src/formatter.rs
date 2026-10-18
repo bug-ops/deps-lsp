@@ -791,7 +791,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_resolved_requirement_still_returns_planned_edit() {
         use crate::types::{MavenDependency, MavenScope};
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::parser::DependencySource;
         use deps_core::position::{Position, Range};
 
@@ -808,9 +808,15 @@ mod tests {
         };
 
         let dv = vuln_fix_dv("1.2.0");
-        let planned =
-            plan_vulnerability_fix(&dep, version_range, "1.0.0", &dv, None, &MavenFormatter)
-                .expect("a resolved requirement must still be rewritten to the fix version");
+        let planned = plan_vulnerability_fix(
+            &dep,
+            version_range,
+            "1.0.0",
+            &dv,
+            FixTargetContext::default(),
+            &MavenFormatter,
+        )
+        .expect("a resolved requirement must still be rewritten to the fix version");
         assert_eq!(planned.edit.new_text, "1.2.0");
     }
 }

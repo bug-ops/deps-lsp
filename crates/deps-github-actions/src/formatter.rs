@@ -645,7 +645,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_still_offered_for_real_tag_pin() {
         use deps_core::ParseResult;
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
@@ -674,7 +674,14 @@ mod tests {
                 version: ConcreteVersion::new("v4"),
             });
 
-        let planned = plan_vulnerability_fix(*dep, version_range, "v3", &dv, None, &formatter());
+        let planned = plan_vulnerability_fix(
+            *dep,
+            version_range,
+            "v3",
+            &dv,
+            FixTargetContext::default(),
+            &formatter(),
+        );
 
         assert_eq!(
             planned
@@ -3084,7 +3091,7 @@ mod tests {
     /// `GithubActionsFormatter`, not a mock.
     #[test]
     fn test_plan_vulnerability_fix_still_remediates_sha_pin() {
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
@@ -3127,7 +3134,7 @@ mod tests {
             d.version_range.expect("test dep has a version range"),
             "v4.2.0",
             &dv,
-            None,
+            FixTargetContext::default(),
             &fmt,
         );
 
@@ -3146,7 +3153,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_sha_pin_fix_version_without_v_prefix_round_trips() {
         use deps_core::ParseResult;
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
@@ -3180,8 +3187,9 @@ mod tests {
                 version: ConcreteVersion::new("4.1.3"),
             });
 
-        let planned = plan_vulnerability_fix(dep, range, "v4.1.2", &dv, None, &fmt)
-            .expect("fix is planned for the SHA pin");
+        let planned =
+            plan_vulnerability_fix(dep, range, "v4.1.2", &dv, FixTargetContext::default(), &fmt)
+                .expect("fix is planned for the SHA pin");
         assert_eq!(planned.edit.new_text, format!("{new_sha} # v4.1.3"));
 
         assert_eq!(
@@ -3553,7 +3561,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_generic_placeholder_through_real_parser_is_not_rewritten() {
         use deps_core::ParseResult;
-        use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
+        use deps_core::edit::{FixTargetContext, VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
@@ -3589,7 +3597,14 @@ mod tests {
                 version: ConcreteVersion::new("v5"),
             });
 
-        let planned = plan_vulnerability_fix(*dep, version_range, current, &dv, None, &formatter());
+        let planned = plan_vulnerability_fix(
+            *dep,
+            version_range,
+            current,
+            &dv,
+            FixTargetContext::default(),
+            &formatter(),
+        );
 
         assert_eq!(
             planned,

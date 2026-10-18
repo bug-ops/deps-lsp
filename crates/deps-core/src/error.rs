@@ -112,17 +112,65 @@ fn offline_message(url: &RedactedUrl) -> String {
 /// let sanitized: SanitizedRegistryError = raw.into();
 /// assert!(!sanitized.to_string().is_empty());
 /// ```
-pub struct SanitizedRegistryError(reqwest::Error);
+pub struct SanitizedRegistryError(Inner);
+
+enum Inner {
+    Transport(reqwest::Error),
+    Resolution(ResolutionFailure),
+}
+
+/// Why the DNS preflight that guards a proxied request could not resolve the target host.
+///
+/// Carried by [`SanitizedRegistryError`] so a preflight failure is classified like the
+/// transport failure the send path would have produced, instead of an untyped cache error.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::error::{ResolutionFailure, SanitizedRegistryError};
+///
+/// let error = SanitizedRegistryError::from(ResolutionFailure::NoAddresses);
+/// assert_eq!(error.resolution_failure(), Some(ResolutionFailure::NoAddresses));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ResolutionFailure {
+    /// The resolver answered with zero addresses for the host.
+    #[error("DNS preflight resolved no addresses")]
+    NoAddresses,
+    /// The host name was unusable or the resolver failed outright.
+    #[error("DNS preflight lookup failed")]
+    LookupFailed,
+}
+
+impl SanitizedRegistryError {
+    /// The preflight resolution failure this error wraps, or `None` for a transport error.
+    #[must_use]
+    pub const fn resolution_failure(&self) -> Option<ResolutionFailure> {
+        match &self.0 {
+            Inner::Resolution(failure) => Some(*failure),
+            Inner::Transport(_) => None,
+        }
+    }
+}
 
 impl From<reqwest::Error> for SanitizedRegistryError {
     fn from(error: reqwest::Error) -> Self {
-        Self(error.without_url())
+        Self(Inner::Transport(error.without_url()))
+    }
+}
+
+impl From<ResolutionFailure> for SanitizedRegistryError {
+    fn from(failure: ResolutionFailure) -> Self {
+        Self(Inner::Resolution(failure))
     }
 }
 
 impl std::fmt::Display for SanitizedRegistryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, f)
+        match &self.0 {
+            Inner::Transport(error) => std::fmt::Display::fmt(error, f),
+            Inner::Resolution(failure) => std::fmt::Display::fmt(failure, f),
+        }
     }
 }
 
@@ -132,7 +180,7 @@ impl std::fmt::Debug for SanitizedRegistryError {
     /// which does recurse into `source` and would reopen the nested-URL leak this type's own
     /// docs describe.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SanitizedRegistryError({})", self.0)
+        write!(f, "SanitizedRegistryError({self})")
     }
 }
 
@@ -398,8 +446,8 @@ pub enum DepsError {
 
     /// A credentialed request targeted a URL outside the credential's trusted prefix, so the
     /// credential was withheld (it would otherwise travel to a host the caller never trusted
-    /// with it). Built only by `crate::cache`; classified like a cache-layer failure
-    /// ([`FetchFailure::Transient`], halting a multi-hop chain).
+    /// with it). Built only by `crate::cache`; a configuration fault, so it is
+    /// [`FetchFailure::Actionable`] (with a fixed, URL-free message) and halts a multi-hop chain.
     #[error("refusing to send a credential to {url} outside its trusted prefix")]
     #[non_exhaustive]
     CredentialOutsideTrustedPrefix {
@@ -706,6 +754,13 @@ impl DepsError {
                     ),
                 })
             }
+            // A configuration fault that no retry resolves, so it must not read as a transient
+            // lookup failure (and must not let a last-good fallback paper over it). The
+            // message is fixed: the request URL is never interpolated (#1841).
+            Self::CredentialOutsideTrustedPrefix { .. } => FetchFailure::Actionable(
+                "credential withheld: the registry URL is outside the credential's trusted prefix"
+                    .to_string(),
+            ),
             // Deliberately `Transient`, not `Actionable` (#1295 critic S5, reverted from an
             // earlier `Actionable` attempt): `lsp_helpers::diagnostics` already suppresses
             // every per-dependency fetch-failure message while `versions.offline` is set,
@@ -729,7 +784,6 @@ impl DepsError {
             | Self::Json(_)
             | Self::UnsupportedEcosystem(_)
             | Self::AmbiguousEcosystem(_)
-            | Self::CredentialOutsideTrustedPrefix { .. }
             | Self::InvalidUri(_) => FetchFailure::Transient,
         }
     }
@@ -865,7 +919,8 @@ impl DepsError {
 pub enum FetchFailure {
     /// The fetch failed with a pre-vetted, safe-to-display hint — produced from
     /// [`DepsError::RateLimited`], [`DepsError::ChainResolutionHalted`],
-    /// [`DepsError::PaginatedListIncomplete`] or [`DepsError::HostBlockedByPolicy`] (see
+    /// [`DepsError::PaginatedListIncomplete`], [`DepsError::HostBlockedByPolicy`] or
+    /// [`DepsError::CredentialOutsideTrustedPrefix`] (see
     /// [`DepsError::fetch_failure`] for the exhaustive, deliberately-chosen list of which
     /// variants produce this versus [`Self::Transient`]).
     Actionable(String),
@@ -947,10 +1002,9 @@ mod tests {
     /// own populated `url` field) as the outer error's `source` (see the type's own docs for
     /// the exact `https_only`/redirect code path), which `.without_url()` on the outer error
     /// alone does not touch. This proves the wrapper discards a real, populated source chain
-    /// (not merely that one never existed): the *raw* wrapped `reqwest::Error` behind
-    /// `sanitized.0` (accessible here since `mod tests` is a child of `error`) genuinely has
-    /// `.source().is_some()` for a real connection-refused failure, yet `SanitizedRegistryError`'s
-    /// own `source()` is unconditionally `None`.
+    /// (not merely that one never existed): the wrapped transport error genuinely has
+    /// `.source().is_some()` for a real connection-refused failure, yet
+    /// `SanitizedRegistryError`'s own `source()` is unconditionally `None`.
     #[tokio::test]
     async fn test_sanitized_registry_error_source_is_always_none() {
         let port = {
@@ -961,8 +1015,11 @@ mod tests {
 
         let reqwest_err = reqwest::Client::new().get(&url).send().await.unwrap_err();
         let sanitized: SanitizedRegistryError = reqwest_err.into();
+        let Inner::Transport(raw) = &sanitized.0 else {
+            panic!("a reqwest error converts to the transport case");
+        };
         assert!(
-            sanitized.0.source().is_some(),
+            raw.source().is_some(),
             "test setup invariant: a connection-refused error must have a populated source chain"
         );
         assert!(
@@ -1495,7 +1552,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_outside_trusted_prefix_is_transient_halts_chain_and_redacts_url() {
+    fn credential_outside_trusted_prefix_is_actionable_halts_chain_and_redacts_url() {
         let err = DepsError::CredentialOutsideTrustedPrefix {
             url: "https://elsewhere.test/api?token=secret".into(),
         };
@@ -1506,7 +1563,13 @@ mod tests {
                 RedactedUrl::new("https://elsewhere.test/api?token=secret")
             )
         );
-        assert_eq!(err.fetch_failure(), FetchFailure::Transient);
+        let FetchFailure::Actionable(hint) = err.fetch_failure() else {
+            panic!("a credential outside its trusted prefix is a configuration fault");
+        };
+        assert!(
+            !hint.contains("elsewhere.test") && !hint.contains("secret"),
+            "{hint}"
+        );
         assert_eq!(err.safe_tracing_summary(), (None, "credential-scope"));
         assert!(!err.is_not_found());
         assert!(!format!("{err} {err:?}").contains("secret"));
@@ -1585,9 +1648,6 @@ mod tests {
             DepsError::UnsupportedEcosystem("unknown".into()),
             DepsError::AmbiguousEcosystem("file.txt".into()),
             DepsError::InvalidUri("not a uri".into()),
-            DepsError::CredentialOutsideTrustedPrefix {
-                url: "https://example.com/x".into(),
-            },
             DepsError::Offline {
                 url: "https://example.com".into(),
             },

@@ -409,6 +409,64 @@ mod tests {
         }
     }
 
+    /// #1832: an `npm:` specifier reuses the npm registry's deprecation data, so a deprecated
+    /// OSV fix target is steered to the next release exactly as for `package.json`.
+    #[test]
+    fn test_plan_vulnerability_fix_steers_past_deprecated_npm_specifier() {
+        use deps_core::lsp_helpers::{PackageVersions, cached_package_versions};
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
+        };
+        use deps_core::{RemovalStatus, edit::FixTargetContext};
+        use std::sync::Arc;
+
+        let dep = test_dep("npm:lodash", "4.17.4");
+        let available: Arc<[ConcreteVersion]> = Arc::from(vec![
+            ConcreteVersion::new("4.18.1"),
+            ConcreteVersion::new("4.18.0"),
+        ]);
+        let flagged: Arc<[(ConcreteVersion, RemovalStatus)]> = Arc::from(vec![(
+            ConcreteVersion::new("4.18.0"),
+            RemovalStatus::AdvisoryDeprecated,
+        )]);
+        let cached = std::collections::HashMap::from([(
+            PackageName::new("npm:lodash"),
+            PackageVersions::new(ConcreteVersion::new("4.18.1"), available).with_yanked(flagged),
+        )]);
+        let advisory = Arc::new(
+            Advisory::new(
+                "GHSA-0000-0000-0000".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec![OsvVersion::new("4.18.0")]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: ConcreteVersion::new("4.18.1"),
+            });
+
+        let version_range = deps_core::position::Range::new(
+            deps_core::position::Position::new(0, 20),
+            deps_core::position::Position::new(0, 26),
+        );
+        let planned = deps_core::edit::plan_vulnerability_fix(
+            &dep,
+            version_range,
+            "4.17.4",
+            &dv,
+            FixTargetContext::default().with_registry(cached_package_versions(
+                &cached,
+                &dep,
+                &DenoFormatter,
+            )),
+            &DenoFormatter,
+        )
+        .expect("the steered target is verified and plans an edit");
+        assert_eq!(planned.edit.new_text, "4.18.1");
+    }
+
     /// #454: drops the pre-#448-blindness exact-pin-only restriction — a `jsr:` range
     /// requirement now surfaces the diagnostic just like an exact pin, matching
     /// Cargo/PyPI/Dart (which never override this hook and so keep the trait default).

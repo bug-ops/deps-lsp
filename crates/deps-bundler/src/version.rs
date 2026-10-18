@@ -1017,23 +1017,28 @@ mod tests {
     }
 
     /// Perf regression test for #1472: both canonicalization helpers used to be O(n^2), taking
-    /// seconds on a 200KB adversarial input in release builds. The linear rewrite must stay well
-    /// under a generous, non-flaky bound even on slow CI runners (Windows, coverage builds).
+    /// seconds on a 200KB adversarial input in release builds. The linear rewrite must keep the
+    /// run time proportional to the input length.
     #[test]
     fn test_compare_versions_linear_on_adversarial_input() {
-        let trailing_shape = format!("1{}", ".0".repeat(100_000));
-        let tag_shape = format!("a.{}1", "0.".repeat(100_000));
-
-        let start = std::time::Instant::now();
-        compare_versions("1.0.0", &trailing_shape);
-        compare_versions(&trailing_shape, "1.0.0");
-        compare_versions("1.0.0", &tag_shape);
-        compare_versions(&tag_shape, "1.0.0");
-        let elapsed = start.elapsed();
-
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "compare_versions took {elapsed:?} on adversarial input, expected well under 2s"
+        deps_core::test_util::scaling::assert_scaling(
+            "compare_versions on adversarial input",
+            deps_core::test_util::scaling::ExpectedGrowth::Linear,
+            100_000,
+            |repeats| {
+                (
+                    format!("1{}", ".0".repeat(repeats)),
+                    format!("a.{}1", "0.".repeat(repeats)),
+                )
+            },
+            |(trailing_shape, tag_shape)| {
+                [
+                    compare_versions("1.0.0", trailing_shape),
+                    compare_versions(trailing_shape, "1.0.0"),
+                    compare_versions("1.0.0", tag_shape),
+                    compare_versions(tag_shape, "1.0.0"),
+                ]
+            },
         );
     }
 }

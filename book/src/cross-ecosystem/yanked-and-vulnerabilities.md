@@ -271,11 +271,27 @@ excluded from the claim, and — crucially — excluded *before* the target vers
 so that advisory's own fix version (which may be much higher) can never inflate the
 recommendation past what the claimed advisories actually need.
 
-The action is independent of the registry fetch that produces the plain update list, so a
-registry outage never hides it. When the registry fetch does succeed, a fix version the
-registry reports as yanked is dropped instead of offered (no action, rather than silently
-retargeting to some other version), and a fix version whose *formatted* manifest text
-already matches the dependency's declared requirement is skipped as a no-op edit — the
+When the registry flags the target version as deprecated (npm, Composer, and Deno `npm:`
+specifiers report this), the action steers to the smallest newer plain `MAJOR.MINOR.PATCH` release on the same
+compatibility line (same major, or same major and minor for `0.x`) that carries no registry
+flag, is no newer than the registry's latest, and is not a release GOSSIP excluded. The registry's
+latest release is also skipped while it is still inside the default three-day release
+cooldown (publish times are known for the latest release only). If no such release exists the
+original target is kept. The steered release is verified against OSV like any other target; if
+it fails verification, the action is omitted rather than falling back to the deprecated
+version. The code action steers from the registry data cached at request time while the OSV
+verification used the data from the last scan; if the two disagree, the action is omitted
+until the next scan.
+
+The action is built before the registry fetch that produces the plain update list. A registry
+that answers the request with an error does not hide it, but an *unverified* registry lookup
+does: when the lookup timed out, is known to be failing (from the background fetch or from an
+earlier hover or code action within the last 30 seconds), or the interactive-fetch concurrency
+cap was reached, the yank check cannot run and the action is dropped instead of offered
+unchecked. Only the request that itself receives the registry error keeps the action. When the
+registry fetch does succeed, a fix version the registry reports as yanked is dropped instead
+of offered (no action, rather than silently retargeting to some other version), and a fix
+version whose *formatted* manifest text already matches the dependency's declared requirement is skipped as a no-op edit — the
 comparison uses the actual text the edit would write, not the bare version, since several
 ecosystems format it differently (Dart wraps it in a `^` constraint, PyPI expands it into a
 `>=,<` range). If the scanned version came from the lock file rather than the declared

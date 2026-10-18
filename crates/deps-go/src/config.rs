@@ -1386,19 +1386,18 @@ mod tests {
     #[test]
     fn test_glob_pattern_many_stars_no_exponential_blowup() {
         let pattern = GlobPattern::new(&format!("{}x", "*".repeat(30)));
-        let text = "a".repeat(60);
 
-        let start = std::time::Instant::now();
-        let matched = pattern.matches(&text);
-        let elapsed = start.elapsed();
+        let matched = deps_core::test_util::scaling::assert_scaling(
+            "glob matching with many consecutive stars",
+            deps_core::test_util::scaling::ExpectedGrowth::Linear,
+            1_000_000,
+            |len| "a".repeat(len),
+            |text| pattern.matches(text),
+        );
 
         assert!(
             !matched,
             "pattern requires a literal 'x' the text never has"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(1),
-            "glob matching took too long: {elapsed:?} (possible backtracking regression)"
         );
     }
 

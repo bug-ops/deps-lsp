@@ -118,7 +118,7 @@ const OSV_API_BASE: &str = "https://api.osv.dev";
 /// post-release/build-number spelling, which is rarer than the pre-release case this fixes
 /// (PyPI/OSV normalize most post-releases to the `.postN` form regardless, and no live-verified
 /// OSV record in this project's test fixtures has hit it).
-fn compare_version_strings(a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn compare_version_strings(a: &str, b: &str) -> std::cmp::Ordering {
     /// The longest leading run of `[0-9.]` in `s`, trailing dot trimmed — the "release" part of
     /// a version string, stopping before any pre-release/build/metadata suffix regardless of
     /// whether that suffix starts with a dot (`.dev0`), a hyphen (`-rc.1`), or no separator at

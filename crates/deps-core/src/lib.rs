@@ -255,8 +255,8 @@ pub use ecosystem::{
 };
 pub use ecosystem_registry::{EcosystemRegistry, WatchedConfigMatch};
 pub use edit::{
-    EcosystemReparse, EditSpan, ManifestEdit, ManifestReparse, PlannedUpdate, UnplannableReason,
-    UpdateCandidate, UpdateKind, VulnFixSkip, apply_edits, classify_update,
+    EcosystemReparse, EditSpan, FixTargetContext, ManifestEdit, ManifestReparse, PlannedUpdate,
+    UnplannableReason, UpdateCandidate, UpdateKind, VulnFixSkip, apply_edits, classify_update,
     collect_update_candidates, collect_update_edits, dedup_overlapping_edits, plan_verified_fix,
     plan_vulnerability_fix, resolve_recommended_fix, resolve_verified_fix,
 };

@@ -1,6 +1,7 @@
 //! Entry point for the `deps-lsp` binary: parses `--stdio`/`--version` flags,
 //! sets up `tracing` logging, and serves [`Backend`] over stdin/stdout.
 
+use deps_lsp::document::LSP_DISPATCH_CONCURRENCY;
 use deps_lsp::server::Backend;
 use std::env;
 use tower_lsp_server::{LspService, Server};
@@ -83,7 +84,10 @@ async fn serve() {
 
     let (service, socket) = LspService::new(Backend::new);
 
-    Server::new(stdin, stdout, socket).serve(service).await;
+    Server::new(stdin, stdout, socket)
+        .concurrency_level(LSP_DISPATCH_CONCURRENCY.get())
+        .serve(service)
+        .await;
 }
 
 /// Sink-level defense-in-depth against CWE-117 log forging (#1505): every field value

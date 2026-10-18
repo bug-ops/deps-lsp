@@ -80,10 +80,11 @@ yanked target, a no-op or still-unsatisfiable rewrite, a text collision with the
 vulnerability fix) can independently suppress the action while the diagnostic itself stays up.
 
 Like the vulnerability fix above, this action is computed before the registry fetch that
-produces the plain update list, so a registry outage never hides it. When the fetch does
-succeed, a target the registry reports as yanked is dropped rather than offered. The
-rewritten text is re-checked against the same unsatisfiability predicate before the action
-is returned, since an ecosystem that preserves operator style when rewriting a requirement
+produces the plain update list. A registry error returned to this very request does not hide
+it, but an unverified lookup (timed out, known to be failing, or over the interactive-fetch
+cap) drops it, as for the vulnerability fix above. When the fetch does succeed, a target
+the registry reports as yanked is dropped rather than offered. The rewritten text is
+re-checked against the same unsatisfiability predicate before the action is returned, since an ecosystem that preserves operator style when rewriting a requirement
 (PyPI, Gradle) can otherwise produce another still-unsatisfiable range; this re-check cannot
 prove a rewrite it cannot evaluate is correct, so it holds for every rewrite the ecosystem's
 own comparator can judge, not unconditionally.

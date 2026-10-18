@@ -923,7 +923,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_unresolved_interpolation_is_not_rewritten() {
         use deps_core::ParseResult;
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
@@ -958,7 +958,7 @@ mod tests {
             deps_core::position::Range::default(),
             current,
             &dv,
-            None,
+            FixTargetContext::default(),
             &BundlerFormatter,
         );
 
@@ -984,7 +984,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_multi_constraint_collapses_to_single_pin() {
         use deps_core::ParseResult;
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
@@ -1015,9 +1015,15 @@ mod tests {
                 version: ConcreteVersion::new("6.1.0"),
             });
 
-        let planned =
-            plan_vulnerability_fix(*dep, version_range, current, &dv, None, &BundlerFormatter)
-                .expect("a non-interpolated multi-constraint requirement must be rewritable");
+        let planned = plan_vulnerability_fix(
+            *dep,
+            version_range,
+            current,
+            &dv,
+            FixTargetContext::default(),
+            &BundlerFormatter,
+        )
+        .expect("a non-interpolated multi-constraint requirement must be rewritable");
 
         assert_eq!(planned.edit.new_text, "6.1.0");
 
@@ -1036,7 +1042,7 @@ mod tests {
     fn test_plan_vulnerability_fix_multi_constraint_later_unresolved_interpolation_is_not_rewritten()
      {
         use deps_core::ParseResult;
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
@@ -1071,7 +1077,7 @@ mod tests {
             deps_core::position::Range::default(),
             current,
             &dv,
-            None,
+            FixTargetContext::default(),
             &BundlerFormatter,
         );
 
@@ -1107,7 +1113,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_generic_placeholder_through_real_parser_is_not_rewritten() {
         use deps_core::ParseResult;
-        use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
+        use deps_core::edit::{FixTargetContext, VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
@@ -1142,7 +1148,7 @@ mod tests {
             deps_core::position::Range::default(),
             current,
             &dv,
-            None,
+            FixTargetContext::default(),
             &BundlerFormatter,
         );
 

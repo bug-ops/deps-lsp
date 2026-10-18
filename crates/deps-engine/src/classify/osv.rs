@@ -17,6 +17,116 @@ use deps_core::lsp_helpers::{
 };
 use std::collections::HashMap;
 
+/// Snapshot of each vulnerable dependency's registry version data, keyed by
+/// [`deps_core::osv::VulnKey`], taken in the same document read as the scan keys (#1832).
+///
+/// Lets the fix-target resolver steer past a deprecated target without re-reading shared
+/// document state after an await. An absent key means no registry data and no steering.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::test_util::vuln_key;
+/// use deps_engine::classify::osv::FixTargetRegistry;
+///
+/// assert!(FixTargetRegistry::default().get(&vuln_key("pkg")).is_none());
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct FixTargetRegistry(
+    HashMap<deps_core::osv::VulnKey, deps_core::lsp_helpers::PackageVersions>,
+);
+
+impl FixTargetRegistry {
+    /// The registry version data snapshotted for `key`, if any.
+    #[must_use]
+    pub fn get(
+        &self,
+        key: &deps_core::osv::VulnKey,
+    ) -> Option<&deps_core::lsp_helpers::PackageVersions> {
+        self.0.get(key)
+    }
+
+    /// Whether no dependency has registry data in this snapshot.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Snapshots the registry version data of every dependency in `parse_result` under the
+/// [`deps_core::osv::VulnKey`] the scan files it under.
+///
+/// Uses [`deps_core::lsp_helpers::cached_package_versions`], the lookup the vulnerability-fix
+/// code action shares, so the phase-B verification and the action steer a deprecated fix
+/// target identically (#1832). Cheap: [`deps_core::lsp_helpers::PackageVersions`] clones share
+/// their version lists.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     PackageVersions, RequirementResolution, SourcePolicy,
+/// };
+/// use deps_core::osv::vulnerability_keys;
+/// use deps_core::test_util::stub_parse_result_with_dependencies;
+/// use deps_core::{ConcreteVersion, EcosystemId, PackageName};
+/// use deps_engine::classify::osv::fix_target_registry;
+/// use std::collections::HashMap;
+///
+/// struct SimpleFormatter;
+/// impl PackageNaming for SimpleFormatter {}
+/// impl PackageRendering for SimpleFormatter {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+///         version.to_string()
+///     }
+///     fn package_url(&self, name: &PackageName) -> String {
+///         name.as_str().to_string()
+///     }
+/// }
+/// impl RequirementResolution for SimpleFormatter {}
+/// impl DiagnosticMessages for SimpleFormatter {}
+/// impl DiagnosticPolicy for SimpleFormatter {}
+/// impl SourcePolicy for SimpleFormatter {}
+/// impl OsvNaming for SimpleFormatter {}
+///
+/// let parsed = stub_parse_result_with_dependencies(1);
+/// let vuln_keys = vulnerability_keys(
+///     parsed.as_ref(),
+///     &HashMap::new(),
+///     None,
+///     &SimpleFormatter,
+///     EcosystemId::Cargo,
+/// );
+/// // Nothing cached: the snapshot is empty and no fix target is steered.
+/// let registry = fix_target_registry(
+///     parsed.as_ref(),
+///     &vuln_keys,
+///     &HashMap::<PackageName, PackageVersions>::new(),
+///     &SimpleFormatter,
+/// );
+/// assert!(registry.is_empty());
+/// ```
+#[must_use]
+pub fn fix_target_registry(
+    parse_result: &dyn deps_core::ParseResult,
+    vuln_keys: &deps_core::osv::VulnKeys,
+    cached_versions: &HashMap<PackageName, deps_core::lsp_helpers::PackageVersions>,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+) -> FixTargetRegistry {
+    let snapshot = parse_result
+        .dependencies()
+        .into_iter()
+        .filter_map(|dep| {
+            let versions =
+                deps_core::lsp_helpers::cached_package_versions(cached_versions, dep, formatter)?;
+            let key = deps_core::osv::vuln_key_for(dep, Some(vuln_keys), formatter);
+            Some((key, versions.clone()))
+        })
+        .collect();
+    FixTargetRegistry(snapshot)
+}
+
 /// Per-[`deps_core::osv::VulnKey`] sibling-tag sources for phase B's candidate checks (#1727).
 ///
 /// Built once per phase B from the parsed manifest and shared by the latest, candidate and
@@ -703,8 +813,9 @@ fn resolve_fix_target(
     osv_name_by_key: &HashMap<deps_core::osv::VulnKey, deps_core::osv::OsvQueryName>,
     candidate_tags: &CandidateTagSources,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+    registry: &FixTargetRegistry,
 ) -> FixTargetResolution {
-    use deps_core::edit::{VulnFixSkip, resolve_recommended_fix};
+    use deps_core::edit::{FixTargetContext, VulnFixSkip, resolve_recommended_fix};
     use deps_core::osv::{OsvQueryName, ScanTarget, UpgradeStatus};
 
     let latest = latest_status.get(key);
@@ -714,7 +825,11 @@ fn resolve_fix_target(
     // Deliberately the *unverified* helper, not `resolve_verified_fix`: this function is
     // itself the producer of `dv.fix_target_status`, so it must not gate on a status it
     // has not computed yet.
-    let (fix, version_native) = match resolve_recommended_fix(dv, latest, formatter) {
+    let (fix, version_native) = match resolve_recommended_fix(
+        dv,
+        FixTargetContext::new(latest).with_registry(registry.get(key)),
+        formatter,
+    ) {
         Ok(pair) => pair,
         Err(VulnFixSkip::NoRecommendedFix) => return FixTargetResolution::Skip,
         // `resolve_recommended_fix` already emits a WARN via `warn_rejected_value` for this
@@ -827,7 +942,9 @@ fn resolve_fix_target(
 /// };
 /// use deps_core::test_util::{stub_parse_result_with_dependencies, vuln_key};
 /// use deps_core::{ConcreteVersion, EcosystemId, PackageName};
-/// use deps_engine::classify::osv::{candidate_tag_sources, collect_fix_target_resolutions};
+/// use deps_engine::classify::osv::{
+///     FixTargetRegistry, candidate_tag_sources, collect_fix_target_resolutions,
+/// };
 /// use std::collections::HashMap;
 /// use std::sync::Arc;
 ///
@@ -890,6 +1007,7 @@ fn resolve_fix_target(
 ///     &latest_status_map,
 ///     &candidate_tags,
 ///     &SimpleFormatter,
+///     &FixTargetRegistry::default(),
 /// );
 ///
 /// assert_eq!(resolved, vec![(vuln_key("pkg"), latest_status)]);
@@ -902,6 +1020,7 @@ pub fn collect_fix_target_resolutions(
     latest_status: &deps_core::osv::LatestStatusMap,
     candidate_tags: &CandidateTagSources,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+    registry: &FixTargetRegistry,
 ) -> (
     Vec<(deps_core::osv::VulnKey, deps_core::osv::UpgradeStatus)>,
     Vec<deps_core::osv::ScanTarget>,
@@ -922,6 +1041,7 @@ pub fn collect_fix_target_resolutions(
             osv_name_by_key,
             candidate_tags,
             formatter,
+            registry,
         ) {
             FixTargetResolution::Skip => {}
             FixTargetResolution::Resolved(status) => resolved.push((key.clone(), status)),
@@ -3177,6 +3297,7 @@ mod tests {
                 &name_map("pkg"),
                 &sources,
                 &StubFormatter::DEFAULT,
+                &FixTargetRegistry::default(),
             );
 
             let FixTargetResolution::NeedsLiveCheck(target) = resolution else {
@@ -3198,6 +3319,7 @@ mod tests {
                 &name_map("pkg"),
                 &sources,
                 &StubFormatter::DEFAULT,
+                &FixTargetRegistry::default(),
             );
 
             assert_eq!(
@@ -3226,6 +3348,7 @@ mod tests {
                     &HashMap::new(),
                     &cold,
                     &StubFormatter::DEFAULT,
+                    &FixTargetRegistry::default()
                 ),
                 FixTargetResolution::Resolved(reused)
             );
@@ -3244,6 +3367,7 @@ mod tests {
                     &provisional,
                     &cold,
                     &StubFormatter::DEFAULT,
+                    &FixTargetRegistry::default()
                 ),
                 FixTargetResolution::Skip
             );
@@ -3260,6 +3384,7 @@ mod tests {
                 &HashMap::new(),
                 &no_tags(),
                 &StubFormatter::DEFAULT,
+                &FixTargetRegistry::default(),
             );
             assert_eq!(resolution, FixTargetResolution::Skip);
         }
@@ -3281,6 +3406,7 @@ mod tests {
                 &HashMap::new(),
                 &no_tags(),
                 &StubFormatter::DEFAULT,
+                &FixTargetRegistry::default(),
             );
             assert_eq!(resolution, FixTargetResolution::Resolved(latest_status));
         }
@@ -3310,6 +3436,7 @@ mod tests {
                 &osv_name_by_key,
                 &no_tags(),
                 &StubFormatter::DEFAULT,
+                &FixTargetRegistry::default(),
             );
             assert_eq!(
                 resolution,
@@ -3350,6 +3477,7 @@ mod tests {
                 &osv_name_by_key,
                 &no_tags(),
                 &StubFormatter::DEFAULT,
+                &FixTargetRegistry::default(),
             );
             assert_eq!(
                 resolution,
@@ -3389,6 +3517,7 @@ mod tests {
                     &osv_name_by_key,
                     &no_tags(),
                     &StubFormatter::DEFAULT,
+                    &FixTargetRegistry::default()
                 ),
                 FixTargetResolution::Skip
             );
@@ -3402,6 +3531,7 @@ mod tests {
                 &latest_status_map,
                 &no_tags(),
                 &StubFormatter::DEFAULT,
+                &FixTargetRegistry::default(),
             );
             assert!(resolved.is_empty(), "{resolved:?}");
             assert!(
@@ -3423,6 +3553,7 @@ mod tests {
                 &HashMap::new(),
                 &no_tags(),
                 &StubFormatter::DEFAULT,
+                &FixTargetRegistry::default(),
             );
             assert_eq!(resolution, FixTargetResolution::Skip);
         }
@@ -3441,8 +3572,66 @@ mod tests {
                 &HashMap::new(),
                 &no_tags(),
                 &StubFormatter::DEFAULT,
+                &FixTargetRegistry::default(),
             );
             assert_eq!(resolution, FixTargetResolution::Skip);
+        }
+
+        fn deprecated_registry(key: &str) -> FixTargetRegistry {
+            use deps_core::RemovalStatus;
+            use deps_core::lsp_helpers::PackageVersions;
+
+            let available: Arc<[ConcreteVersion]> = Arc::from(vec![
+                ConcreteVersion::new("4.18.1"),
+                ConcreteVersion::new("4.18.0"),
+            ]);
+            let flagged: Arc<[(ConcreteVersion, RemovalStatus)]> = Arc::from(vec![(
+                ConcreteVersion::new("4.18.0"),
+                RemovalStatus::AdvisoryDeprecated,
+            )]);
+            FixTargetRegistry(HashMap::from([(
+                deps_core::test_util::vuln_key(key),
+                PackageVersions::new(ConcreteVersion::new("4.18.1"), available)
+                    .with_yanked(flagged),
+            )]))
+        }
+
+        /// #1832: phase B verifies the steered target, not the deprecated fix version, so the
+        /// recommended-fix code action and the CLI planner agree on one target.
+        #[test]
+        fn resolve_fix_target_verifies_the_steered_target_for_a_deprecated_fix() {
+            let dv = dv(vec![advisory("A1", &["4.18.0"])]);
+            let FixTargetResolution::NeedsLiveCheck(target) = resolve_fix_target(
+                &dv,
+                &deps_core::test_util::vuln_key("pkg"),
+                &HashMap::new(),
+                &name_map("pkg"),
+                &no_tags(),
+                &StubFormatter::DEFAULT,
+                &deprecated_registry("pkg"),
+            ) else {
+                panic!("an unreused fix target needs a live check");
+            };
+            assert_eq!(target.display_version.as_str(), "4.18.1");
+            assert_eq!(target.version.as_str(), "4.18.1");
+        }
+
+        /// #1832: a registry snapshot taken for a different key never steers this dependency.
+        #[test]
+        fn resolve_fix_target_ignores_a_registry_snapshot_for_another_key() {
+            let dv = dv(vec![advisory("A1", &["4.18.0"])]);
+            let FixTargetResolution::NeedsLiveCheck(target) = resolve_fix_target(
+                &dv,
+                &deps_core::test_util::vuln_key("pkg"),
+                &HashMap::new(),
+                &name_map("pkg"),
+                &no_tags(),
+                &StubFormatter::DEFAULT,
+                &deprecated_registry("other"),
+            ) else {
+                panic!("an unreused fix target needs a live check");
+            };
+            assert_eq!(target.display_version.as_str(), "4.18.0");
         }
 
         #[test]
@@ -3518,6 +3707,7 @@ mod tests {
                 &latest_status,
                 &no_tags(),
                 &StubFormatter::DEFAULT,
+                &FixTargetRegistry::default(),
             );
 
             assert_eq!(resolved.len(), 1, "{resolved:?}");

@@ -1318,12 +1318,6 @@ mod tests {
         // an 8MB trailing comment with zero ref-pinned deps). Calls the private
         // `build_dependency` directly against one huge, newline-free "line" — the shape
         // the old unbounded `find('\n')` scanned to end-of-document on, once per call.
-        let sha = "a".repeat(40);
-        let filler = "x".repeat(8 * 1024 * 1024);
-        let content = format!("uses: actions/checkout@{sha}{filler}");
-        let line_table = LineOffsetTable::new(&content);
-        let value = format!("actions/checkout@{sha}");
-
         // `Marker` has no public constructor, so a real one is captured once via a cheap
         // parse outside the loop; `Marker` is `Copy`, so it's reused for every iteration.
         let marker = {
@@ -1342,21 +1336,25 @@ mod tests {
             receiver.0.expect("marker for the uses: value scalar")
         };
 
-        // Iteration count halved from 2000 (finding #4) since `REST_OF_LINE_WINDOW_BYTES`
-        // quadrupled, keeping wall-clock budget comparable while still swamping the old
-        // code's per-call cost, which scanned the full 8MB tail regardless of iterations.
-        let start = std::time::Instant::now();
-        for _ in 0..1000 {
-            let candidate = UsesCandidate::new(value.clone(), TScalarStyle::Plain, &marker);
-            let dep = build_dependency(&content, &line_table, candidate);
-            assert!(dep.is_some());
-        }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_secs(1),
-            "1000 build_dependency calls against an 8MB-tail line took {elapsed:?}; \
-             expected the O(1) line-end lookup to make this independent of the trailing \
-             content size instead of re-scanning ~8MB per call"
+        // The fixed call count swamps the old code's per-call cost, which scanned the whole
+        // tail regardless of it; the bounded lookup keeps the run time flat as the tail grows.
+        deps_core::test_util::scaling::assert_scaling(
+            "build_dependency against a huge single-line tail",
+            deps_core::test_util::scaling::ExpectedGrowth::Bounded,
+            8 * 1024 * 1024,
+            |tail_len| {
+                let sha = "a".repeat(40);
+                let content = format!("uses: actions/checkout@{sha}{}", "x".repeat(tail_len));
+                let line_table = LineOffsetTable::new(&content);
+                (content, line_table, format!("actions/checkout@{sha}"))
+            },
+            |(content, line_table, value)| {
+                for _ in 0..1000 {
+                    let candidate = UsesCandidate::new(value.clone(), TScalarStyle::Plain, &marker);
+                    let dep = build_dependency(content, line_table, candidate);
+                    assert!(dep.is_some());
+                }
+            },
         );
     }
 

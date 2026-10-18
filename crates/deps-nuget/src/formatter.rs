@@ -758,7 +758,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_with_real_formatter_and_parsed_dependency() {
         use deps_core::ParseResult;
-        use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
+        use deps_core::edit::{FixTargetContext, VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
@@ -792,7 +792,7 @@ mod tests {
             deps_core::position::Range::default(),
             "$(AutoMapperVersion)",
             &dv,
-            None,
+            FixTargetContext::default(),
             &NuGetFormatter,
         );
 
@@ -917,7 +917,7 @@ mod tests {
     /// unit level above.
     #[test]
     fn test_plan_vulnerability_fix_bare_floor_still_plans_the_edit() {
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
@@ -954,7 +954,7 @@ mod tests {
             version_range,
             dep.version_requirement().unwrap().as_str(),
             &dv,
-            None,
+            FixTargetContext::default(),
             &NuGetFormatter,
         )
         .expect(
@@ -973,7 +973,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_generic_placeholder_through_real_parser_is_not_rewritten() {
         use deps_core::ParseResult;
-        use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
+        use deps_core::edit::{FixTargetContext, VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
@@ -1008,7 +1008,7 @@ mod tests {
             deps_core::position::Range::default(),
             current,
             &dv,
-            None,
+            FixTargetContext::default(),
             &NuGetFormatter,
         );
 

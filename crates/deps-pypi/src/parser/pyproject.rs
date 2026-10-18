@@ -2099,22 +2099,21 @@ requests = "^2.28.0"
         // would take on the order of seconds to parse (extrapolating the
         // measured quadratic growth); with the cap it is rejected in O(1)
         // and the rest of the manifest still parses normally.
-        let huge_extras = "a,".repeat(500_000); // ~1 MiB extras list
-        let requirement = format!("pkg[{huge_extras}]==1.0");
-        assert!(requirement.len() > super::super::MAX_REQUIREMENT_LEN);
-        let toml = format!(
-            "[project]\ndependencies = [\n    \"{requirement}\",\n    \"good-pkg==2.0\",\n]\n"
-        );
         let parser = PypiParser::new();
-
-        let start = std::time::Instant::now();
-        let result = parser.parse_content(&toml, &test_uri()).unwrap();
-        let elapsed = start.elapsed();
-
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "oversized extras dependency took too long to reject: {elapsed:?}"
+        let result = deps_core::test_util::scaling::assert_scaling(
+            "oversized extras dependency rejection",
+            deps_core::test_util::scaling::ExpectedGrowth::Linear,
+            500_000, // ~1 MiB extras list
+            |pairs| {
+                let requirement = format!("pkg[{}]==1.0", "a,".repeat(pairs));
+                assert!(requirement.len() > super::super::MAX_REQUIREMENT_LEN);
+                format!(
+                    "[project]\ndependencies = [\n    \"{requirement}\",\n    \"good-pkg==2.0\",\n]\n"
+                )
+            },
+            |toml| parser.parse_content(toml, &test_uri()).unwrap(),
         );
+
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].name, "good-pkg");
     }
