@@ -52,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: `DiagnosticsSnapshot` is `Clone` instead of `Copy` and carries the typosquat, gossip and license-policy gates (#1815, #1823)
 
 ### Security
+- **deps**: bump `rustls` to 0.23.46, fixing RUSTSEC-2026-0346, -0347, -0348, -0349 (#1837)
 - **deps-core, all registry ecosystems**: the connect-time SSRF guard now holds when a system or HTTP(S) proxy is configured; a proxy named `localhost` or a private name works, and blocked egress fails after a 10 s connect timeout (#1816, #1823)
 - **deps-core, deps-lsp, deps-cli**: a system proxy is reported once at startup (log plus `window/showMessage` in `deps-lsp`, one stderr line in `deps-cli`) with the opt-in variable (#1816, #1823)
 - **deps-core**: a response cached under a credential is never served to an anonymous request, and a removed credential never reads the credentialed entry (#1814, #1823)
