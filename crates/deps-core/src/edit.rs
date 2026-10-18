@@ -225,6 +225,12 @@ pub struct PlannedUpdate {
     /// version — and [`plan_verified_fix`], which never attempts to resolve this field at all
     /// and always leaves it `None` regardless of whether the in-use version is knowable.
     pub current: Option<ConcreteVersion>,
+    /// The declared requirement text, for display only, when `current` is `None` but the text
+    /// is itself a full concrete version (e.g. an `actions/checkout@4.2.2` tag pin the
+    /// registry never published — issue #1833). Never fed to OSV, yank or ignore-rule
+    /// classification: an unpublished pin stays "unresolved" everywhere except the report's
+    /// `current` column. Always `None` when `current` is `Some`.
+    pub declared: Option<VersionReq>,
     /// The version this edit would move the dependency to.
     pub target: ConcreteVersion,
     /// The edit itself.
@@ -903,11 +909,21 @@ pub fn collect_update_candidates(
             )
         });
 
+        let declared = versions
+            .ecosystem
+            .filter(|&ecosystem| {
+                current.is_none()
+                    && crate::lsp_helpers::concrete_pin_version(version_req.as_str(), ecosystem)
+                        .is_some()
+            })
+            .map(|_| version_req.clone());
+
         candidates.push(UpdateCandidate::Planned(PlannedUpdate {
             name,
             normalized_name,
             name_range,
             current,
+            declared,
             target: latest.clone(),
             edit: ManifestEdit {
                 range: version_range,
@@ -1385,6 +1401,7 @@ pub fn plan_verified_fix(
         // above, not a resolved pinned version — `PlannedUpdate::current` documents only the
         // latter, so this caller has none to report.
         current: None,
+        declared: None,
         target: ConcreteVersion::new(version_native),
         edit: ManifestEdit {
             range: version_range,
@@ -1961,6 +1978,77 @@ mod tests {
                 ),
                 UpdateKind::Minor
             );
+            assert_eq!(planned.declared, None);
+        }
+
+        /// Issue #1833: a pin the registry never published (`PinResolution::Unpublished`)
+        /// keeps `current: None` (it must not reach OSV/yank as a fabricated version) but
+        /// carries the declared text for display, case preserved (`V4.2.2`); a SHA-shaped
+        /// requirement carries nothing.
+        #[test]
+        fn test_collect_update_candidates_unpublished_pin_carries_declared_for_display() {
+            struct UnpublishedFormatter;
+            impl crate::lsp_helpers::PackageNaming for UnpublishedFormatter {}
+            impl crate::lsp_helpers::PackageRendering for UnpublishedFormatter {
+                fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                    version.to_string()
+                }
+                fn package_url(&self, name: &PackageName) -> String {
+                    name.as_str().to_string()
+                }
+            }
+            impl crate::lsp_helpers::RequirementResolution for UnpublishedFormatter {
+                fn is_bounded_requirement_up_to_date(
+                    &self,
+                    _requirement: crate::lsp_helpers::BoundedVersionReq<'_>,
+                    _latest: &ConcreteVersion,
+                ) -> bool {
+                    false
+                }
+                fn resolved_pin_version(
+                    &self,
+                    _dep: &dyn Dependency,
+                ) -> crate::lsp_helpers::PinResolution {
+                    crate::lsp_helpers::PinResolution::Unpublished
+                }
+            }
+            impl crate::lsp_helpers::DiagnosticMessages for UnpublishedFormatter {}
+            impl crate::lsp_helpers::DiagnosticPolicy for UnpublishedFormatter {}
+            impl crate::lsp_helpers::SourcePolicy for UnpublishedFormatter {}
+            impl crate::lsp_helpers::OsvNaming for UnpublishedFormatter {}
+
+            let cases = [
+                ("4.2.2", Some(VersionReq::new("4.2.2"))),
+                ("V4.2.2", Some(VersionReq::new("V4.2.2"))),
+                ("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", None),
+            ];
+            for (requirement, expected_declared) in cases {
+                let content = format!("actions/checkout = \"{requirement}\"\n");
+                let start = u32::try_from(content.find(requirement).unwrap()).unwrap();
+                let end = start + u32::try_from(requirement.len()).unwrap();
+                let pr = parse_result(vec![dep(
+                    "actions/checkout",
+                    requirement,
+                    range(0, start, 0, end),
+                )]);
+                let mut cached = HashMap::new();
+                cached.insert(
+                    "actions/checkout".into(),
+                    PackageVersions::latest_only("v7.0.1"),
+                );
+                let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+                let versions =
+                    VersionData::new(&cached, &resolved).with_ecosystem(EcosystemId::GithubActions);
+
+                let candidates =
+                    collect_update_candidates(&pr, &content, versions, &UnpublishedFormatter);
+
+                let [UpdateCandidate::Planned(planned)] = candidates.as_slice() else {
+                    panic!("expected one planned update for {requirement}, got {candidates:?}");
+                };
+                assert_eq!(planned.current, None, "{requirement}");
+                assert_eq!(planned.declared, expected_declared, "{requirement}");
+            }
         }
     }
 

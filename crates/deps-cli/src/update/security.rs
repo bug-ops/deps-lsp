@@ -254,8 +254,10 @@ fn classify_vulnerable_dependency(
     // mode's. Default mode's `collect_update_candidates` (`deps-core::edit`) falls straight
     // from an unresolved `resolve_in_use_version` to `CurrentVersion::Unknown` (rendered as
     // `""`), the honest "we don't know" value `CurrentVersion::update_kind_to` maps to
-    // `UpdateKind::Unknown`. This function instead falls back to the declared requirement text
-    // (`CurrentVersion::Declared`) before `Unknown`, deliberately: an empty `current` in a
+    // `UpdateKind::Unknown`, except for a concrete pin the registry never published, which
+    // `CurrentVersion::from_planned` renders as `Declared` (#1833). This function instead falls
+    // back to the declared requirement text of *any* shape (`CurrentVersion::Declared`) before
+    // `Unknown`, deliberately: an empty `current` in a
     // vulnerability report ("serde  -> 1.0.2") reads as a rendering bug, and a
     // `--security-only` report's whole purpose is communicating exposure, so showing the
     // declared range ("serde 1 -> 1.0.2") when the exact in-use version can't be resolved is

@@ -10,8 +10,8 @@ use deps_core::ConcreteVersion;
 use deps_core::PackageName;
 use deps_core::VersionReq;
 use deps_core::edit::{
-    EditSpan, ManifestEdit, ManifestReparse, UnplannableReason, UpdateCandidate, UpdateKind,
-    apply_edits, classify_update, collect_update_candidates, dedup_overlapping_edits,
+    EditSpan, ManifestEdit, ManifestReparse, PlannedUpdate, UnplannableReason, UpdateCandidate,
+    UpdateKind, apply_edits, classify_update, collect_update_candidates, dedup_overlapping_edits,
 };
 use deps_core::lsp_helpers::{
     CooldownDisposition, EcosystemFormatter, FallbackEditVerdict, LatestVerdict, PackageVersions,
@@ -50,34 +50,32 @@ pub enum CurrentVersion {
     /// A lockfile/registry-resolved in-use version.
     Resolved(ConcreteVersion),
     /// No in-use version could be resolved; falls back to the dependency's declared
-    /// requirement text (`--security-only` mode only — see `security`'s `security_current`).
+    /// requirement text — `--security-only` mode (see `security`'s `security_current`), and
+    /// default mode for a concrete pin the registry never published
+    /// ([`PlannedUpdate::declared`]).
     Declared(VersionReq),
     /// Neither a resolved in-use version nor a declared requirement was available.
     Unknown,
 }
 
-impl From<Option<ConcreteVersion>> for CurrentVersion {
-    /// `Some` maps to [`Self::Resolved`], `None` to [`Self::Unknown`] — the default planner's
-    /// only two possible states (it never produces [`Self::Declared`]; only `--security-only`
-    /// does, via `security_current`).
-    fn from(value: Option<ConcreteVersion>) -> Self {
-        match value {
-            Some(version) => Self::Resolved(version),
-            None => Self::Unknown,
+impl CurrentVersion {
+    /// The `current` of a planned update: [`Self::Resolved`] for a resolved in-use version,
+    /// else [`Self::Declared`] for a concrete pin the registry never published (issue #1833 —
+    /// `actions/checkout@4.2.2` must render as written, not as an empty column), else
+    /// [`Self::Unknown`].
+    pub(crate) fn from_planned(planned: &PlannedUpdate) -> Self {
+        match (&planned.current, &planned.declared) {
+            (Some(version), _) => Self::Resolved(version.clone()),
+            (None, Some(req)) => Self::Declared(req.clone()),
+            (None, None) => Self::Unknown,
         }
     }
-}
 
-impl CurrentVersion {
     /// Classifies the update from this current version to `target`.
     ///
-    /// [`Self::Declared`] and [`Self::Unknown`] both classify as [`UpdateKind::Unknown`] —
-    /// behavior-identical to pre-#1593, though for two different reasons per variant: the
-    /// default planner (the only caller that ever classifies `current`) never produced
-    /// [`Self::Declared`] to begin with, and `--security-only` (the only caller that could)
-    /// never called [`classify_update`] on `current` at all before this refactor. Neither
-    /// caller's classification behavior changes; this method exists so a *future* caller
-    /// cannot classify a [`Self::Declared`] requirement range as if it were a resolved version.
+    /// [`Self::Declared`] and [`Self::Unknown`] both classify as [`UpdateKind::Unknown`], so a
+    /// declared requirement (a range, or an unpublished pin) is never classified as if it were
+    /// a resolved version — ignore rules see the same `Unknown` as before #1833.
     ///
     /// # Examples
     ///
@@ -977,10 +975,7 @@ fn candidate_identity(candidate: &UpdateCandidate) -> (String, deps_core::positi
 /// (matches this planner's pre-#1543 convention for an item with no concrete write target).
 fn latest_current_target(candidate: &UpdateCandidate) -> (CurrentVersion, Option<ConcreteVersion>) {
     match candidate {
-        UpdateCandidate::Planned(p) => (
-            CurrentVersion::from(p.current.clone()),
-            Some(p.target.clone()),
-        ),
+        UpdateCandidate::Planned(p) => (CurrentVersion::from_planned(p), Some(p.target.clone())),
         UpdateCandidate::Unplannable { .. } => (CurrentVersion::Unknown, None),
     }
 }
@@ -998,7 +993,7 @@ fn resolve_from_latest(
     match latest_candidate {
         UpdateCandidate::Planned(p) => {
             let target = p.target.clone();
-            let current = CurrentVersion::from(p.current);
+            let current = CurrentVersion::from_planned(&p);
             let kind = current.update_kind_to(&p.target);
             if let Some(reason) = ignore_rules.skip_reason(&p.normalized_name, kind) {
                 (
@@ -1287,7 +1282,7 @@ fn resolve_occurrence(
                         // the SELECTED (fallback) target unconditionally, regardless of
                         // whether latest is OSV-blocked — previously row 7 wrote the fallback
                         // edit without ever consulting `[update].ignore`.
-                        let current = CurrentVersion::from(fb.current);
+                        let current = CurrentVersion::from_planned(&fb);
                         let kind = current.update_kind_to(&fb.target);
                         if let Some(reason) = ignore_rules.skip_reason(&fb.normalized_name, kind) {
                             build(
@@ -1572,6 +1567,38 @@ mod tests {
             declared.update_kind_to(&ConcreteVersion::from("2.0.0")),
             UpdateKind::Unknown
         );
+    }
+
+    /// Issue #1833: an unpublished tag pin (`current: None`, `declared: Some`) renders as
+    /// written instead of an empty column; resolved wins over declared; neither stays empty.
+    #[test]
+    fn test_current_version_from_planned_prefers_resolved_then_declared() {
+        let planned = |current: Option<&str>, declared: Option<&str>| PlannedUpdate {
+            name: "actions/checkout".to_string(),
+            normalized_name: "actions/checkout".to_string(),
+            name_range: Range::default(),
+            current: current.map(ConcreteVersion::from),
+            declared: declared.map(deps_core::VersionReq::new),
+            target: ConcreteVersion::from("v7.0.1"),
+            edit: ManifestEdit {
+                range: Range::default(),
+                new_text: "v7.0.1".to_string(),
+            },
+        };
+
+        let resolved = CurrentVersion::from_planned(&planned(Some("v4.2.2"), None));
+        assert_eq!(resolved.render_text(), "v4.2.2");
+
+        let declared = CurrentVersion::from_planned(&planned(None, Some("V4.2.2")));
+        assert_eq!(declared.render_text(), "V4.2.2");
+        assert_eq!(
+            declared.update_kind_to(&ConcreteVersion::from("v7.0.1")),
+            UpdateKind::Unknown
+        );
+
+        let unknown = CurrentVersion::from_planned(&planned(None, None));
+        assert_eq!(unknown, CurrentVersion::Unknown);
+        assert_eq!(unknown.render_text(), "");
     }
 
     struct TestDep {

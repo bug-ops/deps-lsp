@@ -14,6 +14,9 @@ a dependency, the section is omitted rather than shown as "unknown".
 Dart, Swift, Gradle, and Deno (issue #660) are covered via a per-ecosystem
 background pre-fetch (mirroring the OSV vulnerability-scan pattern — never
 blocking hover latency) instead of the deps.dev/Packagist hot-path call above.
+The pre-fetch only runs while `license_policy` is non-empty: with an empty policy no
+license data (hover line or diagnostic) is fetched for these ecosystems, and setting a
+non-empty policy at runtime starts it for already-open documents.
 This pre-fetch has its own **10-second timeout floor**, independent of a lower
 configured [`fetch_timeout_secs`](../configuration.md#configuration-reference)
 (which can be set as low as 1s): Gradle's `<parent>` POM traversal (below) may need up

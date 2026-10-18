@@ -7,7 +7,8 @@ use crate::document::{
     change_task_triggers, handle_document_change, handle_document_open, refresh_with_timeout,
     reload_resolved_versions, rescan_after_resolved_version_change, run_license_prefetch,
     spawn_supervised, trigger_gossip_prefetch_for_open_documents,
-    trigger_osv_rescan_for_open_documents, trigger_typosquat_prefetch_for_open_documents,
+    trigger_license_prefetch_for_open_documents, trigger_osv_rescan_for_open_documents,
+    trigger_typosquat_prefetch_for_open_documents,
 };
 use crate::file_watcher;
 use crate::handlers::{
@@ -1079,6 +1080,10 @@ impl LanguageServer for Backend {
         let osv_checks = effects.osv_checks;
         let was_osv_checks = self.state.osv_checks();
         let osv_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
+        // Issue #1831: tier-3 license pre-fetch is skipped under an empty policy (#1407), so
+        // an already-open document needs a catch-up on the empty->non-empty transition.
+        let previous_license_policy = self.state.license_policy();
+        let license_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
 
         // Diff old vs new for parse-affecting changes (#592) under one write-guard
         // acquisition: `DepsConfig` has no `Clone`, so the diff must read the
@@ -1130,6 +1135,17 @@ impl LanguageServer for Backend {
                 &self.client,
                 Arc::clone(&self.config),
                 osv_trigger_fetch_timeout_secs,
+            )
+            .await;
+        }
+
+        // Issue #1831: same rationale, for the license policy's empty->non-empty transition.
+        if previous_license_policy.is_empty() && !self.state.license_policy().is_empty() {
+            trigger_license_prefetch_for_open_documents(
+                &self.state,
+                &self.client,
+                Arc::clone(&self.config),
+                license_trigger_fetch_timeout_secs,
             )
             .await;
         }
