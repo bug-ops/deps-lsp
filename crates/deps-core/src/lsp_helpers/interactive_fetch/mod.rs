@@ -1,6 +1,6 @@
 //! Fail-fast gate for the interactive (hover, code action) registry await.
 //!
-//! [`REGISTRY_FETCH_BUDGET`] bounds one interactive `get_versions_from` await, but a bound
+//! [`REGISTRY_FETCH_BUDGET`](super::REGISTRY_FETCH_BUDGET) bounds one interactive `get_versions_from` await, but a bound
 //! alone has no memory: against a registry that never answers, every request re-pays the
 //! whole budget and four of them occupy every `buffer_unordered(4)` LSP dispatch slot
 //! (#1830). [`InteractiveFetchGate`] adds the memory and the concurrency cap:
@@ -37,9 +37,11 @@ use tokio::sync::{Semaphore, watch};
 use self::attempt::{Attempted, bounded_await_until};
 use self::breaker::EndpointBreaker;
 use self::flight::{FlightKey, FlightResult, ListShape};
-use self::key::{EndpointKey, InteractiveFetchKey, ManifestFingerprint, SourceFingerprint};
+use self::key::{
+    EndpointKey, InteractiveFetchKey, LookupKind, ManifestFingerprint, SourceFingerprint,
+};
 use self::memo::{Decision, InteractiveRecord};
-use super::{REGISTRY_FETCH_BUDGET, VersionData};
+use super::VersionData;
 use crate::freshness::FreshnessSettings;
 use crate::single_flight::Slot;
 use crate::{DependencySource, FetchFailure, NetworkMode, PackageName, Registry, Version};
@@ -112,6 +114,31 @@ impl<T> InteractiveFetch<T> {
     }
 }
 
+/// An interactive lookup other than a package's version list, which
+/// [`await_interactive_fetch`] gates with its own failure memo and budget.
+///
+/// Each kind is memoized separately, so a stalled decoration never degrades the version list
+/// of the same package, and the other way round.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::AuxiliaryLookup;
+///
+/// assert_ne!(AuxiliaryLookup::Decoration, AuxiliaryLookup::PinResolution);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AuxiliaryLookup {
+    /// Optional enrichment of an already-rendered answer, such as NuGet's unlisted markers.
+    /// It may be served by another host than the version list, so it never opens or closes
+    /// the endpoint breaker (it is still refused while the breaker is open for a hover).
+    Decoration,
+    /// Resolution of a floating pin to a concrete release, such as a GitLab CI component's
+    /// `~latest`. It is served by the dependency's own endpoint, so its pace counts for the
+    /// endpoint breaker like a version list's.
+    PinResolution,
+}
+
 /// Which interactive surface is awaiting, for log fields only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchContext {
@@ -172,7 +199,7 @@ impl<'a> InteractiveFetchRequest<'a> {
     /// The gate and key this request is memoized under, or `None` when the request must take
     /// the plain bounded await: no gate attached, no ecosystem to qualify the key with, or
     /// offline mode (FR-013).
-    fn gated(&self) -> Option<(&'a InteractiveFetchGate, InteractiveFetchKey)> {
+    fn gated(&self, kind: LookupKind) -> Option<(&'a InteractiveFetchGate, InteractiveFetchKey)> {
         let gate = self.versions.interactive_fetch?;
         let ecosystem = self.versions.ecosystem?;
         match self.versions.network {
@@ -186,6 +213,7 @@ impl<'a> InteractiveFetchRequest<'a> {
                         source: SourceFingerprint::of(self.source),
                     },
                     package: PackageName::new(self.normalized_name),
+                    kind,
                 },
             )),
         }
@@ -304,7 +332,7 @@ impl InteractiveFetchGate {
             log_skipped(request, "interactive fetch concurrency cap reached");
             return InteractiveFetch::Degraded(NoLiveList::Unverified);
         };
-        let deadline = tokio::time::Instant::now() + REGISTRY_FETCH_BUDGET;
+        let deadline = tokio::time::Instant::now() + key.kind.budget();
         match self
             .attempt(
                 fetch,
@@ -322,7 +350,7 @@ impl InteractiveFetchGate {
     }
 }
 
-/// Awaits `fetch` for hover or a code action, bounded by [`REGISTRY_FETCH_BUDGET`] and
+/// Awaits `fetch` for hover or a code action, bounded by [`REGISTRY_FETCH_BUDGET`](super::REGISTRY_FETCH_BUDGET) and
 /// short-circuited by the request's [`InteractiveFetchGate`] when it carries one.
 ///
 /// Without a gate, an ecosystem, or while offline this is the plain bounded await (FR-013).
@@ -339,7 +367,8 @@ impl InteractiveFetchGate {
 ///
 /// ```
 /// use deps_core::lsp_helpers::{
-///     FetchContext, InteractiveFetch, InteractiveFetchRequest, await_interactive_fetch,
+///     AuxiliaryLookup, FetchContext, InteractiveFetch, InteractiveFetchRequest,
+///     await_interactive_fetch,
 /// };
 /// use deps_core::{DependencySource, PackageName, VersionData};
 /// use std::collections::HashMap;
@@ -363,15 +392,21 @@ impl InteractiveFetchGate {
 ///     .build()
 ///     .unwrap();
 /// let result =
-///     runtime.block_on(await_interactive_fetch(async { Ok::<_, ()>(42_u8) }, request));
+///     runtime.block_on(await_interactive_fetch(
+///     async { Ok::<_, ()>(42_u8) },
+///     request,
+///     AuxiliaryLookup::PinResolution,
+/// ));
 /// assert!(matches!(result, InteractiveFetch::Live(42)));
 /// ```
 pub async fn await_interactive_fetch<T, E>(
     fetch: impl Future<Output = Result<T, E>>,
     request: InteractiveFetchRequest<'_>,
+    kind: AuxiliaryLookup,
 ) -> InteractiveFetch<T> {
-    let Some((gate, key)) = request.gated() else {
-        return plain_bounded_await(fetch, &request).await;
+    let kind = LookupKind::Auxiliary(kind);
+    let Some((gate, key)) = request.gated(kind) else {
+        return plain_bounded_await(fetch, &request, kind).await;
     };
     // Read before the outcomes so an invalidation racing this request discards its writes.
     let generation = gate.generation();
@@ -449,8 +484,8 @@ pub async fn await_interactive_versions<R: Registry + ?Sized>(
             .await
             .map(SharedVersions::from)
     };
-    let Some((gate, key)) = request.gated() else {
-        return plain_bounded_await(fetch, &request).await;
+    let Some((gate, key)) = request.gated(LookupKind::VersionList) else {
+        return plain_bounded_await(fetch, &request, LookupKind::VersionList).await;
     };
     flight::await_shared(gate, key, fetch, &request, ListShape::of(freshness)).await
 }
@@ -458,11 +493,13 @@ pub async fn await_interactive_versions<R: Registry + ?Sized>(
 async fn plain_bounded_await<T, E>(
     fetch: impl Future<Output = Result<T, E>>,
     request: &InteractiveFetchRequest<'_>,
+    kind: LookupKind,
 ) -> InteractiveFetch<T> {
     let (result, _) = bounded_await_until(
         fetch,
-        tokio::time::Instant::now() + REGISTRY_FETCH_BUDGET,
+        tokio::time::Instant::now() + kind.budget(),
         request,
+        kind,
     )
     .await;
     result

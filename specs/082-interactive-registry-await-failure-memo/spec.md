@@ -321,9 +321,19 @@ Conceptual only; representation is a plan-phase decision.
 > - A cancel-driven open on a healthy-but-slow endpoint needs two distinct packages cancelled
 >   after half the budget with no answer in 30 s; the user then sees basic cards, as they
 >   effectively did already.
-> - Scope: the default `generate_hover`/`generate_code_actions` path (FR-012). NuGet's and
->   GitLab CI's ecosystem-specific hover/code-action overrides keep their own ungated 5 s
->   awaits; follow-up #1845.
+> - Scope (#1845): the default `generate_hover`/`generate_code_actions` path (FR-012) and the two
+>   ecosystem-specific awaits that used to keep their own ungated 5 s bounds. NuGet's unlisted
+>   decoration is an `AuxiliaryLookup::Decoration` and GitLab CI's component-pin resolution
+>   (hover and code action) an `AuxiliaryLookup::PinResolution`; each has its own 5 s budget and
+>   failure memo, keyed apart from the package's version list. A decoration is still refused
+>   while the breaker is open for a hover, but it neither opens nor closes the breaker and never
+>   takes the half-open probe, because it may be served by a different host than the base fetch;
+>   a pin resolution counts like a version list.
+> - A NuGet hover now holds two dispatch permits (the base list and the decoration). On a
+>   healthy feed the burst of concurrent hovers that get full information drops from three to
+>   two (with `LSP_DISPATCH_CONCURRENCY - 1 = 3` permits): the first is decorated, the second
+>   gets its list without the decoration, the third the basic card. This errs on the safe side
+>   and is not memoized.
 
 ## 10. See Also
 

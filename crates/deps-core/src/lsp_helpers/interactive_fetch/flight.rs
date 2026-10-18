@@ -13,14 +13,13 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::attempt::Attempted;
-use super::key::InteractiveFetchKey;
+use super::key::{InteractiveFetchKey, LookupKind};
 use super::memo::Decision;
 use super::{
     InteractiveFetch, InteractiveFetchGate, InteractiveFetchRequest, NoLiveList, SharedVersions,
     log_skipped, now,
 };
 use crate::freshness::FreshnessSettings;
-use crate::lsp_helpers::REGISTRY_FETCH_BUDGET;
 use crate::single_flight::{InFlightGuard, Slot, claim_or_follow};
 
 /// Whether a version list carries publish-time enrichment.
@@ -181,7 +180,7 @@ pub(super) async fn await_shared<E>(
         return InteractiveFetch::Degraded(NoLiveList::Unverified);
     };
 
-    let deadline = Instant::now() + REGISTRY_FETCH_BUDGET;
+    let deadline = Instant::now() + LookupKind::VersionList.budget();
     let flight = FlightKey::new(key.clone(), shape, generation);
     let mut fetch = pin!(fetch);
     loop {

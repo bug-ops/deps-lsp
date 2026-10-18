@@ -10,7 +10,10 @@ use deps_core::hover::Hover;
 #[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::sha_comment_mismatch_hover_line;
 #[cfg(feature = "lsp-responses")]
-use deps_core::lsp_helpers::{PackageNaming, PackageRendering};
+use deps_core::lsp_helpers::{
+    AuxiliaryLookup, FetchContext, InteractiveFetch, InteractiveFetchRequest, PackageNaming,
+    PackageRendering, await_interactive_fetch,
+};
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
     Dependency, Ecosystem, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
@@ -39,9 +42,9 @@ use crate::types::{GitlabCiDependency, HostRef, IncludeKind, PinStyle};
 mod lsp;
 #[cfg(feature = "lsp-responses")]
 use lsp::{
-    COMPONENT_PIN_RESOLUTION_TIMEOUT, VERSION_OPERATOR_CHARS, build_dynamic_component_pin_action,
-    build_sha_comment_fix_action, build_sha_pin_action, build_unknown_ref_fix_action,
-    collect_pin_all_to_sha_edits, splice_project_line,
+    VERSION_OPERATOR_CHARS, build_dynamic_component_pin_action, build_sha_comment_fix_action,
+    build_sha_pin_action, build_unknown_ref_fix_action, collect_pin_all_to_sha_edits,
+    splice_project_line,
 };
 
 /// Maximum character count of an interpolated raw host expression before truncation —
@@ -434,6 +437,7 @@ impl Ecosystem for GitlabCiEcosystem {
                 uri,
                 &self.formatter,
                 self.registry.as_ref(),
+                versions,
             )
             .await
             {
@@ -511,40 +515,41 @@ impl Ecosystem for GitlabCiEcosystem {
             // no extra fetch needed) or `Tag`/`Branch` (whose text either is or isn't the
             // version). Resolving it needs the priority ladder run against the project's
             // published releases.
+            let dep_source = dep.source();
             if gl_dep.kind == IncludeKind::Component
                 && let Some(pin @ (PinStyle::Latest | PinStyle::Partial)) = &gl_dep.pin
                 && let deps_core::parser::DependencySource::AlternateRegistry { index, .. } =
-                    dep.source()
-                && let Some(route) = registry.routes().get(&index).map(|r| r.clone())
+                    &dep_source
+                && let Some(route) = registry.routes().get(index).map(|r| r.clone())
                 && let Some(raw) = gl_dep
                     .version_req
                     .as_ref()
                     .map(deps_core::VersionReq::as_str)
             {
-                let outcome = tokio::time::timeout(
-                    COMPONENT_PIN_RESOLUTION_TIMEOUT,
+                let normalized_name = self.formatter.normalize_package_name(dep.name());
+                let outcome = await_interactive_fetch(
                     registry.resolve_component_pin(dep.name(), &route, pin, raw),
+                    InteractiveFetchRequest::new(
+                        versions,
+                        parse_result.uri(),
+                        dep.name(),
+                        normalized_name.as_str(),
+                        &dep_source,
+                        FetchContext::Hover,
+                    ),
+                    AuxiliaryLookup::PinResolution,
                 )
                 .await;
-                match outcome {
-                    Ok(Ok(Some(resolved))) => {
-                        if let Some(sha) = &resolved.sha {
-                            hover.rewrite_markdown(|md| {
-                                deps_core::lsp_helpers::splice_resolved_line(
-                                    md,
-                                    resolved.version.as_str(),
-                                    sha,
-                                )
-                            });
-                        }
-                    }
-                    Ok(Ok(None)) => {}
-                    Ok(Err(error)) => {
-                        tracing::warn!(package = %dep.name().for_tracing(), %error, "FR-007 component pin resolution failed");
-                    }
-                    Err(_) => {
-                        tracing::warn!(package = %dep.name().for_tracing(), "FR-007 component pin resolution timed out");
-                    }
+                if let InteractiveFetch::Live(Some(resolved)) = outcome
+                    && let Some(sha) = &resolved.sha
+                {
+                    hover.rewrite_markdown(|md| {
+                        deps_core::lsp_helpers::splice_resolved_line(
+                            md,
+                            resolved.version.as_str(),
+                            sha,
+                        )
+                    });
                 }
             }
 
@@ -2431,6 +2436,7 @@ mod tests {
                 &uri,
                 &formatter,
                 &registry,
+                deps_core::VersionData::new(&Default::default(), &Default::default()),
             )
             .await
             .expect(
@@ -2468,6 +2474,7 @@ mod tests {
                 &uri,
                 &formatter,
                 &registry,
+                deps_core::VersionData::new(&Default::default(), &Default::default()),
             )
             .await
             .expect("expected a quickfix resolving ~latest to a concrete SHA");
@@ -2502,6 +2509,7 @@ mod tests {
                 &uri,
                 &formatter,
                 &registry,
+                deps_core::VersionData::new(&Default::default(), &Default::default()),
             )
             .await
             .expect("expected a quickfix resolving the partial pin to a concrete SHA");
@@ -2594,6 +2602,7 @@ mod tests {
                 &uri,
                 &formatter,
                 &registry,
+                deps_core::VersionData::new(&Default::default(), &Default::default()),
             )
             .await
             .expect("expected a quickfix resolving ~latest to a concrete SHA");
@@ -2631,11 +2640,150 @@ mod tests {
                     position,
                     &uri,
                     &formatter,
-                    &registry
+                    &registry,
+                    deps_core::VersionData::new(&Default::default(), &Default::default())
                 )
                 .await
                 .is_none()
             );
+        }
+
+        fn releases_mock(
+            server: &mut mockito::ServerGuard,
+            status: usize,
+            body: &str,
+        ) -> mockito::Mock {
+            server
+                .mock("GET", "/api/v4/projects/org%2Fproj/releases")
+                .match_query(mockito::Matcher::Any)
+                .with_status(status)
+                .with_body(body)
+        }
+
+        fn gate() -> deps_core::lsp_helpers::InteractiveFetchGate {
+            deps_core::lsp_helpers::InteractiveFetchGate::new(
+                std::num::NonZeroUsize::new(4).unwrap(),
+            )
+        }
+
+        /// A failed FR-007 resolution is remembered by the shared gate, so the next code action
+        /// for the same component pin withholds the quickfix without a request.
+        #[tokio::test]
+        async fn test_build_dynamic_component_pin_action_after_a_failed_resolution_makes_no_request()
+         {
+            let mut server = mockito::Server::new_async().await;
+            let failing = releases_mock(&mut server, 500, "")
+                .expect_at_least(1)
+                .create_async()
+                .await;
+            let (registry, formatter, parse_result, uri, position) =
+                component_pin_test_setup(&server, PinStyle::Latest, "~latest");
+            let (cached, resolved) = (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            );
+            let gate = gate();
+            let versions = deps_core::VersionData::new(&cached, &resolved)
+                .with_ecosystem(deps_core::EcosystemId::GitlabCi)
+                .with_interactive_fetch_gate(&gate);
+
+            let first = build_dynamic_component_pin_action(
+                &parse_result,
+                position,
+                &uri,
+                &formatter,
+                &registry,
+                versions,
+            )
+            .await;
+            failing.assert_async().await;
+            failing.remove_async().await;
+            let sha = "a".repeat(40);
+            let untouched = releases_mock(
+                &mut server,
+                200,
+                &format!(r#"[{{"tag_name":"2.0.0","commit":{{"id":"{sha}"}}}}]"#),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+            let second = build_dynamic_component_pin_action(
+                &parse_result,
+                position,
+                &uri,
+                &formatter,
+                &registry,
+                versions,
+            )
+            .await;
+
+            assert!(first.is_none() && second.is_none());
+            assert_eq!(gate.len(), 1);
+            untouched.assert_async().await;
+        }
+
+        /// Hover routes the same FR-007 resolution through the gate: after a dead releases
+        /// endpoint failed the base list and the pin resolution once, a second hover makes no
+        /// request at all.
+        #[tokio::test]
+        async fn test_generate_hover_component_pin_after_a_failure_makes_no_request() {
+            let mut server = mockito::Server::new_async().await;
+            let failing = releases_mock(&mut server, 500, "")
+                .expect_at_least(1)
+                .create_async()
+                .await;
+            let (registry, formatter, parse_result, _uri, position) =
+                component_pin_test_setup(&server, PinStyle::Latest, "~latest");
+            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::default());
+            let eco = GitlabCiEcosystem {
+                registry: Arc::new(registry),
+                formatter,
+                instance_host: Arc::new(GitlabInstanceHost::new(
+                    Arc::new(RwLock::new(None)),
+                    Arc::clone(&policy),
+                )),
+                policy,
+            };
+            let (cached, resolved) = (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            );
+            let gate = gate();
+            let versions = deps_core::VersionData::new(&cached, &resolved)
+                .with_ecosystem(deps_core::EcosystemId::GitlabCi)
+                .with_interactive_fetch_gate(&gate);
+
+            let first = eco
+                .generate_hover(
+                    &parse_result,
+                    position,
+                    versions,
+                    deps_core::FreshnessSettings::Disabled,
+                )
+                .await;
+            failing.assert_async().await;
+            failing.remove_async().await;
+            let sha = "a".repeat(40);
+            let untouched = releases_mock(
+                &mut server,
+                200,
+                &format!(r#"[{{"tag_name":"2.0.0","commit":{{"id":"{sha}"}}}}]"#),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+            let second = eco
+                .generate_hover(
+                    &parse_result,
+                    position,
+                    versions,
+                    deps_core::FreshnessSettings::Disabled,
+                )
+                .await;
+
+            assert!(first.is_some() && second.is_some());
+            assert_eq!(gate.len(), 2, "the version list and the pin resolution");
+            untouched.assert_async().await;
         }
 
         /// Neither a `project:` include nor a `component:` `PinStyle::Tag`/`PinStyle::Branch`
@@ -2652,7 +2800,8 @@ mod tests {
                     position,
                     &uri,
                     &formatter,
-                    &registry
+                    &registry,
+                    deps_core::VersionData::new(&Default::default(), &Default::default())
                 )
                 .await
                 .is_none()

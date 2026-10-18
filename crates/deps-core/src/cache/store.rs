@@ -8,6 +8,7 @@ use super::MAX_CACHEABLE_ENTRY_BYTES;
 use super::auth::KeyAuth;
 use super::response::CachedResponse;
 use crate::cache_policy::CACHE_EVICTION_PERCENTAGE;
+#[cfg(feature = "test-util")]
 use bytes::Bytes;
 use std::borrow::Cow;
 use std::sync::atomic::Ordering;

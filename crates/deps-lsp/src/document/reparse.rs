@@ -181,7 +181,12 @@ mod tests {
             &source,
             FetchContext::Hover,
         );
-        deps_core::lsp_helpers::await_interactive_fetch(async { Err::<(), ()>(()) }, request).await;
+        deps_core::lsp_helpers::await_interactive_fetch(
+            async { Err::<(), ()>(()) },
+            request,
+            deps_core::lsp_helpers::AuxiliaryLookup::PinResolution,
+        )
+        .await;
         state.interactive_fetch.len()
     }
 

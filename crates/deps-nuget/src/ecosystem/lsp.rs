@@ -20,12 +20,6 @@ use std::collections::HashSet;
 /// prefix-matched any real version (#1137 critic S1).
 pub(super) const VERSION_OPERATOR_CHARS: &[char] = &['[', '('];
 
-/// Bounds `NuGetEcosystem::generate_hover`'s `unlisted_versions` fetch (S4, #451
-/// follow-up) — mirrors `deps_core::lsp_helpers::hover`'s own private `HOVER_FALLBACK_TIMEOUT`
-/// for its analogous fallback fetch: hover responses must return quickly, and without this
-/// bound a pathological feed's registration-hive walk could run unbounded.
-pub(super) const HOVER_UNLISTED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Injects a `*(unlisted)*` marker into each `"- \`VERSION\` ..."` "Recent versions" bullet
 /// line whose version is in `unlisted`, right after the version literal and before any
 /// existing tag (`*(latest)*`, an age suffix, ...) — matching the position/spacing

@@ -9,11 +9,13 @@
 //! module (which globs `use super::*;`) keeps referencing them unqualified, unchanged from
 //! before the move.
 
-use std::time::Duration;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit, WorkspaceEdit};
 
 use deps_core::PackageName;
-use deps_core::lsp_helpers::{CommentCheck, ShaPinTail, sha_pin_rewrite, truncate_for_diagnostic};
+use deps_core::lsp_helpers::{
+    AuxiliaryLookup, CommentCheck, FetchContext, InteractiveFetch, InteractiveFetchRequest,
+    ShaPinTail, await_interactive_fetch, sha_pin_rewrite, truncate_for_diagnostic,
+};
 
 use super::{
     GitlabCiDependency, GitlabCiFormatter, GitlabCiRegistry, MAX_DIAGNOSTIC_VALUE_CHARS,
@@ -63,12 +65,6 @@ impl deps_core::lsp_helpers::ShaPinning for GitlabCiFormatter {
         })
     }
 }
-
-/// Bound on [`GitlabCiRegistry::resolve_component_pin`]'s FR-007 hover-time resolution
-/// (H1, #466 review) — mirrors `deps_core::lsp_helpers::hover`'s `HOVER_FALLBACK_TIMEOUT`
-/// precedent for a live-fetch fallback invoked from hover generation: a failure or timeout
-/// here degrades gracefully to no `**Resolved**` line, never aborting the rest of the hover.
-pub(super) const COMPONENT_PIN_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Builds the "Pin `{name}` to commit SHA" quickfix (issue #634) for the `PinStyle::Tag`
 /// dependency at `position`, if `GitlabCiFormatter::sha_pin_replacement_for` resolves its
@@ -159,9 +155,11 @@ pub(super) fn build_unknown_ref_fix_action(
 /// `Partial` names a concrete version by itself — resolving one needs the FR-007 priority
 /// ladder run against the project's published releases, exactly the live fetch
 /// `generate_hover`'s `**Resolved**` splice already drives for the same pin forms. Bounded
-/// by [`COMPONENT_PIN_RESOLUTION_TIMEOUT`], mirroring that call site's identical
-/// degrade-to-nothing-on-timeout discipline: a failure or timeout here withholds the
-/// quickfix rather than blocking the rest of `generate_code_actions`.
+/// by the shared interactive gate as an
+/// [`AuxiliaryLookup::PinResolution`],
+/// mirroring that call site's identical degrade-to-nothing discipline: a failure, a timeout,
+/// or a known-dead endpoint withholds the quickfix rather than blocking the rest of
+/// `generate_code_actions`.
 ///
 /// Returns `None` when the dependency at `position` is not a `component:` include pinned
 /// via `Latest`/`Partial`, has no registered route, or the live resolution misses/fails/
@@ -174,6 +172,7 @@ pub(super) async fn build_dynamic_component_pin_action(
     uri: &Url,
     formatter: &GitlabCiFormatter,
     registry: &GitlabCiRegistry,
+    versions: deps_core::VersionData<'_>,
 ) -> Option<CodeAction> {
     // M2 (#640): the same `formatter.is_position_on_dependency` lookup
     // `build_sha_pin_action` uses, rather than a bare `version_range` check — a
@@ -195,27 +194,29 @@ pub(super) async fn build_dynamic_component_pin_action(
         .version_req
         .as_ref()
         .map(deps_core::VersionReq::as_str)?;
-    let deps_core::parser::DependencySource::AlternateRegistry { index, .. } = dep.source() else {
+    let dep_source = dep.source();
+    let deps_core::parser::DependencySource::AlternateRegistry { index, .. } = &dep_source else {
         return None;
     };
-    let route = registry.routes().get(&index).map(|r| r.clone())?;
+    let route = registry.routes().get(index).map(|r| r.clone())?;
 
-    let outcome = tokio::time::timeout(
-        COMPONENT_PIN_RESOLUTION_TIMEOUT,
+    let normalized_name = formatter.normalize_package_name(dep.name());
+    let resolved = match await_interactive_fetch(
         registry.resolve_component_pin(dep.name(), &route, pin, raw),
+        InteractiveFetchRequest::new(
+            versions,
+            uri,
+            dep.name(),
+            normalized_name.as_str(),
+            &dep_source,
+            FetchContext::CodeAction,
+        ),
+        AuxiliaryLookup::PinResolution,
     )
-    .await;
-    let resolved = match outcome {
-        Ok(Ok(Some(resolved))) => resolved,
-        Ok(Ok(None)) => return None,
-        Ok(Err(error)) => {
-            tracing::warn!(package = %dep.name().for_tracing(), %error, "C2 component pin quickfix resolution failed");
-            return None;
-        }
-        Err(_) => {
-            tracing::warn!(package = %dep.name().for_tracing(), "C2 component pin quickfix resolution timed out");
-            return None;
-        }
+    .await
+    {
+        InteractiveFetch::Live(Some(resolved)) => resolved,
+        InteractiveFetch::Live(None) | InteractiveFetch::Degraded(_) => return None,
     };
 
     let changes = deps_core::single_file_edit(

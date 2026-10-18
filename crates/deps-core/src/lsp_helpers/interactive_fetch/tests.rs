@@ -8,10 +8,13 @@ use super::breaker::{
     Admission, BREAKER_CAP, BREAKER_OPEN_DURATION, BreakerAdmission, EndpointBreaker,
     EndpointHealth,
 };
-use super::key::{EndpointKey, ManifestFingerprint, SourceFingerprint};
+use super::key::{
+    BreakerEvidence, EndpointKey, LookupKind, ManifestFingerprint, SourceFingerprint,
+};
 use super::memo::{Decision, FastFail, INTERACTIVE_FAILURE_TTL, INTERACTIVE_MEMO_CAP};
 use super::*;
 use crate::lsp_helpers::DependencyOutcomes;
+use crate::lsp_helpers::REGISTRY_FETCH_BUDGET;
 use crate::test_util::{MockRegistry, MockVersion};
 use crate::{ConcreteVersion, EcosystemId, FetchFailure};
 
@@ -27,6 +30,7 @@ struct Fixture {
     cached: HashMap<PackageName, crate::PackageVersions>,
     resolved: HashMap<PackageName, ConcreteVersion>,
     calls: AtomicUsize,
+    kind: std::sync::Mutex<AuxiliaryLookup>,
     manifest: url::Url,
 }
 
@@ -41,6 +45,7 @@ impl Fixture {
             cached: HashMap::new(),
             resolved: HashMap::new(),
             calls: AtomicUsize::new(0),
+            kind: std::sync::Mutex::new(AuxiliaryLookup::PinResolution),
             manifest: manifest("/project/Cargo.toml"),
         }
     }
@@ -72,6 +77,7 @@ impl Fixture {
             source,
             FetchContext::Hover,
         );
+        let kind = *self.kind.lock().unwrap();
         await_interactive_fetch(
             async {
                 self.calls.fetch_add(1, Ordering::SeqCst);
@@ -85,6 +91,7 @@ impl Fixture {
                 }
             },
             request,
+            kind,
         )
         .await
     }
@@ -215,7 +222,7 @@ async fn seeding_is_discarded_when_the_gate_was_invalidated_after_the_read() {
         &source,
         FetchContext::Hover,
     );
-    let (gate, key) = request.gated().unwrap();
+    let (gate, key) = request.gated(LookupKind::VersionList).unwrap();
     let generation = gate.generation();
     gate.invalidate_all();
 
@@ -425,7 +432,12 @@ async fn request_without_a_gate_is_the_plain_bounded_await() {
         FetchContext::CodeAction,
     );
 
-    let result = await_interactive_fetch(async { Ok::<_, ()>(1_u8) }, request).await;
+    let result = await_interactive_fetch(
+        async { Ok::<_, ()>(1_u8) },
+        request,
+        AuxiliaryLookup::PinResolution,
+    )
+    .await;
 
     assert_matches!(result, InteractiveFetch::Live(1));
 }
@@ -499,7 +511,7 @@ impl Fixture {
             &source,
             context,
         );
-        let (gate, key) = request.gated().unwrap();
+        let (gate, key) = request.gated(LookupKind::VersionList).unwrap();
         let fetch = async {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match behavior {
@@ -1137,8 +1149,12 @@ fn a_stale_probe_settling_inconclusive_leaves_a_closed_breaker_closed() {
     breaker.report(&endpoint, &a, AttemptEvidence::Slow, None, start);
     breaker.report(&endpoint, &b, AttemptEvidence::Slow, None, start);
     let reopened = start + BREAKER_OPEN_DURATION;
-    let Admission::Probe(probe) = breaker.admit(&endpoint, BreakerAdmission::Enforce, reopened)
-    else {
+    let Admission::Probe(probe) = breaker.admit(
+        &endpoint,
+        BreakerAdmission::Enforce,
+        BreakerEvidence::Counts,
+        reopened,
+    ) else {
         panic!("an expired open breaker hands out the probe");
     };
     breaker.report(&endpoint, &a, AttemptEvidence::Answered, None, reopened);
@@ -1226,4 +1242,157 @@ fn the_breaker_stays_within_its_cap() {
     }
 
     assert_eq!(breaker.len(), BREAKER_CAP);
+}
+
+impl Fixture {
+    async fn lookup(
+        &self,
+        kind: AuxiliaryLookup,
+        name: &str,
+        fetch: Fetch,
+    ) -> InteractiveFetch<u8> {
+        *self.kind.lock().unwrap() = kind;
+        self.run(name, &DependencyOutcomes::new(), fetch).await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_auxiliary_lookup_gets_half_the_version_list_budget() {
+    let fixture = Fixture::new();
+    let started = tokio::time::Instant::now();
+
+    let result = fixture
+        .lookup(AuxiliaryLookup::Decoration, "serde", Fetch::Stall)
+        .await;
+
+    assert_degraded(&result, NoLiveList::Unverified);
+    assert_eq!(started.elapsed(), secs(5));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_second_request_on_a_timed_out_lookup_returns_at_once_without_a_call() {
+    for kind in [AuxiliaryLookup::Decoration, AuxiliaryLookup::PinResolution] {
+        let fixture = Fixture::new();
+        fixture.lookup(kind, "serde", Fetch::Stall).await;
+        let waiting = tokio::time::Instant::now();
+
+        let second = fixture.lookup(kind, "serde", Fetch::Succeed).await;
+
+        assert_degraded(&second, NoLiveList::Unverified);
+        assert_eq!(waiting.elapsed(), Duration::ZERO, "{kind:?}");
+        assert_eq!(fixture.calls(), 1, "{kind:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_second_request_on_a_failed_lookup_returns_at_once_without_a_call() {
+    let fixture = Fixture::new();
+    let first = fixture
+        .lookup(AuxiliaryLookup::PinResolution, "comp", Fetch::Fail)
+        .await;
+
+    let second = fixture
+        .lookup(AuxiliaryLookup::PinResolution, "comp", Fetch::Succeed)
+        .await;
+
+    assert_degraded(&first, NoLiveList::Failed);
+    assert_degraded(&second, NoLiveList::Unverified);
+    assert_eq!(fixture.calls(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_lookup_kind_keeps_its_own_failure_record() {
+    let fixture = Fixture::new();
+    fixture
+        .lookup(AuxiliaryLookup::Decoration, "serde", Fetch::Stall)
+        .await;
+
+    let pin = fixture
+        .lookup(AuxiliaryLookup::PinResolution, "serde", Fetch::Succeed)
+        .await;
+    let list = fixture.enriched("serde", Versions::Succeed(secs(1))).await;
+
+    assert_matches!(pin, InteractiveFetch::Live(1));
+    assert_eq!(live_list(list).len(), 1);
+    assert_eq!(fixture.calls(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn auxiliary_lookups_hold_dispatch_permits_like_version_lists() {
+    let fixture = Fixture::new();
+
+    let (_, _, _, version_list) = tokio::join!(
+        fixture.lookup(AuxiliaryLookup::Decoration, "a", Fetch::Stall),
+        fixture.lookup(AuxiliaryLookup::Decoration, "b", Fetch::Stall),
+        fixture.lookup(AuxiliaryLookup::Decoration, "c", Fetch::Stall),
+        fixture.enriched("d", Versions::Succeed(secs(1))),
+    );
+
+    assert_degraded(&version_list, NoLiveList::Unverified);
+    assert_eq!(fixture.calls(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_decorations_leave_no_breaker_evidence() {
+    let fixture = Fixture::new();
+
+    fixture
+        .lookup(AuxiliaryLookup::Decoration, "a", Fetch::Stall)
+        .await;
+    fixture
+        .lookup(AuxiliaryLookup::Decoration, "b", Fetch::Stall)
+        .await;
+    assert_eq!(fixture.health(), None, "a decoration leaves no evidence");
+    let next = fixture.enriched("next", Versions::Succeed(secs(1))).await;
+
+    assert_eq!(live_list(next).len(), 1);
+    assert_eq!(fixture.calls(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_decoration_cannot_close_the_breaker() {
+    let fixture = Fixture::new();
+    fixture.open_the_breaker().await;
+
+    let answered = fixture
+        .lookup(AuxiliaryLookup::Decoration, "fast", Fetch::Succeed)
+        .await;
+
+    assert_degraded(&answered, NoLiveList::Unverified);
+    assert!(is_open(fixture.health()));
+    assert_eq!(fixture.calls(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_decoration_cannot_take_the_half_open_probe() {
+    let fixture = Fixture::new();
+    fixture.open_the_breaker().await;
+    tokio::time::advance(BREAKER_OPEN_DURATION).await;
+
+    let decoration = fixture
+        .lookup(AuxiliaryLookup::Decoration, "deco", Fetch::Succeed)
+        .await;
+    assert_degraded(&decoration, NoLiveList::Unverified);
+    assert!(is_open(fixture.health()));
+
+    let list = fixture.enriched("probe", Versions::Succeed(secs(1))).await;
+    assert_eq!(live_list(list).len(), 1);
+    assert_matches!(fixture.health(), Some(EndpointHealth::Closed { .. }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_pin_resolutions_open_the_breaker_for_version_lists() {
+    let fixture = Fixture::new();
+
+    fixture
+        .lookup(AuxiliaryLookup::PinResolution, "a", Fetch::Stall)
+        .await;
+    fixture
+        .lookup(AuxiliaryLookup::PinResolution, "b", Fetch::Stall)
+        .await;
+    let refused = fixture.enriched("c", Versions::Succeed(secs(1))).await;
+
+    assert!(is_open(fixture.health()));
+    assert_degraded(&refused, NoLiveList::Unverified);
+    assert_eq!(fixture.calls(), 2);
 }

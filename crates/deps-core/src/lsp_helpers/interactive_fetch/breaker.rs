@@ -16,7 +16,7 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 
 use super::attempt::AttemptEvidence;
-use super::key::EndpointKey;
+use super::key::{BreakerEvidence, EndpointKey};
 use super::memo::INTERACTIVE_FAILURE_TTL;
 use super::{FetchContext, InteractiveFetchGate};
 use crate::PackageName;
@@ -176,6 +176,7 @@ impl EndpointBreaker {
         &self,
         endpoint: &EndpointKey,
         admission: BreakerAdmission,
+        counts: BreakerEvidence,
         now: Instant,
     ) -> Admission {
         match admission {
@@ -188,6 +189,9 @@ impl EndpointBreaker {
         match entry.get().health {
             EndpointHealth::Closed { .. } => Admission::Proceed,
             EndpointHealth::Open { until } if now < until => Admission::Refused,
+            // A lookup whose evidence is ignored cannot settle a probe, so it waits for a
+            // counted one to take it.
+            EndpointHealth::Open { .. } if counts == BreakerEvidence::Ignored => Admission::Refused,
             EndpointHealth::Open { .. } => {
                 let probe = ProbeId(self.next_probe.fetch_add(1, Ordering::Relaxed));
                 *entry.get_mut() = EndpointState {
@@ -258,8 +262,17 @@ impl EndpointBreaker {
 
 impl InteractiveFetchGate {
     /// Asks the breaker whether `endpoint` may be polled for a request in `context`.
-    pub(super) fn admit(&self, endpoint: &EndpointKey, context: FetchContext) -> Admission {
-        self.breaker
-            .admit(endpoint, BreakerAdmission::of(context), super::now())
+    pub(super) fn admit(
+        &self,
+        endpoint: &EndpointKey,
+        context: FetchContext,
+        counts: BreakerEvidence,
+    ) -> Admission {
+        self.breaker.admit(
+            endpoint,
+            BreakerAdmission::of(context),
+            counts,
+            super::now(),
+        )
     }
 }

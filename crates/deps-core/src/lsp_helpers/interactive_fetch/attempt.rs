@@ -7,10 +7,9 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::breaker::{Admission, ProbeId};
-use super::key::InteractiveFetchKey;
+use super::key::{BreakerEvidence, InteractiveFetchKey, LookupKind};
 use super::memo::RecordState;
 use super::{InteractiveFetch, InteractiveFetchGate, InteractiveFetchRequest, NoLiveList};
-use crate::lsp_helpers::REGISTRY_FETCH_BUDGET;
 
 /// Margin below the budget within which an answer may be a stale-serve or a race against the
 /// 10 s connect timeout rather than proof the endpoint is responsive.
@@ -24,15 +23,15 @@ pub(super) const MARGIN: Duration = Duration::from_secs(1);
 /// proves nothing, and memoizing it would suppress a package for 30 s on a guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AttemptBudget {
-    /// At least half of [`REGISTRY_FETCH_BUDGET`] remained: an error or elapse is a real failure.
+    /// At least half of the kind's budget remained: an error or elapse is a real failure.
     Full,
     /// Less than half remained: an error or elapse is inconclusive and writes no failure.
     Truncated,
 }
 
 impl AttemptBudget {
-    pub(super) fn of(remaining: Duration) -> Self {
-        if remaining >= REGISTRY_FETCH_BUDGET / 2 {
+    pub(super) fn of(remaining: Duration, budget: Duration) -> Self {
+        if remaining >= budget / 2 {
             Self::Full
         } else {
             Self::Truncated
@@ -90,6 +89,7 @@ struct AttemptGuard<'a> {
     started: Instant,
     probe: Option<ProbeId>,
     settled: bool,
+    counts: BreakerEvidence,
 }
 
 impl AttemptGuard<'_> {
@@ -99,8 +99,12 @@ impl AttemptGuard<'_> {
     }
 
     fn report(&self, end: AttemptEnd) {
+        match self.counts {
+            BreakerEvidence::Counts => {}
+            BreakerEvidence::Ignored => return,
+        }
         let waited = Instant::now().saturating_duration_since(self.started);
-        let evidence = evidence(end, waited, REGISTRY_FETCH_BUDGET);
+        let evidence = evidence(end, waited, self.key.kind.budget());
         if self.gate.generation() != self.generation {
             return;
         }
@@ -133,6 +137,7 @@ pub(super) async fn bounded_await_until<T, E>(
     fetch: impl Future<Output = Result<T, E>>,
     deadline: Instant,
     request: &InteractiveFetchRequest<'_>,
+    kind: LookupKind,
 ) -> (InteractiveFetch<T>, AttemptEnd) {
     let budget = deadline.saturating_duration_since(Instant::now());
     match tokio::time::timeout_at(deadline, fetch).await {
@@ -145,6 +150,7 @@ pub(super) async fn bounded_await_until<T, E>(
             tracing::warn!(
                 package = %request.package.for_tracing(),
                 context = request.context.as_str(),
+                lookup = kind.as_str(),
                 timeout_secs = budget.as_secs(),
                 "primary registry version fetch timed out"
             );
@@ -178,7 +184,8 @@ impl InteractiveFetchGate {
         background_failure_known: bool,
         generation: u64,
     ) -> Attempted<T> {
-        let probe = match self.admit(&key.endpoint, request.context) {
+        let counts = key.kind.breaker_evidence();
+        let probe = match self.admit(&key.endpoint, request.context, counts) {
             Admission::Refused => {
                 super::log_skipped(request, "registry endpoint circuit open");
                 return Attempted::Refused;
@@ -187,7 +194,10 @@ impl InteractiveFetchGate {
             Admission::Proceed => None,
         };
         let started = Instant::now();
-        let budget = AttemptBudget::of(deadline.saturating_duration_since(started));
+        let budget = AttemptBudget::of(
+            deadline.saturating_duration_since(started),
+            key.kind.budget(),
+        );
         let guard = AttemptGuard {
             gate: self,
             key,
@@ -195,8 +205,9 @@ impl InteractiveFetchGate {
             started,
             probe,
             settled: false,
+            counts,
         };
-        let (result, end) = bounded_await_until(fetch, deadline, request).await;
+        let (result, end) = bounded_await_until(fetch, deadline, request, key.kind).await;
         guard.finish(end);
         let result = match result {
             // The background fetch still reports this package as failing, so a stale seeded

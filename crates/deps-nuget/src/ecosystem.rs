@@ -22,6 +22,11 @@ use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
 use deps_core::hover::Hover;
 #[cfg(feature = "lsp-responses")]
+use deps_core::lsp_helpers::{
+    AuxiliaryLookup, FetchContext, InteractiveFetch, InteractiveFetchRequest,
+    await_interactive_fetch,
+};
+#[cfg(feature = "lsp-responses")]
 use deps_core::parser::DependencySource;
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
@@ -41,7 +46,7 @@ use crate::registry::NuGetRegistry;
 #[cfg(feature = "lsp-responses")]
 mod lsp;
 #[cfg(feature = "lsp-responses")]
-use lsp::{HOVER_UNLISTED_TIMEOUT, VERSION_OPERATOR_CHARS, annotate_unlisted_versions};
+use lsp::{VERSION_OPERATOR_CHARS, annotate_unlisted_versions};
 #[cfg(test)]
 #[cfg(feature = "lsp-responses")]
 use std::collections::HashSet;
@@ -275,11 +280,12 @@ impl Ecosystem for NuGetEcosystem {
     ///
     /// The two fetches run concurrently via `tokio::join!`, not sequentially (S4, #451
     /// follow-up): serializing them would double hover's worst-case latency, and the
-    /// unlisted fetch alone is additionally bounded by `HOVER_UNLISTED_TIMEOUT` — without
-    /// it, a pathological feed's registration-hive walk (up to `MAX_EXTERNAL_PAGE_FETCHES`
-    /// sequential page fetches, each with its own HTTP-client timeout) could run
-    /// unbounded, exactly the failure mode `deps_core::lsp_helpers::hover`'s own
-    /// `HOVER_FALLBACK_TIMEOUT` exists to prevent for its analogous fallback fetch. `dep` is
+    /// unlisted fetch alone goes through the shared interactive gate as an
+    /// [`AuxiliaryLookup::Decoration`] —
+    /// without its 5 s bound, a pathological feed's registration-hive walk (up to
+    /// `MAX_EXTERNAL_PAGE_FETCHES` sequential page fetches, each with its own HTTP-client
+    /// timeout) could run unbounded, and without its failure memo every hover on a dead feed
+    /// would re-pay the bound. A degraded lookup simply renders no decoration. `dep` is
     /// resolved once, up front, and reused for the unlisted lookup rather than re-derived
     /// from the rendered hover afterward.
     ///
@@ -342,28 +348,26 @@ impl Ecosystem for NuGetEcosystem {
                 return base_hover.await;
             };
 
-            let unlisted_fetch = tokio::time::timeout(
-                HOVER_UNLISTED_TIMEOUT,
+            let dep_source = dep.source();
+            let normalized_name = self.formatter().normalize_package_name(dep.name());
+            let unlisted_fetch = await_interactive_fetch(
                 unlisted_client.unlisted_versions(dep.name().as_str()),
+                InteractiveFetchRequest::new(
+                    versions,
+                    parse_result.uri(),
+                    dep.name(),
+                    normalized_name.as_str(),
+                    &dep_source,
+                    FetchContext::Hover,
+                ),
+                AuxiliaryLookup::Decoration,
             );
 
             let (hover, unlisted_result) = tokio::join!(base_hover, unlisted_fetch);
             let mut hover = hover?;
 
-            let unlisted = match unlisted_result {
-                Ok(Ok(unlisted)) => unlisted,
-                Ok(Err(error)) => {
-                    tracing::debug!(package = %dep.name().for_tracing(), %error, "hover unlisted-versions fetch failed");
-                    return Some(hover);
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        package = %dep.name().for_tracing(),
-                        timeout_secs = HOVER_UNLISTED_TIMEOUT.as_secs(),
-                        "hover unlisted-versions fetch timed out"
-                    );
-                    return Some(hover);
-                }
+            let InteractiveFetch::Live(unlisted) = unlisted_result else {
+                return Some(hover);
             };
             if unlisted.is_empty() {
                 return Some(hover);
@@ -1652,6 +1656,160 @@ mod tests {
             let content = hover.markdown();
             assert!(content.contains("`13.0.3`"));
             assert!(!content.contains("*(unlisted)*"));
+        }
+
+        fn gated_versions<'a>(
+            cached: &'a std::collections::HashMap<
+                deps_core::PackageName,
+                deps_core::PackageVersions,
+            >,
+            resolved: &'a std::collections::HashMap<
+                deps_core::PackageName,
+                deps_core::ConcreteVersion,
+            >,
+            gate: &'a deps_core::lsp_helpers::InteractiveFetchGate,
+        ) -> deps_core::VersionData<'a> {
+            deps_core::VersionData::new(cached, resolved)
+                .with_ecosystem(deps_core::EcosystemId::NuGet)
+                .with_interactive_fetch_gate(gate)
+        }
+
+        fn interactive_gate() -> deps_core::lsp_helpers::InteractiveFetchGate {
+            deps_core::lsp_helpers::InteractiveFetchGate::new(
+                std::num::NonZeroUsize::new(4).unwrap(),
+            )
+        }
+
+        /// A dead feed fails the base list and the unlisted decoration once; both failures are
+        /// remembered by the shared gate, so the next hover makes no request at all.
+        #[tokio::test]
+        async fn test_generate_hover_after_a_dead_feed_makes_no_request() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+            let dead = server
+                .mock("GET", "/index.json")
+                .with_status(500)
+                .expect_at_least(1)
+                .create_async()
+                .await;
+
+            let registry = NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{base}/index.json"),
+            );
+            let eco = NuGetEcosystem::with_registry(registry);
+            let uri = deps_core::test_util::test_uri("/test/App.csproj");
+            let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let (cached, resolved) = (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            );
+            let gate = interactive_gate();
+            let hover = || async {
+                eco.generate_hover(
+                    parse_result.as_ref(),
+                    Position::new(0, 49),
+                    gated_versions(&cached, &resolved, &gate),
+                    deps_core::FreshnessSettings::Disabled,
+                )
+                .await
+            };
+
+            let first = hover().await;
+            dead.assert_async().await;
+            dead.remove_async().await;
+            let untouched = server
+                .mock("GET", "/index.json")
+                .with_status(200)
+                .with_body(nuget_service_index_body(&base))
+                .expect(0)
+                .create_async()
+                .await;
+            let second = hover().await;
+
+            assert!(first.is_some() && second.is_some());
+            assert_eq!(gate.len(), 2, "the version list and the decoration");
+            untouched.assert_async().await;
+        }
+
+        /// A NuGet hover takes two dispatch permits (the base list and the decoration), so on a
+        /// healthy feed three concurrent hovers get the first fully decorated, the second its
+        /// list without the decoration, and the third only the basic card (spec 082, M3).
+        #[tokio::test]
+        async fn test_three_concurrent_hovers_share_the_dispatch_permits() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+            let _index = server
+                .mock("GET", "/index.json")
+                .with_status(200)
+                .with_body(nuget_service_index_body(&base))
+                .create_async()
+                .await;
+            for id in ["pkg.a", "pkg.b", "pkg.c"] {
+                server
+                    .mock("GET", format!("/flatcontainer/{id}/index.json").as_str())
+                    .with_status(200)
+                    .with_body(r#"{"versions": ["12.0.1", "13.0.3"]}"#)
+                    .create_async()
+                    .await;
+                server
+                    .mock("GET", format!("/registrations/{id}/index.json").as_str())
+                    .with_status(200)
+                    .with_body(
+                        r#"{"count": 1, "items": [{"@id": "x", "count": 2, "items": [
+                        {"catalogEntry": {"version": "12.0.1", "listed": true}},
+                        {"catalogEntry": {"version": "13.0.3", "listed": false}}
+                    ]}]}"#,
+                    )
+                    .create_async()
+                    .await;
+            }
+
+            let registry = NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{base}/index.json"),
+            );
+            let eco = NuGetEcosystem::with_registry(registry);
+            let uri = deps_core::test_util::test_uri("/test/App.csproj");
+            let content = r#"<Project><ItemGroup><PackageReference Include="Pkg.A" Version="1.0.0" /><PackageReference Include="Pkg.B" Version="1.0.0" /><PackageReference Include="Pkg.C" Version="1.0.0" /></ItemGroup></Project>"#;
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let (cached, resolved) = (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            );
+            let gate = interactive_gate();
+            let hover = |name: &str| {
+                let column = u32::try_from(content.find(name).unwrap()).unwrap();
+                let (eco, parse_result, gate) = (&eco, &parse_result, &gate);
+                let (cached, resolved) = (&cached, &resolved);
+                async move {
+                    eco.generate_hover(
+                        parse_result.as_ref(),
+                        Position::new(0, column),
+                        gated_versions(cached, resolved, gate),
+                        deps_core::FreshnessSettings::Disabled,
+                    )
+                    .await
+                    .expect("a hover for a resolvable dependency")
+                }
+            };
+
+            let (a, b, c) = tokio::join!(hover("Pkg.A"), hover("Pkg.B"), hover("Pkg.C"));
+
+            let (a, b, c) = (a.markdown(), b.markdown(), c.markdown());
+            assert!(a.contains("- `13.0.3` *(unlisted)*"), "{a}");
+            assert!(
+                b.contains("- `13.0.3`") && !b.contains("*(unlisted)*"),
+                "{b}"
+            );
+            assert!(!c.contains("- `13.0.3`"), "{c}");
         }
 
         /// S4 regression (#451 follow-up): with no dependency at `position`, the base render

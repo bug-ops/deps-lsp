@@ -4490,7 +4490,12 @@ let package = Package(
                 &source,
                 FetchContext::Hover,
             );
-            await_interactive_fetch(async { Err::<(), ()>(()) }, request).await;
+            await_interactive_fetch(
+                async { Err::<(), ()>(()) },
+                request,
+                deps_core::lsp_helpers::AuxiliaryLookup::PinResolution,
+            )
+            .await;
             assert_eq!(gate.len(), 1);
 
             backend
