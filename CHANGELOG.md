@@ -54,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gitlab-ci**: `gitlab.com` and the `GITLAB_TOKEN_HOST` host are operator-trusted, so a public-looking name that resolves to a private address (split-horizon DNS) is reachable there; IP-literal private hosts stay blocked (#1816, #1823)
 - **deps-github-actions, deps-gitlab-ci**: a GitLab tag pin with a cold tag cache resolves to `NotYetIndexed` instead of `Unresolved`; the duplicated pin-resolution overrides move to `deps_core::lsp_helpers::git_pin` (#1817, #1823)
 - **deps-lsp**: `DiagnosticsSnapshot` is `Clone` instead of `Copy` and carries the typosquat, gossip and license-policy gates (#1815, #1823)
+- **deps-core**: `VersionData` gains `interactive_fetch`, `await_versions_fetch` is replaced by `InteractiveFetchGate` and `await_interactive_fetch`, and a failure inferred from the background fetch drops speculative code actions (#1830, #1846)
+- **deps-core, deps-engine, deps-lsp, deps-cli**: `resolve_recommended_fix`, `resolve_verified_fix` and `plan_vulnerability_fix` take a `FixTargetContext` instead of `latest`, and `collect_fix_target_resolutions` takes a `FixTargetRegistry` (#1832, #1846)
+- **deps-core**: a preflight DNS failure is a `RegistryError` instead of `CacheError`, `CredentialOutsideTrustedPrefix` is Actionable (the Swift last-good fallback no longer serves stale data for it), and `DepsDevClient` no longer stores a separate base URL (#1841, #1846)
+- **deps-core**: `test_util::scaling::TimeRatio` is no longer public (#1838, #1846)
 
 ### Security
 - **deps**: bump `rustls` to 0.23.46, fixing RUSTSEC-2026-0346, -0347, -0348, -0349 (#1837)
@@ -108,6 +112,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SECURITY.md**: supported versions table lists 2.0.x as supported and older lines as unsupported (#1797)
 
 ### Fixed
+- **deps-core, deps-lsp**: hover and code actions answer from the degraded path after a registry lookup failed or timed out, and concurrent live fetches are bounded, so a dead registry no longer stalls every request for 10 s (#1830, #1846)
+- **deps-core, deps-engine, deps-cli**: the advisory fix target skips registry-deprecated versions within the target's compatibility line and never picks a gossip-excluded or cooling-down `latest` (#1832, #1846)
+- **deps-core, deps-gradle, deps-pypi, deps-github-actions, deps-go, deps-bundler**: the remaining wall-clock complexity guards use `assert_scaling`, with contributor guidance in the book (#1838, #1846)
 - **deps-core, deps-gradle, deps-swift**: linear-time tests compare run time at two input sizes (`test_util::scaling::assert_scaling`) instead of asserting a wall-clock bound, so they no longer flake under load (#1824, #1842)
 - **all crates**: 49 broken intra-doc links on private items fixed, and CI renders private items (`--document-private-items`) with warnings denied (#1828, #1842)
 - **deps-cli**: `check` and `update` discover hidden manifest files such as `.gitlab-ci.yml` during a directory walk, including under `--respect-gitignore` (#1829, #1842)
