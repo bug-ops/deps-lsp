@@ -439,7 +439,7 @@ fn choose_project_key(projects: &[RelatedProject]) -> Option<(String, bool)> {
 /// docs for the caching/failure-handling rationale.
 pub struct DepsDevClient {
     cache: Arc<HttpCache>,
-    trusted_origin: crate::net_policy::TrustedPrefix,
+    api_base: crate::net_policy::TrustedPrefix,
     /// The trust-signal memo, coalesced (issue #1454): a losing concurrent caller awaits the
     /// leader's result via [`memo::CoalescedMemo::get_or_fetch`] rather than returning `None`
     /// immediately.
@@ -586,9 +586,9 @@ impl DepsDevClient {
             clippy::expect_used,
             reason = "`DEPS_DEV_API` is a constant absolute URL, checked by a unit test"
         )]
-        let trusted_origin = crate::net_policy::TrustedPrefix::parse(&format!("{DEPS_DEV_API}/"))
+        let api_base = crate::net_policy::TrustedPrefix::parse(&format!("{DEPS_DEV_API}/"))
             .expect("deps.dev base URL must be an absolute URL");
-        Self::with_trusted_origin(cache, trusted_origin)
+        Self::with_api_base(cache, api_base)
     }
 
     /// Creates a client pointed at `base_url` instead of the real deps.dev
@@ -600,24 +600,20 @@ impl DepsDevClient {
             clippy::expect_used,
             reason = "test-only constructor: a test server URL is always absolute"
         )]
-        let trusted_origin =
-            crate::net_policy::TrustedPrefix::parse(&format!("{}/", base_url.into()))
-                .expect("deps.dev base URL must be an absolute URL");
-        Self::with_trusted_origin(cache, trusted_origin)
+        let api_base = crate::net_policy::TrustedPrefix::parse(&format!("{}/", base_url.into()))
+            .expect("deps.dev base URL must be an absolute URL");
+        Self::with_api_base(cache, api_base)
     }
 
     /// The origin every request URL is built from, always ending in `/`.
     fn origin(&self) -> &str {
-        self.trusted_origin.as_str()
+        self.api_base.as_str()
     }
 
-    fn with_trusted_origin(
-        cache: Arc<HttpCache>,
-        trusted_origin: crate::net_policy::TrustedPrefix,
-    ) -> Self {
+    fn with_api_base(cache: Arc<HttpCache>, api_base: crate::net_policy::TrustedPrefix) -> Self {
         Self {
             cache,
-            trusted_origin,
+            api_base,
             signals: CoalescedMemo::new(DEPS_DEV_TTLS),
             projects: TtlMemo::new(DEPS_DEV_TTLS),
             similarity: CoalescedMemo::new(DEPS_DEV_TTLS),
@@ -680,7 +676,7 @@ impl DepsDevClient {
                     url,
                     &[],
                     BodyLimit::new(DEPS_DEV_BODY_LIMIT),
-                    &self.trusted_origin,
+                    &self.api_base,
                 ),
         )
         .await
@@ -1352,7 +1348,7 @@ impl DepsDevClient {
                     &url,
                     &body,
                     BodyLimit::new(DEPS_DEV_BODY_LIMIT),
-                    &self.trusted_origin,
+                    &self.api_base,
                 ),
             )
             .await
