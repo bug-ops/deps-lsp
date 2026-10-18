@@ -3739,7 +3739,7 @@ mod tests {
         .await;
 
         assert!(
-            log.contains("primary registry version fetch timed out"),
+            log.contains("interactive registry lookup timed out"),
             "expected the primary-fetch-timeout WARN to fire: {log:?}"
         );
         assert!(

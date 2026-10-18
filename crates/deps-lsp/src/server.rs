@@ -4493,7 +4493,7 @@ let package = Package(
                 FetchContext::Hover,
             );
             await_interactive_fetch(
-                async { Err::<(), ()>(()) },
+                async { Err::<(), _>(deps_core::DepsError::CacheError("down".into())) },
                 request,
                 deps_core::lsp_helpers::AuxiliaryLookup::PinResolution,
             )

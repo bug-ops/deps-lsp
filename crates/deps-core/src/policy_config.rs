@@ -1111,6 +1111,7 @@ impl FetchTimeout {
         Self::fixed(SECS)
     }
 
+    /// Callers pass a nonzero value; `0` falls back to [`Self::MIN`] rather than failing.
     const fn fixed(secs: u64) -> Self {
         match std::num::NonZeroU64::new(secs) {
             Some(secs) => Self(secs),
@@ -1199,6 +1200,7 @@ impl FetchConcurrency {
         Self::fixed(COUNT)
     }
 
+    /// Callers pass a nonzero value; `0` falls back to [`Self::MIN`] rather than failing.
     const fn fixed(count: usize) -> Self {
         match std::num::NonZeroUsize::new(count) {
             Some(count) => Self(count),

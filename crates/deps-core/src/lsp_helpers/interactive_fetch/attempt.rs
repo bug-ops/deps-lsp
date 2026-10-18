@@ -156,7 +156,8 @@ impl InteractiveFetchError for crate::DepsError {
     }
 }
 
-/// For lookups that carry no error detail.
+/// For test lookups that carry no error detail.
+#[cfg(test)]
 impl InteractiveFetchError for () {
     fn log_cause(&self) -> (Option<u16>, &'static str) {
         (None, "unspecified")
@@ -171,7 +172,6 @@ pub(super) async fn bounded_await_until<T, E: InteractiveFetchError>(
     request: &InteractiveFetchRequest<'_>,
     kind: LookupKind,
 ) -> (InteractiveFetch<T>, AttemptEnd) {
-    let budget = deadline.saturating_duration_since(Instant::now());
     match tokio::time::timeout_at(deadline, fetch).await {
         Ok(Ok(value)) => (InteractiveFetch::Live(value), AttemptEnd::Live),
         Ok(Err(error)) => {
@@ -194,8 +194,8 @@ pub(super) async fn bounded_await_until<T, E: InteractiveFetchError>(
                 package = %request.package.for_tracing(),
                 context = request.context.as_str(),
                 lookup = kind.as_str(),
-                timeout_secs = budget.as_secs(),
-                "primary registry version fetch timed out"
+                timeout_secs = kind.budget().as_secs(),
+                "interactive registry lookup timed out"
             );
             (
                 InteractiveFetch::Degraded(NoLiveList::Unverified),

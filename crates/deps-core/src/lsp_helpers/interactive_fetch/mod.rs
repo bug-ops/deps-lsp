@@ -1,7 +1,7 @@
 //! Fail-fast gate for the interactive (hover, code action) registry await.
 //!
-//! [`REGISTRY_FETCH_BUDGET`](super::REGISTRY_FETCH_BUDGET) bounds one interactive `get_versions_from` await, but a bound
-//! alone has no memory: against a registry that never answers, every request re-pays the
+//! [`REGISTRY_FETCH_BUDGET`](super::REGISTRY_FETCH_BUDGET) bounds one interactive
+//! `get_versions_from` await, but a bound alone has no memory: against a registry that never answers, every request re-pays the
 //! whole budget and four of them occupy every `buffer_unordered(4)` LSP dispatch slot
 //! (#1830). [`InteractiveFetchGate`] adds the memory and the concurrency cap:
 //!
@@ -296,8 +296,8 @@ impl InteractiveFetchGate {
     /// Forgets every record and discards the result of any await already in flight.
     ///
     /// Call when a configuration change (registry URL, token, proxy) or a reparse makes the
-    /// recorded failures and endpoint health untrustworthy (FR-006). Requests that start afterwards never join a
-    /// flight begun before it.
+    /// recorded failures and endpoint health untrustworthy (FR-006). Requests that start
+    /// afterwards never join a flight begun before it.
     pub fn invalidate_all(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.memo.clear();
@@ -320,36 +320,42 @@ impl InteractiveFetchGate {
         self.generation.load(Ordering::SeqCst)
     }
 
-    async fn live<T, E: InteractiveFetchError>(
+    /// Admits a request before any lookup: reads the generation (before the outcomes, so an
+    /// invalidation racing this request discards its writes), consults the failure memo, and
+    /// takes a dispatch permit. `Err` carries the degrade to answer with.
+    ///
+    /// Overflow degrades immediately and is deliberately not memoized: the package itself may
+    /// be perfectly reachable.
+    fn admit_request(
         &self,
-        fetch: impl Future<Output = Result<T, E>>,
         key: &InteractiveFetchKey,
         request: &InteractiveFetchRequest<'_>,
-        background_failure_known: bool,
-        generation: u64,
-    ) -> InteractiveFetch<T> {
-        // Overflow degrades immediately and is deliberately not memoized: the package itself
-        // may be perfectly reachable.
-        let Ok(_permit) = self.permits.try_acquire() else {
-            log_skipped(request, "interactive fetch concurrency cap reached");
-            return InteractiveFetch::Degraded(NoLiveList::Unverified);
-        };
-        let deadline = tokio::time::Instant::now() + key.kind.budget();
-        match self
-            .attempt(
-                fetch,
-                deadline,
-                key,
-                request,
-                background_failure_known,
-                generation,
-            )
-            .await
+    ) -> Result<Admitted<'_>, NoLiveList> {
+        let generation = self.generation();
+        let background_failure_known = request.background_failure_known();
+        if let Decision::Degrade(kind, reason) =
+            self.decide(key, background_failure_known, generation, now())
         {
-            Attempted::Polled(result, _) => result,
-            Attempted::Refused => InteractiveFetch::Degraded(NoLiveList::Unverified),
+            log_skipped(request, reason.as_str());
+            return Err(kind);
         }
+        let Ok(permit) = self.permits.try_acquire() else {
+            log_skipped(request, "interactive fetch concurrency cap reached");
+            return Err(NoLiveList::Unverified);
+        };
+        Ok(Admitted {
+            generation,
+            background_failure_known,
+            _permit: permit,
+        })
     }
+}
+
+/// A request the gate let through; the permit is held until it is dropped.
+struct Admitted<'a> {
+    generation: u64,
+    background_failure_known: bool,
+    _permit: tokio::sync::SemaphorePermit<'a>,
 }
 
 /// Awaits an auxiliary lookup for hover or a code action under the gate.
@@ -376,7 +382,7 @@ impl InteractiveFetchGate {
 ///     AuxiliaryLookup, FetchContext, InteractiveFetch, InteractiveFetchRequest,
 ///     await_interactive_fetch,
 /// };
-/// use deps_core::{DependencySource, PackageName, VersionData};
+/// use deps_core::{DepsError, DependencySource, PackageName, VersionData};
 /// use std::collections::HashMap;
 ///
 /// let cached = HashMap::new();
@@ -397,9 +403,8 @@ impl InteractiveFetchGate {
 ///     .enable_time()
 ///     .build()
 ///     .unwrap();
-/// let result =
-///     runtime.block_on(await_interactive_fetch(
-///     async { Ok::<_, ()>(42_u8) },
+/// let result = runtime.block_on(await_interactive_fetch(
+///     async { Ok::<_, DepsError>(42_u8) },
 ///     request,
 ///     AuxiliaryLookup::PinResolution,
 /// ));
@@ -414,18 +419,24 @@ pub async fn await_interactive_fetch<T, E: InteractiveFetchError>(
     let Some((gate, key)) = request.gated(kind) else {
         return plain_bounded_await(fetch, &request, kind).await;
     };
-    // Read before the outcomes so an invalidation racing this request discards its writes.
-    let generation = gate.generation();
-    let background_failure_known = request.background_failure_known();
-    match gate.decide(&key, background_failure_known, generation, now()) {
-        Decision::Degrade(kind, reason) => {
-            log_skipped(&request, reason.as_str());
-            InteractiveFetch::Degraded(kind)
-        }
-        Decision::Live => {
-            gate.live(fetch, &key, &request, background_failure_known, generation)
-                .await
-        }
+    let admitted = match gate.admit_request(&key, &request) {
+        Ok(admitted) => admitted,
+        Err(kind) => return InteractiveFetch::Degraded(kind),
+    };
+    let deadline = tokio::time::Instant::now() + key.kind.budget();
+    match gate
+        .attempt(
+            fetch,
+            deadline,
+            &key,
+            &request,
+            admitted.background_failure_known,
+            admitted.generation,
+        )
+        .await
+    {
+        Attempted::Polled(result, _) => result,
+        Attempted::Refused => InteractiveFetch::Degraded(NoLiveList::Unverified),
     }
 }
 

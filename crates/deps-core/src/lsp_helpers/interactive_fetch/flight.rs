@@ -166,19 +166,12 @@ pub(super) async fn await_shared<E: InteractiveFetchError>(
     request: &InteractiveFetchRequest<'_>,
     shape: ListShape,
 ) -> InteractiveFetch<SharedVersions> {
-    // Read before the outcomes so an invalidation racing this request discards its writes.
-    let generation = gate.generation();
-    let background_failure_known = request.background_failure_known();
-    if let Decision::Degrade(kind, reason) =
-        gate.decide(&key, background_failure_known, generation, now())
-    {
-        log_skipped(request, reason.as_str());
-        return InteractiveFetch::Degraded(kind);
-    }
-    let Ok(_permit) = gate.permits.try_acquire() else {
-        log_skipped(request, "interactive fetch concurrency cap reached");
-        return InteractiveFetch::Degraded(NoLiveList::Unverified);
+    let admitted = match gate.admit_request(&key, request) {
+        Ok(admitted) => admitted,
+        Err(kind) => return InteractiveFetch::Degraded(kind),
     };
+    let (generation, background_failure_known) =
+        (admitted.generation, admitted.background_failure_known);
 
     let deadline = Instant::now() + LookupKind::VersionList.budget();
     let flight = FlightKey::new(key.clone(), shape, generation);
