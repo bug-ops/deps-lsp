@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core and ecosystem crates**: a blocked host's class and policy travel as one `net_policy::BlockedHost` in the blocked-host errors and occurrences; `BlockingPolicy::for_block`/`hint_suffix`/`describe` move onto it (#1826, #PR)
 - **deps-core**: removed the unused `SystemProxy::current` and `RegistryEnvironment::proxy` (#1827, #PR)
 - **deps-core**: a credential sent outside its trusted prefix is the new `DepsError::CredentialOutsideTrustedPrefix`, no longer `CacheError`; `HttpCache::post_json_limited_trusted_origin` and `get_transport_only_with_headers_limited_trusted_origin` take `&TrustedPrefix` (#1825, #1827, #PR)
+- **deps-core, deps-cli**: `PlannedUpdate.current` is the new `PlannedCurrent` enum (`Resolved`/`Declared`/`Unresolved`) instead of `Option<ConcreteVersion>`, and `CurrentVersion`'s `From<Option<ConcreteVersion>>` impl is removed (#1833, #PR)
 - **deps-core**: `Advisory.id` is a private `OsvId` read via `id()`, `Advisory::url()` returns `String`, and `is_valid_osv_id`/`validated_osv_url` are replaced by `OsvId::parse`/`osv_url`; advisory id fields and `SiblingMatches` use `OsvId` (#1807)
 - **deps-core**: `Diagnostic::new` takes an exhaustive `DiagnosticKind` and `Diagnostic::with_code` is removed; the diagnostic code is no longer sanitized (#1807)
 - **deps-cli**: `CheckFinding.category`/`.code` fields are replaced by `kind` with `category()`/`code()` methods; `advisory_ids` in `update` types and JSON are `OsvId` (wire format unchanged) (#1807)
@@ -53,7 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gitlab-ci**: `gitlab.com` and the `GITLAB_TOKEN_HOST` host are operator-trusted, so a public-looking name that resolves to a private address (split-horizon DNS) is reachable there; IP-literal private hosts stay blocked (#1816, #1823)
 - **deps-github-actions, deps-gitlab-ci**: a GitLab tag pin with a cold tag cache resolves to `NotYetIndexed` instead of `Unresolved`; the duplicated pin-resolution overrides move to `deps_core::lsp_helpers::git_pin` (#1817, #1823)
 - **deps-lsp**: `DiagnosticsSnapshot` is `Clone` instead of `Copy` and carries the typosquat, gossip and license-policy gates (#1815, #1823)
-- **deps-core, deps-cli**: `PlannedUpdate.current` is the new `PlannedCurrent` enum (`Resolved`/`Declared`/`Unresolved`) instead of `Option<ConcreteVersion>`, and `CurrentVersion`'s `From<Option<ConcreteVersion>>` impl is removed (#1833, #PR)
 
 ### Security
 - **deps**: bump `rustls` to 0.23.46, fixing RUSTSEC-2026-0346, -0347, -0348, -0349 (#1837)
@@ -66,6 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: repository editor settings can no longer redirect `GITLAB_TOKEN` through `registries.gitlab_instance_host`; the configuration docs now list the trust impact of every repository-settable field (#1797)
 
 ### Added
+- **deps-core**: `licenses::LicensePolicy::activated_since` (#1831, #PR)
 - **deps-core**: `net_policy::TrustedPrefix::as_url` (#1825, #PR)
 - **deps-github-actions, deps-gitlab-ci**: unknown-ref quick fix rewrites the ref to the published tag spelling when exactly one tag matches (#1807)
 - **deps-core**: `secret::bearer_auth_header`, `CredentialPartition` and `lsp_helpers::dependency_at_position` (#1807)

@@ -180,6 +180,12 @@ directories) still keeps the scan fast without depending on either file. Pass
 `--respect-gitignore` to restore standard `.gitignore`/`.ignore` awareness when scanning a
 target you trust as much as your own `deps.toml`.
 
+The walk skips every dot-prefixed entry except two kinds: a file whose name exactly equals a
+registered ecosystem manifest filename (for example the root or a nested `.gitlab-ci.yml`),
+and the dot-directories an ecosystem claims (`.github`, `.gitlab`). Pattern-matched names
+such as `.x.csproj` or `.dev.requirements.txt` are not admitted, and `.git` and other
+dot-directories stay out of the scan.
+
 A manifest reachable only through a symlink is detected and reported (a warning, non-zero
 exit code) regardless of this flag; it is not resolved and scanned unless
 `--follow-symlinks` is also passed. A symlink whose resolved, canonicalized target falls

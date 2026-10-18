@@ -625,13 +625,20 @@ struct HiddenManifestNames(Arc<BTreeSet<&'static str>>);
 
 impl HiddenManifestNames {
     fn from_registry(registry: &EcosystemRegistry) -> Self {
-        let names = registry
+        let mut names = BTreeSet::new();
+        for ecosystem in registry
             .ecosystem_ids()
             .into_iter()
             .filter_map(|id| registry.get(id))
-            .flat_map(|ecosystem| ecosystem.manifest_filenames().to_vec())
-            .filter(|name| name.starts_with('.'))
-            .collect();
+        {
+            names.extend(
+                ecosystem
+                    .manifest_filenames()
+                    .iter()
+                    .copied()
+                    .filter(|name| name.starts_with('.')),
+            );
+        }
         Self(Arc::new(names))
     }
 

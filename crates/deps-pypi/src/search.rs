@@ -142,8 +142,7 @@ fn backoff_for(attempts: u32) -> Duration {
 pub(crate) struct PackageIndex {
     /// Every entry's normalized name, concatenated in sorted order.
     blob: String,
-    /// `n + 1` byte offsets into `blob`; entry `i` spans `blob[offsets`i`..offsets[i
-    /// + 1]]`.
+    /// `n + 1` byte offsets into `blob`; entry `i` spans `blob[offsets[i]..offsets[i + 1]]`.
     offsets: Vec<u32>,
 }
 
