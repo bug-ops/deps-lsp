@@ -38,6 +38,7 @@
 //! for a test whose production call swallows the underlying error to an empty/missing
 //! result rather than surfacing a `Result` directly.
 
+#[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
 pub mod scaling;
 mod stub_formatter;
 #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]

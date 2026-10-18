@@ -78,7 +78,7 @@ pub const MAX_DIAGNOSTIC_VALUE_CHARS: usize = 128;
 ///
 /// A config-global declaration (a single blocked npm top-level `registry=`, or one
 /// `NuGet.Config` `<add key>` source) can affect *every* dependency in the document — without
-/// this cap, `push_collapsed_blocked_registries` would build up to
+/// this cap, `push_collapsed_registry_diagnostics` would build up to
 /// [`crate::MAX_DEPENDENCIES_PER_DOCUMENT`] `-` `1` `Location`s (each a cloned `Uri` plus a
 /// message) into one diagnostic, republished on every keystroke, for a group whose size alone
 /// already says everything the individual entries would ("every other dependency is affected
@@ -1503,7 +1503,7 @@ const fn should_notify_in_diagnostics(reason: SkipReason) -> bool {
 /// an "Information" squiggle on nearly every dependency in a lockfile-less manifest. Every
 /// individual skipped dependency still survives via `related_information` (name + its own
 /// reason), capped at [`MAX_BLOCKED_REGISTRY_RELATED_INFO`] like
-/// `push_collapsed_blocked_registries`'s sibling cap, so the notice never grows
+/// `push_collapsed_registry_diagnostics`'s sibling cap, so the notice never grows
 /// unbounded with document size.
 ///
 /// Suppressed while `versions.offline`: [`offline_notice`] already covers that case with
@@ -4520,7 +4520,7 @@ mod tests {
         assert!(!related[0].message().contains("glpat-AAAABBBBCCCCDDDD"));
     }
 
-    /// #944 S2/M3 regression: `push_collapsed_blocked_registries` caps individually-named
+    /// #944 S2/M3 regression: `push_collapsed_registry_diagnostics` caps individually-named
     /// `related_information` siblings at [`MAX_BLOCKED_REGISTRY_RELATED_INFO`] (9) and folds
     /// everything beyond that into one trailing "and K more..." entry, instead of an unbounded
     /// fan-out. 12 dependencies sharing one declaration key -> 1 anchor + 11 siblings -> 9
@@ -6017,7 +6017,7 @@ mod tests {
     /// Issue #1392 (critic M5): 10+ skipped dependencies must collapse into one notice
     /// with `related_information` capped at `MAX_BLOCKED_REGISTRY_RELATED_INFO` (9) named
     /// entries plus a trailing "+N more" entry, mirroring
-    /// `push_collapsed_blocked_registries`'s own cap.
+    /// `push_collapsed_registry_diagnostics`'s own cap.
     #[test]
     fn test_generate_diagnostics_from_cache_skip_reason_notice_caps_related_information() {
         use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};

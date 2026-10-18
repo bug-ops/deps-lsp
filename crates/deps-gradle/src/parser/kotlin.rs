@@ -537,6 +537,8 @@ mod tests {
     #[test]
     fn test_versioned_and_versionless_flood_on_one_line_is_linear() {
         let filler = "api(\"g:a:1\")\n".repeat(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
+        // The filler saturates the dependency cap and stays constant, so the healthy ratio is
+        // below the 8x input scale; the flood is what must scale linearly.
         let result = deps_core::test_util::scaling::assert_scaling(
             "kotlin versioned/versionless flood",
             deps_core::test_util::scaling::ExpectedGrowth::Linear,

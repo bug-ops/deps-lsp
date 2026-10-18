@@ -13,7 +13,7 @@ tags:
   - deps-gradle
   - deps-swift
 created: 2026-10-07
-status: draft
+status: partial
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
@@ -231,6 +231,19 @@ THEN the guidance points to the single shared mechanism and no new hard-coded Du
 - Let a test-only hook become reachable from `deps-lsp`'s non-dev dependency tree or release binaries.
 - Edit files under `crates/deps-zed`.
 - Use a bare numeric, string or `bool`-flag type where a dedicated type can express the measure.
+
+> [!warning] Implementation status (issue #1824, PR #PR): partial
+> Option a (scaling ratio) is implemented for the 9 sites the issue lists (gradle groovy/kotlin, swift x2,
+> `matched_spans`, `lsp_helpers/mod.rs`, `git_ref.rs` x3) through `deps_core::test_util::scaling::assert_scaling`:
+> small and full runs interleaved, best of 3 per side, one re-measure before failing, a 100 ms noise floor, and
+> `Linear`/`Linearithmic`/`Bounded` limits as a typed `TimeRatio`. Its decision logic has deterministic unit tests
+> with an injected clock; load-step runs (CPU burners added between the two phases) passed for `matched_spans`
+> and the swift overlapping-forms guard.
+>
+> Still open and not claimed: the remaining ~21 wall-clock asserts (FR-005; `redact/url.rs` x10 and others), the
+> contributor-facing convention doc (FR-010), the mutation check that a deliberately quadratic variant of each
+> guard fails (SC-002), the `retries` question (OQ-5) and the open questions below. The spec is not closed;
+> a follow-up issue tracks the remainder.
 
 ## 9. Open Questions
 

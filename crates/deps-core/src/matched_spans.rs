@@ -209,7 +209,8 @@ mod tests {
 
         let spans = assert_scaling(
             "disjoint span flood",
-            ExpectedGrowth::Linear,
+            // `MatchedSpans` is a `BTreeMap`: n log n, healthy ratio about 13 at this size.
+            ExpectedGrowth::Linearithmic,
             300_000,
             |count| count,
             |&count| {

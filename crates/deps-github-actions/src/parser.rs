@@ -63,7 +63,7 @@ enum ParsedUses {
 
 /// Splits a raw `uses:` value into `owner/repo` (truncated at the second `/`) and its ref,
 /// classifying the source shape. Does not resolve the ref against the tags API — that is
-/// `classify_ref`'s job on the returned `ref_text`.
+/// the tag index's job on the returned `ref_text`.
 fn classify_uses_value(value: &str) -> ParsedUses {
     let value = value.trim();
     if value.is_empty() {
