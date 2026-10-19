@@ -350,10 +350,10 @@ mod tests {
                 let name = name.clone();
                 Box::pin(async move {
                     if name.as_str() == "not-found" {
-                        Err(deps_core::error::DepsError::PackageNotFound {
-                            package: name.as_str().into(),
-                            registry: "mock",
-                        })
+                        Err(deps_core::error::DepsError::not_found_locally(
+                            name.as_str(),
+                            "mock",
+                        ))
                     } else {
                         Err(deps_core::error::DepsError::CacheError(
                             "mock fallback failure".to_string(),

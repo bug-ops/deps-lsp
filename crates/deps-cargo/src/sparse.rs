@@ -9,7 +9,7 @@
 //! # Examples
 //!
 //! ```no_run
-//! use deps_cargo::config::{IndexTrust, RegistryIndex};
+//! use deps_cargo::config::{RegistryTrust, RegistryIndex};
 //! use deps_cargo::sparse::SparseIndexClient;
 //! use deps_core::HttpCache;
 //! use deps_core::net_policy::RegistryAccessPolicy;
@@ -19,7 +19,7 @@
 //! async fn main() {
 //!     let cache = Arc::new(HttpCache::new());
 //!     let policy = RegistryAccessPolicy::default();
-//!     let index = RegistryIndex::new("https://index.crates.io", IndexTrust::Trusted, &policy).unwrap();
+//!     let index = RegistryIndex::new("https://index.crates.io", RegistryTrust::Trusted, &policy).unwrap();
 //!     let client = SparseIndexClient::new(index, cache);
 //!
 //!     let versions = client.get_versions("serde").await.unwrap();
@@ -27,10 +27,10 @@
 //! }
 //! ```
 
-use crate::config::{AuthToken, IndexTrust, RegistryIndex};
+use crate::config::{AuthToken, RegistryIndex, RegistryTrust};
 use crate::types::CargoVersion;
 use deps_core::{
-    DepsError, EgressTier, HttpCache, RegistryEndpoint, Result,
+    DepsError, HttpCache, RegistryEndpoint, Result,
     cache::{CredentialHeader, RequestAuth},
     lsp_helpers::warn_rejected_value,
     net_policy::{RedactedUrl, TrustedPrefix},
@@ -77,10 +77,7 @@ pub(crate) fn is_safe_crate_name(name: &str) -> bool {
 fn reject_unsafe_crate_name(name: &str, registry_display_name: &'static str) -> Result<()> {
     if !is_safe_crate_name(name) {
         warn_rejected_value("is_safe_crate_name", "sparse index request URL", name);
-        return Err(DepsError::PackageNotFound {
-            package: name.to_string().into(),
-            registry: registry_display_name,
-        });
+        return Err(DepsError::not_found_locally(name, registry_display_name));
     }
     Ok(())
 }
@@ -231,11 +228,11 @@ pub struct SparseIndexClient {
     /// ([`deps_core::HttpCache::get_cached_trusted_origin`]) so the header cannot
     /// survive a cross-origin redirect.
     auth_header: Option<deps_core::secret::AuthorizationValue>,
-    /// The [`IndexTrust`] tier `index` was validated under (issue #455, C2): governs which
+    /// The [`RegistryTrust`] tier `index` was validated under (issue #455, C2): governs which
     /// transport [`Self::fetch`] routes through — a `WorkspaceDeclared` index always goes
     /// through [`deps_core::HttpCache::get_cached_workspace`], regardless of whether `auth` is
     /// set, so its connect-time address is scrutinized by the live workspace-registry policy.
-    trust: IndexTrust,
+    trust: RegistryTrust,
     /// Display name used in [`deps_core::DepsError::PackageNotFound`] messages.
     registry_display_name: &'static str,
     /// The endpoint [`Self::endpoint`] reports, computed on first use (the fingerprint hashes
@@ -257,12 +254,12 @@ enum IndexTransport<'a> {
 impl SparseIndexClient {
     fn transport(&self) -> IndexTransport<'_> {
         match (&self.auth_header, self.trust) {
-            (Some(header_value), IndexTrust::Trusted) => {
+            (Some(header_value), RegistryTrust::Trusted) => {
                 IndexTransport::TrustedOrigin(header_value)
             }
-            (None, IndexTrust::Trusted) => IndexTransport::System,
-            (None, IndexTrust::WorkspaceDeclared) => IndexTransport::Workspace,
-            (Some(_), IndexTrust::WorkspaceDeclared) => IndexTransport::Refused,
+            (None, RegistryTrust::Trusted) => IndexTransport::System,
+            (None, RegistryTrust::WorkspaceDeclared) => IndexTransport::Workspace,
+            (Some(_), RegistryTrust::WorkspaceDeclared) => IndexTransport::Refused,
         }
     }
 
@@ -271,19 +268,14 @@ impl SparseIndexClient {
     /// workspace-declared ones).
     #[must_use]
     pub fn endpoint(&self) -> RegistryEndpoint {
-        self.endpoint.get_or_compute(|| {
-            let egress = match self.transport() {
-                IndexTransport::TrustedOrigin(_) | IndexTransport::System => EgressTier::Baseline,
-                IndexTransport::Workspace | IndexTransport::Refused => EgressTier::Guarded,
-            };
-            RegistryEndpoint::base(self.base.as_url(), egress)
-        })
+        self.endpoint
+            .get_or_compute(|| RegistryEndpoint::base(self.base.as_url(), self.trust.egress()))
     }
 
     /// Creates a new unauthenticated sparse-index client for `index`.
     ///
     /// Takes a validated [`RegistryIndex`], not a bare `String` (plan-1b §1.2, critic S2):
-    /// `RegistryIndex::new`'s [`crate::config::IndexTrust`]/policy gate is the *only* public
+    /// `RegistryIndex::new`'s [`crate::config::RegistryTrust`]/policy gate is the *only* public
     /// constructor of a fetchable index URL, so this client cannot be built with one that
     /// skipped it.
     pub fn new(index: RegistryIndex, cache: Arc<HttpCache>) -> Self {
@@ -318,9 +310,9 @@ impl SparseIndexClient {
         }
     }
 
-    /// The [`IndexTrust`] tier this client's index was validated under.
+    /// The [`RegistryTrust`] tier this client's index was validated under.
     #[must_use]
-    pub(crate) const fn trust(&self) -> IndexTrust {
+    pub(crate) const fn trust(&self) -> RegistryTrust {
         self.trust
     }
 
@@ -356,7 +348,7 @@ impl SparseIndexClient {
     /// let policy = deps_core::net_policy::RegistryAccessPolicy::default();
     /// let index = deps_cargo::config::RegistryIndex::new(
     ///     "https://index.crates.io",
-    ///     deps_cargo::config::IndexTrust::Trusted,
+    ///     deps_cargo::config::RegistryTrust::Trusted,
     ///     &policy,
     /// ).unwrap();
     /// let client = SparseIndexClient::new(index, cache);
@@ -447,6 +439,7 @@ impl SparseIndexClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::EgressTier;
     use deps_core::net_policy::RegistryAccessPolicy;
     use std::assert_matches;
 
@@ -455,14 +448,52 @@ mod tests {
     /// the policy gate itself is unit-tested directly in `config.rs`, not re-exercised here.
     fn test_index(raw: &str) -> RegistryIndex {
         let policy = RegistryAccessPolicy::default();
-        RegistryIndex::new(raw, IndexTrust::Trusted, &policy).unwrap()
+        RegistryIndex::new(raw, RegistryTrust::Trusted, &policy).unwrap()
     }
 
-    /// Like [`test_index`], but [`IndexTrust::WorkspaceDeclared`] — for issue #455's C2
+    /// Like [`test_index`], but [`RegistryTrust::WorkspaceDeclared`] — for issue #455's C2
     /// fail-closed/routing tests, which need a `WorkspaceDeclared` index specifically.
     fn test_workspace_index(raw: &str) -> RegistryIndex {
         let policy = RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::All);
-        RegistryIndex::new(raw, IndexTrust::WorkspaceDeclared, &policy).unwrap()
+        RegistryIndex::new(raw, RegistryTrust::WorkspaceDeclared, &policy).unwrap()
+    }
+
+    /// Cargo's transport egress is exactly the core trust's egress (spec 084): Cargo differs from
+    /// the other ecosystems only in what gates a credential, never in which egress a trust uses.
+    #[test]
+    fn test_transport_egress_equals_the_core_trust_egress() {
+        let token = || Some(AuthToken::new("cargo-token".to_string()));
+        for (index, auth, transport_egress) in [
+            (test_index("https://a.example"), None, EgressTier::Baseline),
+            (
+                test_index("https://a.example"),
+                token(),
+                EgressTier::Baseline,
+            ),
+            (
+                test_workspace_index("https://a.example"),
+                None,
+                EgressTier::Guarded,
+            ),
+            (
+                test_workspace_index("https://a.example"),
+                token(),
+                EgressTier::Guarded,
+            ),
+        ] {
+            let trust = index.trust();
+            let client = SparseIndexClient::with_auth(index, Arc::new(HttpCache::new()), auth, "t");
+            let expected = match client.transport() {
+                IndexTransport::TrustedOrigin(_) | IndexTransport::System => EgressTier::Baseline,
+                IndexTransport::Workspace | IndexTransport::Refused => EgressTier::Guarded,
+            };
+            assert_eq!(expected, transport_egress);
+            assert_eq!(trust.egress(), transport_egress);
+            assert_eq!(
+                client.endpoint(),
+                RegistryEndpoint::base(client.base.as_url(), transport_egress)
+            );
+        }
     }
 
     /// Live-network smoke test against the real crates.io sparse index. Restored

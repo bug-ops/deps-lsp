@@ -127,7 +127,7 @@ pub struct DenoParseResult {
     /// [`crate::registry::DenoRegistry::register_alternate_npm`] so a later
     /// `AlternateRegistry`-sourced fetch actually has a client to route through, instead of
     /// failing closed to `PackageNotFound` for every request.
-    pub resolved_registries: Vec<deps_npm::config::NpmRegistryIndex>,
+    pub resolved_registries: Vec<deps_npm::config::DeclaredNpmRegistry>,
 }
 
 deps_core::impl_parse_result!(
@@ -322,7 +322,7 @@ fn classify_npm_imports(
     dependencies: &mut [DenoDependency],
     uri: &Url,
     ctx: &DenoParseContext,
-) -> Vec<deps_npm::config::NpmRegistryIndex> {
+) -> Vec<deps_npm::config::DeclaredNpmRegistry> {
     let Some(manifest_dir) = deps_core::lockfile::resolve_manifest_file_path(uri)
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
     else {

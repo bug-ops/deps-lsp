@@ -885,7 +885,7 @@ mod tests {
             let policy = deps_core::net_policy::RegistryAccessPolicy::default();
             let registry_index = crate::config::RegistryIndex::new(
                 &server.url(),
-                crate::config::IndexTrust::Trusted,
+                crate::config::RegistryTrust::Trusted,
                 &policy,
             )
             .unwrap();

@@ -10,14 +10,15 @@ use crate::config::{NuGetAuth, NuGetSourceChain, ResolvedHop};
 use crate::types::{NuGetVersion, PackageInfo};
 use crate::version::compare_versions;
 use dashmap::DashMap;
-use deps_core::net_policy::{PolicyGate, RegistryAccessPolicy, TrustedPrefix};
+use deps_core::net_policy::{PolicyGate, RegistryAccessPolicy, RegistryTrust, TrustedPrefix};
 use deps_core::parser::DependencySource;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::registry::{KeyShape, register_capped_with_occupied};
 use deps_core::{
-    CredentialHeader, DepsError, EcosystemId, EgressTier, FreshnessSettings, HOVER_RECENT_VERSIONS,
-    HttpCache, PublishTime, RegistryEndpoint, RequestAuth, Result, SafePathSegment,
+    ChainNotFound, CredentialHeader, DepsError, EcosystemId, EgressTier, FreshnessSettings,
+    HOVER_RECENT_VERSIONS, HttpCache, PublishTime, RegistryEndpoint, RequestAuth, Result,
+    SafePathSegment,
 };
 use serde::Deserialize;
 use std::any::Any;
@@ -97,30 +98,46 @@ enum NuGetRegistryTier {
     /// `api.nuget.org` (or a test override) — `HttpCache::get_cached`, today's path,
     /// unchanged, `PolicyGate::Skip`.
     Public,
-    /// A `NuGet.Config`-declared feed — `HttpCache::get_cached_workspace`, so every redirect
-    /// hop is re-classified against the live [`RegistryAccessPolicy`], and each service-index
-    /// resource `@id` is validated with `PolicyGate::Enforce` before being trusted.
-    WorkspaceDeclared,
+    /// A `NuGet.Config`-declared feed. A [`RegistryTrust::WorkspaceDeclared`] one is fetched
+    /// through the origin-pinned guarded transport, so every redirect hop is re-classified
+    /// against the live [`RegistryAccessPolicy`], and each service-index resource `@id` is
+    /// validated with `PolicyGate::Enforce` before being trusted. A [`RegistryTrust::Trusted`]
+    /// one (equal to a URL the operator's user-profile file declares) is fetched like the public
+    /// registry: origin-confined on the Baseline egress, with no policy gate.
+    Declared(RegistryTrust),
 }
 
 /// The transport [`NuGetRegistry::fetch`] sends one request through, decided once per request
-/// so the request path and the breaker identity's egress cannot disagree.
+/// so the request path and the breaker identity's egress cannot disagree. Trust picks the
+/// transport; the credential (when the request may carry one) rides on either.
 enum NuGetTransport<'a> {
-    /// Credentialed, origin-pinned (`get_cached_pinned` with the hop's credential).
-    Authenticated(&'a NuGetAuth),
-    /// Anonymous, origin-pinned, policy-guarded (`get_cached_pinned`).
-    Pinned,
-    /// Anonymous trusted-origin path (`get_cached_trusted_origin`).
-    TrustedOrigin,
+    /// Origin-pinned and policy-guarded (`get_cached_pinned`), for a workspace-declared feed.
+    Pinned(Option<&'a NuGetAuth>),
+    /// Origin-confined on the Baseline egress (`get_cached_trusted_origin`), for the public
+    /// registry and a feed the operator declared.
+    TrustedOrigin(Option<&'a NuGetAuth>),
 }
 
 impl NuGetTransport<'_> {
     const fn egress(&self) -> EgressTier {
         match self {
-            Self::Authenticated(_) | Self::Pinned => EgressTier::Guarded,
-            Self::TrustedOrigin => EgressTier::Baseline,
+            Self::Pinned(_) => EgressTier::Guarded,
+            Self::TrustedOrigin(_) => EgressTier::Baseline,
         }
     }
+}
+
+/// The request authentication for a hop's credential, bound to `prefix`; anonymous without one.
+fn request_auth<'a>(
+    credential: Option<&'a NuGetAuth>,
+    prefix: &'a TrustedPrefix,
+) -> RequestAuth<'a> {
+    credential.map_or(RequestAuth::ANONYMOUS, |auth| {
+        RequestAuth::credential(
+            CredentialHeader::Authorization(auth.as_authorization()),
+            prefix,
+        )
+    })
 }
 
 /// Where a dependency source is fetched from: the single dispatch decision shared by version
@@ -282,14 +299,78 @@ fn pick_resource(resources: &[ServiceResource], type_preference: &[&str]) -> Opt
     None
 }
 
+/// How a service-index resource `@id` is vetted, chosen once per tier by an exhaustive match so a
+/// new tier cannot silently inherit another's check.
+#[derive(Clone, Copy)]
+enum ResourceCheck {
+    /// The public registry's own index: trusted unconditionally.
+    Open,
+    /// A trusted (operator-declared) feed: shape plus the never-a-registry floor, no policy.
+    Floor,
+    /// A workspace-declared feed: shape plus the live workspace policy.
+    Policy,
+}
+
+impl ResourceCheck {
+    const fn for_tier(tier: NuGetRegistryTier) -> Self {
+        match tier {
+            NuGetRegistryTier::Public => Self::Open,
+            NuGetRegistryTier::Declared(RegistryTrust::Trusted) => Self::Floor,
+            NuGetRegistryTier::Declared(RegistryTrust::WorkspaceDeclared) => Self::Policy,
+        }
+    }
+
+    fn validate(
+        self,
+        id: &str,
+        policy: &RegistryAccessPolicy,
+    ) -> std::result::Result<(), ResourceRejection> {
+        use deps_core::net_policy::{IndexUrlError, floor_block, validate_index_url};
+        match self {
+            Self::Open => Ok(()),
+            Self::Policy => {
+                validate_index_url(id, id, EcosystemId::NuGet, PolicyGate::Enforce(policy))
+                    .map(drop)
+                    .map_err(|error| match error {
+                        IndexUrlError::BlockedHost { .. } => ResourceRejection::Policy(error),
+                        other => ResourceRejection::Invalid(other),
+                    })
+            }
+            Self::Floor => {
+                let url = validate_index_url(id, id, EcosystemId::NuGet, PolicyGate::Skip)
+                    .map_err(ResourceRejection::Invalid)?;
+                floor_block(&url, policy.get()).map_or(Ok(()), |block| {
+                    Err(ResourceRejection::Floor(IndexUrlError::BlockedHost {
+                        block,
+                    }))
+                })
+            }
+        }
+    }
+}
+
+/// Why a service-index resource `@id` was refused; each variant names its own cause.
+#[derive(Debug, thiserror::Error)]
+enum ResourceRejection {
+    #[error("is not a valid registry URL: {0}")]
+    Invalid(deps_core::net_policy::IndexUrlError),
+    #[error("is blocked by the workspace registry policy: {0}")]
+    Policy(deps_core::net_policy::IndexUrlError),
+    #[error("is a host that is never a registry: {0}")]
+    Floor(deps_core::net_policy::IndexUrlError),
+}
+
 impl ServiceIndex {
-    /// Resolves the service index's resources. For [`NuGetRegistryTier::WorkspaceDeclared`]
+    /// Resolves the service index's resources. For a workspace-declared [`NuGetRegistryTier::Declared`]
     /// (issue #523, Q3), each picked resource `@id` is validated against `policy` before being
     /// trusted — `HttpCache::get_cached_workspace`'s own doc states it does not re-check the
     /// initial request URL's host class, only DNS-resolved addresses and redirect hops, so this
     /// name-level gate is load-bearing. A rejected `PackageBaseAddress` fails the whole feed
     /// (fail closed); a rejected `RegistrationsBaseUrl`/`SearchQueryService` degrades to
     /// absent, matching how a feed that never declared the resource at all is already handled.
+    /// A trusted (operator-declared) feed skips the workspace policy but not the
+    /// never-a-registry floor: a resource `@id` at a loopback, link-local, cloud-metadata,
+    /// unspecified or reserved host is refused the same way (spec 084).
     /// [`NuGetRegistryTier::Public`] never gates (`PolicyGate::Skip` equivalent) — the default
     /// public registry is trusted unconditionally, matching every other ecosystem's baseline.
     ///
@@ -329,33 +410,17 @@ impl ServiceIndex {
             ],
         );
 
-        if tier != NuGetRegistryTier::WorkspaceDeclared {
-            return Self::assemble(
-                package_base_address,
-                search_query_service,
-                registrations_base_url,
-            );
-        }
-
-        let gate = PolicyGate::Enforce(policy);
-        deps_core::net_policy::validate_index_url(
-            &package_base_address,
-            &package_base_address,
-            EcosystemId::NuGet,
-            gate,
-        )
-        .map_err(|e| {
+        let check = ResourceCheck::for_tier(tier);
+        check.validate(&package_base_address, policy).map_err(|e| {
             deps_core::DepsError::parse_error(
                 "NuGet service index",
-                &format!("PackageBaseAddress blocked by workspace registry policy: {e}"),
+                &format!("PackageBaseAddress {e}"),
             )
         })?;
-        let search_query_service = search_query_service.filter(|u| {
-            deps_core::net_policy::validate_index_url(u, u, EcosystemId::NuGet, gate).is_ok()
-        });
-        let registrations_base_url = registrations_base_url.filter(|u| {
-            deps_core::net_policy::validate_index_url(u, u, EcosystemId::NuGet, gate).is_ok()
-        });
+        let search_query_service =
+            search_query_service.filter(|u| check.validate(u, policy).is_ok());
+        let registrations_base_url =
+            registrations_base_url.filter(|u| check.validate(u, policy).is_ok());
 
         Self::assemble(
             package_base_address,
@@ -525,7 +590,7 @@ pub struct NuGetRegistry {
     endpoint: deps_core::CachedEndpoint,
     service_index: Arc<OnceCell<ServiceIndex>>,
     tier: NuGetRegistryTier,
-    /// Consulted only when [`Self::tier`] is [`NuGetRegistryTier::WorkspaceDeclared`] — see
+    /// Consulted only when [`Self::tier`] is a workspace-declared [`NuGetRegistryTier::Declared`] — see
     /// [`ServiceIndex::resolve`]'s per-`@id` validation. A `Public`-tier instance carries a
     /// default policy that is never consulted (`resolve` skips the gate entirely for that
     /// tier), so `new`/`with_service_index_url` need not thread a live policy through.
@@ -582,9 +647,9 @@ impl NuGetRegistry {
     }
 
     /// Creates a [`NuGetRegistry`] client for one resolved `NuGet.Config`-declared feed
-    /// (issue #523) — `WorkspaceDeclared`-tier so it fetches through
-    /// `Self::fetch`'s origin-pinned transport and validates each service-index resource
-    /// `@id` against `policy`.
+    /// (issue #523) — `Declared`-tier carrying the hop's trust, so a workspace-declared feed
+    /// fetches through `Self::fetch`'s origin-pinned transport and validates each service-index
+    /// resource `@id` against `policy`, while a trusted one fetches like the public registry.
     ///
     /// `fallback_chain` is empty for every call except the *head* client
     /// [`Self::register_alternate`] builds for a multi-hop chain — every other hop is a dead end
@@ -609,7 +674,7 @@ impl NuGetRegistry {
             service_index_url: hop.url.as_str().to_string(),
             endpoint: deps_core::CachedEndpoint::default(),
             service_index: Arc::new(OnceCell::new()),
-            tier: NuGetRegistryTier::WorkspaceDeclared,
+            tier: NuGetRegistryTier::Declared(hop.url.trust()),
             policy,
             alternates: Arc::new(DashMap::new()),
             fallback_chain,
@@ -619,45 +684,36 @@ impl NuGetRegistry {
         }
     }
 
-    /// FR-011: routes every HTTP fetch for a `WorkspaceDeclared`-tier or credentialed source
-    /// through this single decision point (§3.9's four call sites). `prefix` is the
-    /// caller's already-parsed prefix for this specific resource.
+    /// FR-011: routes every HTTP fetch for a declared or credentialed source through this single
+    /// decision point (§3.9's four call sites). `prefix` is the caller's already-parsed prefix
+    /// for this specific resource.
     ///
-    /// Dispatches to:
-    /// 1. The authenticated, origin-pinned transport — iff [`Self::auth`] is `Some` **and**
-    ///    both `url`'s origin and `prefix`'s origin equal [`Self::declared_origin`]
-    ///    (C1, §3.1), checked via [`TrustedPrefix::permits`], the same predicate the
-    ///    redirect-hop and registration-page pre-checks use (issue #795 S2 follow-up) —
-    ///    `declared_origin` always carries a root `/` path (see [`origin_of`]), so the check
-    ///    reduces to plain origin equality here, keeping this decision and the redirect/page-trust
-    ///    decisions from being able to silently disagree. A missing declared origin or an
-    ///    unparseable `url` is a mismatch, never an error — fails closed to arm 2/3,
-    ///    unauthenticated.
-    /// 2. The unauthenticated, origin-pinned workspace transport (#562) — when [`Self::tier`]
-    ///    is [`NuGetRegistryTier::WorkspaceDeclared`] and arm 1 declined.
-    /// 3. Today's public `get_cached_trusted_origin` path — otherwise, byte-identical to spec
-    ///    035.
+    /// The transport follows [`Self::tier`]: the origin-pinned guarded transport (#562) for a
+    /// workspace-declared feed, `get_cached_trusted_origin` (Baseline egress) for the public
+    /// registry and a trusted feed (spec 084).
+    ///
+    /// The credential is attached — on either transport — iff [`Self::auth`] is `Some` **and**
+    /// both `url`'s origin and `prefix`'s origin equal [`Self::declared_origin`] (C1, §3.1),
+    /// checked via [`TrustedPrefix::permits`], the same predicate the redirect-hop and
+    /// registration-page pre-checks use (issue #795 S2 follow-up) — `declared_origin` always
+    /// carries a root `/` path (see [`origin_of`]), so the check reduces to plain origin
+    /// equality here, keeping this decision and the redirect/page-trust decisions from being
+    /// able to silently disagree. A missing declared origin or an unparseable `url` is a
+    /// mismatch, never an error — the request goes out unauthenticated.
     ///
     /// # Errors
     ///
     /// Whatever the underlying `HttpCache` fetch returns.
     async fn fetch(&self, url: &str, prefix: &TrustedPrefix) -> Result<bytes::Bytes> {
         match self.transport(url, prefix) {
-            NuGetTransport::Authenticated(auth) => {
-                let auth = RequestAuth::credential(
-                    CredentialHeader::Authorization(auth.as_authorization()),
-                    prefix,
-                );
-                self.cache.get_cached_pinned(url, prefix, auth, None).await
-            }
-            NuGetTransport::Pinned => {
+            NuGetTransport::Pinned(credential) => {
                 self.cache
-                    .get_cached_pinned(url, prefix, RequestAuth::ANONYMOUS, None)
+                    .get_cached_pinned(url, prefix, request_auth(credential, prefix), None)
                     .await
             }
-            NuGetTransport::TrustedOrigin => {
+            NuGetTransport::TrustedOrigin(credential) => {
                 self.cache
-                    .get_cached_trusted_origin(url, prefix, RequestAuth::ANONYMOUS, None)
+                    .get_cached_trusted_origin(url, prefix, request_auth(credential, prefix), None)
                     .await
             }
         }
@@ -671,10 +727,14 @@ impl NuGetRegistry {
                 && declared.permits(prefix.as_url())
         });
 
-        match (self.auth.as_ref().filter(|_| can_authenticate), self.tier) {
-            (Some(auth), _) => NuGetTransport::Authenticated(auth),
-            (None, NuGetRegistryTier::WorkspaceDeclared) => NuGetTransport::Pinned,
-            (None, NuGetRegistryTier::Public) => NuGetTransport::TrustedOrigin,
+        let credential = self.auth.as_ref().filter(|_| can_authenticate);
+        match self.tier {
+            NuGetRegistryTier::Declared(RegistryTrust::WorkspaceDeclared) => {
+                NuGetTransport::Pinned(credential)
+            }
+            NuGetRegistryTier::Public | NuGetRegistryTier::Declared(RegistryTrust::Trusted) => {
+                NuGetTransport::TrustedOrigin(credential)
+            }
         }
     }
 
@@ -822,20 +882,19 @@ impl NuGetRegistry {
     /// package's name past a merely-unreachable private feed.
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     async fn get_versions_chained(&self, name: &str) -> Result<Vec<NuGetVersion>> {
-        let mut last_miss: Result<Vec<NuGetVersion>> = Err(DepsError::PackageNotFound {
-            package: name.to_string().into(),
-            registry: REGISTRY,
-        });
+        let mut not_found = ChainNotFound::new();
+        let mut last_miss: Result<Vec<NuGetVersion>> = Err(not_found.error(name, REGISTRY));
 
         for hop in std::iter::once(self).chain(self.fallback_chain.iter().map(Arc::as_ref)) {
             match hop.get_versions(name).await {
                 Ok(versions) if !versions.is_empty() => return Ok(versions),
-                Ok(empty) => last_miss = Ok(empty),
+                Ok(empty) => {
+                    not_found.record_answered_empty();
+                    last_miss = Ok(empty);
+                }
                 Err(error) if error.is_not_found() => {
-                    last_miss = Err(DepsError::PackageNotFound {
-                        package: name.to_string().into(),
-                        registry: REGISTRY,
-                    });
+                    not_found.record(&error);
+                    last_miss = Err(not_found.error(name, REGISTRY));
                 }
                 Err(other) => {
                     tracing::warn!(
@@ -1477,7 +1536,14 @@ impl deps_core::Registry for NuGetRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::NuGetFeedUrl;
+    use crate::config::{DeclaredNuGetFeed, NuGetFeedKind};
+    use deps_core::net_policy::OperatorRegistries;
+
+    fn workspace_feed(raw: &str, policy: &RegistryAccessPolicy) -> DeclaredNuGetFeed {
+        OperatorRegistries::default()
+            .classify::<NuGetFeedKind>(raw, raw, policy)
+            .unwrap()
+    }
     use std::assert_matches;
 
     fn freshness(enabled: bool) -> deps_core::FreshnessSettings {
@@ -1813,9 +1879,59 @@ mod tests {
         let policy =
             RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly);
         assert!(
-            ServiceIndex::resolve(&response, NuGetRegistryTier::WorkspaceDeclared, &policy)
-                .is_err()
+            ServiceIndex::resolve(
+                &response,
+                NuGetRegistryTier::Declared(RegistryTrust::WorkspaceDeclared),
+                &policy
+            )
+            .is_err()
         );
+    }
+
+    /// Spec 084: a trusted feed skips the workspace policy, so a private `@id` is accepted under
+    /// `off`, but the never-a-registry floor still applies to every resource.
+    #[test]
+    fn test_service_index_resolve_trusted_tier_skips_policy_but_keeps_the_floor() {
+        let trusted = NuGetRegistryTier::Declared(RegistryTrust::Trusted);
+        let off = RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::Off);
+        let parse = |body: &str| -> ServiceIndexResponse { serde_json::from_str(body).unwrap() };
+
+        let private = parse(
+            r#"{"version": "3.0.0", "resources": [
+                {"@id": "https://10.0.0.5/flat", "@type": "PackageBaseAddress/3.0.0"}
+            ]}"#,
+        );
+        assert!(ServiceIndex::resolve(&private, trusted, &off).is_ok());
+
+        for host in [
+            "169.254.169.254",
+            "127.0.0.1",
+            "0.0.0.0",
+            "[::ffff:127.0.0.1]",
+            "[::1]",
+        ] {
+            let flat = parse(&format!(
+                r#"{{"version": "3.0.0", "resources": [
+                    {{"@id": "https://{host}/flat", "@type": "PackageBaseAddress/3.0.0"}}
+                ]}}"#
+            ));
+            assert!(
+                ServiceIndex::resolve(&flat, trusted, &off).is_err(),
+                "PackageBaseAddress at {host}"
+            );
+
+            let optional = parse(&format!(
+                r#"{{"version": "3.0.0", "resources": [
+                    {{"@id": "https://feed.example/flat", "@type": "PackageBaseAddress/3.0.0"}},
+                    {{"@id": "https://{host}/reg", "@type": "RegistrationsBaseUrl/3.6.0"}}
+                ]}}"#
+            ));
+            let index = ServiceIndex::resolve(&optional, trusted, &off).unwrap();
+            assert!(
+                index.registrations_base_url.is_none(),
+                "registrations at {host}"
+            );
+        }
     }
 
     /// Q3: a blocked `RegistrationsBaseUrl` degrades to absent rather than failing the feed.
@@ -1830,8 +1946,12 @@ mod tests {
         .unwrap();
         let policy =
             RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly);
-        let index = ServiceIndex::resolve(&response, NuGetRegistryTier::WorkspaceDeclared, &policy)
-            .unwrap();
+        let index = ServiceIndex::resolve(
+            &response,
+            NuGetRegistryTier::Declared(RegistryTrust::WorkspaceDeclared),
+            &policy,
+        )
+        .unwrap();
         assert!(index.registrations_base_url.is_none());
     }
 
@@ -2922,7 +3042,7 @@ mod tests {
 
     /// Wraps `feed` in an unauthenticated [`ResolvedHop`] — the shape every
     /// `NuGetRegistry::with_base` test call site below needs post-FR-016.
-    fn hop(feed: &NuGetFeedUrl) -> ResolvedHop {
+    fn hop(feed: &DeclaredNuGetFeed) -> ResolvedHop {
         ResolvedHop {
             url: feed.clone(),
             slot: None,
@@ -2931,7 +3051,7 @@ mod tests {
     }
 
     fn workspace_client(base: &str, policy: &Arc<RegistryAccessPolicy>) -> NuGetRegistry {
-        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), policy).unwrap();
+        let feed = workspace_feed(&format!("{base}/index.json"), policy);
         NuGetRegistry::with_base(
             Arc::new(HttpCache::new()),
             &hop(&feed),
@@ -3092,14 +3212,14 @@ mod tests {
 
         let policy = all_policy();
         let cache = Arc::new(HttpCache::new());
-        let hop1_feed = NuGetFeedUrl::new(&format!("{}/index.json", hop1.url()), &policy).unwrap();
+        let hop1_feed = workspace_feed(&format!("{}/index.json", hop1.url()), &policy);
         let hop1_client = Arc::new(NuGetRegistry::with_base(
             Arc::clone(&cache),
             &hop(&hop1_feed),
             Arc::clone(&policy),
             Vec::new(),
         ));
-        let hop0_feed = NuGetFeedUrl::new(&format!("{}/index.json", hop0.url()), &policy).unwrap();
+        let hop0_feed = workspace_feed(&format!("{}/index.json", hop0.url()), &policy);
         let head = NuGetRegistry::with_base(
             cache,
             &hop(&hop0_feed),
@@ -3115,6 +3235,58 @@ mod tests {
         hop0_flat.assert_async().await;
         hop1_index.assert_async().await;
         hop1_flat.assert_async().await;
+    }
+
+    /// #1854: every hop answering a real 404 reports a not-found that vouches for the endpoint;
+    /// an unregistered chain (a local refusal) does not.
+    #[tokio::test]
+    async fn test_chain_not_found_origin_follows_the_wire() {
+        use deps_core::{ErrorOrigin, FreshnessSettings, PackageName, Registry};
+
+        let mut server = mockito::Server::new_async().await;
+        let _index = server
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{}/flat", server.url()),
+                &format!("{}/search", server.url()),
+            ))
+            .create_async()
+            .await;
+        let _flat = server
+            .mock("GET", "/flat/pkg/index.json")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let policy = all_policy();
+        let cache = Arc::new(HttpCache::new());
+        let feed = workspace_feed(&format!("{}/index.json", server.url()), &policy);
+        let head = NuGetRegistry::with_base(
+            Arc::clone(&cache),
+            &hop(&feed),
+            Arc::clone(&policy),
+            Vec::new(),
+        );
+        let error = head.get_versions_chained("pkg").await.unwrap_err();
+        assert!(error.is_not_found());
+        assert_eq!(error.origin(), ErrorOrigin::Endpoint);
+
+        let root = NuGetRegistry::new(cache);
+        let unregistered = DependencySource::AlternateRegistry {
+            index: "missing".to_string(),
+            mirrors_crates_io: false,
+        };
+        let error = root
+            .get_versions_from(
+                &PackageName::new("pkg"),
+                &unregistered,
+                FreshnessSettings::default(),
+            )
+            .await
+            .err()
+            .expect("an error");
+        assert_eq!(error.origin(), ErrorOrigin::Unattributed);
     }
 
     #[tokio::test]
@@ -3153,7 +3325,7 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let hop1_client = Arc::new(workspace_client(&hop1.url(), &policy));
         let head = {
-            let feed = NuGetFeedUrl::new(&format!("{}/index.json", hop0.url()), &policy).unwrap();
+            let feed = workspace_feed(&format!("{}/index.json", hop0.url()), &policy);
             NuGetRegistry::with_base(cache, &hop(&feed), Arc::clone(&policy), vec![hop1_client])
         };
 
@@ -3179,8 +3351,7 @@ mod tests {
         let hop1_client = Arc::new(workspace_client(&hop1.url(), &policy));
         let port = hop1.socket_address().port();
         let head = {
-            let feed =
-                NuGetFeedUrl::new(&format!("http://localhost:{port}/index.json"), &policy).unwrap();
+            let feed = workspace_feed(&format!("http://localhost:{port}/index.json"), &policy);
             NuGetRegistry::with_base(cache, &hop(&feed), Arc::clone(&policy), vec![hop1_client])
         };
 
@@ -3222,7 +3393,7 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let hop1_client = Arc::new(workspace_client(&hop1.url(), &policy));
         let head = {
-            let feed = NuGetFeedUrl::new(&format!("{}/index.json", hop0.url()), &policy).unwrap();
+            let feed = workspace_feed(&format!("{}/index.json", hop0.url()), &policy);
             NuGetRegistry::with_base(cache, &hop(&feed), Arc::clone(&policy), vec![hop1_client])
         };
 
@@ -3295,8 +3466,8 @@ mod tests {
             format!("{}/index.json", public.url()),
         ));
 
-        let hop0_feed = NuGetFeedUrl::new(&format!("{}/index.json", hop0.url()), &policy).unwrap();
-        let hop1_feed = NuGetFeedUrl::new(&format!("{}/index.json", hop1.url()), &policy).unwrap();
+        let hop0_feed = workspace_feed(&format!("{}/index.json", hop0.url()), &policy);
+        let hop1_feed = workspace_feed(&format!("{}/index.json", hop1.url()), &policy);
         let chain = NuGetSourceChain {
             key: "nuget-chain:test-multi-hop".to_string(),
             hops: vec![hop(&hop0_feed), hop(&hop1_feed)],
@@ -3349,8 +3520,7 @@ mod tests {
         let policy = all_policy();
         let cache = Arc::new(HttpCache::new());
         let root = Arc::new(NuGetRegistry::new(Arc::clone(&cache)));
-        let hop_feed =
-            NuGetFeedUrl::new(&format!("{}/index.json", hop_server.url()), &policy).unwrap();
+        let hop_feed = workspace_feed(&format!("{}/index.json", hop_server.url()), &policy);
         let chain = NuGetSourceChain {
             key: "selection-context-forwarding".to_string(),
             hops: vec![hop(&hop_feed)],
@@ -3384,7 +3554,12 @@ mod tests {
 
     // --- issue #561: authenticated fetch (C1 origin-binding, four-site routing) ---
 
-    fn auth_hop(feed: &NuGetFeedUrl, slot: &str, username: &str, password: &str) -> ResolvedHop {
+    fn auth_hop(
+        feed: &DeclaredNuGetFeed,
+        slot: &str,
+        username: &str,
+        password: &str,
+    ) -> ResolvedHop {
         ResolvedHop {
             url: feed.clone(),
             slot: Some(slot.to_string()),
@@ -3403,9 +3578,9 @@ mod tests {
 
         let policy = all_policy();
         let root = Arc::new(NuGetRegistry::new(Arc::new(HttpCache::new())));
-        let feed = |base: &str| NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+        let feed = |base: &str| workspace_feed(&format!("{base}/index.json"), &policy);
         let (a, b) = (feed("https://a.example/v3"), feed("https://b.example/v3"));
-        let nuget_org = NuGetFeedUrl::new(NUGET_ORG_INDEX_URL, &policy).unwrap();
+        let nuget_org = workspace_feed(NUGET_ORG_INDEX_URL, &policy);
         let register = |key: &str, hops: Vec<ResolvedHop>| {
             let chain = NuGetSourceChain {
                 key: key.to_string(),
@@ -3486,7 +3661,113 @@ mod tests {
             .await;
 
         let policy = all_policy();
-        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+        let feed = workspace_feed(&format!("{base}/index.json"), &policy);
+        let client = NuGetRegistry::with_base(
+            Arc::new(HttpCache::new()),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+            &auth_hop(&feed, "corpfeed", "user", "pat"),
+            Arc::clone(&policy),
+            Vec::new(),
+        );
+
+        let versions = client.get_versions("pkg").await.unwrap();
+        assert_eq!(versions.len(), 1);
+        _index.assert_async().await;
+        _flat.assert_async().await;
+    }
+
+    fn trusted_feed(raw: &str, policy: &RegistryAccessPolicy) -> DeclaredNuGetFeed {
+        let operator = OperatorRegistries::declared_in(
+            &deps_core::config_trust::OperatorPath::for_test("/home/me/NuGet.Config"),
+            [raw],
+        );
+        let feed = operator
+            .classify::<NuGetFeedKind>(raw, raw, policy)
+            .unwrap();
+        assert_eq!(feed.trust(), RegistryTrust::Trusted);
+        feed
+    }
+
+    /// Spec 084: a trusted feed is fetched like the public registry — Baseline egress — with or
+    /// without a credential; a workspace-declared feed stays Guarded.
+    #[test]
+    fn test_endpoint_egress_follows_trust_with_and_without_a_credential() {
+        use deps_core::{EgressTier, PackageName, Registry, RegistryEndpoint};
+
+        let policy = all_policy();
+        let root = Arc::new(NuGetRegistry::new(Arc::new(HttpCache::new())));
+        let url = "https://corp.example/v3/index.json";
+        let trusted = trusted_feed(url, &policy);
+        let declared = workspace_feed("https://repo.example/v3/index.json", &policy);
+        let register = |key: &str, hop: ResolvedHop| {
+            let chain = NuGetSourceChain {
+                key: key.to_string(),
+                hops: vec![hop],
+                implicit_public_fallback: false,
+            };
+            NuGetRegistry::register_alternate(&root, &chain, &policy);
+        };
+        let pat = format!("pat-{}", std::process::id());
+        register("trusted", hop(&trusted));
+        register("trusted-auth", auth_hop(&trusted, "corp", "user", &pat));
+        register("declared", hop(&declared));
+        register("declared-auth", auth_hop(&declared, "repo", "user", &pat));
+
+        let name = PackageName::new("pkg");
+        let endpoint = |key: &str| {
+            root.endpoint_for(
+                &name,
+                &DependencySource::AlternateRegistry {
+                    index: key.to_string(),
+                    mirrors_crates_io: false,
+                },
+            )
+        };
+        let trusted_endpoint = RegistryEndpoint::from_base_str(url, EgressTier::Baseline);
+        assert_eq!(endpoint("trusted"), trusted_endpoint);
+        assert_eq!(endpoint("trusted-auth"), trusted_endpoint);
+        for key in ["declared", "declared-auth"] {
+            assert_eq!(
+                endpoint(key),
+                RegistryEndpoint::from_base_str(
+                    "https://repo.example/v3/index.json",
+                    EgressTier::Guarded
+                ),
+                "{key}"
+            );
+        }
+    }
+
+    /// A trusted, credentialed feed still attaches the credential to both resources on the
+    /// origin-confined baseline transport: trust widens egress, not credential binding.
+    #[tokio::test]
+    async fn test_trusted_feed_attaches_credential_over_the_baseline_transport() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+        let auth = NuGetAuth::new("user", "pat");
+        let _index = server
+            .mock("GET", "/index.json")
+            .match_header("authorization", auth.header_value())
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{base}/flat"),
+                &format!("{base}/search"),
+            ))
+            .create_async()
+            .await;
+        let _flat = server
+            .mock("GET", "/flat/pkg/index.json")
+            .match_header("authorization", auth.header_value())
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0"]}"#)
+            .create_async()
+            .await;
+
+        let policy = Arc::new(RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::Off,
+        ));
+        let feed = trusted_feed(&format!("{base}/index.json"), &policy);
         let client = NuGetRegistry::with_base(
             Arc::new(HttpCache::new()),
             // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
@@ -3530,7 +3811,7 @@ mod tests {
             .await;
 
         let policy = all_policy();
-        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+        let feed = workspace_feed(&format!("{base}/index.json"), &policy);
         let client = NuGetRegistry::with_base(
             Arc::new(HttpCache::new()),
             // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
@@ -3597,7 +3878,7 @@ mod tests {
             .await;
 
         let policy = all_policy();
-        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+        let feed = workspace_feed(&format!("{base}/index.json"), &policy);
         let client = NuGetRegistry::with_base(
             Arc::new(HttpCache::new()),
             // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
@@ -3649,7 +3930,7 @@ mod tests {
             .await;
 
         let policy = all_policy();
-        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+        let feed = workspace_feed(&format!("{base}/index.json"), &policy);
         let client = NuGetRegistry::with_base(
             Arc::new(HttpCache::new()),
             // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
@@ -3692,7 +3973,7 @@ mod tests {
             .await;
 
         let policy = all_policy();
-        let feed = NuGetFeedUrl::new(&format!("{}/index.json", declared.url()), &policy).unwrap();
+        let feed = workspace_feed(&format!("{}/index.json", declared.url()), &policy);
         let client = NuGetRegistry::with_base(
             Arc::new(HttpCache::new()),
             // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
@@ -3771,7 +4052,7 @@ mod tests {
             .await;
 
         let policy = all_policy();
-        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+        let feed = workspace_feed(&format!("{base}/index.json"), &policy);
         let cache = Arc::new(HttpCache::new());
         let client_a = NuGetRegistry::with_base(
             Arc::clone(&cache),
@@ -3855,7 +4136,7 @@ mod tests {
             Arc::clone(&cache),
             NUGET_ORG_INDEX_URL.to_string(),
         ));
-        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+        let feed = workspace_feed(&format!("{base}/index.json"), &policy);
         let chain_key = "nuget-chain:rotation-test".to_string();
 
         // Fill to one under capacity, register `chain_v1` to reach capacity exactly, then
@@ -3923,7 +4204,7 @@ mod tests {
             Arc::clone(&cache),
             NUGET_ORG_INDEX_URL.to_string(),
         ));
-        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+        let feed = workspace_feed(&format!("{base}/index.json"), &policy);
 
         for i in 0..MAX_ALTERNATE_REGISTRIES {
             let dummy = NuGetRegistry::with_base(

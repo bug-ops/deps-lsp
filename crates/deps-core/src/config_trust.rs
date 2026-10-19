@@ -8,17 +8,137 @@
 //! attach a credential; callers keep their own credential-tier enforcement (e.g. deps-nuget's
 //! C2 binding).
 //!
+//! [`OperatorPath`](crate::config_trust::OperatorPath) records a different kind of provenance:
+//! that a config *file* was located through the operator's own home directory or an absolute
+//! operator environment variable, never through the workspace. Together with
+//! [`OperatorRegistries`](crate::net_policy::OperatorRegistries) it anchors the one URL-alone
+//! registry trust rule (spec 084).
+//!
 //! `Windows` + `Project` has no production caller today (deps-nuget reaches this only for
 //! `User`-tier credentials, and rejects `Project`-tier credentials before expansion ever runs);
 //! covered by unit tests only.
 //!
-//! `deps-cargo`'s `Provenance`/`IndexTrust` are intentionally separate from this module (env
-//! overrides, not interpolation) — see that crate's own docs.
+//! `deps-cargo`'s `Provenance` and its alias-provenance use of `RegistryTrust` are intentionally
+//! separate from this module (env overrides, not interpolation); see that crate's own docs and
+//! #1855.
 
 // TODO(#1459): centralize env-override-by-name trust (cargo CARGO_REGISTRIES_*, future
 // COMPOSER_AUTH/PIP_INDEX_URL) once a second ecosystem needs it
 
+use std::path::{Path, PathBuf};
+
 use zeroize::Zeroizing;
+
+use crate::net_policy::EnvSource;
+
+/// The environment variables that may locate an operator-owned config file.
+///
+/// A closed set, not a free variable name: a caller cannot mint an operator path from
+/// `PWD` or any other variable a repository-scoped tool might control (#1822).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OperatorEnvVar {
+    /// `GOENV`: the Go environment file.
+    Goenv,
+    /// `XDG_CONFIG_HOME`: the base directory of per-user config on Unix.
+    XdgConfigHome,
+    /// `APPDATA`: the roaming profile directory on Windows.
+    AppData,
+}
+
+impl OperatorEnvVar {
+    /// The variable's name in the process environment.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Goenv => "GOENV",
+            Self::XdgConfigHome => "XDG_CONFIG_HOME",
+            Self::AppData => "APPDATA",
+        }
+    }
+}
+
+/// An absolute path located through the operator's own home directory, config directory or
+/// operator environment variable, never through the workspace.
+///
+/// Has no public constructor from an arbitrary path: an `OperatorPath` is proof of provenance.
+/// A relative path (a relative `GOENV`, `XDG_CONFIG_HOME` or home) would resolve against whatever
+/// directory the server runs in, which a repository can influence, so it is never operator-owned.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::config_trust::{EnvPath, OperatorEnvVar, OperatorPath};
+/// use deps_core::net_policy::MapEnv;
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let env = MapEnv::new().with_var("XDG_CONFIG_HOME", dir.path().to_str().unwrap());
+/// let EnvPath::Path(xdg) = OperatorPath::from_env(&env, OperatorEnvVar::XdgConfigHome) else {
+///     panic!("an absolute path is accepted");
+/// };
+/// assert_eq!(xdg.join("NuGet").as_path(), dir.path().join("NuGet"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OperatorPath(PathBuf);
+
+/// What [`OperatorPath::from_env`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvPath {
+    /// The variable is not set, or is empty (the XDG convention, and what Go does for `GOENV`).
+    Unset,
+    /// The variable is set to a relative path: it names no operator-owned location, because it
+    /// would resolve against a directory a repository can influence. What happens next is the
+    /// caller's rule: Go uses no file, NuGet skips it and tries the home-based defaults, Swift
+    /// treats its user tier as unusable. An empty value is [`Self::Unset`], not this.
+    Ignored,
+    /// The variable names an absolute operator-owned path.
+    Path(OperatorPath),
+}
+
+impl OperatorPath {
+    /// The user's home directory, when the platform reports an absolute one.
+    #[must_use]
+    pub fn home() -> Option<Self> {
+        crate::UserHome::current().map(|home| Self(home.path().to_path_buf()))
+    }
+
+    /// The path named by `var` in `source`; see [`EnvPath`].
+    #[must_use]
+    pub fn from_env(source: &impl EnvSource, var: OperatorEnvVar) -> EnvPath {
+        match source.var_os(var.name()) {
+            None => EnvPath::Unset,
+            Some(value) if value.is_empty() => EnvPath::Unset,
+            Some(value) if !Path::new(&value).is_absolute() => EnvPath::Ignored,
+            Some(value) => EnvPath::Path(Self(PathBuf::from(value))),
+        }
+    }
+
+    /// The platform's per-user config directory (`os.UserConfigDir()` for Go), when absolute.
+    #[must_use]
+    pub fn user_config_dir() -> Option<Self> {
+        dirs::config_dir().filter(|dir| dir.is_absolute()).map(Self)
+    }
+
+    /// This path with one more component. Takes a `&'static str`, which keeps a workspace-controlled
+    /// string out of an operator path by convention; it is not otherwise enforced by the type.
+    #[must_use]
+    pub fn join(&self, segment: &'static str) -> Self {
+        Self(self.0.join(segment))
+    }
+
+    /// The underlying absolute path.
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// An operator path for `path`, without the absoluteness check: for tests, whose fixtures
+    /// live in temp directories and must also compile on platforms where `/x` is not absolute.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn for_test(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+}
 
 /// Which tier a config value was read from — records provenance for [`expand_env_vars`]'s
 /// interpolation gate. Not a secret-binding gate on its own; see this module's doc.
@@ -271,6 +391,7 @@ pub fn process_env(name: &str) -> Option<Zeroizing<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net_policy::MapEnv;
 
     fn z(s: &str) -> Zeroizing<String> {
         Zeroizing::new(s.to_string())
@@ -598,6 +719,60 @@ mod tests {
             panic!("lookup must not be called: %20 is not a well-formed placeholder")
         });
         assert_eq!(result.unwrap().as_str(), "%20");
+    }
+
+    // --- OperatorPath ---
+
+    #[test]
+    fn operator_path_from_env_unset_empty_relative_and_absolute() {
+        let abs = std::env::temp_dir();
+        let env = MapEnv::new()
+            .with_var("GOENV", "")
+            .with_var("XDG_CONFIG_HOME", "relative/config")
+            .with_var("APPDATA", abs.to_str().unwrap());
+
+        assert_eq!(
+            OperatorPath::from_env(&env, OperatorEnvVar::Goenv),
+            EnvPath::Unset,
+            "empty means unset"
+        );
+        assert_eq!(
+            OperatorPath::from_env(&env, OperatorEnvVar::XdgConfigHome),
+            EnvPath::Ignored
+        );
+        assert_eq!(
+            OperatorPath::from_env(&env, OperatorEnvVar::AppData),
+            EnvPath::Path(OperatorPath(abs))
+        );
+        assert_eq!(
+            OperatorPath::from_env(&MapEnv::new(), OperatorEnvVar::Goenv),
+            EnvPath::Unset
+        );
+    }
+
+    #[test]
+    fn operator_path_goenv_off_is_not_an_absolute_path() {
+        let env = MapEnv::new().with_var("GOENV", "off");
+        assert_eq!(
+            OperatorPath::from_env(&env, OperatorEnvVar::Goenv),
+            EnvPath::Ignored
+        );
+    }
+
+    #[test]
+    fn operator_path_join_appends_one_component() {
+        let base = OperatorPath(std::env::temp_dir());
+        assert_eq!(
+            base.join("go").join("env").as_path(),
+            std::env::temp_dir().join("go").join("env")
+        );
+    }
+
+    #[test]
+    fn operator_env_var_names_are_the_real_variables() {
+        assert_eq!(OperatorEnvVar::Goenv.name(), "GOENV");
+        assert_eq!(OperatorEnvVar::XdgConfigHome.name(), "XDG_CONFIG_HOME");
+        assert_eq!(OperatorEnvVar::AppData.name(), "APPDATA");
     }
 
     // --- process_env ---

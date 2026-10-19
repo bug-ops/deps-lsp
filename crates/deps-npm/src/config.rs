@@ -29,11 +29,14 @@
 //!   [`deps_core::net_policy::RedactedUrl`]) before it ever reaches a `tracing::warn!`
 //!   call or [`InvalidEntry::raw`], which [`NpmConfig::resolve_source_for`] can surface as
 //!   [`DependencySource::CustomRegistry`]'s `url` in hover/diagnostics text.
-//! - **Internal-network reachability (SSRF-adjacent).** [`NpmRegistryIndex::new`] requires a
-//!   [`deps_core::net_policy::RegistryAccessPolicy`] and checks every candidate against it —
-//!   unlike Cargo's `$CARGO_HOME`-is-trusted split, npm's project and user tiers are
-//!   policy-symmetric (spec NFR-003(a)): phase 1 has no credential provenance to protect, so
-//!   there is no tier that is "the user's own configuration" in the way `$CARGO_HOME` is.
+//! - **Internal-network reachability (SSRF-adjacent).** Every candidate is classified by the
+//!   URL-alone trust rule shared with Go, NuGet and Swift (spec 084): a URL equal to one the
+//!   user's own `~/.npmrc` declares (after `${VAR}` expansion, whichever tier declared it in this
+//!   workspace) is [`deps_core::net_policy::RegistryTrust::Trusted`] and skips the workspace
+//!   policy; every other URL is checked against the live
+//!   [`deps_core::net_policy::RegistryAccessPolicy`] and fetched over the guarded egress.
+//!   Equality is per URL, so a repository cannot borrow trust for a different path on the same
+//!   host.
 //! - **`${VAR}` expansion is tier-gated (issue #1420, amending FR-007).** Unlike the rest of
 //!   this module's policy-symmetric tiers, `${VAR}` expansion reads the *server's own process
 //!   environment* — a project-tier value is attacker-controlled the instant a hostile
@@ -48,17 +51,17 @@
 //! implements.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-use deps_core::config_trust::{self, ConfigTier, EnvVarSyntax};
+use deps_core::config_trust::{self, ConfigTier, EnvVarSyntax, OperatorPath};
 use deps_core::net_policy::{
-    BlockedHost, BlockedHostReason, IndexUrlError, RedactedUrl, RegistryAccessPolicy,
-    RegistryRejectionClassifier, RegistryRejectionReason, RegistryUrlKind, RejectionOutcome,
-    ValidatedRegistryUrl,
+    BlockedHost, BlockedHostReason, DeclaredRegistry, IndexUrlError, OperatorRegistries,
+    RedactedUrl, RegistryAccessPolicy, RegistryRejectionClassifier, RegistryRejectionReason,
+    RegistryUrlKind, RejectionOutcome, ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
-use deps_core::{BlockedSourceClass, EcosystemId, PackageName, RejectedSourceClass, UserHome};
+use deps_core::{BlockedSourceClass, EcosystemId, PackageName, RejectedSourceClass};
 
 /// Why a candidate `registry=`/`@scope:registry=` value failed [`NpmRegistryIndex::new`]'s
 /// validation, or why expansion of a `${VAR}` placeholder inside it failed (FR-007).
@@ -141,9 +144,8 @@ impl RegistryUrlKind for NpmRegistryIndexKind {
 /// A validated, normalized npm registry index URL.
 ///
 /// `https`-only (the sole carve-out is a `cfg(test)`/`test-util`-only `http` loopback host),
-/// no userinfo, and `classify_host`/[`RegistryAccessPolicy`]-gated. Deliberately has no
-/// trust-tier concept (unlike `deps-cargo`'s `RegistryIndex`/`IndexTrust`) — npm phase 1
-/// attaches no credential to any request, so there is nothing for a trust tier to gate.
+/// no userinfo, and `classify_host`/[`RegistryAccessPolicy`]-gated. Carries no trust: the trust
+/// the URL-alone rule gave a resolved entry lives in [`DeclaredNpmRegistry`].
 ///
 /// Normalized so `https://npm.pkg.github.com/` and `https://npm.pkg.github.com` produce the
 /// **same** [`Self::as_str`] output — one router entry, not two, and no doubled slash when a
@@ -163,6 +165,10 @@ impl RegistryUrlKind for NpmRegistryIndexKind {
 /// assert!(NpmRegistryIndex::new("https://user:pass@npm.example", &policy).is_err());
 /// ```
 pub type NpmRegistryIndex = ValidatedRegistryUrl<NpmRegistryIndexKind>;
+
+/// A resolved `registry=`/`@scope:registry=` index together with the trust the URL-alone rule
+/// gave it (spec 084).
+pub type DeclaredNpmRegistry = DeclaredRegistry<NpmRegistryIndexKind>;
 
 /// A `registry=`/`@scope:registry=` entry that was present in `.npmrc` but unusable.
 ///
@@ -185,13 +191,13 @@ pub type InvalidEntry = deps_core::net_policy::InvalidEntry<NpmRegistryIndexErro
 #[derive(Debug, Default)]
 pub struct NpmConfig {
     /// The top-level `registry=` override (FR-003), if any entry (valid or not) was found.
-    registry: Option<Result<NpmRegistryIndex, InvalidEntry>>,
+    registry: Option<Result<DeclaredNpmRegistry, InvalidEntry>>,
     /// `@scope:registry=` entries (FR-004), keyed by the scope **including** its leading
     /// `@`, byte-exact as written in `.npmrc` — no case folding. This matches npm's own
     /// literal `@${scope}:registry` key lookup: npm lowercases *package names* at publish
     /// time but never case-folds `.npmrc` keys, so folding here would resolve a registry npm
     /// itself would not.
-    scoped_registries: HashMap<String, Result<NpmRegistryIndex, InvalidEntry>>,
+    scoped_registries: HashMap<String, Result<DeclaredNpmRegistry, InvalidEntry>>,
 }
 
 impl NpmConfig {
@@ -290,12 +296,12 @@ impl NpmConfig {
         })
     }
 
-    /// Every successfully resolved [`NpmRegistryIndex`] this config carries (the top-level
-    /// override plus every scoped entry), deduplicated by [`NpmRegistryIndex::as_str`] — fed
-    /// to `NpmRegistry::register_alternate` at parse time. An invalid/unresolved entry
-    /// contributes nothing here: there is no client to register for it.
+    /// Every successfully resolved [`DeclaredNpmRegistry`] this config carries (the top-level
+    /// override plus every scoped entry), deduplicated by its URL — fed to
+    /// `NpmRegistry::register_alternate` at parse time. An invalid/unresolved entry contributes
+    /// nothing here: there is no client to register for it.
     #[must_use]
-    pub fn resolved_registries(&self) -> Vec<NpmRegistryIndex> {
+    pub fn resolved_registries(&self) -> Vec<DeclaredNpmRegistry> {
         let mut seen = std::collections::HashSet::new();
         self.registry
             .iter()
@@ -307,7 +313,7 @@ impl NpmConfig {
     }
 }
 
-fn source_from_result(result: &Result<NpmRegistryIndex, InvalidEntry>) -> DependencySource {
+fn source_from_result(result: &Result<DeclaredNpmRegistry, InvalidEntry>) -> DependencySource {
     match result {
         Ok(index) => DependencySource::AlternateRegistry {
             index: index.as_str().to_string(),
@@ -407,7 +413,7 @@ struct TieredRawValue {
 /// involved, whether as userinfo or as a query parameter.
 ///
 /// Passes the `${VAR}`-expanded value as
-/// [`deps_core::net_policy::ValidatedRegistryUrl::new_with_raw_for_log`]'s `candidate` and the
+/// [`deps_core::net_policy::OperatorRegistries::classify`]'s `candidate` and the
 /// original, unexpanded `raw` as its `raw_for_log` — an earlier revision logged the
 /// pre-expansion form more permissively, on the theory that it could only ever spell a
 /// placeholder like `${VAR}`, never a real secret, but that assumption does not hold: a hostile
@@ -424,10 +430,12 @@ struct TieredRawValue {
 fn resolve_entry(
     raw: &str,
     tier: ConfigTier,
+    operator: &OperatorRegistries,
     policy: &RegistryAccessPolicy,
-) -> Result<NpmRegistryIndex, InvalidEntry> {
+) -> Result<DeclaredNpmRegistry, InvalidEntry> {
     match config_trust::expand_env_vars(raw, EnvVarSyntax::Shell, tier, config_trust::process_env) {
-        Ok(expanded) => NpmRegistryIndex::new_with_raw_for_log(expanded.as_str(), raw, policy)
+        Ok(expanded) => operator
+            .classify::<NpmRegistryIndexKind>(expanded.as_str(), raw, policy)
             .map_err(|reason| {
                 InvalidEntry::logged(
                     raw,
@@ -569,29 +577,27 @@ pub fn resolve(
     config_cache: &NpmConfigCache,
     policy: &RegistryAccessPolicy,
 ) -> NpmConfig {
-    resolve_with_home(
-        manifest_dir,
-        config_cache,
-        policy,
-        UserHome::current().map(|home| home.path().to_path_buf()),
-    )
+    resolve_with_home(manifest_dir, config_cache, policy, OperatorPath::home())
 }
 
-/// [`resolve`], but taking the user-tier home directory explicitly instead of
-/// [`UserHome::current`] — lets tests inject a fixture home directory.
-fn resolve_with_home(
+/// [`resolve`], but taking the user-tier home directory explicitly.
+///
+/// Lets tests inject a fixture home directory. An [`OperatorPath`] cannot be built from a
+/// workspace path outside test builds, so this seam widens nothing in production.
+#[must_use]
+pub fn resolve_with_home(
     manifest_dir: &Path,
     config_cache: &NpmConfigCache,
     policy: &RegistryAccessPolicy,
-    home: Option<PathBuf>,
+    home: Option<OperatorPath>,
 ) -> NpmConfig {
     let user_npmrc_path = home.map(|h| h.join(".npmrc"));
     // M9: a project under `$HOME` would otherwise find `~/.npmrc` twice via the ancestor
     // walk. Deduped by canonicalized path (catches symlinked homes too), mirroring
     // `deps-cargo::config::load_tiers`.
     let user_canonical = user_npmrc_path
-        .as_deref()
-        .and_then(|p| std::fs::canonicalize(p).ok());
+        .as_ref()
+        .and_then(|p| std::fs::canonicalize(p.as_path()).ok());
 
     let mut registry_raw: Option<TieredRawValue> = None;
     let mut scoped_raw: HashMap<String, TieredRawValue> = HashMap::new();
@@ -622,9 +628,11 @@ fn resolve_with_home(
         }
     }
 
-    if let Some(user_path) = user_npmrc_path.as_deref()
-        && let Some(parsed) = config_cache.get_or_parse(user_path)
+    let mut operator = OperatorRegistries::default();
+    if let Some(user_path) = user_npmrc_path.as_ref()
+        && let Some(parsed) = config_cache.get_or_parse(user_path.as_path())
     {
+        operator = user_tier_registries(user_path, &parsed);
         if registry_raw.is_none()
             && let Some(raw) = &parsed.registry
         {
@@ -644,18 +652,37 @@ fn resolve_with_home(
     }
 
     NpmConfig {
-        registry: registry_raw.map(|v| resolve_entry(&v.raw, v.tier, policy)),
+        registry: registry_raw.map(|v| resolve_entry(&v.raw, v.tier, &operator, policy)),
         scoped_registries: scoped_raw
             .into_iter()
-            .map(|(scope, v)| (scope, resolve_entry(&v.raw, v.tier, policy)))
+            .map(|(scope, v)| (scope, resolve_entry(&v.raw, v.tier, &operator, policy)))
             .collect(),
     }
+}
+
+/// The registries `~/.npmrc` declares, as the post-`${VAR}`-expansion URLs the classification
+/// compares against. An entry that cannot be expanded is skipped: it could never be fetched.
+fn user_tier_registries(file: &OperatorPath, parsed: &RawNpmrc) -> OperatorRegistries {
+    let expanded = parsed
+        .registry
+        .iter()
+        .chain(parsed.scoped.values())
+        .filter_map(|raw| {
+            config_trust::expand_env_vars(
+                raw,
+                EnvVarSyntax::Shell,
+                ConfigTier::User,
+                config_trust::process_env,
+            )
+            .ok()
+        });
+    OperatorRegistries::declared_in(file, expanded.map(|value| value.as_str().to_owned()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::net_policy::{HostClass, WorkspaceRegistryAccess};
+    use deps_core::net_policy::{HostClass, RegistryTrust, WorkspaceRegistryAccess};
     use std::assert_matches;
     use std::time::SystemTime;
 
@@ -669,6 +696,14 @@ mod tests {
 
     fn off_policy() -> RegistryAccessPolicy {
         RegistryAccessPolicy::new(WorkspaceRegistryAccess::Off)
+    }
+
+    fn resolve_workspace_entry(
+        raw: &str,
+        tier: ConfigTier,
+        policy: &RegistryAccessPolicy,
+    ) -> Result<DeclaredNpmRegistry, InvalidEntry> {
+        resolve_entry(raw, tier, &OperatorRegistries::default(), policy)
     }
 
     fn pkg(name: &str) -> PackageName {
@@ -897,7 +932,7 @@ mod tests {
     #[test]
     fn test_resolve_entry_undefined_var_is_invalid() {
         let policy = all_policy();
-        let result = resolve_entry("${UNDEFINED_VAR}", ConfigTier::User, &policy);
+        let result = resolve_workspace_entry("${UNDEFINED_VAR}", ConfigTier::User, &policy);
         assert_matches!(
             result,
             Err(InvalidEntry {
@@ -920,7 +955,7 @@ mod tests {
         let raw = format!("${{{malicious_var}}}");
 
         let log = deps_core::test_util::capture_tracing_output(|| {
-            let result = resolve_entry(&raw, ConfigTier::User, &policy);
+            let result = resolve_workspace_entry(&raw, ConfigTier::User, &policy);
             assert!(result.is_err());
         });
 
@@ -949,7 +984,7 @@ mod tests {
             "test precondition: PATH must be set"
         );
         let raw = "https://exfil-${PATH}.invalid/p/${PATH}";
-        let result = resolve_entry(raw, ConfigTier::Project, &policy);
+        let result = resolve_workspace_entry(raw, ConfigTier::Project, &policy);
         assert_matches!(
             result,
             Err(InvalidEntry {
@@ -971,7 +1006,7 @@ mod tests {
     fn test_resolve_entry_user_tier_still_expands_env_vars() {
         let policy = all_policy();
         let path_value = std::env::var("PATH").expect("test precondition: PATH must be set");
-        let result = resolve_entry("https://${PATH}.invalid/", ConfigTier::User, &policy);
+        let result = resolve_workspace_entry("https://${PATH}.invalid/", ConfigTier::User, &policy);
         // The expanded host is very unlikely to be a valid hostname, so this asserts it was
         // at least attempted (not rejected for the project-tier reason) rather than that it
         // resolves successfully.
@@ -1073,7 +1108,7 @@ mod tests {
     fn test_resolve_entry_redacts_literal_userinfo_from_raw_and_log() {
         let policy = all_policy();
         let log = deps_core::test_util::capture_tracing_output(|| {
-            let invalid = resolve_entry(
+            let invalid = resolve_workspace_entry(
                 "https://user:hunter2@npm.example/",
                 ConfigTier::User,
                 &policy,
@@ -1112,7 +1147,7 @@ mod tests {
     fn test_resolve_entry_redacts_literal_query_string_from_raw_and_log() {
         let policy = off_policy();
         let log = deps_core::test_util::capture_tracing_output(|| {
-            let invalid = resolve_entry(
+            let invalid = resolve_workspace_entry(
                 "https://npm.example/?_authToken=super-secret-value",
                 ConfigTier::User,
                 &policy,
@@ -1148,7 +1183,7 @@ mod tests {
     fn test_resolve_entry_redacts_literal_userinfo_from_unparseable_raw() {
         let policy = all_policy();
         let log = deps_core::test_util::capture_tracing_output(|| {
-            let invalid = resolve_entry(
+            let invalid = resolve_workspace_entry(
                 "https://user:hunter2@npm.example:99999/",
                 ConfigTier::User,
                 &policy,
@@ -1189,7 +1224,7 @@ mod tests {
     fn test_resolve_source_for_top_level_override() {
         let policy = all_policy();
         let config = NpmConfig {
-            registry: Some(resolve_entry(
+            registry: Some(resolve_workspace_entry(
                 "https://npm.mycorp.example",
                 ConfigTier::User,
                 &policy,
@@ -1212,10 +1247,10 @@ mod tests {
         let mut scoped = HashMap::new();
         scoped.insert(
             "@myorg".to_string(),
-            resolve_entry("https://npm.pkg.github.com", ConfigTier::User, &policy),
+            resolve_workspace_entry("https://npm.pkg.github.com", ConfigTier::User, &policy),
         );
         let config = NpmConfig {
-            registry: Some(resolve_entry(
+            registry: Some(resolve_workspace_entry(
                 "https://npm.mycorp.example",
                 ConfigTier::User,
                 &policy,
@@ -1258,7 +1293,7 @@ mod tests {
         let mut scoped = HashMap::new();
         scoped.insert(
             "@myorg".to_string(),
-            resolve_entry("not-a-valid-url", ConfigTier::User, &policy),
+            resolve_workspace_entry("not-a-valid-url", ConfigTier::User, &policy),
         );
         let config = NpmConfig {
             registry: None,
@@ -1281,7 +1316,7 @@ mod tests {
     fn test_blocked_class_for_top_level_override_blocked_by_policy() {
         let policy = public_only_policy();
         let config = NpmConfig {
-            registry: Some(resolve_entry(
+            registry: Some(resolve_workspace_entry(
                 "https://169.254.169.254/registry",
                 ConfigTier::User,
                 &policy,
@@ -1312,14 +1347,14 @@ mod tests {
         let mut scoped = HashMap::new();
         scoped.insert(
             "@myorg".to_string(),
-            resolve_entry(
+            resolve_workspace_entry(
                 "https://169.254.169.254/registry",
                 ConfigTier::User,
                 &policy,
             ),
         );
         let config = NpmConfig {
-            registry: Some(resolve_entry(
+            registry: Some(resolve_workspace_entry(
                 "https://npm.mycorp.example",
                 ConfigTier::User,
                 &policy,
@@ -1345,14 +1380,14 @@ mod tests {
         let mut scoped = HashMap::new();
         scoped.insert(
             "@myorg".to_string(),
-            resolve_entry(
+            resolve_workspace_entry(
                 "https://169.254.169.254/registry",
                 ConfigTier::User,
                 &policy,
             ),
         );
         let config = NpmConfig {
-            registry: Some(resolve_entry(
+            registry: Some(resolve_workspace_entry(
                 "https://169.254.169.254/registry",
                 ConfigTier::User,
                 &policy,
@@ -1377,7 +1412,7 @@ mod tests {
     fn test_blocked_class_for_none_when_not_blocked() {
         let policy = all_policy();
         let config = NpmConfig {
-            registry: Some(resolve_entry(
+            registry: Some(resolve_workspace_entry(
                 "https://npm.mycorp.example",
                 ConfigTier::User,
                 &policy,
@@ -1396,7 +1431,11 @@ mod tests {
     fn test_rejected_reason_for_top_level_override_invalid_url() {
         let policy = all_policy();
         let config = NpmConfig {
-            registry: Some(resolve_entry("not-a-valid-url", ConfigTier::User, &policy)),
+            registry: Some(resolve_workspace_entry(
+                "not-a-valid-url",
+                ConfigTier::User,
+                &policy,
+            )),
             scoped_registries: HashMap::new(),
         };
         let occurrence = config
@@ -1447,7 +1486,7 @@ mod tests {
             ),
         ] {
             let config = NpmConfig {
-                registry: Some(resolve_entry(raw, tier, &policy)),
+                registry: Some(resolve_workspace_entry(raw, tier, &policy)),
                 scoped_registries: HashMap::new(),
             };
             let occurrence = config
@@ -1463,7 +1502,7 @@ mod tests {
     fn test_rejected_reason_for_none_when_blocked_host() {
         let policy = public_only_policy();
         let config = NpmConfig {
-            registry: Some(resolve_entry(
+            registry: Some(resolve_workspace_entry(
                 "https://169.254.169.254/registry",
                 ConfigTier::User,
                 &policy,
@@ -1481,7 +1520,7 @@ mod tests {
         let mut scoped = HashMap::new();
         scoped.insert(
             "@myorg".to_string(),
-            resolve_entry("not-a-valid-url", ConfigTier::User, &policy),
+            resolve_workspace_entry("not-a-valid-url", ConfigTier::User, &policy),
         );
         let config = NpmConfig {
             registry: None,
@@ -1499,7 +1538,7 @@ mod tests {
     fn test_rejected_reason_for_none_when_valid() {
         let policy = all_policy();
         let config = NpmConfig {
-            registry: Some(resolve_entry(
+            registry: Some(resolve_workspace_entry(
                 "https://npm.mycorp.example",
                 ConfigTier::User,
                 &policy,
@@ -1519,18 +1558,18 @@ mod tests {
         let mut scoped = HashMap::new();
         scoped.insert(
             "@myorg".to_string(),
-            resolve_entry("https://npm.pkg.github.com", ConfigTier::User, &policy),
+            resolve_workspace_entry("https://npm.pkg.github.com", ConfigTier::User, &policy),
         );
         scoped.insert(
             "@other".to_string(),
-            resolve_entry("https://npm.pkg.github.com/", ConfigTier::User, &policy), // same index, trailing slash
+            resolve_workspace_entry("https://npm.pkg.github.com/", ConfigTier::User, &policy), // same index, trailing slash
         );
         scoped.insert(
             "@bad".to_string(),
-            resolve_entry("not-a-url", ConfigTier::User, &policy),
+            resolve_workspace_entry("not-a-url", ConfigTier::User, &policy),
         );
         let config = NpmConfig {
-            registry: Some(resolve_entry(
+            registry: Some(resolve_workspace_entry(
                 "https://npm.pkg.github.com",
                 ConfigTier::User,
                 &policy,
@@ -1647,7 +1686,7 @@ mod tests {
             project_dir.path(),
             &cache,
             &policy,
-            Some(home_dir.path().to_path_buf()),
+            Some(OperatorPath::for_test(home_dir.path())),
         );
         assert_eq!(
             config.resolve_source_for(&pkg("express")),
@@ -1656,6 +1695,135 @@ mod tests {
                 mirrors_crates_io: false,
             }
         );
+    }
+
+    /// Writes `project` and `user` `.npmrc` files and resolves under `policy`.
+    fn resolve_trust_fixture(
+        project: Option<&str>,
+        user: Option<&str>,
+        policy: &RegistryAccessPolicy,
+    ) -> NpmConfig {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let project_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        if let Some(content) = project {
+            std::fs::write(project_dir.path().join(".npmrc"), content).unwrap();
+        }
+        if let Some(content) = user {
+            std::fs::write(home_dir.path().join(".npmrc"), content).unwrap();
+        }
+        resolve_with_home(
+            project_dir.path(),
+            &NpmConfigCache::new(),
+            policy,
+            Some(OperatorPath::for_test(home_dir.path())),
+        )
+    }
+
+    fn trust_of(config: &NpmConfig) -> Vec<RegistryTrust> {
+        config
+            .resolved_registries()
+            .iter()
+            .map(DeclaredNpmRegistry::trust)
+            .collect()
+    }
+
+    /// Spec 084: a user-tier registry is the operator's own, so it is Trusted and reachable even
+    /// with `workspace_registries = "off"`.
+    #[test]
+    fn test_user_tier_registry_is_trusted_and_skips_policy_off() {
+        let config = resolve_trust_fixture(
+            None,
+            Some(
+                "registry=https://npm.user.example\n@corp:registry=https://scoped.user.example/\n",
+            ),
+            &off_policy(),
+        );
+        assert_eq!(trust_of(&config), vec![RegistryTrust::Trusted; 2]);
+        assert!(config.blocked_class_for(&pkg("express")).is_none());
+    }
+
+    /// An interpolated user-tier URL is compared in its expanded canonical form, so a project
+    /// `.npmrc` naming the expanded URL stays Trusted.
+    #[test]
+    fn test_interpolated_user_registry_equals_its_expanded_form() {
+        let name = std::env::var("CARGO_PKG_NAME").expect("cargo sets CARGO_PKG_NAME for tests");
+        let user = "registry=https://${CARGO_PKG_NAME}.corp.example/npm/\n";
+        let project = format!("registry=https://{name}.corp.example/npm\n");
+
+        let config = resolve_trust_fixture(Some(&project), Some(user), &off_policy());
+
+        assert_eq!(trust_of(&config), vec![RegistryTrust::Trusted]);
+        assert_eq!(
+            config.resolve_source_for(&pkg("express")),
+            DependencySource::AlternateRegistry {
+                index: format!("https://{name}.corp.example/npm"),
+                mirrors_crates_io: false,
+            }
+        );
+    }
+
+    /// S4: a repository `.npmrc` that names the operator's own URL is still Trusted (trust is a
+    /// function of the URL alone, never folded down by tier).
+    #[test]
+    fn test_project_registry_equal_to_a_user_url_is_trusted() {
+        let config = resolve_trust_fixture(
+            Some("registry=https://npm.user.example/\n"),
+            Some("registry=https://npm.user.example\n"),
+            &off_policy(),
+        );
+        assert_eq!(trust_of(&config), vec![RegistryTrust::Trusted]);
+    }
+
+    /// A URL only the repository declares is workspace-declared: `off` blocks it.
+    #[test]
+    fn test_project_only_registry_is_workspace_declared_and_blocked_under_off() {
+        let config = resolve_trust_fixture(
+            Some("registry=https://npm.repo.example\n"),
+            Some("registry=https://npm.user.example\n"),
+            &off_policy(),
+        );
+        assert!(config.resolved_registries().is_empty());
+        assert!(config.blocked_class_for(&pkg("express")).is_some());
+
+        let allowed = resolve_trust_fixture(
+            Some("registry=https://npm.repo.example\n"),
+            Some("registry=https://npm.user.example\n"),
+            &public_only_policy(),
+        );
+        assert_eq!(trust_of(&allowed), vec![RegistryTrust::WorkspaceDeclared]);
+    }
+
+    /// Equality is per URL: the operator's host with a different path stays repo-declared, and
+    /// `off` blocks it.
+    #[test]
+    fn test_same_host_different_path_is_not_trusted() {
+        let config = resolve_trust_fixture(
+            Some("registry=https://npm.corp.example/repo-chosen\n"),
+            Some("registry=https://npm.corp.example/team\n"),
+            &off_policy(),
+        );
+        assert!(config.resolved_registries().is_empty());
+        assert!(config.blocked_class_for(&pkg("express")).is_some());
+    }
+
+    /// No home directory means no operator set: nothing is Trusted.
+    #[test]
+    fn test_no_home_means_no_operator_tier() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let project_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project_dir.path().join(".npmrc"),
+            "registry=https://npm.repo.example\n",
+        )
+        .unwrap();
+        let config = resolve_with_home(
+            project_dir.path(),
+            &NpmConfigCache::new(),
+            &off_policy(),
+            None,
+        );
+        assert!(config.resolved_registries().is_empty());
     }
 
     #[test]
@@ -1675,7 +1843,7 @@ mod tests {
             project_dir.path(),
             &cache,
             &policy,
-            Some(home_dir.path().to_path_buf()),
+            Some(OperatorPath::for_test(home_dir.path())),
         );
         assert_eq!(
             config.resolve_source_for(&pkg("express")),
@@ -1707,7 +1875,7 @@ mod tests {
             &project_dir,
             &cache,
             &policy,
-            Some(home_dir.path().to_path_buf()),
+            Some(OperatorPath::for_test(home_dir.path())),
         );
         assert_eq!(
             config.resolve_source_for(&pkg("express")),
@@ -1763,7 +1931,7 @@ mod tests {
             &current,
             &cache,
             &policy,
-            Some(home_dir.path().to_path_buf()),
+            Some(OperatorPath::for_test(home_dir.path())),
         );
         let (stats_after, _) = deps_core::fs_probe::snapshot();
 

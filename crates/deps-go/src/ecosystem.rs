@@ -1283,7 +1283,7 @@ go 1.21
         /// querying the public root.
         #[tokio::test]
         async fn test_complete_versions_routes_to_registered_alternate_client() {
-            use crate::config::{GoProxyChain, GoProxyHop, GoProxyUrl};
+            use crate::config::{GoProxyChain, GoProxyHop};
             use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
 
             let mut alt_server = mockito::Server::new_async().await;
@@ -1304,7 +1304,13 @@ go 1.21
             let chain = GoProxyChain {
                 key: "go-proxy:test".to_string(),
                 hops: vec![GoProxyHop::Url(
-                    GoProxyUrl::new(&alt_server.url(), &policy).unwrap(),
+                    deps_core::net_policy::OperatorRegistries::default()
+                        .classify::<crate::config::GoProxyKind>(
+                            &alt_server.url(),
+                            &alt_server.url(),
+                            &policy,
+                        )
+                        .unwrap(),
                 )],
                 ..Default::default()
             };

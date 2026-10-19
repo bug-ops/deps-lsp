@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
-use tower_lsp_server::ls_types::{Diagnostic, Uri};
+use tower_lsp_server::ls_types::{Diagnostic, MessageType, Uri};
 
 /// Floor under the dependency/concurrency-scaled ceiling (issue #632 critic S1): keeps a
 /// small `fetch_timeout` or a small manifest from producing an unrealistically tight
@@ -258,6 +258,12 @@ async fn publish_with<F, Fut>(
     Fut: std::future::Future<Output = Vec<Diagnostic>>,
 {
     let generated = generate_until_current(state, uri, config, generate).await;
+    if let Some(notice) = state.take_egress_notice() {
+        tracing::warn!("{notice}");
+        client
+            .show_message(MessageType::WARNING, format!("deps-lsp: {notice}"))
+            .await;
+    }
     if !generated.current {
         tracing::debug!(
             ?uri,

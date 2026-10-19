@@ -62,7 +62,7 @@ is never sent to GitHub or any other registry.
 
 The project tier overrides the user tier per scope and for `[default]`; a scoped entry in either
 tier wins over `[default]`. Exactly one user-tier path is read, with no existence fallback; an
-empty or relative `XDG_CONFIG_HOME` makes the user tier unusable. The file is decoded with
+relative `XDG_CONFIG_HOME` makes the user tier unusable (an empty one is unset). The file is decoded with
 SwiftPM's strictness (`version` must be `1`, scope keys must follow the scope grammar,
 `authentication.type` must be `basic` or `token`, `security` must be an object when present, unknown
 keys are ignored). A tier that exists but is unusable (unreadable, not a regular file, over 8 MiB,
@@ -88,7 +88,7 @@ depends on the workspace, so a hostile repository cannot redirect a credential.
 
 | | Trusted | Workspace-declared |
 |---|---------|--------------------|
-| Reachability | exempt from `registries.workspace_registries` (like Cargo's `$CARGO_HOME`), except loopback, link-local, cloud-metadata, unspecified and reserved hosts, which are never fetched | gated by `registries.workspace_registries` |
+| Reachability | exempt from `registries.workspace_registries` (the same [operator-owned rule](../configuration.md#operator-owned-registries) Go, npm and NuGet use), except loopback, link-local, cloud-metadata, unspecified and reserved hosts, which are never fetched and show a blocked-host diagnostic | gated by `registries.workspace_registries` |
 | Redirects | confined to the registry's base URL | confined to the registry's base URL |
 | Credential | attached | never attached |
 

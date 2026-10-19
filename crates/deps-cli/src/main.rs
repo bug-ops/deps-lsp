@@ -110,8 +110,19 @@ fn startup_warnings(policy: &PolicyConfig, environment: &RegistryEnvironment) ->
     )
     .user_message()
     .map(str::to_owned);
-    let notice = environment.egress_notice().map(|notice| notice.to_string());
-    effect.into_iter().chain(notice).collect()
+    effect.into_iter().collect()
+}
+
+/// Prints the "system proxy bypassed" notice on drop, once, if the run actually sent a request
+/// over a guarded (workspace-declared) transport.
+struct EgressNoticeOnExit(Arc<deps_core::net_policy::RegistryAccessPolicy>);
+
+impl Drop for EgressNoticeOnExit {
+    fn drop(&mut self) {
+        if let Some(notice) = self.0.take_egress_notice() {
+            eprintln!("deps-cli: {notice}");
+        }
+    }
 }
 
 fn build_runtime_handles(policy: &PolicyConfig, source: &impl EnvSource) -> RuntimeHandles {
@@ -217,6 +228,7 @@ async fn run_check(
 ) -> (CheckReport, bool) {
     let policy = cli_config.policy;
     let handles = build_runtime_handles(&policy, &ProcessEnv);
+    let _egress_notice = EgressNoticeOnExit(Arc::clone(handles.cache.registry_policy()));
     let ctx = CheckContext {
         cache: Arc::clone(&handles.cache),
         osv: handles.osv,
@@ -485,6 +497,7 @@ async fn run_update(
     ignore_config: Option<Vec<deps_cli::config::IgnoreRule>>,
 ) -> Result<UpdatePlan, String> {
     let handles = build_runtime_handles(&policy, &ProcessEnv);
+    let _egress_notice = EgressNoticeOnExit(Arc::clone(handles.cache.registry_policy()));
 
     let walk_outcome = walk::walk(
         std::slice::from_ref(&args.manifest),
@@ -705,10 +718,8 @@ mod startup_warnings_tests {
     }
 
     #[test]
-    fn system_proxy_without_opt_in_names_the_opt_in_variable() {
-        let warnings = warnings(&PolicyConfig::default(), &proxied());
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains(WORKSPACE_REGISTRY_PROXY_ENV));
+    fn system_proxy_alone_is_not_a_startup_warning() {
+        assert!(warnings(&PolicyConfig::default(), &proxied()).is_empty());
     }
 
     #[test]

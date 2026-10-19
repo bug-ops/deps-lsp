@@ -3,7 +3,7 @@
 //! Parses package.json files and extracts dependency information with precise
 //! source positions for LSP operations.
 
-use crate::config::{NpmConfig, NpmParseContext, NpmRegistryIndex};
+use crate::config::{DeclaredNpmRegistry, NpmConfig, NpmParseContext};
 use crate::types::{NpmDependency, NpmDependencySection};
 use deps_core::Result;
 use deps_core::json_ast::{JsonAst, JsonSection};
@@ -27,7 +27,7 @@ pub struct NpmParseResult {
     /// `NpmEcosystem::parse_manifest`, the one place a per-document `.npmrc` resolution and
     /// the long-lived shared router meet. Empty for a workspace declaring no `.npmrc`
     /// (NFR-005: zero regression).
-    pub resolved_registries: Vec<NpmRegistryIndex>,
+    pub resolved_registries: Vec<DeclaredNpmRegistry>,
     /// Dependency lines whose `.npmrc` `registry`/`@scope:registry` resolution was blocked by
     /// the current `registries.workspace_registries` policy (#925, mirrors
     /// `deps_cargo::parser::CargoParseResult::blocked_registries`), where the declaration key

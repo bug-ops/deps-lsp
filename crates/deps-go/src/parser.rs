@@ -1005,7 +1005,7 @@ exclude github.com/bad/module v0.1.0
         cache.set_registry_policy(WorkspaceRegistryAccess::All);
         let ctx = GoParseContext {
             policy: Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)),
-            goenv_path: Some(goenv_path),
+            goenv_path: Some(deps_core::config_trust::OperatorPath::for_test(goenv_path)),
             ..Default::default()
         };
 
@@ -1042,12 +1042,12 @@ exclude github.com/bad/module v0.1.0
 
         let dir = tempfile::tempdir().unwrap();
         let goenv_path = dir.path().join("env");
-        std::fs::write(&goenv_path, "GOPROXY=https://goproxy.mycorp.example\n").unwrap();
+        std::fs::write(&goenv_path, "GOPROXY=https://169.254.169.254\n").unwrap();
 
         let ctx = GoParseContext::new(
             Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::Off)),
             Arc::new(GoEnvCache::new()),
-            Some(goenv_path),
+            Some(deps_core::config_trust::OperatorPath::for_test(goenv_path)),
         );
 
         let content = "module example.com/myapp\n\nrequire github.com/gin-gonic/gin v1.9.0\n";
@@ -1056,7 +1056,7 @@ exclude github.com/bad/module v0.1.0
         assert_eq!(
             result.dependencies[0].source,
             deps_core::parser::DependencySource::CustomRegistry {
-                url: "https://goproxy.mycorp.example".to_string(),
+                url: "https://169.254.169.254".to_string(),
             }
         );
 
@@ -1064,8 +1064,8 @@ exclude github.com/bad/module v0.1.0
         assert_eq!(blocked.len(), 1);
         let occurrence = &blocked[0];
         assert_eq!(occurrence.range, result.dependencies[0].module_path_range);
-        assert_eq!(occurrence.block.class(), HostClass::Global);
-        assert_eq!(occurrence.raw_value, "https://goproxy.mycorp.example");
+        assert_eq!(occurrence.block.class(), HostClass::CloudMetadata);
+        assert_eq!(occurrence.raw_value, "https://169.254.169.254");
         assert_eq!(occurrence.declaration_key, GOPROXY_BLOCKED_DECLARATION_KEY);
     }
 
@@ -1089,7 +1089,7 @@ exclude github.com/bad/module v0.1.0
         let ctx = GoParseContext::new(
             Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)),
             Arc::new(GoEnvCache::new()),
-            Some(goenv_path),
+            Some(deps_core::config_trust::OperatorPath::for_test(goenv_path)),
         );
 
         let content = "module example.com/myapp\n\nrequire github.com/gin-gonic/gin v1.9.0\n";
@@ -1128,12 +1128,12 @@ exclude github.com/bad/module v0.1.0
 
         let dir = tempfile::tempdir().unwrap();
         let goenv_path = dir.path().join("env");
-        std::fs::write(&goenv_path, "GOPROXY=https://goproxy.mycorp.example\n").unwrap();
+        std::fs::write(&goenv_path, "GOPROXY=https://169.254.169.254\n").unwrap();
 
         let ctx = GoParseContext::new(
             Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::Off)),
             Arc::new(GoEnvCache::new()),
-            Some(goenv_path),
+            Some(deps_core::config_trust::OperatorPath::for_test(goenv_path)),
         );
 
         let content = r"module example.com/myapp
@@ -1169,14 +1169,14 @@ require (
         let goenv_path = dir.path().join("env");
         std::fs::write(
             &goenv_path,
-            "GOPROXY=https://goproxy.mycorp.example\nGOPRIVATE=git.mycorp.example/*\n",
+            "GOPROXY=https://169.254.169.254\nGOPRIVATE=git.mycorp.example/*\n",
         )
         .unwrap();
 
         let ctx = GoParseContext::new(
             Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::Off)),
             Arc::new(GoEnvCache::new()),
-            Some(goenv_path),
+            Some(deps_core::config_trust::OperatorPath::for_test(goenv_path)),
         );
 
         let content =

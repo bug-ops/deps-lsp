@@ -115,9 +115,8 @@ impl SystemProxy {
         Self::from_matcher(&Matcher::from_system())
     }
 
-    // TODO(#1822): provenance-keyed egress for operator-owned sources ($GOENV GOPROXY, user
-    // ~/.npmrc, user NuGet.Config). Re-run the DNS-named-proxy live test on every reqwest bump;
-    // the probe assumes reqwest's system proxy resolves destinations exactly like this matcher.
+    // NOTE: re-run the DNS-named-proxy live test on every reqwest bump; the probe assumes
+    // reqwest's system proxy resolves destinations exactly like this matcher.
     fn from_matcher(matcher: &Matcher) -> Self {
         let probe = |raw: &'static str| {
             matcher
@@ -430,6 +429,51 @@ mod tests {
                 assert!(notice.message().contains(WORKSPACE_REGISTRY_PROXY_ENV));
             }
         }
+    }
+
+    fn proxied_policy() -> super::super::RegistryAccessPolicy {
+        let env =
+            MapEnv::new().with_proxy(SystemProxy::for_test(Some("http://proxy.corp:3128"), None));
+        super::super::RegistryAccessPolicy::with_environment(
+            super::super::WorkspaceRegistryAccess::PublicOnly,
+            &RegistryEnvironment::read(&env),
+        )
+    }
+
+    #[test]
+    fn test_egress_notice_waits_for_guarded_traffic() {
+        let policy = proxied_policy();
+        assert!(
+            policy.take_egress_notice().is_none(),
+            "no guarded request yet: an operator-owned-only setup never gets the notice"
+        );
+
+        policy.note_guarded_request();
+        let notice = policy
+            .take_egress_notice()
+            .expect("a guarded request went out");
+        assert!(notice.message().contains(WORKSPACE_REGISTRY_PROXY_ENV));
+        assert!(policy.take_egress_notice().is_none(), "shown once");
+    }
+
+    #[test]
+    fn test_no_egress_notice_without_a_proxy_or_after_opt_in() {
+        let plain = super::super::RegistryAccessPolicy::with_environment(
+            super::super::WorkspaceRegistryAccess::PublicOnly,
+            &RegistryEnvironment::read(&MapEnv::new()),
+        );
+        plain.note_guarded_request();
+        assert!(plain.take_egress_notice().is_none());
+
+        let opted_in = MapEnv::new()
+            .with_proxy(SystemProxy::for_test(Some("http://proxy.corp:3128"), None))
+            .with_var(WORKSPACE_REGISTRY_PROXY_ENV, "proxy");
+        let policy = super::super::RegistryAccessPolicy::with_environment(
+            super::super::WorkspaceRegistryAccess::PublicOnly,
+            &RegistryEnvironment::read(&opted_in),
+        );
+        policy.note_guarded_request();
+        assert!(policy.take_egress_notice().is_none());
     }
 
     #[test]

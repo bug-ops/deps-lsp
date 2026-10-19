@@ -276,10 +276,15 @@ impl crate::Registry for NotFoundRegistry {
         name: &'a PackageName,
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>> {
         Box::pin(async move {
-            Err(crate::error::DepsError::PackageNotFound {
-                package: name.as_str().into(),
-                registry: "mock",
-            })
+            Err(crate::not_found_or(
+                crate::error::DepsError::HttpStatus {
+                    url: "https://mock.invalid/pkg".into(),
+                    status: 404,
+                },
+                name.as_str(),
+                "mock",
+                &[],
+            ))
         })
     }
 

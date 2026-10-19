@@ -295,10 +295,7 @@ impl GitlabCiRegistry {
             }
             DepsError::HttpStatus {
                 status: 404 | 400, ..
-            } => DepsError::PackageNotFound {
-                package: name.to_string().into(),
-                registry: REGISTRY,
-            },
+            } => deps_core::not_found_or(e, name, REGISTRY, &[400]),
             _ => e,
         }
     }
@@ -323,10 +320,7 @@ impl GitlabCiRegistry {
         let host = route.host().clone();
         let Some(project_path) = project_path_from_name(name.as_str(), host.host(), route.endpoint)
         else {
-            return Err(DepsError::PackageNotFound {
-                package: name.as_str().into(),
-                registry: REGISTRY,
-            });
+            return Err(DepsError::not_found_locally(name.as_str(), REGISTRY));
         };
 
         let versions = match route.endpoint {
@@ -432,10 +426,10 @@ impl deps_core::Registry for GitlabCiRegistry {
         name: &'a PackageName,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            Err(DepsError::PackageNotFound {
-                package: name.as_str().into(),
-                registry: "gitlab-ci (no route; source required)",
-            })
+            Err(DepsError::not_found_locally(
+                name.as_str(),
+                "gitlab-ci (no route; source required)",
+            ))
         })
     }
 
@@ -447,10 +441,10 @@ impl deps_core::Registry for GitlabCiRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let Some(route) = self.route(source) else {
-                return Err(DepsError::PackageNotFound {
-                    package: name.as_str().into(),
-                    registry: "gitlab-ci (no registered route)",
-                });
+                return Err(DepsError::not_found_locally(
+                    name.as_str(),
+                    "gitlab-ci (no registered route)",
+                ));
             };
             let versions = self.fetch_route(name, &route).await?;
             Ok(versions
@@ -480,10 +474,10 @@ impl deps_core::Registry for GitlabCiRegistry {
         _selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            Err(DepsError::PackageNotFound {
-                package: name.as_str().into(),
-                registry: "gitlab-ci (no route; source required)",
-            })
+            Err(DepsError::not_found_locally(
+                name.as_str(),
+                "gitlab-ci (no route; source required)",
+            ))
         })
     }
 
@@ -1210,6 +1204,7 @@ mod tests {
             },
         );
         assert_matches!(err, DepsError::PackageNotFound { .. });
+        assert_eq!(err.origin(), deps_core::ErrorOrigin::Endpoint);
     }
 
     /// H3 (#466 review): a residual `400` (the client-level `order_by=version` fallback
@@ -1227,6 +1222,7 @@ mod tests {
             },
         );
         assert_matches!(err, DepsError::PackageNotFound { .. });
+        assert_eq!(err.origin(), deps_core::ErrorOrigin::Endpoint);
     }
 
     /// #1790: a 401 from a host the token is not bound to gets the actionable

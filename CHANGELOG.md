@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `get_cached_trusted_origin_response` and `get_cached_pinned_response` take a `RevalidationFailure` (#1808)
 - **deps-core**: `WatchedConfig::new` takes a `ConfigReach`; `for_watched_config` returns `WatchedConfigMatch` (#1808)
 - **deps-core, deps-github-actions, deps-gitlab-ci**: per-crate `unknown_ref_diagnostics` replaced by `lsp_helpers::unknown_ref_diagnostics` (#1808)
-- **deps-core, all registry ecosystems**: guarded registry traffic bypasses the system proxy by default; opt in with `DEPS_LSP_WORKSPACE_REGISTRY_PROXY=proxy`, operator-owned sources follow until #1822 (#1823)
+- **deps-core, all registry ecosystems**: guarded registry traffic bypasses the system proxy by default; opt in with `DEPS_LSP_WORKSPACE_REGISTRY_PROXY=proxy`, operator-owned sources keep the system proxy (#1822, #1823)
 - **deps-core**: `HttpCache` trusted-origin and pinned APIs take `&TrustedPrefix` and `RequestAuth`; `RequestHeader` carries `Accept` only (#1814, #1823)
 - **deps-core**: `BlockedHost`, `HostBlockedByPolicy` and the occurrence types carry the registry-access `policy`; `HostClass::private_host_hint_suffix` and `blocked_host_class` are removed (#1809, #1823)
 - **deps-core, deps-engine, deps-lsp, deps-cli**: `EcosystemRuntime::from_policy` takes a `&RegistryEnvironment`, and `ServerState::with_private_registries` is replaced by `with_registry_environment`/`from_env_source` (#1811, #1823)
@@ -62,6 +62,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: a preflight DNS failure is a `RegistryError` instead of `CacheError`, `CredentialOutsideTrustedPrefix` is Actionable (the Swift last-good fallback no longer serves stale data for it), and `DepsDevClient` no longer stores a separate base URL (#1841, #1846)
 - **deps-core**: `test_util::scaling::TimeRatio` is no longer public (#1838, #1846)
 - **deps-core**: `await_interactive_fetch` takes the `Registry` the fetch goes through as its first parameter, `InteractiveFetchError` requires `origin`, and `AuxiliaryLookup` gains `LatestFallback` (#1852)
+- **deps-core**: `DepsError::PackageNotFound` gains `origin` and is built by `not_found_locally` or `not_found_or` (#1854, #PR)
+- **deps-core**: `BlockedHostReason::blocked_host` is a required trait method, `InvalidEntry::blocked_class`, `WorkspaceRegistryAccess::allows` and `HttpCache::get_cached_{trusted_origin,pinned}_with_headers` are removed, and `RegistryRuntimeSettings` gains `workspace_registries_effect` (#1808, #1823, #PR)
+- **deps-github-actions, deps-gitlab-ci**: the `MUTABLE_REF_PIN_DIAGNOSTIC_CODE`, `SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE` and `UNRESOLVED_HOST_DIAGNOSTIC_CODE` consts are removed (#1807, #PR)
+- **deps-gitlab-ci**: `GitlabApiClient::has_token` is removed (#1797, #PR)
+- **deps-lsp**: `handle_diagnostics` takes one parameter fewer and `ServerState.license_policy` is no longer public (#1823, #PR)
+- **deps-nuget, deps-swift**: `NuGetAuth` no longer derives `PartialEq`/`Eq` and `SwiftParseResult` is no longer `UnwindSafe` (#1808, #1776, #PR)
+- **deps-go, deps-npm, deps-nuget, deps-swift**: `workspace_registries = "off"` no longer blocks operator-owned registries (#1822, #PR)
+- **deps-nuget**: trusted feeds use the Baseline transport and follow the system proxy (#1822, #PR)
+- **deps-core**: one URL-alone trust rule: `OperatorPath`, `RegistryTrust`, `OperatorRegistries`, `DeclaredRegistry` (#1822, #PR)
+- **deps-go**: `GoProxyHop::Url` carries a `DeclaredRegistry`; `GoEnvConfig::parse` and `goenv_path` use `OperatorPath` (#1822, #PR)
+- **deps-npm, deps-deno**: alternate registries are `DeclaredNpmRegistry` instead of `NpmRegistryIndex` (#1822, #PR)
+- **deps-nuget**: `PackageSourceEntry.value` and `ResolvedHop.url` are `DeclaredNuGetFeed`; user-profile paths are `OperatorPath` (#1822, #PR)
+- **deps-swift**: `RegistryTrust` is the core type; `UserConfigPath` takes `OperatorPath`; a never-a-registry host is a diagnostic (#1822, #PR)
+- **deps-cargo**: `IndexTrust` is renamed `RegistryTrust` (#1822, #1855, #PR)
 
 ### Security
 - **deps**: bump `rustls` to 0.23.46, fixing RUSTSEC-2026-0346, -0347, -0348, -0349 (#1837)
@@ -72,9 +86,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-lsp, deps-cli**: repository settings can no longer reach private registry hosts without the `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` allowlist (#1808)
 - **deps-core, all registry ecosystems**: registry credential headers (`Authorization`, `PRIVATE-TOKEN`) are marked sensitive so they stay out of HTTP-stack debug output (#1772, #1776)
 - **deps-lsp**: repository editor settings can no longer redirect `GITLAB_TOKEN` through `registries.gitlab_instance_host`; the configuration docs now list the trust impact of every repository-settable field (#1797)
+- **deps-go, deps-npm, deps-nuget, deps-swift**: operator-owned registries ignore `workspace_registries` and may reach private addresses (#1822, #PR)
+- **deps-go, deps-nuget, deps-swift, deps-core**: relative `GOENV`, `XDG_CONFIG_HOME` or home no longer locate operator files (#1822, #PR)
 
 ### Added
 - **deps-core and all registry ecosystems**: `Registry::endpoint_for` (default `Unresolved`) reports the network path a lookup travels, with new `RegistryEndpoint`, `EgressTier` and `EndpointFingerprint`; each registry derives it from the route its `get_versions_from` dispatches on (#1852)
+- **deps-core**: `registry::ChainNotFound` accumulates a chain's not-found origin and `DepsError::not_found_locally` builds a locally decided not-found (#1854, #PR)
 - **deps-core**: `DepsError::origin` and `ErrorOrigin` classify whether an error is evidence about the registry endpoint; `cache_policy::evict_oldest_batch_where` and `Ord` on `EcosystemId` added (#1852)
 - **deps-core**: `licenses::LicensePolicy::activated_since` (#1831, #1842)
 - **deps-core**: `net_policy::TrustedPrefix::as_url` (#1825, #1842)
@@ -101,6 +118,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cli**: flagged latest candidates name the sibling release tags they match in hover, diagnostics and `update` (#1783)
 
 ### Changed
+- **ci**: the semver job compares against a git baseline (merge base, previous tip, or `main` a week ago) at release type minor, so it reports only breaks a run introduced (#1836, #PR)
 - **deps-core, deps-cargo, deps-nuget**: `TrustedPrefix` stays parsed down to the transport and redirect policy; in NuGet an unparseable `SearchQueryService` `@id` makes `search` return an empty result, and an unparseable `PackageBaseAddress` fails the whole service index, like a missing one (#1825, #1842)
 - **deps-npm, deps-nuget, deps-swift**: the home directory comes from `UserHome` instead of the `dirs` crate, and tests use `assert_matches!` with a CI guard against `assert!(matches!(..))` (#1818, #1823)
 - **deps**: lock bump to `zeroize` 1.9.1 and `either` 1.19.0 (#1813, #1823)
@@ -121,6 +139,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: an endpoint circuit breaker makes hover skip a registry endpoint for 30 s once two distinct packages were slow, so a dead registry no longer costs every hover a full await (#1851)
 
 ### Fixed
+- **deps-core**: breaker evidence comes from wire contact: a lookup answered from a memo, a cache hit or a local error no longer closes the breaker, and only a request outstanding for half the budget (restarted by each response) counts as slow (#1853, #PR)
+- **deps-core and ecosystem crates**: a not-found a registry answered vouches for the endpoint again, while a locally decided one does not (#1854, #PR)
 - **deps-core, all registry ecosystems**: the interactive circuit breaker and failure memo are keyed by the real registry path, so one dead npm scope, Maven repository, NuGet feed or alternate index no longer refuses the public packages of the same manifest, and two manifests on one dead registry share one breaker (#1847, #1852)
 - **deps-core**: a fast local error (policy block, cache fault, unbuildable request) no longer keeps the breaker closed on a dead endpoint, and a lost half-open probe expires after a lease (#1849, #1852)
 - **deps-core**: hover's `get_latest_matching_from` fallback goes through the interactive gate with its own memo and breaker evidence (no dispatch permit) instead of an ungated 5 s await (#1848, #1852)

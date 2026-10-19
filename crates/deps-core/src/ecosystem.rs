@@ -980,11 +980,12 @@ impl UserHome {
     }
 
     /// The process's home directory, resolved on first use and cached; `None` when the platform
-    /// reports none.
+    /// reports none or reports one that is not an absolute path (a relative home would be
+    /// resolved against whatever directory the server runs in, so it is never operator-owned).
     #[must_use]
     pub fn current() -> Option<&'static Self> {
         static HOME: std::sync::OnceLock<Option<UserHome>> = std::sync::OnceLock::new();
-        HOME.get_or_init(|| std::env::home_dir().map(Self::resolve))
+        HOME.get_or_init(|| absolute_home(std::env::home_dir()).map(Self::resolve))
             .as_ref()
     }
 
@@ -996,6 +997,27 @@ impl UserHome {
 
     fn is(&self, dir: &Path) -> bool {
         self.raw == dir || self.canonical.as_deref() == Some(dir)
+    }
+}
+
+/// `home` when it is an absolute path: a relative home would resolve against whatever directory
+/// the server runs in, so it counts as no home.
+fn absolute_home(home: Option<PathBuf>) -> Option<PathBuf> {
+    home.filter(|home| home.is_absolute())
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::absolute_home;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_relative_home_is_no_home() {
+        assert_eq!(absolute_home(Some(PathBuf::from("relative/home"))), None);
+        assert_eq!(absolute_home(Some(PathBuf::new())), None);
+        assert_eq!(absolute_home(None), None);
+        let absolute = std::env::temp_dir();
+        assert_eq!(absolute_home(Some(absolute.clone())), Some(absolute));
     }
 }
 

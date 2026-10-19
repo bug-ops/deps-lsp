@@ -130,10 +130,7 @@ impl SwiftRegistry {
         name: &str,
         lookup: PublishedAtLookup,
     ) -> Result<Vec<SwiftVersion>> {
-        let not_found = || DepsError::PackageNotFound {
-            package: name.into(),
-            registry: SE_0292_REGISTRY,
-        };
+        let not_found = || DepsError::not_found_locally(name, SE_0292_REGISTRY);
         let identity = RegistryIdentity::parse(name).ok_or_else(not_found)?;
         let Some(client) = self.alternate(index) else {
             tracing::debug!("no SE-0292 client registered for the dependency's registry");
@@ -441,10 +438,10 @@ fn route(source: &DependencySource) -> Route<'_> {
 fn not_fetchable<T: Send + 'static>(
     name: &deps_core::PackageName,
 ) -> deps_core::ecosystem::BoxFuture<'static, Result<T>> {
-    Box::pin(std::future::ready(Err(DepsError::PackageNotFound {
-        package: name.as_str().into(),
-        registry: SE_0292_REGISTRY,
-    })))
+    Box::pin(std::future::ready(Err(DepsError::not_found_locally(
+        name.as_str(),
+        SE_0292_REGISTRY,
+    ))))
 }
 
 fn box_versions(versions: Vec<SwiftVersion>) -> Vec<Box<dyn deps_core::Version>> {

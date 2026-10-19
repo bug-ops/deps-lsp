@@ -811,10 +811,7 @@ fn route(name: &str) -> Result<Option<(MavenRoute, String)>> {
             "maven metadata URL groupId:artifactId",
             name,
         );
-        return Err(DepsError::PackageNotFound {
-            package: name.to_string().into(),
-            registry: REGISTRY,
-        });
+        return Err(DepsError::not_found_locally(name, REGISTRY));
     };
     Ok(Some((MavenRoute::of(group_id), coordinate_path)))
 }

@@ -13,6 +13,7 @@ use super::key::{
 };
 use super::memo::{Decision, FastFail, INTERACTIVE_FAILURE_TTL, INTERACTIVE_MEMO_CAP};
 use super::*;
+use crate::endpoint_contact::{Contact, ResponseSeen, note_request, note_response};
 use crate::lsp_helpers::DependencyOutcomes;
 use crate::lsp_helpers::REGISTRY_FETCH_BUDGET;
 use crate::test_util::{MockRegistry, MockVersion};
@@ -133,14 +134,24 @@ impl Fixture {
             async {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 match fetch {
-                    Fetch::Succeed => Ok(1),
-                    Fetch::Fail => Err(Failure(ErrorOrigin::Endpoint)),
+                    Fetch::Succeed => {
+                        note_request();
+                        note_response();
+                        Ok(1)
+                    }
+                    Fetch::Fail => {
+                        note_request();
+                        note_response();
+                        Err(Failure(ErrorOrigin::Endpoint))
+                    }
                     Fetch::FailLocal => Err(Failure(ErrorOrigin::Unattributed)),
                     Fetch::FailLocalSlow => {
+                        note_request();
                         tokio::time::sleep(Duration::from_secs(6)).await;
                         Err(Failure(ErrorOrigin::Unattributed))
                     }
                     Fetch::Stall => {
+                        note_request();
                         tokio::time::sleep(REGISTRY_FETCH_BUDGET + Duration::from_secs(5)).await;
                         Ok(1)
                     }
@@ -523,8 +534,19 @@ async fn memo_stays_within_the_cap_and_sweeps_expired_entries() {
 
 #[derive(Clone, Copy)]
 enum Versions {
+    /// A response arrives after the delay and the list is served.
     Succeed(Duration),
+    /// An error response (an HTTP status) arrives after the delay.
     Fail(Duration),
+    /// The transport fails after the delay with no response, such as a connect timeout.
+    Transport(Duration),
+    /// Served after the delay without any request: a memo, a fresh cache entry, or a wait on
+    /// another task's lock.
+    Untouched(Duration),
+    /// A chain whose first hop answers in 1 s and whose second hop never does.
+    AnswerThenStall,
+    /// Pages that each answer in 3 s, for far longer than the budget.
+    Paging,
 }
 
 impl Versions {
@@ -576,12 +598,40 @@ impl Fixture {
             .unwrap();
         let fetch = async {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if !matches!(behavior, Versions::Untouched(_)) {
+                note_request();
+            }
             match behavior {
-                Versions::Succeed(delay) => {
+                Versions::Untouched(delay) => {
                     tokio::time::sleep(delay).await;
                     Ok(list())
                 }
+                Versions::AnswerThenStall => {
+                    tokio::time::sleep(secs(1)).await;
+                    note_response();
+                    note_request();
+                    tokio::time::sleep(secs(60)).await;
+                    Ok(list())
+                }
+                Versions::Paging => {
+                    for _ in 0..20 {
+                        tokio::time::sleep(secs(3)).await;
+                        note_response();
+                        note_request();
+                    }
+                    Ok(list())
+                }
+                Versions::Succeed(delay) => {
+                    tokio::time::sleep(delay).await;
+                    note_response();
+                    Ok(list())
+                }
                 Versions::Fail(delay) => {
+                    tokio::time::sleep(delay).await;
+                    note_response();
+                    Err(())
+                }
+                Versions::Transport(delay) => {
                     tokio::time::sleep(delay).await;
                     Err(())
                 }
@@ -871,67 +921,181 @@ fn is_open(health: Option<EndpointHealth>) -> bool {
     matches!(health, Some(EndpointHealth::Open { .. }))
 }
 
+const ANSWERED: Contact = Contact {
+    response: ResponseSeen::Yes,
+    stall: None,
+};
+
+const fn stalled_for(stall: Duration) -> Contact {
+    Contact {
+        response: ResponseSeen::No,
+        stall: Some(stall),
+    }
+}
+
+const fn answered_then_stalled_for(stall: Duration) -> Contact {
+    Contact {
+        response: ResponseSeen::Yes,
+        stall: Some(stall),
+    }
+}
+
 #[test]
 fn evidence_follows_the_unified_table() {
     let budget = secs(10);
     let just_under = |limit: Duration| limit.saturating_sub(Duration::from_millis(1));
+    let untouched = Contact::UNTOUCHED;
     let cases = [
+        // A response within the budget vouches for the endpoint; nothing else does.
         (
             AttemptEnd::Live,
-            just_under(secs(9)),
-            AttemptEvidence::Answered,
-        ),
-        (AttemptEnd::Live, secs(9), AttemptEvidence::Inconclusive),
-        (AttemptEnd::Live, secs(10), AttemptEvidence::Inconclusive),
-        (
-            AttemptEnd::Err(ErrorOrigin::Endpoint),
+            ANSWERED,
             just_under(secs(9)),
             AttemptEvidence::Answered,
         ),
         (
+            AttemptEnd::Live,
+            untouched,
+            just_under(secs(9)),
+            AttemptEvidence::Inconclusive,
+        ),
+        (
+            AttemptEnd::Live,
+            ANSWERED,
+            secs(9),
+            AttemptEvidence::Inconclusive,
+        ),
+        (
+            AttemptEnd::Live,
+            ANSWERED,
+            secs(10),
+            AttemptEvidence::Inconclusive,
+        ),
+        (
             AttemptEnd::Err(ErrorOrigin::Endpoint),
+            ANSWERED,
+            just_under(secs(9)),
+            AttemptEvidence::Answered,
+        ),
+        (
+            AttemptEnd::Err(ErrorOrigin::Endpoint),
+            untouched,
+            just_under(secs(9)),
+            AttemptEvidence::Inconclusive,
+        ),
+        // A request outstanding for half the budget accuses it, however the attempt ends.
+        (
+            AttemptEnd::Err(ErrorOrigin::Endpoint),
+            stalled_for(secs(9)),
             secs(9),
             AttemptEvidence::Slow,
         ),
         (
+            AttemptEnd::Err(ErrorOrigin::Endpoint),
+            stalled_for(Duration::from_millis(9500)),
+            Duration::from_millis(9500),
+            AttemptEvidence::Slow,
+        ),
+        (
+            AttemptEnd::Err(ErrorOrigin::Endpoint),
+            ANSWERED,
+            secs(9),
+            AttemptEvidence::Inconclusive,
+        ),
+        (
             AttemptEnd::Err(ErrorOrigin::Unattributed),
+            stalled_for(just_under(secs(5))),
             just_under(secs(5)),
             AttemptEvidence::Inconclusive,
         ),
         (
             AttemptEnd::Err(ErrorOrigin::Unattributed),
+            stalled_for(secs(5)),
             secs(5),
             AttemptEvidence::Slow,
         ),
         (
             AttemptEnd::Err(ErrorOrigin::Unattributed),
+            stalled_for(secs(9)),
             secs(9),
             AttemptEvidence::Slow,
         ),
-        (AttemptEnd::Elapsed, secs(10), AttemptEvidence::Slow),
-        (AttemptEnd::Elapsed, secs(5), AttemptEvidence::Slow),
+        (
+            AttemptEnd::Err(ErrorOrigin::Unattributed),
+            untouched,
+            secs(9),
+            AttemptEvidence::Inconclusive,
+        ),
         (
             AttemptEnd::Elapsed,
+            stalled_for(secs(10)),
+            secs(10),
+            AttemptEvidence::Slow,
+        ),
+        (
+            AttemptEnd::Elapsed,
+            stalled_for(secs(5)),
+            secs(5),
+            AttemptEvidence::Slow,
+        ),
+        (
+            AttemptEnd::Elapsed,
+            stalled_for(just_under(secs(5))),
             just_under(secs(5)),
             AttemptEvidence::Inconclusive,
         ),
-        (AttemptEnd::Cancelled, secs(5), AttemptEvidence::Slow),
+        // Waiting on another task's lock sends no request of its own.
+        (
+            AttemptEnd::Elapsed,
+            untouched,
+            secs(10),
+            AttemptEvidence::Inconclusive,
+        ),
+        // Pagination keeps receiving responses, so no request has been outstanding long.
+        (
+            AttemptEnd::Elapsed,
+            ANSWERED,
+            secs(10),
+            AttemptEvidence::Inconclusive,
+        ),
+        // A request that only started late, after a lock wait or a long response, is too young.
+        (
+            AttemptEnd::Elapsed,
+            answered_then_stalled_for(secs(2)),
+            secs(10),
+            AttemptEvidence::Inconclusive,
+        ),
+        // A chain whose first hop answered fast and whose second hop hangs.
+        (
+            AttemptEnd::Elapsed,
+            answered_then_stalled_for(secs(5)),
+            secs(10),
+            AttemptEvidence::Slow,
+        ),
         (
             AttemptEnd::Cancelled,
+            stalled_for(secs(5)),
+            secs(5),
+            AttemptEvidence::Slow,
+        ),
+        (
+            AttemptEnd::Cancelled,
+            stalled_for(just_under(secs(5))),
             just_under(secs(5)),
             AttemptEvidence::Inconclusive,
         ),
         (
             AttemptEnd::Cancelled,
+            untouched,
             Duration::ZERO,
             AttemptEvidence::Inconclusive,
         ),
     ];
-    for (end, waited, expected) in cases {
+    for (end, contact, waited, expected) in cases {
         assert_eq!(
-            evidence(end, waited, budget),
+            evidence(end, contact, waited, budget),
             expected,
-            "{end:?} after {waited:?}"
+            "{end:?} {contact:?} after {waited:?}"
         );
     }
 }
@@ -1030,7 +1194,7 @@ async fn a_fast_error_answers_for_the_endpoint_and_a_late_one_is_slow() {
     );
 
     let late = Fixture::new();
-    late.enriched("late", Versions::Fail(Duration::from_millis(9500)))
+    late.enriched("late", Versions::Transport(Duration::from_millis(9500)))
         .await;
     assert_matches!(
         late.health(),
@@ -1133,6 +1297,67 @@ async fn a_slow_probe_reopens_the_breaker() {
     assert_degraded(&refused, NoLiveList::Unverified);
     assert!(is_open(fixture.health()));
     assert_eq!(fixture.calls(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_chain_whose_second_hop_hangs_after_a_fast_first_hop_opens_the_breaker() {
+    let fixture = Fixture::new();
+
+    fixture.enriched("chain-a", Versions::AnswerThenStall).await;
+    fixture.enriched("chain-b", Versions::AnswerThenStall).await;
+
+    assert!(is_open(fixture.health()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_paginating_fetch_that_keeps_receiving_responses_never_opens_the_breaker() {
+    let fixture = Fixture::new();
+
+    fixture.enriched("paged-a", Versions::Paging).await;
+    fixture.enriched("paged-b", Versions::Paging).await;
+
+    assert_matches!(
+        fixture.health(),
+        Some(EndpointHealth::Closed { suspect: None, .. })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn lookups_that_only_wait_on_a_lock_never_open_the_breaker() {
+    let fixture = Fixture::new();
+
+    fixture
+        .enriched("waiter-a", Versions::Untouched(secs(60)))
+        .await;
+    fixture
+        .enriched("waiter-b", Versions::Untouched(secs(60)))
+        .await;
+
+    assert_matches!(
+        fixture.health(),
+        Some(EndpointHealth::Closed { suspect: None, .. })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_probe_served_without_a_request_does_not_close_the_breaker_but_a_network_probe_does() {
+    let fixture = Fixture::new();
+    fixture.open_the_breaker().await;
+    tokio::time::advance(BREAKER_OPEN_DURATION).await;
+
+    let memo_probe = fixture.enriched("memo", Versions::Untouched(secs(1))).await;
+    assert_eq!(live_list(memo_probe).len(), 1);
+    assert!(is_open(fixture.health()), "no response, no vouching");
+
+    let network_probe = fixture.enriched("net", Versions::Succeed(secs(1))).await;
+    assert_eq!(live_list(network_probe).len(), 1);
+    assert_matches!(
+        fixture.health(),
+        Some(EndpointHealth::Closed {
+            last_answered: Some(_),
+            ..
+        })
+    );
 }
 
 #[tokio::test(start_paused = true)]

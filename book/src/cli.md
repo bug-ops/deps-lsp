@@ -161,7 +161,7 @@ access policy blocks, for example a private address without an allowlist entry, 
 policy decision, reported as an informational `other` finding naming the policy and the
 [allowlist hint](configuration.md#private-registry-allowlist), and the run exits `0` unless you add
 `--fail-on other`. Guarded registry hosts bypass the system proxy unless
-`DEPS_LSP_WORKSPACE_REGISTRY_PROXY=proxy` is set (see
+`DEPS_LSP_WORKSPACE_REGISTRY_PROXY=proxy` is set, while [operator-owned registries](configuration.md#operator-owned-registries) always follow it (see
 [Proxies and guarded registry traffic](configuration.md#proxies-and-guarded-registry-traffic));
 `deps-cli` prints one stderr line at startup when it detects a system proxy.
 

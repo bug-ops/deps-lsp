@@ -8,11 +8,11 @@
 //!
 //! A repository's own `registries.json` is attacker-controlled the moment it is opened, so:
 //!
-//! - **Trust is a function of the URL alone.** A registry URL is [`RegistryTrust::Trusted`] iff
-//!   it equals a URL declared in the user tier (the user's own file), whichever tier declared it
-//!   in the current workspace; otherwise it is [`RegistryTrust::WorkspaceDeclared`]. Trust,
-//!   transport and credential binding therefore never differ between two workspaces sharing a
-//!   URL.
+//! - **Trust is a function of the URL alone** (spec 084, the rule `deps-core` shares with Go, npm
+//!   and NuGet). A registry URL is [`RegistryTrust::Trusted`] iff it equals a URL declared in the
+//!   user tier (the user's own file), whichever tier declared it in the current workspace;
+//!   otherwise it is [`RegistryTrust::WorkspaceDeclared`]. Trust, transport and credential binding
+//!   therefore never differ between two workspaces sharing a URL.
 //! - **An unusable tier fails closed.** A tier that exists but cannot be used (unreadable, not a
 //!   regular file, over the size cap, or failing SwiftPM's strict decode) makes every `id:`
 //!   dependency unresolved, never a fallback to the other tier, so a broken file cannot redirect
@@ -21,16 +21,17 @@
 //!   credential is attached only to `Trusted` URLs (see `crate::auth::bind_credential`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
+use deps_core::config_trust::{EnvPath, OperatorEnvVar, OperatorPath};
+pub use deps_core::net_policy::RegistryTrust;
 use deps_core::net_policy::{
-    BlockedHost, BlockedHostReason, HostClass, IndexUrlError, InvalidEntry, PolicyGate,
-    RedactedUrl, RegistryAccessPolicy, RegistryRejectionClassifier, RejectionOutcome,
-    TrustedPrefix, classify_host, validate_index_url,
+    BlockedHost, BlockedHostReason, IndexUrlError, InvalidEntry, OperatorRegistries, ProcessEnv,
+    RedactedUrl, RegistryAccessPolicy, RegistryRejectionClassifier, RegistryUrlKind,
+    RejectionOutcome, TrustedPrefix,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{BlockedSourceClass, EcosystemId, RejectedSourceClass};
@@ -78,8 +79,8 @@ pub(crate) enum RegistriesConfigError {
     /// `security` is present but not an object.
     #[error("`security` is not an object")]
     SecurityNotAnObject,
-    /// `XDG_CONFIG_HOME` is set but empty or not an absolute path.
-    #[error("XDG_CONFIG_HOME is empty or not an absolute path")]
+    /// `XDG_CONFIG_HOME` is set to a relative path.
+    #[error("XDG_CONFIG_HOME is not an absolute path")]
     InvalidXdgConfigHome,
 }
 
@@ -341,19 +342,21 @@ impl UserConfigPlatform {
 /// # Examples
 ///
 /// ```
+/// use deps_core::config_trust::OperatorPath;
 /// use deps_swift::config::{UserConfigPath, UserConfigPlatform};
-/// use std::path::Path;
+/// use deps_core::config_trust::EnvPath;
 ///
-/// let home = Path::new("home");
-/// let path = UserConfigPath::resolve(UserConfigPlatform::Other, Some(home), None);
+/// let home = OperatorPath::for_test("/home/me");
+/// let path = UserConfigPath::resolve(UserConfigPlatform::Other, Some(&home), EnvPath::Unset);
 /// let expected = home.join(".swiftpm").join("configuration").join("registries.json");
 /// assert_eq!(path, UserConfigPath::Path(expected));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserConfigPath {
     /// The single user-tier file path.
-    Path(PathBuf),
-    /// `XDG_CONFIG_HOME` is set but empty or not absolute: the user tier is unusable.
+    Path(OperatorPath),
+    /// `XDG_CONFIG_HOME` is set to a relative path: the user tier is unusable. An empty value is
+    /// unset and falls back to the home-based default.
     InvalidXdgConfigHome,
     /// No home directory and no usable `XDG_CONFIG_HOME`: there is no user tier.
     NoUserTier,
@@ -364,21 +367,19 @@ impl UserConfigPath {
     #[must_use]
     pub fn resolve(
         platform: UserConfigPlatform,
-        home: Option<&Path>,
-        xdg_config_home: Option<&OsStr>,
+        home: Option<&OperatorPath>,
+        xdg_config_home: EnvPath,
     ) -> Self {
-        let tail = Path::new("configuration").join(REGISTRIES_FILE);
+        let file = |base: &OperatorPath| base.join("configuration").join(REGISTRIES_FILE);
         match platform {
             UserConfigPlatform::MacOs => home.map_or(Self::NoUserTier, |home| {
-                Self::Path(home.join("Library/org.swift.swiftpm").join(tail))
+                Self::Path(file(&home.join("Library").join("org.swift.swiftpm")))
             }),
             UserConfigPlatform::Other => match xdg_config_home {
-                Some(xdg) if xdg.is_empty() || !Path::new(xdg).is_absolute() => {
-                    Self::InvalidXdgConfigHome
-                }
-                Some(xdg) => Self::Path(Path::new(xdg).join("swiftpm").join(tail)),
-                None => home.map_or(Self::NoUserTier, |home| {
-                    Self::Path(home.join(".swiftpm").join(tail))
+                EnvPath::Ignored => Self::InvalidXdgConfigHome,
+                EnvPath::Path(xdg) => Self::Path(file(&xdg.join("swiftpm"))),
+                EnvPath::Unset => home.map_or(Self::NoUserTier, |home| {
+                    Self::Path(file(&home.join(".swiftpm")))
                 }),
             },
         }
@@ -389,45 +390,28 @@ impl UserConfigPath {
     pub fn from_environment() -> Self {
         Self::resolve(
             UserConfigPlatform::current(),
-            deps_core::UserHome::current().map(deps_core::UserHome::path),
-            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+            OperatorPath::home().as_ref(),
+            OperatorPath::from_env(&ProcessEnv, OperatorEnvVar::XdgConfigHome),
         )
     }
-}
-
-/// Whether a registry URL may receive the environment credential and skip the workspace policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RegistryTrust {
-    /// Declared in, or equal to a URL declared in, the user-level `registries.json`.
-    Trusted,
-    /// Declared only by the workspace: policy-gated, never authenticated.
-    WorkspaceDeclared,
 }
 
 /// What the user tier establishes: the trust anchors and the authentication types.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct UserTier {
-    urls: HashSet<String>,
+    urls: OperatorRegistries,
     authentication: HashMap<RegistryHostKey, SwiftAuthType>,
 }
 
 impl UserTier {
-    fn from_raw(raw: &RawRegistries) -> Self {
-        let urls = raw
-            .default
-            .iter()
-            .chain(raw.scoped.values())
-            .filter_map(|url| validate_shape(url, PolicyGate::Skip).ok())
-            .map(|url| normalize(&url))
-            .collect();
+    fn from_raw(raw: &RawRegistries, file: &OperatorPath) -> Self {
         Self {
-            urls,
+            urls: OperatorRegistries::declared_in(
+                file,
+                raw.default.iter().chain(raw.scoped.values()),
+            ),
             authentication: raw.authentication.clone(),
         }
-    }
-
-    fn contains(&self, normalized: &str) -> bool {
-        self.urls.contains(normalized)
     }
 
     pub(crate) fn auth_type_for(&self, host: &RegistryHostKey) -> Option<SwiftAuthType> {
@@ -440,7 +424,7 @@ impl UserTier {
         authentication: HashMap<RegistryHostKey, SwiftAuthType>,
     ) -> Self {
         Self {
-            urls: urls.iter().map(|url| (*url).to_string()).collect(),
+            urls: OperatorRegistries::declared_in(&OperatorPath::for_test("/home/me"), urls),
             authentication,
         }
     }
@@ -452,17 +436,12 @@ pub enum SwiftRegistryUrlError {
     /// Not a URL, not https, carries userinfo, query or fragment, or is policy-blocked.
     #[error(transparent)]
     Url(#[from] IndexUrlError),
-    /// A user-declared host that is never a registry (loopback, link-local, cloud metadata,
-    /// unspecified, reserved); no setting unblocks it.
-    #[error("host class {0} is never a registry")]
-    NeverARegistryHost(HostClass),
 }
 
 impl BlockedHostReason for SwiftRegistryUrlError {
     fn blocked_host(&self) -> Option<BlockedHost> {
         match self {
             Self::Url(e) => e.blocked_host(),
-            Self::NeverARegistryHost(_) => None,
         }
     }
 }
@@ -471,7 +450,6 @@ impl RegistryRejectionClassifier for SwiftRegistryUrlError {
     fn rejection_reason(&self) -> RejectionOutcome {
         match self {
             Self::Url(e) => e.rejection_reason(),
-            Self::NeverARegistryHost(_) => RejectionOutcome::IntentionallySilent,
         }
     }
 }
@@ -519,16 +497,16 @@ pub struct SwiftRegistryUrl {
     host_key: RegistryHostKey,
 }
 
-fn validate_shape(raw: &str, gate: PolicyGate<'_>) -> Result<Url, IndexUrlError> {
-    let url = validate_index_url(raw, raw, EcosystemId::Swift, gate)?;
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err(IndexUrlError::InvalidUrl(RedactedUrl::new(raw)));
-    }
-    Ok(url)
-}
+/// [`RegistryUrlKind`] marker for SE-0292 registry base URLs: https only, no userinfo, and no
+/// query or fragment (every request URL is built by appending path segments).
+pub(crate) enum SwiftRegistryKind {}
 
-fn normalize(url: &Url) -> String {
-    url.as_str().trim_end_matches('/').to_string()
+impl deps_core::net_policy::private::Sealed for SwiftRegistryKind {}
+
+impl RegistryUrlKind for SwiftRegistryKind {
+    const ECOSYSTEM: EcosystemId = EcosystemId::Swift;
+    const REJECT_QUERY_FRAGMENT: bool = true;
+    type Error = SwiftRegistryUrlError;
 }
 
 impl SwiftRegistryUrl {
@@ -541,27 +519,19 @@ impl SwiftRegistryUrl {
         user_tier: &UserTier,
         policy: &RegistryAccessPolicy,
     ) -> Result<Self, SwiftRegistryUrlError> {
-        let shape = validate_shape(raw, PolicyGate::Skip)?;
-        let normalized = normalize(&shape);
-        let host_key = RegistryHostKey::of(&shape)
-            .ok_or_else(|| IndexUrlError::InvalidUrl(RedactedUrl::new(raw)))?;
-        let trust = if user_tier.contains(&normalized) {
-            let class = classify_host(&shape);
-            if class.never_a_registry() {
-                return Err(SwiftRegistryUrlError::NeverARegistryHost(class));
-            }
-            RegistryTrust::Trusted
-        } else {
-            validate_shape(raw, PolicyGate::Enforce(policy))?;
-            RegistryTrust::WorkspaceDeclared
-        };
-        let prefix = TrustedPrefix::parse(&format!("{normalized}/"))
-            .map_err(|_| IndexUrlError::InvalidUrl(RedactedUrl::new(raw)))?;
+        let declared = user_tier
+            .urls
+            .classify::<SwiftRegistryKind>(raw, raw, policy)?;
+        let invalid = || IndexUrlError::InvalidUrl(RedactedUrl::new(raw));
+        let normalized = declared.as_str().to_string();
+        let parsed = Url::parse(&normalized).map_err(|_| invalid())?;
+        let host_key = RegistryHostKey::of(&parsed).ok_or_else(invalid)?;
+        let prefix = TrustedPrefix::parse(&format!("{normalized}/")).map_err(|_| invalid())?;
         Ok(Self {
             normalized,
-            parsed: shape,
+            parsed,
             prefix,
-            trust,
+            trust: declared.trust(),
             host_key,
         })
     }
@@ -665,13 +635,21 @@ pub(crate) struct SwiftRegistriesConfig {
     scoped: HashMap<RegistryScope, Entry>,
 }
 
+/// The user tier as `merge` receives it: a file read from a known operator path, or a tier with
+/// no file behind it (absent, or unusable because its location is invalid), so a parsed user
+/// file always comes with the path that proves it is the operator's.
+enum UserInput<'a> {
+    Read(&'a OperatorPath, TierFile),
+    NoFile(TierFile),
+}
+
 impl SwiftRegistriesConfig {
     /// Merges `project` over `user` (per scope key and for `[default]`) and resolves every entry.
     ///
     /// Either tier being unusable makes the whole config unusable, with no fallback.
     fn merge(
         project: TierFile,
-        user: TierFile,
+        user: UserInput<'_>,
         policy: &RegistryAccessPolicy,
         credential: CredentialLookup<'_>,
     ) -> Self {
@@ -683,11 +661,18 @@ impl SwiftRegistriesConfig {
                 None
             }
         };
+        let (user_path, user) = match user {
+            UserInput::Read(path, file) => (Some(path), file),
+            UserInput::NoFile(file) => (None, file),
+        };
         let (Some(project), Some(user)) = (tier(project), tier(user)) else {
             return Self::default();
         };
 
-        let user_tier = user.as_deref().map_or_default(UserTier::from_raw);
+        let user_tier = match (user.as_deref(), user_path) {
+            (Some(raw), Some(path)) => UserTier::from_raw(raw, path),
+            (Some(_) | None, _) => UserTier::default(),
+        };
         let mut default = user.as_ref().and_then(|raw| raw.default.clone());
         let mut scoped = user.as_ref().map_or_default(|raw| raw.scoped.clone());
         if let Some(project) = &project {
@@ -1001,13 +986,13 @@ impl SwiftParseContext {
             })
             .map_or(TierFile::Absent, |path| self.cache.read(&path));
         let user = match &self.user_config {
-            UserConfigPath::Path(path) => self.cache.read(path),
-            UserConfigPath::InvalidXdgConfigHome => self.cache.unusable(
+            UserConfigPath::Path(path) => UserInput::Read(path, self.cache.read(path.as_path())),
+            UserConfigPath::InvalidXdgConfigHome => UserInput::NoFile(self.cache.unusable(
                 Path::new("$XDG_CONFIG_HOME"),
                 None,
                 RegistriesConfigError::InvalidXdgConfigHome,
-            ),
-            UserConfigPath::NoUserTier => TierFile::Absent,
+            )),
+            UserConfigPath::NoUserTier => UserInput::NoFile(TierFile::Absent),
         };
         let merge = |credential: CredentialLookup<'_>| {
             SwiftRegistriesConfig::merge(project, user, &self.policy, credential)
@@ -1026,7 +1011,9 @@ impl SwiftParseContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::net_policy::{BlockedHost, RegistryRejectionReason, WorkspaceRegistryAccess};
+    use deps_core::net_policy::{
+        BlockedHost, HostClass, RegistryRejectionReason, WorkspaceRegistryAccess,
+    };
     use deps_core::secret::Redacted;
     use std::assert_matches;
 
@@ -1116,7 +1103,7 @@ mod tests {
                     )),
                 )),
                 Arc::default(),
-                UserConfigPath::Path(self.user_file()),
+                UserConfigPath::Path(OperatorPath::for_test(self.user_file())),
                 credential,
             )
         }
@@ -1161,34 +1148,48 @@ mod tests {
     #[test]
     fn test_user_config_path_table() {
         use UserConfigPlatform::{MacOs, Other};
-        let home = Path::new("home").join("u");
-        let home = home.as_path();
-        let tail = Path::new("configuration").join("registries.json");
-        let xdg = std::env::temp_dir();
-        let resolve =
-            |platform, home, xdg: Option<&OsStr>| UserConfigPath::resolve(platform, home, xdg);
+        let home = OperatorPath::for_test(std::env::temp_dir().join("u"));
+        let tail = |base: OperatorPath| base.join("configuration").join("registries.json");
+        let xdg = OperatorPath::for_test(std::env::temp_dir());
+        let resolve = UserConfigPath::resolve;
 
         assert_eq!(
-            resolve(MacOs, Some(home), Some(xdg.as_os_str())),
-            UserConfigPath::Path(home.join("Library/org.swift.swiftpm").join(&tail))
+            resolve(MacOs, Some(&home), EnvPath::Path(xdg.clone())),
+            UserConfigPath::Path(tail(home.join("Library").join("org.swift.swiftpm")))
         );
         assert_eq!(
-            resolve(Other, Some(home), Some(xdg.as_os_str())),
-            UserConfigPath::Path(xdg.join("swiftpm").join(&tail))
+            resolve(Other, Some(&home), EnvPath::Path(xdg.clone())),
+            UserConfigPath::Path(tail(xdg.join("swiftpm")))
         );
         assert_eq!(
-            resolve(Other, Some(home), None),
-            UserConfigPath::Path(home.join(".swiftpm").join(tail))
+            resolve(Other, Some(&home), EnvPath::Unset),
+            UserConfigPath::Path(tail(home.join(".swiftpm")))
         );
-        for bad in ["", "relative/dir"] {
-            assert_eq!(
-                resolve(Other, Some(home), Some(OsStr::new(bad))),
-                UserConfigPath::InvalidXdgConfigHome,
-                "{bad:?}"
-            );
-        }
-        assert_eq!(resolve(Other, None, None), UserConfigPath::NoUserTier);
-        assert_eq!(resolve(MacOs, None, None), UserConfigPath::NoUserTier);
+        assert_eq!(
+            resolve(Other, Some(&home), EnvPath::Ignored),
+            UserConfigPath::InvalidXdgConfigHome
+        );
+        let empty = deps_core::net_policy::MapEnv::new().with_var("XDG_CONFIG_HOME", "");
+        assert_eq!(
+            resolve(
+                Other,
+                Some(&home),
+                OperatorPath::from_env(
+                    &empty,
+                    deps_core::config_trust::OperatorEnvVar::XdgConfigHome
+                )
+            ),
+            UserConfigPath::Path(tail(home.join(".swiftpm"))),
+            "an empty XDG_CONFIG_HOME is unset"
+        );
+        assert_eq!(
+            resolve(Other, None, EnvPath::Unset),
+            UserConfigPath::NoUserTier
+        );
+        assert_eq!(
+            resolve(MacOs, None, EnvPath::Unset),
+            UserConfigPath::NoUserTier
+        );
     }
 
     #[test]
@@ -1702,7 +1703,7 @@ mod tests {
     // --- SC-005a / policy ---
 
     #[test]
-    fn test_trusted_never_a_registry_hosts_are_rejected_silently() {
+    fn test_trusted_never_a_registry_hosts_are_rejected_at_the_floor() {
         for host in [
             "https://127.0.0.1",
             "https://[::1]",
@@ -1719,8 +1720,12 @@ mod tests {
                 DependencySource::CustomRegistry { .. },
                 "{host}"
             );
-            assert!(config.blocked_class_for(&acme).is_none(), "{host}");
-            assert!(config.rejected_reason_for(&acme).is_none(), "{host}");
+            let blocked = config.blocked_class_for(&acme).expect(host);
+            assert_eq!(
+                blocked.block.policy(),
+                deps_core::net_policy::BlockingPolicy::Floor,
+                "{host}"
+            );
             assert!(config.resolved_registries().is_empty(), "{host}");
         }
     }
@@ -1849,12 +1854,6 @@ mod tests {
 
     #[test]
     fn test_registry_url_error_classification() {
-        let silent = SwiftRegistryUrlError::NeverARegistryHost(HostClass::Loopback);
-        assert_eq!(
-            silent.rejection_reason(),
-            RejectionOutcome::IntentionallySilent
-        );
-        assert_eq!(silent.blocked_host(), None);
         let block = BlockedHost::new(HostClass::PrivateV4, WorkspaceRegistryAccess::PublicOnly);
         let blocked = SwiftRegistryUrlError::Url(IndexUrlError::BlockedHost { block });
         assert_eq!(blocked.blocked_host(), Some(block));

@@ -30,7 +30,7 @@
 //! ```
 
 use crate::config::{
-    AuthToken, ConfigFileCache, IndexTrust, RegistryIndex, RegistryIndexError, SourceReplacement,
+    AuthToken, ConfigFileCache, RegistryIndex, RegistryIndexError, RegistryTrust, SourceReplacement,
 };
 use crate::types::{
     CargoDependency, CargoDependencySection, CustomRegistryOrigin, DependencySource,
@@ -137,7 +137,7 @@ pub fn parse_cargo_toml(content: &str, doc_uri: &Url) -> Result<CargoParseResult
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct CargoParseContext {
-    /// Gates every `IndexTrust::WorkspaceDeclared` [`RegistryIndex`] this parse constructs.
+    /// Gates every `RegistryTrust::WorkspaceDeclared` [`RegistryIndex`] this parse constructs.
     pub policy: Arc<RegistryAccessPolicy>,
     /// Memoizes each distinct `.cargo/config.toml`/`$CARGO_HOME/config.toml` file's raw,
     /// unvalidated contents across every parse that reads it.
@@ -382,7 +382,7 @@ fn resolve_alternate_registries(
         // validation error (not a URL at all — the common case where `value` is actually an
         // alias — or a genuinely invalid URL) falls through to alias resolution below
         // safely: a URL-shaped alias lookup simply won't match any `[registries.*]` entry.
-        match RegistryIndex::new(value, IndexTrust::WorkspaceDeclared, &ctx.policy) {
+        match RegistryIndex::new(value, RegistryTrust::WorkspaceDeclared, &ctx.policy) {
             Ok(index) => {
                 resolved_by_raw_value.insert(value.clone(), index.clone());
                 newly_resolved.push((index, None));

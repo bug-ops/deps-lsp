@@ -6,9 +6,10 @@
 //!
 //! All HTTP requests are cached aggressively using ETag/Last-Modified headers.
 
-use crate::config::NpmRegistryIndex;
+use crate::config::DeclaredNpmRegistry;
 use crate::types::{NpmDeprecation, NpmPackage, NpmVersion};
 use dashmap::DashMap;
+use deps_core::net_policy::RegistryTrust;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
@@ -16,7 +17,7 @@ use deps_core::{
     RegistryEndpoint, RequestHeader, Result, SafePathSegment, SegmentedPathName,
     not_found_or as core_not_found_or,
     parser::DependencySource,
-    registry::{KeyShape, register_capped},
+    registry::{KeyShape, register_capped_with_occupied},
 };
 use serde::Deserialize;
 use std::any::Any;
@@ -83,20 +84,30 @@ enum NpmRegistryTier {
     /// `registry.npmjs.org` (or a test override) — `HttpCache::get_cached_with_headers`,
     /// today's path, unchanged.
     Public,
-    /// A `.npmrc`-declared alternate index — `HttpCache::get_cached_workspace_with_headers`,
-    /// so every redirect hop is re-classified against the live
-    /// [`deps_core::net_policy::RegistryAccessPolicy`] (mirrors
-    /// `deps-cargo/src/sparse.rs`'s identical `WorkspaceDeclared` routing).
-    WorkspaceDeclared,
+    /// A `.npmrc`-declared alternate index. [`RegistryTrust::Trusted`] (equal to a URL the user's
+    /// own `~/.npmrc` declares) fetches through `HttpCache::get_cached_with_headers` on the
+    /// Baseline egress; [`RegistryTrust::WorkspaceDeclared`] fetches through
+    /// `HttpCache::get_cached_workspace_with_headers`, so every redirect hop is re-classified
+    /// against the live [`deps_core::net_policy::RegistryAccessPolicy`].
+    Declared(RegistryTrust),
 }
 
 impl NpmRegistryTier {
-    /// The egress of the transport this tier fetches through (the `get_cached*` family for
-    /// `Public`, the guarded `get_cached_workspace*` family for `WorkspaceDeclared`).
+    /// The egress of the transport this tier fetches through (the `get_cached*` family on the
+    /// Baseline egress for `Public` and a Trusted declaration, the guarded
+    /// `get_cached_workspace*` family for a workspace-declared one).
     const fn egress(self) -> EgressTier {
         match self {
             Self::Public => EgressTier::Baseline,
-            Self::WorkspaceDeclared => EgressTier::Guarded,
+            Self::Declared(trust) => trust.egress(),
+        }
+    }
+
+    /// Whether this tier is an alternate (declared) index rather than the public registry.
+    const fn is_declared(self) -> bool {
+        match self {
+            Self::Public => false,
+            Self::Declared(_) => true,
         }
     }
 }
@@ -238,7 +249,7 @@ pub struct NpmRegistry {
     publish_times: Arc<DashMap<String, CachedTimes>>,
     /// Which transport [`Self::get_versions`]/[`Self::search`] fetch through (spec FR-008).
     tier: NpmRegistryTier,
-    /// Resolved alternate-registry clients, keyed by [`NpmRegistryIndex::as_str`] on both
+    /// Resolved alternate-registry clients, keyed by [`DeclaredNpmRegistry::as_str`] on both
     /// registration ([`Self::register_alternate`]) and lookup ([`Self::alternate_client`]).
     /// `Arc<DashMap<..>>` (not a bare `DashMap`) because `NpmRegistry` is `Clone` and is
     /// cloned for `deps-deno`'s `DenoRegistry::with_npm` — a bare field would silently fork
@@ -279,16 +290,17 @@ impl NpmRegistry {
     /// ordinary production constructor (unlike `Self::with_public_base_for_test`, not gated).
     ///
     /// No `AlternateNpmClient` type exists: an alternate client *is* an [`NpmRegistry`] with
-    /// a different base and `tier: WorkspaceDeclared`, so it fetches through
-    /// `HttpCache::get_cached_workspace_with_headers` (FR-008's redirect-hop gating) instead
-    /// of the ungated transport. Its own `alternates` map is always empty — only the root
-    /// (`Public`-tier) registry this was registered on ever registers further alternates.
+    /// a different base and a `Declared` tier carrying the index's trust, so a workspace-declared
+    /// index fetches through `HttpCache::get_cached_workspace_with_headers` (FR-008's redirect-hop
+    /// gating) and a trusted one through the ungated transport. Its own `alternates` map is
+    /// always empty — only the root (`Public`-tier) registry this was registered on ever
+    /// registers further alternates.
     #[must_use]
-    pub fn with_base(cache: Arc<HttpCache>, index: &NpmRegistryIndex) -> Self {
+    pub fn with_base(cache: Arc<HttpCache>, index: &DeclaredNpmRegistry) -> Self {
         Self::build(
             cache,
             index.as_str().to_string(),
-            NpmRegistryTier::WorkspaceDeclared,
+            NpmRegistryTier::Declared(index.trust()),
         )
     }
 
@@ -306,8 +318,10 @@ impl NpmRegistry {
     /// Registers (or reuses an existing registration for) `index` as an alternate registry
     /// client, callable via [`Self::alternate_client`].
     ///
-    /// A no-op when `index` is already registered — the first successful registration for a
-    /// given index URL sticks for the process lifetime. Also a no-op, with a
+    /// A no-op when `index` is already registered with the same trust — otherwise the first
+    /// successful registration for a given index URL sticks for the process lifetime. When the
+    /// trust differs (the operator edited `~/.npmrc`), the newest operator set wins and the
+    /// client is replaced, since trust decides the transport. Also a no-op, with a
     /// `tracing::warn!`, once [`deps_core::registry::MAX_ALTERNATE_REGISTRIES`] is reached and
     /// `index` is not already present: the dependency stays unregistered (fails closed to
     /// [`DepsError::PackageNotFound`] at fetch time, spec FR-010) rather than evicting an
@@ -317,20 +331,26 @@ impl NpmRegistry {
     /// — the one place a per-document `.npmrc` resolution and this long-lived shared router
     /// meet. Registration is parse-time-only; there is no lazy creation on the fetch path
     /// (spec FR-010 dispatch table).
-    pub fn register_alternate(&self, index: NpmRegistryIndex) {
+    pub fn register_alternate(&self, index: DeclaredNpmRegistry) {
         let key = index.as_str().to_string();
-        register_capped(
+        let make = || Arc::new(Self::with_base(Arc::clone(&self.cache), &index));
+        register_capped_with_occupied(
             &self.alternates,
             key,
             EcosystemId::Npm,
             KeyShape::Url,
-            || Arc::new(Self::with_base(Arc::clone(&self.cache), &index)),
+            make,
+            |slot| {
+                if slot.tier != NpmRegistryTier::Declared(index.trust()) {
+                    *slot = make();
+                }
+            },
         );
     }
 
     /// The registered client for `index`, if any — read-only, performs no registration, no
     /// validation. `index` only ever originates from an already-validated
-    /// [`NpmRegistryIndex::as_str`], on both sides (registration above, and a dependency's
+    /// [`DeclaredNpmRegistry::as_str`], on both sides (registration above, and a dependency's
     /// own resolved [`DependencySource::AlternateRegistry`] `index` string), so lookup stays
     /// a plain map read.
     #[must_use]
@@ -394,8 +414,11 @@ impl NpmRegistry {
         let url = versions_url(&self.registry_base, safe_name_segments(name)?);
         let headers = [RequestHeader::Accept(ABBREVIATED_ACCEPT)];
         let data = match self.tier {
-            NpmRegistryTier::Public => self.cache.get_cached_with_headers(&url, &headers).await,
-            NpmRegistryTier::WorkspaceDeclared => {
+            NpmRegistryTier::Public | NpmRegistryTier::Declared(RegistryTrust::Trusted) => {
+                // TODO(#1856): Trusted fetches follow redirects to any host; confine to the origin if live proxies do not redirect cross-origin
+                self.cache.get_cached_with_headers(&url, &headers).await
+            }
+            NpmRegistryTier::Declared(RegistryTrust::WorkspaceDeclared) => {
                 self.cache
                     .get_cached_workspace_with_headers(&url, &headers)
                     .await
@@ -428,7 +451,7 @@ impl NpmRegistry {
         freshness: deps_core::FreshnessSettings,
     ) -> Result<Vec<NpmVersion>> {
         let mut versions = self.get_versions(name).await?;
-        if freshness.is_enabled() && self.tier == NpmRegistryTier::Public {
+        if freshness.is_enabled() && !self.tier.is_declared() {
             let all_versions: Vec<String> =
                 versions.iter().map(|v| v.version.to_string()).collect();
             let top8 = top_n(&versions, HOVER_RECENT_VERSIONS);
@@ -645,7 +668,7 @@ impl NpmRegistry {
         // enforces that today, and this method's request goes through the **ungated**
         // transport below, bypassing FR-008's redirect-hop gating if a future caller reached
         // it — so it's enforced here, not relied on via the call graph.
-        if self.tier == NpmRegistryTier::WorkspaceDeclared {
+        if self.tier.is_declared() {
             return Ok(Vec::new());
         }
 
@@ -1357,7 +1380,7 @@ mod tests {
         let result = not_found_or(err, "left-pad");
         assert_matches!(
             result,
-            DepsError::PackageNotFound { package, registry }
+            DepsError::PackageNotFound { package, registry, .. }
                 if package == "left-pad" && registry == REGISTRY
         );
     }
@@ -2618,8 +2641,10 @@ mod tests {
     /// both gates open — the `cfg(test)` `http`-loopback carve-out in `NpmRegistryIndex::new`
     /// (automatic in a test binary) **and** the runtime policy (`WorkspaceRegistryAccess::All`
     /// here, since the default `PublicOnly` denies `HostClass::Loopback`).
-    fn alternate_index(raw: &str) -> crate::config::NpmRegistryIndex {
-        crate::config::NpmRegistryIndex::new(raw, &all_policy()).unwrap()
+    fn alternate_index(raw: &str) -> DeclaredNpmRegistry {
+        deps_core::net_policy::OperatorRegistries::default()
+            .classify::<crate::config::NpmRegistryIndexKind>(raw, raw, &all_policy())
+            .unwrap()
     }
 
     #[tokio::test]
@@ -2891,7 +2916,7 @@ mod tests {
         registry.register_alternate(local.clone());
         registry.register_alternate(remote.clone());
         let name = PackageName::new("@corp/pkg");
-        let via = |index: &crate::config::NpmRegistryIndex| {
+        let via = |index: &DeclaredNpmRegistry| {
             registry.endpoint_for(
                 &name,
                 &DependencySource::AlternateRegistry {
@@ -2977,13 +3002,86 @@ mod tests {
         assert!(cloned.alternate_client(index.as_str()).is_some());
     }
 
+    fn trusted_index(raw: &str) -> DeclaredNpmRegistry {
+        let operator = deps_core::net_policy::OperatorRegistries::declared_in(
+            &deps_core::config_trust::OperatorPath::for_test("/home/me/.npmrc"),
+            [raw],
+        );
+        operator
+            .classify::<crate::config::NpmRegistryIndexKind>(raw, raw, &all_policy())
+            .unwrap()
+    }
+
+    /// Spec 084: a Trusted index reports the Baseline egress, a workspace-declared one Guarded.
+    #[test]
+    fn test_alternate_endpoint_egress_follows_trust() {
+        use deps_core::{PackageName, Registry, RegistryEndpoint};
+
+        let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
+        let trusted = trusted_index("https://npm.trusted.example");
+        let declared = alternate_index("https://npm.declared.example");
+        registry.register_alternate(trusted.clone());
+        registry.register_alternate(declared.clone());
+
+        let name = PackageName::new("pkg");
+        let endpoint = |index: &DeclaredNpmRegistry| {
+            registry.endpoint_for(
+                &name,
+                &DependencySource::AlternateRegistry {
+                    index: index.as_str().to_string(),
+                    mirrors_crates_io: false,
+                },
+            )
+        };
+        assert_eq!(
+            endpoint(&trusted),
+            RegistryEndpoint::from_base_str(trusted.as_str(), EgressTier::Baseline)
+        );
+        assert_eq!(
+            endpoint(&declared),
+            RegistryEndpoint::from_base_str(declared.as_str(), EgressTier::Guarded)
+        );
+    }
+
+    /// The newest operator set wins: re-registering a URL with a different trust replaces the
+    /// client, because trust decides the transport.
+    #[test]
+    fn test_register_alternate_replaces_the_client_when_trust_changes() {
+        let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
+        let url = "https://npm.pkg.github.com";
+
+        registry.register_alternate(alternate_index(url));
+        let declared = registry.alternate_client(url).unwrap();
+        assert_eq!(
+            declared.tier,
+            NpmRegistryTier::Declared(RegistryTrust::WorkspaceDeclared)
+        );
+
+        registry.register_alternate(trusted_index(url));
+        let trusted = registry.alternate_client(url).unwrap();
+        assert_eq!(
+            trusted.tier,
+            NpmRegistryTier::Declared(RegistryTrust::Trusted)
+        );
+        assert!(!Arc::ptr_eq(&declared, &trusted));
+
+        registry.register_alternate(trusted_index(url));
+        assert!(Arc::ptr_eq(
+            &trusted,
+            &registry.alternate_client(url).unwrap()
+        ));
+    }
+
     #[test]
     fn test_with_base_sets_workspace_declared_tier_and_empty_alternates() {
         let cache = Arc::new(HttpCache::new());
         let index = alternate_index("https://npm.pkg.github.com");
         let alternate = NpmRegistry::with_base(cache, &index);
 
-        assert_eq!(alternate.tier, NpmRegistryTier::WorkspaceDeclared);
+        assert_eq!(
+            alternate.tier,
+            NpmRegistryTier::Declared(RegistryTrust::WorkspaceDeclared)
+        );
         assert!(alternate.alternates.is_empty());
         assert_eq!(alternate.registry_base, "https://npm.pkg.github.com");
     }

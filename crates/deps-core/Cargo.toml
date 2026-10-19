@@ -55,6 +55,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 deps-core-macros = { workspace = true }
+dirs = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
 hyper-util = { workspace = true, features = ["client-proxy", "client-proxy-system"] }
@@ -67,7 +68,7 @@ serde_json = { workspace = true }
 tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["std", "parsing"] }
-tokio = { workspace = true, features = ["sync", "time", "fs", "net"] }
+tokio = { workspace = true, features = ["sync", "time", "fs", "net", "rt"] }
 toml-span = { workspace = true }
 tower-lsp-server = { workspace = true, optional = true }
 tracing = { workspace = true }

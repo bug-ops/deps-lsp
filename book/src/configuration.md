@@ -36,7 +36,7 @@ control, see [Conventions](cross-ecosystem/conventions.md).
 | `diagnostics` | `vulnerabilities_enabled` | `true` | Whether OSV.dev-backed vulnerability diagnostics run at all |
 | `freshness` | `enabled` | `true` | Flag a "latest" version still inside its cooldown window |
 | `freshness` | `cooldown_secs` | `259200` | Cooldown window in seconds (3 days), clamped to 0-30 days |
-| `registries` | `workspace_registries` | `"public_only"` | Which workspace-declared registry index hosts are ever fetched, across every ecosystem (Cargo's `.cargo/config.toml`/`[source]`, npm's `.npmrc`, PyPI's `--index-url`/Poetry/uv sources, Go's `$GOENV` `GOPROXY`, NuGet's `NuGet.Config`, Swift's `registries.json`) — `"public_only"`, `"off"`, or `"all"`; see [Cargo Custom/Private Registries](ecosystems/cargo.md#customprivate-registries), [npm Custom/Private Registries](ecosystems/npm.md#customprivate-registries), [PyPI Custom/Private Indexes](ecosystems/pypi.md#customprivate-indexes), [Go GOPROXY/GOPRIVATE Support](ecosystems/go.md#goproxygoprivate-support), [NuGet Private/Custom Feeds](ecosystems/nuget.md#privatecustom-feeds), and [Swift Package Registries](ecosystems/swift.md#package-registries-se-0292). |
+| `registries` | `workspace_registries` | `"public_only"` | Which workspace-declared registry index hosts are ever fetched, across every ecosystem (Cargo's `.cargo/config.toml`/`[source]`, npm's `.npmrc`, PyPI's `--index-url`/Poetry/uv sources, NuGet's `NuGet.Config`, Swift's `registries.json`) — `"public_only"`, `"off"`, or `"all"`. A registry you declared yourself is exempt: Go's `$GOENV` `GOPROXY`, your user `~/.npmrc`, your user-profile `NuGet.Config` and your user-level `registries.json`, and any repository URL equal to one of them, ignore this setting (see [Operator-owned registries](#operator-owned-registries)). See [Cargo Custom/Private Registries](ecosystems/cargo.md#customprivate-registries), [npm Custom/Private Registries](ecosystems/npm.md#customprivate-registries), [PyPI Custom/Private Indexes](ecosystems/pypi.md#customprivate-indexes), [Go GOPROXY/GOPRIVATE Support](ecosystems/go.md#goproxygoprivate-support), [NuGet Private/Custom Feeds](ecosystems/nuget.md#privatecustom-feeds), and [Swift Package Registries](ecosystems/swift.md#package-registries-se-0292). |
 | `registries` | `nuget_user_profile_sources` | `false` | Whether a NuGet user-profile-tier `NuGet.Config` source with no repo-declared counterpart becomes a routing hop (`AlternateRegistry`-sourced — OSV/deps.dev/hover-trust suppressed for it), instead of only ever supplying credentials for a matching repo-declared source; see [NuGet Private/Custom Feeds](ecosystems/nuget.md#privatecustom-feeds) |
 | `registries` | `swift_keychain_credentials` | `"disabled"` | `"enabled"` also reads macOS Keychain credentials for user-declared Swift SE-0292 registries (may show a macOS access prompt; ignored by `deps-cli`); see [Swift macOS Keychain credentials](ecosystems/swift.md#macos-keychain-credentials) |
 | `registries` | `gitlab_instance_host` | `""` | The self-hosted GitLab instance host that a `project:` include and a `$CI_SERVER_FQDN`-relative `component:` include resolve against, which never receives `GITLAB_TOKEN` (the token goes only to `gitlab.com` or the host in the `GITLAB_TOKEN_HOST` environment variable). Unset (`""`) means neither form is version-resolved; see [GitLab CI/CD Self-Hosted Instances](ecosystems/gitlab-ci.md#self-hosted-instances) |
@@ -95,12 +95,47 @@ When a registry host is blocked by the access policy, the hint that suggests
 `workspace_registries = "all"` and `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` is not shown at `"off"` or for a host refused under every policy (loopback, link-local,
 cloud-metadata), where the allowlist cannot help.
 
+### Operator-owned registries
+
+One rule decides, for Go, npm, NuGet and Swift, whether a registry URL is yours or the
+repository's. A URL is **operator-owned** (trusted) exactly when it equals a URL declared in a
+file you own, whichever file in the repository declared it:
+
+| Ecosystem | Your file |
+|---|---|
+| Go | `$GOENV` (default `os.UserConfigDir()/go/env`) `GOPROXY` |
+| npm | `~/.npmrc` `registry=` and `@scope:registry=` (after `${VAR}` expansion) |
+| NuGet | the user-profile `NuGet.Config` `<packageSources>` (not a source you removed or disabled there) |
+| Swift | the user-level `registries.json` |
+
+An operator-owned URL skips `registries.workspace_registries` entirely, **including `"off"`**, and
+is fetched over the same system-proxy path as the public registries. It may resolve to a private
+address under `"public_only"`: you wrote the URL, and a repository cannot make a file of yours
+vouch for another address. The never-a-registry floor still applies (loopback, link-local,
+cloud-metadata, unspecified and reserved hosts are refused under every setting).
+
+Equality is per URL, not per host. A repository that names your host with a different path
+(`https://npm.corp.example/team-b` against your `https://npm.corp.example/team-a`) is
+workspace-declared and stays subject to the policy and the direct connection.
+
+A file counts as yours only when it is located through your home directory or an **absolute**
+`GOENV`, `XDG_CONFIG_HOME` or `APPDATA`. `GOENV=off` disables the Go file. An empty value is unset. A relative `GOENV` finds no Go file
+(no fallback to the default), a relative `XDG_CONFIG_HOME` is skipped (NuGet then uses its
+home-based defaults, Swift treats its user tier as unusable), and a relative home directory is
+treated as none. An absolute `GOENV` or `XDG_CONFIG_HOME` exported by repository-scoped tooling (direnv,
+mise, a per-project editor environment) is part of your environment and counts as yours: keep that
+tooling's own trust prompt enabled.
+
+Cargo keeps its own rule: its trust follows where the registry alias came from (`$CARGO_HOME` and
+`CARGO_REGISTRIES_*` are trusted, a repository file is not) because it also decides whether a
+registry token may be sent (tracked in #1855).
+
 ### Proxies and guarded registry traffic
 
-Registry requests that the access policy guards (hosts declared by the workspace, pinned
-registries, and operator-owned sources such as the `$GOENV` `GOPROXY`, your user `~/.npmrc` and
-your user-profile `NuGet.Config`) connect **directly** by default and bypass the system and
-`HTTP(S)_PROXY` proxy. The connect-time SSRF guard checks the address a host actually resolves to,
+Registry requests that the access policy guards (hosts declared by the workspace and pinned
+registries) connect **directly** by default and bypass the system and `HTTP(S)_PROXY` proxy.
+[Operator-owned registries](#operator-owned-registries) (the `$GOENV` `GOPROXY`, your user
+`~/.npmrc`, your user-profile `NuGet.Config`) follow your proxy like the public registries. The connect-time SSRF guard checks the address a host actually resolves to,
 and a proxy would hide that address from it. Public default registries (crates.io, npm, PyPI and
 so on) keep using your proxy.
 

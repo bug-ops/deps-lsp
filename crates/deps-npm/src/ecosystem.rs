@@ -1725,7 +1725,13 @@ mod tests {
             let policy = deps_core::net_policy::RegistryAccessPolicy::new(
                 deps_core::net_policy::WorkspaceRegistryAccess::All,
             );
-            let index = crate::config::NpmRegistryIndex::new(&alt_server.url(), &policy).unwrap();
+            let index = deps_core::net_policy::OperatorRegistries::default()
+                .classify::<crate::config::NpmRegistryIndexKind>(
+                    &alt_server.url(),
+                    &alt_server.url(),
+                    &policy,
+                )
+                .unwrap();
             registry.register_alternate(index.clone());
 
             let dep = dep_with_source(

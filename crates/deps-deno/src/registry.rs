@@ -120,10 +120,7 @@ fn not_found_or(err: DepsError, full_name: &str) -> DepsError {
 /// facade's `npm:` arm in normal use (M2) and must be rejected here rather than turned
 /// into a GET against the bare npm registry base URL.
 fn unroutable(name: &PackageName) -> DepsError {
-    DepsError::PackageNotFound {
-        package: name.as_str().into(),
-        registry: "deno",
-    }
+    DepsError::not_found_locally(name.as_str(), "deno")
 }
 
 /// Extracts the bare npm package name from an `npm:`-scheme [`PackageName`]'s
@@ -286,10 +283,7 @@ impl JsrRegistry {
         // `get_versions_with`, `get_latest_matching`).
         if is_dot_prefixed(scope) || is_dot_prefixed(name) {
             warn_rejected_value("is_dot_prefixed", "jsr meta.json request URL", &full_name);
-            return Err(DepsError::PackageNotFound {
-                package: full_name.into(),
-                registry: REGISTRY,
-            });
+            return Err(DepsError::not_found_locally(&full_name, REGISTRY));
         }
         let url = meta_json_url(&self.base, scope, name);
         let data = self
@@ -534,7 +528,7 @@ impl DenoRegistry {
     /// field, so this passthrough is the only way `DenoEcosystem::parse_manifest` can reach
     /// it — the `deno.json` equivalent of `NpmEcosystem::parse_manifest`'s own registration
     /// loop over `NpmParseResult::resolved_registries`.
-    pub fn register_alternate_npm(&self, index: deps_npm::config::NpmRegistryIndex) {
+    pub fn register_alternate_npm(&self, index: deps_npm::config::DeclaredNpmRegistry) {
         self.npm.register_alternate(index);
     }
 
@@ -964,7 +958,7 @@ mod tests {
         let result = not_found_or(err, "@std/fs");
         assert_matches!(
             result,
-            DepsError::PackageNotFound { package, registry }
+            DepsError::PackageNotFound { package, registry, .. }
                 if package == "@std/fs" && registry == REGISTRY
         );
     }
@@ -1706,8 +1700,10 @@ mod tests {
     /// Mirrors `deps_npm`'s own `alternate_index` test helper: mockito binds
     /// `http://127.0.0.1`, so both the `cfg(test)` loopback carve-out in
     /// `NpmRegistryIndex::new` and `WorkspaceRegistryAccess::All` are needed to register it.
-    fn alternate_index(raw: &str) -> deps_npm::config::NpmRegistryIndex {
-        deps_npm::config::NpmRegistryIndex::new(raw, &all_policy()).unwrap()
+    fn alternate_index(raw: &str) -> deps_npm::config::DeclaredNpmRegistry {
+        deps_core::net_policy::OperatorRegistries::default()
+            .classify::<deps_npm::config::NpmRegistryIndexKind>(raw, raw, &all_policy())
+            .unwrap()
     }
 
     /// #1227: proves `DenoRegistry::get_versions_from` forwards an `AlternateRegistry`

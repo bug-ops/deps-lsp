@@ -11,6 +11,13 @@
 //!   `ClearTextPassword`/`Password` value is ever deserialized into a field, so no code path
 //!   in this module can hold a credential (NFR-001 is then structurally provable). A source
 //!   named there becomes [`NuGetFeedUrlError::HasCredentials`] and is dropped, fail-closed.
+//! - **Trust is a function of the URL alone** (spec 084, shared with Go, npm and Swift). A source
+//!   URL equal to one the user-profile `NuGet.Config` declares (and has neither removed nor
+//!   disabled) is [`RegistryTrust::Trusted`] whichever tier declared it in this workspace: it
+//!   skips the workspace policy and is fetched over the Baseline egress. Every other URL is
+//!   workspace-declared. Trust widens egress only; credential binding below is unchanged. The
+//!   set is built from the user-profile file whether or not `nuget_user_profile_sources` routes
+//!   it, because that setting governs routing, not which URLs the operator wrote.
 //! - **`<clear/>` is merged root→leaf, not "nearest file wins".** A root `NuGet.Config`
 //!   `<clear/>` that removes the implicit `nuget.org` hop must stay removed for every
 //!   descendant project, even one whose own `NuGet.Config` adds a feed without repeating the
@@ -44,10 +51,11 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use deps_core::config_trust::{self, EnvVarSyntax};
+use deps_core::config_trust::{self, EnvPath, EnvVarSyntax, OperatorEnvVar, OperatorPath};
 use deps_core::net_policy::{
-    BlockedHost, BlockedHostReason, IndexUrlError, RedactedUrl, RegistryAccessPolicy,
-    RegistryRejectionClassifier, RegistryRejectionReason, RegistryUrlKind, RejectionOutcome,
+    BlockedHost, BlockedHostReason, DeclaredRegistry, EnvSource, IndexUrlError, OperatorRegistries,
+    ProcessEnv, RedactedUrl, RegistryAccessPolicy, RegistryRejectionClassifier,
+    RegistryRejectionReason, RegistryTrust, RegistryUrlKind, RejectionOutcome,
     ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
@@ -218,6 +226,9 @@ impl deps_core::net_policy::TrustedConstantRegistryUrl for NuGetFeedKind {}
 /// normalized feed URL never carries a trailing `/`.
 pub type NuGetFeedUrl = ValidatedRegistryUrl<NuGetFeedKind>;
 
+/// A resolved feed URL together with the trust the URL-alone rule gave it (spec 084).
+pub type DeclaredNuGetFeed = DeclaredRegistry<NuGetFeedKind>;
+
 /// The real public NuGet service index, trusted unconditionally — never policy-gated, since it
 /// is a hardcoded constant this LSP already queries ungated for every project declaring no
 /// `NuGet.Config` override at all (FR-010's carve-out), not workspace provenance. Used only for
@@ -243,9 +254,9 @@ pub type NuGetFeedUrl = ValidatedRegistryUrl<NuGetFeedKind>;
 ///
 /// Panics if `NUGET_ORG_INDEX_URL` fails validation. Covered by a unit test so this panic is
 /// unreachable in practice.
-fn trusted_public() -> NuGetFeedUrl {
+fn trusted_public() -> DeclaredNuGetFeed {
     let raw = crate::registry::NUGET_ORG_INDEX_URL;
-    NuGetFeedUrl::new_trusted_constant(raw)
+    DeclaredNuGetFeed::trusted_constant(raw)
         .unwrap_or_else(|error| panic!("NUGET_ORG_INDEX_URL {raw:?} failed validation: {error}"))
 }
 
@@ -376,10 +387,10 @@ pub struct PackageSourceEntry {
     /// The declared `<add key>` name, case preserved.
     #[redact(key)]
     pub key: String,
-    /// The resolved feed URL, or why it was rejected — already redacted by [`NuGetFeedUrl`]'s
-    /// and [`InvalidEntry`]'s own `Debug` impls (#1237).
+    /// The resolved feed URL with its trust, or why it was rejected — already redacted by
+    /// [`NuGetFeedUrl`]'s and [`InvalidEntry`]'s own `Debug` impls (#1237).
     #[raw]
-    pub value: Result<NuGetFeedUrl, InvalidEntry>,
+    pub value: Result<DeclaredNuGetFeed, InvalidEntry>,
     /// Which tier's file last set [`Self::value`] (issue #561) — diagnostics/gating metadata
     /// only, see [`ConfigTier`]'s doc for the "never a credential gate" invariant.
     #[raw]
@@ -404,8 +415,8 @@ pub struct PackageSourceEntry {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ResolvedHop {
-    /// The resolved feed URL for this hop.
-    pub url: NuGetFeedUrl,
+    /// The resolved feed URL for this hop, with the trust that selects its transport.
+    pub url: DeclaredNuGetFeed,
     /// The lowercased declared `<add key>` that supplied [`Self::auth`], or `None` when this
     /// hop carries no credential. Used (not the credential value) by
     /// `NuGetSourceChain::chain`'s hash and by `NuGetRegistry::register_alternate`'s
@@ -418,6 +429,16 @@ pub struct ResolvedHop {
 }
 
 impl ResolvedHop {
+    /// Stable text for [`Self::url`]'s trust in [`NuGetSourceChain::chain`]'s hash, so the same
+    /// URL under a different trust (the operator edited the user-profile file) is a different
+    /// chain with a different transport.
+    const fn trust_key_part(&self) -> &'static str {
+        match self.url.trust() {
+            RegistryTrust::Trusted => "trusted",
+            RegistryTrust::WorkspaceDeclared => "workspace-declared",
+        }
+    }
+
     /// Two-part `&str` encoding of [`Self::slot`] for [`NuGetSourceChain::chain`]'s hash — a
     /// presence marker (`"slot"`/`"no-slot"`) followed by the slot string itself (`""` when
     /// absent). Keeping the per-hop part count constant, rather than folding presence into a
@@ -471,7 +492,7 @@ impl NuGetSourceChain {
             hops.iter()
                 .flat_map(|hop| {
                     let [presence, slot] = hop.slot_key_parts();
-                    [hop.url.as_str(), presence, slot]
+                    [hop.url.as_str(), presence, slot, hop.trust_key_part()]
                 })
                 .chain(std::iter::once(flag)),
         );
@@ -1371,7 +1392,11 @@ fn decode_attr(raw: &str) -> String {
 
 /// Validates one raw `<add>` entry, logging at `debug!` (an unsupported-but-legitimate shape:
 /// V2 protocol, a local/UNC path) or `warn!` (a genuinely malformed/blocked value).
-fn resolve_source_entry(add: &RawSourceAdd, policy: &RegistryAccessPolicy) -> InvalidOrValid {
+fn resolve_source_entry(
+    add: &RawSourceAdd,
+    operator: &OperatorRegistries,
+    policy: &RegistryAccessPolicy,
+) -> InvalidOrValid {
     if add.protocol_version.as_deref() == Some("2") {
         tracing::debug!(
             key = %sanitize_invisible(&add.key),
@@ -1397,32 +1422,35 @@ fn resolve_source_entry(add: &RawSourceAdd, policy: &RegistryAccessPolicy) -> In
             NuGetFeedUrlError::LocalFeedUnsupported,
         ));
     }
-    NuGetFeedUrl::new(&add.value, policy).map_err(|reason| {
-        // #767 S2a: `RedactedUrl`, not `redact_userinfo` alone — `raw` also lands in
-        // `InvalidEntry::raw`, which can surface as `DependencySource::CustomRegistry`'s
-        // hover/diagnostics text, so a query-string credential must be stripped too.
-        let redacted = RedactedUrl::new(&add.value);
-        tracing::warn!(
-            key = %sanitize_invisible(&add.key),
-            // Same #1501 impl-critic M1 rationale as the `debug!` above — `reason` can embed
-            // an unswept `RedactedUrl` (`NuGetFeedUrlError::Url(IndexUrlError::InvalidUrl)`).
-            raw = %sanitize_invisible(redacted.as_ref()),
-            reason = %sanitize_invisible(&reason.to_string()),
-            "NuGet package source failed validation"
-        );
-        InvalidEntry::new(redacted, reason)
-    })
+    operator
+        .classify::<NuGetFeedKind>(&add.value, &add.value, policy)
+        .map_err(|reason| {
+            // #767 S2a: `RedactedUrl`, not `redact_userinfo` alone — `raw` also lands in
+            // `InvalidEntry::raw`, which can surface as `DependencySource::CustomRegistry`'s
+            // hover/diagnostics text, so a query-string credential must be stripped too.
+            let redacted = RedactedUrl::new(&add.value);
+            tracing::warn!(
+                key = %sanitize_invisible(&add.key),
+                // Same #1501 impl-critic M1 rationale as the `debug!` above — `reason` can embed
+                // an unswept `RedactedUrl` (`NuGetFeedUrlError::Url(IndexUrlError::InvalidUrl)`).
+                raw = %sanitize_invisible(redacted.as_ref()),
+                reason = %sanitize_invisible(&reason.to_string()),
+                "NuGet package source failed validation"
+            );
+            InvalidEntry::new(redacted, reason)
+        })
 }
 
-type InvalidOrValid = Result<NuGetFeedUrl, InvalidEntry>;
+type InvalidOrValid = Result<DeclaredNuGetFeed, InvalidEntry>;
 
 fn upsert_source(
     sources: &mut Vec<PackageSourceEntry>,
     add: &RawSourceAdd,
+    operator: &OperatorRegistries,
     policy: &RegistryAccessPolicy,
     tier: ConfigTier,
 ) {
-    let value = resolve_source_entry(add, policy);
+    let value = resolve_source_entry(add, operator, policy);
     // LOW (security review): use the same `key_candidates_overlap` union funnel as every
     // other key comparison in this module (documented invariant at this module's
     // `PackageSourceEntry` doc) — raw-lowercase-only comparison here would let
@@ -1536,7 +1564,7 @@ pub struct NuGetParseContext {
     /// picked up only on restart, a documented limitation, not a bug). `None` when no
     /// candidate exists; [`NuGetParseContext::default`] leaves this `None`, so tests that
     /// don't care about the user-profile tier are unaffected.
-    pub user_profile_config: Option<PathBuf>,
+    pub user_profile_config: Option<OperatorPath>,
     /// Live-updatable `registries.nuget_user_profile_sources` setting (FR-006) — gates only the
     /// *routing* half of a user-profile file's contribution (see [`resolve_with_context`]'s doc); the
     /// credential half always applies regardless of this flag.
@@ -1561,45 +1589,49 @@ impl NuGetParseContext {
     }
 }
 
-/// FR-001: the first-existing user-profile-tier `NuGet.Config` candidate, in order — Windows
-/// `%APPDATA%\NuGet\NuGet.Config`; Unix `$XDG_CONFIG_HOME/NuGet/NuGet.Config` (if set) ->
-/// `~/.config/NuGet/NuGet.Config` -> `~/.nuget/NuGet/NuGet.Config`. Exactly one file, never
-/// merged — mirrors [`CONFIG_FILENAMES`]'s existing first-match idiom.
-fn user_profile_config_candidates(home: Option<&Path>) -> Vec<PathBuf> {
+/// FR-001: the user-profile-tier `NuGet.Config` candidates, in order — Windows
+/// `%APPDATA%\NuGet\NuGet.Config`; Unix `$XDG_CONFIG_HOME/NuGet/NuGet.Config` (when absolute)
+/// -> `~/.config/NuGet/NuGet.Config` -> `~/.nuget/NuGet/NuGet.Config`. A relative or empty
+/// variable names no operator-owned location and is skipped (the home candidates still apply).
+/// Exactly one file is used, never merged — mirrors [`CONFIG_FILENAMES`]'s first-match idiom.
+fn user_profile_config_candidates(
+    home: Option<&OperatorPath>,
+    env: &impl EnvSource,
+) -> Vec<OperatorPath> {
+    let nuget_config = |base: &OperatorPath| base.join("NuGet").join("NuGet.Config");
     let mut candidates = Vec::new();
     if cfg!(windows) {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            candidates.push(PathBuf::from(appdata).join("NuGet").join("NuGet.Config"));
+        if let EnvPath::Path(appdata) = OperatorPath::from_env(env, OperatorEnvVar::AppData) {
+            candidates.push(nuget_config(&appdata));
         }
     } else {
-        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
-            && !xdg.is_empty()
-        {
-            candidates.push(PathBuf::from(xdg).join("NuGet").join("NuGet.Config"));
+        if let EnvPath::Path(xdg) = OperatorPath::from_env(env, OperatorEnvVar::XdgConfigHome) {
+            candidates.push(nuget_config(&xdg));
         }
         if let Some(home) = home {
-            candidates.push(home.join(".config").join("NuGet").join("NuGet.Config"));
-            candidates.push(home.join(".nuget").join("NuGet").join("NuGet.Config"));
+            candidates.push(nuget_config(&home.join(".config")));
+            candidates.push(nuget_config(&home.join(".nuget")));
         }
     }
     candidates
 }
 
-/// [`discover_user_profile_config`], but taking `home` explicitly instead of [`deps_core::UserHome::current`]
-/// — lets tests inject a fixture home directory, mirroring `deps_npm::config::resolve_with_home`.
-fn discover_user_profile_config_with_home(home: Option<PathBuf>) -> Option<PathBuf> {
-    user_profile_config_candidates(home.as_deref())
+/// [`discover_user_profile_config`], but taking `home` and the environment explicitly instead of
+/// the process's — lets tests inject fixtures, mirroring `deps_npm::config::resolve_with_home`.
+fn discover_user_profile_config_with(
+    home: Option<&OperatorPath>,
+    env: &impl EnvSource,
+) -> Option<OperatorPath> {
+    user_profile_config_candidates(home, env)
         .into_iter()
-        .find(|p| deps_core::fs_probe::is_file(p))
+        .find(|p| deps_core::fs_probe::is_file(p.as_path()))
 }
 
 /// Resolves the user-profile-tier `NuGet.Config` path once (FR-001) — call at
 /// [`NuGetParseContext`] construction, never per manifest parse.
 #[must_use]
-fn discover_user_profile_config() -> Option<PathBuf> {
-    discover_user_profile_config_with_home(
-        deps_core::UserHome::current().map(|home| home.path().to_path_buf()),
-    )
+fn discover_user_profile_config() -> Option<OperatorPath> {
+    discover_user_profile_config_with(OperatorPath::home().as_ref(), &ProcessEnv)
 }
 
 /// Test-only convenience: [`NuGetEcosystem::parse_manifest`] calls [`resolve_with_context`]
@@ -1663,10 +1695,23 @@ pub fn resolve_with_context(
     manifest_dir: &Path,
     config_cache: &NuGetConfigCache,
     policy: &RegistryAccessPolicy,
-    user_profile_config: Option<&Path>,
+    user_profile_config: Option<&OperatorPath>,
     user_profile_sources: &AtomicToggle<UserProfileSources>,
 ) -> NuGetConfig {
-    let ancestors = collect_config_ancestors(manifest_dir, config_cache, user_profile_config);
+    let ancestors = collect_config_ancestors(
+        manifest_dir,
+        config_cache,
+        user_profile_config.map(OperatorPath::as_path),
+    );
+    let operator = user_profile_config
+        .zip(
+            ancestors
+                .iter()
+                .find_map(|(tier, file)| (*tier == ConfigTier::User).then_some(file)),
+        )
+        .map_or_else(OperatorRegistries::default, |(path, file)| {
+            user_profile_registries(path, file)
+        });
 
     let user_profile_sources = user_profile_sources.get();
 
@@ -1676,9 +1721,28 @@ pub fn resolve_with_context(
     // warnings against it below.
     let config_fingerprint = config_ancestors_fingerprint(&ancestors);
 
-    let accumulated = accumulate_config_tiers(&ancestors, policy, user_profile_sources);
+    let accumulated = accumulate_config_tiers(&ancestors, &operator, policy, user_profile_sources);
 
     bind_credentials_and_finalize(accumulated, config_cache, config_fingerprint)
+}
+
+/// The feed URLs the user-profile `NuGet.Config` at `path` declares: its `<add>` sources minus
+/// those it `<remove>`s or disables, V3 only. A removed or disabled source is one the operator
+/// turned off, so a repository naming it does not inherit the operator's trust.
+fn user_profile_registries(path: &OperatorPath, file: &RawNuGetConfigFile) -> OperatorRegistries {
+    let disabled = |key: &str| {
+        file.disabled
+            .iter()
+            .any(|(k, v)| v.eq_ignore_ascii_case("true") && key_candidates_overlap(k, key))
+    };
+    let removed = |key: &str| file.removed.iter().any(|r| key_candidates_overlap(r, key));
+    let urls = file
+        .sources
+        .iter()
+        .filter(|add| add.protocol_version.as_deref() != Some("2"))
+        .filter(|add| !disabled(&add.key) && !removed(&add.key))
+        .map(|add| add.value.as_str());
+    OperatorRegistries::declared_in(path, urls)
 }
 
 /// Walks `manifest_dir`'s ancestor directories collecting each `NuGet.Config` found (FR-001),
@@ -1786,6 +1850,7 @@ struct AccumulatedConfig {
 /// the rest of the walk once set — see this module's doc.
 fn accumulate_config_tiers(
     ancestors: &[(ConfigTier, Arc<RawNuGetConfigFile>)],
+    operator: &OperatorRegistries,
     policy: &RegistryAccessPolicy,
     user_profile_sources: UserProfileSources,
 ) -> AccumulatedConfig {
@@ -1823,7 +1888,13 @@ fn accumulate_config_tiers(
                 user_profile_add.clear();
             }
             for add in &file.sources {
-                upsert_source(&mut user_profile_add, add, policy, ConfigTier::User);
+                upsert_source(
+                    &mut user_profile_add,
+                    add,
+                    operator,
+                    policy,
+                    ConfigTier::User,
+                );
             }
             for key in &file.removed {
                 user_profile_add.retain(|e| !key_candidates_overlap(&e.key, key));
@@ -1849,7 +1920,7 @@ fn accumulate_config_tiers(
             cleared = true;
         }
         for add in &file.sources {
-            upsert_source(&mut sources, add, policy, tier);
+            upsert_source(&mut sources, add, operator, policy, tier);
         }
         // S4 fix (impl-critic): `<remove key="..."/>` removes a source accumulated so far
         // (this file's own `<add>`s or an inherited ancestor entry) — without this, an
@@ -2378,7 +2449,8 @@ mod tests {
     fn source(key: &str, url: &str, policy: &RegistryAccessPolicy) -> PackageSourceEntry {
         PackageSourceEntry {
             key: key.to_string(),
-            value: NuGetFeedUrl::new(url, policy)
+            value: OperatorRegistries::default()
+                .classify::<NuGetFeedKind>(url, url, policy)
                 .map_err(|reason| InvalidEntry::new(RedactedUrl::new(url), reason)),
             tier: ConfigTier::Project,
             auth: None,
@@ -4587,7 +4659,7 @@ mod tests {
             repo_dir,
             cache,
             policy,
-            user_profile,
+            user_profile.map(OperatorPath::for_test).as_ref(),
             &AtomicToggle::new(flag_on),
         )
     }
@@ -5439,6 +5511,206 @@ mod tests {
         );
     }
 
+    // --- spec 084: URL-alone trust ---
+
+    fn off_policy() -> RegistryAccessPolicy {
+        RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::Off)
+    }
+
+    /// Resolves a repo `NuGet.Config` (when given) over a user-profile one (when given).
+    fn resolve_trust_fixture(
+        repo: Option<&str>,
+        user_profile: Option<&str>,
+        flag: UserProfileSources,
+        policy: &RegistryAccessPolicy,
+    ) -> NuGetConfig {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        let repo_dir = root.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        if let Some(content) = repo {
+            write_config(&repo_dir, content);
+        }
+        let user_path = user_profile.map(|content| write_user_profile(root.path(), content));
+        resolve_ctx(
+            &repo_dir,
+            &NuGetConfigCache::new(),
+            policy,
+            user_path.as_deref(),
+            flag,
+        )
+    }
+
+    fn feed(url: &str) -> String {
+        format!(
+            r#"<configuration><packageSources>
+                <add key="Corp" value="{url}" />
+            </packageSources></configuration>"#
+        )
+    }
+
+    fn trusts(config: &NuGetConfig) -> Vec<RegistryTrust> {
+        config
+            .resolved_chains()
+            .iter()
+            .flat_map(|chain| chain.hops.iter().map(|hop| hop.url.trust()))
+            .collect()
+    }
+
+    /// A user-profile source is the operator's own: Trusted, and reachable under `off`.
+    #[test]
+    fn test_user_profile_source_is_trusted_and_skips_policy_off() {
+        let config = resolve_trust_fixture(
+            None,
+            Some(&feed("https://corp.example/v3/index.json")),
+            UserProfileSources::Enabled,
+            &off_policy(),
+        );
+        assert_eq!(trusts(&config), vec![RegistryTrust::Trusted]);
+    }
+
+    /// The setting routes the user-profile file; it does not change which URLs the operator
+    /// wrote, so a repository naming the operator's URL is Trusted with routing off too.
+    #[test]
+    fn test_repo_source_equal_to_a_user_profile_url_is_trusted_even_with_routing_off() {
+        let config = resolve_trust_fixture(
+            Some(&feed("https://corp.example/v3/index.json")),
+            Some(&feed("https://corp.example/v3/index.json")),
+            UserProfileSources::Disabled,
+            &off_policy(),
+        );
+        assert_eq!(trusts(&config), vec![RegistryTrust::Trusted]);
+    }
+
+    /// A URL only the repository declares is workspace-declared: `off` blocks it, a looser
+    /// policy admits it as workspace-declared.
+    #[test]
+    fn test_repo_only_source_is_workspace_declared_and_blocked_under_off() {
+        let blocked = resolve_trust_fixture(
+            Some(&feed("https://repo.example/v3/index.json")),
+            Some(&feed("https://corp.example/v3/index.json")),
+            UserProfileSources::Disabled,
+            &off_policy(),
+        );
+        assert!(blocked.resolved_chains().is_empty());
+        assert!(!blocked.blocked_class_for(&pkg("Any.Package")).is_empty());
+
+        let allowed = resolve_trust_fixture(
+            Some(&feed("https://repo.example/v3/index.json")),
+            Some(&feed("https://corp.example/v3/index.json")),
+            UserProfileSources::Disabled,
+            &all_policy(),
+        );
+        assert_eq!(trusts(&allowed), vec![RegistryTrust::WorkspaceDeclared]);
+    }
+
+    /// Equality is per URL: the operator's host with a different path stays repo-declared.
+    #[test]
+    fn test_same_host_different_path_is_not_trusted() {
+        let config = resolve_trust_fixture(
+            Some(&feed("https://corp.example/repo-chosen/index.json")),
+            Some(&feed("https://corp.example/v3/index.json")),
+            UserProfileSources::Disabled,
+            &off_policy(),
+        );
+        assert!(config.resolved_chains().is_empty());
+        assert!(!config.blocked_class_for(&pkg("Any.Package")).is_empty());
+    }
+
+    /// A source the operator removed or disabled is not a URL they vouch for.
+    #[test]
+    fn test_removed_and_disabled_user_profile_sources_confer_no_trust() {
+        let user_profile = r#"<configuration>
+            <packageSources>
+                <add key="Gone" value="https://gone.example/v3/index.json" />
+                <add key="Off" value="https://off.example/v3/index.json" />
+                <remove key="Gone" />
+            </packageSources>
+            <disabledPackageSources><add key="Off" value="true" /></disabledPackageSources>
+        </configuration>"#;
+        for url in [
+            "https://gone.example/v3/index.json",
+            "https://off.example/v3/index.json",
+        ] {
+            let config = resolve_trust_fixture(
+                Some(&feed(url)),
+                Some(user_profile),
+                UserProfileSources::Disabled,
+                &off_policy(),
+            );
+            assert!(config.resolved_chains().is_empty(), "{url}");
+        }
+    }
+
+    /// The public constant is Trusted by construction and never needs an operator file.
+    #[test]
+    fn test_trusted_public_is_trusted() {
+        assert_eq!(trusted_public().trust(), RegistryTrust::Trusted);
+    }
+
+    /// The same URL under a different trust is a different chain (a different transport).
+    #[test]
+    fn test_chain_key_depends_on_trust() {
+        let url = "https://corp.example/v3/index.json";
+        let hop = |operator: &OperatorRegistries| ResolvedHop {
+            url: operator
+                .classify::<NuGetFeedKind>(url, url, &all_policy())
+                .unwrap(),
+            slot: None,
+            auth: None,
+        };
+        let trusted = OperatorRegistries::declared_in(&OperatorPath::for_test("/u"), [url]);
+        let key = |operator| NuGetSourceChain::chain(vec![hop(operator)], false).key;
+        assert_ne!(key(&trusted), key(&OperatorRegistries::default()));
+    }
+
+    fn candidates(env: &deps_core::net_policy::MapEnv, home: &OperatorPath) -> Vec<OperatorPath> {
+        user_profile_config_candidates(Some(home), env)
+    }
+
+    /// With no (or a relative, hence absent) home and a relative `XDG_CONFIG_HOME`, there is no
+    /// user-profile candidate at all.
+    #[cfg(not(windows))]
+    #[test]
+    fn test_relative_xdg_and_no_home_yield_no_candidate() {
+        use deps_core::net_policy::MapEnv;
+        let env = MapEnv::new().with_var("XDG_CONFIG_HOME", "relative/xdg");
+        assert!(user_profile_config_candidates(None, &env).is_empty());
+    }
+
+    /// A relative `APPDATA` names no operator-owned location on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn test_relative_appdata_yields_no_candidate() {
+        use deps_core::net_policy::MapEnv;
+        let env = MapEnv::new().with_var("APPDATA", "relative\\appdata");
+        assert!(user_profile_config_candidates(None, &env).is_empty());
+    }
+
+    /// A relative or empty `XDG_CONFIG_HOME` is skipped and the home candidates still apply.
+    #[cfg(not(windows))]
+    #[test]
+    fn test_relative_xdg_is_skipped_and_home_candidates_remain() {
+        use deps_core::net_policy::MapEnv;
+        let home = OperatorPath::for_test(std::env::temp_dir().join("home"));
+        let home_candidates = vec![
+            home.join(".config").join("NuGet").join("NuGet.Config"),
+            home.join(".nuget").join("NuGet").join("NuGet.Config"),
+        ];
+
+        for xdg in ["", "relative/xdg"] {
+            let env = MapEnv::new().with_var("XDG_CONFIG_HOME", xdg);
+            assert_eq!(candidates(&env, &home), home_candidates, "{xdg:?}");
+        }
+        assert_eq!(candidates(&MapEnv::new(), &home), home_candidates);
+
+        let abs = std::env::temp_dir().join("xdg");
+        let env = MapEnv::new().with_var("XDG_CONFIG_HOME", abs.to_str().unwrap());
+        let found = candidates(&env, &home);
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0].as_path(), abs.join("NuGet").join("NuGet.Config"));
+    }
+
     /// FR-009: the non-transitive key-aliasing counterexample from the critic review —
     /// `"Corp_x005f_x0020_Feed"` and `"Corp Feed"` don't overlap each other directly, but both
     /// overlap `"Corp_x0020_Feed"`. `unique_overlap` must resolve this as ambiguous (>=2
@@ -5499,11 +5771,13 @@ mod tests {
         1,
         PackageSourceEntry {
             key: deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string(),
-            value: Ok(NuGetFeedUrl::new(
-                "https://feed.mycorp.example/v3/index.json",
-                &all_policy()
-            )
-            .unwrap(),),
+            value: Ok(OperatorRegistries::default()
+                .classify::<NuGetFeedKind>(
+                    "https://feed.mycorp.example/v3/index.json",
+                    "https://feed.mycorp.example/v3/index.json",
+                    &all_policy()
+                )
+                .unwrap(),),
             tier: ConfigTier::Project,
             auth: None,
         },
@@ -5522,7 +5796,7 @@ mod tests {
         let policy = all_policy();
 
         let log = deps_core::test_util::capture_tracing_output_at(tracing::Level::DEBUG, || {
-            let _ = resolve_source_entry(&add, &policy);
+            let _ = resolve_source_entry(&add, &OperatorRegistries::default(), &policy);
         });
 
         assert!(
