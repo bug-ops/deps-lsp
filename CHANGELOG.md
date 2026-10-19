@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **release**: crates.io publishing runs through `scripts/publish-crates.sh`, which publishes in dependency order (#1868)
+
 ## [3.0.0] - 2026-10-19
 
 ### Breaking
