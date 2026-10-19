@@ -6,8 +6,11 @@
 //! `buffer_unordered(4)` LSP dispatch slot (#1830). [`InteractiveFetchGate`] adds the memory and
 //! the concurrency cap:
 //!
-//! - a short-lived, source-qualified failure memo, seeded from the background fetch's
-//!   [`DependencyOutcomes`] and written by interactive awaits that fail or time out;
+//! - a short-lived failure memo, keyed by the network path the registry reports through
+//!   [`Registry::endpoint_for`] (the manifest when it cannot say) and seeded from the background
+//!   fetch's [`DependencyOutcomes`]; interactive awaits that fail or time out write it;
+//! - a per-endpoint circuit breaker, so a dead endpoint costs one slow await per sweep instead
+//!   of one per package, shared by every lookup that travels the same path;
 //! - a semaphore that leaves at least one dispatch slot free for non-registry requests;
 //! - single-flight for version lists, so concurrent requests for one package share one
 //!   registry poll ([`await_interactive_versions`]).
@@ -40,13 +43,16 @@ use self::attempt::{Attempted, bounded_await_until};
 use self::breaker::EndpointBreaker;
 use self::flight::{FlightKey, FlightResult, ListShape};
 use self::key::{
-    EndpointKey, InteractiveFetchKey, LookupKind, ManifestFingerprint, SourceFingerprint,
+    BackgroundSeed, LookupKey, LookupKind, ManifestFingerprint, PermitPolicy, RouteKey, RouteScope,
+    SourceFingerprint,
 };
 use self::memo::{Decision, InteractiveRecord};
 use super::VersionData;
 use crate::freshness::FreshnessSettings;
 use crate::single_flight::Slot;
-use crate::{DependencySource, FetchFailure, NetworkMode, PackageName, Registry, Version};
+use crate::{
+    DependencySource, FetchFailure, NetworkMode, PackageName, Registry, RegistryEndpoint, Version,
+};
 
 /// A version list shared between the requests of one flight.
 ///
@@ -120,7 +126,8 @@ impl<T> InteractiveFetch<T> {
 /// [`await_interactive_fetch`] gates with its own failure memo and budget.
 ///
 /// Each kind is memoized separately, so a stalled decoration never degrades the version list
-/// of the same package, and the other way round.
+/// of the same package. A pin resolution additionally honors an interactive failure of the
+/// same package's version list, never the reverse.
 ///
 /// # Examples
 ///
@@ -136,9 +143,18 @@ pub enum AuxiliaryLookup {
     /// the endpoint breaker (it is still refused while the breaker is open for a hover).
     Decoration,
     /// Resolution of a floating pin to a concrete release, such as a GitLab CI component's
-    /// `~latest`. It is served by the dependency's own endpoint, so its pace counts for the
-    /// endpoint breaker like a version list's.
+    /// `~latest`. Its pace counts for the endpoint breaker like a version list's.
+    ///
+    /// The fetch must go through the same route as the package's version list (GitLab's
+    /// `resolve_component_pin` uses the same route function as `get_versions_from`): that is
+    /// what makes honoring the version list's failure sound.
     PinResolution,
+    /// A `get_latest_matching_from` call a hover makes when the list-based pick found nothing.
+    /// It reaches the same endpoint as the version list, so its pace counts for the breaker,
+    /// but it is not what the background fetch did, so the background failure never seeds it.
+    /// It runs right after the list await and takes no dispatch permit, so a loaded server
+    /// cannot starve the `**Latest**` line of a hover whose list just answered.
+    LatestFallback,
 }
 
 /// Which interactive surface is awaiting: a log field, and the switch deciding whether the
@@ -173,13 +189,16 @@ pub struct InteractiveFetchRequest<'a> {
 
 impl<'a> InteractiveFetchRequest<'a> {
     /// Bundles the lookup identity: `manifest` is the document being served, `package` the raw
-    /// manifest name (log output only), `normalized_name` the formatter-normalized name the
-    /// outcomes map and the memo key use.
+    /// manifest name (the name the registry is asked for and the log output), `normalized_name`
+    /// the formatter-normalized name the outcomes map and the memo key use.
     ///
-    /// The manifest scopes the memo: a default-registry dependency
-    /// ([`DependencySource::Registry`]) resolves against a registry chosen by per-project
+    /// The memo and the endpoint breaker are keyed by the network path the registry reports
+    /// through [`Registry::endpoint_for`] for this package and source, so documents that
+    /// resolve to the same registry share a record. A registry that cannot name its endpoint
+    /// leaves the key scoped to `manifest`: a default-registry dependency
+    /// ([`DependencySource::Registry`]) may resolve against a registry chosen by per-project
     /// configuration (`.npmrc`, Cargo source replacement) that `deps-core` cannot see, so two
-    /// documents never share a record.
+    /// documents then never share a record.
     #[must_use]
     pub const fn new(
         versions: VersionData<'a>,
@@ -199,31 +218,50 @@ impl<'a> InteractiveFetchRequest<'a> {
         }
     }
 
-    /// The gate and key this request is memoized under, or `None` when the request must take
-    /// the plain bounded await: no gate attached, no ecosystem to qualify the key with, or
+    /// The gate and lookup this request is memoized under, or `None` when the request must
+    /// take the plain bounded await: no gate attached, no ecosystem to qualify the key with, or
     /// offline mode (FR-013).
-    fn gated(&self, kind: LookupKind) -> Option<(&'a InteractiveFetchGate, InteractiveFetchKey)> {
+    ///
+    /// The route is the registry's own [`Registry::endpoint_for`] answer; a registry that
+    /// cannot name its endpoint scopes the lookup to the manifest instead, because per-project
+    /// configuration (`.npmrc`, Cargo source replacement) is invisible to `deps-core`.
+    fn gated<R: Registry + ?Sized>(
+        &self,
+        registry: &R,
+        kind: LookupKind,
+    ) -> Option<(&'a InteractiveFetchGate, Arc<LookupKey>)> {
         let gate = self.versions.interactive_fetch?;
         let ecosystem = self.versions.ecosystem?;
         match self.versions.network {
             NetworkMode::Offline => None,
-            NetworkMode::Online => Some((
-                gate,
-                InteractiveFetchKey {
-                    endpoint: EndpointKey {
+            NetworkMode::Online => {
+                let scope = match registry.endpoint_for(self.package, self.source) {
+                    RegistryEndpoint::Resolved(endpoint) => RouteScope::Endpoint(endpoint),
+                    RegistryEndpoint::Unresolved => {
+                        RouteScope::Manifest(ManifestFingerprint::of(self.manifest))
+                    }
+                };
+                let key = LookupKey {
+                    route: RouteKey {
                         ecosystem,
-                        manifest: ManifestFingerprint::of(self.manifest),
                         source: SourceFingerprint::of(self.source),
+                        scope,
                     },
                     package: PackageName::new(self.normalized_name),
-                    kind,
-                },
-            )),
+                    slot: kind,
+                };
+                Some((gate, Arc::new(key)))
+            }
         }
     }
 
-    /// True when the background fetch recorded a failure that says nothing is reachable.
-    fn background_failure_known(&self) -> bool {
+    /// True when the background fetch recorded a failure that says nothing is reachable and
+    /// that failure applies to `kind`.
+    fn background_failure_known(&self, kind: LookupKind) -> bool {
+        match kind.background_seed() {
+            BackgroundSeed::Applies => {}
+            BackgroundSeed::Ignored => return false,
+        }
         let failure = self
             .versions
             .outcomes
@@ -254,8 +292,10 @@ fn log_skipped(request: &InteractiveFetchRequest<'_>, reason: &str) {
 ///
 /// One instance lives for the server's lifetime and is attached to hover and code-action
 /// requests through [`VersionData::with_interactive_fetch_gate`]. Records are keyed by
-/// ecosystem, normalized package name, and a fingerprint of the dependency source, so a
-/// failure against one registry never degrades the same name resolved from another.
+/// ecosystem, a fingerprint of the dependency source, the network path the registry reports
+/// for the package (the manifest when it reports none), the normalized package name and the
+/// lookup kind, so a failure against one registry never degrades the same name resolved from
+/// another.
 ///
 /// # Examples
 ///
@@ -270,7 +310,7 @@ fn log_skipped(request: &InteractiveFetchRequest<'_>, reason: &str) {
 /// ```
 #[derive(Debug)]
 pub struct InteractiveFetchGate {
-    memo: DashMap<InteractiveFetchKey, InteractiveRecord>,
+    memo: DashMap<Arc<LookupKey>, InteractiveRecord>,
     version_flights: DashMap<FlightKey, watch::Receiver<Slot<FlightResult>>>,
     breaker: EndpointBreaker,
     permits: Semaphore,
@@ -329,20 +369,26 @@ impl InteractiveFetchGate {
     /// be perfectly reachable.
     fn admit_request(
         &self,
-        key: &InteractiveFetchKey,
+        lookup: &Arc<LookupKey>,
         request: &InteractiveFetchRequest<'_>,
     ) -> Result<Admitted<'_>, NoLiveList> {
         let generation = self.generation();
-        let background_failure_known = request.background_failure_known();
+        let background_failure_known = request.background_failure_known(lookup.kind());
         if let Decision::Degrade(kind, reason) =
-            self.decide(key, background_failure_known, generation, now())
+            self.decide(lookup, background_failure_known, generation, now())
         {
             log_skipped(request, reason.as_str());
             return Err(kind);
         }
-        let Ok(permit) = self.permits.try_acquire() else {
-            log_skipped(request, "interactive fetch concurrency cap reached");
-            return Err(NoLiveList::Unverified);
+        let permit = match lookup.kind().permit_policy() {
+            PermitPolicy::Required => {
+                let Ok(permit) = self.permits.try_acquire() else {
+                    log_skipped(request, "interactive fetch concurrency cap reached");
+                    return Err(NoLiveList::Unverified);
+                };
+                Some(permit)
+            }
+            PermitPolicy::Exempt => None,
         };
         Ok(Admitted {
             generation,
@@ -356,12 +402,12 @@ impl InteractiveFetchGate {
 struct Admitted<'a> {
     generation: u64,
     background_failure_known: bool,
-    _permit: tokio::sync::SemaphorePermit<'a>,
+    _permit: Option<tokio::sync::SemaphorePermit<'a>>,
 }
 
 /// Awaits an auxiliary lookup for hover or a code action under the gate.
 ///
-/// The await is bounded by `kind`'s budget (5 s for either [`AuxiliaryLookup`]; a version list
+/// The await is bounded by `kind`'s budget (5 s for each [`AuxiliaryLookup`] kind; a version list
 /// gets [`REGISTRY_FETCH_BUDGET`](super::REGISTRY_FETCH_BUDGET) through
 /// [`await_interactive_versions`]) and short-circuited by the request's
 /// [`InteractiveFetchGate`] when it carries one.
@@ -376,6 +422,10 @@ struct Admitted<'a> {
 /// Concurrent calls for one package are not coalesced here; a version list should go through
 /// [`await_interactive_versions`], which is.
 ///
+/// `fetch` must travel the network path `registry.endpoint_for(request's package and source)`
+/// names, unless `kind` is [`AuxiliaryLookup::Decoration`], whose pace is never counted. The
+/// breaker attributes the attempt's timing to that path.
+///
 /// # Examples
 ///
 /// ```
@@ -386,6 +436,20 @@ struct Admitted<'a> {
 /// use deps_core::{DepsError, DependencySource, PackageName, VersionData};
 /// use std::collections::HashMap;
 ///
+/// # struct Offline;
+/// # impl deps_core::Registry for Offline {
+/// #     fn get_versions<'a>(&'a self, _: &'a PackageName)
+/// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Version>>>>
+/// #     { Box::pin(async { Ok(Vec::new()) }) }
+/// #     fn get_latest_matching<'a>(&'a self, _: &'a PackageName, _: &'a deps_core::VersionReq,
+/// #         _: &'a deps_core::SelectionContext)
+/// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn deps_core::Version>>>>
+/// #     { Box::pin(async { Ok(None) }) }
+/// #     fn search_raw<'a>(&'a self, _: &'a str, _: usize)
+/// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>>
+/// #     { Box::pin(async { Ok(Vec::new()) }) }
+/// #     fn as_any(&self) -> &dyn std::any::Any { self }
+/// # }
 /// let cached = HashMap::new();
 /// let resolved = HashMap::new();
 /// let package = PackageName::new("serde");
@@ -405,31 +469,33 @@ struct Admitted<'a> {
 ///     .build()
 ///     .unwrap();
 /// let result = runtime.block_on(await_interactive_fetch(
+///     &Offline,
 ///     async { Ok::<_, DepsError>(42_u8) },
 ///     request,
 ///     AuxiliaryLookup::PinResolution,
 /// ));
 /// assert!(matches!(result, InteractiveFetch::Live(42)));
 /// ```
-pub async fn await_interactive_fetch<T, E: InteractiveFetchError>(
+pub async fn await_interactive_fetch<T, E: InteractiveFetchError, R: Registry + ?Sized>(
+    registry: &R,
     fetch: impl Future<Output = Result<T, E>>,
     request: InteractiveFetchRequest<'_>,
     kind: AuxiliaryLookup,
 ) -> InteractiveFetch<T> {
     let kind = LookupKind::Auxiliary(kind);
-    let Some((gate, key)) = request.gated(kind) else {
+    let Some((gate, lookup)) = request.gated(registry, kind) else {
         return plain_bounded_await(fetch, &request, kind).await;
     };
-    let admitted = match gate.admit_request(&key, &request) {
+    let admitted = match gate.admit_request(&lookup, &request) {
         Ok(admitted) => admitted,
         Err(kind) => return InteractiveFetch::Degraded(kind),
     };
-    let deadline = tokio::time::Instant::now() + key.kind.budget();
+    let deadline = tokio::time::Instant::now() + lookup.kind().budget();
     match gate
         .attempt(
             fetch,
             deadline,
-            &key,
+            &lookup,
             &request,
             admitted.background_failure_known,
             admitted.generation,
@@ -502,10 +568,10 @@ pub async fn await_interactive_versions<R: Registry + ?Sized>(
             .await
             .map(SharedVersions::from)
     };
-    let Some((gate, key)) = request.gated(LookupKind::VersionList) else {
+    let Some((gate, lookup)) = request.gated(registry, LookupKind::VersionList) else {
         return plain_bounded_await(fetch, &request, LookupKind::VersionList).await;
     };
-    flight::await_shared(gate, key, fetch, &request, ListShape::of(freshness)).await
+    flight::await_shared(gate, lookup, fetch, &request, ListShape::of(freshness)).await
 }
 
 async fn plain_bounded_await<T, E: InteractiveFetchError>(

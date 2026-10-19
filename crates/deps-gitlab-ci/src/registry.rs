@@ -21,6 +21,7 @@ use crate::client::{
     parse_releases_page, parse_tags_page,
 };
 use crate::types::{EndpointKind, GitlabCiVersion, GitlabRoute, PinStyle};
+use deps_core::RegistryEndpoint;
 
 /// Display name for the registry backing GitLab CI version lookups.
 pub const REGISTRY: &str = "GitLab";
@@ -210,6 +211,19 @@ impl GitlabCiRegistry {
             }
         }
         refused
+    }
+
+    /// The registered route of `source`, or `None` for a source that is not an
+    /// `AlternateRegistry` or names an index that was never registered. The single decision
+    /// behind version lookups, pin resolution and `Registry::endpoint_for`.
+    pub(crate) fn route(
+        &self,
+        source: &deps_core::parser::DependencySource,
+    ) -> Option<GitlabRoute> {
+        let deps_core::parser::DependencySource::AlternateRegistry { index, .. } = source else {
+            return None;
+        };
+        self.routes.get(index).map(|route| route.clone())
     }
 
     fn rate_limit_gate(&self, origin: &str) -> Arc<RateLimitGate> {
@@ -432,17 +446,10 @@ impl deps_core::Registry for GitlabCiRegistry {
         _freshness: deps_core::FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            let deps_core::parser::DependencySource::AlternateRegistry { index, .. } = source
-            else {
+            let Some(route) = self.route(source) else {
                 return Err(DepsError::PackageNotFound {
                     package: name.as_str().into(),
-                    registry: "gitlab-ci (no route; source required)",
-                });
-            };
-            let Some(route) = self.routes.get(index).map(|r| r.clone()) else {
-                return Err(DepsError::PackageNotFound {
-                    package: name.as_str().into(),
-                    registry: "gitlab-ci (unregistered route)",
+                    registry: "gitlab-ci (no registered route)",
                 });
             };
             let versions = self.fetch_route(name, &route).await?;
@@ -451,6 +458,17 @@ impl deps_core::Registry for GitlabCiRegistry {
                 .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
                 .collect())
         })
+    }
+
+    fn endpoint_for(
+        &self,
+        _name: &PackageName,
+        source: &deps_core::parser::DependencySource,
+    ) -> RegistryEndpoint {
+        self.route(source)
+            .map_or(RegistryEndpoint::Unresolved, |route| {
+                self.client.endpoint(route.host())
+            })
     }
 
     /// Unconditional [`DepsError::PackageNotFound`] — this trait method's counterpart to
@@ -562,6 +580,70 @@ mod tests {
             host: crate::host::GitlabHost::for_test(origin),
             endpoint,
         }
+    }
+
+    // --- endpoint_for: the gate keys its breaker on the route's host ---
+
+    fn via(index: &str) -> DependencySource {
+        DependencySource::AlternateRegistry {
+            index: index.to_string(),
+            mirrors_crates_io: false,
+        }
+    }
+
+    /// The pin resolution fetches through `route(source)`, so its breaker key must be exactly
+    /// the version list's: both derive from that one route. A source without a registered
+    /// route has no endpoint, and a host outside the operator's environment is a different
+    /// (guarded) network path than the same URL would be for an operator-trusted host.
+    #[test]
+    fn test_endpoint_for_follows_the_registered_route() {
+        use deps_core::{EgressTier, RegistryEndpoint};
+
+        let client = test_client();
+        let registry = GitlabCiRegistry::new(Arc::clone(&client));
+        let gitlab_com = crate::host::GitlabHost::gitlab_com();
+        registry.register_alternate(&[
+            (
+                "com".to_string(),
+                GitlabRoute {
+                    host: gitlab_com.clone(),
+                    endpoint: EndpointKind::Releases,
+                },
+            ),
+            (
+                "corp".to_string(),
+                route("gitlab.corp", EndpointKind::Releases),
+            ),
+        ]);
+        let name = PackageName::new("gitlab.com/org/proj");
+        let endpoint = |source: &DependencySource| registry.endpoint_for(&name, source);
+
+        let com = endpoint(&via("com"));
+        let corp = endpoint(&via("corp"));
+
+        assert_eq!(
+            com,
+            RegistryEndpoint::base(gitlab_com.trusted_prefix().as_url(), EgressTier::Baseline)
+        );
+        assert_eq!(
+            corp,
+            RegistryEndpoint::base(
+                crate::host::GitlabHost::for_test("gitlab.corp")
+                    .trusted_prefix()
+                    .as_url(),
+                EgressTier::Guarded
+            ),
+            "a host outside the operator's environment is the guarded egress"
+        );
+        assert_ne!(com, RegistryEndpoint::Unresolved);
+        assert_ne!(com, corp);
+        let pin_route = registry.route(&via("corp")).expect("registered");
+        assert_eq!(client.endpoint(pin_route.host()), corp);
+        assert_eq!(endpoint(&via("missing")), RegistryEndpoint::Unresolved);
+        assert_eq!(
+            endpoint(&DependencySource::Registry),
+            RegistryEndpoint::Unresolved
+        );
     }
 
     // --- get_versions / get_latest_matching: unconditional PackageNotFound (no route) ---

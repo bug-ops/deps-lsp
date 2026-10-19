@@ -61,6 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-engine, deps-lsp, deps-cli**: `resolve_recommended_fix`, `resolve_verified_fix` and `plan_vulnerability_fix` take a `FixTargetContext` instead of `latest`, and `collect_fix_target_resolutions` takes a `FixTargetRegistry` (#1832, #1846)
 - **deps-core**: a preflight DNS failure is a `RegistryError` instead of `CacheError`, `CredentialOutsideTrustedPrefix` is Actionable (the Swift last-good fallback no longer serves stale data for it), and `DepsDevClient` no longer stores a separate base URL (#1841, #1846)
 - **deps-core**: `test_util::scaling::TimeRatio` is no longer public (#1838, #1846)
+- **deps-core**: `await_interactive_fetch` takes the `Registry` the fetch goes through as its first parameter, `InteractiveFetchError` requires `origin`, and `AuxiliaryLookup` gains `LatestFallback` (#1852)
 
 ### Security
 - **deps**: bump `rustls` to 0.23.46, fixing RUSTSEC-2026-0346, -0347, -0348, -0349 (#1837)
@@ -73,6 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: repository editor settings can no longer redirect `GITLAB_TOKEN` through `registries.gitlab_instance_host`; the configuration docs now list the trust impact of every repository-settable field (#1797)
 
 ### Added
+- **deps-core and all registry ecosystems**: `Registry::endpoint_for` (default `Unresolved`) reports the network path a lookup travels, with new `RegistryEndpoint`, `EgressTier` and `EndpointFingerprint`; each registry derives it from the route its `get_versions_from` dispatches on (#1852)
+- **deps-core**: `DepsError::origin` and `ErrorOrigin` classify whether an error is evidence about the registry endpoint; `cache_policy::evict_oldest_batch_where` and `Ord` on `EcosystemId` added (#1852)
 - **deps-core**: `licenses::LicensePolicy::activated_since` (#1831, #1842)
 - **deps-core**: `net_policy::TrustedPrefix::as_url` (#1825, #1842)
 - **deps-github-actions, deps-gitlab-ci**: unknown-ref quick fix rewrites the ref to the published tag spelling when exactly one tag matches (#1807)
@@ -118,6 +121,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: an endpoint circuit breaker makes hover skip a registry endpoint for 30 s once two distinct packages were slow, so a dead registry no longer costs every hover a full await (#1851)
 
 ### Fixed
+- **deps-core, all registry ecosystems**: the interactive circuit breaker and failure memo are keyed by the real registry path, so one dead npm scope, Maven repository, NuGet feed or alternate index no longer refuses the public packages of the same manifest, and two manifests on one dead registry share one breaker (#1847, #1852)
+- **deps-core**: a fast local error (policy block, cache fault, unbuildable request) no longer keeps the breaker closed on a dead endpoint, and a lost half-open probe expires after a lease (#1849, #1852)
+- **deps-core**: hover's `get_latest_matching_from` fallback goes through the interactive gate with its own memo and breaker evidence (no dispatch permit) instead of an ungated 5 s await (#1848, #1852)
+- **deps-core, deps-gitlab-ci**: a GitLab component pin resolution honors a failed version list for the same package, so a dead host costs one await for hover and code action together (#1849, #1852)
+- **deps-cargo**: feature completion for an unregistered, non-mirror alternate registry returns empty, and an unregistered mirror falls back to crates.io like hover (#1852)
+- **deps-core**: the breaker and failure memo take read locks on the hot path, and the breaker evicts a bounded batch of closed endpoints at its cap (#1850, #1852)
 - **deps-nuget, deps-gitlab-ci**: the NuGet unlisted decoration and the GitLab CI component-pin resolution (hover and code action) go through the shared interactive gate, so a dead feed or host no longer costs every request its own 5 s await (#1851)
 - **deps-core, deps-lsp**: hover and code actions answer from the degraded path after a registry lookup failed or timed out, and concurrent live fetches are bounded, so a dead registry no longer stalls every request for 10 s (#1830, #1846)
 - **deps-core, deps-engine, deps-cli**: the advisory fix target skips registry-deprecated versions within the target's compatibility line and never picks a gossip-excluded or cooling-down `latest` (#1832, #1846)

@@ -2,14 +2,16 @@
 //! the memo.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
 use super::breaker::{Admission, ProbeId};
-use super::key::{BreakerEvidence, InteractiveFetchKey, LookupKind};
+use super::key::{BreakerEvidence, LookupKey, LookupKind};
 use super::memo::RecordState;
 use super::{InteractiveFetch, InteractiveFetchGate, InteractiveFetchRequest, NoLiveList};
+use crate::ErrorOrigin;
 
 /// Margin below the budget within which an answer may be a stale-serve or a race against the
 /// 10 s connect timeout rather than proof the endpoint is responsive.
@@ -43,7 +45,7 @@ impl AttemptBudget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AttemptEnd {
     Live,
-    Err,
+    Err(ErrorOrigin),
     Elapsed,
     /// The awaiting future was dropped, for instance by `$/cancelRequest`.
     Cancelled,
@@ -59,21 +61,29 @@ pub(super) enum AttemptEvidence {
 
 /// Evidence from an attempt that ended as `end` after `waited` against a budget of `budget`.
 ///
-/// A fast `Live` or `Err` shows the endpoint is responsive. A `Live` near the budget is
-/// inconclusive: the HTTP cache serves stale data after a failed revalidation, so it may come
-/// from a dead host. Giving up at or beyond half the budget is slow; giving up earlier (a
-/// promoted request with little budget left, an early cancel) says nothing.
+/// A fast `Live` or endpoint-attributed `Err` shows the endpoint is responsive. A `Live` near
+/// the budget is inconclusive: the HTTP cache serves stale data after a failed revalidation, so
+/// it may come from a dead host. Giving up at or beyond half the budget is slow, whether by
+/// elapse, cancel, or an unattributed error such as a late DNS failure; giving up earlier
+/// (a promoted request with little budget left, an early cancel, a fast local failure) says
+/// nothing.
 pub(super) fn evidence(end: AttemptEnd, waited: Duration, budget: Duration) -> AttemptEvidence {
     let responsive = waited < budget.saturating_sub(MARGIN);
     match end {
         AttemptEnd::Live if responsive => AttemptEvidence::Answered,
         AttemptEnd::Live => AttemptEvidence::Inconclusive,
-        AttemptEnd::Err if responsive => AttemptEvidence::Answered,
-        AttemptEnd::Err => AttemptEvidence::Slow,
-        AttemptEnd::Elapsed | AttemptEnd::Cancelled if waited >= budget / 2 => {
+        AttemptEnd::Err(ErrorOrigin::Endpoint) if responsive => AttemptEvidence::Answered,
+        AttemptEnd::Err(ErrorOrigin::Endpoint) => AttemptEvidence::Slow,
+        AttemptEnd::Err(ErrorOrigin::Unattributed)
+        | AttemptEnd::Elapsed
+        | AttemptEnd::Cancelled
+            if waited >= budget / 2 =>
+        {
             AttemptEvidence::Slow
         }
-        AttemptEnd::Elapsed | AttemptEnd::Cancelled => AttemptEvidence::Inconclusive,
+        AttemptEnd::Err(ErrorOrigin::Unattributed)
+        | AttemptEnd::Elapsed
+        | AttemptEnd::Cancelled => AttemptEvidence::Inconclusive,
     }
 }
 
@@ -84,7 +94,7 @@ pub(super) fn evidence(end: AttemptEnd, waited: Duration, budget: Duration) -> A
 /// before the editor gave up is evidence the endpoint is slow.
 struct AttemptGuard<'a> {
     gate: &'a InteractiveFetchGate,
-    key: &'a InteractiveFetchKey,
+    lookup: &'a Arc<LookupKey>,
     generation: u64,
     started: Instant,
     probe: Option<ProbeId>,
@@ -104,13 +114,14 @@ impl AttemptGuard<'_> {
             BreakerEvidence::Ignored => return,
         }
         let waited = Instant::now().saturating_duration_since(self.started);
-        let evidence = evidence(end, waited, self.key.kind.budget());
+        let evidence = evidence(end, waited, self.lookup.kind().budget());
         if self.gate.generation() != self.generation {
             return;
         }
+        let endpoint = self.lookup.route.endpoint();
         self.gate.breaker.report(
-            &self.key.endpoint,
-            &self.key.package,
+            &endpoint,
+            &self.lookup.package,
             evidence,
             self.probe,
             super::now(),
@@ -118,7 +129,7 @@ impl AttemptGuard<'_> {
         // Re-checked after the write, as for the memo: an invalidation in between would
         // otherwise leave this endpoint's stale evidence behind.
         if self.gate.generation() != self.generation {
-            self.gate.breaker.forget(&self.key.endpoint);
+            self.gate.breaker.forget(&endpoint);
         }
     }
 }
@@ -144,15 +155,24 @@ impl Drop for AttemptGuard<'_> {
 ///
 /// let error = DepsError::CacheError("poisoned lock".into());
 /// assert_eq!(error.log_cause(), (None, "cache"));
+/// assert_eq!(InteractiveFetchError::origin(&error), deps_core::ErrorOrigin::Unattributed);
 /// ```
 pub trait InteractiveFetchError {
     /// The HTTP status when there is one, plus a short stable cause label.
     fn log_cause(&self) -> (Option<u16>, &'static str);
+
+    /// Whether the failure is evidence about the registry endpoint, which decides if a fast
+    /// failure vouches for it (see [`ErrorOrigin`]).
+    fn origin(&self) -> ErrorOrigin;
 }
 
 impl InteractiveFetchError for crate::DepsError {
     fn log_cause(&self) -> (Option<u16>, &'static str) {
         self.safe_tracing_summary()
+    }
+
+    fn origin(&self) -> ErrorOrigin {
+        Self::origin(self)
     }
 }
 
@@ -161,6 +181,10 @@ impl InteractiveFetchError for crate::DepsError {
 impl InteractiveFetchError for () {
     fn log_cause(&self) -> (Option<u16>, &'static str) {
         (None, "unspecified")
+    }
+
+    fn origin(&self) -> ErrorOrigin {
+        ErrorOrigin::Endpoint
     }
 }
 
@@ -186,7 +210,7 @@ pub(super) async fn bounded_await_until<T, E: InteractiveFetchError>(
             );
             (
                 InteractiveFetch::Degraded(NoLiveList::Failed),
-                AttemptEnd::Err,
+                AttemptEnd::Err(error.origin()),
             )
         }
         Err(_) => {
@@ -223,13 +247,13 @@ impl InteractiveFetchGate {
         &self,
         fetch: impl Future<Output = Result<T, E>>,
         deadline: Instant,
-        key: &InteractiveFetchKey,
+        lookup: &Arc<LookupKey>,
         request: &InteractiveFetchRequest<'_>,
         background_failure_known: bool,
         generation: u64,
     ) -> Attempted<T> {
-        let counts = key.kind.breaker_evidence();
-        let probe = match self.admit(&key.endpoint, request.context, counts) {
+        let counts = lookup.kind().breaker_evidence();
+        let probe = match self.admit(&lookup.route.endpoint(), request.context, counts) {
             Admission::Refused => {
                 super::log_skipped(request, "registry endpoint circuit open");
                 return Attempted::Refused;
@@ -240,18 +264,18 @@ impl InteractiveFetchGate {
         let started = Instant::now();
         let budget = AttemptBudget::of(
             deadline.saturating_duration_since(started),
-            key.kind.budget(),
+            lookup.kind().budget(),
         );
         let guard = AttemptGuard {
             gate: self,
-            key,
+            lookup,
             generation,
             started,
             probe,
             settled: false,
             counts,
         };
-        let (result, end) = bounded_await_until(fetch, deadline, request, key.kind).await;
+        let (result, end) = bounded_await_until(fetch, deadline, request, lookup.kind()).await;
         guard.finish(end);
         let result = match result {
             // The background fetch still reports this package as failing, so a stale seeded
@@ -263,16 +287,14 @@ impl InteractiveFetchGate {
         };
         match (&result, background_failure_known, budget) {
             (InteractiveFetch::Degraded(_), _, AttemptBudget::Full) => {
-                self.record(key, RecordState::InteractiveFailed, generation);
+                self.record(lookup, RecordState::InteractiveFailed, generation);
             }
             (InteractiveFetch::Degraded(_), _, AttemptBudget::Truncated) => {}
             (InteractiveFetch::Live(_), true, _) => {
-                self.record(key, RecordState::InteractiveSucceeded, generation);
+                self.record(lookup, RecordState::InteractiveSucceeded, generation);
             }
             // Nothing a success record could override, so it must not occupy the capped memo.
-            (InteractiveFetch::Live(_), false, _) => {
-                self.memo.remove(key);
-            }
+            (InteractiveFetch::Live(_), false, _) => self.forget_record(lookup),
         }
         Attempted::Polled(result, budget)
     }

@@ -6,7 +6,7 @@ use std::time::Duration;
 use super::attempt::{AttemptEnd, AttemptEvidence, evidence};
 use super::breaker::{
     Admission, BREAKER_CAP, BREAKER_OPEN_DURATION, BreakerAdmission, EndpointBreaker,
-    EndpointHealth,
+    EndpointHealth, PROBE_LEASE, ProbeId, Verdict, verdict,
 };
 use super::key::{
     BreakerEvidence, EndpointKey, LookupKind, ManifestFingerprint, SourceFingerprint,
@@ -16,13 +16,30 @@ use super::*;
 use crate::lsp_helpers::DependencyOutcomes;
 use crate::lsp_helpers::REGISTRY_FETCH_BUDGET;
 use crate::test_util::{MockRegistry, MockVersion};
-use crate::{ConcreteVersion, EcosystemId, FetchFailure};
+use crate::{ConcreteVersion, EcosystemId, ErrorOrigin, FetchFailure};
+use crate::{EgressTier, RegistryEndpoint};
 
 #[derive(Clone, Copy)]
 enum Fetch {
     Succeed,
     Fail,
+    /// Fails with an error that says nothing about the endpoint (a local policy block).
+    FailLocal,
+    /// A local failure that surfaces only after 6 s, such as a DNS preflight timeout.
+    FailLocalSlow,
     Stall,
+}
+
+struct Failure(ErrorOrigin);
+
+impl InteractiveFetchError for Failure {
+    fn log_cause(&self) -> (Option<u16>, &'static str) {
+        (None, "test")
+    }
+
+    fn origin(&self) -> ErrorOrigin {
+        self.0
+    }
 }
 
 struct Fixture {
@@ -32,6 +49,7 @@ struct Fixture {
     calls: AtomicUsize,
     kind: std::sync::Mutex<AuxiliaryLookup>,
     manifest: url::Url,
+    registry: MockRegistry,
 }
 
 fn manifest(path: &str) -> url::Url {
@@ -47,7 +65,13 @@ impl Fixture {
             calls: AtomicUsize::new(0),
             kind: std::sync::Mutex::new(AuxiliaryLookup::PinResolution),
             manifest: manifest("/project/Cargo.toml"),
+            registry: MockRegistry::new(),
         }
+    }
+
+    fn with_endpoint(mut self, endpoint: RegistryEndpoint) -> Self {
+        self.registry = MockRegistry::new().with_endpoint(endpoint);
+        self
     }
 
     fn calls(&self) -> usize {
@@ -56,6 +80,32 @@ impl Fixture {
 
     async fn run_full(
         &self,
+        manifest: &url::Url,
+        name: &str,
+        source: &DependencySource,
+        outcomes: &DependencyOutcomes,
+        network: NetworkMode,
+        fetch: Fetch,
+    ) -> InteractiveFetch<u8> {
+        self.run_via(
+            &self.registry,
+            manifest,
+            name,
+            source,
+            outcomes,
+            network,
+            fetch,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a test fixture's full request shape"
+    )]
+    async fn run_via(
+        &self,
+        registry: &MockRegistry,
         manifest: &url::Url,
         name: &str,
         source: &DependencySource,
@@ -79,11 +129,17 @@ impl Fixture {
         );
         let kind = *self.kind.lock().unwrap();
         await_interactive_fetch(
+            registry,
             async {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 match fetch {
                     Fetch::Succeed => Ok(1),
-                    Fetch::Fail => Err(()),
+                    Fetch::Fail => Err(Failure(ErrorOrigin::Endpoint)),
+                    Fetch::FailLocal => Err(Failure(ErrorOrigin::Unattributed)),
+                    Fetch::FailLocalSlow => {
+                        tokio::time::sleep(Duration::from_secs(6)).await;
+                        Err(Failure(ErrorOrigin::Unattributed))
+                    }
                     Fetch::Stall => {
                         tokio::time::sleep(REGISTRY_FETCH_BUDGET + Duration::from_secs(5)).await;
                         Ok(1)
@@ -223,11 +279,13 @@ async fn seeding_is_discarded_when_the_gate_was_invalidated_after_the_read() {
         &source,
         FetchContext::Hover,
     );
-    let (gate, key) = request.gated(LookupKind::VersionList).unwrap();
+    let (gate, lookup) = request
+        .gated(&fixture.registry, LookupKind::VersionList)
+        .unwrap();
     let generation = gate.generation();
     gate.invalidate_all();
 
-    let decision = gate.decide(&key, true, generation, now());
+    let decision = gate.decide(&lookup, true, generation, now());
 
     assert_matches!(
         decision,
@@ -434,6 +492,7 @@ async fn request_without_a_gate_is_the_plain_bounded_await() {
     );
 
     let result = await_interactive_fetch(
+        &MockRegistry::new(),
         async { Ok::<_, ()>(1_u8) },
         request,
         AuxiliaryLookup::PinResolution,
@@ -512,7 +571,9 @@ impl Fixture {
             &source,
             context,
         );
-        let (gate, key) = request.gated(LookupKind::VersionList).unwrap();
+        let (gate, lookup) = request
+            .gated(&self.registry, LookupKind::VersionList)
+            .unwrap();
         let fetch = async {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match behavior {
@@ -526,7 +587,7 @@ impl Fixture {
                 }
             }
         };
-        flight::await_shared(gate, key, fetch, &request, ListShape::of(freshness)).await
+        flight::await_shared(gate, lookup, fetch, &request, ListShape::of(freshness)).await
     }
 
     async fn enriched(&self, name: &str, behavior: Versions) -> InteractiveFetch<SharedVersions> {
@@ -763,11 +824,7 @@ async fn public_entry_point_shares_the_registry_list() {
 
 impl Fixture {
     fn endpoint(&self) -> EndpointKey {
-        EndpointKey {
-            ecosystem: EcosystemId::Cargo,
-            manifest: ManifestFingerprint::of(&self.manifest),
-            source: SourceFingerprint::of(&DependencySource::Registry),
-        }
+        scoped_endpoint(&self.manifest)
     }
 
     fn health(&self) -> Option<EndpointHealth> {
@@ -802,6 +859,14 @@ impl Fixture {
     }
 }
 
+fn scoped_endpoint(manifest: &url::Url) -> EndpointKey {
+    EndpointKey::Scoped {
+        ecosystem: EcosystemId::Cargo,
+        manifest: ManifestFingerprint::of(manifest),
+        source: SourceFingerprint::of(&DependencySource::Registry),
+    }
+}
+
 fn is_open(health: Option<EndpointHealth>) -> bool {
     matches!(health, Some(EndpointHealth::Open { .. }))
 }
@@ -819,11 +884,30 @@ fn evidence_follows_the_unified_table() {
         (AttemptEnd::Live, secs(9), AttemptEvidence::Inconclusive),
         (AttemptEnd::Live, secs(10), AttemptEvidence::Inconclusive),
         (
-            AttemptEnd::Err,
+            AttemptEnd::Err(ErrorOrigin::Endpoint),
             just_under(secs(9)),
             AttemptEvidence::Answered,
         ),
-        (AttemptEnd::Err, secs(9), AttemptEvidence::Slow),
+        (
+            AttemptEnd::Err(ErrorOrigin::Endpoint),
+            secs(9),
+            AttemptEvidence::Slow,
+        ),
+        (
+            AttemptEnd::Err(ErrorOrigin::Unattributed),
+            just_under(secs(5)),
+            AttemptEvidence::Inconclusive,
+        ),
+        (
+            AttemptEnd::Err(ErrorOrigin::Unattributed),
+            secs(5),
+            AttemptEvidence::Slow,
+        ),
+        (
+            AttemptEnd::Err(ErrorOrigin::Unattributed),
+            secs(9),
+            AttemptEvidence::Slow,
+        ),
         (AttemptEnd::Elapsed, secs(10), AttemptEvidence::Slow),
         (AttemptEnd::Elapsed, secs(5), AttemptEvidence::Slow),
         (
@@ -1232,17 +1316,16 @@ fn the_breaker_stays_within_its_cap() {
     let package = PackageName::new("a");
     let start = now();
     for index in 0..BREAKER_CAP + 50 {
-        let manifest = manifest(&format!("/project-{index}/Cargo.toml"));
-        let endpoint = EndpointKey {
-            ecosystem: EcosystemId::Cargo,
-            manifest: ManifestFingerprint::of(&manifest),
-            source: SourceFingerprint::of(&DependencySource::Registry),
-        };
+        let endpoint = breaker_endpoint(index);
         let at = start + Duration::from_millis(index as u64);
         breaker.report(&endpoint, &package, AttemptEvidence::Answered, None, at);
     }
 
-    assert_eq!(breaker.len(), BREAKER_CAP);
+    assert!(breaker.len() <= BREAKER_CAP);
+    assert!(
+        breaker.len() > BREAKER_CAP / 2,
+        "eviction is a bounded batch"
+    );
 }
 
 impl Fixture {
@@ -1422,11 +1505,7 @@ async fn a_truncated_leaders_failure_is_not_adopted_by_a_request_that_joined_it(
 }
 
 fn breaker_endpoint(index: usize) -> EndpointKey {
-    EndpointKey {
-        ecosystem: EcosystemId::Cargo,
-        manifest: ManifestFingerprint::of(&manifest(&format!("/project-{index}/Cargo.toml"))),
-        source: SourceFingerprint::of(&DependencySource::Registry),
-    }
+    scoped_endpoint(&manifest(&format!("/project-{index}/Cargo.toml")))
 }
 
 fn open_endpoint(breaker: &EndpointBreaker, endpoint: &EndpointKey, at: std::time::Instant) {
@@ -1528,4 +1607,578 @@ fn an_expired_open_endpoint_is_evicted_to_make_room() {
 
     assert_eq!(breaker.len(), 1);
     assert!(breaker.health(&newcomer).is_some());
+}
+
+fn url(text: &str) -> url::Url {
+    url::Url::parse(text).unwrap()
+}
+
+fn endpoint_at(text: &str, egress: EgressTier) -> RegistryEndpoint {
+    RegistryEndpoint::base(&url(text), egress)
+}
+
+fn registry_at(text: &str, egress: EgressTier) -> MockRegistry {
+    MockRegistry::new().with_endpoint(endpoint_at(text, egress))
+}
+
+fn route_of(
+    fixture: &Fixture,
+    registry: &MockRegistry,
+    ecosystem: EcosystemId,
+    name: &str,
+) -> EndpointKey {
+    let package = PackageName::new(name);
+    let source = DependencySource::Registry;
+    let outcomes = DependencyOutcomes::new();
+    let request = InteractiveFetchRequest::new(
+        VersionData::new(&fixture.cached, &fixture.resolved)
+            .with_ecosystem(ecosystem)
+            .with_outcomes(&outcomes)
+            .with_interactive_fetch_gate(&fixture.gate),
+        &fixture.manifest,
+        &package,
+        name,
+        &source,
+        FetchContext::Hover,
+    );
+    let (_, lookup) = request
+        .gated(registry, LookupKind::VersionList)
+        .expect("a gated request");
+    lookup.route.endpoint()
+}
+
+#[test]
+fn routes_split_by_endpoint_egress_and_ecosystem_but_not_by_manifest() {
+    let fixture = Fixture::new();
+    let local = registry_at("https://art.corp/npm/local/", EgressTier::Baseline);
+    let remote = registry_at("https://art.corp/npm/remote/", EgressTier::Baseline);
+    let guarded = registry_at("https://art.corp/npm/local/", EgressTier::Guarded);
+    let cargo = EcosystemId::Cargo;
+    let reference = route_of(&fixture, &local, cargo, "pkg");
+
+    assert_eq!(reference, route_of(&fixture, &local, cargo, "other-pkg"));
+    assert_ne!(reference, route_of(&fixture, &remote, cargo, "pkg"));
+    assert_ne!(reference, route_of(&fixture, &guarded, cargo, "pkg"));
+    assert_ne!(
+        reference,
+        route_of(&fixture, &local, EcosystemId::Npm, "pkg")
+    );
+    let elsewhere = Fixture {
+        manifest: manifest("/elsewhere/Cargo.toml"),
+        ..Fixture::new()
+    };
+    assert_eq!(reference, route_of(&elsewhere, &local, cargo, "pkg"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_resolved_endpoint_shares_breaker_and_memo_across_manifests() {
+    let fixture =
+        Fixture::new().with_endpoint(endpoint_at("https://art.corp/npm/", EgressTier::Baseline));
+    let (none, source) = (DependencyOutcomes::new(), DependencySource::Registry);
+    let online = NetworkMode::Online;
+    for (name, path) in [("slow-a", "/one/p.json"), ("slow-b", "/two/p.json")] {
+        fixture
+            .run_full(&manifest(path), name, &source, &none, online, Fetch::Stall)
+            .await;
+    }
+
+    let refused = fixture
+        .run_full(
+            &manifest("/three/p.json"),
+            "third",
+            &source,
+            &none,
+            online,
+            Fetch::Succeed,
+        )
+        .await;
+    let memoized = fixture
+        .run_full(
+            &manifest("/four/p.json"),
+            "slow-a",
+            &source,
+            &none,
+            online,
+            Fetch::Succeed,
+        )
+        .await;
+
+    assert_degraded(&refused, NoLiveList::Unverified);
+    assert_degraded(&memoized, NoLiveList::Unverified);
+    assert_eq!(fixture.calls(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unresolved_endpoint_keeps_the_breaker_per_manifest() {
+    let fixture = Fixture::new();
+    let (none, source) = (DependencyOutcomes::new(), DependencySource::Registry);
+    let online = NetworkMode::Online;
+    for (name, path) in [("slow-a", "/one/p.json"), ("slow-b", "/two/p.json")] {
+        fixture
+            .run_full(&manifest(path), name, &source, &none, online, Fetch::Stall)
+            .await;
+    }
+
+    let live = fixture
+        .run_full(
+            &manifest("/one/p.json"),
+            "third",
+            &source,
+            &none,
+            online,
+            Fetch::Succeed,
+        )
+        .await;
+
+    assert_matches!(live, InteractiveFetch::Live(1));
+    assert_eq!(fixture.calls(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_endpoints_of_one_manifest_have_independent_breakers() {
+    let fixture = Fixture::new();
+    let (none, source) = (DependencyOutcomes::new(), DependencySource::Registry);
+    let online = NetworkMode::Online;
+    let dead = registry_at("https://dead.example/", EgressTier::Baseline);
+    let live = registry_at("https://live.example/", EgressTier::Baseline);
+    let at = &fixture.manifest;
+    for name in ["slow-a", "slow-b"] {
+        fixture
+            .run_via(&dead, at, name, &source, &none, online, Fetch::Stall)
+            .await;
+    }
+
+    let healthy = fixture
+        .run_via(&live, at, "other", &source, &none, online, Fetch::Succeed)
+        .await;
+    let refused = fixture
+        .run_via(&dead, at, "third", &source, &none, online, Fetch::Succeed)
+        .await;
+
+    assert_matches!(healthy, InteractiveFetch::Live(1));
+    assert_degraded(&refused, NoLiveList::Unverified);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pin_resolution_honors_a_stalled_version_list_without_polling() {
+    let fixture = Fixture::new();
+    let started = tokio::time::Instant::now();
+    fixture.enriched("comp", Versions::STALL).await;
+
+    let pin = fixture
+        .lookup(AuxiliaryLookup::PinResolution, "comp", Fetch::Succeed)
+        .await;
+
+    assert_degraded(&pin, NoLiveList::Unverified);
+    assert_eq!(started.elapsed(), secs(10), "the pin fetch costs nothing");
+    assert_eq!(fixture.calls(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_pin_resolution_does_not_degrade_the_version_list() {
+    let fixture = Fixture::new();
+    fixture
+        .lookup(AuxiliaryLookup::PinResolution, "comp", Fetch::Stall)
+        .await;
+
+    let list = fixture.enriched("comp", Versions::Succeed(secs(1))).await;
+
+    assert_eq!(live_list(list).len(), 1);
+    assert_eq!(fixture.calls(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_latest_fallback_ignores_the_background_failure_but_keeps_its_own_record() {
+    let fixture = Fixture::new();
+    let outcomes = failing("serde", FetchFailure::Transient);
+    *fixture.kind.lock().unwrap() = AuxiliaryLookup::LatestFallback;
+
+    let polled = fixture.run("serde", &outcomes, Fetch::Stall).await;
+    let replay = fixture.run("serde", &outcomes, Fetch::Succeed).await;
+
+    assert_degraded(&polled, NoLiveList::Unverified);
+    assert_degraded(&replay, NoLiveList::Unverified);
+    assert_eq!(
+        fixture.calls(),
+        1,
+        "the seed was ignored; the memo replayed"
+    );
+    assert_eq!(fixture.gate.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_latest_fallback_does_not_degrade_the_version_list() {
+    let fixture = Fixture::new();
+    fixture
+        .lookup(AuxiliaryLookup::LatestFallback, "serde", Fetch::Stall)
+        .await;
+
+    let list = fixture.enriched("serde", Versions::Succeed(secs(1))).await;
+
+    assert_eq!(live_list(list).len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_latest_fallback_counts_for_the_endpoint_breaker() {
+    let fixture = Fixture::new();
+
+    fixture
+        .lookup(AuxiliaryLookup::LatestFallback, "a", Fetch::Stall)
+        .await;
+    fixture
+        .lookup(AuxiliaryLookup::LatestFallback, "b", Fetch::Stall)
+        .await;
+
+    assert!(is_open(fixture.health()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_local_failure_is_no_evidence_but_an_endpoint_failure_answers() {
+    let none = DependencyOutcomes::new();
+    let local = Fixture::new();
+    local.run("slow-a", &none, Fetch::Stall).await;
+    local.run("blocked", &none, Fetch::FailLocal).await;
+    local.run("slow-b", &none, Fetch::Stall).await;
+    assert!(
+        is_open(local.health()),
+        "a local failure vouches for nothing"
+    );
+
+    let remote = Fixture::new();
+    remote.run("slow-a", &none, Fetch::Stall).await;
+    remote.run("refused", &none, Fetch::Fail).await;
+    remote.run("slow-b", &none, Fetch::Stall).await;
+    assert_matches!(remote.health(), Some(EndpointHealth::Closed { .. }));
+}
+
+#[test]
+fn lookup_kinds_follow_the_policy_table() {
+    use super::key::{BackgroundSeed, MAX_LOOKUP_BUDGET};
+    let pin = LookupKind::Auxiliary(AuxiliaryLookup::PinResolution);
+    let decoration = LookupKind::Auxiliary(AuxiliaryLookup::Decoration);
+    let fallback = LookupKind::Auxiliary(AuxiliaryLookup::LatestFallback);
+    let (counts, ignored) = (BreakerEvidence::Counts, BreakerEvidence::Ignored);
+    let (applies, not_applied) = (BackgroundSeed::Applies, BackgroundSeed::Ignored);
+    let honors_list = Some(LookupKind::VersionList);
+    let cases = [
+        (LookupKind::VersionList, secs(10), counts, applies, None),
+        (pin, secs(5), counts, applies, honors_list),
+        (decoration, secs(5), ignored, applies, None),
+        (fallback, secs(5), counts, not_applied, None),
+    ];
+    for (kind, budget, evidence, seed, honors) in cases {
+        assert_eq!(kind.budget(), budget, "{kind:?}");
+        assert_eq!(kind.breaker_evidence(), evidence, "{kind:?}");
+        assert_eq!(kind.background_seed(), seed, "{kind:?}");
+        assert_eq!(kind.memo_policy().honors, honors, "{kind:?}");
+        assert!(kind.budget() <= MAX_LOOKUP_BUDGET, "{kind:?}");
+    }
+}
+
+/// Opens `endpoint` at `start` and takes its probe once the open period ran out.
+fn expired_probe(
+    breaker: &EndpointBreaker,
+    endpoint: &EndpointKey,
+    start: std::time::Instant,
+) -> (ProbeId, std::time::Instant) {
+    open_endpoint(breaker, endpoint, start);
+    let reopened = start + BREAKER_OPEN_DURATION;
+    let Admission::Probe(probe) = breaker.admit(
+        endpoint,
+        BreakerAdmission::Enforce,
+        BreakerEvidence::Counts,
+        reopened,
+    ) else {
+        panic!("an expired open breaker hands out the probe");
+    };
+    (probe, reopened)
+}
+
+fn report_for(
+    breaker: &EndpointBreaker,
+    endpoint: &EndpointKey,
+    evidence: AttemptEvidence,
+    probe: Option<ProbeId>,
+    at: std::time::Instant,
+) {
+    breaker.report(endpoint, &PackageName::new("a"), evidence, probe, at);
+}
+
+#[test]
+fn verdict_follows_the_health_table() {
+    let (breaker, endpoint, start) = (EndpointBreaker::default(), breaker_endpoint(0), now());
+    let (_, reopened) = expired_probe(&breaker, &endpoint, start);
+    let half_open = breaker.health(&endpoint).unwrap();
+    let open = EndpointHealth::Open {
+        until: start + BREAKER_OPEN_DURATION,
+    };
+    let closed = EndpointHealth::Closed {
+        last_answered: None,
+        suspect: None,
+    };
+    let lease_end = reopened + PROBE_LEASE;
+    let (counts, ignored) = (BreakerEvidence::Counts, BreakerEvidence::Ignored);
+    let before_expiry = start + BREAKER_OPEN_DURATION.saturating_sub(secs(1));
+
+    assert_eq!(verdict(None, counts, start), Verdict::Proceed);
+    assert_eq!(verdict(Some(&closed), counts, start), Verdict::Proceed);
+    assert_eq!(verdict(Some(&open), counts, before_expiry), Verdict::Refuse);
+    assert_eq!(verdict(Some(&open), counts, reopened), Verdict::TakeProbe);
+    assert_eq!(verdict(Some(&open), ignored, reopened), Verdict::Refuse);
+    let within_lease = reopened + PROBE_LEASE.saturating_sub(secs(1));
+    assert_eq!(
+        verdict(Some(&half_open), counts, within_lease),
+        Verdict::Refuse
+    );
+    assert_eq!(
+        verdict(Some(&half_open), counts, lease_end),
+        Verdict::TakeProbe
+    );
+    assert_eq!(
+        verdict(Some(&half_open), ignored, lease_end),
+        Verdict::Refuse,
+        "an expired lease must not hand a probe to a lookup that cannot settle it"
+    );
+}
+
+#[test]
+fn the_write_pass_re_decides_on_the_current_entry() {
+    let (breaker, endpoint, start) = (EndpointBreaker::default(), breaker_endpoint(0), now());
+    let counts = BreakerEvidence::Counts;
+    assert_eq!(
+        breaker.take_probe(&endpoint, counts, start),
+        Admission::Proceed,
+        "vacant"
+    );
+
+    report_for(&breaker, &endpoint, AttemptEvidence::Answered, None, start);
+    assert_eq!(
+        breaker.take_probe(&endpoint, counts, start),
+        Admission::Proceed,
+        "turned closed"
+    );
+
+    let other = breaker_endpoint(1);
+    let (_, reopened) = expired_probe(&breaker, &other, start);
+    assert_eq!(
+        breaker.take_probe(&other, counts, reopened),
+        Admission::Refused,
+        "fresh half-open"
+    );
+}
+
+#[test]
+fn a_probe_that_ends_inconclusive_leaves_the_next_request_to_probe() {
+    let (breaker, endpoint, start) = (EndpointBreaker::default(), breaker_endpoint(0), now());
+    let (probe, reopened) = expired_probe(&breaker, &endpoint, start);
+
+    let inconclusive = AttemptEvidence::Inconclusive;
+    report_for(&breaker, &endpoint, inconclusive, Some(probe), reopened);
+
+    assert_eq!(
+        breaker.health(&endpoint),
+        Some(EndpointHealth::Open { until: reopened })
+    );
+    assert_matches!(
+        breaker.admit(
+            &endpoint,
+            BreakerAdmission::Enforce,
+            BreakerEvidence::Counts,
+            reopened
+        ),
+        Admission::Probe(_)
+    );
+}
+
+#[test]
+fn a_lost_probe_expires_and_a_stale_probe_can_only_close() {
+    let (breaker, endpoint, start) = (EndpointBreaker::default(), breaker_endpoint(0), now());
+    let (stale, reopened) = expired_probe(&breaker, &endpoint, start);
+    let later = reopened + PROBE_LEASE;
+    let Admission::Probe(fresh) = breaker.admit(
+        &endpoint,
+        BreakerAdmission::Enforce,
+        BreakerEvidence::Counts,
+        later,
+    ) else {
+        panic!("a lost probe is reissued once its lease ends");
+    };
+    assert_ne!(stale, fresh);
+    let held = breaker.health(&endpoint);
+
+    report_for(
+        &breaker,
+        &endpoint,
+        AttemptEvidence::Slow,
+        Some(stale),
+        later,
+    );
+    let inconclusive = AttemptEvidence::Inconclusive;
+    report_for(&breaker, &endpoint, inconclusive, Some(stale), later);
+    assert_eq!(
+        breaker.health(&endpoint),
+        held,
+        "a stale probe cannot reopen"
+    );
+
+    let answered = AttemptEvidence::Answered;
+    report_for(&breaker, &endpoint, answered, Some(stale), later);
+    assert_matches!(
+        breaker.health(&endpoint),
+        Some(EndpointHealth::Closed { .. })
+    );
+}
+
+/// S1: the read pass of `report` sees `Closed{suspect: a}` and a corroborating slow `b` would
+/// open the breaker; a concurrent live answer lands before the write pass. The write pass must
+/// fold `b` into the answered state, not write the `Open` the stale read implied.
+#[test]
+fn a_report_applies_to_the_current_health_not_to_an_earlier_read() {
+    let (breaker, endpoint, start) = (EndpointBreaker::default(), breaker_endpoint(0), now());
+    let (a, b, c) = (
+        PackageName::new("a"),
+        PackageName::new("b"),
+        PackageName::new("c"),
+    );
+    breaker.report(&endpoint, &a, AttemptEvidence::Slow, None, start);
+
+    breaker.report_between(
+        &endpoint,
+        &b,
+        AttemptEvidence::Slow,
+        None,
+        start + secs(2),
+        || {
+            breaker.report(
+                &endpoint,
+                &c,
+                AttemptEvidence::Answered,
+                None,
+                start + secs(1),
+            );
+        },
+    );
+
+    assert_matches!(
+        breaker.health(&endpoint),
+        Some(EndpointHealth::Closed {
+            last_answered: Some(_),
+            suspect: None
+        })
+    );
+}
+
+#[test]
+fn answers_inside_the_refresh_window_do_not_rewrite_the_entry() {
+    let (breaker, endpoint, start) = (EndpointBreaker::default(), breaker_endpoint(0), now());
+    let answered_at = || match breaker.health(&endpoint) {
+        Some(EndpointHealth::Closed { last_answered, .. }) => last_answered,
+        other => panic!("expected a closed endpoint, got {other:?}"),
+    };
+    let answered = AttemptEvidence::Answered;
+    report_for(&breaker, &endpoint, answered, None, start);
+
+    report_for(&breaker, &endpoint, answered, None, start + secs(1));
+    assert_eq!(answered_at(), Some(start));
+    let inconclusive = AttemptEvidence::Inconclusive;
+    report_for(&breaker, &endpoint, inconclusive, None, start + secs(2));
+    assert_eq!(answered_at(), Some(start));
+    report_for(&breaker, &endpoint, answered, None, start + secs(6));
+    assert_eq!(answered_at(), Some(start + secs(6)));
+}
+
+#[test]
+fn a_full_breaker_makes_room_with_a_bounded_batch_of_closed_endpoints() {
+    let breaker = EndpointBreaker::default();
+    let start = now();
+    let answered = AttemptEvidence::Answered;
+    for index in 0..BREAKER_CAP {
+        report_for(&breaker, &breaker_endpoint(index), answered, None, start);
+    }
+    assert_eq!(breaker.len(), BREAKER_CAP);
+
+    let newcomer = breaker_endpoint(BREAKER_CAP);
+    report_for(&breaker, &newcomer, answered, None, start + secs(1));
+
+    assert_eq!(breaker.len(), BREAKER_CAP - BREAKER_CAP / 10 + 1);
+    assert!(breaker.health(&newcomer).is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_memo_evicts_exactly_one_oldest_record_per_insert_at_the_cap() {
+    let fixture = Fixture::new();
+    let none = DependencyOutcomes::new();
+    for index in 0..INTERACTIVE_MEMO_CAP {
+        fixture
+            .run(&format!("pkg{index}"), &none, Fetch::Fail)
+            .await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+
+    fixture.run("overflow", &none, Fetch::Fail).await;
+
+    assert_eq!(fixture.gate.len(), INTERACTIVE_MEMO_CAP);
+    let calls = fixture.calls();
+    let oldest = fixture.run("pkg0", &none, Fetch::Succeed).await;
+    let next_oldest = fixture.run("pkg1", &none, Fetch::Succeed).await;
+    assert_matches!(oldest, InteractiveFetch::Live(1));
+    assert_degraded(&next_oldest, NoLiveList::Unverified);
+    assert_eq!(fixture.calls(), calls + 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_local_failures_of_distinct_packages_open_the_breaker() {
+    let fixture = Fixture::new();
+    let none = DependencyOutcomes::new();
+
+    fixture.run("dns-a", &none, Fetch::FailLocalSlow).await;
+    fixture.run("dns-b", &none, Fetch::FailLocalSlow).await;
+
+    assert!(is_open(fixture.health()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_seed_from_one_manifest_survives_another_manifests_clean_request() {
+    let fixture =
+        Fixture::new().with_endpoint(endpoint_at("https://art.corp/npm/", EgressTier::Baseline));
+    let source = DependencySource::Registry;
+    let online = NetworkMode::Online;
+    let (first, second) = (manifest("/one/p.json"), manifest("/two/p.json"));
+    let failing = failing("serde", FetchFailure::Transient);
+    let clean = DependencyOutcomes::new();
+    let fetch = Fetch::Succeed;
+
+    let seeded = fixture
+        .run_full(&first, "serde", &source, &failing, online, fetch)
+        .await;
+    let other = fixture
+        .run_full(&second, "serde", &source, &clean, online, fetch)
+        .await;
+    let again = fixture
+        .run_full(&first, "serde", &source, &failing, online, fetch)
+        .await;
+
+    assert_degraded(&seeded, NoLiveList::Unverified);
+    assert_matches!(other, InteractiveFetch::Live(1));
+    assert_degraded(&again, NoLiveList::Unverified);
+    assert_eq!(fixture.calls(), 1, "only the clean manifest fetched");
+    assert_eq!(
+        fixture.gate.len(),
+        1,
+        "the seed was neither removed nor rewritten"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_latest_fallback_is_not_starved_by_a_saturated_gate() {
+    let fixture = Fixture::new();
+
+    let (_, _, _, fallback) = tokio::join!(
+        fixture.lookup(AuxiliaryLookup::Decoration, "a", Fetch::Stall),
+        fixture.lookup(AuxiliaryLookup::Decoration, "b", Fetch::Stall),
+        fixture.lookup(AuxiliaryLookup::Decoration, "c", Fetch::Stall),
+        fixture.lookup(AuxiliaryLookup::LatestFallback, "d", Fetch::Succeed),
+    );
+
+    assert_matches!(fallback, InteractiveFetch::Live(1));
 }

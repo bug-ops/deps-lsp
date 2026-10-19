@@ -16,8 +16,9 @@ use deps_core::parser::DependencySource;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
-    DepsError, EcosystemId, FreshnessSettings, HttpCache, RequestHeader, Result,
-    lsp_helpers::warn_rejected_value, not_found_or as core_not_found_or, registry::register_capped,
+    DepsError, EcosystemId, EgressTier, FreshnessSettings, HttpCache, RegistryEndpoint,
+    RequestHeader, Result, lsp_helpers::warn_rejected_value, not_found_or as core_not_found_or,
+    registry::register_capped,
 };
 use pep440_rs::{Version, VersionSpecifiers};
 use serde::Deserialize;
@@ -53,6 +54,28 @@ enum PypiRegistryTier {
     /// against the live [`deps_core::net_policy::RegistryAccessPolicy`] (mirrors
     /// `deps-npm`'s identical `WorkspaceDeclared` routing).
     WorkspaceDeclared,
+}
+
+impl PypiRegistryTier {
+    /// The egress of the transport this tier fetches through (the `get_cached*` family for
+    /// `Public`, the guarded `get_cached_workspace*` family for `WorkspaceDeclared`).
+    const fn egress(self) -> EgressTier {
+        match self {
+            Self::Public => EgressTier::Baseline,
+            Self::WorkspaceDeclared => EgressTier::Guarded,
+        }
+    }
+}
+
+/// Where a dependency source is fetched from: the single dispatch decision shared by version
+/// lookups and [`Registry::endpoint_for`](deps_core::Registry::endpoint_for), so they cannot
+/// drift apart.
+enum PypiRoute {
+    Public,
+    Chain(Arc<PypiRegistry>),
+    /// An alternate index with no registered chain. It never falls back to `pypi.org`: that
+    /// would send a private package name to the public index.
+    Unregistered,
 }
 
 /// Base URL for package pages on pypi.org
@@ -171,6 +194,9 @@ pub struct PypiRegistry {
     /// lookup. Deliberately does **not** parameterize `metadata_url` too — see that
     /// function's own doc for why (different URL root, would 404).
     simple_base: String,
+    /// The endpoint [`Self::endpoint`] reports, computed on first use (the fingerprint hashes
+    /// URL text, which the gate would otherwise redo for every lookup).
+    endpoint: deps_core::CachedEndpoint,
     /// Build-once, in-memory package-name search index (issue #419). See
     /// `crate::search` for the full design. Never populated for a `WorkspaceDeclared`-tier
     /// client — `search`/`warm_search_index` are tier-guarded off before ever reaching it
@@ -216,6 +242,7 @@ impl PypiRegistry {
             cache,
             index_url,
             simple_base: PYPI_SIMPLE_BASE.to_string(),
+            endpoint: deps_core::CachedEndpoint::default(),
             index: Arc::new(crate::search::IndexCell::new()),
             tier: PypiRegistryTier::Public,
             alternates: Arc::new(DashMap::new()),
@@ -240,6 +267,7 @@ impl PypiRegistry {
             cache,
             index_url: crate::search::SIMPLE_INDEX_URL.to_string(),
             simple_base,
+            endpoint: deps_core::CachedEndpoint::default(),
             index: Arc::new(crate::search::IndexCell::new()),
             tier: PypiRegistryTier::Public,
             alternates: Arc::new(DashMap::new()),
@@ -269,6 +297,7 @@ impl PypiRegistry {
             cache,
             index_url: crate::search::SIMPLE_INDEX_URL.to_string(),
             simple_base: simple_base.as_str().to_string(),
+            endpoint: deps_core::CachedEndpoint::default(),
             index: Arc::new(crate::search::IndexCell::new()),
             tier: PypiRegistryTier::WorkspaceDeclared,
             alternates: Arc::new(DashMap::new()),
@@ -328,6 +357,7 @@ impl PypiRegistry {
                         cache: Arc::clone(&root.cache),
                         index_url: root.index_url.clone(),
                         simple_base: root.simple_base.clone(),
+                        endpoint: deps_core::CachedEndpoint::default(),
                         index: Arc::new(crate::search::IndexCell::new()),
                         tier: PypiRegistryTier::Public,
                         alternates: Arc::new(DashMap::new()),
@@ -352,6 +382,27 @@ impl PypiRegistry {
     #[must_use]
     pub fn alternate_client(&self, index: &str) -> Option<Arc<Self>> {
         self.alternates.get(index).map(|entry| Arc::clone(&entry))
+    }
+
+    fn route(&self, source: &DependencySource) -> PypiRoute {
+        match source {
+            DependencySource::AlternateRegistry { index, .. } => self
+                .alternate_client(index)
+                .map_or(PypiRoute::Unregistered, PypiRoute::Chain),
+            _ => PypiRoute::Public,
+        }
+    }
+
+    /// The network path of a lookup through this client: its own simple base, then each
+    /// fallback hop's, in walk order (the order [`Self::get_versions_chained`] tries them).
+    fn endpoint(&self) -> RegistryEndpoint {
+        self.endpoint.get_or_compute(|| {
+            RegistryEndpoint::chain_from_strs(
+                std::iter::once(self)
+                    .chain(self.fallback_chain.iter().map(Arc::as_ref))
+                    .map(|hop| (hop.simple_base.as_str(), hop.tier.egress())),
+            )
+        })
     }
 
     /// FR-005/NFR-006: tries `self` (hop 0) first, then each already-resolved
@@ -735,25 +786,32 @@ impl deps_core::Registry for PypiRegistry {
         deps_core::error::Result<Vec<Box<dyn deps_core::Version>>>,
     > {
         Box::pin(async move {
-            match source {
-                DependencySource::AlternateRegistry { index, .. } => {
-                    match self.alternate_client(index) {
-                        Some(client) => {
-                            let versions = client.get_versions_chained(name.as_str()).await?;
-                            Ok(versions
-                                .into_iter()
-                                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                                .collect())
-                        }
-                        None => Err(DepsError::PackageNotFound {
-                            package: name.as_str().into(),
-                            registry: "alternate registry (not registered)",
-                        }),
-                    }
+            match self.route(source) {
+                PypiRoute::Chain(client) => {
+                    let versions = client.get_versions_chained(name.as_str()).await?;
+                    Ok(versions
+                        .into_iter()
+                        .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                        .collect())
                 }
-                _ => deps_core::Registry::get_versions_with(self, name, freshness).await,
+                PypiRoute::Public => {
+                    deps_core::Registry::get_versions_with(self, name, freshness).await
+                }
+                PypiRoute::Unregistered => Err(deps_core::registry::alternate_not_registered(name)),
             }
         })
+    }
+
+    fn endpoint_for(
+        &self,
+        _name: &deps_core::PackageName,
+        source: &DependencySource,
+    ) -> RegistryEndpoint {
+        match self.route(source) {
+            PypiRoute::Public => self.endpoint(),
+            PypiRoute::Chain(client) => client.endpoint(),
+            PypiRoute::Unregistered => RegistryEndpoint::Unresolved,
+        }
     }
 
     /// `get_versions_from`'s `get_latest_matching`-shaped counterpart — same dispatch, same
@@ -779,31 +837,23 @@ impl deps_core::Registry for PypiRegistry {
         deps_core::error::Result<Option<Box<dyn deps_core::Version>>>,
     > {
         Box::pin(async move {
-            match source {
-                DependencySource::AlternateRegistry { index, .. } => {
-                    match self.alternate_client(index) {
-                        Some(client) => {
-                            let versions: Vec<Box<dyn deps_core::Version>> = client
-                                .get_versions_chained(name.as_str())
-                                .await?
-                                .into_iter()
-                                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                                .collect();
-                            let idx =
-                                client.select_latest_matching(&versions, req, selection_context);
-                            Ok(idx.and_then(|i| versions.into_iter().nth(i)))
-                        }
-                        None => Err(DepsError::PackageNotFound {
-                            package: name.as_str().into(),
-                            registry: "alternate registry (not registered)",
-                        }),
-                    }
+            match self.route(source) {
+                PypiRoute::Chain(client) => {
+                    let versions: Vec<Box<dyn deps_core::Version>> = client
+                        .get_versions_chained(name.as_str())
+                        .await?
+                        .into_iter()
+                        .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                        .collect();
+                    let idx = client.select_latest_matching(&versions, req, selection_context);
+                    Ok(idx.and_then(|i| versions.into_iter().nth(i)))
                 }
-                _ => {
+                PypiRoute::Public => {
                     let version =
                         Self::get_latest_matching(self, name.as_str(), req.as_str()).await?;
                     Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
                 }
+                PypiRoute::Unregistered => Err(deps_core::registry::alternate_not_registered(name)),
             }
         })
     }
@@ -2431,6 +2481,52 @@ mod tests {
         };
         PypiRegistry::register_alternate(&root, &chain);
         assert!(root.alternate_client("empty").is_none());
+    }
+
+    /// The gate keys its breaker on `endpoint_for`, so it must follow `get_versions_from`'s
+    /// route: the public index, the whole hop chain (order and per-hop egress included) for a
+    /// registered alternate, and nothing for an unregistered one.
+    #[test]
+    fn test_endpoint_for_follows_the_dispatch_route() {
+        use deps_core::{EgressTier, PackageName, Registry, RegistryEndpoint};
+
+        let root = Arc::new(PypiRegistry::new(Arc::new(HttpCache::new())));
+        let register = |key: &str, hops: &[&str]| {
+            let chain = crate::config::ResolvedChain {
+                key: key.to_string(),
+                key_shape: deps_core::registry::KeyShape::Opaque,
+                hops: hops.iter().map(|hop| index_url(hop)).collect(),
+                implicit_public_fallback: false,
+            };
+            PypiRegistry::register_alternate(&root, &chain);
+        };
+        register("one", &["https://a.example/simple"]);
+        register(
+            "two",
+            &["https://a.example/simple", "https://b.example/simple"],
+        );
+        register(
+            "rev",
+            &["https://b.example/simple", "https://a.example/simple"],
+        );
+        let name = PackageName::new("pkg");
+        let endpoint = |source: &DependencySource| root.endpoint_for(&name, source);
+        let via = |key: &str| DependencySource::AlternateRegistry {
+            index: key.to_string(),
+            mirrors_crates_io: false,
+        };
+
+        assert_eq!(
+            endpoint(&DependencySource::Registry),
+            RegistryEndpoint::from_base_str("https://pypi.org/simple", EgressTier::Baseline)
+        );
+        assert_eq!(
+            endpoint(&via("one")),
+            RegistryEndpoint::from_base_str("https://a.example/simple", EgressTier::Guarded)
+        );
+        assert_ne!(endpoint(&via("one")), endpoint(&via("two")));
+        assert_ne!(endpoint(&via("two")), endpoint(&via("rev")));
+        assert_eq!(endpoint(&via("missing")), RegistryEndpoint::Unresolved);
     }
 
     /// `register_alternate` is idempotent per key — a second registration for the same key is a

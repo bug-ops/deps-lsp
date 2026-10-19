@@ -518,9 +518,7 @@ impl Ecosystem for GitlabCiEcosystem {
             let dep_source = dep.source();
             if gl_dep.kind == IncludeKind::Component
                 && let Some(pin @ (PinStyle::Latest | PinStyle::Partial)) = &gl_dep.pin
-                && let deps_core::parser::DependencySource::AlternateRegistry { index, .. } =
-                    &dep_source
-                && let Some(route) = registry.routes().get(index).map(|r| r.clone())
+                && let Some(route) = registry.route(&dep_source)
                 && let Some(raw) = gl_dep
                     .version_req
                     .as_ref()
@@ -528,6 +526,7 @@ impl Ecosystem for GitlabCiEcosystem {
             {
                 let normalized_name = self.formatter.normalize_package_name(dep.name());
                 let outcome = await_interactive_fetch(
+                    registry.as_ref(),
                     registry.resolve_component_pin(dep.name(), &route, pin, raw),
                     InteractiveFetchRequest::new(
                         versions,
@@ -2704,9 +2703,9 @@ mod tests {
             untouched.assert_async().await;
         }
 
-        /// Hover routes the same FR-007 resolution through the gate: after a dead releases
-        /// endpoint failed the base list and the pin resolution once, a second hover makes no
-        /// request at all.
+        /// Hover routes the same FR-007 resolution through the gate: a dead releases endpoint
+        /// fails the base list once, the pin resolution (which honors that failure) is never
+        /// polled, and a second hover makes no request at all.
         #[tokio::test]
         async fn test_generate_hover_component_pin_after_a_failure_makes_no_request() {
             let mut server = mockito::Server::new_async().await;
@@ -2764,7 +2763,7 @@ mod tests {
                 .await;
 
             assert!(first.is_some() && second.is_some());
-            assert_eq!(gate.len(), 2, "the version list and the pin resolution");
+            assert_eq!(gate.len(), 1, "only the version list is recorded");
             untouched.assert_async().await;
         }
 

@@ -30,7 +30,7 @@
 use crate::config::{AuthToken, IndexTrust, RegistryIndex};
 use crate::types::CargoVersion;
 use deps_core::{
-    DepsError, HttpCache, Result,
+    DepsError, EgressTier, HttpCache, RegistryEndpoint, Result,
     cache::{CredentialHeader, RequestAuth},
     lsp_helpers::warn_rejected_value,
     net_policy::{RedactedUrl, TrustedPrefix},
@@ -238,9 +238,48 @@ pub struct SparseIndexClient {
     trust: IndexTrust,
     /// Display name used in [`deps_core::DepsError::PackageNotFound`] messages.
     registry_display_name: &'static str,
+    /// The endpoint [`Self::endpoint`] reports, computed on first use (the fingerprint hashes
+    /// URL text, which the gate would otherwise redo for every lookup).
+    endpoint: deps_core::CachedEndpoint,
+}
+
+/// The transport [`SparseIndexClient::fetch`] sends a request through, decided once from the
+/// client's credential and trust tier so the request path and
+/// [`SparseIndexClient::endpoint`]'s egress cannot disagree.
+enum IndexTransport<'a> {
+    TrustedOrigin(&'a deps_core::secret::AuthorizationValue),
+    System,
+    Workspace,
+    /// A credential on a workspace-declared index: no request is sent.
+    Refused,
 }
 
 impl SparseIndexClient {
+    fn transport(&self) -> IndexTransport<'_> {
+        match (&self.auth_header, self.trust) {
+            (Some(header_value), IndexTrust::Trusted) => {
+                IndexTransport::TrustedOrigin(header_value)
+            }
+            (None, IndexTrust::Trusted) => IndexTransport::System,
+            (None, IndexTrust::WorkspaceDeclared) => IndexTransport::Workspace,
+            (Some(_), IndexTrust::WorkspaceDeclared) => IndexTransport::Refused,
+        }
+    }
+
+    /// The network path this client's requests travel: its index base through the egress its
+    /// transport uses (system proxy for trusted indexes, the guarded direct path for
+    /// workspace-declared ones).
+    #[must_use]
+    pub fn endpoint(&self) -> RegistryEndpoint {
+        self.endpoint.get_or_compute(|| {
+            let egress = match self.transport() {
+                IndexTransport::TrustedOrigin(_) | IndexTransport::System => EgressTier::Baseline,
+                IndexTransport::Workspace | IndexTransport::Refused => EgressTier::Guarded,
+            };
+            RegistryEndpoint::base(self.base.as_url(), egress)
+        })
+    }
+
     /// Creates a new unauthenticated sparse-index client for `index`.
     ///
     /// Takes a validated [`RegistryIndex`], not a bare `String` (plan-1b §1.2, critic S2):
@@ -254,6 +293,7 @@ impl SparseIndexClient {
             cache,
             auth_header: None,
             registry_display_name: "sparse index",
+            endpoint: deps_core::CachedEndpoint::default(),
         }
     }
 
@@ -274,6 +314,7 @@ impl SparseIndexClient {
             cache,
             auth_header,
             registry_display_name,
+            endpoint: deps_core::CachedEndpoint::default(),
         }
     }
 
@@ -377,8 +418,8 @@ impl SparseIndexClient {
     ///
     /// Same as [`Self::get_versions`], plus `DepsError::CacheError` for the fail-closed arm.
     async fn fetch(&self, url: &str) -> Result<bytes::Bytes> {
-        match (&self.auth_header, self.trust) {
-            (Some(header_value), IndexTrust::Trusted) => {
+        match self.transport() {
+            IndexTransport::TrustedOrigin(header_value) => {
                 let auth = RequestAuth::credential(
                     CredentialHeader::Authorization(header_value),
                     &self.base,
@@ -387,9 +428,9 @@ impl SparseIndexClient {
                     .get_cached_trusted_origin(url, &self.base, auth, None)
                     .await
             }
-            (None, IndexTrust::Trusted) => self.cache.get_cached(url).await,
-            (None, IndexTrust::WorkspaceDeclared) => self.cache.get_cached_workspace(url).await,
-            (Some(_), IndexTrust::WorkspaceDeclared) => {
+            IndexTransport::System => self.cache.get_cached(url).await,
+            IndexTransport::Workspace => self.cache.get_cached_workspace(url).await,
+            IndexTransport::Refused => {
                 let safe_base_url = RedactedUrl::new(self.base.as_str());
                 tracing::error!(
                     url = %safe_base_url,

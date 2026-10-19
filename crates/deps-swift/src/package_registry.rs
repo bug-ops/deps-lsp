@@ -18,7 +18,9 @@ use deps_core::github::{normalize_tag, semver_tags_newest_first};
 use deps_core::keychain_credentials::{KeychainGeneration, KeychainSnapshot};
 use deps_core::pagination::{NextPage, next_page};
 use deps_core::policy_config::KeychainCredentials;
-use deps_core::{DepsError, HttpCache, Result, RevalidationFailure, not_found_or};
+use deps_core::{
+    DepsError, EgressTier, HttpCache, RegistryEndpoint, Result, RevalidationFailure, not_found_or,
+};
 use serde::Deserialize;
 use url::Url;
 
@@ -80,6 +82,16 @@ pub(crate) enum TransportKind {
     TrustedOrigin,
     /// Origin-pinned redirects, workspace-policy connect guard, never authenticated.
     Pinned,
+}
+
+impl TransportKind {
+    /// The egress this transport sends requests through.
+    const fn egress(self) -> EgressTier {
+        match self {
+            Self::TrustedOrigin => EgressTier::Baseline,
+            Self::Pinned => EgressTier::Guarded,
+        }
+    }
 }
 
 /// The only place a transport is chosen.
@@ -246,6 +258,9 @@ pub(crate) struct PackageRegistryClient {
     round_seq: AtomicU64,
     published_at: PublishedAtCache,
     credential_state: Mutex<Option<CredentialState>>,
+    /// The endpoint [`Self::endpoint`] reports, computed on first use (the fingerprint hashes
+    /// URL text, which the gate would otherwise redo for every lookup).
+    endpoint: deps_core::CachedEndpoint,
 }
 
 /// Whether a request carried a credential.
@@ -276,6 +291,17 @@ impl CredentialState {
 }
 
 impl PackageRegistryClient {
+    /// The network path every request of this client travels: its registry URL through the
+    /// egress of the transport its trust tier selects.
+    pub(crate) fn endpoint(&self) -> RegistryEndpoint {
+        self.endpoint.get_or_compute(|| {
+            RegistryEndpoint::from_base_str(
+                self.registry.url.as_str(),
+                transport_for(self.registry.url.trust()).egress(),
+            )
+        })
+    }
+
     pub(crate) fn new(cache: Arc<HttpCache>, registry: ResolvedSwiftRegistry) -> Self {
         let digest = registry.digest();
         Self {
@@ -287,6 +313,7 @@ impl PackageRegistryClient {
             round_seq: AtomicU64::new(0),
             published_at: PublishedAtCache::new(),
             credential_state: Mutex::new(None),
+            endpoint: deps_core::CachedEndpoint::default(),
         }
     }
 
@@ -799,6 +826,30 @@ mod tests {
             transport_for(RegistryTrust::WorkspaceDeclared),
             TransportKind::Pinned
         );
+    }
+
+    /// The gate keys its breaker on this endpoint, so its egress must be the one the
+    /// transport chosen for the trust tier uses, and the trailing slash must not split it.
+    #[test]
+    fn test_endpoint_follows_the_transport_chosen_for_the_trust_tier() {
+        use deps_core::{EgressTier, RegistryEndpoint};
+
+        let trusted = client("https://r.example/api", RegistryTrust::Trusted, None);
+        let declared = client(
+            "https://r.example/api/",
+            RegistryTrust::WorkspaceDeclared,
+            None,
+        );
+
+        assert_eq!(
+            trusted.endpoint(),
+            RegistryEndpoint::from_base_str("https://r.example/api", EgressTier::Baseline)
+        );
+        assert_eq!(
+            declared.endpoint(),
+            RegistryEndpoint::from_base_str("https://r.example/api", EgressTier::Guarded)
+        );
+        assert_ne!(trusted.endpoint(), declared.endpoint());
     }
 
     #[test]

@@ -10,8 +10,9 @@
 use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
 use crate::types::{DenoMetadata, JsrPackage, JsrVersion};
 use deps_core::{
-    DepsError, FreshnessSettings, HttpCache, Metadata, PackageName, Registry, Result, Version,
-    VersionReq, lsp_helpers::warn_rejected_value, not_found_or as core_not_found_or,
+    DependencySource, DepsError, EgressTier, FreshnessSettings, HttpCache, Metadata, PackageName,
+    Registry, RegistryEndpoint, Result, Version, VersionReq, lsp_helpers::warn_rejected_value,
+    not_found_or as core_not_found_or,
 };
 use deps_npm::NpmRegistry;
 use serde::Deserialize;
@@ -136,6 +137,28 @@ fn npm_bare_name(name: &PackageName, rest: &str) -> Result<PackageName> {
     Ok(PackageName::new(rest))
 }
 
+/// Where a Deno package name is fetched from. The single dispatch decision shared by every
+/// `Registry` method and [`Registry::endpoint_for`], so they cannot drift apart.
+enum DenoRoute<'a> {
+    Jsr { scope: &'a str, pkg: &'a str },
+    Npm { bare: PackageName },
+}
+
+/// Routes a scheme-qualified `name`, or fails as [`unroutable`] does for a name no registry
+/// can serve (no scheme, a bare `npm:`, a `jsr:` name without a scope).
+fn route(name: &PackageName) -> Result<DenoRoute<'_>> {
+    match split_scheme(name.as_str()) {
+        Some((Scheme::Jsr, rest)) => {
+            let (scope, pkg) = split_scoped(rest).ok_or_else(|| unroutable(name))?;
+            Ok(DenoRoute::Jsr { scope, pkg })
+        }
+        Some((Scheme::Npm, rest)) => Ok(DenoRoute::Npm {
+            bare: npm_bare_name(name, rest)?,
+        }),
+        None => Err(unroutable(name)),
+    }
+}
+
 /// One JSR package version entry inside `meta.json`'s `versions` object.
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -187,6 +210,9 @@ pub struct JsrRegistry {
     cache: Arc<HttpCache>,
     base: String,
     api_base: String,
+    /// The endpoint [`Self::endpoint`] reports, computed on first use (the fingerprint hashes
+    /// URL text, which the gate would otherwise redo for every lookup).
+    endpoint: deps_core::CachedEndpoint,
 }
 
 impl JsrRegistry {
@@ -201,7 +227,14 @@ impl JsrRegistry {
             cache,
             base,
             api_base,
+            endpoint: deps_core::CachedEndpoint::default(),
         }
+    }
+
+    /// The network path `meta.json` lookups travel.
+    fn endpoint(&self) -> RegistryEndpoint {
+        self.endpoint
+            .get_or_compute(|| RegistryEndpoint::from_base_str(&self.base, EgressTier::Baseline))
     }
 
     /// Fetches all versions of `@{scope}/{name}` from `meta.json`.
@@ -533,24 +566,19 @@ impl Registry for DenoRegistry {
         name: &'a PackageName,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn Version>>>> {
         Box::pin(async move {
-            match split_scheme(name.as_str()) {
-                Some((Scheme::Jsr, rest)) => {
-                    let (scope, pkg) = split_scoped(rest).ok_or_else(|| unroutable(name))?;
+            match route(name)? {
+                DenoRoute::Jsr { scope, pkg } => {
                     let versions = self.jsr.get_versions(scope, pkg).await?;
                     Ok(versions
                         .into_iter()
                         .map(|v| Box::new(v) as Box<dyn Version>)
                         .collect())
                 }
-                Some((Scheme::Npm, rest)) => {
-                    let bare = npm_bare_name(name, rest)?;
-                    // S3: `NpmRegistry` has an *inherent* `get_versions` that shadows the
-                    // trait method and silently drops `get_versions_with`'s freshness
-                    // semantics if called via plain method syntax — UFCS forces the trait
-                    // method.
-                    Registry::get_versions(&self.npm, &bare).await
-                }
-                None => Err(unroutable(name)),
+                // S3: `NpmRegistry` has an *inherent* `get_versions` that shadows the
+                // trait method and silently drops `get_versions_with`'s freshness
+                // semantics if called via plain method syntax — UFCS forces the trait
+                // method.
+                DenoRoute::Npm { bare } => Registry::get_versions(&self.npm, &bare).await,
             }
         })
     }
@@ -561,14 +589,13 @@ impl Registry for DenoRegistry {
         freshness: FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn Version>>>> {
         Box::pin(async move {
-            match split_scheme(name.as_str()) {
-                Some((Scheme::Npm, rest)) => {
-                    let bare = npm_bare_name(name, rest)?;
+            match route(name)? {
+                DenoRoute::Npm { bare } => {
                     Registry::get_versions_with(&self.npm, &bare, freshness).await
                 }
                 // JSR's `meta.json` already carries `createdAt` in the same response
                 // `get_versions` fetches (D10) — no separate freshness request needed.
-                _ => self.get_versions(name).await,
+                DenoRoute::Jsr { .. } => self.get_versions(name).await,
             }
         })
     }
@@ -588,12 +615,11 @@ impl Registry for DenoRegistry {
         freshness: FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn Version>>>> {
         Box::pin(async move {
-            match split_scheme(name.as_str()) {
-                Some((Scheme::Npm, rest)) => {
-                    let bare = npm_bare_name(name, rest)?;
+            match route(name)? {
+                DenoRoute::Npm { bare } => {
                     Registry::get_versions_from(&self.npm, &bare, source, freshness).await
                 }
-                _ => self.get_versions_with(name, freshness).await,
+                DenoRoute::Jsr { .. } => self.get_versions_with(name, freshness).await,
             }
         })
     }
@@ -605,9 +631,8 @@ impl Registry for DenoRegistry {
         selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
         Box::pin(async move {
-            match split_scheme(name.as_str()) {
-                Some((Scheme::Jsr, rest)) => {
-                    let (scope, pkg) = split_scoped(rest).ok_or_else(|| unroutable(name))?;
+            match route(name)? {
+                DenoRoute::Jsr { scope, pkg } => {
                     // Pre-check before any network call: a malformed requirement must stay
                     // `Err` (R5c's diagnostic), not silently become `Ok(None)` (R5e, no diagnostic).
                     deps_npm::parse_range_safe(req.as_str())
@@ -625,11 +650,9 @@ impl Registry for DenoRegistry {
                         .select_latest_matching(&versions, req, selection_context)
                         .and_then(|idx| versions.into_iter().nth(idx)))
                 }
-                Some((Scheme::Npm, rest)) => {
-                    let bare = npm_bare_name(name, rest)?;
+                DenoRoute::Npm { bare } => {
                     Registry::get_latest_matching(&self.npm, &bare, req, selection_context).await
                 }
-                None => Err(unroutable(name)),
             }
         })
     }
@@ -646,9 +669,8 @@ impl Registry for DenoRegistry {
         selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
         Box::pin(async move {
-            match split_scheme(name.as_str()) {
-                Some((Scheme::Npm, rest)) => {
-                    let bare = npm_bare_name(name, rest)?;
+            match route(name)? {
+                DenoRoute::Npm { bare } => {
                     Registry::get_latest_matching_from(
                         &self.npm,
                         &bare,
@@ -658,9 +680,19 @@ impl Registry for DenoRegistry {
                     )
                     .await
                 }
-                _ => self.get_latest_matching(name, req, selection_context).await,
+                DenoRoute::Jsr { .. } => {
+                    self.get_latest_matching(name, req, selection_context).await
+                }
             }
         })
+    }
+
+    fn endpoint_for(&self, name: &PackageName, source: &DependencySource) -> RegistryEndpoint {
+        match route(name) {
+            Ok(DenoRoute::Jsr { .. }) => self.jsr.endpoint(),
+            Ok(DenoRoute::Npm { bare }) => Registry::endpoint_for(&self.npm, &bare, source),
+            Err(_) => RegistryEndpoint::Unresolved,
+        }
     }
 
     fn search_raw<'a>(
@@ -1946,5 +1978,44 @@ mod tests {
             .get_license(&PackageName::new("npm:react"), "18.0.0")
             .await;
         assert!(license.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use std::sync::Arc;
+
+    use deps_core::{
+        DependencySource, EgressTier, HttpCache, PackageName, Registry, RegistryEndpoint,
+    };
+    use deps_npm::NpmRegistry;
+
+    use super::DenoRegistry;
+
+    /// The gate keys its breaker on `endpoint_for`, so a name must get the endpoint of the
+    /// registry `get_versions_from` dispatches it to: `jsr:` to JSR, `npm:` to whatever npm's
+    /// own route gives the bare name, and an unroutable name to none.
+    #[test]
+    fn endpoint_for_follows_the_scheme_dispatch() {
+        let cache = Arc::new(HttpCache::new());
+        let npm = NpmRegistry::new(Arc::clone(&cache));
+        let registry = DenoRegistry::with_npm(cache, npm.clone());
+        let source = DependencySource::Registry;
+        let endpoint = |name: &str| registry.endpoint_for(&PackageName::new(name), &source);
+
+        let jsr = endpoint("jsr:@std/fs");
+        let npm_endpoint = endpoint("npm:react");
+
+        assert_eq!(
+            jsr,
+            RegistryEndpoint::from_base_str("https://jsr.io", EgressTier::Baseline)
+        );
+        assert_eq!(
+            npm_endpoint,
+            npm.endpoint_for(&PackageName::new("react"), &source)
+        );
+        assert_ne!(jsr, npm_endpoint);
+        assert_eq!(endpoint("react"), RegistryEndpoint::Unresolved);
+        assert_eq!(endpoint("npm:"), RegistryEndpoint::Unresolved);
     }
 }

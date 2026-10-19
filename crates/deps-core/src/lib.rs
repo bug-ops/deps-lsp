@@ -215,6 +215,8 @@ pub mod redact_debug;
 /// The [`registry::Registry`] trait: version lookup and search that every
 /// ecosystem's registry client implements.
 pub mod registry;
+/// [`registry_endpoint::RegistryEndpoint`]: the network path of a registry lookup.
+pub mod registry_endpoint;
 /// Re-export of [`redact::secret`] at its pre-#1247 path.
 pub use redact::secret;
 /// [`selection::SelectionContext`]/[`selection::StabilityFloor`]: manifest-scoped
@@ -261,7 +263,7 @@ pub use edit::{
     collect_update_candidates, collect_update_edits, dedup_overlapping_edits, plan_verified_fix,
     plan_vulnerability_fix, resolve_recommended_fix, resolve_verified_fix,
 };
-pub use error::{DepsError, FetchFailure, RateLimitEvidence, Result};
+pub use error::{DepsError, ErrorOrigin, FetchFailure, RateLimitEvidence, Result};
 pub use freshness::{
     CooldownWindow, DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_relative_age,
 };
@@ -312,6 +314,7 @@ pub use registry::{
     existence_wildcard_req, find_latest_stable, has_default_prerelease_marker, hash_routing_key,
     is_existence_wildcard, is_existence_wildcard_str, not_found_or, select_latest_for_existence,
 };
+pub use registry_endpoint::{CachedEndpoint, EgressTier, EndpointFingerprint, RegistryEndpoint};
 pub use selection::{
     InvalidStabilityOccurrence, SelectionContext, StabilityFloor, UnknownStability,
 };

@@ -33,7 +33,9 @@ use deps_core::parser::DependencySource;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::registry::{KeyShape, register_capped_with_occupied};
-use deps_core::{DepsError, EcosystemId, HttpCache, PackageName, Result, net_policy::RedactedUrl};
+use deps_core::{
+    EcosystemId, HttpCache, PackageName, RegistryEndpoint, Result, net_policy::RedactedUrl,
+};
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use std::any::Any;
@@ -113,6 +115,11 @@ impl CratesIoRegistry {
             cache,
             search_base: base.to_string(),
         }
+    }
+
+    /// The network path version lookups travel: the built-in sparse index.
+    fn endpoint(&self) -> RegistryEndpoint {
+        self.sparse.endpoint()
     }
 
     /// Fetches all versions for a crate from the sparse index.
@@ -425,6 +432,15 @@ pub struct CargoRegistry {
     cache: Arc<HttpCache>,
 }
 
+/// Where a dependency source is fetched from: the single dispatch decision shared by
+/// version lookups and `endpoint_for`, so they cannot drift apart.
+enum CargoRoute {
+    CratesIo,
+    Alternate(Arc<SparseIndexClient>),
+    /// An alternate index with no registered client and no crates.io mirror claim.
+    Unregistered,
+}
+
 impl CargoRegistry {
     /// Creates a new router with the given HTTP cache, backing both crates.io and every
     /// alternate registry client this router later registers.
@@ -468,7 +484,7 @@ impl CargoRegistry {
     /// [`deps_core::registry::MAX_ALTERNATE_REGISTRIES`] is reached and `index` is not
     /// already present (spec NFR-007) — the dependency stays unregistered rather than
     /// evicting an existing, possibly still-in-use, client: it degrades to
-    /// [`DepsError::PackageNotFound`], never to a crates.io lookup by name.
+    /// [`deps_core::DepsError::PackageNotFound`], never to a crates.io lookup by name.
     ///
     /// Issue #455, C3: a re-registration of an *already-registered* index URL now folds to
     /// the stricter of the stored and incoming [`crate::config::IndexTrust`] tier, dropping
@@ -536,6 +552,31 @@ impl CargoRegistry {
         self.alternates.get(index).map(|entry| Arc::clone(&entry))
     }
 
+    /// Routes `source`. An unregistered *verified crates.io mirror* degrades to crates.io
+    /// rather than blanking the manifest (Cargo verifies per-version checksums against
+    /// crates.io for a mirror, plan-1b §6 M2); a genuinely private registry stays
+    /// [`CargoRoute::Unregistered`].
+    fn route(&self, source: &DependencySource) -> CargoRoute {
+        match source {
+            DependencySource::AlternateRegistry {
+                index,
+                mirrors_crates_io,
+            } => match self.alternate_client(index) {
+                Some(client) => CargoRoute::Alternate(client),
+                None if *mirrors_crates_io => CargoRoute::CratesIo,
+                None => CargoRoute::Unregistered,
+            },
+            _ => CargoRoute::CratesIo,
+        }
+    }
+
+    fn record_index(source: &DependencySource) {
+        if let DependencySource::AlternateRegistry { index, .. } = source {
+            tracing::Span::current()
+                .record("index", tracing::field::display(RedactedUrl::new(index)));
+        }
+    }
+
     #[tracing::instrument(skip_all, fields(package = %name.for_tracing(), index = tracing::field::Empty), level = "debug")]
     async fn get_versions_for_source(
         &self,
@@ -543,35 +584,15 @@ impl CargoRegistry {
         source: &DependencySource,
         freshness: deps_core::freshness::FreshnessSettings,
     ) -> Result<Vec<CargoVersion>> {
-        match source {
-            DependencySource::AlternateRegistry {
-                index,
-                mirrors_crates_io,
-            } => {
-                tracing::Span::current()
-                    .record("index", tracing::field::display(RedactedUrl::new(index)));
-                match self.alternate_client(index) {
-                    Some(client) => client.get_versions(name.as_str()).await,
-                    // M2 (plan-1b §6): an unregistered *verified crates.io mirror* degrades to
-                    // crates.io rather than blanking the manifest (Cargo verifies per-version
-                    // checksums against crates.io for a mirror); a genuinely private registry
-                    // still fails `PackageNotFound` below.
-                    None if *mirrors_crates_io => {
-                        self.crates_io
-                            .get_versions_with(name.as_str(), freshness)
-                            .await
-                    }
-                    None => Err(DepsError::PackageNotFound {
-                        package: name.as_str().into(),
-                        registry: "alternate registry (not registered)",
-                    }),
-                }
-            }
-            _ => {
+        Self::record_index(source);
+        match self.route(source) {
+            CargoRoute::Alternate(client) => client.get_versions(name.as_str()).await,
+            CargoRoute::CratesIo => {
                 self.crates_io
                     .get_versions_with(name.as_str(), freshness)
                     .await
             }
+            CargoRoute::Unregistered => Err(deps_core::registry::alternate_not_registered(name)),
         }
     }
 
@@ -582,38 +603,19 @@ impl CargoRegistry {
         source: &DependencySource,
         req: &deps_core::VersionReq,
     ) -> Result<Option<CargoVersion>> {
-        match source {
-            DependencySource::AlternateRegistry {
-                index,
-                mirrors_crates_io,
-            } => {
-                tracing::Span::current()
-                    .record("index", tracing::field::display(RedactedUrl::new(index)));
-                match self.alternate_client(index) {
-                    Some(client) => {
-                        client
-                            .get_latest_matching(name.as_str(), req.as_str())
-                            .await
-                    }
-                    // M2 (plan-1b §6, N4): the hover-fallback/background-fetch-mirror dispatch
-                    // site needs the identical arm — this exact enumeration has been wrong twice
-                    // during design review, so both sites are asserted independently in tests.
-                    None if *mirrors_crates_io => {
-                        self.crates_io
-                            .get_latest_matching(name.as_str(), req.as_str())
-                            .await
-                    }
-                    None => Err(DepsError::PackageNotFound {
-                        package: name.as_str().into(),
-                        registry: "alternate registry (not registered)",
-                    }),
-                }
+        Self::record_index(source);
+        match self.route(source) {
+            CargoRoute::Alternate(client) => {
+                client
+                    .get_latest_matching(name.as_str(), req.as_str())
+                    .await
             }
-            _ => {
+            CargoRoute::CratesIo => {
                 self.crates_io
                     .get_latest_matching(name.as_str(), req.as_str())
                     .await
             }
+            CargoRoute::Unregistered => Err(deps_core::registry::alternate_not_registered(name)),
         }
     }
 }
@@ -660,6 +662,14 @@ impl deps_core::Registry for CargoRegistry {
         deps_core::Registry::get_latest_matching(&self.crates_io, name, req, selection_context)
     }
 
+    fn endpoint_for(&self, _name: &PackageName, source: &DependencySource) -> RegistryEndpoint {
+        match self.route(source) {
+            CargoRoute::CratesIo => self.crates_io.endpoint(),
+            CargoRoute::Alternate(client) => client.endpoint(),
+            CargoRoute::Unregistered => RegistryEndpoint::Unresolved,
+        }
+    }
+
     fn get_latest_matching_from<'a>(
         &'a self,
         name: &'a PackageName,
@@ -704,8 +714,8 @@ mod tests {
     use super::*;
     use crate::config::IndexTrust;
     use crate::ecosystem::CargoEcosystem;
-    use deps_core::Ecosystem;
     use deps_core::net_policy::RegistryAccessPolicy;
+    use deps_core::{DepsError, Ecosystem};
     use std::assert_matches;
     use std::collections::HashMap;
 
@@ -928,6 +938,64 @@ mod tests {
             )
             .await;
         assert_matches!(result.err(), Some(DepsError::PackageNotFound { .. }));
+    }
+
+    fn alternate(index: &str, mirrors_crates_io: bool) -> DependencySource {
+        DependencySource::AlternateRegistry {
+            index: index.to_string(),
+            mirrors_crates_io,
+        }
+    }
+
+    /// The gate keys its breaker on `endpoint_for`, which must follow the same route
+    /// `get_versions_from` takes: crates.io by default and for an unregistered verified mirror,
+    /// the registered client's own index otherwise.
+    #[test]
+    fn test_endpoint_for_follows_the_dispatch_route() {
+        use deps_core::{EgressTier, Registry, RegistryEndpoint};
+
+        let registry = CargoRegistry::new(Arc::new(HttpCache::new()));
+        let name = PackageName::new("serde");
+        let crates_io = registry.endpoint_for(&name, &DependencySource::Registry);
+        let index = "https://index.mycorp.dev";
+        registry.register_alternate(test_index_with_trust(index, IndexTrust::Trusted), None);
+        registry.register_alternate(
+            test_index_with_trust("https://authed.mycorp.dev", IndexTrust::Trusted),
+            Some(AuthToken::new("token".to_string())),
+        );
+        registry.register_alternate(
+            test_index_with_trust("https://ws.mycorp.dev", IndexTrust::WorkspaceDeclared),
+            None,
+        );
+
+        let endpoint = |source: &DependencySource| registry.endpoint_for(&name, source);
+
+        assert_eq!(
+            crates_io,
+            RegistryEndpoint::from_base_str("https://index.crates.io", EgressTier::Baseline)
+        );
+        assert_eq!(
+            endpoint(&alternate("https://index.never-registered.example", true)),
+            crates_io,
+            "an unregistered mirror is fetched from crates.io"
+        );
+        assert_eq!(
+            endpoint(&alternate("https://index.never-registered.example", false)),
+            RegistryEndpoint::Unresolved
+        );
+        assert_eq!(
+            endpoint(&alternate("https://index.mycorp.dev/", false)),
+            RegistryEndpoint::from_base_str(index, EgressTier::Baseline)
+        );
+        assert_eq!(
+            endpoint(&alternate("https://authed.mycorp.dev/", false)),
+            RegistryEndpoint::from_base_str("https://authed.mycorp.dev", EgressTier::Baseline),
+            "a credentialed trusted index uses the origin-pinned baseline transport"
+        );
+        assert_eq!(
+            endpoint(&alternate("https://ws.mycorp.dev/", false)),
+            RegistryEndpoint::from_base_str("https://ws.mycorp.dev", EgressTier::Guarded)
+        );
     }
 
     /// Builds a `CargoRegistry` whose `crates_io` field points at `mockito_url` instead of

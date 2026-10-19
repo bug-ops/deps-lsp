@@ -110,24 +110,29 @@ impl CargoEcosystem {
     ) -> Completions {
         use deps_core::completion::build_feature_completion;
 
-        let versions_result: Result<Vec<Box<dyn Version>>> =
-            match resolve_completion_source(parse_result, package_name) {
-                CompletionSource::Ambiguous => return Completions::default(),
-                CompletionSource::NotInManifest
-                | CompletionSource::Resolved(DependencySource::Registry) => {
-                    Registry::get_versions(self.registry.as_ref(), package_name).await
-                }
-                CompletionSource::Resolved(DependencySource::AlternateRegistry {
-                    index, ..
-                }) => match self.registry.alternate_client(&index) {
-                    Some(client) => Registry::get_versions(client.as_ref(), package_name).await,
-                    None => return Completions::default(),
-                },
-                CompletionSource::Resolved(_) => return Completions::default(),
-            };
+        // One dispatch on the source, shared with hover and the background fetch.
+        let source = match resolve_completion_source(parse_result, package_name) {
+            CompletionSource::Ambiguous => return Completions::default(),
+            CompletionSource::NotInManifest => DependencySource::Registry,
+            CompletionSource::Resolved(
+                source @ (DependencySource::Registry | DependencySource::AlternateRegistry { .. }),
+            ) => source,
+            CompletionSource::Resolved(_) => return Completions::default(),
+        };
+        let versions_result: Result<Vec<Box<dyn Version>>> = Registry::get_versions_from(
+            self.registry.as_ref(),
+            package_name,
+            &source,
+            deps_core::FreshnessSettings::Disabled,
+        )
+        .await;
 
         let versions = match versions_result {
             Ok(v) => v,
+            Err(e) if e.is_not_found() => {
+                tracing::debug!(package = %package_name.for_tracing(), "no versions for feature completion");
+                return Completions::default();
+            }
             Err(e) => {
                 tracing::warn!(
                     "Failed to fetch versions for '{}': {}",

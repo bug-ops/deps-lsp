@@ -195,13 +195,11 @@ pub(super) async fn build_dynamic_component_pin_action(
         .as_ref()
         .map(deps_core::VersionReq::as_str)?;
     let dep_source = dep.source();
-    let deps_core::parser::DependencySource::AlternateRegistry { index, .. } = &dep_source else {
-        return None;
-    };
-    let route = registry.routes().get(index).map(|r| r.clone())?;
+    let route = registry.route(&dep_source)?;
 
     let normalized_name = formatter.normalize_package_name(dep.name());
     let resolved = match await_interactive_fetch(
+        registry,
         registry.resolve_component_pin(dep.name(), &route, pin, raw),
         InteractiveFetchRequest::new(
             versions,

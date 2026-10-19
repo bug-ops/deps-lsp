@@ -150,12 +150,47 @@ pub fn evict_oldest_batch<K, V>(
 ) where
     K: Eq + std::hash::Hash + Clone + Ord,
 {
+    evict_oldest_batch_where(map, max_entries, fetched_at, |_| true);
+}
+
+/// [`evict_oldest_batch`] restricted to entries `evictable` accepts.
+///
+/// The batch size is still `1/CACHE_EVICTION_PERCENTAGE` of `max_entries`, but only accepted
+/// entries are candidates, so a map full of protected entries evicts nothing. Ties on
+/// `fetched_at` break by key order, which keeps the victims deterministic.
+///
+/// # Examples
+///
+/// ```
+/// use dashmap::DashMap;
+/// use deps_core::cache_policy::evict_oldest_batch_where;
+/// use std::time::{Duration, Instant};
+///
+/// let map: DashMap<u32, (Instant, bool)> = DashMap::new();
+/// let now = Instant::now();
+/// map.insert(0, (now, false)); // oldest, but protected
+/// map.insert(1, (now + Duration::from_secs(1), true));
+///
+/// evict_oldest_batch_where(&map, 10, |(at, _)| *at, |(_, evictable)| *evictable);
+///
+/// assert!(map.contains_key(&0));
+/// assert!(!map.contains_key(&1));
+/// ```
+pub fn evict_oldest_batch_where<K, V>(
+    map: &DashMap<K, V>,
+    max_entries: usize,
+    fetched_at: impl Fn(&V) -> Instant,
+    evictable: impl Fn(&V) -> bool,
+) where
+    K: Eq + std::hash::Hash + Clone + Ord,
+{
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
     let target_removals = (max_entries / CACHE_EVICTION_PERCENTAGE).max(1);
     let mut oldest: BinaryHeap<Reverse<(Instant, K)>> = map
         .iter()
+        .filter(|entry| evictable(entry.value()))
         .map(|entry| Reverse((fetched_at(entry.value()), entry.key().clone())))
         .collect();
 

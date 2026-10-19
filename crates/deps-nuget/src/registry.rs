@@ -16,8 +16,8 @@ use deps_core::parser::DependencySource;
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::registry::{KeyShape, register_capped_with_occupied};
 use deps_core::{
-    CredentialHeader, DepsError, EcosystemId, FreshnessSettings, HOVER_RECENT_VERSIONS, HttpCache,
-    PublishTime, RequestAuth, Result, SafePathSegment,
+    CredentialHeader, DepsError, EcosystemId, EgressTier, FreshnessSettings, HOVER_RECENT_VERSIONS,
+    HttpCache, PublishTime, RegistryEndpoint, RequestAuth, Result, SafePathSegment,
 };
 use serde::Deserialize;
 use std::any::Any;
@@ -101,6 +101,37 @@ enum NuGetRegistryTier {
     /// hop is re-classified against the live [`RegistryAccessPolicy`], and each service-index
     /// resource `@id` is validated with `PolicyGate::Enforce` before being trusted.
     WorkspaceDeclared,
+}
+
+/// The transport [`NuGetRegistry::fetch`] sends one request through, decided once per request
+/// so the request path and the breaker identity's egress cannot disagree.
+enum NuGetTransport<'a> {
+    /// Credentialed, origin-pinned (`get_cached_pinned` with the hop's credential).
+    Authenticated(&'a NuGetAuth),
+    /// Anonymous, origin-pinned, policy-guarded (`get_cached_pinned`).
+    Pinned,
+    /// Anonymous trusted-origin path (`get_cached_trusted_origin`).
+    TrustedOrigin,
+}
+
+impl NuGetTransport<'_> {
+    const fn egress(&self) -> EgressTier {
+        match self {
+            Self::Authenticated(_) | Self::Pinned => EgressTier::Guarded,
+            Self::TrustedOrigin => EgressTier::Baseline,
+        }
+    }
+}
+
+/// Where a dependency source is fetched from: the single dispatch decision shared by version
+/// lookups, the unlisted-versions decoration and
+/// [`Registry::endpoint_for`](deps_core::Registry::endpoint_for), so they cannot drift apart.
+pub(crate) enum NuGetRoute {
+    Public,
+    Chain(Arc<NuGetRegistry>),
+    /// An alternate feed with no registered chain. It never falls back to api.nuget.org: that
+    /// would send a private package name to the public registry.
+    Unregistered,
 }
 
 #[derive(Debug, Deserialize)]
@@ -489,6 +520,9 @@ fn safe_name(name: &str) -> Result<SafePathSegment<'_>> {
 pub struct NuGetRegistry {
     cache: Arc<HttpCache>,
     service_index_url: String,
+    /// The endpoint [`Self::endpoint`] reports, computed on first use (the fingerprint hashes
+    /// URL text, which the gate would otherwise redo for every lookup).
+    endpoint: deps_core::CachedEndpoint,
     service_index: Arc<OnceCell<ServiceIndex>>,
     tier: NuGetRegistryTier,
     /// Consulted only when [`Self::tier`] is [`NuGetRegistryTier::WorkspaceDeclared`] — see
@@ -535,6 +569,7 @@ impl NuGetRegistry {
         Self {
             cache,
             service_index_url,
+            endpoint: deps_core::CachedEndpoint::default(),
             service_index: Arc::new(OnceCell::new()),
             tier: NuGetRegistryTier::Public,
             policy: Arc::new(RegistryAccessPolicy::default()),
@@ -572,6 +607,7 @@ impl NuGetRegistry {
         Self {
             cache,
             service_index_url: hop.url.as_str().to_string(),
+            endpoint: deps_core::CachedEndpoint::default(),
             service_index: Arc::new(OnceCell::new()),
             tier: NuGetRegistryTier::WorkspaceDeclared,
             policy,
@@ -606,31 +642,74 @@ impl NuGetRegistry {
     ///
     /// Whatever the underlying `HttpCache` fetch returns.
     async fn fetch(&self, url: &str, prefix: &TrustedPrefix) -> Result<bytes::Bytes> {
+        match self.transport(url, prefix) {
+            NuGetTransport::Authenticated(auth) => {
+                let auth = RequestAuth::credential(
+                    CredentialHeader::Authorization(auth.as_authorization()),
+                    prefix,
+                );
+                self.cache.get_cached_pinned(url, prefix, auth, None).await
+            }
+            NuGetTransport::Pinned => {
+                self.cache
+                    .get_cached_pinned(url, prefix, RequestAuth::ANONYMOUS, None)
+                    .await
+            }
+            NuGetTransport::TrustedOrigin => {
+                self.cache
+                    .get_cached_trusted_origin(url, prefix, RequestAuth::ANONYMOUS, None)
+                    .await
+            }
+        }
+    }
+
+    /// The transport arm [`Self::fetch`] takes for a request to `url` under `prefix` (see its
+    /// doc for the three arms).
+    fn transport(&self, url: &str, prefix: &TrustedPrefix) -> NuGetTransport<'_> {
         let can_authenticate = self.declared_origin.as_ref().is_some_and(|declared| {
             url::Url::parse(url).is_ok_and(|u| declared.permits(&u))
                 && declared.permits(prefix.as_url())
         });
 
-        if let Some(auth) = self.auth.as_ref()
-            && can_authenticate
-        {
-            let auth = RequestAuth::credential(
-                CredentialHeader::Authorization(auth.as_authorization()),
-                prefix,
-            );
-            return self.cache.get_cached_pinned(url, prefix, auth, None).await;
+        match (self.auth.as_ref().filter(|_| can_authenticate), self.tier) {
+            (Some(auth), _) => NuGetTransport::Authenticated(auth),
+            (None, NuGetRegistryTier::WorkspaceDeclared) => NuGetTransport::Pinned,
+            (None, NuGetRegistryTier::Public) => NuGetTransport::TrustedOrigin,
         }
+    }
 
-        if self.tier == NuGetRegistryTier::WorkspaceDeclared {
-            return self
-                .cache
-                .get_cached_pinned(url, prefix, RequestAuth::ANONYMOUS, None)
-                .await;
+    /// The egress of this hop's service-index request, or `None` when its declared origin did
+    /// not parse and the index is never fetched.
+    fn service_index_egress(&self) -> Option<EgressTier> {
+        let declared = self.declared_origin.as_ref()?;
+        Some(self.transport(&self.service_index_url, declared).egress())
+    }
+
+    /// The network path of a lookup through this client: its service index, then each fallback
+    /// hop's, in walk order. Resource hosts discovered through the service index (flat
+    /// container, registration hive) are not part of the identity: they are only known after
+    /// I/O.
+    fn endpoint(&self) -> RegistryEndpoint {
+        self.endpoint.get_or_compute(|| {
+            let hops: Option<Vec<(&str, EgressTier)>> = std::iter::once(self)
+                .chain(self.fallback_chain.iter().map(Arc::as_ref))
+                .map(|hop| Some((hop.service_index_url.as_str(), hop.service_index_egress()?)))
+                .collect();
+            hops.map_or(
+                RegistryEndpoint::Unresolved,
+                RegistryEndpoint::chain_from_strs,
+            )
+        })
+    }
+
+    /// Routes `source`: the public root, a registered chain, or neither.
+    pub(crate) fn route(&self, source: &DependencySource) -> NuGetRoute {
+        match source {
+            DependencySource::AlternateRegistry { index, .. } => self
+                .alternate_client(index)
+                .map_or(NuGetRoute::Unregistered, NuGetRoute::Chain),
+            _ => NuGetRoute::Public,
         }
-
-        self.cache
-            .get_cached_trusted_origin(url, prefix, RequestAuth::ANONYMOUS, None)
-            .await
     }
 
     /// Builds the full hop tree for one [`NuGetSourceChain`] and inserts the head into
@@ -1259,25 +1338,34 @@ impl deps_core::Registry for NuGetRegistry {
         freshness: FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            match source {
-                DependencySource::AlternateRegistry { index, .. } => {
-                    match self.alternate_client(index) {
-                        Some(client) => {
-                            let versions = client.get_versions_chained(name.as_str()).await?;
-                            Ok(versions
-                                .into_iter()
-                                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                                .collect())
-                        }
-                        None => Err(DepsError::PackageNotFound {
-                            package: name.as_str().into(),
-                            registry: "alternate registry (not registered)",
-                        }),
-                    }
+            match self.route(source) {
+                NuGetRoute::Chain(client) => {
+                    let versions = client.get_versions_chained(name.as_str()).await?;
+                    Ok(versions
+                        .into_iter()
+                        .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                        .collect())
                 }
-                _ => deps_core::Registry::get_versions_with(self, name, freshness).await,
+                NuGetRoute::Public => {
+                    deps_core::Registry::get_versions_with(self, name, freshness).await
+                }
+                NuGetRoute::Unregistered => {
+                    Err(deps_core::registry::alternate_not_registered(name))
+                }
             }
         })
+    }
+
+    fn endpoint_for(
+        &self,
+        _name: &deps_core::PackageName,
+        source: &DependencySource,
+    ) -> RegistryEndpoint {
+        match self.route(source) {
+            NuGetRoute::Public => self.endpoint(),
+            NuGetRoute::Chain(client) => client.endpoint(),
+            NuGetRoute::Unregistered => RegistryEndpoint::Unresolved,
+        }
     }
 
     /// `get_versions_from`'s `get_latest_matching`-shaped counterpart — same dispatch, same
@@ -1293,31 +1381,25 @@ impl deps_core::Registry for NuGetRegistry {
         selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            match source {
-                DependencySource::AlternateRegistry { index, .. } => {
-                    match self.alternate_client(index) {
-                        Some(client) => {
-                            let versions: Vec<Box<dyn deps_core::Version>> = client
-                                .get_versions_chained(name.as_str())
-                                .await?
-                                .into_iter()
-                                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                                .collect();
-                            let idx =
-                                client.select_latest_matching(&versions, req, selection_context);
-                            Ok(idx.and_then(|i| versions.into_iter().nth(i)))
-                        }
-                        None => Err(DepsError::PackageNotFound {
-                            package: name.as_str().into(),
-                            registry: "alternate registry (not registered)",
-                        }),
-                    }
+            match self.route(source) {
+                NuGetRoute::Chain(client) => {
+                    let versions: Vec<Box<dyn deps_core::Version>> = client
+                        .get_versions_chained(name.as_str())
+                        .await?
+                        .into_iter()
+                        .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                        .collect();
+                    let idx = client.select_latest_matching(&versions, req, selection_context);
+                    Ok(idx.and_then(|i| versions.into_iter().nth(i)))
                 }
-                _ => {
+                NuGetRoute::Public => {
                     let version = self
                         .get_latest_matching(name.as_str(), req.as_str())
                         .await?;
                     Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+                }
+                NuGetRoute::Unregistered => {
+                    Err(deps_core::registry::alternate_not_registered(name))
                 }
             }
         })
@@ -3308,6 +3390,71 @@ mod tests {
             slot: Some(slot.to_string()),
             auth: Some(NuGetAuth::new(username, password)),
         }
+    }
+
+    /// The gate keys its breaker on `endpoint_for`, so it must follow `get_versions_from`'s
+    /// route: the public service index on the baseline egress, the chain of declared service
+    /// indexes (guarded egress, order included) for a registered feed, and nothing for an
+    /// unregistered one. The same URL reached as the public root and as a declared feed is two
+    /// network paths.
+    #[test]
+    fn test_endpoint_for_follows_the_dispatch_route() {
+        use deps_core::{EgressTier, PackageName, Registry, RegistryEndpoint};
+
+        let policy = all_policy();
+        let root = Arc::new(NuGetRegistry::new(Arc::new(HttpCache::new())));
+        let feed = |base: &str| NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+        let (a, b) = (feed("https://a.example/v3"), feed("https://b.example/v3"));
+        let nuget_org = NuGetFeedUrl::new(NUGET_ORG_INDEX_URL, &policy).unwrap();
+        let register = |key: &str, hops: Vec<ResolvedHop>| {
+            let chain = NuGetSourceChain {
+                key: key.to_string(),
+                hops,
+                implicit_public_fallback: false,
+            };
+            NuGetRegistry::register_alternate(&root, &chain, &policy);
+        };
+        register("one", vec![hop(&a)]);
+        register("ab", vec![hop(&a), hop(&b)]);
+        register("ba", vec![hop(&b), hop(&a)]);
+        register("declared-nuget-org", vec![hop(&nuget_org)]);
+        let pat = format!("pat-{}", std::process::id());
+        register("authed", vec![auth_hop(&a, "corpfeed", "user", &pat)]);
+        let name = PackageName::new("pkg");
+        let endpoint = |source: &DependencySource| root.endpoint_for(&name, source);
+        let via = |key: &str| DependencySource::AlternateRegistry {
+            index: key.to_string(),
+            mirrors_crates_io: false,
+        };
+
+        assert_eq!(
+            endpoint(&DependencySource::Registry),
+            RegistryEndpoint::from_base_str(NUGET_ORG_INDEX_URL, EgressTier::Baseline)
+        );
+        assert_eq!(
+            endpoint(&via("one")),
+            RegistryEndpoint::from_base_str("https://a.example/v3/index.json", EgressTier::Guarded)
+        );
+        assert_eq!(
+            endpoint(&via("authed")),
+            endpoint(&via("one")),
+            "a credential does not change the network path, and a credentialed declared feed is guarded"
+        );
+        assert_ne!(endpoint(&via("ab")), endpoint(&via("ba")));
+        assert_ne!(endpoint(&via("ab")), endpoint(&via("one")));
+        assert_ne!(
+            endpoint(&via("declared-nuget-org")),
+            endpoint(&DependencySource::Registry),
+            "the same URL as a declared feed travels the guarded egress"
+        );
+        assert_eq!(endpoint(&via("missing")), RegistryEndpoint::Unresolved);
+        // The decoration asks the root: a chain head knows no alternates.
+        let head = root.alternate_client("one").expect("registered");
+        assert_eq!(
+            head.endpoint_for(&name, &via("one")),
+            RegistryEndpoint::Unresolved
+        );
+        assert_eq!(endpoint(&via("one")), head.endpoint());
     }
 
     /// SC-001/SC-011: an authenticated `WorkspaceDeclared` client attaches the credential to

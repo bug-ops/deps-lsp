@@ -4495,6 +4495,7 @@ let package = Package(
                 FetchContext::Hover,
             );
             await_interactive_fetch(
+                &deps_core::test_util::MockRegistry::new(),
                 async { Err::<(), _>(deps_core::DepsError::CacheError("down".into())) },
                 request,
                 deps_core::lsp_helpers::AuxiliaryLookup::PinResolution,

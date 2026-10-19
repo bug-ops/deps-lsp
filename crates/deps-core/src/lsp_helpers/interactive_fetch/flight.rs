@@ -13,7 +13,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::attempt::{AttemptBudget, Attempted, InteractiveFetchError};
-use super::key::{InteractiveFetchKey, LookupKind};
+use super::key::{LookupKey, LookupKind};
 use super::memo::Decision;
 use super::{
     InteractiveFetch, InteractiveFetchGate, InteractiveFetchRequest, NoLiveList, SharedVersions,
@@ -45,13 +45,13 @@ impl ListShape {
 /// [`InteractiveFetchGate::invalidate_all`] from pairing with requests made after it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct FlightKey {
-    key: InteractiveFetchKey,
+    key: Arc<LookupKey>,
     shape: ListShape,
     generation: u64,
 }
 
 impl FlightKey {
-    pub(super) const fn new(key: InteractiveFetchKey, shape: ListShape, generation: u64) -> Self {
+    pub(super) const fn new(key: Arc<LookupKey>, shape: ListShape, generation: u64) -> Self {
         Self {
             key,
             shape,
@@ -61,7 +61,7 @@ impl FlightKey {
 
     fn with_shape(&self, shape: ListShape) -> Self {
         Self {
-            key: self.key.clone(),
+            key: Arc::clone(&self.key),
             shape,
             generation: self.generation,
         }
@@ -161,12 +161,12 @@ async fn follow(mut receiver: FlightReceiver, deadline: Instant) -> Followed {
 /// `fetch` is polled at most once, and only if this request becomes the leader.
 pub(super) async fn await_shared<E: InteractiveFetchError>(
     gate: &InteractiveFetchGate,
-    key: InteractiveFetchKey,
+    lookup: Arc<LookupKey>,
     fetch: impl Future<Output = Result<SharedVersions, E>>,
     request: &InteractiveFetchRequest<'_>,
     shape: ListShape,
 ) -> InteractiveFetch<SharedVersions> {
-    let admitted = match gate.admit_request(&key, request) {
+    let admitted = match gate.admit_request(&lookup, request) {
         Ok(admitted) => admitted,
         Err(kind) => return InteractiveFetch::Degraded(kind),
     };
@@ -174,7 +174,7 @@ pub(super) async fn await_shared<E: InteractiveFetchError>(
         (admitted.generation, admitted.background_failure_known);
 
     let deadline = Instant::now() + LookupKind::VersionList.budget();
-    let flight = FlightKey::new(key.clone(), shape, generation);
+    let flight = FlightKey::new(Arc::clone(&lookup), shape, generation);
     let mut fetch = pin!(fetch);
     loop {
         match gate.claim_or_follow(&flight) {
@@ -193,7 +193,7 @@ pub(super) async fn await_shared<E: InteractiveFetchError>(
                     gate,
                     fetch.as_mut(),
                     deadline,
-                    &key,
+                    &lookup,
                     request,
                     background_failure_known,
                     generation,
@@ -226,7 +226,7 @@ async fn lead<E: InteractiveFetchError>(
     gate: &InteractiveFetchGate,
     fetch: impl Future<Output = Result<SharedVersions, E>>,
     deadline: Instant,
-    key: &InteractiveFetchKey,
+    lookup: &Arc<LookupKey>,
     request: &InteractiveFetchRequest<'_>,
     background_failure_known: bool,
     generation: u64,
@@ -234,7 +234,7 @@ async fn lead<E: InteractiveFetchError>(
     // A leader that finished between this request's first decision and its claim may have
     // written a record; polling again would be a wholly avoidable duplicate.
     if let Decision::Degrade(kind, reason) =
-        gate.decide(key, background_failure_known, generation, now())
+        gate.decide(lookup, background_failure_known, generation, now())
     {
         log_skipped(request, reason.as_str());
         return Led::Answered(InteractiveFetch::Degraded(kind));
@@ -247,7 +247,7 @@ async fn lead<E: InteractiveFetchError>(
         .attempt(
             fetch,
             deadline,
-            key,
+            lookup,
             request,
             background_failure_known,
             generation,

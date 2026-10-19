@@ -22,11 +22,12 @@ use super::diagnostics::{MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_VALUE_CHARS};
 use super::diagnostics::{MAX_DIAGNOSTIC_PROSE_CHARS, MAX_VERSION_DIAGNOSTIC_CHARS};
 use super::hover_markdown::{FieldKind, HoverMarkdown};
 use super::{
-    CooldownBlocker, CooldownPrecedence, DiagnosticMessages, EcosystemFormatter, FetchContext,
-    HOVER_RECENT_VERSIONS, InteractiveFetchRequest, LatestVerdict, SiblingMatchNote, VersionData,
-    await_interactive_versions, cached_package_versions_by_name, cooldown_precedence,
-    escape_markdown, in_use_version, latest_verdict, markdown_code_span, position_in_range,
-    resolve_in_use_version, resolve_scan_outcome,
+    AuxiliaryLookup, CooldownBlocker, CooldownPrecedence, DiagnosticMessages, EcosystemFormatter,
+    FetchContext, HOVER_RECENT_VERSIONS, InteractiveFetchRequest, LatestVerdict, SiblingMatchNote,
+    VersionData, await_interactive_fetch, await_interactive_versions,
+    cached_package_versions_by_name, cooldown_precedence, escape_markdown, in_use_version,
+    latest_verdict, markdown_code_span, position_in_range, resolve_in_use_version,
+    resolve_scan_outcome,
 };
 use crate::github::normalize_tag;
 
@@ -63,20 +64,6 @@ fn version_age_secs(version: &dyn Version, now: PublishTime) -> Option<u64> {
         .published_at()
         .map(|published| published.age_secs_from(now))
 }
-
-/// Bounds the `Registry::get_latest_matching` fallback (#373) hover fires when the
-/// list-based `**Latest**` pick fails on a non-empty live list. Hover responses must
-/// return quickly (`.claude/rules/rust-code.md`), and without this the fallback would
-/// stack on top of `get_versions_with`'s own up-to-30s `reqwest` client timeout
-/// (`HttpCache`), doubling worst-case hover latency to ~60s. `generate_hover` has no
-/// `timeout_secs` config threaded in the way `lifecycle.rs`'s background fetch does, so
-/// this is a fixed local bound rather than a configurable one — a few seconds is enough
-/// slack for the already-rare "list-based pick failed" path without meaningfully
-/// delaying the common case, which never reaches this fallback at all.
-///
-/// Runs only after the primary fetch returned a live list (the registry just answered), so it
-/// deliberately sits outside the interactive-fetch concurrency permit (#1830).
-const HOVER_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The `Cmd+.` update-footer markdown this function appends when a code action may exist
 /// for the hovered dependency.
@@ -158,21 +145,18 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // `.ok()`, not `.ok()?`: a fetch failure (off-VPN, expired token, DNS-blocked internal
     // host) must degrade to the same basic card the `!resolvable` branch renders, not vanish
     // the whole hover response.
+    let fetch_request = InteractiveFetchRequest::new(
+        versions,
+        parse_result.uri(),
+        dep.name(),
+        normalized_name.as_str(),
+        &dep_source,
+        FetchContext::Hover,
+    );
     let available_versions = if resolvable {
-        await_interactive_versions(
-            registry,
-            InteractiveFetchRequest::new(
-                versions,
-                parse_result.uri(),
-                dep.name(),
-                normalized_name.as_str(),
-                &dep_source,
-                FetchContext::Hover,
-            ),
-            freshness,
-        )
-        .await
-        .into_live()
+        await_interactive_versions(registry, fetch_request, freshness)
+            .await
+            .into_live()
     } else {
         None
     };
@@ -229,40 +213,27 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // `/@v/list` never enumerates pseudo-versions, so an untagged module's all-pre-release
     // history fails the list-based pick. Mirrors `lifecycle.rs`'s own fallback: a second call
     // to `Registry::get_latest_matching`, which some registries (Go's `/@latest`) answer more
-    // completely than the list endpoint. Bounded by `HOVER_FALLBACK_TIMEOUT`; any failure,
-    // timeout, or `None` degrades gracefully to no `**Latest**` line.
-    // TODO(critic): route get_latest_matching_from through the interactive gate as an AuxiliaryLookup (memo + permit)
+    // completely than the list endpoint. Gated as `LatestFallback`; failure or refusal means
+    // no `**Latest**` line.
     let list_fallback_latest = if available_versions.as_ref().is_some_and(|v| !v.is_empty())
         && live_latest_idx.is_none()
     {
-        match tokio::time::timeout(
-            HOVER_FALLBACK_TIMEOUT,
+        let found = await_interactive_fetch(
+            registry,
             registry.get_latest_matching_from(
                 dep.name(),
                 &dep_source,
                 &wildcard_req,
                 &selection_context,
             ),
+            fetch_request,
+            AuxiliaryLookup::LatestFallback,
         )
         .await
-        {
-            Ok(Ok(found)) => {
-                tracing::debug!(package = %dep.name().for_tracing(), found = found.is_some(), "hover latest fallback (get_latest_matching) resolved");
-                found
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(package = %dep.name().for_tracing(), %error, "hover latest fallback (get_latest_matching) failed");
-                None
-            }
-            Err(_) => {
-                tracing::warn!(
-                    package = %dep.name().for_tracing(),
-                    timeout_secs = HOVER_FALLBACK_TIMEOUT.as_secs(),
-                    "hover latest fallback (get_latest_matching) timed out"
-                );
-                None
-            }
-        }
+        .into_live()
+        .flatten();
+        tracing::debug!(package = %dep.name().for_tracing(), found = found.is_some(), "hover latest fallback (get_latest_matching) resolved");
+        found
     } else {
         None
     };
@@ -3752,9 +3723,9 @@ mod tests {
         );
     }
 
-    /// #1209 C1: the "hover latest fallback" WARN (`hover.rs`'s own event, not the shared
-    /// `bounded_await` sink) used to interpolate `dep.name()` raw. Now redacted via
-    /// `dep.name().for_tracing()`.
+    /// #1209 C1: the hover latest fallback's failure log used to interpolate `dep.name()` raw.
+    /// The fallback now runs through the interactive gate, whose log redacts the name via
+    /// `dep.name().for_tracing()` and carries only a coarse cause, never the error text.
     #[tokio::test]
     async fn test_generate_hover_fallback_failure_log_redacts_credential_shaped_package_name() {
         use std::any::Any;
@@ -3810,7 +3781,7 @@ mod tests {
         let parse_result = freshness_test_parse_result(sentinel_name);
         let registry = FallbackFailsRegistry;
 
-        let log = crate::test_util::capture_tracing_output_async_at(tracing::Level::WARN, async {
+        let log = crate::test_util::capture_tracing_output_async_at(tracing::Level::DEBUG, async {
             generate_hover(
                 &parse_result,
                 Position::new(0, 2).into(),
@@ -3826,8 +3797,12 @@ mod tests {
         .await;
 
         assert!(
-            log.contains("hover latest fallback (get_latest_matching) failed"),
-            "expected the fallback-failure WARN to fire: {log:?}"
+            log.contains("interactive registry lookup failed") && log.contains("latest fallback"),
+            "expected the fallback-failure log to fire: {log:?}"
+        );
+        assert!(
+            !log.contains("transient backend failure"),
+            "the log must carry a coarse cause, not the error text: {log:?}"
         );
         assert!(
             !log.contains("AUDITSENTINEL0000"),
@@ -3837,6 +3812,196 @@ mod tests {
             log.contains("git.internal.corp"),
             "host should survive redaction: {log:?}"
         );
+    }
+
+    /// #1848: the latest fallback is an auxiliary lookup of the interactive gate, so a failure
+    /// is memoized and the next hover skips the fallback request instead of repaying it.
+    #[tokio::test]
+    async fn test_generate_hover_fallback_failure_is_memoized_by_the_gate() {
+        use std::any::Any;
+        use std::collections::HashMap;
+        use std::num::NonZeroUsize;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingFallbackRegistry {
+            fallback_calls: AtomicUsize,
+        }
+
+        impl crate::Registry for CountingFallbackRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a crate::PackageName,
+            ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![Box::new(TestVersion {
+                        version: ConcreteVersion::new("1.2.3"),
+                        yanked: false,
+                    }) as Box<dyn crate::Version>])
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a crate::PackageName,
+                _req: &'a crate::VersionReq,
+                _selection_context: &'a crate::SelectionContext,
+            ) -> crate::ecosystem::BoxFuture<
+                'a,
+                crate::error::Result<Option<Box<dyn crate::Version>>>,
+            > {
+                Box::pin(async move {
+                    self.fallback_calls.fetch_add(1, Ordering::SeqCst);
+                    Err(crate::error::DepsError::CacheError(
+                        "transient backend failure".to_string(),
+                    ))
+                })
+            }
+
+            fn search_raw<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let parse_result = freshness_test_parse_result("serde");
+        let registry = CountingFallbackRegistry {
+            fallback_calls: AtomicUsize::new(0),
+        };
+        let gate = crate::lsp_helpers::InteractiveFetchGate::new(NonZeroUsize::new(4).unwrap());
+        let (cached, resolved) = (HashMap::new(), HashMap::new());
+        let versions = VersionData::new(&cached, &resolved)
+            .with_ecosystem(crate::EcosystemId::Cargo)
+            .with_interactive_fetch_gate(&gate);
+
+        for _ in 0..2 {
+            generate_hover(
+                &parse_result,
+                Position::new(0, 2).into(),
+                versions,
+                &registry,
+                &MOCK_FORMATTER,
+                crate::freshness::FreshnessSettings::default(),
+                PublishTime::now(),
+            )
+            .await
+            .expect("hover must still render when the fallback fetch fails");
+        }
+
+        assert_eq!(registry.fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// #1848: with the fallback on the gate, a stalled `get_latest_matching_from` is bounded by
+    /// the auxiliary 5 s budget (not the version list's 10 s), the hover still renders, and the
+    /// next hover for the package skips the memoized stall. (Its list answered, so the endpoint
+    /// breaker stays closed: an answering endpoint is not dead.)
+    #[tokio::test(start_paused = true)]
+    async fn test_generate_hover_stalled_fallback_is_capped_and_memoized() {
+        use std::any::Any;
+        use std::collections::HashMap;
+        use std::num::NonZeroUsize;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        struct StalledFallbackRegistry {
+            list_calls: AtomicUsize,
+            fallback_calls: AtomicUsize,
+        }
+
+        impl crate::Registry for StalledFallbackRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a crate::PackageName,
+            ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+            {
+                Box::pin(async move {
+                    self.list_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![Box::new(TestVersion {
+                        version: ConcreteVersion::new("1.2.3"),
+                        yanked: false,
+                    }) as Box<dyn crate::Version>])
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a crate::PackageName,
+                _req: &'a crate::VersionReq,
+                _selection_context: &'a crate::SelectionContext,
+            ) -> crate::ecosystem::BoxFuture<
+                'a,
+                crate::error::Result<Option<Box<dyn crate::Version>>>,
+            > {
+                Box::pin(async move {
+                    self.fallback_calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(None)
+                })
+            }
+
+            fn search_raw<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry = StalledFallbackRegistry {
+            list_calls: AtomicUsize::new(0),
+            fallback_calls: AtomicUsize::new(0),
+        };
+        let gate = crate::lsp_helpers::InteractiveFetchGate::new(NonZeroUsize::new(4).unwrap());
+        let (cached, resolved) = (HashMap::new(), HashMap::new());
+        let versions = VersionData::new(&cached, &resolved)
+            .with_ecosystem(crate::EcosystemId::Cargo)
+            .with_interactive_fetch_gate(&gate);
+        let hover = |name: &'static str| {
+            let parse_result = freshness_test_parse_result(name);
+            let registry = &registry;
+            async move {
+                generate_hover(
+                    &parse_result,
+                    Position::new(0, 2).into(),
+                    versions,
+                    registry,
+                    &MOCK_FORMATTER,
+                    crate::freshness::FreshnessSettings::default(),
+                    PublishTime::now(),
+                )
+                .await
+                .expect("hover must still render when the fallback stalls")
+            }
+        };
+
+        let started = tokio::time::Instant::now();
+        hover("pkg-a").await;
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+
+        let repeated_at = tokio::time::Instant::now();
+        hover("pkg-a").await;
+
+        assert_eq!(
+            repeated_at.elapsed(),
+            Duration::ZERO,
+            "the memoized stall is not repaid"
+        );
+        assert_eq!(registry.fallback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.list_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

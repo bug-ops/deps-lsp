@@ -272,18 +272,39 @@ Conceptual only; representation is a plan-phase decision.
 >   runs on configuration changes (after the apply) and after reparses that change registry
 >   routing (`RefetchPolicy::AllDependencies`); a requirements-only reparse keeps the memo. A
 >   live success records nothing unless the background outcomes still show a failure.
-> - **OQ-7** (#1844): a per-endpoint circuit breaker. "Endpoint" is the registry as this manifest
->   resolves it: ecosystem, manifest and dependency source, because `deps-core` cannot see the
->   resolved host (`.npmrc`, source replacement, proxy). An attempt that waited at least half
+> - **OQ-7** (#1844, #1847): a per-endpoint circuit breaker. "Endpoint" is the network path
+>   `Registry::endpoint_for(name, source)` reports: the fingerprint of the ordered hops of the
+>   lookup (normalized base URL, egress tier), keyed by a per-process random key, derived from
+>   URL text only and never stored as a URL. Every production registry derives it from the same
+>   route function its `get_versions_from` dispatches on (cargo, npm, pypi, go, nuget, swift,
+>   gitlab-ci; deno composes jsr and npm; maven routes Google groups apart from the rest), so
+>   `androidx` and `commons` on Maven, `npm:x` and `jsr:@s/x` on Deno, and two `.npmrc` scope
+>   registries of one host are different endpoints, while two manifests on one registry share
+>   one. The breaker key is `(ecosystem, endpoint)` for a resolved endpoint and
+>   `(ecosystem, manifest, source)` when the registry reports none (GitLab CI's default
+>   source, an unregistered alternate). An attempt that waited at least half
 >   the budget before giving up or being cancelled by the editor is *slow*; one that answered
->   (a list or an error) well inside the budget is an *answer*; the rest is inconclusive
->   (a list that arrived within 1 s of the budget may be a stale-serve from a dead host).
+>   (a list, or an error produced by the endpoint) well inside the budget is an *answer*; the
+>   rest is inconclusive: a list that arrived within 1 s of the budget may be a stale-serve
+>   from a dead host, and a fast error raised locally (policy block, cache fault, configuration,
+>   a request that could not be built) says nothing about the endpoint (#1849).
 >   Two slow attempts for *distinct* packages within 30 s, with no answer from the endpoint in
 >   that window, open the breaker for 30 s. Hover awaits to an open endpoint return `Unverified`
 >   without polling and are not memoized; code actions are never refused (a false open would
 >   drop the fix actions of a whole manifest) but still report evidence. After 30 s the first
 >   hover is the single probe: a list closes the breaker, a slow or aborted probe re-arms it.
->   `invalidate_all` resets it.
+>   A probe lease of `MAX_LOOKUP_BUDGET + 1 s` ends a probe whose holder was lost, so the next
+>   enforced request takes over; a stale probe can only close the breaker. `invalidate_all`
+>   resets it. The breaker is capped at 256 endpoints: stale entries go first, then a batch of
+>   the oldest closed ones; an unexpired open or half-open entry is never evicted, and when
+>   every slot holds one the newcomer is simply not tracked.
+> - **Lookup kinds** (#1848, #1849): `VersionList` (10 s), `PinResolution` (5 s), `Decoration`
+>   (5 s, never counts for the breaker) and `LatestFallback` (5 s, hover's
+>   `get_latest_matching_from` after a list whose pick found nothing; counts for the breaker,
+>   takes no permit, is never seeded from the background outcomes). Each has its own failure memo
+>   slot; a `PinResolution` additionally honors an interactive failure of the same package's version
+>   list, never the reverse, so a dead GitLab host costs one 10 s await for hover and code
+>   action together, not two.
 > - **FR-007** (#1843): version-list awaits go through `await_interactive_versions`, which
 >   shares one registry poll per package, source, manifest and invalidation generation. The
 >   first request polls; the rest receive the same `Arc<[Box<dyn Version>]>`. Followers hold a
@@ -311,28 +332,29 @@ Conceptual only; representation is a plan-phase decision.
 >   large package on a healthy endpoint cannot open it. A dead endpoint therefore costs two
 >   awaits, then instant refusals; N manifests on one dead host cost 2N awaits, and a
 >   per-package source (`Git { url }`) degrades to plain memo behaviour.
-> - Endpoints that conflate routes (npm `@scope:registry`, `GOPRIVATE`, `extra-index-url`,
->   multi-repository Maven, multi-feed NuGet) share one breaker, so a dead private route can
->   refuse public packages for up to 30 s once two distinct packages were slow. Keying by the
->   real host is deferred until `Registry` exposes it.
+> - The endpoint identity of a NuGet feed is its chain of service-index URLs. The version list
+>   itself comes from the flat-container resource the service index names, which may sit on
+>   another host than the index, and the registration hive (publish times) likewise; those hosts
+>   are only known after I/O and are not part of the identity. A stalled flat-container CDN is
+>   therefore attributed to the feed's service-index endpoint, and so is a stalled PyPI JSON
+>   API under freshness to the primary index. Both are the intended granularity.
 > - Under hover-only refusal, code actions on a dead endpoint still pay an await per distinct
 >   package and hold dispatch permits meanwhile. A cancel after half the budget feeds the
 >   breaker (so it helps hovers) but never the memo.
 > - A cancel-driven open on a healthy-but-slow endpoint needs two distinct packages cancelled
 >   after half the budget with no answer in 30 s; the user then sees basic cards, as they
 >   effectively did already.
-> - A fast local `Err` counts as an answer for the breaker, including errors that never reached
->   the endpoint (the GitLab rate-limit gate, an invalid project path, a policy block). On a dead
->   endpoint such packages refresh `last_answered` and keep the breaker closed for up to 30 s.
-> - On a dead GitLab host the first hover per component still costs a full version-list await
->   plus a full `PinResolution` await, and so does the first code action, because the two lookup
->   kinds keep separate failure memos over the same route.
-> - `HalfOpen` carries no age: it is safe only because every probe holder reports (or cancels).
->   A future path that takes the probe without reporting would refuse hovers to that endpoint
->   until a code action answers or the entry is evicted.
-> - Hover's `get_latest_matching_from` fallback (`HOVER_FALLBACK_TIMEOUT`) is a third ungated,
->   permitless 5 s await that runs only after a live list; routing it through the gate as an
->   auxiliary lookup is a follow-up (`TODO(critic)` in `hover.rs`).
+> - A fast `Err` produced by `PackageNotFound` is classified as unattributed, because that
+>   variant does not record whether the registry or a local mapping produced it. An untokened
+>   GitLab private project (a `404`) therefore no longer vouches for its host, and on a dead
+>   endpoint that error no longer refreshes `last_answered` either. A typed not-found provenance
+>   would restore the vouching (`TODO(critic)` in `DepsError::origin`). `RateLimited` uses
+>   `source_status` as a proxy for provenance: a confirmed `429` rebuilt without a status
+>   (GitLab) reads as unattributed, which only shifts the verdict toward inconclusive.
+> - Swift's `peek_credentialed_trusted_origin` path (Keychain credential unavailable, offline
+>   cache) returns the cached list without touching the network. That fast `Live` counts as an
+>   answer and vouches for an endpoint that was never contacted. It is rare and bounded by the
+>   30 s evidence window.
 > - Scope (#1845): the default `generate_hover`/`generate_code_actions` path (FR-012) and the two
 >   ecosystem-specific awaits that used to keep their own ungated 5 s bounds. NuGet's unlisted
 >   decoration is an `AuxiliaryLookup::Decoration` and GitLab CI's component-pin resolution
@@ -341,6 +363,10 @@ Conceptual only; representation is a plan-phase decision.
 >   while the breaker is open for a hover, but it neither opens nor closes the breaker and never
 >   takes the half-open probe, because it may be served by a different host than the base fetch;
 >   a pin resolution counts like a version list.
+> - Hover's `get_latest_matching_from` fallback (`LatestFallback`) takes no dispatch permit: it
+>   continues a hover whose list await just passed the cap, and a permit try-acquire there would
+>   drop the `**Latest**` line of an untagged module nondeterministically under load. It is still
+>   bounded (5 s), memoized, and counted by the breaker.
 > - A NuGet hover now holds two dispatch permits (the base list and the decoration). On a
 >   healthy feed the burst of concurrent hovers that get full information drops from three to
 >   two (with `LSP_DISPATCH_CONCURRENCY - 1 = 3` permits): the first is decorated, the second

@@ -313,6 +313,14 @@ impl deps_core::Registry for RubyGemsRegistry {
     deps_core::impl_registry_versions_method!(get_versions);
     deps_core::impl_registry_versions_method!(get_versions_with);
 
+    fn endpoint_for(
+        &self,
+        _name: &deps_core::PackageName,
+        _source: &deps_core::DependencySource,
+    ) -> deps_core::RegistryEndpoint {
+        deps_core::RegistryEndpoint::from_base_str(&self.api_base, deps_core::EgressTier::Baseline)
+    }
+
     fn get_latest_matching<'a>(
         &'a self,
         name: &'a deps_core::PackageName,
@@ -962,5 +970,27 @@ mod tests {
 
         assert!(!versions.is_empty());
         assert!(versions.iter().any(|v| v.number.as_str().starts_with("7.")));
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use std::sync::Arc;
+
+    use deps_core::{
+        DependencySource, EgressTier, HttpCache, PackageName, Registry, RegistryEndpoint,
+    };
+
+    use super::{RUBYGEMS_API_BASE, RubyGemsRegistry};
+
+    #[test]
+    fn endpoint_for_is_the_api_base_on_baseline_egress() {
+        let registry = RubyGemsRegistry::new(Arc::new(HttpCache::new()));
+        let expected = RegistryEndpoint::from_base_str(RUBYGEMS_API_BASE, EgressTier::Baseline);
+
+        let endpoint = registry.endpoint_for(&PackageName::new("pkg"), &DependencySource::Registry);
+
+        assert_ne!(expected, RegistryEndpoint::Unresolved);
+        assert_eq!(endpoint, expected);
     }
 }
