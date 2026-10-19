@@ -210,7 +210,7 @@ impl Ecosystem for NuGetEcosystem {
                         &dir,
                         &self.context.config_cache,
                         &self.context.policy,
-                        self.context.user_profile_config.as_deref(),
+                        self.context.user_profile_config.as_ref(),
                         &self.context.user_profile_sources,
                     )
                 })
@@ -1279,9 +1279,13 @@ mod tests {
                 format!("{public_base}/index.json"),
             ));
 
-            let feed_url =
-                crate::config::NuGetFeedUrl::new(&format!("{alt_base}/index.json"), &policy)
-                    .unwrap();
+            let feed_url = deps_core::net_policy::OperatorRegistries::default()
+                .classify::<crate::config::NuGetFeedKind>(
+                    &format!("{alt_base}/index.json"),
+                    &format!("{alt_base}/index.json"),
+                    &policy,
+                )
+                .unwrap();
             let chain = crate::config::NuGetSourceChain {
                 key: "nuget-chain:test-alt".to_string(),
                 hops: vec![crate::config::ResolvedHop {

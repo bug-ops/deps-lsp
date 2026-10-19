@@ -190,6 +190,16 @@ pub enum ErrorOrigin {
     Unattributed,
 }
 
+impl ErrorOrigin {
+    /// Combines two origins observed for one logical lookup: any endpoint involvement wins.
+    pub(crate) const fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unattributed, Self::Unattributed) => Self::Unattributed,
+            (Self::Endpoint, _) | (_, Self::Endpoint) => Self::Endpoint,
+        }
+    }
+}
+
 impl From<reqwest::Error> for SanitizedRegistryError {
     fn from(error: reqwest::Error) -> Self {
         Self(Inner::Transport(error.without_url()))
@@ -342,13 +352,22 @@ pub enum DepsError {
     },
 
     /// A package name was not found on the given registry.
+    ///
+    /// `#[non_exhaustive]` on the variant itself (#1854): from outside `deps-core` the
+    /// constructors are [`Self::not_found_locally`] (never vouches for the endpoint) and
+    /// [`crate::not_found_or`] (which yields [`ErrorOrigin::Endpoint`] from a received HTTP
+    /// status). Misuse-resistant, not sealed: an `HttpStatus` literal is still constructible, so
+    /// feeding `not_found_or` a status that was not received would mislabel the origin.
     #[error("{package} not found on {registry}")]
+    #[non_exhaustive]
     PackageNotFound {
         /// Name of the package that was looked up — stored redacted (#1209): the raw value
         /// is unreachable from this field's type.
         package: RedactedName,
         /// Name of the registry that reported the package as missing.
         registry: &'static str,
+        /// Whether a registry response produced this error or it was decided locally.
+        origin: ErrorOrigin,
     },
 
     /// A registry HTTP request returned a non-success status code.
@@ -563,10 +582,15 @@ impl std::fmt::Debug for DepsError {
                 .field("verified", verified)
                 .field("source_status", source_status)
                 .finish(),
-            Self::PackageNotFound { package, registry } => f
+            Self::PackageNotFound {
+                package,
+                registry,
+                origin,
+            } => f
                 .debug_struct("PackageNotFound")
                 .field("package", package)
                 .field("registry", registry)
+                .field("origin", origin)
                 .finish(),
             Self::HttpStatus { url, status } => f
                 .debug_struct("HttpStatus")
@@ -681,6 +705,43 @@ impl DepsError {
         }
     }
 
+    /// Constructs a [`Self::PackageNotFound`] decided locally (a rejected name, a missing
+    /// route, an unregistered alternate), which is [`ErrorOrigin::Unattributed`]: it neither
+    /// vouches for the registry endpoint nor accuses it (#1854).
+    ///
+    /// A not-found that a registry actually answered is built only by
+    /// [`crate::not_found_or`], so a remote 404 is the one way to get
+    /// [`ErrorOrigin::Endpoint`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::DepsError;
+    /// use deps_core::error::ErrorOrigin;
+    ///
+    /// let error = DepsError::not_found_locally("left-pad", "npm");
+    /// assert!(error.is_not_found());
+    /// assert_eq!(error.origin(), ErrorOrigin::Unattributed);
+    /// ```
+    #[must_use]
+    pub fn not_found_locally(package: &str, registry: &'static str) -> Self {
+        Self::PackageNotFound {
+            package: package.into(),
+            registry,
+            origin: ErrorOrigin::Unattributed,
+        }
+    }
+
+    /// Constructs a [`Self::PackageNotFound`] from a registry's own not-found response.
+    /// Crate-private so [`ErrorOrigin::Endpoint`] stays reachable only through a response.
+    pub(crate) fn not_found_at_endpoint(package: &str, registry: &'static str) -> Self {
+        Self::PackageNotFound {
+            package: package.into(),
+            registry,
+            origin: ErrorOrigin::Endpoint,
+        }
+    }
+
     /// Returns `true` when this error means the registry was successfully asked and
     /// answered "this package doesn't exist", as opposed to the registry not having
     /// been answerable at all (network failure, timeout, malformed response, 5xx).
@@ -699,10 +760,7 @@ impl DepsError {
     /// ```
     /// use deps_core::DepsError;
     ///
-    /// let not_found = DepsError::PackageNotFound {
-    ///     package: "left-pad".into(),
-    ///     registry: "npm",
-    /// };
+    /// let not_found = DepsError::not_found_locally("left-pad", "npm");
     /// assert!(not_found.is_not_found());
     ///
     /// let http_404 = DepsError::HttpStatus {
@@ -946,8 +1004,8 @@ impl DepsError {
     ///
     /// [`Self::RateLimited`] uses `source_status` as a proxy for provenance: a confirmed 429
     /// rebuilt without a status (GitLab) reads as [`ErrorOrigin::Unattributed`], which only
-    /// shifts the verdict toward inconclusive. [`Self::PackageNotFound`] is deliberately
-    /// unattributed: it does not record whether the registry or a local mapping produced it.
+    /// shifts the verdict toward inconclusive. [`Self::PackageNotFound`] carries its own origin:
+    /// [`ErrorOrigin::Endpoint`] only when built from a registry response.
     ///
     /// **Exhaustive by design, no wildcard arm** (#1244 — see [`Self::fetch_failure`]).
     ///
@@ -962,8 +1020,8 @@ impl DepsError {
     /// ```
     #[must_use]
     pub fn origin(&self) -> ErrorOrigin {
-        // TODO(critic): typed not-found provenance on PackageNotFound so a remote 404 vouches for the endpoint again
         match self {
+            Self::PackageNotFound { origin, .. } => *origin,
             Self::HttpStatus { .. }
             | Self::ApiResponse { .. }
             | Self::ResponseTooLarge { .. }
@@ -990,7 +1048,6 @@ impl DepsError {
             }
             | Self::ParseError { .. }
             | Self::CacheError(_)
-            | Self::PackageNotFound { .. }
             | Self::InvalidVersionReq(_)
             | Self::InvalidPackageName(_)
             | Self::Io(_)
@@ -1205,11 +1262,7 @@ mod tests {
             (None, "api-response")
         );
         assert_eq!(
-            DepsError::PackageNotFound {
-                package: "flask".into(),
-                registry: "PyPI",
-            }
-            .safe_tracing_summary(),
+            DepsError::not_found_locally("flask", "PyPI").safe_tracing_summary(),
             (None, "not-found")
         );
         assert_eq!(
@@ -1434,10 +1487,7 @@ mod tests {
     /// come through unchanged.
     #[test]
     fn test_debug_still_shows_non_url_fields() {
-        let error = DepsError::PackageNotFound {
-            package: "left-pad".into(),
-            registry: "npm",
-        };
+        let error = DepsError::not_found_locally("left-pad", "npm");
         let debug = format!("{error:?}");
         assert!(debug.contains("left-pad"), "debug: {debug}");
         assert!(debug.contains("npm"), "debug: {debug}");
@@ -1502,10 +1552,7 @@ mod tests {
 
     #[test]
     fn test_package_not_found() {
-        let error = DepsError::PackageNotFound {
-            package: "flask".into(),
-            registry: "PyPI",
-        };
+        let error = DepsError::not_found_locally("flask", "PyPI");
         assert_eq!(error.to_string(), "flask not found on PyPI");
     }
 
@@ -1516,10 +1563,10 @@ mod tests {
     /// reads verbatim.
     #[test]
     fn test_package_not_found_display_redacts_credential_shaped_name() {
-        let error = DepsError::PackageNotFound {
-            package: "com.example:deploy:AUDITSENTINEL0000@git.internal.corp".into(),
-            registry: "Maven Central",
-        };
+        let error = DepsError::not_found_locally(
+            "com.example:deploy:AUDITSENTINEL0000@git.internal.corp",
+            "Maven Central",
+        );
         assert!(
             !error.to_string().contains("AUDITSENTINEL0000"),
             "Display leaked a credential-shaped package name: {error}"
@@ -1724,10 +1771,7 @@ mod tests {
                 source: reqwest_err.into(),
             },
             DepsError::CacheError("connection reset".into()),
-            DepsError::PackageNotFound {
-                package: "flask".into(),
-                registry: "PyPI",
-            },
+            DepsError::not_found_locally("flask", "PyPI"),
             DepsError::HttpStatus {
                 url: "https://example.com".into(),
                 status: 500,
@@ -1805,6 +1849,15 @@ mod tests {
                 verified: RateLimitEvidence::Confirmed,
                 source_status: Some(429),
             },
+            crate::not_found_or(
+                DepsError::HttpStatus {
+                    url: "https://r.example/x".into(),
+                    status: 404,
+                },
+                "p",
+                "npm",
+                &[],
+            ),
         ];
         for error in endpoint {
             assert_eq!(error.origin(), ErrorOrigin::Endpoint, "{error:?}");
@@ -1812,10 +1865,7 @@ mod tests {
 
         let unattributed = [
             DepsError::CacheError("x".into()),
-            DepsError::PackageNotFound {
-                package: "p".into(),
-                registry: "npm",
-            },
+            DepsError::not_found_locally("p", "npm"),
             DepsError::PaginatedListIncomplete {
                 package: "p".into(),
                 registry: "gitlab",

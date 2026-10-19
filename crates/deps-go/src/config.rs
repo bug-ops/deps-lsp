@@ -29,13 +29,15 @@
 //! See `specs/034-go-goproxy-private-registry/spec.md` FR-001–FR-016 for the design this module
 //! implements.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use deps_core::EcosystemId;
+use deps_core::config_trust::{EnvPath, OperatorEnvVar, OperatorPath};
 use deps_core::net_policy::{
-    BlockedHost, BlockedHostReason, RedactedUrl, RegistryAccessPolicy, RegistryRejectionReason,
-    RegistryUrlKind, ValidatedRegistryUrl,
+    BlockedHost, BlockedHostReason, DeclaredRegistry, EnvSource, OperatorRegistries, ProcessEnv,
+    RedactedUrl, RegistryAccessPolicy, RegistryRejectionReason, RegistryUrlKind,
+    ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
 
@@ -92,8 +94,8 @@ pub type GoProxyUrl = ValidatedRegistryUrl<GoProxyKind>;
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoProxyHop {
-    /// A validated, fetchable proxy host.
-    Url(GoProxyUrl),
+    /// A validated, fetchable proxy host with the trust the operator-file rule gave it.
+    Url(DeclaredRegistry<GoProxyKind>),
     /// `direct`: resolve straight from the VCS host — phase 1 has no direct-VCS resolution
     /// mechanism (see this crate's module docs / spec FR-006), so this is a fail-closed
     /// terminal hop that never issues a network request.
@@ -119,11 +121,16 @@ pub type InvalidEntry = deps_core::net_policy::InvalidEntry<GoProxyUrlError>;
 /// Parses and validates one `,`-or-`|`-separated `GOPROXY` chain entry (FR-002), logging a
 /// `tracing::warn!` naming the raw value (redacted — see
 /// [`deps_core::net_policy::RedactedUrl`]) on failure.
-fn parse_hop(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyHop, InvalidEntry> {
+fn parse_hop(
+    raw: &str,
+    operator: &OperatorRegistries,
+    policy: &RegistryAccessPolicy,
+) -> Result<GoProxyHop, InvalidEntry> {
     match raw {
         "direct" => Ok(GoProxyHop::Direct),
         "off" => Ok(GoProxyHop::Off),
-        _ => GoProxyUrl::new(raw, policy)
+        _ => operator
+            .classify::<GoProxyKind>(raw, raw, policy)
             .map(GoProxyHop::Url)
             .map_err(|reason| {
                 InvalidEntry::logged(
@@ -262,6 +269,7 @@ struct GoProxyChainFailure {
 #[allow(clippy::string_slice)]
 fn parse_goproxy(
     raw: &str,
+    operator: &OperatorRegistries,
     policy: &RegistryAccessPolicy,
 ) -> Result<GoProxyChain, GoProxyChainFailure> {
     let mut hops: Vec<GoProxyHop> = Vec::new();
@@ -293,7 +301,7 @@ fn parse_goproxy(
 
         let trimmed = entry.trim();
         if !trimmed.is_empty() {
-            match parse_hop(trimmed, policy) {
+            match parse_hop(trimmed, operator, policy) {
                 Ok(hop) => {
                     let terminal = matches!(hop, GoProxyHop::Direct | GoProxyHop::Off);
                     if !hops.is_empty() {
@@ -689,21 +697,23 @@ pub struct GoEnvConfig {
 }
 
 impl GoEnvConfig {
-    /// Parses `$GOENV` file content (FR-001: `KEY=VALUE` lines, `#`-comments and blank lines
-    /// ignored) into a resolved config, validating any `GOPROXY` hop against `policy`
-    /// (FR-011).
+    /// Parses the content of the operator-owned `$GOENV` file at `file` (FR-001: `KEY=VALUE`
+    /// lines, `#`-comments and blank lines ignored) into a resolved config.
+    ///
+    /// Every `GOPROXY` hop is declared by that file, so each valid hop is
+    /// [`deps_core::net_policy::RegistryTrust::Trusted`] and skips `policy` (spec 084); a hop of a
+    /// host that is never a registry is still rejected.
     #[must_use]
-    pub fn parse(content: &str, policy: &RegistryAccessPolicy) -> Self {
-        Self::from_raw(&parse_goenv_raw(content), policy)
+    pub fn parse(content: &str, file: &OperatorPath, policy: &RegistryAccessPolicy) -> Self {
+        Self::from_raw(&parse_goenv_raw(content), file, policy)
     }
 
-    fn from_raw(raw: &RawGoEnv, policy: &RegistryAccessPolicy) -> Self {
+    fn from_raw(raw: &RawGoEnv, file: &OperatorPath, policy: &RegistryAccessPolicy) -> Self {
+        let goproxy = raw.goproxy.as_deref().filter(|s| !s.is_empty());
+        let operator =
+            OperatorRegistries::declared_in(file, goproxy.map_or_else(Vec::new, goproxy_urls));
         Self {
-            goproxy: raw
-                .goproxy
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(|raw| parse_goproxy(raw, policy)),
+            goproxy: goproxy.map(|raw| parse_goproxy(raw, &operator, policy)),
             // Compiled once per distinct `RawGoEnv` (memoized on `raw` itself, see its
             // `compiled_goprivate` doc) rather than on every `from_raw` call — GOPRIVATE glob
             // compilation never depends on `policy`, unlike GOPROXY hop validation above, so
@@ -848,6 +858,15 @@ impl GoEnvConfig {
     }
 }
 
+/// The URL-shaped entries of a raw `GOPROXY` value (everything but the `direct`/`off`
+/// sentinels), split on both chain separators.
+fn goproxy_urls(raw: &str) -> Vec<&str> {
+    raw.split([',', '|'])
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty() && !matches!(*entry, "direct" | "off"))
+        .collect()
+}
+
 /// One `$GOENV` file's raw (unvalidated) `GOPROXY`/`GOPRIVATE` values — see
 /// [`parse_goenv_raw`]'s doc for exactly which keys this can ever contain.
 #[derive(Debug, Default)]
@@ -946,7 +965,10 @@ pub struct GoParseContext {
     /// (`deps_engine::setup::register_ecosystems`) pass [`goenv_path`]'s result; tests pass a fixture
     /// path. `None` — the [`Default`] value — means "no `$GOENV` file", the same hermetic,
     /// zero-host-read behavior [`crate::parser::parse_go_mod`]'s doc already promises.
-    pub goenv_path: Option<PathBuf>,
+    ///
+    /// An [`OperatorPath`], never a bare path: a `GOENV` that is `off`, empty or relative names no
+    /// operator-owned file and is `None` here.
+    pub goenv_path: Option<OperatorPath>,
 }
 
 impl GoParseContext {
@@ -973,7 +995,7 @@ impl GoParseContext {
     pub const fn new(
         policy: Arc<RegistryAccessPolicy>,
         config_cache: Arc<GoEnvCache>,
-        goenv_path: Option<PathBuf>,
+        goenv_path: Option<OperatorPath>,
     ) -> Self {
         Self {
             policy,
@@ -985,23 +1007,32 @@ impl GoParseContext {
 
 /// Resolves `$GOENV`'s path (FR-001).
 ///
-/// The `GOENV` environment variable if set and non-empty, else the platform default
+/// The `GOENV` environment variable when it is an absolute path, else the platform default
 /// `os.UserConfigDir()/go/env` (`~/.config/go/env` on Linux/macOS, `%AppData%\go\env` on
-/// Windows).
+/// Windows). `GOENV=off` disables the file (`None`), as `go` itself does, and an empty or
+/// relative `GOENV` is ignored without falling back to the default: a relative path would
+/// resolve against a directory a repository can influence.
 #[must_use]
-pub fn goenv_path() -> Option<PathBuf> {
-    goenv_path_with_env(std::env::var("GOENV").ok())
+pub fn goenv_path() -> Option<OperatorPath> {
+    goenv_path_with_env(&ProcessEnv)
 }
 
-/// [`goenv_path`], but taking the `GOENV` environment variable's value explicitly instead of
-/// reading the real process environment — lets tests inject a fixture value without mutating
-/// process-global state (this crate forbids `unsafe` code, so an actual `std::env::set_var`
-/// call, which is `unsafe` since Rust 2024, is not an option here).
-fn goenv_path_with_env(env_value: Option<String>) -> Option<PathBuf> {
-    if let Some(value) = env_value.filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(value));
+/// [`goenv_path`], but reading `GOENV` from `env` instead of the real process environment —
+/// lets tests inject a fixture value without mutating process-global state (this crate forbids
+/// `unsafe` code, so an actual `std::env::set_var` call, which is `unsafe` since Rust 2024, is
+/// not an option here).
+fn goenv_path_with_env(env: &impl EnvSource) -> Option<OperatorPath> {
+    if env
+        .var_os(OperatorEnvVar::Goenv.name())
+        .is_some_and(|value| value == "off")
+    {
+        return None;
     }
-    dirs::config_dir().map(|dir| dir.join("go").join("env"))
+    match OperatorPath::from_env(env, OperatorEnvVar::Goenv) {
+        EnvPath::Path(path) => Some(path),
+        EnvPath::Ignored => None,
+        EnvPath::Unset => OperatorPath::user_config_dir().map(|dir| dir.join("go").join("env")),
+    }
 }
 
 /// Resolves `$GOENV` into a [`GoEnvConfig`] (spec FR-001–FR-008).
@@ -1039,7 +1070,7 @@ fn goenv_path_with_env(env_value: Option<String>) -> Option<PathBuf> {
 /// ```
 #[must_use]
 pub fn resolve(cache: &GoEnvCache, policy: &RegistryAccessPolicy) -> GoEnvConfig {
-    resolve_at(cache, policy, goenv_path())
+    resolve_at(cache, policy, goenv_path().as_ref())
 }
 
 /// Resolves `$GOENV` into a [`GoEnvConfig`], reading the already-resolved
@@ -1050,7 +1081,7 @@ pub fn resolve(cache: &GoEnvCache, policy: &RegistryAccessPolicy) -> GoEnvConfig
 /// path without depending on the real host `$GOENV`.
 #[must_use]
 pub fn resolve_with_context(ctx: &GoParseContext) -> GoEnvConfig {
-    resolve_at(&ctx.config_cache, &ctx.policy, ctx.goenv_path.clone())
+    resolve_at(&ctx.config_cache, &ctx.policy, ctx.goenv_path.as_ref())
 }
 
 /// [`resolve`], but taking the `$GOENV` path explicitly instead of [`goenv_path`] — lets tests
@@ -1058,22 +1089,27 @@ pub fn resolve_with_context(ctx: &GoParseContext) -> GoEnvConfig {
 fn resolve_at(
     cache: &GoEnvCache,
     policy: &RegistryAccessPolicy,
-    path: Option<PathBuf>,
+    path: Option<&OperatorPath>,
 ) -> GoEnvConfig {
     let Some(path) = path else {
         return GoEnvConfig::default();
     };
-    let Some(raw) = cache.get_or_parse(&path) else {
+    let Some(raw) = cache.get_or_parse(path.as_path()) else {
         return GoEnvConfig::default();
     };
-    GoEnvConfig::from_raw(&raw, policy)
+    GoEnvConfig::from_raw(&raw, path, policy)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use deps_core::net_policy::{HostClass, WorkspaceRegistryAccess};
+    use deps_core::net_policy::{MapEnv, RegistryTrust};
     use std::assert_matches;
+
+    fn parse_fixture(content: &str, policy: &RegistryAccessPolicy) -> GoEnvConfig {
+        GoEnvConfig::parse(content, &OperatorPath::for_test("/home/me/go/env"), policy)
+    }
 
     fn all_policy() -> RegistryAccessPolicy {
         RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)
@@ -1438,7 +1474,11 @@ mod tests {
         let cache = GoEnvCache::new();
         let log = deps_core::test_util::capture_tracing_output(|| {
             for _ in 0..4 {
-                let _ = resolve_at(&cache, &all_policy(), Some(path.clone()));
+                let _ = resolve_at(
+                    &cache,
+                    &all_policy(),
+                    Some(&OperatorPath::for_test(path.clone())),
+                );
             }
 
             // A genuine content change (distinguishable mtime) must re-trigger the warning
@@ -1455,7 +1495,11 @@ mod tests {
                 .unwrap();
 
             for _ in 0..2 {
-                let _ = resolve_at(&cache, &all_policy(), Some(path.clone()));
+                let _ = resolve_at(
+                    &cache,
+                    &all_policy(),
+                    Some(&OperatorPath::for_test(path.clone())),
+                );
             }
         });
 
@@ -1471,7 +1515,7 @@ mod tests {
 
     #[test]
     fn test_empty_content_resolves_to_plain_registry() {
-        let config = GoEnvConfig::parse("", &all_policy());
+        let config = parse_fixture("", &all_policy());
         assert_eq!(
             config.resolve_source_for("github.com/gin-gonic/gin"),
             DependencySource::Registry
@@ -1483,14 +1527,14 @@ mod tests {
     #[test]
     fn test_comments_and_blank_lines_ignored() {
         let content = "# a comment\n\nGOPROXY=https://goproxy.mycorp.example\n";
-        let config = GoEnvConfig::parse(content, &all_policy());
+        let config = parse_fixture(content, &all_policy());
         assert!(config.goproxy_chain().is_some());
     }
 
     /// US-001: a single-hop `GOPROXY,direct` chain resolves to `AlternateRegistry`.
     #[test]
     fn test_goproxy_single_hop_plus_direct() {
-        let config = GoEnvConfig::parse(
+        let config = parse_fixture(
             "GOPROXY=https://goproxy.mycorp.example,direct",
             &all_policy(),
         );
@@ -1513,7 +1557,7 @@ mod tests {
     /// US-004: `GOPROXY=off` as sole entry.
     #[test]
     fn test_goproxy_off_sole_entry() {
-        let config = GoEnvConfig::parse("GOPROXY=off", &all_policy());
+        let config = parse_fixture("GOPROXY=off", &all_policy());
         let chain = config.goproxy_chain().unwrap();
         assert_eq!(chain.hops, vec![GoProxyHop::Off]);
     }
@@ -1521,7 +1565,7 @@ mod tests {
     /// FR-009: sole invalid entry fails the whole chain closed to `CustomRegistry`.
     #[test]
     fn test_goproxy_sole_invalid_entry_fails_closed() {
-        let config = GoEnvConfig::parse("GOPROXY=not-a-valid-url", &all_policy());
+        let config = parse_fixture("GOPROXY=not-a-valid-url", &all_policy());
         assert_eq!(
             config.resolve_source_for("github.com/gin-gonic/gin"),
             DependencySource::CustomRegistry {
@@ -1535,7 +1579,7 @@ mod tests {
     /// escalation.
     #[test]
     fn test_goproxy_invalid_hop_dropped_when_valid_hop_remains() {
-        let config = GoEnvConfig::parse(
+        let config = parse_fixture(
             "GOPROXY=not-a-valid-url,https://goproxy.mycorp.example",
             &all_policy(),
         );
@@ -1544,10 +1588,11 @@ mod tests {
         assert_matches!(chain.hops[0], GoProxyHop::Url(_));
     }
 
-    /// FR-011: a policy-blocked hop is treated the same as an invalid one.
+    /// FR-011: a blocked hop (here a never-a-registry host, which no policy level unblocks) is
+    /// treated the same as an invalid one.
     #[test]
     fn test_goproxy_policy_blocked_hop_fails_closed() {
-        let config = GoEnvConfig::parse("GOPROXY=https://goproxy.mycorp.example", &off_policy());
+        let config = parse_fixture("GOPROXY=https://169.254.169.254", &all_policy());
         assert_matches!(
             config.resolve_source_for("github.com/gin-gonic/gin"),
             DependencySource::CustomRegistry { .. }
@@ -1558,16 +1603,16 @@ mod tests {
     /// the data `GoParseResult::blocked_registries` surfaces as a diagnostic.
     #[test]
     fn test_blocked_class_some_when_goproxy_policy_blocked() {
-        let config = GoEnvConfig::parse("GOPROXY=https://goproxy.mycorp.example", &off_policy());
+        let config = parse_fixture("GOPROXY=https://169.254.169.254", &all_policy());
         let (host, raw) = config.blocked_class().expect("expected a blocked class");
-        assert_eq!(host.class(), HostClass::Global);
-        assert_eq!(raw, "https://goproxy.mycorp.example");
+        assert_eq!(host.class(), HostClass::CloudMetadata);
+        assert_eq!(raw, "https://169.254.169.254");
     }
 
     /// #958: no `GOPROXY` override at all -> nothing to report.
     #[test]
     fn test_blocked_class_none_when_no_goproxy() {
-        let config = GoEnvConfig::parse("", &off_policy());
+        let config = parse_fixture("", &off_policy());
         assert_eq!(config.blocked_class(), None);
     }
 
@@ -1575,7 +1620,7 @@ mod tests {
     /// misreported as a policy block.
     #[test]
     fn test_blocked_class_none_for_non_policy_invalid_reason() {
-        let config = GoEnvConfig::parse("GOPROXY=not-a-valid-url", &all_policy());
+        let config = parse_fixture("GOPROXY=not-a-valid-url", &all_policy());
         assert_eq!(config.blocked_class(), None);
     }
 
@@ -1583,7 +1628,7 @@ mod tests {
     /// closed, so there is nothing blocked to report even though one hop was policy-blocked.
     #[test]
     fn test_blocked_class_none_when_valid_hop_remains() {
-        let config = GoEnvConfig::parse(
+        let config = parse_fixture(
             "GOPROXY=https://goproxy.mycorp.example,direct",
             &off_policy(),
         );
@@ -1596,9 +1641,9 @@ mod tests {
     /// `blocked_class` still reports the second hop's block.
     #[test]
     fn test_blocked_class_not_masked_by_earlier_invalid_url_hop() {
-        let config = GoEnvConfig::parse(
-            "GOPROXY=not-a-valid-url,https://goproxy.mycorp.example",
-            &off_policy(),
+        let config = parse_fixture(
+            "GOPROXY=not-a-valid-url,https://169.254.169.254",
+            &all_policy(),
         );
         assert_eq!(
             config.resolve_source_for("github.com/gin-gonic/gin"),
@@ -1607,8 +1652,8 @@ mod tests {
             }
         );
         let (host, raw) = config.blocked_class().expect("expected a blocked class");
-        assert_eq!(host.class(), HostClass::Global);
-        assert_eq!(raw, "https://goproxy.mycorp.example");
+        assert_eq!(host.class(), HostClass::CloudMetadata);
+        assert_eq!(raw, "https://169.254.169.254");
     }
 
     /// #958 code-review fix (S1): the realistic variant — a plain-`http` internal proxy
@@ -1616,13 +1661,13 @@ mod tests {
     /// hop's own policy block.
     #[test]
     fn test_blocked_class_not_masked_by_earlier_non_https_hop() {
-        let config = GoEnvConfig::parse(
-            "GOPROXY=http://a.mycorp.example,https://b.mycorp.example",
-            &off_policy(),
+        let config = parse_fixture(
+            "GOPROXY=http://a.mycorp.example,https://169.254.169.254",
+            &all_policy(),
         );
         let (host, raw) = config.blocked_class().expect("expected a blocked class");
-        assert_eq!(host.class(), HostClass::Global);
-        assert_eq!(raw, "https://b.mycorp.example");
+        assert_eq!(host.class(), HostClass::CloudMetadata);
+        assert_eq!(raw, "https://169.254.169.254");
     }
 
     /// #1438: `rejected_reason_for` is [`GoEnvConfig::blocked_class`]'s counterpart for every
@@ -1630,7 +1675,7 @@ mod tests {
     /// equivalent reporting at all.
     #[test]
     fn test_rejected_reason_for_sole_invalid_entry() {
-        let config = GoEnvConfig::parse("GOPROXY=not-a-valid-url", &all_policy());
+        let config = parse_fixture("GOPROXY=not-a-valid-url", &all_policy());
         let (reason, raw) = config
             .rejected_reason_for()
             .expect("expected a rejected reason");
@@ -1646,7 +1691,7 @@ mod tests {
     /// #1438: no `GOPROXY` override at all -> nothing to report.
     #[test]
     fn test_rejected_reason_for_none_when_no_goproxy() {
-        let config = GoEnvConfig::parse("", &off_policy());
+        let config = parse_fixture("", &off_policy());
         assert_eq!(config.rejected_reason_for(), None);
     }
 
@@ -1654,7 +1699,7 @@ mod tests {
     /// `blocked_class`, so `rejected_reason_for` must not also report it.
     #[test]
     fn test_rejected_reason_for_none_when_sole_hop_is_blocked_host() {
-        let config = GoEnvConfig::parse("GOPROXY=https://goproxy.mycorp.example", &off_policy());
+        let config = parse_fixture("GOPROXY=https://goproxy.mycorp.example", &off_policy());
         assert_eq!(config.rejected_reason_for(), None);
     }
 
@@ -1662,7 +1707,7 @@ mod tests {
     /// rejected to report even though one hop was invalid.
     #[test]
     fn test_rejected_reason_for_none_when_valid_hop_remains() {
-        let config = GoEnvConfig::parse("GOPROXY=not-a-valid-url,direct", &all_policy());
+        let config = parse_fixture("GOPROXY=not-a-valid-url,direct", &all_policy());
         assert_eq!(config.rejected_reason_for(), None);
     }
 
@@ -1673,9 +1718,9 @@ mod tests {
     /// `test_blocked_class_not_masked_by_earlier_invalid_url_hop`).
     #[test]
     fn test_rejected_reason_for_reports_first_invalid_hop_alongside_later_blocked_hop() {
-        let config = GoEnvConfig::parse(
-            "GOPROXY=not-a-valid-url,https://goproxy.mycorp.example",
-            &off_policy(),
+        let config = parse_fixture(
+            "GOPROXY=not-a-valid-url,https://169.254.169.254",
+            &all_policy(),
         );
         let (reason, raw) = config
             .rejected_reason_for()
@@ -1689,7 +1734,7 @@ mod tests {
     /// dropped at parse time.
     #[test]
     fn test_goproxy_hops_after_terminal_are_dropped() {
-        let config = GoEnvConfig::parse(
+        let config = parse_fixture(
             "GOPROXY=https://a.example,direct,https://b.example",
             &all_policy(),
         );
@@ -1701,8 +1746,7 @@ mod tests {
     /// FR-002: pipe-separated entries parse the same as comma-separated ones.
     #[test]
     fn test_goproxy_pipe_separated() {
-        let config =
-            GoEnvConfig::parse("GOPROXY=https://a.example|https://b.example", &all_policy());
+        let config = parse_fixture("GOPROXY=https://a.example|https://b.example", &all_policy());
         let chain = config.goproxy_chain().unwrap();
         assert_eq!(chain.hops.len(), 2);
     }
@@ -1711,7 +1755,7 @@ mod tests {
     /// collapsing to the same fallback rule.
     #[test]
     fn test_goproxy_separators_recorded_distinctly() {
-        let config = GoEnvConfig::parse(
+        let config = parse_fixture(
             "GOPROXY=https://a.example,https://b.example|https://c.example",
             &all_policy(),
         );
@@ -1727,7 +1771,7 @@ mod tests {
     /// `NotFoundOnly`, matching this feature's original behavior.
     #[test]
     fn test_goproxy_all_comma_separators() {
-        let config = GoEnvConfig::parse(
+        let config = parse_fixture(
             "GOPROXY=https://a.example,https://b.example,direct",
             &all_policy(),
         );
@@ -1743,7 +1787,7 @@ mod tests {
     fn test_goprivate_bypasses_goproxy() {
         let content =
             "GOPROXY=https://goproxy.mycorp.example,direct\nGOPRIVATE=git.mycorp.example/*\n";
-        let config = GoEnvConfig::parse(content, &all_policy());
+        let config = parse_fixture(content, &all_policy());
 
         let private_source = config.resolve_source_for("git.mycorp.example/internal/auth");
         assert_eq!(
@@ -1764,7 +1808,7 @@ mod tests {
     /// bypass chain.
     #[test]
     fn test_goprivate_without_goproxy() {
-        let config = GoEnvConfig::parse("GOPRIVATE=git.mycorp.example/*", &all_policy());
+        let config = parse_fixture("GOPRIVATE=git.mycorp.example/*", &all_policy());
         assert!(config.goproxy_chain().is_none());
         assert_eq!(
             config.resolve_source_for("git.mycorp.example/internal/auth"),
@@ -1784,7 +1828,7 @@ mod tests {
     /// hop/pattern, no panic.
     #[test]
     fn test_goenv_empty_goproxy_and_goprivate_values_are_absent() {
-        let config = GoEnvConfig::parse("GOPROXY=\nGOPRIVATE=\n", &all_policy());
+        let config = parse_fixture("GOPROXY=\nGOPRIVATE=\n", &all_policy());
         assert!(config.goproxy_chain().is_none());
         assert!(!config.has_goprivate());
         assert_eq!(
@@ -1798,7 +1842,7 @@ mod tests {
     #[test]
     fn test_goenv_malformed_line_without_equals_is_ignored() {
         let content = "GARBAGE LINE WITH NO EQUALS\nGOPROXY=https://goproxy.mycorp.example\n";
-        let config = GoEnvConfig::parse(content, &all_policy());
+        let config = parse_fixture(content, &all_policy());
         assert!(config.goproxy_chain().is_some());
     }
 
@@ -1806,7 +1850,7 @@ mod tests {
     /// (no dedup requirement, no panic) — duplicates are just redundant, not invalid.
     #[test]
     fn test_goenv_duplicate_goprivate_patterns_still_match() {
-        let config = GoEnvConfig::parse(
+        let config = parse_fixture(
             "GOPRIVATE=git.mycorp.example/*,git.mycorp.example/*",
             &all_policy(),
         );
@@ -1825,7 +1869,7 @@ mod tests {
     /// transition with its own real semantics, not the first separator seen in the value.
     #[test]
     fn test_goproxy_mixed_pipe_then_comma_separators() {
-        let config = GoEnvConfig::parse(
+        let config = parse_fixture(
             "GOPROXY=https://a.example|https://b.example,direct",
             &all_policy(),
         );
@@ -1846,7 +1890,7 @@ mod tests {
     /// doc.
     #[test]
     fn test_goproxy_separator_before_dropped_hop_is_merged_most_permissive_wins() {
-        let config = GoEnvConfig::parse(
+        let config = parse_fixture(
             "GOPROXY=https://a.example|not-a-valid-url,https://c.example",
             &all_policy(),
         );
@@ -1861,7 +1905,7 @@ mod tests {
     #[test]
     fn test_has_goprivate_false_when_all_patterns_rejected() {
         let long_pattern = "*".repeat(MAX_GLOB_PATTERN_LENGTH + 1);
-        let config = GoEnvConfig::parse(&format!("GOPRIVATE={long_pattern}"), &all_policy());
+        let config = parse_fixture(&format!("GOPRIVATE={long_pattern}"), &all_policy());
         assert!(!config.has_goprivate());
         assert!(config.resolved_chains().is_empty());
     }
@@ -1873,7 +1917,7 @@ mod tests {
     fn test_has_goprivate_true_when_at_least_one_pattern_usable() {
         let long_pattern = "*".repeat(MAX_GLOB_PATTERN_LENGTH + 1);
         let content = format!("GOPRIVATE={long_pattern},git.mycorp.example/*");
-        let config = GoEnvConfig::parse(&content, &all_policy());
+        let config = parse_fixture(&content, &all_policy());
         assert!(config.has_goprivate());
         assert_eq!(config.resolved_chains().len(), 1);
     }
@@ -1883,7 +1927,7 @@ mod tests {
     /// (and thus `resolved_chains()`) the same way.
     #[test]
     fn test_has_goprivate_false_for_malformed_pattern() {
-        let config = GoEnvConfig::parse("GOPRIVATE=git.corp.example/[abc", &all_policy());
+        let config = parse_fixture("GOPRIVATE=git.corp.example/[abc", &all_policy());
         assert!(!config.has_goprivate());
         assert!(config.resolved_chains().is_empty());
         assert_eq!(
@@ -1899,7 +1943,7 @@ mod tests {
     /// one.
     #[test]
     fn test_has_goprivate_true_for_pattern_with_reversed_range() {
-        let config = GoEnvConfig::parse("GOPRIVATE=git.corp.example/repo[c-a]", &all_policy());
+        let config = parse_fixture("GOPRIVATE=git.corp.example/repo[c-a]", &all_policy());
         assert!(config.has_goprivate());
         assert_eq!(config.resolved_chains().len(), 1);
     }
@@ -1911,7 +1955,7 @@ mod tests {
     #[test]
     fn test_invalid_hop_redacts_userinfo_from_raw_and_log() {
         let log = deps_core::test_util::capture_tracing_output(|| {
-            let config = GoEnvConfig::parse(
+            let config = parse_fixture(
                 "GOPROXY=https://user:hunter2@goproxy.mycorp.example",
                 &all_policy(),
             );
@@ -1935,7 +1979,7 @@ mod tests {
     #[test]
     fn test_compile_glob_dangling_escape_warn_redacts_query_credential() {
         let log = deps_core::test_util::capture_tracing_output(|| {
-            let config = GoEnvConfig::parse(
+            let config = parse_fixture(
                 r"GOPRIVATE=git.corp.example/pkg?token=SUPERSECRET_TOKEN\",
                 &all_policy(),
             );
@@ -1955,7 +1999,7 @@ mod tests {
     #[test]
     fn test_compile_glob_reversed_range_warn_redacts_query_credential() {
         let log = deps_core::test_util::capture_tracing_output(|| {
-            let config = GoEnvConfig::parse(
+            let config = parse_fixture(
                 "GOPRIVATE=git.corp.example/repo?token=SUPERSECRET_TOKEN[c-a]",
                 &all_policy(),
             );
@@ -1975,7 +2019,7 @@ mod tests {
     #[test]
     fn test_compile_glob_unterminated_class_warn_redacts_query_credential() {
         let log = deps_core::test_util::capture_tracing_output(|| {
-            let config = GoEnvConfig::parse(
+            let config = parse_fixture(
                 "GOPRIVATE=git.corp.example/repo?token=SUPERSECRET_TOKEN[abc",
                 &all_policy(),
             );
@@ -2017,7 +2061,7 @@ mod tests {
         let config = resolve_at(
             &cache,
             &all_policy(),
-            Some(PathBuf::from("/nonexistent/go/env")),
+            Some(&OperatorPath::for_test("/nonexistent/go/env")),
         );
         assert!(config.goproxy_chain().is_none());
     }
@@ -2029,20 +2073,76 @@ mod tests {
         std::fs::write(&path, "GOPROXY=https://goproxy.mycorp.example,direct\n").unwrap();
 
         let cache = GoEnvCache::new();
-        let config = resolve_at(&cache, &all_policy(), Some(path));
+        let config = resolve_at(&cache, &all_policy(), Some(&OperatorPath::for_test(path)));
         assert!(config.goproxy_chain().is_some());
     }
 
-    #[test]
-    fn test_goenv_path_honors_env_var() {
-        let path = goenv_path_with_env(Some("/custom/goenv/path".to_string()));
-        assert_eq!(path, Some(PathBuf::from("/custom/goenv/path")));
+    fn env(value: &str) -> MapEnv {
+        MapEnv::new().with_var("GOENV", value)
     }
 
     #[test]
+    fn test_goenv_path_honors_an_absolute_env_var() {
+        let abs = std::env::temp_dir().join("goenv");
+        let path = goenv_path_with_env(&env(abs.to_str().unwrap()));
+        assert_eq!(
+            path.as_ref().map(OperatorPath::as_path),
+            Some(abs.as_path())
+        );
+    }
+
+    #[test]
+    fn test_goenv_path_unset_falls_back_to_the_platform_default() {
+        let path = goenv_path_with_env(&MapEnv::new());
+        let expected = OperatorPath::user_config_dir().map(|dir| dir.join("go").join("env"));
+        assert_eq!(path, expected);
+    }
+
+    #[test]
+    fn test_goenv_off_disables_the_file_and_is_never_a_relative_path() {
+        assert_eq!(goenv_path_with_env(&env("off")), None);
+    }
+
+    #[test]
+    fn test_goenv_relative_has_no_fallback_to_the_default() {
+        for value in ["rel/path/env", "./env", "env"] {
+            assert_eq!(goenv_path_with_env(&env(value)), None, "{value:?}");
+        }
+    }
+
+    /// Go treats an empty `GOENV` as unset and reads the default env file.
+    #[test]
     fn test_goenv_path_empty_env_var_falls_back_to_platform_default() {
-        let with_empty = goenv_path_with_env(Some(String::new()));
-        let with_none = goenv_path_with_env(None);
-        assert_eq!(with_empty, with_none);
+        assert_eq!(
+            goenv_path_with_env(&env("")),
+            goenv_path_with_env(&MapEnv::new())
+        );
+    }
+
+    #[test]
+    fn test_goenv_hops_are_trusted_and_skip_the_workspace_policy() {
+        let config = parse_fixture(
+            "GOPROXY=https://goproxy.mycorp.example,https://second.mycorp.example|direct\n",
+            &off_policy(),
+        );
+        let chain = config
+            .goproxy_chain()
+            .expect("operator hops skip policy `off`");
+        let trusts: Vec<_> = chain
+            .hops
+            .iter()
+            .filter_map(|hop| match hop {
+                GoProxyHop::Url(url) => Some(url.trust()),
+                GoProxyHop::Direct | GoProxyHop::Off => None,
+            })
+            .collect();
+        assert_eq!(trusts, vec![RegistryTrust::Trusted; 2]);
+    }
+
+    #[test]
+    fn test_goenv_never_a_registry_hop_is_still_rejected_under_every_policy() {
+        let config = parse_fixture("GOPROXY=https://169.254.169.254/\n", &all_policy());
+        assert!(config.goproxy_chain().is_none());
+        assert!(config.blocked_class().is_some());
     }
 }

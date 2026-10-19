@@ -22,9 +22,9 @@ workspace = true
 lsp-responses = ["dep:tower-lsp-server", "deps-core/lsp-responses"]
 
 [dependencies]
+bytes.workspace = true
 dashmap.workspace = true
 deps-core = { workspace = true }
-dirs.workspace = true
 regex.workspace = true
 semver.workspace = true
 serde.workspace = true

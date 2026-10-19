@@ -67,19 +67,20 @@ reachability policy below shows no version data for the affected dependency —
 never a silent fallback to `registry.npmjs.org`, matching Cargo's equivalent
 guarantee for a misconfigured registry alias.
 
-**Proxies.** Guarded traffic, including your user `~/.npmrc` registries, connects directly and bypasses the
-system proxy by default; set `DEPS_LSP_WORKSPACE_REGISTRY_PROXY=proxy` to route it through
-the proxy (see [Proxies and guarded registry traffic](../configuration.md#proxies-and-guarded-registry-traffic)).
+**Proxies.** A registry your user `~/.npmrc` declares (and a project `.npmrc` URL equal to one)
+is an [operator-owned registry](../configuration.md#operator-owned-registries): it follows your
+system proxy like the public registries. Registries only a project `.npmrc` declares stay
+workspace-guarded and direct by default (see
+[Proxies and guarded registry traffic](../configuration.md#proxies-and-guarded-registry-traffic)).
 
-**Reachability policy**: governed by the same `registries.workspace_registries`
-setting documented in [Cargo](cargo.md#customprivate-registries), including its
-[connect-time message](cargo.md#customprivate-registries) for a host that resolves to a blocked
-address — unlike
-Cargo's `$CARGO_HOME`-is-trusted split, npm's project and user `.npmrc` tiers
-are policy-*symmetric*: phase 1 has no credential provenance to protect, so
-there is no tier that is "the user's own configuration" in the way
-`$CARGO_HOME` is for Cargo. Setting `registries.workspace_registries` to
-`"all"` for npm's benefit also widens it for Cargo, and vice versa; either way only the hosts in
+**Reachability policy**: a URL equal to one your `~/.npmrc` declares (after `${VAR}`
+expansion), whichever `.npmrc` declared it in this workspace, is trusted and **ignores
+`registries.workspace_registries`, including `"off"`**; it may resolve to a private address under
+`"public_only"`. Equality is per URL, so the same host with another path is not trusted. Every
+other URL is governed by the setting documented in [Cargo](cargo.md#customprivate-registries),
+including its [connect-time message](cargo.md#customprivate-registries) for a host that resolves to
+a blocked address. Setting `registries.workspace_registries` to `"all"` for npm's benefit also
+widens it for Cargo, and vice versa; either way only the hosts in
 `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` become reachable (see
 [Configuration](../configuration.md#private-registry-allowlist)).
 

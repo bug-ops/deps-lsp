@@ -240,3 +240,97 @@ async fn test_build_client_wires_in_blocked_addr_resolver() {
          Loopback, got: {debug}"
     );
 }
+
+// Spec 084: the transport a URL's trust selects decides what its connect-time guard allows.
+// The synthetic lookup resolves every name to an RFC1918 address, so the resolver guard rejects
+// (or admits) before any TCP attempt.
+mod trust_connect {
+    use super::*;
+    use crate::EgressTier;
+    use crate::config_trust::OperatorPath;
+    use crate::net_policy::{OperatorRegistries, RegistryTrust};
+
+    /// A guard the way each trust's egress builds one: Baseline for Trusted, the workspace guard
+    /// for workspace-declared.
+    fn guard_for(trust: RegistryTrust) -> AddrGuard {
+        match trust.egress() {
+            EgressTier::Baseline => AddrGuard::Baseline,
+            EgressTier::Guarded => workspace_guard(WorkspaceRegistryAccess::PublicOnly, &[]),
+        }
+    }
+
+    fn private_lookup() -> TestLookup {
+        TestLookup(Arc::new(|_host: &str| vec!["10.0.0.1:0".parse().unwrap()]))
+    }
+
+    fn trust_of(operator: &OperatorRegistries, url: &str) -> RegistryTrust {
+        use crate::net_policy::{IndexUrlError, RegistryAccessPolicy, RegistryUrlKind};
+        enum Kind {}
+        impl crate::net_policy::private::Sealed for Kind {}
+        impl RegistryUrlKind for Kind {
+            const ECOSYSTEM: crate::EcosystemId = crate::EcosystemId::Npm;
+            const REJECT_QUERY_FRAGMENT: bool = false;
+            type Error = IndexUrlError;
+        }
+        let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::All);
+        operator
+            .classify::<Kind>(url, url, &policy)
+            .unwrap()
+            .trust()
+    }
+
+    async fn resolves(trust: RegistryTrust) -> bool {
+        use reqwest::dns::Resolve;
+        BlockedAddrResolver::with_lookup(guard_for(trust), Arc::from([]), private_lookup())
+            .resolve("registry.corp.example".parse().unwrap())
+            .await
+            .is_ok()
+    }
+
+    fn operator() -> OperatorRegistries {
+        OperatorRegistries::declared_in(
+            &OperatorPath::for_test("/home/me/.npmrc"),
+            ["https://registry.corp.example/team-a"],
+        )
+    }
+
+    #[tokio::test]
+    async fn a_trusted_private_host_is_reachable() {
+        let trust = trust_of(&operator(), "https://registry.corp.example/team-a");
+        assert_eq!(trust, RegistryTrust::Trusted);
+        assert!(resolves(trust).await);
+    }
+
+    #[tokio::test]
+    async fn a_project_declared_host_resolving_to_rfc1918_is_blocked_under_public_only() {
+        let trust = trust_of(&operator(), "https://repo-chosen.example/team-a");
+        assert_eq!(trust, RegistryTrust::WorkspaceDeclared);
+        assert!(!resolves(trust).await);
+    }
+
+    #[tokio::test]
+    async fn the_operators_host_with_another_path_stays_blocked_at_connect() {
+        let trust = trust_of(&operator(), "https://registry.corp.example/team-b");
+        assert_eq!(trust, RegistryTrust::WorkspaceDeclared);
+        assert!(!resolves(trust).await);
+    }
+
+    #[tokio::test]
+    async fn a_trusted_host_still_cannot_resolve_to_cloud_metadata() {
+        use reqwest::dns::Resolve;
+        let lookup = TestLookup(Arc::new(|_host: &str| {
+            vec!["169.254.169.254:0".parse().unwrap()]
+        }));
+        let resolver = BlockedAddrResolver::with_lookup(
+            guard_for(RegistryTrust::Trusted),
+            Arc::from([]),
+            lookup,
+        );
+        assert!(
+            resolver
+                .resolve("registry.corp.example".parse().unwrap())
+                .await
+                .is_err()
+        );
+    }
+}

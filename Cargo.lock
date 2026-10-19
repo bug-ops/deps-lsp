@@ -645,6 +645,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "deps-core-macros",
+ "dirs",
  "futures",
  "http",
  "hyper-util",
@@ -784,10 +785,10 @@ dependencies = [
 name = "deps-go"
 version = "2.0.0"
 dependencies = [
+ "bytes",
  "criterion",
  "dashmap",
  "deps-core",
- "dirs",
  "mockito",
  "regex",
  "semver",

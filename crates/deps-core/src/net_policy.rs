@@ -23,7 +23,7 @@
 use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::EcosystemId;
 
@@ -41,6 +41,7 @@ pub(crate) use {min_v4_prefix, min_v6_prefix};
 
 mod allowlist;
 mod egress;
+mod trust;
 
 macro_rules! private_host_hint {
     () => {
@@ -64,6 +65,7 @@ pub use egress::{
     EgressNotice, EnvSource, GuardedEgress, ProcessEnv, ProxyEndpoint, RegistryEnvironment,
     SystemProxy, WORKSPACE_REGISTRY_PROXY_ENV, normalize_host,
 };
+pub use trust::{DeclaredRegistry, OperatorRegistries, RegistryTrust, floor_block};
 
 /// Classification of a URL's host, for [`RegistryAccessPolicy`] to evaluate against
 /// [`WorkspaceRegistryAccess`].
@@ -587,6 +589,12 @@ pub struct RegistryAccessPolicy {
     level: AtomicU8,
     allowlist: Arc<PrivateRegistryAllowlist>,
     egress: GuardedEgress,
+    /// The "system proxy is bypassed" notice of the environment this handle was built from.
+    egress_notice: Option<EgressNotice>,
+    /// Whether a request has gone out over a guarded (workspace-declared or pinned) transport.
+    guarded_traffic: AtomicBool,
+    /// Whether [`Self::take_egress_notice`] has already handed the notice out.
+    egress_notice_taken: AtomicBool,
 }
 
 impl RegistryAccessPolicy {
@@ -620,6 +628,9 @@ impl RegistryAccessPolicy {
             level: AtomicU8::new(initial.to_u8()),
             allowlist,
             egress: GuardedEgress::Direct,
+            egress_notice: None,
+            guarded_traffic: AtomicBool::new(false),
+            egress_notice_taken: AtomicBool::new(false),
         }
     }
 
@@ -637,7 +648,29 @@ impl RegistryAccessPolicy {
             level: AtomicU8::new(initial.to_u8()),
             allowlist: environment.allowlist().allowlist(),
             egress: environment.egress(),
+            egress_notice: environment.egress_notice(),
+            guarded_traffic: AtomicBool::new(false),
+            egress_notice_taken: AtomicBool::new(false),
         }
+    }
+
+    /// Records that a request went out over a guarded transport.
+    pub(crate) fn note_guarded_request(&self) {
+        self.guarded_traffic.store(true, Ordering::Relaxed);
+    }
+
+    /// The "a system proxy is configured but guarded registries connect directly" notice, once,
+    /// and only after a request has actually gone out over a guarded transport.
+    ///
+    /// A setup whose registries are all operator-owned or public never connects directly, so it
+    /// never gets the notice. `None` when the environment has no such notice, when no guarded
+    /// request has been sent yet, or when it was already handed out.
+    #[must_use]
+    pub fn take_egress_notice(&self) -> Option<EgressNotice> {
+        let notice = self.egress_notice.as_ref()?;
+        (self.guarded_traffic.load(Ordering::Relaxed)
+            && !self.egress_notice_taken.swap(true, Ordering::Relaxed))
+        .then(|| notice.clone())
     }
 
     /// How traffic to workspace-declared hosts leaves the process.
@@ -753,7 +786,7 @@ pub enum IndexUrlError {
 /// [`RegistryAccessPolicy`].
 ///
 /// An explicit enum, not `Option`/`bool`: a trusted-provenance candidate (e.g. `deps-cargo`'s
-/// `$CARGO_HOME`-sourced `IndexTrust::Trusted`) skipping the policy check entirely is a
+/// `$CARGO_HOME`-sourced `RegistryTrust::Trusted`) skipping the policy check entirely is a
 /// security-relevant decision each call site must make visibly, not something that can be
 /// expressed by a `None` a reader might mistake for "no policy configured yet".
 ///
@@ -1034,7 +1067,7 @@ pub trait TrustedConstantRegistryUrl: RegistryUrlKind {}
 ///
 /// `deps-cargo`'s `RegistryIndex` deliberately does not migrate to this type (issue #959, D1):
 /// it stores a `url::Url` rather than a normalized `String`, does not trim a trailing `/`, and
-/// carries an `IndexTrust` this type has no field for.
+/// carries a `RegistryTrust` this type has no field for.
 ///
 /// Carries no bound on `K` itself — [`Clone`], [`Debug`](std::fmt::Debug), [`PartialEq`],
 /// [`Eq`], [`Hash`](std::hash::Hash), and [`Display`](std::fmt::Display) are all hand-written

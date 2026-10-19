@@ -3017,10 +3017,10 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    Err(deps_core::error::DepsError::PackageNotFound {
-                        package: name.as_str().into(),
-                        registry: "mock",
-                    })
+                    Err(deps_core::error::DepsError::not_found_locally(
+                        name.as_str(),
+                        "mock",
+                    ))
                 })
             }
 
@@ -3032,10 +3032,10 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    Err(deps_core::error::DepsError::PackageNotFound {
-                        package: name.as_str().into(),
-                        registry: "mock",
-                    })
+                    Err(deps_core::error::DepsError::not_found_locally(
+                        name.as_str(),
+                        "mock",
+                    ))
                 })
             }
 
@@ -3232,10 +3232,10 @@ mod tests {
                 let name = name.clone();
                 Box::pin(async move {
                     if name.as_str() == "not-found" {
-                        Err(deps_core::error::DepsError::PackageNotFound {
-                            package: name.as_str().into(),
-                            registry: "mock",
-                        })
+                        Err(deps_core::error::DepsError::not_found_locally(
+                            name.as_str(),
+                            "mock",
+                        ))
                     } else {
                         Err(deps_core::error::DepsError::CacheError(
                             "mock fallback failure".to_string(),
@@ -3379,10 +3379,10 @@ mod tests {
             {
                 Box::pin(async move {
                     if name.as_str() == "typo-pkg" {
-                        Err(deps_core::error::DepsError::PackageNotFound {
-                            package: name.as_str().into(),
-                            registry: "mock",
-                        })
+                        Err(deps_core::error::DepsError::not_found_locally(
+                            name.as_str(),
+                            "mock",
+                        ))
                     } else {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         Err(deps_core::error::DepsError::CacheError(
@@ -3467,10 +3467,10 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    Err(deps_core::error::DepsError::PackageNotFound {
-                        package: name.as_str().into(),
-                        registry: "mock",
-                    })
+                    Err(deps_core::error::DepsError::not_found_locally(
+                        name.as_str(),
+                        "mock",
+                    ))
                 })
             }
 

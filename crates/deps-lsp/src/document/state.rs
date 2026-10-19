@@ -1507,8 +1507,8 @@ impl ServerState {
     }
 
     /// The startup notice for a system proxy that workspace-declared registries bypass.
-    pub(crate) fn egress_notice(&self) -> Option<deps_core::net_policy::EgressNotice> {
-        self.registry_environment.egress_notice()
+    pub(crate) fn take_egress_notice(&self) -> Option<deps_core::net_policy::EgressNotice> {
+        self.registry_policy.take_egress_notice()
     }
 
     /// Records the latest resolved effect and returns it only when it differs from the

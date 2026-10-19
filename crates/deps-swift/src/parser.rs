@@ -1002,7 +1002,9 @@ let package = Package(
                 SwiftParseContext::new(
                     Arc::new(RegistryAccessPolicy::new(access)),
                     Arc::default(),
-                    UserConfigPath::Path(self.dir.path().join("no-user-tier.json")),
+                    UserConfigPath::Path(deps_core::config_trust::OperatorPath::for_test(
+                        self.dir.path().join("no-user-tier.json"),
+                    )),
                     None,
                 )
             }

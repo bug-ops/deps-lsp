@@ -1,4 +1,4 @@
-use crate::error::{DepsError, Result};
+use crate::error::{DepsError, ErrorOrigin, Result};
 use crate::parser::DependencySource;
 use crate::{ConcreteVersion, EcosystemId, PackageName, RegistryEndpoint, VersionReq};
 use dashmap::DashMap;
@@ -497,6 +497,10 @@ pub fn has_default_prerelease_marker(version: &str) -> bool {
 /// Maps a `404` (plus any status in `also_not_found`) [`DepsError::HttpStatus`] to
 /// [`DepsError::PackageNotFound`], passing through any other error unchanged.
 ///
+/// The result is an [`ErrorOrigin::Endpoint`] not-found (#1854): it consumes an HTTP status the
+/// caller received, so it vouches for the endpoint. That is a contract on the caller, not
+/// something the types enforce.
+///
 /// Extracted from four byte-identical copies of this mapper in `deps-pypi`, `deps-deno`,
 /// `deps-npm`, and `deps-go` (deps-lsp#929 item 1). `also_not_found` keeps ecosystem-specific
 /// extra statuses explicit at the call site instead of hardcoded here — `deps-go` passes
@@ -537,12 +541,68 @@ pub fn not_found_or(
         DepsError::HttpStatus { status, .. }
             if status == 404 || also_not_found.contains(&status) =>
         {
-            DepsError::PackageNotFound {
-                package: package.into(),
-                registry,
-            }
+            DepsError::not_found_at_endpoint(package, registry)
         }
         other => other,
+    }
+}
+
+/// Accumulates the provenance of the misses along an alternate-registry chain, so the
+/// not-found a chain finally reports vouches for an endpoint iff some hop actually reached one
+/// (#1854).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::DepsError;
+/// use deps_core::error::ErrorOrigin;
+/// use deps_core::registry::ChainNotFound;
+///
+/// let mut chain = ChainNotFound::new();
+/// chain.record(&DepsError::not_found_locally("pkg", "npm"));
+/// assert_eq!(chain.error("pkg", "npm").origin(), ErrorOrigin::Unattributed);
+///
+/// chain.record_answered_empty();
+/// assert_eq!(chain.error("pkg", "npm").origin(), ErrorOrigin::Endpoint);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct ChainNotFound {
+    origin: ErrorOrigin,
+}
+
+impl ChainNotFound {
+    /// A chain that has not reached any endpoint yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            origin: ErrorOrigin::Unattributed,
+        }
+    }
+
+    /// Folds in a hop's not-found, keeping any endpoint involvement it carries.
+    pub fn record(&mut self, miss: &DepsError) {
+        self.origin = self.origin.merge(miss.origin());
+    }
+
+    /// Folds in a hop that answered successfully with no versions. The caller attests that a
+    /// response was received; the type cannot check it.
+    pub fn record_answered_empty(&mut self) {
+        self.origin = self.origin.merge(ErrorOrigin::Endpoint);
+    }
+
+    /// The not-found the whole chain reports, carrying the accumulated origin.
+    #[must_use]
+    pub fn error(&self, package: &str, registry: &'static str) -> DepsError {
+        match self.origin {
+            ErrorOrigin::Endpoint => DepsError::not_found_at_endpoint(package, registry),
+            ErrorOrigin::Unattributed => DepsError::not_found_locally(package, registry),
+        }
+    }
+}
+
+impl Default for ChainNotFound {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1104,10 +1164,7 @@ pub trait Metadata: Send + Sync {
 /// ```
 #[must_use]
 pub fn alternate_not_registered(name: &PackageName) -> DepsError {
-    DepsError::PackageNotFound {
-        package: name.as_str().into(),
-        registry: "alternate registry (not registered)",
-    }
+    DepsError::not_found_locally(name.as_str(), "alternate registry (not registered)")
 }
 
 /// Shared capacity ceiling for a per-ecosystem alternate-registry client map.
@@ -1297,9 +1354,85 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     use crate::test_util::MockVersion;
+
+    fn http_404() -> DepsError {
+        DepsError::HttpStatus {
+            url: "https://r.example/pkg".into(),
+            status: 404,
+        }
+    }
+
+    #[test]
+    fn not_found_or_maps_a_received_status_to_an_endpoint_origin() {
+        let mapped = not_found_or(http_404(), "pkg", "npm", &[]);
+        assert_matches!(mapped, DepsError::PackageNotFound { .. });
+        assert_eq!(mapped.origin(), ErrorOrigin::Endpoint);
+    }
+
+    #[test]
+    fn not_found_or_extra_status_is_an_endpoint_origin() {
+        let gone = DepsError::HttpStatus {
+            url: "https://r.example/pkg".into(),
+            status: 410,
+        };
+        let mapped = not_found_or(gone, "pkg", "go", &[410]);
+        assert_eq!(mapped.origin(), ErrorOrigin::Endpoint);
+    }
+
+    #[test]
+    fn locally_decided_not_found_is_unattributed() {
+        assert_eq!(
+            DepsError::not_found_locally("pkg", "npm").origin(),
+            ErrorOrigin::Unattributed
+        );
+        assert_eq!(
+            alternate_not_registered(&PackageName::new("pkg")).origin(),
+            ErrorOrigin::Unattributed
+        );
+    }
+
+    #[test]
+    fn chain_not_found_starts_unattributed() {
+        let chain = ChainNotFound::new();
+        assert_eq!(chain.error("p", "npm").origin(), ErrorOrigin::Unattributed);
+    }
+
+    #[test]
+    fn chain_not_found_remote_miss_then_local_miss_stays_endpoint() {
+        let mut chain = ChainNotFound::new();
+        chain.record(&not_found_or(http_404(), "p", "npm", &[]));
+        chain.record(&DepsError::not_found_locally("p", "npm"));
+        assert_eq!(chain.error("p", "npm").origin(), ErrorOrigin::Endpoint);
+    }
+
+    #[test]
+    fn chain_not_found_answered_empty_is_endpoint() {
+        let mut chain = ChainNotFound::new();
+        chain.record_answered_empty();
+        assert_eq!(chain.error("p", "npm").origin(), ErrorOrigin::Endpoint);
+    }
+
+    #[test]
+    fn chain_not_found_all_local_misses_stay_unattributed() {
+        let mut chain = ChainNotFound::new();
+        chain.record(&DepsError::not_found_locally("p", "npm"));
+        chain.record(&DepsError::not_found_locally("p", "npm"));
+        assert_eq!(chain.error("p", "npm").origin(), ErrorOrigin::Unattributed);
+    }
+
+    #[test]
+    fn error_origin_merge_lets_endpoint_win() {
+        use ErrorOrigin::{Endpoint, Unattributed};
+        assert_eq!(Unattributed.merge(Unattributed), Unattributed);
+        assert_eq!(Unattributed.merge(Endpoint), Endpoint);
+        assert_eq!(Endpoint.merge(Unattributed), Endpoint);
+        assert_eq!(Endpoint.merge(Endpoint), Endpoint);
+    }
 
     /// A [`Registry`] whose `search_raw` records whether it was called, for
     /// [`dyn_registry_search_rejects_credential_bearing_query_before_calling_search_raw`]

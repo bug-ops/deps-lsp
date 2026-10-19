@@ -44,6 +44,7 @@ use reqwest::{Client, StatusCode, Url, header};
 use std::time::Instant;
 
 mod auth;
+mod contact;
 mod entries;
 mod errors;
 mod guard;

@@ -16,9 +16,9 @@ use deps_core::parser::DependencySource;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
-    DepsError, EcosystemId, EgressTier, FreshnessSettings, HttpCache, RegistryEndpoint,
-    RequestHeader, Result, lsp_helpers::warn_rejected_value, not_found_or as core_not_found_or,
-    registry::register_capped,
+    ChainNotFound, DepsError, EcosystemId, EgressTier, FreshnessSettings, HttpCache,
+    RegistryEndpoint, RequestHeader, Result, lsp_helpers::warn_rejected_value,
+    not_found_or as core_not_found_or, registry::register_capped,
 };
 use pep440_rs::{Version, VersionSpecifiers};
 use serde::Deserialize;
@@ -427,20 +427,19 @@ impl PypiRegistry {
     /// distinguishable diagnostic.
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     async fn get_versions_chained(&self, name: &str) -> Result<Vec<PypiVersion>> {
-        let mut last_miss: Result<Vec<PypiVersion>> = Err(DepsError::PackageNotFound {
-            package: name.to_string().into(),
-            registry: REGISTRY,
-        });
+        let mut not_found = ChainNotFound::new();
+        let mut last_miss: Result<Vec<PypiVersion>> = Err(not_found.error(name, REGISTRY));
 
         for hop in std::iter::once(self).chain(self.fallback_chain.iter().map(Arc::as_ref)) {
             match hop.get_versions(name).await {
                 Ok(versions) if !versions.is_empty() => return Ok(versions),
-                Ok(empty) => last_miss = Ok(empty),
-                Err(DepsError::PackageNotFound { .. }) => {
-                    last_miss = Err(DepsError::PackageNotFound {
-                        package: name.to_string().into(),
-                        registry: REGISTRY,
-                    });
+                Ok(empty) => {
+                    not_found.record_answered_empty();
+                    last_miss = Ok(empty);
+                }
+                Err(miss @ DepsError::PackageNotFound { .. }) => {
+                    not_found.record(&miss);
+                    last_miss = Err(not_found.error(name, REGISTRY));
                 }
                 Err(other) => {
                     tracing::warn!(
@@ -502,10 +501,7 @@ impl PypiRegistry {
                 "PyPI simple API request URL",
                 name,
             );
-            return Err(DepsError::PackageNotFound {
-                package: name.to_string().into(),
-                registry: REGISTRY,
-            });
+            return Err(DepsError::not_found_locally(name, REGISTRY));
         }
         let url = simple_api_url(&self.simple_base, &normalized);
         let headers = [RequestHeader::Accept(SIMPLE_API_ACCEPT)];
@@ -686,10 +682,7 @@ impl PypiRegistry {
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_package_metadata(&self, name: &str) -> Result<PypiPackage> {
         if self.tier == PypiRegistryTier::WorkspaceDeclared {
-            return Err(DepsError::PackageNotFound {
-                package: name.to_string().into(),
-                registry: REGISTRY,
-            });
+            return Err(DepsError::not_found_locally(name, REGISTRY));
         }
         let normalized = crate::name::normalize(name);
         if normalized.is_empty() {
@@ -698,10 +691,7 @@ impl PypiRegistry {
                 "PyPI package metadata request URL",
                 name,
             );
-            return Err(DepsError::PackageNotFound {
-                package: name.to_string().into(),
-                registry: REGISTRY,
-            });
+            return Err(DepsError::not_found_locally(name, REGISTRY));
         }
         let url = metadata_url(&normalized);
         let data = self
@@ -1750,7 +1740,7 @@ mod tests {
         let result = not_found_or(err, "flask");
         assert_matches!(
             result,
-            DepsError::PackageNotFound { package, registry }
+            DepsError::PackageNotFound { package, registry, .. }
                 if package == "flask" && registry == REGISTRY
         );
     }
@@ -1802,7 +1792,7 @@ mod tests {
         let err = registry.get_versions("---").await.unwrap_err();
         assert_matches!(
             err,
-            DepsError::PackageNotFound { package, registry }
+            DepsError::PackageNotFound { package, registry, .. }
                 if package == "---" && registry == REGISTRY
         );
     }
@@ -2293,6 +2283,58 @@ mod tests {
 
         hop0_mock.assert_async().await;
         hop1_mock.assert_async().await;
+    }
+
+    /// #1854: a chain that every hop answered with a real 404 reports a not-found that vouches
+    /// for the endpoint; a local refusal (an unregistered alternate) does not.
+    #[tokio::test]
+    async fn test_chain_not_found_origin_follows_the_wire() {
+        use deps_core::{ErrorOrigin, FreshnessSettings, PackageName, Registry};
+
+        let mut hop0 = mockito::Server::new_async().await;
+        let _m0 = hop0
+            .mock("GET", "/simple/pkg/")
+            .with_status(404)
+            .create_async()
+            .await;
+        let mut hop1 = mockito::Server::new_async().await;
+        let _m1 = hop1
+            .mock("GET", "/simple/pkg/")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let tail = Arc::new(PypiRegistry::with_base(
+            Arc::clone(&cache),
+            &index_url(&format!("{}/simple", hop1.url())),
+            Vec::new(),
+        ));
+        let head = PypiRegistry::with_base(
+            Arc::clone(&cache),
+            &index_url(&format!("{}/simple", hop0.url())),
+            vec![tail],
+        );
+        let error = head.get_versions_chained("pkg").await.unwrap_err();
+        assert!(error.is_not_found());
+        assert_eq!(error.origin(), ErrorOrigin::Endpoint);
+
+        let root = PypiRegistry::new(cache);
+        let unregistered = DependencySource::AlternateRegistry {
+            index: "missing".to_string(),
+            mirrors_crates_io: false,
+        };
+        let error = root
+            .get_versions_from(
+                &PackageName::new("pkg"),
+                &unregistered,
+                FreshnessSettings::default(),
+            )
+            .await
+            .err()
+            .expect("an error");
+        assert_eq!(error.origin(), ErrorOrigin::Unattributed);
     }
 
     /// S5 failure taxonomy: hop 0 answers `200` with an empty listing (not a 404) -> treated

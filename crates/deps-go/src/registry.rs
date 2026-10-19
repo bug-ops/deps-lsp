@@ -25,16 +25,19 @@
 //! }
 //! ```
 
-use crate::config::{ChainSeparator, GoProxyChain, GoProxyHop, GoProxyUrl};
+use crate::config::{ChainSeparator, GoProxyChain, GoProxyHop, GoProxyKind};
 use crate::types::GoVersion;
 use crate::version::{escape_module_path, escape_version, is_pseudo_version};
 use dashmap::DashMap;
+#[cfg(test)]
+use deps_core::net_policy::OperatorRegistries;
+use deps_core::net_policy::{DeclaredRegistry, RegistryTrust};
 use deps_core::parser::DependencySource;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
-    DepsError, EcosystemId, EgressTier, HttpCache, InvalidPackageName, RegistryEndpoint, Result,
-    is_dot_segment,
+    ChainNotFound, DepsError, EcosystemId, EgressTier, HttpCache, InvalidPackageName,
+    RegistryEndpoint, Result, is_dot_segment,
     lsp_helpers::warn_rejected_value,
     not_found_or as core_not_found_or,
     registry::{KeyShape, register_capped},
@@ -58,11 +61,12 @@ enum GoRegistryTier {
     /// `proxy.golang.org` (or a test override) — `HttpCache::get_cached`, today's path,
     /// unchanged, never subject to `registries.workspace_registries` (FR-011).
     Public,
-    /// A `$GOENV`-declared `GOPROXY` hop — `HttpCache::get_cached_workspace`, so every
-    /// redirect hop is re-classified against the live
-    /// [`deps_core::net_policy::RegistryAccessPolicy`] (mirrors `deps-pypi`/`deps-npm`'s
-    /// identical `WorkspaceDeclared` routing).
-    WorkspaceDeclared,
+    /// A `$GOENV`-declared `GOPROXY` hop. [`RegistryTrust::Trusted`] (the operator's own file, the
+    /// only provenance a hop has today) fetches through `HttpCache::get_cached` on the Baseline
+    /// egress with the system proxy; [`RegistryTrust::WorkspaceDeclared`] would fetch through
+    /// `HttpCache::get_cached_workspace`, re-classifying every redirect hop against the live
+    /// [`deps_core::net_policy::RegistryAccessPolicy`].
+    Declared(RegistryTrust),
     /// A [`GoProxyHop::Direct`]/[`GoProxyHop::Off`] sentinel (FR-004/FR-006) — every inherent
     /// fetch method short-circuits to [`DepsError::PackageNotFound`] before building any URL
     /// or issuing any request. Both sentinels are observably identical: phase 1 has no
@@ -76,7 +80,7 @@ impl GoRegistryTier {
     const fn egress(self) -> Option<EgressTier> {
         match self {
             Self::Public => Some(EgressTier::Baseline),
-            Self::WorkspaceDeclared => Some(EgressTier::Guarded),
+            Self::Declared(trust) => Some(trust.egress()),
             Self::Terminal => None,
         }
     }
@@ -247,7 +251,7 @@ fn record_miss(last_miss: &mut Result<Vec<GoVersion>>, miss: Result<Vec<GoVersio
 pub struct GoRegistry {
     cache: Arc<HttpCache>,
     /// Version-fetch base for **this client's own hop** — `PROXY_BASE` for the public root; a
-    /// resolved [`GoProxyUrl`]'s own URL for a `$GOENV`-declared `GOPROXY` hop; unused
+    /// resolved [`DeclaredRegistry`]'s own URL for a `$GOENV`-declared `GOPROXY` hop; unused
     /// (never reached — every fetch short-circuits first) for a `Terminal`-tier client.
     proxy_base: String,
     /// The endpoint [`Self::endpoint`] reports, computed on first use (the fingerprint hashes
@@ -311,9 +315,8 @@ impl GoRegistry {
         }
     }
 
-    /// Creates a [`GoRegistry`] client for one resolved `$GOENV`-declared `GOPROXY` hop —
-    /// `WorkspaceDeclared`-tier so it fetches through `HttpCache::get_cached_workspace`
-    /// (FR-011's redirect-hop gating) instead of the ungated public transport.
+    /// Creates a [`GoRegistry`] client for one resolved `$GOENV`-declared `GOPROXY` hop, fetching
+    /// through the transport its [`RegistryTrust`] selects (see [`GoRegistryTier::Declared`]).
     ///
     /// `fallback_chain` is empty for every call except the *head* client
     /// [`Self::register_alternate`] builds for a multi-hop chain — every other hop is a leaf with
@@ -321,14 +324,14 @@ impl GoRegistry {
     #[must_use]
     fn with_base(
         cache: Arc<HttpCache>,
-        url: &GoProxyUrl,
+        url: &DeclaredRegistry<GoProxyKind>,
         fallback_chain: Vec<(ChainSeparator, Arc<Self>)>,
     ) -> Self {
         Self {
             cache,
             proxy_base: url.as_str().to_string(),
             endpoint: deps_core::CachedEndpoint::default(),
-            tier: GoRegistryTier::WorkspaceDeclared,
+            tier: GoRegistryTier::Declared(url.trust()),
             alternates: Arc::new(DashMap::new()),
             fallback_chain,
         }
@@ -453,6 +456,22 @@ impl GoRegistry {
         self.get_versions(module_path).await
     }
 
+    /// Fetches `url` through the transport this client's tier selects.
+    async fn fetch_bytes(&self, url: &str) -> Result<bytes::Bytes> {
+        match self.tier {
+            GoRegistryTier::Public | GoRegistryTier::Declared(RegistryTrust::Trusted) => {
+                // TODO(#1856): Trusted fetches follow redirects to any host; confine to the origin if live proxies do not redirect cross-origin
+                self.cache.get_cached(url).await
+            }
+            GoRegistryTier::Declared(RegistryTrust::WorkspaceDeclared) => {
+                self.cache.get_cached_workspace(url).await
+            }
+            GoRegistryTier::Terminal => {
+                Err(DepsError::not_found_locally("direct/off hop", REGISTRY))
+            }
+        }
+    }
+
     /// FR-005/NFR-006: tries `self` (hop 0) first, then each already-resolved
     /// `Self::fallback_chain` entry in order (each via
     /// [`Self::get_versions_with_latest_fallback`], S3). A [`GoProxyHop::Direct`]/
@@ -475,10 +494,9 @@ impl GoRegistry {
         // (`redact_declaration_key`'s own contract), so reusing the same redacted string is
         // both cheaper and immune to a future fallback-chain-length bump multiplying the cost.
         let redacted_module_path = deps_core::net_policy::redact_declaration_key(module_path);
-        let mut last_miss: Result<Vec<GoVersion>> = Err(DepsError::PackageNotFound {
-            package: redacted_module_path.clone().into_owned().into(),
-            registry: REGISTRY,
-        });
+        let mut not_found = ChainNotFound::new();
+        let mut last_miss: Result<Vec<GoVersion>> =
+            Err(not_found.error(&redacted_module_path, REGISTRY));
 
         // `next_seps[k]` is the separator governing hop `k`'s fallback to hop `k + 1` — `None`
         // past the last hop (nothing to fall through to, so any error there is unconditionally
@@ -496,14 +514,15 @@ impl GoRegistry {
         for (hop, next_sep) in hops.iter().zip(next_seps.iter()) {
             match hop.get_versions_with_latest_fallback(module_path).await {
                 Ok(versions) if !versions.is_empty() => return Ok(versions),
-                Ok(empty) => record_miss(&mut last_miss, Ok(empty)),
-                Err(DepsError::PackageNotFound { .. }) => {
+                Ok(empty) => {
+                    not_found.record_answered_empty();
+                    record_miss(&mut last_miss, Ok(empty));
+                }
+                Err(miss @ DepsError::PackageNotFound { .. }) => {
+                    not_found.record(&miss);
                     record_miss(
                         &mut last_miss,
-                        Err(DepsError::PackageNotFound {
-                            package: redacted_module_path.clone().into_owned().into(),
-                            registry: REGISTRY,
-                        }),
+                        Err(not_found.error(&redacted_module_path, REGISTRY)),
                     );
                 }
                 Err(other) => match next_sep {
@@ -565,21 +584,16 @@ impl GoRegistry {
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(module_path)), level = "debug")]
     pub async fn get_versions(&self, module_path: &str) -> Result<Vec<GoVersion>> {
         if self.tier == GoRegistryTier::Terminal {
-            return Err(DepsError::PackageNotFound {
-                package: module_path.to_string().into(),
-                registry: REGISTRY,
-            });
+            return Err(DepsError::not_found_locally(module_path, REGISTRY));
         }
         validate_module_path(module_path)?;
 
         let url = versions_list_url_at(&self.proxy_base, module_path);
 
-        let data = match self.tier {
-            GoRegistryTier::Public => self.cache.get_cached(&url).await,
-            GoRegistryTier::WorkspaceDeclared => self.cache.get_cached_workspace(&url).await,
-            GoRegistryTier::Terminal => unreachable!("short-circuited above"),
-        }
-        .map_err(|e| not_found_or(e, module_path))?;
+        let data = self
+            .fetch_bytes(&url)
+            .await
+            .map_err(|e| not_found_or(e, module_path))?;
 
         parse_version_list(&data)
     }
@@ -613,22 +627,17 @@ impl GoRegistry {
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(module_path), version = ?version), level = "debug")]
     pub async fn get_version_info(&self, module_path: &str, version: &str) -> Result<GoVersion> {
         if self.tier == GoRegistryTier::Terminal {
-            return Err(DepsError::PackageNotFound {
-                package: module_path.to_string().into(),
-                registry: REGISTRY,
-            });
+            return Err(DepsError::not_found_locally(module_path, REGISTRY));
         }
         validate_module_path(module_path)?;
         validate_version_string(version)?;
 
         let url = version_url_at(&self.proxy_base, module_path, version, "info");
 
-        let data = match self.tier {
-            GoRegistryTier::Public => self.cache.get_cached(&url).await,
-            GoRegistryTier::WorkspaceDeclared => self.cache.get_cached_workspace(&url).await,
-            GoRegistryTier::Terminal => unreachable!("short-circuited above"),
-        }
-        .map_err(|e| not_found_or(e, module_path))?;
+        let data = self
+            .fetch_bytes(&url)
+            .await
+            .map_err(|e| not_found_or(e, module_path))?;
 
         parse_version_info(module_path, &data)
     }
@@ -670,22 +679,17 @@ impl GoRegistry {
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(module_path)), level = "debug")]
     pub async fn get_latest_stable(&self, module_path: &str) -> Result<GoVersion> {
         if self.tier == GoRegistryTier::Terminal {
-            return Err(DepsError::PackageNotFound {
-                package: module_path.to_string().into(),
-                registry: REGISTRY,
-            });
+            return Err(DepsError::not_found_locally(module_path, REGISTRY));
         }
         validate_module_path(module_path)?;
 
         let escaped = escape_module_path(module_path);
         let url = format!("{}/{escaped}/@latest", self.proxy_base);
 
-        let data = match self.tier {
-            GoRegistryTier::Public => self.cache.get_cached(&url).await,
-            GoRegistryTier::WorkspaceDeclared => self.cache.get_cached_workspace(&url).await,
-            GoRegistryTier::Terminal => unreachable!("short-circuited above"),
-        }
-        .map_err(|e| not_found_or(e, module_path))?;
+        let data = self
+            .fetch_bytes(&url)
+            .await
+            .map_err(|e| not_found_or(e, module_path))?;
 
         parse_version_info(module_path, &data)
     }
@@ -745,22 +749,17 @@ impl GoRegistry {
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(module_path), version = ?version), level = "debug")]
     pub async fn get_go_mod(&self, module_path: &str, version: &str) -> Result<String> {
         if self.tier == GoRegistryTier::Terminal {
-            return Err(DepsError::PackageNotFound {
-                package: module_path.to_string().into(),
-                registry: REGISTRY,
-            });
+            return Err(DepsError::not_found_locally(module_path, REGISTRY));
         }
         validate_module_path(module_path)?;
         validate_version_string(version)?;
 
         let url = version_url_at(&self.proxy_base, module_path, version, "mod");
 
-        let data = match self.tier {
-            GoRegistryTier::Public => self.cache.get_cached(&url).await,
-            GoRegistryTier::WorkspaceDeclared => self.cache.get_cached_workspace(&url).await,
-            GoRegistryTier::Terminal => unreachable!("short-circuited above"),
-        }
-        .map_err(|e| not_found_or(e, module_path))?;
+        let data = self
+            .fetch_bytes(&url)
+            .await
+            .map_err(|e| not_found_or(e, module_path))?;
 
         std::str::from_utf8(&data)
             .map(std::string::ToString::to_string)
@@ -1112,7 +1111,7 @@ mod tests {
         let result = not_found_or(err, "github.com/x/y");
         assert_matches!(
             result,
-            DepsError::PackageNotFound { package, registry }
+            DepsError::PackageNotFound { package, registry, .. }
                 if package == "github.com/x/y" && registry == REGISTRY
         );
     }
@@ -1138,7 +1137,7 @@ mod tests {
         let result = not_found_or(err, "github.com/x/y");
         assert_matches!(
             result,
-            DepsError::PackageNotFound { package, registry }
+            DepsError::PackageNotFound { package, registry, .. }
                 if package == "github.com/x/y" && registry == REGISTRY
         );
     }
@@ -1673,7 +1672,11 @@ mod tests {
     }
 
     fn url_hop(raw: &str, policy: &RegistryAccessPolicy) -> GoProxyHop {
-        GoProxyHop::Url(GoProxyUrl::new(raw, policy).unwrap())
+        GoProxyHop::Url(
+            OperatorRegistries::default()
+                .classify::<GoProxyKind>(raw, raw, policy)
+                .unwrap(),
+        )
     }
 
     #[test]
@@ -1732,6 +1735,44 @@ mod tests {
         assert_ne!(endpoint(&via("two")), endpoint(&via("one")));
         assert_eq!(endpoint(&via("only-off")), RegistryEndpoint::Unresolved);
         assert_eq!(endpoint(&via("missing")), RegistryEndpoint::Unresolved);
+    }
+
+    /// Spec 084: a hop the operator's `$GOENV` declares is `Trusted`, so it reports the Baseline
+    /// egress (system proxy) and fetches through the ungated transport.
+    #[test]
+    fn test_trusted_goenv_hop_reports_baseline_egress() {
+        use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+        use deps_core::{EgressTier, PackageName, Registry, RegistryEndpoint};
+
+        let root = Arc::new(GoRegistry::new(Arc::new(HttpCache::new())));
+        let url = "https://goproxy.mycorp.example";
+        let operator = OperatorRegistries::declared_in(
+            &deps_core::config_trust::OperatorPath::for_test("/home/me/go/env"),
+            [url],
+        );
+        let off = RegistryAccessPolicy::new(WorkspaceRegistryAccess::Off);
+        let hop = operator.classify::<GoProxyKind>(url, url, &off).unwrap();
+        assert_eq!(hop.trust(), RegistryTrust::Trusted);
+        GoRegistry::register_alternate(
+            &root,
+            &GoProxyChain {
+                key: "trusted".to_string(),
+                hops: vec![GoProxyHop::Url(hop)],
+                ..Default::default()
+            },
+        );
+
+        let endpoint = root.endpoint_for(
+            &PackageName::new("example.com/mod"),
+            &DependencySource::AlternateRegistry {
+                index: "trusted".to_string(),
+                mirrors_crates_io: false,
+            },
+        );
+        assert_eq!(
+            endpoint,
+            RegistryEndpoint::from_base_str(url, EgressTier::Baseline)
+        );
     }
 
     #[test]
@@ -1886,6 +1927,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(versions.len(), 1);
+    }
+
+    /// #1854: every hop answering a real 404/410 reports a not-found that vouches for the
+    /// endpoint; an unregistered chain (a local refusal) does not.
+    #[tokio::test]
+    async fn test_chain_not_found_origin_follows_the_wire() {
+        use deps_core::{ErrorOrigin, FreshnessSettings, PackageName, Registry};
+
+        let mut hop0 = mockito::Server::new_async().await;
+        hop0.mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .create_async()
+            .await;
+        let mut hop1 = mockito::Server::new_async().await;
+        hop1.mock("GET", mockito::Matcher::Any)
+            .with_status(410)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let policy = all_policy();
+        GoRegistry::register_alternate(
+            &root,
+            &GoProxyChain {
+                key: "go-proxy:test".to_string(),
+                hops: vec![url_hop(&hop0.url(), &policy), url_hop(&hop1.url(), &policy)],
+                ..Default::default()
+            },
+        );
+        let name = PackageName::new("github.com/gin-gonic/gin");
+        let source = |index: &str| DependencySource::AlternateRegistry {
+            index: index.to_string(),
+            mirrors_crates_io: false,
+        };
+        let error = root
+            .get_versions_from(
+                &name,
+                &source("go-proxy:test"),
+                FreshnessSettings::default(),
+            )
+            .await
+            .err()
+            .expect("an error");
+        assert!(error.is_not_found());
+        assert_eq!(error.origin(), ErrorOrigin::Endpoint);
+
+        let error = root
+            .get_versions_from(&name, &source("missing"), FreshnessSettings::default())
+            .await
+            .err()
+            .expect("an error");
+        assert_eq!(error.origin(), ErrorOrigin::Unattributed);
     }
 
     /// C1: a `410 Gone` not-found response (Athens/Artifactory/Nexus/GitLab's shape) falls
@@ -2235,7 +2330,11 @@ mod tests {
             public_proxy.url()
         );
         let policy = all_policy();
-        let go_config = crate::config::GoEnvConfig::parse(&content, &policy);
+        let go_config = crate::config::GoEnvConfig::parse(
+            &content,
+            &deps_core::config_trust::OperatorPath::for_test("/home/me/go/env"),
+            &policy,
+        );
         let source = go_config.resolve_source_for("git.mycorp.example/internal/auth");
         assert_eq!(
             source,

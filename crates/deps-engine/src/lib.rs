@@ -41,3 +41,5 @@ pub mod setup;
 /// `test_util` module's `#[cfg(any(test, feature = "test-util"))]` gate.
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
+#[cfg(test)]
+mod trust_consistency;

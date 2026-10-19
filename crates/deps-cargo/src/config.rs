@@ -25,7 +25,7 @@
 //!     on it to decide whether to attach a credential — grepping for `Provenance` outside
 //!     this module should find no such branch (verified in this PR's security review).
 //! - **Internal-network reachability (SSRF-adjacent, #443).** [`RegistryIndex::new`] requires
-//!   an [`IndexTrust`] and a [`deps_core::net_policy::RegistryAccessPolicy`]: a
+//!   an [`RegistryTrust`] and a [`deps_core::net_policy::RegistryAccessPolicy`]: a
 //!   `WorkspaceDeclared` URL is checked against the live policy before it can ever become a
 //!   fetchable index, while a `Trusted` (`$CARGO_HOME`-provenance) URL is never
 //!   policy-checked at all — it is the user's own configuration, not something a cloned
@@ -60,7 +60,7 @@ pub struct AuthToken(deps_core::secret::Redacted);
 impl AuthToken {
     /// Wraps `token`. Kept `pub(crate)` rather than `pub`: the module-level security-model
     /// docs above are the enforcement, and widening this to `pub` would let any other crate
-    /// construct one with no [`Provenance`]/[`IndexTrust`] to account for at all.
+    /// construct one with no [`Provenance`]/[`RegistryTrust`] to account for at all.
     pub(crate) fn new(token: String) -> Self {
         Self(deps_core::secret::Redacted::new(token))
     }
@@ -109,45 +109,30 @@ pub enum Provenance {
     Workspace,
 }
 
-/// Whose input a candidate registry index URL is, for [`RegistryIndex::new`]'s
-/// [`deps_core::net_policy::RegistryAccessPolicy`] gate.
-///
-/// A new enum rather than a reuse of [`Provenance`], even though the variants map 1:1:
-/// `Provenance`'s doc comment is an explicit "nothing ever branches on this" invariant
-/// protecting the auth boundary; adding a policy branch on it would make that sentence false
-/// and invite a future reader to add an auth branch too. Two small enums, one invariant
-/// each.
-///
-/// **Exhaustive** (issue #769): a security-sensitive `Trusted`/`WorkspaceDeclared` split — a
-/// wildcard arm at a future consuming match site would silently trust workspace-declared
-/// input instead of failing to compile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum IndexTrust {
-    /// `$CARGO_HOME/config.toml` or a `CARGO_REGISTRIES_*` environment variable — the
-    /// user's own environment. Never policy-checked (see [`RegistryIndex::new`]).
-    Trusted,
-    /// A workspace file: the `Cargo.toml` alias target itself, or any ancestor
-    /// `.cargo/config.toml`/`[source]` chain link within the workspace. Checked against the
-    /// live [`deps_core::net_policy::RegistryAccessPolicy`].
-    WorkspaceDeclared,
-}
+/// Cargo's registry trust is the core [`RegistryTrust`], with one Cargo-specific rule on top:
+/// trust here also gates a credential (`IndexTransport::Refused`) and is folded down a
+/// `[source]` replace-with chain, so a repository cannot borrow a `$CARGO_HOME` source's
+/// credential. Cargo is the documented exception to spec 084's URL-alone rule: its trust follows
+/// the alias provenance (`$CARGO_HOME` / `CARGO_REGISTRIES_*` are `Trusted`, a workspace file is
+/// `WorkspaceDeclared`) rather than equality with an operator-declared URL, until the egress and
+/// credential halves are split (#1855).
+pub use deps_core::net_policy::RegistryTrust;
 
-impl IndexTrust {
-    /// The less-trusted of `self` and `other` — `WorkspaceDeclared` if either is, `Trusted`
-    /// only if both are.
-    ///
-    /// Used to fold a `[source]` replace-with chain's trust (plan-1b §1.4 step 3): one
-    /// workspace-tier link anywhere in the chain makes the whole chain `WorkspaceDeclared`,
-    /// closing the shape where a hostile `[source.crates-io] replace-with = "corp"` in the
-    /// repo borrows a `$CARGO_HOME`-defined source's credential. Also used by
-    /// [`crate::registry::CargoRegistry::register_alternate`] (issue #455, C3) to fold a
-    /// re-registration of the same index URL to the stricter of its old and new trust tier.
-    #[must_use]
-    pub(crate) const fn min(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::WorkspaceDeclared, _) | (_, Self::WorkspaceDeclared) => Self::WorkspaceDeclared,
-            (Self::Trusted, Self::Trusted) => Self::Trusted,
+/// The less-trusted of `a` and `b` — `WorkspaceDeclared` if either is, `Trusted` only if both
+/// are.
+///
+/// Used to fold a `[source]` replace-with chain's trust (plan-1b §1.4 step 3): one workspace-tier
+/// link anywhere in the chain makes the whole chain `WorkspaceDeclared`, closing the shape where a
+/// hostile `[source.crates-io] replace-with = "corp"` in the repo borrows a `$CARGO_HOME`-defined
+/// source's credential. Also used by [`crate::registry::CargoRegistry::register_alternate`]
+/// (issue #455, C3) to fold a re-registration of the same index URL to the stricter of its old
+/// and new trust tier.
+pub(crate) const fn stricter(a: RegistryTrust, b: RegistryTrust) -> RegistryTrust {
+    match (a, b) {
+        (RegistryTrust::WorkspaceDeclared, _) | (_, RegistryTrust::WorkspaceDeclared) => {
+            RegistryTrust::WorkspaceDeclared
         }
+        (RegistryTrust::Trusted, RegistryTrust::Trusted) => RegistryTrust::Trusted,
     }
 }
 
@@ -162,12 +147,12 @@ impl IndexTrust {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RegistryIndex {
     url: url::Url,
-    /// This candidate's [`IndexTrust`] tier, carried alongside the validated URL so a
+    /// This candidate's [`RegistryTrust`] tier, carried alongside the validated URL so a
     /// consumer (issue #455's [`crate::sparse::SparseIndexClient`] fail-closed auth gate, C2;
     /// [`crate::registry::CargoRegistry::register_alternate`]'s trust fold, C3) never needs a
     /// second, disconnected argument that could drift from the tier this URL was actually
     /// validated under.
-    trust: IndexTrust,
+    trust: RegistryTrust,
 }
 
 /// Why a candidate index URL failed [`RegistryIndex::new`]'s validation.
@@ -181,9 +166,9 @@ impl RegistryIndex {
     /// `.cargo/config.toml` `[registries.<name>].index` value, or a `[source.<name>]
     /// registry` value, either optionally prefixed with `sparse+`.
     ///
-    /// `trust` states whose input `raw` is; for [`IndexTrust::WorkspaceDeclared`], `policy`'s
+    /// `trust` states whose input `raw` is; for [`RegistryTrust::WorkspaceDeclared`], `policy`'s
     /// current [`deps_core::net_policy::WorkspaceRegistryAccess`] setting is consulted — a
-    /// [`IndexTrust::Trusted`] candidate is never policy-checked at all, since it is the
+    /// [`RegistryTrust::Trusted`] candidate is never policy-checked at all, since it is the
     /// user's own `$CARGO_HOME` configuration, not something a cloned repository controls.
     ///
     /// # Errors
@@ -195,21 +180,21 @@ impl RegistryIndex {
     /// # Examples
     ///
     /// ```
-    /// use deps_cargo::config::{IndexTrust, RegistryIndex};
+    /// use deps_cargo::config::{RegistryTrust, RegistryIndex};
     /// use deps_core::net_policy::RegistryAccessPolicy;
     ///
     /// let policy = RegistryAccessPolicy::default();
     /// assert!(
-    ///     RegistryIndex::new("sparse+https://index.mycorp.dev", IndexTrust::Trusted, &policy)
+    ///     RegistryIndex::new("sparse+https://index.mycorp.dev", RegistryTrust::Trusted, &policy)
     ///         .is_ok()
     /// );
     /// assert!(
-    ///     RegistryIndex::new("http://index.mycorp.dev", IndexTrust::Trusted, &policy).is_err()
+    ///     RegistryIndex::new("http://index.mycorp.dev", RegistryTrust::Trusted, &policy).is_err()
     /// );
     /// assert!(
     ///     RegistryIndex::new(
     ///         "https://user:pass@index.mycorp.dev",
-    ///         IndexTrust::Trusted,
+    ///         RegistryTrust::Trusted,
     ///         &policy
     ///     )
     ///     .is_err()
@@ -217,21 +202,21 @@ impl RegistryIndex {
     /// ```
     pub fn new(
         raw: &str,
-        trust: IndexTrust,
+        trust: RegistryTrust,
         policy: &RegistryAccessPolicy,
     ) -> Result<Self, RegistryIndexError> {
         let stripped = raw.strip_prefix("sparse+").unwrap_or(raw);
         let gate = match trust {
-            IndexTrust::Trusted => PolicyGate::Skip,
-            IndexTrust::WorkspaceDeclared => PolicyGate::Enforce(policy),
+            RegistryTrust::Trusted => PolicyGate::Skip,
+            RegistryTrust::WorkspaceDeclared => PolicyGate::Enforce(policy),
         };
         let url = validate_index_url(stripped, stripped, EcosystemId::Cargo, gate)?;
         Ok(Self { url, trust })
     }
 
     /// Wraps a compile-time-known-safe literal (e.g. crates.io's own sparse index base),
-    /// bypassing [`IndexTrust`]/policy entirely — equivalent to [`Self::new`] with
-    /// [`IndexTrust::Trusted`], since a `Trusted` candidate is never policy-checked.
+    /// bypassing [`RegistryTrust`]/policy entirely — equivalent to [`Self::new`] with
+    /// [`RegistryTrust::Trusted`], since a `Trusted` candidate is never policy-checked.
     ///
     /// `pub(crate)` — for a literal known at compile time, not a workspace-provenance value.
     ///
@@ -242,7 +227,7 @@ impl RegistryIndex {
     #[must_use]
     pub(crate) fn builtin(raw: &'static str) -> Self {
         let policy = RegistryAccessPolicy::default();
-        Self::new(raw, IndexTrust::Trusted, &policy).unwrap_or_else(|error| {
+        Self::new(raw, RegistryTrust::Trusted, &policy).unwrap_or_else(|error| {
             panic!("builtin registry index {raw:?} failed validation: {error}")
         })
     }
@@ -260,9 +245,9 @@ impl RegistryIndex {
         TrustedPrefix::from_url(self.url.clone())
     }
 
-    /// The [`IndexTrust`] tier this index was validated under.
+    /// The [`RegistryTrust`] tier this index was validated under.
     #[must_use]
-    pub const fn trust(&self) -> IndexTrust {
+    pub const fn trust(&self) -> RegistryTrust {
         self.trust
     }
 }
@@ -368,7 +353,7 @@ pub enum SourceReplacement {
         /// The validated, fetchable mirror index.
         index: RegistryIndex,
         /// The bearer token to attach to requests against `index`, if any — populated only
-        /// when the whole chain's [`IndexTrust`] folded to [`IndexTrust::Trusted`] (plan-1b
+        /// when the whole chain's [`RegistryTrust`] folded to [`RegistryTrust::Trusted`] (plan-1b
         /// §1.4's "coupled trust trap" guard): a single workspace-tier link anywhere in the
         /// chain forces this to `None`, even if the terminal itself is a `$CARGO_HOME`
         /// `[registries]` entry carrying a token.
@@ -392,7 +377,7 @@ struct SourceEntry {
 
 /// The kind of source a `[source.<name>]` table declares — classified purely by the
 /// `sparse+` prefix on a `registry` value (spec FR-005/FR-006), never carrying an
-/// [`IndexTrust`] of its own: trust is derived from the [`CachedTier`] the containing file
+/// [`RegistryTrust`] of its own: trust is derived from the [`CachedTier`] the containing file
 /// belongs to at merge time, not tagged per entry (plan-1b §1.4/§1.5(c) — the same
 /// "per-entry tag a later reader must get right" hazard §1.5(c) already eliminated for
 /// `[registries]` entries).
@@ -823,7 +808,7 @@ fn resolve_registries(
             CachedTier::CargoHome(_) => None,
         }) {
             let (raw_index, _file) = entry;
-            match RegistryIndex::new(raw_index, IndexTrust::WorkspaceDeclared, policy) {
+            match RegistryIndex::new(raw_index, RegistryTrust::WorkspaceDeclared, policy) {
                 Ok(index) => {
                     registries.insert(
                         alias.clone(),
@@ -876,7 +861,7 @@ enum CargoHomeResolution {
     Resolved(ResolvedRegistryEntry),
     /// A `CARGO_REGISTRIES_*_INDEX` override or `$CARGO_HOME/config.toml` entry existed but
     /// failed validation for a reason other than a policy-blocked host (#1453 S1). Unlike the
-    /// workspace tier, `BlockedHost` can never be the reason here — [`IndexTrust::Trusted`]
+    /// workspace tier, `BlockedHost` can never be the reason here — [`RegistryTrust::Trusted`]
     /// skips the policy gate entirely — but `InvalidUrl`/`NotHttps`/`UserInfoPresent` still
     /// apply, and this tier used to drop such an entry silently with only a
     /// `tracing::warn!`, exactly the #1453 shape for a workspace-tier entry.
@@ -905,7 +890,7 @@ fn resolve_cargo_home_tier(
     // "env override failed, fall back" behavior).
     let mut env_rejection = None;
     if env_allowed && let Some(index_override) = env(&env_var_name(alias, "INDEX")) {
-        match RegistryIndex::new(&index_override, IndexTrust::Trusted, policy) {
+        match RegistryIndex::new(&index_override, RegistryTrust::Trusted, policy) {
             Ok(index) => {
                 let auth = env(&env_var_name(alias, "TOKEN"))
                     .map(AuthToken::new)
@@ -933,7 +918,7 @@ fn resolve_cargo_home_tier(
     if env_allowed && let Some(token_override) = env(&env_var_name(alias, "TOKEN")) {
         auth = Some(AuthToken::new(token_override));
     }
-    match RegistryIndex::new(&raw_index, IndexTrust::Trusted, policy) {
+    match RegistryIndex::new(&raw_index, RegistryTrust::Trusted, policy) {
         Ok(index) => CargoHomeResolution::Resolved(ResolvedRegistryEntry {
             index,
             auth,
@@ -963,7 +948,7 @@ const MAX_SOURCE_REPLACEMENT_HOPS: usize = 16;
 /// resolution, spec FR-005's "two-stage: alias -> source id", critic S4) — closest
 /// workspace tier first, then `$CARGO_HOME`.
 ///
-/// Returns **only** the raw index string and its tier's [`IndexTrust`] — never the
+/// Returns **only** the raw index string and its tier's [`RegistryTrust`] — never the
 /// `$CARGO_HOME` tier's token, so a workspace-tier chain crossing into a `[registries]`
 /// entry has no way to carry that entry's credential forward even by accident (plan-1b
 /// §1.4's "coupled trust trap" guard, critic N3): the drop is enforced by this function's
@@ -971,26 +956,26 @@ const MAX_SOURCE_REPLACEMENT_HOPS: usize = 16;
 fn lookup_raw_registry_index<'a>(
     id: &str,
     tiers: &'a LoadedTiers,
-) -> Option<(&'a str, IndexTrust)> {
+) -> Option<(&'a str, RegistryTrust)> {
     for file in &tiers.workspace {
         if let CachedTier::Workspace(map) = &file.tier
             && let Some(raw) = map.get(id)
         {
-            return Some((raw.as_str(), IndexTrust::WorkspaceDeclared));
+            return Some((raw.as_str(), RegistryTrust::WorkspaceDeclared));
         }
     }
     if let Some(file) = &tiers.cargo_home
         && let CachedTier::CargoHome(map) = &file.tier
         && let Some((raw, _token)) = map.get(id)
     {
-        return Some((raw.as_str(), IndexTrust::Trusted));
+        return Some((raw.as_str(), RegistryTrust::Trusted));
     }
     None
 }
 
 /// Looks `id` up as a `[registries]` alias in the `$CARGO_HOME` tier *specifically for its
 /// token* — used only once a chain's overall trust has already folded to
-/// [`IndexTrust::Trusted`], to re-derive the credential to attach rather than ever reading
+/// [`RegistryTrust::Trusted`], to re-derive the credential to attach rather than ever reading
 /// one off [`lookup_raw_registry_index`]'s result (plan-1b §1.4's coupled-trust-trap guard).
 fn cargo_home_token_for(tiers: &LoadedTiers, id: &str) -> Option<AuthToken> {
     let file = tiers.cargo_home.as_deref()?;
@@ -1009,7 +994,7 @@ fn cargo_home_token_for(tiers: &LoadedTiers, id: &str) -> Option<AuthToken> {
 fn resolve_source_chain(tiers: &LoadedTiers, policy: &RegistryAccessPolicy) -> SourceReplacement {
     let mut current_id = "crates-io".to_string();
     let mut visited: HashSet<String> = HashSet::new();
-    let mut chain_trust = IndexTrust::Trusted;
+    let mut chain_trust = RegistryTrust::Trusted;
 
     for _hop in 0..MAX_SOURCE_REPLACEMENT_HOPS {
         if !visited.insert(current_id.clone()) {
@@ -1026,18 +1011,18 @@ fn resolve_source_chain(tiers: &LoadedTiers, policy: &RegistryAccessPolicy) -> S
             .find_map(|file| {
                 file.sources
                     .get(&current_id)
-                    .map(|entry| (entry, IndexTrust::WorkspaceDeclared))
+                    .map(|entry| (entry, RegistryTrust::WorkspaceDeclared))
             })
             .or_else(|| {
                 tiers
                     .cargo_home
                     .as_deref()
                     .and_then(|file| file.sources.get(&current_id))
-                    .map(|entry| (entry, IndexTrust::Trusted))
+                    .map(|entry| (entry, RegistryTrust::Trusted))
             });
 
         if let Some((entry, entry_trust)) = found_source {
-            chain_trust = chain_trust.min(entry_trust);
+            chain_trust = stricter(chain_trust, entry_trust);
             // Cargo resolves `replace-with` **before** consulting the table's own kind (critic
             // S2): an explicit `registry =`/`directory =`/etc. alongside `replace-with` does
             // not disable the replacement — the shape most public mirror setup docs publish
@@ -1065,7 +1050,7 @@ fn resolve_source_chain(tiers: &LoadedTiers, policy: &RegistryAccessPolicy) -> S
         // Stage 1 (critic S4): not declared as a `[source]` entry — try a `[registries]`
         // crossover before giving up on this id.
         if let Some((raw_index, crossover_trust)) = lookup_raw_registry_index(&current_id, tiers) {
-            chain_trust = chain_trust.min(crossover_trust);
+            chain_trust = stricter(chain_trust, crossover_trust);
             if raw_index.starts_with("sparse+") {
                 return finalize_source_replacement(
                     raw_index,
@@ -1091,7 +1076,7 @@ fn resolve_source_chain(tiers: &LoadedTiers, policy: &RegistryAccessPolicy) -> S
 
 fn finalize_source_replacement(
     raw: &str,
-    chain_trust: IndexTrust,
+    chain_trust: RegistryTrust,
     terminal_id: &str,
     tiers: &LoadedTiers,
     policy: &RegistryAccessPolicy,
@@ -1100,7 +1085,7 @@ fn finalize_source_replacement(
         Ok(index) => {
             // Never read a token off the `[registries]` crossover lookup itself — re-derive it
             // here, gated on whether the whole chain folded to `Trusted` (plan-1b §1.4).
-            let auth = if chain_trust == IndexTrust::Trusted {
+            let auth = if chain_trust == RegistryTrust::Trusted {
                 cargo_home_token_for(tiers, terminal_id)
             } else {
                 None
@@ -1178,7 +1163,7 @@ mod tests {
         let policy = all_policy();
         let index = RegistryIndex::new(
             "sparse+https://index.mycorp.dev",
-            IndexTrust::Trusted,
+            RegistryTrust::Trusted,
             &policy,
         )
         .unwrap();
@@ -1189,7 +1174,7 @@ mod tests {
     fn test_registry_index_rejects_http() {
         let policy = all_policy();
         assert_matches!(
-            RegistryIndex::new("http://index.mycorp.dev", IndexTrust::Trusted, &policy),
+            RegistryIndex::new("http://index.mycorp.dev", RegistryTrust::Trusted, &policy),
             Err(RegistryIndexError::NotHttps(_))
         );
     }
@@ -1200,7 +1185,7 @@ mod tests {
         assert_matches!(
             RegistryIndex::new(
                 "https://user:pass@index.mycorp.dev",
-                IndexTrust::Trusted,
+                RegistryTrust::Trusted,
                 &policy
             ),
             Err(RegistryIndexError::UserInfoPresent)
@@ -1213,7 +1198,7 @@ mod tests {
         assert_matches!(
             RegistryIndex::new(
                 "https://user@index.mycorp.dev",
-                IndexTrust::Trusted,
+                RegistryTrust::Trusted,
                 &policy
             ),
             Err(RegistryIndexError::UserInfoPresent)
@@ -1224,7 +1209,7 @@ mod tests {
     fn test_registry_index_rejects_invalid_url() {
         let policy = all_policy();
         assert_matches!(
-            RegistryIndex::new("not a url", IndexTrust::Trusted, &policy),
+            RegistryIndex::new("not a url", RegistryTrust::Trusted, &policy),
             Err(RegistryIndexError::InvalidUrl(_))
         );
     }
@@ -1240,7 +1225,7 @@ mod tests {
         let policy = all_policy();
         let err = RegistryIndex::new(
             "https://user:hunter2@index.mycorp.dev:99999",
-            IndexTrust::Trusted,
+            RegistryTrust::Trusted,
             &policy,
         )
         .unwrap_err();
@@ -1252,7 +1237,7 @@ mod tests {
     fn test_registry_index_accepts_https_without_sparse_prefix() {
         let policy = all_policy();
         assert!(
-            RegistryIndex::new("https://index.mycorp.dev", IndexTrust::Trusted, &policy).is_ok()
+            RegistryIndex::new("https://index.mycorp.dev", RegistryTrust::Trusted, &policy).is_ok()
         );
     }
 
@@ -1268,26 +1253,27 @@ mod tests {
     fn test_registry_index_trust_round_trips_new_argument() {
         let policy = all_policy();
         let trusted =
-            RegistryIndex::new("https://index.mycorp.dev", IndexTrust::Trusted, &policy).unwrap();
-        assert_eq!(trusted.trust(), IndexTrust::Trusted);
+            RegistryIndex::new("https://index.mycorp.dev", RegistryTrust::Trusted, &policy)
+                .unwrap();
+        assert_eq!(trusted.trust(), RegistryTrust::Trusted);
 
         let workspace_declared = RegistryIndex::new(
             "https://index.mycorp.dev",
-            IndexTrust::WorkspaceDeclared,
+            RegistryTrust::WorkspaceDeclared,
             &policy,
         )
         .unwrap();
-        assert_eq!(workspace_declared.trust(), IndexTrust::WorkspaceDeclared);
+        assert_eq!(workspace_declared.trust(), RegistryTrust::WorkspaceDeclared);
     }
 
     // Issue #455, test-plan item 11: `builtin` is always `Trusted`.
     #[test]
     fn test_registry_index_builtin_is_trusted() {
         let index = RegistryIndex::builtin("https://index.crates.io");
-        assert_eq!(index.trust(), IndexTrust::Trusted);
+        assert_eq!(index.trust(), RegistryTrust::Trusted);
     }
 
-    /// Policy gate matrix (plan-1b §4): every `WorkspaceRegistryAccess` x `IndexTrust`
+    /// Policy gate matrix (plan-1b §4): every `WorkspaceRegistryAccess` x `RegistryTrust`
     /// combination against a metadata-IP URL. `Trusted` is always allowed (it is the
     /// user's own `$CARGO_HOME` config, never policy-checked); `WorkspaceDeclared` follows
     /// the policy exactly.
@@ -1295,7 +1281,7 @@ mod tests {
     fn test_registry_index_trusted_metadata_ip_always_allowed() {
         for policy in [off_policy(), public_only_policy(), all_policy()] {
             assert!(
-                RegistryIndex::new("https://169.254.169.254/", IndexTrust::Trusted, &policy)
+                RegistryIndex::new("https://169.254.169.254/", RegistryTrust::Trusted, &policy)
                     .is_ok(),
                 "a Trusted candidate must never be policy-checked"
             );
@@ -1308,7 +1294,7 @@ mod tests {
         assert_matches!(
             RegistryIndex::new(
                 "https://169.254.169.254/",
-                IndexTrust::WorkspaceDeclared,
+                RegistryTrust::WorkspaceDeclared,
                 &policy
             ),
             Err(RegistryIndexError::BlockedHost { .. })
@@ -1321,7 +1307,7 @@ mod tests {
         assert!(
             RegistryIndex::new(
                 "https://index.mycorp.dev",
-                IndexTrust::WorkspaceDeclared,
+                RegistryTrust::WorkspaceDeclared,
                 &policy
             )
             .is_ok()
@@ -1334,7 +1320,7 @@ mod tests {
         assert_matches!(
             RegistryIndex::new(
                 "https://index.mycorp.dev",
-                IndexTrust::WorkspaceDeclared,
+                RegistryTrust::WorkspaceDeclared,
                 &policy
             ),
             Err(RegistryIndexError::BlockedHost { .. })
@@ -1345,7 +1331,12 @@ mod tests {
     fn test_registry_index_workspace_declared_rfc1918_allowed_under_all() {
         let policy = all_policy();
         assert!(
-            RegistryIndex::new("https://10.0.0.1/", IndexTrust::WorkspaceDeclared, &policy).is_ok()
+            RegistryIndex::new(
+                "https://10.0.0.1/",
+                RegistryTrust::WorkspaceDeclared,
+                &policy
+            )
+            .is_ok()
         );
     }
 
@@ -1533,7 +1524,7 @@ token = "secret-token"
 
     /// #1453 impl-critic S1: a `$CARGO_HOME/config.toml` `[registries.<name>] index = ...`
     /// entry that fails validation for a non-blocked-host reason must populate
-    /// `CargoConfig::rejected` exactly like a workspace-tier entry does — `IndexTrust::Trusted`
+    /// `CargoConfig::rejected` exactly like a workspace-tier entry does — `RegistryTrust::Trusted`
     /// only skips the policy gate, not the scheme/userinfo/URL-shape checks
     /// `validate_index_url` still applies.
     #[test]

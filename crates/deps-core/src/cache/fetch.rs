@@ -23,15 +23,36 @@ use super::response::CredentialPartition;
 use super::response::ResponseValidators;
 use super::response::RevalidationFailure;
 use super::transport::Transport;
+use crate::endpoint_contact::{note_request, note_response};
 use crate::error::{DepsError, Result};
 use crate::net_policy::TrustedPrefix;
 use crate::redact::RedactedUrl;
 use bytes::Bytes;
-use reqwest::{StatusCode, header};
+use reqwest::{RequestBuilder, Response, StatusCode, header};
 use serde::Serialize;
 use std::sync::atomic::Ordering;
 
+/// Sends `request`, recording the arrival of any response for the interactive fetch gate's
+/// breaker evidence (see [`crate::endpoint_contact`]).
+async fn send_noted(request: RequestBuilder, url: &str) -> Result<Response> {
+    // TODO(#1857): a stalled body after headers reads as Responded; track body progress if mirrors stall mid-stream
+    let response = request.send().await.map_err(|e| send_error(url, e))?;
+    note_response();
+    Ok(response)
+}
+
 impl HttpCache {
+    /// Tells the policy a request is about to leave over a guarded transport, so the startup
+    /// proxy notice is shown only to setups that actually connect directly.
+    fn note_guarded(&self, transport: &Transport) {
+        match transport.tier {
+            CacheTier::Baseline => {}
+            CacheTier::WorkspaceDeclared(_) | CacheTier::Pinned { .. } => {
+                self.policy.note_guarded_request();
+            }
+        }
+    }
+
     /// The prefix marking a workspace-tier cache key, chosen as a control character that can
     /// never appear at the start of a URL string this module writes: production code paths
     /// only ever write keys derived from this function, which are either the bare URL (starting
@@ -579,6 +600,8 @@ impl HttpCache {
     ) -> Result<Option<CachedResponse>> {
         self.ensure_online(url)?;
         ensure_https(url)?;
+        note_request();
+        self.note_guarded(transport);
         transport.preflight(url).await?;
         let mut request = apply_request_headers(transport.client.get(url), extra_headers);
         if let Some(etag) = &cached.etag {
@@ -588,7 +611,7 @@ impl HttpCache {
             request = request.header(header::IF_MODIFIED_SINCE, last_modified);
         }
 
-        let response = request.send().await.map_err(|e| send_error(url, e))?;
+        let response = send_noted(request, url).await?;
 
         if response.status() == StatusCode::NOT_MODIFIED {
             return Ok(None);
@@ -633,6 +656,8 @@ impl HttpCache {
     ) -> Result<CachedResponse> {
         self.ensure_online(url)?;
         ensure_https(url)?;
+        note_request();
+        self.note_guarded(transport);
         transport.preflight(url).await?;
         // #756 security follow-up (S-A): `RedactedUrl`, not the raw `url` — this is the
         // direct callee of the now-hardened `get_cached_via`, and at `debug`
@@ -646,7 +671,7 @@ impl HttpCache {
 
         let request = apply_request_headers(transport.client.get(url), extra_headers);
 
-        let response = request.send().await.map_err(|e| send_error(url, e))?;
+        let response = send_noted(request, url).await?;
 
         if !response.status().is_success() {
             return Err(http_status_error(
@@ -737,15 +762,11 @@ impl HttpCache {
     ) -> Result<Bytes> {
         self.ensure_online(url)?;
         ensure_https(url)?;
+        note_request();
+        self.note_guarded(transport);
         transport.preflight(url).await?;
 
-        let response = transport
-            .client
-            .post(url)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| send_error(url, e))?;
+        let response = send_noted(transport.client.post(url).json(body), url).await?;
 
         if !response.status().is_success() {
             return Err(http_status_error(
@@ -874,11 +895,13 @@ impl HttpCache {
     ) -> Result<CachedResponse> {
         self.ensure_online(url)?;
         ensure_https(url)?;
+        note_request();
+        self.note_guarded(transport);
         transport.preflight(url).await?;
 
         let request = apply_request_headers(transport.client.get(url), extra_headers);
 
-        let response = request.send().await.map_err(|e| send_error(url, e))?;
+        let response = send_noted(request, url).await?;
 
         if !response.status().is_success() {
             return Err(http_status_error(

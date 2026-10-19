@@ -279,6 +279,12 @@ impl HttpCache {
         Self::with_policy(Arc::new(RegistryAccessPolicy::default()))
     }
 
+    /// The registry-access policy this cache enforces and reports guarded traffic to.
+    #[must_use]
+    pub const fn registry_policy(&self) -> &Arc<RegistryAccessPolicy> {
+        &self.policy
+    }
+
     /// Creates a new HTTP cache whose [`Self::get_cached_workspace`] requests are governed by
     /// `policy`'s live value.
     ///

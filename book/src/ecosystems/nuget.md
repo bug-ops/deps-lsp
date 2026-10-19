@@ -150,12 +150,19 @@ source down to zero — with or without an invalid entry left to name — is an
 explicit fail-closed state, never a silent fallback to `api.nuget.org` (the
 same issue #248/#502/#513 regression class Cargo/npm/PyPI already closed).
 
-**Proxies.** Guarded traffic, including user-profile `NuGet.Config` feeds, connects directly and bypasses the
-system proxy by default; set `DEPS_LSP_WORKSPACE_REGISTRY_PROXY=proxy` to route it through
-the proxy (see [Proxies and guarded registry traffic](../configuration.md#proxies-and-guarded-registry-traffic)).
+**Proxies.** A feed your user-profile `NuGet.Config` declares (and a repository source whose URL
+equals one) is an [operator-owned registry](../configuration.md#operator-owned-registries): it
+follows your system proxy like `api.nuget.org`, fetched over the same origin-confined transport,
+and a credential bound to it still goes only to its declared origin. Feeds only a repository
+declares stay workspace-guarded and direct by default (see
+[Proxies and guarded registry traffic](../configuration.md#proxies-and-guarded-registry-traffic)).
 
-**Reachability policy**: governed by the same `registries.workspace_registries`
-setting documented in [Cargo](cargo.md#customprivate-registries), including its
+**Reachability policy**: a source URL equal to one your user-profile `NuGet.Config` declares (and
+has not removed or disabled there) is trusted and **ignores `registries.workspace_registries`,
+including `"off"`**, whether or not `registries.nuget_user_profile_sources` routes that file; it
+may resolve to a private address under `"public_only"`. Equality is per URL, so the same host
+with another path is not trusted. Every other source is governed by the setting documented in
+[Cargo](cargo.md#customprivate-registries), including its
 [connect-time message](cargo.md#customprivate-registries) for a host that resolves to a blocked
 address (a blocked feed halts the chain with that message). Additionally,
 a workspace-declared feed's own service-index resource URLs

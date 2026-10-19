@@ -28,7 +28,7 @@
 // fixture data.
 #![allow(clippy::unwrap_used)]
 
-use deps_cargo::config::{ConfigFileCache, IndexTrust};
+use deps_cargo::config::{ConfigFileCache, RegistryTrust};
 use deps_cargo::{CargoConfig, CargoRegistry, DependencySource};
 use deps_core::freshness::FreshnessSettings;
 use deps_core::net_policy::RegistryAccessPolicy;
@@ -43,7 +43,7 @@ fn test_policy() -> RegistryAccessPolicy {
 }
 
 fn test_index(raw: &str) -> deps_cargo::config::RegistryIndex {
-    deps_cargo::config::RegistryIndex::new(raw, IndexTrust::Trusted, &test_policy()).unwrap()
+    deps_cargo::config::RegistryIndex::new(raw, RegistryTrust::Trusted, &test_policy()).unwrap()
 }
 
 /// FR-001: `Registry::get_versions`/`get_versions_with`'s source-aware counterpart,

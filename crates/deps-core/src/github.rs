@@ -213,10 +213,7 @@ pub fn classify_tags_fetch_error(
         DepsError::HttpStatus { status: 403, .. } if !has_token => {
             github_rate_limit_error(RateLimitEvidence::Inferred)
         }
-        DepsError::HttpStatus { status: 404, .. } => DepsError::PackageNotFound {
-            package: name.to_string().into(),
-            registry,
-        },
+        DepsError::HttpStatus { status: 404, .. } => crate::not_found_or(e, name, registry, &[]),
         _ => e,
     }
 }

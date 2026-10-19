@@ -6,11 +6,12 @@
 //! it for [`BREAKER_OPEN_DURATION`] without polling.
 //!
 //! It tracks responsiveness, not correctness: a fast response from the endpoint (an HTTP
-//! status, an oversized or undecodable API body, a transport error) counts as an answer, while
-//! a fast error raised locally (policy, cache, configuration, a manifest or JSON parse error,
-//! `PackageNotFound`) says nothing about it. A single slow package never opens it (the
-//! package may just be big); two *distinct* slow packages with no answer from the endpoint in
-//! the meantime do.
+//! status, an oversized or undecodable API body, a registry's own not-found) counts as an
+//! answer, while an error with no response behind it says nothing about it: a fast transport
+//! error, or one raised locally (policy, cache, configuration, a parse error, a locally decided
+//! not-found). A request outstanding for half the budget counts as slow. A single slow package
+//! never opens it (the package may just be big); two *distinct* slow packages with no answer
+//! from the endpoint in the meantime do.
 //!
 //! The key is the network path [`Registry::endpoint_for`](crate::Registry::endpoint_for)
 //! reports, shared across manifests and dependency sources, or the manifest and source when

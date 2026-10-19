@@ -11,7 +11,7 @@
 
 use deps_cargo::DependencySource;
 use deps_cargo::config::{
-    ConfigFileCache, IndexTrust, RegistryIndex, cargo_home_config_path, resolve,
+    ConfigFileCache, RegistryIndex, RegistryTrust, cargo_home_config_path, resolve,
 };
 use deps_cargo::parse_cargo_toml;
 use deps_core::net_policy::RegistryAccessPolicy;
@@ -149,21 +149,23 @@ fn test_registry_index_validation_public_api() {
     assert!(
         RegistryIndex::new(
             "sparse+https://index.mycorp.dev",
-            IndexTrust::Trusted,
+            RegistryTrust::Trusted,
             &policy
         )
         .is_ok()
     );
-    assert!(RegistryIndex::new("http://index.mycorp.dev", IndexTrust::Trusted, &policy).is_err());
+    assert!(
+        RegistryIndex::new("http://index.mycorp.dev", RegistryTrust::Trusted, &policy).is_err()
+    );
     assert!(
         RegistryIndex::new(
             "https://user:pass@index.mycorp.dev",
-            IndexTrust::Trusted,
+            RegistryTrust::Trusted,
             &policy
         )
         .is_err()
     );
-    assert!(RegistryIndex::new("not a url", IndexTrust::Trusted, &policy).is_err());
+    assert!(RegistryIndex::new("not a url", RegistryTrust::Trusted, &policy).is_err());
 }
 
 /// FR-004: `$CARGO_HOME` unset yields no cargo-home config path, and no

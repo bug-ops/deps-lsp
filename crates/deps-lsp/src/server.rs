@@ -900,13 +900,6 @@ impl LanguageServer for Backend {
             self.show_config_notices(notices).await;
         }
 
-        if let Some(notice) = self.state.egress_notice() {
-            tracing::warn!("{notice}");
-            self.client
-                .show_message(MessageType::WARNING, format!("deps-lsp: {notice}"))
-                .await;
-        }
-
         self.start_tag_refresh_listeners();
         self.start_keychain_refresh_listener();
         self.start_republish_worker();
@@ -4348,11 +4341,14 @@ let package = Package(
             );
         }
 
-        /// #1816: a system proxy that guarded registries bypass is announced once at
-        /// `initialize`, naming the opt-in variable; opting in silences it.
+        /// #1816: a system proxy that guarded registries bypass is announced once, naming the
+        /// opt-in variable, but only after a request actually went out over a guarded transport:
+        /// `initialize` is silent, an operator-owned-only setup never connects directly, and
+        /// opting in silences it.
         #[cfg(all(not(windows), any(feature = "cargo", feature = "github-actions")))]
         #[tokio::test]
-        async fn test_initialize_announces_bypassed_system_proxy() {
+        async fn test_bypassed_system_proxy_is_announced_after_guarded_traffic() {
+            use deps_core::HttpCache;
             use deps_core::net_policy::{SystemProxy, WORKSPACE_REGISTRY_PROXY_ENV};
             use futures::StreamExt as _;
 
@@ -4360,24 +4356,21 @@ let package = Package(
                 MapEnv::new()
                     .with_proxy(SystemProxy::for_test(Some("http://proxy.corp:3128"), None))
             };
-            let service_for = |source: MapEnv| {
-                tower_lsp_server::LspService::build(move |client| {
-                    Backend::with_state(client, ServerState::from_env_source(&source))
-                })
-                .finish()
-            };
+            let mut server = mockito::Server::new_async().await;
+            let _mock = server
+                .mock("GET", "/pkg")
+                .with_status(200)
+                .with_body("ok")
+                .expect_at_least(1)
+                .create_async()
+                .await;
+            let url = format!("{}/pkg", server.url());
 
-            let (service, mut socket) = service_for(proxied());
-            service
-                .inner()
-                .initialize(InitializeParams::default())
-                .await
-                .unwrap();
-            let message = next_client_message(&mut socket).await;
-            assert!(show_message_text(&message).contains(WORKSPACE_REGISTRY_PROXY_ENV));
-
-            let (service, mut socket) =
-                service_for(proxied().with_var(WORKSPACE_REGISTRY_PROXY_ENV, "proxy"));
+            let source = proxied();
+            let (service, mut socket) = tower_lsp_server::LspService::build(move |client| {
+                Backend::with_state(client, ServerState::from_env_source(&source))
+            })
+            .finish();
             service
                 .inner()
                 .initialize(InitializeParams::default())
@@ -4387,6 +4380,31 @@ let package = Package(
                 tokio::time::timeout(std::time::Duration::from_millis(200), socket.next())
                     .await
                     .is_err(),
+                "initialize must not announce a proxy nothing has bypassed yet"
+            );
+
+            let state = ServerState::from_env_source(&proxied());
+            assert!(state.take_egress_notice().is_none());
+            let cache = HttpCache::with_policy(Arc::clone(&state.registry_policy));
+            cache.get_cached(&url).await.unwrap();
+            assert!(
+                state.take_egress_notice().is_none(),
+                "an operator-owned or public request does not connect directly"
+            );
+            cache.get_cached_workspace(&url).await.unwrap();
+            let notice = state
+                .take_egress_notice()
+                .expect("a guarded request went out");
+            assert!(notice.message().contains(WORKSPACE_REGISTRY_PROXY_ENV));
+            assert!(state.take_egress_notice().is_none(), "announced once");
+
+            let opted_in = ServerState::from_env_source(
+                &proxied().with_var(WORKSPACE_REGISTRY_PROXY_ENV, "proxy"),
+            );
+            let cache = HttpCache::with_policy(Arc::clone(&opted_in.registry_policy));
+            cache.get_cached_workspace(&url).await.unwrap();
+            assert!(
+                opted_in.take_egress_notice().is_none(),
                 "an opted-in proxy must not warn"
             );
         }

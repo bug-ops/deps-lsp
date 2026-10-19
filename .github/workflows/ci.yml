@@ -661,6 +661,15 @@ jobs:
     # PR/push runs stay non-blocking again; the weekly scheduled sweep still hard-fails and
     # files/updates a tracking issue, so a genuine breaking change is never silently lost —
     # it just doesn't block an individual PR anymore. Not part of `ci-success`'s `needs`.
+    #
+    # The baseline is a git revision, not the crates.io release (#1836): every crate shares one
+    # workspace version, so a registry baseline reports every break since the last release on
+    # every run and the weekly issue never goes quiet. A PR is compared against its merge base, a
+    # push against the previous tip, and the weekly sweep against `main` as it was a week ago, so
+    # each run reports only the breaks it introduced. `release-type: minor` keeps additive
+    # changes (`inherent_method_must_use_added` and friends, the #1048 noise) from failing at an
+    # unchanged workspace version while still failing every major-level break; match each
+    # reported break against `### Breaking` in CHANGELOG.md.
     if: github.event_name == 'schedule' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -670,11 +679,52 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Check semver
+      - name: Select baseline revision
+        id: baseline
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              rev=$(git merge-base "origin/${BASE_REF}" HEAD)
+              ;;
+            push)
+              rev="$BEFORE_SHA"
+              # The zero SHA (a branch's first push) and an object that is gone (a force push)
+              # have no previous tip; fall back to the first parent.
+              if [[ "$rev" =~ ^0+$ ]] || ! git cat-file -e "${rev}^{commit}" 2>/dev/null; then
+                rev=$(git rev-parse HEAD^)
+              fi
+              ;;
+            *)
+              rev=$(git rev-list -n1 --before='7 days ago' origin/main)
+              # A repository younger than the window compares against its first commit.
+              rev=${rev:-$(git rev-list --max-parents=0 HEAD | tail -n1)}
+              ;;
+          esac
+          echo "Baseline revision: ${rev}"
+          echo "rev=${rev}" >> "$GITHUB_OUTPUT"
+
+      - name: Check semver against the baseline revision
         uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239  # v2.9
         with:
           feature-group: all-features
+          baseline-rev: ${{ steps.baseline.outputs.rev }}
+          release-type: minor
+
+      # Build health only: `release-type: major` allows every break, so this fails solely when
+      # the workspace no longer builds its rustdoc against the published 2.x line.
+      - name: Check the published crates still build as a baseline
+        if: ${{ !cancelled() && github.event_name == 'schedule' }}
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239  # v2.9
+        with:
+          feature-group: all-features
+          release-type: major
 
       - name: File or update tracking issue on scheduled failure
         if: failure() && github.event_name == 'schedule'
@@ -683,7 +733,7 @@ jobs:
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           body="Scheduled semver-check run ${run_url} failed.
 
-          This job is part of the weekly regression sweep (\`.github/workflows/ci.yml\`, job \`semver\`), advisory-only on PR/push again since #1048. See the run log for the semver-violation or build-failure detail — a failure here that also reproduces on a PR/push run's non-blocking check is a real breaking-change candidate worth its own fix, not noise from an incidental additive change."
+          This job is part of the weekly regression sweep (\`.github/workflows/ci.yml\`, job \`semver\`), advisory-only on PR/push again since #1048. It compares the workspace against \`main\` as it was seven days earlier at release type minor, so every reported break landed this week: match each one against the \`### Breaking\` section of CHANGELOG.md and add the missing entry, or fix the unintended break. A build failure in the log is a separate, infrastructure-level problem."
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --search "in:title \"${title}\"" --state open --json number --jq '.[0].number // empty')
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"

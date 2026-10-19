@@ -45,9 +45,12 @@ pattern, gets the same hover/diagnostic/completion value a
 data, or (before this feature) silently checking the wrong (public) proxy.
 
 **Resolution**: `$GOENV` is read once per process — the `GOENV` environment
-variable if set and non-empty, else the platform default
+variable if it is an absolute path, else the platform default
 `os.UserConfigDir()/go/env` (`~/.config/go/env` on Linux/macOS,
-`%AppData%\go\env` on Windows), matching `go env -w`'s own file. `GOPROXY` is
+`%AppData%\go\env` on Windows), matching `go env -w`'s own file. `GOENV=off` disables the
+file, as it does for `go` itself, and an empty `GOENV` is unset (the default file is read), while a relative `GOENV` is ignored without
+falling back to the default (a relative path would resolve against a directory a repository can
+influence). `GOPROXY` is
 parsed as a comma-or-pipe-separated ordered chain of hops (`go help goproxy`
 semantics), recognizing the `direct` and `off` sentinels; when absent, the
 existing hardcoded `https://proxy.golang.org` default applies unchanged.
@@ -109,15 +112,18 @@ dropped entry — a "skip on any failure" the user wrote is never silently
 narrowed to "skip only when not found" just because the hop in between
 turned out invalid.
 
-**Proxies.** Guarded traffic, including the `$GOENV` `GOPROXY` chain, connects directly and bypasses the
-system proxy by default; set `DEPS_LSP_WORKSPACE_REGISTRY_PROXY=proxy` to route it through
-the proxy (see [Proxies and guarded registry traffic](../configuration.md#proxies-and-guarded-registry-traffic)).
+**Proxies.** The `$GOENV` `GOPROXY` chain is a file you own, so it is an
+[operator-owned registry](../configuration.md#operator-owned-registries): it follows your system
+proxy like the public registries. Workspace-guarded traffic stays direct by default (see
+[Proxies and guarded registry traffic](../configuration.md#proxies-and-guarded-registry-traffic)).
 
-**Reachability policy**: governed by the same `registries.workspace_registries`
-setting documented in [Cargo](cargo.md#customprivate-registries), including its
-[connect-time message](cargo.md#customprivate-registries) for a host that resolves to a blocked
-address. A hop blocked this way halts a `,` chain with that message; in a `|` chain a later
-not-found or error does not hide it. The default
+**Reachability policy**: every `GOPROXY` hop comes from your `$GOENV`, so it is trusted and
+**ignores `registries.workspace_registries`, including `"off"`**, and may resolve to a private
+address under `"public_only"` (see [Operator-owned registries](../configuration.md#operator-owned-registries)).
+A hop whose host is never a registry (loopback, link-local, cloud-metadata, unspecified,
+reserved) is still refused under every setting, by the shared
+[connect-time message](cargo.md#customprivate-registries). A hop blocked this way halts a `,`
+chain with that message; in a `|` chain a later not-found or error does not hide it. The default
 public chain (`https://proxy.golang.org,direct`) used when `$GOENV` declares no
 `GOPROXY` override is never subject to this gate — it is the same
 ungated public-tier client `deps-go` already uses today. A hop blocked by the

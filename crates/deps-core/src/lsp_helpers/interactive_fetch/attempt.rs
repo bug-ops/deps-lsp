@@ -12,6 +12,7 @@ use super::key::{BreakerEvidence, LookupKey, LookupKind};
 use super::memo::RecordState;
 use super::{InteractiveFetch, InteractiveFetchGate, InteractiveFetchRequest, NoLiveList};
 use crate::ErrorOrigin;
+use crate::endpoint_contact::{Contact, ContactLedger, ResponseSeen};
 
 /// Margin below the budget within which an answer may be a stale-serve or a race against the
 /// 10 s connect timeout rather than proof the endpoint is responsive.
@@ -59,31 +60,46 @@ pub(super) enum AttemptEvidence {
     Inconclusive,
 }
 
-/// Evidence from an attempt that ended as `end` after `waited` against a budget of `budget`.
+/// Evidence from an attempt that ended as `end` after `waited` against a budget of `budget`,
+/// given what it did on the wire (`contact`).
 ///
-/// A fast `Live` or endpoint-attributed `Err` shows the endpoint is responsive. A `Live` near
-/// the budget is inconclusive: the HTTP cache serves stale data after a failed revalidation, so
-/// it may come from a dead host. Giving up at or beyond half the budget is slow, whether by
-/// elapse, cancel, or an unattributed error such as a late DNS failure; giving up earlier
-/// (a promoted request with little budget left, an early cancel, a fast local failure) says
-/// nothing.
-pub(super) fn evidence(end: AttemptEnd, waited: Duration, budget: Duration) -> AttemptEvidence {
+/// A response is required to vouch for an endpoint, and a stalled request to accuse it:
+///
+/// - A `Live` result, or an endpoint-attributed `Err`, within the budget minus a margin is
+///   [`AttemptEvidence::Answered`] only if a response arrived. One served from a memo, a fresh
+///   cache entry or a local error never touched the endpoint. A `Live` near the budget is
+///   inconclusive: the HTTP cache serves stale data after a failed revalidation, so it may come
+///   from a dead host.
+/// - An ending with a request outstanding for at least half the budget, by elapse, cancel or
+///   any error, is [`AttemptEvidence::Slow`]. The stall clock restarts at each request after a
+///   response, so a chain whose first hop answers fast and whose second hangs is slow, while a
+///   paginating fetch that keeps receiving responses is not.
+/// - Everything else is [`AttemptEvidence::Inconclusive`]: a promoted request with little
+///   budget left, an early cancel, a fast local failure, a lookup that only waited on another
+///   task's lock or single-flight (it sent nothing, so while a background fetch holds one the
+///   breaker cannot open), and an attempt whose concurrent requests were partially answered (a
+///   response clears the pending request even if a sibling still hangs).
+pub(super) fn evidence(
+    end: AttemptEnd,
+    contact: Contact,
+    waited: Duration,
+    budget: Duration,
+) -> AttemptEvidence {
     let responsive = waited < budget.saturating_sub(MARGIN);
+    let answered = contact.response == ResponseSeen::Yes;
+    let stalled = contact.stall.is_some_and(|stall| stall >= budget / 2);
     match end {
-        AttemptEnd::Live if responsive => AttemptEvidence::Answered,
+        AttemptEnd::Live if responsive && answered => AttemptEvidence::Answered,
         AttemptEnd::Live => AttemptEvidence::Inconclusive,
-        AttemptEnd::Err(ErrorOrigin::Endpoint) if responsive => AttemptEvidence::Answered,
-        AttemptEnd::Err(ErrorOrigin::Endpoint) => AttemptEvidence::Slow,
-        AttemptEnd::Err(ErrorOrigin::Unattributed)
-        | AttemptEnd::Elapsed
-        | AttemptEnd::Cancelled
-            if waited >= budget / 2 =>
-        {
+        AttemptEnd::Err(_) | AttemptEnd::Elapsed | AttemptEnd::Cancelled if stalled => {
             AttemptEvidence::Slow
         }
-        AttemptEnd::Err(ErrorOrigin::Unattributed)
-        | AttemptEnd::Elapsed
-        | AttemptEnd::Cancelled => AttemptEvidence::Inconclusive,
+        AttemptEnd::Err(ErrorOrigin::Endpoint) if responsive && answered => {
+            AttemptEvidence::Answered
+        }
+        AttemptEnd::Err(_) | AttemptEnd::Elapsed | AttemptEnd::Cancelled => {
+            AttemptEvidence::Inconclusive
+        }
     }
 }
 
@@ -100,6 +116,7 @@ struct AttemptGuard<'a> {
     probe: Option<ProbeId>,
     settled: bool,
     counts: BreakerEvidence,
+    ledger: Arc<ContactLedger>,
 }
 
 impl AttemptGuard<'_> {
@@ -113,8 +130,10 @@ impl AttemptGuard<'_> {
             BreakerEvidence::Counts => {}
             BreakerEvidence::Ignored => return,
         }
-        let waited = Instant::now().saturating_duration_since(self.started);
-        let evidence = evidence(end, waited, self.lookup.kind().budget());
+        let now = Instant::now();
+        let waited = now.saturating_duration_since(self.started);
+        let contact = self.ledger.snapshot(now);
+        let evidence = evidence(end, contact, waited, self.lookup.kind().budget());
         if self.gate.generation() != self.generation {
             return;
         }
@@ -274,8 +293,10 @@ impl InteractiveFetchGate {
             probe,
             settled: false,
             counts,
+            ledger: ContactLedger::new(),
         };
-        let (result, end) = bounded_await_until(fetch, deadline, request, lookup.kind()).await;
+        let scoped = guard.ledger.scope(fetch);
+        let (result, end) = bounded_await_until(scoped, deadline, request, lookup.kind()).await;
         guard.finish(end);
         let result = match result {
             // The background fetch still reports this package as failing, so a stale seeded

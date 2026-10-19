@@ -25,7 +25,7 @@
 //! ```
 
 #[cfg(all(test, feature = "lsp-responses"))]
-use crate::config::IndexTrust;
+use crate::config::RegistryTrust;
 use crate::config::{AuthToken, RegistryIndex};
 use crate::sparse::SparseIndexClient;
 use crate::types::{CargoVersion, CrateInfo};
@@ -108,7 +108,7 @@ impl CratesIoRegistry {
     #[must_use]
     pub(crate) fn with_base_for_test(cache: Arc<HttpCache>, base: &str) -> Self {
         let policy = deps_core::net_policy::RegistryAccessPolicy::default();
-        let index = RegistryIndex::new(base, IndexTrust::Trusted, &policy)
+        let index = RegistryIndex::new(base, RegistryTrust::Trusted, &policy)
             .expect("mock server URL must pass RegistryIndex validation");
         Self {
             sparse: SparseIndexClient::new(index, Arc::clone(&cache)),
@@ -419,7 +419,7 @@ pub struct CargoRegistry {
     /// (`Self::register_alternate`) and lookup (`Self::alternate_client`) both key off one
     /// already-validated `RegistryIndex::as_str()`, symmetrically — a lookup no longer needs
     /// to reconstruct and re-validate a `RegistryIndex` of its own, which would otherwise
-    /// need its own `IndexTrust`/policy argument just to answer a plain map lookup).
+    /// need its own `RegistryTrust`/policy argument just to answer a plain map lookup).
     /// Populated by [`Self::register_alternate`] at parse time (see `crate::ecosystem`'s
     /// `parse_manifest` override) — the *only* place an [`AuthToken`] is ever attached to a
     /// client, since only that call site has the [`crate::config::CargoConfig`]/
@@ -487,7 +487,7 @@ impl CargoRegistry {
     /// [`deps_core::DepsError::PackageNotFound`], never to a crates.io lookup by name.
     ///
     /// Issue #455, C3: a re-registration of an *already-registered* index URL now folds to
-    /// the stricter of the stored and incoming [`crate::config::IndexTrust`] tier, dropping
+    /// the stricter of the stored and incoming [`crate::config::RegistryTrust`] tier, dropping
     /// any stored credential when the fold actually tightens — closing the shape where a
     /// `Trusted`+token registration of URL X (from `$CARGO_HOME`) makes a later
     /// `WorkspaceDeclared` registration of the same X a no-op, leaving a workspace-controlled
@@ -519,7 +519,7 @@ impl CargoRegistry {
             },
             |current| {
                 let stored_trust = current.trust();
-                let folded = stored_trust.min(incoming_trust);
+                let folded = crate::config::stricter(stored_trust, incoming_trust);
                 if folded != stored_trust {
                     tracing::warn!(
                         index = %RedactedUrl::new(index_for_replace.as_str()),
@@ -541,7 +541,7 @@ impl CargoRegistry {
     /// validation. A plain map lookup: `index` only ever originates from an already-validated
     /// [`RegistryIndex::as_str`], on both sides — registration above, and a dependency's own
     /// resolved `index` string (`crate::parser`) — so normalization stays symmetric with no
-    /// need to reconstruct a `RegistryIndex` (and the `IndexTrust`/policy that would require)
+    /// need to reconstruct a `RegistryIndex` (and the `RegistryTrust`/policy that would require)
     /// just to look one up (plan-1b §1.2, critic S2).
     ///
     /// Used by completion (`crate::ecosystem::CargoEcosystem::generate_completions`, FR-012)
@@ -712,7 +712,7 @@ impl deps_core::Registry for CargoRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::IndexTrust;
+    use crate::config::RegistryTrust;
     use crate::ecosystem::CargoEcosystem;
     use deps_core::net_policy::RegistryAccessPolicy;
     use deps_core::{DepsError, Ecosystem};
@@ -723,13 +723,13 @@ mod tests {
     /// identical helper for why an all-allow-equivalent (`Trusted`) policy is used.
     fn test_index(raw: &str) -> RegistryIndex {
         let policy = RegistryAccessPolicy::default();
-        RegistryIndex::new(raw, IndexTrust::Trusted, &policy).unwrap()
+        RegistryIndex::new(raw, RegistryTrust::Trusted, &policy).unwrap()
     }
 
-    /// Like [`test_index`], but takes an explicit [`IndexTrust`] — issue #455's C3 fold test
+    /// Like [`test_index`], but takes an explicit [`RegistryTrust`] — issue #455's C3 fold test
     /// needs to construct indices at both `Trusted` and `WorkspaceDeclared`, unlike every other
     /// test in this module.
-    fn test_index_with_trust(raw: &str, trust: IndexTrust) -> RegistryIndex {
+    fn test_index_with_trust(raw: &str, trust: RegistryTrust) -> RegistryIndex {
         let policy = RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::All);
         RegistryIndex::new(raw, trust, &policy).unwrap()
     }
@@ -958,13 +958,13 @@ mod tests {
         let name = PackageName::new("serde");
         let crates_io = registry.endpoint_for(&name, &DependencySource::Registry);
         let index = "https://index.mycorp.dev";
-        registry.register_alternate(test_index_with_trust(index, IndexTrust::Trusted), None);
+        registry.register_alternate(test_index_with_trust(index, RegistryTrust::Trusted), None);
         registry.register_alternate(
-            test_index_with_trust("https://authed.mycorp.dev", IndexTrust::Trusted),
+            test_index_with_trust("https://authed.mycorp.dev", RegistryTrust::Trusted),
             Some(AuthToken::new("token".to_string())),
         );
         registry.register_alternate(
-            test_index_with_trust("https://ws.mycorp.dev", IndexTrust::WorkspaceDeclared),
+            test_index_with_trust("https://ws.mycorp.dev", RegistryTrust::WorkspaceDeclared),
             None,
         );
 
@@ -1217,23 +1217,23 @@ mod tests {
         let url = "https://index.mycorp.dev";
 
         registry.register_alternate(
-            test_index_with_trust(url, IndexTrust::Trusted),
+            test_index_with_trust(url, RegistryTrust::Trusted),
             Some(AuthToken::new("token".to_string())),
         );
         let client = registry
             .alternate_client("https://index.mycorp.dev/")
             .expect("registered");
-        assert_eq!(client.trust(), IndexTrust::Trusted);
+        assert_eq!(client.trust(), RegistryTrust::Trusted);
         assert!(client.has_auth());
 
         registry.register_alternate(
-            test_index_with_trust(url, IndexTrust::WorkspaceDeclared),
+            test_index_with_trust(url, RegistryTrust::WorkspaceDeclared),
             None,
         );
         let client = registry
             .alternate_client("https://index.mycorp.dev/")
             .expect("still registered");
-        assert_eq!(client.trust(), IndexTrust::WorkspaceDeclared);
+        assert_eq!(client.trust(), RegistryTrust::WorkspaceDeclared);
         assert!(
             !client.has_auth(),
             "the fold must drop the stored credential"
@@ -1251,18 +1251,18 @@ mod tests {
         let url = "https://index.mycorp.dev";
 
         registry.register_alternate(
-            test_index_with_trust(url, IndexTrust::WorkspaceDeclared),
+            test_index_with_trust(url, RegistryTrust::WorkspaceDeclared),
             None,
         );
         registry.register_alternate(
-            test_index_with_trust(url, IndexTrust::Trusted),
+            test_index_with_trust(url, RegistryTrust::Trusted),
             Some(AuthToken::new("token".to_string())),
         );
 
         let client = registry
             .alternate_client("https://index.mycorp.dev/")
             .expect("still registered");
-        assert_eq!(client.trust(), IndexTrust::WorkspaceDeclared);
+        assert_eq!(client.trust(), RegistryTrust::WorkspaceDeclared);
         assert!(
             !client.has_auth(),
             "a WorkspaceDeclared registration must not gain a credential from a later Trusted \
@@ -1304,11 +1304,11 @@ mod tests {
 
         let log = deps_core::test_util::capture_tracing_output(|| {
             registry.register_alternate(
-                test_index_with_trust(url, IndexTrust::Trusted),
+                test_index_with_trust(url, RegistryTrust::Trusted),
                 Some(AuthToken::new("token".to_string())),
             );
             registry.register_alternate(
-                test_index_with_trust(url, IndexTrust::WorkspaceDeclared),
+                test_index_with_trust(url, RegistryTrust::WorkspaceDeclared),
                 None,
             );
         });

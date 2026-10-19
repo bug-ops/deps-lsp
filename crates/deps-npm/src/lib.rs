@@ -21,7 +21,9 @@ pub mod registry;
 pub mod types;
 
 pub use catalog::{CatalogOrigin, CatalogOutcome, PnpmWorkspaceCache};
-pub use config::{NpmConfig, NpmConfigCache, NpmParseContext, NpmRegistryIndex};
+pub use config::{
+    DeclaredNpmRegistry, NpmConfig, NpmConfigCache, NpmParseContext, NpmRegistryIndex,
+};
 pub use ecosystem::NpmEcosystem;
 pub use formatter::{NpmFormatter, RangeParseError, compile_node_semver_range, parse_range_safe};
 pub use lockfile::NpmLockParser;

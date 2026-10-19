@@ -4036,10 +4036,7 @@ pub fn dot_segment_rejection_error(
     registry: &'static str,
 ) -> DepsError {
     warn_rejected_value(gate, context, name);
-    DepsError::PackageNotFound {
-        package: name.into(),
-        registry,
-    }
+    DepsError::not_found_locally(name, registry)
 }
 
 /// Converts a domain [`url::Url`] back into a `tower_lsp_server::ls_types::Uri` for

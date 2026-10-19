@@ -140,6 +140,7 @@ pub mod ecosystem;
 /// Routes a manifest path to its owning [`ecosystem::Ecosystem`] implementation.
 pub mod ecosystem_registry;
 pub mod edit;
+mod endpoint_contact;
 /// Unified error types (`DepsError`, `FetchFailure`) shared across ecosystems.
 pub mod error;
 pub mod fallback_completion;
@@ -310,9 +311,10 @@ pub use parser::{
 pub use path_segment::{DotSegmentError, SafePathSegment, SegmentedPathName};
 pub use position::{Position, Range};
 pub use registry::{
-    Deprecation, Metadata, Registry, RemovalStatus, Version, classify_default_registry_url,
-    existence_wildcard_req, find_latest_stable, has_default_prerelease_marker, hash_routing_key,
-    is_existence_wildcard, is_existence_wildcard_str, not_found_or, select_latest_for_existence,
+    ChainNotFound, Deprecation, Metadata, Registry, RemovalStatus, Version,
+    classify_default_registry_url, existence_wildcard_req, find_latest_stable,
+    has_default_prerelease_marker, hash_routing_key, is_existence_wildcard,
+    is_existence_wildcard_str, not_found_or, select_latest_for_existence,
 };
 pub use registry_endpoint::{CachedEndpoint, EgressTier, EndpointFingerprint, RegistryEndpoint};
 pub use selection::{
