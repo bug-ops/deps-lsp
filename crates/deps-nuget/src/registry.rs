@@ -3418,10 +3418,8 @@ mod tests {
         register("ab", vec![hop(&a), hop(&b)]);
         register("ba", vec![hop(&b), hop(&a)]);
         register("declared-nuget-org", vec![hop(&nuget_org)]);
-        register(
-            "authed",
-            vec![auth_hop(&a, "corpfeed", "user", "pat-for-endpoint-test")],
-        );
+        let pat = format!("pat-{}", std::process::id());
+        register("authed", vec![auth_hop(&a, "corpfeed", "user", &pat)]);
         let name = PackageName::new("pkg");
         let endpoint = |source: &DependencySource| root.endpoint_for(&name, source);
         let via = |key: &str| DependencySource::AlternateRegistry {
