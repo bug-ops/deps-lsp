@@ -318,6 +318,8 @@ impl<K> Hash for DeclaredRegistry<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
+
     use crate::EcosystemId;
     use crate::net_policy::{BlockingPolicy, HostClass, WorkspaceRegistryAccess};
 
@@ -381,7 +383,7 @@ mod tests {
         assert_eq!(declared.trust(), RegistryTrust::WorkspaceDeclared);
 
         let blocked = classify(&set, "https://repo.example", WorkspaceRegistryAccess::Off);
-        assert!(matches!(blocked, Err(IndexUrlError::BlockedHost { .. })));
+        assert_matches!(blocked, Err(IndexUrlError::BlockedHost { .. }));
     }
 
     #[test]
@@ -401,7 +403,7 @@ mod tests {
             "https://npm.corp.example/team-b",
             WorkspaceRegistryAccess::Off,
         );
-        assert!(matches!(off, Err(IndexUrlError::BlockedHost { .. })));
+        assert_matches!(off, Err(IndexUrlError::BlockedHost { .. }));
     }
 
     #[test]

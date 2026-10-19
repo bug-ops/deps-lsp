@@ -1354,6 +1354,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     use crate::test_util::MockVersion;
@@ -1368,7 +1370,7 @@ mod tests {
     #[test]
     fn not_found_or_maps_a_received_status_to_an_endpoint_origin() {
         let mapped = not_found_or(http_404(), "pkg", "npm", &[]);
-        assert!(matches!(mapped, DepsError::PackageNotFound { .. }));
+        assert_matches!(mapped, DepsError::PackageNotFound { .. });
         assert_eq!(mapped.origin(), ErrorOrigin::Endpoint);
     }
 
