@@ -845,6 +845,8 @@ mod tests {
     /// version-list response) should ever reach a network call.
     mod license_prefetch_tests {
         use super::*;
+        // Every user is behind some ecosystem feature, so --no-default-features has none.
+        #[allow(unused_imports)]
         use deps_core::policy_config::FetchTimeout;
 
         /// Issue #697: exhaustive per-[`EcosystemId`] table, so a 15th ecosystem or a

@@ -119,10 +119,11 @@ fn failing(name: &str, failure: FetchFailure) -> DependencyOutcomes {
 }
 
 fn assert_degraded<T>(result: &InteractiveFetch<T>, expected: NoLiveList) {
-    assert!(
-        matches!(result, InteractiveFetch::Degraded(kind) if *kind == expected),
-        "expected Degraded({expected:?})"
-    );
+    let actual = match result {
+        InteractiveFetch::Degraded(kind) => Some(*kind),
+        InteractiveFetch::Live(_) => None,
+    };
+    assert_eq!(actual, Some(expected));
 }
 
 #[tokio::test(start_paused = true)]

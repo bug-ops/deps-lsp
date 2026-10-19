@@ -1840,7 +1840,9 @@ fn build_batch_workspace_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "cargo")]
     use deps_core::policy_config::FetchConcurrency;
+    #[cfg(feature = "cargo")]
     use deps_core::policy_config::FetchTimeout;
 
     use std::assert_matches;

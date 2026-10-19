@@ -1103,10 +1103,8 @@ impl FetchTimeout {
     #[must_use]
     pub const fn constant<const SECS: u64>() -> Self {
         const {
-            assert!(
-                matches!(SECS, 1..=300),
-                "fetch timeout must be 1..=300 seconds"
-            );
+            let in_range = matches!(SECS, 1..=300);
+            assert!(in_range, "fetch timeout must be 1..=300 seconds");
         };
         Self::fixed(SECS)
     }
@@ -1192,10 +1190,8 @@ impl FetchConcurrency {
     #[must_use]
     pub const fn constant<const COUNT: usize>() -> Self {
         const {
-            assert!(
-                matches!(COUNT, 1..=100),
-                "fetch concurrency must be 1..=100"
-            );
+            let in_range = matches!(COUNT, 1..=100);
+            assert!(in_range, "fetch concurrency must be 1..=100");
         };
         Self::fixed(COUNT)
     }
