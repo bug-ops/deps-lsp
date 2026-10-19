@@ -20,6 +20,30 @@ pub(crate) mod test_helpers {
         (client, config)
     }
 
+    /// Seeds `ecosystem`'s shared `TagIndex` for `name` with one `tag -> sha` entry,
+    /// downcasting through `Ecosystem::registry()`/`Registry::as_any()` — the tests that use it
+    /// never drive a live registry fetch, so the index has to be seeded directly for a SHA-pin
+    /// replacement to have anything to resolve.
+    #[cfg(feature = "github-actions")]
+    pub(crate) fn seed_gha_tag_index(
+        ecosystem: &dyn deps_core::Ecosystem,
+        name: &str,
+        tag: &str,
+        sha: &str,
+    ) {
+        let registry = ecosystem.registry();
+        let gha_registry = registry
+            .as_any()
+            .downcast_ref::<deps_github_actions::GithubActionsRegistry>()
+            .expect("github-actions ecosystem must back onto a GithubActionsRegistry");
+        let commit_sha = deps_core::lsp_helpers::CommitSha::parse(sha)
+            .expect("test fixture must pass a valid 40-hex SHA");
+        let index = deps_core::lsp_helpers::TagIndex::from_tags([(tag, &commit_sha)]);
+        gha_registry
+            .tag_index()
+            .insert(deps_core::PackageName::new(name), Arc::new(index));
+    }
+
     /// The advisory id of [`advisory_state`]'s document.
     #[cfg(feature = "cargo")]
     pub(crate) const ADVISORY_ID: &str = "RUSTSEC-2020-0071";

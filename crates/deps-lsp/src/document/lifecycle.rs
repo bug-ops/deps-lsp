@@ -26,7 +26,7 @@ use deps_core::FetchFailure;
 use deps_core::PackageName;
 use deps_core::Result;
 use deps_core::VersionReq;
-use deps_core::policy_config::OsvChecks;
+use deps_core::policy_config::{FetchTimeout, OsvChecks};
 use deps_engine::classify::fetch::{fetch_latest_versions_parallel, prepare_fetch};
 use deps_engine::classify::resolved::{
     cached_versions_from_lockfile, dependency_version_map, load_resolved_versions,
@@ -253,7 +253,7 @@ async fn run_document_open_background_task(
         &uri,
         &state,
         &ecosystem,
-        diagnostics_snapshot.fetch_timeout_secs,
+        diagnostics_snapshot.fetch_timeout,
         PrefetchGates {
             run_osv: diagnostics_snapshot.osv_checks().is_active(),
             run_license: true,
@@ -274,7 +274,7 @@ async fn run_document_open_background_task(
         &client,
         &ecosystem,
         &config,
-        diagnostics_snapshot.fetch_timeout_secs,
+        diagnostics_snapshot.fetch_timeout,
         true,
     )
     .await;
@@ -287,7 +287,7 @@ async fn run_document_open_background_task(
         &client,
         &ecosystem,
         &config,
-        diagnostics_snapshot.fetch_timeout_secs,
+        diagnostics_snapshot.fetch_timeout,
     )
     .await;
 
@@ -377,7 +377,7 @@ async fn run_document_open_background_task(
         &in_use,
         progress_sender,
         diagnostics_snapshot.freshness,
-        diagnostics_snapshot.fetch_timeout_secs,
+        diagnostics_snapshot.fetch_timeout,
         diagnostics_snapshot.max_concurrent_fetches,
         &selection_context,
         // deps-lsp surfaces GOSSIP via its own prefetch (spec 072), not this filter (spec 074).
@@ -483,7 +483,7 @@ async fn run_document_open_background_task(
         &state,
         &client,
         ecosystem.as_ref(),
-        diagnostics_snapshot.fetch_timeout_secs,
+        diagnostics_snapshot.fetch_timeout,
     )
     .await;
 
@@ -496,7 +496,7 @@ async fn run_document_open_background_task(
         &state,
         &client,
         &ecosystem,
-        diagnostics_snapshot.fetch_timeout_secs,
+        diagnostics_snapshot.fetch_timeout,
     )
     .await;
 
@@ -904,7 +904,7 @@ pub(crate) async fn handle_document_change_guarded(
 /// `diagnostics` (issue #1399 critic M6) doubles as this task's fetch-timeout/concurrency
 /// source, not just its diagnostics-ceiling one: `CacheConfig`'s only other field,
 /// `enabled`, isn't read anywhere in [`run_document_change_task`], so keeping a separate
-/// `CacheConfig` snapshot here would only duplicate `diagnostics.fetch_timeout_secs`/
+/// `CacheConfig` snapshot here would only duplicate `diagnostics.fetch_timeout`/
 /// `max_concurrent_fetches` under a second name.
 struct ChangeTaskConfig {
     diagnostics: diagnostics::DiagnosticsSnapshot,
@@ -1011,7 +1011,7 @@ fn spawn_osv_and_license_prefetch(
     uri: &Uri,
     state: &Arc<ServerState>,
     ecosystem: &Arc<dyn Ecosystem>,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
     gates: PrefetchGates,
 ) -> (
     Option<JoinHandle<Option<OsvScanResult>>>,
@@ -1023,7 +1023,7 @@ fn spawn_osv_and_license_prefetch(
                 uri.clone(),
                 Arc::clone(state),
                 Arc::clone(ecosystem),
-                fetch_timeout_secs,
+                fetch_timeout,
             )
             .instrument(tracing::Span::current()),
         )
@@ -1035,7 +1035,7 @@ fn spawn_osv_and_license_prefetch(
                 uri.clone(),
                 Arc::clone(state),
                 Arc::clone(ecosystem),
-                fetch_timeout_secs,
+                fetch_timeout,
             )
             .instrument(tracing::Span::current()),
         )
@@ -1056,7 +1056,7 @@ async fn refresh_and_maybe_spawn_typosquat(
     client: &Client,
     ecosystem: &Arc<dyn Ecosystem>,
     config: &Arc<RwLock<DepsConfig>>,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
     force: bool,
 ) {
     let names_changed = state.documents.get_mut(uri).is_some_and(|mut doc| {
@@ -1077,7 +1077,7 @@ async fn refresh_and_maybe_spawn_typosquat(
             client.clone(),
             Arc::clone(ecosystem),
             Arc::clone(config),
-            fetch_timeout_secs,
+            fetch_timeout,
         );
         state
             .track_typosquat_task(uri.clone(), typosquat_generation, typosquat_task)
@@ -1094,7 +1094,7 @@ async fn spawn_and_track_gossip(
     client: &Client,
     ecosystem: &Arc<dyn Ecosystem>,
     config: &Arc<RwLock<DepsConfig>>,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
 ) {
     let gossip_generation = state.next_gossip_task_generation();
     let gossip_task = spawn_gossip_prefetch_and_republish(
@@ -1103,7 +1103,7 @@ async fn spawn_and_track_gossip(
         client.clone(),
         Arc::clone(ecosystem),
         Arc::clone(config),
-        fetch_timeout_secs,
+        fetch_timeout,
     );
     state
         .track_gossip_task(uri.clone(), gossip_generation, gossip_task)
@@ -1246,7 +1246,7 @@ async fn run_document_change_task(
         &uri,
         &state,
         &ecosystem,
-        config.diagnostics.fetch_timeout_secs,
+        config.diagnostics.fetch_timeout,
         PrefetchGates {
             run_osv: should_run_osv_phase_a,
             run_license: needs_license_refresh,
@@ -1271,7 +1271,7 @@ async fn run_document_change_task(
         &client,
         &ecosystem,
         &live_config,
-        config.diagnostics.fetch_timeout_secs,
+        config.diagnostics.fetch_timeout,
         false,
     )
     .await;
@@ -1285,7 +1285,7 @@ async fn run_document_change_task(
         &client,
         &ecosystem,
         &live_config,
-        config.diagnostics.fetch_timeout_secs,
+        config.diagnostics.fetch_timeout,
     )
     .await;
 
@@ -1313,7 +1313,7 @@ async fn run_document_change_task(
             &state,
             &client,
             ecosystem.as_ref(),
-            config.diagnostics.fetch_timeout_secs,
+            config.diagnostics.fetch_timeout,
         )
         .await;
 
@@ -1325,7 +1325,7 @@ async fn run_document_change_task(
             &state,
             &client,
             &ecosystem,
-            config.diagnostics.fetch_timeout_secs,
+            config.diagnostics.fetch_timeout,
         )
         .await;
 
@@ -1360,7 +1360,7 @@ async fn run_document_change_task(
             &resolved_version_candidates,
             deps_to_fetch,
             config.diagnostics.freshness,
-            config.diagnostics.fetch_timeout_secs,
+            config.diagnostics.fetch_timeout,
             config.diagnostics.max_concurrent_fetches,
             config.refetch,
         )
@@ -1416,7 +1416,7 @@ async fn run_document_change_task(
         &state,
         &client,
         ecosystem.as_ref(),
-        config.diagnostics.fetch_timeout_secs,
+        config.diagnostics.fetch_timeout,
     )
     .await;
 
@@ -1427,7 +1427,7 @@ async fn run_document_change_task(
         &state,
         &client,
         &ecosystem,
-        config.diagnostics.fetch_timeout_secs,
+        config.diagnostics.fetch_timeout,
     )
     .await;
 
@@ -1455,7 +1455,7 @@ async fn await_and_commit_osv_phase_b(
     state: &Arc<ServerState>,
     client: &Client,
     ecosystem: &dyn Ecosystem,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
 ) {
     let Some(osv_task) = osv_task else {
         return;
@@ -1468,7 +1468,7 @@ async fn await_and_commit_osv_phase_b(
                 state,
                 ecosystem_id,
                 ecosystem.formatter(),
-                fetch_timeout_secs,
+                fetch_timeout,
                 phase_a_result,
             )
             .await;
@@ -1557,7 +1557,7 @@ where
 /// fan-out covers all seven major deps.dev ecosystems, can cost up to `2 + 2N`
 /// sequential-per-candidate deps.dev round trips per dependency, and its diagnostic is only an
 /// opt-in, best-effort `Severity::Hint` — gating real OSV/outdated diagnostics on it would
-/// violate spec 071 NFR-001. `fetch_timeout_secs` bounds the pre-fetch itself and is taken as
+/// violate spec 071 NFR-001. `fetch_timeout` bounds the pre-fetch itself and is taken as
 /// the caller's spawn-time value (matching every other background task's timeout parameter).
 /// See [`spawn_prefetch_and_republish`]'s doc for the rest of the shared
 /// spawn/republish/panic-supervision shape.
@@ -1567,14 +1567,10 @@ fn spawn_typosquat_prefetch_and_republish(
     client: Client,
     ecosystem: Arc<dyn Ecosystem>,
     config: Arc<RwLock<DepsConfig>>,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
 ) -> tokio::task::AbortHandle {
-    let prefetch = run_typosquat_prefetch(
-        uri.clone(),
-        Arc::clone(&state),
-        ecosystem,
-        fetch_timeout_secs,
-    );
+    let prefetch =
+        run_typosquat_prefetch(uri.clone(), Arc::clone(&state), ecosystem, fetch_timeout);
     spawn_prefetch_and_republish(uri, state, client, config, "typosquat", prefetch)
 }
 
@@ -1590,14 +1586,9 @@ fn spawn_gossip_prefetch_and_republish(
     client: Client,
     ecosystem: Arc<dyn Ecosystem>,
     config: Arc<RwLock<DepsConfig>>,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
 ) -> tokio::task::AbortHandle {
-    let prefetch = run_gossip_prefetch(
-        uri.clone(),
-        Arc::clone(&state),
-        ecosystem,
-        fetch_timeout_secs,
-    );
+    let prefetch = run_gossip_prefetch(uri.clone(), Arc::clone(&state), ecosystem, fetch_timeout);
     spawn_prefetch_and_republish(uri, state, client, config, "GOSSIP", prefetch)
 }
 
@@ -1636,7 +1627,7 @@ pub(crate) async fn trigger_gossip_prefetch_for_open_documents(
     state: &Arc<ServerState>,
     client: &Client,
     config: Arc<RwLock<DepsConfig>>,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
 ) {
     for (uri, ecosystem) in open_documents_with_ecosystem(state) {
         let gossip_generation = state.next_gossip_task_generation();
@@ -1646,7 +1637,7 @@ pub(crate) async fn trigger_gossip_prefetch_for_open_documents(
             client.clone(),
             ecosystem,
             Arc::clone(&config),
-            fetch_timeout_secs,
+            fetch_timeout,
         );
         state
             .track_gossip_task(uri, gossip_generation, gossip_task)
@@ -1665,7 +1656,7 @@ pub(crate) async fn trigger_typosquat_prefetch_for_open_documents(
     state: &Arc<ServerState>,
     client: &Client,
     config: Arc<RwLock<DepsConfig>>,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
 ) {
     for (uri, ecosystem) in open_documents_with_ecosystem(state) {
         // Seeds `PackageSignals::typosquat_checked_names` from the current content (issue
@@ -1685,7 +1676,7 @@ pub(crate) async fn trigger_typosquat_prefetch_for_open_documents(
             client.clone(),
             ecosystem,
             Arc::clone(&config),
-            fetch_timeout_secs,
+            fetch_timeout,
         );
         // Only registers the task handle (issue #1455 batch item 1) — does not await the
         // pre-fetch itself, preserving this function's own "returns as soon as every
@@ -1720,7 +1711,7 @@ pub(crate) async fn trigger_osv_rescan_for_open_documents(
     state: &Arc<ServerState>,
     client: &Client,
     config: Arc<RwLock<DepsConfig>>,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
 ) {
     for (uri, ecosystem) in open_documents_with_ecosystem(state) {
         let state = Arc::clone(state);
@@ -1733,7 +1724,7 @@ pub(crate) async fn trigger_osv_rescan_for_open_documents(
                     uri.clone(),
                     Arc::clone(&state),
                     Arc::clone(&ecosystem),
-                    fetch_timeout_secs,
+                    fetch_timeout,
                 )
                 .await
                 else {
@@ -1744,7 +1735,7 @@ pub(crate) async fn trigger_osv_rescan_for_open_documents(
                     &state,
                     ecosystem_id,
                     ecosystem.formatter(),
-                    fetch_timeout_secs,
+                    fetch_timeout,
                     phase_a_result,
                 )
                 .await;
@@ -1786,7 +1777,7 @@ pub(crate) async fn trigger_license_prefetch_for_open_documents(
     state: &Arc<ServerState>,
     client: &Client,
     config: Arc<RwLock<DepsConfig>>,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
 ) {
     for (uri, ecosystem) in open_tier3_license_documents(state) {
         let state = Arc::clone(state);
@@ -1794,13 +1785,8 @@ pub(crate) async fn trigger_license_prefetch_for_open_documents(
         let config = Arc::clone(&config);
         spawn_supervised(
             async move {
-                run_license_prefetch(
-                    uri.clone(),
-                    Arc::clone(&state),
-                    ecosystem,
-                    fetch_timeout_secs,
-                )
-                .await;
+                run_license_prefetch(uri.clone(), Arc::clone(&state), ecosystem, fetch_timeout)
+                    .await;
                 let dep_count = diagnostics::document_dependency_count(&state, &uri);
                 diagnostics::publish_document_diagnostics(
                     &state, &client, &uri, &config, dep_count,
@@ -2340,7 +2326,7 @@ mod tests {
                 deps_core::NetworkMode::Online,
             ),
             diagnostics::loading_ceiling(
-                crate::config::CacheConfig::default().fetch_timeout_secs,
+                crate::config::CacheConfig::default().fetch_timeout,
                 cap,
                 crate::config::CacheConfig::default().max_concurrent_fetches,
             ),
@@ -2407,7 +2393,7 @@ mod tests {
                 deps_core::NetworkMode::Online,
             ),
             diagnostics::loading_ceiling(
-                crate::config::CacheConfig::default().fetch_timeout_secs,
+                crate::config::CacheConfig::default().fetch_timeout,
                 cap,
                 crate::config::CacheConfig::default().max_concurrent_fetches,
             ),
@@ -2585,7 +2571,7 @@ mod tests {
                     deps_core::NetworkMode::Online,
                 ),
                 diagnostics::loading_ceiling(
-                    crate::config::CacheConfig::default().fetch_timeout_secs,
+                    crate::config::CacheConfig::default().fetch_timeout,
                     1,
                     crate::config::CacheConfig::default().max_concurrent_fetches,
                 ),
@@ -2690,7 +2676,7 @@ mod tests {
                     deps_core::NetworkMode::Online,
                 ),
                 diagnostics::loading_ceiling(
-                    crate::config::CacheConfig::default().fetch_timeout_secs,
+                    crate::config::CacheConfig::default().fetch_timeout,
                     1,
                     crate::config::CacheConfig::default().max_concurrent_fetches,
                 ),

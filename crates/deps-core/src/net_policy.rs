@@ -80,7 +80,7 @@ pub use egress::{
 /// class is a realistic, desirable future addition — a newly-documented cloud-metadata
 /// endpoint or reserved range should ship as a non-breaking patch, not force a major version
 /// bump on every consumer. No exhaustive `match` on this enum exists outside `deps-core`
-/// today (`crate::cache::hop_targets_blocked_host` and other callers compare by equality or
+/// today (`crate::cache::guard::hop_targets_blocked_host` and other callers compare by equality or
 /// [`Self::never_a_registry`], not an exhaustive match), so this costs nothing in-tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

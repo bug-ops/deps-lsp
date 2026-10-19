@@ -5,7 +5,9 @@ use crate::document::config_epoch::ConfigEpoch;
 use crate::document::{
     DocStamp, PrefetchVisibility, PublishTicket, ServerState, ensure_document_loaded,
 };
-use deps_core::policy_config::{GossipChecks, OsvChecks, TyposquatChecks};
+use deps_core::policy_config::{
+    FetchConcurrency, FetchTimeout, GossipChecks, OsvChecks, TyposquatChecks,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -13,7 +15,7 @@ use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{Diagnostic, Uri};
 
 /// Floor under the dependency/concurrency-scaled ceiling (issue #632 critic S1): keeps a
-/// small `fetch_timeout_secs` or a small manifest from producing an unrealistically tight
+/// small `fetch_timeout` or a small manifest from producing an unrealistically tight
 /// ceiling.
 pub(crate) const MIN_LOADING_CEILING: Duration = Duration::from_secs(120);
 
@@ -36,10 +38,10 @@ pub(crate) const MAX_LOADING_CEILING: Duration = Duration::from_mins(30);
 /// whatever cache is already available (issue #632).
 ///
 /// Models the actual worst case: a single package fetch can take up to roughly
-/// `2 * fetch_timeout_secs` (the primary registry call plus its own timeout-bounded
+/// `2 * fetch_timeout` (the primary registry call plus its own timeout-bounded
 /// `get_latest_matching_from` fallback — see `document::fetch::fetch_and_classify_package`),
 /// run `max_concurrent_fetches`-wide via `buffer_unordered` — so `dep_count` dependencies
-/// take roughly `ceil(dep_count / max_concurrent_fetches) * 2 * fetch_timeout_secs` even when
+/// take roughly `ceil(dep_count / max_concurrent_fetches) * 2 * fetch_timeout` even when
 /// nothing is wrong (issue #636: a fixed multiplier under-counted this for a low
 /// `max_concurrent_fetches` combined with a non-trivial dependency count — e.g. `C=1`,
 /// `T=10s`, 10 dependencies legitimately needs 200s). The result is clamped between
@@ -56,15 +58,15 @@ pub(crate) const MAX_LOADING_CEILING: Duration = Duration::from_mins(30);
 /// incremental fetch on a 300-dependency manifest gets a 300-dependency ceiling. This is
 /// conservative (a looser ceiling), never unsafe.
 pub(crate) fn loading_ceiling(
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
     dep_count: usize,
-    max_concurrent_fetches: usize,
+    max_concurrent_fetches: FetchConcurrency,
 ) -> Duration {
-    let batches = dep_count.div_ceil(max_concurrent_fetches.max(1));
+    let batches = dep_count.div_ceil(max_concurrent_fetches.get());
     let worst_case_secs = u64::try_from(batches)
         .unwrap_or(u64::MAX)
         .saturating_mul(2)
-        .saturating_mul(fetch_timeout_secs);
+        .saturating_mul(fetch_timeout.as_secs());
     Duration::from_secs(worst_case_secs).clamp(MIN_LOADING_CEILING, MAX_LOADING_CEILING)
 }
 
@@ -106,8 +108,8 @@ pub(crate) struct DiagnosticsSnapshot {
     typosquat: TyposquatChecks,
     gossip: GossipChecks,
     license_policy: Arc<deps_core::LicensePolicy>,
-    pub(crate) fetch_timeout_secs: u64,
-    pub(crate) max_concurrent_fetches: usize,
+    pub(crate) fetch_timeout: FetchTimeout,
+    pub(crate) max_concurrent_fetches: FetchConcurrency,
     epoch: ConfigEpoch,
     stamp: Option<DocStamp>,
 }
@@ -130,7 +132,7 @@ impl DiagnosticsSnapshot {
             typosquat: config.policy.typosquat_checks(),
             gossip: config.policy.gossip_checks(),
             license_policy: Arc::new(config.policy.license_policy.to_policy()),
-            fetch_timeout_secs: config.policy.cache.fetch_timeout_secs,
+            fetch_timeout: config.policy.cache.fetch_timeout,
             max_concurrent_fetches: config.policy.cache.max_concurrent_fetches,
             epoch,
             stamp,
@@ -199,8 +201,8 @@ impl DiagnosticsSnapshot {
             typosquat: inactive.typosquat_checks(),
             gossip: inactive.gossip_checks(),
             license_policy: Arc::new(deps_core::LicensePolicy::default()),
-            fetch_timeout_secs: 0,
-            max_concurrent_fetches: 1,
+            fetch_timeout: FetchTimeout::MIN,
+            max_concurrent_fetches: FetchConcurrency::MIN,
             epoch: ConfigEpoch::default(),
             stamp: None,
         }
@@ -234,7 +236,7 @@ pub(crate) async fn publish_document_diagnostics(
 ) {
     publish_with(state, client, uri, config, |snapshot| async move {
         let ceiling = loading_ceiling(
-            snapshot.fetch_timeout_secs,
+            snapshot.fetch_timeout,
             dep_count,
             snapshot.max_concurrent_fetches,
         );
@@ -380,7 +382,7 @@ pub async fn handle_diagnostics(
 
     let dep_count = document_dependency_count(&state, uri);
     let ceiling = loading_ceiling(
-        snapshot.fetch_timeout_secs,
+        snapshot.fetch_timeout,
         dep_count,
         snapshot.max_concurrent_fetches,
     );
@@ -525,6 +527,14 @@ pub(crate) async fn generate_diagnostics_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn secs(seconds: u64) -> FetchTimeout {
+        FetchTimeout::try_from_secs(seconds).expect("test timeout inside the accepted range")
+    }
+
+    fn conc(count: usize) -> FetchConcurrency {
+        FetchConcurrency::try_new(count).expect("test concurrency inside the accepted range")
+    }
     use crate::config::DiagnosticsConfig;
     use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
@@ -648,8 +658,14 @@ mod tests {
     fn test_loading_ceiling_small_manifest_hits_floor() {
         // A small manifest under default concurrency stays well under
         // `MIN_LOADING_CEILING` — the floor must win.
-        assert_eq!(loading_ceiling(10, 1, 20), Duration::from_secs(120));
-        assert_eq!(loading_ceiling(1, 1, 20), Duration::from_secs(120));
+        assert_eq!(
+            loading_ceiling(secs(10), 1, conc(20)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            loading_ceiling(secs(1), 1, conc(20)),
+            Duration::from_secs(120)
+        );
     }
 
     #[test]
@@ -657,24 +673,28 @@ mod tests {
         // Issue #636: a low `max_concurrent_fetches` combined with a non-trivial
         // dependency count must scale the ceiling past the floor —
         // ceil(10 / 1) * 2 * 10s = 200s.
-        assert_eq!(loading_ceiling(10, 10, 1), Duration::from_secs(200));
+        assert_eq!(
+            loading_ceiling(secs(10), 10, conc(1)),
+            Duration::from_secs(200)
+        );
         // ceil(21 / 20) * 2 * 5s = 20s, still under the floor.
-        assert_eq!(loading_ceiling(5, 21, 20), Duration::from_secs(120));
+        assert_eq!(
+            loading_ceiling(secs(5), 21, conc(20)),
+            Duration::from_secs(120)
+        );
         // ceil(41 / 20) * 2 * 5s = 30s, still under the floor.
-        assert_eq!(loading_ceiling(5, 41, 20), Duration::from_secs(120));
+        assert_eq!(
+            loading_ceiling(secs(5), 41, conc(20)),
+            Duration::from_secs(120)
+        );
     }
 
     #[test]
     fn test_loading_ceiling_zero_dependencies_hits_floor() {
-        assert_eq!(loading_ceiling(50, 0, 20), Duration::from_secs(120));
-    }
-
-    #[test]
-    fn test_loading_ceiling_zero_max_concurrent_fetches_does_not_panic() {
-        // Defensive: `max_concurrent_fetches` is clamped to >= 1 by
-        // `config::deserialize_max_concurrent`, but this free function must not panic
-        // (integer division by zero) if ever called with an un-clamped value directly.
-        assert_eq!(loading_ceiling(10, 10, 0), Duration::from_secs(200));
+        assert_eq!(
+            loading_ceiling(secs(50), 0, conc(20)),
+            Duration::from_secs(120)
+        );
     }
 
     /// Issue #636 critic S1: an unbounded ceiling would reinstate issue #632's
@@ -684,9 +704,15 @@ mod tests {
     #[test]
     fn test_loading_ceiling_caps_at_max_loading_ceiling() {
         // C=1, T=300s, 300 dependencies -> uncapped would be 300 * 2 * 300s = 50 hours.
-        assert_eq!(loading_ceiling(300, 300, 1), MAX_LOADING_CEILING);
+        assert_eq!(
+            loading_ceiling(secs(300), 300, conc(1)),
+            MAX_LOADING_CEILING
+        );
         // Defaults (C=20, T=10s) with a very large manifest also hits the cap.
-        assert_eq!(loading_ceiling(10, 2000, 20), MAX_LOADING_CEILING);
+        assert_eq!(
+            loading_ceiling(secs(10), 2000, conc(20)),
+            MAX_LOADING_CEILING
+        );
     }
 
     /// Issue #1437 NFR-002 (perf-review finding): diagnostics generation must never

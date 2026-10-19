@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
+- **deps-core, deps-engine, deps-cli**: fetch timeout and concurrency are the `FetchTimeout` and `FetchConcurrency` newtypes; the config JSON is unchanged (#1851)
+- **deps-core**: `TagIndex::tag_to_sha` is private; use `sha_for_tag` and `from_tags` (#1851)
+- **deps-core**: `await_interactive_fetch` takes a required `AuxiliaryLookup`; version lists use `await_interactive_versions` (#1851)
 - **deps-core and ecosystem crates**: a blocked host's class and policy travel as one `net_policy::BlockedHost` in the blocked-host errors and occurrences; `BlockingPolicy::for_block`/`hint_suffix`/`describe` move onto it (#1826, #1842)
 - **deps-core**: removed the unused `SystemProxy::current` and `RegistryEnvironment::proxy` (#1827, #1842)
 - **deps-core**: a credential sent outside its trusted prefix is the new `DepsError::CredentialOutsideTrustedPrefix`, no longer `CacheError`; `HttpCache::post_json_limited_trusted_origin` and `get_transport_only_with_headers_limited_trusted_origin` take `&TrustedPrefix` (#1825, #1827, #1842)
@@ -110,8 +113,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-github-actions, deps-gitlab-ci**: tag-to-SHA quickfixes write `<sha> # <tag>` through the shared rewrite rule, and a bare SHA when the ref is quoted, in a flow mapping or the tag is not version-shaped (#1770)
 - **deps**: lock-only bump of tokio 1.53.2, toml-span 0.7.2 and 30 transitive crates (#1797)
 - **SECURITY.md**: supported versions table lists 2.0.x as supported and older lines as unsupported (#1797)
+- **deps-core**: `cache.rs` split into a `cache/` module tree (transport, auth, guard, redirect, resolver, fetch, store, tests) with unchanged public paths (#1851)
+- **deps-core**: concurrent hover and code-action version-list awaits for one package share a single registry poll through the new `lsp_helpers::await_interactive_versions` and `SharedVersions` (#1851)
+- **deps-core**: an endpoint circuit breaker makes hover skip a registry endpoint for 30 s once two distinct packages were slow, so a dead registry no longer costs every hover a full await (#1851)
 
 ### Fixed
+- **deps-nuget, deps-gitlab-ci**: the NuGet unlisted decoration and the GitLab CI component-pin resolution (hover and code action) go through the shared interactive gate, so a dead feed or host no longer costs every request its own 5 s await (#1851)
 - **deps-core, deps-lsp**: hover and code actions answer from the degraded path after a registry lookup failed or timed out, and concurrent live fetches are bounded, so a dead registry no longer stalls every request for 10 s (#1830, #1846)
 - **deps-core, deps-engine, deps-cli**: the advisory fix target skips registry-deprecated versions within the target's compatibility line and never picks a gossip-excluded or cooling-down `latest` (#1832, #1846)
 - **deps-core, deps-gradle, deps-pypi, deps-github-actions, deps-go, deps-bundler**: the remaining wall-clock complexity guards use `assert_scaling`, with contributor guidance in the book (#1838, #1846)

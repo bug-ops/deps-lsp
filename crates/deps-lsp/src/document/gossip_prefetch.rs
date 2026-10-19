@@ -7,6 +7,7 @@
 use super::state::ServerState;
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
+use deps_core::policy_config::FetchTimeout;
 use deps_core::{Ecosystem, GossipFindings, PackageName};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use tower_lsp_server::ls_types::Uri;
 use tracing::Instrument;
 
 /// Ceiling on the GOSSIP pre-fetch's overall timeout, independent of the configured
-/// `fetch_timeout_secs` — mirrors [`super::typosquat`]'s `TYPOSQUAT_PREFETCH_TIMEOUT_CEILING_SECS`
+/// `fetch_timeout` — mirrors [`super::typosquat`]'s `TYPOSQUAT_PREFETCH_TIMEOUT_CEILING_SECS`
 /// exactly, bounding one document's whole batch call so a pathological manifest or a slow
 /// deps.dev response can't leave this background task running indefinitely.
 const GOSSIP_PREFETCH_TIMEOUT_CEILING_SECS: u64 = 30;
@@ -52,7 +53,7 @@ pub(crate) async fn run_gossip_prefetch(
     uri: Uri,
     state: Arc<ServerState>,
     ecosystem: Arc<dyn Ecosystem>,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
 ) -> bool {
     if !state.gossip_checks().is_active() {
         return false;
@@ -67,7 +68,7 @@ pub(crate) async fn run_gossip_prefetch(
     };
 
     let Some(findings) = super::prefetch_support::bounded_prefetch_fetch(
-        fetch_timeout_secs,
+        fetch_timeout,
         GOSSIP_PREFETCH_TIMEOUT_CEILING_SECS,
         "GOSSIP",
         deps_core::lsp_helpers::fetch_gossip_findings_batch(
@@ -305,6 +306,7 @@ mod tests {
     use super::*;
     use crate::document::DocumentState;
     use deps_core::EcosystemId;
+    use deps_core::policy_config::FetchTimeout;
     use deps_core::test_util::test_uri;
 
     /// Default `ServerState` starts with `policy.gossip.enabled == false` — no document
@@ -320,7 +322,13 @@ mod tests {
             .get(EcosystemId::Npm)
             .expect("npm ecosystem not found");
 
-        let changed = run_gossip_prefetch(uri, Arc::clone(&state), ecosystem, 5).await;
+        let changed = run_gossip_prefetch(
+            uri,
+            Arc::clone(&state),
+            ecosystem,
+            FetchTimeout::constant::<5>(),
+        )
+        .await;
 
         assert!(!changed);
         assert_eq!(state.document_count(), 0);
@@ -338,7 +346,13 @@ mod tests {
             .get(EcosystemId::Npm)
             .expect("npm ecosystem not found");
 
-        let changed = run_gossip_prefetch(uri, Arc::clone(&state), ecosystem, 5).await;
+        let changed = run_gossip_prefetch(
+            uri,
+            Arc::clone(&state),
+            ecosystem,
+            FetchTimeout::constant::<5>(),
+        )
+        .await;
 
         assert!(!changed);
         assert_eq!(state.document_count(), 0);
@@ -660,7 +674,7 @@ mod tests {
             uri.clone(),
             Arc::clone(&state),
             Arc::clone(&ecosystem),
-            5,
+            FetchTimeout::constant::<5>(),
         ));
 
         // Let the fetch start (and enter its 80ms sleep) before simulating an edit that
@@ -760,7 +774,13 @@ mod tests {
         // Legitimate prefetch while "vite" is still registry-sourced: populates
         // `gossip_findings` with version "8.4.0", matching `cached_versions.latest` — no
         // mismatch yet.
-        run_gossip_prefetch(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5).await;
+        run_gossip_prefetch(
+            uri.clone(),
+            Arc::clone(&state),
+            Arc::clone(&ecosystem),
+            FetchTimeout::constant::<5>(),
+        )
+        .await;
         let seeded = state
             .with_document(&uri, |doc| {
                 doc.signals
@@ -868,10 +888,15 @@ mod tests {
         let p1_state = Arc::clone(&state);
         let p1_ecosystem = Arc::clone(&ecosystem);
         let p1_uri = uri.clone();
-        let p1 =
-            tokio::spawn(
-                async move { run_gossip_prefetch(p1_uri, p1_state, p1_ecosystem, 5).await },
-            );
+        let p1 = tokio::spawn(async move {
+            run_gossip_prefetch(
+                p1_uri,
+                p1_state,
+                p1_ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await
+        });
         state
             .track_gossip_task(uri.clone(), p1_generation, p1.abort_handle())
             .await;

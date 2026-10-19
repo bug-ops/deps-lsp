@@ -3572,7 +3572,7 @@ mod tests {
     /// and match the right `Authorization` header. `HttpCache::len()` is the only
     /// discriminator: entry folding collapses the expected 4 (2 URLs x 2 credentials) down to
     /// 2 (2 URLs, credential ignored). `deps-core`'s own
-    /// `test_get_cached_pinned_distinct_auth_id_never_shares_cache_entry` (`cache.rs`) only
+    /// `test_get_cached_pinned_distinct_auth_id_never_shares_cache_entry` (`cache/tests/auth.rs`) only
     /// verifies `cache_key`'s *string derivation* the same way, not this behavioral folding
     /// question — see #1026's handoff discussion for detail.
     #[tokio::test]

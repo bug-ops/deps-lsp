@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use crate::report::{CheckContext, CheckError};
 
-/// Ceiling on the OSV scan timeout, independent of the configured `fetch_timeout_secs` —
+/// Ceiling on the OSV scan timeout, independent of the configured `fetch_timeout` —
 /// mirrors `deps-lsp`'s `document::osv_scan::OSV_SCAN_TIMEOUT_CEILING_SECS` and
 /// `report.rs`'s own (now-removed) copy of the same constant: the shared `reqwest` client
 /// behind [`deps_core::HttpCache`] already imposes its own client-wide 30s timeout, so a
@@ -446,7 +446,7 @@ pub async fn analyze_manifest(
         &prep.in_use,
         None,
         ctx.policy.freshness.to_freshness(),
-        ctx.policy.cache.fetch_timeout_secs,
+        ctx.policy.cache.fetch_timeout,
         ctx.policy.cache.max_concurrent_fetches,
         &prep.selection_context,
         Some(&gossip_findings),
@@ -514,7 +514,7 @@ pub async fn analyze_manifest(
                 &resolved_versions,
                 &resolved_version_candidates,
                 &license_policy,
-                ctx.policy.cache.fetch_timeout_secs,
+                ctx.policy.cache.fetch_timeout,
                 ctx.policy.cache.max_concurrent_fetches,
             )
             .await
@@ -541,7 +541,8 @@ pub async fn analyze_manifest(
                 let timeout = Duration::from_secs(
                     ctx.policy
                         .cache
-                        .fetch_timeout_secs
+                        .fetch_timeout
+                        .as_secs()
                         .min(OSV_SCAN_TIMEOUT_CEILING_SECS),
                 );
                 let scanned = ctx.osv.scan(ecosystem_id, &targets, timeout).await;
@@ -622,7 +623,8 @@ pub async fn analyze_manifest(
             let timeout = Duration::from_secs(
                 ctx.policy
                     .cache
-                    .fetch_timeout_secs
+                    .fetch_timeout
+                    .as_secs()
                     .min(OSV_SCAN_TIMEOUT_CEILING_SECS),
             );
             let checked = ctx
@@ -658,7 +660,8 @@ pub async fn analyze_manifest(
             let timeout = Duration::from_secs(
                 ctx.policy
                     .cache
-                    .fetch_timeout_secs
+                    .fetch_timeout
+                    .as_secs()
                     .min(OSV_SCAN_TIMEOUT_CEILING_SECS),
             );
             let checked = ctx

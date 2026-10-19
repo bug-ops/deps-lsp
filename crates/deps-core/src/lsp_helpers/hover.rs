@@ -24,9 +24,9 @@ use super::hover_markdown::{FieldKind, HoverMarkdown};
 use super::{
     CooldownBlocker, CooldownPrecedence, DiagnosticMessages, EcosystemFormatter, FetchContext,
     HOVER_RECENT_VERSIONS, InteractiveFetchRequest, LatestVerdict, SiblingMatchNote, VersionData,
-    await_interactive_fetch, cached_package_versions_by_name, cooldown_precedence, escape_markdown,
-    in_use_version, latest_verdict, markdown_code_span, position_in_range, resolve_in_use_version,
-    resolve_scan_outcome,
+    await_interactive_versions, cached_package_versions_by_name, cooldown_precedence,
+    escape_markdown, in_use_version, latest_verdict, markdown_code_span, position_in_range,
+    resolve_in_use_version, resolve_scan_outcome,
 };
 use crate::github::normalize_tag;
 
@@ -159,8 +159,8 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // host) must degrade to the same basic card the `!resolvable` branch renders, not vanish
     // the whole hover response.
     let available_versions = if resolvable {
-        await_interactive_fetch(
-            registry.get_versions_from(dep.name(), &dep_source, freshness),
+        await_interactive_versions(
+            registry,
             InteractiveFetchRequest::new(
                 versions,
                 parse_result.uri(),
@@ -169,6 +169,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
                 &dep_source,
                 FetchContext::Hover,
             ),
+            freshness,
         )
         .await
         .into_live()
@@ -230,6 +231,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // to `Registry::get_latest_matching`, which some registries (Go's `/@latest`) answer more
     // completely than the list endpoint. Bounded by `HOVER_FALLBACK_TIMEOUT`; any failure,
     // timeout, or `None` degrades gracefully to no `**Latest**` line.
+    // TODO(critic): route get_latest_matching_from through the interactive gate as an AuxiliaryLookup (memo + permit)
     let list_fallback_latest = if available_versions.as_ref().is_some_and(|v| !v.is_empty())
         && live_latest_idx.is_none()
     {
@@ -3737,7 +3739,7 @@ mod tests {
         .await;
 
         assert!(
-            log.contains("primary registry version fetch timed out"),
+            log.contains("interactive registry lookup timed out"),
             "expected the primary-fetch-timeout WARN to fire: {log:?}"
         );
         assert!(

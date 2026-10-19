@@ -175,7 +175,7 @@ pub fn git_tag_replacement(
     let Some(index) = index else {
         return styled;
     };
-    let published = |tag: &str| index.tag_to_sha.contains_key(tag);
+    let published = |tag: &str| index.sha_for_tag(tag).is_some();
     if published(&styled) {
         return styled;
     }

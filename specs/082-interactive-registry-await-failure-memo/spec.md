@@ -196,7 +196,7 @@ Conceptual only; representation is a plan-phase decision.
 |--------|-------------|----------------|
 | Known failure (existing) | Per-package outcome recorded by the lifecycle fetch in `DependencyOutcomes` | normalized name, `FetchFailure` (`Actionable`, `Transient`, `NotAttempted`) |
 | Interactive failure memo (new, shape open, OQ-1) | Short-lived record that an interactive await for a package and source failed or timed out | package name, source key, failure class (typed), recorded-at instant, expiry |
-| In-flight interactive fetch (new, optional, FR-007) | Shared handle that lets concurrent requests for one package and source await a single fetch | package name, source key, shared future |
+| In-flight interactive fetch (new, optional, FR-007) | Shared handle that lets concurrent requests for one package and source await a single fetch | package name, source key, manifest, generation, list shape, shared version list |
 | Interactive concurrency bound (new, OQ-4) | Cap on simultaneously awaiting hover/code-action registry fetches | max in flight, overflow policy (degrade immediately) |
 
 ## 6. Edge Cases and Error Handling
@@ -211,7 +211,7 @@ Conceptual only; representation is a plan-phase decision.
 | Code action on a dependency whose failure was a **timeout** | Semantics per OQ-5: today a timeout drops speculative fix/unsatisfiable actions (an unverified yank check must not fail open), whereas a genuine error lets them through |
 | Package count in the thousands, all failing | Memo capped (NFR-004); eviction never causes more than one extra bounded live fetch per package per TTL |
 | Four concurrent hovers on distinct, not-yet-known-failing packages | At most the bounded number hit the registry; the rest degrade immediately (FR-008); dispatch slots stay free (NFR-003) |
-| Dead proxy (`HTTPS_PROXY` unreachable) with default crates.io | Same as black-holed registry: every package fails; per-package memo plus background outcomes cover all of them after the first failure per package (host-level aggregation is OQ-7) |
+| Dead proxy (`HTTPS_PROXY` unreachable) with default crates.io | Same as black-holed registry: every package fails; per-package memo plus background outcomes cover each package after its first failure, and the endpoint breaker (OQ-7) refuses the rest of the hover sweep after two slow distinct packages |
 | Document closed and reopened, or manifest reparsed | Records tied to the document's outcomes clear with it; a memo scoped beyond one document expires by TTL or reload (FR-006) |
 | Config reload changes registry URL, token, or proxy | Records are invalidated (FR-006) so a fixed configuration takes effect without waiting out the TTL |
 
@@ -272,7 +272,27 @@ Conceptual only; representation is a plan-phase decision.
 >   runs on configuration changes (after the apply) and after reparses that change registry
 >   routing (`RefetchPolicy::AllDependencies`); a requirements-only reparse keeps the memo. A
 >   live success records nothing unless the background outcomes still show a failure.
-> - **OQ-7** and **FR-007** are deferred to #1844 and #1843.
+> - **OQ-7** (#1844): a per-endpoint circuit breaker. "Endpoint" is the registry as this manifest
+>   resolves it: ecosystem, manifest and dependency source, because `deps-core` cannot see the
+>   resolved host (`.npmrc`, source replacement, proxy). An attempt that waited at least half
+>   the budget before giving up or being cancelled by the editor is *slow*; one that answered
+>   (a list or an error) well inside the budget is an *answer*; the rest is inconclusive
+>   (a list that arrived within 1 s of the budget may be a stale-serve from a dead host).
+>   Two slow attempts for *distinct* packages within 30 s, with no answer from the endpoint in
+>   that window, open the breaker for 30 s. Hover awaits to an open endpoint return `Unverified`
+>   without polling and are not memoized; code actions are never refused (a false open would
+>   drop the fix actions of a whole manifest) but still report evidence. After 30 s the first
+>   hover is the single probe: a list closes the breaker, a slow or aborted probe re-arms it.
+>   `invalidate_all` resets it.
+> - **FR-007** (#1843): version-list awaits go through `await_interactive_versions`, which
+>   shares one registry poll per package, source, manifest and invalidation generation. The
+>   first request polls; the rest receive the same `Arc<[Box<dyn Version>]>`. Followers hold a
+>   dispatch permit like any waiter (FR-008), and a request that follows a leader that got no
+>   list returns `Unverified`, never `Failed`, as a memo replay does. A cancelled leader hands
+>   the flight to a follower, which polls itself. An attempt that starts with less than half of
+>   `REGISTRY_FETCH_BUDGET` left (a promoted follower) writes no failure record on an error or
+>   elapse. A freshness-disabled request (code actions) may follow a freshness-enabled flight
+>   (hover); the reverse costs a second request.
 >
 > **Accepted limitations**
 > - FR-006 "a later successful fetch" clears only seeded records. An interactive-failed record
@@ -284,9 +304,48 @@ Conceptual only; representation is a plan-phase decision.
 > - A hover cancelled by the client before it completes never memoizes (the future is dropped
 >   before the record is written), so on a cold document only the background outcome seeds a
 >   record.
-> - Scope: the default `generate_hover`/`generate_code_actions` path (FR-012). NuGet's and
->   GitLab CI's ecosystem-specific hover/code-action overrides keep their own ungated 5 s
->   awaits; follow-up #1845.
+> - A code action that follows a hover's enriched flight inherits its latency; if that passes
+>   the 10 s budget it gets `Unverified` and drops its speculative fixes even though its own
+>   bare fetch might have answered in time.
+> - The breaker needs two slow distinct packages, not one as the issue suggests, so a single slow
+>   large package on a healthy endpoint cannot open it. A dead endpoint therefore costs two
+>   awaits, then instant refusals; N manifests on one dead host cost 2N awaits, and a
+>   per-package source (`Git { url }`) degrades to plain memo behaviour.
+> - Endpoints that conflate routes (npm `@scope:registry`, `GOPRIVATE`, `extra-index-url`,
+>   multi-repository Maven, multi-feed NuGet) share one breaker, so a dead private route can
+>   refuse public packages for up to 30 s once two distinct packages were slow. Keying by the
+>   real host is deferred until `Registry` exposes it.
+> - Under hover-only refusal, code actions on a dead endpoint still pay an await per distinct
+>   package and hold dispatch permits meanwhile. A cancel after half the budget feeds the
+>   breaker (so it helps hovers) but never the memo.
+> - A cancel-driven open on a healthy-but-slow endpoint needs two distinct packages cancelled
+>   after half the budget with no answer in 30 s; the user then sees basic cards, as they
+>   effectively did already.
+> - A fast local `Err` counts as an answer for the breaker, including errors that never reached
+>   the endpoint (the GitLab rate-limit gate, an invalid project path, a policy block). On a dead
+>   endpoint such packages refresh `last_answered` and keep the breaker closed for up to 30 s.
+> - On a dead GitLab host the first hover per component still costs a full version-list await
+>   plus a full `PinResolution` await, and so does the first code action, because the two lookup
+>   kinds keep separate failure memos over the same route.
+> - `HalfOpen` carries no age: it is safe only because every probe holder reports (or cancels).
+>   A future path that takes the probe without reporting would refuse hovers to that endpoint
+>   until a code action answers or the entry is evicted.
+> - Hover's `get_latest_matching_from` fallback (`HOVER_FALLBACK_TIMEOUT`) is a third ungated,
+>   permitless 5 s await that runs only after a live list; routing it through the gate as an
+>   auxiliary lookup is a follow-up (`TODO(critic)` in `hover.rs`).
+> - Scope (#1845): the default `generate_hover`/`generate_code_actions` path (FR-012) and the two
+>   ecosystem-specific awaits that used to keep their own ungated 5 s bounds. NuGet's unlisted
+>   decoration is an `AuxiliaryLookup::Decoration` and GitLab CI's component-pin resolution
+>   (hover and code action) an `AuxiliaryLookup::PinResolution`; each has its own 5 s budget and
+>   failure memo, keyed apart from the package's version list. A decoration is still refused
+>   while the breaker is open for a hover, but it neither opens nor closes the breaker and never
+>   takes the half-open probe, because it may be served by a different host than the base fetch;
+>   a pin resolution counts like a version list.
+> - A NuGet hover now holds two dispatch permits (the base list and the decoration). On a
+>   healthy feed the burst of concurrent hovers that get full information drops from three to
+>   two (with `LSP_DISPATCH_CONCURRENCY - 1 = 3` permits): the first is decorated, the second
+>   gets its list without the decoration, the third the basic card. This errs on the safe side
+>   and is not memoized.
 
 ## 10. See Also
 

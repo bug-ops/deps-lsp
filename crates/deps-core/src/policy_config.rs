@@ -596,7 +596,7 @@ impl PolicyConfig {
         } = new_diagnostics;
         let CacheConfig {
             enabled: _,
-            fetch_timeout_secs: _,
+            fetch_timeout: _,
             max_concurrent_fetches: _,
         } = new_cache;
         let FreshnessConfig {
@@ -895,19 +895,19 @@ impl DiagnosticsConfig {
 /// # Defaults
 ///
 /// - `enabled`: `true`
-/// - `fetch_timeout_secs`: `10` (10 seconds per package)
+/// - `fetch_timeout_secs` (field [`Self::fetch_timeout`]): `5` (5 seconds per package)
 /// - `max_concurrent_fetches`: `20` (20 concurrent requests)
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_core::policy_config::CacheConfig;
+/// use deps_core::policy_config::{CacheConfig, FetchConcurrency, FetchTimeout};
 ///
 /// let config = CacheConfig::new()
-///     .with_fetch_timeout_secs(5)
-///     .with_max_concurrent_fetches(20);
+///     .with_fetch_timeout(FetchTimeout::try_from_secs(8).unwrap())
+///     .with_max_concurrent_fetches(FetchConcurrency::try_new(20).unwrap());
 ///
-/// assert_eq!(config.fetch_timeout_secs, 5);
+/// assert_eq!(config.fetch_timeout.as_secs(), 8);
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, Deserialize)]
@@ -929,18 +929,21 @@ pub struct CacheConfig {
     /// every already-stored entry servable through this fallback indefinitely.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Timeout for fetching a single package's versions (default: 10 seconds)
+    /// Timeout for fetching a single package's versions (default: 5 seconds). The config key
+    /// stays `fetch_timeout_secs`; an out-of-range value is clamped with a warning.
     #[serde(
-        default = "default_fetch_timeout_secs",
+        rename = "fetch_timeout_secs",
+        default = "FetchTimeout::default",
         deserialize_with = "deserialize_fetch_timeout"
     )]
-    pub fetch_timeout_secs: u64,
-    /// Maximum concurrent package fetches (default: 20)
+    pub fetch_timeout: FetchTimeout,
+    /// Maximum concurrent package fetches (default: 20); an out-of-range value is clamped
+    /// with a warning.
     #[serde(
-        default = "default_max_concurrent_fetches",
+        default = "FetchConcurrency::default",
         deserialize_with = "deserialize_max_concurrent"
     )]
-    pub max_concurrent_fetches: usize,
+    pub max_concurrent_fetches: FetchConcurrency,
 }
 
 impl Default for CacheConfig {
@@ -964,8 +967,8 @@ impl CacheConfig {
     pub const fn new() -> Self {
         Self {
             enabled: true,
-            fetch_timeout_secs: default_fetch_timeout_secs(),
-            max_concurrent_fetches: default_max_concurrent_fetches(),
+            fetch_timeout: FetchTimeout::DEFAULT,
+            max_concurrent_fetches: FetchConcurrency::DEFAULT,
         }
     }
 
@@ -976,42 +979,24 @@ impl CacheConfig {
         self
     }
 
-    /// Overrides [`Self::fetch_timeout_secs`]. See [`Self::new`]. Not clamped to the
-    /// bounds `deserialize_fetch_timeout` enforces — that validation only guards
-    /// untrusted LSP-client input, not construction from trusted Rust code.
+    /// Overrides [`Self::fetch_timeout`]. See [`Self::new`].
     #[must_use]
-    pub const fn with_fetch_timeout_secs(mut self, fetch_timeout_secs: u64) -> Self {
-        self.fetch_timeout_secs = fetch_timeout_secs;
+    pub const fn with_fetch_timeout(mut self, fetch_timeout: FetchTimeout) -> Self {
+        self.fetch_timeout = fetch_timeout;
         self
     }
 
-    /// Overrides [`Self::max_concurrent_fetches`]. See [`Self::new`]. Enforces the same
-    /// `>= 1` floor (`MIN_CONCURRENT_FETCHES`) that `deserialize_max_concurrent` enforces
-    /// on untrusted LSP-client input — but, unlike that deserializer, does not also cap the
-    /// `MAX_CONCURRENT_FETCHES` ceiling, so a very large value passes through uncapped: this
-    /// value is used directly as `futures::StreamExt::buffer_unordered`'s concurrency limit
-    /// (`document::fetch`), and `buffer_unordered(0)` never polls its source stream, hanging
-    /// the fetch forever instead of erroring (issue #833) — unlike
-    /// [`Self::with_fetch_timeout_secs`], `0` here is not a merely degenerate value, so this
-    /// setter enforces the floor itself rather than relying on a downstream re-guard
-    /// (`handlers::diagnostics::loading_ceiling` also re-guards its own divisor, but that is
-    /// a second, independent consumer, not a safety net for this one).
+    /// Overrides [`Self::max_concurrent_fetches`]. See [`Self::new`].
     ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_core::policy_config::CacheConfig;
-    ///
-    /// let config = CacheConfig::new().with_max_concurrent_fetches(0);
-    /// assert_eq!(config.max_concurrent_fetches, 1);
-    /// ```
+    /// The value is used directly as `futures::StreamExt::buffer_unordered`'s concurrency
+    /// limit, which never polls its source for `0` (issue #833); [`FetchConcurrency`] cannot be
+    /// zero, so no caller needs a floor of its own.
     #[must_use]
-    pub const fn with_max_concurrent_fetches(mut self, max_concurrent_fetches: usize) -> Self {
-        self.max_concurrent_fetches = if max_concurrent_fetches == 0 {
-            MIN_CONCURRENT_FETCHES
-        } else {
-            max_concurrent_fetches
-        };
+    pub const fn with_max_concurrent_fetches(
+        mut self,
+        max_concurrent_fetches: FetchConcurrency,
+    ) -> Self {
+        self.max_concurrent_fetches = max_concurrent_fetches;
         self
     }
 }
@@ -1052,60 +1037,238 @@ const fn default_unknown_ref_severity() -> Severity {
     Severity::Warning
 }
 
-const fn default_fetch_timeout_secs() -> u64 {
-    5
+/// Why a value is not a valid [`FetchTimeout`] or [`FetchConcurrency`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
+///
+/// assert!(FetchTimeout::try_from_secs(0).is_err());
+/// assert!(FetchConcurrency::try_new(101).is_err());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FetchLimitError {
+    /// The timeout is outside `FetchTimeout::MIN..=FetchTimeout::MAX` seconds.
+    #[error("fetch timeout of {secs}s is outside {min}..={max} seconds", min = FetchTimeout::MIN.as_secs(), max = FetchTimeout::MAX.as_secs())]
+    TimeoutOutOfRange {
+        /// The rejected value.
+        secs: u64,
+    },
+    /// The concurrency is outside `FetchConcurrency::MIN..=FetchConcurrency::MAX`.
+    #[error("fetch concurrency of {count} is outside {min}..={max}", min = FetchConcurrency::MIN.get(), max = FetchConcurrency::MAX.get())]
+    ConcurrencyOutOfRange {
+        /// The rejected value.
+        count: usize,
+    },
 }
 
-const fn default_max_concurrent_fetches() -> usize {
-    20
+/// Per-package registry fetch timeout, between 1 and 300 seconds.
+///
+/// A zero timeout would elapse every fetch before it starts, so the type cannot hold one;
+/// the 300 s ceiling keeps a typo from stalling a fetch for hours. An untrusted configuration
+/// value is clamped into range with a warning instead of rejected.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::policy_config::FetchTimeout;
+/// use std::time::Duration;
+///
+/// let timeout = FetchTimeout::try_from_secs(30).unwrap();
+/// assert_eq!(timeout.as_duration(), Duration::from_secs(30));
+/// assert!(FetchTimeout::try_from_secs(301).is_err());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FetchTimeout(std::num::NonZeroU64);
+
+impl FetchTimeout {
+    /// The shortest accepted timeout, 1 second.
+    pub const MIN: Self = Self(std::num::NonZeroU64::MIN);
+    /// The longest accepted timeout, 300 seconds.
+    pub const MAX: Self = Self::constant::<300>();
+    /// The default timeout, 5 seconds.
+    pub const DEFAULT: Self = Self::constant::<5>();
+
+    /// A timeout known at compile time; a value outside `1..=300` fails the build.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::policy_config::FetchTimeout;
+    ///
+    /// const SCAN: FetchTimeout = FetchTimeout::constant::<30>();
+    /// assert_eq!(SCAN.as_secs(), 30);
+    /// ```
+    #[must_use]
+    pub const fn constant<const SECS: u64>() -> Self {
+        const {
+            let in_range = matches!(SECS, 1..=300);
+            assert!(in_range, "fetch timeout must be 1..=300 seconds");
+        };
+        Self::fixed(SECS)
+    }
+
+    /// Callers pass a nonzero value; `0` falls back to [`Self::MIN`] rather than failing.
+    const fn fixed(secs: u64) -> Self {
+        match std::num::NonZeroU64::new(secs) {
+            Some(secs) => Self(secs),
+            None => Self::MIN,
+        }
+    }
+
+    /// Validates `secs` against the accepted range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FetchLimitError::TimeoutOutOfRange`] when `secs` is `0` or above 300.
+    pub fn try_from_secs(secs: u64) -> Result<Self, FetchLimitError> {
+        match std::num::NonZeroU64::new(secs) {
+            Some(nonzero) if secs <= Self::MAX.as_secs() => Ok(Self(nonzero)),
+            Some(_) | None => Err(FetchLimitError::TimeoutOutOfRange { secs }),
+        }
+    }
+
+    /// The timeout in whole seconds, always `1..=300`.
+    #[must_use]
+    pub const fn as_secs(self) -> u64 {
+        self.0.get()
+    }
+
+    /// The timeout as a [`Duration`](std::time::Duration).
+    #[must_use]
+    pub const fn as_duration(self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.0.get())
+    }
+
+    fn clamped(secs: u64) -> Self {
+        Self::fixed(secs.clamp(Self::MIN.as_secs(), Self::MAX.as_secs()))
+    }
 }
 
-/// Minimum timeout (seconds) to prevent zero-timeout edge case
-const MIN_FETCH_TIMEOUT_SECS: u64 = 1;
-/// Maximum timeout (seconds) - 5 minutes is generous
-const MAX_FETCH_TIMEOUT_SECS: u64 = 300;
+impl Default for FetchTimeout {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
-/// Minimum concurrent fetches (must be at least 1)
-const MIN_CONCURRENT_FETCHES: usize = 1;
-/// Maximum concurrent fetches
-const MAX_CONCURRENT_FETCHES: usize = 100;
+/// Maximum concurrent package fetches, between 1 and 100.
+///
+/// Used as the limit of `futures::StreamExt::buffer_unordered`, which never polls its source
+/// when given `0`, so the type cannot hold one. An untrusted configuration value is clamped
+/// into range with a warning instead of rejected.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::policy_config::FetchConcurrency;
+///
+/// assert_eq!(FetchConcurrency::try_new(20).unwrap().get(), 20);
+/// assert!(FetchConcurrency::try_new(0).is_err());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FetchConcurrency(std::num::NonZeroUsize);
 
-/// Custom deserializer for fetch_timeout_secs that validates bounds
-fn deserialize_fetch_timeout<'de, D>(deserializer: D) -> Result<u64, D::Error>
+impl FetchConcurrency {
+    /// The lowest accepted concurrency, 1.
+    pub const MIN: Self = Self(std::num::NonZeroUsize::MIN);
+    /// The highest accepted concurrency, 100.
+    pub const MAX: Self = Self::constant::<100>();
+    /// The default concurrency, 20.
+    pub const DEFAULT: Self = Self::constant::<20>();
+
+    /// A concurrency known at compile time; a value outside `1..=100` fails the build.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::policy_config::FetchConcurrency;
+    ///
+    /// const LICENSES: FetchConcurrency = FetchConcurrency::constant::<8>();
+    /// assert_eq!(LICENSES.get(), 8);
+    /// ```
+    #[must_use]
+    pub const fn constant<const COUNT: usize>() -> Self {
+        const {
+            let in_range = matches!(COUNT, 1..=100);
+            assert!(in_range, "fetch concurrency must be 1..=100");
+        };
+        Self::fixed(COUNT)
+    }
+
+    /// Callers pass a nonzero value; `0` falls back to [`Self::MIN`] rather than failing.
+    const fn fixed(count: usize) -> Self {
+        match std::num::NonZeroUsize::new(count) {
+            Some(count) => Self(count),
+            None => Self::MIN,
+        }
+    }
+
+    /// Validates `count` against the accepted range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FetchLimitError::ConcurrencyOutOfRange`] when `count` is `0` or above 100.
+    pub fn try_new(count: usize) -> Result<Self, FetchLimitError> {
+        match std::num::NonZeroUsize::new(count) {
+            Some(nonzero) if count <= Self::MAX.get() => Ok(Self(nonzero)),
+            Some(_) | None => Err(FetchLimitError::ConcurrencyOutOfRange { count }),
+        }
+    }
+
+    /// The concurrency limit, always `1..=100`.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+
+    fn clamped(count: usize) -> Self {
+        Self::fixed(count.clamp(Self::MIN.get(), Self::MAX.get()))
+    }
+}
+
+impl Default for FetchConcurrency {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Custom deserializer for `fetch_timeout_secs` that clamps into the accepted range
+fn deserialize_fetch_timeout<'de, D>(deserializer: D) -> Result<FetchTimeout, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let secs = u64::deserialize(deserializer)?;
-    let clamped = secs.clamp(MIN_FETCH_TIMEOUT_SECS, MAX_FETCH_TIMEOUT_SECS);
-    if clamped != secs {
+    let timeout = FetchTimeout::clamped(secs);
+    if timeout.as_secs() != secs {
         tracing::warn!(
             "fetch_timeout_secs {} clamped to {} (valid range: {}-{})",
             secs,
-            clamped,
-            MIN_FETCH_TIMEOUT_SECS,
-            MAX_FETCH_TIMEOUT_SECS
+            timeout.as_secs(),
+            FetchTimeout::MIN.as_secs(),
+            FetchTimeout::MAX.as_secs()
         );
     }
-    Ok(clamped)
+    Ok(timeout)
 }
 
-/// Custom deserializer for max_concurrent_fetches that validates bounds
-fn deserialize_max_concurrent<'de, D>(deserializer: D) -> Result<usize, D::Error>
+/// Custom deserializer for `max_concurrent_fetches` that clamps into the accepted range
+fn deserialize_max_concurrent<'de, D>(deserializer: D) -> Result<FetchConcurrency, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let count = usize::deserialize(deserializer)?;
-    let clamped = count.clamp(MIN_CONCURRENT_FETCHES, MAX_CONCURRENT_FETCHES);
-    if clamped != count {
+    let concurrency = FetchConcurrency::clamped(count);
+    if concurrency.get() != count {
         tracing::warn!(
             "max_concurrent_fetches {} clamped to {} (valid range: {}-{})",
             count,
-            clamped,
-            MIN_CONCURRENT_FETCHES,
-            MAX_CONCURRENT_FETCHES
+            concurrency.get(),
+            FetchConcurrency::MIN.get(),
+            FetchConcurrency::MAX.get()
         );
     }
-    Ok(clamped)
+    Ok(concurrency)
 }
 
 /// Configuration for the release-freshness signal (issue #145).
@@ -2300,22 +2463,76 @@ mod tests {
     fn test_cache_config_defaults() {
         let config = CacheConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.fetch_timeout_secs, 5);
-        assert_eq!(config.max_concurrent_fetches, 20);
+        assert_eq!(config.fetch_timeout, FetchTimeout::DEFAULT);
+        assert_eq!(config.fetch_timeout.as_secs(), 5);
+        assert_eq!(config.max_concurrent_fetches, FetchConcurrency::DEFAULT);
+        assert_eq!(config.max_concurrent_fetches.get(), 20);
     }
 
     #[test]
     fn test_cache_config_fetch_timeout_clamped() {
-        let json = r#"{ "fetch_timeout_secs": 10000 }"#;
-        let config: CacheConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.fetch_timeout_secs, MAX_FETCH_TIMEOUT_SECS);
+        for (raw, expected) in [(0, 1), (1, 1), (300, 300), (301, 300), (10_000, 300)] {
+            let json = format!(r#"{{ "fetch_timeout_secs": {raw} }}"#);
+            let config: CacheConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(config.fetch_timeout.as_secs(), expected, "{raw}");
+        }
     }
 
     #[test]
     fn test_cache_config_max_concurrent_fetches_clamped() {
-        let json = r#"{ "max_concurrent_fetches": 0 }"#;
-        let config: CacheConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.max_concurrent_fetches, MIN_CONCURRENT_FETCHES);
+        for (raw, expected) in [(0, 1), (1, 1), (100, 100), (101, 100), (100_000, 100)] {
+            let json = format!(r#"{{ "max_concurrent_fetches": {raw} }}"#);
+            let config: CacheConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(config.max_concurrent_fetches.get(), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn test_fetch_timeout_try_from_secs_boundaries() {
+        assert_eq!(
+            FetchTimeout::try_from_secs(0),
+            Err(FetchLimitError::TimeoutOutOfRange { secs: 0 })
+        );
+        assert_eq!(FetchTimeout::try_from_secs(1), Ok(FetchTimeout::MIN));
+        assert_eq!(FetchTimeout::try_from_secs(300), Ok(FetchTimeout::MAX));
+        assert_eq!(
+            FetchTimeout::try_from_secs(301),
+            Err(FetchLimitError::TimeoutOutOfRange { secs: 301 })
+        );
+        assert_eq!(
+            FetchTimeout::try_from_secs(u64::MAX),
+            Err(FetchLimitError::TimeoutOutOfRange { secs: u64::MAX })
+        );
+    }
+
+    #[test]
+    fn test_fetch_concurrency_try_new_boundaries() {
+        assert_eq!(
+            FetchConcurrency::try_new(0),
+            Err(FetchLimitError::ConcurrencyOutOfRange { count: 0 })
+        );
+        assert_eq!(FetchConcurrency::try_new(1), Ok(FetchConcurrency::MIN));
+        assert_eq!(FetchConcurrency::try_new(100), Ok(FetchConcurrency::MAX));
+        assert_eq!(
+            FetchConcurrency::try_new(101),
+            Err(FetchLimitError::ConcurrencyOutOfRange { count: 101 })
+        );
+        assert_eq!(
+            FetchConcurrency::try_new(usize::MAX),
+            Err(FetchLimitError::ConcurrencyOutOfRange { count: usize::MAX })
+        );
+    }
+
+    #[test]
+    fn test_fetch_limit_defaults_are_inside_their_ranges() {
+        assert_eq!(
+            FetchTimeout::try_from_secs(FetchTimeout::DEFAULT.as_secs()),
+            Ok(FetchTimeout::DEFAULT)
+        );
+        assert_eq!(
+            FetchConcurrency::try_new(FetchConcurrency::DEFAULT.get()),
+            Ok(FetchConcurrency::DEFAULT)
+        );
     }
 
     #[test]

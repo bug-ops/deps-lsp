@@ -112,7 +112,7 @@ pub fn validate_owner_repo(name: &str) -> Result<()> {
 
 /// Message for a *confirmed* rate limit (`verified: RateLimitEvidence::Confirmed`, #1295): the response itself
 /// confirmed exhaustion (`X-RateLimit-Remaining: 0` or `Retry-After` — see
-/// `crate::cache::confirmed_rate_limit_exhaustion`).
+/// `crate::cache::errors::confirmed_rate_limit_exhaustion`).
 const GITHUB_RATE_LIMIT_MESSAGE_VERIFIED: &str = "GitHub API rate limit exceeded. Set GITHUB_TOKEN to increase the limit \
      (5000 req/h). Run: export GITHUB_TOKEN=$(gh auth token)";
 
@@ -920,7 +920,7 @@ impl ReleaseDatesCache {
         .await;
         match &fetch_result {
             // #756: never interpolate `e`'s `Display` — see `DepsError::safe_tracing_summary`.
-            // Same invariant as `cache.rs`/`osv/mod.rs`, kept uniform even though GitHub auth
+            // Same invariant as `cache/`/`osv/mod.rs`, kept uniform even though GitHub auth
             // flows via header (currently safe) rather than the URL.
             Ok(Err(e)) => {
                 let (status, cause) = e.safe_tracing_summary();
@@ -1460,7 +1460,7 @@ mod tests {
     async fn test_fetch_authenticated_blocks_cross_origin_redirect() {
         // Two separate `mockito::Server` instances bind to distinct ports, so a 302 from
         // one to the other is a genuine cross-origin redirect the trusted-origin pin must
-        // stop (mirrors `cache::tests::test_get_cached_trusted_origin_stops_cross_origin_redirect`).
+        // stop (mirrors `cache::tests::redirect::test_get_cached_trusted_origin_stops_cross_origin_redirect`).
         let mut trusted_server = mockito::Server::new_async().await;
         let mut other_server = mockito::Server::new_async().await;
 

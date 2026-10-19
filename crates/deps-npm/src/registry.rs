@@ -65,7 +65,7 @@ const PUBLISH_TIMES_MAX_ENTRIES: usize = 256;
 /// This is a mitigation, not a structural bound: it is a fixed, independent cap, not
 /// derived from whatever outer budget remains after the abbreviated fetch that runs first
 /// in the same `get_versions_with` call. `fetch_timeout_secs` is user-configurable down to
-/// 1s (`deps-lsp`'s `default_fetch_timeout_secs`/config bounds), and even at the 10s
+/// 1s (`deps-lsp`'s `FetchTimeout::DEFAULT`/config bounds), and even at the 10s
 /// default a slow-but-under-cap abbreviated fetch plus a full 5s of this timeout can still
 /// exceed the outer budget. Deriving this from the remaining outer time would close that
 /// gap but needs threading the outer deadline into this call — left as a known limitation
@@ -2229,7 +2229,7 @@ mod tests {
 
     /// H1: `fetch_publish_times`'s internal timeout must stay strictly tighter than the
     /// bulk fetch loop's outer per-package timeout (10s default, `deps-lsp`'s
-    /// `default_fetch_timeout_secs`) — otherwise a hanging full-packument request could
+    /// `FetchTimeout::DEFAULT`) — otherwise a hanging full-packument request could
     /// consume the entire outer budget and lose the abbreviated fetch's own result too,
     /// reproducing the "Registry lookup failed" regression #339 introduced by routing
     /// this fetch through the bulk diagnostics-cache-population pass. A live

@@ -7,12 +7,13 @@
 use super::state::{DocumentState, ServerState};
 use deps_core::Ecosystem;
 use deps_core::PackageName;
+use deps_core::policy_config::FetchTimeout;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::Uri;
 
 /// Ceiling on the typosquat pre-fetch's overall timeout, independent of the configured
-/// `fetch_timeout_secs` (issue #1437 impl-critic S4/perf NFR-002) — mirrors
+/// `fetch_timeout` (issue #1437 impl-critic S4/perf NFR-002) — mirrors
 /// `deps_core::osv`-scan-style timeout ceilings' exact rationale, bounding one document's whole
 /// pre-fetch fan-out (not any single deps.dev call, which has its own, separate
 /// `deps_core::deps_dev`-internal timeout) so a pathological manifest can't leave this
@@ -218,7 +219,7 @@ pub(crate) async fn run_typosquat_prefetch(
     uri: Uri,
     state: Arc<ServerState>,
     ecosystem: Arc<dyn Ecosystem>,
-    fetch_timeout_secs: u64,
+    fetch_timeout: FetchTimeout,
 ) -> bool {
     if !state.typosquat_checks().is_active() {
         return false;
@@ -244,7 +245,7 @@ pub(crate) async fn run_typosquat_prefetch(
     };
 
     let Some(outcome) = super::prefetch_support::bounded_prefetch_fetch(
-        fetch_timeout_secs,
+        fetch_timeout,
         TYPOSQUAT_PREFETCH_TIMEOUT_CEILING_SECS,
         "typosquat",
         deps_core::lsp_helpers::fetch_typosquat_signals(
@@ -424,6 +425,7 @@ mod tests {
         use super::super::super::state::DocumentState;
         use super::*;
         use deps_core::EcosystemId;
+        use deps_core::policy_config::FetchTimeout;
 
         /// Default `ServerState` starts with `policy.typosquat.enabled == false` — no
         /// document inserted for `uri` at all, so if the enabled-gate didn't short-circuit
@@ -440,7 +442,13 @@ mod tests {
                 .get(EcosystemId::Npm)
                 .expect("npm ecosystem not found");
 
-            let changed = run_typosquat_prefetch(uri, Arc::clone(&state), ecosystem, 5).await;
+            let changed = run_typosquat_prefetch(
+                uri,
+                Arc::clone(&state),
+                ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             assert!(!changed);
             assert_eq!(state.document_count(), 0);
@@ -459,7 +467,13 @@ mod tests {
                 .get(EcosystemId::Npm)
                 .expect("npm ecosystem not found");
 
-            let changed = run_typosquat_prefetch(uri, Arc::clone(&state), ecosystem, 5).await;
+            let changed = run_typosquat_prefetch(
+                uri,
+                Arc::clone(&state),
+                ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
 
             assert!(!changed);
             assert_eq!(state.document_count(), 0);
@@ -529,8 +543,13 @@ mod tests {
                     .refresh_from(names_snapshot);
             }
 
-            let changed =
-                run_typosquat_prefetch(uri.clone(), Arc::clone(&state), ecosystem, 5).await;
+            let changed = run_typosquat_prefetch(
+                uri.clone(),
+                Arc::clone(&state),
+                ecosystem,
+                FetchTimeout::constant::<5>(),
+            )
+            .await;
             assert!(
                 !changed,
                 "a fetch that resolved no usable signal must not report a merge"

@@ -365,7 +365,7 @@ fn ignored_sections(policy: &PolicyConfig, required: bool) -> Vec<&'static str> 
             sections.push("diagnostics");
         }
         if policy.cache.enabled != default.cache.enabled
-            || policy.cache.fetch_timeout_secs != default.cache.fetch_timeout_secs
+            || policy.cache.fetch_timeout != default.cache.fetch_timeout
             || policy.cache.max_concurrent_fetches != default.cache.max_concurrent_fetches
         {
             sections.push("cache");
@@ -830,8 +830,8 @@ b = 2
             default.license_policy.allow
         );
         assert_eq!(
-            config.policy.cache.fetch_timeout_secs,
-            default.cache.fetch_timeout_secs
+            config.policy.cache.fetch_timeout,
+            default.cache.fetch_timeout
         );
         assert_eq!(
             config.policy.supply_chain.enabled,

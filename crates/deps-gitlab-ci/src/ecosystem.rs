@@ -10,7 +10,10 @@ use deps_core::hover::Hover;
 #[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::sha_comment_mismatch_hover_line;
 #[cfg(feature = "lsp-responses")]
-use deps_core::lsp_helpers::{PackageNaming, PackageRendering};
+use deps_core::lsp_helpers::{
+    AuxiliaryLookup, FetchContext, InteractiveFetch, InteractiveFetchRequest, PackageNaming,
+    PackageRendering, await_interactive_fetch,
+};
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
     Dependency, Ecosystem, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
@@ -39,9 +42,9 @@ use crate::types::{GitlabCiDependency, HostRef, IncludeKind, PinStyle};
 mod lsp;
 #[cfg(feature = "lsp-responses")]
 use lsp::{
-    COMPONENT_PIN_RESOLUTION_TIMEOUT, VERSION_OPERATOR_CHARS, build_dynamic_component_pin_action,
-    build_sha_comment_fix_action, build_sha_pin_action, build_unknown_ref_fix_action,
-    collect_pin_all_to_sha_edits, splice_project_line,
+    VERSION_OPERATOR_CHARS, build_dynamic_component_pin_action, build_sha_comment_fix_action,
+    build_sha_pin_action, build_unknown_ref_fix_action, collect_pin_all_to_sha_edits,
+    splice_project_line,
 };
 
 /// Maximum character count of an interpolated raw host expression before truncation —
@@ -74,7 +77,7 @@ fn is_registry_confirmed_tag(gl_dep: &GitlabCiDependency, formatter: &GitlabCiFo
                 formatter
                     .tag_index
                     .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()))
-                    .is_some_and(|index| index.tag_to_sha.contains_key(ref_text))
+                    .is_some_and(|index| index.sha_for_tag(ref_text).is_some())
             }),
         Some(PinStyle::Sha { .. } | PinStyle::Latest | PinStyle::Partial) | None => false,
     }
@@ -434,6 +437,7 @@ impl Ecosystem for GitlabCiEcosystem {
                 uri,
                 &self.formatter,
                 self.registry.as_ref(),
+                versions,
             )
             .await
             {
@@ -511,40 +515,41 @@ impl Ecosystem for GitlabCiEcosystem {
             // no extra fetch needed) or `Tag`/`Branch` (whose text either is or isn't the
             // version). Resolving it needs the priority ladder run against the project's
             // published releases.
+            let dep_source = dep.source();
             if gl_dep.kind == IncludeKind::Component
                 && let Some(pin @ (PinStyle::Latest | PinStyle::Partial)) = &gl_dep.pin
                 && let deps_core::parser::DependencySource::AlternateRegistry { index, .. } =
-                    dep.source()
-                && let Some(route) = registry.routes().get(&index).map(|r| r.clone())
+                    &dep_source
+                && let Some(route) = registry.routes().get(index).map(|r| r.clone())
                 && let Some(raw) = gl_dep
                     .version_req
                     .as_ref()
                     .map(deps_core::VersionReq::as_str)
             {
-                let outcome = tokio::time::timeout(
-                    COMPONENT_PIN_RESOLUTION_TIMEOUT,
+                let normalized_name = self.formatter.normalize_package_name(dep.name());
+                let outcome = await_interactive_fetch(
                     registry.resolve_component_pin(dep.name(), &route, pin, raw),
+                    InteractiveFetchRequest::new(
+                        versions,
+                        parse_result.uri(),
+                        dep.name(),
+                        normalized_name.as_str(),
+                        &dep_source,
+                        FetchContext::Hover,
+                    ),
+                    AuxiliaryLookup::PinResolution,
                 )
                 .await;
-                match outcome {
-                    Ok(Ok(Some(resolved))) => {
-                        if let Some(sha) = &resolved.sha {
-                            hover.rewrite_markdown(|md| {
-                                deps_core::lsp_helpers::splice_resolved_line(
-                                    md,
-                                    resolved.version.as_str(),
-                                    sha,
-                                )
-                            });
-                        }
-                    }
-                    Ok(Ok(None)) => {}
-                    Ok(Err(error)) => {
-                        tracing::warn!(package = %dep.name().for_tracing(), %error, "FR-007 component pin resolution failed");
-                    }
-                    Err(_) => {
-                        tracing::warn!(package = %dep.name().for_tracing(), "FR-007 component pin resolution timed out");
-                    }
+                if let InteractiveFetch::Live(Some(resolved)) = outcome
+                    && let Some(sha) = &resolved.sha
+                {
+                    hover.rewrite_markdown(|md| {
+                        deps_core::lsp_helpers::splice_resolved_line(
+                            md,
+                            resolved.version.as_str(),
+                            sha,
+                        )
+                    });
                 }
             }
 
@@ -2079,11 +2084,8 @@ mod tests {
                     .unwrap();
 
             let formatter = test_formatter();
-            let mut index = TagIndex::default();
             let sha = "a".repeat(40);
-            index
-                .tag_to_sha
-                .insert("v1.0.0".to_string(), CommitSha::parse(&sha).unwrap());
+            let index = TagIndex::from_tags([("v1.0.0", &CommitSha::parse(&sha).unwrap())]);
             formatter.tag_index.insert(
                 (
                     EndpointKind::Tags,
@@ -2153,11 +2155,8 @@ mod tests {
                     .unwrap();
 
             let formatter = test_formatter();
-            let mut index = TagIndex::default();
-            index.tag_to_sha.insert(
-                "main".to_string(),
-                CommitSha::parse(&"a".repeat(40)).unwrap(),
-            );
+            let index =
+                TagIndex::from_tags([("main", &CommitSha::parse(&"a".repeat(40)).unwrap())]);
             formatter.tag_index.insert(
                 (
                     EndpointKind::Tags,
@@ -2193,10 +2192,7 @@ mod tests {
             let formatter = test_formatter();
             let sha1 = "1".repeat(40);
             let sha2 = "2".repeat(40);
-            let mut index1 = TagIndex::default();
-            index1
-                .tag_to_sha
-                .insert("v1.0.0".to_string(), CommitSha::parse(&sha1).unwrap());
+            let index1 = TagIndex::from_tags([("v1.0.0", &CommitSha::parse(&sha1).unwrap())]);
             formatter.tag_index.insert(
                 (
                     EndpointKind::Tags,
@@ -2204,10 +2200,7 @@ mod tests {
                 ),
                 Arc::new(index1),
             );
-            let mut index2 = TagIndex::default();
-            index2
-                .tag_to_sha
-                .insert("v2.0.0".to_string(), CommitSha::parse(&sha2).unwrap());
+            let index2 = TagIndex::from_tags([("v2.0.0", &CommitSha::parse(&sha2).unwrap())]);
             formatter.tag_index.insert(
                 (
                     EndpointKind::Tags,
@@ -2276,11 +2269,8 @@ mod tests {
             let formatter = test_formatter();
             let project_sha = "1".repeat(40);
             let component_sha = "2".repeat(40);
-            let mut project_index = TagIndex::default();
-            project_index.tag_to_sha.insert(
-                "v1.0.0".to_string(),
-                CommitSha::parse(&project_sha).unwrap(),
-            );
+            let project_index =
+                TagIndex::from_tags([("v1.0.0", &CommitSha::parse(&project_sha).unwrap())]);
             formatter.tag_index.insert(
                 (
                     EndpointKind::Tags,
@@ -2288,11 +2278,8 @@ mod tests {
                 ),
                 Arc::new(project_index),
             );
-            let mut component_index = TagIndex::default();
-            component_index.tag_to_sha.insert(
-                "1.0.0".to_string(),
-                CommitSha::parse(&component_sha).unwrap(),
-            );
+            let component_index =
+                TagIndex::from_tags([("1.0.0", &CommitSha::parse(&component_sha).unwrap())]);
             formatter.tag_index.insert(
                 (
                     EndpointKind::Releases,
@@ -2431,6 +2418,7 @@ mod tests {
                 &uri,
                 &formatter,
                 &registry,
+                deps_core::VersionData::new(&Default::default(), &Default::default()),
             )
             .await
             .expect(
@@ -2468,6 +2456,7 @@ mod tests {
                 &uri,
                 &formatter,
                 &registry,
+                deps_core::VersionData::new(&Default::default(), &Default::default()),
             )
             .await
             .expect("expected a quickfix resolving ~latest to a concrete SHA");
@@ -2502,6 +2491,7 @@ mod tests {
                 &uri,
                 &formatter,
                 &registry,
+                deps_core::VersionData::new(&Default::default(), &Default::default()),
             )
             .await
             .expect("expected a quickfix resolving the partial pin to a concrete SHA");
@@ -2594,6 +2584,7 @@ mod tests {
                 &uri,
                 &formatter,
                 &registry,
+                deps_core::VersionData::new(&Default::default(), &Default::default()),
             )
             .await
             .expect("expected a quickfix resolving ~latest to a concrete SHA");
@@ -2631,11 +2622,150 @@ mod tests {
                     position,
                     &uri,
                     &formatter,
-                    &registry
+                    &registry,
+                    deps_core::VersionData::new(&Default::default(), &Default::default())
                 )
                 .await
                 .is_none()
             );
+        }
+
+        fn releases_mock(
+            server: &mut mockito::ServerGuard,
+            status: usize,
+            body: &str,
+        ) -> mockito::Mock {
+            server
+                .mock("GET", "/api/v4/projects/org%2Fproj/releases")
+                .match_query(mockito::Matcher::Any)
+                .with_status(status)
+                .with_body(body)
+        }
+
+        fn gate() -> deps_core::lsp_helpers::InteractiveFetchGate {
+            deps_core::lsp_helpers::InteractiveFetchGate::new(
+                std::num::NonZeroUsize::new(4).unwrap(),
+            )
+        }
+
+        /// A failed FR-007 resolution is remembered by the shared gate, so the next code action
+        /// for the same component pin withholds the quickfix without a request.
+        #[tokio::test]
+        async fn test_build_dynamic_component_pin_action_after_a_failed_resolution_makes_no_request()
+         {
+            let mut server = mockito::Server::new_async().await;
+            let failing = releases_mock(&mut server, 500, "")
+                .expect_at_least(1)
+                .create_async()
+                .await;
+            let (registry, formatter, parse_result, uri, position) =
+                component_pin_test_setup(&server, PinStyle::Latest, "~latest");
+            let (cached, resolved) = (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            );
+            let gate = gate();
+            let versions = deps_core::VersionData::new(&cached, &resolved)
+                .with_ecosystem(deps_core::EcosystemId::GitlabCi)
+                .with_interactive_fetch_gate(&gate);
+
+            let first = build_dynamic_component_pin_action(
+                &parse_result,
+                position,
+                &uri,
+                &formatter,
+                &registry,
+                versions,
+            )
+            .await;
+            failing.assert_async().await;
+            failing.remove_async().await;
+            let sha = "a".repeat(40);
+            let untouched = releases_mock(
+                &mut server,
+                200,
+                &format!(r#"[{{"tag_name":"2.0.0","commit":{{"id":"{sha}"}}}}]"#),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+            let second = build_dynamic_component_pin_action(
+                &parse_result,
+                position,
+                &uri,
+                &formatter,
+                &registry,
+                versions,
+            )
+            .await;
+
+            assert!(first.is_none() && second.is_none());
+            assert_eq!(gate.len(), 1);
+            untouched.assert_async().await;
+        }
+
+        /// Hover routes the same FR-007 resolution through the gate: after a dead releases
+        /// endpoint failed the base list and the pin resolution once, a second hover makes no
+        /// request at all.
+        #[tokio::test]
+        async fn test_generate_hover_component_pin_after_a_failure_makes_no_request() {
+            let mut server = mockito::Server::new_async().await;
+            let failing = releases_mock(&mut server, 500, "")
+                .expect_at_least(1)
+                .create_async()
+                .await;
+            let (registry, formatter, parse_result, _uri, position) =
+                component_pin_test_setup(&server, PinStyle::Latest, "~latest");
+            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::default());
+            let eco = GitlabCiEcosystem {
+                registry: Arc::new(registry),
+                formatter,
+                instance_host: Arc::new(GitlabInstanceHost::new(
+                    Arc::new(RwLock::new(None)),
+                    Arc::clone(&policy),
+                )),
+                policy,
+            };
+            let (cached, resolved) = (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            );
+            let gate = gate();
+            let versions = deps_core::VersionData::new(&cached, &resolved)
+                .with_ecosystem(deps_core::EcosystemId::GitlabCi)
+                .with_interactive_fetch_gate(&gate);
+
+            let first = eco
+                .generate_hover(
+                    &parse_result,
+                    position,
+                    versions,
+                    deps_core::FreshnessSettings::Disabled,
+                )
+                .await;
+            failing.assert_async().await;
+            failing.remove_async().await;
+            let sha = "a".repeat(40);
+            let untouched = releases_mock(
+                &mut server,
+                200,
+                &format!(r#"[{{"tag_name":"2.0.0","commit":{{"id":"{sha}"}}}}]"#),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+            let second = eco
+                .generate_hover(
+                    &parse_result,
+                    position,
+                    versions,
+                    deps_core::FreshnessSettings::Disabled,
+                )
+                .await;
+
+            assert!(first.is_some() && second.is_some());
+            assert_eq!(gate.len(), 2, "the version list and the pin resolution");
+            untouched.assert_async().await;
         }
 
         /// Neither a `project:` include nor a `component:` `PinStyle::Tag`/`PinStyle::Branch`
@@ -2652,7 +2782,8 @@ mod tests {
                     position,
                     &uri,
                     &formatter,
-                    &registry
+                    &registry,
+                    deps_core::VersionData::new(&Default::default(), &Default::default())
                 )
                 .await
                 .is_none()
@@ -2680,18 +2811,12 @@ mod tests {
             let deps = deps_core::ParseResult::dependencies(parse_result.as_ref());
             let sha1 = "1".repeat(40);
             let sha2 = "2".repeat(40);
-            let mut index1 = TagIndex::default();
-            index1
-                .tag_to_sha
-                .insert("v1.0.0".to_string(), CommitSha::parse(&sha1).unwrap());
+            let index1 = TagIndex::from_tags([("v1.0.0", &CommitSha::parse(&sha1).unwrap())]);
             eco.formatter.tag_index.insert(
                 (EndpointKind::Tags, deps[0].name().clone()),
                 Arc::new(index1),
             );
-            let mut index2 = TagIndex::default();
-            index2
-                .tag_to_sha
-                .insert("v2.0.0".to_string(), CommitSha::parse(&sha2).unwrap());
+            let index2 = TagIndex::from_tags([("v2.0.0", &CommitSha::parse(&sha2).unwrap())]);
             eco.formatter.tag_index.insert(
                 (EndpointKind::Tags, deps[1].name().clone()),
                 Arc::new(index2),
@@ -2765,10 +2890,7 @@ mod tests {
                 .clone();
 
             let sha = "a".repeat(40);
-            let mut index = TagIndex::default();
-            index
-                .tag_to_sha
-                .insert("2.0.0".to_string(), CommitSha::parse(&sha).unwrap());
+            let index = TagIndex::from_tags([("2.0.0", &CommitSha::parse(&sha).unwrap())]);
             eco.formatter
                 .tag_index
                 .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
@@ -2796,13 +2918,10 @@ mod tests {
 
             let sha_low = "1".repeat(40);
             let sha_high = "2".repeat(40);
-            let mut index = TagIndex::default();
-            index
-                .tag_to_sha
-                .insert("1.2.0".to_string(), CommitSha::parse(&sha_low).unwrap());
-            index
-                .tag_to_sha
-                .insert("1.2.5".to_string(), CommitSha::parse(&sha_high).unwrap());
+            let index = TagIndex::from_tags([
+                ("1.2.0", &CommitSha::parse(&sha_low).unwrap()),
+                ("1.2.5", &CommitSha::parse(&sha_high).unwrap()),
+            ]);
             eco.formatter
                 .tag_index
                 .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
@@ -2843,11 +2962,8 @@ mod tests {
                 .clone();
 
             // Only "1.0.0" has a TagIndex entry; "2.0.0" (the true winner) does not.
-            let mut index = TagIndex::default();
-            index.tag_to_sha.insert(
-                "1.0.0".to_string(),
-                CommitSha::parse(&"a".repeat(40)).unwrap(),
-            );
+            let index =
+                TagIndex::from_tags([("1.0.0", &CommitSha::parse(&"a".repeat(40)).unwrap())]);
             eco.formatter
                 .tag_index
                 .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
@@ -2887,13 +3003,10 @@ mod tests {
 
             let sha_first = "1".repeat(40);
             let sha_last = "2".repeat(40);
-            let mut index = TagIndex::default();
-            index
-                .tag_to_sha
-                .insert("1.2.0".to_string(), CommitSha::parse(&sha_first).unwrap());
-            index
-                .tag_to_sha
-                .insert("v1.2.0".to_string(), CommitSha::parse(&sha_last).unwrap());
+            let index = TagIndex::from_tags([
+                ("1.2.0", &CommitSha::parse(&sha_first).unwrap()),
+                ("v1.2.0", &CommitSha::parse(&sha_last).unwrap()),
+            ]);
             eco.formatter
                 .tag_index
                 .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
@@ -2933,10 +3046,7 @@ mod tests {
                 .name()
                 .clone();
             let sha = "a".repeat(40);
-            let mut index = TagIndex::default();
-            index
-                .tag_to_sha
-                .insert("v1.0.0".to_string(), CommitSha::parse(&sha).unwrap());
+            let index = TagIndex::from_tags([("v1.0.0", &CommitSha::parse(&sha).unwrap())]);
             eco.formatter
                 .tag_index
                 .insert((EndpointKind::Tags, name), Arc::new(index));

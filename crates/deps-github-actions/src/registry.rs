@@ -655,7 +655,7 @@ mod tests {
         let refreshed = refreshes.try_recv().unwrap();
         let index = registry.tag_index().get(&refreshed).map(|e| Arc::clone(&e));
         assert_eq!(
-            index.and_then(|index| index.tag_to_sha.get("v4").cloned()),
+            index.and_then(|index| index.sha_for_tag("v4").cloned()),
             CommitSha::parse(&sha)
         );
     }
@@ -760,7 +760,7 @@ mod tests {
         let name = PackageName::new("actions/checkout");
         let index = registry.tag_index.get(&name).unwrap();
         assert_eq!(
-            index.tag_to_sha.get("v4.2.0"),
+            index.sha_for_tag("v4.2.0"),
             Some(&CommitSha::parse(sha).unwrap())
         );
         assert_eq!(
@@ -799,7 +799,7 @@ mod tests {
         let name = PackageName::new("actions/checkout");
         let index = registry.tag_index.get(&name).unwrap();
         assert_eq!(
-            index.tag_to_sha.get("v4"),
+            index.sha_for_tag("v4"),
             Some(&CommitSha::parse(sha).unwrap()),
             "the SHA-pin index must resolve a bare-major tag even though it's not a version"
         );
@@ -912,8 +912,8 @@ mod tests {
         // tag_to_sha has no such ambiguity (keyed by the workflow's own literal ref
         // text) — both names must still resolve to the shared SHA.
         let expected_sha = CommitSha::parse(&sha).unwrap();
-        assert_eq!(index.tag_to_sha.get("v1"), Some(&expected_sha));
-        assert_eq!(index.tag_to_sha.get("v0.1.15"), Some(&expected_sha));
+        assert_eq!(index.sha_for_tag("v1"), Some(&expected_sha));
+        assert_eq!(index.sha_for_tag("v0.1.15"), Some(&expected_sha));
     }
 
     #[tokio::test]

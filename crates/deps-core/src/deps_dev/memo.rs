@@ -13,11 +13,11 @@ use std::hash::Hash;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
 use tokio::sync::watch;
 
 use super::FetchCompleteness;
 use crate::cache_policy::evict_expired_then_oldest;
+use crate::single_flight::{InFlightGuard, Slot, claim_or_follow};
 
 /// The outcome of one deps.dev call evaluation, carrying its own completeness rather than a
 /// completeness flag stored alongside a plain value.
@@ -187,53 +187,6 @@ where
     }
 }
 
-/// A [`coalesce`] watch-channel payload: "leader hasn't finished yet" vs. "leader finished with
-/// `T`". A dedicated enum rather than `Option<T>`: this "pending vs. ready" state is distinct
-/// from — and must not be conflated with — `coalesce`'s own `Option<T>` *return* value, where
-/// `None` instead means every takeover attempt was exhausted.
-#[derive(Debug, Clone)]
-pub(super) enum Slot<T> {
-    /// The leader's `fetch` has not completed (or panicked) yet.
-    Pending,
-    /// The leader's `fetch` completed with this value.
-    Ready(T),
-}
-
-/// Releases an in-flight claim on drop — including on panic — so a claim can never leak and
-/// permanently block later calls for the same key.
-struct InFlightGuard<'a, K: Hash + Eq, W> {
-    map: &'a DashMap<K, W>,
-    key: K,
-}
-
-impl<K: Hash + Eq, W> Drop for InFlightGuard<'_, K, W> {
-    fn drop(&mut self) {
-        self.map.remove(&self.key);
-    }
-}
-
-/// Either claims `key` as the leader (installing a fresh, `Pending` channel) or joins as a
-/// follower of whichever channel the current leader already installed — a plain, synchronous
-/// function so the returned [`Entry`] guard is dropped before [`coalesce`] ever reaches an
-/// `.await` (this workspace's `clippy.toml` denies holding one across an await point on
-/// principle, regardless of whether a given case is provably safe).
-fn claim_or_follow<K, T>(
-    in_flight: &DashMap<K, watch::Receiver<Slot<T>>>,
-    key: K,
-) -> Result<watch::Sender<Slot<T>>, watch::Receiver<Slot<T>>>
-where
-    K: Hash + Eq,
-{
-    match in_flight.entry(key) {
-        Entry::Occupied(occupied) => Err(occupied.get().clone()),
-        Entry::Vacant(vacant) => {
-            let (tx, rx) = watch::channel(Slot::Pending);
-            vacant.insert(rx);
-            Ok(tx)
-        }
-    }
-}
-
 /// Bounds how many times [`coalesce`] takes over as a new leader after the previous one was
 /// cancelled before sending (issue #1455 critic S2), so a leader that keeps getting cancelled (or
 /// keeps panicking deterministically) cannot loop forever — the last attempt's caller either
@@ -281,10 +234,7 @@ where
     for attempt in 0..=MAX_COALESCE_TAKEOVER_ATTEMPTS {
         match claim_or_follow(in_flight, key.clone()) {
             Ok(tx) => {
-                let _guard = InFlightGuard {
-                    map: in_flight,
-                    key,
-                };
+                let _guard = InFlightGuard::new(in_flight, key);
                 let value = fetch().await;
                 let _ = tx.send(Slot::Ready(value.clone()));
                 return Some(value);

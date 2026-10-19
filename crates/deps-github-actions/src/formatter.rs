@@ -48,8 +48,7 @@ impl GithubActionsFormatter {
     /// use std::sync::Arc;
     ///
     /// let tag_index = Arc::new(DashMap::new());
-    /// let mut index = TagIndex::default();
-    /// index.tag_to_sha.insert("v4".to_string(), CommitSha::parse(&"a".repeat(40)).unwrap());
+    /// let index = TagIndex::from_tags([("v4", &CommitSha::parse(&"a".repeat(40)).unwrap())]);
     /// tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
     ///
     /// let formatter = GithubActionsFormatter::new(tag_index);
@@ -85,8 +84,7 @@ impl GithubActionsFormatter {
     /// use std::sync::Arc;
     ///
     /// let tag_index = Arc::new(DashMap::new());
-    /// let mut index = TagIndex::default();
-    /// index.tag_to_sha.insert("v4".to_string(), CommitSha::parse(&"a".repeat(40)).unwrap());
+    /// let index = TagIndex::from_tags([("v4", &CommitSha::parse(&"a".repeat(40)).unwrap())]);
     /// tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
     ///
     /// let formatter = GithubActionsFormatter::new(tag_index);
@@ -110,7 +108,7 @@ impl GithubActionsFormatter {
     fn commit_for_tag(&self, name: &PackageName, tag: &str) -> Option<CommitSha> {
         self.tag_index
             .get(name)
-            .and_then(|index| index.tag_to_sha.get(tag).cloned())
+            .and_then(|index| index.sha_for_tag(tag).cloned())
     }
 
     /// The index's spelling of release `version` and its commit, tolerating a `v` prefix
@@ -2185,12 +2183,8 @@ mod tests {
     fn test_pinned_commit_exact_tag_is_none_floating_is_some() {
         let sha = "c".repeat(40);
         let fmt = formatter();
-        let mut index = TagIndex::default();
-        for tag in ["v4", "v4.1.2"] {
-            index
-                .tag_to_sha
-                .insert(tag.to_string(), CommitSha::parse(&sha).unwrap());
-        }
+        let commit = CommitSha::parse(&sha).unwrap();
+        let index = TagIndex::from_tags([("v4", &commit), ("v4.1.2", &commit)]);
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
         let mut d = dep(Some(PinStyle::Tag), "actions/checkout");
@@ -2696,10 +2690,7 @@ mod tests {
     fn test_sha_pin_comment_tag_round_trips_through_format_version_replacing_for() {
         let sha = "b".repeat(40);
         let fmt = formatter();
-        let mut index = TagIndex::default();
-        index
-            .tag_to_sha
-            .insert("v4".to_string(), CommitSha::parse(&sha).unwrap());
+        let index = TagIndex::from_tags([("v4", &CommitSha::parse(&sha).unwrap())]);
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
@@ -3017,11 +3008,8 @@ mod tests {
     fn test_format_version_replacing_for_sha_resolves_via_tag_index() {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "v5.0.0".to_string(),
-            CommitSha::parse(&"deadbeef".repeat(5)).unwrap(),
-        );
+        let index =
+            TagIndex::from_tags([("v5.0.0", &CommitSha::parse(&"deadbeef".repeat(5)).unwrap())]);
         fmt.tag_index.insert(name, Arc::new(index));
 
         let d = dep(
@@ -3098,11 +3086,8 @@ mod tests {
 
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "v5.0.0".to_string(),
-            CommitSha::parse(&"deadbeef".repeat(5)).unwrap(),
-        );
+        let index =
+            TagIndex::from_tags([("v5.0.0", &CommitSha::parse(&"deadbeef".repeat(5)).unwrap())]);
         fmt.tag_index.insert(name, Arc::new(index));
 
         let old_sha = "a".repeat(40);
@@ -3218,11 +3203,8 @@ mod tests {
     fn test_format_version_replacing_for_sha_quoted_scalar_keeps_closing_quote() {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "v5.0.0".to_string(),
-            CommitSha::parse(&"deadbeef".repeat(5)).unwrap(),
-        );
+        let index =
+            TagIndex::from_tags([("v5.0.0", &CommitSha::parse(&"deadbeef".repeat(5)).unwrap())]);
         fmt.tag_index.insert(name, Arc::new(index));
 
         let content = format!(
@@ -3245,11 +3227,8 @@ mod tests {
     fn test_format_version_replacing_for_sha_non_version_target_writes_no_comment() {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "stable".to_string(),
-            CommitSha::parse(&"deadbeef".repeat(5)).unwrap(),
-        );
+        let index =
+            TagIndex::from_tags([("stable", &CommitSha::parse(&"deadbeef".repeat(5)).unwrap())]);
         fmt.tag_index.insert(name, Arc::new(index));
 
         let d = dep(
@@ -3266,11 +3245,8 @@ mod tests {
     /// and returns the edited line.
     fn rewrite_to_non_version_release(line: &str) -> String {
         let fmt = formatter();
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "stable".to_string(),
-            CommitSha::parse(&"deadbeef".repeat(5)).unwrap(),
-        );
+        let index =
+            TagIndex::from_tags([("stable", &CommitSha::parse(&"deadbeef".repeat(5)).unwrap())]);
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
@@ -3338,11 +3314,8 @@ mod tests {
     fn test_format_version_replacing_for_sha_flow_style_commentless_rewrites_only_the_sha() {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "v5.0.0".to_string(),
-            CommitSha::parse(&"deadbeef".repeat(5)).unwrap(),
-        );
+        let index =
+            TagIndex::from_tags([("v5.0.0", &CommitSha::parse(&"deadbeef".repeat(5)).unwrap())]);
         fmt.tag_index.insert(name, Arc::new(index));
 
         let sha = "11bd71901bbe5b1630ceea73d27597364c9af683";
@@ -3363,11 +3336,8 @@ mod tests {
     #[test]
     fn test_format_version_replacing_for_sha_quoted_commentless_rewrites_only_the_sha() {
         let fmt = formatter();
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "v5.0.0".to_string(),
-            CommitSha::parse(&"deadbeef".repeat(5)).unwrap(),
-        );
+        let index =
+            TagIndex::from_tags([("v5.0.0", &CommitSha::parse(&"deadbeef".repeat(5)).unwrap())]);
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
@@ -3394,11 +3364,8 @@ mod tests {
     fn test_format_version_replacing_for_sha_last_on_line_still_appends_tag_comment() {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "v5.0.0".to_string(),
-            CommitSha::parse(&"deadbeef".repeat(5)).unwrap(),
-        );
+        let index =
+            TagIndex::from_tags([("v5.0.0", &CommitSha::parse(&"deadbeef".repeat(5)).unwrap())]);
         fmt.tag_index.insert(name, Arc::new(index));
 
         let d = dep(
@@ -3445,10 +3412,7 @@ mod tests {
     fn test_sha_pin_replacement_for_hit() {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
-        let mut index = TagIndex::default();
-        index
-            .tag_to_sha
-            .insert("v4".to_string(), CommitSha::parse(&"a".repeat(40)).unwrap());
+        let index = TagIndex::from_tags([("v4", &CommitSha::parse(&"a".repeat(40)).unwrap())]);
         fmt.tag_index.insert(name.clone(), Arc::new(index));
 
         assert_eq!(
@@ -3463,11 +3427,7 @@ mod tests {
     fn test_sha_pin_replacement_for_hit_without_v_prefix() {
         let fmt = formatter();
         let name = PackageName::new("owner/repo");
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "2.1.0".to_string(),
-            CommitSha::parse(&"b".repeat(40)).unwrap(),
-        );
+        let index = TagIndex::from_tags([("2.1.0", &CommitSha::parse(&"b".repeat(40)).unwrap())]);
         fmt.tag_index.insert(name.clone(), Arc::new(index));
 
         assert_eq!(
@@ -3487,10 +3447,7 @@ mod tests {
     fn test_sha_pin_replacement_for_miss_tag_not_indexed() {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
-        let mut index = TagIndex::default();
-        index
-            .tag_to_sha
-            .insert("v4".to_string(), CommitSha::parse(&"a".repeat(40)).unwrap());
+        let index = TagIndex::from_tags([("v4", &CommitSha::parse(&"a".repeat(40)).unwrap())]);
         fmt.tag_index.insert(name.clone(), Arc::new(index));
 
         assert_eq!(fmt.sha_pin_replacement_for(&name, "v5"), None);
@@ -3503,10 +3460,7 @@ mod tests {
     fn test_sha_pin_replacement_for_matches_format_version_replacing_for_sha_branch() {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
-        let mut index = TagIndex::default();
-        index
-            .tag_to_sha
-            .insert("v4".to_string(), CommitSha::parse(&"a".repeat(40)).unwrap());
+        let index = TagIndex::from_tags([("v4", &CommitSha::parse(&"a".repeat(40)).unwrap())]);
         fmt.tag_index.insert(name.clone(), Arc::new(index));
 
         let via_sha_pin_action = fmt.sha_pin_replacement_for(&name, "v4").unwrap();

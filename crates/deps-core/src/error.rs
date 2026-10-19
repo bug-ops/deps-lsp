@@ -257,7 +257,7 @@ pub enum DepsError {
         /// which case it is redacted the same way a credential-bearing value would be (e.g. a
         /// Maven/Gradle `group:artifact` coordinate becomes `group:***`) — a cosmetic false
         /// positive, never a correctness issue, since no current call site populates this
-        /// field with a coordinate (only `cache.rs` does, always with a URL).
+        /// field with a coordinate (only `cache/` does, always with a URL).
         package: RedactedUrl,
         /// The underlying `reqwest` error, with its embedded request URL stripped.
         #[source]
