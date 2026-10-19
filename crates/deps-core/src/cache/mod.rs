@@ -36,7 +36,7 @@ const MAX_CACHE_ENTRIES: usize = 1000;
 /// Maximum total bytes retained across all cached response bodies.
 ///
 /// `MAX_CACHE_ENTRIES` alone bounds entry *count*, not size: since a single
-/// response body may be as large as [`MAX_RESPONSE_BYTES`] (32 MiB), a cache
+/// response body may be as large as [`MAX_RESPONSE_BYTES`](self::body::MAX_RESPONSE_BYTES) (32 MiB), a cache
 /// full of near-cap entries could retain tens of gigabytes even though real
 /// registry payloads are typically well under 1 MB. This budget is a
 /// defense-in-depth cap (CWE-400) against that worst case, evicted
@@ -57,7 +57,7 @@ const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// stored.
 ///
 /// Without this cap, [`MAX_CACHE_BYTES`] alone lets a handful of
-/// large-but-legitimate responses (up to [`MAX_RESPONSE_BYTES`], 32 MiB
+/// large-but-legitimate responses (up to [`MAX_RESPONSE_BYTES`](self::body::MAX_RESPONSE_BYTES), 32 MiB
 /// each) evict the *entire* rest of the cache: at a 2x ratio between the
 /// two constants, just two max-size entries would saturate the whole
 /// budget. Set to an eighth of [`MAX_CACHE_BYTES`] (8 MiB) so no single
@@ -155,11 +155,11 @@ impl CacheMode {
     }
 }
 
-/// Which cache-key namespace and [`AddrGuard`] tier a [`Transport`] enforces.
+/// Which cache-key namespace and [`AddrGuard`](self::guard::AddrGuard) tier a [`Transport`] enforces.
 ///
 /// `Baseline` is every non-workspace request (all 11 ecosystems' registry/redirect/API
 /// traffic); `WorkspaceDeclared` is Cargo's workspace-declared-registry traffic, carrying the
-/// same [`WorkspaceRegistryAccess`] **value snapshot** an [`AddrGuard::WorkspaceDeclared`]
+/// same [`WorkspaceRegistryAccess`] **value snapshot** an [`AddrGuard::WorkspaceDeclared`](self::guard::AddrGuard::WorkspaceDeclared)
 /// carries (see that variant's docs) — [`HttpCache::cache_key`] reads the digit from this
 /// snapshot, never from a live `Arc<RegistryAccessPolicy>` read, so a request's cache key and
 /// its guard always agree on which policy era they were constructed under.
@@ -343,7 +343,7 @@ impl HttpCache {
 
     /// Returns `Err(DepsError::Offline)` when `network.offline` is set, without making any
     /// request — the last check before a socket opens at each of this module's 4 send
-    /// sites, placed beside the existing [`ensure_https`] call at each.
+    /// sites, placed beside the existing [`ensure_https`](self::guard::ensure_https) call at each.
     fn ensure_online(&self, url: &str) -> Result<()> {
         if self.is_offline() {
             return Err(DepsError::Offline {

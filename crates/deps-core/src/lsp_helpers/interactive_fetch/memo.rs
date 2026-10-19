@@ -1,4 +1,4 @@
-//! The source-qualified failure memo behind [`InteractiveFetchGate`](super::InteractiveFetchGate).
+//! The source-qualified failure memo behind [`InteractiveFetchGate`].
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};

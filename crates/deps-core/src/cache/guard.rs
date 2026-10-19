@@ -89,12 +89,12 @@ pub(super) fn hop_targets_blocked_host(url: &Url) -> bool {
     class_blocked
 }
 
-/// The tier a [`Transport`]'s redirect policy and DNS resolver both enforce.
+/// The tier a [`Transport`](super::transport::Transport)'s redirect policy and DNS resolver both enforce.
 ///
 /// `WorkspaceDeclared` holds an [`AccessSnapshot`] (level and allowlist) **value snapshot**, taken once at
-/// [`Transport::workspace`] construction time — not a live `Arc<RegistryAccessPolicy>` read on
-/// every `AddrGuard::permits_declared` call. [`Transport::workspace`] takes this same snapshot for its
-/// paired [`CacheTier::WorkspaceDeclared`], and [`HttpCache::set_registry_policy`] rebuilds the
+/// [`Transport::workspace`](super::transport::Transport::workspace) construction time — not a live `Arc<RegistryAccessPolicy>` read on
+/// every `AddrGuard::permits_declared` call. [`Transport::workspace`](super::transport::Transport::workspace) takes this same snapshot for its
+/// paired [`CacheTier::WorkspaceDeclared`](super::CacheTier::WorkspaceDeclared), and [`HttpCache::set_registry_policy`](super::HttpCache::set_registry_policy) rebuilds the
 /// whole `Transport` (both snapshots included) on every actual policy transition, so a
 /// request's cache key and its guard always come from one consistent construction-time value,
 /// with no read-skew window between them.

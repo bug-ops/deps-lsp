@@ -8,7 +8,7 @@ use std::sync::Arc;
 /// connection use — either it produced no address, or at least one resolved address falls into
 /// a blocked [`crate::net_policy::HostClass`].
 ///
-/// Kept distinct from [`DepsError`] since this crosses into `reqwest::dns::Resolve`'s own
+/// Kept distinct from [`DepsError`](crate::error::DepsError) since this crosses into `reqwest::dns::Resolve`'s own
 /// `BoxError` (`Box<dyn std::error::Error + Send + Sync>`) return type, not this crate's own
 /// error type.
 #[derive(Debug, thiserror::Error)]
@@ -89,8 +89,8 @@ impl std::fmt::Debug for TestLookup {
     }
 }
 
-/// Connect-time DNS resolver that closes the rebinding TOCTOU gap left by [`ensure_https`]/
-/// [`hop_targets_blocked_host`]'s URL-string-only classification (issue #449): those check the
+/// Connect-time DNS resolver that closes the rebinding TOCTOU gap left by [`ensure_https`](super::guard::ensure_https)/
+/// [`hop_targets_blocked_host`](super::guard::hop_targets_blocked_host)'s URL-string-only classification (issue #449): those check the
 /// declared hostname, but `reqwest`'s connector resolves DNS independently, later, and an
 /// attacker who controls the hostname's DNS can rebind it to a blocked address in between.
 ///
@@ -102,7 +102,7 @@ impl std::fmt::Debug for TestLookup {
 /// This resolver's guard tier decides how much a resolved address is scrutinized: under
 /// [`AddrGuard::Baseline`] this enforces only the policy-independent
 /// [`crate::net_policy::HostClass::never_a_registry`] tier (loopback, link-local,
-/// cloud-metadata, unspecified, reserved), the same tier [`hop_targets_blocked_host`] already
+/// cloud-metadata, unspecified, reserved), the same tier [`hop_targets_blocked_host`](super::guard::hop_targets_blocked_host) already
 /// applies — closing issue #449's filed exploit (cloud-metadata rebinding) but not full `PublicOnly`
 /// semantics. Under [`AddrGuard::WorkspaceDeclared`], [`validate_resolved_addrs`] additionally
 /// rejects any resolved address outside the snapshotted [`crate::net_policy::WorkspaceRegistryAccess`]
@@ -127,12 +127,12 @@ impl std::fmt::Debug for TestLookup {
 ///   attacker-controlled, so NOT claimed as a defended case.
 /// - Never applies to an IP-literal host (`https://169.254.169.254/`): `hyper-util`'s connector
 ///   parses those directly and never calls the configured resolver, so
-///   [`classify_host`](crate::net_policy::classify_host) (via [`ensure_https`]/
-///   [`hop_targets_blocked_host`]/[`redirect_policy`]'s tier term) remains the sole guard for
+///   [`classify_host`](crate::net_policy::classify_host) (via [`ensure_https`](super::guard::ensure_https)/
+///   [`hop_targets_blocked_host`](super::guard::hop_targets_blocked_host)/[`redirect_policy`](super::redirect::redirect_policy)'s tier term) remains the sole guard for
 ///   literals — a disjoint domain from this resolver's name-based one, not a gap. This is also
-///   why the cache layer gives [`HttpCache::get_cached_workspace`] zero protection against an
+///   why the cache layer gives [`HttpCache::get_cached_workspace`](super::HttpCache::get_cached_workspace) zero protection against an
 ///   *initial* request URL that is itself an IP literal — see that method's docs.
-/// - Unlike [`ensure_https`]/[`hop_targets_blocked_host`], this resolver has **no** `test-util`
+/// - Unlike [`ensure_https`](super::guard::ensure_https)/[`hop_targets_blocked_host`](super::guard::hop_targets_blocked_host), this resolver has **no** `test-util`
 ///   carve-out for `Loopback`: it blocks a `localhost`/`127.0.0.1` *name* unconditionally, in
 ///   every build. A downstream `test-util` consumer that mocks by binding an IP literal (as
 ///   this workspace's own `mockito` usage does) is unaffected — literals never reach this

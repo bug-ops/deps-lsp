@@ -179,7 +179,7 @@ impl Transport {
         )
     }
 
-    /// The transport for one [`HttpCache::transport_for_origin`]-pinned origin: a plain
+    /// The transport for one [`HttpCache::transport_for_origin`](super::HttpCache::transport_for_origin)-pinned origin: a plain
     /// [`AddrGuard::Baseline`] resolver, paired with [`trusted_origin_redirect_policy`] instead
     /// of [`redirect_policy`] — that policy pins by URL prefix, which already subsumes the
     /// blocked-host hop check.

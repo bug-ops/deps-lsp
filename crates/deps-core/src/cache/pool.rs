@@ -31,7 +31,7 @@ impl HttpCache {
     /// [`CacheTier::Pinned`] transport (issue #561/#562) — building and pooling one on first
     /// use, keyed by `(trusted_origin, CacheTier::Pinned { .. })` so an authenticated and
     /// unauthenticated transport for the same origin share one pool entry; the credential state
-    /// lives in the request's [`RequestAuth`], not the transport.
+    /// lives in the request's [`RequestAuth`](super::RequestAuth), not the transport.
     pub(super) fn transport_for_pinned(&self, trusted_origin: &TrustedPrefix) -> Transport {
         let snapshot = self.policy.snapshot();
         let digest = pinned_digest(trusted_origin, snapshot.level);

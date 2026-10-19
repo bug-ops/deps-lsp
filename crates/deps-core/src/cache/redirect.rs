@@ -25,10 +25,10 @@ impl RedirectScope {
     }
 }
 
-/// Redirect policy for a [`Transport`]'s client, parameterized by the [`AddrGuard`] tier that
+/// Redirect policy for a [`Transport`](super::transport::Transport)'s client, parameterized by the [`AddrGuard`] tier that
 /// client enforces.
 ///
-/// [`ensure_https`] only validates the *initial* request URL; a `3xx` response can still
+/// [`ensure_https`](super::guard::ensure_https) only validates the *initial* request URL; a `3xx` response can still
 /// redirect the actual connection anywhere, including down to plain HTTP — or, per spec
 /// `.local/specs/023-cargo-custom-registries/spec.md` NFR-003/plan-1b §1.1, straight to a
 /// cloud metadata endpoint or other host no legitimate registry redirect ever targets. This
@@ -54,7 +54,7 @@ impl RedirectScope {
 ///
 /// This only classifies the redirect target's URL string, not its DNS-resolved address — that
 /// residual gap (issue #449, "D1" in PR #447's plan) is closed for the name-hop case by
-/// [`BlockedAddrResolver`], which `build_client_inner` wires into every client this module
+/// [`BlockedAddrResolver`](super::resolver::BlockedAddrResolver), which `build_client_inner` wires into every client this module
 /// builds: a redirect hop reuses the same `Client`, so its target's resolved address is
 /// validated too, for free (FR-007).
 ///
@@ -87,7 +87,7 @@ pub(super) fn redirect_policy(guard: AddrGuard, scope: RedirectScope) -> reqwest
     })
 }
 
-/// Redirect policy for a [`HttpCache::transport_for_origin`]-scoped client.
+/// Redirect policy for a [`HttpCache::transport_for_origin`](super::HttpCache::transport_for_origin)-scoped client.
 ///
 /// Stops any hop unless [`TrustedPrefix::permits`] accepts it — origin equality (scheme, host
 /// and port must match exactly) **and** the hop's path lying at or under the prefix's own path,

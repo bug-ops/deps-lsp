@@ -26,8 +26,8 @@ impl HttpCache {
     ///
     /// [`CacheTier::WorkspaceDeclared`] folds in a policy digit so a policy tightening can never
     /// serve a body fetched under a looser policy (C5): the digit comes from `tier`'s own
-    /// snapshot — the exact same value the paired [`Transport`]'s [`AddrGuard`] enforced for
-    /// this request, taken together at [`Transport::workspace`] construction time — never a
+    /// snapshot — the exact same value the paired [`Transport`](super::transport::Transport)'s [`AddrGuard`](super::guard::AddrGuard) enforced for
+    /// this request, taken together at [`Transport::workspace`](super::transport::Transport::workspace) construction time — never a
     /// separate live `self.policy` read, which would open a read-skew window between the guard
     /// that let a fetch through and the key that fetch's body gets stored under.
     ///
@@ -37,9 +37,9 @@ impl HttpCache {
     ///
     /// `auth` is folded in for [`CacheTier::Pinned`] and [`CacheTier::Baseline`], always with a
     /// one-char variant tag (`A` credentialed, `U` anonymous) ahead of the partition, so the
-    /// same [`CredentialPartition`] used with and without a credential yields two entries. A
+    /// same [`CredentialPartition`](super::CredentialPartition) used with and without a credential yields two entries. A
     /// partition is encoded as a tag (`0`/`1`) before a fixed-width hex field rather than a `0`
-    /// sentinel: [`auth_digest`] is a non-cryptographic hash, so
+    /// sentinel: `auth_digest` is a non-cryptographic hash, so
     /// `Some(0)` is a legitimate digest (issue #1025). Every field is fixed width, so no tag or
     /// field can be confused with part of another field or `url`.
     pub(super) fn cache_key<'a>(
@@ -200,7 +200,7 @@ impl HttpCache {
     /// since it depends on the byte budget as well as the count target.
     ///
     /// Every byte-count adjustment here is a relative `fetch_sub` applied to
-    /// exactly the entry [`DashMap::remove`] actually returned — never a
+    /// exactly the entry [`DashMap::remove`](dashmap::DashMap::remove) actually returned — never a
     /// snapshot-then-absolute-`store` of a locally computed total. The
     /// latter would silently discard any [`Self::store_entry`] delta that
     /// lands between this method's start and its end (lost-update race), and

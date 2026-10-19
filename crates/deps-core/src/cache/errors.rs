@@ -52,7 +52,7 @@ pub(super) fn confirmed_rate_limit_exhaustion(
 
 /// Fixed, registry-neutral message for a confirmed rate-limit-exhaustion classification
 /// (#1295, critic S1). Deliberately generic — [`http_status_error`] runs at every
-/// [`HttpCache`] live-fetch site, shared by all 14 ecosystems, not only GitHub, so it must not
+/// [`HttpCache`](super::HttpCache) live-fetch site, shared by all 14 ecosystems, not only GitHub, so it must not
 /// assume a GitHub-specific remedy (`GITHUB_TOKEN`) applies to whichever registry actually
 /// sent the confirming evidence. A GitHub-aware caller
 /// (`crate::github::classify_tags_fetch_error`) swaps in the GitHub-specific hint on top of
