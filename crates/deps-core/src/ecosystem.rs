@@ -221,7 +221,7 @@ macro_rules! ecosystem_ids {
         ///
         /// assert!("unknown".parse::<EcosystemId>().is_err());
         /// ```
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
         pub enum EcosystemId {
             $( $(#[$vmeta])* $variant, )+
         }

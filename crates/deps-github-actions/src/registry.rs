@@ -408,6 +408,14 @@ fn attach_publish_times(
 impl deps_core::Registry for GithubActionsRegistry {
     deps_core::impl_registry_versions_method!(get_versions);
 
+    fn endpoint_for(
+        &self,
+        _name: &deps_core::PackageName,
+        _source: &deps_core::DependencySource,
+    ) -> deps_core::RegistryEndpoint {
+        self.github.endpoint()
+    }
+
     fn get_versions_with<'a>(
         &'a self,
         name: &'a deps_core::PackageName,
@@ -1686,5 +1694,28 @@ mod tests {
                 "{body}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use std::sync::Arc;
+
+    use deps_core::github::GITHUB_API;
+    use deps_core::{
+        DependencySource, EgressTier, HttpCache, PackageName, Registry, RegistryEndpoint,
+    };
+
+    use super::GithubActionsRegistry;
+
+    #[test]
+    fn endpoint_for_is_the_github_api_on_baseline_egress() {
+        let registry = GithubActionsRegistry::new(Arc::new(HttpCache::new()));
+        let expected = RegistryEndpoint::from_base_str(GITHUB_API, EgressTier::Baseline);
+
+        let endpoint = registry.endpoint_for(&PackageName::new("o/r"), &DependencySource::Registry);
+
+        assert_ne!(expected, RegistryEndpoint::Unresolved);
+        assert_eq!(endpoint, expected);
     }
 }

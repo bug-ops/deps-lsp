@@ -42,6 +42,8 @@ use crate::formatter::NuGetFormatter;
 use crate::lockfile::NuGetLockParser;
 use crate::parser::NuGetParseResult;
 use crate::registry::NuGetRegistry;
+#[cfg(feature = "lsp-responses")]
+use crate::registry::NuGetRoute;
 
 #[cfg(feature = "lsp-responses")]
 mod lsp;
@@ -338,9 +340,13 @@ impl Ecosystem for NuGetEcosystem {
             // (unresolvable) alternate index, or any other source kind, skips the fetch
             // entirely rather than risk that leak.
             let unlisted_client: Option<Arc<NuGetRegistry>> = match dep.source() {
-                DependencySource::Registry => Some(Arc::clone(&self.registry)),
-                DependencySource::AlternateRegistry { index, .. } => {
-                    self.registry.alternate_client(&index)
+                source @ (DependencySource::Registry
+                | DependencySource::AlternateRegistry { .. }) => {
+                    match self.registry.route(&source) {
+                        NuGetRoute::Public => Some(Arc::clone(&self.registry)),
+                        NuGetRoute::Chain(client) => Some(client),
+                        NuGetRoute::Unregistered => None,
+                    }
                 }
                 _ => None,
             };
@@ -351,6 +357,8 @@ impl Ecosystem for NuGetEcosystem {
             let dep_source = dep.source();
             let normalized_name = self.formatter().normalize_package_name(dep.name());
             let unlisted_fetch = await_interactive_fetch(
+                // The root, not the chain head: only it resolves the alternate source's key.
+                self.registry.as_ref(),
                 unlisted_client.unlisted_versions(dep.name().as_str()),
                 InteractiveFetchRequest::new(
                     versions,

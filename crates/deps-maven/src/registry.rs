@@ -8,7 +8,7 @@ use crate::version::compare_versions;
 use bytes::Bytes;
 use dashmap::DashMap;
 use deps_core::{
-    DepsError, HttpCache, PublishTime, Result,
+    DependencySource, DepsError, EgressTier, HttpCache, PublishTime, RegistryEndpoint, Result,
     lsp_helpers::warn_rejected_value,
     maven_coordinate_path,
     net_policy::{RedactedUrl, redact_parse_error_for_log},
@@ -18,7 +18,7 @@ use quick_xml::reader::Reader;
 use serde::Deserialize;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 const MAVEN_REPO_BASE: &str = "https://repo1.maven.org/maven2";
@@ -159,10 +159,58 @@ fn is_google_group(group_id: &str) -> bool {
 /// );
 /// ```
 pub fn repo_base_for_group(group_id: &str) -> &'static str {
-    if is_google_group(group_id) {
-        GOOGLE_MAVEN_BASE
-    } else {
-        MAVEN_REPO_BASE
+    match MavenRoute::of(group_id) {
+        MavenRoute::Google => GOOGLE_MAVEN_BASE,
+        MavenRoute::Central => MAVEN_REPO_BASE,
+    }
+}
+
+/// Which repositories serve a group's `maven-metadata.xml`: the single routing decision shared
+/// by [`metadata_urls`] and
+/// [`Registry::endpoint_for`](deps_core::Registry::endpoint_for), so they cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MavenRoute {
+    /// Google-hosted groups: Google Maven only, they are not mirrored elsewhere.
+    Google,
+    /// Everything else: Maven Central, then the Gradle Plugin Portal as fallback.
+    Central,
+}
+
+impl MavenRoute {
+    fn of(group_id: &str) -> Self {
+        if is_google_group(group_id) {
+            Self::Google
+        } else {
+            Self::Central
+        }
+    }
+
+    /// The repository bases `get_metadata` tries, in order.
+    const fn bases(self) -> &'static [&'static str] {
+        match self {
+            Self::Google => &[GOOGLE_MAVEN_BASE],
+            Self::Central => &[MAVEN_REPO_BASE, GRADLE_PLUGIN_PORTAL_BASE],
+        }
+    }
+
+    /// Every base is reached through the system-proxy `get_cached` path.
+    fn endpoint(self) -> RegistryEndpoint {
+        static GOOGLE: LazyLock<RegistryEndpoint> =
+            LazyLock::new(|| MavenRoute::Google.compute_endpoint());
+        static CENTRAL: LazyLock<RegistryEndpoint> =
+            LazyLock::new(|| MavenRoute::Central.compute_endpoint());
+        match self {
+            Self::Google => *GOOGLE,
+            Self::Central => *CENTRAL,
+        }
+    }
+
+    fn compute_endpoint(self) -> RegistryEndpoint {
+        RegistryEndpoint::chain_from_strs(
+            self.bases()
+                .iter()
+                .map(|base| (*base, EgressTier::Baseline)),
+        )
     }
 }
 
@@ -739,8 +787,23 @@ where
 /// 404, so hover correctly renders nothing for a rejected coordinate instead of a broken
 /// "package not found" section (#366).
 fn metadata_urls(name: &str) -> Result<Vec<String>> {
+    Ok(match route(name)? {
+        None => vec![],
+        Some((route, coordinate_path)) => route
+            .bases()
+            .iter()
+            .map(|base| format!("{base}/{coordinate_path}/maven-metadata.xml"))
+            .collect(),
+    })
+}
+
+/// Routes `name` (`groupId:artifactId`) and validates its coordinate path.
+///
+/// `Ok(None)` for a name with no `:` separator; `Err(PackageNotFound)` for a coordinate
+/// [`maven_coordinate_path`] rejects (see [`metadata_urls`]).
+fn route(name: &str) -> Result<Option<(MavenRoute, String)>> {
     let Some((group_id, artifact_id)) = name.split_once(':') else {
-        return Ok(vec![]);
+        return Ok(None);
     };
     let Some(coordinate_path) = maven_coordinate_path(group_id, artifact_id) else {
         warn_rejected_value(
@@ -753,17 +816,7 @@ fn metadata_urls(name: &str) -> Result<Vec<String>> {
             registry: REGISTRY,
         });
     };
-    let primary_base = repo_base_for_group(group_id);
-    let primary = format!("{primary_base}/{coordinate_path}/maven-metadata.xml");
-
-    Ok(if is_google_group(group_id) {
-        vec![primary]
-    } else {
-        vec![
-            primary,
-            format!("{GRADLE_PLUGIN_PORTAL_BASE}/{coordinate_path}/maven-metadata.xml"),
-        ]
-    })
+    Ok(Some((MavenRoute::of(group_id), coordinate_path)))
 }
 
 /// Parses maven-metadata.xml to extract version list and the authoritative release version.
@@ -1022,6 +1075,19 @@ impl deps_core::Registry for MavenCentralRegistry {
                 .await?;
             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
         })
+    }
+
+    fn endpoint_for(
+        &self,
+        name: &deps_core::PackageName,
+        _source: &DependencySource,
+    ) -> RegistryEndpoint {
+        // Group-only routing: a coordinate `route` rejects fails locally, so it is not re-checked.
+        name.as_str()
+            .split_once(':')
+            .map_or(RegistryEndpoint::Unresolved, |(group_id, _)| {
+                MavenRoute::of(group_id).endpoint()
+            })
     }
 
     fn search_raw<'a>(
@@ -2796,5 +2862,48 @@ mod tests {
 
         assert!(!versions.is_empty());
         assert!(versions.iter().all(|v| v.published_at.is_none()));
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use std::sync::Arc;
+
+    use deps_core::{
+        DependencySource, EgressTier, HttpCache, PackageName, Registry, RegistryEndpoint,
+    };
+
+    use super::{
+        GOOGLE_MAVEN_BASE, GRADLE_PLUGIN_PORTAL_BASE, MAVEN_REPO_BASE, MavenCentralRegistry,
+    };
+
+    /// The gate keys its breaker on `endpoint_for`, so a coordinate must get the endpoint of
+    /// the repositories `get_metadata` tries for it: Google Maven alone for a Google group,
+    /// Central then the Plugin Portal otherwise, and nothing for a name without a group.
+    #[test]
+    fn endpoint_for_follows_the_metadata_routing() {
+        let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
+        let endpoint = |name: &str| {
+            registry.endpoint_for(&PackageName::new(name), &DependencySource::Registry)
+        };
+
+        let google = endpoint("androidx.core:core-ktx");
+        let central = endpoint("org.apache.commons:commons-lang3");
+
+        assert_eq!(
+            google,
+            RegistryEndpoint::from_base_str(GOOGLE_MAVEN_BASE, EgressTier::Baseline)
+        );
+        assert_eq!(
+            central,
+            RegistryEndpoint::chain_from_strs([
+                (MAVEN_REPO_BASE, EgressTier::Baseline),
+                (GRADLE_PLUGIN_PORTAL_BASE, EgressTier::Baseline),
+            ])
+        );
+        assert_ne!(google, central);
+        assert_eq!(endpoint("com.google.firebase:firebase-auth"), google);
+        assert_eq!(endpoint("com.google.guava:guava"), central);
+        assert_eq!(endpoint("no-separator"), RegistryEndpoint::Unresolved);
     }
 }

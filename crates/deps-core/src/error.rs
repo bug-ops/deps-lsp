@@ -151,6 +151,43 @@ impl SanitizedRegistryError {
             Inner::Transport(_) => None,
         }
     }
+
+    /// Whether this failure says anything about the registry endpoint.
+    ///
+    /// A DNS-preflight failure and a request that could not even be built are local, so they
+    /// are [`ErrorOrigin::Unattributed`]; any other transport error (connect, timeout, TLS,
+    /// body) is [`ErrorOrigin::Endpoint`].
+    #[must_use]
+    pub fn origin(&self) -> ErrorOrigin {
+        match &self.0 {
+            Inner::Resolution(_) => ErrorOrigin::Unattributed,
+            Inner::Transport(error) if error.is_builder() => ErrorOrigin::Unattributed,
+            Inner::Transport(_) => ErrorOrigin::Endpoint,
+        }
+    }
+}
+
+/// Where a [`DepsError`] was produced, which decides whether it counts as evidence about the
+/// registry endpoint it was fetched from.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::DepsError;
+/// use deps_core::error::ErrorOrigin;
+///
+/// let status = DepsError::HttpStatus { url: "https://registry.example/x".into(), status: 503 };
+/// assert_eq!(status.origin(), ErrorOrigin::Endpoint);
+/// assert_eq!(DepsError::CacheError("poisoned".into()).origin(), ErrorOrigin::Unattributed);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorOrigin {
+    /// The endpoint produced or caused the error: a response was received, or the transport to
+    /// it failed.
+    Endpoint,
+    /// The error was raised locally (policy, parsing, cache, configuration) or cannot be tied
+    /// to the endpoint. It neither vouches for the endpoint nor accuses it.
+    Unattributed,
 }
 
 impl From<reqwest::Error> for SanitizedRegistryError {
@@ -902,6 +939,68 @@ impl DepsError {
             Self::PaginatedListIncomplete { .. } => (None, "paginated-list-incomplete"),
             Self::HostBlockedByPolicy { .. } => (None, "host-blocked-by-policy"),
             Self::CredentialOutsideTrustedPrefix { .. } => (None, "credential-scope"),
+        }
+    }
+
+    /// Whether this error is evidence about the registry endpoint that was fetched from.
+    ///
+    /// [`Self::RateLimited`] uses `source_status` as a proxy for provenance: a confirmed 429
+    /// rebuilt without a status (GitLab) reads as [`ErrorOrigin::Unattributed`], which only
+    /// shifts the verdict toward inconclusive. [`Self::PackageNotFound`] is deliberately
+    /// unattributed: it does not record whether the registry or a local mapping produced it.
+    ///
+    /// **Exhaustive by design, no wildcard arm** (#1244 — see [`Self::fetch_failure`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::DepsError;
+    /// use deps_core::error::ErrorOrigin;
+    ///
+    /// let halted = DepsError::ChainResolutionHalted;
+    /// assert_eq!(halted.origin(), ErrorOrigin::Endpoint);
+    /// ```
+    #[must_use]
+    pub fn origin(&self) -> ErrorOrigin {
+        // TODO(critic): typed not-found provenance on PackageNotFound so a remote 404 vouches for the endpoint again
+        match self {
+            Self::HttpStatus { .. }
+            | Self::ApiResponse { .. }
+            | Self::ResponseTooLarge { .. }
+            | Self::ChainResolutionHalted
+            | Self::RateLimited {
+                source_status: Some(_),
+                ..
+            }
+            | Self::PaginatedListIncomplete {
+                reason:
+                    PaginationStop::PageCap
+                    | PaginationStop::InvalidNextLink
+                    | PaginationStop::TimeBudget,
+                ..
+            } => ErrorOrigin::Endpoint,
+            Self::RegistryError { source, .. } => source.origin(),
+            Self::RateLimited {
+                source_status: None,
+                ..
+            }
+            | Self::PaginatedListIncomplete {
+                reason: PaginationStop::NoConsistentSnapshot,
+                ..
+            }
+            | Self::ParseError { .. }
+            | Self::CacheError(_)
+            | Self::PackageNotFound { .. }
+            | Self::InvalidVersionReq(_)
+            | Self::InvalidPackageName(_)
+            | Self::Io(_)
+            | Self::Json(_)
+            | Self::UnsupportedEcosystem(_)
+            | Self::AmbiguousEcosystem(_)
+            | Self::InvalidUri(_)
+            | Self::Offline { .. }
+            | Self::HostBlockedByPolicy { .. }
+            | Self::CredentialOutsideTrustedPrefix { .. } => ErrorOrigin::Unattributed,
         }
     }
 }
@@ -1681,6 +1780,131 @@ mod tests {
                  index"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn origin_table() {
+        let endpoint = [
+            DepsError::HttpStatus {
+                url: "https://r.example/x".into(),
+                status: 500,
+            },
+            DepsError::ResponseTooLarge {
+                url: "https://r.example/x".into(),
+                limit: 1,
+            },
+            DepsError::ChainResolutionHalted,
+            DepsError::PaginatedListIncomplete {
+                package: "p".into(),
+                registry: "gitlab",
+                reason: PaginationStop::PageCap,
+            },
+            DepsError::RateLimited {
+                message: "m".into(),
+                verified: RateLimitEvidence::Confirmed,
+                source_status: Some(429),
+            },
+        ];
+        for error in endpoint {
+            assert_eq!(error.origin(), ErrorOrigin::Endpoint, "{error:?}");
+        }
+
+        let unattributed = [
+            DepsError::CacheError("x".into()),
+            DepsError::PackageNotFound {
+                package: "p".into(),
+                registry: "npm",
+            },
+            DepsError::PaginatedListIncomplete {
+                package: "p".into(),
+                registry: "gitlab",
+                reason: PaginationStop::NoConsistentSnapshot,
+            },
+            DepsError::rate_limited("m", RateLimitEvidence::Confirmed),
+            DepsError::Offline {
+                url: "https://r.example/x".into(),
+            },
+        ];
+        for error in unattributed {
+            assert_eq!(error.origin(), ErrorOrigin::Unattributed, "{error:?}");
+        }
+    }
+
+    /// Every `DepsError` variant has a declared origin, so a new variant's class is a decision
+    /// made here and not a default.
+    #[test]
+    fn origin_of_every_remaining_variant() {
+        let api = serde_json::from_str::<serde_json::Value>("{bad}").unwrap_err();
+        let endpoint = [
+            DepsError::ApiResponse {
+                package: "p".into(),
+                registry: "npm",
+                source: api,
+            },
+            DepsError::PaginatedListIncomplete {
+                package: "p".into(),
+                registry: "gitlab",
+                reason: PaginationStop::InvalidNextLink,
+            },
+            DepsError::PaginatedListIncomplete {
+                package: "p".into(),
+                registry: "gitlab",
+                reason: PaginationStop::TimeBudget,
+            },
+        ];
+        for error in endpoint {
+            assert_eq!(error.origin(), ErrorOrigin::Endpoint, "{error:?}");
+        }
+
+        let unattributed = [
+            DepsError::parse_error("Cargo.toml", &"bad"),
+            DepsError::Io(std::io::Error::other("io")),
+            DepsError::Json(serde_json::from_str::<serde_json::Value>("{bad}").unwrap_err()),
+            DepsError::InvalidVersionReq("bad".into()),
+            DepsError::InvalidPackageName(InvalidPackageName::new("bad")),
+            DepsError::UnsupportedEcosystem("x".into()),
+            DepsError::AmbiguousEcosystem("x".into()),
+            DepsError::InvalidUri("x".into()),
+            DepsError::HostBlockedByPolicy {
+                url: "https://r.example/".into(),
+                block: BlockedHost::new(HostClass::PrivateV4, WorkspaceRegistryAccess::PublicOnly),
+            },
+            DepsError::CredentialOutsideTrustedPrefix {
+                url: "https://r.example/".into(),
+            },
+        ];
+        for error in unattributed {
+            assert_eq!(error.origin(), ErrorOrigin::Unattributed, "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_that_is_not_a_builder_error_is_endpoint() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("http://127.0.0.1:{port}/pkg");
+        let refused = reqwest::Client::new().get(&url).send().await.unwrap_err();
+        let error = DepsError::RegistryError {
+            package: url.as_str().into(),
+            source: refused.into(),
+        };
+
+        assert_eq!(error.origin(), ErrorOrigin::Endpoint);
+    }
+
+    #[test]
+    fn registry_error_origin_follows_the_sanitized_cause() {
+        let builder = reqwest::Client::new().get("not a url").build().unwrap_err();
+        assert_eq!(
+            SanitizedRegistryError::from(builder).origin(),
+            ErrorOrigin::Unattributed
+        );
+        assert_eq!(
+            SanitizedRegistryError::from(ResolutionFailure::LookupFailed).origin(),
+            ErrorOrigin::Unattributed
         );
     }
 }

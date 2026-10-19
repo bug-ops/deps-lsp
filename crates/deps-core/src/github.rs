@@ -235,6 +235,9 @@ pub struct GithubTagsClient {
     /// `{api_base}/`, precomputed once so [`Self::fetch_authenticated`] never re-`format!`s
     /// it per request; the trailing slash is load-bearing (see that method's docs).
     trusted_origin: TrustedPrefix,
+    /// The endpoint [`Self::endpoint`] reports, computed on first use (the fingerprint hashes
+    /// URL text, which the gate would otherwise redo for every lookup).
+    endpoint: crate::CachedEndpoint,
 }
 
 /// `{base}/` as a [`TrustedPrefix`]; the trailing slash is load-bearing (see
@@ -278,6 +281,7 @@ impl GithubTagsClient {
             has_token,
             trusted_origin: api_prefix(GITHUB_API),
             api_base: GITHUB_API.to_string(),
+            endpoint: crate::CachedEndpoint::default(),
         }
     }
 
@@ -302,6 +306,7 @@ impl GithubTagsClient {
             has_token,
             trusted_origin: api_prefix(&api_base),
             api_base,
+            endpoint: crate::CachedEndpoint::default(),
         }
     }
 
@@ -316,6 +321,26 @@ impl GithubTagsClient {
     #[must_use]
     pub fn api_base(&self) -> &str {
         &self.api_base
+    }
+
+    /// The network path every fetch of this client travels: [`Self::api_base`] through the
+    /// baseline egress, since all requests use the trusted-origin pinned path.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::{HttpCache, RegistryEndpoint};
+    /// use deps_core::github::GithubTagsClient;
+    /// use std::sync::Arc;
+    ///
+    /// let client = GithubTagsClient::new(Arc::new(HttpCache::new()));
+    /// assert_ne!(client.endpoint(), RegistryEndpoint::Unresolved);
+    /// ```
+    #[must_use]
+    pub fn endpoint(&self) -> crate::RegistryEndpoint {
+        self.endpoint.get_or_compute(|| {
+            crate::RegistryEndpoint::from_base_str(&self.api_base, crate::EgressTier::Baseline)
+        })
     }
 
     /// The request auth for each call: the bearer credential, or anonymous when no token is set.

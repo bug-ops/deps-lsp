@@ -18,7 +18,9 @@ use deps_core::github::{
 };
 use deps_core::parser::DependencySource;
 use deps_core::registry::{CapResult, KeyShape, register_capped_with_occupied};
-use deps_core::{DepsError, EcosystemId, HttpCache, PublishTime, Result, Version};
+use deps_core::{
+    DepsError, EcosystemId, HttpCache, PublishTime, RegistryEndpoint, Result, Version,
+};
 use serde::Deserialize;
 use std::any::Any;
 use std::collections::HashMap;
@@ -133,11 +135,16 @@ impl SwiftRegistry {
             registry: SE_0292_REGISTRY,
         };
         let identity = RegistryIdentity::parse(name).ok_or_else(not_found)?;
-        let Some(client) = self.alternates.get(index).map(|entry| Arc::clone(&entry)) else {
+        let Some(client) = self.alternate(index) else {
             tracing::debug!("no SE-0292 client registered for the dependency's registry");
             return Err(not_found());
         };
         client.list_releases(&identity, lookup).await
+    }
+
+    /// The registered SE-0292 client for `index`, if any.
+    fn alternate(&self, index: &str) -> Option<Arc<PackageRegistryClient>> {
+        self.alternates.get(index).map(|entry| Arc::clone(&entry))
     }
 
     /// Fetches all semver-tagged versions for a package.
@@ -502,6 +509,20 @@ impl deps_core::Registry for SwiftRegistry {
                 .await?;
             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
         })
+    }
+
+    fn endpoint_for(
+        &self,
+        _name: &deps_core::PackageName,
+        source: &DependencySource,
+    ) -> RegistryEndpoint {
+        match route(source) {
+            Route::GithubTags => self.github.endpoint(),
+            Route::Se0292(index) => self
+                .alternate(index)
+                .map_or(RegistryEndpoint::Unresolved, |client| client.endpoint()),
+            Route::NotFetchable => RegistryEndpoint::Unresolved,
+        }
     }
 
     fn get_latest_matching_from<'a>(
@@ -1389,5 +1410,53 @@ mod tests {
             "the raw, un-escaped payload (with its literal CR/ESC bytes) must not survive \
              intact: {log:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use std::sync::Arc;
+
+    use deps_core::{
+        DependencySource, EgressTier, HttpCache, PackageName, Registry, RegistryEndpoint,
+    };
+
+    use super::SwiftRegistry;
+
+    /// The gate keys its breaker on `endpoint_for`, so it must follow `route`: GitHub for
+    /// `Registry`, and nothing for an unregistered SE-0292 index or an unfetchable source.
+    #[test]
+    fn endpoint_for_follows_the_route() {
+        let registry = SwiftRegistry::new(Arc::new(HttpCache::new()));
+        let name = PackageName::new("owner/repo");
+        let endpoint = |source: &DependencySource| registry.endpoint_for(&name, source);
+        let unregistered = DependencySource::AlternateRegistry {
+            index: "https://swift.example/api".to_string(),
+            mirrors_crates_io: false,
+        };
+        let git = DependencySource::Git {
+            url: "https://example.com/r.git".to_string(),
+            rev: None,
+        };
+
+        assert_eq!(
+            endpoint(&DependencySource::Registry),
+            RegistryEndpoint::from_base_str(deps_core::github::GITHUB_API, EgressTier::Baseline)
+        );
+        let url = crate::config::SwiftRegistryUrl::for_test(
+            "https://swift.example/api",
+            crate::config::RegistryTrust::WorkspaceDeclared,
+        );
+        registry.register_alternate(crate::config::ResolvedSwiftRegistry { url, auth: None });
+        assert_eq!(
+            endpoint(&unregistered),
+            RegistryEndpoint::from_base_str("https://swift.example/api", EgressTier::Guarded)
+        );
+        let unknown = DependencySource::AlternateRegistry {
+            index: "https://other.example/api".to_string(),
+            mirrors_crates_io: false,
+        };
+        assert_eq!(endpoint(&unknown), RegistryEndpoint::Unresolved);
+        assert_eq!(endpoint(&git), RegistryEndpoint::Unresolved);
     }
 }

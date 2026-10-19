@@ -434,6 +434,7 @@ pub enum SearchBehavior {
 pub struct MockRegistry {
     versions: Vec<MockVersion>,
     search: Option<SearchBehavior>,
+    endpoint: Option<crate::RegistryEndpoint>,
 }
 
 impl MockRegistry {
@@ -457,6 +458,13 @@ impl MockRegistry {
     #[must_use]
     pub fn with_search(mut self, search: SearchBehavior) -> Self {
         self.search = Some(search);
+        self
+    }
+
+    /// Sets what [`crate::Registry::endpoint_for`] reports; unresolved by default.
+    #[must_use]
+    pub fn with_endpoint(mut self, endpoint: crate::RegistryEndpoint) -> Self {
+        self.endpoint = Some(endpoint);
         self
     }
 }
@@ -518,6 +526,14 @@ impl crate::Registry for MockRegistry {
         versions
             .iter()
             .position(|v| !v.removal_status().blocks_resolution())
+    }
+
+    fn endpoint_for(
+        &self,
+        _name: &crate::PackageName,
+        _source: &crate::DependencySource,
+    ) -> crate::RegistryEndpoint {
+        self.endpoint.unwrap_or(crate::RegistryEndpoint::Unresolved)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

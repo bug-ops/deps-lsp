@@ -1,6 +1,6 @@
 use crate::error::{DepsError, Result};
 use crate::parser::DependencySource;
-use crate::{ConcreteVersion, EcosystemId, PackageName, VersionReq};
+use crate::{ConcreteVersion, EcosystemId, PackageName, RegistryEndpoint, VersionReq};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use std::any::Any;
@@ -271,6 +271,21 @@ pub trait Registry: Send + Sync {
     ) -> BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
         let _ = source;
         self.get_latest_matching(name, req, selection_context)
+    }
+
+    /// The network path a fetch of `name` from `source` travels, for fail-fast circuit
+    /// breaking of interactive awaits.
+    ///
+    /// Two lookups with equal [`RegistryEndpoint::Resolved`] values must travel the same
+    /// network path, so a stall of one is evidence about the other. An implementor must derive
+    /// the result from the same routing decision [`get_versions_from`](Self::get_versions_from)
+    /// takes, never from a parallel rule, so the two cannot drift apart.
+    ///
+    /// Default: [`RegistryEndpoint::Unresolved`], which scopes the breaker to the manifest and
+    /// source instead of sharing it, the conservative choice for a registry that cannot say.
+    fn endpoint_for(&self, name: &PackageName, source: &DependencySource) -> RegistryEndpoint {
+        let _ = (name, source);
+        RegistryEndpoint::Unresolved
     }
 
     /// Searches for packages by name or keywords.
@@ -1071,6 +1086,28 @@ pub trait Metadata: Send + Sync {
 
     /// Downcast to concrete metadata type
     fn as_any(&self) -> &dyn Any;
+}
+
+/// The error for a dependency whose `AlternateRegistry` index has no registered client.
+///
+/// Every routing registry answers this way instead of falling back to the public registry,
+/// which would send a private package name there.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::PackageName;
+/// use deps_core::registry::alternate_not_registered;
+///
+/// let error = alternate_not_registered(&PackageName::new("internal"));
+/// assert!(error.is_not_found());
+/// ```
+#[must_use]
+pub fn alternate_not_registered(name: &PackageName) -> DepsError {
+    DepsError::PackageNotFound {
+        package: name.as_str().into(),
+        registry: "alternate registry (not registered)",
+    }
 }
 
 /// Shared capacity ceiling for a per-ecosystem alternate-registry client map.

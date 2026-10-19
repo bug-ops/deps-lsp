@@ -8,6 +8,8 @@
 
 use bytes::Bytes;
 use dashmap::DashSet;
+use deps_core::EgressTier;
+use deps_core::RegistryEndpoint;
 use deps_core::cache::{CredentialHeader, HttpCache, RequestAuth};
 use deps_core::error::{DepsError, RateLimitEvidence, Result};
 use serde::Deserialize;
@@ -138,11 +140,20 @@ fn parse_gitlab_page<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<Vec<
 
 /// The transport tier a GitLab host is reached through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GitlabRoute {
+enum GitlabTransport {
     /// `gitlab.com` or the environment-bound token host: baseline trusted-origin tier.
     OperatorTrusted,
     /// Any other host: guarded pinned tier, never a credential.
     WorkspaceDeclared,
+}
+
+impl GitlabTransport {
+    const fn egress(self) -> EgressTier {
+        match self {
+            Self::OperatorTrusted => EgressTier::Baseline,
+            Self::WorkspaceDeclared => EgressTier::Guarded,
+        }
+    }
 }
 
 /// Client for fetching repository tags and project releases from a per-call GitLab
@@ -276,7 +287,7 @@ impl GitlabApiClient {
     async fn fetch_pinned(&self, host: &GitlabHost, url: &str) -> Result<Bytes> {
         let prefix = host.trusted_prefix();
         match self.route_for(host) {
-            GitlabRoute::OperatorTrusted => {
+            GitlabTransport::OperatorTrusted => {
                 let auth = self
                     .token
                     .token_for(host)
@@ -290,12 +301,22 @@ impl GitlabApiClient {
                     .get_cached_trusted_origin(url, prefix, auth, None)
                     .await
             }
-            GitlabRoute::WorkspaceDeclared => {
+            GitlabTransport::WorkspaceDeclared => {
                 self.cache
                     .get_cached_pinned(url, prefix, RequestAuth::ANONYMOUS, None)
                     .await
             }
         }
+    }
+
+    /// The network path every request to `host` travels: its trusted prefix through the egress
+    /// of the transport tier `route_for` picks.
+    #[must_use]
+    pub fn endpoint(&self, host: &GitlabHost) -> RegistryEndpoint {
+        RegistryEndpoint::base(
+            host.trusted_prefix().as_url(),
+            self.route_for(host).egress(),
+        )
     }
 
     /// Which transport tier `host` is fetched through.
@@ -304,11 +325,11 @@ impl GitlabApiClient {
     /// environment, so they use the baseline trusted-origin tier (system proxy, never-a-registry
     /// floor); every other host is workspace-declared and uses the guarded pinned tier without a
     /// credential.
-    fn route_for(&self, host: &GitlabHost) -> GitlabRoute {
+    fn route_for(&self, host: &GitlabHost) -> GitlabTransport {
         if *host == GitlabHost::gitlab_com() || self.token.bound_host() == Some(host) {
-            GitlabRoute::OperatorTrusted
+            GitlabTransport::OperatorTrusted
         } else {
-            GitlabRoute::WorkspaceDeclared
+            GitlabTransport::WorkspaceDeclared
         }
     }
 }
@@ -338,23 +359,23 @@ mod tests {
 
         assert_eq!(
             unbound.route_for(&host("gitlab.com")),
-            GitlabRoute::OperatorTrusted
+            GitlabTransport::OperatorTrusted
         );
         assert_eq!(
             bound.route_for(&host("gitlab.com")),
-            GitlabRoute::OperatorTrusted
+            GitlabTransport::OperatorTrusted
         );
         assert_eq!(
             bound.route_for(&host("gitlab.corp")),
-            GitlabRoute::OperatorTrusted
+            GitlabTransport::OperatorTrusted
         );
         assert_eq!(
             bound.route_for(&host("gitlab.other")),
-            GitlabRoute::WorkspaceDeclared
+            GitlabTransport::WorkspaceDeclared
         );
         assert_eq!(
             unbound.route_for(&host("gitlab.corp")),
-            GitlabRoute::WorkspaceDeclared
+            GitlabTransport::WorkspaceDeclared
         );
     }
 

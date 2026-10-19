@@ -12,8 +12,9 @@ use dashmap::DashMap;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
-    DepsError, EcosystemId, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, RequestHeader, Result,
-    SafePathSegment, SegmentedPathName, not_found_or as core_not_found_or,
+    DepsError, EcosystemId, EgressTier, HOVER_RECENT_VERSIONS, HttpCache, PublishTime,
+    RegistryEndpoint, RequestHeader, Result, SafePathSegment, SegmentedPathName,
+    not_found_or as core_not_found_or,
     parser::DependencySource,
     registry::{KeyShape, register_capped},
 };
@@ -87,6 +88,28 @@ enum NpmRegistryTier {
     /// [`deps_core::net_policy::RegistryAccessPolicy`] (mirrors
     /// `deps-cargo/src/sparse.rs`'s identical `WorkspaceDeclared` routing).
     WorkspaceDeclared,
+}
+
+impl NpmRegistryTier {
+    /// The egress of the transport this tier fetches through (the `get_cached*` family for
+    /// `Public`, the guarded `get_cached_workspace*` family for `WorkspaceDeclared`).
+    const fn egress(self) -> EgressTier {
+        match self {
+            Self::Public => EgressTier::Baseline,
+            Self::WorkspaceDeclared => EgressTier::Guarded,
+        }
+    }
+}
+
+/// Where a dependency source is fetched from: the single dispatch decision shared by version
+/// lookups and [`NpmRegistry::endpoint_for`](deps_core::Registry::endpoint_for), so they cannot
+/// drift apart.
+enum NpmRoute {
+    Public,
+    Alternate(Arc<NpmRegistry>),
+    /// An alternate index with no registered client. It never falls back to the public
+    /// registry: that would send a private package name to `registry.npmjs.org`.
+    Unregistered,
 }
 
 /// Base URL for package pages on npmjs.com
@@ -203,6 +226,9 @@ pub struct NpmRegistry {
     /// via [`Self::with_base`]. Never carries a trailing slash (see
     /// [`crate::config::NpmRegistryIndex`]'s normalization).
     registry_base: String,
+    /// The endpoint [`Self::endpoint`] reports, computed on first use (the fingerprint hashes
+    /// URL text, which the gate would otherwise redo for every lookup).
+    endpoint: deps_core::CachedEndpoint,
     /// Derived publish-time maps, keyed by package name. Separate from `cache`: the full
     /// packument body itself is never retained anywhere (fetched via
     /// `HttpCache::get_transport_only_with_headers`, which bypasses the entry-map cache) —
@@ -270,6 +296,7 @@ impl NpmRegistry {
         Self {
             cache,
             registry_base,
+            endpoint: deps_core::CachedEndpoint::default(),
             publish_times: Arc::new(DashMap::new()),
             tier,
             alternates: Arc::new(DashMap::new()),
@@ -309,6 +336,21 @@ impl NpmRegistry {
     #[must_use]
     pub fn alternate_client(&self, index: &str) -> Option<Arc<Self>> {
         self.alternates.get(index).map(|entry| Arc::clone(&entry))
+    }
+
+    fn route(&self, source: &DependencySource) -> NpmRoute {
+        match source {
+            DependencySource::AlternateRegistry { index, .. } => self
+                .alternate_client(index)
+                .map_or(NpmRoute::Unregistered, NpmRoute::Alternate),
+            _ => NpmRoute::Public,
+        }
+    }
+
+    fn endpoint(&self) -> RegistryEndpoint {
+        self.endpoint.get_or_compute(|| {
+            RegistryEndpoint::from_base_str(&self.registry_base, self.tier.egress())
+        })
     }
 
     /// Fetches all versions for a package from the npm registry.
@@ -797,22 +839,28 @@ impl deps_core::Registry for NpmRegistry {
         freshness: deps_core::FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            match source {
-                DependencySource::AlternateRegistry { index, .. } => {
-                    match self.alternate_client(index) {
-                        Some(client) => {
-                            deps_core::Registry::get_versions_with(client.as_ref(), name, freshness)
-                                .await
-                        }
-                        None => Err(DepsError::PackageNotFound {
-                            package: name.as_str().into(),
-                            registry: "alternate registry (not registered)",
-                        }),
-                    }
+            match self.route(source) {
+                NpmRoute::Alternate(client) => {
+                    deps_core::Registry::get_versions_with(client.as_ref(), name, freshness).await
                 }
-                _ => deps_core::Registry::get_versions_with(self, name, freshness).await,
+                NpmRoute::Public => {
+                    deps_core::Registry::get_versions_with(self, name, freshness).await
+                }
+                NpmRoute::Unregistered => Err(deps_core::registry::alternate_not_registered(name)),
             }
         })
+    }
+
+    fn endpoint_for(
+        &self,
+        _name: &deps_core::PackageName,
+        source: &DependencySource,
+    ) -> RegistryEndpoint {
+        match self.route(source) {
+            NpmRoute::Public => self.endpoint(),
+            NpmRoute::Alternate(client) => client.endpoint(),
+            NpmRoute::Unregistered => RegistryEndpoint::Unresolved,
+        }
     }
 
     fn get_latest_matching<'a>(
@@ -844,28 +892,21 @@ impl deps_core::Registry for NpmRegistry {
         _selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            match source {
-                DependencySource::AlternateRegistry { index, .. } => {
-                    match self.alternate_client(index) {
-                        Some(client) => {
-                            let version = client
-                                .get_latest_matching(name.as_str(), req.as_str())
-                                .await?;
-                            Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
-                        }
-                        None => Err(DepsError::PackageNotFound {
-                            package: name.as_str().into(),
-                            registry: "alternate registry (not registered)",
-                        }),
-                    }
-                }
-                _ => {
-                    let version = self
+            let version = match self.route(source) {
+                NpmRoute::Alternate(client) => {
+                    client
                         .get_latest_matching(name.as_str(), req.as_str())
-                        .await?;
-                    Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+                        .await?
                 }
-            }
+                NpmRoute::Public => {
+                    self.get_latest_matching(name.as_str(), req.as_str())
+                        .await?
+                }
+                NpmRoute::Unregistered => {
+                    return Err(deps_core::registry::alternate_not_registered(name));
+                }
+            };
+            Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
         })
     }
 
@@ -2834,6 +2875,46 @@ mod tests {
         let second = registry.alternate_client(index.as_str()).unwrap();
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// The gate keys its breaker on `endpoint_for`, so it must follow `get_versions_from`'s
+    /// route: the public registry, one endpoint per `.npmrc` scope registry (two registries of
+    /// one host and different paths are different endpoints), and nothing for an unregistered
+    /// index.
+    #[test]
+    fn test_endpoint_for_follows_the_dispatch_route() {
+        use deps_core::{EgressTier, PackageName, Registry, RegistryEndpoint};
+
+        let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
+        let local = alternate_index("https://art.corp/api/npm/local/");
+        let remote = alternate_index("https://art.corp/api/npm/remote/");
+        registry.register_alternate(local.clone());
+        registry.register_alternate(remote.clone());
+        let name = PackageName::new("@corp/pkg");
+        let via = |index: &crate::config::NpmRegistryIndex| {
+            registry.endpoint_for(
+                &name,
+                &DependencySource::AlternateRegistry {
+                    index: index.as_str().to_string(),
+                    mirrors_crates_io: false,
+                },
+            )
+        };
+
+        let public = registry.endpoint_for(&name, &DependencySource::Registry);
+
+        assert_eq!(
+            public,
+            RegistryEndpoint::from_base_str("https://registry.npmjs.org", EgressTier::Baseline)
+        );
+        assert_eq!(
+            via(&local),
+            RegistryEndpoint::from_base_str(local.as_str(), EgressTier::Guarded)
+        );
+        assert_ne!(via(&local), via(&remote));
+        assert_ne!(via(&local), public);
+        let unregistered = alternate_index("https://elsewhere.corp/npm/");
+        assert_eq!(via(&unregistered), RegistryEndpoint::Unresolved);
     }
 
     #[test]

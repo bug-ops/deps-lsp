@@ -1,9 +1,10 @@
 //! The source-qualified failure memo behind [`InteractiveFetchGate`].
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use super::key::InteractiveFetchKey;
+use super::key::LookupKey;
 use super::{InteractiveFetchGate, NoLiveList};
 use crate::cache_policy::evict_expired_then_oldest_at;
 
@@ -38,6 +39,8 @@ pub(super) struct InteractiveRecord {
 pub(super) enum FastFail {
     Seeded,
     Memo,
+    /// Another lookup kind of the same package on the same route already failed interactively.
+    Route,
 }
 
 impl FastFail {
@@ -45,6 +48,7 @@ impl FastFail {
         match self {
             Self::Seeded => "seeded from background outcome",
             Self::Memo => "interactive failure memo",
+            Self::Route => "interactive failure of the package's version list",
         }
     }
 }
@@ -56,16 +60,46 @@ pub(super) enum Decision {
 }
 
 impl InteractiveFetchGate {
+    /// The memo's verdict for `lookup`: its own slot first, then the slot of any kind its
+    /// policy honors (an interactive failure only; a seeded record never crosses kinds).
     pub(super) fn decide(
         &self,
-        key: &InteractiveFetchKey,
+        lookup: &Arc<LookupKey>,
+        background_failure_known: bool,
+        generation: u64,
+        now: Instant,
+    ) -> Decision {
+        let own = self.decide_slot(lookup, background_failure_known, generation, now);
+        if let Decision::Degrade(..) = own {
+            return own;
+        }
+        let Some(honored) = lookup.kind().memo_policy().honors else {
+            return own;
+        };
+        if self.interactive_failure_active(&lookup.in_slot(honored), now) {
+            Decision::Degrade(NoLiveList::Unverified, FastFail::Route)
+        } else {
+            own
+        }
+    }
+
+    fn interactive_failure_active(&self, key: &LookupKey, now: Instant) -> bool {
+        self.memo.get(key).is_some_and(|record| {
+            record.state == RecordState::InteractiveFailed
+                && now.saturating_duration_since(record.recorded_at) < INTERACTIVE_FAILURE_TTL
+        })
+    }
+
+    fn decide_slot(
+        &self,
+        lookup: &Arc<LookupKey>,
         background_failure_known: bool,
         generation: u64,
         now: Instant,
     ) -> Decision {
         let existing = self
             .memo
-            .get(key)
+            .get(&**lookup)
             .map(|record| (record.state, record.recorded_at));
         match existing {
             Some((state, recorded_at))
@@ -75,13 +109,8 @@ impl InteractiveFetchGate {
                     RecordState::SeededFromOutcome if background_failure_known => {
                         Decision::Degrade(NoLiveList::Unverified, FastFail::Seeded)
                     }
-                    RecordState::SeededFromOutcome => {
-                        // The background fetch has since succeeded (or been cleared).
-                        self.memo.remove_if(key, |_, record| {
-                            record.state == RecordState::SeededFromOutcome
-                        });
-                        Decision::Live
-                    }
+                    // A shared key's seed may be another manifest's: only the TTL retires it.
+                    RecordState::SeededFromOutcome => Decision::Live,
                     RecordState::InteractiveFailed => {
                         Decision::Degrade(NoLiveList::Unverified, FastFail::Memo)
                     }
@@ -90,14 +119,14 @@ impl InteractiveFetchGate {
             }
             Some(_) => Decision::Live,
             None if background_failure_known => {
-                self.record(key, RecordState::SeededFromOutcome, generation);
+                self.record(lookup, RecordState::SeededFromOutcome, generation);
                 Decision::Degrade(NoLiveList::Unverified, FastFail::Seeded)
             }
             None => Decision::Live,
         }
     }
 
-    fn insert(&self, key: InteractiveFetchKey, state: RecordState, now: Instant) {
+    fn insert(&self, key: &Arc<LookupKey>, state: RecordState, now: Instant) {
         evict_expired_then_oldest_at(
             &self.memo,
             INTERACTIVE_MEMO_CAP,
@@ -106,7 +135,7 @@ impl InteractiveFetchGate {
             |_| INTERACTIVE_FAILURE_TTL,
         );
         self.memo.insert(
-            key,
+            Arc::clone(key),
             InteractiveRecord {
                 state,
                 recorded_at: now,
@@ -115,11 +144,19 @@ impl InteractiveFetchGate {
     }
 
     /// Writes `state` unless [`Self::invalidate_all`] ran since `generation` was read.
-    pub(super) fn record(&self, key: &InteractiveFetchKey, state: RecordState, generation: u64) {
-        self.insert(key.clone(), state, super::now());
+    pub(super) fn record(&self, key: &Arc<LookupKey>, state: RecordState, generation: u64) {
+        self.insert(key, state, super::now());
         // Re-checked after the insert: an invalidation between a pre-check and the insert
         // would otherwise leave a stale record behind.
         if self.generation.load(Ordering::SeqCst) != generation {
+            self.memo.remove(&**key);
+        }
+    }
+
+    /// Drops a record that a live answer made moot. The common case has none, and a miss must
+    /// not take a shard write lock.
+    pub(super) fn forget_record(&self, key: &LookupKey) {
+        if self.memo.contains_key(key) {
             self.memo.remove(key);
         }
     }

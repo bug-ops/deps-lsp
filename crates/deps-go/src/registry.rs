@@ -33,7 +33,8 @@ use deps_core::parser::DependencySource;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
-    DepsError, EcosystemId, HttpCache, InvalidPackageName, Result, is_dot_segment,
+    DepsError, EcosystemId, EgressTier, HttpCache, InvalidPackageName, RegistryEndpoint, Result,
+    is_dot_segment,
     lsp_helpers::warn_rejected_value,
     not_found_or as core_not_found_or,
     registry::{KeyShape, register_capped},
@@ -67,6 +68,29 @@ enum GoRegistryTier {
     /// or issuing any request. Both sentinels are observably identical: phase 1 has no
     /// direct-VCS resolution mechanism, and `off` disallows downloads outright.
     Terminal,
+}
+
+impl GoRegistryTier {
+    /// The egress of the transport this tier fetches through, or `None` for `Terminal`, which
+    /// short-circuits before any request.
+    const fn egress(self) -> Option<EgressTier> {
+        match self {
+            Self::Public => Some(EgressTier::Baseline),
+            Self::WorkspaceDeclared => Some(EgressTier::Guarded),
+            Self::Terminal => None,
+        }
+    }
+}
+
+/// Where a dependency source is fetched from: the single dispatch decision shared by version
+/// lookups and [`Registry::endpoint_for`](deps_core::Registry::endpoint_for), so they cannot
+/// drift apart.
+enum GoRoute {
+    Public,
+    Chain(Arc<GoRegistry>),
+    /// An alternate index with no registered chain. It never falls back to
+    /// `proxy.golang.org`: that would send a private module path to the public proxy.
+    Unregistered,
 }
 
 /// Maximum allowed module path length to prevent DoS
@@ -226,6 +250,9 @@ pub struct GoRegistry {
     /// resolved [`GoProxyUrl`]'s own URL for a `$GOENV`-declared `GOPROXY` hop; unused
     /// (never reached — every fetch short-circuits first) for a `Terminal`-tier client.
     proxy_base: String,
+    /// The endpoint [`Self::endpoint`] reports, computed on first use (the fingerprint hashes
+    /// URL text, which the gate would otherwise redo for every lookup).
+    endpoint: deps_core::CachedEndpoint,
     /// Which transport/behavior this client uses (spec 034 FR-004/FR-006/FR-011).
     tier: GoRegistryTier,
     /// Resolved chain-router clients, keyed by [`GoProxyChain::key`] (a `GOPROXY` chain) or
@@ -248,6 +275,7 @@ impl GoRegistry {
         Self {
             cache,
             proxy_base: PROXY_BASE.to_string(),
+            endpoint: deps_core::CachedEndpoint::default(),
             tier: GoRegistryTier::Public,
             alternates: Arc::new(DashMap::new()),
             fallback_chain: Vec::new(),
@@ -276,6 +304,7 @@ impl GoRegistry {
         Self {
             cache,
             proxy_base,
+            endpoint: deps_core::CachedEndpoint::default(),
             tier: GoRegistryTier::Public,
             alternates: Arc::new(DashMap::new()),
             fallback_chain: Vec::new(),
@@ -298,6 +327,7 @@ impl GoRegistry {
         Self {
             cache,
             proxy_base: url.as_str().to_string(),
+            endpoint: deps_core::CachedEndpoint::default(),
             tier: GoRegistryTier::WorkspaceDeclared,
             alternates: Arc::new(DashMap::new()),
             fallback_chain,
@@ -313,6 +343,7 @@ impl GoRegistry {
         Self {
             cache,
             proxy_base: String::new(),
+            endpoint: deps_core::CachedEndpoint::default(),
             tier: GoRegistryTier::Terminal,
             alternates: Arc::new(DashMap::new()),
             fallback_chain,
@@ -387,6 +418,28 @@ impl GoRegistry {
     #[must_use]
     pub fn alternate_client(&self, index: &str) -> Option<Arc<Self>> {
         self.alternates.get(index).map(|entry| Arc::clone(&entry))
+    }
+
+    fn route(&self, source: &DependencySource) -> GoRoute {
+        match source {
+            DependencySource::AlternateRegistry { index, .. } => self
+                .alternate_client(index)
+                .map_or(GoRoute::Unregistered, GoRoute::Chain),
+            _ => GoRoute::Public,
+        }
+    }
+
+    /// The network path of a lookup through this client: the proxy base of each hop that makes
+    /// a request, in walk order. A `Terminal` hop makes none, so a chain of only `Terminal`
+    /// hops has no endpoint.
+    fn endpoint(&self) -> RegistryEndpoint {
+        self.endpoint.get_or_compute(|| {
+            RegistryEndpoint::chain_from_strs(
+                std::iter::once(self)
+                    .chain(self.fallback_chain.iter().map(|(_, hop)| hop.as_ref()))
+                    .filter_map(|hop| Some((hop.proxy_base.as_str(), hop.tier.egress()?))),
+            )
+        })
     }
 
     /// S3 (spec 034 review): tries `/@latest` first — mirrors the public-path
@@ -836,25 +889,32 @@ impl deps_core::Registry for GoRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Version>>>>
     {
         Box::pin(async move {
-            match source {
-                DependencySource::AlternateRegistry { index, .. } => {
-                    match self.alternate_client(index) {
-                        Some(client) => {
-                            let versions = client.get_versions_chained(name.as_str()).await?;
-                            Ok(versions
-                                .into_iter()
-                                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                                .collect())
-                        }
-                        None => Err(DepsError::PackageNotFound {
-                            package: name.as_str().into(),
-                            registry: "alternate registry (not registered)",
-                        }),
-                    }
+            match self.route(source) {
+                GoRoute::Chain(client) => {
+                    let versions = client.get_versions_chained(name.as_str()).await?;
+                    Ok(versions
+                        .into_iter()
+                        .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                        .collect())
                 }
-                _ => deps_core::Registry::get_versions_with(self, name, freshness).await,
+                GoRoute::Public => {
+                    deps_core::Registry::get_versions_with(self, name, freshness).await
+                }
+                GoRoute::Unregistered => Err(deps_core::registry::alternate_not_registered(name)),
             }
         })
+    }
+
+    fn endpoint_for(
+        &self,
+        _name: &deps_core::PackageName,
+        source: &DependencySource,
+    ) -> RegistryEndpoint {
+        match self.route(source) {
+            GoRoute::Public => self.endpoint(),
+            GoRoute::Chain(client) => client.endpoint(),
+            GoRoute::Unregistered => RegistryEndpoint::Unresolved,
+        }
     }
 
     /// `get_versions_from`'s `get_latest_matching`-shaped counterpart — same dispatch, same
@@ -875,36 +935,29 @@ impl deps_core::Registry for GoRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn deps_core::Version>>>>
     {
         Box::pin(async move {
-            match source {
-                DependencySource::AlternateRegistry { index, .. } => {
-                    match self.alternate_client(index) {
-                        Some(client) => {
-                            let versions: Vec<Box<dyn deps_core::Version>> = client
-                                .get_versions_chained(name.as_str())
-                                .await?
-                                .into_iter()
-                                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-                                .collect();
-                            let idx = deps_core::Registry::select_latest_matching(
-                                client.as_ref(),
-                                &versions,
-                                req,
-                                selection_context,
-                            );
-                            Ok(idx.and_then(|i| versions.into_iter().nth(i)))
-                        }
-                        None => Err(DepsError::PackageNotFound {
-                            package: name.as_str().into(),
-                            registry: "alternate registry (not registered)",
-                        }),
-                    }
+            match self.route(source) {
+                GoRoute::Chain(client) => {
+                    let versions: Vec<Box<dyn deps_core::Version>> = client
+                        .get_versions_chained(name.as_str())
+                        .await?
+                        .into_iter()
+                        .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                        .collect();
+                    let idx = deps_core::Registry::select_latest_matching(
+                        client.as_ref(),
+                        &versions,
+                        req,
+                        selection_context,
+                    );
+                    Ok(idx.and_then(|i| versions.into_iter().nth(i)))
                 }
                 // Preserves the plain public-registry path's existing `/@latest`
                 // fast-path/`/@v/list`-fallback behavior unchanged (NFR-005).
-                _ => {
+                GoRoute::Public => {
                     deps_core::Registry::get_latest_matching(self, name, req, selection_context)
                         .await
                 }
+                GoRoute::Unregistered => Err(deps_core::registry::alternate_not_registered(name)),
             }
         })
     }
@@ -1635,6 +1688,50 @@ mod tests {
         GoRegistry::register_alternate(&root, &chain);
         assert!(root.alternate_client("go-proxy:test").is_some());
         assert!(root.alternate_client("nonexistent").is_none());
+    }
+
+    /// The gate keys its breaker on `endpoint_for`, so it must follow `get_versions_from`'s
+    /// route: the public proxy, the proxy hops of a registered chain in order, skipping the
+    /// `direct`/`off` sentinels that make no request, and nothing for an unregistered chain or
+    /// one made only of sentinels.
+    #[test]
+    fn test_endpoint_for_follows_the_dispatch_route() {
+        use deps_core::{EgressTier, PackageName, Registry, RegistryEndpoint};
+
+        let root = Arc::new(GoRegistry::new(Arc::new(HttpCache::new())));
+        let policy = all_policy();
+        let register = |key: &str, hops: Vec<GoProxyHop>| {
+            let chain = GoProxyChain {
+                key: key.to_string(),
+                hops,
+                ..Default::default()
+            };
+            GoRegistry::register_alternate(&root, &chain);
+        };
+        let (a, b) = ("https://a.example", "https://b.example");
+        register("one", vec![url_hop(a, &policy)]);
+        register("with-direct", vec![url_hop(a, &policy), GoProxyHop::Direct]);
+        register("two", vec![url_hop(a, &policy), url_hop(b, &policy)]);
+        register("only-off", vec![GoProxyHop::Off]);
+        let name = PackageName::new("example.com/mod");
+        let endpoint = |source: &DependencySource| root.endpoint_for(&name, source);
+        let via = |key: &str| DependencySource::AlternateRegistry {
+            index: key.to_string(),
+            mirrors_crates_io: false,
+        };
+
+        assert_eq!(
+            endpoint(&DependencySource::Registry),
+            RegistryEndpoint::from_base_str("https://proxy.golang.org", EgressTier::Baseline)
+        );
+        assert_eq!(
+            endpoint(&via("one")),
+            RegistryEndpoint::from_base_str(a, EgressTier::Guarded)
+        );
+        assert_eq!(endpoint(&via("with-direct")), endpoint(&via("one")));
+        assert_ne!(endpoint(&via("two")), endpoint(&via("one")));
+        assert_eq!(endpoint(&via("only-off")), RegistryEndpoint::Unresolved);
+        assert_eq!(endpoint(&via("missing")), RegistryEndpoint::Unresolved);
     }
 
     #[test]
