@@ -44,7 +44,7 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 
 ```toml
 [dependencies]
-deps-core = "2.0"
+deps-core = "3.0"
 ```
 
 > [!IMPORTANT]
