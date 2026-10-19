@@ -10,7 +10,7 @@ tags:
   - cross-ecosystem
   - deps-core
 created: 2026-10-19
-status: specify
+status: implemented
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"

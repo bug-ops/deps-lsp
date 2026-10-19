@@ -59,7 +59,7 @@ or `.github/actions/<name>/`, issue #706), and implements `deps_core::Ecosystem`
 
 ```toml
 [dependencies]
-deps-github-actions = "2.0"
+deps-github-actions = "3.0"
 ```
 
 > [!IMPORTANT]

@@ -132,7 +132,7 @@ To drive the `check` pipeline programmatically:
 
 ```toml
 [dependencies]
-deps-cli = "2.0"
+deps-cli = "3.0"
 ```
 
 > [!IMPORTANT]

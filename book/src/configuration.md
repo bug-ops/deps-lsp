@@ -315,3 +315,22 @@ An invalid `GITLAB_TOKEN_HOST` disables the token entirely. See
 > **Tip:** Increase `fetch_timeout_secs` for slower networks. The per-dependency timeout prevents
 > slow packages from blocking others. Cold start support ensures LSP features work immediately
 > when your IDE restores previously opened files.
+
+### Slow or unreachable registries
+
+Hover and code actions wait only a bounded time for a registry answer, then fall back to what is
+already cached, so a registry outage never freezes the editor.
+
+- **Shared waits.** Concurrent hovers and code actions for the same package share one registry
+  lookup instead of each starting their own.
+- **Failure memo.** After a lookup fails or times out, repeat requests for that package answer
+  immediately from the degraded view (no live version data, no speculative quick fixes) until the
+  memo expires.
+- **Endpoint circuit breaker.** Once two *different* packages are slow on the same registry
+  endpoint with no answer from it in between, hover skips that endpoint for 30 seconds, then lets
+  one probe request through. A single slow package never trips it, and any registry answer
+  (including a genuine "not found") keeps it closed.
+
+The breaker is keyed by the real network path, not the ecosystem. One dead npm scope, Maven
+repository, NuGet feed or alternate Cargo index does not block the public packages in the same
+manifest, and two manifests that use the same dead registry share one breaker.

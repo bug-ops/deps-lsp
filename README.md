@@ -4,7 +4,7 @@
 [![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/bug-ops/deps-lsp/badge)](https://scorecard.dev/viewer/?uri=github.com/bug-ops/deps-lsp)
 [![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ)](https://codecov.io/gh/bug-ops/deps-lsp)
-[![Tests](https://img.shields.io/badge/tests-8065%20passed-brightgreen)](https://github.com/bug-ops/deps-lsp/actions)
+[![Tests](https://img.shields.io/badge/tests-8985%20passed-brightgreen)](https://github.com/bug-ops/deps-lsp/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.98-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
@@ -216,6 +216,14 @@ never to a host taken from editor settings:
 export GITLAB_TOKEN=glpat-...
 export GITLAB_TOKEN_HOST=gitlab.mycorp.dev   # self-hosted only; omit for gitlab.com
 ```
+
+### Private registries and proxies
+
+Repository settings alone never reach private registry hosts: `registries.workspace_registries = "all"`
+only reaches hosts and CIDR ranges you list in the `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` environment
+variable. Registry traffic for repository-declared hosts bypasses the system proxy unless you set
+`DEPS_LSP_WORKSPACE_REGISTRY_PROXY=proxy`. Details are in the book's
+[**Configuration**](https://bug-ops.github.io/deps-lsp/configuration.html) chapter.
 
 ## Development
 
