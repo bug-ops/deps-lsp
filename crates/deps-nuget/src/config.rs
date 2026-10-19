@@ -5664,6 +5664,7 @@ mod tests {
         assert_ne!(key(&trusted), key(&OperatorRegistries::default()));
     }
 
+    #[cfg(not(windows))]
     fn candidates(env: &deps_core::net_policy::MapEnv, home: &OperatorPath) -> Vec<OperatorPath> {
         user_profile_config_candidates(Some(home), env)
     }
