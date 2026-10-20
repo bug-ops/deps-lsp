@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use deps_core::HOVER_RECENT_VERSIONS;
 use deps_core::cache::{CachedResponse, CredentialHeader, CredentialPartition, RequestAuth};
-use deps_core::error::PaginationStop;
+use deps_core::error::{LookupBudget, PaginationStop};
 use deps_core::github::{normalize_tag, semver_tags_newest_first};
 use deps_core::keychain_credentials::{KeychainGeneration, KeychainSnapshot};
 use deps_core::pagination::{NextPage, next_page};
@@ -664,9 +664,7 @@ impl PackageRegistryClient {
         .unwrap_or_else(|_elapsed| {
             if merged_pages.load(Ordering::Relaxed) == 0 {
                 // A slow first page is an ordinary transient failure, not a partial list.
-                Err(DepsError::CacheError(
-                    "registry did not answer within the time budget".into(),
-                ))
+                Err(DepsError::BudgetExceeded(LookupBudget::Time))
             } else {
                 Err(incomplete_list(&package, PaginationStop::TimeBudget))
             }
@@ -1649,6 +1647,9 @@ mod tests {
     fn test_only_incomplete_and_transient_failures_fall_back_to_the_memo() {
         assert!(may_fall_back_to_last_good(&DepsError::CacheError(
             "x".into()
+        )));
+        assert!(may_fall_back_to_last_good(&DepsError::BudgetExceeded(
+            LookupBudget::Time
         )));
         assert!(may_fall_back_to_last_good(&incomplete_list(
             &package("Acme.Net"),

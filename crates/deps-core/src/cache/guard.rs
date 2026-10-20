@@ -61,10 +61,9 @@ pub(super) fn ensure_https(url: &str) -> Result<()> {
     if is_loopback_host(url) {
         return Ok(());
     }
-    Err(DepsError::CacheError(format!(
-        "URL must use HTTPS: {}",
-        RedactedUrl::new(url)
-    )))
+    Err(DepsError::InsecureScheme {
+        url: RedactedUrl::new(url),
+    })
 }
 
 /// True when a redirect hop moves from an `https` origin to a plain `http` one.

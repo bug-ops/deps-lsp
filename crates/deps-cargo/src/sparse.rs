@@ -175,8 +175,8 @@ struct IndexEntry {
 
 /// Parses newline-delimited JSON from a sparse index.
 fn parse_index_json(data: &[u8]) -> Result<Vec<CargoVersion>> {
-    let content = std::str::from_utf8(data)
-        .map_err(|e| DepsError::CacheError(format!("Invalid UTF-8: {e}")))?;
+    let content =
+        std::str::from_utf8(data).map_err(|e| DepsError::parse_error("sparse index", &e))?;
 
     // Cache each parsed Version alongside its CargoVersion to avoid re-parsing for the sort.
     let mut versions_with_parsed: Vec<(CargoVersion, Version)> = content

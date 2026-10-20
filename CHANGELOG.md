@@ -10,12 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **deps-core**: `observe_ecosystem` and `observe_endpoint` tag orchestration fetches so interactive hovers can see requests another task has on the wire (#PR)
 - **deps-core**: `CachedEndpoint::new` is a `const fn` (#PR)
+- **deps-core**: `DepsError::{InsecureScheme, BudgetExceeded, RecentlyFailed}` and `error::LookupBudget` give the non-cache failures that used `CacheError` their own variants (#PR)
 
 ### Fixed
 - **deps-core, deps-nuget, deps-github-actions**: the endpoint circuit breaker opens again for hovers that wait on a background fetch's request (NuGet service index, GitHub Actions per-repository lock); stall is measured as busy time (#PR)
 - **deps-core**: the blocked-registry diagnostic and warning say "is never a registry host" for floor-blocked hosts instead of blaming `registries.workspace_registries` (#PR)
 
 ### Changed
+- **deps-core, deps-cargo, deps-maven, deps-swift, deps-lsp**: a non-https request URL is `InsecureScheme` and now reads as an actionable configuration fault, malformed index and metadata responses are `ParseError`, budget overruns and search suppression have typed variants, and document size limits are `Io` errors of kind `FileTooLarge`; `CacheError` stays only for Cargo's fail-closed credential arm (#PR)
 - **deps-core, deps-bundler, deps-dart, deps-composer**: single-flight claims are held by a `Leader` handle, `cache::Transport` fields are private, the operator-registry trust rule parses each URL once with one canonical form, and Bundler, Dart and Composer cache their endpoint (#PR)
 - **release**: crates.io publishing runs through `scripts/publish-crates.sh`, which publishes in dependency order (#1868)
 

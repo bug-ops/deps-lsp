@@ -9,6 +9,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use deps_core::{
     DependencySource, DepsError, EgressTier, HttpCache, PublishTime, RegistryEndpoint, Result,
+    error::LookupBudget,
     lsp_helpers::warn_rejected_value,
     maven_coordinate_path,
     net_policy::{RedactedUrl, redact_parse_error_for_log},
@@ -543,10 +544,7 @@ impl MavenCentralRegistry {
         );
 
         if is_recently_failed(&self.recent_search_failures, query) {
-            return Err(DepsError::CacheError(format!(
-                "solrsearch recently failed for query {query:?}, \
-                 skipping duplicate live attempt"
-            )));
+            return Err(DepsError::RecentlyFailed);
         }
 
         let url = search_url(query);
@@ -745,9 +743,7 @@ where
             }
             Err(_) => {
                 tracing::debug!(attempt = i + 1, timeout = ?attempt_timeout, "solrsearch attempt timed out");
-                last_err = Some(DepsError::CacheError(format!(
-                    "search request timed out after {attempt_timeout:?}"
-                )));
+                last_err = Some(DepsError::BudgetExceeded(LookupBudget::Time));
                 true
             }
         };
@@ -824,11 +820,12 @@ fn route(name: &str) -> Result<Option<(MavenRoute, String)>> {
 ///
 /// # Errors
 ///
-/// Returns `DepsError::CacheError` if the XML is malformed, or if the document exceeds
+/// Returns `DepsError::ParseError` if the XML is malformed, or
+/// `DepsError::BudgetExceeded(LookupBudget::Scan)` if the document exceeds
 /// [`deps_core::xml_bounds::MAX_METADATA_VERSIONS`]/[`deps_core::xml_bounds::MAX_METADATA_BYTES_SCANNED`]
 /// (#698). A malformed-XML error's `Display` text is passed through
 /// [`deps_core::net_policy::redact_parse_error_for_log`] before being wrapped into
-/// `CacheError` (#1249): `quick_xml::Error` can embed the offending tag/attribute name
+/// the `ParseError` (#1249): `quick_xml::Error` can embed the offending tag/attribute name
 /// verbatim, which can itself be credential-shaped when the metadata response body is
 /// attacker-influenced. A truncated `versions` list — whether from silently stopping at a parse error or
 /// from silently breaking out of the scan loop once the budget is exhausted, rather than
@@ -849,9 +846,7 @@ fn parse_metadata_xml(data: &[u8]) -> Result<(Vec<MavenVersion>, Option<String>)
 
     loop {
         if deps_core::xml_bounds::exhausted(versions.len(), reader.buffer_position()) {
-            return Err(DepsError::CacheError(
-                "maven-metadata.xml exceeded the version scan budget".to_string(),
-            ));
+            return Err(DepsError::BudgetExceeded(LookupBudget::Scan));
         }
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => match e.name().as_ref() {
@@ -884,10 +879,10 @@ fn parse_metadata_xml(data: &[u8]) -> Result<(Vec<MavenVersion>, Option<String>)
             }
             Ok(Event::Eof) => break,
             Err(e) => {
-                return Err(DepsError::CacheError(format!(
-                    "malformed maven-metadata.xml: {}",
-                    redact_parse_error_for_log(&e.to_string())
-                )));
+                return Err(DepsError::parse_error(
+                    "maven-metadata.xml",
+                    &redact_parse_error_for_log(&e.to_string()),
+                ));
             }
             _ => {}
         }
@@ -1602,7 +1597,7 @@ mod tests {
 
     /// #1249: `quick_xml`'s `IllFormed::MismatchedEndTag` embeds the raw tag-name text
     /// verbatim in its `Display` output, so a credential-shaped tag name in a malformed
-    /// `maven-metadata.xml` response must be redacted before reaching `DepsError::CacheError`,
+    /// `maven-metadata.xml` response must be redacted before reaching `DepsError::ParseError`,
     /// the same way the `deps-nuget`/`toml_span`/`yaml_rust2` parse-error sites already are
     /// (#1240/#1241/#1243). Mirrors `deps-nuget`'s
     /// `test_parse_mismatched_end_tag_error_redacts_credential`.
@@ -1813,7 +1808,20 @@ mod tests {
 
         let err = registry.search("guava", 20).await.unwrap_err();
 
-        assert!(err.to_string().contains("skipping duplicate live attempt"));
+        assert!(matches!(err, DepsError::RecentlyFailed), "got {err:?}");
+    }
+
+    /// The typed budget and suppression errors stay retry-classified as the `CacheError`s they
+    /// replaced: the search retry loop retries a timed-out attempt and a scan overrun alike.
+    #[test]
+    fn test_typed_budget_errors_stay_retryable() {
+        assert!(is_retryable_error(&DepsError::BudgetExceeded(
+            LookupBudget::Time
+        )));
+        assert!(is_retryable_error(&DepsError::BudgetExceeded(
+            LookupBudget::Scan
+        )));
+        assert!(is_retryable_error(&DepsError::RecentlyFailed));
     }
 
     /// Issue #483 M2: an offline block must not poison `recent_search_failures` — unlike a

@@ -49,7 +49,8 @@ use tracing::Instrument;
 ///
 /// # Errors
 ///
-/// Returns `Err(DepsError::CacheError)` if `content` exceeds `MAX_FILE_SIZE`.
+/// Returns `Err(DepsError::Io)` of kind [`std::io::ErrorKind::FileTooLarge`] if `content`
+/// exceeds `MAX_FILE_SIZE`.
 fn check_content_size(content: &str, uri: &Uri) -> Result<()> {
     let size = content.len() as u64;
     if size > MAX_FILE_SIZE {
@@ -59,8 +60,9 @@ fn check_content_size(content: &str, uri: &Uri) -> Result<()> {
             MAX_FILE_SIZE,
             uri
         );
-        return Err(deps_core::error::DepsError::CacheError(format!(
-            "document too large: {size} bytes (max: {MAX_FILE_SIZE} bytes)"
+        return Err(deps_core::error::DepsError::Io(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("document too large: {size} bytes (max: {MAX_FILE_SIZE} bytes)"),
         )));
     }
     Ok(())
@@ -3057,10 +3059,10 @@ mod tests {
         let content = "a".repeat(MAX_FILE_SIZE as usize + 1);
         let result = check_content_size(&content, &uri);
         match result {
-            Err(deps_core::error::DepsError::CacheError(msg)) => {
-                assert!(msg.contains("too large"), "unexpected message: {msg}");
+            Err(deps_core::error::DepsError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
             }
-            other => panic!("Expected CacheError, got {other:?}"),
+            other => panic!("Expected an Io error, got {other:?}"),
         }
     }
 
@@ -3397,13 +3399,10 @@ serde = "1.0""#;
 
             assert!(result.is_err(), "Oversized content should be rejected");
             match result {
-                Err(deps_core::error::DepsError::CacheError(msg)) => {
-                    assert!(
-                        msg.contains("too large"),
-                        "Error message should indicate size issue: {msg}"
-                    );
+                Err(deps_core::error::DepsError::Io(error)) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
                 }
-                other => panic!("Expected CacheError for oversized content, got {other:?}"),
+                other => panic!("Expected an Io error for oversized content, got {other:?}"),
             }
             assert_eq!(
                 state.document_count(),
@@ -3455,13 +3454,10 @@ serde = "1.0"
 
             assert!(result.is_err(), "Oversized content should be rejected");
             match result {
-                Err(deps_core::error::DepsError::CacheError(msg)) => {
-                    assert!(
-                        msg.contains("too large"),
-                        "Error message should indicate size issue: {msg}"
-                    );
+                Err(deps_core::error::DepsError::Io(error)) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
                 }
-                other => panic!("Expected CacheError for oversized content, got {other:?}"),
+                other => panic!("Expected an Io error for oversized content, got {other:?}"),
             }
             assert_eq!(
                 state.document_count(),

@@ -65,7 +65,9 @@ const LARGE_FILE_THRESHOLD: u64 = 1_000_000; // 1MB
 ///
 /// - `DepsError::InvalidUri` - URI is not a file:// URI
 /// - `DepsError::Io` - File read error (not found, permission denied, etc.)
-/// - `DepsError::CacheError` - Not a regular file, or exceeds `MAX_FILE_SIZE`
+/// - `DepsError::Io` - Also for a path that is not a regular file
+///   ([`std::io::ErrorKind::InvalidInput`]) or exceeds `MAX_FILE_SIZE`
+///   ([`std::io::ErrorKind::FileTooLarge`])
 ///
 /// # Examples
 ///
@@ -105,9 +107,9 @@ pub async fn load_document_from_disk(uri: &Url) -> Result<String> {
             // `deps-cargo/src/parser.rs`).
             if !metadata.is_file() {
                 tracing::warn!("Rejecting non-regular-file document: {:?}", path);
-                return Err(DepsError::CacheError(format!(
-                    "not a regular file: {}",
-                    path.display()
+                return Err(DepsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("not a regular file: {}", path.display()),
                 )));
             }
 
@@ -119,8 +121,9 @@ pub async fn load_document_from_disk(uri: &Url) -> Result<String> {
                     size,
                     MAX_FILE_SIZE
                 );
-                return Err(DepsError::CacheError(format!(
-                    "file too large: {size} bytes (max: {MAX_FILE_SIZE} bytes)"
+                return Err(DepsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::FileTooLarge,
+                    format!("file too large: {size} bytes (max: {MAX_FILE_SIZE} bytes)"),
                 )));
             }
 
@@ -162,7 +165,9 @@ pub async fn load_document_from_disk(uri: &Url) -> Result<String> {
     .await
     .map_err(|e| {
         tracing::error!("document read task for {:?} panicked: {}", path, e);
-        DepsError::CacheError(format!("document read task failed: {e}"))
+        DepsError::Io(std::io::Error::other(format!(
+            "document read task failed: {e}"
+        )))
     })?
     .map_err(|e| {
         match e.kind() {
@@ -193,8 +198,9 @@ pub async fn load_document_from_disk(uri: &Url) -> Result<String> {
                 MAX_FILE_SIZE,
                 path
             );
-            return Err(DepsError::CacheError(format!(
-                "file too large (max: {MAX_FILE_SIZE} bytes)"
+            return Err(DepsError::Io(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!("file too large (max: {MAX_FILE_SIZE} bytes)"),
             )));
         }
     };
@@ -522,18 +528,16 @@ serde = "1.0"
 
             assert!(result.is_err(), "Should reject files > MAX_FILE_SIZE");
             match result {
-                Err(DepsError::CacheError(msg)) => {
-                    assert!(
-                        msg.contains("file too large"),
-                        "Error message should indicate file size issue: {msg}"
-                    );
+                Err(DepsError::Io(error)) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+                    let msg = error.to_string();
                     assert!(
                         msg.contains(&beyond_limit.to_string())
                             || msg.contains(&(beyond_limit + 1).to_string()),
                         "Error should mention actual file size: {msg}"
                     );
                 }
-                _ => panic!("Expected CacheError for oversized file"),
+                _ => panic!("Expected an Io error for oversized file"),
             }
         }
     }
