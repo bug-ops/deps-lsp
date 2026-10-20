@@ -18,9 +18,10 @@
 //! `User`-tier credentials, and rejects `Project`-tier credentials before expansion ever runs);
 //! covered by unit tests only.
 //!
-//! `deps-cargo`'s `Provenance` and its alias-provenance use of `RegistryTrust` are intentionally
-//! separate from this module (env overrides, not interpolation); see that crate's own docs and
-//! #1855.
+//! `deps-cargo` reads its operator-declared registries through the same
+//! [`OperatorRegistries`](crate::net_policy::OperatorRegistries) rule; its `CARGO_REGISTRIES_*`
+//! environment overrides are declared with
+//! [`OperatorRegistries::declared_in_env`](crate::net_policy::OperatorRegistries::declared_in_env).
 
 // TODO(#1459): centralize env-override-by-name trust (cargo CARGO_REGISTRIES_*, future
 // COMPOSER_AUTH/PIP_INDEX_URL) once a second ecosystem needs it
@@ -43,6 +44,8 @@ pub enum OperatorEnvVar {
     XdgConfigHome,
     /// `APPDATA`: the roaming profile directory on Windows.
     AppData,
+    /// `CARGO_HOME`: the directory holding Cargo's operator-owned `config.toml`.
+    CargoHome,
 }
 
 impl OperatorEnvVar {
@@ -53,6 +56,7 @@ impl OperatorEnvVar {
             Self::Goenv => "GOENV",
             Self::XdgConfigHome => "XDG_CONFIG_HOME",
             Self::AppData => "APPDATA",
+            Self::CargoHome => "CARGO_HOME",
         }
     }
 }
@@ -773,6 +777,7 @@ mod tests {
         assert_eq!(OperatorEnvVar::Goenv.name(), "GOENV");
         assert_eq!(OperatorEnvVar::XdgConfigHome.name(), "XDG_CONFIG_HOME");
         assert_eq!(OperatorEnvVar::AppData.name(), "APPDATA");
+        assert_eq!(OperatorEnvVar::CargoHome.name(), "CARGO_HOME");
     }
 
     // --- process_env ---

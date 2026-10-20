@@ -311,9 +311,9 @@ pub enum DepsError {
         source: SanitizedRegistryError,
     },
 
-    /// A failure with no typed home: today only Cargo's fail-closed credential-on-a-workspace-
-    /// declared-index arm (`deps-cargo`'s `IndexTransport::Refused`), which #1855 removes by
-    /// making that state unrepresentable. Every other former producer has its own variant.
+    /// A failure with no typed home. No production path constructs it any more: every former
+    /// producer has its own variant, and Cargo's credential-on-a-workspace-declared-index state is
+    /// unrepresentable (#1855).
     #[error("cache error: {0}")]
     CacheError(String),
 

@@ -51,6 +51,37 @@ async fn test_get_cached_follows_same_scheme_redirect() {
     assert_eq!(result.as_ref(), b"redirected data");
 }
 
+// #1856: an anonymous fetch is deliberately not origin-confined. Operator proxies (Athens in
+// redirect mode, Artifactory redirecting to object storage) answer metadata requests with a
+// cross-origin redirect, and npm and Go `Trusted` fetches rely on following it. The floor and the
+// https-downgrade stop still apply on every hop (see the cloud-metadata test above).
+#[tokio::test]
+async fn test_get_cached_anonymous_follows_cross_origin_redirect() {
+    let mut origin_server = mockito::Server::new_async().await;
+    let mut storage_server = mockito::Server::new_async().await;
+    let target_url = format!("{}/api/target", storage_server.url());
+
+    let _redirect = origin_server
+        .mock("GET", "/api/source")
+        .with_status(302)
+        .with_header("location", &target_url)
+        .create_async()
+        .await;
+    let target = storage_server
+        .mock("GET", "/api/target")
+        .with_status(200)
+        .with_body("from the other origin")
+        .create_async()
+        .await;
+
+    let cache = HttpCache::new();
+    let source_url = format!("{}/api/source", origin_server.url());
+    let result: Bytes = cache.get_cached(&source_url).await.unwrap();
+
+    assert_eq!(result.as_ref(), b"from the other origin");
+    target.assert_async().await;
+}
+
 // Issue #455, test-plan item 4(a): loopback -> loopback. `Baseline` follows the hop
 // (test-cfg carve-out for `Loopback`); `WorkspaceDeclared(PublicOnly)` stops it since
 // `PublicOnly.allows(Loopback) == false` — the contrast proving the tier split is real.

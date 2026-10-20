@@ -29,7 +29,7 @@ related:
 
 ### Problem Statement
 
-Swift decides registry trust from the URL alone: a URL equal to one declared in the user's own `registries.json` is trusted whichever tier declared it in the current workspace. Cargo trusts `$CARGO_HOME`. Go (`$GOENV` `GOPROXY`), npm (`~/.npmrc`) and NuGet (user-profile `NuGet.Config`) read operator-owned files too, yet treat every URL as workspace-declared: they enforce the workspace policy on the operator's own URL and route it through the guarded egress tier (no system proxy, RFC1918 refused under `public_only`). A corporate registry the operator configured is therefore unreachable behind a proxy or on a private address, and the same URL behaves differently per ecosystem.
+Swift decides registry trust from the URL alone: a URL equal to one declared in the user's own `registries.json` is trusted whichever tier declared it in the current workspace. Cargo trusted by alias provenance (`$CARGO_HOME` and `CARGO_REGISTRIES_*` trusted, a repository file not). Go (`$GOENV` `GOPROXY`), npm (`~/.npmrc`) and NuGet (user-profile `NuGet.Config`) read operator-owned files too, yet treat every URL as workspace-declared: they enforce the workspace policy on the operator's own URL and route it through the guarded egress tier (no system proxy, RFC1918 refused under `public_only`). A corporate registry the operator configured is therefore unreachable behind a proxy or on a private address, and the same URL behaves differently per ecosystem.
 
 ### Rule
 
@@ -46,16 +46,18 @@ An operator-owned file is one located through the user's home directory or an **
 - **FR-005**: The operator URL set shall be built from the post-expansion canonical URLs of the operator-owned file, so an entry written with `${VAR}` equals its expanded form.
 - **FR-006**: Where an operator path comes from an environment variable, the system shall accept it only through a closed set of variable names, and only when it is absolute; `GOENV=off` shall disable the Go file and shall not be read as a relative path, and an empty variable shall be treated as unset.
 - **FR-007**: If the user home directory is not absolute, then the system shall report no home.
-- **FR-008**: Go, npm, NuGet and Swift shall apply FR-001 to FR-007 through one shared implementation in `deps-core`.
-- **FR-009**: Cargo shall use the same trust type, but because its trust also gates a credential (`IndexTransport::Refused`, the replace-with fold), Cargo's alias-provenance rule remains (#1855) and is documented as the one exception.
+- **FR-008**: Cargo, Go, npm, NuGet and Swift shall apply FR-001 to FR-007 through one shared implementation in `deps-core`.
+- **FR-009**: Cargo shall classify an index URL by FR-001 against the URLs declared in `$CARGO_HOME/config.toml` (`[registries]` and `[source]` sparse terminals) and in the `CARGO_REGISTRIES_<ALIAS>_INDEX` variables, whichever file or alias named the URL. A relative `CARGO_HOME` is not operator-owned.
+- **FR-010**: Cargo shall decide a registry credential separately from egress: a credential shall be attached only to an index that FR-009 classified Trusted and that was resolved from a `$CARGO_HOME` entry or a `CARGO_REGISTRIES_*` variable, and a `[source]` replace-with chain shall carry a credential only when every link is an operator link. A workspace alias that names an operator URL shall get that URL's Trusted egress and no credential.
 
 ## 3. Decisions and residual risks
 
 - **Accepted relaxation (S3)**: an operator-declared host that resolves to a private address becomes reachable under `public_only`. The operator wrote the URL; the rule makes that provenance impossible for a repository to plant.
 - **`workspace_registries = "off"` (S2)**: it no longer blocks operator-owned sources or a repository URL equal to one of them. It continues to block every other workspace-declared URL.
 - **Env trust boundary (M9)**: an absolute `GOENV` or `XDG_CONFIG_HOME` exported by repository-scoped environment tooling (direnv `.envrc`, mise, per-project shell capture in an editor) counts as operator-owned. That is the environment trust boundary of #1459, gated by the tool's own trust prompt; no code change.
-- **Redirects**: Trusted npm and Go keep any-host redirects (proxies such as Artifactory redirect across origins); NuGet and Swift keep origin-confined fetches. Revisit after live testing.
-- **Out of scope**: Cargo egress/credential split (#1855).
+- **Redirects (#1856)**: a request that can carry a credential is origin-confined. An anonymous Trusted npm or Go metadata fetch *may* leave its origin, because operator proxies (Athens in redirect mode, Artifactory redirecting to object storage) do so on purpose; the never-a-registry floor and the https-downgrade stop still apply on every hop, and a stopped cross-origin hop is logged at WARN with both origins redacted. NuGet and Swift keep their anonymous Trusted fetches origin-confined by choice. Live checks found no cross-origin redirect on the metadata endpoints of goproxy.cn, goproxy.io, proxy.golang.org or registry.npmmirror.com.
+- **Behavior change (#1855)**: the never-a-registry floor now applies to a `$CARGO_HOME` registry, so one on a loopback or link-local host is rejected, as for the other ecosystems.
+- **Out of scope**: binding a Cargo credential by operator-URL equality (as NuGet and Swift do), so a workspace alias naming an operator URL neither loses nor drops the operator's credential.
 
 ## 4. Acceptance
 
@@ -64,4 +66,5 @@ An operator-owned file is one located through the user's home directory or an **
 - `workspace_registries = "off"` with an operator URL is reachable; with a project-only URL it is blocked.
 - Same host, different path from an operator URL stays WorkspaceDeclared and is blocked on RFC1918.
 - `GOENV=off`, a relative `GOENV`, a relative `XDG_CONFIG_HOME` and a relative home each yield no operator tier.
-- A cross-ecosystem consistency test asserts the egress tier for Go, npm, NuGet and Swift under the rule, with Cargo's exception asserted explicitly.
+- A cross-ecosystem consistency test asserts the egress tier for Cargo, Go, npm, NuGet and Swift under the rule.
+- A Cargo credential is never attached to a workspace-declared index, an index reached through a workspace link of a replace-with chain, or a URL outside the operator set.

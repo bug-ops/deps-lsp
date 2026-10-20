@@ -24,9 +24,9 @@
 //! }
 //! ```
 
+use crate::config::RegistryIndex;
 #[cfg(all(test, feature = "lsp-responses"))]
 use crate::config::RegistryTrust;
-use crate::config::{AuthToken, RegistryIndex};
 use crate::sparse::SparseIndexClient;
 use crate::types::{CargoVersion, CrateInfo};
 use deps_core::parser::DependencySource;
@@ -81,6 +81,7 @@ impl CratesIoRegistry {
             sparse: SparseIndexClient::new(
                 RegistryIndex::builtin(SPARSE_INDEX_BASE),
                 Arc::clone(&cache),
+                "sparse index",
             ),
             cache,
             search_base: SEARCH_API_BASE.to_string(),
@@ -96,7 +97,7 @@ impl CratesIoRegistry {
     /// result.
     ///
     /// `#[cfg(test)]`, not `#[cfg(feature = "test-util")]`: the `expect` below only succeeds
-    /// because `deps-core`'s `test-util` feature relaxes `RegistryIndex::new`'s https-only
+    /// because `deps-core`'s `test-util` feature relaxes `RegistryIndex::declared`'s https-only
     /// gate for a loopback host, and that feature is pulled in unconditionally by this
     /// crate's own `deps-cargo = { path = ".", features = ["test-util"] }` dev-dependency
     /// (`Cargo.toml`) — so it is guaranteed active in every build where `#[cfg(test)]` code
@@ -107,11 +108,9 @@ impl CratesIoRegistry {
     #[cfg(feature = "lsp-responses")]
     #[must_use]
     pub(crate) fn with_base_for_test(cache: Arc<HttpCache>, base: &str) -> Self {
-        let policy = deps_core::net_policy::RegistryAccessPolicy::default();
-        let index = RegistryIndex::new(base, RegistryTrust::Trusted, &policy)
-            .expect("mock server URL must pass RegistryIndex validation");
+        let index = RegistryIndex::for_test(base, RegistryTrust::Trusted);
         Self {
-            sparse: SparseIndexClient::new(index, Arc::clone(&cache)),
+            sparse: SparseIndexClient::new(index, Arc::clone(&cache), "sparse index"),
             cache,
             search_base: base.to_string(),
         }
@@ -421,12 +420,12 @@ pub struct CargoRegistry {
     /// to reconstruct and re-validate a `RegistryIndex` of its own, which would otherwise
     /// need its own `RegistryTrust`/policy argument just to answer a plain map lookup).
     /// Populated by [`Self::register_alternate`] at parse time (see `crate::ecosystem`'s
-    /// `parse_manifest` override) — the *only* place an [`AuthToken`] is ever attached to a
-    /// client, since only that call site has the [`crate::config::CargoConfig`]/
-    /// [`crate::config::SourceReplacement`] resolution in hand. A fetch that lands here with
-    /// an unregistered index (never resolved, or dropped for capacity) has no way to
-    /// recover a token and must not fall back to crates.io unless the dependency is a
-    /// verified crates.io mirror (`mirrors_crates_io`, spec plan-1b §6 M2) — see
+    /// `parse_manifest` override) — the *only* place a client, and the credential its
+    /// [`RegistryIndex`] may carry, is created, since only that call site has the
+    /// [`crate::config::CargoConfig`]/[`crate::config::SourceReplacement`] resolution in hand. A
+    /// fetch that lands here with an unregistered index (never resolved, or dropped for
+    /// capacity) has no way to recover a token and must not fall back to crates.io unless the
+    /// dependency is a verified crates.io mirror (`mirrors_crates_io`, spec plan-1b §6 M2) — see
     /// [`Self::get_versions_for_source`]/[`Self::get_latest_matching_for_source`].
     alternates: dashmap::DashMap<String, Arc<SparseIndexClient>>,
     cache: Arc<HttpCache>,
@@ -469,12 +468,12 @@ impl CargoRegistry {
         }
     }
 
-    /// Registers (or reuses an existing registration for) `index`, with `auth` attached to
-    /// every request against it.
+    /// Registers (or reuses an existing registration for) `index`, whose credential (if it has
+    /// one) is attached to every request against it.
     ///
     /// A no-op when `index` is already registered — the first successful registration for
     /// a given index URL sticks for the process lifetime; a later registration attempt
-    /// carrying a *different* `auth` for the same already-registered `index` is silently
+    /// carrying a *different* credential for the same already-registered `index` is silently
     /// ignored. This is a known, accepted limitation for a P4-priority feature (see
     /// `ECOSYSTEM_GUIDE.md`): it can only matter if the same index URL is reachable through
     /// two different resolution paths with different tokens across the process's lifetime,
@@ -495,13 +494,12 @@ impl CargoRegistry {
     /// tighten the tier keeps the existing client (and its credential) untouched — this is a
     /// stricter, not weaker, version of the pre-existing idempotency contract this method's
     /// summary line above documents.
-    pub fn register_alternate(&self, index: RegistryIndex, auth: Option<AuthToken>) {
+    pub fn register_alternate(&self, index: RegistryIndex) {
         let key = index.as_str().to_string();
         let incoming_trust = index.trust();
         // Cloned unconditionally: the Vacant/Occupied outcome isn't known until
         // `register_capped_with_occupied` inspects the map, and `make` below moves `index`,
-        // so the (rare) trust-fold replace path needs its own owned copy. Cheap: a `Url`
-        // plus a `Copy` trust tag.
+        // so the (rare) trust-fold replace path needs its own owned copy.
         let index_for_replace = index.clone();
 
         register_capped_with_occupied(
@@ -510,26 +508,25 @@ impl CargoRegistry {
             EcosystemId::Cargo,
             KeyShape::Url,
             || {
-                Arc::new(SparseIndexClient::with_auth(
+                Arc::new(SparseIndexClient::new(
                     index,
                     Arc::clone(&self.cache),
-                    auth,
                     "alternate registry",
                 ))
             },
             |current| {
                 let stored_trust = current.trust();
                 let folded = crate::config::stricter(stored_trust, incoming_trust);
+                // TODO(critic): bind the credential by operator URL equality (as deps-nuget/deps-swift) so a workspace alias naming an operator URL neither loses nor drops the credential
                 if folded != stored_trust {
                     tracing::warn!(
                         index = %RedactedUrl::new(index_for_replace.as_str()),
                         "re-registration folds an alternate registry to the stricter trust \
                          tier; dropping any stored credential"
                     );
-                    *current = Arc::new(SparseIndexClient::with_auth(
+                    *current = Arc::new(SparseIndexClient::new(
                         index_for_replace,
                         Arc::clone(&self.cache),
-                        None,
                         "alternate registry",
                     ));
                 }
@@ -714,24 +711,21 @@ mod tests {
     use super::*;
     use crate::config::RegistryTrust;
     use crate::ecosystem::CargoEcosystem;
-    use deps_core::net_policy::RegistryAccessPolicy;
     use deps_core::{DepsError, Ecosystem};
     use std::assert_matches;
     use std::collections::HashMap;
 
-    /// Wraps `raw` into a [`RegistryIndex`] for test call sites — see `sparse.rs`'s
-    /// identical helper for why an all-allow-equivalent (`Trusted`) policy is used.
+    /// Wraps `raw` into a Trusted [`RegistryIndex`] for test call sites — see `sparse.rs`'s
+    /// identical helper.
     fn test_index(raw: &str) -> RegistryIndex {
-        let policy = RegistryAccessPolicy::default();
-        RegistryIndex::new(raw, RegistryTrust::Trusted, &policy).unwrap()
+        RegistryIndex::for_test(raw, RegistryTrust::Trusted)
     }
 
     /// Like [`test_index`], but takes an explicit [`RegistryTrust`] — issue #455's C3 fold test
     /// needs to construct indices at both `Trusted` and `WorkspaceDeclared`, unlike every other
     /// test in this module.
     fn test_index_with_trust(raw: &str, trust: RegistryTrust) -> RegistryIndex {
-        let policy = RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::All);
-        RegistryIndex::new(raw, trust, &policy).unwrap()
+        RegistryIndex::for_test(raw, trust)
     }
 
     /// Live-network smoke test against the real crates.io search API. Restored (review
@@ -958,15 +952,15 @@ mod tests {
         let name = PackageName::new("serde");
         let crates_io = registry.endpoint_for(&name, &DependencySource::Registry);
         let index = "https://index.mycorp.dev";
-        registry.register_alternate(test_index_with_trust(index, RegistryTrust::Trusted), None);
-        registry.register_alternate(
-            test_index_with_trust("https://authed.mycorp.dev", RegistryTrust::Trusted),
-            Some(AuthToken::new("token".to_string())),
-        );
-        registry.register_alternate(
-            test_index_with_trust("https://ws.mycorp.dev", RegistryTrust::WorkspaceDeclared),
-            None,
-        );
+        registry.register_alternate(test_index_with_trust(index, RegistryTrust::Trusted));
+        registry.register_alternate(RegistryIndex::credentialed_for_test(
+            "https://authed.mycorp.dev",
+            "token",
+        ));
+        registry.register_alternate(test_index_with_trust(
+            "https://ws.mycorp.dev",
+            RegistryTrust::WorkspaceDeclared,
+        ));
 
         let endpoint = |source: &DependencySource| registry.endpoint_for(&name, source);
 
@@ -984,16 +978,16 @@ mod tests {
             RegistryEndpoint::Unresolved
         );
         assert_eq!(
-            endpoint(&alternate("https://index.mycorp.dev/", false)),
+            endpoint(&alternate("https://index.mycorp.dev", false)),
             RegistryEndpoint::from_base_str(index, EgressTier::Baseline)
         );
         assert_eq!(
-            endpoint(&alternate("https://authed.mycorp.dev/", false)),
+            endpoint(&alternate("https://authed.mycorp.dev", false)),
             RegistryEndpoint::from_base_str("https://authed.mycorp.dev", EgressTier::Baseline),
             "a credentialed trusted index uses the origin-pinned baseline transport"
         );
         assert_eq!(
-            endpoint(&alternate("https://ws.mycorp.dev/", false)),
+            endpoint(&alternate("https://ws.mycorp.dev", false)),
             RegistryEndpoint::from_base_str("https://ws.mycorp.dev", EgressTier::Guarded)
         );
     }
@@ -1007,7 +1001,7 @@ mod tests {
         mockito_url: &str,
         cache: Arc<HttpCache>,
     ) -> CargoRegistry {
-        let sparse = SparseIndexClient::new(test_index(mockito_url), Arc::clone(&cache));
+        let sparse = SparseIndexClient::new(test_index(mockito_url), Arc::clone(&cache), "test");
         CargoRegistry {
             crates_io: CratesIoRegistry {
                 sparse,
@@ -1187,19 +1181,22 @@ mod tests {
         let registry = CargoRegistry::new(cache);
         let index = test_index("https://index.mycorp.dev");
 
-        registry.register_alternate(index.clone(), None);
+        registry.register_alternate(index);
         assert!(
             registry
-                .alternate_client("https://index.mycorp.dev/")
+                .alternate_client("https://index.mycorp.dev")
                 .is_some()
         );
 
         // Re-registering the same index with a different auth must not replace the
         // already-registered client (documented limitation).
-        registry.register_alternate(index, Some(AuthToken::new("token".to_string())));
+        registry.register_alternate(RegistryIndex::credentialed_for_test(
+            "https://index.mycorp.dev",
+            "token",
+        ));
         assert!(
             registry
-                .alternate_client("https://index.mycorp.dev/")
+                .alternate_client("https://index.mycorp.dev")
                 .is_some()
         );
     }
@@ -1216,22 +1213,16 @@ mod tests {
         let registry = CargoRegistry::new(cache);
         let url = "https://index.mycorp.dev";
 
-        registry.register_alternate(
-            test_index_with_trust(url, RegistryTrust::Trusted),
-            Some(AuthToken::new("token".to_string())),
-        );
+        registry.register_alternate(RegistryIndex::credentialed_for_test(url, "token"));
         let client = registry
-            .alternate_client("https://index.mycorp.dev/")
+            .alternate_client("https://index.mycorp.dev")
             .expect("registered");
         assert_eq!(client.trust(), RegistryTrust::Trusted);
         assert!(client.has_auth());
 
-        registry.register_alternate(
-            test_index_with_trust(url, RegistryTrust::WorkspaceDeclared),
-            None,
-        );
+        registry.register_alternate(test_index_with_trust(url, RegistryTrust::WorkspaceDeclared));
         let client = registry
-            .alternate_client("https://index.mycorp.dev/")
+            .alternate_client("https://index.mycorp.dev")
             .expect("still registered");
         assert_eq!(client.trust(), RegistryTrust::WorkspaceDeclared);
         assert!(
@@ -1250,17 +1241,11 @@ mod tests {
         let registry = CargoRegistry::new(cache);
         let url = "https://index.mycorp.dev";
 
-        registry.register_alternate(
-            test_index_with_trust(url, RegistryTrust::WorkspaceDeclared),
-            None,
-        );
-        registry.register_alternate(
-            test_index_with_trust(url, RegistryTrust::Trusted),
-            Some(AuthToken::new("token".to_string())),
-        );
+        registry.register_alternate(test_index_with_trust(url, RegistryTrust::WorkspaceDeclared));
+        registry.register_alternate(RegistryIndex::credentialed_for_test(url, "token"));
 
         let client = registry
-            .alternate_client("https://index.mycorp.dev/")
+            .alternate_client("https://index.mycorp.dev")
             .expect("still registered");
         assert_eq!(client.trust(), RegistryTrust::WorkspaceDeclared);
         assert!(
@@ -1279,16 +1264,16 @@ mod tests {
         let registry = CargoRegistry::new(cache);
         for i in 0..MAX_ALTERNATE_REGISTRIES {
             let index = test_index(&format!("https://index{i}.example"));
-            registry.register_alternate(index, None);
+            registry.register_alternate(index);
         }
         assert_eq!(registry.alternates.len(), MAX_ALTERNATE_REGISTRIES);
 
         let overflow = test_index("https://overflow.example");
-        registry.register_alternate(overflow, None);
+        registry.register_alternate(overflow);
         assert_eq!(registry.alternates.len(), MAX_ALTERNATE_REGISTRIES);
         assert!(
             registry
-                .alternate_client("https://overflow.example/")
+                .alternate_client("https://overflow.example")
                 .is_none()
         );
     }
@@ -1303,14 +1288,9 @@ mod tests {
         let url = "https://index.mycorp.dev/?api_key=SUPERSECRET_TOKEN";
 
         let log = deps_core::test_util::capture_tracing_output(|| {
-            registry.register_alternate(
-                test_index_with_trust(url, RegistryTrust::Trusted),
-                Some(AuthToken::new("token".to_string())),
-            );
-            registry.register_alternate(
-                test_index_with_trust(url, RegistryTrust::WorkspaceDeclared),
-                None,
-            );
+            registry.register_alternate(RegistryIndex::credentialed_for_test(url, "token"));
+            registry
+                .register_alternate(test_index_with_trust(url, RegistryTrust::WorkspaceDeclared));
         });
 
         assert!(log.contains("re-registration folds"), "log: {log}");
@@ -1329,12 +1309,12 @@ mod tests {
         let registry = CargoRegistry::new(cache);
         for i in 0..MAX_ALTERNATE_REGISTRIES {
             let index = test_index(&format!("https://index{i}.example"));
-            registry.register_alternate(index, None);
+            registry.register_alternate(index);
         }
 
         let overflow = test_index("https://overflow.example/?api_key=SUPERSECRET_TOKEN");
         let log = deps_core::test_util::capture_tracing_output(|| {
-            registry.register_alternate(overflow, None);
+            registry.register_alternate(overflow);
         });
 
         assert!(log.contains("alternate registry cap reached"), "log: {log}");

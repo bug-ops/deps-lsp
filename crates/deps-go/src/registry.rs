@@ -460,7 +460,7 @@ impl GoRegistry {
     async fn fetch_bytes(&self, url: &str) -> Result<bytes::Bytes> {
         match self.tier {
             GoRegistryTier::Public | GoRegistryTier::Declared(RegistryTrust::Trusted) => {
-                // TODO(#1856): Trusted fetches follow redirects to any host; confine to the origin if live proxies do not redirect cross-origin
+                // Anonymous fetches may leave the origin (operator proxies redirect on purpose); see `trusted_origin_redirect_policy`
                 self.cache.get_cached(url).await
             }
             GoRegistryTier::Declared(RegistryTrust::WorkspaceDeclared) => {
@@ -1829,6 +1829,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(versions.len(), 1);
+    }
+
+    fn trusted_registry(url: &str) -> Arc<GoRegistry> {
+        let operator = OperatorRegistries::declared_in(
+            &deps_core::config_trust::OperatorPath::for_test("/home/me/go/env"),
+            [url],
+        );
+        let hop = operator
+            .classify::<GoProxyKind>(url, url, &all_policy())
+            .unwrap();
+        assert_eq!(hop.trust(), RegistryTrust::Trusted);
+        let root = Arc::new(GoRegistry::new(Arc::new(HttpCache::new())));
+        GoRegistry::register_alternate(
+            &root,
+            &GoProxyChain {
+                key: "go-proxy:trusted".to_string(),
+                hops: vec![GoProxyHop::Url(hop)],
+                ..Default::default()
+            },
+        );
+        root
+    }
+
+    async fn trusted_versions(root: &GoRegistry) -> Result<Vec<Box<dyn deps_core::Version>>> {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let source = DependencySource::AlternateRegistry {
+            index: "go-proxy:trusted".to_string(),
+            mirrors_crates_io: false,
+        };
+        root.get_versions_from(
+            &deps_core::PackageName::new("example.com/m"),
+            &source,
+            FreshnessSettings::default(),
+        )
+        .await
+    }
+
+    /// #1856: an anonymous `Trusted` fetch follows a cross-origin redirect, as an Athens proxy in
+    /// redirect mode needs.
+    #[tokio::test]
+    async fn test_trusted_fetch_follows_cross_origin_redirect() {
+        let mut proxy = mockito::Server::new_async().await;
+        let mut storage = mockito::Server::new_async().await;
+        let _redirect = proxy
+            .mock("GET", "/example.com/m/@v/list")
+            .with_status(302)
+            .with_header("location", &format!("{}/blob/list", storage.url()))
+            .create_async()
+            .await;
+        let _blob = storage
+            .mock("GET", "/blob/list")
+            .with_status(200)
+            .with_body("v1.0.0\n")
+            .create_async()
+            .await;
+
+        let root = trusted_registry(&proxy.url());
+        assert_eq!(trusted_versions(&root).await.unwrap().len(), 1);
+    }
+
+    /// #1856: the never-a-registry floor still stops a `Trusted` fetch's redirect hop.
+    #[tokio::test]
+    async fn test_trusted_fetch_stops_redirect_to_cloud_metadata() {
+        let mut proxy = mockito::Server::new_async().await;
+        let _redirect = proxy
+            .mock("GET", "/example.com/m/@v/list")
+            .with_status(302)
+            .with_header("location", "https://169.254.169.254/latest/meta-data/")
+            .create_async()
+            .await;
+
+        let root = trusted_registry(&proxy.url());
+        assert!(trusted_versions(&root).await.is_err());
     }
 
     /// #1444 M2/M3: `get_latest_matching_from`'s `AlternateRegistry` branch must forward the

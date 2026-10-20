@@ -109,8 +109,8 @@ impl Ecosystem for CargoEcosystem {
             let result = crate::parser::parse_cargo_toml_with_context(content, uri, &self.context)?;
             // Registers every alternate index this parse resolved (FR-002), including its
             // credential. See `CargoParseResult::resolved_registries`'s docs.
-            for (index, auth) in result.resolved_registries.clone() {
-                self.registry.register_alternate(index, auth);
+            for index in result.resolved_registries.clone() {
+                self.registry.register_alternate(index);
             }
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
         })
@@ -882,15 +882,12 @@ mod tests {
             let cache = Arc::new(deps_core::HttpCache::new());
             let ecosystem = CargoEcosystem::new(cache);
 
-            let policy = deps_core::net_policy::RegistryAccessPolicy::default();
-            let registry_index = crate::config::RegistryIndex::new(
+            let registry_index = crate::config::RegistryIndex::for_test(
                 &server.url(),
                 crate::config::RegistryTrust::Trusted,
-                &policy,
-            )
-            .unwrap();
+            );
             let index_key = registry_index.as_str().to_string();
-            ecosystem.registry.register_alternate(registry_index, None);
+            ecosystem.registry.register_alternate(registry_index);
 
             let mut dep = mock_dependency("serde", Some("1.0"), 0, 0);
             dep.source = DependencySource::AlternateRegistry {

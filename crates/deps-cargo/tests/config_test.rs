@@ -10,11 +10,9 @@
 #![allow(clippy::unwrap_used)]
 
 use deps_cargo::DependencySource;
-use deps_cargo::config::{
-    ConfigFileCache, RegistryIndex, RegistryTrust, cargo_home_config_path, resolve,
-};
+use deps_cargo::config::{ConfigFileCache, RegistryIndex, cargo_home_config_path, resolve};
 use deps_cargo::parse_cargo_toml;
-use deps_core::net_policy::RegistryAccessPolicy;
+use deps_core::net_policy::{OperatorRegistries, RegistryAccessPolicy};
 use std::collections::HashSet;
 use url::Url;
 
@@ -54,7 +52,7 @@ fn test_alias_resolves_end_to_end_via_workspace_config() {
     assert_eq!(result.dependencies.len(), 1);
     match &result.dependencies[0].source {
         DependencySource::AlternateRegistry { index, .. } => {
-            assert_eq!(index, "https://index.mycorp.dev/");
+            assert_eq!(index, "https://index.mycorp.dev");
         }
         other => panic!("expected AlternateRegistry, got {other:?}"),
     }
@@ -118,7 +116,7 @@ fn test_ancestor_precedence_closest_directory_wins() {
 
     match &result.dependencies[0].source {
         DependencySource::AlternateRegistry { index, .. } => {
-            assert_eq!(index, "https://close.example/", "closest ancestor must win");
+            assert_eq!(index, "https://close.example", "closest ancestor must win");
         }
         other => panic!("expected AlternateRegistry, got {other:?}"),
     }
@@ -146,26 +144,11 @@ fn test_no_custom_registry_dependency_triggers_no_resolution() {
 #[test]
 fn test_registry_index_validation_public_api() {
     let policy = test_policy();
-    assert!(
-        RegistryIndex::new(
-            "sparse+https://index.mycorp.dev",
-            RegistryTrust::Trusted,
-            &policy
-        )
-        .is_ok()
-    );
-    assert!(
-        RegistryIndex::new("http://index.mycorp.dev", RegistryTrust::Trusted, &policy).is_err()
-    );
-    assert!(
-        RegistryIndex::new(
-            "https://user:pass@index.mycorp.dev",
-            RegistryTrust::Trusted,
-            &policy
-        )
-        .is_err()
-    );
-    assert!(RegistryIndex::new("not a url", RegistryTrust::Trusted, &policy).is_err());
+    let none = OperatorRegistries::default();
+    assert!(RegistryIndex::declared("sparse+https://index.mycorp.dev", &none, &policy).is_ok());
+    assert!(RegistryIndex::declared("http://index.mycorp.dev", &none, &policy).is_err());
+    assert!(RegistryIndex::declared("https://user:pass@index.mycorp.dev", &none, &policy).is_err());
+    assert!(RegistryIndex::declared("not a url", &none, &policy).is_err());
 }
 
 /// FR-004: `$CARGO_HOME` unset yields no cargo-home config path, and no
@@ -182,7 +165,7 @@ fn test_discover_and_resolve_public_api_smoke() {
     let (config, _) = resolve(
         &aliases,
         &[],
-        cargo_home_config_path().as_deref(),
+        cargo_home_config_path().as_ref(),
         &cache,
         &policy,
     );
@@ -217,7 +200,7 @@ fn test_workspace_resolved_registry_never_carries_auth_even_with_cargo_home_pres
 
     assert_eq!(result.resolved_registries.len(), 1);
     assert!(
-        result.resolved_registries[0].1.is_none(),
+        !result.resolved_registries[0].has_credential(),
         "a workspace-resolved registry entry must never carry a credential"
     );
 }
@@ -241,10 +224,10 @@ fn test_registry_index_literal_resolves_without_config_and_without_auth() {
 
     match &result.dependencies[0].source {
         DependencySource::AlternateRegistry { index, .. } => {
-            assert_eq!(index, "https://index.mycorp.dev/");
+            assert_eq!(index, "https://index.mycorp.dev");
         }
         other => panic!("expected AlternateRegistry, got {other:?}"),
     }
     assert_eq!(result.resolved_registries.len(), 1);
-    assert!(result.resolved_registries[0].1.is_none());
+    assert!(!result.resolved_registries[0].has_credential());
 }

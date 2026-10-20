@@ -4,6 +4,7 @@ use super::guard::AddrGuard;
 use super::guard::hop_targets_blocked_host;
 use super::guard::is_https_downgrade;
 use crate::net_policy::{GuardedEgress, TrustedPrefix};
+use crate::redact::url_for_tracing;
 
 /// Whether a redirect may leave the host of the request that produced it.
 ///
@@ -98,11 +99,29 @@ pub(super) fn redirect_policy(guard: AddrGuard, scope: RedirectScope) -> reqwest
 ///
 /// Origin equality also covers a downgrade to plain `http://`: an `http://` hop's origin can
 /// never equal an `https://`-scheme trusted origin, which every current caller passes.
+///
+/// This policy is the confinement rule for every request that can carry a credential: the
+/// credential-bearing entry points route through it, so a registry can never redirect a token to
+/// another origin. A request that carries no credential is not bound by it. The anonymous
+/// `Trusted` npm and Go metadata fetches use [`redirect_policy`] instead and may leave their
+/// origin, because operator proxies (Athens in redirect mode, Artifactory redirecting to object
+/// storage) do that on purpose; the never-a-registry floor and the https-downgrade stop still apply
+/// on every hop. NuGet and Swift keep their anonymous `Trusted` fetches origin-confined by choice.
+///
+/// A hop this policy stops is logged at `WARN` with both origins redacted, since the caller only
+/// sees the preceding `3xx` status.
 pub(super) fn trusted_origin_redirect_policy(prefix: TrustedPrefix) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
         if prefix.permits(attempt.url()) {
             reqwest::redirect::Policy::default().redirect(attempt)
         } else {
+            if let Some(previous) = attempt.previous().last() {
+                tracing::warn!(
+                    from = %url_for_tracing(&previous.origin().ascii_serialization()),
+                    to = %url_for_tracing(&attempt.url().origin().ascii_serialization()),
+                    "stopped a redirect that left the trusted origin"
+                );
+            }
             attempt.stop()
         }
     })

@@ -11,38 +11,43 @@
 //!
 //! A workspace's own `Cargo.toml`/`.cargo/config.toml` is attacker-controlled the moment a
 //! hostile repository is cloned and opened — this LSP parses on file open, before any build
-//! ever runs. Two, related, threats this module closes:
+//! ever runs. Two related threats this module closes, each by its own decision:
 //!
-//! - **Credential exfiltration.** [`AuthToken`] must never be attachable to a request whose
-//!   destination URL provenance traces to a workspace file. This is enforced
-//!   **structurally**, not by a runtime check:
-//!   - `parse_workspace_registries_raw` has no return type capable of expressing a token —
-//!     its value type is a bare `String`, with no token field anywhere. There is no `token`
-//!     field lookup anywhere in that function's body.
-//!   - Only `parse_cargo_home_registries_raw` (fed `$CARGO_HOME/config.toml`'s content) and
-//!     the environment-variable lookup in [`resolve`] ever construct `Some(AuthToken)`.
-//!   - [`Provenance`] exists purely for logging/diagnostics. Nothing in this crate branches
-//!     on it to decide whether to attach a credential — grepping for `Provenance` outside
-//!     this module should find no such branch (verified in this PR's security review).
-//! - **Internal-network reachability (SSRF-adjacent, #443).** [`RegistryIndex::new`] requires
-//!   an [`RegistryTrust`] and a [`deps_core::net_policy::RegistryAccessPolicy`]: a
-//!   `WorkspaceDeclared` URL is checked against the live policy before it can ever become a
-//!   fetchable index, while a `Trusted` (`$CARGO_HOME`-provenance) URL is never
-//!   policy-checked at all — it is the user's own configuration, not something a cloned
-//!   repository controls. See `.local/specs/023-cargo-custom-registries/plan-1b.md` §1-§2.
+//! - **Egress** (where a request may go, #443). Every index URL is classified by the shared
+//!   URL-alone rule, [`OperatorRegistries::classify`]: a URL equal to one the operator declared
+//!   (`$CARGO_HOME/config.toml`, or a `CARGO_REGISTRIES_<ALIAS>_INDEX` variable) is
+//!   [`RegistryTrust::Trusted`] and skips the workspace policy; any other URL is
+//!   [`RegistryTrust::WorkspaceDeclared`] and is checked against the live
+//!   [`deps_core::net_policy::RegistryAccessPolicy`]. The never-a-registry floor applies to both,
+//!   so a `$CARGO_HOME` registry on a loopback or link-local host is rejected. Provenance plays no
+//!   part: a workspace alias that names an operator URL gets the operator URL's trust.
+//! - **Credential exfiltration.** A credential is a separate decision and lives inside
+//!   [`RegistryIndex`] as `IndexAccess::Credentialed`, which exists only for an index that
+//!   classified Trusted. Enforced **structurally**:
+//!   - `parse_workspace_registries_raw` has no return type capable of expressing a token.
+//!   - Only `parse_cargo_home_registries_raw` and the `CARGO_REGISTRIES_<ALIAS>_TOKEN` lookup
+//!     produce an `AuthToken`, and an `AuthToken` reaches an index only through
+//!     `RegistryIndex::declared_with_credential`, which attaches it when, and only when, the
+//!     URL classified Trusted.
+//!   - No constructor takes a [`Provenance`] or a [`RegistryTrust`]: a caller cannot assert trust,
+//!     only present a URL to the operator set. [`Provenance`] is diagnostics only.
+//!   - A request carrying a credential travels over an origin-confined transport, so a redirect
+//!     cannot move the header to another origin.
 //!
-//! See spec `.local/specs/023-cargo-custom-registries/spec.md` FR-008/FR-009 and the design
-//! review handoffs cited there for the two rounds of critique the credential boundary
+//! See spec `.local/specs/023-cargo-custom-registries/spec.md` FR-008/FR-009, spec 084 and the
+//! design review handoffs cited there for the rounds of critique the credential boundary
 //! survived.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use toml_span::value::Table;
 
+use deps_core::config_trust::{EnvPath, OperatorEnvVar, OperatorPath};
 use deps_core::net_policy::{
-    BlockedHost, PolicyGate, RedactedUrl, RegistryAccessPolicy, RegistryRejectionClassifier,
-    RegistryRejectionReason, TrustedPrefix, validate_index_url,
+    BlockedHost, DeclaredRegistry, EnvSource, IndexUrlError, OperatorRegistries, ProcessEnv,
+    RedactedUrl, RegistryAccessPolicy, RegistryRejectionClassifier, RegistryRejectionReason,
+    RegistryUrlKind, TrustedConstantRegistryUrl, TrustedPrefix, ValidatedRegistryUrl,
 };
 use deps_core::{DEFAULT_MAX_CACHED_FILES, EcosystemId, MtimeFileCache};
 
@@ -55,25 +60,25 @@ use deps_core::{DEFAULT_MAX_CACHED_FILES, EcosystemId, MtimeFileCache};
 /// `AuthToken(***)`, not `Redacted(***)`, so a panic message or log line still names which
 /// credential leaked its type.
 #[derive(Clone, PartialEq, Eq)]
-pub struct AuthToken(deps_core::secret::Redacted);
+pub(crate) struct AuthToken(deps_core::secret::Redacted);
 
 impl AuthToken {
-    /// Wraps `token`. Kept `pub(crate)` rather than `pub`: the module-level security-model
-    /// docs above are the enforcement, and widening this to `pub` would let any other crate
-    /// construct one with no [`Provenance`]/[`RegistryTrust`] to account for at all.
+    /// Wraps `token`. Kept `pub(crate)`: the module-level security-model docs above are the
+    /// enforcement, and a token only ever reaches an index through
+    /// [`RegistryIndex::declared_with_credential`].
     pub(crate) fn new(token: String) -> Self {
         Self(deps_core::secret::Redacted::new(token))
+    }
+
+    /// The wrapped secret, for building the `Authorization` value.
+    pub(crate) const fn as_redacted(&self) -> &deps_core::secret::Redacted {
+        &self.0
     }
 
     /// The raw token value, for asserting on it in tests.
     #[cfg(test)]
     pub(crate) fn expose_secret(&self) -> &str {
         self.0.expose_secret()
-    }
-
-    /// The wrapped secret, for building the `Authorization` value.
-    pub(crate) const fn as_redacted(&self) -> &deps_core::secret::Redacted {
-        &self.0
     }
 }
 
@@ -91,11 +96,10 @@ impl std::fmt::Display for AuthToken {
 
 /// Where a [`ResolvedRegistryEntry`] came from.
 ///
-/// **Diagnostics and logging only.** Never gates whether [`ResolvedRegistryEntry::auth`]
-/// is populated — that is a structural property of which parsing function produced the
-/// entry (see the module-level docs), not a runtime branch on this enum. A future change
-/// that starts branching on this to decide whether to attach a credential reintroduces the
-/// exact vulnerability class this design closed.
+/// **Diagnostics and logging only.** Nothing decides egress or a credential from it: the
+/// egress decision is the URL-alone rule ([`OperatorRegistries::classify`]) and a credential is
+/// held by the [`RegistryIndex`] itself (see the module-level docs). A change that starts
+/// branching on this to decide either reintroduces the vulnerability class this design closed.
 ///
 /// **Exhaustive** (issue #769): a closed 2-variant `CargoHome`/`Workspace` split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,13 +113,9 @@ pub enum Provenance {
     Workspace,
 }
 
-/// Cargo's registry trust is the core [`RegistryTrust`], with one Cargo-specific rule on top:
-/// trust here also gates a credential (`IndexTransport::Refused`) and is folded down a
-/// `[source]` replace-with chain, so a repository cannot borrow a `$CARGO_HOME` source's
-/// credential. Cargo is the documented exception to spec 084's URL-alone rule: its trust follows
-/// the alias provenance (`$CARGO_HOME` / `CARGO_REGISTRIES_*` are `Trusted`, a workspace file is
-/// `WorkspaceDeclared`) rather than equality with an operator-declared URL, until the egress and
-/// credential halves are split (#1855).
+/// Cargo's registry trust is the core [`RegistryTrust`]: the same URL-alone rule as Go, npm,
+/// NuGet and Swift decides it, and it decides egress only. Whether a credential is sent is a
+/// separate decision held by [`RegistryIndex`] (#1855).
 pub use deps_core::net_policy::RegistryTrust;
 
 /// The less-trusted of `a` and `b` — `WorkspaceDeclared` if either is, `Trusted` only if both
@@ -136,119 +136,317 @@ pub(crate) const fn stricter(a: RegistryTrust, b: RegistryTrust) -> RegistryTrus
     }
 }
 
-/// A validated, `sparse+`-prefix-stripped sparse-index URL: `https` scheme, no userinfo, and
-/// (for a `WorkspaceDeclared` candidate) a host the live
-/// [`deps_core::net_policy::RegistryAccessPolicy`] allows.
+/// The `sparse+` protocol prefix Cargo allows on an index URL.
+const SPARSE_PREFIX: &str = "sparse+";
+
+/// An index URL text with its optional `sparse+` prefix removed.
 ///
-/// Validated at construction so an invalid or unsafe URL (`http://`, a scheme other than
-/// `sparse+https`, a `user:pass@` component, or a workspace-declared host the policy blocks)
-/// can never reach a network call — this is SSRF-adjacent input, since a workspace file
-/// controls a network destination (spec NFR-002, plan-1b §1.1-§1.2).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RegistryIndex {
-    url: url::Url,
-    /// This candidate's [`RegistryTrust`] tier, carried alongside the validated URL so a
-    /// consumer (issue #455's [`crate::sparse::SparseIndexClient`] fail-closed auth gate, C2;
-    /// [`crate::registry::CargoRegistry::register_alternate`]'s trust fold, C3) never needs a
-    /// second, disconnected argument that could drift from the tier this URL was actually
-    /// validated under.
-    trust: RegistryTrust,
+/// Only [`strip_sparse_prefix`] makes one, and every consumer takes this type, so a value is
+/// stripped exactly once and the operator set and the classifier always see the same text (a
+/// second strip of `sparse+sparse+https://…` would classify a different URL than was declared).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StrippedIndexUrl<'a>(&'a str);
+
+impl<'a> StrippedIndexUrl<'a> {
+    pub(crate) const fn as_str(self) -> &'a str {
+        self.0
+    }
 }
 
-/// Why a candidate index URL failed [`RegistryIndex::new`]'s validation.
+/// `raw` without a leading `sparse+`.
+pub(crate) fn strip_sparse_prefix(raw: &str) -> StrippedIndexUrl<'_> {
+    StrippedIndexUrl(raw.strip_prefix(SPARSE_PREFIX).unwrap_or(raw))
+}
+
+/// [`RegistryUrlKind`] marker selecting Cargo's validation rules for an index URL.
+pub enum CargoIndexKind {}
+
+impl deps_core::net_policy::private::Sealed for CargoIndexKind {}
+
+impl RegistryUrlKind for CargoIndexKind {
+    const ECOSYSTEM: EcosystemId = EcosystemId::Cargo;
+    const REJECT_QUERY_FRAGMENT: bool = false;
+    type Error = RegistryIndexError;
+}
+
+impl TrustedConstantRegistryUrl for CargoIndexKind {}
+
+/// Why a candidate index URL failed [`RegistryIndex::declared`]'s validation.
 ///
 /// An alias of the shared [`deps_core::net_policy::IndexUrlError`] — see that type's docs
 /// for the variants and their wording.
 pub use deps_core::net_policy::IndexUrlError as RegistryIndexError;
 
+/// A credential for a registry index the operator declared.
+///
+/// Its only constructor takes the classification of the index it is for and returns it only for
+/// [`RegistryTrust::Trusted`], so a credential for a workspace-declared index cannot be built.
+#[derive(Clone, PartialEq, Eq)]
+struct OperatorCredential(AuthToken);
+
+impl OperatorCredential {
+    fn for_trusted(
+        token: AuthToken,
+        classified: &DeclaredRegistry<CargoIndexKind>,
+    ) -> Option<Self> {
+        match classified.trust() {
+            RegistryTrust::Trusted => Some(Self(token)),
+            RegistryTrust::WorkspaceDeclared => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for OperatorCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OperatorCredential(***)")
+    }
+}
+
+/// How requests against a [`RegistryIndex`] authenticate.
+///
+/// `Credentialed` implies [`RegistryTrust::Trusted`]: its only constructor is
+/// [`OperatorCredential::for_trusted`]. `Anonymous` carries the URL-alone classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IndexAccess {
+    Credentialed(OperatorCredential),
+    Anonymous(RegistryTrust),
+}
+
+/// A validated, `sparse+`-prefix-stripped sparse-index URL.
+///
+/// `https` scheme, no userinfo, and (for a [`RegistryTrust::WorkspaceDeclared`] candidate) a host
+/// the live [`deps_core::net_policy::RegistryAccessPolicy`] allows. Validated at construction so an invalid or unsafe URL (`http://`, a scheme other than
+/// `sparse+https`, a `user:pass@` component, or a workspace-declared host the policy blocks)
+/// can never reach a network call — this is SSRF-adjacent input, since a workspace file
+/// controls a network destination (spec NFR-002, plan-1b §1.1-§1.2).
+///
+/// Carries its own credential, if it has one: egress trust and credential are two decisions,
+/// and the credential exists only for a URL the operator declared (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryIndex {
+    url: ValidatedRegistryUrl<CargoIndexKind>,
+    base: TrustedPrefix,
+    access: IndexAccess,
+}
+
+/// URLs whose withheld credential has already been logged.
+static WITHHELD_CREDENTIAL_WARNED: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Cap on distinct URLs [`WITHHELD_CREDENTIAL_WARNED`] remembers.
+const MAX_WITHHELD_WARNINGS: usize = 64;
+
+fn warn_credential_withheld(index: &str) {
+    let first_time = {
+        let mut warned = WITHHELD_CREDENTIAL_WARNED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        warned.len() < MAX_WITHHELD_WARNINGS && warned.insert(index.to_string())
+    };
+    if first_time {
+        tracing::warn!(
+            index = %RedactedUrl::new(index),
+            "registry credential withheld: the index URL is not declared in an operator-owned file"
+        );
+    }
+}
+
 impl RegistryIndex {
-    /// Validates and wraps `raw` — a `registry-index` manifest value, a
+    fn from_classified(
+        classified: DeclaredRegistry<CargoIndexKind>,
+        credential: Option<AuthToken>,
+    ) -> Result<Self, RegistryIndexError> {
+        let base = TrustedPrefix::parse(classified.as_str())
+            .map_err(|_| IndexUrlError::InvalidUrl(RedactedUrl::new(classified.as_str())))?;
+        let access = match credential {
+            Some(token) => match OperatorCredential::for_trusted(token, &classified) {
+                Some(credential) => IndexAccess::Credentialed(credential),
+                None => {
+                    warn_credential_withheld(classified.as_str());
+                    IndexAccess::Anonymous(classified.trust())
+                }
+            },
+            None => IndexAccess::Anonymous(classified.trust()),
+        };
+        Ok(Self {
+            url: classified.url().clone(),
+            base,
+            access,
+        })
+    }
+
+    /// Validates and classifies `raw` — a `registry-index` manifest value, a
     /// `.cargo/config.toml` `[registries.<name>].index` value, or a `[source.<name>]
-    /// registry` value, either optionally prefixed with `sparse+`.
+    /// registry` value, either optionally prefixed with `sparse+` — with no credential.
     ///
-    /// `trust` states whose input `raw` is; for [`RegistryTrust::WorkspaceDeclared`], `policy`'s
-    /// current [`deps_core::net_policy::WorkspaceRegistryAccess`] setting is consulted — a
-    /// [`RegistryTrust::Trusted`] candidate is never policy-checked at all, since it is the
-    /// user's own `$CARGO_HOME` configuration, not something a cloned repository controls.
+    /// A URL equal to one in `operator` is [`RegistryTrust::Trusted`] and skips the workspace
+    /// policy; any other URL is checked against `policy`. The never-a-registry floor applies to
+    /// both.
     ///
     /// # Errors
     ///
     /// Returns [`RegistryIndexError`] if `raw` does not parse as a URL, is not `https`,
-    /// carries a userinfo component, or (for a `WorkspaceDeclared` candidate) resolves to a
-    /// host class the current policy blocks.
+    /// carries a userinfo component, resolves to a host class that is never a registry, or (for
+    /// a workspace-declared URL) to a host class the current policy blocks.
     ///
     /// # Examples
     ///
     /// ```
-    /// use deps_cargo::config::{RegistryTrust, RegistryIndex};
-    /// use deps_core::net_policy::RegistryAccessPolicy;
+    /// use deps_cargo::config::{RegistryIndex, RegistryTrust};
+    /// use deps_core::net_policy::{OperatorRegistries, RegistryAccessPolicy};
     ///
     /// let policy = RegistryAccessPolicy::default();
+    /// let none = OperatorRegistries::default();
+    /// let index = RegistryIndex::declared("sparse+https://index.mycorp.dev", &none, &policy)
+    ///     .unwrap();
+    /// assert_eq!(index.trust(), RegistryTrust::WorkspaceDeclared);
+    /// assert!(RegistryIndex::declared("http://index.mycorp.dev", &none, &policy).is_err());
     /// assert!(
-    ///     RegistryIndex::new("sparse+https://index.mycorp.dev", RegistryTrust::Trusted, &policy)
-    ///         .is_ok()
-    /// );
-    /// assert!(
-    ///     RegistryIndex::new("http://index.mycorp.dev", RegistryTrust::Trusted, &policy).is_err()
-    /// );
-    /// assert!(
-    ///     RegistryIndex::new(
-    ///         "https://user:pass@index.mycorp.dev",
-    ///         RegistryTrust::Trusted,
-    ///         &policy
-    ///     )
-    ///     .is_err()
+    ///     RegistryIndex::declared("https://user:pass@index.mycorp.dev", &none, &policy).is_err()
     /// );
     /// ```
-    pub fn new(
+    pub fn declared(
         raw: &str,
-        trust: RegistryTrust,
+        operator: &OperatorRegistries,
         policy: &RegistryAccessPolicy,
     ) -> Result<Self, RegistryIndexError> {
-        let stripped = raw.strip_prefix("sparse+").unwrap_or(raw);
-        let gate = match trust {
-            RegistryTrust::Trusted => PolicyGate::Skip,
-            RegistryTrust::WorkspaceDeclared => PolicyGate::Enforce(policy),
-        };
-        let url = validate_index_url(stripped, stripped, EcosystemId::Cargo, gate)?;
-        Ok(Self { url, trust })
+        Self::declared_stripped(strip_sparse_prefix(raw), operator, policy)
     }
 
-    /// Wraps a compile-time-known-safe literal (e.g. crates.io's own sparse index base),
-    /// bypassing [`RegistryTrust`]/policy entirely — equivalent to [`Self::new`] with
-    /// [`RegistryTrust::Trusted`], since a `Trusted` candidate is never policy-checked.
+    /// [`Self::declared`] for a value whose `sparse+` prefix is already stripped.
+    pub(crate) fn declared_stripped(
+        stripped: StrippedIndexUrl<'_>,
+        operator: &OperatorRegistries,
+        policy: &RegistryAccessPolicy,
+    ) -> Result<Self, RegistryIndexError> {
+        let text = stripped.as_str();
+        Self::from_classified(
+            operator.classify::<CargoIndexKind>(text, text, policy)?,
+            None,
+        )
+    }
+
+    /// [`Self::declared_stripped`] for a value that comes with a `token`.
+    ///
+    /// The token is attached only when the URL classified [`RegistryTrust::Trusted`]; otherwise
+    /// the index is anonymous and a `WARN`, deduplicated per URL, records the withheld credential.
+    pub(crate) fn declared_with_credential(
+        stripped: StrippedIndexUrl<'_>,
+        operator: &OperatorRegistries,
+        policy: &RegistryAccessPolicy,
+        token: AuthToken,
+    ) -> Result<Self, RegistryIndexError> {
+        let text = stripped.as_str();
+        Self::from_classified(
+            operator.classify::<CargoIndexKind>(text, text, policy)?,
+            Some(token),
+        )
+    }
+
+    /// Wraps a compile-time-known-safe literal (e.g. crates.io's own sparse index base), which
+    /// is [`RegistryTrust::Trusted`] without an operator file vouching for it.
     ///
     /// `pub(crate)` — for a literal known at compile time, not a workspace-provenance value.
     ///
     /// # Panics
     ///
-    /// Panics if `raw` fails [`Self::new`]'s validation. Covered by a unit test so this
-    /// panic is unreachable in practice.
+    /// Panics if `raw` fails validation. Covered by a unit test so this panic is unreachable in
+    /// practice.
     #[must_use]
     pub(crate) fn builtin(raw: &'static str) -> Self {
-        let policy = RegistryAccessPolicy::default();
-        Self::new(raw, RegistryTrust::Trusted, &policy).unwrap_or_else(|error| {
-            panic!("builtin registry index {raw:?} failed validation: {error}")
-        })
+        DeclaredRegistry::<CargoIndexKind>::trusted_constant(raw)
+            .and_then(|classified| Self::from_classified(classified, None))
+            .unwrap_or_else(|error| {
+                panic!("builtin registry index {raw:?} failed validation: {error}")
+            })
     }
 
-    /// The validated URL as a string, with no trailing slash guarantee either way (callers
-    /// splicing a path onto this must trim as needed — see `sparse::sparse_index_url`).
+    /// The normalized URL, never carrying a trailing `/`.
     #[must_use]
     pub fn as_str(&self) -> &str {
         self.url.as_str()
     }
 
-    /// This index as a [`TrustedPrefix`], reusing the already validated URL (no re-parse).
+    /// This index as a [`TrustedPrefix`] (no re-parse).
     #[must_use]
     pub(crate) fn trusted_prefix(&self) -> TrustedPrefix {
-        TrustedPrefix::from_url(self.url.clone())
+        self.base.clone()
     }
 
-    /// The [`RegistryTrust`] tier this index was validated under.
+    /// The [`RegistryTrust`] the URL-alone rule gave this index.
     #[must_use]
     pub const fn trust(&self) -> RegistryTrust {
-        self.trust
+        match self.access {
+            IndexAccess::Credentialed(_) => RegistryTrust::Trusted,
+            IndexAccess::Anonymous(trust) => trust,
+        }
+    }
+
+    /// Whether requests against this index carry a credential. The credential itself is never
+    /// exposed outside the crate.
+    #[must_use]
+    pub const fn has_credential(&self) -> bool {
+        matches!(self.access, IndexAccess::Credentialed(_))
+    }
+
+    /// The credential, when the index has one.
+    pub(crate) const fn credential(&self) -> Option<&AuthToken> {
+        match &self.access {
+            IndexAccess::Credentialed(credential) => Some(&credential.0),
+            IndexAccess::Anonymous(_) => None,
+        }
+    }
+
+    /// Test-only: an anonymous index of the given trust, built through the same classification
+    /// path as production (an operator set holding `raw` for [`RegistryTrust::Trusted`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `raw` fails validation.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn for_test(raw: &str, trust: RegistryTrust) -> Self {
+        let (operator, policy) = Self::test_classification(raw, trust);
+        Self::declared(raw, &operator, &policy)
+            .unwrap_or_else(|error| panic!("test index {raw:?} failed validation: {error}"))
+    }
+
+    /// Test-only: [`Self::for_test`] for a Trusted index that carries `token`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `raw` fails validation.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn credentialed_for_test(raw: &str, token: &str) -> Self {
+        let (operator, policy) = Self::test_classification(raw, RegistryTrust::Trusted);
+        Self::declared_with_credential(
+            strip_sparse_prefix(raw),
+            &operator,
+            &policy,
+            AuthToken::new(token.to_string()),
+        )
+        .unwrap_or_else(|error| panic!("test index {raw:?} failed validation: {error}"))
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn test_classification(
+        raw: &str,
+        trust: RegistryTrust,
+    ) -> (OperatorRegistries, RegistryAccessPolicy) {
+        use deps_core::net_policy::{MapEnv, WorkspaceRegistryAccess};
+
+        let operator = match trust {
+            RegistryTrust::Trusted => OperatorRegistries::declared_in_env(
+                &MapEnv::new(),
+                [strip_sparse_prefix(raw).as_str()],
+            ),
+            RegistryTrust::WorkspaceDeclared => OperatorRegistries::default(),
+        };
+        (
+            operator,
+            RegistryAccessPolicy::new(WorkspaceRegistryAccess::All),
+        )
     }
 }
 
@@ -265,12 +463,8 @@ impl std::fmt::Display for RegistryIndex {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ResolvedRegistryEntry {
-    /// The validated, fetchable index URL.
+    /// The validated, fetchable index. Carries its own credential, if it has one.
     pub index: RegistryIndex,
-    /// The bearer token to attach to requests against `index`, if any. `Some` only when
-    /// `provenance` is [`Provenance::CargoHome`] — see the module-level security-model
-    /// docs for why this is a structural, not runtime, guarantee.
-    pub auth: Option<AuthToken>,
     /// Where this entry was resolved from. Diagnostics/logging only.
     pub provenance: Provenance,
 }
@@ -309,6 +503,16 @@ enum UnresolvedIndex {
     Rejected(RegistryRejectionReason),
 }
 
+impl UnresolvedIndex {
+    /// The cause a failed validation is surfaced as, if it is surfaced at all.
+    fn from_error(error: &RegistryIndexError) -> Option<Self> {
+        match error {
+            RegistryIndexError::BlockedHost { block } => Some(Self::Blocked(*block)),
+            other => other.rejection_reason().into_reason().map(Self::Rejected),
+        }
+    }
+}
+
 impl CargoConfig {
     /// The resolved entry for `alias`, if it resolved successfully.
     #[must_use]
@@ -345,24 +549,21 @@ impl CargoConfig {
 pub enum SourceReplacement {
     /// No `[source]` override applies — no `[source.crates-io]` table, a `directory`/
     /// `local-registry`/non-sparse-git terminal (FR-006), a cyclic/unbounded chain
-    /// (FR-007), or a terminal that failed [`RegistryIndex::new`]'s validation/policy gate.
+    /// (FR-007), or a terminal that failed [`RegistryIndex::declared`]'s validation/policy gate.
     /// Plain dependencies keep resolving against crates.io, unchanged from today.
     None,
     /// The chain terminated at a `sparse+https://` index (FR-005).
     SparseMirror {
-        /// The validated, fetchable mirror index.
+        /// The validated, fetchable mirror index. It carries a credential only when every link
+        /// of the chain is an operator link (plan-1b §1.4's "coupled trust trap" guard): a
+        /// single workspace-tier link anywhere in the chain leaves it anonymous, even if the
+        /// terminal itself is a `$CARGO_HOME` `[registries]` entry carrying a token.
         index: RegistryIndex,
-        /// The bearer token to attach to requests against `index`, if any — populated only
-        /// when the whole chain's [`RegistryTrust`] folded to [`RegistryTrust::Trusted`] (plan-1b
-        /// §1.4's "coupled trust trap" guard): a single workspace-tier link anywhere in the
-        /// chain forces this to `None`, even if the terminal itself is a `$CARGO_HOME`
-        /// `[registries]` entry carrying a token.
-        auth: Option<AuthToken>,
     },
 }
 
 /// A raw (unvalidated) `[source.<name>]` table entry, as parsed from one config file —
-/// unvalidated because validation ([`RegistryIndex::new`]'s policy gate, in particular)
+/// unvalidated because validation ([`RegistryIndex::declared`]'s policy gate, in particular)
 /// must run per parse against the live policy, never cached (plan-1b §1.5(b)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceEntry {
@@ -466,7 +667,7 @@ fn parse_source_entries_raw(content: &str) -> HashMap<String, SourceEntry> {
 
 /// Parses a table value's `index` field into a raw (unvalidated) string, warning and
 /// returning `None` only when the field is missing or not a string — actual URL validation
-/// happens per parse in [`RegistryIndex::new`], never here (plan-1b §1.5(b)): caching a
+/// happens per parse in [`RegistryIndex::declared`], never here (plan-1b §1.5(b)): caching a
 /// validated `RegistryIndex` would go stale across a `didChangeConfiguration` policy change.
 fn parse_raw_index_field(entry: &Table<'_>) -> Option<String> {
     entry
@@ -588,7 +789,7 @@ enum CachedTier {
 /// (spec NFR-005, plan-1b §1.5).
 ///
 /// Caches **raw**, unvalidated tables — alias filtering, env overrides,
-/// [`RegistryIndex::new`] validation, and `[source]` chain walking all run **per parse**
+/// [`RegistryIndex::declared`] validation, and `[source]` chain walking all run **per parse**
 /// against these cached tables, never cached themselves. This is what keeps a policy change
 /// (`didChangeConfiguration`), a newly-referenced alias, or an env-var change taking effect
 /// immediately without any cache invalidation of their own.
@@ -634,23 +835,29 @@ impl ConfigFileCache {
     }
 }
 
-/// `$CARGO_HOME/config.toml`'s path, or `None` if `$CARGO_HOME` is not set.
+/// `$CARGO_HOME/config.toml`'s path, or `None` if `$CARGO_HOME` is unset or relative.
 ///
 /// Deliberately reads only the `CARGO_HOME` environment variable — no fallback to
 /// `$HOME`/`%USERPROFILE%` when it is unset (spec FR-004), and no `dirs`/`home` crate
-/// dependency added to compute one.
+/// dependency added to compute one. A relative `CARGO_HOME` would resolve against a directory a
+/// repository can influence, so it names no operator-owned location and is ignored.
 #[must_use]
-pub fn cargo_home_config_path() -> Option<PathBuf> {
-    cargo_home_config_path_with_env(|name| std::env::var_os(name))
+pub fn cargo_home_config_path() -> Option<OperatorPath> {
+    cargo_home_config_path_with_env(&ProcessEnv)
 }
 
-/// [`cargo_home_config_path`], but reading the environment through `env` instead of
-/// [`std::env::var_os`] directly — lets tests inject a fake environment instead of
-/// mutating the real (`unsafe`-only, since Rust 2024) process environment.
-fn cargo_home_config_path_with_env(
-    env: impl Fn(&str) -> Option<std::ffi::OsString>,
-) -> Option<PathBuf> {
-    env("CARGO_HOME").map(|home| PathBuf::from(home).join("config.toml"))
+/// [`cargo_home_config_path`], but reading the environment through `env` instead of the process
+/// environment — lets tests inject a fake environment instead of mutating the real
+/// (`unsafe`-only, since Rust 2024) process environment.
+fn cargo_home_config_path_with_env(env: &impl EnvSource) -> Option<OperatorPath> {
+    match OperatorPath::from_env(env, OperatorEnvVar::CargoHome) {
+        EnvPath::Path(home) => Some(home.join("config.toml")),
+        EnvPath::Unset => None,
+        EnvPath::Ignored => {
+            tracing::warn!("ignoring a relative CARGO_HOME: it names no operator-owned location");
+            None
+        }
+    }
 }
 
 /// The loaded, per-file tiers a [`resolve`] call operates against — workspace tiers
@@ -663,14 +870,15 @@ struct LoadedTiers {
 
 fn load_tiers(
     workspace_config_paths: &[PathBuf],
-    cargo_home_config_path: Option<&Path>,
+    cargo_home_config_path: Option<&OperatorPath>,
     config_cache: &ConfigFileCache,
 ) -> LoadedTiers {
+    let cargo_home_path = cargo_home_config_path.map(OperatorPath::as_path);
     // Under the default layout, `~/.cargo/config.toml` is also found by the workspace-tier
     // walk — uncompared, it'd double-count as workspace-tier, winning over the real
     // `$CARGO_HOME` tier and silently dropping its token. Canonicalizing also catches a
     // symlinked `$CARGO_HOME`.
-    let cargo_home_canonical = cargo_home_config_path.and_then(|p| std::fs::canonicalize(p).ok());
+    let cargo_home_canonical = cargo_home_path.and_then(|p| std::fs::canonicalize(p).ok());
 
     let workspace = workspace_config_paths
         .iter()
@@ -680,8 +888,7 @@ fn load_tiers(
         .filter_map(|path| config_cache.get_or_parse_workspace(path))
         .collect();
 
-    let cargo_home =
-        cargo_home_config_path.and_then(|path| config_cache.get_or_parse_cargo_home(path));
+    let cargo_home = cargo_home_path.and_then(|path| config_cache.get_or_parse_cargo_home(path));
 
     LoadedTiers {
         workspace,
@@ -699,7 +906,16 @@ fn load_tiers(
 /// dependencies declared; `workspace_config_paths` and `cargo_home_config_path` come from
 /// `crate::parser`'s merged ancestor walk (closest-first); `config_cache` memoizes each
 /// distinct config file's raw contents (spec NFR-005); `policy` gates every
-/// `WorkspaceDeclared` [`RegistryIndex`] this call constructs.
+/// [`RegistryTrust::WorkspaceDeclared`] [`RegistryIndex`] this call constructs.
+///
+/// # Trust
+///
+/// The operator set is every index URL `$CARGO_HOME/config.toml` declares (`[registries]` and
+/// `[source]` sparse terminals) plus the `CARGO_REGISTRIES_<ALIAS>_INDEX` values read for the
+/// referenced aliases. Every index, whichever file named it, is classified against that set by
+/// [`OperatorRegistries::classify`]; only an index that classified
+/// [`RegistryTrust::Trusted`] and was resolved from a `$CARGO_HOME` entry or a
+/// `CARGO_REGISTRIES_*` variable can carry a credential.
 ///
 /// # Precedence
 ///
@@ -730,7 +946,7 @@ fn load_tiers(
 pub fn resolve(
     referenced_aliases: &HashSet<String>,
     workspace_config_paths: &[PathBuf],
-    cargo_home_config_path: Option<&Path>,
+    cargo_home_config_path: Option<&OperatorPath>,
     config_cache: &ConfigFileCache,
     policy: &RegistryAccessPolicy,
 ) -> (CargoConfig, SourceReplacement) {
@@ -740,40 +956,56 @@ pub fn resolve(
         cargo_home_config_path,
         config_cache,
         policy,
-        &|name| std::env::var(name).ok(),
+        &ProcessEnv,
     )
 }
 
-/// [`resolve`], but reading environment variables through `env` instead of
-/// [`std::env::var`] directly — lets tests inject a fake environment instead of mutating
-/// the real process environment (this workspace forbids `unsafe`, and Rust 2024 made
+/// [`resolve`], but reading environment variables through `env` instead of the process
+/// environment — lets tests inject a fake environment instead of mutating the real process
+/// environment (this workspace forbids `unsafe`, and Rust 2024 made
 /// `std::env::set_var`/`remove_var` `unsafe fn`s, so a test cannot do that mutation at
 /// all). Production callers always go through [`resolve`].
+///
+/// Two passes. Pass 1 reads every raw value that can name an operator index: the
+/// `$CARGO_HOME` entries and the environment overrides of the referenced aliases that did not
+/// collide. Pass 2 builds the operator set from those same values, then classifies every
+/// candidate against it. Each value's `sparse+` prefix is removed by [`strip_sparse_prefix`]
+/// in both passes, so the set and the classifier see identical text.
 fn resolve_with_env(
     referenced_aliases: &HashSet<String>,
     workspace_config_paths: &[PathBuf],
-    cargo_home_config_path: Option<&Path>,
+    cargo_home_config_path: Option<&OperatorPath>,
     config_cache: &ConfigFileCache,
     policy: &RegistryAccessPolicy,
-    env: &dyn Fn(&str) -> Option<String>,
+    env: &impl EnvSource,
 ) -> (CargoConfig, SourceReplacement) {
     let tiers = load_tiers(workspace_config_paths, cargo_home_config_path, config_cache);
 
-    let registries = resolve_registries(referenced_aliases, &tiers, policy, env);
-    let source_replacement = resolve_source_chain(&tiers, policy);
+    let env_collided = env_collided_aliases(referenced_aliases);
+    let env_indexes = read_env_indexes(referenced_aliases, &env_collided, env);
+    let operator = operator_registries(&tiers, cargo_home_config_path, env, &env_indexes);
+
+    let registries = resolve_registries(
+        referenced_aliases,
+        &tiers,
+        &Candidates {
+            operator: &operator,
+            env_collided: &env_collided,
+            env_indexes: &env_indexes,
+        },
+        policy,
+        env,
+    );
+    let source_replacement = resolve_source_chain(&tiers, &operator, policy);
 
     (registries, source_replacement)
 }
 
-fn resolve_registries(
-    referenced_aliases: &HashSet<String>,
-    tiers: &LoadedTiers,
-    policy: &RegistryAccessPolicy,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> CargoConfig {
-    // FR-015: two alias spellings deriving the same env-var name (e.g. "my-corp"/"my_corp")
-    // must not let either pick up an override meant for the other. Detected once over the
-    // whole set — a per-alias check would have nothing to compare against.
+/// Aliases whose derived `CARGO_REGISTRIES_*` variable name collides with another referenced
+/// alias's (FR-015): two spellings deriving the same env-var name (e.g. "my-corp"/"my_corp")
+/// must not let either pick up an override meant for the other. Detected once over the whole
+/// set — a per-alias check would have nothing to compare against.
+fn env_collided_aliases(referenced_aliases: &HashSet<String>) -> HashSet<&str> {
     let mut env_name_to_aliases: HashMap<String, Vec<&String>> = HashMap::new();
     for alias in referenced_aliases {
         env_name_to_aliases
@@ -781,7 +1013,7 @@ fn resolve_registries(
             .or_default()
             .push(alias);
     }
-    let env_collided: HashSet<&str> = env_name_to_aliases
+    env_name_to_aliases
         .values()
         .filter(|aliases| aliases.len() > 1)
         .flat_map(|aliases| {
@@ -798,33 +1030,105 @@ fn resolve_registries(
             );
             names
         })
-        .collect();
+        .collect()
+}
 
+/// Pass 1: the raw `CARGO_REGISTRIES_<ALIAS>_INDEX` value of every referenced alias that did
+/// not collide, keyed by alias.
+fn read_env_indexes(
+    referenced_aliases: &HashSet<String>,
+    env_collided: &HashSet<&str>,
+    env: &impl EnvSource,
+) -> HashMap<String, String> {
+    referenced_aliases
+        .iter()
+        .filter(|alias| !env_collided.contains(alias.as_str()))
+        .filter_map(|alias| {
+            env_string(env, &env_var_name(alias, "INDEX")).map(|value| (alias.clone(), value))
+        })
+        .collect()
+}
+
+/// The environment variable `name` as text, when set and valid Unicode.
+fn env_string(env: &impl EnvSource, name: &str) -> Option<String> {
+    env.var_os(name).and_then(|value| value.into_string().ok())
+}
+
+/// Every index URL a `$CARGO_HOME` config file declares: its `[registries]` entries and its
+/// `[source]` tables that end at a `sparse+` registry.
+fn cargo_home_index_values(file: &ParsedConfigFile) -> impl Iterator<Item = &str> {
+    let registries = match &file.tier {
+        CachedTier::CargoHome(map) => Some(map.values().map(|(raw, _token)| raw.as_str())),
+        CachedTier::Workspace(_) => None,
+    };
+    let sources = file.sources.values().filter_map(|entry| match &entry.kind {
+        Some(SourceKind::SparseRegistry { raw }) => Some(raw.as_str()),
+        Some(SourceKind::NonSparse) | None => None,
+    });
+    registries.into_iter().flatten().chain(sources)
+}
+
+/// Pass 2: the operator set built from the values pass 1 read.
+fn operator_registries(
+    tiers: &LoadedTiers,
+    cargo_home_config_path: Option<&OperatorPath>,
+    env: &impl EnvSource,
+    env_indexes: &HashMap<String, String>,
+) -> OperatorRegistries {
+    let mut operator = match (cargo_home_config_path, tiers.cargo_home.as_deref()) {
+        (Some(path), Some(file)) => OperatorRegistries::declared_in(
+            path,
+            cargo_home_index_values(file).map(|raw| strip_sparse_prefix(raw).as_str()),
+        ),
+        _ => OperatorRegistries::default(),
+    };
+    operator.extend(OperatorRegistries::declared_in_env(
+        env,
+        env_indexes
+            .values()
+            .map(|raw| strip_sparse_prefix(raw).as_str()),
+    ));
+    operator
+}
+
+/// What pass 1 read and pass 2 derived, shared by every alias's resolution.
+struct Candidates<'a> {
+    operator: &'a OperatorRegistries,
+    env_collided: &'a HashSet<&'a str>,
+    env_indexes: &'a HashMap<String, String>,
+}
+
+fn resolve_registries(
+    referenced_aliases: &HashSet<String>,
+    tiers: &LoadedTiers,
+    candidates: &Candidates<'_>,
+    policy: &RegistryAccessPolicy,
+    env: &impl EnvSource,
+) -> CargoConfig {
     let mut registries = HashMap::new();
     let mut unresolved = HashMap::new();
     for alias in referenced_aliases {
-        if let Some(entry) = tiers.workspace.iter().find_map(|file| match &file.tier {
-            CachedTier::Workspace(map) => map.get(alias).map(|raw_index| (raw_index, file)),
+        if let Some(raw_index) = tiers.workspace.iter().find_map(|file| match &file.tier {
+            CachedTier::Workspace(map) => map.get(alias),
             CachedTier::CargoHome(_) => None,
         }) {
-            let (raw_index, _file) = entry;
-            match RegistryIndex::new(raw_index, RegistryTrust::WorkspaceDeclared, policy) {
+            match RegistryIndex::declared_stripped(
+                strip_sparse_prefix(raw_index),
+                candidates.operator,
+                policy,
+            ) {
                 Ok(index) => {
                     registries.insert(
                         alias.clone(),
                         ResolvedRegistryEntry {
                             index,
-                            auth: None,
                             provenance: Provenance::Workspace,
                         },
                     );
                 }
-                Err(RegistryIndexError::BlockedHost { block }) => {
-                    unresolved.insert(alias.clone(), UnresolvedIndex::Blocked(block));
-                }
                 Err(error) => {
-                    if let Some(reason) = error.rejection_reason().into_reason() {
-                        unresolved.insert(alias.clone(), UnresolvedIndex::Rejected(reason));
+                    if let Some(cause) = UnresolvedIndex::from_error(&error) {
+                        unresolved.insert(alias.clone(), cause);
                     }
                     tracing::warn!(alias, %error, "registry index failed validation");
                 }
@@ -832,18 +1136,12 @@ fn resolve_registries(
             continue;
         }
 
-        match resolve_cargo_home_tier(
-            alias,
-            tiers.cargo_home.as_deref(),
-            !env_collided.contains(alias.as_str()),
-            policy,
-            env,
-        ) {
+        match resolve_cargo_home_tier(alias, tiers.cargo_home.as_deref(), candidates, policy, env) {
             CargoHomeResolution::Resolved(entry) => {
                 registries.insert(alias.clone(), entry);
             }
-            CargoHomeResolution::Rejected(reason) => {
-                unresolved.insert(alias.clone(), UnresolvedIndex::Rejected(reason));
+            CargoHomeResolution::Unresolved(cause) => {
+                unresolved.insert(alias.clone(), cause);
             }
             CargoHomeResolution::Absent => {}
         }
@@ -860,68 +1158,81 @@ enum CargoHomeResolution {
     /// Resolved to a usable index (possibly with a credential).
     Resolved(ResolvedRegistryEntry),
     /// A `CARGO_REGISTRIES_*_INDEX` override or `$CARGO_HOME/config.toml` entry existed but
-    /// failed validation for a reason other than a policy-blocked host (#1453 S1). Unlike the
-    /// workspace tier, `BlockedHost` can never be the reason here — [`RegistryTrust::Trusted`]
-    /// skips the policy gate entirely — but `InvalidUrl`/`NotHttps`/`UserInfoPresent` still
-    /// apply, and this tier used to drop such an entry silently with only a
-    /// `tracing::warn!`, exactly the #1453 shape for a workspace-tier entry.
-    Rejected(RegistryRejectionReason),
+    /// failed validation (#1453 S1). The operator's own URLs skip the workspace policy, so a
+    /// [`UnresolvedIndex::Blocked`] here can only be the never-a-registry floor; the other
+    /// rejections (`InvalidUrl`/`NotHttps`/`UserInfoPresent`) apply too. This tier used to drop
+    /// such an entry silently with only a `tracing::warn!`, exactly the #1453 shape for a
+    /// workspace-tier entry.
+    Unresolved(UnresolvedIndex),
     /// No entry at all — the ordinary "alias not configured in this tier" outcome.
     Absent,
 }
 
+/// Builds the index for one `$CARGO_HOME`-tier value, with its credential when it has one.
+fn cargo_home_index(
+    raw_index: &str,
+    token: Option<AuthToken>,
+    operator: &OperatorRegistries,
+    policy: &RegistryAccessPolicy,
+) -> Result<RegistryIndex, RegistryIndexError> {
+    let stripped = strip_sparse_prefix(raw_index);
+    match token {
+        Some(token) => RegistryIndex::declared_with_credential(stripped, operator, policy, token),
+        None => RegistryIndex::declared_stripped(stripped, operator, policy),
+    }
+}
+
 /// Resolves one alias against the `$CARGO_HOME` tier: an environment-variable override
-/// first (when `env_allowed`), then `$CARGO_HOME/config.toml`'s own entry.
+/// first (when pass 1 read one), then `$CARGO_HOME/config.toml`'s own entry.
 fn resolve_cargo_home_tier(
     alias: &str,
     cargo_home_file: Option<&ParsedConfigFile>,
-    env_allowed: bool,
+    candidates: &Candidates<'_>,
     policy: &RegistryAccessPolicy,
-    env: &dyn Fn(&str) -> Option<String>,
+    env: &impl EnvSource,
 ) -> CargoHomeResolution {
     let cargo_home_map = cargo_home_file.and_then(|file| match &file.tier {
         CachedTier::CargoHome(map) => Some(map),
         CachedTier::Workspace(_) => None,
     });
+    let env_allowed = !candidates.env_collided.contains(alias);
 
     // #1453 S1: an invalid env override still falls through to the file tier exactly as
-    // before — only remembered here so a rejection can be reported if the file tier also
+    // before — only remembered here so its failure can be reported if the file tier also
     // yields nothing usable (a valid file-tier entry silently wins, matching the pre-#1453
     // "env override failed, fall back" behavior).
-    let mut env_rejection = None;
-    if env_allowed && let Some(index_override) = env(&env_var_name(alias, "INDEX")) {
-        match RegistryIndex::new(&index_override, RegistryTrust::Trusted, policy) {
+    let mut env_failure = None;
+    if let Some(index_override) = candidates.env_indexes.get(alias) {
+        let token = env_string(env, &env_var_name(alias, "TOKEN"))
+            .map(AuthToken::new)
+            .or_else(|| {
+                cargo_home_map
+                    .and_then(|map| map.get(alias))
+                    .and_then(|(_, token)| token.clone())
+            });
+        match cargo_home_index(index_override, token, candidates.operator, policy) {
             Ok(index) => {
-                let auth = env(&env_var_name(alias, "TOKEN"))
-                    .map(AuthToken::new)
-                    .or_else(|| {
-                        cargo_home_map
-                            .and_then(|map| map.get(alias))
-                            .and_then(|(_, token)| token.clone())
-                    });
                 return CargoHomeResolution::Resolved(ResolvedRegistryEntry {
                     index,
-                    auth,
                     provenance: Provenance::CargoHome,
                 });
             }
             Err(error) => {
                 tracing::warn!(alias, %error, "CARGO_REGISTRIES_*_INDEX environment override failed validation");
-                env_rejection = error.rejection_reason().into_reason();
+                env_failure = UnresolvedIndex::from_error(&error);
             }
         }
     }
 
     let Some((raw_index, mut auth)) = cargo_home_map.and_then(|map| map.get(alias)).cloned() else {
-        return env_rejection.map_or(CargoHomeResolution::Absent, CargoHomeResolution::Rejected);
+        return env_failure.map_or(CargoHomeResolution::Absent, CargoHomeResolution::Unresolved);
     };
-    if env_allowed && let Some(token_override) = env(&env_var_name(alias, "TOKEN")) {
+    if env_allowed && let Some(token_override) = env_string(env, &env_var_name(alias, "TOKEN")) {
         auth = Some(AuthToken::new(token_override));
     }
-    match RegistryIndex::new(&raw_index, RegistryTrust::Trusted, policy) {
+    match cargo_home_index(&raw_index, auth, candidates.operator, policy) {
         Ok(index) => CargoHomeResolution::Resolved(ResolvedRegistryEntry {
             index,
-            auth,
             provenance: Provenance::CargoHome,
         }),
         Err(error) => {
@@ -931,9 +1242,9 @@ fn resolve_cargo_home_tier(
             // (and, per this function's own precedence, the intended) value for this alias;
             // reporting the file-tier's unrelated failure instead would misattribute why the
             // env override the user actually set didn't take effect.
-            env_rejection
-                .or_else(|| error.rejection_reason().into_reason())
-                .map_or(CargoHomeResolution::Absent, CargoHomeResolution::Rejected)
+            env_failure
+                .or_else(|| UnresolvedIndex::from_error(&error))
+                .map_or(CargoHomeResolution::Absent, CargoHomeResolution::Unresolved)
         }
     }
 }
@@ -948,7 +1259,7 @@ const MAX_SOURCE_REPLACEMENT_HOPS: usize = 16;
 /// resolution, spec FR-005's "two-stage: alias -> source id", critic S4) — closest
 /// workspace tier first, then `$CARGO_HOME`.
 ///
-/// Returns **only** the raw index string and its tier's [`RegistryTrust`] — never the
+/// Returns **only** the raw index string and the tier it came from — never the
 /// `$CARGO_HOME` tier's token, so a workspace-tier chain crossing into a `[registries]`
 /// entry has no way to carry that entry's credential forward even by accident (plan-1b
 /// §1.4's "coupled trust trap" guard, critic N3): the drop is enforced by this function's
@@ -974,9 +1285,9 @@ fn lookup_raw_registry_index<'a>(
 }
 
 /// Looks `id` up as a `[registries]` alias in the `$CARGO_HOME` tier *specifically for its
-/// token* — used only once a chain's overall trust has already folded to
-/// [`RegistryTrust::Trusted`], to re-derive the credential to attach rather than ever reading
-/// one off [`lookup_raw_registry_index`]'s result (plan-1b §1.4's coupled-trust-trap guard).
+/// token* — used only once a chain's links have all been operator links, to re-derive the
+/// credential to attach rather than ever reading one off [`lookup_raw_registry_index`]'s result
+/// (plan-1b §1.4's coupled-trust-trap guard).
 fn cargo_home_token_for(tiers: &LoadedTiers, id: &str) -> Option<AuthToken> {
     let file = tiers.cargo_home.as_deref()?;
     let CachedTier::CargoHome(map) = &file.tier else {
@@ -991,7 +1302,11 @@ fn cargo_home_token_for(tiers: &LoadedTiers, id: &str) -> Option<AuthToken> {
 /// critic S4) the merged `[registries]` tables via [`lookup_raw_registry_index`] — a
 /// `[registries]` hit is terminal by construction, since a `[registries]` entry has no
 /// `replace-with` of its own.
-fn resolve_source_chain(tiers: &LoadedTiers, policy: &RegistryAccessPolicy) -> SourceReplacement {
+fn resolve_source_chain(
+    tiers: &LoadedTiers,
+    operator: &OperatorRegistries,
+    policy: &RegistryAccessPolicy,
+) -> SourceReplacement {
     let mut current_id = "crates-io".to_string();
     let mut visited: HashSet<String> = HashSet::new();
     let mut chain_trust = RegistryTrust::Trusted;
@@ -1038,6 +1353,7 @@ fn resolve_source_chain(tiers: &LoadedTiers, policy: &RegistryAccessPolicy) -> S
                         chain_trust,
                         &current_id,
                         tiers,
+                        operator,
                         policy,
                     );
                 }
@@ -1051,12 +1367,13 @@ fn resolve_source_chain(tiers: &LoadedTiers, policy: &RegistryAccessPolicy) -> S
         // crossover before giving up on this id.
         if let Some((raw_index, crossover_trust)) = lookup_raw_registry_index(&current_id, tiers) {
             chain_trust = stricter(chain_trust, crossover_trust);
-            if raw_index.starts_with("sparse+") {
+            if raw_index.starts_with(SPARSE_PREFIX) {
                 return finalize_source_replacement(
                     raw_index,
                     chain_trust,
                     &current_id,
                     tiers,
+                    operator,
                     policy,
                 );
             }
@@ -1079,19 +1396,17 @@ fn finalize_source_replacement(
     chain_trust: RegistryTrust,
     terminal_id: &str,
     tiers: &LoadedTiers,
+    operator: &OperatorRegistries,
     policy: &RegistryAccessPolicy,
 ) -> SourceReplacement {
-    match RegistryIndex::new(raw, chain_trust, policy) {
-        Ok(index) => {
-            // Never read a token off the `[registries]` crossover lookup itself — re-derive it
-            // here, gated on whether the whole chain folded to `Trusted` (plan-1b §1.4).
-            let auth = if chain_trust == RegistryTrust::Trusted {
-                cargo_home_token_for(tiers, terminal_id)
-            } else {
-                None
-            };
-            SourceReplacement::SparseMirror { index, auth }
-        }
+    // Never read a token off the `[registries]` crossover lookup itself — re-derive it here,
+    // and only when every link of the chain was an operator link (plan-1b §1.4).
+    let token = match chain_trust {
+        RegistryTrust::Trusted => cargo_home_token_for(tiers, terminal_id),
+        RegistryTrust::WorkspaceDeclared => None,
+    };
+    match cargo_home_index(raw, token, operator, policy) {
+        Ok(index) => SourceReplacement::SparseMirror { index },
         Err(error) => {
             tracing::warn!(
                 id = terminal_id,
@@ -1121,7 +1436,7 @@ pub fn referenced_aliases(dependencies: &[crate::types::CargoDependency]) -> Has
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::net_policy::WorkspaceRegistryAccess;
+    use deps_core::net_policy::{MapEnv, WorkspaceRegistryAccess};
     use std::assert_matches;
 
     #[test]
@@ -1158,23 +1473,35 @@ mod tests {
         RegistryAccessPolicy::new(WorkspaceRegistryAccess::Off)
     }
 
+    fn no_operator() -> OperatorRegistries {
+        OperatorRegistries::default()
+    }
+
+    fn operator_declaring(urls: &[&str]) -> OperatorRegistries {
+        OperatorRegistries::declared_in(
+            &OperatorPath::for_test("/home/me/.cargo/config.toml"),
+            urls.iter().copied(),
+        )
+    }
+
+    fn cargo_home_config(dir: &Path) -> OperatorPath {
+        OperatorPath::for_test(dir.join("config.toml"))
+    }
+
     #[test]
     fn test_registry_index_strips_sparse_prefix() {
         let policy = all_policy();
-        let index = RegistryIndex::new(
-            "sparse+https://index.mycorp.dev",
-            RegistryTrust::Trusted,
-            &policy,
-        )
-        .unwrap();
-        assert_eq!(index.as_str(), "https://index.mycorp.dev/");
+        let index =
+            RegistryIndex::declared("sparse+https://index.mycorp.dev", &no_operator(), &policy)
+                .unwrap();
+        assert_eq!(index.as_str(), "https://index.mycorp.dev");
     }
 
     #[test]
     fn test_registry_index_rejects_http() {
         let policy = all_policy();
         assert_matches!(
-            RegistryIndex::new("http://index.mycorp.dev", RegistryTrust::Trusted, &policy),
+            RegistryIndex::declared("http://index.mycorp.dev", &no_operator(), &policy),
             Err(RegistryIndexError::NotHttps(_))
         );
     }
@@ -1183,9 +1510,9 @@ mod tests {
     fn test_registry_index_rejects_userinfo() {
         let policy = all_policy();
         assert_matches!(
-            RegistryIndex::new(
+            RegistryIndex::declared(
                 "https://user:pass@index.mycorp.dev",
-                RegistryTrust::Trusted,
+                &no_operator(),
                 &policy
             ),
             Err(RegistryIndexError::UserInfoPresent)
@@ -1196,11 +1523,7 @@ mod tests {
     fn test_registry_index_rejects_bare_username() {
         let policy = all_policy();
         assert_matches!(
-            RegistryIndex::new(
-                "https://user@index.mycorp.dev",
-                RegistryTrust::Trusted,
-                &policy
-            ),
+            RegistryIndex::declared("https://user@index.mycorp.dev", &no_operator(), &policy),
             Err(RegistryIndexError::UserInfoPresent)
         );
     }
@@ -1209,7 +1532,7 @@ mod tests {
     fn test_registry_index_rejects_invalid_url() {
         let policy = all_policy();
         assert_matches!(
-            RegistryIndex::new("not a url", RegistryTrust::Trusted, &policy),
+            RegistryIndex::declared("not a url", &no_operator(), &policy),
             Err(RegistryIndexError::InvalidUrl(_))
         );
     }
@@ -1219,13 +1542,13 @@ mod tests {
     /// `UserInfoPresent` — every call site here logs this error via `tracing::warn!(alias,
     /// %error, …)`, so the credential must never survive into `InvalidUrl`'s payload or its
     /// `Display`. Fixed once inside `deps_core::net_policy::validate_index_url`, which every
-    /// `RegistryIndex::new` call routes through — no separate redaction needed here.
+    /// `RegistryIndex::declared` call routes through — no separate redaction needed here.
     #[test]
     fn test_registry_index_invalid_url_error_redacts_userinfo() {
         let policy = all_policy();
-        let err = RegistryIndex::new(
+        let err = RegistryIndex::declared(
             "https://user:hunter2@index.mycorp.dev:99999",
-            RegistryTrust::Trusted,
+            &no_operator(),
             &policy,
         )
         .unwrap_err();
@@ -1237,7 +1560,7 @@ mod tests {
     fn test_registry_index_accepts_https_without_sparse_prefix() {
         let policy = all_policy();
         assert!(
-            RegistryIndex::new("https://index.mycorp.dev", RegistryTrust::Trusted, &policy).is_ok()
+            RegistryIndex::declared("https://index.mycorp.dev", &no_operator(), &policy).is_ok()
         );
     }
 
@@ -1245,24 +1568,19 @@ mod tests {
     fn test_registry_index_builtin_crates_io() {
         // Also the coverage that makes `builtin`'s panic path unreachable in practice.
         let index = RegistryIndex::builtin("https://index.crates.io");
-        assert_eq!(index.as_str(), "https://index.crates.io/");
+        assert_eq!(index.as_str(), "https://index.crates.io");
     }
 
-    // Issue #455, test-plan item 11: `RegistryIndex::trust()` round-trips `new`'s argument.
+    /// The URL-alone rule, not the caller, assigns trust: a URL the operator declared is
+    /// Trusted and any other is workspace-declared.
     #[test]
-    fn test_registry_index_trust_round_trips_new_argument() {
+    fn test_registry_index_trust_follows_the_operator_set() {
         let policy = all_policy();
-        let trusted =
-            RegistryIndex::new("https://index.mycorp.dev", RegistryTrust::Trusted, &policy)
-                .unwrap();
+        let url = "https://index.mycorp.dev";
+        let trusted = RegistryIndex::declared(url, &operator_declaring(&[url]), &policy).unwrap();
         assert_eq!(trusted.trust(), RegistryTrust::Trusted);
 
-        let workspace_declared = RegistryIndex::new(
-            "https://index.mycorp.dev",
-            RegistryTrust::WorkspaceDeclared,
-            &policy,
-        )
-        .unwrap();
+        let workspace_declared = RegistryIndex::declared(url, &no_operator(), &policy).unwrap();
         assert_eq!(workspace_declared.trust(), RegistryTrust::WorkspaceDeclared);
     }
 
@@ -1273,30 +1591,34 @@ mod tests {
         assert_eq!(index.trust(), RegistryTrust::Trusted);
     }
 
-    /// Policy gate matrix (plan-1b §4): every `WorkspaceRegistryAccess` x `RegistryTrust`
-    /// combination against a metadata-IP URL. `Trusted` is always allowed (it is the
-    /// user's own `$CARGO_HOME` config, never policy-checked); `WorkspaceDeclared` follows
-    /// the policy exactly.
+    /// An operator-declared URL skips the workspace policy under every level, but never the
+    /// never-a-registry floor: the cloud-metadata address is rejected even though the operator
+    /// named it (#1855).
     #[test]
-    fn test_registry_index_trusted_metadata_ip_always_allowed() {
+    fn test_registry_index_operator_declared_metadata_ip_rejected_by_the_floor() {
+        let url = "https://169.254.169.254/";
         for policy in [off_policy(), public_only_policy(), all_policy()] {
-            assert!(
-                RegistryIndex::new("https://169.254.169.254/", RegistryTrust::Trusted, &policy)
-                    .is_ok(),
-                "a Trusted candidate must never be policy-checked"
+            assert_matches!(
+                RegistryIndex::declared(url, &operator_declaring(&[url]), &policy),
+                Err(RegistryIndexError::BlockedHost { .. }),
+                "the floor applies to a Trusted candidate too"
             );
         }
+    }
+
+    #[test]
+    fn test_registry_index_operator_declared_private_host_skips_the_policy() {
+        let url = "https://10.0.0.1/";
+        let index =
+            RegistryIndex::declared(url, &operator_declaring(&[url]), &off_policy()).unwrap();
+        assert_eq!(index.trust(), RegistryTrust::Trusted);
     }
 
     #[test]
     fn test_registry_index_workspace_declared_metadata_ip_blocked_under_public_only() {
         let policy = public_only_policy();
         assert_matches!(
-            RegistryIndex::new(
-                "https://169.254.169.254/",
-                RegistryTrust::WorkspaceDeclared,
-                &policy
-            ),
+            RegistryIndex::declared("https://169.254.169.254/", &no_operator(), &policy),
             Err(RegistryIndexError::BlockedHost { .. })
         );
     }
@@ -1305,12 +1627,7 @@ mod tests {
     fn test_registry_index_workspace_declared_global_allowed_under_public_only() {
         let policy = public_only_policy();
         assert!(
-            RegistryIndex::new(
-                "https://index.mycorp.dev",
-                RegistryTrust::WorkspaceDeclared,
-                &policy
-            )
-            .is_ok()
+            RegistryIndex::declared("https://index.mycorp.dev", &no_operator(), &policy).is_ok()
         );
     }
 
@@ -1318,11 +1635,7 @@ mod tests {
     fn test_registry_index_workspace_declared_blocked_under_off() {
         let policy = off_policy();
         assert_matches!(
-            RegistryIndex::new(
-                "https://index.mycorp.dev",
-                RegistryTrust::WorkspaceDeclared,
-                &policy
-            ),
+            RegistryIndex::declared("https://index.mycorp.dev", &no_operator(), &policy),
             Err(RegistryIndexError::BlockedHost { .. })
         );
     }
@@ -1330,14 +1643,63 @@ mod tests {
     #[test]
     fn test_registry_index_workspace_declared_rfc1918_allowed_under_all() {
         let policy = all_policy();
-        assert!(
-            RegistryIndex::new(
-                "https://10.0.0.1/",
-                RegistryTrust::WorkspaceDeclared,
-                &policy
-            )
-            .is_ok()
+        assert!(RegistryIndex::declared("https://10.0.0.1/", &no_operator(), &policy).is_ok());
+    }
+
+    /// #1855: a credential is attached only when the URL classified Trusted; for any other URL
+    /// the index is anonymous, so a credential for a workspace-declared index cannot exist.
+    #[test]
+    fn test_declared_with_credential_attaches_only_to_a_trusted_url() {
+        let policy = all_policy();
+        let url = "https://index.mycorp.dev/credential-binding";
+        let token = || AuthToken::new("operator-token".to_string());
+
+        let trusted = RegistryIndex::declared_with_credential(
+            strip_sparse_prefix(url),
+            &operator_declaring(&[url]),
+            &policy,
+            token(),
+        )
+        .unwrap();
+        assert_eq!(
+            trusted.credential().map(AuthToken::expose_secret),
+            Some("operator-token")
         );
+
+        let workspace = RegistryIndex::declared_with_credential(
+            strip_sparse_prefix(url),
+            &no_operator(),
+            &policy,
+            token(),
+        )
+        .unwrap();
+        assert_eq!(workspace.trust(), RegistryTrust::WorkspaceDeclared);
+        assert!(!workspace.has_credential());
+    }
+
+    /// #1855: the withheld-credential `WARN` is logged once per canonical URL, whatever the
+    /// spelling of the URL or how often it is presented.
+    #[test]
+    fn test_withheld_credential_warning_is_deduplicated_per_canonical_url() {
+        let policy = all_policy();
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            for spelling in [
+                "https://dedup.mycorp.dev/index",
+                "https://dedup.mycorp.dev/index/",
+                "sparse+https://dedup.mycorp.dev/index",
+            ] {
+                let index = RegistryIndex::declared_with_credential(
+                    strip_sparse_prefix(spelling),
+                    &no_operator(),
+                    &policy,
+                    AuthToken::new("operator-token".to_string()),
+                )
+                .unwrap();
+                assert!(!index.has_credential());
+            }
+        });
+        assert_eq!(log.matches("credential withheld").count(), 1, "log: {log}");
+        assert!(!log.contains("operator-token"), "log: {log}");
     }
 
     #[test]
@@ -1396,15 +1758,23 @@ token = "secret-token"
 
     #[test]
     fn test_cargo_home_config_path_none_when_unset() {
-        assert!(cargo_home_config_path_with_env(|_| None).is_none());
+        assert!(cargo_home_config_path_with_env(&MapEnv::new()).is_none());
     }
 
     #[test]
     fn test_cargo_home_config_path_some_when_set() {
-        let path = cargo_home_config_path_with_env(|name| {
-            (name == "CARGO_HOME").then(|| std::ffi::OsString::from("/home/user/.cargo"))
-        });
-        assert_eq!(path, Some(PathBuf::from("/home/user/.cargo/config.toml")));
+        let dir = tempfile::tempdir().unwrap();
+        let env = MapEnv::new().with_var("CARGO_HOME", dir.path().to_str().unwrap());
+        let path = cargo_home_config_path_with_env(&env).unwrap();
+        assert_eq!(path.as_path(), dir.path().join("config.toml"));
+    }
+
+    /// A relative `CARGO_HOME` would resolve against a directory a repository can influence, so
+    /// it names no operator-owned location and is ignored (#1855).
+    #[test]
+    fn test_cargo_home_config_path_ignores_a_relative_cargo_home() {
+        let env = MapEnv::new().with_var("CARGO_HOME", "relative/.cargo");
+        assert!(cargo_home_config_path_with_env(&env).is_none());
     }
 
     #[test]
@@ -1432,15 +1802,15 @@ token = "secret-token"
         let (config, _) = resolve(
             &aliases,
             &[root.path().join(".cargo/config.toml")],
-            Some(&cargo_home.path().join("config.toml")),
+            Some(&cargo_home_config(cargo_home.path())),
             &cache,
             &policy,
         );
 
         let entry = config.get("my-corp").unwrap();
-        assert_eq!(entry.index.as_str(), "https://workspace.example/");
+        assert_eq!(entry.index.as_str(), "https://workspace.example");
         assert!(
-            entry.auth.is_none(),
+            !entry.index.has_credential(),
             "workspace-shadowed entry must never carry the cargo-home token"
         );
         assert_eq!(entry.provenance, Provenance::Workspace);
@@ -1475,16 +1845,16 @@ token = "secret-token"
         let (config, _) = resolve(
             &aliases,
             &workspace_paths,
-            Some(&cargo_home_config),
+            Some(&OperatorPath::for_test(cargo_home_config)),
             &cache,
             &policy,
         );
 
         let entry = config.get("my-corp").unwrap();
-        assert_eq!(entry.index.as_str(), "https://real.example/");
+        assert_eq!(entry.index.as_str(), "https://real.example");
         assert_eq!(entry.provenance, Provenance::CargoHome);
         assert_eq!(
-            entry.auth.as_ref().map(AuthToken::expose_secret),
+            entry.index.credential().map(AuthToken::expose_secret),
             Some("real-token"),
             "the CARGO_HOME token must not be lost just because the project lives \
              under $HOME"
@@ -1508,15 +1878,15 @@ token = "secret-token"
         let (config, _) = resolve(
             &aliases,
             &[],
-            Some(&cargo_home.path().join("config.toml")),
+            Some(&cargo_home_config(cargo_home.path())),
             &cache,
             &policy,
         );
 
         let entry = config.get("my-corp").unwrap();
-        assert_eq!(entry.index.as_str(), "https://real.example/");
+        assert_eq!(entry.index.as_str(), "https://real.example");
         assert_eq!(
-            entry.auth.as_ref().unwrap().as_redacted().expose_secret(),
+            entry.index.credential().unwrap().expose_secret(),
             "real-token"
         );
         assert_eq!(entry.provenance, Provenance::CargoHome);
@@ -1544,7 +1914,7 @@ token = "secret-token"
         let (config, _) = resolve(
             &aliases,
             &[],
-            Some(&cargo_home.path().join("config.toml")),
+            Some(&cargo_home_config(cargo_home.path())),
             &cache,
             &policy,
         );
@@ -1571,9 +1941,7 @@ token = "secret-token"
         )
         .unwrap();
 
-        let env = |name: &str| {
-            (name == "CARGO_REGISTRIES_MY_CORP_INDEX").then(|| "not-a-valid-url".to_string())
-        };
+        let env = MapEnv::new().with_var("CARGO_REGISTRIES_MY_CORP_INDEX", "not-a-valid-url");
 
         let aliases: HashSet<String> = std::iter::once("my-corp".to_string()).collect();
         let cache = ConfigFileCache::new();
@@ -1581,14 +1949,14 @@ token = "secret-token"
         let (config, _) = resolve_with_env(
             &aliases,
             &[],
-            Some(&cargo_home.path().join("config.toml")),
+            Some(&cargo_home_config(cargo_home.path())),
             &cache,
             &policy,
             &env,
         );
 
         let entry = config.get("my-corp").unwrap();
-        assert_eq!(entry.index.as_str(), "https://real.example/");
+        assert_eq!(entry.index.as_str(), "https://real.example");
         assert_eq!(config.rejected_reason("my-corp"), None);
     }
 
@@ -1599,10 +1967,10 @@ token = "secret-token"
     fn test_resolve_env_var_index_override_rejected_with_no_file_entry_populates_rejected() {
         // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
-        let env = |name: &str| {
-            (name == "CARGO_REGISTRIES_MY_CORP_INDEX")
-                .then(|| "sparse+https://user:pass@index.mycorp.dev".to_string())
-        };
+        let env = MapEnv::new().with_var(
+            "CARGO_REGISTRIES_MY_CORP_INDEX",
+            "sparse+https://user:pass@index.mycorp.dev",
+        );
 
         let aliases: HashSet<String> = std::iter::once("my-corp".to_string()).collect();
         let cache = ConfigFileCache::new();
@@ -1631,10 +1999,10 @@ token = "secret-token"
         )
         .unwrap();
 
-        let env = |name: &str| {
-            (name == "CARGO_REGISTRIES_MY_CORP_INDEX")
-                .then(|| "sparse+https://user:pass@index.mycorp.dev".to_string())
-        };
+        let env = MapEnv::new().with_var(
+            "CARGO_REGISTRIES_MY_CORP_INDEX",
+            "sparse+https://user:pass@index.mycorp.dev",
+        );
 
         let aliases: HashSet<String> = std::iter::once("my-corp".to_string()).collect();
         let cache = ConfigFileCache::new();
@@ -1642,7 +2010,7 @@ token = "secret-token"
         let (config, _) = resolve_with_env(
             &aliases,
             &[],
-            Some(&cargo_home.path().join("config.toml")),
+            Some(&cargo_home_config(cargo_home.path())),
             &cache,
             &policy,
             &env,
@@ -1672,21 +2040,20 @@ token = "secret-token"
         // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let aliases: HashSet<String> = std::iter::once("env-only-corp".to_string()).collect();
-        let env = |name: &str| match name {
-            "CARGO_REGISTRIES_ENV_ONLY_CORP_INDEX" => {
-                Some("sparse+https://env.example".to_string())
-            }
-            "CARGO_REGISTRIES_ENV_ONLY_CORP_TOKEN" => Some("env-token".to_string()),
-            _ => None,
-        };
+        let env = MapEnv::new()
+            .with_var(
+                "CARGO_REGISTRIES_ENV_ONLY_CORP_INDEX",
+                "sparse+https://env.example",
+            )
+            .with_var("CARGO_REGISTRIES_ENV_ONLY_CORP_TOKEN", "env-token");
 
         let cache = ConfigFileCache::new();
         let policy = all_policy();
         let (config, _) = resolve_with_env(&aliases, &[], None, &cache, &policy, &env);
         let entry = config.get("env-only-corp").unwrap();
-        assert_eq!(entry.index.as_str(), "https://env.example/");
+        assert_eq!(entry.index.as_str(), "https://env.example");
         assert_eq!(
-            entry.auth.as_ref().unwrap().as_redacted().expose_secret(),
+            entry.index.credential().unwrap().expose_secret(),
             "env-token"
         );
         assert_eq!(entry.provenance, Provenance::CargoHome);
@@ -1701,10 +2068,10 @@ token = "secret-token"
         let aliases: HashSet<String> = ["my-corp".to_string(), "my_corp".to_string()]
             .into_iter()
             .collect();
-        let env = |name: &str| {
-            (name == "CARGO_REGISTRIES_MY_CORP_INDEX")
-                .then(|| "sparse+https://ambiguous.example".to_string())
-        };
+        let env = MapEnv::new().with_var(
+            "CARGO_REGISTRIES_MY_CORP_INDEX",
+            "sparse+https://ambiguous.example",
+        );
 
         let cache = ConfigFileCache::new();
         let policy = all_policy();
@@ -1728,9 +2095,7 @@ token = "secret-token"
         )
         .unwrap();
 
-        let env = |name: &str| {
-            (name == "CARGO_REGISTRIES_GITHUB_TOKEN").then(|| "legitimate-token".to_string())
-        };
+        let env = MapEnv::new().with_var("CARGO_REGISTRIES_GITHUB_TOKEN", "legitimate-token");
 
         let aliases: HashSet<String> = std::iter::once("github".to_string()).collect();
         let cache = ConfigFileCache::new();
@@ -1745,10 +2110,195 @@ token = "secret-token"
         );
 
         let entry = config.get("github").unwrap();
-        assert_eq!(entry.index.as_str(), "https://attacker.example/");
+        assert_eq!(entry.index.as_str(), "https://attacker.example");
         assert!(
-            entry.auth.is_none(),
+            !entry.index.has_credential(),
             "the legitimate env token must never attach to the attacker-controlled index"
+        );
+    }
+
+    /// #1855: a `sparse+` registry in `$CARGO_HOME` is operator-declared, so it classifies
+    /// Trusted and carries its token.
+    #[test]
+    fn test_resolve_sparse_prefixed_cargo_home_registry_is_trusted_with_credential() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let cargo_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cargo_home.path().join("config.toml"),
+            "[registries.corp]\nindex = \"sparse+https://corp.example/index\"\ntoken = \"corp-token\"\n",
+        )
+        .unwrap();
+
+        let aliases: HashSet<String> = std::iter::once("corp".to_string()).collect();
+        let (config, _) = resolve_with_env(
+            &aliases,
+            &[],
+            Some(&cargo_home_config(cargo_home.path())),
+            &ConfigFileCache::new(),
+            &off_policy(),
+            &MapEnv::new(),
+        );
+
+        let entry = config.get("corp").unwrap();
+        assert_eq!(entry.index.trust(), RegistryTrust::Trusted);
+        assert_eq!(
+            entry.index.credential().map(AuthToken::expose_secret),
+            Some("corp-token")
+        );
+    }
+
+    /// #1855: an operator registry declared only through `CARGO_REGISTRIES_<ALIAS>_INDEX`, with
+    /// `$CARGO_HOME` unset, is still operator-declared: Trusted, policy skipped, token attached.
+    #[test]
+    fn test_resolve_env_only_operator_registry_is_trusted_without_cargo_home() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let env = MapEnv::new()
+            .with_var(
+                "CARGO_REGISTRIES_ENVREG_INDEX",
+                "sparse+https://envreg.example",
+            )
+            .with_var("CARGO_REGISTRIES_ENVREG_TOKEN", "env-token");
+
+        let aliases: HashSet<String> = std::iter::once("envreg".to_string()).collect();
+        let (config, _) = resolve_with_env(
+            &aliases,
+            &[],
+            None,
+            &ConfigFileCache::new(),
+            &off_policy(),
+            &env,
+        );
+
+        let entry = config.get("envreg").unwrap();
+        assert_eq!(entry.index.trust(), RegistryTrust::Trusted);
+        assert_eq!(
+            entry.index.credential().map(AuthToken::expose_secret),
+            Some("env-token")
+        );
+    }
+
+    /// #1855: a workspace alias that names an operator-declared URL gets that URL's egress trust
+    /// (the policy is skipped, even under `off`) but never the operator's credential.
+    #[test]
+    fn test_resolve_workspace_alias_naming_an_operator_url_is_trusted_but_anonymous() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
+        std::fs::write(
+            root.path().join(".cargo/config.toml"),
+            "[registries.repo-alias]\nindex = \"sparse+https://corp.example/index/\"\n",
+        )
+        .unwrap();
+        let cargo_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cargo_home.path().join("config.toml"),
+            "[registries.corp]\nindex = \"sparse+https://corp.example/index\"\ntoken = \"corp-token\"\n",
+        )
+        .unwrap();
+
+        let aliases: HashSet<String> = std::iter::once("repo-alias".to_string()).collect();
+        let (config, _) = resolve_with_env(
+            &aliases,
+            &[root.path().join(".cargo/config.toml")],
+            Some(&cargo_home_config(cargo_home.path())),
+            &ConfigFileCache::new(),
+            &off_policy(),
+            &MapEnv::new(),
+        );
+
+        let entry = config.get("repo-alias").unwrap();
+        assert_eq!(entry.provenance, Provenance::Workspace);
+        assert_eq!(entry.index.trust(), RegistryTrust::Trusted);
+        assert!(!entry.index.has_credential());
+    }
+
+    /// #1855: a workspace alias naming a URL the operator did not declare stays
+    /// workspace-declared and is refused under `off`.
+    #[test]
+    fn test_resolve_workspace_alias_for_an_undeclared_url_is_policy_gated() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
+        std::fs::write(
+            root.path().join(".cargo/config.toml"),
+            "[registries.repo-alias]\nindex = \"sparse+https://repo-chosen.example/index\"\n",
+        )
+        .unwrap();
+
+        let aliases: HashSet<String> = std::iter::once("repo-alias".to_string()).collect();
+        let (config, _) = resolve_with_env(
+            &aliases,
+            &[root.path().join(".cargo/config.toml")],
+            None,
+            &ConfigFileCache::new(),
+            &off_policy(),
+            &MapEnv::new(),
+        );
+
+        assert!(config.get("repo-alias").is_none());
+        assert!(config.blocked_class("repo-alias").is_some());
+    }
+
+    /// #1855: the never-a-registry floor applies to an operator-declared `$CARGO_HOME` registry
+    /// too: loopback and link-local hosts are rejected and reported as blocked.
+    #[test]
+    fn test_resolve_cargo_home_registry_on_loopback_or_link_local_is_blocked() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let cargo_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cargo_home.path().join("config.toml"),
+            "[registries.loop]\nindex = \"sparse+https://127.0.0.1:8443\"\n\
+             [registries.metadata]\nindex = \"sparse+https://169.254.169.254\"\n",
+        )
+        .unwrap();
+
+        let aliases: HashSet<String> = ["loop".to_string(), "metadata".to_string()]
+            .into_iter()
+            .collect();
+        let (config, _) = resolve_with_env(
+            &aliases,
+            &[],
+            Some(&cargo_home_config(cargo_home.path())),
+            &ConfigFileCache::new(),
+            &all_policy(),
+            &MapEnv::new(),
+        );
+
+        for alias in ["loop", "metadata"] {
+            assert!(config.get(alias).is_none(), "{alias}");
+            assert!(config.blocked_class(alias).is_some(), "{alias}");
+        }
+    }
+
+    /// #1855: `sparse+` is removed exactly once, so the operator set and the classifier agree on
+    /// the text; a doubled prefix is left as `sparse+https://…` and refused as not https.
+    #[test]
+    fn test_resolve_strips_the_sparse_prefix_once() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let env = MapEnv::new().with_var(
+            "CARGO_REGISTRIES_DOUBLE_INDEX",
+            "sparse+sparse+https://double.example",
+        );
+        let aliases: HashSet<String> = std::iter::once("double".to_string()).collect();
+        let (config, _) = resolve_with_env(
+            &aliases,
+            &[],
+            None,
+            &ConfigFileCache::new(),
+            &all_policy(),
+            &env,
+        );
+
+        assert!(config.get("double").is_none());
+        assert_eq!(
+            config.rejected_reason("double"),
+            Some(RegistryRejectionReason::NotHttps)
         );
     }
 
@@ -1948,9 +2498,9 @@ token = "secret-token"
         let (_, replacement) = resolve(&HashSet::new(), &[path], None, &cache, &policy);
 
         match replacement {
-            SourceReplacement::SparseMirror { index, auth } => {
-                assert_eq!(index.as_str(), "https://mirror.example/");
-                assert!(auth.is_none());
+            SourceReplacement::SparseMirror { index } => {
+                assert_eq!(index.as_str(), "https://mirror.example");
+                assert!(!index.has_credential());
             }
             SourceReplacement::None => panic!("expected a resolved mirror"),
         }
@@ -2161,7 +2711,7 @@ token = "secret-token"
 
         match replacement {
             SourceReplacement::SparseMirror { index, .. } => {
-                assert_eq!(index.as_str(), "https://index.mycorp.dev/");
+                assert_eq!(index.as_str(), "https://index.mycorp.dev");
             }
             SourceReplacement::None => panic!("expected the [registries] crossover to resolve"),
         }
@@ -2191,7 +2741,7 @@ token = "secret-token"
 
         match replacement {
             SourceReplacement::SparseMirror { index, .. } => {
-                assert_eq!(index.as_str(), "https://mirror.example/index/");
+                assert_eq!(index.as_str(), "https://mirror.example/index");
             }
             SourceReplacement::None => panic!(
                 "replace-with must apply even though [source.crates-io] also declares an explicit kind"
@@ -2224,7 +2774,7 @@ token = "secret-token"
             SourceReplacement::SparseMirror { index, .. } => {
                 assert_eq!(
                     index.as_str(),
-                    "https://b.example/index/",
+                    "https://b.example/index",
                     "replace-with must win over the table's own sparse `registry` value"
                 );
             }
@@ -2258,16 +2808,16 @@ token = "secret-token"
         let (_, replacement) = resolve(
             &HashSet::new(),
             &[workspace_path],
-            Some(&cargo_home.path().join("config.toml")),
+            Some(&cargo_home_config(cargo_home.path())),
             &cache,
             &policy,
         );
 
         match replacement {
-            SourceReplacement::SparseMirror { index, auth } => {
-                assert_eq!(index.as_str(), "https://index.mycorp.dev/");
+            SourceReplacement::SparseMirror { index } => {
+                assert_eq!(index.as_str(), "https://index.mycorp.dev");
                 assert!(
-                    auth.is_none(),
+                    !index.has_credential(),
                     "a workspace-tier chain link must never let a $CARGO_HOME token ride along"
                 );
             }
@@ -2294,15 +2844,15 @@ token = "secret-token"
         let (_, replacement) = resolve(
             &HashSet::new(),
             &[],
-            Some(&cargo_home.path().join("config.toml")),
+            Some(&cargo_home_config(cargo_home.path())),
             &cache,
             &policy,
         );
 
         match replacement {
-            SourceReplacement::SparseMirror { auth, .. } => {
+            SourceReplacement::SparseMirror { index } => {
                 assert_eq!(
-                    auth.as_ref().map(AuthToken::expose_secret),
+                    index.credential().map(AuthToken::expose_secret),
                     Some("real-token")
                 );
             }

@@ -97,12 +97,13 @@ cloud-metadata), where the allowlist cannot help.
 
 ### Operator-owned registries
 
-One rule decides, for Go, npm, NuGet and Swift, whether a registry URL is yours or the
+One rule decides, for Cargo, Go, npm, NuGet and Swift, whether a registry URL is yours or the
 repository's. A URL is **operator-owned** (trusted) exactly when it equals a URL declared in a
 file you own, whichever file in the repository declared it:
 
 | Ecosystem | Your file |
 |---|---|
+| Cargo | `$CARGO_HOME/config.toml` `[registries]` and `[source]` `sparse+` registries, and the `CARGO_REGISTRIES_<ALIAS>_INDEX` variables |
 | Go | `$GOENV` (default `os.UserConfigDir()/go/env`) `GOPROXY` |
 | npm | `~/.npmrc` `registry=` and `@scope:registry=` (after `${VAR}` expansion) |
 | NuGet | the user-profile `NuGet.Config` `<packageSources>` (not a source you removed or disabled there) |
@@ -119,16 +120,24 @@ Equality is per URL, not per host. A repository that names your host with a diff
 workspace-declared and stays subject to the policy and the direct connection.
 
 A file counts as yours only when it is located through your home directory or an **absolute**
-`GOENV`, `XDG_CONFIG_HOME` or `APPDATA`. `GOENV=off` disables the Go file. An empty value is unset. A relative `GOENV` finds no Go file
+`GOENV`, `XDG_CONFIG_HOME`, `APPDATA` or `CARGO_HOME`. `GOENV=off` disables the Go file. An empty value is unset. A relative `GOENV` finds no Go file
 (no fallback to the default), a relative `XDG_CONFIG_HOME` is skipped (NuGet then uses its
 home-based defaults, Swift treats its user tier as unusable), and a relative home directory is
 treated as none. An absolute `GOENV` or `XDG_CONFIG_HOME` exported by repository-scoped tooling (direnv,
 mise, a per-project editor environment) is part of your environment and counts as yours: keep that
 tooling's own trust prompt enabled.
 
-Cargo keeps its own rule: its trust follows where the registry alias came from (`$CARGO_HOME` and
-`CARGO_REGISTRIES_*` are trusted, a repository file is not) because it also decides whether a
-registry token may be sent (tracked in #1855).
+Cargo decides egress by the same rule and decides the credential separately: a registry token is
+sent only to an index your `$CARGO_HOME/config.toml` or `CARGO_REGISTRIES_*` variables declare. A
+repository alias that names one of your URLs gets your URL's trust (the policy is skipped) but
+never your token. A relative `CARGO_HOME` is ignored, and a `$CARGO_HOME` registry on a loopback or
+link-local host is now rejected like the other ecosystems' (the never-a-registry floor).
+
+**Redirects.** A request that can carry a credential never leaves its origin. An anonymous fetch
+from an operator-owned npm or Go registry *may* follow a redirect to another origin, because proxies
+such as Athens in redirect mode and Artifactory redirect to object storage on purpose; hops to
+never-a-registry hosts and https downgrades are still stopped, and a stopped cross-origin hop is
+logged as a warning. NuGet and Swift keep their anonymous fetches origin-confined by choice.
 
 ### Proxies and guarded registry traffic
 

@@ -415,7 +415,7 @@ impl NpmRegistry {
         let headers = [RequestHeader::Accept(ABBREVIATED_ACCEPT)];
         let data = match self.tier {
             NpmRegistryTier::Public | NpmRegistryTier::Declared(RegistryTrust::Trusted) => {
-                // TODO(#1856): Trusted fetches follow redirects to any host; confine to the origin if live proxies do not redirect cross-origin
+                // Anonymous fetches may leave the origin (operator proxies redirect on purpose); see `trusted_origin_redirect_policy`
                 self.cache.get_cached_with_headers(&url, &headers).await
             }
             NpmRegistryTier::Declared(RegistryTrust::WorkspaceDeclared) => {
@@ -3000,6 +3000,47 @@ mod tests {
         registry.register_alternate(index.clone());
 
         assert!(cloned.alternate_client(index.as_str()).is_some());
+    }
+
+    /// #1856: an anonymous `Trusted` fetch follows a cross-origin redirect, as an operator proxy
+    /// that redirects to object storage needs.
+    #[tokio::test]
+    async fn test_trusted_fetch_follows_cross_origin_redirect() {
+        let mut proxy = mockito::Server::new_async().await;
+        let mut storage = mockito::Server::new_async().await;
+        let _redirect = proxy
+            .mock("GET", "/left-pad")
+            .with_status(302)
+            .with_header("location", &format!("{}/blob/left-pad", storage.url()))
+            .create_async()
+            .await;
+        let _blob = storage
+            .mock("GET", "/blob/left-pad")
+            .with_status(200)
+            .with_body(r#"{"versions":{"1.3.0":{}}}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::with_base(cache, &trusted_index(&proxy.url()));
+        let versions = registry.get_versions("left-pad").await.unwrap();
+        assert_eq!(versions.len(), 1);
+    }
+
+    /// #1856: the never-a-registry floor still stops a `Trusted` fetch's redirect hop.
+    #[tokio::test]
+    async fn test_trusted_fetch_stops_redirect_to_cloud_metadata() {
+        let mut proxy = mockito::Server::new_async().await;
+        let _redirect = proxy
+            .mock("GET", "/left-pad")
+            .with_status(302)
+            .with_header("location", "https://169.254.169.254/latest/meta-data/")
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::with_base(cache, &trusted_index(&proxy.url()));
+        assert!(registry.get_versions("left-pad").await.is_err());
     }
 
     fn trusted_index(raw: &str) -> DeclaredNpmRegistry {

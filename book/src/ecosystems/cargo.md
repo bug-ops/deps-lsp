@@ -50,11 +50,11 @@ Cargo's `CARGO_REGISTRIES_<NAME>_INDEX`/`_TOKEN` environment variable overrides 
 also honored.
 
 **Authentication**: a registry token is attached to requests against a registry
-resolved from `$CARGO_HOME/config.toml` (or its own `CARGO_REGISTRIES_<NAME>_TOKEN`
-environment variable) only. A registry alias resolved from a workspace
+declared in `$CARGO_HOME/config.toml` (or by its own `CARGO_REGISTRIES_<NAME>_INDEX`/`_TOKEN`
+environment variables) only. A registry alias resolved from a workspace
 `.cargo/config.toml` — a file a cloned, untrusted repository fully controls — never
 gets a credential attached, even if an identically-named alias is configured with
-one in `$CARGO_HOME`. This is deliberate: it prevents a hostile repository from
+one in `$CARGO_HOME`, and even if it names the same URL as one. This is deliberate: it prevents a hostile repository from
 redirecting a familiar alias name (e.g. `"github"`) to an attacker-controlled host
 and harvesting whatever token the user's real, differently-scoped registry of that
 name would have used.
@@ -111,9 +111,11 @@ registries.workspace_registries policy" and adds that private hosts need `"all"`
 `DEPS_LSP_PRIVATE_REGISTRY_HOSTS`. Cached data for a registry is still served while
 revalidation is blocked, since no connection is made.
 
-`$CARGO_HOME/config.toml`-configured registries are **never** policy-checked, under
-any of the three values — that file is the user's own trusted configuration, not
-something a cloned repository controls. A blocked index is never silent: it is
+Registries your `$CARGO_HOME/config.toml` (or `CARGO_REGISTRIES_<NAME>_INDEX`) declares, and
+any workspace alias naming the same URL, are **never** policy-checked, under any of the three
+values — that file is the user's own trusted configuration, not something a cloned repository
+controls. The never-a-registry floor still applies: such a registry on a loopback or link-local
+host is rejected. A blocked index is never silent: it is
 logged, and a `registry`/`registry-index` dependency line additionally gets an
 informational diagnostic naming the blocked host class (a `[source]`-chain block is
 log-only, since it is a property of `.cargo/config.toml`, not of any one

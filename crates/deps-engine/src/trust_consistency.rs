@@ -7,12 +7,12 @@
 ))]
 //! Cross-ecosystem consistency of the URL-alone registry trust rule (spec 084, #1822).
 //!
-//! Go, npm, NuGet and Swift each read an operator-owned file, and all four must give the same
-//! answer for the same scenario: a URL the operator declared is `Trusted` (Baseline egress,
+//! Cargo, Go, npm, NuGet and Swift each read an operator-owned file, and all five must give the
+//! same answer for the same scenario: a URL the operator declared is `Trusted` (Baseline egress,
 //! workspace policy skipped, even `off`); a URL only the repository declared is
 //! `WorkspaceDeclared` (Guarded egress, blocked under `off`); and equality is per URL, so the
-//! operator's host with a different path is not trusted. Cargo is the documented exception: its
-//! trust follows alias provenance because it also gates a credential.
+//! operator's host with a different path is not trusted. Cargo additionally binds a credential to
+//! a Trusted URL, but that decision is separate and never changes the egress trust.
 
 use std::sync::Arc;
 
@@ -35,6 +35,33 @@ type Observed = Option<(RegistryTrust, EgressTier)>;
 
 fn observed(trust: RegistryTrust) -> Observed {
     Some((trust, trust.egress()))
+}
+
+fn cargo(repo_url: &str, level: WorkspaceRegistryAccess) -> Observed {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("repo/.cargo");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        workspace.join("config.toml"),
+        format!("[registries.repo]\nindex = \"sparse+{repo_url}\"\n"),
+    )
+    .unwrap();
+    let cargo_home = root.path().join("cargo-home.toml");
+    std::fs::write(
+        &cargo_home,
+        format!("[registries.corp]\nindex = \"sparse+{OPERATOR_URL}\"\n"),
+    )
+    .unwrap();
+
+    let aliases = std::iter::once("repo".to_string()).collect();
+    let (config, _) = deps_cargo::config::resolve(
+        &aliases,
+        &[workspace.join("config.toml")],
+        Some(&OperatorPath::for_test(&cargo_home)),
+        &deps_cargo::config::ConfigFileCache::new(),
+        &policy(level),
+    );
+    observed(config.get("repo")?.index.trust())
 }
 
 fn go(repo_url: &str, level: WorkspaceRegistryAccess) -> Observed {
@@ -131,7 +158,12 @@ fn swift(repo_url: &str, level: WorkspaceRegistryAccess) -> Observed {
 
 type Probe = fn(&str, WorkspaceRegistryAccess) -> Observed;
 
-const PROBES: [(&str, Probe); 3] = [("npm", npm), ("nuget", nuget), ("swift", swift)];
+const PROBES: [(&str, Probe); 4] = [
+    ("cargo", cargo),
+    ("npm", npm),
+    ("nuget", nuget),
+    ("swift", swift),
+];
 
 /// The operator's own URL is Trusted on the Baseline egress under every policy, `off` included.
 #[test]
@@ -183,23 +215,4 @@ fn operator_host_with_a_different_path_is_not_trusted_on_any_ecosystem() {
             "{name}"
         );
     }
-}
-
-/// Cargo's documented exception: trust follows alias provenance, so a workspace alias naming the
-/// same URL as a `$CARGO_HOME` registry stays workspace-declared (blocked under `off`), while
-/// the egress of each trust is still the core `RegistryTrust::egress`.
-#[test]
-fn cargo_trust_follows_provenance_not_url_equality() {
-    use deps_cargo::config::RegistryIndex;
-
-    let off = policy(WorkspaceRegistryAccess::Off);
-    let trusted = RegistryIndex::new(OPERATOR_URL, RegistryTrust::Trusted, &off).unwrap();
-    assert_eq!(trusted.trust().egress(), EgressTier::Baseline);
-
-    let same_url_from_workspace =
-        RegistryIndex::new(OPERATOR_URL, RegistryTrust::WorkspaceDeclared, &off);
-    assert!(
-        same_url_from_workspace.is_err(),
-        "Cargo does not lift a workspace alias to Trusted by URL equality"
-    );
 }

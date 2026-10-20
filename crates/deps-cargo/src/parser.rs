@@ -29,13 +29,13 @@
 //! assert_eq!(result.dependencies[0].name, "serde");
 //! ```
 
-use crate::config::{
-    AuthToken, ConfigFileCache, RegistryIndex, RegistryIndexError, RegistryTrust, SourceReplacement,
-};
+use crate::config::{ConfigFileCache, RegistryIndex, RegistryIndexError, SourceReplacement};
 use crate::types::{
     CargoDependency, CargoDependencySection, CustomRegistryOrigin, DependencySource,
 };
-use deps_core::net_policy::{RegistryAccessPolicy, RegistryRejectionClassifier};
+use deps_core::net_policy::{
+    OperatorRegistries, RegistryAccessPolicy, RegistryRejectionClassifier,
+};
 use deps_core::position::Range;
 use deps_core::{DepsError, Result};
 use std::collections::{HashMap, HashSet};
@@ -59,8 +59,8 @@ pub struct CargoParseResult {
     pub workspace_root: Option<PathBuf>,
     /// Document URI
     pub uri: Url,
-    /// Every alternate-registry index this parse resolved (spec FR-002), paired with the
-    /// credential (if any) to attach to requests against it.
+    /// Every alternate-registry index this parse resolved (spec FR-002). An index carries its
+    /// own credential, if it has one.
     ///
     /// `crate::ecosystem::CargoEcosystem::parse_manifest` registers each of these into the
     /// shared `CargoRegistry` router immediately after parsing, so a later
@@ -71,7 +71,7 @@ pub struct CargoParseResult {
     /// zero-extra-work lazy trigger (spec NFR-004) no longer holds unconditionally once 1b's
     /// `[source]` support is in play, since a mirror can rewrite every plain dependency (spec
     /// NFR-005's corrected premise).
-    pub resolved_registries: Vec<(RegistryIndex, Option<AuthToken>)>,
+    pub resolved_registries: Vec<RegistryIndex>,
     /// Dependency lines whose `registry`/`registry-index` resolution was blocked by the
     /// current `registries.workspace_registries` policy (spec #443, plan-1b §1.7). The
     /// declaration key is the same as the raw declared value here: an alias name or a
@@ -277,13 +277,13 @@ fn get_val<'a>(table: &'a Table<'a>, key: &str) -> Option<&'a Value<'a>> {
     table.get(key)
 }
 
-/// Return type of [`resolve_alternate_registries`]: the newly-resolved `(index, auth)`
-/// pairs to register into the shared `CargoRegistry` router, alongside every dependency
+/// Return type of [`resolve_alternate_registries`]: the newly-resolved indexes to register
+/// into the shared `CargoRegistry` router, alongside every dependency
 /// line whose registry-index resolution was blocked by policy (spec #443, plan-1b §1.7) and
 /// every dependency line whose registry-index resolution was rejected for any other reason
 /// (#1453).
 type AlternateRegistryResolution = (
-    Vec<(RegistryIndex, Option<AuthToken>)>,
+    Vec<RegistryIndex>,
     Vec<deps_core::BlockedRegistryOccurrence>,
     Vec<deps_core::RejectedRegistryOccurrence>,
 );
@@ -292,15 +292,15 @@ type AlternateRegistryResolution = (
 /// resolved `DependencySource::AlternateRegistry` when possible (spec FR-002), and every
 /// plain `DependencySource::Registry` entry into a resolved `AlternateRegistry {
 /// mirrors_crates_io: true, .. }` when a `[source.crates-io] replace-with` chain resolves to
-/// a sparse mirror (spec FR-005/006/007, plan-1b §1.4). Returns the newly-resolved `(index,
-/// auth)` pairs for `crate::ecosystem::CargoEcosystem::parse_manifest` to register into the
-/// shared `CargoRegistry` router.
+/// a sparse mirror (spec FR-005/006/007, plan-1b §1.4). Returns the newly-resolved indexes
+/// for `crate::ecosystem::CargoEcosystem::parse_manifest` to register into the shared
+/// `CargoRegistry` router.
 ///
 /// Two distinct forms of `CustomRegistry` reach the alias-resolution half of this function:
 /// - `registry-index = "sparse+https://..."` — `url` is already a concrete index URL, so it
-///   resolves directly via [`RegistryIndex::new`], with no `.cargo/config.toml` lookup and
-///   no possible credential (a literal URL in `Cargo.toml` is workspace-declared by
-///   definition — `auth` is always `None` for this form).
+///   resolves directly via [`RegistryIndex::declared`] against an empty operator set, with no
+///   `.cargo/config.toml` lookup and no possible credential (a literal URL in `Cargo.toml` is
+///   workspace-declared by definition).
 /// - `registry = "<alias>"` — `url` is an alias name, which does not parse as a URL, so it
 ///   falls through to alias resolution via `crate::config::resolve` against the
 ///   `.cargo/config.toml` hierarchy plus `$CARGO_HOME/config.toml` (spec FR-003: an alias
@@ -375,17 +375,20 @@ fn resolve_alternate_registries(
         String,
         deps_core::net_policy::RegistryRejectionReason,
     > = HashMap::new();
-    let mut newly_resolved: Vec<(RegistryIndex, Option<AuthToken>)> = Vec::new();
+    let mut newly_resolved: Vec<RegistryIndex> = Vec::new();
+    // ASSUMPTION: a literal `registry-index` URL is classified against an empty operator set, so
+    // it is always workspace-declared; the operator set is only built once aliases are resolved.
+    let no_operator = OperatorRegistries::default();
 
     for value in &raw_values {
         // A literal `registry-index` URL is workspace-declared by construction. Any
         // validation error (not a URL at all — the common case where `value` is actually an
         // alias — or a genuinely invalid URL) falls through to alias resolution below
         // safely: a URL-shaped alias lookup simply won't match any `[registries.*]` entry.
-        match RegistryIndex::new(value, RegistryTrust::WorkspaceDeclared, &ctx.policy) {
+        match RegistryIndex::declared(value, &no_operator, &ctx.policy) {
             Ok(index) => {
                 resolved_by_raw_value.insert(value.clone(), index.clone());
-                newly_resolved.push((index, None));
+                newly_resolved.push(index);
             }
             Err(RegistryIndexError::BlockedHost { block }) => {
                 blocked_by_raw_value.insert(value.clone(), block);
@@ -408,7 +411,7 @@ fn resolve_alternate_registries(
     let (config, source_replacement) = crate::config::resolve(
         &aliases,
         workspace_config_paths,
-        cargo_home_path.as_deref(),
+        cargo_home_path.as_ref(),
         &ctx.config_cache,
         &ctx.policy,
     );
@@ -421,7 +424,7 @@ fn resolve_alternate_registries(
     for alias in &aliases {
         if let Some(entry) = config.get(alias) {
             resolved_by_raw_value.insert(alias.clone(), entry.index.clone());
-            newly_resolved.push((entry.index.clone(), entry.auth.clone()));
+            newly_resolved.push(entry.index.clone());
         } else if let Some(host) = config.blocked_class(alias) {
             blocked_by_raw_value.insert(alias.clone(), host);
         } else if let Some(reason) = config.rejected_reason(alias) {
@@ -464,8 +467,8 @@ fn resolve_alternate_registries(
     // [source] replace-with mirror rewrite (FR-005/006/007): every plain `Registry`
     // dependency reroutes to the resolved mirror. An alias-based `AlternateRegistry` from the
     // loop above is left untouched — a `[registries]` alias is not crates.io.
-    if let SourceReplacement::SparseMirror { index, auth } = source_replacement {
-        newly_resolved.push((index.clone(), auth));
+    if let SourceReplacement::SparseMirror { index } = source_replacement {
+        newly_resolved.push(index.clone());
         for dep in dependencies.iter_mut() {
             if dep.source == DependencySource::Registry {
                 dep.source = DependencySource::AlternateRegistry {
@@ -1294,7 +1297,7 @@ internal-crate = { version = "1.0", registry-index = "https://gitlab.mycorp.com/
             other => panic!("expected AlternateRegistry, got {other:?}"),
         }
         assert_eq!(result.resolved_registries.len(), 1);
-        assert!(result.resolved_registries[0].1.is_none());
+        assert!(!result.resolved_registries[0].has_credential());
     }
 
     #[test]
@@ -1391,7 +1394,7 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
         assert_eq!(occurrence.declaration_key, occurrence.raw_value);
     }
 
-    /// #1453: a literal `registry-index` URL carrying userinfo fails `RegistryIndex::new`
+    /// #1453: a literal `registry-index` URL carrying userinfo fails `RegistryIndex::declared`
     /// with `UserInfoPresent`. Unlike a bare alias name, a userinfo-bearing value can only
     /// be a malformed literal index — so it must populate `rejected_registries`, not just
     /// the `tracing::warn!` the alias-fallback path also emits (see
@@ -1510,7 +1513,7 @@ internal-crate = { version = "1.0", registry-index = "http://insecure.mycorp.com
     /// #1453 regression guard: an unconfigured `registry = "<alias>"` reference — no
     /// `.cargo/config.toml` entry matches it anywhere — must stay silent (spec FR-003's
     /// pre-existing behavior), never misreported as a rejected registry-index. Every bare
-    /// alias fails `RegistryIndex::new`'s literal-URL attempt the same way a genuinely
+    /// alias fails `RegistryIndex::declared`'s literal-URL attempt the same way a genuinely
     /// malformed `registry-index` value would (both classify as `InvalidUrl`), so this test
     /// guards specifically against conflating the two.
     #[test]
@@ -1552,7 +1555,7 @@ internal-crate = { version = "1.0", registry = "my-corp" }"#;
         assert!(result.rejected_registries.is_empty());
         match &result.dependencies[0].source {
             DependencySource::AlternateRegistry { index, .. } => {
-                assert_eq!(index, "https://real.example/");
+                assert_eq!(index, "https://real.example");
             }
             other => panic!("expected AlternateRegistry, got {other:?}"),
         }
@@ -1593,7 +1596,7 @@ b = { version = "1.0", registry = "my-corp" }"#;
     }
 
     /// #536/#767/#1453: a `registry-index` value carrying literal `user:pass@` userinfo
-    /// fails `RegistryIndex::new` with `UserInfoPresent`, so it now surfaces as a structured
+    /// fails `RegistryIndex::declared` with `UserInfoPresent`, so it now surfaces as a structured
     /// `rejected_registries` diagnostic rather than falling through to a bare
     /// `tracing::warn!` — redaction of the diagnostic's own `raw_value`/`declaration_key`
     /// fields is covered separately by `#[redact(url)]`/`#[redact(key)]` on
@@ -1763,13 +1766,13 @@ internal-crate = { version = "1.0", registry = "my-corp" }"#;
         assert_eq!(result.dependencies.len(), 1);
         match &result.dependencies[0].source {
             DependencySource::AlternateRegistry { index, .. } => {
-                assert_eq!(index, "https://index.mycorp.dev/");
+                assert_eq!(index, "https://index.mycorp.dev");
             }
             other => panic!("expected AlternateRegistry, got {other:?}"),
         }
         assert_eq!(result.resolved_registries.len(), 1);
         assert!(
-            result.resolved_registries[0].1.is_none(),
+            !result.resolved_registries[0].has_credential(),
             "workspace-sourced entry must never carry a token"
         );
     }
@@ -1819,7 +1822,7 @@ serde = "1.0""#;
                 index,
                 mirrors_crates_io,
             } => {
-                assert_eq!(index, "https://mirror.corp.example/");
+                assert_eq!(index, "https://mirror.corp.example");
                 assert!(*mirrors_crates_io);
             }
             other => panic!("expected a resolved crates.io mirror, got {other:?}"),
@@ -2221,7 +2224,7 @@ tokio = "1.0"
         assert_eq!(result.workspace_root, Some(workspace_dir));
         match &result.dependencies[0].source {
             DependencySource::AlternateRegistry { index, .. } => {
-                assert_eq!(index, "https://above-root.example/");
+                assert_eq!(index, "https://above-root.example");
             }
             other => panic!(
                 "expected the above-workspace-root config to resolve the alias, got {other:?}"
