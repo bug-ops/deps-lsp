@@ -84,10 +84,10 @@ async fn test_mirrored_workspace_plain_deps_carry_mirrors_crates_io_and_resolve_
         }
     }
 
-    // Exactly one resolved (index, auth) pair — every plain dependency shares the same
-    // mirror registration, not one per dependency.
+    // Exactly one resolved index — every plain dependency shares the same mirror
+    // registration, not one per dependency.
     assert_eq!(result.resolved_registries.len(), 1);
-    assert!(result.resolved_registries[0].1.is_none());
+    assert!(!result.resolved_registries[0].has_credential());
 }
 
 /// (b), the fetch half: registering the resolved mirror into a `CargoRegistry` and fetching
@@ -125,8 +125,8 @@ async fn test_mirrored_dependency_fetch_hits_mirror_not_crates_io() {
 
     let cache = Arc::new(deps_core::HttpCache::new());
     let registry = deps_cargo::CargoRegistry::new(cache);
-    for (index, auth) in result.resolved_registries {
-        registry.register_alternate(index, auth);
+    for index in result.resolved_registries {
+        registry.register_alternate(index);
     }
 
     let dep = &result.dependencies[0];

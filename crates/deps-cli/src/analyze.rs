@@ -7,7 +7,6 @@
 //! [`check_manifest`](crate::report::check_manifest) is now [`analyze_manifest`] followed by
 //! `generate_diagnostics`/`to_finding` — no behavior change to `check` itself.
 
-use deps_core::NormalizeName;
 use deps_core::licenses::LicensePolicy;
 use deps_core::lsp_helpers::{
     CooldownDisposition, DependencyOutcomes, LatestVerdict, PackageVersions, RequirementGate,
@@ -294,18 +293,13 @@ impl ManifestAnalysis {
             self.ecosystem_id,
         );
         self.parse_result.dependencies().into_iter().any(|dep| {
-            let normalized_name = formatter.normalize_package_name(dep.name());
-            if !crate::update::is_requested(package_filter, normalized_name.as_str(), formatter)
-                || ignore_rules.matches_name(normalized_name.as_str())
+            let key = deps_core::PackageKey::new(dep.name(), formatter);
+            if !crate::update::is_requested(package_filter, key.normalized(), formatter)
+                || ignore_rules.matches_name(key.normalized())
             {
                 return false;
             }
-            let Some(latest) = self
-                .cached_versions
-                .get(normalized_name.as_str())
-                .or_else(|| self.cached_versions.get(dep.name()))
-                .map(|v| &v.latest)
-            else {
+            let Some(latest) = key.find_in(&self.cached_versions).map(|v| &v.latest) else {
                 return false;
             };
             let Some(version_req) = dep.version_requirement() else {
@@ -321,7 +315,7 @@ impl ManifestAnalysis {
                     self.latest_status.as_ref(),
                     dep,
                     Some(&vuln_keys),
-                    normalized_name.as_str(),
+                    &key,
                     latest.as_str(),
                     formatter,
                 ),
@@ -442,6 +436,7 @@ pub async fn analyze_manifest(
     .await;
 
     let fetch_result = fetch_latest_versions_parallel(
+        ecosystem_id,
         ecosystem.registry(),
         prep.dep_sources,
         &prep.in_use,

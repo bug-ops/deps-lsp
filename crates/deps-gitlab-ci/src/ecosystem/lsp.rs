@@ -9,14 +9,13 @@
 //! module (which globs `use super::*;`) keeps referencing them unqualified, unchanged from
 //! before the move.
 
-use deps_core::NormalizeName;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit, WorkspaceEdit};
 
-use deps_core::PackageName;
 use deps_core::lsp_helpers::{
     AuxiliaryLookup, CommentCheck, FetchContext, InteractiveFetch, InteractiveFetchRequest,
     ShaPinTail, await_interactive_fetch, sha_pin_rewrite, truncate_for_diagnostic,
 };
+use deps_core::{PackageKey, PackageName};
 
 use super::{
     GitlabCiDependency, GitlabCiFormatter, GitlabCiRegistry, MAX_DIAGNOSTIC_VALUE_CHARS,
@@ -197,16 +196,14 @@ pub(super) async fn build_dynamic_component_pin_action(
     let dep_source = dep.source();
     let route = registry.route(&dep_source)?;
 
-    let normalized_name = formatter.normalize_package_name(dep.name());
     let resolved = match await_interactive_fetch(
         registry,
         registry.resolve_component_pin(dep.name(), &route, pin, raw),
-        InteractiveFetchRequest::new(
+        InteractiveFetchRequest::for_dependency(
             versions,
             uri,
-            dep.name(),
-            &normalized_name,
-            &dep_source,
+            dep,
+            formatter,
             FetchContext::CodeAction,
         ),
         AuxiliaryLookup::PinResolution,
@@ -346,11 +343,8 @@ pub(super) fn reconstitute_component_releases(
     formatter: &GitlabCiFormatter,
     versions: deps_core::VersionData<'_>,
 ) -> Option<Vec<crate::types::GitlabCiVersion>> {
-    let normalized_name = formatter.normalize_package_name(name);
     let available = versions
-        .cached
-        .get(normalized_name.as_str())
-        .or_else(|| versions.cached.get(name))
+        .cached_for(&PackageKey::new(name, formatter))
         .map(|v| &v.available)?;
     let endpoint = gl_dep.kind.endpoint();
     let tag_index = formatter.tag_index.get(&(endpoint, gl_dep.name.clone()));

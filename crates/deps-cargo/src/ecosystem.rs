@@ -109,8 +109,8 @@ impl Ecosystem for CargoEcosystem {
             let result = crate::parser::parse_cargo_toml_with_context(content, uri, &self.context)?;
             // Registers every alternate index this parse resolved (FR-002), including its
             // credential. See `CargoParseResult::resolved_registries`'s docs.
-            for (index, auth) in result.resolved_registries.clone() {
-                self.registry.register_alternate(index, auth);
+            for index in result.resolved_registries.clone() {
+                self.registry.register_alternate(index);
             }
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
         })
@@ -882,15 +882,12 @@ mod tests {
             let cache = Arc::new(deps_core::HttpCache::new());
             let ecosystem = CargoEcosystem::new(cache);
 
-            let policy = deps_core::net_policy::RegistryAccessPolicy::default();
-            let registry_index = crate::config::RegistryIndex::new(
+            let registry_index = crate::config::RegistryIndex::for_test(
                 &server.url(),
                 crate::config::RegistryTrust::Trusted,
-                &policy,
-            )
-            .unwrap();
+            );
             let index_key = registry_index.as_str().to_string();
-            ecosystem.registry.register_alternate(registry_index, None);
+            ecosystem.registry.register_alternate(registry_index);
 
             let mut dep = mock_dependency("serde", Some("1.0"), 0, 0);
             dep.source = DependencySource::AlternateRegistry {
@@ -1391,5 +1388,205 @@ mod tests {
             assert_eq!(via_dispatch.items, direct.items);
             assert!(direct.items.is_empty());
         }
+    }
+}
+
+/// Credential binding observed at the parse level (#1855): what a client registered in the shared
+/// router carries after real manifests are parsed through one [`CargoEcosystem`].
+#[cfg(test)]
+mod credential_binding_tests {
+    use super::*;
+    use crate::config::ConfigFileCache;
+    use crate::config::RegistryTrust;
+    use deps_core::Ecosystem;
+    use deps_core::net_policy::{MapEnv, RegistryAccessPolicy, WorkspaceRegistryAccess};
+
+    const OPERATOR_URL: &str = "https://corp.example/index";
+
+    struct Fixture {
+        cargo_home: tempfile::TempDir,
+        project: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new(workspace_config: &str) -> Self {
+            let cargo_home = tempfile::tempdir().unwrap();
+            std::fs::write(
+                cargo_home.path().join("config.toml"),
+                format!(
+                    "[registries.corp]\nindex = \"sparse+{OPERATOR_URL}\"\ntoken = \"operator-token\"\n"
+                ),
+            )
+            .unwrap();
+            let project = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(project.path().join(".cargo")).unwrap();
+            std::fs::write(project.path().join(".cargo/config.toml"), workspace_config).unwrap();
+            Self {
+                cargo_home,
+                project,
+            }
+        }
+
+        fn ecosystem(&self, env: MapEnv) -> CargoEcosystem {
+            let context = CargoParseContext::new(
+                Arc::new(RegistryAccessPolicy::new(
+                    WorkspaceRegistryAccess::PublicOnly,
+                )),
+                Arc::new(ConfigFileCache::new()),
+            )
+            .with_env_for_test(env);
+            CargoEcosystem::with_context(Arc::new(deps_core::HttpCache::new()), context)
+        }
+
+        fn env(&self) -> MapEnv {
+            MapEnv::new().with_var("CARGO_HOME", self.cargo_home.path().to_str().unwrap())
+        }
+
+        async fn parse(&self, ecosystem: &CargoEcosystem, dependencies: &str) {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let content = format!("[dependencies]\n{dependencies}\n");
+            let path = self.project.path().join("Cargo.toml");
+            std::fs::write(&path, &content).unwrap();
+            let uri = url::Url::from_file_path(&path).unwrap();
+            ecosystem.parse_manifest(&content, &uri).await.unwrap();
+        }
+    }
+
+    fn assert_client(ecosystem: &CargoEcosystem, url: &str, credentialed: bool, context: &str) {
+        let client = ecosystem
+            .registry
+            .alternate_client(url)
+            .unwrap_or_else(|| panic!("{context}: no client registered"));
+        assert_eq!(client.trust(), RegistryTrust::Trusted, "{context}");
+        assert_eq!(client.has_auth(), credentialed, "{context}");
+    }
+
+    /// S1: a literal `registry-index` equal to a `$CARGO_HOME` registry stays Trusted and keeps
+    /// the operator's credential; it must not tighten the client the alias registered.
+    #[tokio::test]
+    async fn test_literal_registry_index_keeps_the_operator_credential() {
+        let fixture = Fixture::new("");
+        let ecosystem = fixture.ecosystem(fixture.env());
+
+        fixture
+            .parse(&ecosystem, "a = { version = \"1\", registry = \"corp\" }")
+            .await;
+        assert_client(&ecosystem, OPERATOR_URL, true, "after the alias");
+
+        fixture
+            .parse(
+                &ecosystem,
+                &format!("b = {{ version = \"1\", registry-index = \"sparse+{OPERATOR_URL}\" }}"),
+            )
+            .await;
+        assert_client(
+            &ecosystem,
+            OPERATOR_URL,
+            true,
+            "after the literal registry-index",
+        );
+    }
+
+    /// The literal alone, with no alias ever parsed, is already Trusted and credentialed.
+    #[tokio::test]
+    async fn test_literal_registry_index_alone_is_trusted_and_credentialed() {
+        let fixture = Fixture::new("");
+        let ecosystem = fixture.ecosystem(fixture.env());
+
+        fixture
+            .parse(
+                &ecosystem,
+                &format!("b = {{ version = \"1\", registry-index = \"sparse+{OPERATOR_URL}\" }}"),
+            )
+            .await;
+        assert_client(&ecosystem, OPERATOR_URL, true, "literal only");
+    }
+
+    /// S2: a workspace alias and an operator alias naming one URL give the same client whatever
+    /// order they register in, so the outcome is identical on every run.
+    #[tokio::test]
+    async fn test_same_url_aliases_bind_the_credential_deterministically() {
+        let fixture = Fixture::new(&format!(
+            "[registries.wsalias]\nindex = \"sparse+{OPERATOR_URL}\"\n"
+        ));
+        for iteration in 0..50 {
+            let ecosystem = fixture.ecosystem(fixture.env());
+            fixture
+                .parse(
+                    &ecosystem,
+                    "a = { version = \"1\", registry = \"corp\" }\nb = { version = \"1\", registry = \"wsalias\" }",
+                )
+                .await;
+            assert_client(
+                &ecosystem,
+                OPERATOR_URL,
+                true,
+                &format!("iteration {iteration}"),
+            );
+        }
+    }
+
+    /// S2: registering the workspace alias first or the operator alias first (separate manifests,
+    /// every order) never changes the outcome.
+    #[tokio::test]
+    async fn test_same_url_aliases_bind_the_credential_in_every_registration_order() {
+        let fixture = Fixture::new(&format!(
+            "[registries.wsalias]\nindex = \"sparse+{OPERATOR_URL}\"\n"
+        ));
+        let alias = |name: &str| format!("d = {{ version = \"1\", registry = \"{name}\" }}");
+        for order in [["wsalias", "corp"], ["corp", "wsalias"]] {
+            let ecosystem = fixture.ecosystem(fixture.env());
+            for name in order {
+                fixture.parse(&ecosystem, &alias(name)).await;
+            }
+            assert_client(&ecosystem, OPERATOR_URL, true, &format!("order {order:?}"));
+        }
+    }
+
+    /// A workspace alias naming a different host never gets the operator's token: the credential
+    /// is bound to its own URL only.
+    #[tokio::test]
+    async fn test_workspace_alias_naming_a_different_host_never_gets_the_token() {
+        let fixture =
+            Fixture::new("[registries.other]\nindex = \"sparse+https://other.example/index\"\n");
+        let ecosystem = fixture.ecosystem(fixture.env());
+
+        fixture
+            .parse(
+                &ecosystem,
+                "a = { version = \"1\", registry = \"corp\" }\nb = { version = \"1\", registry = \"other\" }",
+            )
+            .await;
+
+        assert_client(&ecosystem, OPERATOR_URL, true, "operator URL");
+        let other = ecosystem
+            .registry
+            .alternate_client("https://other.example/index")
+            .expect("registered");
+        assert_eq!(other.trust(), RegistryTrust::WorkspaceDeclared);
+        assert!(!other.has_auth());
+    }
+
+    /// M1: an env-declared registry is operator-owned for every manifest, whether or not that
+    /// manifest references the alias whose variable declares it.
+    #[tokio::test]
+    async fn test_env_declared_registry_is_operator_owned_for_every_manifest() {
+        let fixture = Fixture::new("");
+        let env = fixture
+            .env()
+            .with_var(
+                "CARGO_REGISTRIES_ENVREG_INDEX",
+                "sparse+https://env.example/index",
+            )
+            .with_var("CARGO_REGISTRIES_ENVREG_TOKEN", "env-token");
+        let ecosystem = fixture.ecosystem(env);
+
+        fixture
+            .parse(
+                &ecosystem,
+                "c = { version = \"1\", registry-index = \"sparse+https://env.example/index\" }",
+            )
+            .await;
+        assert_client(&ecosystem, "https://env.example/index", true, "env literal");
     }
 }

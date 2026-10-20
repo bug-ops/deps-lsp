@@ -1,5 +1,5 @@
 use super::*;
-use crate::endpoint_contact::{ContactLedger, ResponseSeen};
+use crate::endpoint_contact::{Contact, ContactLedger, ResponseSeen};
 use std::time::Duration;
 
 #[tokio::test]
@@ -105,5 +105,88 @@ async fn a_refused_connection_closes_the_request_without_a_response() {
     assert!(
         contact.stall <= elapsed,
         "a transport error accumulates no stall beyond the request's own duration"
+    );
+}
+
+/// Serves one request by writing each `(delay, bytes)` step after sleeping `delay`, then goes
+/// silent without closing the connection.
+fn scripted_server(script: Vec<(Duration, &'static [u8])>) -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request);
+        for (delay, bytes) in script {
+            std::thread::sleep(delay);
+            if stream.write_all(bytes).is_err() {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    });
+    addr
+}
+
+const HEADERS: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
+
+/// Fetches from `addr` until `deadline` drops the request, then reads the ledger.
+async fn contact_after_cancelling(addr: std::net::SocketAddr, deadline: Duration) -> Contact {
+    let cache = HttpCache::new();
+    let url = format!("http://{addr}/pkg");
+    let ledger = ContactLedger::new();
+    ledger
+        .scope(async {
+            tokio::time::timeout(deadline, cache.get_cached(&url))
+                .await
+                .unwrap_err();
+        })
+        .await;
+    ledger.snapshot(tokio::time::Instant::now())
+}
+
+#[tokio::test]
+async fn a_body_that_stalls_after_its_headers_reads_as_stalled() {
+    let addr = scripted_server(vec![(Duration::ZERO, HEADERS), (Duration::ZERO, b"part")]);
+
+    let contact = contact_after_cancelling(addr, Duration::from_millis(400)).await;
+
+    assert_eq!(contact.response, ResponseSeen::Yes);
+    assert!(
+        contact.stall >= Duration::from_millis(150),
+        "a body stalled since its last chunk is busy time, got {:?}",
+        contact.stall
+    );
+}
+
+#[tokio::test]
+async fn a_drip_fed_body_restarts_the_stall_with_every_chunk() {
+    let gap = Duration::from_millis(50);
+    let mut script = vec![(Duration::ZERO, HEADERS)];
+    script.extend(std::iter::repeat_n((gap, b"x" as &'static [u8]), 40));
+    let addr = scripted_server(script);
+
+    let contact = contact_after_cancelling(addr, Duration::from_millis(500)).await;
+
+    assert_eq!(contact.response, ResponseSeen::Yes);
+    assert!(
+        contact.stall < Duration::from_millis(300),
+        "chunks arriving every {gap:?} must keep the stall short, got {:?}",
+        contact.stall
+    );
+}
+
+#[tokio::test]
+async fn the_wait_for_headers_does_not_count_once_they_arrive() {
+    let addr = scripted_server(vec![(Duration::from_millis(300), HEADERS)]);
+
+    let contact = contact_after_cancelling(addr, Duration::from_millis(450)).await;
+
+    assert_eq!(contact.response, ResponseSeen::Yes);
+    assert!(
+        contact.stall < Duration::from_millis(300),
+        "the time before the headers is answered, got {:?}",
+        contact.stall
     );
 }

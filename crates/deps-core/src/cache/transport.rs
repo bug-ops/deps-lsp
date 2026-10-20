@@ -96,6 +96,9 @@ pub(super) fn base_client_builder(route: &ProxyRoute) -> reqwest::ClientBuilder 
         .user_agent(format!("deps-lsp/{}", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
         .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
+        // A registry URL can embed a credential (`?_authToken=`, a path token); the default
+        // `Referer` would hand it to a cross-origin redirect target.
+        .referer(false)
 }
 
 /// Builds a client with `HttpCache`'s shared configuration (user agent, timeouts), varying the

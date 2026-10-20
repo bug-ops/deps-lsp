@@ -51,6 +51,69 @@ async fn test_get_cached_follows_same_scheme_redirect() {
     assert_eq!(result.as_ref(), b"redirected data");
 }
 
+// #1856: an anonymous fetch is deliberately not origin-confined. Operator proxies (Athens in
+// redirect mode, Artifactory redirecting to object storage) answer metadata requests with a
+// cross-origin redirect, and npm and Go `Trusted` fetches rely on following it. The floor and the
+// https-downgrade stop still apply on every hop (see the cloud-metadata test above).
+#[tokio::test]
+async fn test_get_cached_anonymous_follows_cross_origin_redirect() {
+    let mut origin_server = mockito::Server::new_async().await;
+    let mut storage_server = mockito::Server::new_async().await;
+    let target_url = format!("{}/api/target", storage_server.url());
+
+    let _redirect = origin_server
+        .mock("GET", "/api/source")
+        .with_status(302)
+        .with_header("location", &target_url)
+        .create_async()
+        .await;
+    let target = storage_server
+        .mock("GET", "/api/target")
+        .with_status(200)
+        .with_body("from the other origin")
+        .create_async()
+        .await;
+
+    let cache = HttpCache::new();
+    let source_url = format!("{}/api/source", origin_server.url());
+    let result: Bytes = cache.get_cached(&source_url).await.unwrap();
+
+    assert_eq!(result.as_ref(), b"from the other origin");
+    target.assert_async().await;
+}
+
+// A URL can embed a credential (`?_authToken=`, a path token). The shared client must not hand it
+// to a cross-origin redirect target through `Referer`.
+#[tokio::test]
+async fn test_cross_origin_redirect_hop_carries_no_referer() {
+    let mut origin_server = mockito::Server::new_async().await;
+    let mut storage_server = mockito::Server::new_async().await;
+    let target_url = format!("{}/api/target", storage_server.url());
+
+    let _redirect = origin_server
+        .mock("GET", "/api/source")
+        .match_query(mockito::Matcher::Any)
+        .with_status(302)
+        .with_header("location", &target_url)
+        .create_async()
+        .await;
+    let target = storage_server
+        .mock("GET", "/api/target")
+        .match_header("referer", mockito::Matcher::Missing)
+        .with_status(200)
+        .with_body("no referer")
+        .expect(1)
+        .create_async()
+        .await;
+
+    let cache = HttpCache::new();
+    let source_url = format!("{}/api/source?_authToken=SECRET-QUERY", origin_server.url());
+    let result: Bytes = cache.get_cached(&source_url).await.unwrap();
+
+    assert_eq!(result.as_ref(), b"no referer");
+    target.assert_async().await;
+}
+
 // Issue #455, test-plan item 4(a): loopback -> loopback. `Baseline` follows the hop
 // (test-cfg carve-out for `Loopback`); `WorkspaceDeclared(PublicOnly)` stops it since
 // `PublicOnly.allows(Loopback) == false` — the contrast proving the tier split is real.
@@ -194,6 +257,92 @@ async fn test_get_cached_trusted_origin_stops_cross_origin_redirect() {
 
     // Proves the escape origin was never contacted, not just that the result is a 302.
     escape.assert_async().await;
+}
+
+// #1856 M5: a hop the trusted-origin policy stops is logged once per origin pair, with the
+// origins only (no userinfo, path or query of the redirect target).
+#[tokio::test]
+async fn test_trusted_origin_stopped_cross_origin_hop_warns_once_with_redacted_origins() {
+    let mut trusted_server = mockito::Server::new_async().await;
+    let other_server = mockito::Server::new_async().await;
+
+    let trusted_origin = format!("{}/", trusted_server.url());
+    let other = url::Url::parse(&other_server.url()).unwrap();
+    let escape_target = format!(
+        "http://user:hunter2@{}:{}/api/stolen?token=SECRET-QUERY",
+        other.host_str().unwrap(),
+        other.port().unwrap()
+    );
+    let _redirect = trusted_server
+        .mock("GET", "/api/source")
+        .with_status(302)
+        .with_header("location", &escape_target)
+        .expect_at_least(2)
+        .create_async()
+        .await;
+
+    let cache = HttpCache::new();
+    let source_url = format!("{}/api/source", trusted_server.url());
+    let log = crate::test_util::capture_tracing_output_async(async {
+        for _ in 0..2 {
+            let result: Result<Bytes> = cache
+                .get_cached_trusted_origin(
+                    &source_url,
+                    &prefix(&trusted_origin),
+                    RequestAuth::ANONYMOUS,
+                    None,
+                )
+                .await;
+            assert_matches!(result, Err(DepsError::HttpStatus { status: 302, .. }));
+        }
+    })
+    .await;
+
+    assert_eq!(
+        log.matches("left the trusted origin").count(),
+        1,
+        "deduplicated per origin pair: {log}"
+    );
+    assert!(log.contains(&trusted_server.url()), "from origin: {log}");
+    assert!(log.contains(&other_server.url()), "to origin: {log}");
+    for (index, secret) in ["hunter2", "SECRET-QUERY", "stolen"]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(!log.contains(secret), "secret #{index} leaked into the log");
+    }
+}
+
+// #1856 M5: a hop that stays on the origin but leaves the trusted path prefix is not a
+// "left the origin" event, and the message must not claim it is.
+#[tokio::test]
+async fn test_trusted_origin_same_origin_path_escape_warns_as_path_escape() {
+    let mut server = mockito::Server::new_async().await;
+    let prefix_url = format!("{}/registry/", server.url());
+    let _redirect = server
+        .mock("GET", "/registry/source")
+        .with_status(302)
+        .with_header("location", &format!("{}/elsewhere/data", server.url()))
+        .create_async()
+        .await;
+
+    let cache = HttpCache::new();
+    let source_url = format!("{}/registry/source", server.url());
+    let log = crate::test_util::capture_tracing_output_async(async {
+        let result: Result<Bytes> = cache
+            .get_cached_trusted_origin(
+                &source_url,
+                &prefix(&prefix_url),
+                RequestAuth::ANONYMOUS,
+                None,
+            )
+            .await;
+        assert_matches!(result, Err(DepsError::HttpStatus { status: 302, .. }));
+    })
+    .await;
+
+    assert!(log.contains("left the trusted registry path"), "{log}");
+    assert!(!log.contains("left the trusted origin"), "{log}");
 }
 
 #[tokio::test]

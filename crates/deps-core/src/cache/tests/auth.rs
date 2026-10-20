@@ -459,7 +459,10 @@ fn test_rate_limit_revocation_default_revokes_and_ignores_unrelated_errors() {
         source_status: Some(429),
     };
     assert!(!RateLimitRevocation::Revokes.revokes_credential(&rate_limited));
-    assert!(!RateLimitRevocation::Revokes.revokes_credential(&DepsError::CacheError("x".into())));
+    assert!(
+        !RateLimitRevocation::Revokes
+            .revokes_credential(&DepsError::Io(std::io::Error::other("x")))
+    );
     assert!(
         RateLimitRevocation::Revokes.revokes_credential(&DepsError::HttpStatus {
             url: "https://r.test/".into(),

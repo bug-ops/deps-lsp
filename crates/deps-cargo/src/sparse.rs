@@ -9,31 +9,31 @@
 //! # Examples
 //!
 //! ```no_run
-//! use deps_cargo::config::{RegistryTrust, RegistryIndex};
+//! use deps_cargo::config::RegistryIndex;
 //! use deps_cargo::sparse::SparseIndexClient;
 //! use deps_core::HttpCache;
-//! use deps_core::net_policy::RegistryAccessPolicy;
+//! use deps_core::net_policy::{OperatorRegistries, RegistryAccessPolicy};
 //! use std::sync::Arc;
 //!
 //! #[tokio::main]
 //! async fn main() {
 //!     let cache = Arc::new(HttpCache::new());
 //!     let policy = RegistryAccessPolicy::default();
-//!     let index = RegistryIndex::new("https://index.crates.io", RegistryTrust::Trusted, &policy).unwrap();
-//!     let client = SparseIndexClient::new(index, cache);
+//!     let index = RegistryIndex::declared("https://index.crates.io", &OperatorRegistries::default(), &policy).unwrap();
+//!     let client = SparseIndexClient::new(index, cache, "sparse index");
 //!
 //!     let versions = client.get_versions("serde").await.unwrap();
 //!     println!("Latest serde: {}", versions[0].num);
 //! }
 //! ```
 
-use crate::config::{AuthToken, RegistryIndex, RegistryTrust};
+use crate::config::{RegistryIndex, RegistryTrust};
 use crate::types::CargoVersion;
 use deps_core::{
     DepsError, HttpCache, RegistryEndpoint, Result,
     cache::{CredentialHeader, RequestAuth},
     lsp_helpers::warn_rejected_value,
-    net_policy::{RedactedUrl, TrustedPrefix},
+    net_policy::TrustedPrefix,
 };
 use semver::{Version, VersionReq};
 use serde::Deserialize;
@@ -217,22 +217,9 @@ fn parse_index_json(data: &[u8]) -> Result<Vec<CargoVersion>> {
 pub struct SparseIndexClient {
     base: TrustedPrefix,
     cache: Arc<HttpCache>,
-    /// Pre-formatted verbatim-token `Authorization` header value (no `Bearer` prefix, as Cargo
-    /// sends it), when a credential is present. Formatted once in [`Self::with_auth`] and held [`deps_core::secret::Redacted`]
-    /// from that point on (issue #672) — mirrors [`deps_core::github::GithubTagsClient::new`]
-    /// and `deps_nuget::config::NuGetAuth::new`'s format-once-at-construction pattern, rather
-    /// than re-formatting a fresh unzeroized copy on every [`Self::fetch`] call. See
-    /// [`crate::config::ResolvedRegistryEntry::auth`] for the security invariant on how the
-    /// source token is populated — this client has no opinion on that; it just attaches
-    /// whatever it is given, over an origin-pinned transport
-    /// ([`deps_core::HttpCache::get_cached_trusted_origin`]) so the header cannot
-    /// survive a cross-origin redirect.
-    auth_header: Option<deps_core::secret::AuthorizationValue>,
-    /// The [`RegistryTrust`] tier `index` was validated under (issue #455, C2): governs which
-    /// transport [`Self::fetch`] routes through — a `WorkspaceDeclared` index always goes
-    /// through [`deps_core::HttpCache::get_cached_workspace`], regardless of whether `auth` is
-    /// set, so its connect-time address is scrutinized by the live workspace-registry policy.
-    trust: RegistryTrust,
+    /// How requests leave this client, decided once from the [`RegistryIndex`] it was built from
+    /// so the request path and [`Self::endpoint`]'s egress cannot disagree.
+    transport: IndexTransport,
     /// Display name used in [`deps_core::DepsError::PackageNotFound`] messages.
     registry_display_name: &'static str,
     /// The endpoint [`Self::endpoint`] reports, computed on first use (the fingerprint hashes
@@ -240,80 +227,74 @@ pub struct SparseIndexClient {
     endpoint: deps_core::CachedEndpoint,
 }
 
-/// The transport [`SparseIndexClient::fetch`] sends a request through, decided once from the
-/// client's credential and trust tier so the request path and
-/// [`SparseIndexClient::endpoint`]'s egress cannot disagree.
-enum IndexTransport<'a> {
-    TrustedOrigin(&'a deps_core::secret::AuthorizationValue),
+/// The transport [`SparseIndexClient::fetch`] sends a request through.
+///
+/// A credential exists only on [`Self::TrustedOrigin`], whose index the URL-alone rule
+/// classified Trusted (see [`RegistryIndex`]), so a credential on a workspace-declared index is
+/// not representable. The `Authorization` value is formatted once at construction and held
+/// [`deps_core::secret::Redacted`] from then on (issue #672).
+#[derive(Clone)]
+enum IndexTransport {
+    /// A credentialed request over an origin-confined transport, so the header cannot survive a
+    /// cross-origin redirect.
+    TrustedOrigin(deps_core::secret::AuthorizationValue),
+    /// An anonymous request to a Trusted index, over the system-proxy Baseline egress.
     System,
+    /// An anonymous request to a workspace-declared index, over the guarded egress whose
+    /// connect-time address is scrutinized by the live workspace-registry policy.
     Workspace,
-    /// A credential on a workspace-declared index: no request is sent.
-    Refused,
+}
+
+impl IndexTransport {
+    fn for_index(index: &RegistryIndex) -> Self {
+        match (index.credential(), index.trust()) {
+            (Some(token), _) => {
+                Self::TrustedOrigin(deps_core::secret::cargo_token_header(token.as_redacted()))
+            }
+            (None, RegistryTrust::Trusted) => Self::System,
+            (None, RegistryTrust::WorkspaceDeclared) => Self::Workspace,
+        }
+    }
 }
 
 impl SparseIndexClient {
-    fn transport(&self) -> IndexTransport<'_> {
-        match (&self.auth_header, self.trust) {
-            (Some(header_value), RegistryTrust::Trusted) => {
-                IndexTransport::TrustedOrigin(header_value)
-            }
-            (None, RegistryTrust::Trusted) => IndexTransport::System,
-            (None, RegistryTrust::WorkspaceDeclared) => IndexTransport::Workspace,
-            (Some(_), RegistryTrust::WorkspaceDeclared) => IndexTransport::Refused,
-        }
-    }
-
     /// The network path this client's requests travel: its index base through the egress its
     /// transport uses (system proxy for trusted indexes, the guarded direct path for
     /// workspace-declared ones).
     #[must_use]
     pub fn endpoint(&self) -> RegistryEndpoint {
         self.endpoint
-            .get_or_compute(|| RegistryEndpoint::base(self.base.as_url(), self.trust.egress()))
+            .get_or_compute(|| RegistryEndpoint::base(self.base.as_url(), self.trust().egress()))
     }
 
-    /// Creates a new unauthenticated sparse-index client for `index`.
+    /// Creates a client for `index`, which it consumes whole: its URL, its trust and its
+    /// credential (if any) are all decided by the [`RegistryIndex`] it is built from.
+    /// `registry_display_name` appears in not-found error messages.
     ///
-    /// Takes a validated [`RegistryIndex`], not a bare `String` (plan-1b §1.2, critic S2):
-    /// `RegistryIndex::new`'s [`crate::config::RegistryTrust`]/policy gate is the *only* public
-    /// constructor of a fetchable index URL, so this client cannot be built with one that
-    /// skipped it.
-    pub fn new(index: RegistryIndex, cache: Arc<HttpCache>) -> Self {
-        Self {
-            trust: index.trust(),
-            base: index.trusted_prefix(),
-            cache,
-            auth_header: None,
-            registry_display_name: "sparse index",
-            endpoint: deps_core::CachedEndpoint::default(),
-        }
-    }
-
-    /// Creates a new sparse-index client for `index`, attaching `auth` (if any) to
-    /// every request as a verbatim `Authorization` header, and using
-    /// `registry_display_name` in not-found error messages.
-    pub fn with_auth(
+    /// Takes a validated [`RegistryIndex`], not a bare `String` (plan-1b §1.2, critic S2): the
+    /// URL-alone classification is the *only* way to obtain a fetchable index, so this client
+    /// cannot be built with a URL that skipped it.
+    pub fn new(
         index: RegistryIndex,
         cache: Arc<HttpCache>,
-        auth: Option<AuthToken>,
         registry_display_name: &'static str,
     ) -> Self {
-        let auth_header =
-            auth.map(|token| deps_core::secret::cargo_token_header(token.as_redacted()));
         Self {
-            trust: index.trust(),
+            transport: IndexTransport::for_index(&index),
             base: index.trusted_prefix(),
             cache,
-            auth_header,
             registry_display_name,
             endpoint: deps_core::CachedEndpoint::default(),
         }
     }
 
-    /// The [`RegistryTrust`] tier this client's index was validated under.
+    /// The [`RegistryTrust`] tier this client's index was classified under.
     #[must_use]
     pub(crate) const fn trust(&self) -> RegistryTrust {
-        self.trust
+        match self.transport {
+            IndexTransport::TrustedOrigin(_) | IndexTransport::System => RegistryTrust::Trusted,
+            IndexTransport::Workspace => RegistryTrust::WorkspaceDeclared,
+        }
     }
 
     /// Whether this client attaches a credential to its requests. Test/diagnostic-only: private
@@ -321,8 +302,8 @@ impl SparseIndexClient {
     /// fold test needs this accessor to assert a credential was dropped, alongside
     /// [`Self::trust`].
     #[cfg(test)]
-    pub(crate) fn has_auth(&self) -> bool {
-        self.auth_header.is_some()
+    pub(crate) const fn has_auth(&self) -> bool {
+        matches!(self.transport, IndexTransport::TrustedOrigin(_))
     }
 
     /// Fetches all versions for a crate from the sparse index.
@@ -346,12 +327,12 @@ impl SparseIndexClient {
     /// # async fn main() {
     /// let cache = Arc::new(HttpCache::new());
     /// let policy = deps_core::net_policy::RegistryAccessPolicy::default();
-    /// let index = deps_cargo::config::RegistryIndex::new(
+    /// let index = deps_cargo::config::RegistryIndex::declared(
     ///     "https://index.crates.io",
-    ///     deps_cargo::config::RegistryTrust::Trusted,
+    ///     &deps_core::net_policy::OperatorRegistries::default(),
     ///     &policy,
     /// ).unwrap();
-    /// let client = SparseIndexClient::new(index, cache);
+    /// let client = SparseIndexClient::new(index, cache, "sparse index");
     ///
     /// let versions = client.get_versions("serde").await.unwrap();
     /// assert!(!versions.is_empty());
@@ -392,25 +373,18 @@ impl SparseIndexClient {
         }))
     }
 
-    /// Routes the request through the transport matching [`Self::auth_header`] and [`Self::trust`]
-    /// — the sole call site deciding between [`deps_core::HttpCache::get_cached`],
+    /// Routes the request through the transport [`Self::transport`] selects — the sole call site
+    /// deciding between [`deps_core::HttpCache::get_cached`],
     /// [`deps_core::HttpCache::get_cached_trusted_origin`], and (issue #455)
     /// [`deps_core::HttpCache::get_cached_workspace`], so the two
     /// [`Self::get_versions`]/pagination-free shape of this client never duplicates that
     /// branch.
     ///
-    /// `(Some(_), WorkspaceDeclared)` is a fail-closed arm, not a routed request: every current
-    /// [`RegistryIndex`] producer already prevents a `WorkspaceDeclared` index from carrying a
-    /// credential (`config::finalize_source_replacement` drops it on a folded chain,
-    /// `resolve_cargo_home_tier` only ever produces `Trusted`, and a plain workspace
-    /// `[registries]`/`registry-index` resolution never attaches one) — this arm is
-    /// defense-in-depth against a future producer regression, not a currently reachable path.
-    ///
     /// # Errors
     ///
-    /// Same as [`Self::get_versions`], plus `DepsError::CacheError` for the fail-closed arm.
+    /// Same as [`Self::get_versions`].
     async fn fetch(&self, url: &str) -> Result<bytes::Bytes> {
-        match self.transport() {
+        match &self.transport {
             IndexTransport::TrustedOrigin(header_value) => {
                 let auth = RequestAuth::credential(
                     CredentialHeader::Authorization(header_value),
@@ -422,16 +396,6 @@ impl SparseIndexClient {
             }
             IndexTransport::System => self.cache.get_cached(url).await,
             IndexTransport::Workspace => self.cache.get_cached_workspace(url).await,
-            IndexTransport::Refused => {
-                let safe_base_url = RedactedUrl::new(self.base.as_str());
-                tracing::error!(
-                    url = %safe_base_url,
-                    "refusing to attach a credential to a workspace-declared registry index request"
-                );
-                Err(DepsError::CacheError(format!(
-                    "refusing authenticated request to workspace-declared index {safe_base_url}"
-                )))
-            }
         }
     }
 }
@@ -439,53 +403,44 @@ impl SparseIndexClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AuthToken, CargoOperator};
     use deps_core::EgressTier;
-    use deps_core::net_policy::RegistryAccessPolicy;
+    use deps_core::net_policy::{OperatorRegistries, RegistryAccessPolicy};
     use std::assert_matches;
 
-    /// Wraps `raw` into a [`RegistryIndex`] for test call sites, using an all-allow policy
-    /// so a test's own choice of URL (including a loopback mockito URL) is never blocked —
-    /// the policy gate itself is unit-tested directly in `config.rs`, not re-exercised here.
+    /// Wraps `raw` into a Trusted [`RegistryIndex`] for test call sites, so a test's own choice
+    /// of URL (including a loopback mockito URL) is never blocked — the classification itself is
+    /// unit-tested directly in `config.rs`, not re-exercised here.
     fn test_index(raw: &str) -> RegistryIndex {
-        let policy = RegistryAccessPolicy::default();
-        RegistryIndex::new(raw, RegistryTrust::Trusted, &policy).unwrap()
+        RegistryIndex::for_test(raw, RegistryTrust::Trusted)
     }
 
     /// Like [`test_index`], but [`RegistryTrust::WorkspaceDeclared`] — for issue #455's C2
-    /// fail-closed/routing tests, which need a `WorkspaceDeclared` index specifically.
+    /// routing tests, which need a `WorkspaceDeclared` index specifically.
     fn test_workspace_index(raw: &str) -> RegistryIndex {
-        let policy = RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::All);
-        RegistryIndex::new(raw, RegistryTrust::WorkspaceDeclared, &policy).unwrap()
+        RegistryIndex::for_test(raw, RegistryTrust::WorkspaceDeclared)
     }
 
-    /// Cargo's transport egress is exactly the core trust's egress (spec 084): Cargo differs from
-    /// the other ecosystems only in what gates a credential, never in which egress a trust uses.
+    /// Cargo's transport egress is exactly the core trust's egress (spec 084): the credential
+    /// decision never changes which egress a trust uses.
     #[test]
     fn test_transport_egress_equals_the_core_trust_egress() {
-        let token = || Some(AuthToken::new("cargo-token".to_string()));
-        for (index, auth, transport_egress) in [
-            (test_index("https://a.example"), None, EgressTier::Baseline),
+        for (index, transport_egress) in [
+            (test_index("https://a.example"), EgressTier::Baseline),
             (
-                test_index("https://a.example"),
-                token(),
+                RegistryIndex::credentialed_for_test("https://a.example", "cargo-token"),
                 EgressTier::Baseline,
             ),
             (
                 test_workspace_index("https://a.example"),
-                None,
-                EgressTier::Guarded,
-            ),
-            (
-                test_workspace_index("https://a.example"),
-                token(),
                 EgressTier::Guarded,
             ),
         ] {
             let trust = index.trust();
-            let client = SparseIndexClient::with_auth(index, Arc::new(HttpCache::new()), auth, "t");
-            let expected = match client.transport() {
+            let client = SparseIndexClient::new(index, Arc::new(HttpCache::new()), "t");
+            let expected = match client.transport {
                 IndexTransport::TrustedOrigin(_) | IndexTransport::System => EgressTier::Baseline,
-                IndexTransport::Workspace | IndexTransport::Refused => EgressTier::Guarded,
+                IndexTransport::Workspace => EgressTier::Guarded,
             };
             assert_eq!(expected, transport_egress);
             assert_eq!(trust.egress(), transport_egress);
@@ -503,7 +458,7 @@ mod tests {
     #[ignore = "requires network access"]
     async fn test_fetch_real_serde_versions() {
         let cache = Arc::new(HttpCache::new());
-        let client = SparseIndexClient::new(test_index("https://index.crates.io"), cache);
+        let client = SparseIndexClient::new(test_index("https://index.crates.io"), cache, "test");
         let versions = client.get_versions("serde").await.unwrap();
 
         assert!(!versions.is_empty());
@@ -516,7 +471,7 @@ mod tests {
     #[ignore = "requires network access"]
     async fn test_get_latest_matching_real() {
         let cache = Arc::new(HttpCache::new());
-        let client = SparseIndexClient::new(test_index("https://index.crates.io"), cache);
+        let client = SparseIndexClient::new(test_index("https://index.crates.io"), cache, "test");
         let latest = client.get_latest_matching("serde", "^1.0").await.unwrap();
 
         assert!(latest.is_some());
@@ -825,6 +780,7 @@ mod tests {
         let client = SparseIndexClient::new(
             test_index("https://index.crates.io"),
             Arc::new(HttpCache::new()),
+            "test",
         );
         let err = client.get_versions("..").await.unwrap_err();
         assert_matches!(err, DepsError::PackageNotFound { .. });
@@ -835,6 +791,7 @@ mod tests {
         let client = SparseIndexClient::new(
             test_index("https://index.crates.io"),
             Arc::new(HttpCache::new()),
+            "test",
         );
         let err = client.get_versions("../../etc/passwd").await.unwrap_err();
         assert_matches!(err, DepsError::PackageNotFound { .. });
@@ -850,7 +807,11 @@ mod tests {
             .create_async()
             .await;
 
-        let client = SparseIndexClient::new(test_index(&server.url()), Arc::new(HttpCache::new()));
+        let client = SparseIndexClient::new(
+            test_index(&server.url()),
+            Arc::new(HttpCache::new()),
+            "test",
+        );
         let versions = client.get_versions("serde").await.unwrap();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].num, "1.0.0");
@@ -867,61 +828,51 @@ mod tests {
             .create_async()
             .await;
 
-        let client = SparseIndexClient::with_auth(
-            test_index(&server.url()),
+        let client = SparseIndexClient::new(
+            RegistryIndex::credentialed_for_test(&server.url(), "secret-token"),
             Arc::new(HttpCache::new()),
-            Some(AuthToken::new("secret-token".to_string())),
             "my-corp",
         );
         let versions = client.get_versions("serde").await.unwrap();
         assert_eq!(versions.len(), 1);
     }
 
-    // Issue #455, test-plan item 8 (C2 fail-closed): `(Some(auth), WorkspaceDeclared)` must
-    // never send a request at all — the mockito mock asserting `expect(0)` proves no request
-    // reached the network, not just that `get_versions` returned an error.
+    /// #1855: a credential bound to one operator URL is never sent to another URL, so a
+    /// workspace-declared index goes out anonymously over the workspace transport.
     #[tokio::test]
-    async fn test_fetch_refuses_authenticated_workspace_declared_request() {
+    async fn test_credential_for_another_url_is_never_sent() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/se/rd/serde")
+            .match_header("authorization", mockito::Matcher::Missing)
             .with_status(200)
             .with_body(r#"{"name":"serde","vers":"1.0.0","yanked":false,"features":{},"deps":[]}"#)
-            .expect(0)
+            .expect(1)
             .create_async()
             .await;
 
-        let client = SparseIndexClient::with_auth(
-            test_workspace_index(&server.url()),
-            Arc::new(HttpCache::new()),
-            Some(AuthToken::new("secret-token".to_string())),
-            "workspace index",
+        let other = "https://operator.example/index";
+        let mut operator = CargoOperator::declaring(OperatorRegistries::declared_in(
+            &deps_core::config_trust::OperatorPath::for_test("/test/.cargo/config.toml"),
+            [other],
+        ));
+        operator.bind(
+            crate::config::strip_sparse_prefix(other),
+            AuthToken::new("secret-token".to_string()),
         );
-        let err = client.get_versions("serde").await.unwrap_err();
-        assert_matches!(err, DepsError::CacheError(_));
+        let index = RegistryIndex::declared_bound(
+            crate::config::strip_sparse_prefix(&server.url()),
+            &operator,
+            &RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::All),
+        )
+        .unwrap();
+        assert_eq!(index.trust(), RegistryTrust::WorkspaceDeclared);
+        assert!(!index.has_credential());
+
+        let client = SparseIndexClient::new(index, Arc::new(HttpCache::new()), "workspace index");
+        assert!(!client.has_auth());
+        client.get_versions("serde").await.unwrap();
         mock.assert_async().await;
-    }
-
-    /// #767: the fail-closed `(Some(_), WorkspaceDeclared)` arm's `tracing::error!` and
-    /// `DepsError::CacheError` message both used to embed `base_url` raw — a query-string
-    /// credential in a workspace-declared index URL would have leaked into both.
-    #[tokio::test]
-    async fn test_fetch_refuses_authenticated_workspace_declared_request_redacts_query_string() {
-        let server = mockito::Server::new_async().await;
-        let base = format!("{}/?token=super-secret-value", server.url());
-        let client = SparseIndexClient::with_auth(
-            test_workspace_index(&base),
-            Arc::new(HttpCache::new()),
-            Some(AuthToken::new("secret-token".to_string())),
-            "workspace index",
-        );
-
-        let output = deps_core::test_util::capture_tracing_output_async(async {
-            let err = client.get_versions("serde").await.unwrap_err();
-            assert!(!err.to_string().contains("super-secret-value"), "{err}");
-        })
-        .await;
-        assert!(!output.contains("super-secret-value"), "output: {output}");
     }
 
     // Issue #455, test-plan item 9 (C2 routing): a successful `(None, WorkspaceDeclared)` fetch
@@ -939,8 +890,11 @@ mod tests {
             .await;
 
         let cache = Arc::new(HttpCache::new());
-        let client =
-            SparseIndexClient::new(test_workspace_index(&server.url()), Arc::clone(&cache));
+        let client = SparseIndexClient::new(
+            test_workspace_index(&server.url()),
+            Arc::clone(&cache),
+            "test",
+        );
         let versions = client.get_versions("serde").await.unwrap();
         assert_eq!(versions.len(), 1);
 
@@ -965,7 +919,11 @@ mod tests {
             .create_async()
             .await;
 
-        let client = SparseIndexClient::new(test_index(&server.url()), Arc::new(HttpCache::new()));
+        let client = SparseIndexClient::new(
+            test_index(&server.url()),
+            Arc::new(HttpCache::new()),
+            "test",
+        );
         let latest = client.get_latest_matching("serde", "^1.0").await.unwrap();
         assert_eq!(latest.unwrap().num, "1.0.0");
     }

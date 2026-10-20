@@ -264,7 +264,7 @@ pub use edit::{
     collect_update_candidates, collect_update_edits, dedup_overlapping_edits, plan_verified_fix,
     plan_vulnerability_fix, resolve_recommended_fix, resolve_verified_fix,
 };
-pub use endpoint_contact::{observe_ecosystem, observe_endpoint};
+pub use endpoint_contact::{EndpointObserver, observe_endpoint};
 pub use error::{DepsError, ErrorOrigin, FetchFailure, RateLimitEvidence, Result};
 pub use freshness::{
     CooldownWindow, DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_relative_age,
@@ -301,7 +301,9 @@ pub use lsp_helpers::{
 };
 pub use matched_spans::MatchedSpans;
 pub use mtime_cache::{DEFAULT_MAX_CACHED_FILES, MAX_CACHED_FILE_BYTES, MtimeFileCache};
-pub use package::{ConcreteVersion, InvalidPackageName, NormalizedName, PackageName, VersionReq};
+pub use package::{
+    ConcreteVersion, InvalidPackageName, NormalizedName, PackageKey, PackageName, VersionReq,
+};
 pub use parser::{
     CheckedTomlError, DependencySource, LoadingState, MAX_JSON_NESTING_DEPTH,
     MAX_TOML_NESTING_DEPTH, MAX_YAML_EXPANDED_BYTES, MAX_YAML_NESTING_DEPTH,

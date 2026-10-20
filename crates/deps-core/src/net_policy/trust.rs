@@ -9,16 +9,16 @@
 //! trimmed; equality is per URL, never per host.
 //!
 //! This module decides **egress and workspace policy only**. A consumer may additionally bind a
-//! credential to a Trusted URL (`deps-swift`, `deps-nuget`) or refuse a transport (`deps-cargo`);
-//! those rules live with the consumer.
+//! credential to a Trusted URL (`deps-swift`, `deps-nuget`, `deps-cargo`); that rule lives with
+//! the consumer and is only ever applied to a URL this rule classified Trusted.
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 use super::{
-    BlockedHost, CanonicalUrl, IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy,
-    RegistryUrlKind, TrustedConstantRegistryUrl, ValidatedRegistryUrl, WorkspaceRegistryAccess,
-    classify_host, enforce_policy, validate_index_url,
+    BlockedHost, CanonicalUrl, EnvSource, IndexUrlError, PolicyGate, RedactedUrl,
+    RegistryAccessPolicy, RegistryUrlKind, TrustedConstantRegistryUrl, ValidatedRegistryUrl,
+    WorkspaceRegistryAccess, classify_host, enforce_policy, validate_index_url,
 };
 use crate::EgressTier;
 use crate::config_trust::OperatorPath;
@@ -122,13 +122,60 @@ impl OperatorRegistries {
     ) -> Self {
         // `_file` is a provenance token only: holding one says `candidates` come from a file
         // located through the operator's own environment.
-        let urls = candidates
+        Self {
+            urls: Self::canonical_urls(candidates),
+        }
+    }
+
+    /// The URLs held by the environment variables `names`, read from `env` here so a URL in the
+    /// set provably came from the environment (for Cargo, the `CARGO_REGISTRIES_<ALIAS>_INDEX`
+    /// variables). `normalize` maps a variable's text to the URL text the ecosystem classifies
+    /// (for Cargo, removing `sparse+`).
+    ///
+    /// The environment is operator-owned: a repository cannot set it. Unparseable values and
+    /// values carrying userinfo are skipped, as in [`Self::declared_in`]. Misuse-resistant only,
+    /// not unforgeable: `env` is any [`EnvSource`], so the caller asserts it is the process
+    /// environment.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::{MapEnv, OperatorRegistries};
+    ///
+    /// let env = MapEnv::new().with_var("REGISTRY_INDEX", "https://index.corp.example");
+    /// let set = OperatorRegistries::declared_in_env(&env, ["REGISTRY_INDEX"], |raw| raw);
+    /// assert!(set.contains_str("https://index.corp.example/"));
+    /// ```
+    #[must_use]
+    pub fn declared_in_env<N: AsRef<str>>(
+        env: &(impl EnvSource + ?Sized),
+        names: impl IntoIterator<Item = N>,
+        normalize: for<'a> fn(&'a str) -> &'a str,
+    ) -> Self {
+        let values: Vec<String> = names
+            .into_iter()
+            .filter_map(|name| env.var_os(name.as_ref()))
+            .filter_map(|value| value.into_string().ok())
+            .collect();
+        Self {
+            urls: Self::canonical_urls(values.iter().map(|value| normalize(value))),
+        }
+    }
+
+    /// Adds every URL `other` declares to this set.
+    pub fn extend(&mut self, other: Self) {
+        self.urls.extend(other.urls);
+    }
+
+    fn canonical_urls<S: AsRef<str>>(
+        candidates: impl IntoIterator<Item = S>,
+    ) -> HashSet<CanonicalUrl> {
+        candidates
             .into_iter()
             .filter_map(|candidate| url::Url::parse(candidate.as_ref()).ok())
             .filter(|url| url.username().is_empty() && url.password().is_none())
             .map(|url| CanonicalUrl::of(&url))
-            .collect();
-        Self { urls }
+            .collect()
     }
 
     /// Whether the set declares no URL.

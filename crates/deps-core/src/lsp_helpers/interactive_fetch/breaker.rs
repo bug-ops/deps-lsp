@@ -27,7 +27,7 @@ use super::attempt::{AttemptEvidence, MARGIN};
 use super::key::{BreakerEvidence, EndpointKey, MAX_LOOKUP_BUDGET};
 use super::memo::INTERACTIVE_FAILURE_TTL;
 use super::{FetchContext, InteractiveFetchGate};
-use crate::PackageName;
+use crate::NormalizedName;
 use crate::cache_policy::evict_oldest_batch_where;
 
 /// How long an opened breaker refuses requests before letting one probe through.
@@ -55,7 +55,7 @@ pub(super) struct ProbeId(u64);
 /// A package whose attempt was slow while the endpoint had not recently answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Suspect {
-    pub(super) package: PackageName,
+    pub(super) package: NormalizedName,
     pub(super) at: Instant,
 }
 
@@ -124,7 +124,7 @@ impl EndpointHealth {
     pub(super) fn after(
         &self,
         evidence: AttemptEvidence,
-        package: &PackageName,
+        package: &NormalizedName,
         probe: Option<ProbeId>,
         now: Instant,
     ) -> Self {
@@ -143,7 +143,7 @@ impl EndpointHealth {
         }
     }
 
-    fn after_slow(&self, package: &PackageName, probe: Option<ProbeId>, now: Instant) -> Self {
+    fn after_slow(&self, package: &NormalizedName, probe: Option<ProbeId>, now: Instant) -> Self {
         match self {
             Self::HalfOpen { probe: leased, .. } if Some(*leased) == probe => Self::Open {
                 until: now + BREAKER_OPEN_DURATION,
@@ -282,7 +282,7 @@ impl EndpointBreaker {
     pub(super) fn report(
         &self,
         endpoint: &EndpointKey,
-        package: &PackageName,
+        package: &NormalizedName,
         evidence: AttemptEvidence,
         probe: Option<ProbeId>,
         now: Instant,
@@ -295,7 +295,7 @@ impl EndpointBreaker {
     pub(super) fn report_between(
         &self,
         endpoint: &EndpointKey,
-        package: &PackageName,
+        package: &NormalizedName,
         evidence: AttemptEvidence,
         probe: Option<ProbeId>,
         now: Instant,
@@ -328,7 +328,7 @@ impl EndpointBreaker {
     fn is_noop(
         &self,
         endpoint: &EndpointKey,
-        package: &PackageName,
+        package: &NormalizedName,
         evidence: AttemptEvidence,
         now: Instant,
     ) -> bool {

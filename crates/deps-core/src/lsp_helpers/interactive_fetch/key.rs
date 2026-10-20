@@ -6,7 +6,7 @@ use std::time::Duration;
 use super::AuxiliaryLookup;
 use crate::lsp_helpers::REGISTRY_FETCH_BUDGET;
 use crate::registry_endpoint::keyed_hash64;
-use crate::{DependencySource, EcosystemId, EndpointFingerprint, PackageName};
+use crate::{DependencySource, EcosystemId, EndpointFingerprint, NormalizedName};
 
 /// Budget of an [`AuxiliaryLookup`]: each is an optional enrichment or fallback of a response
 /// that already has its basic card, so they get half the version list's.
@@ -139,7 +139,7 @@ impl SourceFingerprint {
 }
 
 /// Keyed hash of the manifest URL the request is served for (see
-/// [`InteractiveFetchRequest::new`](super::InteractiveFetchRequest::new)).
+/// [`InteractiveFetchRequest::for_dependency`](super::InteractiveFetchRequest::for_dependency)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct ManifestFingerprint(u64);
 
@@ -203,7 +203,7 @@ pub(super) enum EndpointKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct LookupKey {
     pub(super) route: RouteKey,
-    pub(super) package: PackageName,
+    pub(super) package: NormalizedName,
     pub(super) slot: LookupKind,
 }
 

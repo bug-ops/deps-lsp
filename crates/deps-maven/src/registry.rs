@@ -8,7 +8,8 @@ use crate::version::compare_versions;
 use bytes::Bytes;
 use dashmap::DashMap;
 use deps_core::{
-    DependencySource, DepsError, EgressTier, HttpCache, PublishTime, RegistryEndpoint, Result,
+    DependencySource, DepsError, EgressTier, ErrorOrigin, HttpCache, PublishTime, RegistryEndpoint,
+    Result,
     error::LookupBudget,
     lsp_helpers::warn_rejected_value,
     maven_coordinate_path,
@@ -686,21 +687,26 @@ fn record_search_success(failures: &DashMap<String, tokio::time::Instant>, query
 
 /// Whether a failed search attempt is worth retrying live (#274).
 ///
-/// A client-side timeout is always worth retrying — `solrsearch`'s dominant failure
-/// mode is a silent hang, not a clean error. An HTTP 5xx may be transient. Any 4xx is
-/// treated as terminal: a 400 means the query itself is malformed and retrying changes
-/// nothing, and a 429 specifically must NOT be retried immediately — that adds to the
-/// very request volume this endpoint's undocumented rate limiting reacts to.
+/// An allowlist of transient endpoint faults: an HTTP 5xx, a transport failure that reached the
+/// endpoint ([`ErrorOrigin::Endpoint`], e.g. a connection reset or a body read
+/// error), and a lookup that overran its time or scan budget. A client-side timeout is retried
+/// by the caller before this is consulted, since `solrsearch`'s dominant failure mode is a
+/// silent hang, not a clean error.
 ///
-/// `DepsError::Offline` (issue #483) is likewise terminal: it is deterministic and
-/// permanent for the duration of the config, so retrying it just pays
-/// [`SEARCH_RETRY_DELAY`] and an extra iteration for nothing, on a path with a
-/// user-facing completion deadline. Before the M2 fix this cost was absorbed by
-/// `recent_search_failures` after the first query; now that `search` skips
-/// recording an offline block there, every offline completion would otherwise pay it.
+/// Everything else is terminal: a 4xx (a 400 means the query itself is malformed, and a 429
+/// must NOT be retried immediately — that adds to the very request volume this endpoint's
+/// undocumented rate limiting reacts to), `DepsError::Offline` (issue #483: deterministic and
+/// permanent for the duration of the config), configuration faults, DNS resolution failures
+/// (no connection was attempted) and a 200 response that does not parse, such as an HTML
+/// error page from a proxy. Retrying those only pays [`SEARCH_RETRY_DELAY`] on a path with a
+/// user-facing completion deadline.
 fn is_retryable_error(e: &DepsError) -> bool {
-    !matches!(e, DepsError::HttpStatus { status, .. } if (400..500).contains(status))
-        && !e.is_offline()
+    match e {
+        DepsError::HttpStatus { status, .. } => (500..600).contains(status),
+        DepsError::RegistryError { .. } => e.origin() == ErrorOrigin::Endpoint,
+        DepsError::BudgetExceeded(_) => true,
+        _ => false,
+    }
 }
 
 /// Retries `fetch` across [`SEARCH_ATTEMPT_TIMEOUTS`], each attempt bounded by its own
@@ -1155,6 +1161,7 @@ impl deps_core::Registry for MavenCentralRegistry {
 mod tests {
     use super::*;
 
+    use deps_core::error::{ResolutionFailure, SanitizedRegistryError};
     use std::assert_matches;
 
     fn freshness(enabled: bool) -> deps_core::FreshnessSettings {
@@ -1836,17 +1843,80 @@ mod tests {
         assert_matches!(err, DepsError::RecentlyFailed, "got {err:?}");
     }
 
-    /// The typed budget and suppression errors stay retry-classified as the `CacheError`s they
-    /// replaced: the search retry loop retries a timed-out attempt and a scan overrun alike.
+    /// The typed budget errors stay retry-classified as the untyped cache errors they replaced: the
+    /// search retry loop retries a timed-out attempt and a scan overrun alike.
     #[test]
-    fn test_typed_budget_errors_stay_retryable() {
+    fn test_budget_overruns_are_retryable() {
         assert!(is_retryable_error(&DepsError::BudgetExceeded(
             LookupBudget::Time
         )));
         assert!(is_retryable_error(&DepsError::BudgetExceeded(
             LookupBudget::Scan
         )));
-        assert!(is_retryable_error(&DepsError::RecentlyFailed));
+    }
+
+    /// A suppression sent nothing, so a retry would be suppressed again.
+    #[test]
+    fn test_recently_failed_suppression_is_not_retried() {
+        assert!(!is_retryable_error(&DepsError::RecentlyFailed));
+    }
+
+    fn http_status(status: u16) -> DepsError {
+        DepsError::HttpStatus {
+            url: "https://repo.example/solrsearch".into(),
+            status,
+        }
+    }
+
+    fn registry_error(source: SanitizedRegistryError) -> DepsError {
+        DepsError::RegistryError {
+            package: RedactedUrl::new("https://repo.example/solrsearch"),
+            source,
+        }
+    }
+
+    #[test]
+    fn test_retry_allowlist_http_status_boundaries() {
+        assert!(!is_retryable_error(&http_status(404)));
+        assert!(!is_retryable_error(&http_status(429)));
+        assert!(!is_retryable_error(&http_status(499)));
+        assert!(is_retryable_error(&http_status(500)));
+        assert!(is_retryable_error(&http_status(503)));
+        assert!(is_retryable_error(&http_status(599)));
+        assert!(!is_retryable_error(&http_status(600)));
+    }
+
+    #[tokio::test]
+    async fn test_retry_allowlist_retries_endpoint_transport_failures() {
+        let error = registry_error(SanitizedRegistryError::endpoint_failure_for_test().await);
+        assert_eq!(error.origin(), ErrorOrigin::Endpoint);
+        assert!(is_retryable_error(&error));
+    }
+
+    #[test]
+    fn test_retry_allowlist_does_not_retry_dns_failures() {
+        for failure in [
+            ResolutionFailure::NoAddresses,
+            ResolutionFailure::LookupFailed,
+        ] {
+            let error = registry_error(failure.into());
+            assert_eq!(error.origin(), ErrorOrigin::Unattributed);
+            assert!(!is_retryable_error(&error));
+        }
+    }
+
+    #[test]
+    fn test_retry_allowlist_does_not_retry_an_unparseable_200() {
+        let error = parse_search_response(b"<html>proxy error page</html>", 20).unwrap_err();
+        assert_matches!(error, DepsError::Json(_));
+        assert!(!is_retryable_error(&error));
+    }
+
+    #[test]
+    fn test_retry_allowlist_does_not_retry_configuration_faults() {
+        assert!(!is_retryable_error(&DepsError::Io(std::io::Error::other(
+            "misconfigured"
+        ))));
     }
 
     /// Issue #483 M2: an offline block must not poison `recent_search_failures` — unlike a
@@ -1899,7 +1969,10 @@ mod tests {
                 let n = calls.fetch_add(1, Ordering::SeqCst);
                 async move {
                     if n == 0 {
-                        Err(DepsError::CacheError("boom".into()))
+                        Err(DepsError::HttpStatus {
+                            url: "https://repo.example/solrsearch".into(),
+                            status: 503,
+                        })
                     } else {
                         Ok(Bytes::from_static(b"ok"))
                     }

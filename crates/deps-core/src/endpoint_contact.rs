@@ -8,21 +8,37 @@
 //! [`AttemptContact::scope`] installs a ledger for one polled attempt. The HTTP send sites call
 //! [`note_request`] after their local guards and before DNS preflight (so a hung lookup counts
 //! as outstanding) and hold the returned [`RequestNote`] until the send ends:
-//! [`RequestNote::answered`] once any status line arrives, a plain drop on error or
-//! cancellation. [`note_request`] is a no-op outside a scope.
+//! [`RequestNote::headers`] once any status line arrives, which turns it into a [`BodyNote`]
+//! that is told of every body chunk ([`BodyNote::progressed`]) and closed by
+//! [`BodyNote::finished`]; a plain drop on error or cancellation. [`note_request`] is a no-op
+//! outside a scope.
 //!
 //! The ledger measures busy time: the time at least one request was outstanding since the last
-//! response. A request that fails after a long wait still counts as stalled, while a fast
-//! transport error followed by idle time does not accumulate anything.
+//! response or body chunk. A request that fails after a long wait still counts as stalled, while
+//! a fast transport error followed by idle time does not accumulate anything. A body that
+//! stalls after its headers therefore reads as slow, whereas one that keeps delivering chunks
+//! (a drip-feed) is never slow, and each chunk restarts the windows of coalesced waiters.
 //!
 //! An attempt that coalesces onto a request another task put on the wire (a `OnceCell`, a
 //! per-key lock) sends nothing of its own. Orchestration code tags the task that does send with
-//! [`observe_ecosystem`] and [`observe_endpoint`], so its requests also feed a ledger shared by
-//! every task of the same `(ecosystem, endpoint)`; an attempt that never saw a response of its
-//! own reads that ledger over its own wait.
+//! an [`EndpointObserver`], so its requests also feed a ledger shared by every task of the same
+//! `(ecosystem, endpoint)`; an attempt that never saw a response of its own reads that ledger
+//! over its own wait.
+//!
+//! A request counts from before DNS preflight, so time spent resolving or queued behind the
+//! client's own connection limits is busy time too. That is deliberate: a hung resolver or an
+//! exhausted pool is indistinguishable, to the user waiting on a hover, from an endpoint that
+//! never answers, and a request that sat in the queue is outstanding for the lookups waiting on
+//! it either way.
+//!
+//! The shared ledger is deliberately per endpoint, not per key: a healthy sibling response
+//! restarts the busy interval for every outstanding request on it, so one hung GitHub Actions
+//! repository cannot open the breaker for all of `api.github.com`. A stuck per-key request that
+//! the endpoint keeps answering around is the endpoint's success, not its failure.
 
 use std::future::Future;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
@@ -34,7 +50,6 @@ use crate::{EcosystemId, EndpointFingerprint, RegistryEndpoint};
 
 tokio::task_local! {
     static CONTACT: ContactScope;
-    static ECOSYSTEM: EcosystemId;
 }
 
 /// Which ledgers a request sent in the current task feeds.
@@ -161,6 +176,21 @@ impl WireState {
         }
     }
 
+    /// A response or body chunk arrived: the busy time restarts and every outstanding request
+    /// stays outstanding.
+    fn progressed(&mut self, now: Instant) {
+        self.responded = ResponseSeen::Yes;
+        self.epoch = self.epoch.saturating_add(1);
+        self.busy_closed = Duration::ZERO;
+        self.busy = match self.busy {
+            Busy::Idle => Busy::Idle,
+            Busy::Open { outstanding, .. } => Busy::Open {
+                since: now,
+                outstanding,
+            },
+        };
+    }
+
     fn answered(&mut self, now: Instant) {
         self.responded = ResponseSeen::Yes;
         self.epoch = self.epoch.saturating_add(1);
@@ -214,6 +244,10 @@ impl ContactLedger {
         state.busy = state.busy.opened(now);
     }
 
+    fn progressed(&self, now: Instant) {
+        self.lock().progressed(now);
+    }
+
     fn answered(&self, now: Instant) {
         self.lock().answered(now);
     }
@@ -248,10 +282,10 @@ impl ContactLedger {
 
 /// One request that left (or is about to leave) over the wire.
 ///
-/// Hold it across the send. [`Self::answered`] records the response; dropping it unanswered
-/// (error, cancellation, a timeout dropping the future) closes the request without vouching
-/// for the endpoint. It owns its (at most two) ledgers, so it needs no task-local scope when it
-/// ends.
+/// Hold it across the send. [`Self::headers`] records the response and hands over to a
+/// [`BodyNote`]; dropping it unanswered (error, cancellation, a timeout dropping the future)
+/// closes the request without vouching for the endpoint. It owns its (at most two) ledgers, so
+/// it needs no task-local scope when it ends.
 #[must_use = "the note must be held across the send so the request counts as outstanding"]
 #[derive(Debug, Default)]
 pub(crate) struct RequestNote {
@@ -260,8 +294,57 @@ pub(crate) struct RequestNote {
 }
 
 impl RequestNote {
-    /// Records that a response (any status) arrived.
-    pub(crate) fn answered(mut self) {
+    /// Records that a status line arrived. The request stays outstanding until the returned
+    /// note is [`finished`](BodyNote::finished), so a body that stalls reads as slow.
+    pub(crate) fn headers(mut self) -> BodyNote {
+        let note = BodyNote {
+            own: self.own.take(),
+            shared: self.shared.take(),
+        };
+        note.progressed();
+        note
+    }
+
+    /// Records a request answered in full, for tests that do not read a body.
+    #[cfg(test)]
+    pub(crate) fn answered(self) {
+        self.headers().finished();
+    }
+}
+
+impl Drop for RequestNote {
+    fn drop(&mut self) {
+        abandon([self.own.take(), self.shared.take()]);
+    }
+}
+
+/// A request whose headers arrived and whose body is being read.
+///
+/// Call [`Self::progressed`] for every chunk and [`Self::finished`] once the body is complete or
+/// not needed. Dropping it earlier (a read error, a cancelled or timed-out future) abandons the
+/// request, with the time since the last chunk counted as stalled.
+#[must_use = "the note must be held while the body is read so a stalled body counts as outstanding"]
+#[derive(Debug)]
+pub(crate) struct BodyNote {
+    own: Option<Arc<ContactLedger>>,
+    shared: Option<Arc<ContactLedger>>,
+}
+
+impl BodyNote {
+    fn ledgers(&self) -> impl Iterator<Item = &Arc<ContactLedger>> {
+        self.own.iter().chain(self.shared.iter())
+    }
+
+    /// Records that bytes arrived, restarting the stall.
+    pub(crate) fn progressed(&self) {
+        let now = Instant::now();
+        for ledger in self.ledgers() {
+            ledger.progressed(now);
+        }
+    }
+
+    /// Records that the request ended with its response consumed.
+    pub(crate) fn finished(mut self) {
         let now = Instant::now();
         for ledger in [self.own.take(), self.shared.take()].into_iter().flatten() {
             ledger.answered(now);
@@ -269,12 +352,16 @@ impl RequestNote {
     }
 }
 
-impl Drop for RequestNote {
+impl Drop for BodyNote {
     fn drop(&mut self) {
-        let now = Instant::now();
-        for ledger in [self.own.take(), self.shared.take()].into_iter().flatten() {
-            ledger.abandoned(now);
-        }
+        abandon([self.own.take(), self.shared.take()]);
+    }
+}
+
+fn abandon(ledgers: [Option<Arc<ContactLedger>>; 2]) {
+    let now = Instant::now();
+    for ledger in ledgers.into_iter().flatten() {
+        ledger.abandoned(now);
     }
 }
 
@@ -296,22 +383,35 @@ pub(crate) fn note_request() -> RequestNote {
         .unwrap_or_default()
 }
 
-/// Past this many registered endpoints, dead entries are pruned before the next insert.
-const PRUNE_ABOVE: usize = 64;
+/// The registered-endpoint count below which dead entries are never pruned.
+const PRUNE_FLOOR: usize = 64;
 
 /// Ledgers shared by every task of one `(ecosystem, endpoint)`.
 ///
 /// Entries are weak: a ledger lives while some fetch or attempt holds it, so the map cannot
-/// grow with the endpoints a long session has touched.
+/// grow with the endpoints a long session has touched. Pruning is amortized: after a prune the
+/// next one waits until the map has doubled, so a map full of live ledgers is not rescanned on
+/// every acquire.
 #[derive(Debug, Default)]
-struct SharedLedgers(DashMap<(EcosystemId, EndpointFingerprint), Weak<ContactLedger>>);
+struct SharedLedgers {
+    ledgers: DashMap<(EcosystemId, EndpointFingerprint), Weak<ContactLedger>>,
+    prune_at: AtomicUsize,
+}
 
 impl SharedLedgers {
-    fn acquire(&self, ecosystem: EcosystemId, endpoint: EndpointFingerprint) -> Arc<ContactLedger> {
-        if self.0.len() > PRUNE_ABOVE {
-            self.0.retain(|_, ledger| ledger.strong_count() > 0);
+    fn prune_if_due(&self) {
+        let threshold = self.prune_at.load(Ordering::Relaxed).max(PRUNE_FLOOR);
+        if self.ledgers.len() <= threshold {
+            return;
         }
-        match self.0.entry((ecosystem, endpoint)) {
+        self.ledgers.retain(|_, ledger| ledger.strong_count() > 0);
+        let next = self.ledgers.len().saturating_mul(2).max(PRUNE_FLOOR);
+        self.prune_at.store(next, Ordering::Relaxed);
+    }
+
+    fn acquire(&self, ecosystem: EcosystemId, endpoint: EndpointFingerprint) -> Arc<ContactLedger> {
+        self.prune_if_due();
+        match self.ledgers.entry((ecosystem, endpoint)) {
             Entry::Occupied(mut slot) => slot.get().upgrade().unwrap_or_else(|| {
                 let ledger = ContactLedger::new();
                 slot.insert(Arc::downgrade(&ledger));
@@ -422,73 +522,84 @@ impl AttemptContact {
     }
 }
 
-/// Runs `fetch` with `ecosystem` recorded, so that [`observe_endpoint`] inside it knows which
-/// ecosystem's breaker evidence its requests belong to.
+/// Makes the HTTP requests of a fetch feed the breaker evidence of one `(ecosystem, endpoint)`.
 ///
-/// For orchestration code that fetches on behalf of an ecosystem (the background fetch, the
-/// completion dispatch), not for ecosystem crates: a crate's coalescing layer needs no hook of
-/// its own.
-///
-/// # Examples
-///
-/// ```
-/// use deps_core::{EcosystemId, observe_ecosystem};
-///
-/// # #[tokio::main(flavor = "current_thread")]
-/// # async fn main() {
-/// let answer = observe_ecosystem(EcosystemId::NuGet, async { 42 }).await;
-/// assert_eq!(answer, 42);
-/// # }
-/// ```
-pub async fn observe_ecosystem<F: Future>(ecosystem: EcosystemId, fetch: F) -> F::Output {
-    ECOSYSTEM.scope(ecosystem, fetch).await
-}
-
-/// Runs `fetch` so that its HTTP requests feed the breaker evidence of `endpoint`, under the
-/// ecosystem set by an enclosing [`observe_ecosystem`].
-///
-/// An interactive lookup that waits on this fetch's request (a shared `OnceCell`, a per-key
+/// An interactive lookup that waits on such a fetch's request (a shared `OnceCell`, a per-key
 /// lock) sends nothing itself; this lets the interactive fetch gate see that the request is
-/// outstanding. For orchestration code, not for ecosystem crates.
+/// outstanding. For orchestration code that fetches on behalf of an ecosystem (the background
+/// fetch, the completion dispatch), not for ecosystem crates: a crate's coalescing layer needs no
+/// hook of its own. Build one per distinct endpoint and [`observe`](Self::observe) every fetch
+/// against it.
 ///
-/// It runs `fetch` unchanged when there is no enclosing [`observe_ecosystem`], when `endpoint`
-/// is [`RegistryEndpoint::Unresolved`], or when the task is already inside an interactive
-/// attempt (whose own accounting must not be shadowed).
+/// [`Self::observe`] runs the fetch unchanged when the endpoint is
+/// [`RegistryEndpoint::Unresolved`], or when the task is already inside an interactive attempt
+/// (whose own accounting must not be shadowed).
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_core::{EcosystemId, EgressTier, RegistryEndpoint, observe_ecosystem, observe_endpoint};
+/// use deps_core::{EcosystemId, EgressTier, EndpointObserver, RegistryEndpoint};
 ///
 /// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() {
 /// let endpoint = RegistryEndpoint::from_base_str("https://api.nuget.org/v3/", EgressTier::Baseline);
-/// let answer = observe_ecosystem(
-///     EcosystemId::NuGet,
-///     observe_endpoint(endpoint, async { 42 }),
-/// )
-/// .await;
-/// assert_eq!(answer, 42);
+/// let observer = EndpointObserver::new(EcosystemId::NuGet, endpoint);
+/// assert_eq!(observer.observe(async { 42 }).await, 42);
 /// # }
 /// ```
-pub async fn observe_endpoint<F: Future>(endpoint: RegistryEndpoint, fetch: F) -> F::Output {
-    match fetch_scope(endpoint) {
-        Some(scope) => CONTACT.scope(scope, fetch).await,
-        None => fetch.await,
+#[derive(Debug, Clone)]
+pub struct EndpointObserver(Option<Arc<ContactLedger>>);
+
+impl EndpointObserver {
+    /// Observes `endpoint` on behalf of `ecosystem`, sharing a ledger with every other observer
+    /// of the same pair.
+    #[must_use]
+    pub fn new(ecosystem: EcosystemId, endpoint: RegistryEndpoint) -> Self {
+        match endpoint {
+            RegistryEndpoint::Resolved(fingerprint) => {
+                Self(Some(SHARED.acquire(ecosystem, fingerprint)))
+            }
+            RegistryEndpoint::Unresolved => Self(None),
+        }
+    }
+
+    /// Runs `fetch` so that its HTTP requests feed this observer's endpoint.
+    pub async fn observe<F: Future>(&self, fetch: F) -> F::Output {
+        match &self.0 {
+            Some(shared) if CONTACT.try_with(|_| ()).is_err() => {
+                let scope = ContactScope::Fetch {
+                    shared: Arc::clone(shared),
+                };
+                CONTACT.scope(scope, fetch).await
+            }
+            _ => fetch.await,
+        }
     }
 }
 
-fn fetch_scope(endpoint: RegistryEndpoint) -> Option<ContactScope> {
-    if CONTACT.try_with(|_| ()).is_ok() {
-        return None;
-    }
-    let RegistryEndpoint::Resolved(fingerprint) = endpoint else {
-        return None;
-    };
-    let ecosystem = ECOSYSTEM.try_with(|ecosystem| *ecosystem).ok()?;
-    Some(ContactScope::Fetch {
-        shared: SHARED.acquire(ecosystem, fingerprint),
-    })
+/// Runs `fetch` observed against `endpoint` for `ecosystem`, for a single fetch; see
+/// [`EndpointObserver`] to share one observer across many fetches of the same endpoint.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::{EcosystemId, EgressTier, RegistryEndpoint, observe_endpoint};
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() {
+/// let endpoint = RegistryEndpoint::from_base_str("https://api.nuget.org/v3/", EgressTier::Baseline);
+/// let answer = observe_endpoint(EcosystemId::NuGet, endpoint, async { 42 }).await;
+/// assert_eq!(answer, 42);
+/// # }
+/// ```
+pub async fn observe_endpoint<F: Future>(
+    ecosystem: EcosystemId,
+    endpoint: RegistryEndpoint,
+    fetch: F,
+) -> F::Output {
+    EndpointObserver::new(ecosystem, endpoint)
+        .observe(fetch)
+        .await
 }
 
 #[cfg(test)]
@@ -668,13 +779,10 @@ mod tests {
     /// Spawns a task that holds one never-answered request on `base` for `hold` seconds.
     fn spawn_holder(ecosystem: EcosystemId, base: &str, hold: u64) -> tokio::task::JoinHandle<()> {
         let endpoint = RegistryEndpoint::from_base_str(base, crate::EgressTier::Baseline);
-        tokio::spawn(observe_ecosystem(
-            ecosystem,
-            observe_endpoint(endpoint, async move {
-                let _note = note_request();
-                sleep(hold).await;
-            }),
-        ))
+        tokio::spawn(observe_endpoint(ecosystem, endpoint, async move {
+            let _note = note_request();
+            sleep(hold).await;
+        }))
     }
 
     #[test]
@@ -774,15 +882,16 @@ mod tests {
     async fn a_paging_holder_never_looks_stalled_to_a_waiter() {
         let base = "https://paging.example/";
         let endpoint = RegistryEndpoint::from_base_str(base, crate::EgressTier::Baseline);
-        let holder = tokio::spawn(observe_ecosystem(
+        let holder = tokio::spawn(observe_endpoint(
             EcosystemId::GithubActions,
-            observe_endpoint(endpoint, async {
+            endpoint,
+            async {
                 for _ in 0..12 {
                     let note = note_request();
                     sleep(1).await;
                     note.answered();
                 }
-            }),
+            },
         ));
         tokio::task::yield_now().await;
         let waiter = AttemptContact::on_endpoint(EcosystemId::GithubActions, fingerprint(base));
@@ -791,6 +900,77 @@ mod tests {
         let (contact, _) = waiter.observe(Instant::now());
         assert!(contact.stall < secs(5), "stall was {:?}", contact.stall);
         holder.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_healthy_sibling_response_restarts_a_stuck_requests_stall() {
+        let base = "https://per-endpoint.example/";
+        let holder = spawn_holder(EcosystemId::GithubActions, base, 60);
+        tokio::task::yield_now().await;
+        let waiter = AttemptContact::on_endpoint(EcosystemId::GithubActions, fingerprint(base));
+        sleep(3).await;
+        let endpoint = RegistryEndpoint::from_base_str(base, crate::EgressTier::Baseline);
+        observe_endpoint(EcosystemId::GithubActions, endpoint, async {
+            note_request().answered();
+        })
+        .await;
+        sleep(2).await;
+
+        let (contact, _) = waiter.observe(Instant::now());
+        assert_eq!(contact.stall, secs(2));
+        holder.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_body_after_headers_reads_as_stalled() {
+        let ledger = ContactLedger::new();
+        ledger
+            .scope(async {
+                let body = note_request().headers();
+                sleep(2).await;
+                body.progressed();
+                sleep(4).await;
+
+                let contact = ledger.snapshot(Instant::now());
+                assert_eq!(contact.response, ResponseSeen::Yes);
+                assert_eq!(contact.stall, secs(4));
+
+                body.finished();
+                assert_eq!(ledger.snapshot(Instant::now()).stall, Duration::ZERO);
+            })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_drip_fed_body_never_looks_stalled() {
+        let ledger = ContactLedger::new();
+        ledger
+            .scope(async {
+                let body = note_request().headers();
+                for _ in 0..10 {
+                    sleep(3).await;
+                    body.progressed();
+                }
+                assert_eq!(ledger.snapshot(Instant::now()).stall, Duration::ZERO);
+            })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_body_dropped_mid_stream_counts_the_time_since_its_last_chunk() {
+        let ledger = ContactLedger::new();
+        ledger
+            .scope(async {
+                let body = note_request().headers();
+                sleep(1).await;
+                body.progressed();
+                sleep(5).await;
+                drop(body);
+                sleep(30).await;
+
+                assert_eq!(ledger.snapshot(Instant::now()).stall, secs(5));
+            })
+            .await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -827,57 +1007,69 @@ mod tests {
         let endpoint = RegistryEndpoint::from_base_str(base, crate::EgressTier::Baseline);
         let watcher = AttemptContact::on_endpoint(EcosystemId::NuGet, fingerprint(base));
         let attempt = AttemptContact::own_only();
-        observe_ecosystem(
-            EcosystemId::NuGet,
-            attempt.scope(observe_endpoint(endpoint, async {
+        attempt
+            .scope(observe_endpoint(EcosystemId::NuGet, endpoint, async {
                 let _note = note_request();
                 sleep(4).await;
-            })),
-        )
-        .await;
+            }))
+            .await;
 
         assert_eq!(attempt.own.snapshot(Instant::now()).stall, secs(4));
         assert_eq!(watcher.observe(Instant::now()).0, Contact::UNTOUCHED);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn observe_endpoint_without_an_ecosystem_or_a_resolved_endpoint_is_a_no_op() {
+    async fn observing_an_unresolved_endpoint_is_a_no_op() {
         let base = "https://no-op.example/";
-        let endpoint = RegistryEndpoint::from_base_str(base, crate::EgressTier::Baseline);
         let watcher = AttemptContact::on_endpoint(EcosystemId::NuGet, fingerprint(base));
 
-        observe_endpoint(endpoint, async {
+        observe_endpoint(EcosystemId::NuGet, RegistryEndpoint::Unresolved, async {
             let _note = note_request();
             sleep(4).await;
         })
-        .await;
-        observe_ecosystem(
-            EcosystemId::NuGet,
-            observe_endpoint(RegistryEndpoint::Unresolved, async {
-                let _note = note_request();
-                sleep(4).await;
-            }),
-        )
         .await;
 
         assert_eq!(watcher.observe(Instant::now()).0, Contact::UNTOUCHED);
     }
 
     #[test]
-    fn dead_shared_ledgers_are_pruned_past_the_threshold() {
+    fn dead_shared_ledgers_are_pruned_past_the_floor() {
         let ledgers = SharedLedgers::default();
-        for index in 0..=PRUNE_ABOVE {
+        for index in 0..=PRUNE_FLOOR {
             let fingerprint = fingerprint(&format!("https://prune-{index}.example/"));
             drop(ledgers.acquire(EcosystemId::Cargo, fingerprint));
         }
-        assert!(ledgers.0.len() > PRUNE_ABOVE);
+        assert!(ledgers.ledgers.len() > PRUNE_FLOOR);
 
         let live = ledgers.acquire(
             EcosystemId::Cargo,
             fingerprint("https://prune-live.example/"),
         );
-        assert_eq!(ledgers.0.len(), 1);
+        assert_eq!(ledgers.ledgers.len(), 1);
         drop(live);
+    }
+
+    #[test]
+    fn a_map_of_live_ledgers_is_not_rescanned_until_it_doubles() {
+        let ledgers = SharedLedgers::default();
+        let mut held = Vec::new();
+        for index in 0..=PRUNE_FLOOR + 1 {
+            let fingerprint = fingerprint(&format!("https://amortized-{index}.example/"));
+            held.push(ledgers.acquire(EcosystemId::Cargo, fingerprint));
+        }
+        assert_eq!(
+            ledgers.prune_at.load(Ordering::Relaxed),
+            2 * (PRUNE_FLOOR + 1)
+        );
+
+        assert_eq!(held.len(), PRUNE_FLOOR + 2);
+        let dead = fingerprint("https://amortized-dead.example/");
+        drop(ledgers.acquire(EcosystemId::Cargo, dead));
+        drop(ledgers.acquire(
+            EcosystemId::Cargo,
+            fingerprint("https://amortized-next.example/"),
+        ));
+        assert!(ledgers.ledgers.contains_key(&(EcosystemId::Cargo, dead)));
     }
 
     #[test]

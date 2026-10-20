@@ -22,8 +22,8 @@ use crate::lsp_helpers::{
     truncate_for_diagnostic, warn_rejected_value,
 };
 use crate::{
-    ConcreteVersion, FreshnessSettings, Metadata, PackageName, ParseResult, PublishTime, Version,
-    format_relative_age,
+    ConcreteVersion, EcosystemId, FreshnessSettings, Metadata, PackageName, ParseResult,
+    PublishTime, Version, format_relative_age,
 };
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionTextEdit,
@@ -1695,6 +1695,8 @@ pub async fn complete_package_names_generic(
 ///
 /// # Arguments
 ///
+/// * `ecosystem` - Ecosystem the request is made on behalf of; its breaker evidence is fed by
+///   the registry request (see [`crate::EndpointObserver`])
 /// * `registry` - Package registry to fetch versions from
 /// * `formatter` - Source-resolvability policy; see the gate above
 /// * `package_name` - Name of the package
@@ -1760,6 +1762,7 @@ pub async fn complete_package_names_generic(
 /// };
 ///
 /// let items = complete_versions_generic_replacing(
+///     deps_core::EcosystemId::Cargo,
 ///     registry,
 ///     &DefaultFormatter,
 ///     &PackageName::new("twig/twig"),
@@ -1774,12 +1777,12 @@ pub async fn complete_package_names_generic(
 /// ```
 #[allow(
     clippy::too_many_arguments,
-    reason = "mirrors complete_versions_generic_from's own 7 parameters plus the two \
-              (`replacement`, `selection_context`) this function adds; wrapping the existing \
-              7 in a request struct now would break every other ecosystem's already-stable \
-              call pattern"
+    reason = "mirrors complete_versions_generic_from's own 8 parameters plus the one \
+              (`replacement`) this function adds; wrapping the existing 8 in a request \
+              struct now would break every other ecosystem's already-stable call pattern"
 )]
 pub async fn complete_versions_generic_replacing(
+    ecosystem: EcosystemId,
     registry: &dyn crate::Registry,
     formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     package_name: &PackageName,
@@ -1795,6 +1798,7 @@ pub async fn complete_versions_generic_replacing(
     }
 
     let versions = match crate::observe_endpoint(
+        ecosystem,
         registry.endpoint_for(package_name, source),
         registry.get_versions_from(package_name, source, freshness),
     )
@@ -1919,6 +1923,7 @@ pub async fn complete_versions_generic_replacing(
 ///
 /// // Cargo: strip ^, ~, =, <, > operators
 /// let items = complete_versions_generic_from(
+///     deps_core::EcosystemId::Cargo,
 ///     registry,
 ///     &DefaultFormatter,
 ///     &PackageName::new("serde"),
@@ -1931,6 +1936,7 @@ pub async fn complete_versions_generic_replacing(
 ///
 /// // Go: no operators to strip
 /// let items = complete_versions_generic_from(
+///     deps_core::EcosystemId::Cargo,
 ///     registry,
 ///     &DefaultFormatter,
 ///     &PackageName::new("github.com/gin-gonic/gin"),
@@ -1944,11 +1950,12 @@ pub async fn complete_versions_generic_replacing(
 /// ```
 #[allow(
     clippy::too_many_arguments,
-    reason = "mirrors complete_versions_generic_replacing's own 9 parameters minus \
-              `replacement`; wrapping the existing 8 in a request struct now would break \
+    reason = "mirrors complete_versions_generic_replacing's own 10 parameters minus \
+              `replacement`; wrapping the existing 9 in a request struct now would break \
               every other ecosystem's already-stable call pattern"
 )]
 pub async fn complete_versions_generic_from(
+    ecosystem: EcosystemId,
     registry: &dyn crate::Registry,
     formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     package_name: &PackageName,
@@ -1959,6 +1966,7 @@ pub async fn complete_versions_generic_from(
     selection_context: &crate::SelectionContext,
 ) -> Vec<CompletionItem> {
     complete_versions_generic_replacing(
+        ecosystem,
         registry,
         formatter,
         package_name,
@@ -2024,6 +2032,7 @@ pub async fn complete_versions_generic_from(
 /// let freshness = deps_core::FreshnessSettings::default();
 /// let position = Position { line: 3, character: 12 };
 /// let items = complete_versions_at_position(
+///     deps_core::EcosystemId::Cargo,
 ///     registry,
 ///     &DefaultFormatter,
 ///     parse_result,
@@ -2034,7 +2043,14 @@ pub async fn complete_versions_generic_from(
 /// ).await;
 /// # }
 /// ```
+#[allow(
+    clippy::too_many_arguments,
+    reason = "completes complete_versions_generic_from's own call pattern with a cursor \
+              position in place of the dependency; wrapping the 8 in a request struct now \
+              would break every other ecosystem's already-stable call pattern"
+)]
 pub async fn complete_versions_at_position(
+    ecosystem: EcosystemId,
     registry: &dyn crate::Registry,
     formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     parse_result: &dyn ParseResult,
@@ -2051,6 +2067,7 @@ pub async fn complete_versions_at_position(
     };
 
     complete_versions_generic_from(
+        ecosystem,
         registry,
         formatter,
         dep.name(),
@@ -5010,6 +5027,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5026,6 +5044,7 @@ mod tests {
         assert_eq!(items[1].label, "1.0.1");
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5041,6 +5060,7 @@ mod tests {
         assert_eq!(items[0].label, "1.1.0 (latest)");
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5056,6 +5076,7 @@ mod tests {
         assert_eq!(items[0].label, "2.0.0 (latest)");
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5090,6 +5111,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5153,6 +5175,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &VStyleFormatter,
             &pkg("test-pkg"),
@@ -5194,6 +5217,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &VStyleFormatter,
             &pkg("test-pkg"),
@@ -5230,6 +5254,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5275,6 +5300,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5317,6 +5343,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_replacing(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5362,6 +5389,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_replacing(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5427,6 +5455,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &PanicsIfQueriedRegistry,
             &MOCK_FORMATTER,
             &pkg("private-pkg"),
@@ -5537,6 +5566,7 @@ mod tests {
         // uses a formatter that widens `can_resolve_source` to accept it — otherwise the
         // #1136 gate would return an empty vec before ever reaching `get_versions_from`.
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_WIDENED_RESOLVE_FORMATTER,
             &pkg("test-pkg"),
@@ -5574,6 +5604,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5592,6 +5623,7 @@ mod tests {
         assert!(!items.iter().any(|item| item.label == "2.1.0"));
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5626,6 +5658,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5659,6 +5692,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5693,6 +5727,7 @@ mod tests {
         let registry = MockRegistry { versions };
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5727,6 +5762,7 @@ mod tests {
 
         // Go has no operators, so empty array
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("github.com/gin-gonic/gin"),
@@ -5763,6 +5799,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("Newtonsoft.Json"),
@@ -5807,6 +5844,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5847,6 +5885,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),
@@ -5908,6 +5947,7 @@ mod tests {
         };
 
         let items = complete_versions_generic_from(
+            EcosystemId::Cargo,
             &registry,
             &MOCK_FORMATTER,
             &pkg("test-pkg"),

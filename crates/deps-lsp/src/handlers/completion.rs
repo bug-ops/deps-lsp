@@ -5,7 +5,6 @@
 use crate::config::DepsConfig;
 use crate::document::{ServerState, ensure_document_loaded};
 use deps_core::EcosystemId;
-use deps_core::NormalizeName;
 use deps_core::completion::{
     COMPLETION_SEARCH_TIMEOUT, CompletionOrigin, is_valid_completion_prefix_len,
 };
@@ -140,14 +139,11 @@ pub async fn handle_completion(
                 // `documents.get_mut` on the same shard for the duration (#319).
                 let completion_result = tokio::time::timeout(
                     COMPLETION_SEARCH_TIMEOUT,
-                    deps_core::observe_ecosystem(
-                        ecosystem_id,
-                        ecosystem.generate_completions(
-                            parse_result.as_ref(),
-                            position,
-                            &content,
-                            freshness,
-                        ),
+                    ecosystem.generate_completions(
+                        parse_result.as_ref(),
+                        position,
+                        &content,
+                        freshness,
                     ),
                 )
                 .await;
@@ -356,7 +352,7 @@ fn apply_osv_latest_verdict_to_completions(
                 formatter,
                 doc.ecosystem,
             );
-            let normalized_name = formatter.normalize_package_name(dep.name());
+            let key = deps_core::PackageKey::new(dep.name(), formatter);
             let (latest_status, candidate_status) = match osv_checks.state() {
                 CheckState::Active => (
                     Some(&doc.signals.latest_status),
@@ -380,7 +376,7 @@ fn apply_osv_latest_verdict_to_completions(
                                 latest_status,
                                 dep,
                                 Some(&vuln_keys),
-                                normalized_name.as_str(),
+                                &key,
                                 version,
                                 formatter,
                             )
@@ -389,7 +385,7 @@ fn apply_osv_latest_verdict_to_completions(
                                 candidate_status,
                                 dep,
                                 Some(&vuln_keys),
-                                normalized_name.as_str(),
+                                &key,
                                 version,
                                 formatter,
                             )
@@ -2938,6 +2934,7 @@ ser"
             {
                 Box::pin(async move {
                     let items = deps_core::completion::complete_versions_generic_replacing(
+                        deps_core::EcosystemId::Cargo,
                         self.registry.as_ref(),
                         &deps_core::test_util::StubFormatter::DEFAULT,
                         &deps_core::PackageName::new("serde"),

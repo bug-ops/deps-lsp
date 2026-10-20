@@ -2011,25 +2011,39 @@ impl VulnKey {
     /// # Examples
     ///
     /// ```
+    /// use deps_core::NormalizedName;
     /// use deps_core::test_util::vuln_key;
     ///
-    /// assert!(vuln_key("serde").is_for_name("serde"));
-    /// assert!(!vuln_key("serde_json").is_for_name("serde"));
-    /// assert!(vuln_key("serde\u{0}v:1.0").is_for_name("serde"));
+    /// let serde = NormalizedName::for_test("serde");
+    /// assert!(vuln_key("serde").is_for_name(&serde));
+    /// assert!(!vuln_key("serde_json").is_for_name(&serde));
+    /// assert!(vuln_key("serde\u{0}v:1.0").is_for_name(&serde));
     /// ```
     #[must_use]
-    pub fn is_for_name(&self, normalized_name: &str) -> bool {
+    pub fn is_for_name(&self, name: &crate::NormalizedName) -> bool {
         self.0
             .split_once(VERSION_QUALIFIER_SEPARATOR)
             .map_or(self.0.as_str(), |(name, _)| name)
-            == normalized_name
+            == name.as_str()
     }
 
-    /// Builds a key directly from an already-computed name, for `deps-core`-internal fallback
-    /// construction (e.g. [`crate::lsp_helpers::resolve_scan_outcome`]'s normalized/declared-name
-    /// lookups) where going through [`vuln_key_for`] would require a full [`crate::Dependency`].
-    pub(crate) fn from_name(name: String) -> Self {
-        Self(name)
+    /// Builds the plain key for an already-normalized name, for `deps-core`-internal fallback
+    /// construction (e.g. [`crate::lsp_helpers::resolve_scan_outcome`]'s normalized-name
+    /// lookup) where going through [`vuln_key_for`] would require a full [`crate::Dependency`].
+    pub(crate) fn from_name(name: &crate::NormalizedName) -> Self {
+        Self(name.as_str().to_string())
+    }
+
+    /// Builds the plain key under a dependency's declared spelling, the last step of
+    /// [`crate::lsp_helpers::resolve_scan_outcome`]'s fallback chain.
+    pub(crate) fn from_declared(name: &crate::PackageName) -> Self {
+        Self(name.as_str().to_string())
+    }
+
+    /// A key spelled as given, for fixtures that stand in for a derived key.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn from_spelling(spelling: String) -> Self {
+        Self(spelling)
     }
 }
 
@@ -2316,11 +2330,11 @@ pub fn vulnerability_keys(
     let signatures: Vec<(String, String)> = deps
         .iter()
         .map(|dep| {
-            let name = formatter.normalize_package_name(dep.name());
+            let key = crate::PackageKey::new(dep.name(), formatter);
             let signature = if formatter.source_is_public_registry_content(&dep.source()) {
                 match resolve_in_use_versions(
                     *dep,
-                    name.as_str(),
+                    &key,
                     resolved,
                     resolved_candidates,
                     formatter,
@@ -2348,7 +2362,7 @@ pub fn vulnerability_keys(
             } else {
                 "n".to_string()
             };
-            (name.into_string(), signature)
+            (key.normalized().as_str().to_string(), signature)
         })
         .collect();
 
@@ -2392,7 +2406,7 @@ mod vuln_key_display_tests {
     /// call site — `tracing-subscriber` 0.3.23 escapes ESC/C1 on its own but not `\n`/`\r`.
     #[test]
     fn display_sanitizes_newlines_and_carriage_returns() {
-        let key = VulnKey::from_name("evil\nWARN forged log line\r\n".to_string());
+        let key = VulnKey::from_spelling("evil\nWARN forged log line\r\n".to_string());
         let rendered = key.to_string();
         assert!(!rendered.contains('\n'));
         assert!(!rendered.contains('\r'));
@@ -2406,7 +2420,7 @@ mod vuln_key_display_tests {
     /// render time).
     #[test]
     fn display_sanitizes_render_but_not_the_stored_disambiguation_separator() {
-        let key = VulnKey::from_name("pkg\u{0}v:1.0".to_string());
+        let key = VulnKey::from_spelling("pkg\u{0}v:1.0".to_string());
 
         // Stored identity — what `Hash`/`Eq`, and thus `HashMap` lookups, key off of —
         // still carries the raw `\u{0}` separator.

@@ -49,15 +49,17 @@ URLs are supported; `http://` and any URL carrying `user:pass@` are rejected.
 Cargo's `CARGO_REGISTRIES_<NAME>_INDEX`/`_TOKEN` environment variable overrides are
 also honored.
 
-**Authentication**: a registry token is attached to requests against a registry
-resolved from `$CARGO_HOME/config.toml` (or its own `CARGO_REGISTRIES_<NAME>_TOKEN`
-environment variable) only. A registry alias resolved from a workspace
+**Authentication**: a registry token is bound to the registry URL declared in
+`$CARGO_HOME/config.toml` (or by its own `CARGO_REGISTRIES_<NAME>_INDEX`/`_TOKEN` environment
+variables) and is sent to that URL only. A registry alias resolved from a workspace
 `.cargo/config.toml` — a file a cloned, untrusted repository fully controls — never
-gets a credential attached, even if an identically-named alias is configured with
-one in `$CARGO_HOME`. This is deliberate: it prevents a hostile repository from
-redirecting a familiar alias name (e.g. `"github"`) to an attacker-controlled host
+gets a credential attached just because an identically-named alias is configured with
+one in `$CARGO_HOME`: the alias name carries nothing. This is deliberate: it prevents a hostile
+repository from redirecting a familiar alias name (e.g. `"github"`) to an attacker-controlled host
 and harvesting whatever token the user's real, differently-scoped registry of that
-name would have used.
+name would have used. A repository entry that names *the same URL* as your registry (an alias, a
+`registry-index`, or a `[source]` replace-with target) does get your token for that URL, and only
+for that URL, so which entry registers first never matters.
 
 The token is sent verbatim in the `Authorization` header, with no `Bearer` prefix, exactly as
 Cargo itself sends it.
@@ -111,9 +113,11 @@ registries.workspace_registries policy" and adds that private hosts need `"all"`
 `DEPS_LSP_PRIVATE_REGISTRY_HOSTS`. Cached data for a registry is still served while
 revalidation is blocked, since no connection is made.
 
-`$CARGO_HOME/config.toml`-configured registries are **never** policy-checked, under
-any of the three values — that file is the user's own trusted configuration, not
-something a cloned repository controls. A blocked index is never silent: it is
+Registries your `$CARGO_HOME/config.toml` (or `CARGO_REGISTRIES_<NAME>_INDEX`) declares, and
+any workspace alias naming the same URL, are **never** policy-checked, under any of the three
+values — that file is the user's own trusted configuration, not something a cloned repository
+controls. The never-a-registry floor still applies: such a registry on a loopback or link-local
+host is rejected. A blocked index is never silent: it is
 logged, and a `registry`/`registry-index` dependency line additionally gets an
 informational diagnostic naming the blocked host class (a `[source]`-chain block is
 log-only, since it is a property of `.cargo/config.toml`, not of any one

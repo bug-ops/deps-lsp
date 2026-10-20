@@ -97,7 +97,7 @@ impl OsvScanPlan {
     }
 
     /// Drops the entry for a removed dependency's normalized name.
-    pub(crate) fn retain_not_named(&mut self, normalized: &str) {
+    pub(crate) fn retain_not_named(&mut self, normalized: &deps_core::NormalizedName) {
         self.0.retain(|key, _| !key.is_for_name(normalized));
     }
 }
@@ -2830,7 +2830,7 @@ mod tests {
             .collect();
             let mut plan = OsvScanPlan::new(&[], &skipped);
 
-            plan.retain_not_named("a");
+            plan.retain_not_named(&deps_core::NormalizedName::for_test("a"));
 
             assert_eq!(plan.len(), 1);
             assert!(plan.0.contains_key(&deps_core::test_util::vuln_key("ab")));

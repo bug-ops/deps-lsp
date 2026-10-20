@@ -2,7 +2,7 @@
 //! native-form yank filter, and the three-outcome classification (#1120, spec 068 FR-008
 //! through FR-015).
 
-use deps_core::NormalizeName;
+use deps_core::PackageKey;
 use deps_core::policy_config::FetchTimeout;
 use std::time::Duration;
 
@@ -11,9 +11,7 @@ use deps_core::edit::{
     FixTargetContext, VulnFixSkip, plan_verified_fix, resolve_recommended_fix, resolve_verified_fix,
 };
 use deps_core::lsp_helpers::CommitRewrite;
-use deps_core::lsp_helpers::{
-    RequirementGate, cached_package_versions_by_name, resolve_in_use_version, resolve_scan_outcome,
-};
+use deps_core::lsp_helpers::{RequirementGate, resolve_in_use_version, resolve_scan_outcome};
 use deps_core::osv::{OsvClient, OsvId, ScanOutcome};
 
 use crate::analyze::ManifestAnalysis;
@@ -192,20 +190,17 @@ pub async fn plan_security_updates(
 
     let mut items = Vec::new();
     for dep in analysis.parse_result.dependencies() {
-        let normalized_name = formatter.normalize_package_name(dep.name());
-        let Some(ScanOutcome::Vulnerable(dv)) = resolve_scan_outcome(
-            &vulnerabilities,
-            dep,
-            Some(&vuln_key_by_range),
-            normalized_name.as_str(),
-        ) else {
+        let key = PackageKey::new(dep.name(), formatter);
+        let Some(ScanOutcome::Vulnerable(dv)) =
+            resolve_scan_outcome(&vulnerabilities, dep, Some(&vuln_key_by_range), &key)
+        else {
             continue;
         };
 
-        if !is_requested(package_filter, normalized_name.as_str(), formatter) {
+        if !is_requested(package_filter, key.normalized(), formatter) {
             items.push(skipped_not_requested(
                 dep,
-                normalized_name.as_str(),
+                &key,
                 ecosystem_id,
                 analysis,
                 formatter,
@@ -214,19 +209,14 @@ pub async fn plan_security_updates(
         }
 
         let latest = analysis.latest_status.as_ref().and_then(|map| {
-            deps_core::lsp_helpers::resolve_latest_status(
-                map,
-                dep,
-                Some(&vuln_key_by_range),
-                normalized_name.as_str(),
-            )
+            deps_core::lsp_helpers::resolve_latest_status(map, dep, Some(&vuln_key_by_range), &key)
         });
 
         items.push(classify_vulnerable_dependency(
             dep,
             dv,
             latest,
-            normalized_name.as_str(),
+            &key,
             analysis,
             formatter,
             ecosystem_id,
@@ -253,7 +243,7 @@ fn classify_vulnerable_dependency(
     dep: &dyn deps_core::Dependency,
     dv: &deps_core::osv::DependencyVulnerabilities,
     latest: Option<&deps_core::osv::UpgradeStatus>,
-    normalized_name: &str,
+    key: &PackageKey,
     analysis: &ManifestAnalysis,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem_id: deps_core::EcosystemId,
@@ -278,8 +268,8 @@ fn classify_vulnerable_dependency(
     // strictly more useful here than it would be worth changing default mode's shared,
     // LSP-facing `current` semantics to match (which FR-001's byte-identical-`deps-lsp`
     // constraint rules out doing casually anyway).
-    let current = security_current(dep, normalized_name, analysis, formatter, ecosystem_id);
-    let ignore_rule_overridden = ignore_override(ignore_rules, normalized_name);
+    let current = security_current(dep, key, analysis, formatter, ecosystem_id);
+    let ignore_rule_overridden = ignore_override(ignore_rules, key.normalized());
 
     // FR-011: the two-signal, load-bearing `Unfixable` rule — `fetch_and_classify_package`
     // (`crates/deps-engine/src/classify/fetch.rs:605-825`) upholds the disjointness between
@@ -290,11 +280,7 @@ fn classify_vulnerable_dependency(
     // stricter than `deps-lsp` (`code_actions.rs:590-604`), which fails closed only on a
     // *timed-out* fetch and leaves a plain fetch failure unfiltered — the CLI's broader rule
     // is intentional (the safe direction) and must not be narrowed to match `deps-lsp`.
-    let cached = cached_package_versions_by_name(
-        &analysis.cached_versions,
-        normalized_name,
-        dep.name().as_str(),
-    );
+    let cached = key.find_in(&analysis.cached_versions);
     if analysis.fetch_failed.contains(dep.name()) || cached.is_none() {
         return unfixable_item(
             dep,
@@ -545,14 +531,14 @@ fn sibling_match_note(
 /// [`deps_core::edit::collect_update_candidates`], which never falls back to the declared text.
 fn security_current(
     dep: &dyn deps_core::Dependency,
-    normalized_name: &str,
+    key: &PackageKey,
     analysis: &ManifestAnalysis,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem_id: deps_core::EcosystemId,
 ) -> CurrentVersion {
     resolve_in_use_version(
         dep,
-        normalized_name,
+        key,
         &analysis.resolved_versions,
         Some(&analysis.resolved_version_candidates),
         formatter,
@@ -569,18 +555,21 @@ fn security_current(
 
 /// Whether a `[update].ignore` rule matches this dependency, purely for the FR-008 override
 /// report — never for suppression in `--security-only` mode.
-fn ignore_override(ignore_rules: &IgnoreRules, normalized_name: &str) -> bool {
+fn ignore_override(
+    ignore_rules: &IgnoreRules,
+    normalized_name: &deps_core::NormalizedName,
+) -> bool {
     ignore_rules.matches_name(normalized_name)
 }
 
 fn skipped_not_requested(
     dep: &dyn deps_core::Dependency,
-    normalized_name: &str,
+    key: &PackageKey,
     ecosystem_id: deps_core::EcosystemId,
     analysis: &ManifestAnalysis,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> PlannedUpdateItem {
-    let current = security_current(dep, normalized_name, analysis, formatter, ecosystem_id);
+    let current = security_current(dep, key, analysis, formatter, ecosystem_id);
     PlannedUpdateItem::new(
         dep.name().as_str().to_string(),
         current,
@@ -1021,7 +1010,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1068,7 +1057,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1117,7 +1106,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1143,7 +1132,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1167,7 +1156,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1192,7 +1181,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &NO_COMPILE_REQUIREMENT_FORMATTER,
             EcosystemId::Cargo,
@@ -1215,7 +1204,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "foo",
+            &deps_core::test_util::package_key("foo"),
             &analysis,
             &UnsupportedShapeFormatter,
             EcosystemId::Cargo,
@@ -1260,7 +1249,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "foo",
+            &deps_core::test_util::package_key("foo"),
             &analysis,
             &FloorLikeFormatter,
             EcosystemId::Cargo,
@@ -1287,7 +1276,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "foo",
+            &deps_core::test_util::package_key("foo"),
             &analysis,
             &IndeterminateFormatter,
             EcosystemId::Cargo,
@@ -1323,7 +1312,7 @@ mod tests {
             &rewrite_dep,
             &rewrite_dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &rewrite_analysis,
             &rewrite_formatter,
             EcosystemId::Cargo,
@@ -1341,7 +1330,7 @@ mod tests {
             &lockfile_dep,
             &lockfile_dv,
             None,
-            "tokio",
+            &deps_core::test_util::package_key("tokio"),
             &lockfile_analysis,
             &lockfile_formatter,
             EcosystemId::Cargo,
@@ -1385,7 +1374,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1412,7 +1401,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1447,7 +1436,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1476,7 +1465,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1506,7 +1495,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1547,7 +1536,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1587,7 +1576,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1629,7 +1618,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1665,7 +1654,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1715,7 +1704,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1759,7 +1748,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1789,7 +1778,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1819,7 +1808,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1847,7 +1836,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "serde",
+            &deps_core::test_util::package_key("serde"),
             &analysis,
             &formatter,
             EcosystemId::Cargo,
@@ -1881,7 +1870,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "foo",
+            &deps_core::test_util::package_key("foo"),
             &analysis,
             &deps_engine::setup::CargoFormatter,
             EcosystemId::Cargo,
@@ -1907,7 +1896,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "foo",
+            &deps_core::test_util::package_key("foo"),
             &analysis,
             &CommitPinFormatter(deps_core::lsp_helpers::CommitRewrite::NoReleaseTag),
             EcosystemId::Cargo,
@@ -1935,7 +1924,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "foo",
+            &deps_core::test_util::package_key("foo"),
             &analysis,
             &CommitPinFormatter(deps_core::lsp_helpers::CommitRewrite::IndexUnavailable),
             EcosystemId::Cargo,
@@ -2023,7 +2012,7 @@ mod tests {
             dep,
             &dv,
             None,
-            "owner/action",
+            &deps_core::test_util::package_key("owner/action"),
             &analysis,
             &formatter,
             EcosystemId::GithubActions,
@@ -2104,7 +2093,7 @@ mod tests {
             dep,
             &dv,
             None,
-            "owner/action",
+            &deps_core::test_util::package_key("owner/action"),
             &analysis,
             &formatter,
             EcosystemId::GithubActions,
@@ -2133,7 +2122,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "foo",
+            &deps_core::test_util::package_key("foo"),
             &analysis,
             &PanicsIfCompiledFormatter,
             EcosystemId::Cargo,
@@ -2179,7 +2168,7 @@ mod tests {
             &dep,
             &dv,
             None,
-            "foo",
+            &deps_core::test_util::package_key("foo"),
             &analysis,
             &deps_engine::setup::CargoFormatter,
             EcosystemId::Cargo,

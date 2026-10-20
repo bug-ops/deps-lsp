@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::lsp_helpers::{BoundedVersionReq, EcosystemFormatter, PinResolution, ResolvedPin};
 use crate::osv::SiblingCoverage;
-use crate::{ConcreteVersion, Dependency, EcosystemId, PackageName};
+use crate::{ConcreteVersion, Dependency, EcosystemId, PackageKey, PackageName};
 
 /// How a *bare* (no explicit pin marker) version requirement should be treated when
 /// deciding whether it denotes a single concrete version.
@@ -435,24 +435,18 @@ fn best_candidate_for_requirement<'a>(
 /// per-occurrence disambiguation policy (US-001/US-002).
 pub(crate) fn resolve_occurrence_version<'a>(
     dep: &dyn Dependency,
-    normalized_name: &str,
+    key: &PackageKey,
     resolved_versions: &'a HashMap<PackageName, ConcreteVersion>,
     resolved_version_candidates: Option<&'a HashMap<PackageName, Vec<ConcreteVersion>>>,
     formatter: &dyn EcosystemFormatter,
 ) -> Option<&'a ConcreteVersion> {
-    let candidates = resolved_version_candidates.and_then(|candidates| {
-        candidates
-            .get(normalized_name)
-            .or_else(|| candidates.get(dep.name()))
-    });
+    let candidates = resolved_version_candidates.and_then(|candidates| key.find_in(candidates));
 
     match (candidates, dep.version_requirement()) {
         (Some(candidates), Some(req)) if candidates.len() > 1 => {
             best_candidate_for_requirement(candidates, req, formatter)
         }
-        _ => resolved_versions
-            .get(normalized_name)
-            .or_else(|| resolved_versions.get(dep.name())),
+        _ => key.find_in(resolved_versions),
     }
 }
 
@@ -486,7 +480,7 @@ pub(crate) fn resolve_occurrence_version<'a>(
 ///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
 ///     RequirementResolution, SourcePolicy, resolve_in_use_version,
 /// };
-/// use deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageName, VersionReq};
+/// use deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageKey, PackageName, VersionReq};
 /// use std::any::Any;
 /// use std::collections::HashMap;
 /// use deps_core::position::Range;
@@ -542,13 +536,20 @@ pub(crate) fn resolve_occurrence_version<'a>(
 /// // No lock file, but the requirement is already an exact pin — falls
 /// // back to it, stripped of its `=` marker.
 /// assert_eq!(
-///     resolve_in_use_version(&dep, "time", &resolved_versions, None, &SimpleFormatter, EcosystemId::Cargo),
+///     resolve_in_use_version(
+///         &dep,
+///         &PackageKey::new(dep.name(), &SimpleFormatter),
+///         &resolved_versions,
+///         None,
+///         &SimpleFormatter,
+///         EcosystemId::Cargo,
+///     ),
 ///     Some(ConcreteVersion::new("0.1.43"))
 /// );
 /// ```
 pub fn resolve_in_use_version(
     dep: &dyn Dependency,
-    normalized_name: &str,
+    key: &PackageKey,
     resolved_versions: &HashMap<PackageName, ConcreteVersion>,
     resolved_version_candidates: Option<&HashMap<PackageName, Vec<ConcreteVersion>>>,
     formatter: &dyn EcosystemFormatter,
@@ -556,7 +557,7 @@ pub fn resolve_in_use_version(
 ) -> Option<ConcreteVersion> {
     resolve_in_use_versions(
         dep,
-        normalized_name,
+        key,
         resolved_versions,
         resolved_version_candidates,
         formatter,
@@ -677,7 +678,7 @@ impl InUseVersions {
 ///     RequirementResolution, SourcePolicy, resolve_in_use_versions,
 /// };
 /// use deps_core::position::Range;
-/// use deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageName, VersionReq};
+/// use deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageKey, PackageName, VersionReq};
 /// use std::any::Any;
 /// use std::collections::HashMap;
 ///
@@ -729,7 +730,7 @@ impl InUseVersions {
 /// };
 /// let versions = resolve_in_use_versions(
 ///     &dep,
-///     "time",
+///     &PackageKey::new(dep.name(), &SimpleFormatter),
 ///     &HashMap::new(),
 ///     None,
 ///     &SimpleFormatter,
@@ -741,7 +742,7 @@ impl InUseVersions {
 /// ```
 pub fn resolve_in_use_versions(
     dep: &dyn Dependency,
-    normalized_name: &str,
+    key: &PackageKey,
     resolved_versions: &HashMap<PackageName, ConcreteVersion>,
     resolved_version_candidates: Option<&HashMap<PackageName, Vec<ConcreteVersion>>>,
     formatter: &dyn EcosystemFormatter,
@@ -756,7 +757,7 @@ pub fn resolve_in_use_versions(
 
     if let Some(version) = resolve_occurrence_version(
         dep,
-        normalized_name,
+        key,
         resolved_versions,
         resolved_version_candidates,
         formatter,
@@ -965,7 +966,7 @@ mod tests {
         for formatter in &unqueryable {
             let result = resolve_in_use_version(
                 &dep,
-                "actions/checkout",
+                &crate::test_util::package_key("actions/checkout"),
                 &HashMap::new(),
                 None,
                 formatter,
@@ -1008,7 +1009,7 @@ mod tests {
         ] {
             let result = resolve_in_use_version(
                 &dep,
-                "obi1kenobi/cargo-semver-checks-action",
+                &crate::test_util::package_key("obi1kenobi/cargo-semver-checks-action"),
                 &HashMap::new(),
                 None,
                 &formatter,
@@ -1041,7 +1042,7 @@ mod tests {
 
         let result = resolve_in_use_version(
             &dep,
-            "actions/checkout",
+            &crate::test_util::package_key("actions/checkout"),
             &resolved_versions,
             None,
             &FixedResolvedPinFormatter::most_specific("v1.3.0"),
@@ -1071,7 +1072,7 @@ mod tests {
 
         let result = resolve_in_use_version(
             &dep,
-            "actions/checkout",
+            &crate::test_util::package_key("actions/checkout"),
             &HashMap::new(),
             None,
             &FixedResolvedPinFormatter::most_specific("v1.3.0"),
@@ -1097,7 +1098,7 @@ mod tests {
         let resolve = |formatter: &FixedResolvedPinFormatter| {
             resolve_in_use_version(
                 &dep,
-                "actions/checkout",
+                &crate::test_util::package_key("actions/checkout"),
                 &HashMap::new(),
                 None,
                 formatter,
@@ -1146,7 +1147,7 @@ mod tests {
         let coverage = |formatter: &FixedResolvedPinFormatter| {
             resolve_in_use_versions(
                 &dep,
-                "actions/checkout",
+                &crate::test_util::package_key("actions/checkout"),
                 &HashMap::new(),
                 None,
                 formatter,
@@ -1676,7 +1677,7 @@ mod tests {
 
         let renamed_result = resolve_in_use_version(
             &renamed_old_major,
-            "serde",
+            &crate::test_util::package_key("serde"),
             &resolved_versions,
             Some(&candidates),
             &crate::lsp_helpers::test_support::MOCK_FORMATTER,
@@ -1684,7 +1685,7 @@ mod tests {
         );
         let plain_result = resolve_in_use_version(
             &plain_current_major,
-            "serde",
+            &crate::test_util::package_key("serde"),
             &resolved_versions,
             Some(&candidates),
             &crate::lsp_helpers::test_support::MOCK_FORMATTER,
@@ -1722,7 +1723,7 @@ mod tests {
 
         let result = resolve_in_use_version(
             &dep,
-            "serde",
+            &crate::test_util::package_key("serde"),
             &resolved_versions,
             Some(&candidates),
             &crate::lsp_helpers::test_support::MOCK_FORMATTER,
@@ -1758,7 +1759,7 @@ mod tests {
 
         let result = resolve_in_use_version(
             &dep,
-            "serde",
+            &crate::test_util::package_key("serde"),
             &resolved_versions,
             Some(&candidates),
             &crate::lsp_helpers::test_support::MOCK_FORMATTER,
@@ -1793,7 +1794,7 @@ mod tests {
 
         let with_candidates = resolve_in_use_version(
             &dep,
-            "serde",
+            &crate::test_util::package_key("serde"),
             &resolved_versions,
             Some(&candidates),
             &crate::lsp_helpers::test_support::MOCK_FORMATTER,
@@ -1801,7 +1802,7 @@ mod tests {
         );
         let without_candidates = resolve_in_use_version(
             &dep,
-            "serde",
+            &crate::test_util::package_key("serde"),
             &resolved_versions,
             None,
             &crate::lsp_helpers::test_support::MOCK_FORMATTER,
@@ -1928,7 +1929,7 @@ mod tests {
 
         let result = resolve_in_use_version(
             &dep,
-            "pkg",
+            &crate::test_util::package_key("pkg"),
             &resolved_versions,
             Some(&candidates),
             &CaretFormatter,
@@ -1958,7 +1959,7 @@ mod tests {
 
         let result = resolve_in_use_version(
             &dep,
-            "express",
+            &crate::test_util::package_key("express"),
             &HashMap::new(),
             None,
             &crate::lsp_helpers::test_support::MOCK_FORMATTER,
@@ -1984,7 +1985,7 @@ mod tests {
 
         let result = resolve_in_use_version(
             &dep,
-            "monolog/monolog",
+            &crate::test_util::package_key("monolog/monolog"),
             &HashMap::new(),
             None,
             &crate::lsp_helpers::test_support::MOCK_FORMATTER,
@@ -2011,7 +2012,7 @@ mod tests {
 
         let result = resolve_in_use_version(
             &dep,
-            "serde",
+            &crate::test_util::package_key("serde"),
             &HashMap::new(),
             None,
             &crate::lsp_helpers::test_support::MOCK_FORMATTER,
@@ -2040,7 +2041,7 @@ mod tests {
 
         let result = resolve_in_use_version(
             &dep,
-            "express",
+            &crate::test_util::package_key("express"),
             &HashMap::new(),
             None,
             &crate::lsp_helpers::test_support::MOCK_FORMATTER,
@@ -2076,7 +2077,7 @@ mod tests {
 
         let result = resolve_in_use_version(
             &dep,
-            "newtonsoft.json",
+            &crate::test_util::package_key("newtonsoft.json"),
             &HashMap::new(),
             None,
             &crate::lsp_helpers::test_support::MOCK_FORMATTER,
@@ -2107,7 +2108,7 @@ mod tests {
         ]);
         let versions = resolve_in_use_versions(
             &sha_pinned_dep(),
-            "actions/checkout",
+            &crate::test_util::package_key("actions/checkout"),
             &HashMap::new(),
             None,
             &formatter,
@@ -2125,7 +2126,7 @@ mod tests {
         let formatter = FixedResolvedPinFormatter::from_index(&["v2.9", "v2.10"]);
         let versions = resolve_in_use_versions(
             &sha_pinned_dep(),
-            "actions/checkout",
+            &crate::test_util::package_key("actions/checkout"),
             &HashMap::new(),
             None,
             &formatter,
@@ -2146,7 +2147,7 @@ mod tests {
         )]);
         let versions = resolve_in_use_versions(
             &sha_pinned_dep(),
-            "actions/checkout",
+            &crate::test_util::package_key("actions/checkout"),
             &resolved,
             None,
             &formatter,
@@ -2164,7 +2165,7 @@ mod tests {
         assert_eq!(
             resolve_in_use_version(
                 &sha_pinned_dep(),
-                "actions/checkout",
+                &crate::test_util::package_key("actions/checkout"),
                 &HashMap::new(),
                 None,
                 &formatter,

@@ -1848,7 +1848,7 @@ pub enum WorkspaceRegistriesSetting {
 
 impl WorkspaceRegistriesSetting {
     /// Converts this LSP-facing setting into the `deps-core` policy value threaded through
-    /// `deps_cargo::config::RegistryIndex::new`.
+    /// `deps_cargo::config::RegistryIndex::declared`.
     ///
     /// # Examples
     ///

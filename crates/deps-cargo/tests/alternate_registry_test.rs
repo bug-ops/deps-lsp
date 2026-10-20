@@ -30,6 +30,7 @@
 
 use deps_cargo::config::{ConfigFileCache, RegistryTrust};
 use deps_cargo::{CargoConfig, CargoRegistry, DependencySource};
+use deps_core::config_trust::OperatorPath;
 use deps_core::freshness::FreshnessSettings;
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{HttpCache, PackageName, Registry, SelectionContext, VersionReq};
@@ -43,7 +44,7 @@ fn test_policy() -> RegistryAccessPolicy {
 }
 
 fn test_index(raw: &str) -> deps_cargo::config::RegistryIndex {
-    deps_cargo::config::RegistryIndex::new(raw, RegistryTrust::Trusted, &test_policy()).unwrap()
+    deps_cargo::config::RegistryIndex::for_test(raw, RegistryTrust::Trusted)
 }
 
 /// FR-001: `Registry::get_versions`/`get_versions_with`'s source-aware counterpart,
@@ -63,7 +64,7 @@ async fn test_get_versions_from_routes_to_alternate_index() {
     let cache = Arc::new(HttpCache::new());
     let registry = CargoRegistry::new(cache);
     let index = test_index(&server.url());
-    registry.register_alternate(index.clone(), None);
+    registry.register_alternate(index.clone());
 
     let source = DependencySource::AlternateRegistry {
         index: index.as_str().to_string(),
@@ -100,7 +101,7 @@ async fn test_get_latest_matching_from_routes_to_alternate_index() {
     let cache = Arc::new(HttpCache::new());
     let registry = CargoRegistry::new(cache);
     let index = test_index(&server.url());
-    registry.register_alternate(index.clone(), None);
+    registry.register_alternate(index.clone());
 
     let source = DependencySource::AlternateRegistry {
         index: index.as_str().to_string(),
@@ -142,7 +143,7 @@ async fn test_get_latest_matching_from_on_empty_list_routes_to_alternate_index()
     let cache = Arc::new(HttpCache::new());
     let registry = CargoRegistry::new(cache);
     let index = test_index(&server.url());
-    registry.register_alternate(index.clone(), None);
+    registry.register_alternate(index.clone());
 
     let source = DependencySource::AlternateRegistry {
         index: index.as_str().to_string(),
@@ -179,11 +180,9 @@ async fn test_authenticated_alternate_registry_sends_authorization_header() {
 
     let cache = Arc::new(HttpCache::new());
     let registry = CargoRegistry::new(cache);
-    let index = test_index(&server.url());
-    // No public constructor for `AuthToken` outside `deps_cargo::config` (by design —
-    // see that module's security-model docs), so this test resolves a real
-    // `$CARGO_HOME/config.toml`-shaped fixture through the public `resolve` API instead
-    // of hand-constructing a token.
+    // A credential is only ever built from an operator-declared URL (see the `deps_cargo::config`
+    // security-model docs), so this test resolves a real `$CARGO_HOME/config.toml`-shaped
+    // fixture through the public `resolve` API instead of hand-constructing a token.
     let cargo_home = tempfile::tempdir().unwrap();
     std::fs::write(
         cargo_home.path().join("config.toml"),
@@ -200,17 +199,19 @@ async fn test_authenticated_alternate_registry_sends_authorization_header() {
     let (config, _): (CargoConfig, _) = deps_cargo::config::resolve(
         &aliases,
         &[],
-        Some(&cargo_home.path().join("config.toml")),
+        Some(&OperatorPath::for_test(
+            cargo_home.path().join("config.toml"),
+        )),
         &config_cache,
         &policy,
     );
     let entry = config
         .get("my-corp")
         .expect("cargo-home entry must resolve");
-    registry.register_alternate(index.clone(), entry.auth.clone());
+    registry.register_alternate(entry.index.clone());
 
     let source = DependencySource::AlternateRegistry {
-        index: index.as_str().to_string(),
+        index: entry.index.as_str().to_string(),
         mirrors_crates_io: false,
     };
     let name = PackageName::new("internal-crate");
@@ -263,8 +264,8 @@ async fn test_end_to_end_parse_register_and_fetch() {
 
     let cache = Arc::new(HttpCache::new());
     let registry = CargoRegistry::new(cache);
-    for (index, auth) in parse_result.resolved_registries {
-        registry.register_alternate(index, auth);
+    for index in parse_result.resolved_registries {
+        registry.register_alternate(index);
     }
 
     let dep = &parse_result.dependencies[0];

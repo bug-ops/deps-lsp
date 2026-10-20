@@ -18,21 +18,17 @@ async fn the_background_fetch_tags_each_package_request_with_its_endpoint() {
         (PackageName::new("bg-b"), DependencySource::Registry),
     ];
     let background = async {
-        // The ecosystem scope is the caller's (deps-lsp) responsibility; this pins the
-        // per-package endpoint scope that this crate adds inside it.
-        let result = deps_core::observe_ecosystem(
+        let result = fetch_latest_versions_parallel(
             EcosystemId::Cargo,
-            fetch_latest_versions_parallel(
-                Arc::clone(&registry) as Arc<dyn deps_core::Registry>,
-                sources,
-                &HashMap::new(),
-                None,
-                FreshnessSettings::Disabled,
-                FetchTimeout::constant::<60>(),
-                FetchConcurrency::constant::<4>(),
-                &SelectionContext::none(),
-                None,
-            ),
+            Arc::clone(&registry) as Arc<dyn deps_core::Registry>,
+            sources,
+            &HashMap::new(),
+            None,
+            FreshnessSettings::Disabled,
+            FetchTimeout::constant::<60>(),
+            FetchConcurrency::constant::<4>(),
+            &SelectionContext::none(),
+            None,
         )
         .await;
         drop(result);

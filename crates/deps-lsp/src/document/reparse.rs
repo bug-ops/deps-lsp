@@ -171,20 +171,18 @@ mod tests {
         let package = PackageName::new("serde");
         let source = DependencySource::Registry;
         let manifest = url::Url::parse("file:///project/Cargo.toml").unwrap();
-        let normalized = deps_core::NormalizedName::for_test("serde");
-        let request = InteractiveFetchRequest::new(
+        let request = InteractiveFetchRequest::from_parts(
             VersionData::new(&cached, &resolved)
                 .with_ecosystem(deps_core::EcosystemId::Cargo)
                 .with_interactive_fetch_gate(&state.interactive_fetch),
             &manifest,
-            &package,
-            &normalized,
-            &source,
+            deps_core::test_util::package_key(package.as_str()),
+            source,
             FetchContext::Hover,
         );
         deps_core::lsp_helpers::await_interactive_fetch(
             &deps_core::test_util::MockRegistry::new(),
-            async { Err::<(), _>(deps_core::DepsError::CacheError("down".into())) },
+            async { Err::<(), _>(deps_core::DepsError::Io(std::io::Error::other("down"))) },
             request,
             deps_core::lsp_helpers::AuxiliaryLookup::PinResolution,
         )

@@ -127,13 +127,11 @@ impl Fixture {
             .with_network(network)
             .with_outcomes(outcomes)
             .with_interactive_fetch_gate(&self.gate);
-        let normalized = crate::NormalizedName::for_test(name);
-        let request = InteractiveFetchRequest::new(
+        let request = InteractiveFetchRequest::from_parts(
             versions,
             manifest,
-            &package,
-            &normalized,
-            source,
+            crate::test_util::package_key(package.as_str()),
+            source.clone(),
             FetchContext::Hover,
         );
         let kind = *self.kind.lock().unwrap();
@@ -285,16 +283,14 @@ async fn seeding_is_discarded_when_the_gate_was_invalidated_after_the_read() {
     let package = PackageName::new("serde");
     let source = DependencySource::Registry;
     let outcomes = failing("serde", FetchFailure::Transient);
-    let normalized = crate::NormalizedName::for_test("serde");
-    let request = InteractiveFetchRequest::new(
+    let request = InteractiveFetchRequest::from_parts(
         VersionData::new(&fixture.cached, &fixture.resolved)
             .with_ecosystem(EcosystemId::Cargo)
             .with_outcomes(&outcomes)
             .with_interactive_fetch_gate(&fixture.gate),
         &fixture.manifest,
-        &package,
-        &normalized,
-        &source,
+        crate::test_util::package_key(package.as_str()),
+        source,
         FetchContext::Hover,
     );
     let (gate, lookup) = request
@@ -498,15 +494,13 @@ async fn request_without_a_gate_is_the_plain_bounded_await() {
     let source = DependencySource::Registry;
     let outcomes = failing("serde", FetchFailure::Transient);
     let document = manifest("/project/Cargo.toml");
-    let normalized = crate::NormalizedName::for_test("serde");
-    let request = InteractiveFetchRequest::new(
+    let request = InteractiveFetchRequest::from_parts(
         VersionData::new(&cached, &resolved)
             .with_ecosystem(EcosystemId::Cargo)
             .with_outcomes(&outcomes),
         &document,
-        &package,
-        &normalized,
-        &source,
+        crate::test_util::package_key(package.as_str()),
+        source.clone(),
         FetchContext::CodeAction,
     );
 
@@ -592,16 +586,14 @@ impl Fixture {
         let package = PackageName::new(name);
         let source = DependencySource::Registry;
         let outcomes = DependencyOutcomes::new();
-        let normalized = crate::NormalizedName::for_test(name);
-        let request = InteractiveFetchRequest::new(
+        let request = InteractiveFetchRequest::from_parts(
             VersionData::new(&self.cached, &self.resolved)
                 .with_ecosystem(self.ecosystem)
                 .with_outcomes(&outcomes)
                 .with_interactive_fetch_gate(&self.gate),
             &self.manifest,
-            &package,
-            &normalized,
-            &source,
+            crate::test_util::package_key(package.as_str()),
+            source.clone(),
             context,
         );
         let (gate, lookup) = request
@@ -873,16 +865,14 @@ async fn public_entry_point_shares_the_registry_list() {
     let package = PackageName::new("serde");
     let source = DependencySource::Registry;
     let outcomes = DependencyOutcomes::new();
-    let normalized = crate::NormalizedName::for_test("serde");
-    let request = InteractiveFetchRequest::new(
+    let request = InteractiveFetchRequest::from_parts(
         VersionData::new(&fixture.cached, &fixture.resolved)
             .with_ecosystem(EcosystemId::Cargo)
             .with_outcomes(&outcomes)
             .with_interactive_fetch_gate(&fixture.gate),
         &fixture.manifest,
-        &package,
-        &normalized,
-        &source,
+        crate::test_util::package_key(package.as_str()),
+        source.clone(),
         FetchContext::CodeAction,
     );
 
@@ -1480,7 +1470,10 @@ async fn a_promoted_follower_with_little_budget_left_reports_nothing() {
 fn a_stale_probe_settling_inconclusive_leaves_a_closed_breaker_closed() {
     let breaker = EndpointBreaker::default();
     let endpoint = Fixture::new().endpoint();
-    let (a, b) = (PackageName::new("a"), PackageName::new("b"));
+    let (a, b) = (
+        crate::NormalizedName::for_test("a"),
+        crate::NormalizedName::for_test("b"),
+    );
     let start = now();
     breaker.report(&endpoint, &a, AttemptEvidence::Slow, None, start);
     breaker.report(&endpoint, &b, AttemptEvidence::Slow, None, start);
@@ -1513,7 +1506,7 @@ fn a_stale_probe_settling_inconclusive_leaves_a_closed_breaker_closed() {
 fn the_same_package_twice_is_not_corroboration() {
     let breaker = EndpointBreaker::default();
     let endpoint = Fixture::new().endpoint();
-    let package = PackageName::new("a");
+    let package = crate::NormalizedName::for_test("a");
     let start = now();
 
     breaker.report(&endpoint, &package, AttemptEvidence::Slow, None, start);
@@ -1542,14 +1535,14 @@ fn a_stale_suspect_is_not_corroboration() {
 
     breaker.report(
         &endpoint,
-        &PackageName::new("a"),
+        &crate::NormalizedName::for_test("a"),
         AttemptEvidence::Slow,
         None,
         start,
     );
     breaker.report(
         &endpoint,
-        &PackageName::new("b"),
+        &crate::NormalizedName::for_test("b"),
         AttemptEvidence::Slow,
         None,
         start + BREAKER_OPEN_DURATION,
@@ -1564,7 +1557,7 @@ fn a_stale_suspect_is_not_corroboration() {
 #[test]
 fn the_breaker_stays_within_its_cap() {
     let breaker = EndpointBreaker::default();
-    let package = PackageName::new("a");
+    let package = crate::NormalizedName::for_test("a");
     let start = now();
     for index in 0..BREAKER_CAP + 50 {
         let endpoint = breaker_endpoint(index);
@@ -1763,7 +1756,7 @@ fn open_endpoint(breaker: &EndpointBreaker, endpoint: &EndpointKey, at: std::tim
     for package in ["a", "b"] {
         breaker.report(
             endpoint,
-            &PackageName::new(package),
+            &crate::NormalizedName::for_test(package),
             AttemptEvidence::Slow,
             None,
             at,
@@ -1779,7 +1772,7 @@ fn a_full_breaker_evicts_a_closed_endpoint_before_an_open_one() {
     let closed = breaker_endpoint(0);
     breaker.report(
         &closed,
-        &PackageName::new("a"),
+        &crate::NormalizedName::for_test("a"),
         AttemptEvidence::Answered,
         None,
         start,
@@ -1796,7 +1789,7 @@ fn a_full_breaker_evicts_a_closed_endpoint_before_an_open_one() {
     let newcomer = breaker_endpoint(BREAKER_CAP);
     breaker.report(
         &newcomer,
-        &PackageName::new("a"),
+        &crate::NormalizedName::for_test("a"),
         AttemptEvidence::Answered,
         None,
         start + secs(1),
@@ -1829,7 +1822,7 @@ fn a_breaker_full_of_open_endpoints_does_not_track_a_newcomer() {
     let newcomer = breaker_endpoint(BREAKER_CAP);
     breaker.report(
         &newcomer,
-        &PackageName::new("a"),
+        &crate::NormalizedName::for_test("a"),
         AttemptEvidence::Answered,
         None,
         start + secs(1),
@@ -1850,7 +1843,7 @@ fn an_expired_open_endpoint_is_evicted_to_make_room() {
     let newcomer = breaker_endpoint(BREAKER_CAP);
     breaker.report(
         &newcomer,
-        &PackageName::new("a"),
+        &crate::NormalizedName::for_test("a"),
         AttemptEvidence::Answered,
         None,
         start + BREAKER_OPEN_DURATION,
@@ -1881,16 +1874,14 @@ fn route_of(
     let package = PackageName::new(name);
     let source = DependencySource::Registry;
     let outcomes = DependencyOutcomes::new();
-    let normalized = crate::NormalizedName::for_test(name);
-    let request = InteractiveFetchRequest::new(
+    let request = InteractiveFetchRequest::from_parts(
         VersionData::new(&fixture.cached, &fixture.resolved)
             .with_ecosystem(ecosystem)
             .with_outcomes(&outcomes)
             .with_interactive_fetch_gate(&fixture.gate),
         &fixture.manifest,
-        &package,
-        &normalized,
-        &source,
+        crate::test_util::package_key(package.as_str()),
+        source,
         FetchContext::Hover,
     );
     let (_, lookup) = request
@@ -2153,7 +2144,13 @@ fn report_for(
     probe: Option<ProbeId>,
     at: std::time::Instant,
 ) {
-    breaker.report(endpoint, &PackageName::new("a"), evidence, probe, at);
+    breaker.report(
+        endpoint,
+        &crate::NormalizedName::for_test("a"),
+        evidence,
+        probe,
+        at,
+    );
 }
 
 #[test]
@@ -2288,9 +2285,9 @@ fn a_lost_probe_expires_and_a_stale_probe_can_only_close() {
 fn a_report_applies_to_the_current_health_not_to_an_earlier_read() {
     let (breaker, endpoint, start) = (EndpointBreaker::default(), breaker_endpoint(0), now());
     let (a, b, c) = (
-        PackageName::new("a"),
-        PackageName::new("b"),
-        PackageName::new("c"),
+        crate::NormalizedName::for_test("a"),
+        crate::NormalizedName::for_test("b"),
+        crate::NormalizedName::for_test("c"),
     );
     breaker.report(&endpoint, &a, AttemptEvidence::Slow, None, start);
 

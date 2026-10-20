@@ -41,7 +41,7 @@ pub struct PackageSignals {
     /// Every lock-file-resolved version for a package name with more than one retained
     /// entry (issue #649), built alongside [`Self::resolved_versions`] by the same lock
     /// file load. Additive: only names with more than one occurrence get an entry here —
-    /// see [`deps_core::VersionData::resolved_version_candidates`] for the per-occurrence
+    /// see [`deps_core::VersionData::resolved_candidates_for`] for the per-occurrence
     /// disambiguation this enables.
     pub resolved_version_candidates: HashMap<PackageName, Vec<ConcreteVersion>>,
     /// Set by every `DocumentState::update_resolved_versions` call (issue #1395 critic S3):
@@ -302,7 +302,7 @@ impl PackageSignals {
             gossip_findings.remove(removed_dep);
             let normalized = formatter.normalize_package_name(removed_dep);
             vulnerabilities.retain(|key, _| key.as_str() != normalized.as_str());
-            osv_scan_plan.retain_not_named(normalized.as_str());
+            osv_scan_plan.retain_not_named(&normalized);
             latest_status.retain(|key, _| key.as_str() != normalized.as_str());
             candidate_status.retain(|key, _| key.as_str() != normalized.as_str());
             outcomes.remove(&normalized);
@@ -730,7 +730,10 @@ mod tests {
         let signals = fixture();
         let snapshot = signals.snapshot().finish();
         let data = snapshot.version_data();
-        assert!(data.resolved_version_candidates.is_none());
+        assert!(
+            data.resolved_candidates_for(&deps_core::test_util::package_key("MyPkg"))
+                .is_none()
+        );
         assert!(data.vulnerabilities.is_none());
         assert!(data.outcomes.is_none());
         assert!(data.license_prefetch.is_none());
@@ -749,7 +752,13 @@ mod tests {
             .with_license_prefetch()
             .finish();
         let data = snapshot.version_data();
-        assert_eq!(data.resolved_version_candidates.map(HashMap::len), Some(2));
+        for name in ["MyPkg", "Other"] {
+            assert_eq!(
+                data.resolved_candidates_for(&deps_core::test_util::package_key(name))
+                    .map(<[_]>::len),
+                Some(1)
+            );
+        }
         assert_eq!(data.vulnerabilities.map(HashMap::len), Some(3));
         assert_eq!(
             data.outcomes.map(|o| o

@@ -118,7 +118,7 @@ refused immediately for 30 s.
 - Reverting #1858's intent: an attempt that is served locally (memo, fresh cache entry, local error) must
   still not vouch for or accuse an endpoint (see section 3).
 - The Cargo path, which is correct.
-- Body-stall tracking after headers (`TODO(#1857)` in `send_noted`).
+- Body-stall tracking after headers: shipped by #1857 (`RequestNote::headers` hands over to a `BodyNote` that is told of every chunk, so a body that stalls reads as Slow and a drip-fed body never does).
 - The `Decoration` lookup kind, which stays `BreakerEvidence::Ignored`.
 - Background fetch timeouts, retry counts and `max_concurrent_fetches`.
 
@@ -280,7 +280,7 @@ All use paused time. "Stalled" means no response for at least `budget / 2` (5 s 
 ## 10. Resolved Questions
 
 > [!success] Resolved
-> - **OQ-1 mechanism**: a ledger shared by every task of one `(ecosystem, endpoint)`, held weakly in a process-wide map. Orchestration code tags the task that sends (`observe_ecosystem`, `observe_endpoint`), the HTTP send sites feed every ledger of the task's scope, and an interactive attempt on a resolved endpoint reads the shared ledger over its own wait. Ecosystem crates need no hook (FR-005).
+> - **OQ-1 mechanism**: a ledger shared by every task of one `(ecosystem, endpoint)`, held weakly in a process-wide map. Orchestration code tags the task that sends with an `EndpointObserver` built from a typed `(EcosystemId, RegistryEndpoint)` (#1871; no ambient ecosystem task-local), the HTTP send sites feed every ledger of the task's scope, and an interactive attempt on a resolved endpoint reads the shared ledger over its own wait. Ecosystem crates need no hook (FR-005).
 > - **OQ-2 coalesced vouching**: no. An attempt that received no response of its own is never `Answered`; only its own responses vouch.
 > - **OQ-3 stall clock**: the stall is measured over the attempt's own wait, as the shared ledger's busy time between the attempt's start and end marks (restarting from zero at a response), so a late joiner is not `Slow` for a request that was already old.
 

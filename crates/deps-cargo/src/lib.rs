@@ -35,7 +35,7 @@ pub mod sparse;
 /// Domain types for Cargo dependencies (parsed `Cargo.toml` entries, crates.io versions).
 pub mod types;
 
-pub use config::{CargoConfig, Provenance, RegistryIndex, ResolvedRegistryEntry};
+pub use config::{CargoConfig, CargoIndexKind, Provenance, RegistryIndex, ResolvedRegistryEntry};
 pub use ecosystem::CargoEcosystem;
 pub use formatter::CargoFormatter;
 pub use lockfile::CargoLockParser;

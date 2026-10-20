@@ -75,6 +75,7 @@ impl GradleEcosystem {
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
         deps_core::completion::complete_versions_generic_from(
+            self.ecosystem_id(),
             self.registry.as_ref(),
             &self.formatter,
             package_name,
@@ -246,6 +247,7 @@ impl Ecosystem for GradleEcosystem {
                     ) {
                         Some(dep) => {
                             deps_core::completion::complete_versions_generic_from(
+                                self.ecosystem_id(),
                                 self.registry.as_ref(),
                                 &self.formatter,
                                 dep.name(),

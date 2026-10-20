@@ -77,9 +77,9 @@ impl crate::Registry for ErrorRegistry {
         _name: &'a PackageName,
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>> {
         Box::pin(async move {
-            Err(crate::error::DepsError::CacheError(
-                "mock registry error".to_string(),
-            ))
+            Err(crate::error::DepsError::Io(std::io::Error::other(
+                "mock registry error",
+            )))
         })
     }
 
@@ -216,9 +216,9 @@ impl crate::Registry for CountingRegistry {
             match mode {
                 CountingMode::Succeed => {}
                 CountingMode::Fail => {
-                    return Err(crate::error::DepsError::CacheError(
-                        "mock registry error".to_string(),
-                    ));
+                    return Err(crate::error::DepsError::Io(std::io::Error::other(
+                        "mock registry error",
+                    )));
                 }
                 CountingMode::Stall => {
                     tokio::time::sleep(REGISTRY_FETCH_BUDGET + std::time::Duration::from_secs(1))
@@ -266,7 +266,7 @@ impl crate::Registry for CountingRegistry {
 
 /// A registry whose `get_versions` always errs with `PackageNotFound`, for
 /// exercising a "package genuinely doesn't exist" code path — distinct from
-/// [`ErrorRegistry`], whose `CacheError` stands in for a transient/unanswerable
+/// [`ErrorRegistry`], whose I/O error stands in for a transient/unanswerable
 /// failure instead.
 pub(crate) struct NotFoundRegistry;
 

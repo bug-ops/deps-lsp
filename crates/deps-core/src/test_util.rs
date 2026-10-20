@@ -156,6 +156,23 @@ pub async fn fallback_edit_outcome(
     )
 }
 
+/// Builds a [`crate::PackageKey`] for `name` through [`StubFormatter::DEFAULT`] (identity
+/// normalization), for fixtures that need a key but have no formatter of their own.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::test_util::package_key;
+///
+/// let key = package_key("serde");
+/// assert_eq!(key.declared().as_str(), "serde");
+/// assert_eq!(key.normalized().as_str(), "serde");
+/// ```
+#[must_use]
+pub fn package_key(name: &str) -> crate::PackageKey {
+    crate::PackageKey::new(&crate::PackageName::new(name), &StubFormatter::DEFAULT)
+}
+
 /// Builds a [`crate::osv::VulnKey`] from a plain name, for [`crate::osv::VulnerabilityMap`]
 /// test fixtures.
 ///
@@ -174,7 +191,7 @@ pub async fn fallback_edit_outcome(
 /// ```
 #[must_use]
 pub fn vuln_key(name: &str) -> crate::osv::VulnKey {
-    crate::osv::VulnKey::from_name(name.to_string())
+    crate::osv::VulnKey::from_spelling(name.to_string())
 }
 
 /// Builds a validated [`crate::osv::OsvId`] from a literal fixture id.
