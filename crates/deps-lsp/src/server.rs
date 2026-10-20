@@ -4502,15 +4502,13 @@ let package = Package(
             let package = PackageName::new("serde");
             let source = DependencySource::Registry;
             let manifest = url::Url::parse("file:///project/Cargo.toml").unwrap();
-            let normalized = deps_core::NormalizedName::for_test("serde");
-            let request = InteractiveFetchRequest::new(
+            let request = InteractiveFetchRequest::from_parts(
                 VersionData::new(&cached, &resolved)
                     .with_ecosystem(deps_core::EcosystemId::Cargo)
                     .with_interactive_fetch_gate(gate),
                 &manifest,
-                &package,
-                &normalized,
-                &source,
+                deps_core::test_util::package_key(package.as_str()),
+                source,
                 FetchContext::Hover,
             );
             await_interactive_fetch(

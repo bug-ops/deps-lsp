@@ -1603,7 +1603,7 @@ pub trait RequirementResolution: Send + Sync {
     /// MVS, unlike Cargo/npm where the manifest holds a range and the lock
     /// file holds the pin. When true, hover and inlay hints prefer
     /// [`Dependency::version_requirement`] over the lock-file-derived entry
-    /// in [`crate::lsp_helpers::VersionData::resolved`], because `go.sum` is a checksum ledger
+    /// in [`crate::lsp_helpers::VersionData::resolved_for`], because `go.sum` is a checksum ledger
     /// that `go get`/`go build` only ever append to (only `go mod tidy`
     /// prunes it) — a stale, no-longer-selected higher version can remain
     /// recorded there after a downgrade and, since go.sum is written sorted

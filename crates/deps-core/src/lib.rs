@@ -301,7 +301,9 @@ pub use lsp_helpers::{
 };
 pub use matched_spans::MatchedSpans;
 pub use mtime_cache::{DEFAULT_MAX_CACHED_FILES, MAX_CACHED_FILE_BYTES, MtimeFileCache};
-pub use package::{ConcreteVersion, InvalidPackageName, NormalizedName, PackageName, VersionReq};
+pub use package::{
+    ConcreteVersion, InvalidPackageName, NormalizedName, PackageKey, PackageName, VersionReq,
+};
 pub use parser::{
     CheckedTomlError, DependencySource, LoadingState, MAX_JSON_NESTING_DEPTH,
     MAX_TOML_NESTING_DEPTH, MAX_YAML_EXPANDED_BYTES, MAX_YAML_NESTING_DEPTH,

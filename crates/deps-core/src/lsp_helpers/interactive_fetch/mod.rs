@@ -47,11 +47,11 @@ use self::key::{
     SourceFingerprint,
 };
 use self::memo::{Decision, InteractiveRecord};
-use super::VersionData;
+use super::{EcosystemFormatter, VersionData};
 use crate::freshness::FreshnessSettings;
 use crate::single_flight::Slot;
 use crate::{
-    DependencySource, FetchFailure, NetworkMode, NormalizedName, PackageName, Registry,
+    Dependency, DependencySource, FetchFailure, NetworkMode, PackageKey, PackageName, Registry,
     RegistryEndpoint, Version,
 };
 
@@ -178,20 +178,20 @@ impl FetchContext {
 }
 
 /// Everything [`await_interactive_fetch`] needs to identify the package under the cursor.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct InteractiveFetchRequest<'a> {
     versions: VersionData<'a>,
     manifest: &'a url::Url,
-    package: &'a PackageName,
-    normalized_name: &'a NormalizedName,
-    source: &'a DependencySource,
+    key: PackageKey,
+    source: DependencySource,
     context: FetchContext,
 }
 
 impl<'a> InteractiveFetchRequest<'a> {
-    /// Bundles the lookup identity: `manifest` is the document being served, `package` the raw
-    /// manifest name (the name the registry is asked for and the log output), `normalized_name`
-    /// the formatter-normalized name the outcomes map and the memo key use.
+    /// Bundles the lookup identity of `dep`: `manifest` is the document being served. Both
+    /// spellings of the name come from `dep` through `formatter` in one call, so the declared
+    /// name the registry is asked for and the normalized name the outcomes map and the memo key
+    /// use cannot belong to different dependencies.
     ///
     /// The memo and the endpoint breaker are keyed by the network path the registry reports
     /// through [`Registry::endpoint_for`] for this package and source, so documents that
@@ -201,22 +201,55 @@ impl<'a> InteractiveFetchRequest<'a> {
     /// configuration (`.npmrc`, Cargo source replacement) that `deps-core` cannot see, so two
     /// documents then never share a record.
     #[must_use]
-    pub const fn new(
+    pub fn for_dependency(
         versions: VersionData<'a>,
         manifest: &'a url::Url,
-        package: &'a PackageName,
-        normalized_name: &'a NormalizedName,
-        source: &'a DependencySource,
+        dep: &dyn Dependency,
+        formatter: &dyn EcosystemFormatter,
+        context: FetchContext,
+    ) -> Self {
+        Self::from_key(
+            versions,
+            manifest,
+            PackageKey::new(dep.name(), formatter),
+            dep.source(),
+            context,
+        )
+    }
+
+    /// A request from parts a fixture chose, for tests that have no dependency to derive them
+    /// from.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub const fn from_parts(
+        versions: VersionData<'a>,
+        manifest: &'a url::Url,
+        key: PackageKey,
+        source: DependencySource,
+        context: FetchContext,
+    ) -> Self {
+        Self::from_key(versions, manifest, key, source, context)
+    }
+
+    const fn from_key(
+        versions: VersionData<'a>,
+        manifest: &'a url::Url,
+        key: PackageKey,
+        source: DependencySource,
         context: FetchContext,
     ) -> Self {
         Self {
             versions,
             manifest,
-            package,
-            normalized_name,
+            key,
             source,
             context,
         }
+    }
+
+    /// The package name as the manifest spells it, which the registry is asked for.
+    const fn package(&self) -> &PackageName {
+        self.key.declared()
     }
 
     /// The gate and lookup this request is memoized under, or `None` when the request must
@@ -236,7 +269,7 @@ impl<'a> InteractiveFetchRequest<'a> {
         match self.versions.network {
             NetworkMode::Offline => None,
             NetworkMode::Online => {
-                let scope = match registry.endpoint_for(self.package, self.source) {
+                let scope = match registry.endpoint_for(self.package(), &self.source) {
                     RegistryEndpoint::Resolved(endpoint) => RouteScope::Endpoint(endpoint),
                     RegistryEndpoint::Unresolved => {
                         RouteScope::Manifest(ManifestFingerprint::of(self.manifest))
@@ -245,10 +278,10 @@ impl<'a> InteractiveFetchRequest<'a> {
                 let key = LookupKey {
                     route: RouteKey {
                         ecosystem,
-                        source: SourceFingerprint::of(self.source),
+                        source: SourceFingerprint::of(&self.source),
                         scope,
                     },
-                    package: PackageName::new(self.normalized_name.as_str()),
+                    package: self.key.normalized().clone(),
                     slot: kind,
                 };
                 Some((gate, Arc::new(key)))
@@ -266,7 +299,7 @@ impl<'a> InteractiveFetchRequest<'a> {
         let failure = self
             .versions
             .outcomes
-            .and_then(|outcomes| outcomes.fetch_failure(self.normalized_name));
+            .and_then(|outcomes| outcomes.fetch_failure(self.key.normalized()));
         match failure {
             Some(FetchFailure::Actionable(_) | FetchFailure::Transient) => true,
             // Never attempted is not evidence the registry is unreachable (FR-009).
@@ -282,7 +315,7 @@ fn now() -> Instant {
 
 fn log_skipped(request: &InteractiveFetchRequest<'_>, reason: &str) {
     tracing::debug!(
-        package = %request.package.for_tracing(),
+        package = %request.package().for_tracing(),
         context = request.context.as_str(),
         reason,
         "interactive registry await skipped"
@@ -430,6 +463,7 @@ struct Admitted<'a> {
 /// # Examples
 ///
 /// ```
+/// # #[cfg(feature = "test-util")] {
 /// use deps_core::lsp_helpers::{
 ///     AuxiliaryLookup, FetchContext, InteractiveFetch, InteractiveFetchRequest,
 ///     await_interactive_fetch,
@@ -456,16 +490,11 @@ struct Admitted<'a> {
 /// let package = PackageName::new("serde");
 /// let source = DependencySource::Registry;
 /// let manifest = url::Url::parse("file:///project/Cargo.toml").unwrap();
-/// # struct Identity;
-/// # impl deps_core::lsp_helpers::PackageNaming for Identity {}
-/// let normalized =
-///     deps_core::lsp_helpers::NormalizeName::normalize_package_name(&Identity, &package);
-/// let request = InteractiveFetchRequest::new(
+/// let request = InteractiveFetchRequest::from_parts(
 ///     VersionData::new(&cached, &resolved),
 ///     &manifest,
-///     &package,
-///     &normalized,
-///     &source,
+///     deps_core::test_util::package_key(package.as_str()),
+///     source,
 ///     FetchContext::Hover,
 /// );
 ///
@@ -480,6 +509,7 @@ struct Admitted<'a> {
 ///     AuxiliaryLookup::PinResolution,
 /// ));
 /// assert!(matches!(result, InteractiveFetch::Live(42)));
+/// # }
 /// ```
 pub async fn await_interactive_fetch<T, E: InteractiveFetchError, R: Registry + ?Sized>(
     registry: &R,
@@ -540,16 +570,11 @@ pub async fn await_interactive_fetch<T, E: InteractiveFetchError, R: Registry + 
 /// let package = PackageName::new("serde");
 /// let source = DependencySource::Registry;
 /// let manifest = url::Url::parse("file:///project/Cargo.toml").unwrap();
-/// # struct Identity;
-/// # impl deps_core::lsp_helpers::PackageNaming for Identity {}
-/// let normalized =
-///     deps_core::lsp_helpers::NormalizeName::normalize_package_name(&Identity, &package);
-/// let request = InteractiveFetchRequest::new(
+/// let request = InteractiveFetchRequest::from_parts(
 ///     VersionData::new(&cached, &resolved),
 ///     &manifest,
-///     &package,
-///     &normalized,
-///     &source,
+///     deps_core::test_util::package_key(package.as_str()),
+///     source,
 ///     FetchContext::Hover,
 /// );
 /// let registry = MockRegistry::new().with_versions(vec![MockVersion::new("1.0.0")]);
@@ -573,7 +598,7 @@ pub async fn await_interactive_versions<R: Registry + ?Sized>(
 ) -> InteractiveFetch<SharedVersions> {
     let fetch = async {
         registry
-            .get_versions_from(request.package, request.source, freshness)
+            .get_versions_from(request.package(), &request.source, freshness)
             .await
             .map(SharedVersions::from)
     };

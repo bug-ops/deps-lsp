@@ -249,7 +249,7 @@ pub(super) async fn bounded_await_until<T, E: InteractiveFetchError>(
         Ok(Err(error)) => {
             let (status, cause) = error.log_cause();
             tracing::debug!(
-                package = %request.package.for_tracing(),
+                package = %request.package().for_tracing(),
                 context = request.context.as_str(),
                 lookup = kind.as_str(),
                 ?status,
@@ -263,7 +263,7 @@ pub(super) async fn bounded_await_until<T, E: InteractiveFetchError>(
         }
         Err(_) => {
             tracing::warn!(
-                package = %request.package.for_tracing(),
+                package = %request.package().for_tracing(),
                 context = request.context.as_str(),
                 lookup = kind.as_str(),
                 timeout_secs = kind.budget().as_secs(),

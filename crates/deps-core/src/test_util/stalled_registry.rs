@@ -19,12 +19,11 @@ use super::{StubFormatter, test_uri};
 use crate::ecosystem::BoxFuture;
 use crate::lsp_helpers::{
     DependencyOutcomes, FetchContext, InteractiveFetch, InteractiveFetchGate,
-    InteractiveFetchRequest, NoLiveList, NormalizeName, SharedVersions, VersionData,
-    await_interactive_versions,
+    InteractiveFetchRequest, NoLiveList, SharedVersions, VersionData, await_interactive_versions,
 };
 use crate::{
-    DependencySource, EcosystemId, EgressTier, FreshnessSettings, HttpCache, PackageName, Registry,
-    RegistryEndpoint,
+    DependencySource, EcosystemId, EgressTier, FreshnessSettings, HttpCache, PackageKey,
+    PackageName, Registry, RegistryEndpoint,
 };
 
 /// A loopback socket that accepts connections and never replies, standing in for a dead
@@ -74,18 +73,16 @@ async fn hover<R: Registry + ?Sized>(
     let package = PackageName::new(name);
     let source = DependencySource::Registry;
     let outcomes = DependencyOutcomes::new();
-    let normalized = StubFormatter::DEFAULT.normalize_package_name(&package);
     let (cached, resolved) = (HashMap::new(), HashMap::new());
     let manifest = test_uri("/project/stalled/manifest");
-    let request = InteractiveFetchRequest::new(
+    let request = InteractiveFetchRequest::from_parts(
         VersionData::new(&cached, &resolved)
             .with_ecosystem(ecosystem)
             .with_outcomes(&outcomes)
             .with_interactive_fetch_gate(gate),
         &manifest,
-        &package,
-        &normalized,
-        &source,
+        PackageKey::new(&package, &StubFormatter::DEFAULT),
+        source,
         FetchContext::Hover,
     );
     await_interactive_versions(registry, request, FreshnessSettings::Disabled).await

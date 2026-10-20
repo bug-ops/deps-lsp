@@ -1,4 +1,3 @@
-use crate::lsp_helpers::NormalizeName;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,8 +10,8 @@ use crate::licenses::resolve_license_entries_for_display;
 use crate::osv::ScanOutcome;
 use crate::{
     ConcreteVersion, Dependency, DependencySource, Deprecation, GossipLowUsage, LicenseSource,
-    ParseResult, ProvenanceStatus, PublishTime, Registry, SupplyChainTrustSignal, Version,
-    VersionReq,
+    PackageKey, ParseResult, ProvenanceStatus, PublishTime, Registry, SupplyChainTrustSignal,
+    Version, VersionReq,
 };
 
 use super::diagnostics::{MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_VALUE_CHARS};
@@ -25,10 +24,9 @@ use super::hover_markdown::{FieldKind, HoverMarkdown};
 use super::{
     AuxiliaryLookup, CooldownBlocker, CooldownPrecedence, DiagnosticMessages, EcosystemFormatter,
     FetchContext, HOVER_RECENT_VERSIONS, InteractiveFetchRequest, LatestVerdict, SiblingMatchNote,
-    VersionData, await_interactive_fetch, await_interactive_versions,
-    cached_package_versions_by_name, cooldown_precedence, escape_markdown, in_use_version,
-    latest_verdict, markdown_code_span, position_in_range, resolve_in_use_version,
-    resolve_scan_outcome,
+    VersionData, await_interactive_fetch, await_interactive_versions, cooldown_precedence,
+    escape_markdown, in_use_version, latest_verdict, markdown_code_span, position_in_range,
+    resolve_in_use_version, resolve_scan_outcome,
 };
 use crate::github::normalize_tag;
 
@@ -120,25 +118,13 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     // Hoisted so the fetch is spawned before awaiting the registry fetch below, letting the
     // two requests overlap instead of stacking (spec 037, plan.md §8 M6).
-    let normalized_name = formatter.normalize_package_name(dep.name());
+    let key = PackageKey::new(dep.name(), formatter);
 
-    let trust_handle = spawn_trust_signal_fetch(
-        dep,
-        &dep_source,
-        &versions,
-        formatter,
-        normalized_name.as_str(),
-    );
+    let trust_handle = spawn_trust_signal_fetch(dep, &dep_source, &versions, formatter, &key);
     // Issue #1456, spec 072 FR-005: hover's only remaining *live* GOSSIP fetch (cooldown
     // is sourced synchronously from `versions.gossip_prefetch` below instead) — spawned
     // here, alongside `trust_handle`, so the two overlap rather than stack.
-    let gossip_handle = spawn_gossip_low_usage_fetch(
-        dep,
-        &dep_source,
-        &versions,
-        formatter,
-        normalized_name.as_str(),
-    );
+    let gossip_handle = spawn_gossip_low_usage_fetch(dep, &dep_source, &versions, formatter, &key);
 
     // `now` is caller-supplied (#227 M4), not `PublishTime::now()`, so tests can pin an exact
     // cooldown-boundary instant and every age in this response is aged consistently.
@@ -146,16 +132,15 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // `.ok()`, not `.ok()?`: a fetch failure (off-VPN, expired token, DNS-blocked internal
     // host) must degrade to the same basic card the `!resolvable` branch renders, not vanish
     // the whole hover response.
-    let fetch_request = InteractiveFetchRequest::new(
+    let fetch_request = InteractiveFetchRequest::for_dependency(
         versions,
         parse_result.uri(),
-        dep.name(),
-        &normalized_name,
-        &dep_source,
+        dep,
+        formatter,
         FetchContext::Hover,
     );
     let available_versions = if resolvable {
-        await_interactive_versions(registry, fetch_request, freshness)
+        await_interactive_versions(registry, fetch_request.clone(), freshness)
             .await
             .into_live()
     } else {
@@ -178,9 +163,9 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     } else {
         in_use_version::resolve_occurrence_version(
             dep,
-            normalized_name.as_str(),
-            versions.resolved,
-            versions.resolved_version_candidates,
+            &key,
+            versions.resolved_map(),
+            versions.candidates_map(),
             formatter,
         )
         .map(ConcreteVersion::as_str)
@@ -238,15 +223,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     } else {
         None
     };
-    let cached_latest = resolvable
-        .then(|| {
-            cached_package_versions_by_name(
-                versions.cached,
-                normalized_name.as_str(),
-                dep.name().as_str(),
-            )
-        })
-        .flatten();
+    let cached_latest = resolvable.then(|| versions.cached_for(&key)).flatten();
     // A non-empty live list with no stable entry tries `list_fallback_latest` (#373) first
     // rather than Ch1, since the cache's version wouldn't be part of what the live list just
     // showed. An empty live list has no such contradiction risk and falls back to Ch1 as usual.
@@ -286,8 +263,8 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     let vuln_keys = versions.ecosystem.map(|ecosystem| {
         crate::osv::vulnerability_keys(
             parse_result,
-            versions.resolved,
-            versions.resolved_version_candidates,
+            versions.resolved_map(),
+            versions.candidates_map(),
             formatter,
             ecosystem,
         )
@@ -299,7 +276,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             versions.latest_status,
             dep,
             vuln_keys.as_ref(),
-            normalized_name.as_str(),
+            &key,
             latest_ver,
             formatter,
         ),
@@ -317,16 +294,16 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     let vuln_outcome = versions
         .vulnerabilities
-        .and_then(|m| resolve_scan_outcome(m, dep, vuln_keys.as_ref(), normalized_name.as_str()));
+        .and_then(|m| resolve_scan_outcome(m, dep, vuln_keys.as_ref(), &key));
     let deprecation = versions
         .outcomes
-        .and_then(|o| o.deprecation(&normalized_name));
+        .and_then(|o| o.deprecation(key.normalized()));
     // Package-level context (#205) renders before per-version security advisories:
     // deprecation is a property of the package, advisories of the version.
     push_deprecation_hover_section(&mut markdown, formatter, deprecation);
-    let latest_status_for_dep = versions.latest_status.and_then(|m| {
-        super::resolve_latest_status(m, dep, vuln_keys.as_ref(), normalized_name.as_str())
-    });
+    let latest_status_for_dep = versions
+        .latest_status
+        .and_then(|m| super::resolve_latest_status(m, dep, vuln_keys.as_ref(), &key));
     push_vulnerability_hover_section(
         &mut markdown,
         formatter,
@@ -371,9 +348,9 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     let in_use_version: Option<ConcreteVersion> = versions.ecosystem.and_then(|ecosystem| {
         resolve_in_use_version(
             dep,
-            normalized_name.as_str(),
-            versions.resolved,
-            versions.resolved_version_candidates,
+            &key,
+            versions.resolved_map(),
+            versions.candidates_map(),
             formatter,
             ecosystem,
         )
@@ -537,7 +514,7 @@ fn spawn_trust_signal_fetch(
     dep_source: &DependencySource,
     versions: &VersionData<'_>,
     formatter: &dyn EcosystemFormatter,
-    normalized_name: &str,
+    key: &PackageKey,
 ) -> Option<tokio::task::JoinHandle<Option<SupplyChainTrustSignal>>> {
     versions.trust.and_then(|client| {
         let ecosystem = versions.ecosystem?;
@@ -548,9 +525,9 @@ fn spawn_trust_signal_fetch(
         }
         let version = resolve_in_use_version(
             dep,
-            normalized_name,
-            versions.resolved,
-            versions.resolved_version_candidates,
+            key,
+            versions.resolved_map(),
+            versions.candidates_map(),
             formatter,
             ecosystem,
         )?;
@@ -577,7 +554,7 @@ fn spawn_gossip_low_usage_fetch(
     dep_source: &DependencySource,
     versions: &VersionData<'_>,
     formatter: &dyn EcosystemFormatter,
-    normalized_name: &str,
+    key: &PackageKey,
 ) -> Option<tokio::task::JoinHandle<Option<crate::GossipFindings>>> {
     versions.gossip_client.and_then(|client| {
         let ecosystem = versions.ecosystem?;
@@ -588,9 +565,9 @@ fn spawn_gossip_low_usage_fetch(
         }
         let version = resolve_in_use_version(
             dep,
-            normalized_name,
-            versions.resolved,
-            versions.resolved_version_candidates,
+            key,
+            versions.resolved_map(),
+            versions.candidates_map(),
             formatter,
             ecosystem,
         )?;

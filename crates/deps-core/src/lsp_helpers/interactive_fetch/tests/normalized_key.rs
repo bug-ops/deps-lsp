@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::NormalizedName;
-use crate::lsp_helpers::NormalizeName;
 use crate::test_util::StubFormatter;
 
 fn hover_request<'a>(
@@ -12,18 +11,15 @@ fn hover_request<'a>(
         &'a HashMap<PackageName, ConcreteVersion>,
     ),
     manifest: &'a url::Url,
-    package: &'a PackageName,
-    key: &'a NormalizedName,
-    source: &'a DependencySource,
+    key: PackageKey,
 ) -> InteractiveFetchRequest<'a> {
-    InteractiveFetchRequest::new(
+    InteractiveFetchRequest::from_parts(
         VersionData::new(maps.0, maps.1)
             .with_ecosystem(EcosystemId::Pypi)
             .with_outcomes(outcomes),
         manifest,
-        package,
         key,
-        source,
+        DependencySource::Registry,
         FetchContext::Hover,
     )
 }
@@ -32,35 +28,27 @@ fn hover_request<'a>(
 fn the_background_seed_is_found_under_the_formatter_normalized_key_only() {
     let formatter = StubFormatter::new().with_lowercase_names();
     let package = PackageName::new("My_Pkg");
-    let normalized = formatter.normalize_package_name(&package);
-    assert_eq!(normalized.as_str(), "my_pkg");
-    let outcomes =
-        DependencyOutcomes::new().with_fetch_failure(normalized.clone(), FetchFailure::Transient);
+    let key = PackageKey::new(&package, &formatter);
+    assert_eq!(key.normalized().as_str(), "my_pkg");
     let (cached, resolved) = (HashMap::new(), HashMap::new());
-    let source = DependencySource::Registry;
     let manifest = manifest("/project/pyproject.toml");
-    let declared_spelling = NormalizedName::for_test("My_Pkg");
+
+    let seeded_normalized = DependencyOutcomes::new()
+        .with_fetch_failure(key.normalized().clone(), FetchFailure::Transient);
+    let seeded_declared = DependencyOutcomes::new()
+        .with_fetch_failure(NormalizedName::for_test("My_Pkg"), FetchFailure::Transient);
 
     let by_normalized = hover_request(
-        &outcomes,
+        &seeded_normalized,
         (&cached, &resolved),
         &manifest,
-        &package,
-        &normalized,
-        &source,
+        key.clone(),
     );
-    let by_declared = hover_request(
-        &outcomes,
-        (&cached, &resolved),
-        &manifest,
-        &package,
-        &declared_spelling,
-        &source,
-    );
+    let by_declared = hover_request(&seeded_declared, (&cached, &resolved), &manifest, key);
 
     assert!(by_normalized.background_failure_known(LookupKind::VersionList));
     assert!(
         !by_declared.background_failure_known(LookupKind::VersionList),
-        "the declared spelling must miss the seed the normalized key finds"
+        "a seed under the declared spelling must not be found"
     );
 }

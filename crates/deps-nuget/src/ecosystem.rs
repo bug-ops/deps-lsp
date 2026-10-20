@@ -18,7 +18,6 @@
 //! package from `cached_versions`), so no special-casing is needed here.
 
 #[cfg(feature = "lsp-responses")]
-use deps_core::NormalizeName;
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
@@ -356,18 +355,15 @@ impl Ecosystem for NuGetEcosystem {
                 return base_hover.await;
             };
 
-            let dep_source = dep.source();
-            let normalized_name = self.formatter().normalize_package_name(dep.name());
             let unlisted_fetch = await_interactive_fetch(
                 // The root, not the chain head: only it resolves the alternate source's key.
                 self.registry.as_ref(),
                 unlisted_client.unlisted_versions(dep.name().as_str()),
-                InteractiveFetchRequest::new(
+                InteractiveFetchRequest::for_dependency(
                     versions,
                     parse_result.uri(),
-                    dep.name(),
-                    &normalized_name,
-                    &dep_source,
+                    dep,
+                    self.formatter(),
                     FetchContext::Hover,
                 ),
                 AuxiliaryLookup::Decoration,

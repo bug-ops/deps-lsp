@@ -15,16 +15,15 @@ use crate::position::{Position, Range};
 use crate::redact::{RedactedUrl, redact_declaration_key, sanitize_invisible};
 use crate::{
     BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, DepsDevClient,
-    EcosystemId, FetchCompleteness, FetchFailure, NormalizedName, PackageName, ParseResult,
+    EcosystemId, FetchCompleteness, FetchFailure, PackageKey, PackageName, ParseResult,
     PublishTime, RegistryOccurrence, RejectedRegistryOccurrence, RemovalStatus, TyposquatSignal,
     VersionReq, format_relative_age,
 };
 
 use super::{
     CooldownBlocker, CooldownDisposition, DiagnosticMessages, EcosystemFormatter, LatestVerdict,
-    NormalizeName, PackageVersions, RequirementGate, RequirementMatcher, RequirementStatus,
-    VersionData, cached_package_versions_by_name, cooldown_disposition, resolve_scan_outcome,
-    version_range_is_synthetic_empty,
+    PackageVersions, RequirementGate, RequirementMatcher, RequirementStatus, VersionData,
+    cooldown_disposition, resolve_scan_outcome, version_range_is_synthetic_empty,
 };
 
 /// Stable [`Diagnostic::code`] set on the unsatisfiable-requirement diagnostic.
@@ -1152,8 +1151,8 @@ pub fn generate_diagnostics_from_cache(
     let vuln_keys = versions.ecosystem.map(|ecosystem| {
         crate::osv::vulnerability_keys(
             parse_result,
-            versions.resolved,
-            versions.resolved_version_candidates,
+            versions.resolved_map(),
+            versions.candidates_map(),
             formatter,
             ecosystem,
         )
@@ -1161,17 +1160,13 @@ pub fn generate_diagnostics_from_cache(
 
     // Computed once and shared by `skip_reason_notice` below and the main per-dependency
     // loop's `RuleContext`, so `normalize_package_name` (an allocating call) never runs
-    // twice for the same dependency (#1392 code-review finding 4). Keyed by name range
-    // like `vuln_keys`, since two occurrences of one name have distinct positions.
-    let normalized_names: HashMap<Range, NormalizedName> = deps
+    // twice for the same dependency (#1392 code-review finding 4). A synthetic `name_range()`
+    // has no real document position and every rule anchors on it (critic S1, #905), so those
+    // dependencies are dropped here rather than skipped in each consumer.
+    let keyed_deps: Vec<(&dyn Dependency, PackageKey)> = deps
         .iter()
         .filter(|dep| !dep.name_range_is_synthetic())
-        .map(|dep| {
-            (
-                dep.name_range(),
-                formatter.normalize_package_name(dep.name()),
-            )
-        })
+        .map(|dep| (*dep, PackageKey::new(dep.name(), formatter)))
         .collect();
 
     dependency_ceiling_notice(&mut diagnostics, parse_result);
@@ -1179,27 +1174,18 @@ pub fn generate_diagnostics_from_cache(
     offline_notice(&mut diagnostics, versions, &deps);
     skip_reason_notice(
         &mut diagnostics,
-        &deps,
+        &keyed_deps,
         versions,
-        &normalized_names,
         uri,
         vuln_keys.as_ref(),
     );
     blocked_and_rejected_registry_diagnostics(&mut diagnostics, parse_result, &deps);
 
-    for dep in deps {
-        // Critic S1 (#905): a synthetic `name_range()` has no real document position, and every
-        // rule below anchors on it — skip diagnostics entirely rather than stack on a sentinel range.
-        if dep.name_range_is_synthetic() {
-            continue;
-        }
-
-        let Some(normalized_name) = normalized_names.get(&dep.name_range()) else {
-            continue;
-        };
+    for (dep, key) in &keyed_deps {
+        let dep = *dep;
         let ctx = RuleContext {
             dep,
-            normalized_name,
+            key,
             versions,
             formatter,
             severities,
@@ -1268,9 +1254,9 @@ pub fn generate_diagnostics_from_cache(
 /// `RuleContext` is held by value.
 struct RuleContext<'a> {
     dep: &'a dyn Dependency,
-    /// `formatter.normalize_package_name(dep.name())`, computed once per dependency
-    /// because five rules key their lookups on it.
-    normalized_name: &'a NormalizedName,
+    /// Both spellings of `dep`'s name, computed once per dependency because five rules key
+    /// their lookups on it.
+    key: &'a PackageKey,
     versions: VersionData<'a>,
     formatter: &'a dyn EcosystemFormatter,
     severities: DiagnosticSeverities,
@@ -1288,11 +1274,7 @@ impl<'a> RuleContext<'a> {
     /// first and the declared name second. `None` routes the dependency into the
     /// unknown-package family (R5) and ends its evaluation.
     fn cached_versions(&self) -> Option<&'a PackageVersions> {
-        cached_package_versions_by_name(
-            self.versions.cached,
-            self.normalized_name.as_str(),
-            self.dep.name().as_str(),
-        )
+        self.versions.cached_for(self.key)
     }
 }
 
@@ -1520,16 +1502,15 @@ const fn should_notify_in_diagnostics(reason: SkipReason) -> bool {
 /// not by iterating the vulnerability map's values directly, which would double-count
 /// nothing but also silently drop or misattribute duplicate-name occurrences pinned to
 /// different versions (#394 S2's same concern), or surface a stale entry for a dependency
-/// no longer in `deps` at all. `normalized_names` is precomputed once by the caller and
+/// no longer in `deps` at all. `keyed_deps` is precomputed once by the caller and
 /// shared with the main per-dependency loop, so `EcosystemFormatter::normalize_package_name`
 /// (an allocating call) never runs twice for the same dependency.
 /// Emits: at most one [`Severity::Information`] at `Position(0,0)`, appended right after
 /// [`offline_notice`] so both file-level R0 notices stay adjacent.
 fn skip_reason_notice(
     diagnostics: &mut Vec<Diagnostic>,
-    deps: &[&dyn Dependency],
+    keyed_deps: &[(&dyn Dependency, PackageKey)],
     versions: VersionData<'_>,
-    normalized_names: &HashMap<Range, NormalizedName>,
     uri: &url::Url,
     vuln_keys: Option<&crate::osv::VulnKeys>,
 ) {
@@ -1551,15 +1532,8 @@ fn skip_reason_notice(
     }
 
     let mut entries: Vec<SkippedEntry> = Vec::new();
-    for dep in deps {
-        if dep.name_range_is_synthetic() {
-            continue;
-        }
-        let Some(normalized_name) = normalized_names.get(&dep.name_range()) else {
-            continue;
-        };
-        let outcome =
-            resolve_scan_outcome(vulnerabilities, *dep, vuln_keys, normalized_name.as_str());
+    for (dep, key) in keyed_deps {
+        let outcome = resolve_scan_outcome(vulnerabilities, *dep, vuln_keys, key);
 
         if let Some(ScanOutcome::Skipped(reason)) = outcome
             && should_notify_in_diagnostics(*reason)
@@ -1907,12 +1881,9 @@ fn apply_vulnerability_rule<'a>(
     vuln_keys: Option<&crate::osv::VulnKeys>,
 ) -> Option<&'a crate::osv::DependencyVulnerabilities> {
     let vulnerabilities = ctx.versions.vulnerabilities?;
-    let Some(ScanOutcome::Vulnerable(dv)) = resolve_scan_outcome(
-        vulnerabilities,
-        ctx.dep,
-        vuln_keys,
-        ctx.normalized_name.as_str(),
-    ) else {
+    let Some(ScanOutcome::Vulnerable(dv)) =
+        resolve_scan_outcome(vulnerabilities, ctx.dep, vuln_keys, ctx.key)
+    else {
         return None;
     };
     push_vulnerability_diagnostics(diagnostics, ctx.dep, dv, ctx.formatter);
@@ -2289,7 +2260,7 @@ fn apply_deprecation_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'
         .then(|| {
             ctx.versions
                 .outcomes
-                .and_then(|o| o.deprecation(ctx.normalized_name))
+                .and_then(|o| o.deprecation(ctx.key.normalized()))
         })
         .flatten();
     if let Some(dep_info) = deprecation {
@@ -2368,7 +2339,7 @@ fn apply_in_use_yanked_rule(
         && ctx
             .versions
             .outcomes
-            .and_then(|o| o.yanked(ctx.normalized_name))
+            .and_then(|o| o.yanked(ctx.key.normalized()))
             .is_some_and(|(_, status)| *status != RemovalStatus::Yanked);
 
     if deprecation_suppresses_yanked {
@@ -2376,13 +2347,13 @@ fn apply_in_use_yanked_rule(
     } else if let Some((yanked_version, _status)) = ctx
         .versions
         .outcomes
-        .and_then(|o| o.yanked(ctx.normalized_name))
+        .and_then(|o| o.yanked(ctx.key.normalized()))
         && ctx.versions.ecosystem.is_none_or(|ecosystem| {
             super::resolve_in_use_version(
                 ctx.dep,
-                ctx.normalized_name.as_str(),
-                ctx.versions.resolved,
-                ctx.versions.resolved_version_candidates,
+                ctx.key,
+                ctx.versions.resolved_map(),
+                ctx.versions.candidates_map(),
                 ctx.formatter,
                 ecosystem,
             )
@@ -2449,11 +2420,7 @@ fn apply_unknown_package_rule(
     ctx: &RuleContext<'_>,
 ) {
     let dep = ctx.dep;
-    let in_lockfile = ctx
-        .versions
-        .resolved
-        .contains_key(ctx.normalized_name.as_str())
-        || ctx.versions.resolved.contains_key(dep.name());
+    let in_lockfile = ctx.versions.is_resolved(ctx.key);
     if in_lockfile {
         return;
     }
@@ -2463,14 +2430,14 @@ fn apply_unknown_package_rule(
         .then(|| {
             ctx.versions
                 .outcomes
-                .and_then(|o| o.fetch_failure(ctx.normalized_name))
+                .and_then(|o| o.fetch_failure(ctx.key.normalized()))
         })
         .flatten();
     let no_comparable_versions = can_resolve_source
         && ctx
             .versions
             .outcomes
-            .is_some_and(|o| o.no_comparable_versions(ctx.normalized_name));
+            .is_some_and(|o| o.no_comparable_versions(ctx.key.normalized()));
     match ctx.formatter.validate_package_name(dep.name().as_str()) {
         Err(reason) => {
             diagnostics.push(
@@ -2732,8 +2699,7 @@ fn push_flagged_latest_admitted_by_requirement(
     let (verdict, raw_status) = match ctx.versions.latest_status {
         None => (LatestVerdict::NotApplicable, None),
         Some(map) => {
-            let raw_status =
-                super::resolve_latest_status(map, ctx.dep, vuln_keys, ctx.normalized_name.as_str());
+            let raw_status = super::resolve_latest_status(map, ctx.dep, vuln_keys, ctx.key);
             (
                 super::upgrade_status_to_verdict(raw_status, latest, ctx.dep, ctx.formatter),
                 raw_status,
@@ -2819,9 +2785,9 @@ fn flagged_latest_duplicates_vulnerability_finding(
     };
     let in_use_version = super::resolve_in_use_version(
         ctx.dep,
-        ctx.normalized_name.as_str(),
-        ctx.versions.resolved,
-        ctx.versions.resolved_version_candidates,
+        ctx.key,
+        ctx.versions.resolved_map(),
+        ctx.versions.candidates_map(),
         ctx.formatter,
         ecosystem,
     );
@@ -2936,7 +2902,7 @@ fn apply_outdated_rule(
         ctx.versions.latest_status,
         dep,
         vuln_keys,
-        ctx.normalized_name.as_str(),
+        ctx.key,
         latest.as_str(),
         ctx.formatter,
     );

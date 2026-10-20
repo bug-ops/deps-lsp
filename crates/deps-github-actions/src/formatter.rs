@@ -1838,7 +1838,7 @@ mod tests {
     ) -> Option<ConcreteVersion> {
         deps_core::lsp_helpers::resolve_in_use_version(
             d,
-            "embarkstudios/cargo-deny-action",
+            &deps_core::test_util::package_key("embarkstudios/cargo-deny-action"),
             &std::collections::HashMap::new(),
             None,
             fmt,
@@ -2359,7 +2359,7 @@ mod tests {
         d.version_req = Some(written.into());
         deps_core::lsp_helpers::resolve_in_use_version(
             &d,
-            "actions/checkout",
+            &deps_core::test_util::package_key("actions/checkout"),
             &std::collections::HashMap::new(),
             None,
             &fmt,
@@ -2561,7 +2561,7 @@ mod tests {
             d.version_req = Some(comment.into());
             resolve_in_use_versions(
                 &d,
-                "actions/checkout",
+                &deps_core::test_util::package_key("actions/checkout"),
                 &std::collections::HashMap::new(),
                 None,
                 &fmt,
@@ -2639,7 +2639,7 @@ mod tests {
         d.version_req = Some("v4.2.0".into());
         let in_use = resolve_in_use_versions(
             &d,
-            "actions/checkout",
+            &deps_core::test_util::package_key("actions/checkout"),
             &std::collections::HashMap::new(),
             None,
             &fmt,

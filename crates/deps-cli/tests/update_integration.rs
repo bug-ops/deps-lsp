@@ -328,3 +328,129 @@ fn test_apply_plan_dry_run_leaves_the_manifest_byte_for_byte_intact() {
         "dry_run must never write, even though a real edit was planned"
     );
 }
+
+// --- #1869: name spellings through the update planner, on a case-folding ecosystem ---
+
+/// A Composer manifest declaring `Monolog/Monolog`, planned in process with the real Composer
+/// formatter and a registry cache keyed by the normalized spelling. An in-process pipeline
+/// rather than a subprocess: no ecosystem crate exposes a mock registry, and `--offline` leaves
+/// the cache empty. Composer rather than PyPI because the PyPI parser already normalizes the
+/// name it hands out, so its declared and normalized spellings never differ.
+fn plan_monolog(ignore_name: Option<&str>) -> String {
+    use deps_cli::analyze::ManifestAnalysis;
+    use deps_cli::update::ignore::IgnoreRules;
+    use deps_cli::update::plan_updates;
+    use deps_core::lsp_helpers::{DependencyOutcomes, PackageVersions};
+    use deps_core::net_policy::{MapEnv, RegistryEnvironment};
+    use deps_core::policy_config::PolicyConfig;
+    use deps_core::{EcosystemId, EcosystemRegistry, HttpCache, PackageName};
+    use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    let policy = PolicyConfig::default();
+    let runtime =
+        EcosystemRuntime::from_policy(&policy, &RegistryEnvironment::read(&MapEnv::new()));
+    let cache = Arc::new(HttpCache::with_policy(Arc::clone(&runtime.policy)));
+    let registry = EcosystemRegistry::new();
+    let _ = register_ecosystems(&registry, cache, &runtime);
+    let ecosystem = registry
+        .get(EcosystemId::Composer)
+        .expect("the Composer ecosystem is registered");
+    let formatter = ecosystem.formatter();
+
+    let content = "{\n  \"require\": {\n    \"Monolog/Monolog\": \"^2.0\"\n  }\n}\n";
+    let uri = deps_core::test_util::test_uri("/project/composer.json");
+    let parse_result = deps_core::ecosystem::parse_manifest_now(ecosystem.as_ref(), content, &uri)
+        .expect("the fixture parses");
+    let declared = PackageName::new("Monolog/Monolog");
+    assert!(
+        parse_result
+            .dependencies()
+            .iter()
+            .any(|dep| *dep.name() == declared),
+        "the parser must keep the declared spelling"
+    );
+
+    let mut cached = HashMap::new();
+    cached.insert(
+        PackageName::new("monolog/monolog"),
+        PackageVersions::latest_only("3.5.0"),
+    );
+    let analysis = ManifestAnalysis {
+        parse_result,
+        uri,
+        now: deps_core::PublishTime::now(),
+        ecosystem_id: EcosystemId::Composer,
+        cached_versions: cached,
+        resolved_versions: HashMap::new(),
+        resolved_version_candidates: HashMap::new(),
+        outcomes: DependencyOutcomes::new(),
+        vulnerabilities: None,
+        latest_status: None,
+        fallback_status: None,
+        cooldown_fallback_view: None,
+        gossip_findings: HashMap::new(),
+        licenses: HashMap::new(),
+        license_policy: deps_core::licenses::LicensePolicy::default(),
+        license_source: deps_core::LicenseSource::default(),
+        network: deps_core::NetworkMode::Online,
+        fetch_failed: HashSet::new(),
+        registry_unreachable: false,
+        license_fetch_incomplete: false,
+    };
+
+    let ignore_rules = match ignore_name {
+        None => IgnoreRules::empty(),
+        Some(name) => {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let path = dir.path().join("deps.toml");
+            std::fs::write(&path, format!("[[update.ignore]]\nname = \"{name}\"\n"))
+                .expect("write config");
+            let config = deps_cli::config::load(Some(&path), dir.path()).expect("load config");
+            IgnoreRules::new(config.update.ignore, formatter)
+        }
+    };
+    let reparse = |_: &str| -> Option<Box<dyn deps_core::ParseResult>> { None };
+    let plan = plan_updates(
+        &analysis,
+        content,
+        formatter,
+        &reparse,
+        &["monolog/monolog".to_string()],
+        &ignore_rules,
+        deps_core::FreshnessSettings::Disabled,
+        analysis.now,
+    );
+    deps_cli::format::json::render_update(&plan, DryRun::Yes).expect("render the plan as JSON")
+}
+
+/// N3: `--package monolog/monolog` selects `Monolog/Monolog`, and the JSON names it with the
+/// bytes the manifest declares, not the normalized spelling the cache and the filter use.
+#[tokio::test]
+async fn test_update_json_names_the_declared_spelling_for_a_case_folding_ecosystem() {
+    let json = plan_monolog(None);
+    let document: deps_cli::format::json::UpdateReportDocument =
+        serde_json::from_str(&json).expect("stdout must be the versioned JSON document");
+
+    assert_eq!(document.items.len(), 1, "{json}");
+    assert_eq!(document.items[0].name.as_bytes(), b"Monolog/Monolog");
+    assert_eq!(document.items[0].target.as_deref(), Some("3.5.0"));
+}
+
+/// N3: a mixed-case ignore rule matches through the same normalization, and the skipped item
+/// still carries the declared spelling.
+#[tokio::test]
+async fn test_update_mixed_case_ignore_rule_skips_the_declared_name() {
+    let json = plan_monolog(Some("MONOLOG/monolog"));
+    let document: deps_cli::format::json::UpdateReportDocument =
+        serde_json::from_str(&json).expect("stdout must be the versioned JSON document");
+
+    assert_eq!(document.items.len(), 1, "{json}");
+    assert_eq!(document.items[0].name.as_bytes(), b"Monolog/Monolog");
+    assert_eq!(
+        document.items[0].outcome,
+        deps_cli::format::json::OutcomeToken::Skipped,
+        "{json}"
+    );
+}

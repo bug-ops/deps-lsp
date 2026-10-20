@@ -194,10 +194,10 @@ pub(crate) fn resolved_versions_changed(
 ) -> Vec<PackageName> {
     deps.iter()
         .filter_map(|dep| {
-            let normalized = formatter.normalize_package_name(dep.name());
+            let key = deps_core::PackageKey::new(dep.name(), formatter);
             let old = deps_core::lsp_helpers::resolve_in_use_version(
                 *dep,
-                normalized.as_str(),
+                &key,
                 old_resolved,
                 Some(old_candidates),
                 formatter,
@@ -205,7 +205,7 @@ pub(crate) fn resolved_versions_changed(
             );
             let new = deps_core::lsp_helpers::resolve_in_use_version(
                 *dep,
-                normalized.as_str(),
+                &key,
                 new_resolved,
                 Some(new_candidates),
                 formatter,

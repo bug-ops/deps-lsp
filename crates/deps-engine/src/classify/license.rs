@@ -22,7 +22,6 @@
 use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
-use deps_core::NormalizeName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::resolve_in_use_version;
 use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
@@ -195,10 +194,10 @@ pub fn tier3_license_targets(
         .into_iter()
         .filter(|d| formatter.source_is_public_registry_content(&d.source()))
         .filter_map(|d| {
-            let normalized = formatter.normalize_package_name(d.name());
+            let key = deps_core::PackageKey::new(d.name(), formatter);
             let version = resolve_in_use_version(
                 d,
-                normalized.as_str(),
+                &key,
                 resolved_versions,
                 Some(resolved_version_candidates),
                 formatter,

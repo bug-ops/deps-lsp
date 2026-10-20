@@ -8,7 +8,6 @@ pub mod security;
 
 use deps_core::ConcreteVersion;
 use deps_core::NormalizeName;
-use deps_core::PackageName;
 use deps_core::VersionReq;
 use deps_core::edit::{
     EditSpan, ManifestEdit, ManifestReparse, PlannedCurrent, PlannedUpdate, UnplannableReason,
@@ -19,6 +18,7 @@ use deps_core::lsp_helpers::{
     CooldownDisposition, EcosystemFormatter, FallbackEditVerdict, LatestVerdict, PackageVersions,
     cooldown_disposition, fallback_edit_excludes_newer, latest_verdict,
 };
+use deps_core::{NormalizedName, PackageKey, PackageName};
 use std::collections::HashMap;
 
 use crate::analyze::ManifestAnalysis;
@@ -568,42 +568,24 @@ impl PlannedUpdateItem {
 #[must_use]
 pub fn is_requested(
     package_filter: &[String],
-    normalized_name: &str,
+    normalized_name: &NormalizedName,
     formatter: &dyn EcosystemFormatter,
 ) -> bool {
     package_filter.is_empty()
         || package_filter.iter().any(|name| {
-            formatter
-                .normalize_package_name(&PackageName::new(name.clone()))
-                .as_str()
-                == normalized_name
+            formatter.normalize_package_name(&PackageName::new(name.clone())) == *normalized_name
         })
 }
 
-/// The cached registry data for `normalized_name` (or, failing that, `raw_name`) — the shared
-/// lookup [`gossip_excluded_version`] and the unified planner both need (code-review finding:
-/// previously each ran this same two-step `HashMap` lookup independently).
-fn cached_package_versions<'a>(
-    analysis: &'a ManifestAnalysis,
-    normalized_name: &str,
-    raw_name: &str,
-) -> Option<&'a deps_core::lsp_helpers::PackageVersions> {
-    analysis
-        .cached_versions
-        .get(normalized_name)
-        .or_else(|| analysis.cached_versions.get(raw_name))
-}
-
 /// The version [`deps_core::lsp_helpers::PackageVersions::gossip_excluded_version`] recorded
-/// for `normalized_name` (or, failing that, `raw_name`), when the registry fetch's spec 074
-/// GOSSIP-cooldown filter held one back from being `latest` (issue #1521 item 1) — mirrors
-/// `crate::report::to_finding`'s identical lookup for `check`'s own attribution.
+/// for `key`, when the registry fetch's spec 074 GOSSIP-cooldown filter held one back from
+/// being `latest` (issue #1521 item 1) — mirrors `crate::report::to_finding`'s identical
+/// lookup for `check`'s own attribution.
 fn gossip_excluded_version(
     analysis: &ManifestAnalysis,
-    normalized_name: &str,
-    raw_name: &str,
+    key: &PackageKey,
 ) -> Option<deps_core::ConcreteVersion> {
-    cached_package_versions(analysis, normalized_name, raw_name)
+    key.find_in(&analysis.cached_versions)
         .and_then(|v| v.gossip_excluded_version.clone())
 }
 
@@ -842,27 +824,28 @@ pub fn plan_updates(
     // requirement. `None` on a detected collision is deliberate — every lookup keyed on it
     // (the downgrade guard, OSV advisory attribution) then fails closed instead of guessing.
     let mut deps_by_name_range: HashMap<
-        (String, deps_core::position::Range),
+        (NormalizedName, deps_core::position::Range),
         Vec<&dyn deps_core::Dependency>,
     > = HashMap::new();
     for dep in analysis.parse_result.dependencies() {
         deps_by_name_range
             .entry((
-                formatter.normalize_package_name(dep.name()).into_string(),
+                formatter.normalize_package_name(dep.name()),
                 dep.name_range(),
             ))
             .or_default()
             .push(dep);
     }
-    let occurrence_key = |normalized_name: &str, name_range: deps_core::position::Range| {
+    let occurrence_key = |normalized_name: &NormalizedName,
+                          name_range: deps_core::position::Range| {
         let version_range = match deps_by_name_range
-            .get(&(normalized_name.to_string(), name_range))
+            .get(&(normalized_name.clone(), name_range))
             .map(Vec::as_slice)
         {
             Some([dep]) => dep.version_range(),
             _ => None,
         };
-        (normalized_name.to_string(), name_range, version_range)
+        (normalized_name.clone(), name_range, version_range)
     };
 
     // Same collision guard as `dep_by_key` below: a colliding occurrence's fallback candidate is
@@ -956,7 +939,7 @@ pub fn plan_updates(
 /// closing that fully needs the deeper per-occurrence identity plan.md's `OccurrenceCandidate`
 /// design implies.
 type OccurrenceKey = (
-    String,
+    NormalizedName,
     deps_core::position::Range,
     Option<deps_core::position::Range>,
 );
@@ -964,14 +947,12 @@ type OccurrenceKey = (
 /// [`UpdateCandidate`]'s `(normalized_name, name_range)` — the two fields every variant carries
 /// unconditionally, fed into [`plan_updates`]'s `occurrence_key` closure to resolve the full
 /// [`OccurrenceKey`] (including `version_range`) uniformly regardless of Planned/Unplannable.
-fn candidate_identity(candidate: &UpdateCandidate) -> (String, deps_core::position::Range) {
+fn candidate_identity(candidate: &UpdateCandidate) -> (NormalizedName, deps_core::position::Range) {
     match candidate {
-        UpdateCandidate::Planned(p) => (p.normalized_name.clone(), p.name_range),
+        UpdateCandidate::Planned(p) => (p.key.normalized().clone(), p.name_range),
         UpdateCandidate::Unplannable {
-            normalized_name,
-            name_range,
-            ..
-        } => (normalized_name.clone(), *name_range),
+            key, name_range, ..
+        } => (key.normalized().clone(), *name_range),
     }
 }
 
@@ -1000,7 +981,7 @@ fn resolve_from_latest(
             let target = p.target.clone();
             let current = CurrentVersion::from_planned(&p);
             let kind = current.update_kind_to(&p.target);
-            if let Some(reason) = ignore_rules.skip_reason(&p.normalized_name, kind) {
+            if let Some(reason) = ignore_rules.skip_reason(p.key.normalized(), kind) {
                 (
                     current,
                     Outcome::Skipped {
@@ -1020,13 +1001,9 @@ fn resolve_from_latest(
                 )
             }
         }
-        UpdateCandidate::Unplannable {
-            normalized_name,
-            reason,
-            ..
-        } => {
+        UpdateCandidate::Unplannable { key, reason, .. } => {
             let outcome = if let Some(rule_reason) =
-                ignore_rules.skip_reason(&normalized_name, UpdateKind::Unknown)
+                ignore_rules.skip_reason(key.normalized(), UpdateKind::Unknown)
             {
                 Outcome::Skipped {
                     reason: rule_reason,
@@ -1057,21 +1034,14 @@ fn osv_verdict_details(
     status: Option<&deps_core::osv::LatestStatusMap>,
     dep: Option<&dyn deps_core::Dependency>,
     vuln_keys: &deps_core::osv::VulnKeys,
-    normalized_name: &str,
+    key: &PackageKey,
     version: &str,
     formatter: &dyn EcosystemFormatter,
 ) -> OsvVerdictDetails {
     let Some(dep) = dep else {
         return (Vec::new(), None);
     };
-    match latest_verdict(
-        status,
-        dep,
-        Some(vuln_keys),
-        normalized_name,
-        version,
-        formatter,
-    ) {
+    match latest_verdict(status, dep, Some(vuln_keys), key, version, formatter) {
         LatestVerdict::Flagged {
             advisory_ids,
             via_sibling_tags,
@@ -1114,15 +1084,11 @@ fn resolve_occurrence(
     vuln_keys: &deps_core::osv::VulnKeys,
     now: deps_core::PublishTime,
 ) -> PlannedUpdateItem {
-    let (name, normalized_name) = match &latest_candidate {
-        UpdateCandidate::Planned(p) => (p.name.clone(), p.normalized_name.clone()),
-        UpdateCandidate::Unplannable {
-            name,
-            normalized_name,
-            ..
-        } => (name.clone(), normalized_name.clone()),
+    let package_key = match &latest_candidate {
+        UpdateCandidate::Planned(p) => p.key.clone(),
+        UpdateCandidate::Unplannable { key, .. } => key.clone(),
     };
-    let gossip_excluded = gossip_excluded_version(analysis, &normalized_name, &name);
+    let gossip_excluded = gossip_excluded_version(analysis, &package_key);
     let fallback_candidate = fallback_by_key.remove(&key);
 
     let build = |current: CurrentVersion,
@@ -1130,7 +1096,7 @@ fn resolve_occurrence(
                  advisory_ids: Vec<deps_core::osv::OsvId>,
                  cooldown_fallback: Option<CooldownFallbackNote>| {
         PlannedUpdateItem::new(
-            name.clone(),
+            package_key.declared().as_str().to_string(),
             current,
             outcome,
             advisory_ids,
@@ -1140,7 +1106,7 @@ fn resolve_occurrence(
         )
     };
 
-    if !is_requested(package_filter, &normalized_name, formatter) {
+    if !is_requested(package_filter, package_key.normalized(), formatter) {
         let (current, target) = latest_current_target(&latest_candidate);
         return build(
             current,
@@ -1153,14 +1119,13 @@ fn resolve_occurrence(
         );
     }
 
-    let package_versions = cached_package_versions(analysis, &normalized_name, &name);
+    let package_versions = package_key.find_in(&analysis.cached_versions);
     // Security M1: the RAW name — matches `gossip_findings`/`apply_outdated_rule`'s own keying;
     // the normalized name silently hid GOSSIP data for case-changing ecosystems (#1529).
-    let gossip_name = PackageName::new(name.clone());
     let disposition = package_versions.map_or(CooldownDisposition::NotEvaluated, |versions| {
         cooldown_disposition(
             versions,
-            &gossip_name,
+            package_key.declared(),
             freshness,
             Some(&analysis.gossip_findings),
             now,
@@ -1186,7 +1151,7 @@ fn resolve_occurrence(
                         analysis.latest_status.as_ref(),
                         dep_by_key.get(&key).copied(),
                         vuln_keys,
-                        &normalized_name,
+                        &package_key,
                         versions.latest.as_str(),
                         formatter,
                     )
@@ -1274,7 +1239,7 @@ fn resolve_occurrence(
                         );
                         if let FallbackEditVerdict::Rejected(reason) = verdict {
                             tracing::debug!(
-                                package = %normalized_name,
+                                package = ?package_key.normalized(),
                                 fallback = %fb.target,
                                 ?reason,
                                 "fallback edit rejected by fallback_edit_excludes_newer"
@@ -1289,7 +1254,7 @@ fn resolve_occurrence(
                         // edit without ever consulting `[update].ignore`.
                         let current = CurrentVersion::from_planned(&fb);
                         let kind = current.update_kind_to(&fb.target);
-                        if let Some(reason) = ignore_rules.skip_reason(&fb.normalized_name, kind) {
+                        if let Some(reason) = ignore_rules.skip_reason(fb.key.normalized(), kind) {
                             build(
                                 current,
                                 Outcome::Skipped {
@@ -1310,7 +1275,7 @@ fn resolve_occurrence(
                                             analysis.latest_status.as_ref(),
                                             dep_by_key.get(&key).copied(),
                                             vuln_keys,
-                                            &normalized_name,
+                                            &package_key,
                                             latest.as_str(),
                                             formatter,
                                         )
@@ -1359,7 +1324,7 @@ fn resolve_occurrence(
                         // never demoted regardless of why the fallback also failed.
                         resolve_latest_only(latest_candidate)
                     } else if let Some(rule_reason) =
-                        ignore_rules.skip_reason(&normalized_name, UpdateKind::Unknown)
+                        ignore_rules.skip_reason(package_key.normalized(), UpdateKind::Unknown)
                     {
                         // Fix-cycle item 4/S4: an ignored package's OSV-blocked fallback must
                         // not exit non-zero — mirrors `resolve_from_latest`'s identical
@@ -1385,7 +1350,7 @@ fn resolve_occurrence(
                             analysis.fallback_status.as_ref(),
                             dep_by_key.get(&key).copied(),
                             vuln_keys,
-                            &normalized_name,
+                            &package_key,
                             fallback.version.as_str(),
                             formatter,
                         );
@@ -1579,8 +1544,7 @@ mod tests {
     #[test]
     fn test_current_version_from_planned_prefers_resolved_then_declared() {
         let planned = |current: PlannedCurrent| PlannedUpdate {
-            name: "actions/checkout".to_string(),
-            normalized_name: "actions/checkout".to_string(),
+            key: deps_core::test_util::package_key("actions/checkout"),
             name_range: Range::default(),
             current,
             target: ConcreteVersion::from("v7.0.1"),
@@ -2606,15 +2570,19 @@ mod tests {
 
     #[test]
     fn test_is_requested_empty_filter_matches_everything() {
-        assert!(is_requested(&[], "serde", &STUB_FORMATTER));
+        assert!(is_requested(
+            &[],
+            deps_core::test_util::package_key("serde").normalized(),
+            &STUB_FORMATTER
+        ));
         assert!(is_requested(
             &["serde".to_string()],
-            "serde",
+            deps_core::test_util::package_key("serde").normalized(),
             &STUB_FORMATTER
         ));
         assert!(!is_requested(
             &["tokio".to_string()],
-            "serde",
+            deps_core::test_util::package_key("serde").normalized(),
             &STUB_FORMATTER
         ));
     }

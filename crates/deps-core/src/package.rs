@@ -10,7 +10,10 @@
 //! type's documentation for details.
 
 use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::fmt;
+
+use crate::lsp_helpers::{NormalizeName, PackageNaming};
 
 /// A package/crate name as it appears in a manifest file.
 ///
@@ -189,11 +192,16 @@ impl PartialEq<&str> for PackageName {
 ///
 /// A dependency has two spellings: the declared [`PackageName`] and the ecosystem's normalized
 /// form (PyPI folds `My_Pkg` to `my-pkg`, NuGet and Composer fold case). A value of this type
-/// is the second one: the only way to obtain it is
-/// [`NormalizeName::normalize_package_name`](crate::lsp_helpers::NormalizeName::normalize_package_name),
-/// so a map keyed by it cannot be probed with the declared spelling, and a function taking one
-/// cannot be handed `dep.name().as_str()`. Deliberately no `Borrow<str>` and no public
-/// constructor.
+/// is the second one: it is produced only by
+/// [`NormalizeName::normalize_package_name`]
+/// (or [`PackageKey::new`]), so a map keyed by it cannot be probed with the declared spelling
+/// by accident, and a function taking one cannot be handed `dep.name().as_str()`. Deliberately
+/// no `Borrow<str>` and no public constructor.
+///
+/// This guards against passing the wrong spelling, not against a wrong formatter:
+/// [`PackageNaming`] is public and unsealed, so any
+/// implementation can mint a key from an arbitrary string, and nothing binds a key to the
+/// ecosystem whose formatter produced it.
 ///
 /// `Debug` redacts like [`PackageName`]'s, since the text derives from a manifest name.
 ///
@@ -226,7 +234,7 @@ pub struct NormalizedName(String);
 
 impl NormalizedName {
     /// Wraps a spelling a formatter produced; reachable only through
-    /// [`NormalizeName`](crate::lsp_helpers::NormalizeName).
+    /// [`NormalizeName`].
     pub(crate) const fn new(spelling: String) -> Self {
         Self(spelling)
     }
@@ -254,6 +262,100 @@ impl NormalizedName {
 impl fmt::Debug for NormalizedName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&crate::redact::redact_declaration_key(&self.0), f)
+    }
+}
+
+/// A dependency's two lookup spellings, bound together at construction.
+///
+/// Every cache the LSP and CLI layers consult is keyed by either the declared spelling or the
+/// ecosystem-normalized one, depending on which producer filled it. A `PackageKey` carries both
+/// halves, derived from one [`PackageName`] through one formatter in a single call, so a
+/// consumer can no longer pair one dependency's declared name with another's normalized key.
+/// Functions that need the normalized spelling take a `&PackageKey` (or a
+/// [`NormalizedName`]) instead of a `&str`, so `dep.name().as_str()` stops compiling there.
+///
+/// This is misuse-resistant, not unforgeable: the fields are private and there is no `From`,
+/// `Default` or `Deserialize`, but [`Self::new`] trusts the caller that `naming` is the
+/// document's own formatter, and any [`PackageNaming`]
+/// implementation can mint any normalized spelling.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::PackageNaming;
+/// use deps_core::{PackageKey, PackageName};
+/// use std::collections::HashMap;
+///
+/// struct Lowercase;
+/// impl PackageNaming for Lowercase {
+///     fn normalized_spelling(&self, name: &PackageName) -> String {
+///         name.as_str().to_lowercase()
+///     }
+/// }
+///
+/// let key = PackageKey::new(&PackageName::new("Flask"), &Lowercase);
+/// assert_eq!(key.declared().as_str(), "Flask");
+/// assert_eq!(key.normalized().as_str(), "flask");
+///
+/// let mut cache: HashMap<PackageName, u32> = HashMap::new();
+/// cache.insert(PackageName::new("flask"), 3);
+/// assert_eq!(key.find_in(&cache), Some(&3));
+/// ```
+///
+/// A struct literal does not compile, so a key cannot be assembled from unrelated halves:
+///
+/// ```compile_fail
+/// use deps_core::lsp_helpers::{NormalizeName, PackageNaming};
+/// use deps_core::{PackageKey, PackageName};
+///
+/// struct Identity;
+/// impl PackageNaming for Identity {}
+///
+/// let declared = PackageName::new("serde");
+/// let normalized = Identity.normalize_package_name(&declared);
+/// let _ = PackageKey { declared, normalized };
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PackageKey {
+    declared: PackageName,
+    normalized: NormalizedName,
+}
+
+impl PackageKey {
+    /// Derives both spellings of `declared` through `naming`.
+    ///
+    /// The caller asserts that `naming` is the formatter of the document `declared` came from.
+    #[must_use]
+    pub fn new(declared: &PackageName, naming: &(impl PackageNaming + ?Sized)) -> Self {
+        Self {
+            declared: declared.clone(),
+            normalized: naming.normalize_package_name(declared),
+        }
+    }
+
+    /// The name as the manifest spells it.
+    #[must_use]
+    pub const fn declared(&self) -> &PackageName {
+        &self.declared
+    }
+
+    /// The ecosystem-normalized spelling.
+    #[must_use]
+    pub const fn normalized(&self) -> &NormalizedName {
+        &self.normalized
+    }
+
+    /// Looks the package up in a map keyed by [`PackageName`]: the normalized spelling first,
+    /// the declared one second.
+    ///
+    /// The workspace's only dual probe. Producers of these maps disagree on which spelling
+    /// they key by, and a case-folding ecosystem must resolve a dependency the same way on
+    /// every surface (#1832).
+    // TODO(#1873): re-key these maps to `NormalizedName` at the producers; drop the declared probe.
+    #[must_use]
+    pub fn find_in<'m, V>(&self, map: &'m HashMap<PackageName, V>) -> Option<&'m V> {
+        map.get(self.normalized.as_str())
+            .or_else(|| map.get(self.declared.as_str()))
     }
 }
 

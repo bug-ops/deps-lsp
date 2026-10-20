@@ -684,14 +684,13 @@ fn to_finding(
     // Spec 074 FR-005: attribute an `Outdated` finding to an active GOSSIP cooldown when it
     // is the sole reason a newer version was excluded from being "latest" — matched by the
     // occurrence's own (pre-redaction) `PackageName`, never `CheckFinding::dependency_name`
-    // (already redacted by this point, and not guaranteed to equal `cached_versions`'s raw
-    // key). No `deps-core` change: this only reads the additive
+    // (already redacted by this point, and not guaranteed to equal `cached_versions`'s key). No `deps-core` change: this only reads the additive
     // `PackageVersions::gossip_excluded_version` field `deps-engine`'s fetch already set.
     let mut message = diagnostic.message().to_string();
     if classify(diagnostic.kind()) == Category::Outdated
         && let Some(dep) = dep
-        && cached_versions
-            .get(dep.name())
+        && deps_core::PackageKey::new(dep.name(), formatter)
+            .find_in(cached_versions)
             .is_some_and(|v| v.gossip_excluded_version.is_some())
     {
         message.push_str(

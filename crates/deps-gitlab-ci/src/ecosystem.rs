@@ -1,7 +1,6 @@
 //! GitLab CI ecosystem implementation for deps-lsp.
 
 #[cfg(feature = "lsp-responses")]
-use deps_core::NormalizeName;
 #[cfg(test)]
 #[cfg(feature = "lsp-responses")]
 use deps_core::PackageName;
@@ -527,16 +526,14 @@ impl Ecosystem for GitlabCiEcosystem {
                     .as_ref()
                     .map(deps_core::VersionReq::as_str)
             {
-                let normalized_name = self.formatter.normalize_package_name(dep.name());
                 let outcome = await_interactive_fetch(
                     registry.as_ref(),
                     registry.resolve_component_pin(dep.name(), &route, pin, raw),
-                    InteractiveFetchRequest::new(
+                    InteractiveFetchRequest::for_dependency(
                         versions,
                         parse_result.uri(),
-                        dep.name(),
-                        &normalized_name,
-                        &dep_source,
+                        dep,
+                        &self.formatter,
                         FetchContext::Hover,
                     ),
                     AuxiliaryLookup::PinResolution,

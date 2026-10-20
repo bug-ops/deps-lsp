@@ -1,13 +1,11 @@
-use crate::lsp_helpers::NormalizeName;
 use tower_lsp_server::ls_types::{InlayHint, InlayHintKind, InlayHintLabel, InlayHintTooltip};
 
-use crate::{ConcreteVersion, EcosystemConfig, ParseResult};
+use crate::{ConcreteVersion, EcosystemConfig, PackageKey, ParseResult};
 
 use super::diagnostics::{MAX_VERSION_DIAGNOSTIC_CHARS, flagged_detail};
 use super::{
     EcosystemFormatter, LatestVerdict, RequirementGate, RequirementStatus, SiblingMatchNote,
-    VersionData, cached_package_versions_by_name, in_use_version, latest_verdict,
-    sanitize_and_truncate_for_diagnostic,
+    VersionData, in_use_version, latest_verdict, sanitize_and_truncate_for_diagnostic,
 };
 
 /// Sanitizes and caps a version-shaped string (`latest` or `resolved_version`) for
@@ -46,8 +44,8 @@ pub fn generate_inlay_hints(
     let vuln_keys = versions.ecosystem.map(|ecosystem| {
         crate::osv::vulnerability_keys(
             parse_result,
-            versions.resolved,
-            versions.resolved_version_candidates,
+            versions.resolved_map(),
+            versions.candidates_map(),
             formatter,
             ecosystem,
         )
@@ -59,13 +57,8 @@ pub fn generate_inlay_hints(
         };
         let version_range: tower_lsp_server::ls_types::Range = version_range.into();
 
-        let normalized_name = formatter.normalize_package_name(dep.name());
-        let latest_version = cached_package_versions_by_name(
-            versions.cached,
-            normalized_name.as_str(),
-            dep.name().as_str(),
-        )
-        .map(|v| &v.latest);
+        let key = PackageKey::new(dep.name(), formatter);
+        let latest_version = versions.cached_for(&key).map(|v| &v.latest);
         let resolved_version: Option<ConcreteVersion> =
             if formatter.manifest_requirement_is_resolved_version(dep) {
                 dep.version_requirement()
@@ -73,9 +66,9 @@ pub fn generate_inlay_hints(
             } else {
                 in_use_version::resolve_occurrence_version(
                     dep,
-                    normalized_name.as_str(),
-                    versions.resolved,
-                    versions.resolved_version_candidates,
+                    &key,
+                    versions.resolved_map(),
+                    versions.candidates_map(),
                     formatter,
                 )
                 .cloned()
@@ -204,7 +197,7 @@ pub fn generate_inlay_hints(
                     versions.latest_status,
                     dep,
                     vuln_keys.as_ref(),
-                    normalized_name.as_str(),
+                    &key,
                     latest.as_str(),
                     formatter,
                 );
@@ -242,7 +235,7 @@ pub fn generate_inlay_hints(
                     versions.latest_status,
                     dep,
                     vuln_keys.as_ref(),
-                    normalized_name.as_str(),
+                    &key,
                     latest.as_str(),
                     formatter,
                 );

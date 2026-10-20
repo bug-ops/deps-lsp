@@ -1,18 +1,17 @@
-use crate::lsp_helpers::NormalizeName;
 use std::collections::HashSet;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, Range, WorkspaceEdit};
 
 use crate::edit::{FixTargetContext, replacement_text, requirement_is_placeholder_for};
 use crate::osv::ScanOutcome;
-use crate::{Dependency, ParseResult, Registry, VersionReq};
+use crate::{Dependency, PackageKey, ParseResult, Registry, VersionReq};
 
 use super::{
     DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, FetchContext, InteractiveFetch,
     InteractiveFetchRequest, LatestVerdict, LineOffsetTable, NoLiveList,
-    UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, await_interactive_versions,
-    cached_package_versions, candidate_verdict, is_safe_version_string, latest_verdict,
-    literal_span_matches, requirement_is_unsatisfiable, resolve_latest_status,
-    resolve_scan_outcome, single_file_edit, slice_for_range, strip_whitespace, warn_rejected_value,
+    UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, await_interactive_versions, candidate_verdict,
+    is_safe_version_string, latest_verdict, literal_span_matches, requirement_is_unsatisfiable,
+    resolve_latest_status, resolve_scan_outcome, single_file_edit, slice_for_range,
+    strip_whitespace, warn_rejected_value,
 };
 
 /// The vulnerability-fix quickfix built by [`build_vulnerability_fix_action`],
@@ -57,22 +56,22 @@ fn build_vulnerability_fix_action(
     version_req: &str,
     formatter: &dyn EcosystemFormatter,
 ) -> Option<VulnerabilityFixAction> {
-    let normalized_name = formatter.normalize_package_name(dep.name());
+    let key = PackageKey::new(dep.name(), formatter);
     // #394 S2: prefer the version-qualified key so a fix action for one
     // occurrence of a duplicated name is never built from another
     // occurrence's OSV result. See `crate::osv::vulnerability_keys`.
     let vuln_keys = versions.ecosystem.map(|ecosystem| {
         crate::osv::vulnerability_keys(
             parse_result,
-            versions.resolved,
-            versions.resolved_version_candidates,
+            versions.resolved_map(),
+            versions.candidates_map(),
             formatter,
             ecosystem,
         )
     });
     let outcome = versions
         .vulnerabilities
-        .and_then(|m| resolve_scan_outcome(m, dep, vuln_keys.as_ref(), normalized_name.as_str()))?;
+        .and_then(|m| resolve_scan_outcome(m, dep, vuln_keys.as_ref(), &key))?;
     let ScanOutcome::Vulnerable(dv) = outcome else {
         return None;
     };
@@ -81,7 +80,7 @@ fn build_vulnerability_fix_action(
     // calls below rather than re-deriving it twice.
     let latest = versions
         .latest_status
-        .and_then(|m| resolve_latest_status(m, dep, vuln_keys.as_ref(), normalized_name.as_str()));
+        .and_then(|m| resolve_latest_status(m, dep, vuln_keys.as_ref(), &key));
 
     // Planning core (the no-op guard, `is_safe_version_string`, `osv_version_to_native`,
     // `format_version_replacing_for`, and the #462 fix-target-verification gate) lives in
@@ -93,11 +92,7 @@ fn build_vulnerability_fix_action(
         version_range.into(),
         version_req,
         dv,
-        FixTargetContext::new(latest).with_registry(cached_package_versions(
-            versions.cached,
-            dep,
-            formatter,
-        )),
+        FixTargetContext::new(latest).with_registry(versions.cached_for(&key)),
         formatter,
     )
     .ok()?;
@@ -135,11 +130,7 @@ fn build_vulnerability_fix_action(
     // the declared requirement — rewriting the manifest alone would then not
     // clear the diagnostic until the lockfile is regenerated. Say so in the
     // title rather than silently overclaiming.
-    let lockfile_hit = versions
-        .resolved
-        .get(normalized_name.as_str())
-        .or_else(|| versions.resolved.get(dep.name()))
-        .is_some();
+    let lockfile_hit = versions.is_resolved(&key);
 
     // Names only the first (worst-severity, per `recommended_fix`'s sort)
     // advisory id and summarizes the rest — `recommended_fix` can return an
@@ -246,7 +237,7 @@ fn build_unsatisfiable_fix_action(
         return None;
     }
 
-    let package_versions = cached_package_versions(versions.cached, dep, formatter)?;
+    let package_versions = versions.cached_for(&PackageKey::new(dep.name(), formatter))?;
 
     if !requirement_is_unsatisfiable(formatter, version_req, &package_versions.available) {
         return None;
@@ -330,10 +321,10 @@ fn build_replacement_action(
         return None;
     }
 
-    let normalized_name = formatter.normalize_package_name(dep.name());
+    let key = PackageKey::new(dep.name(), formatter);
     let replacement = versions
         .outcomes
-        .and_then(|o| o.deprecation(&normalized_name))
+        .and_then(|o| o.deprecation(key.normalized()))
         .and_then(|dep_info| dep_info.replacement.as_deref())
         .filter(|r| !r.is_empty())?;
 
@@ -542,16 +533,15 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     // dependency must never be looked up against this ecosystem's default registry client,
     // which would offer bogus "update to X" actions for an unrelated package.
     let dep_source = dep.source();
-    let normalized_name = formatter.normalize_package_name(dep.name());
+    let key = PackageKey::new(dep.name(), formatter);
     let (registry_versions, fetch_unverified) = if formatter.can_resolve_source(&dep_source) {
         match await_interactive_versions(
             registry,
-            InteractiveFetchRequest::new(
+            InteractiveFetchRequest::for_dependency(
                 versions,
                 uri,
-                dep.name(),
-                &normalized_name,
-                &dep_source,
+                dep,
+                formatter,
                 FetchContext::CodeAction,
             ),
             crate::freshness::FreshnessSettings::Disabled,
@@ -634,8 +624,8 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     let latest_vuln_keys = versions.ecosystem.map(|ecosystem| {
         crate::osv::vulnerability_keys(
             parse_result,
-            versions.resolved,
-            versions.resolved_version_candidates,
+            versions.resolved_map(),
+            versions.candidates_map(),
             formatter,
             ecosystem,
         )
@@ -680,7 +670,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                     versions.latest_status,
                     dep,
                     latest_vuln_keys.as_ref(),
-                    normalized_name.as_str(),
+                    &key,
                     item.version.as_str(),
                     formatter,
                 )
@@ -689,7 +679,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                     versions.candidate_status,
                     dep,
                     latest_vuln_keys.as_ref(),
-                    normalized_name.as_str(),
+                    &key,
                     item.version.as_str(),
                     formatter,
                 )

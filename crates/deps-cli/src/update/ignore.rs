@@ -1,8 +1,8 @@
 //! `[update].ignore` rule evaluation (#1119, spec 068).
 
-use deps_core::NormalizeName;
+use deps_core::NormalizedName;
 use deps_core::edit::UpdateKind;
-use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::lsp_helpers::{EcosystemFormatter, NormalizeName};
 
 use crate::config::IgnoreRule;
 use crate::update::SkipReason;
@@ -14,7 +14,7 @@ use crate::update::SkipReason;
 /// `deps.toml`, so there are never any rules to evaluate in that case).
 #[derive(Debug, Default)]
 pub struct IgnoreRules {
-    rules: Vec<(String, Option<Vec<crate::config::UpdateTypeToken>>)>,
+    rules: Vec<(NormalizedName, Option<Vec<crate::config::UpdateTypeToken>>)>,
 }
 
 impl IgnoreRules {
@@ -33,7 +33,7 @@ impl IgnoreRules {
             .map(|rule| {
                 let normalized =
                     formatter.normalize_package_name(&deps_core::PackageName::new(rule.name));
-                (normalized.into_string(), rule.update_types)
+                (normalized, rule.update_types)
             })
             .collect();
         Self { rules }
@@ -44,7 +44,7 @@ impl IgnoreRules {
     /// candidate there), since an overridden rule is reported as "would have applied"
     /// independent of whether its scope would actually have matched this update's kind.
     #[must_use]
-    pub fn matches_name(&self, normalized_name: &str) -> bool {
+    pub fn matches_name(&self, normalized_name: &NormalizedName) -> bool {
         self.rules.iter().any(|(name, _)| name == normalized_name)
     }
 
@@ -57,7 +57,11 @@ impl IgnoreRules {
     /// (FR-006): a rule that cannot confirm an update is below its stated threshold treats it
     /// as if it met the threshold.
     #[must_use]
-    pub fn skip_reason(&self, normalized_name: &str, kind: UpdateKind) -> Option<SkipReason> {
+    pub fn skip_reason(
+        &self,
+        normalized_name: &NormalizedName,
+        kind: UpdateKind,
+    ) -> Option<SkipReason> {
         let (_, update_types) = self
             .rules
             .iter()
@@ -79,10 +83,16 @@ mod tests {
     const STUB_FORMATTER: deps_core::test_util::StubFormatter =
         deps_core::test_util::StubFormatter::new().with_package_url_prefix("");
 
+    fn name(declared: &str) -> NormalizedName {
+        deps_core::test_util::package_key(declared)
+            .normalized()
+            .clone()
+    }
+
     #[test]
     fn test_empty_rules_never_skip() {
         let rules = IgnoreRules::empty();
-        assert_eq!(rules.skip_reason("tokio", UpdateKind::Major), None);
+        assert_eq!(rules.skip_reason(&name("tokio"), UpdateKind::Major), None);
     }
 
     #[test]
@@ -95,11 +105,11 @@ mod tests {
             &STUB_FORMATTER,
         );
         assert_eq!(
-            rules.skip_reason("legacy-thing", UpdateKind::Patch),
+            rules.skip_reason(&name("legacy-thing"), UpdateKind::Patch),
             Some(SkipReason::IgnoreRule)
         );
         assert_eq!(
-            rules.skip_reason("legacy-thing", UpdateKind::Unknown),
+            rules.skip_reason(&name("legacy-thing"), UpdateKind::Unknown),
             Some(SkipReason::IgnoreRule)
         );
     }
@@ -114,11 +124,11 @@ mod tests {
             &STUB_FORMATTER,
         );
         assert_eq!(
-            rules.skip_reason("tokio", UpdateKind::Major),
+            rules.skip_reason(&name("tokio"), UpdateKind::Major),
             Some(SkipReason::IgnoreRule)
         );
-        assert_eq!(rules.skip_reason("tokio", UpdateKind::Minor), None);
-        assert_eq!(rules.skip_reason("tokio", UpdateKind::Patch), None);
+        assert_eq!(rules.skip_reason(&name("tokio"), UpdateKind::Minor), None);
+        assert_eq!(rules.skip_reason(&name("tokio"), UpdateKind::Patch), None);
     }
 
     /// FR-006 fail-closed clause: a scoped rule still skips an `Unknown`-classified update,
@@ -133,7 +143,7 @@ mod tests {
             &STUB_FORMATTER,
         );
         assert_eq!(
-            rules.skip_reason("tokio", UpdateKind::Unknown),
+            rules.skip_reason(&name("tokio"), UpdateKind::Unknown),
             Some(SkipReason::IgnoreRule)
         );
     }
@@ -147,6 +157,6 @@ mod tests {
             }],
             &STUB_FORMATTER,
         );
-        assert_eq!(rules.skip_reason("serde", UpdateKind::Major), None);
+        assert_eq!(rules.skip_reason(&name("serde"), UpdateKind::Major), None);
     }
 }

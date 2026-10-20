@@ -10,7 +10,6 @@
 
 use deps_core::ConcreteVersion;
 use deps_core::EcosystemId;
-use deps_core::NormalizeName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::{
     CandidateSiblings, CandidateSiblingsUnknown, CandidateTagSource, OsvNameAvailability,
@@ -347,7 +346,7 @@ pub fn build_scan_targets(
     );
 
     for dep in parse_result.dependencies() {
-        let normalized_name = formatter.normalize_package_name(dep.name());
+        let package_key = deps_core::PackageKey::new(dep.name(), formatter);
         let key = deps_core::osv::vuln_key_for(dep, Some(&keys), formatter);
 
         if !formatter.source_is_public_registry_content(&dep.source()) {
@@ -361,7 +360,7 @@ pub fn build_scan_targets(
         // `manifest_requirement_is_resolved_version`).
         let versions = resolve_in_use_versions(
             dep,
-            normalized_name.as_str(),
+            &package_key,
             resolved_versions,
             Some(resolved_version_candidates),
             formatter,
@@ -469,10 +468,7 @@ fn classify_dep_for_check_targets<'a>(
         return DepCheckClassification::NonRegistrySource;
     }
 
-    let normalized_name = formatter.normalize_package_name(dep.name());
-    let Some(cached) = cached_versions
-        .get(normalized_name.as_str())
-        .or_else(|| cached_versions.get(dep.name()))
+    let Some(cached) = deps_core::PackageKey::new(dep.name(), formatter).find_in(cached_versions)
     else {
         return DepCheckClassification::NoCachedVersions;
     };
