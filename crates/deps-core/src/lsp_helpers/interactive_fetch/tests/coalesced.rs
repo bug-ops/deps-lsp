@@ -232,3 +232,35 @@ async fn a_decoration_writes_no_shared_state() {
         Contact::UNTOUCHED
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_probe_coalesced_onto_a_stalled_request_rearms_the_breaker() {
+    let endpoint = endpoint_of("probe-rearm");
+    let fixture = Fixture::new().with_endpoint(endpoint);
+    let scenario = async {
+        let refused = fixture
+            .two_cancelled_then_a_third(Versions::Untouched(secs(60)))
+            .await;
+        assert_degraded(&refused, NoLiveList::Unverified);
+
+        tokio::time::sleep(BREAKER_OPEN_DURATION).await;
+        fixture
+            .cancelled_with("probe", ms(5500), Versions::Untouched(secs(60)))
+            .await;
+
+        let polled_before = fixture.calls();
+        let after = tokio::time::timeout(
+            ms(100),
+            fixture.enriched("after", Versions::Untouched(secs(60))),
+        )
+        .await
+        .expect("the re-armed breaker refuses without polling");
+        assert_degraded(&after, NoLiveList::Unverified);
+        assert_eq!(fixture.calls(), polled_before);
+    };
+
+    tokio::join!(
+        holds_request(EcosystemId::Cargo, endpoint, secs(300)),
+        scenario
+    );
+}

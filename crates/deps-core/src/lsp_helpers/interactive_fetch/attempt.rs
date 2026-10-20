@@ -201,8 +201,8 @@ impl Drop for AttemptGuard<'_> {
 /// use deps_core::DepsError;
 /// use deps_core::lsp_helpers::InteractiveFetchError;
 ///
-/// let error = DepsError::CacheError("poisoned lock".into());
-/// assert_eq!(error.log_cause(), (None, "cache"));
+/// let error = DepsError::RecentlyFailed;
+/// assert_eq!(error.log_cause(), (None, "recently-failed"));
 /// assert_eq!(InteractiveFetchError::origin(&error), deps_core::ErrorOrigin::Unattributed);
 /// ```
 pub trait InteractiveFetchError {

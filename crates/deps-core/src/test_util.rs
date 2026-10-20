@@ -40,7 +40,10 @@
 
 #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
 pub mod scaling;
+mod stalled_registry;
 mod stub_formatter;
+#[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
+pub use stalled_registry::StalledCoalescingRegistry;
 #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
 pub use stub_formatter::StubFormatter;
 

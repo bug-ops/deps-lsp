@@ -329,8 +329,8 @@ impl GitlabInstanceHost {
             Err(IndexUrlError::BlockedHost { block }) => {
                 tracing::warn!(
                     class = %block.class(),
-                    "registries.gitlab_instance_host is blocked by the current \
-                     registries.workspace_registries policy; treating it as unset for host \
+                    reason = block.reason(),
+                    "registries.gitlab_instance_host is refused; treating it as unset for host \
                      resolution"
                 );
                 InstanceHostOutcome::Blocked {
@@ -548,6 +548,39 @@ mod tests {
         assert!(
             log.contains(&RedactedUrl::new(raw_value).into_inner()),
             "expected the redacted form to still be present: {log}"
+        );
+    }
+
+    /// The blocked-host WARN names the rule that actually refused the value: the floor is not
+    /// a `registries.workspace_registries` setting and must not be blamed on one.
+    #[test]
+    fn test_gitlab_instance_host_block_log_names_the_rule_that_refused_it() {
+        let blocked_log = |raw: &str, level| {
+            let policy = Arc::new(RegistryAccessPolicy::new(level));
+            let handle =
+                GitlabInstanceHost::new(Arc::new(RwLock::new(Some(raw.to_string()))), policy);
+            deps_core::test_util::capture_tracing_output(|| {
+                assert!(handle.get().is_none());
+            })
+        };
+
+        let floor = blocked_log(
+            "127.0.0.1",
+            deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly,
+        );
+        assert!(floor.contains("is never a registry host"), "log: {floor}");
+        assert!(
+            !floor.contains("registries.workspace_registries"),
+            "log: {floor}"
+        );
+
+        let gated = blocked_log(
+            "10.0.0.5",
+            deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly,
+        );
+        assert!(
+            gated.contains("blocked by registries.workspace_registries policy"),
+            "log: {gated}"
         );
     }
 

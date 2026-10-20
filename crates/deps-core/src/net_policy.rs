@@ -1361,7 +1361,19 @@ impl BlockedHost {
     /// The clause naming the rule that refused the host, without the allowlist hint.
     ///
     /// The floor is not a setting, so its clause never blames `registries.workspace_registries`.
-    pub(crate) const fn reason(self) -> &'static str {
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::{BlockedHost, HostClass, WorkspaceRegistryAccess};
+    ///
+    /// let floor = BlockedHost::new(HostClass::Loopback, WorkspaceRegistryAccess::All);
+    /// assert_eq!(floor.reason(), "is never a registry host");
+    /// let gated = BlockedHost::new(HostClass::PrivateV4, WorkspaceRegistryAccess::Off);
+    /// assert_eq!(gated.reason(), "blocked by registries.workspace_registries policy");
+    /// ```
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
         match self.policy {
             BlockingPolicy::Floor => "is never a registry host",
             BlockingPolicy::WorkspaceRegistries(_) => {

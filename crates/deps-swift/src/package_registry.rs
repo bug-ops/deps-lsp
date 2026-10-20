@@ -1236,6 +1236,7 @@ mod tests {
             .list_releases_within(&identity(), PublishedAtLookup::Skip, limits)
             .await
             .unwrap_err();
+        assert_matches!(err, DepsError::BudgetExceeded(LookupBudget::Time));
         assert_matches!(err.fetch_failure(), deps_core::FetchFailure::Transient);
         assert_matches!(
             c.list_releases_within(&identity(), PublishedAtLookup::Skip, limits)

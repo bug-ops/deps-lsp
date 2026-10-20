@@ -1606,7 +1606,9 @@ mod tests {
         let xml =
             b"<metadata><https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x ></metadata>";
 
-        let message = parse_metadata_xml(xml).unwrap_err().to_string();
+        let error = parse_metadata_xml(xml).unwrap_err();
+        assert!(matches!(error, DepsError::ParseError { .. }), "{error:?}");
+        let message = error.to_string();
 
         assert!(!message.contains("ghp_SUPERSECRETTOKEN123"));
         assert!(!message.contains("svcacct"));
@@ -1629,7 +1631,28 @@ mod tests {
         }
         xml.push_str("</versions></versioning></metadata>");
         let result = parse_metadata_xml(xml.as_bytes());
-        assert!(result.is_err(), "expected Err, got {result:?}");
+        assert!(
+            matches!(result, Err(DepsError::BudgetExceeded(LookupBudget::Scan))),
+            "expected the scan budget error, got {result:?}"
+        );
+    }
+
+    /// The per-attempt search timeout is the typed time budget, not a cache error.
+    #[tokio::test(start_paused = true)]
+    async fn test_search_with_retry_timeout_is_a_typed_time_budget_error() {
+        let result = search_with_retry(
+            || async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(Bytes::new())
+            },
+            || None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(DepsError::BudgetExceeded(LookupBudget::Time))),
+            "{result:?}"
+        );
     }
 
     #[test]

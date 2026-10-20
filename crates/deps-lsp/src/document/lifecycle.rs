@@ -2830,7 +2830,7 @@ mod tests {
         }
 
         struct SlowFetchEcosystem {
-            registry: Arc<SlowRegistry>,
+            registry: Arc<dyn Registry>,
         }
         impl Sealed for SlowFetchEcosystem {}
         impl Ecosystem for SlowFetchEcosystem {
@@ -3044,6 +3044,90 @@ mod tests {
                     "no document may be left stuck in Loading once every fetch has completed"
                 );
             }
+        }
+
+        /// #1863: the open path's background fetch must feed the endpoint breaker, so hovers
+        /// that only wait on its request count it. Drives the real `handle_document_open`.
+        #[tokio::test(start_paused = true)]
+        async fn the_open_path_background_fetch_feeds_the_endpoint_breaker() {
+            let state = Arc::new(ServerState::new());
+            let stalled = Arc::new(deps_core::test_util::StalledCoalescingRegistry::new());
+            state
+                .ecosystem_registry
+                .register(Arc::new(SlowFetchEcosystem {
+                    registry: Arc::clone(&stalled) as Arc<dyn Registry>,
+                }));
+            let (client, config) = crate::test_utils::test_helpers::create_test_client_and_config();
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/stalled-open/Cargo.toml",
+            ));
+
+            let background = async {
+                handle_document_open(uri, "x".to_string(), Some(1), state, client, config)
+                    .await
+                    .unwrap()
+                    .await
+                    .unwrap();
+            };
+
+            assert!(
+                stalled
+                    .waiters_open_the_breaker_while(deps_core::EcosystemId::Cargo, background)
+                    .await
+            );
+        }
+
+        /// #1863: the change path's background fetch feeds the endpoint breaker too. Drives the
+        /// real `fetch_registry_versions_for_change`.
+        #[tokio::test(start_paused = true)]
+        async fn the_change_path_background_fetch_feeds_the_endpoint_breaker() {
+            let state = ServerState::new();
+            let stalled = Arc::new(deps_core::test_util::StalledCoalescingRegistry::new());
+            let ecosystem = SlowFetchEcosystem {
+                registry: Arc::clone(&stalled) as Arc<dyn Registry>,
+            };
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+            let url = deps_core::test_util::test_uri("/test/stalled-change/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let parse_result: Box<dyn deps_core::ParseResult> = Box::new(FakeParseResult {
+                uri: url,
+                dep: FakeDependency {
+                    name: PackageName::new("pkg"),
+                    version_requirement: VersionReq::new("*"),
+                },
+            });
+            state.update_document(
+                uri.clone(),
+                DocumentState::new_from_parse_result(
+                    deps_core::EcosystemId::Cargo,
+                    "x".to_string(),
+                    parse_result,
+                ),
+            );
+
+            let background = async {
+                let _ = fetch_registry_versions_for_change(
+                    &uri,
+                    &state,
+                    &client,
+                    &ecosystem,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    vec![PackageName::new("pkg")],
+                    FreshnessSettings::Disabled,
+                    FetchTimeout::constant::<60>(),
+                    deps_core::policy_config::FetchConcurrency::constant::<4>(),
+                    RefetchPolicy::Diff,
+                )
+                .await;
+            };
+
+            assert!(
+                stalled
+                    .waiters_open_the_breaker_while(deps_core::EcosystemId::Cargo, background)
+                    .await
+            );
         }
     }
 

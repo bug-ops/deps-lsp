@@ -1529,6 +1529,9 @@ pub fn apply_fetch_outcomes(
 }
 
 #[cfg(test)]
+mod wiring_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

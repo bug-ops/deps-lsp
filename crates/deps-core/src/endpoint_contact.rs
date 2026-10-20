@@ -326,6 +326,7 @@ impl SharedLedgers {
     }
 }
 
+// Process-global: tests that share it must use a host/ecosystem pair no other test uses.
 static SHARED: LazyLock<SharedLedgers> = LazyLock::new(SharedLedgers::default);
 
 /// Which of an attempt's two views of the wire decided its stall.

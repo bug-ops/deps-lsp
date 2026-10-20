@@ -178,7 +178,7 @@ impl SanitizedRegistryError {
 ///
 /// let status = DepsError::HttpStatus { url: "https://registry.example/x".into(), status: 503 };
 /// assert_eq!(status.origin(), ErrorOrigin::Endpoint);
-/// assert_eq!(DepsError::CacheError("poisoned".into()).origin(), ErrorOrigin::Unattributed);
+/// assert_eq!(DepsError::RecentlyFailed.origin(), ErrorOrigin::Unattributed);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorOrigin {
@@ -832,8 +832,8 @@ impl DepsError {
     /// };
     /// assert!(!outage.is_not_found());
     ///
-    /// let cache_err = DepsError::CacheError("connection reset".into());
-    /// assert!(!cache_err.is_not_found());
+    /// let skipped = DepsError::RecentlyFailed;
+    /// assert!(!skipped.is_not_found());
     /// ```
     #[must_use]
     pub const fn is_not_found(&self) -> bool {
@@ -873,7 +873,7 @@ impl DepsError {
     ///     FetchFailure::Actionable("set GITHUB_TOKEN".into())
     /// );
     ///
-    /// let other = DepsError::CacheError("connection reset".into());
+    /// let other = DepsError::RecentlyFailed;
     /// assert_eq!(other.fetch_failure(), FetchFailure::Transient);
     /// ```
     #[must_use]
@@ -960,7 +960,7 @@ impl DepsError {
     /// let offline = DepsError::Offline { url: "https://crates.io/".into() };
     /// assert!(offline.is_offline());
     ///
-    /// let other = DepsError::CacheError("connection reset".into());
+    /// let other = DepsError::RecentlyFailed;
     /// assert!(!other.is_offline());
     /// ```
     #[must_use]
@@ -979,7 +979,7 @@ impl DepsError {
     /// ```
     /// use deps_core::DepsError;
     ///
-    /// let halted = DepsError::CacheError("reset".into()).into_chain_halt();
+    /// let halted = DepsError::RecentlyFailed.into_chain_halt();
     /// assert!(matches!(halted, DepsError::ChainResolutionHalted));
     /// ```
     #[must_use]
@@ -1173,7 +1173,7 @@ pub enum FetchFailure {
 ///
 /// fn get_version(name: &str) -> Result<String> {
 ///     if name.is_empty() {
-///         return Err(deps_core::error::DepsError::CacheError("empty name".into()));
+///         return Err(deps_core::error::DepsError::parse_error("name", &"empty name"));
 ///     }
 ///     Ok("1.0.0".into())
 /// }

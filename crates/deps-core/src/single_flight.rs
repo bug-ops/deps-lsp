@@ -196,20 +196,45 @@ mod tests {
         );
     }
 
+    /// A reader holding the claim's shard blocks its removal. While it does, dropping the leader
+    /// must not wake a follower: the claim is released first, then the sender is dropped, so a
+    /// woken follower always finds the key free.
     #[tokio::test]
-    async fn the_claim_is_free_by_the_time_a_waiting_follower_wakes() {
-        let flights = Flights::new();
-        let leader = leader(&flights, "key");
-        let waiting = follower(&flights, "key");
-        let woken = async {
-            let value = waiting.wait().await;
-            (value, claim_or_follow(&flights, "key"))
-        };
+    async fn followers_are_woken_only_after_the_claim_is_released() {
+        use std::sync::mpsc;
+        use std::time::Duration;
 
-        let ((value, reclaimed), ()) = tokio::join!(woken, async { drop(leader) });
+        let flights: &'static Flights = Box::leak(Box::new(Flights::new()));
+        let leader = leader(flights, "key");
+        let mut waiting = Box::pin(follower(flights, "key").wait());
 
-        assert_eq!(value, None);
-        assert!(matches!(reclaimed, Claim::Leader(_)));
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            let guard = flights.get(&"key");
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(guard);
+        });
+        held_rx.recv().unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            drop(leader);
+        });
+        started_rx.recv().unwrap();
+
+        tokio::select! {
+            woken = &mut waiting => panic!("follower woke ({woken:?}) while the claim was still held"),
+            () = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+
+        release_tx.send(()).unwrap();
+        assert_eq!(waiting.await, None);
+        assert!(matches!(claim_or_follow(flights, "key"), Claim::Leader(_)));
+        reader.join().unwrap();
+        dropper.join().unwrap();
     }
 
     #[test]

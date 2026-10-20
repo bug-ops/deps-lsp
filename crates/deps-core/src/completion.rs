@@ -2064,6 +2064,9 @@ pub async fn complete_versions_at_position(
 }
 
 #[cfg(test)]
+mod wiring_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::MOCK_FORMATTER;
