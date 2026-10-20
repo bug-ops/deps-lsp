@@ -138,6 +138,10 @@ where
 mod tests {
     use super::*;
 
+    fn claims_as_leader(flights: &FlightMap<&'static str, u32>) -> bool {
+        matches!(claim_or_follow(flights, "key"), Claim::Leader(_))
+    }
+
     type Flights = FlightMap<&'static str, u32>;
 
     fn leader<'a>(flights: &'a Flights, key: &'static str) -> Leader<'a, &'static str, u32> {
@@ -191,7 +195,7 @@ mod tests {
         );
         assert!(flights.is_empty(), "the claim was released");
         assert!(
-            matches!(claim_or_follow(&flights, "key"), Claim::Leader(_)),
+            claims_as_leader(&flights),
             "a promoted follower can claim the key again"
         );
     }
@@ -232,7 +236,7 @@ mod tests {
 
         release_tx.send(()).unwrap();
         assert_eq!(waiting.await, None);
-        assert!(matches!(claim_or_follow(flights, "key"), Claim::Leader(_)));
+        assert!(claims_as_leader(flights));
         reader.join().unwrap();
         dropper.join().unwrap();
     }

@@ -1,4 +1,5 @@
 use super::*;
+use std::assert_matches;
 
 /// The resolved-address decision and its label come from one method: the floor tier
 /// refuses exactly the never-a-registry classes, and the workspace tier refuses whatever
@@ -44,10 +45,10 @@ fn test_addr_guard_refusal_decides_and_labels_in_one_place() {
 // test the "reject any other HTTP host" branch would never run.
 #[test]
 fn test_ensure_https_rejects_non_loopback_http() {
-    assert!(matches!(
+    assert_matches!(
         ensure_https("http://example.com"),
         Err(DepsError::InsecureScheme { .. })
-    ));
+    );
 }
 
 /// #767 M2: `ensure_https`'s error used to bake the raw rejected URL in

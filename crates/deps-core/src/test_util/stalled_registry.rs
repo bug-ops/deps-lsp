@@ -145,7 +145,7 @@ pub async fn waiters_open_the_breaker_while<R: Registry + ?Sized>(
     let gate = InteractiveFetchGate::new(GATE_CONCURRENCY);
     let hovers = async {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        tokio::join!(
+        futures::join!(
             cancelled_hover(
                 registry,
                 &gate,
@@ -167,7 +167,7 @@ pub async fn waiters_open_the_breaker_while<R: Registry + ?Sized>(
         matches!(third, InteractiveFetch::Degraded(NoLiveList::Unverified))
             && started.elapsed() < Duration::from_secs(1)
     };
-    let ((), refused) = tokio::join!(background, hovers);
+    let ((), refused) = futures::join!(background, hovers);
     refused
 }
 

@@ -1745,10 +1745,7 @@ mod tests {
         );
         assert_eq!(insecure.origin(), ErrorOrigin::Unattributed);
         assert_eq!(insecure.safe_tracing_summary(), (None, "insecure-scheme"));
-        assert!(matches!(
-            insecure.into_chain_halt(),
-            DepsError::ChainResolutionHalted
-        ));
+        assert_matches!(insecure.into_chain_halt(), DepsError::ChainResolutionHalted);
 
         let transient = [
             (

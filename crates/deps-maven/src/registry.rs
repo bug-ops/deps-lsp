@@ -1607,7 +1607,7 @@ mod tests {
             b"<metadata><https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x ></metadata>";
 
         let error = parse_metadata_xml(xml).unwrap_err();
-        assert!(matches!(error, DepsError::ParseError { .. }), "{error:?}");
+        assert_matches!(error, DepsError::ParseError { .. }, "{error:?}");
         let message = error.to_string();
 
         assert!(!message.contains("ghp_SUPERSECRETTOKEN123"));
@@ -1631,8 +1631,9 @@ mod tests {
         }
         xml.push_str("</versions></versioning></metadata>");
         let result = parse_metadata_xml(xml.as_bytes());
-        assert!(
-            matches!(result, Err(DepsError::BudgetExceeded(LookupBudget::Scan))),
+        assert_matches!(
+            result,
+            Err(DepsError::BudgetExceeded(LookupBudget::Scan)),
             "expected the scan budget error, got {result:?}"
         );
     }
@@ -1649,8 +1650,9 @@ mod tests {
         )
         .await;
 
-        assert!(
-            matches!(result, Err(DepsError::BudgetExceeded(LookupBudget::Time))),
+        assert_matches!(
+            result,
+            Err(DepsError::BudgetExceeded(LookupBudget::Time)),
             "{result:?}"
         );
     }
@@ -1831,7 +1833,7 @@ mod tests {
 
         let err = registry.search("guava", 20).await.unwrap_err();
 
-        assert!(matches!(err, DepsError::RecentlyFailed), "got {err:?}");
+        assert_matches!(err, DepsError::RecentlyFailed, "got {err:?}");
     }
 
     /// The typed budget and suppression errors stay retry-classified as the `CacheError`s they

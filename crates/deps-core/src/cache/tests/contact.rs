@@ -92,16 +92,18 @@ async fn a_refused_connection_closes_the_request_without_a_response() {
     let url = format!("http://127.0.0.1:{port}/pkg");
     let ledger = ContactLedger::new();
 
+    let started = tokio::time::Instant::now();
     ledger
         .scope(async {
             cache.get_cached(&url).await.unwrap_err();
         })
         .await;
+    let elapsed = started.elapsed();
 
     let contact = ledger.snapshot(tokio::time::Instant::now());
     assert_eq!(contact.response, ResponseSeen::No);
     assert!(
-        contact.stall < Duration::from_secs(1),
-        "a fast transport error accumulates no stall"
+        contact.stall <= elapsed,
+        "a transport error accumulates no stall beyond the request's own duration"
     );
 }

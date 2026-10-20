@@ -257,6 +257,7 @@ mod tests {
     use deps_core::DependencyOutcomes;
     #[cfg(feature = "pypi")]
     use deps_core::EcosystemId;
+    #[cfg(feature = "pypi")]
     use deps_core::NormalizeName;
     #[cfg(feature = "pypi")]
     use deps_core::Registry;

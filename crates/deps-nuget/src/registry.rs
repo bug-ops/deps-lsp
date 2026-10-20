@@ -1769,7 +1769,7 @@ mod tests {
         let error = ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy())
             .unwrap_err();
 
-        assert!(matches!(error, DepsError::ParseError { .. }), "{error:?}");
+        assert_matches!(error, DepsError::ParseError { .. }, "{error:?}");
         assert_eq!(error.fetch_failure(), deps_core::FetchFailure::Transient);
     }
 
