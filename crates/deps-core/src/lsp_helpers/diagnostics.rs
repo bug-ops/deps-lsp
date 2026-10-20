@@ -1794,9 +1794,9 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
         DiagnosticKind::Notice,
         occurrence.range,
         format!(
-            "registry index \"{}\" blocked by registries.workspace_registries policy \
-             (host class: {}; declaration: {}){}",
+            "registry index \"{}\" {} (host class: {}; declaration: {}){}",
             sanitize_and_truncate_for_diagnostic(&redacted_value, MAX_DIAGNOSTIC_VALUE_CHARS),
+            occurrence.block.reason(),
             occurrence.block.class(),
             sanitize_and_truncate_for_diagnostic(&redacted_key, MAX_DIAGNOSTIC_VALUE_CHARS),
             occurrence.block.hint_suffix(),
@@ -4021,7 +4021,7 @@ mod tests {
 
         diagnostics
             .into_iter()
-            .find(|d| d.message().contains("blocked"))
+            .find(|d| d.message().starts_with("registry index"))
             .expect("expected a blocked-registry diagnostic")
     }
 
@@ -4077,6 +4077,42 @@ mod tests {
         assert!(!mentions_allowlist(
             BlockedHost::floor(HostClass::CloudMetadata).unwrap()
         ));
+    }
+
+    #[test]
+    fn test_blocked_registry_diagnostic_blames_the_setting_only_when_it_can_unblock() {
+        use crate::net_policy::{BlockedHost, HostClass, WorkspaceRegistryAccess};
+
+        let message_for = |block| {
+            build_blocked_registry_diagnostic(&BlockedRegistryOccurrence {
+                range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+                block,
+                raw_value: "https://169.254.169.254/index".to_string(),
+                declaration_key: "top-level".to_string(),
+            })
+            .message()
+            .to_string()
+        };
+
+        let floor = message_for(BlockedHost::new(
+            HostClass::CloudMetadata,
+            WorkspaceRegistryAccess::All,
+        ));
+        assert!(floor.contains("is never a registry host"), "{floor}");
+        assert!(
+            !floor.contains("registries.workspace_registries"),
+            "{floor}"
+        );
+        assert!(floor.contains("cloud metadata"), "{floor}");
+
+        let policy = message_for(BlockedHost::new(
+            HostClass::PrivateV4,
+            WorkspaceRegistryAccess::Off,
+        ));
+        assert!(
+            policy.contains("blocked by registries.workspace_registries policy"),
+            "{policy}"
+        );
     }
 
     /// #936: `raw_value` can carry a query-string credential (userinfo is rejected earlier
@@ -4373,7 +4409,7 @@ mod tests {
 
         let blocked_diagnostics: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message().contains("blocked"))
+            .filter(|d| d.message().starts_with("registry index"))
             .collect();
         assert_eq!(
             blocked_diagnostics.len(),
@@ -4605,7 +4641,7 @@ mod tests {
 
         let blocked_diagnostics: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message().contains("blocked"))
+            .filter(|d| d.message().starts_with("registry index"))
             .collect();
         assert_eq!(
             blocked_diagnostics.len(),
@@ -4733,7 +4769,7 @@ mod tests {
 
         let blocked_diagnostic = diagnostics
             .iter()
-            .find(|d| d.message().contains("blocked"))
+            .find(|d| d.message().starts_with("registry index"))
             .expect("expected a blocked-registry diagnostic");
         assert!(
             blocked_diagnostic.message().len() < long_alias.len(),

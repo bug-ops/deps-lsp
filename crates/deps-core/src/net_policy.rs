@@ -945,15 +945,22 @@ pub fn validate_index_url(
         && !policy.permits_url(&url)
     {
         let class = classify_host(&url);
-        tracing::warn!(
-            url = %RedactedUrl::new(raw_for_log),
-            ?class,
-            %ecosystem,
-            "workspace-declared registry index host blocked by registries.workspace_registries policy"
-        );
-        return Err(IndexUrlError::BlockedHost {
-            block: BlockedHost::new(class, policy.get()),
-        });
+        let block = BlockedHost::new(class, policy.get());
+        match block.policy() {
+            BlockingPolicy::Floor => tracing::warn!(
+                url = %RedactedUrl::new(raw_for_log),
+                ?class,
+                %ecosystem,
+                "workspace-declared registry index host is never a registry; rejected"
+            ),
+            BlockingPolicy::WorkspaceRegistries(_) => tracing::warn!(
+                url = %RedactedUrl::new(raw_for_log),
+                ?class,
+                %ecosystem,
+                "workspace-declared registry index host blocked by registries.workspace_registries policy"
+            ),
+        }
+        return Err(IndexUrlError::BlockedHost { block });
     }
     Ok(url)
 }
@@ -1319,16 +1326,22 @@ impl BlockedHost {
         }
     }
 
+    /// The clause naming the rule that refused the host, without the allowlist hint.
+    ///
+    /// The floor is not a setting, so its clause never blames `registries.workspace_registries`.
+    pub(crate) const fn reason(self) -> &'static str {
+        match self.policy {
+            BlockingPolicy::Floor => "is never a registry host",
+            BlockingPolicy::WorkspaceRegistries(_) => {
+                "blocked by registries.workspace_registries policy"
+            }
+        }
+    }
+
     /// The clause explaining the refusal, hint included.
     #[must_use]
     pub fn describe(self) -> String {
-        match self.policy {
-            BlockingPolicy::Floor => "is never a registry host".to_string(),
-            BlockingPolicy::WorkspaceRegistries(_) => format!(
-                "blocked by registries.workspace_registries policy{}",
-                self.hint_suffix()
-            ),
-        }
+        format!("{}{}", self.reason(), self.hint_suffix())
     }
 }
 

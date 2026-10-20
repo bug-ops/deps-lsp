@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-core, deps-nuget, deps-github-actions**: the endpoint circuit breaker opens again for hovers that wait on a background fetch's request (NuGet service index, GitHub Actions per-repository lock); stall is measured as busy time (#PR)
+- **deps-core**: the blocked-registry diagnostic and warning say "is never a registry host" for floor-blocked hosts instead of blaming `registries.workspace_registries` (#PR)
 
 ### Changed
 - **release**: crates.io publishing runs through `scripts/publish-crates.sh`, which publishes in dependency order (#1868)
