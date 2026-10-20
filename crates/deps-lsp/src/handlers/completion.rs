@@ -140,14 +140,11 @@ pub async fn handle_completion(
                 // `documents.get_mut` on the same shard for the duration (#319).
                 let completion_result = tokio::time::timeout(
                     COMPLETION_SEARCH_TIMEOUT,
-                    deps_core::observe_ecosystem(
-                        ecosystem_id,
-                        ecosystem.generate_completions(
-                            parse_result.as_ref(),
-                            position,
-                            &content,
-                            freshness,
-                        ),
+                    ecosystem.generate_completions(
+                        parse_result.as_ref(),
+                        position,
+                        &content,
+                        freshness,
                     ),
                 )
                 .await;
@@ -2938,6 +2935,7 @@ ser"
             {
                 Box::pin(async move {
                     let items = deps_core::completion::complete_versions_generic_replacing(
+                        deps_core::EcosystemId::Cargo,
                         self.registry.as_ref(),
                         &deps_core::test_util::StubFormatter::DEFAULT,
                         &deps_core::PackageName::new("serde"),

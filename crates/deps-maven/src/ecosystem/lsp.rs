@@ -204,6 +204,7 @@ pub(super) async fn complete_self_closing_version(
                 replaced_text: value.to_string(),
             };
             deps_core::completion::complete_versions_generic_replacing(
+                deps_core::EcosystemId::Maven,
                 registry,
                 formatter,
                 dep.name(),

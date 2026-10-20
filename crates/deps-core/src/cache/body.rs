@@ -1,5 +1,6 @@
 //! Capped response-body reading and the per-request body-size limit.
 
+use crate::endpoint_contact::BodyNote;
 use crate::error::{DepsError, Result};
 use crate::redact::RedactedUrl;
 use bytes::{Bytes, BytesMut};
@@ -74,10 +75,15 @@ impl BodyLimit {
 /// `Content-Length`, so the only reliable guard against an oversized or
 /// maliciously amplified (decompression-bomb) response is counting bytes
 /// as they arrive and bailing before the whole body is buffered.
+///
+/// Every chunk is reported to `note`, so a body that stalls after its headers reads as slow
+/// breaker evidence while one that keeps arriving does not; `note` is finished once the body is
+/// complete and abandoned on any error.
 pub(super) async fn read_body_capped(
     url: &str,
     mut response: Response,
     limit: BodyLimit,
+    note: BodyNote,
 ) -> Result<Bytes> {
     let mut body = BytesMut::new();
     let limit = limit.bytes();
@@ -96,8 +102,10 @@ pub(super) async fn read_body_capped(
                 limit,
             });
         }
+        note.progressed();
         body.extend_from_slice(&chunk);
     }
 
+    note.finished();
     Ok(body.freeze())
 }

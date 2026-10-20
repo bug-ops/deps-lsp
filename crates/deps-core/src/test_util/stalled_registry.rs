@@ -3,8 +3,8 @@
 //! breaker opened, and a ready-made NuGet-style registry built on both.
 //!
 //! The breaker opens for hovers that merely wait on a request another task sent only if the
-//! fetch under test tagged that request with [`observe_ecosystem`](crate::observe_ecosystem)
-//! and [`observe_endpoint`](crate::observe_endpoint).
+//! fetch under test tagged that request with an [`EndpointObserver`](crate::EndpointObserver)
+//! (or [`observe_endpoint`](crate::observe_endpoint)).
 
 use std::collections::HashMap;
 use std::future::Future;

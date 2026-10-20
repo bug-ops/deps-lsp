@@ -1993,6 +1993,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         Box::pin(async move {
             let registry = self.registry();
             crate::completion::complete_versions_at_position(
+                self.ecosystem_id(),
                 registry.as_ref(),
                 self.formatter(),
                 request.parse_result,

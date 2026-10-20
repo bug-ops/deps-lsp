@@ -264,7 +264,7 @@ pub use edit::{
     collect_update_candidates, collect_update_edits, dedup_overlapping_edits, plan_verified_fix,
     plan_vulnerability_fix, resolve_recommended_fix, resolve_verified_fix,
 };
-pub use endpoint_contact::{observe_ecosystem, observe_endpoint};
+pub use endpoint_contact::{EndpointObserver, observe_endpoint};
 pub use error::{DepsError, ErrorOrigin, FetchFailure, RateLimitEvidence, Result};
 pub use freshness::{
     CooldownWindow, DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_relative_age,

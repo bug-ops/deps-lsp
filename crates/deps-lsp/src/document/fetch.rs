@@ -169,21 +169,19 @@ pub(crate) async fn fetch_registry_versions_for_change(
     let attempted_names: Vec<PackageName> =
         dep_sources.iter().map(|(name, _)| name.clone()).collect();
     let registry = ecosystem.registry();
-    let fetch_result = deps_core::observe_ecosystem(
+    let fetch_result = fetch_latest_versions_parallel(
         ecosystem.ecosystem_id(),
-        fetch_latest_versions_parallel(
-            registry,
-            dep_sources,
-            &in_use,
-            progress_sender,
-            freshness_settings,
-            fetch_timeout,
-            max_concurrent_fetches,
-            &selection_context,
-            // See `lifecycle.rs`'s identical call site — deps-lsp's own GOSSIP surfacing (spec
-            // 072) does not go through this fetch-level filter.
-            None,
-        ),
+        registry,
+        dep_sources,
+        &in_use,
+        progress_sender,
+        freshness_settings,
+        fetch_timeout,
+        max_concurrent_fetches,
+        &selection_context,
+        // See `lifecycle.rs`'s identical call site — deps-lsp's own GOSSIP surfacing (spec
+        // 072) does not go through this fetch-level filter.
+        None,
     )
     .await;
 
@@ -385,6 +383,7 @@ mod tests {
         let packages = vec![PackageName::new("flaky"), PackageName::new("not-found")];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -617,6 +616,7 @@ dependencies = ["requests>=2.0.0"]
 
             let registry: Arc<dyn Registry> = Arc::new(MockYankedRegistry { pinned_version });
             let fetch_result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 with_registry_source(dep_names),
                 &in_use,

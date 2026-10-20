@@ -9,19 +9,17 @@ use crate::{DependencySource, EcosystemId, FreshnessSettings, PackageName, Selec
 async fn version_completion_tags_its_request_with_the_endpoint() {
     let registry = StalledCoalescingRegistry::new();
     let completion = async {
-        let items = crate::observe_ecosystem(
+        let items = complete_versions_generic_replacing(
             EcosystemId::Cargo,
-            complete_versions_generic_replacing(
-                &registry,
-                &StubFormatter::DEFAULT,
-                &PackageName::new("completed"),
-                &DependencySource::Registry,
-                "",
-                &[],
-                FreshnessSettings::Disabled,
-                None,
-                &SelectionContext::none(),
-            ),
+            &registry,
+            &StubFormatter::DEFAULT,
+            &PackageName::new("completed"),
+            &DependencySource::Registry,
+            "",
+            &[],
+            FreshnessSettings::Disabled,
+            None,
+            &SelectionContext::none(),
         )
         .await;
         drop(items);

@@ -93,6 +93,7 @@ impl MavenEcosystem {
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
         deps_core::completion::complete_versions_generic_from(
+            deps_core::EcosystemId::Maven,
             self.registry.as_ref(),
             &self.formatter,
             package_name,
@@ -330,6 +331,7 @@ impl Ecosystem for MavenEcosystem {
                     ) {
                         Some(dep) => {
                             deps_core::completion::complete_versions_generic_from(
+                                deps_core::EcosystemId::Maven,
                                 self.registry.as_ref(),
                                 &self.formatter,
                                 dep.name(),

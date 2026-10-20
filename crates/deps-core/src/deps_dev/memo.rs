@@ -194,18 +194,6 @@ where
 /// loses that final round gets `None` back.
 const MAX_COALESCE_TAKEOVER_ATTEMPTS: u8 = 2;
 
-/// Test-only synchronization hook, notified exactly when a caller joins [`coalesce`]'s follower
-/// branch (an already-`Occupied` in-flight entry). Regression tests await this to prove a
-/// follower genuinely registered before the leader is cancelled, instead of guessing with a fixed
-/// `sleep` that a slow CI runner can silently invalidate (issue #1464). Process-global by design:
-/// safe under `cargo nextest`'s per-test-process isolation (this workspace's test runner), but a
-/// stale permit could leak across tests sharing one process under plain `cargo test`'s
-/// multi-threaded test harness. Also key-agnostic — it is not scoped per in-flight `key` — so it
-/// must not be reused as-is by a test that exercises more than one key concurrently in the same
-/// process; that would require a per-key signal instead.
-#[cfg(test)]
-static COALESCE_FOLLOWER_JOINED: tokio::sync::Notify = tokio::sync::Notify::const_new();
-
 /// Coalesces concurrent callers for the same in-flight `key`: the first caller (the leader) runs
 /// `fetch` and broadcasts its result to every other concurrent caller for the same key (the
 /// followers) via a [`watch`] channel, instead of a follower returning a default value
@@ -217,10 +205,20 @@ static COALESCE_FOLLOWER_JOINED: tokio::sync::Notify = tokio::sync::Notify::cons
 /// [`MAX_COALESCE_TAKEOVER_ATTEMPTS`]; `in_flight`'s entry for `key` is removed on every path
 /// (including a panic or abort), by dropping its leader handle.
 ///
+/// `on_follow` runs each time a caller joins the follower branch (an already-`Occupied` in-flight
+/// entry). Tests inject a per-test signal through it to prove a follower genuinely registered
+/// before the leader is cancelled (issue #1464), without a process-global that sibling tests under
+/// plain `cargo test` could steal permits from (issue #1870).
+///
 /// Returns `None` when every takeover attempt was exhausted without ever resolving a real
 /// outcome — the caller ([`CoalescedMemo::get_or_fetch`]) maps that explicitly to a degraded
 /// fallback rather than relying on a `Default` value to silently mean failure.
-async fn coalesce<K, T, F, Fut>(in_flight: &FlightMap<K, T>, key: K, fetch: F) -> Option<T>
+async fn coalesce<K, T, F, Fut>(
+    in_flight: &FlightMap<K, T>,
+    key: K,
+    fetch: F,
+    on_follow: &(dyn Fn() + Sync),
+) -> Option<T>
 where
     K: Hash + Eq + Clone + Send + Sync,
     T: Clone + Send + Sync,
@@ -235,8 +233,7 @@ where
                 return Some(value);
             }
             Claim::Follower(follower) => {
-                #[cfg(test)]
-                COALESCE_FOLLOWER_JOINED.notify_one();
+                on_follow();
                 if let Some(value) = follower.wait().await {
                     return Some(value);
                 }
@@ -301,18 +298,23 @@ where
             return outcome;
         }
 
-        coalesce(&self.in_flight, key.clone(), || async {
-            // Re-check the memo now that this call has actually won the leader claim (issue
-            // #1455 critic M1): a leader that finished and wrote the memo between the check
-            // above and this call's claim attempt would otherwise cost a wholly avoidable
-            // duplicate fetch.
-            if let Some(outcome) = self.memo.get_fresh(&key) {
-                return outcome;
-            }
-            let outcome = fetch().await;
-            self.memo.insert(key.clone(), outcome.clone());
-            outcome
-        })
+        coalesce(
+            &self.in_flight,
+            key.clone(),
+            || async {
+                // Re-check the memo now that this call has actually won the leader claim (issue
+                // #1455 critic M1): a leader that finished and wrote the memo between the check
+                // above and this call's claim attempt would otherwise cost a wholly avoidable
+                // duplicate fetch.
+                if let Some(outcome) = self.memo.get_fresh(&key) {
+                    return outcome;
+                }
+                let outcome = fetch().await;
+                self.memo.insert(key.clone(), outcome.clone());
+                outcome
+            },
+            &|| {},
+        )
         .await
         .unwrap_or_else(|| CallOutcome::Degraded(V::default()))
     }
@@ -356,27 +358,38 @@ mod tests {
     async fn coalesce_leader_panic_lets_follower_take_over_and_recover_real_value() {
         let map: Arc<DashMap<u32, watch::Receiver<Slot<u32>>>> = Arc::new(DashMap::new());
 
+        let joined = Arc::new(tokio::sync::Notify::new());
         let leader_map = Arc::clone(&map);
+        let leader_joined = Arc::clone(&joined);
         let leader = tokio::spawn(async move {
-            coalesce(&leader_map, 1u32, || async {
-                // Wait for the follower to actually join (see the Occupied entry and start
-                // waiting on `changed()`) before panicking, instead of guessing with a fixed
-                // sleep — otherwise a stalled test thread could let this leader panic (and its
-                // in-flight entry get cleaned up) before the follower ever calls `coalesce`,
-                // which would let the follower claim leadership itself and never exercise
-                // takeover.
-                tokio::time::timeout(Duration::from_secs(5), COALESCE_FOLLOWER_JOINED.notified())
-                    .await
-                    .expect("follower must join before the leader panics");
-                panic!("leader fetch panics");
-                #[allow(unreachable_code)]
-                0u32
-            })
+            coalesce(
+                &leader_map,
+                1u32,
+                || async {
+                    // Wait for the follower to actually join (see the Occupied entry and start
+                    // waiting on `changed()`) before panicking, instead of guessing with a fixed
+                    // sleep — otherwise a stalled test thread could let this leader panic (and its
+                    // in-flight entry get cleaned up) before the follower ever calls `coalesce`,
+                    // which would let the follower claim leadership itself and never exercise
+                    // takeover.
+                    tokio::time::timeout(Duration::from_secs(5), leader_joined.notified())
+                        .await
+                        .expect("follower must join before the leader panics");
+                    panic!("leader fetch panics");
+                    #[allow(unreachable_code)]
+                    0u32
+                },
+                &|| {},
+            )
             .await
         });
 
         wait_for_claim(&map, &1u32).await;
-        let follower = coalesce(&map, 1u32, || async { 99u32 }).await;
+        let follower_joined = Arc::clone(&joined);
+        let follower = coalesce(&map, 1u32, || async { 99u32 }, &|| {
+            follower_joined.notify_one();
+        })
+        .await;
 
         assert!(
             leader.await.is_err(),
@@ -401,21 +414,32 @@ mod tests {
 
         let leader_map = Arc::clone(&map);
         let leader = tokio::spawn(async move {
-            coalesce(&leader_map, 1u32, || async {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                0u32
-            })
+            coalesce(
+                &leader_map,
+                1u32,
+                || async {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    0u32
+                },
+                &|| {},
+            )
             .await
         });
         wait_for_claim(&map, &1u32).await;
 
         let follower_map = Arc::clone(&map);
-        let follower =
-            tokio::spawn(async move { coalesce(&follower_map, 1u32, || async { 7u32 }).await });
+        let joined = Arc::new(tokio::sync::Notify::new());
+        let follower_joined = Arc::clone(&joined);
+        let follower = tokio::spawn(async move {
+            coalesce(&follower_map, 1u32, || async { 7u32 }, &|| {
+                follower_joined.notify_one();
+            })
+            .await
+        });
         // Wait for the follower to actually join (see the Occupied entry and start waiting on
         // `changed()`) before the leader is cancelled out from under it, instead of guessing
         // with a fixed sleep.
-        tokio::time::timeout(Duration::from_secs(5), COALESCE_FOLLOWER_JOINED.notified())
+        tokio::time::timeout(Duration::from_secs(5), joined.notified())
             .await
             .expect("follower must join before the leader is aborted");
 

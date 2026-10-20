@@ -442,6 +442,7 @@ pub async fn analyze_manifest(
     .await;
 
     let fetch_result = fetch_latest_versions_parallel(
+        ecosystem_id,
         ecosystem.registry(),
         prep.dep_sources,
         &prep.in_use,

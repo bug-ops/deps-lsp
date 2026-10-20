@@ -524,6 +524,7 @@ impl FetchResult {
 ///     let sources = vec![(PackageName::new("time"), DependencySource::Registry)];
 ///
 ///     let result = fetch_latest_versions_parallel(
+///         deps_core::EcosystemId::Cargo,
 ///         Arc::new(SingleVersionRegistry),
 ///         sources,
 ///         &HashMap::new(),
@@ -549,6 +550,7 @@ impl FetchResult {
               per-call-site churn across this module's ~15 production and test call sites"
 )]
 pub async fn fetch_latest_versions_parallel(
+    ecosystem: deps_core::EcosystemId,
     registry: Arc<dyn Registry>,
     package_sources: DepSources,
     in_use: &HashMap<PackageName, Vec<ConcreteVersion>>,
@@ -566,6 +568,8 @@ pub async fn fetch_latest_versions_parallel(
     let wildcard_req = deps_core::VersionReq::new("*");
     let check_yanked = registry.reports_yanked();
 
+    let mut observers: HashMap<deps_core::RegistryEndpoint, deps_core::EndpointObserver> =
+        HashMap::new();
     let results: Vec<_> = stream::iter(package_sources)
         .map(|(name, source)| {
             let registry = Arc::clone(&registry);
@@ -573,11 +577,14 @@ pub async fn fetch_latest_versions_parallel(
             let progress_sender = progress_sender.clone();
             let wildcard_req = &wildcard_req;
             let in_use_versions = in_use.get(&name).cloned().unwrap_or_default();
+            let endpoint = registry.endpoint_for(&name, &source);
+            let observer = observers
+                .entry(endpoint)
+                .or_insert_with(|| deps_core::EndpointObserver::new(ecosystem, endpoint))
+                .clone();
             async move {
-                let endpoint = registry.endpoint_for(&name, &source);
-                deps_core::observe_endpoint(
-                    endpoint,
-                    fetch_and_classify_package(
+                observer
+                    .observe(fetch_and_classify_package(
                         registry.as_ref(),
                         name,
                         source,
@@ -590,9 +597,8 @@ pub async fn fetch_latest_versions_parallel(
                         gossip,
                         &fetched,
                         progress_sender.as_ref(),
-                    ),
-                )
-                .await
+                    ))
+                    .await
             }
         })
         .buffer_unordered(max_concurrent.get())
@@ -1884,6 +1890,7 @@ mod tests {
         let packages = vec![PackageName::new("slow-package")];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -1966,6 +1973,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -2068,6 +2076,7 @@ mod tests {
             .collect();
 
         fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -2182,6 +2191,7 @@ mod tests {
         ];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -2235,6 +2245,7 @@ mod tests {
         let packages = vec![PackageName::new("serde")];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -2295,6 +2306,7 @@ mod tests {
         let packages = vec![PackageName::new("serde")];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -2395,6 +2407,7 @@ mod tests {
         ];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -2500,6 +2513,7 @@ mod tests {
         let packages = vec![PackageName::new("widget")];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -2597,6 +2611,7 @@ mod tests {
         let packages = vec![PackageName::new("vendor/pkg")];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             Arc::clone(&registry) as Arc<dyn Registry>,
             with_registry_source(packages),
             &HashMap::new(),
@@ -2688,6 +2703,7 @@ mod tests {
         let packages = vec![PackageName::new("vendor/pkg")];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             Arc::clone(&registry) as Arc<dyn Registry>,
             with_registry_source(packages),
             &HashMap::new(),
@@ -2775,6 +2791,7 @@ mod tests {
         let packages = vec![PackageName::new("golang.org/x/exp")];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -2855,6 +2872,7 @@ mod tests {
         ];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -2971,6 +2989,7 @@ mod tests {
         let log =
             deps_core::test_util::capture_tracing_output_async_at(tracing::Level::DEBUG, async {
                 let result = fetch_latest_versions_parallel(
+                    deps_core::EcosystemId::Cargo,
                     registry,
                     with_registry_source(packages),
                     &HashMap::new(),
@@ -3066,6 +3085,7 @@ mod tests {
         let packages = vec![PackageName::new("typo-pkg")];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -3102,6 +3122,7 @@ mod tests {
         let packages = vec![PackageName::new("dtolnay/rust-toolchain")];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -3190,6 +3211,7 @@ mod tests {
         let packages = vec![PackageName::new("typo-pkg")];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -3271,6 +3293,7 @@ mod tests {
         let packages = vec![PackageName::new("flaky"), PackageName::new("not-found")];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -3348,6 +3371,7 @@ mod tests {
         let packages = vec![PackageName::new("slow-fallback")];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -3432,6 +3456,7 @@ mod tests {
         ];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -3514,6 +3539,7 @@ mod tests {
         ];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -3595,6 +3621,7 @@ mod tests {
         ];
 
         let result = fetch_latest_versions_parallel(
+            deps_core::EcosystemId::Cargo,
             registry,
             with_registry_source(packages),
             &HashMap::new(),
@@ -3800,6 +3827,7 @@ mod tests {
             );
 
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
@@ -3832,6 +3860,7 @@ mod tests {
             );
 
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
@@ -3859,6 +3888,7 @@ mod tests {
             });
 
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &HashMap::new(),
@@ -3897,6 +3927,7 @@ mod tests {
             );
 
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
@@ -3935,6 +3966,7 @@ mod tests {
             );
 
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
@@ -3973,6 +4005,7 @@ mod tests {
             );
 
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
@@ -4013,6 +4046,7 @@ mod tests {
             );
 
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
@@ -4112,6 +4146,7 @@ mod tests {
             );
 
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 Arc::new(YankedThenFallbackErrorRegistry),
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
@@ -4170,6 +4205,7 @@ mod tests {
             );
 
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
@@ -4205,6 +4241,7 @@ mod tests {
             });
 
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &HashMap::new(),
@@ -4240,6 +4277,7 @@ mod tests {
             });
 
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &HashMap::new(),
@@ -4289,6 +4327,7 @@ mod tests {
             );
 
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
@@ -4322,6 +4361,7 @@ mod tests {
             );
 
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
@@ -4433,6 +4473,7 @@ mod tests {
             });
 
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &HashMap::new(),
@@ -4459,6 +4500,7 @@ mod tests {
             let registry: Arc<dyn Registry> = Arc::new(SingleVersionRegistry { deprecation: None });
 
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &HashMap::new(),
@@ -4633,6 +4675,7 @@ mod tests {
                 );
             }
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 with_registry_source(vec![PackageName::new("pkg")]),
                 &in_use_map,
@@ -5048,6 +5091,7 @@ mod tests {
                 );
             }
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 with_registry_source(vec![PackageName::new("pkg")]),
                 &in_use_map,
@@ -5602,6 +5646,7 @@ mod tests {
                 vec![ConcreteVersion::from("1.0.0")],
             );
             let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
                 registry,
                 with_registry_source(vec![PackageName::new("pkg")]),
                 &in_use_map,

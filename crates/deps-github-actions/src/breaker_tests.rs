@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use deps_core::test_util::{SilentListener, waiters_open_the_breaker_while};
 use deps_core::{
-    DependencySource, EcosystemId, HttpCache, PackageName, Registry, observe_ecosystem,
-    observe_endpoint,
+    DependencySource, EcosystemId, HttpCache, PackageName, Registry, observe_endpoint,
 };
 
 use crate::registry::GithubActionsRegistry;
@@ -14,12 +13,9 @@ use crate::registry::GithubActionsRegistry;
 async fn background_fetch(registry: &GithubActionsRegistry, name: &str) {
     let package = PackageName::new(name);
     let endpoint = registry.endpoint_for(&package, &DependencySource::Registry);
-    observe_ecosystem(
-        EcosystemId::GithubActions,
-        observe_endpoint(endpoint, async {
-            let _ = registry.get_versions(name).await;
-        }),
-    )
+    observe_endpoint(EcosystemId::GithubActions, endpoint, async {
+        let _ = registry.get_versions(name).await;
+    })
     .await;
 }
 

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::endpoint_contact::AttemptContact;
-use crate::{observe_ecosystem, observe_endpoint};
+use crate::observe_endpoint;
 
 const fn ms(millis: u64) -> Duration {
     Duration::from_millis(millis)
@@ -10,37 +10,27 @@ const fn ms(millis: u64) -> Duration {
 
 /// A task of the background fetch that holds one request on `endpoint` for `hold`.
 async fn holds_request(ecosystem: EcosystemId, endpoint: RegistryEndpoint, hold: Duration) {
-    observe_ecosystem(
-        ecosystem,
-        observe_endpoint(endpoint, async move {
-            let _note = note_request();
-            tokio::time::sleep(hold).await;
-        }),
-    )
+    observe_endpoint(ecosystem, endpoint, async move {
+        let _note = note_request();
+        tokio::time::sleep(hold).await;
+    })
     .await;
 }
 
 /// A task that holds the shared lock or cell for `hold` with no request on the wire.
 async fn holds_idle(ecosystem: EcosystemId, endpoint: RegistryEndpoint, hold: Duration) {
-    observe_ecosystem(
-        ecosystem,
-        observe_endpoint(endpoint, tokio::time::sleep(hold)),
-    )
-    .await;
+    observe_endpoint(ecosystem, endpoint, tokio::time::sleep(hold)).await;
 }
 
 /// `count` pages that each answer after a second.
 async fn pages(ecosystem: EcosystemId, endpoint: RegistryEndpoint, count: u32) {
-    observe_ecosystem(
-        ecosystem,
-        observe_endpoint(endpoint, async move {
-            for _ in 0..count {
-                let note = note_request();
-                tokio::time::sleep(secs(1)).await;
-                note.answered();
-            }
-        }),
-    )
+    observe_endpoint(ecosystem, endpoint, async move {
+        for _ in 0..count {
+            let note = note_request();
+            tokio::time::sleep(secs(1)).await;
+            note.answered();
+        }
+    })
     .await;
 }
 

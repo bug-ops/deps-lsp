@@ -23,7 +23,7 @@ use super::response::CredentialPartition;
 use super::response::ResponseValidators;
 use super::response::RevalidationFailure;
 use super::transport::Transport;
-use crate::endpoint_contact::{RequestNote, note_request};
+use crate::endpoint_contact::{BodyNote, RequestNote, note_request};
 use crate::error::{DepsError, Result};
 use crate::net_policy::TrustedPrefix;
 use crate::redact::RedactedUrl;
@@ -32,13 +32,16 @@ use reqwest::{RequestBuilder, Response, StatusCode, header};
 use serde::Serialize;
 use std::sync::atomic::Ordering;
 
-/// Sends `request`, recording the arrival of any response on `note` for the interactive fetch
-/// gate's breaker evidence (see [`crate::endpoint_contact`]).
-async fn send_noted(request: RequestBuilder, url: &str, note: RequestNote) -> Result<Response> {
-    // TODO(#1857): a stalled body after headers reads as Responded; track body progress if mirrors stall mid-stream
+/// Sends `request`, recording the arrival of the response headers on `note` for the interactive
+/// fetch gate's breaker evidence (see [`crate::endpoint_contact`]). The returned [`BodyNote`]
+/// must follow the body: [`read_body_capped`], or [`BodyNote::finished`] when none is read.
+async fn send_noted(
+    request: RequestBuilder,
+    url: &str,
+    note: RequestNote,
+) -> Result<(Response, BodyNote)> {
     let response = request.send().await.map_err(|e| send_error(url, e))?;
-    note.answered();
-    Ok(response)
+    Ok((response, note.headers()))
 }
 
 impl HttpCache {
@@ -611,13 +614,15 @@ impl HttpCache {
             request = request.header(header::IF_MODIFIED_SINCE, last_modified);
         }
 
-        let response = send_noted(request, url, note).await?;
+        let (response, body_note) = send_noted(request, url, note).await?;
 
         if response.status() == StatusCode::NOT_MODIFIED {
+            body_note.finished();
             return Ok(None);
         }
 
         if !response.status().is_success() {
+            body_note.finished();
             return Err(http_status_error(
                 url,
                 response.status(),
@@ -626,7 +631,7 @@ impl HttpCache {
         }
 
         let validators = ResponseValidators::from_headers(response.headers());
-        let body = read_body_capped(url, response, BodyLimit::DEFAULT).await?;
+        let body = read_body_capped(url, response, BodyLimit::DEFAULT, body_note).await?;
         let fresh = validators.into_response(body);
         self.store_entry(cache_key.to_string(), fresh.clone());
 
@@ -671,9 +676,10 @@ impl HttpCache {
 
         let request = apply_request_headers(transport.client().get(url), extra_headers);
 
-        let response = send_noted(request, url, note).await?;
+        let (response, body_note) = send_noted(request, url, note).await?;
 
         if !response.status().is_success() {
+            body_note.finished();
             return Err(http_status_error(
                 url,
                 response.status(),
@@ -682,7 +688,7 @@ impl HttpCache {
         }
 
         let validators = ResponseValidators::from_headers(response.headers());
-        let body = read_body_capped(url, response, BodyLimit::DEFAULT).await?;
+        let body = read_body_capped(url, response, BodyLimit::DEFAULT, body_note).await?;
         let fresh = validators.into_response(body);
         self.store_entry(cache_key.to_string(), fresh.clone());
 
@@ -766,9 +772,11 @@ impl HttpCache {
         self.note_guarded(transport);
         transport.preflight(url).await?;
 
-        let response = send_noted(transport.client().post(url).json(body), url, note).await?;
+        let (response, body_note) =
+            send_noted(transport.client().post(url).json(body), url, note).await?;
 
         if !response.status().is_success() {
+            body_note.finished();
             return Err(http_status_error(
                 url,
                 response.status(),
@@ -776,7 +784,7 @@ impl HttpCache {
             ));
         }
 
-        read_body_capped(url, response, limit).await
+        read_body_capped(url, response, limit, body_note).await
     }
 
     /// GETs `url` and returns the response body, bypassing the entry-map
@@ -901,9 +909,10 @@ impl HttpCache {
 
         let request = apply_request_headers(transport.client().get(url), extra_headers);
 
-        let response = send_noted(request, url, note).await?;
+        let (response, body_note) = send_noted(request, url, note).await?;
 
         if !response.status().is_success() {
+            body_note.finished();
             return Err(http_status_error(
                 url,
                 response.status(),
@@ -912,7 +921,7 @@ impl HttpCache {
         }
 
         let validators = ResponseValidators::from_headers(response.headers());
-        let body = read_body_capped(url, response, limit).await?;
+        let body = read_body_capped(url, response, limit, body_note).await?;
         Ok(validators.into_response(body))
     }
 }
