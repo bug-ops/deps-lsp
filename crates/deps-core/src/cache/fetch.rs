@@ -351,12 +351,12 @@ impl HttpCache {
     /// policy-scoped namespace (see `Self::cache_key`, private) distinct from every other method on
     /// this cache.
     ///
-    /// This gives the *resolved address* the same policy scrutiny `deps_cargo::config::RegistryIndex::new`
+    /// This gives the *resolved address* the same policy scrutiny `deps_cargo::config::RegistryIndex::declared`
     /// already gives the declared URL string at parse time — it does **not**
     /// re-check the initial request URL itself: a caller passing an IP-literal `url` whose
     /// class the policy would reject connects anyway, since `hyper-util`'s connector parses an
     /// IP literal directly and never calls the configured resolver (see
-    /// `BlockedAddrResolver`'s docs, private). `RegistryIndex::new` is the sole, by-design gate for
+    /// `BlockedAddrResolver`'s docs, private). `RegistryIndex::declared` is the sole, by-design gate for
     /// that residual — every caller of this method already went through it.
     ///
     /// If an entry is already cached, a revalidation failure — including a guard rejection

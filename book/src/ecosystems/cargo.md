@@ -49,15 +49,17 @@ URLs are supported; `http://` and any URL carrying `user:pass@` are rejected.
 Cargo's `CARGO_REGISTRIES_<NAME>_INDEX`/`_TOKEN` environment variable overrides are
 also honored.
 
-**Authentication**: a registry token is attached to requests against a registry
-declared in `$CARGO_HOME/config.toml` (or by its own `CARGO_REGISTRIES_<NAME>_INDEX`/`_TOKEN`
-environment variables) only. A registry alias resolved from a workspace
+**Authentication**: a registry token is bound to the registry URL declared in
+`$CARGO_HOME/config.toml` (or by its own `CARGO_REGISTRIES_<NAME>_INDEX`/`_TOKEN` environment
+variables) and is sent to that URL only. A registry alias resolved from a workspace
 `.cargo/config.toml` — a file a cloned, untrusted repository fully controls — never
-gets a credential attached, even if an identically-named alias is configured with
-one in `$CARGO_HOME`, and even if it names the same URL as one. This is deliberate: it prevents a hostile repository from
-redirecting a familiar alias name (e.g. `"github"`) to an attacker-controlled host
+gets a credential attached just because an identically-named alias is configured with
+one in `$CARGO_HOME`: the alias name carries nothing. This is deliberate: it prevents a hostile
+repository from redirecting a familiar alias name (e.g. `"github"`) to an attacker-controlled host
 and harvesting whatever token the user's real, differently-scoped registry of that
-name would have used.
+name would have used. A repository entry that names *the same URL* as your registry (an alias, a
+`registry-index`, or a `[source]` replace-with target) does get your token for that URL, and only
+for that URL, so which entry registers first never matters.
 
 The token is sent verbatim in the `Authorization` header, with no `Bearer` prefix, exactly as
 Cargo itself sends it.

@@ -143,6 +143,27 @@ pub enum ResolutionFailure {
 }
 
 impl SanitizedRegistryError {
+    /// A real [`ErrorOrigin::Endpoint`] transport failure (connection refused on a closed
+    /// loopback port), for tests of code that classifies errors by origin.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "test-only constructor: a setup failure must abort the test"
+    )]
+    pub async fn endpoint_failure_for_test() -> Self {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            listener.local_addr().expect("local addr").port()
+        };
+        reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("nothing listens on the closed port")
+            .into()
+    }
+
     /// The preflight resolution failure this error wraps, or `None` for a transport error.
     #[must_use]
     pub const fn resolution_failure(&self) -> Option<ResolutionFailure> {

@@ -1161,6 +1161,7 @@ impl deps_core::Registry for MavenCentralRegistry {
 mod tests {
     use super::*;
 
+    use deps_core::error::{ResolutionFailure, SanitizedRegistryError};
     use std::assert_matches;
 
     fn freshness(enabled: bool) -> deps_core::FreshnessSettings {
@@ -1843,28 +1844,76 @@ mod tests {
     }
 
     /// The typed budget errors stay retry-classified as the `CacheError`s they replaced: the
-    /// search retry loop retries a timed-out attempt and a scan overrun alike. A suppression
-    /// is terminal: nothing was sent, so a retry would be suppressed again.
+    /// search retry loop retries a timed-out attempt and a scan overrun alike.
     #[test]
-    fn test_typed_budget_errors_stay_retryable() {
+    fn test_budget_overruns_are_retryable() {
         assert!(is_retryable_error(&DepsError::BudgetExceeded(
             LookupBudget::Time
         )));
         assert!(is_retryable_error(&DepsError::BudgetExceeded(
             LookupBudget::Scan
         )));
+    }
+
+    /// A suppression sent nothing, so a retry would be suppressed again.
+    #[test]
+    fn test_recently_failed_suppression_is_not_retried() {
         assert!(!is_retryable_error(&DepsError::RecentlyFailed));
     }
 
-    #[test]
-    fn test_retry_allowlist_covers_only_transient_endpoint_faults() {
-        let status = |status| DepsError::HttpStatus {
+    fn http_status(status: u16) -> DepsError {
+        DepsError::HttpStatus {
             url: "https://repo.example/solrsearch".into(),
             status,
-        };
-        assert!(is_retryable_error(&status(503)));
-        assert!(!is_retryable_error(&status(404)));
-        assert!(!is_retryable_error(&status(429)));
+        }
+    }
+
+    fn registry_error(source: SanitizedRegistryError) -> DepsError {
+        DepsError::RegistryError {
+            package: RedactedUrl::new("https://repo.example/solrsearch"),
+            source,
+        }
+    }
+
+    #[test]
+    fn test_retry_allowlist_http_status_boundaries() {
+        assert!(!is_retryable_error(&http_status(404)));
+        assert!(!is_retryable_error(&http_status(429)));
+        assert!(!is_retryable_error(&http_status(499)));
+        assert!(is_retryable_error(&http_status(500)));
+        assert!(is_retryable_error(&http_status(503)));
+        assert!(is_retryable_error(&http_status(599)));
+        assert!(!is_retryable_error(&http_status(600)));
+    }
+
+    #[tokio::test]
+    async fn test_retry_allowlist_retries_endpoint_transport_failures() {
+        let error = registry_error(SanitizedRegistryError::endpoint_failure_for_test().await);
+        assert_eq!(error.origin(), ErrorOrigin::Endpoint);
+        assert!(is_retryable_error(&error));
+    }
+
+    #[test]
+    fn test_retry_allowlist_does_not_retry_dns_failures() {
+        for failure in [
+            ResolutionFailure::NoAddresses,
+            ResolutionFailure::LookupFailed,
+        ] {
+            let error = registry_error(failure.into());
+            assert_eq!(error.origin(), ErrorOrigin::Unattributed);
+            assert!(!is_retryable_error(&error));
+        }
+    }
+
+    #[test]
+    fn test_retry_allowlist_does_not_retry_an_unparseable_200() {
+        let error = parse_search_response(b"<html>proxy error page</html>", 20).unwrap_err();
+        assert_matches!(error, DepsError::Json(_));
+        assert!(!is_retryable_error(&error));
+    }
+
+    #[test]
+    fn test_retry_allowlist_does_not_retry_configuration_faults() {
         assert!(!is_retryable_error(&DepsError::CacheError(
             "misconfigured".into()
         )));

@@ -107,7 +107,7 @@ impl OperatorPath {
 
     /// The path named by `var` in `source`; see [`EnvPath`].
     #[must_use]
-    pub fn from_env(source: &impl EnvSource, var: OperatorEnvVar) -> EnvPath {
+    pub fn from_env(source: &(impl EnvSource + ?Sized), var: OperatorEnvVar) -> EnvPath {
         match source.var_os(var.name()) {
             None => EnvPath::Unset,
             Some(value) if value.is_empty() => EnvPath::Unset,

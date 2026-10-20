@@ -403,7 +403,7 @@ impl SparseIndexClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AuthToken;
+    use crate::config::{AuthToken, CargoOperator};
     use deps_core::EgressTier;
     use deps_core::net_policy::{OperatorRegistries, RegistryAccessPolicy};
     use std::assert_matches;
@@ -837,10 +837,10 @@ mod tests {
         assert_eq!(versions.len(), 1);
     }
 
-    /// #1855: a token offered for a workspace-declared URL is withheld, so the request goes out
-    /// anonymously over the workspace transport — the credential cannot reach a workspace index.
+    /// #1855: a credential bound to one operator URL is never sent to another URL, so a
+    /// workspace-declared index goes out anonymously over the workspace transport.
     #[tokio::test]
-    async fn test_credential_for_workspace_declared_index_is_never_sent() {
+    async fn test_credential_for_another_url_is_never_sent() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/se/rd/serde")
@@ -851,45 +851,28 @@ mod tests {
             .create_async()
             .await;
 
-        let index = RegistryIndex::declared_with_credential(
-            crate::config::strip_sparse_prefix(&server.url()),
-            &OperatorRegistries::default(),
-            &RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::All),
+        let other = "https://operator.example/index";
+        let mut operator = CargoOperator::declaring(OperatorRegistries::declared_in(
+            &deps_core::config_trust::OperatorPath::for_test("/test/.cargo/config.toml"),
+            [other],
+        ));
+        operator.bind(
+            crate::config::strip_sparse_prefix(other),
             AuthToken::new("secret-token".to_string()),
+        );
+        let index = RegistryIndex::declared_bound(
+            crate::config::strip_sparse_prefix(&server.url()),
+            &operator,
+            &RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::All),
         )
         .unwrap();
         assert_eq!(index.trust(), RegistryTrust::WorkspaceDeclared);
-        assert!(index.credential().is_none());
+        assert!(!index.has_credential());
 
         let client = SparseIndexClient::new(index, Arc::new(HttpCache::new()), "workspace index");
         assert!(!client.has_auth());
         client.get_versions("serde").await.unwrap();
         mock.assert_async().await;
-    }
-
-    /// #767: the withheld-credential `WARN` must not embed a query-string credential carried by
-    /// a workspace-declared index URL.
-    #[tokio::test]
-    async fn test_withheld_credential_warning_redacts_query_string() {
-        let server = mockito::Server::new_async().await;
-        let base = format!(
-            "{}/withheld-redaction?token=super-secret-value",
-            server.url()
-        );
-
-        let output = deps_core::test_util::capture_tracing_output_async(async {
-            let index = RegistryIndex::declared_with_credential(
-                crate::config::strip_sparse_prefix(&base),
-                &OperatorRegistries::default(),
-                &RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::All),
-                AuthToken::new("secret-token".to_string()),
-            )
-            .unwrap();
-            assert!(index.credential().is_none());
-        })
-        .await;
-        assert!(output.contains("credential withheld"), "output: {output}");
-        assert!(!output.contains("super-secret-value"), "output: {output}");
     }
 
     // Issue #455, test-plan item 9 (C2 routing): a successful `(None, WorkspaceDeclared)` fetch

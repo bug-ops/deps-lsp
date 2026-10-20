@@ -127,27 +127,38 @@ impl OperatorRegistries {
         }
     }
 
-    /// The URLs declared by the process environment, given as the values the ecosystem read
-    /// from it (for Cargo, the `CARGO_REGISTRIES_<ALIAS>_INDEX` variables).
+    /// The URLs held by the environment variables `names`, read from `env` here so a URL in the
+    /// set provably came from the environment (for Cargo, the `CARGO_REGISTRIES_<ALIAS>_INDEX`
+    /// variables). `normalize` maps a variable's text to the URL text the ecosystem classifies
+    /// (for Cargo, removing `sparse+`).
     ///
-    /// The environment is operator-owned: a repository cannot set it. Candidates are filtered
-    /// exactly as in [`Self::declared_in`].
+    /// The environment is operator-owned: a repository cannot set it. Unparseable values and
+    /// values carrying userinfo are skipped, as in [`Self::declared_in`]. Misuse-resistant only,
+    /// not unforgeable: `env` is any [`EnvSource`], so the caller asserts it is the process
+    /// environment.
     ///
     /// # Examples
     ///
     /// ```
     /// use deps_core::net_policy::{MapEnv, OperatorRegistries};
     ///
-    /// let set = OperatorRegistries::declared_in_env(&MapEnv::new(), ["https://index.corp.example"]);
+    /// let env = MapEnv::new().with_var("REGISTRY_INDEX", "https://index.corp.example");
+    /// let set = OperatorRegistries::declared_in_env(&env, ["REGISTRY_INDEX"], |raw| raw);
     /// assert!(set.contains_str("https://index.corp.example/"));
     /// ```
     #[must_use]
-    pub fn declared_in_env<S: AsRef<str>>(
-        _env: &impl EnvSource,
-        candidates: impl IntoIterator<Item = S>,
+    pub fn declared_in_env<N: AsRef<str>>(
+        env: &(impl EnvSource + ?Sized),
+        names: impl IntoIterator<Item = N>,
+        normalize: for<'a> fn(&'a str) -> &'a str,
     ) -> Self {
+        let values: Vec<String> = names
+            .into_iter()
+            .filter_map(|name| env.var_os(name.as_ref()))
+            .filter_map(|value| value.into_string().ok())
+            .collect();
         Self {
-            urls: Self::canonical_urls(candidates),
+            urls: Self::canonical_urls(values.iter().map(|value| normalize(value))),
         }
     }
 

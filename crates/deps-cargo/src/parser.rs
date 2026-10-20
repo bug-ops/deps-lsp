@@ -29,12 +29,14 @@
 //! assert_eq!(result.dependencies[0].name, "serde");
 //! ```
 
-use crate::config::{ConfigFileCache, RegistryIndex, RegistryIndexError, SourceReplacement};
+use crate::config::{
+    ConfigFileCache, RegistryIndex, RegistryIndexError, SourceReplacement, strip_sparse_prefix,
+};
 use crate::types::{
     CargoDependency, CargoDependencySection, CustomRegistryOrigin, DependencySource,
 };
 use deps_core::net_policy::{
-    OperatorRegistries, RegistryAccessPolicy, RegistryRejectionClassifier,
+    EnvSource, ProcessEnv, RegistryAccessPolicy, RegistryRejectionClassifier,
 };
 use deps_core::position::Range;
 use deps_core::{DepsError, Result};
@@ -142,6 +144,9 @@ pub struct CargoParseContext {
     /// Memoizes each distinct `.cargo/config.toml`/`$CARGO_HOME/config.toml` file's raw,
     /// unvalidated contents across every parse that reads it.
     pub config_cache: Arc<ConfigFileCache>,
+    /// The environment `CARGO_HOME` and `CARGO_REGISTRIES_*` are read from: the process
+    /// environment in production.
+    env: Arc<dyn EnvSource + Send + Sync>,
 }
 
 impl Default for CargoParseContext {
@@ -175,14 +180,21 @@ impl CargoParseContext {
     /// assert!(Arc::strong_count(&ctx.policy) >= 1);
     /// ```
     #[must_use]
-    pub const fn new(
-        policy: Arc<RegistryAccessPolicy>,
-        config_cache: Arc<ConfigFileCache>,
-    ) -> Self {
+    pub fn new(policy: Arc<RegistryAccessPolicy>, config_cache: Arc<ConfigFileCache>) -> Self {
         Self {
             policy,
             config_cache,
+            env: Arc::new(ProcessEnv),
         }
+    }
+
+    /// Test-only: reads `CARGO_HOME` and `CARGO_REGISTRIES_*` from `env` instead of the process
+    /// environment, which a test cannot mutate.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_env_for_test(mut self, env: deps_core::net_policy::MapEnv) -> Self {
+        self.env = Arc::new(env);
+        self
     }
 }
 
@@ -298,9 +310,9 @@ type AlternateRegistryResolution = (
 ///
 /// Two distinct forms of `CustomRegistry` reach the alias-resolution half of this function:
 /// - `registry-index = "sparse+https://..."` — `url` is already a concrete index URL, so it
-///   resolves directly via [`RegistryIndex::declared`] against an empty operator set, with no
-///   `.cargo/config.toml` lookup and no possible credential (a literal URL in `Cargo.toml` is
-///   workspace-declared by definition).
+///   resolves directly via `RegistryIndex::declared_bound` against what the operator declared,
+///   with no `.cargo/config.toml` alias lookup: it is Trusted, and carries the operator's
+///   credential, exactly when the URL equals one the operator declared.
 /// - `registry = "<alias>"` — `url` is an alias name, which does not parse as a URL, so it
 ///   falls through to alias resolution via `crate::config::resolve` against the
 ///   `.cargo/config.toml` hierarchy plus `$CARGO_HOME/config.toml` (spec FR-003: an alias
@@ -376,16 +388,19 @@ fn resolve_alternate_registries(
         deps_core::net_policy::RegistryRejectionReason,
     > = HashMap::new();
     let mut newly_resolved: Vec<RegistryIndex> = Vec::new();
-    // ASSUMPTION: a literal `registry-index` URL is classified against an empty operator set, so
-    // it is always workspace-declared; the operator set is only built once aliases are resolved.
-    let no_operator = OperatorRegistries::default();
+    // A literal `registry-index` URL is classified like any other: against what the operator
+    // declared, so a URL equal to a `$CARGO_HOME` registry is Trusted and gets its credential.
+    let env = &*ctx.env;
+    let cargo_home_path = crate::config::cargo_home_config_path_with_env(env);
+    let operator =
+        crate::config::cargo_operator_with_env(cargo_home_path.as_ref(), &ctx.config_cache, env);
 
     for value in &raw_values {
         // A literal `registry-index` URL is workspace-declared by construction. Any
         // validation error (not a URL at all — the common case where `value` is actually an
         // alias — or a genuinely invalid URL) falls through to alias resolution below
         // safely: a URL-shaped alias lookup simply won't match any `[registries.*]` entry.
-        match RegistryIndex::declared(value, &no_operator, &ctx.policy) {
+        match RegistryIndex::declared_bound(strip_sparse_prefix(value), &operator, &ctx.policy) {
             Ok(index) => {
                 resolved_by_raw_value.insert(value.clone(), index.clone());
                 newly_resolved.push(index);
@@ -407,13 +422,13 @@ fn resolve_alternate_registries(
         }
     }
 
-    let cargo_home_path = crate::config::cargo_home_config_path();
-    let (config, source_replacement) = crate::config::resolve(
+    let (config, source_replacement) = crate::config::resolve_with_env(
         &aliases,
         workspace_config_paths,
         cargo_home_path.as_ref(),
         &ctx.config_cache,
         &ctx.policy,
+        env,
     );
 
     // A `.cargo/config.toml`/`$CARGO_HOME` alias resolution's own rejection (#1453) — kept

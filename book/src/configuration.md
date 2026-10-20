@@ -128,16 +128,22 @@ mise, a per-project editor environment) is part of your environment and counts a
 tooling's own trust prompt enabled.
 
 Cargo decides egress by the same rule and decides the credential separately: a registry token is
-sent only to an index your `$CARGO_HOME/config.toml` or `CARGO_REGISTRIES_*` variables declare. A
-repository alias that names one of your URLs gets your URL's trust (the policy is skipped) but
-never your token. A relative `CARGO_HOME` is ignored, and a `$CARGO_HOME` registry on a loopback or
+bound to the URL your `$CARGO_HOME/config.toml` or `CARGO_REGISTRIES_*` variables declare it for,
+and is sent to that URL only (never to any other), whichever alias, `registry-index` or `[source]`
+chain names it. A repository alias that names one of your URLs therefore gets your URL's trust (the
+policy is skipped) and your token for that URL; it cannot redirect the token elsewhere. Every
+`CARGO_REGISTRIES_*_INDEX` variable counts, whether or not the manifest references its alias. A
+relative `CARGO_HOME` is ignored, and a `$CARGO_HOME` registry on a loopback or
 link-local host is now rejected like the other ecosystems' (the never-a-registry floor).
 
-**Redirects.** A request that can carry a credential never leaves its origin. An anonymous fetch
-from an operator-owned npm or Go registry *may* follow a redirect to another origin, because proxies
-such as Athens in redirect mode and Artifactory redirect to object storage on purpose; hops to
-never-a-registry hosts and https downgrades are still stopped, and a stopped cross-origin hop is
-logged as a warning. NuGet and Swift keep their anonymous fetches origin-confined by choice.
+**Redirects.** A request that carries a credential header never leaves its origin. An anonymous
+fetch from an operator-owned npm, Go or Cargo registry *may* follow a redirect to another origin,
+because proxies such as Athens in redirect mode and Artifactory redirect to object storage on
+purpose; hops to never-a-registry hosts and https downgrades are still stopped. A hop stopped for a
+credential-bearing or origin-confined request is logged as a warning (once per origin pair);
+anonymous stops are silent. NuGet and Swift keep their anonymous fetches origin-confined by choice.
+A credential written into a registry URL itself (a query or path token) is not a header and is not
+confined, so the server sends no `Referer` and the URL is never handed to a redirect target.
 
 ### Proxies and guarded registry traffic
 

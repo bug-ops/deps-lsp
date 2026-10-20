@@ -3040,7 +3040,10 @@ mod tests {
 
         let cache = Arc::new(HttpCache::new());
         let registry = NpmRegistry::with_base(cache, &trusted_index(&proxy.url()));
-        assert!(registry.get_versions("left-pad").await.is_err());
+        assert_matches!(
+            registry.get_versions("left-pad").await,
+            Err(DepsError::HttpStatus { status: 302, .. })
+        );
     }
 
     fn trusted_index(raw: &str) -> DeclaredNpmRegistry {

@@ -699,7 +699,28 @@ pub fn npm_style_name_boundary(rest: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConcreteVersion, PackageName, VersionReq};
+    use super::{ConcreteVersion, PackageKey, PackageName, VersionReq};
+    use crate::lsp_helpers::PackageNaming;
+    use std::collections::HashMap;
+
+    struct Lowercase;
+    impl PackageNaming for Lowercase {
+        fn normalized_spelling(&self, name: &PackageName) -> String {
+            name.as_str().to_lowercase()
+        }
+    }
+
+    #[test]
+    fn find_in_prefers_the_normalized_spelling_over_the_declared_one() {
+        let key = PackageKey::new(&PackageName::new("Flask"), &Lowercase);
+        let mut map = HashMap::new();
+        map.insert(PackageName::new("Flask"), "declared");
+        map.insert(PackageName::new("flask"), "normalized");
+        assert_eq!(key.find_in(&map), Some(&"normalized"));
+
+        map.remove("flask");
+        assert_eq!(key.find_in(&map), Some(&"declared"));
+    }
 
     #[test]
     fn eq_ignoring_build_metadata_cases() {

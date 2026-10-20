@@ -1852,7 +1852,7 @@ mod tests {
         root
     }
 
-    async fn trusted_versions(root: &GoRegistry) -> Result<Vec<Box<dyn deps_core::Version>>> {
+    async fn trusted_versions(root: &GoRegistry) -> Result<usize> {
         use deps_core::{FreshnessSettings, Registry};
 
         let source = DependencySource::AlternateRegistry {
@@ -1865,6 +1865,7 @@ mod tests {
             FreshnessSettings::default(),
         )
         .await
+        .map(|versions| versions.len())
     }
 
     /// #1856: an anonymous `Trusted` fetch follows a cross-origin redirect, as an Athens proxy in
@@ -1887,7 +1888,7 @@ mod tests {
             .await;
 
         let root = trusted_registry(&proxy.url());
-        assert_eq!(trusted_versions(&root).await.unwrap().len(), 1);
+        assert_eq!(trusted_versions(&root).await.unwrap(), 1);
     }
 
     /// #1856: the never-a-registry floor still stops a `Trusted` fetch's redirect hop.
@@ -1902,7 +1903,12 @@ mod tests {
             .await;
 
         let root = trusted_registry(&proxy.url());
-        assert!(trusted_versions(&root).await.is_err());
+        let client = root.alternate_client("go-proxy:trusted").unwrap();
+        let url = format!("{}/example.com/m/@v/list", proxy.url());
+        assert_matches!(
+            client.fetch_bytes(&url).await,
+            Err(DepsError::HttpStatus { status: 302, .. })
+        );
     }
 
     /// #1444 M2/M3: `get_latest_matching_from`'s `AlternateRegistry` branch must forward the

@@ -348,6 +348,12 @@ fn plan_monolog(ignore_name: Option<&str>) -> String {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
+    // `parse_manifest_now` fails closed outside a tokio runtime context.
+    let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("build a tokio runtime");
+    let _runtime_guard = tokio_runtime.enter();
+
     let policy = PolicyConfig::default();
     let runtime =
         EcosystemRuntime::from_policy(&policy, &RegistryEnvironment::read(&MapEnv::new()));
@@ -427,8 +433,8 @@ fn plan_monolog(ignore_name: Option<&str>) -> String {
 
 /// N3: `--package monolog/monolog` selects `Monolog/Monolog`, and the JSON names it with the
 /// bytes the manifest declares, not the normalized spelling the cache and the filter use.
-#[tokio::test]
-async fn test_update_json_names_the_declared_spelling_for_a_case_folding_ecosystem() {
+#[test]
+fn test_update_json_names_the_declared_spelling_for_a_case_folding_ecosystem() {
     let json = plan_monolog(None);
     let document: deps_cli::format::json::UpdateReportDocument =
         serde_json::from_str(&json).expect("stdout must be the versioned JSON document");
@@ -440,8 +446,8 @@ async fn test_update_json_names_the_declared_spelling_for_a_case_folding_ecosyst
 
 /// N3: a mixed-case ignore rule matches through the same normalization, and the skipped item
 /// still carries the declared spelling.
-#[tokio::test]
-async fn test_update_mixed_case_ignore_rule_skips_the_declared_name() {
+#[test]
+fn test_update_mixed_case_ignore_rule_skips_the_declared_name() {
     let json = plan_monolog(Some("MONOLOG/monolog"));
     let document: deps_cli::format::json::UpdateReportDocument =
         serde_json::from_str(&json).expect("stdout must be the versioned JSON document");

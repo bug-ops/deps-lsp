@@ -171,6 +171,9 @@ pub trait EnvSource: private::Sealed {
     /// The raw value of environment variable `name`.
     fn var_os(&self, name: &str) -> Option<OsString>;
 
+    /// The names of the set variables that start with `prefix` and are valid Unicode.
+    fn var_names_with_prefix(&self, prefix: &str) -> Vec<String>;
+
     /// The system proxy configuration.
     fn system_proxy(&self) -> SystemProxy;
 }
@@ -188,6 +191,13 @@ impl private::Sealed for ProcessEnv {}
 impl EnvSource for ProcessEnv {
     fn var_os(&self, name: &str) -> Option<OsString> {
         std::env::var_os(name)
+    }
+
+    fn var_names_with_prefix(&self, prefix: &str) -> Vec<String> {
+        std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .filter(|name| name.starts_with(prefix))
+            .collect()
     }
 
     fn system_proxy(&self) -> SystemProxy {
@@ -233,6 +243,14 @@ impl private::Sealed for MapEnv {}
 impl EnvSource for MapEnv {
     fn var_os(&self, name: &str) -> Option<OsString> {
         self.vars.get(name).cloned()
+    }
+
+    fn var_names_with_prefix(&self, prefix: &str) -> Vec<String> {
+        self.vars
+            .keys()
+            .filter(|name| name.starts_with(prefix))
+            .cloned()
+            .collect()
     }
 
     fn system_proxy(&self) -> SystemProxy {
