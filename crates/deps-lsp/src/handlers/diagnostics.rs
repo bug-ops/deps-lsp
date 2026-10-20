@@ -2219,7 +2219,7 @@ serde = "1.0.0"
                 .set_resolved_versions_without_bump(resolved, std::collections::HashMap::new());
 
             doc_state.replace_outcomes(deps_core::DependencyOutcomes::new().with_yanked(
-                "left-pad",
+                deps_core::NormalizedName::for_test("left-pad"),
                 ("1.0.1".into(), deps_core::RemovalStatus::AdvisoryDeprecated),
             ));
 

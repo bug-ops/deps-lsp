@@ -7,6 +7,7 @@ use deps_core::Dependency;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::FetchFailure;
+use deps_core::NormalizeName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
 use std::collections::{HashMap, HashSet};
@@ -196,7 +197,7 @@ pub(crate) fn resolved_versions_changed(
             let normalized = formatter.normalize_package_name(dep.name());
             let old = deps_core::lsp_helpers::resolve_in_use_version(
                 *dep,
-                &normalized,
+                normalized.as_str(),
                 old_resolved,
                 Some(old_candidates),
                 formatter,
@@ -204,7 +205,7 @@ pub(crate) fn resolved_versions_changed(
             );
             let new = deps_core::lsp_helpers::resolve_in_use_version(
                 *dep,
-                &normalized,
+                normalized.as_str(),
                 new_resolved,
                 Some(new_candidates),
                 formatter,
@@ -638,7 +639,7 @@ time = "0.1.43"
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.replace_outcomes(DependencyOutcomes::new().with_yanked(
-                    "time",
+                    deps_core::NormalizedName::for_test("time"),
                     (ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked),
                 ));
             }
@@ -664,7 +665,9 @@ time = "0.1.43"
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.signals.outcomes.yanked("time"),
+                doc.signals
+                    .outcomes
+                    .yanked(&deps_core::NormalizedName::for_test("time")),
                 Some(&(ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked))
             );
         }
@@ -695,7 +698,7 @@ time = "0.1.43"
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.replace_outcomes(DependencyOutcomes::new().with_deprecation(
-                    "time",
+                    deps_core::NormalizedName::for_test("time"),
                     Deprecation {
                         reason: Some("archived".to_string()),
                         replacement: None,
@@ -724,7 +727,9 @@ time = "0.1.43"
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.signals.outcomes.deprecation("time"),
+                doc.signals
+                    .outcomes
+                    .deprecation(&deps_core::NormalizedName::for_test("time")),
                 Some(&Deprecation {
                     reason: Some("archived".to_string()),
                     replacement: None,
@@ -759,7 +764,7 @@ time = "0.1.43"
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.replace_outcomes(DependencyOutcomes::new().with_deprecation(
-                    "time",
+                    deps_core::NormalizedName::for_test("time"),
                     Deprecation {
                         reason: Some("archived".to_string()),
                         replacement: None,
@@ -803,7 +808,10 @@ serde = "1.0"
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.signals.outcomes.deprecation("time").is_none(),
+                doc.signals
+                    .outcomes
+                    .deprecation(&deps_core::NormalizedName::for_test("time"))
+                    .is_none(),
                 "removed dependency's deprecation entry must be pruned"
             );
         }
@@ -914,9 +922,12 @@ time = "0.1.44"
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.replace_outcomes(
                     DependencyOutcomes::new()
-                        .with_yanked("time", ("0.1.44".into(), RemovalStatus::Yanked))
+                        .with_yanked(
+                            deps_core::NormalizedName::for_test("time"),
+                            ("0.1.44".into(), RemovalStatus::Yanked),
+                        )
                         .with_deprecation(
-                            "time",
+                            deps_core::NormalizedName::for_test("time"),
                             Deprecation {
                                 reason: Some("archived".to_string()),
                                 replacement: None,
@@ -941,17 +952,25 @@ time = "0.1.43"
             if let Some(old_doc) = state.get_document(&uri) {
                 preserve_cache(&mut doc_state2, &old_doc);
             }
-            doc_state2.signals.outcomes.clear_yanked("time");
+            doc_state2
+                .signals
+                .outcomes
+                .clear_yanked(&deps_core::NormalizedName::for_test("time"));
 
             state.update_document(uri.clone(), doc_state2);
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.signals.outcomes.yanked("time").is_none(),
+                doc.signals
+                    .outcomes
+                    .yanked(&deps_core::NormalizedName::for_test("time"))
+                    .is_none(),
                 "the stale version-level yanked finding must be dropped"
             );
             assert_eq!(
-                doc.signals.outcomes.deprecation("time"),
+                doc.signals
+                    .outcomes
+                    .deprecation(&deps_core::NormalizedName::for_test("time")),
                 Some(&Deprecation {
                     reason: Some("archived".to_string()),
                     replacement: None,
@@ -993,10 +1012,16 @@ time = "0.1.44"
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.replace_outcomes(
                     DependencyOutcomes::new()
-                        .with_yanked("time", ("0.1.44".into(), RemovalStatus::Yanked))
-                        .with_fetch_failure("time", FetchFailure::Transient)
+                        .with_yanked(
+                            deps_core::NormalizedName::for_test("time"),
+                            ("0.1.44".into(), RemovalStatus::Yanked),
+                        )
+                        .with_fetch_failure(
+                            deps_core::NormalizedName::for_test("time"),
+                            FetchFailure::Transient,
+                        )
                         .with_deprecation(
-                            "time",
+                            deps_core::NormalizedName::for_test("time"),
                             Deprecation {
                                 reason: Some("archived".to_string()),
                                 replacement: None,
@@ -1047,15 +1072,23 @@ time = "0.1.43"
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.signals.outcomes.yanked("time").is_none(),
+                doc.signals
+                    .outcomes
+                    .yanked(&deps_core::NormalizedName::for_test("time"))
+                    .is_none(),
                 "the stale version-level yanked finding must be dropped"
             );
             assert!(
-                doc.signals.outcomes.fetch_failure("time").is_none(),
+                doc.signals
+                    .outcomes
+                    .fetch_failure(&deps_core::NormalizedName::for_test("time"))
+                    .is_none(),
                 "the stale fetch-failure finding must be dropped"
             );
             assert_eq!(
-                doc.signals.outcomes.deprecation("time"),
+                doc.signals
+                    .outcomes
+                    .deprecation(&deps_core::NormalizedName::for_test("time")),
                 Some(&Deprecation {
                     reason: Some("archived".to_string()),
                     replacement: None,
@@ -1091,7 +1124,7 @@ time = "0.1.43"
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.replace_outcomes(DependencyOutcomes::new().with_yanked(
-                    "time",
+                    deps_core::NormalizedName::for_test("time"),
                     (ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked),
                 ));
             }
@@ -1132,7 +1165,10 @@ serde = "1.0"
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.signals.outcomes.yanked("time").is_none(),
+                doc.signals
+                    .outcomes
+                    .yanked(&deps_core::NormalizedName::for_test("time"))
+                    .is_none(),
                 "removed dependency's yanked entry must be pruned"
             );
         }
@@ -1171,7 +1207,7 @@ time = "=0.1.43"
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.replace_outcomes(DependencyOutcomes::new().with_yanked(
-                    "time",
+                    deps_core::NormalizedName::for_test("time"),
                     (ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked),
                 ));
             }
@@ -1222,7 +1258,10 @@ time = "=0.1.44"
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.signals.outcomes.yanked("time").is_none(),
+                doc.signals
+                    .outcomes
+                    .yanked(&deps_core::NormalizedName::for_test("time"))
+                    .is_none(),
                 "stale yanked entry against the OLD version must not survive an in-place edit"
             );
         }
@@ -1256,9 +1295,10 @@ time = "0.1.43"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.replace_outcomes(
-                    DependencyOutcomes::new().with_fetch_failure("time", FetchFailure::Transient),
-                );
+                doc.replace_outcomes(DependencyOutcomes::new().with_fetch_failure(
+                    deps_core::NormalizedName::for_test("time"),
+                    FetchFailure::Transient,
+                ));
             }
 
             let content2 = r#"[dependencies]
@@ -1289,7 +1329,11 @@ serde = "1.0"
             // carries `fetch_failed` across the edit, not just the final
             // (already-pruned) state below.
             assert!(
-                doc_state2.signals.outcomes.fetch_failure("time").is_some(),
+                doc_state2
+                    .signals
+                    .outcomes
+                    .fetch_failure(&deps_core::NormalizedName::for_test("time"))
+                    .is_some(),
                 "preserve_cache must carry fetch_failed across an edit"
             );
 
@@ -1305,7 +1349,10 @@ serde = "1.0"
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.signals.outcomes.fetch_failure("time").is_none(),
+                doc.signals
+                    .outcomes
+                    .fetch_failure(&deps_core::NormalizedName::for_test("time"))
+                    .is_none(),
                 "removed dependency's fetch_failed entry must be pruned"
             );
         }
@@ -1374,7 +1421,7 @@ time = "0.1.43"
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.replace_outcomes(DependencyOutcomes::new().with_yanked(
-                    "time",
+                    deps_core::NormalizedName::for_test("time"),
                     (ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked),
                 ));
             }
@@ -1400,7 +1447,9 @@ time = "0.1.43"
             // lockfile in the meantime, nothing here would know.
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.signals.outcomes.yanked("time"),
+                doc.signals
+                    .outcomes
+                    .yanked(&deps_core::NormalizedName::for_test("time")),
                 Some(&(ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked))
             );
         }

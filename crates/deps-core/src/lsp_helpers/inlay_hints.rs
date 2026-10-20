@@ -1,3 +1,4 @@
+use crate::lsp_helpers::NormalizeName;
 use tower_lsp_server::ls_types::{InlayHint, InlayHintKind, InlayHintLabel, InlayHintTooltip};
 
 use crate::{ConcreteVersion, EcosystemConfig, ParseResult};

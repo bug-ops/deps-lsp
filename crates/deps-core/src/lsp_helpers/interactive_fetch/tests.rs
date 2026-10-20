@@ -127,11 +127,12 @@ impl Fixture {
             .with_network(network)
             .with_outcomes(outcomes)
             .with_interactive_fetch_gate(&self.gate);
+        let normalized = crate::NormalizedName::for_test(name);
         let request = InteractiveFetchRequest::new(
             versions,
             manifest,
             &package,
-            name,
+            &normalized,
             source,
             FetchContext::Hover,
         );
@@ -187,7 +188,7 @@ impl Fixture {
 }
 
 fn failing(name: &str, failure: FetchFailure) -> DependencyOutcomes {
-    DependencyOutcomes::new().with_fetch_failure(name, failure)
+    DependencyOutcomes::new().with_fetch_failure(crate::NormalizedName::for_test(name), failure)
 }
 
 fn assert_degraded<T>(result: &InteractiveFetch<T>, expected: NoLiveList) {
@@ -284,6 +285,7 @@ async fn seeding_is_discarded_when_the_gate_was_invalidated_after_the_read() {
     let package = PackageName::new("serde");
     let source = DependencySource::Registry;
     let outcomes = failing("serde", FetchFailure::Transient);
+    let normalized = crate::NormalizedName::for_test("serde");
     let request = InteractiveFetchRequest::new(
         VersionData::new(&fixture.cached, &fixture.resolved)
             .with_ecosystem(EcosystemId::Cargo)
@@ -291,7 +293,7 @@ async fn seeding_is_discarded_when_the_gate_was_invalidated_after_the_read() {
             .with_interactive_fetch_gate(&fixture.gate),
         &fixture.manifest,
         &package,
-        "serde",
+        &normalized,
         &source,
         FetchContext::Hover,
     );
@@ -496,13 +498,14 @@ async fn request_without_a_gate_is_the_plain_bounded_await() {
     let source = DependencySource::Registry;
     let outcomes = failing("serde", FetchFailure::Transient);
     let document = manifest("/project/Cargo.toml");
+    let normalized = crate::NormalizedName::for_test("serde");
     let request = InteractiveFetchRequest::new(
         VersionData::new(&cached, &resolved)
             .with_ecosystem(EcosystemId::Cargo)
             .with_outcomes(&outcomes),
         &document,
         &package,
-        "serde",
+        &normalized,
         &source,
         FetchContext::CodeAction,
     );
@@ -589,6 +592,7 @@ impl Fixture {
         let package = PackageName::new(name);
         let source = DependencySource::Registry;
         let outcomes = DependencyOutcomes::new();
+        let normalized = crate::NormalizedName::for_test(name);
         let request = InteractiveFetchRequest::new(
             VersionData::new(&self.cached, &self.resolved)
                 .with_ecosystem(self.ecosystem)
@@ -596,7 +600,7 @@ impl Fixture {
                 .with_interactive_fetch_gate(&self.gate),
             &self.manifest,
             &package,
-            name,
+            &normalized,
             &source,
             context,
         );
@@ -869,6 +873,7 @@ async fn public_entry_point_shares_the_registry_list() {
     let package = PackageName::new("serde");
     let source = DependencySource::Registry;
     let outcomes = DependencyOutcomes::new();
+    let normalized = crate::NormalizedName::for_test("serde");
     let request = InteractiveFetchRequest::new(
         VersionData::new(&fixture.cached, &fixture.resolved)
             .with_ecosystem(EcosystemId::Cargo)
@@ -876,7 +881,7 @@ async fn public_entry_point_shares_the_registry_list() {
             .with_interactive_fetch_gate(&fixture.gate),
         &fixture.manifest,
         &package,
-        "serde",
+        &normalized,
         &source,
         FetchContext::CodeAction,
     );
@@ -1876,6 +1881,7 @@ fn route_of(
     let package = PackageName::new(name);
     let source = DependencySource::Registry;
     let outcomes = DependencyOutcomes::new();
+    let normalized = crate::NormalizedName::for_test(name);
     let request = InteractiveFetchRequest::new(
         VersionData::new(&fixture.cached, &fixture.resolved)
             .with_ecosystem(ecosystem)
@@ -1883,7 +1889,7 @@ fn route_of(
             .with_interactive_fetch_gate(&fixture.gate),
         &fixture.manifest,
         &package,
-        name,
+        &normalized,
         &source,
         FetchContext::Hover,
     );
@@ -2430,3 +2436,4 @@ async fn a_latest_fallback_is_not_starved_by_a_saturated_gate() {
 }
 
 mod coalesced;
+mod normalized_key;

@@ -781,7 +781,7 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
 /// soft ranking hint, not a security gate, so an approximate (not exact PEP 503)
 /// equivalence is an acceptable trade for staying ecosystem-agnostic —
 /// [`build_package_completion`] has no access to any ecosystem's
-/// `PackageNaming::normalize_package_name`. Compares `char`-by-`char` rather than
+/// `NormalizeName::normalize_package_name`. Compares `char`-by-`char` rather than
 /// byte-slicing `candidate` at `prefix.len()`, which would panic when that byte offset
 /// falls inside a multi-byte `char` in `candidate`.
 ///

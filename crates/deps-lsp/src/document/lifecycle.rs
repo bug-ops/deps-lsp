@@ -23,6 +23,7 @@ use deps_core::ConcreteVersion;
 use deps_core::DependencyOutcomes;
 use deps_core::Ecosystem;
 use deps_core::FetchFailure;
+use deps_core::NormalizeName;
 use deps_core::PackageName;
 use deps_core::Result;
 use deps_core::VersionReq;
@@ -2443,9 +2444,12 @@ mod tests {
             );
             doc.replace_outcomes(
                 DependencyOutcomes::new()
-                    .with_fetch_failure("serde", FetchFailure::Transient)
+                    .with_fetch_failure(
+                        deps_core::NormalizedName::for_test("serde"),
+                        FetchFailure::Transient,
+                    )
                     .with_yanked(
-                        "other",
+                        deps_core::NormalizedName::for_test("other"),
                         (ConcreteVersion::new("2.0.0"), RemovalStatus::Yanked),
                     ),
             );
@@ -2461,14 +2465,19 @@ mod tests {
                 "cached_versions must be dropped"
             );
             assert_eq!(
-                doc.signals.outcomes.fetch_failure("serde"),
+                doc.signals
+                    .outcomes
+                    .fetch_failure(&deps_core::NormalizedName::for_test("serde")),
                 Some(&FetchFailure::NotAttempted),
                 "the stale fetch-failure finding must be replaced with a NotAttempted \
                  placeholder, not left absent (S1: an absent entry surviving into a \
                  concurrent empty-diff commit renders as the misleading 'Unknown package')"
             );
             assert!(
-                doc.signals.outcomes.yanked("other").is_some(),
+                doc.signals
+                    .outcomes
+                    .yanked(&deps_core::NormalizedName::for_test("other"))
+                    .is_some(),
                 "a yanked finding on a different package must survive untouched"
             );
             assert_eq!(
@@ -2493,7 +2502,10 @@ mod tests {
 
             assert!(doc.signals.cached_versions.is_empty());
             assert!(
-                doc.signals.outcomes.fetch_failure("serde").is_none(),
+                doc.signals
+                    .outcomes
+                    .fetch_failure(&deps_core::NormalizedName::for_test("serde"))
+                    .is_none(),
                 "a dependency outside deps_to_fetch must not be given a placeholder"
             );
         }

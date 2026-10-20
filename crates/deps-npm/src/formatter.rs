@@ -674,6 +674,7 @@ impl OsvNaming for NpmFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::NormalizeName;
     use deps_core::lsp_helpers::RequirementGate;
     use std::assert_matches;
 
@@ -859,11 +860,11 @@ mod tests {
         let formatter = NpmFormatter;
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("react")),
-            "react"
+            deps_core::NormalizedName::for_test("react")
         );
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("@types/node")),
-            "@types/node"
+            deps_core::NormalizedName::for_test("@types/node")
         );
     }
 

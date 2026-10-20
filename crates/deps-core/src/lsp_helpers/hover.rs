@@ -1,3 +1,4 @@
+use crate::lsp_helpers::NormalizeName;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -149,7 +150,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         versions,
         parse_result.uri(),
         dep.name(),
-        normalized_name.as_str(),
+        &normalized_name,
         &dep_source,
         FetchContext::Hover,
     );
@@ -298,7 +299,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             versions.latest_status,
             dep,
             vuln_keys.as_ref(),
-            &normalized_name,
+            normalized_name.as_str(),
             latest_ver,
             formatter,
         ),
@@ -316,16 +317,16 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     let vuln_outcome = versions
         .vulnerabilities
-        .and_then(|m| resolve_scan_outcome(m, dep, vuln_keys.as_ref(), &normalized_name));
+        .and_then(|m| resolve_scan_outcome(m, dep, vuln_keys.as_ref(), normalized_name.as_str()));
     let deprecation = versions
         .outcomes
         .and_then(|o| o.deprecation(&normalized_name));
     // Package-level context (#205) renders before per-version security advisories:
     // deprecation is a property of the package, advisories of the version.
     push_deprecation_hover_section(&mut markdown, formatter, deprecation);
-    let latest_status_for_dep = versions
-        .latest_status
-        .and_then(|m| super::resolve_latest_status(m, dep, vuln_keys.as_ref(), &normalized_name));
+    let latest_status_for_dep = versions.latest_status.and_then(|m| {
+        super::resolve_latest_status(m, dep, vuln_keys.as_ref(), normalized_name.as_str())
+    });
     push_vulnerability_hover_section(
         &mut markdown,
         formatter,
@@ -3610,8 +3611,10 @@ mod tests {
         let parse_result = freshness_test_parse_result("serde");
         let registry = CountingRegistry::new(CountingMode::Succeed);
         let gate = InteractiveFetchGate::new(std::num::NonZeroUsize::new(4).unwrap());
-        let outcomes =
-            DependencyOutcomes::new().with_fetch_failure("serde", crate::FetchFailure::Transient);
+        let outcomes = DependencyOutcomes::new().with_fetch_failure(
+            crate::NormalizedName::for_test("serde"),
+            crate::FetchFailure::Transient,
+        );
         let (cached, resolved) = (HashMap::new(), HashMap::new());
 
         for _ in 0..3 {
@@ -4881,7 +4884,7 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let outcomes = crate::lsp_helpers::DependencyOutcomes::new().with_deprecation(
-            "pkg",
+            crate::NormalizedName::for_test("pkg"),
             crate::Deprecation {
                 reason: Some("no longer maintained".to_string()),
                 replacement: None,

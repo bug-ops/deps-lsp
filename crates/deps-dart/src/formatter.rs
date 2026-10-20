@@ -160,6 +160,7 @@ impl OsvNaming for DartFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::NormalizeName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
 
@@ -328,7 +329,7 @@ mod tests {
         let f = DartFormatter;
         assert_eq!(
             f.normalize_package_name(&PackageName::new("flutter_bloc")),
-            "flutter_bloc"
+            deps_core::NormalizedName::for_test("flutter_bloc")
         );
     }
 

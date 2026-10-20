@@ -51,7 +51,8 @@ use super::VersionData;
 use crate::freshness::FreshnessSettings;
 use crate::single_flight::Slot;
 use crate::{
-    DependencySource, FetchFailure, NetworkMode, PackageName, Registry, RegistryEndpoint, Version,
+    DependencySource, FetchFailure, NetworkMode, NormalizedName, PackageName, Registry,
+    RegistryEndpoint, Version,
 };
 
 /// A version list shared between the requests of one flight.
@@ -182,7 +183,7 @@ pub struct InteractiveFetchRequest<'a> {
     versions: VersionData<'a>,
     manifest: &'a url::Url,
     package: &'a PackageName,
-    normalized_name: &'a str,
+    normalized_name: &'a NormalizedName,
     source: &'a DependencySource,
     context: FetchContext,
 }
@@ -204,7 +205,7 @@ impl<'a> InteractiveFetchRequest<'a> {
         versions: VersionData<'a>,
         manifest: &'a url::Url,
         package: &'a PackageName,
-        normalized_name: &'a str,
+        normalized_name: &'a NormalizedName,
         source: &'a DependencySource,
         context: FetchContext,
     ) -> Self {
@@ -247,7 +248,7 @@ impl<'a> InteractiveFetchRequest<'a> {
                         source: SourceFingerprint::of(self.source),
                         scope,
                     },
-                    package: PackageName::new(self.normalized_name),
+                    package: PackageName::new(self.normalized_name.as_str()),
                     slot: kind,
                 };
                 Some((gate, Arc::new(key)))
@@ -455,11 +456,15 @@ struct Admitted<'a> {
 /// let package = PackageName::new("serde");
 /// let source = DependencySource::Registry;
 /// let manifest = url::Url::parse("file:///project/Cargo.toml").unwrap();
+/// # struct Identity;
+/// # impl deps_core::lsp_helpers::PackageNaming for Identity {}
+/// let normalized =
+///     deps_core::lsp_helpers::NormalizeName::normalize_package_name(&Identity, &package);
 /// let request = InteractiveFetchRequest::new(
 ///     VersionData::new(&cached, &resolved),
 ///     &manifest,
 ///     &package,
-///     "serde",
+///     &normalized,
 ///     &source,
 ///     FetchContext::Hover,
 /// );
@@ -535,11 +540,15 @@ pub async fn await_interactive_fetch<T, E: InteractiveFetchError, R: Registry + 
 /// let package = PackageName::new("serde");
 /// let source = DependencySource::Registry;
 /// let manifest = url::Url::parse("file:///project/Cargo.toml").unwrap();
+/// # struct Identity;
+/// # impl deps_core::lsp_helpers::PackageNaming for Identity {}
+/// let normalized =
+///     deps_core::lsp_helpers::NormalizeName::normalize_package_name(&Identity, &package);
 /// let request = InteractiveFetchRequest::new(
 ///     VersionData::new(&cached, &resolved),
 ///     &manifest,
 ///     &package,
-///     "serde",
+///     &normalized,
 ///     &source,
 ///     FetchContext::Hover,
 /// );

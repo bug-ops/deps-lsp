@@ -7,6 +7,7 @@
 //! [`check_manifest`](crate::report::check_manifest) is now [`analyze_manifest`] followed by
 //! `generate_diagnostics`/`to_finding` — no behavior change to `check` itself.
 
+use deps_core::NormalizeName;
 use deps_core::licenses::LicensePolicy;
 use deps_core::lsp_helpers::{
     CooldownDisposition, DependencyOutcomes, LatestVerdict, PackageVersions, RequirementGate,
@@ -294,8 +295,8 @@ impl ManifestAnalysis {
         );
         self.parse_result.dependencies().into_iter().any(|dep| {
             let normalized_name = formatter.normalize_package_name(dep.name());
-            if !crate::update::is_requested(package_filter, &normalized_name, formatter)
-                || ignore_rules.matches_name(&normalized_name)
+            if !crate::update::is_requested(package_filter, normalized_name.as_str(), formatter)
+                || ignore_rules.matches_name(normalized_name.as_str())
             {
                 return false;
             }
@@ -320,7 +321,7 @@ impl ManifestAnalysis {
                     self.latest_status.as_ref(),
                     dep,
                     Some(&vuln_keys),
-                    &normalized_name,
+                    normalized_name.as_str(),
                     latest.as_str(),
                     formatter,
                 ),

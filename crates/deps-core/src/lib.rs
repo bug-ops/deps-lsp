@@ -285,8 +285,8 @@ pub use lockfile::{
 pub use lsp_helpers::{
     DependencyOutcome, DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy,
     DiagnosticSeverities, EcosystemFormatter, HOVER_RECENT_VERSIONS,
-    LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE, LineOffsetTable, OsvNaming, PackageNaming,
-    PackageRendering, PackageVersions, RequirementMatcher, RequirementResolution,
+    LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE, LineOffsetTable, NormalizeName, OsvNaming,
+    PackageNaming, PackageRendering, PackageVersions, RequirementMatcher, RequirementResolution,
     RequirementStatus, SourcePolicy, UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, is_dot_segment,
     is_safe_feature_name, is_safe_maven_coordinate_segment, is_safe_package_name,
     is_safe_registry_url, is_safe_version_string, is_same_major_minor, maven_coordinate_path,
@@ -301,7 +301,7 @@ pub use lsp_helpers::{
 };
 pub use matched_spans::MatchedSpans;
 pub use mtime_cache::{DEFAULT_MAX_CACHED_FILES, MAX_CACHED_FILE_BYTES, MtimeFileCache};
-pub use package::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
+pub use package::{ConcreteVersion, InvalidPackageName, NormalizedName, PackageName, VersionReq};
 pub use parser::{
     CheckedTomlError, DependencySource, LoadingState, MAX_JSON_NESTING_DEPTH,
     MAX_TOML_NESTING_DEPTH, MAX_YAML_EXPANDED_BYTES, MAX_YAML_NESTING_DEPTH,

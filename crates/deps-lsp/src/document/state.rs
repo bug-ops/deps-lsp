@@ -1,6 +1,7 @@
 use super::config_epoch::{ConfigApplyGuard, ConfigEpoch, ConfigEpochCell};
 use dashmap::DashMap;
 use deps_core::HttpCache;
+use deps_core::NormalizeName;
 use deps_core::lockfile::LockFileCache;
 use deps_core::lsp_helpers::InteractiveFetchGate;
 use deps_core::net_policy::RegistryAccessPolicy;
@@ -1883,7 +1884,7 @@ impl ServerState {
             return;
         }
 
-        let not_attempted: Vec<String> = self
+        let not_attempted: Vec<deps_core::NormalizedName> = self
             .ecosystem_registry
             .get(doc.ecosystem)
             .zip(doc.parse_result())

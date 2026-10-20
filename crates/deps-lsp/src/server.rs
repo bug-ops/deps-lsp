@@ -4502,13 +4502,14 @@ let package = Package(
             let package = PackageName::new("serde");
             let source = DependencySource::Registry;
             let manifest = url::Url::parse("file:///project/Cargo.toml").unwrap();
+            let normalized = deps_core::NormalizedName::for_test("serde");
             let request = InteractiveFetchRequest::new(
                 VersionData::new(&cached, &resolved)
                     .with_ecosystem(deps_core::EcosystemId::Cargo)
                     .with_interactive_fetch_gate(gate),
                 &manifest,
                 &package,
-                "serde",
+                &normalized,
                 &source,
                 FetchContext::Hover,
             );

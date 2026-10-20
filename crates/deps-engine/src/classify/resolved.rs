@@ -3,6 +3,7 @@
 use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
+use deps_core::NormalizeName;
 use deps_core::PackageName;
 use deps_core::PackageVersions;
 use deps_core::VersionReq;
@@ -86,7 +87,7 @@ pub fn collect_in_use_versions(
         let normalized_name = formatter.normalize_package_name(dep.name());
         if let Some(v) = resolve_in_use_version(
             dep,
-            &normalized_name,
+            normalized_name.as_str(),
             resolved_versions,
             Some(resolved_version_candidates),
             formatter,

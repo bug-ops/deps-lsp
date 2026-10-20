@@ -1,5 +1,6 @@
 //! `[update].ignore` rule evaluation (#1119, spec 068).
 
+use deps_core::NormalizeName;
 use deps_core::edit::UpdateKind;
 use deps_core::lsp_helpers::EcosystemFormatter;
 
@@ -32,7 +33,7 @@ impl IgnoreRules {
             .map(|rule| {
                 let normalized =
                     formatter.normalize_package_name(&deps_core::PackageName::new(rule.name));
-                (normalized, rule.update_types)
+                (normalized.into_string(), rule.update_types)
             })
             .collect();
         Self { rules }

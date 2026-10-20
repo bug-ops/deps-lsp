@@ -5,6 +5,7 @@
 use crate::config::DepsConfig;
 use crate::document::{ServerState, ensure_document_loaded};
 use deps_core::EcosystemId;
+use deps_core::NormalizeName;
 use deps_core::completion::{
     COMPLETION_SEARCH_TIMEOUT, CompletionOrigin, is_valid_completion_prefix_len,
 };
@@ -379,7 +380,7 @@ fn apply_osv_latest_verdict_to_completions(
                                 latest_status,
                                 dep,
                                 Some(&vuln_keys),
-                                &normalized_name,
+                                normalized_name.as_str(),
                                 version,
                                 formatter,
                             )
@@ -388,7 +389,7 @@ fn apply_osv_latest_verdict_to_completions(
                                 candidate_status,
                                 dep,
                                 Some(&vuln_keys),
-                                &normalized_name,
+                                normalized_name.as_str(),
                                 version,
                                 formatter,
                             )

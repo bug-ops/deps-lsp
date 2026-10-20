@@ -1,6 +1,7 @@
 use deps_core::ConcreteVersion;
 use deps_core::Dependency;
 use deps_core::InvalidPackageName;
+use deps_core::NormalizeName;
 use deps_core::PackageName;
 use deps_core::StabilityFloor;
 use deps_core::interval::{VersionRange, range_from_edges, tighter_lower, tighter_upper};
@@ -838,7 +839,7 @@ fn or_gap_excludes_version(branches: &[VersionRange<String>], version: &str) -> 
 pub struct ComposerFormatter;
 
 impl PackageNaming for ComposerFormatter {
-    fn normalize_package_name(&self, name: &PackageName) -> String {
+    fn normalized_spelling(&self, name: &PackageName) -> String {
         name.as_str().to_lowercase()
     }
 
@@ -1054,7 +1055,7 @@ impl OsvNaming for ComposerFormatter {
     ///
     /// Must stay ungated: this is plain OSV-classification logic reachable from `deps-cli`, not LSP-response code (#1545).
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<OsvPackageName> {
-        OsvPackageName::new_or_skip(self.normalize_package_name(dep.name()))
+        OsvPackageName::new_or_skip(self.normalize_package_name(dep.name()).into_string())
     }
 }
 
@@ -1363,11 +1364,11 @@ mod tests {
         let f = ComposerFormatter;
         assert_eq!(
             f.normalize_package_name(&PackageName::new("Vendor/Package")),
-            "vendor/package"
+            deps_core::NormalizedName::for_test("vendor/package")
         );
         assert_eq!(
             f.normalize_package_name(&PackageName::new("symfony/console")),
-            "symfony/console"
+            deps_core::NormalizedName::for_test("symfony/console")
         );
     }
 
@@ -3893,7 +3894,7 @@ mod tests {
         );
 
         let outcomes = deps_core::lsp_helpers::DependencyOutcomes::new().with_deprecation(
-            "vendor/package",
+            deps_core::NormalizedName::for_test("vendor/package"),
             deps_core::Deprecation {
                 reason: None,
                 replacement: Some("other/package".to_string()),
@@ -3969,7 +3970,7 @@ mod tests {
         let version_range = dep.version_range.expect("version_range must be present");
 
         let outcomes = deps_core::lsp_helpers::DependencyOutcomes::new().with_deprecation(
-            "vendor/package",
+            deps_core::NormalizedName::for_test("vendor/package"),
             deps_core::Deprecation {
                 reason: None,
                 replacement: Some("other/package".to_string()),

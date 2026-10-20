@@ -41,6 +41,7 @@ impl Harness {
         let source = DependencySource::Registry;
         let outcomes = DependencyOutcomes::new();
         let (cached, resolved) = (HashMap::new(), HashMap::new());
+        let normalized = deps_core::NormalizedName::for_test(name);
         let request = InteractiveFetchRequest::new(
             VersionData::new(&cached, &resolved)
                 .with_ecosystem(EcosystemId::GithubActions)
@@ -48,7 +49,7 @@ impl Harness {
                 .with_interactive_fetch_gate(&self.gate),
             &self.manifest,
             &package,
-            name,
+            &normalized,
             &source,
             FetchContext::Hover,
         );

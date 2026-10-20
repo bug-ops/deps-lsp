@@ -10,6 +10,7 @@ use crate::osv::{
     CandidateStatusMap, CandidateStatuses, LatestStatusMap, ScanOutcome, StructuralSkipReason,
     UpgradeStatus, VulnKey, VulnSeverity, VulnerabilityMap,
 };
+use crate::package::NormalizedName;
 use crate::position::{Position, Range};
 use crate::{
     ConcreteVersion, CooldownWindow, Dependency, Deprecation, DepsDevClient, EcosystemId,
@@ -84,8 +85,8 @@ pub use diagnostics::requirement_is_oversized;
 pub(crate) use diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
 pub use formatter::{
     BareMeaning, BuildMetadataPolicy, DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter,
-    OsvNameAvailability, OsvNaming, PackageNaming, PackageRendering, RequirementGate,
-    RequirementResolution, RequirementRewriteShape, SourcePolicy, bare_meaning,
+    NormalizeName, OsvNameAvailability, OsvNaming, PackageNaming, PackageRendering,
+    RequirementGate, RequirementResolution, RequirementRewriteShape, SourcePolicy, bare_meaning,
     classify_requirement_rewrite_shape, format_version_replacing_by_shape, requirement_is_compound,
     up_to_date_for_comparators_via_compiled_matcher, up_to_date_via_compiled_matcher,
 };
@@ -1089,7 +1090,7 @@ impl DependencyOutcome {
 /// Keyed by plain normalized name — unlike [`crate::osv::VulnerabilityMap`], which is keyed by
 /// [`crate::osv::VulnKey`] to disambiguate multiple occurrences of one name.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct DependencyOutcomes(HashMap<String, DependencyOutcome>);
+pub struct DependencyOutcomes(HashMap<NormalizedName, DependencyOutcome>);
 
 impl DependencyOutcomes {
     /// Creates an empty map.
@@ -1100,53 +1101,53 @@ impl DependencyOutcomes {
 
     /// Looks up the full outcome recorded for `name`.
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<&DependencyOutcome> {
+    pub fn get(&self, name: &NormalizedName) -> Option<&DependencyOutcome> {
         self.0.get(name)
     }
 
     /// Looks up the yanked-version finding for `name`.
     #[must_use]
-    pub fn yanked(&self, name: &str) -> Option<&(ConcreteVersion, RemovalStatus)> {
+    pub fn yanked(&self, name: &NormalizedName) -> Option<&(ConcreteVersion, RemovalStatus)> {
         self.0.get(name)?.yanked.as_ref()
     }
 
     /// Looks up the package-level deprecation finding for `name`.
     #[must_use]
-    pub fn deprecation(&self, name: &str) -> Option<&Deprecation> {
+    pub fn deprecation(&self, name: &NormalizedName) -> Option<&Deprecation> {
         self.0.get(name)?.deprecation.as_ref()
     }
 
     /// Looks up the fetch-failure finding for `name`.
     #[must_use]
-    pub fn fetch_failure(&self, name: &str) -> Option<&FetchFailure> {
+    pub fn fetch_failure(&self, name: &NormalizedName) -> Option<&FetchFailure> {
         self.0.get(name)?.fetch_failure.as_ref()
     }
 
     /// True when the registry fetch for `name` succeeded but produced zero comparable
     /// versions (#550). See [`DependencyOutcome::no_comparable_versions`].
     #[must_use]
-    pub fn no_comparable_versions(&self, name: &str) -> bool {
+    pub fn no_comparable_versions(&self, name: &NormalizedName) -> bool {
         self.0.get(name).is_some_and(|o| o.no_comparable_versions)
     }
 
     /// Records a yanked-version finding for `name`, creating the entry if absent.
-    pub fn set_yanked(&mut self, name: String, yanked: (ConcreteVersion, RemovalStatus)) {
+    pub fn set_yanked(&mut self, name: NormalizedName, yanked: (ConcreteVersion, RemovalStatus)) {
         self.0.entry(name).or_default().yanked = Some(yanked);
     }
 
     /// Records a package-level deprecation finding for `name`, creating the entry if absent.
-    pub fn set_deprecation(&mut self, name: String, deprecation: Deprecation) {
+    pub fn set_deprecation(&mut self, name: NormalizedName, deprecation: Deprecation) {
         self.0.entry(name).or_default().deprecation = Some(deprecation);
     }
 
     /// Records a fetch-failure finding for `name`, creating the entry if absent.
-    pub fn set_fetch_failure(&mut self, name: String, failure: FetchFailure) {
+    pub fn set_fetch_failure(&mut self, name: NormalizedName, failure: FetchFailure) {
         self.0.entry(name).or_default().fetch_failure = Some(failure);
     }
 
     /// Records a fetch-failure finding for `name` only if one is not already recorded,
     /// creating the entry if absent.
-    pub fn set_fetch_failure_if_absent(&mut self, name: String, failure: FetchFailure) {
+    pub fn set_fetch_failure_if_absent(&mut self, name: NormalizedName, failure: FetchFailure) {
         self.0
             .entry(name)
             .or_default()
@@ -1156,13 +1157,13 @@ impl DependencyOutcomes {
 
     /// Records that `name`'s registry fetch succeeded but produced zero comparable
     /// versions (#550), creating the entry if absent.
-    pub fn set_no_comparable_versions(&mut self, name: String) {
+    pub fn set_no_comparable_versions(&mut self, name: NormalizedName) {
         self.0.entry(name).or_default().no_comparable_versions = true;
     }
 
     /// Clears the no-comparable-versions channel for `name`, pruning the entry if it
     /// becomes empty.
-    pub fn clear_no_comparable_versions(&mut self, name: &str) {
+    pub fn clear_no_comparable_versions(&mut self, name: &NormalizedName) {
         if let Some(entry) = self.0.get_mut(name) {
             entry.no_comparable_versions = false;
             self.prune(name);
@@ -1170,7 +1171,7 @@ impl DependencyOutcomes {
     }
 
     /// Clears the yanked-version channel for `name`, pruning the entry if it becomes empty.
-    pub fn clear_yanked(&mut self, name: &str) {
+    pub fn clear_yanked(&mut self, name: &NormalizedName) {
         if let Some(entry) = self.0.get_mut(name) {
             entry.yanked = None;
             self.prune(name);
@@ -1178,7 +1179,7 @@ impl DependencyOutcomes {
     }
 
     /// Clears the deprecation channel for `name`, pruning the entry if it becomes empty.
-    pub fn clear_deprecation(&mut self, name: &str) {
+    pub fn clear_deprecation(&mut self, name: &NormalizedName) {
         if let Some(entry) = self.0.get_mut(name) {
             entry.deprecation = None;
             self.prune(name);
@@ -1186,7 +1187,7 @@ impl DependencyOutcomes {
     }
 
     /// Clears the fetch-failure channel for `name`, pruning the entry if it becomes empty.
-    pub fn clear_fetch_failure(&mut self, name: &str) {
+    pub fn clear_fetch_failure(&mut self, name: &NormalizedName) {
         if let Some(entry) = self.0.get_mut(name) {
             entry.fetch_failure = None;
             self.prune(name);
@@ -1194,7 +1195,7 @@ impl DependencyOutcomes {
     }
 
     /// Removes the whole entry for `name`, regardless of which channels are set.
-    pub fn remove(&mut self, name: &str) {
+    pub fn remove(&mut self, name: &NormalizedName) {
         self.0.remove(name);
     }
 
@@ -1205,13 +1206,13 @@ impl DependencyOutcomes {
     /// routing itself changed, so a failure recorded under the old routing must not survive
     /// to be merged with results fetched under the new one.
     pub fn clear_all_fetch_failures(&mut self) {
-        let names: Vec<String> = self.0.keys().cloned().collect();
+        let names: Vec<NormalizedName> = self.0.keys().cloned().collect();
         for name in names {
             self.clear_fetch_failure(&name);
         }
     }
 
-    fn prune(&mut self, name: &str) {
+    fn prune(&mut self, name: &NormalizedName) {
         if self.0.get(name).is_some_and(DependencyOutcome::is_empty) {
             self.0.remove(name);
         }
@@ -1254,33 +1255,33 @@ impl DependencyOutcomes {
     #[must_use]
     pub fn with_yanked(
         mut self,
-        name: impl Into<String>,
+        name: NormalizedName,
         yanked: (ConcreteVersion, RemovalStatus),
     ) -> Self {
-        self.set_yanked(name.into(), yanked);
+        self.set_yanked(name, yanked);
         self
     }
 
     /// Chainable builder recording a package-level deprecation finding. Test/fixture
     /// ergonomics.
     #[must_use]
-    pub fn with_deprecation(mut self, name: impl Into<String>, deprecation: Deprecation) -> Self {
-        self.set_deprecation(name.into(), deprecation);
+    pub fn with_deprecation(mut self, name: NormalizedName, deprecation: Deprecation) -> Self {
+        self.set_deprecation(name, deprecation);
         self
     }
 
     /// Chainable builder recording a fetch-failure finding. Test/fixture ergonomics.
     #[must_use]
-    pub fn with_fetch_failure(mut self, name: impl Into<String>, failure: FetchFailure) -> Self {
-        self.set_fetch_failure(name.into(), failure);
+    pub fn with_fetch_failure(mut self, name: NormalizedName, failure: FetchFailure) -> Self {
+        self.set_fetch_failure(name, failure);
         self
     }
 
     /// Chainable builder recording a no-comparable-versions finding (#550). Test/fixture
     /// ergonomics.
     #[must_use]
-    pub fn with_no_comparable_versions(mut self, name: impl Into<String>) -> Self {
-        self.set_no_comparable_versions(name.into());
+    pub fn with_no_comparable_versions(mut self, name: NormalizedName) -> Self {
+        self.set_no_comparable_versions(name);
         self
     }
 }
@@ -4814,30 +4815,40 @@ mod tests {
     #[test]
     fn test_dependency_outcomes_prunes_entry_once_all_channels_cleared() {
         let mut outcomes = DependencyOutcomes::new()
-            .with_yanked("pkg", ("1.0.0".into(), RemovalStatus::Yanked))
+            .with_yanked(
+                crate::NormalizedName::for_test("pkg"),
+                ("1.0.0".into(), RemovalStatus::Yanked),
+            )
             .with_deprecation(
-                "pkg",
+                crate::NormalizedName::for_test("pkg"),
                 Deprecation {
                     reason: None,
                     replacement: None,
                 },
             )
-            .with_fetch_failure("pkg", FetchFailure::Transient);
+            .with_fetch_failure(
+                crate::NormalizedName::for_test("pkg"),
+                FetchFailure::Transient,
+            );
         assert_eq!(outcomes.len(), 1);
 
-        outcomes.clear_yanked("pkg");
+        outcomes.clear_yanked(&crate::NormalizedName::for_test("pkg"));
         assert!(
-            outcomes.get("pkg").is_some(),
+            outcomes
+                .get(&crate::NormalizedName::for_test("pkg"))
+                .is_some(),
             "entry must survive while other channels are still set"
         );
 
-        outcomes.clear_deprecation("pkg");
+        outcomes.clear_deprecation(&crate::NormalizedName::for_test("pkg"));
         assert!(
-            outcomes.get("pkg").is_some(),
+            outcomes
+                .get(&crate::NormalizedName::for_test("pkg"))
+                .is_some(),
             "entry must survive while the fetch-failure channel is still set"
         );
 
-        outcomes.clear_fetch_failure("pkg");
+        outcomes.clear_fetch_failure(&crate::NormalizedName::for_test("pkg"));
         assert!(
             outcomes.is_empty(),
             "entry must be pruned once its last channel is cleared, not left as a vacuous Some"
@@ -4849,14 +4860,18 @@ mod tests {
     /// prune channels that ARE still set (each `clear_*` only nulls its own field).
     #[test]
     fn test_dependency_outcomes_clear_on_unset_channel_is_a_no_op_for_others() {
-        let mut outcomes = DependencyOutcomes::new()
-            .with_yanked("pkg", ("1.0.0".into(), RemovalStatus::AdvisoryDeprecated));
+        let mut outcomes = DependencyOutcomes::new().with_yanked(
+            crate::NormalizedName::for_test("pkg"),
+            ("1.0.0".into(), RemovalStatus::AdvisoryDeprecated),
+        );
 
-        outcomes.clear_deprecation("pkg");
-        outcomes.clear_fetch_failure("pkg");
+        outcomes.clear_deprecation(&crate::NormalizedName::for_test("pkg"));
+        outcomes.clear_fetch_failure(&crate::NormalizedName::for_test("pkg"));
 
         assert!(
-            outcomes.yanked("pkg").is_some(),
+            outcomes
+                .yanked(&crate::NormalizedName::for_test("pkg"))
+                .is_some(),
             "clearing unset channels must not touch the still-set yanked channel"
         );
         assert_eq!(outcomes.len(), 1);
@@ -4867,12 +4882,22 @@ mod tests {
     #[test]
     fn test_dependency_outcomes_remove_drops_entry_with_multiple_channels_set() {
         let mut outcomes = DependencyOutcomes::new()
-            .with_yanked("pkg", ("1.0.0".into(), RemovalStatus::Yanked))
-            .with_fetch_failure("pkg", FetchFailure::Transient);
+            .with_yanked(
+                crate::NormalizedName::for_test("pkg"),
+                ("1.0.0".into(), RemovalStatus::Yanked),
+            )
+            .with_fetch_failure(
+                crate::NormalizedName::for_test("pkg"),
+                FetchFailure::Transient,
+            );
 
-        outcomes.remove("pkg");
+        outcomes.remove(&crate::NormalizedName::for_test("pkg"));
 
-        assert!(outcomes.get("pkg").is_none());
+        assert!(
+            outcomes
+                .get(&crate::NormalizedName::for_test("pkg"))
+                .is_none()
+        );
         assert!(outcomes.is_empty());
     }
 
@@ -4882,19 +4907,36 @@ mod tests {
     #[test]
     fn test_dependency_outcomes_clear_all_fetch_failures() {
         let mut outcomes = DependencyOutcomes::new()
-            .with_fetch_failure("only-failure", FetchFailure::Transient)
-            .with_yanked("mixed", ("1.0.0".into(), RemovalStatus::Yanked))
-            .with_fetch_failure("mixed", FetchFailure::Transient);
+            .with_fetch_failure(
+                crate::NormalizedName::for_test("only-failure"),
+                FetchFailure::Transient,
+            )
+            .with_yanked(
+                crate::NormalizedName::for_test("mixed"),
+                ("1.0.0".into(), RemovalStatus::Yanked),
+            )
+            .with_fetch_failure(
+                crate::NormalizedName::for_test("mixed"),
+                FetchFailure::Transient,
+            );
 
         outcomes.clear_all_fetch_failures();
 
         assert!(
-            outcomes.get("only-failure").is_none(),
+            outcomes
+                .get(&crate::NormalizedName::for_test("only-failure"))
+                .is_none(),
             "an entry whose only channel was fetch-failure must be pruned"
         );
-        assert!(outcomes.fetch_failure("mixed").is_none());
         assert!(
-            outcomes.yanked("mixed").is_some(),
+            outcomes
+                .fetch_failure(&crate::NormalizedName::for_test("mixed"))
+                .is_none()
+        );
+        assert!(
+            outcomes
+                .yanked(&crate::NormalizedName::for_test("mixed"))
+                .is_some(),
             "clearing fetch-failure must not touch a mixed entry's other channels"
         );
     }
@@ -4913,14 +4955,17 @@ mod tests {
     #[test]
     fn test_dependency_outcomes_set_fetch_failure_if_absent_does_not_clobber_existing() {
         let mut outcomes = DependencyOutcomes::new().with_fetch_failure(
-            "pkg",
+            crate::NormalizedName::for_test("pkg"),
             FetchFailure::Actionable("set GITHUB_TOKEN".to_string()),
         );
 
-        outcomes.set_fetch_failure_if_absent("pkg".to_string(), FetchFailure::NotAttempted);
+        outcomes.set_fetch_failure_if_absent(
+            crate::NormalizedName::for_test("pkg".to_string()),
+            FetchFailure::NotAttempted,
+        );
 
         assert_eq!(
-            outcomes.fetch_failure("pkg"),
+            outcomes.fetch_failure(&crate::NormalizedName::for_test("pkg")),
             Some(&FetchFailure::Actionable("set GITHUB_TOKEN".to_string())),
             "an existing genuine failure must survive a collided-name NotAttempted marker"
         );
@@ -4932,10 +4977,13 @@ mod tests {
     fn test_dependency_outcomes_set_fetch_failure_if_absent_populates_when_unset() {
         let mut outcomes = DependencyOutcomes::new();
 
-        outcomes.set_fetch_failure_if_absent("pkg".to_string(), FetchFailure::NotAttempted);
+        outcomes.set_fetch_failure_if_absent(
+            crate::NormalizedName::for_test("pkg".to_string()),
+            FetchFailure::NotAttempted,
+        );
 
         assert_eq!(
-            outcomes.fetch_failure("pkg"),
+            outcomes.fetch_failure(&crate::NormalizedName::for_test("pkg")),
             Some(&FetchFailure::NotAttempted)
         );
     }
@@ -6117,7 +6165,7 @@ mod tests {
         let formatter = MOCK_FORMATTER;
         assert_eq!(
             formatter.normalize_package_name(&pkg("test-pkg")),
-            "test-pkg"
+            crate::NormalizedName::for_test("test-pkg")
         );
         assert_eq!(formatter.yanked_message(), "This version has been yanked");
         assert_eq!(formatter.yanked_label(), "*(yanked)*");
@@ -6182,7 +6230,7 @@ mod tests {
         struct PyPIFormatter;
 
         impl PackageNaming for PyPIFormatter {
-            fn normalize_package_name(&self, name: &PackageName) -> String {
+            fn normalized_spelling(&self, name: &PackageName) -> String {
                 name.as_str().to_lowercase().replace('-', "_")
             }
         }
@@ -6214,7 +6262,7 @@ mod tests {
         let formatter = PyPIFormatter;
         assert_eq!(
             formatter.normalize_package_name(&pkg("Test-Package")),
-            "test_package"
+            crate::NormalizedName::for_test("test_package")
         );
         assert_eq!(
             formatter.format_version_for_text_edit(&ConcreteVersion::new("1.2.3")),

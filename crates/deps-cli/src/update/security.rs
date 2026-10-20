@@ -2,6 +2,7 @@
 //! native-form yank filter, and the three-outcome classification (#1120, spec 068 FR-008
 //! through FR-015).
 
+use deps_core::NormalizeName;
 use deps_core::policy_config::FetchTimeout;
 use std::time::Duration;
 
@@ -196,15 +197,15 @@ pub async fn plan_security_updates(
             &vulnerabilities,
             dep,
             Some(&vuln_key_by_range),
-            &normalized_name,
+            normalized_name.as_str(),
         ) else {
             continue;
         };
 
-        if !is_requested(package_filter, &normalized_name, formatter) {
+        if !is_requested(package_filter, normalized_name.as_str(), formatter) {
             items.push(skipped_not_requested(
                 dep,
-                &normalized_name,
+                normalized_name.as_str(),
                 ecosystem_id,
                 analysis,
                 formatter,
@@ -217,7 +218,7 @@ pub async fn plan_security_updates(
                 map,
                 dep,
                 Some(&vuln_key_by_range),
-                &normalized_name,
+                normalized_name.as_str(),
             )
         });
 
@@ -225,7 +226,7 @@ pub async fn plan_security_updates(
             dep,
             dv,
             latest,
-            &normalized_name,
+            normalized_name.as_str(),
             analysis,
             formatter,
             ecosystem_id,

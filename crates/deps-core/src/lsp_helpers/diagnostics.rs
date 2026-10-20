@@ -15,15 +15,15 @@ use crate::position::{Position, Range};
 use crate::redact::{RedactedUrl, redact_declaration_key, sanitize_invisible};
 use crate::{
     BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, DepsDevClient,
-    EcosystemId, FetchCompleteness, FetchFailure, PackageName, ParseResult, PublishTime,
-    RegistryOccurrence, RejectedRegistryOccurrence, RemovalStatus, TyposquatSignal, VersionReq,
-    format_relative_age,
+    EcosystemId, FetchCompleteness, FetchFailure, NormalizedName, PackageName, ParseResult,
+    PublishTime, RegistryOccurrence, RejectedRegistryOccurrence, RemovalStatus, TyposquatSignal,
+    VersionReq, format_relative_age,
 };
 
 use super::{
     CooldownBlocker, CooldownDisposition, DiagnosticMessages, EcosystemFormatter, LatestVerdict,
-    PackageVersions, RequirementGate, RequirementMatcher, RequirementStatus, VersionData,
-    cached_package_versions_by_name, cooldown_disposition, resolve_scan_outcome,
+    NormalizeName, PackageVersions, RequirementGate, RequirementMatcher, RequirementStatus,
+    VersionData, cached_package_versions_by_name, cooldown_disposition, resolve_scan_outcome,
     version_range_is_synthetic_empty,
 };
 
@@ -1163,7 +1163,7 @@ pub fn generate_diagnostics_from_cache(
     // loop's `RuleContext`, so `normalize_package_name` (an allocating call) never runs
     // twice for the same dependency (#1392 code-review finding 4). Keyed by name range
     // like `vuln_keys`, since two occurrences of one name have distinct positions.
-    let normalized_names: HashMap<Range, String> = deps
+    let normalized_names: HashMap<Range, NormalizedName> = deps
         .iter()
         .filter(|dep| !dep.name_range_is_synthetic())
         .map(|dep| {
@@ -1194,9 +1194,9 @@ pub fn generate_diagnostics_from_cache(
             continue;
         }
 
-        let normalized_name = normalized_names
-            .get(&dep.name_range())
-            .map_or("", String::as_str);
+        let Some(normalized_name) = normalized_names.get(&dep.name_range()) else {
+            continue;
+        };
         let ctx = RuleContext {
             dep,
             normalized_name,
@@ -1270,7 +1270,7 @@ struct RuleContext<'a> {
     dep: &'a dyn Dependency,
     /// `formatter.normalize_package_name(dep.name())`, computed once per dependency
     /// because five rules key their lookups on it.
-    normalized_name: &'a str,
+    normalized_name: &'a NormalizedName,
     versions: VersionData<'a>,
     formatter: &'a dyn EcosystemFormatter,
     severities: DiagnosticSeverities,
@@ -1290,7 +1290,7 @@ impl<'a> RuleContext<'a> {
     fn cached_versions(&self) -> Option<&'a PackageVersions> {
         cached_package_versions_by_name(
             self.versions.cached,
-            self.normalized_name,
+            self.normalized_name.as_str(),
             self.dep.name().as_str(),
         )
     }
@@ -1529,7 +1529,7 @@ fn skip_reason_notice(
     diagnostics: &mut Vec<Diagnostic>,
     deps: &[&dyn Dependency],
     versions: VersionData<'_>,
-    normalized_names: &HashMap<Range, String>,
+    normalized_names: &HashMap<Range, NormalizedName>,
     uri: &url::Url,
     vuln_keys: Option<&crate::osv::VulnKeys>,
 ) {
@@ -1555,10 +1555,11 @@ fn skip_reason_notice(
         if dep.name_range_is_synthetic() {
             continue;
         }
-        let normalized_name = normalized_names
-            .get(&dep.name_range())
-            .map_or("", String::as_str);
-        let outcome = resolve_scan_outcome(vulnerabilities, *dep, vuln_keys, normalized_name);
+        let Some(normalized_name) = normalized_names.get(&dep.name_range()) else {
+            continue;
+        };
+        let outcome =
+            resolve_scan_outcome(vulnerabilities, *dep, vuln_keys, normalized_name.as_str());
 
         if let Some(ScanOutcome::Skipped(reason)) = outcome
             && should_notify_in_diagnostics(*reason)
@@ -1906,9 +1907,12 @@ fn apply_vulnerability_rule<'a>(
     vuln_keys: Option<&crate::osv::VulnKeys>,
 ) -> Option<&'a crate::osv::DependencyVulnerabilities> {
     let vulnerabilities = ctx.versions.vulnerabilities?;
-    let Some(ScanOutcome::Vulnerable(dv)) =
-        resolve_scan_outcome(vulnerabilities, ctx.dep, vuln_keys, ctx.normalized_name)
-    else {
+    let Some(ScanOutcome::Vulnerable(dv)) = resolve_scan_outcome(
+        vulnerabilities,
+        ctx.dep,
+        vuln_keys,
+        ctx.normalized_name.as_str(),
+    ) else {
         return None;
     };
     push_vulnerability_diagnostics(diagnostics, ctx.dep, dv, ctx.formatter);
@@ -2376,7 +2380,7 @@ fn apply_in_use_yanked_rule(
         && ctx.versions.ecosystem.is_none_or(|ecosystem| {
             super::resolve_in_use_version(
                 ctx.dep,
-                ctx.normalized_name,
+                ctx.normalized_name.as_str(),
                 ctx.versions.resolved,
                 ctx.versions.resolved_version_candidates,
                 ctx.formatter,
@@ -2445,7 +2449,10 @@ fn apply_unknown_package_rule(
     ctx: &RuleContext<'_>,
 ) {
     let dep = ctx.dep;
-    let in_lockfile = ctx.versions.resolved.contains_key(ctx.normalized_name)
+    let in_lockfile = ctx
+        .versions
+        .resolved
+        .contains_key(ctx.normalized_name.as_str())
         || ctx.versions.resolved.contains_key(dep.name());
     if in_lockfile {
         return;
@@ -2726,7 +2733,7 @@ fn push_flagged_latest_admitted_by_requirement(
         None => (LatestVerdict::NotApplicable, None),
         Some(map) => {
             let raw_status =
-                super::resolve_latest_status(map, ctx.dep, vuln_keys, ctx.normalized_name);
+                super::resolve_latest_status(map, ctx.dep, vuln_keys, ctx.normalized_name.as_str());
             (
                 super::upgrade_status_to_verdict(raw_status, latest, ctx.dep, ctx.formatter),
                 raw_status,
@@ -2812,7 +2819,7 @@ fn flagged_latest_duplicates_vulnerability_finding(
     };
     let in_use_version = super::resolve_in_use_version(
         ctx.dep,
-        ctx.normalized_name,
+        ctx.normalized_name.as_str(),
         ctx.versions.resolved,
         ctx.versions.resolved_version_candidates,
         ctx.formatter,
@@ -2929,7 +2936,7 @@ fn apply_outdated_rule(
         ctx.versions.latest_status,
         dep,
         vuln_keys,
-        ctx.normalized_name,
+        ctx.normalized_name.as_str(),
         latest.as_str(),
         ctx.formatter,
     );
@@ -3442,7 +3449,7 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let outcomes = DependencyOutcomes::new().with_fetch_failure(
-            CREDENTIAL_SHAPED_NAME,
+            crate::NormalizedName::for_test(CREDENTIAL_SHAPED_NAME),
             FetchFailure::Actionable("set GITHUB_TOKEN to increase the rate limit".to_string()),
         );
 
@@ -3937,8 +3944,8 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let outcomes =
-            DependencyOutcomes::new().with_no_comparable_versions("dtolnay/rust-toolchain");
+        let outcomes = DependencyOutcomes::new()
+            .with_no_comparable_versions(crate::NormalizedName::for_test("dtolnay/rust-toolchain"));
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -5151,8 +5158,10 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let outcomes = DependencyOutcomes::new()
-            .with_yanked("serde", ("1.0.5\u{202E}evil".into(), RemovalStatus::Yanked));
+        let outcomes = DependencyOutcomes::new().with_yanked(
+            crate::NormalizedName::for_test("serde"),
+            ("1.0.5\u{202E}evil".into(), RemovalStatus::Yanked),
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -5285,7 +5294,7 @@ mod tests {
         let resolved_versions = HashMap::new();
         let overlong_reason = "X".repeat(MAX_DIAGNOSTIC_PROSE_CHARS + 50);
         let outcomes = DependencyOutcomes::new().with_deprecation(
-            "left-pad",
+            crate::NormalizedName::for_test("left-pad"),
             Deprecation {
                 reason: Some(format!("bidi\u{202E}{overlong_reason}")),
                 replacement: Some("left-pad\u{202E}evil".to_string()),
@@ -5336,8 +5345,10 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let outcomes =
-            DependencyOutcomes::new().with_fetch_failure("flaky-pkg", FetchFailure::Transient);
+        let outcomes = DependencyOutcomes::new().with_fetch_failure(
+            crate::NormalizedName::for_test("flaky-pkg"),
+            FetchFailure::Transient,
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -5387,8 +5398,14 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let outcomes = DependencyOutcomes::new()
-            .with_fetch_failure("flaky-pkg-a", FetchFailure::Transient)
-            .with_fetch_failure("flaky-pkg-b", FetchFailure::Transient);
+            .with_fetch_failure(
+                crate::NormalizedName::for_test("flaky-pkg-a"),
+                FetchFailure::Transient,
+            )
+            .with_fetch_failure(
+                crate::NormalizedName::for_test("flaky-pkg-b"),
+                FetchFailure::Transient,
+            );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -6142,7 +6159,7 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let outcomes = DependencyOutcomes::new().with_fetch_failure(
-            "rate-limited-pkg",
+            crate::NormalizedName::for_test("rate-limited-pkg"),
             FetchFailure::Actionable("set GITHUB_TOKEN to increase the rate limit".to_string()),
         );
 
@@ -6207,9 +6224,18 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let outcomes = DependencyOutcomes::new()
-            .with_fetch_failure("flaky-1", FetchFailure::Transient)
-            .with_fetch_failure("flaky-2", FetchFailure::Transient)
-            .with_fetch_failure("flaky-3", FetchFailure::Transient);
+            .with_fetch_failure(
+                crate::NormalizedName::for_test("flaky-1"),
+                FetchFailure::Transient,
+            )
+            .with_fetch_failure(
+                crate::NormalizedName::for_test("flaky-2"),
+                FetchFailure::Transient,
+            )
+            .with_fetch_failure(
+                crate::NormalizedName::for_test("flaky-3"),
+                FetchFailure::Transient,
+            );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -6290,8 +6316,14 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let outcomes = DependencyOutcomes::new()
-            .with_fetch_failure("flaky-1", FetchFailure::Transient)
-            .with_fetch_failure("flaky-2", FetchFailure::Transient);
+            .with_fetch_failure(
+                crate::NormalizedName::for_test("flaky-1"),
+                FetchFailure::Transient,
+            )
+            .with_fetch_failure(
+                crate::NormalizedName::for_test("flaky-2"),
+                FetchFailure::Transient,
+            );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -6368,9 +6400,18 @@ mod tests {
         let resolved_versions = HashMap::new();
         let shared_hint = "set GITHUB_TOKEN to increase the rate limit".to_string();
         let outcomes = DependencyOutcomes::new()
-            .with_fetch_failure("flaky-1", FetchFailure::Actionable(shared_hint.clone()))
-            .with_fetch_failure("flaky-2", FetchFailure::Actionable(shared_hint.clone()))
-            .with_fetch_failure("flaky-3", FetchFailure::Actionable(shared_hint.clone()));
+            .with_fetch_failure(
+                crate::NormalizedName::for_test("flaky-1"),
+                FetchFailure::Actionable(shared_hint.clone()),
+            )
+            .with_fetch_failure(
+                crate::NormalizedName::for_test("flaky-2"),
+                FetchFailure::Actionable(shared_hint.clone()),
+            )
+            .with_fetch_failure(
+                crate::NormalizedName::for_test("flaky-3"),
+                FetchFailure::Actionable(shared_hint.clone()),
+            );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -6431,8 +6472,10 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let outcomes =
-            DependencyOutcomes::new().with_fetch_failure("transient-pkg", FetchFailure::Transient);
+        let outcomes = DependencyOutcomes::new().with_fetch_failure(
+            crate::NormalizedName::for_test("transient-pkg"),
+            FetchFailure::Transient,
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -6474,8 +6517,10 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let outcomes = DependencyOutcomes::new()
-            .with_fetch_failure("collided-pkg", FetchFailure::NotAttempted);
+        let outcomes = DependencyOutcomes::new().with_fetch_failure(
+            crate::NormalizedName::for_test("collided-pkg"),
+            FetchFailure::NotAttempted,
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -6518,8 +6563,10 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let outcomes =
-            DependencyOutcomes::new().with_fetch_failure("bad name", FetchFailure::Transient);
+        let outcomes = DependencyOutcomes::new().with_fetch_failure(
+            crate::NormalizedName::for_test("bad name"),
+            FetchFailure::Transient,
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -8209,8 +8256,10 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let outcomes =
-            DependencyOutcomes::new().with_yanked("serde", ("1.0.5".into(), RemovalStatus::Yanked));
+        let outcomes = DependencyOutcomes::new().with_yanked(
+            crate::NormalizedName::for_test("serde"),
+            ("1.0.5".into(), RemovalStatus::Yanked),
+        );
 
         let severities = DiagnosticSeverities {
             yanked: Severity::Error,
@@ -8254,8 +8303,10 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let outcomes =
-            DependencyOutcomes::new().with_yanked("serde", ("1.0.5".into(), RemovalStatus::Yanked));
+        let outcomes = DependencyOutcomes::new().with_yanked(
+            crate::NormalizedName::for_test("serde"),
+            ("1.0.5".into(), RemovalStatus::Yanked),
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -8339,8 +8390,10 @@ mod tests {
         let mut cached_versions = HashMap::new();
         cached_versions.insert("serde".into(), PackageVersions::latest_only("2.0.0"));
         let resolved_versions = HashMap::new();
-        let outcomes =
-            DependencyOutcomes::new().with_yanked("serde", ("1.0.5".into(), RemovalStatus::Yanked));
+        let outcomes = DependencyOutcomes::new().with_yanked(
+            crate::NormalizedName::for_test("serde"),
+            ("1.0.5".into(), RemovalStatus::Yanked),
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -8396,11 +8449,11 @@ mod tests {
         let resolved_versions = HashMap::new();
         let outcomes = DependencyOutcomes::new()
             .with_yanked(
-                "left-pad",
+                crate::NormalizedName::for_test("left-pad"),
                 ("1.3.0".into(), RemovalStatus::AdvisoryDeprecated),
             )
             .with_deprecation(
-                "left-pad",
+                crate::NormalizedName::for_test("left-pad"),
                 Deprecation {
                     reason: Some("use String.prototype.padStart()".to_string()),
                     replacement: None,
@@ -8454,9 +8507,12 @@ mod tests {
         cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.0.0"));
         let resolved_versions = HashMap::new();
         let outcomes = DependencyOutcomes::new()
-            .with_yanked("pkg", ("1.0.0".into(), RemovalStatus::Yanked))
+            .with_yanked(
+                crate::NormalizedName::for_test("pkg"),
+                ("1.0.0".into(), RemovalStatus::Yanked),
+            )
             .with_deprecation(
-                "pkg",
+                crate::NormalizedName::for_test("pkg"),
                 Deprecation {
                     reason: Some("project archived".to_string()),
                     replacement: None,
@@ -8519,11 +8575,11 @@ mod tests {
         let resolved_versions = HashMap::new();
         let outcomes = DependencyOutcomes::new()
             .with_yanked(
-                "left-pad",
+                crate::NormalizedName::for_test("left-pad"),
                 ("1.3.0".into(), RemovalStatus::AdvisoryDeprecated),
             )
             .with_deprecation(
-                "left-pad",
+                crate::NormalizedName::for_test("left-pad"),
                 Deprecation {
                     reason: Some("use String.prototype.padStart()".to_string()),
                     replacement: None,
@@ -8574,7 +8630,7 @@ mod tests {
         cached_versions.insert("dep".into(), PackageVersions::latest_only("1.0.0"));
         let resolved_versions = HashMap::new();
         let outcomes = DependencyOutcomes::new().with_deprecation(
-            "dep",
+            crate::NormalizedName::for_test("dep"),
             Deprecation {
                 reason: Some("archived".to_string()),
                 replacement: None,
@@ -8659,8 +8715,10 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let outcomes =
-            DependencyOutcomes::new().with_yanked("serde", ("1.0.5".into(), RemovalStatus::Yanked));
+        let outcomes = DependencyOutcomes::new().with_yanked(
+            crate::NormalizedName::for_test("serde"),
+            ("1.0.5".into(), RemovalStatus::Yanked),
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -8701,8 +8759,10 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         // Keyed by the *normalized* (lowercase) name, not the raw manifest name.
-        let outcomes = DependencyOutcomes::new()
-            .with_yanked("newtonsoft.json", ("13.0.1".into(), RemovalStatus::Yanked));
+        let outcomes = DependencyOutcomes::new().with_yanked(
+            crate::NormalizedName::for_test("newtonsoft.json"),
+            ("13.0.1".into(), RemovalStatus::Yanked),
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -8752,8 +8812,10 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let outcomes =
-            DependencyOutcomes::new().with_yanked("time", ("0.1.43".into(), RemovalStatus::Yanked));
+        let outcomes = DependencyOutcomes::new().with_yanked(
+            crate::NormalizedName::for_test("time"),
+            ("0.1.43".into(), RemovalStatus::Yanked),
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -8813,8 +8875,10 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let outcomes =
-            DependencyOutcomes::new().with_yanked("time", ("0.1.43".into(), RemovalStatus::Yanked));
+        let outcomes = DependencyOutcomes::new().with_yanked(
+            crate::NormalizedName::for_test("time"),
+            ("0.1.43".into(), RemovalStatus::Yanked),
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -10910,7 +10974,7 @@ mod tests {
             // the bug this test guards against is suppression that vacuously fires on this
             // case.
             let outcomes = DependencyOutcomes::new().with_deprecation(
-                "serde",
+                crate::NormalizedName::for_test("serde"),
                 Deprecation {
                     reason: Some("archived".to_string()),
                     replacement: None,
@@ -10984,7 +11048,7 @@ mod tests {
             // proves the suppression decision comes from #247's own matched-entry status,
             // not the #263 map.
             let outcomes = DependencyOutcomes::new().with_deprecation(
-                "serde",
+                crate::NormalizedName::for_test("serde"),
                 Deprecation {
                     reason: Some("archived".to_string()),
                     replacement: None,
@@ -11056,9 +11120,12 @@ mod tests {
             // #263 entry for a *different* version ("2.0.0") than the one #247 matches
             // ("1.2.1"), with status `AdvisoryDeprecated` — this is the D5-suppressed case.
             let outcomes = DependencyOutcomes::new()
-                .with_yanked("serde", ("2.0.0".into(), RemovalStatus::AdvisoryDeprecated))
+                .with_yanked(
+                    crate::NormalizedName::for_test("serde"),
+                    ("2.0.0".into(), RemovalStatus::AdvisoryDeprecated),
+                )
                 .with_deprecation(
-                    "serde",
+                    crate::NormalizedName::for_test("serde"),
                     Deprecation {
                         reason: Some("archived".to_string()),
                         replacement: None,
@@ -11133,8 +11200,10 @@ mod tests {
                 },
             );
             let resolved_versions = HashMap::new();
-            let outcomes = DependencyOutcomes::new()
-                .with_yanked("serde", ("1.2.1".into(), RemovalStatus::Yanked));
+            let outcomes = DependencyOutcomes::new().with_yanked(
+                crate::NormalizedName::for_test("serde"),
+                ("1.2.1".into(), RemovalStatus::Yanked),
+            );
 
             let diagnostics = generate_diagnostics_from_cache(
                 &parse_result,

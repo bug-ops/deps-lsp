@@ -7,6 +7,8 @@
 //! since it mutates `DocumentState` fields these functions never touch.
 
 use deps_core::Deprecation;
+use deps_core::NormalizeName;
+use deps_core::NormalizedName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::DependencyOutcomes;
 use std::collections::{HashMap, HashSet};
@@ -32,8 +34,8 @@ use std::collections::{HashMap, HashSet};
 /// ```
 /// use deps_core::Deprecation;
 /// use deps_core::lsp_helpers::{
-///     DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-///     PackageRendering, RequirementResolution, SourcePolicy,
+///     DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy, NormalizeName, OsvNaming,
+///     PackageNaming, PackageRendering, RequirementResolution, SourcePolicy,
 /// };
 /// use deps_core::{ConcreteVersion, PackageName};
 /// use deps_engine::classify::diff::merge_deprecations_after_fetch;
@@ -55,9 +57,10 @@ use std::collections::{HashMap, HashSet};
 /// impl SourcePolicy for SimpleFormatter {}
 /// impl OsvNaming for SimpleFormatter {}
 ///
+/// let old_finding = SimpleFormatter.normalize_package_name(&PackageName::new("old-finding"));
 /// let mut outcomes = DependencyOutcomes::new();
 /// outcomes.set_deprecation(
-///     "old-finding".to_string(),
+///     old_finding.clone(),
 ///     Deprecation { reason: None, replacement: None },
 /// );
 ///
@@ -70,7 +73,7 @@ use std::collections::{HashMap, HashSet};
 ///     &SimpleFormatter,
 /// );
 ///
-/// assert!(outcomes.deprecation("old-finding").is_none());
+/// assert!(outcomes.deprecation(&old_finding).is_none());
 /// ```
 pub fn merge_deprecations_after_fetch(
     outcomes: &mut DependencyOutcomes,
@@ -81,7 +84,7 @@ pub fn merge_deprecations_after_fetch(
     // I2: decide per normalized name in one pass, not incrementally per raw name — raw
     // names sharing a normalized key (e.g. Composer's case-insensitive `require`) would
     // otherwise flip the outcome based on `fetched_names`' unspecified HashMap iteration order.
-    let mut per_normalized: HashMap<String, Option<Deprecation>> = HashMap::new();
+    let mut per_normalized: HashMap<NormalizedName, Option<Deprecation>> = HashMap::new();
     for name in fetched_names {
         let normalized = formatter.normalize_package_name(name);
         let found = fetched_deprecations.remove(name);
@@ -123,8 +126,8 @@ pub fn merge_deprecations_after_fetch(
 ///
 /// ```
 /// use deps_core::lsp_helpers::{
-///     DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-///     PackageRendering, RequirementResolution, SourcePolicy,
+///     DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy, NormalizeName, OsvNaming,
+///     PackageNaming, PackageRendering, RequirementResolution, SourcePolicy,
 /// };
 /// use deps_core::{ConcreteVersion, PackageName};
 /// use deps_engine::classify::diff::merge_no_comparable_versions_after_fetch;
@@ -146,6 +149,8 @@ pub fn merge_deprecations_after_fetch(
 /// impl SourcePolicy for SimpleFormatter {}
 /// impl OsvNaming for SimpleFormatter {}
 ///
+/// let toolchain =
+///     SimpleFormatter.normalize_package_name(&PackageName::new("dtolnay-rust-toolchain"));
 /// let mut outcomes = DependencyOutcomes::new();
 /// let mut fetched = HashSet::new();
 /// fetched.insert(PackageName::new("dtolnay-rust-toolchain"));
@@ -157,7 +162,7 @@ pub fn merge_deprecations_after_fetch(
 ///     &SimpleFormatter,
 /// );
 ///
-/// assert!(outcomes.no_comparable_versions("dtolnay-rust-toolchain"));
+/// assert!(outcomes.no_comparable_versions(&toolchain));
 /// ```
 pub fn merge_no_comparable_versions_after_fetch(
     outcomes: &mut DependencyOutcomes,
@@ -166,7 +171,7 @@ pub fn merge_no_comparable_versions_after_fetch(
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) {
     // Same normalized-name dedup rationale as `merge_deprecations_after_fetch` (I2).
-    let mut per_normalized: HashMap<String, bool> = HashMap::new();
+    let mut per_normalized: HashMap<NormalizedName, bool> = HashMap::new();
     for name in attempted_names {
         let normalized = formatter.normalize_package_name(name);
         let found = fetched_no_comparable_versions.remove(name);
@@ -196,7 +201,7 @@ mod tests {
             let formatter = CargoFormatter;
             let mut outcomes = DependencyOutcomes::new();
             outcomes.set_deprecation(
-                "vendor/a".to_string(),
+                deps_core::NormalizedName::for_test("vendor/a".to_string()),
                 Deprecation {
                     reason: None,
                     replacement: Some("vendor/a2".to_string()),
@@ -221,7 +226,7 @@ mod tests {
             );
 
             assert_eq!(
-                outcomes.deprecation("vendor/a"),
+                outcomes.deprecation(&deps_core::NormalizedName::for_test("vendor/a")),
                 Some(&Deprecation {
                     reason: None,
                     replacement: Some("vendor/a2".to_string()),
@@ -229,7 +234,7 @@ mod tests {
                 "a finding for a name not in this round's fetch must survive untouched"
             );
             assert_eq!(
-                outcomes.deprecation("vendor/b"),
+                outcomes.deprecation(&deps_core::NormalizedName::for_test("vendor/b")),
                 Some(&Deprecation {
                     reason: Some("abandoned".to_string()),
                     replacement: None,
@@ -245,7 +250,7 @@ mod tests {
             let formatter = CargoFormatter;
             let mut outcomes = DependencyOutcomes::new();
             outcomes.set_deprecation(
-                "vendor/a".to_string(),
+                deps_core::NormalizedName::for_test("vendor/a".to_string()),
                 Deprecation {
                     reason: None,
                     replacement: None,
@@ -261,7 +266,9 @@ mod tests {
             );
 
             assert!(
-                outcomes.deprecation("vendor/a").is_none(),
+                outcomes
+                    .deprecation(&deps_core::NormalizedName::for_test("vendor/a"))
+                    .is_none(),
                 "a name that was fetched and produced no finding must be cleared"
             );
         }
@@ -290,12 +297,12 @@ mod tests {
             );
 
             assert!(
-                outcomes.no_comparable_versions("vendor/b"),
+                outcomes.no_comparable_versions(&deps_core::NormalizedName::for_test("vendor/b")),
                 "a package whose fetch was attempted and found zero comparable versions \
                  this round must be recorded"
             );
             assert!(
-                !outcomes.no_comparable_versions("vendor/a"),
+                !outcomes.no_comparable_versions(&deps_core::NormalizedName::for_test("vendor/a")),
                 "a package never attempted this round must not be flagged"
             );
         }
@@ -309,7 +316,9 @@ mod tests {
          {
             let formatter = CargoFormatter;
             let mut outcomes = DependencyOutcomes::new();
-            outcomes.set_no_comparable_versions("vendor/a".to_string());
+            outcomes.set_no_comparable_versions(deps_core::NormalizedName::for_test(
+                "vendor/a".to_string(),
+            ));
 
             // "vendor/a" was re-fetched this round and this time resolved a real
             // version, so it's absent from the fetched-flags set.
@@ -321,7 +330,7 @@ mod tests {
             );
 
             assert!(
-                !outcomes.no_comparable_versions("vendor/a"),
+                !outcomes.no_comparable_versions(&deps_core::NormalizedName::for_test("vendor/a")),
                 "a package that was attempted and this time resolved a real version must \
                  have its stale marker cleared, or R5e would keep suppressing Unknown \
                  package diagnostics for a name that could now legitimately need one"
@@ -335,7 +344,9 @@ mod tests {
         fn test_merge_no_comparable_versions_after_fetch_retains_finding_for_name_not_attempted() {
             let formatter = CargoFormatter;
             let mut outcomes = DependencyOutcomes::new();
-            outcomes.set_no_comparable_versions("vendor/a".to_string());
+            outcomes.set_no_comparable_versions(deps_core::NormalizedName::for_test(
+                "vendor/a".to_string(),
+            ));
 
             // Only "vendor/b" was attempted this round; "vendor/a" was untouched.
             merge_no_comparable_versions_after_fetch(
@@ -346,7 +357,7 @@ mod tests {
             );
 
             assert!(
-                outcomes.no_comparable_versions("vendor/a"),
+                outcomes.no_comparable_versions(&deps_core::NormalizedName::for_test("vendor/a")),
                 "a finding for a name not attempted this round must survive untouched"
             );
         }
@@ -393,7 +404,7 @@ mod tests {
                 merge_deprecations_after_fetch(&mut outcomes, &names, fetched, &formatter);
 
                 assert_eq!(
-                    outcomes.deprecation("vendor/package"),
+                    outcomes.deprecation(&deps_core::NormalizedName::for_test("vendor/package")),
                     Some(&Deprecation {
                         reason: None,
                         replacement: Some("vendor/other".to_string()),

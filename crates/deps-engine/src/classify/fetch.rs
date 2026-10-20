@@ -12,6 +12,7 @@ use crate::progress::ProgressSender;
 use deps_core::ConcreteVersion;
 use deps_core::Deprecation;
 use deps_core::FetchFailure;
+use deps_core::NormalizeName;
 use deps_core::PackageName;
 use deps_core::PackageVersions;
 use deps_core::Registry;
@@ -1462,8 +1463,8 @@ fn compute_cooldown_fallback(
 ///
 /// ```
 /// use deps_core::lsp_helpers::{
-///     DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-///     PackageRendering, RequirementResolution, SourcePolicy,
+///     DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy, NormalizeName, OsvNaming,
+///     PackageNaming, PackageRendering, RequirementResolution, SourcePolicy,
 /// };
 /// use deps_core::{ConcreteVersion, PackageName, RemovalStatus};
 /// use deps_engine::classify::fetch::apply_fetch_outcomes;
@@ -1485,6 +1486,7 @@ fn compute_cooldown_fallback(
 /// impl SourcePolicy for SimpleFormatter {}
 /// impl OsvNaming for SimpleFormatter {}
 ///
+/// let time = SimpleFormatter.normalize_package_name(&PackageName::new("time"));
 /// let mut outcomes = DependencyOutcomes::new();
 /// let mut yanked = HashMap::new();
 /// yanked.insert(
@@ -1501,7 +1503,7 @@ fn compute_cooldown_fallback(
 /// );
 ///
 /// assert_eq!(
-///     outcomes.yanked("time").map(|(v, _)| v.to_string()),
+///     outcomes.yanked(&time).map(|(v, _)| v.to_string()),
 ///     Some("0.1.43".to_string())
 /// );
 /// ```
@@ -1575,7 +1577,7 @@ mod tests {
             );
 
             assert_eq!(
-                outcomes.yanked("time"),
+                outcomes.yanked(&deps_core::NormalizedName::for_test("time")),
                 Some(&("0.1.43".into(), RemovalStatus::Yanked))
             );
         }
@@ -1600,7 +1602,7 @@ mod tests {
             );
 
             assert_eq!(
-                outcomes.fetch_failure("serde"),
+                outcomes.fetch_failure(&deps_core::NormalizedName::for_test("serde")),
                 Some(&FetchFailure::Transient),
                 "a genuine fetch failure must survive a collided name normalizing to the same key"
             );
@@ -1623,7 +1625,7 @@ mod tests {
             );
 
             assert_eq!(
-                outcomes.fetch_failure("serde"),
+                outcomes.fetch_failure(&deps_core::NormalizedName::for_test("serde")),
                 Some(&FetchFailure::NotAttempted)
             );
         }

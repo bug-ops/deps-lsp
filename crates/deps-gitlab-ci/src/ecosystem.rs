@@ -1,5 +1,7 @@
 //! GitLab CI ecosystem implementation for deps-lsp.
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::NormalizeName;
 #[cfg(test)]
 #[cfg(feature = "lsp-responses")]
 use deps_core::PackageName;
@@ -11,8 +13,8 @@ use deps_core::hover::Hover;
 use deps_core::lsp_helpers::sha_comment_mismatch_hover_line;
 #[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::{
-    AuxiliaryLookup, FetchContext, InteractiveFetch, InteractiveFetchRequest, PackageNaming,
-    PackageRendering, await_interactive_fetch,
+    AuxiliaryLookup, FetchContext, InteractiveFetch, InteractiveFetchRequest, PackageRendering,
+    await_interactive_fetch,
 };
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
@@ -532,7 +534,7 @@ impl Ecosystem for GitlabCiEcosystem {
                         versions,
                         parse_result.uri(),
                         dep.name(),
-                        normalized_name.as_str(),
+                        &normalized_name,
                         &dep_source,
                         FetchContext::Hover,
                     ),

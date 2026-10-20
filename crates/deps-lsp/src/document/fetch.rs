@@ -257,6 +257,7 @@ mod tests {
     use deps_core::DependencyOutcomes;
     #[cfg(feature = "pypi")]
     use deps_core::EcosystemId;
+    use deps_core::NormalizeName;
     #[cfg(feature = "pypi")]
     use deps_core::Registry;
     #[cfg(feature = "pypi")]
@@ -562,7 +563,7 @@ dependencies = ["requests>=2.0.0"]
             pinned_version: &'static str,
         ) -> (
             Vec<deps_core::diagnostic::Diagnostic>,
-            HashMap<String, (ConcreteVersion, RemovalStatus)>,
+            HashMap<deps_core::NormalizedName, (ConcreteVersion, RemovalStatus)>,
         ) {
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/pyproject.toml");
@@ -627,7 +628,10 @@ dependencies = ["requests>=2.0.0"]
             )
             .await;
 
-            let yanked_versions: HashMap<String, (ConcreteVersion, RemovalStatus)> = fetch_result
+            let yanked_versions: HashMap<
+                deps_core::NormalizedName,
+                (ConcreteVersion, RemovalStatus),
+            > = fetch_result
                 .yanked_versions
                 .into_iter()
                 .map(|(name, v)| (formatter.normalize_package_name(&name), v))
@@ -666,7 +670,7 @@ dependencies = ["requests>=2.0.0"]
             let (diagnostics, yanked_versions) = run_pipeline("typing_extensions", "4.9.0").await;
 
             assert_eq!(
-                yanked_versions.get("typing-extensions"),
+                yanked_versions.get(&deps_core::NormalizedName::for_test("typing-extensions")),
                 Some(&(ConcreteVersion::new("4.9.0"), RemovalStatus::Yanked)),
                 "must be keyed by the normalized (dash) name, not the raw manifest name"
             );
@@ -681,7 +685,7 @@ dependencies = ["requests>=2.0.0"]
             let (diagnostics, yanked_versions) = run_pipeline("zope.interface", "5.0.0").await;
 
             assert_eq!(
-                yanked_versions.get("zope-interface"),
+                yanked_versions.get(&deps_core::NormalizedName::for_test("zope-interface")),
                 Some(&(ConcreteVersion::new("5.0.0"), RemovalStatus::Yanked)),
                 "must be keyed by the normalized (dotted -> dash) name"
             );

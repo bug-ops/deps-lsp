@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+- **deps-core and every formatter**: the override hook is `PackageNaming::normalized_spelling`, and `normalize_package_name` moves to the sealed `NormalizeName` trait (add `use deps_core::NormalizeName`), returning the new `NormalizedName` (#PR)
+- **deps-core, deps-engine, deps-lsp**: `DependencyOutcomes` getters, setters and `with_*` builders take `NormalizedName` instead of strings (#PR)
+- **deps-core**: `InteractiveFetchRequest::new` takes `&NormalizedName` as its normalized name (#PR)
+
 ### Added
 - **deps-core**: `observe_ecosystem` and `observe_endpoint` tag orchestration fetches so interactive hovers can see requests another task has on the wire (#PR)
 - **deps-core**: `CachedEndpoint::new` is a `const fn` (#PR)
+- **deps-core**: `NormalizedName`, the formatter-normalized lookup key that only `NormalizeName::normalize_package_name` builds (#PR)
 - **deps-core**: `DepsError::{InsecureScheme, BudgetExceeded, RecentlyFailed}` and `error::LookupBudget` give the non-cache failures that used `CacheError` their own variants (#PR)
 
 ### Fixed

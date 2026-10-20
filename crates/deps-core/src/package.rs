@@ -185,6 +185,78 @@ impl PartialEq<&str> for PackageName {
     }
 }
 
+/// A formatter-normalized package lookup key.
+///
+/// A dependency has two spellings: the declared [`PackageName`] and the ecosystem's normalized
+/// form (PyPI folds `My_Pkg` to `my-pkg`, NuGet and Composer fold case). A value of this type
+/// is the second one: the only way to obtain it is
+/// [`NormalizeName::normalize_package_name`](crate::lsp_helpers::NormalizeName::normalize_package_name),
+/// so a map keyed by it cannot be probed with the declared spelling, and a function taking one
+/// cannot be handed `dep.name().as_str()`. Deliberately no `Borrow<str>` and no public
+/// constructor.
+///
+/// `Debug` redacts like [`PackageName`]'s, since the text derives from a manifest name.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{NormalizeName, PackageNaming};
+/// use deps_core::PackageName;
+///
+/// struct Lowercase;
+/// impl PackageNaming for Lowercase {
+///     fn normalized_spelling(&self, name: &PackageName) -> String {
+///         name.as_str().to_lowercase()
+///     }
+/// }
+///
+/// let key = Lowercase.normalize_package_name(&PackageName::new("Serde"));
+/// assert_eq!(key.as_str(), "serde");
+/// ```
+///
+/// Neither a raw string nor a hand-built value is accepted where a key is expected:
+///
+/// ```compile_fail
+/// use deps_core::NormalizedName;
+///
+/// let _: NormalizedName = NormalizedName::new("serde".to_string());
+/// ```
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NormalizedName(String);
+
+impl NormalizedName {
+    /// Wraps a spelling a formatter produced; reachable only through
+    /// [`NormalizeName`](crate::lsp_helpers::NormalizeName).
+    pub(crate) const fn new(spelling: String) -> Self {
+        Self(spelling)
+    }
+
+    /// A key spelled as given, for fixtures that stand in for a formatter's output.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn for_test(spelling: impl Into<String>) -> Self {
+        Self(spelling.into())
+    }
+
+    /// The normalized spelling.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes the key, returning the normalized spelling.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Debug for NormalizedName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&crate::redact::redact_declaration_key(&self.0), f)
+    }
+}
+
 /// A package name that failed a [`PackageNaming::validate_package_name`] lint.
 ///
 /// This is not a construction-time gate — [`PackageName::new`] stays infallible — it

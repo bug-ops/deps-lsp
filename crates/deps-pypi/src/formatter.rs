@@ -1,6 +1,7 @@
 use deps_core::ConcreteVersion;
 use deps_core::Dependency;
 use deps_core::InvalidPackageName;
+use deps_core::NormalizeName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
@@ -44,7 +45,7 @@ impl RequirementMatcher for Pep440Matcher {
 pub struct PypiFormatter;
 
 impl PackageNaming for PypiFormatter {
-    fn normalize_package_name(&self, name: &PackageName) -> String {
+    fn normalized_spelling(&self, name: &PackageName) -> String {
         crate::name::normalize(name.as_str())
     }
 
@@ -260,7 +261,7 @@ impl OsvNaming for PypiFormatter {
     /// the whole batch with it, silently dropping every sibling dependency's advisories.
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<OsvPackageName> {
         self.validate_package_name(dep.name().as_str()).ok()?;
-        OsvPackageName::new_or_skip(self.normalize_package_name(dep.name()))
+        OsvPackageName::new_or_skip(self.normalize_package_name(dep.name()).into_string())
     }
 }
 
@@ -337,19 +338,19 @@ mod tests {
         let formatter = PypiFormatter;
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("requests")),
-            "requests"
+            deps_core::NormalizedName::for_test("requests")
         );
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("Django-REST-Framework")),
-            "django-rest-framework"
+            deps_core::NormalizedName::for_test("django-rest-framework")
         );
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("My-Package")),
-            "my-package"
+            deps_core::NormalizedName::for_test("my-package")
         );
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("zope.interface")),
-            "zope-interface"
+            deps_core::NormalizedName::for_test("zope-interface")
         );
     }
 
@@ -494,15 +495,15 @@ mod tests {
         // Already lowercase, no hyphens - should hit fast path
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("requests")),
-            "requests"
+            deps_core::NormalizedName::for_test("requests")
         );
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("flask")),
-            "flask"
+            deps_core::NormalizedName::for_test("flask")
         );
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("numpy")),
-            "numpy"
+            deps_core::NormalizedName::for_test("numpy")
         );
     }
 

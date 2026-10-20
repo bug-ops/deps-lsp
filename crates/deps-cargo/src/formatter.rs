@@ -214,6 +214,7 @@ impl OsvNaming for CargoFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::NormalizeName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
 
@@ -512,11 +513,11 @@ mod tests {
         let formatter = CargoFormatter;
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("serde")),
-            "serde"
+            deps_core::NormalizedName::for_test("serde")
         );
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("tokio-util")),
-            "tokio-util"
+            deps_core::NormalizedName::for_test("tokio-util")
         );
     }
 

@@ -114,7 +114,7 @@ impl StubFormatter {
         self
     }
 
-    /// [`PackageNaming::normalize_package_name`] lowercases the name instead of leaving it
+    /// [`PackageNaming::normalized_spelling`] lowercases the name instead of leaving it
     /// as-is.
     #[must_use]
     pub const fn with_lowercase_names(mut self) -> Self {
@@ -174,7 +174,7 @@ impl Default for StubFormatter {
 }
 
 impl PackageNaming for StubFormatter {
-    fn normalize_package_name(&self, name: &PackageName) -> String {
+    fn normalized_spelling(&self, name: &PackageName) -> String {
         if self.lowercase_names {
             name.as_str().to_lowercase()
         } else {
@@ -242,7 +242,7 @@ impl OsvNaming for StubFormatter {
 mod tests {
     use super::StubFormatter;
     use crate::lsp_helpers::{
-        PackageNaming, PackageRendering, RequirementResolution, SourcePolicy,
+        NormalizeName, PackageNaming, PackageRendering, RequirementResolution, SourcePolicy,
     };
     use crate::parser::DependencySource;
     use crate::{ConcreteVersion, Dependency, PackageName};
@@ -333,7 +333,7 @@ mod tests {
             stub.format_version_for_text_edit(&ConcreteVersion::new("1.2.3")),
             "1.2.3"
         );
-        assert_eq!(stub.normalize_package_name(&name), "serde");
+        assert_eq!(stub.normalize_package_name(&name).as_str(), "serde");
         assert_eq!(stub.package_url(&name), "https://example.com/serde");
         assert!(!stub.manifest_requirement_is_resolved_version(&StubDep));
         assert!(!stub.resolves_alternate_registry());
@@ -352,7 +352,8 @@ mod tests {
     fn with_lowercase_names_normalizes_to_lowercase() {
         const F: StubFormatter = StubFormatter::new().with_lowercase_names();
         assert_eq!(
-            F.normalize_package_name(&PackageName::new("Newtonsoft.Json")),
+            F.normalize_package_name(&PackageName::new("Newtonsoft.Json"))
+                .as_str(),
             "newtonsoft.json"
         );
     }

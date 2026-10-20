@@ -283,6 +283,7 @@ impl OsvNaming for MavenFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::NormalizeName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::{RequirementGate, RequirementStatus};
 
@@ -384,7 +385,7 @@ mod tests {
         let f = MavenFormatter;
         assert_eq!(
             f.normalize_package_name(&PackageName::new("org.apache.commons:commons-lang3")),
-            "org.apache.commons:commons-lang3"
+            deps_core::NormalizedName::for_test("org.apache.commons:commons-lang3")
         );
     }
 
