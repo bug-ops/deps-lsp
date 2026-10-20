@@ -169,18 +169,21 @@ pub(crate) async fn fetch_registry_versions_for_change(
     let attempted_names: Vec<PackageName> =
         dep_sources.iter().map(|(name, _)| name.clone()).collect();
     let registry = ecosystem.registry();
-    let fetch_result = fetch_latest_versions_parallel(
-        registry,
-        dep_sources,
-        &in_use,
-        progress_sender,
-        freshness_settings,
-        fetch_timeout,
-        max_concurrent_fetches,
-        &selection_context,
-        // See `lifecycle.rs`'s identical call site — deps-lsp's own GOSSIP surfacing (spec
-        // 072) does not go through this fetch-level filter.
-        None,
+    let fetch_result = deps_core::observe_ecosystem(
+        ecosystem.ecosystem_id(),
+        fetch_latest_versions_parallel(
+            registry,
+            dep_sources,
+            &in_use,
+            progress_sender,
+            freshness_settings,
+            fetch_timeout,
+            max_concurrent_fetches,
+            &selection_context,
+            // See `lifecycle.rs`'s identical call site — deps-lsp's own GOSSIP surfacing (spec
+            // 072) does not go through this fetch-level filter.
+            None,
+        ),
     )
     .await;
 

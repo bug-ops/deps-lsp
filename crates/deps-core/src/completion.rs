@@ -1794,9 +1794,11 @@ pub async fn complete_versions_generic_replacing(
         return vec![];
     }
 
-    let versions = match registry
-        .get_versions_from(package_name, source, freshness)
-        .await
+    let versions = match crate::observe_endpoint(
+        registry.endpoint_for(package_name, source),
+        registry.get_versions_from(package_name, source, freshness),
+    )
+    .await
     {
         Ok(v) => v,
         Err(e) => {

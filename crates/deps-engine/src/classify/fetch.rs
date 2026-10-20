@@ -573,19 +573,23 @@ pub async fn fetch_latest_versions_parallel(
             let wildcard_req = &wildcard_req;
             let in_use_versions = in_use.get(&name).cloned().unwrap_or_default();
             async move {
-                fetch_and_classify_package(
-                    registry.as_ref(),
-                    name,
-                    source,
-                    in_use_versions,
-                    wildcard_req,
-                    freshness,
-                    timeout,
-                    selection_context,
-                    check_yanked,
-                    gossip,
-                    &fetched,
-                    progress_sender.as_ref(),
+                let endpoint = registry.endpoint_for(&name, &source);
+                deps_core::observe_endpoint(
+                    endpoint,
+                    fetch_and_classify_package(
+                        registry.as_ref(),
+                        name,
+                        source,
+                        in_use_versions,
+                        wildcard_req,
+                        freshness,
+                        timeout,
+                        selection_context,
+                        check_yanked,
+                        gossip,
+                        &fetched,
+                        progress_sender.as_ref(),
+                    ),
                 )
                 .await
             }

@@ -139,11 +139,14 @@ pub async fn handle_completion(
                 // `documents.get_mut` on the same shard for the duration (#319).
                 let completion_result = tokio::time::timeout(
                     COMPLETION_SEARCH_TIMEOUT,
-                    ecosystem.generate_completions(
-                        parse_result.as_ref(),
-                        position,
-                        &content,
-                        freshness,
+                    deps_core::observe_ecosystem(
+                        ecosystem_id,
+                        ecosystem.generate_completions(
+                            parse_result.as_ref(),
+                            position,
+                            &content,
+                            freshness,
+                        ),
                     ),
                 )
                 .await;

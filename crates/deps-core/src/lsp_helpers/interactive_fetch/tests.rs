@@ -44,6 +44,7 @@ impl InteractiveFetchError for Failure {
 }
 
 struct Fixture {
+    ecosystem: EcosystemId,
     gate: InteractiveFetchGate,
     cached: HashMap<PackageName, crate::PackageVersions>,
     resolved: HashMap<PackageName, ConcreteVersion>,
@@ -60,6 +61,7 @@ fn manifest(path: &str) -> url::Url {
 impl Fixture {
     fn new() -> Self {
         Self {
+            ecosystem: EcosystemId::Cargo,
             gate: InteractiveFetchGate::new(NonZeroUsize::new(4).unwrap()),
             cached: HashMap::new(),
             resolved: HashMap::new(),
@@ -72,6 +74,11 @@ impl Fixture {
 
     fn with_endpoint(mut self, endpoint: RegistryEndpoint) -> Self {
         self.registry = MockRegistry::new().with_endpoint(endpoint);
+        self
+    }
+
+    fn with_ecosystem(mut self, ecosystem: EcosystemId) -> Self {
+        self.ecosystem = ecosystem;
         self
     }
 
@@ -116,7 +123,7 @@ impl Fixture {
     ) -> InteractiveFetch<u8> {
         let package = PackageName::new(name);
         let versions = VersionData::new(&self.cached, &self.resolved)
-            .with_ecosystem(EcosystemId::Cargo)
+            .with_ecosystem(self.ecosystem)
             .with_network(network)
             .with_outcomes(outcomes)
             .with_interactive_fetch_gate(&self.gate);
@@ -541,6 +548,8 @@ enum Versions {
     /// Served after the delay without any request: a memo, a fresh cache entry, or a wait on
     /// another task's lock.
     Untouched(Duration),
+    /// Waits on another task for the delay, then sends a request of its own that never answers.
+    WaitThenStall(Duration),
     /// A chain whose first hop answers in 1 s and whose second hop never does.
     AnswerThenStall,
     /// Pages that each answer in 3 s, for far longer than the budget.
@@ -582,7 +591,7 @@ impl Fixture {
         let outcomes = DependencyOutcomes::new();
         let request = InteractiveFetchRequest::new(
             VersionData::new(&self.cached, &self.resolved)
-                .with_ecosystem(EcosystemId::Cargo)
+                .with_ecosystem(self.ecosystem)
                 .with_outcomes(&outcomes)
                 .with_interactive_fetch_gate(&self.gate),
             &self.manifest,
@@ -596,10 +605,20 @@ impl Fixture {
             .unwrap();
         let fetch = async {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let mut note = (!matches!(behavior, Versions::Untouched(_))).then(note_request);
+            let mut note = (!matches!(
+                behavior,
+                Versions::Untouched(_) | Versions::WaitThenStall(_)
+            ))
+            .then(note_request);
             match behavior {
                 Versions::Untouched(delay) => {
                     tokio::time::sleep(delay).await;
+                    Ok(list())
+                }
+                Versions::WaitThenStall(delay) => {
+                    tokio::time::sleep(delay).await;
+                    let _own = note_request();
+                    tokio::time::sleep(secs(60)).await;
                     Ok(list())
                 }
                 Versions::AnswerThenStall => {
@@ -2409,3 +2428,5 @@ async fn a_latest_fallback_is_not_starved_by_a_saturated_gate() {
 
     assert_matches!(fallback, InteractiveFetch::Live(1));
 }
+
+mod coalesced;

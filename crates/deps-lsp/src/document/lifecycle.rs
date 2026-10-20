@@ -371,17 +371,20 @@ async fn run_document_open_background_task(
     tracing::debug!("progress started, fetching versions");
 
     let registry = ecosystem.registry();
-    let fetch_result = fetch_latest_versions_parallel(
-        registry,
-        dep_sources,
-        &in_use,
-        progress_sender,
-        diagnostics_snapshot.freshness,
-        diagnostics_snapshot.fetch_timeout,
-        diagnostics_snapshot.max_concurrent_fetches,
-        &selection_context,
-        // deps-lsp surfaces GOSSIP via its own prefetch (spec 072), not this filter (spec 074).
-        None,
+    let fetch_result = deps_core::observe_ecosystem(
+        ecosystem.ecosystem_id(),
+        fetch_latest_versions_parallel(
+            registry,
+            dep_sources,
+            &in_use,
+            progress_sender,
+            diagnostics_snapshot.freshness,
+            diagnostics_snapshot.fetch_timeout,
+            diagnostics_snapshot.max_concurrent_fetches,
+            &selection_context,
+            // deps-lsp surfaces GOSSIP via its own prefetch (spec 072), not this filter (spec 074).
+            None,
+        ),
     )
     .await;
     drop(fetch_permit);
