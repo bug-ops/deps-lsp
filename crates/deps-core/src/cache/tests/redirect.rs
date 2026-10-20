@@ -305,8 +305,11 @@ async fn test_trusted_origin_stopped_cross_origin_hop_warns_once_with_redacted_o
     );
     assert!(log.contains(&trusted_server.url()), "from origin: {log}");
     assert!(log.contains(&other_server.url()), "to origin: {log}");
-    for secret in ["hunter2", "SECRET-QUERY", "stolen"] {
-        assert!(!log.contains(secret), "{secret} leaked: {log}");
+    for (index, secret) in ["hunter2", "SECRET-QUERY", "stolen"]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(!log.contains(secret), "secret #{index} leaked into the log");
     }
 }
 
