@@ -260,7 +260,7 @@ mod tests {
         for failed in [
             PublishedAtMemo::classify(Err(status(404))),
             PublishedAtMemo::classify(Err(status(503))),
-            PublishedAtMemo::classify(Err(DepsError::CacheError("timeout".into()))),
+            PublishedAtMemo::classify(Err(DepsError::Io(std::io::Error::other("timeout")))),
             PublishedAtMemo::classify(Ok(response("not json"))),
         ] {
             assert_matches!(failed, PublishedAtMemo::Failed { .. });

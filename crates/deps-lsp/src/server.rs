@@ -4513,7 +4513,7 @@ let package = Package(
             );
             await_interactive_fetch(
                 &deps_core::test_util::MockRegistry::new(),
-                async { Err::<(), _>(deps_core::DepsError::CacheError("down".into())) },
+                async { Err::<(), _>(deps_core::DepsError::Io(std::io::Error::other("down"))) },
                 request,
                 deps_core::lsp_helpers::AuxiliaryLookup::PinResolution,
             )

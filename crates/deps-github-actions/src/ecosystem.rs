@@ -194,7 +194,7 @@ impl Ecosystem for GithubActionsEcosystem {
                 return Completions::default();
             }
             deps_core::completion::complete_versions_at_position(
-                deps_core::EcosystemId::GithubActions,
+                self.ecosystem_id(),
                 self.registry.as_ref(),
                 &self.formatter,
                 request.parse_result,
@@ -3464,7 +3464,7 @@ mod tests {
                 panic!("expected Version context, got {context:?}");
             };
             let direct = deps_core::completion::complete_versions_at_position(
-                deps_core::EcosystemId::GithubActions,
+                eco.ecosystem_id(),
                 eco.registry.as_ref(),
                 &eco.formatter,
                 parse_result.as_ref(),

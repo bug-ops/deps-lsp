@@ -485,15 +485,14 @@ impl CargoRegistry {
     /// evicting an existing, possibly still-in-use, client: it degrades to
     /// [`deps_core::DepsError::PackageNotFound`], never to a crates.io lookup by name.
     ///
-    /// Issue #455, C3: a re-registration of an *already-registered* index URL now folds to
-    /// the stricter of the stored and incoming [`crate::config::RegistryTrust`] tier, dropping
-    /// any stored credential when the fold actually tightens — closing the shape where a
-    /// `Trusted`+token registration of URL X (from `$CARGO_HOME`) makes a later
-    /// `WorkspaceDeclared` registration of the same X a no-op, leaving a workspace-controlled
-    /// alias fetch through the looser `Trusted`-tier client. A re-registration that does not
-    /// tighten the tier keeps the existing client (and its credential) untouched — this is a
-    /// stricter, not weaker, version of the pre-existing idempotency contract this method's
-    /// summary line above documents.
+    /// Issue #455, C3: a re-registration of an *already-registered* index URL folds to the
+    /// stricter of the stored and incoming [`crate::config::RegistryTrust`] tier. Trust and
+    /// credential are functions of the URL and what the operator declared, so within one
+    /// configuration every registration of a URL is identical and the fold is a no-op; it matters
+    /// when the configuration changes between parses (the operator stops declaring the URL, or
+    /// the workspace policy tightens): the stored client is then replaced by the incoming
+    /// `WorkspaceDeclared`, anonymous one, so a looser client never outlives its justification. A
+    /// re-registration that does not tighten the tier keeps the existing client untouched.
     pub fn register_alternate(&self, index: RegistryIndex) {
         let key = index.as_str().to_string();
         let incoming_trust = index.trust();
@@ -517,7 +516,6 @@ impl CargoRegistry {
             |current| {
                 let stored_trust = current.trust();
                 let folded = crate::config::stricter(stored_trust, incoming_trust);
-                // TODO(critic): bind the credential by operator URL equality (as deps-nuget/deps-swift) so a workspace alias naming an operator URL neither loses nor drops the credential
                 if folded != stored_trust {
                     tracing::warn!(
                         index = %RedactedUrl::new(index_for_replace.as_str()),

@@ -1646,8 +1646,8 @@ mod tests {
 
     #[test]
     fn test_only_incomplete_and_transient_failures_fall_back_to_the_memo() {
-        assert!(may_fall_back_to_last_good(&DepsError::CacheError(
-            "x".into()
+        assert!(may_fall_back_to_last_good(&DepsError::Io(
+            std::io::Error::other("x")
         )));
         assert!(may_fall_back_to_last_good(&DepsError::BudgetExceeded(
             LookupBudget::Time

@@ -358,9 +358,9 @@ mod tests {
                             "mock",
                         ))
                     } else {
-                        Err(deps_core::error::DepsError::CacheError(
-                            "mock fallback failure".to_string(),
-                        ))
+                        Err(deps_core::error::DepsError::Io(std::io::Error::other(
+                            "mock fallback failure",
+                        )))
                     }
                 })
             }

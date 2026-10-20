@@ -2125,8 +2125,8 @@ mod tests {
                             tokio::time::sleep(Duration::from_secs(10)).await;
                             Ok(vec![])
                         }
-                        "package-error" => Err(deps_core::error::DepsError::CacheError(
-                            "Mock registry error".to_string(),
+                        "package-error" => Err(deps_core::error::DepsError::Io(
+                            std::io::Error::other("Mock registry error"),
                         )),
                         _ => Ok(vec![]),
                     }
@@ -2149,8 +2149,8 @@ mod tests {
                             tokio::time::sleep(Duration::from_secs(10)).await;
                             Ok(None)
                         }
-                        "package-error" => Err(deps_core::error::DepsError::CacheError(
-                            "Mock registry error".to_string(),
+                        "package-error" => Err(deps_core::error::DepsError::Io(
+                            std::io::Error::other("Mock registry error"),
                         )),
                         _ => Ok(None),
                     }
@@ -2828,9 +2828,8 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    Err(deps_core::error::DepsError::CacheError(format!(
-                        "Failed to fetch package: {}",
-                        name.as_str()
+                    Err(deps_core::error::DepsError::Io(std::io::Error::other(
+                        format!("Failed to fetch package: {}", name.as_str()),
                     )))
                 })
             }
@@ -2843,9 +2842,8 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    Err(deps_core::error::DepsError::CacheError(format!(
-                        "Failed to fetch package: {}",
-                        name.as_str()
+                    Err(deps_core::error::DepsError::Io(std::io::Error::other(
+                        format!("Failed to fetch package: {}", name.as_str()),
                     )))
                 })
             }
@@ -2937,9 +2935,9 @@ mod tests {
             // (`inner_fetch{package=...}: ...`) into the captured line at all — a span with no
             // event inside it produces no output on its own.
             tracing::debug!("mock registry fetch invoked");
-            Err(deps_core::error::DepsError::CacheError(
-                "transient backend failure".to_string(),
-            ))
+            Err(deps_core::error::DepsError::Io(std::io::Error::other(
+                "transient backend failure",
+            )))
         }
 
         struct AlwaysFailsRegistry;
@@ -2961,9 +2959,9 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    Err(deps_core::error::DepsError::CacheError(
-                        "transient backend failure".to_string(),
-                    ))
+                    Err(deps_core::error::DepsError::Io(std::io::Error::other(
+                        "transient backend failure",
+                    )))
                 })
             }
 
@@ -3268,9 +3266,9 @@ mod tests {
                             "mock",
                         ))
                     } else {
-                        Err(deps_core::error::DepsError::CacheError(
-                            "mock fallback failure".to_string(),
-                        ))
+                        Err(deps_core::error::DepsError::Io(std::io::Error::other(
+                            "mock fallback failure",
+                        )))
                     }
                 })
             }
@@ -3418,9 +3416,9 @@ mod tests {
                         ))
                     } else {
                         tokio::time::sleep(Duration::from_millis(50)).await;
-                        Err(deps_core::error::DepsError::CacheError(
-                            "rate limit exceeded".to_string(),
-                        ))
+                        Err(deps_core::error::DepsError::Io(std::io::Error::other(
+                            "rate limit exceeded",
+                        )))
                     }
                 })
             }
@@ -3750,8 +3748,8 @@ mod tests {
                                 Box::new(MockVersion::new(*v).yanked(*y)) as Box<dyn Version>
                             })
                             .collect()),
-                        Some(FetchOutcome::Error) => Err(deps_core::error::DepsError::CacheError(
-                            "mock fetch error".to_string(),
+                        Some(FetchOutcome::Error) => Err(deps_core::error::DepsError::Io(
+                            std::io::Error::other("mock fetch error"),
                         )),
                         Some(FetchOutcome::Timeout) => {
                             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -4113,9 +4111,9 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    Err(deps_core::error::DepsError::CacheError(
-                        "mock fallback failure".to_string(),
-                    ))
+                    Err(deps_core::error::DepsError::Io(std::io::Error::other(
+                        "mock fallback failure",
+                    )))
                 })
             }
 

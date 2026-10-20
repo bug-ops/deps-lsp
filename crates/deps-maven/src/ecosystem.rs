@@ -93,7 +93,7 @@ impl MavenEcosystem {
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
         deps_core::completion::complete_versions_generic_from(
-            deps_core::EcosystemId::Maven,
+            self.ecosystem_id(),
             self.registry.as_ref(),
             &self.formatter,
             package_name,
@@ -331,7 +331,7 @@ impl Ecosystem for MavenEcosystem {
                     ) {
                         Some(dep) => {
                             deps_core::completion::complete_versions_generic_from(
-                                deps_core::EcosystemId::Maven,
+                                self.ecosystem_id(),
                                 self.registry.as_ref(),
                                 &self.formatter,
                                 dep.name(),
@@ -369,6 +369,7 @@ impl Ecosystem for MavenEcosystem {
                 }
                 MavenXmlContext::SelfClosingVersion { tag_span } => {
                     let items = complete_self_closing_version(
+                        self.ecosystem_id(),
                         self.registry.as_ref(),
                         &self.formatter,
                         parse_result,
@@ -2343,6 +2344,7 @@ mod tests {
             };
 
             let items = complete_self_closing_version(
+                deps_core::EcosystemId::Maven,
                 &registry,
                 &MavenFormatter,
                 &parse_result,

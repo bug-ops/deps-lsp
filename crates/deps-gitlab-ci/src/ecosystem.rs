@@ -322,7 +322,7 @@ impl Ecosystem for GitlabCiEcosystem {
             }
 
             deps_core::completion::complete_versions_generic_from(
-                deps_core::EcosystemId::GitlabCi,
+                self.ecosystem_id(),
                 self.registry.as_ref(),
                 &self.formatter,
                 dep.name(),
@@ -3233,7 +3233,7 @@ mod tests {
                 .generate_completions(&parse_result, Position::new(2, 13), content, freshness)
                 .await;
             let direct = deps_core::completion::complete_versions_generic_from(
-                deps_core::EcosystemId::GitlabCi,
+                eco.ecosystem_id(),
                 eco.registry.as_ref(),
                 &eco.formatter,
                 &deps_core::PackageName::new("org/proj"),

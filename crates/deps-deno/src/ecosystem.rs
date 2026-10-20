@@ -725,7 +725,7 @@ mod tests {
             // `DenoEcosystem::complete_versions` (position-based since #1136, needing a real
             // manifest fixture this test has no other reason to build).
             let results = deps_core::completion::complete_versions_generic_from(
-                deps_core::EcosystemId::Deno,
+                ecosystem.ecosystem_id(),
                 ecosystem.registry.as_ref(),
                 &DenoFormatter,
                 &deps_core::PackageName::new("jsr:@this-scope/does-not-exist-12345"),

@@ -1843,7 +1843,7 @@ mod tests {
         assert_matches!(err, DepsError::RecentlyFailed, "got {err:?}");
     }
 
-    /// The typed budget errors stay retry-classified as the `CacheError`s they replaced: the
+    /// The typed budget errors stay retry-classified as the untyped cache errors they replaced: the
     /// search retry loop retries a timed-out attempt and a scan overrun alike.
     #[test]
     fn test_budget_overruns_are_retryable() {
@@ -1914,9 +1914,9 @@ mod tests {
 
     #[test]
     fn test_retry_allowlist_does_not_retry_configuration_faults() {
-        assert!(!is_retryable_error(&DepsError::CacheError(
-            "misconfigured".into()
-        )));
+        assert!(!is_retryable_error(&DepsError::Io(std::io::Error::other(
+            "misconfigured"
+        ))));
     }
 
     /// Issue #483 M2: an offline block must not poison `recent_search_failures` — unlike a

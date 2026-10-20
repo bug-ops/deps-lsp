@@ -143,7 +143,7 @@ purpose; hops to never-a-registry hosts and https downgrades are still stopped. 
 credential-bearing or origin-confined request is logged as a warning (once per origin pair);
 anonymous stops are silent. NuGet and Swift keep their anonymous fetches origin-confined by choice.
 A credential written into a registry URL itself (a query or path token) is not a header and is not
-confined, so the server sends no `Referer` and the URL is never handed to a redirect target.
+confined, so the client sends no `Referer` and the URL is never handed to a redirect target.
 
 ### Proxies and guarded registry traffic
 

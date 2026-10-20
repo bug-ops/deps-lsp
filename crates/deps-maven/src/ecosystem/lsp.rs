@@ -180,6 +180,7 @@ pub(super) fn self_closing_version_probe_range(tag_span: LspRange) -> LspRange {
               have exactly one caller and one test"
 )]
 pub(super) async fn complete_self_closing_version(
+    ecosystem: deps_core::EcosystemId,
     registry: &dyn Registry,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     parse_result: &dyn ParseResultTrait,
@@ -204,7 +205,7 @@ pub(super) async fn complete_self_closing_version(
                 replaced_text: value.to_string(),
             };
             deps_core::completion::complete_versions_generic_replacing(
-                deps_core::EcosystemId::Maven,
+                ecosystem,
                 registry,
                 formatter,
                 dep.name(),

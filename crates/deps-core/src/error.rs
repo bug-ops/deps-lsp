@@ -332,12 +332,6 @@ pub enum DepsError {
         source: SanitizedRegistryError,
     },
 
-    /// A failure with no typed home. No production path constructs it any more: every former
-    /// producer has its own variant, and Cargo's credential-on-a-workspace-declared-index state is
-    /// unrepresentable (#1855).
-    #[error("cache error: {0}")]
-    CacheError(String),
-
     /// A request URL was not `https`, refused at the egress chokepoint before any send. A
     /// configuration fault that no retry resolves, so it is [`FetchFailure::Actionable`] with a
     /// fixed, URL-free message.
@@ -648,7 +642,6 @@ impl std::fmt::Debug for DepsError {
                 .field("package", package)
                 .field("source", source)
                 .finish(),
-            Self::CacheError(message) => f.debug_tuple("CacheError").field(message).finish(),
             Self::InsecureScheme { url } => {
                 f.debug_struct("InsecureScheme").field("url", url).finish()
             }
@@ -953,7 +946,6 @@ impl DepsError {
             Self::Offline { .. }
             | Self::ParseError { .. }
             | Self::RegistryError { .. }
-            | Self::CacheError(_)
             | Self::BudgetExceeded(_)
             | Self::RecentlyFailed
             | Self::PackageNotFound { .. }
@@ -1013,7 +1005,6 @@ impl DepsError {
             Self::HostBlockedByPolicy { .. } => self,
             Self::ParseError { .. }
             | Self::RegistryError { .. }
-            | Self::CacheError(_)
             | Self::InsecureScheme { .. }
             | Self::BudgetExceeded(_)
             | Self::RecentlyFailed
@@ -1059,7 +1050,6 @@ impl DepsError {
         match self {
             Self::HttpStatus { status, .. } => (Some(*status), "http-status"),
             Self::RegistryError { .. } => (None, "transport"),
-            Self::CacheError(_) => (None, "cache"),
             Self::InsecureScheme { .. } => (None, "insecure-scheme"),
             Self::BudgetExceeded(_) => (None, "budget-exceeded"),
             Self::RecentlyFailed => (None, "recently-failed"),
@@ -1140,7 +1130,6 @@ impl DepsError {
                 ..
             }
             | Self::ParseError { .. }
-            | Self::CacheError(_)
             | Self::InsecureScheme { .. }
             | Self::BudgetExceeded(_)
             | Self::RecentlyFailed
@@ -1214,8 +1203,8 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        let error = DepsError::CacheError("test error".into());
-        assert_eq!(error.to_string(), "cache error: test error");
+        let error = DepsError::Io(std::io::Error::other("test error"));
+        assert_eq!(error.to_string(), "I/O error: test error");
     }
 
     /// #789: `SanitizedRegistryError`'s own `Display` must never re-embed the request URL,
@@ -1310,10 +1299,6 @@ mod tests {
             }
             .safe_tracing_summary(),
             (None, "transport")
-        );
-        assert_eq!(
-            DepsError::CacheError("poisoned lock".into()).safe_tracing_summary(),
-            (None, "cache")
         );
         assert_eq!(
             DepsError::Offline {
@@ -1642,7 +1627,7 @@ mod tests {
         assert!(error.is_offline());
         assert!(!error.is_not_found());
 
-        let other = DepsError::CacheError("boom".into());
+        let other = DepsError::Io(std::io::Error::other("boom"));
         assert!(!other.is_offline());
     }
 
@@ -1860,7 +1845,7 @@ mod tests {
             DepsError::HostBlockedByPolicy { .. }
         );
         assert_matches!(
-            DepsError::CacheError("x".into()).into_chain_halt(),
+            DepsError::Io(std::io::Error::other("x")).into_chain_halt(),
             DepsError::ChainResolutionHalted
         );
     }
@@ -1897,7 +1882,7 @@ mod tests {
                 package: "flask".into(),
                 source: reqwest_err.into(),
             },
-            DepsError::CacheError("connection reset".into()),
+            DepsError::Io(std::io::Error::other("connection reset")),
             DepsError::not_found_locally("flask", "PyPI"),
             DepsError::HttpStatus {
                 url: "https://example.com".into(),
@@ -1991,7 +1976,7 @@ mod tests {
         }
 
         let unattributed = [
-            DepsError::CacheError("x".into()),
+            DepsError::Io(std::io::Error::other("x")),
             DepsError::not_found_locally("p", "npm"),
             DepsError::PaginatedListIncomplete {
                 package: "p".into(),

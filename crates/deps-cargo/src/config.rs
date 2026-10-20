@@ -36,7 +36,7 @@
 //!   - A request carrying a credential travels over an origin-confined transport, so a redirect
 //!     cannot move the header to another origin.
 //!
-//! See spec `.local/specs/023-cargo-custom-registries/spec.md` FR-008/FR-009, spec 084 and the
+//! See spec `specs/023-cargo-custom-registries/spec.md` FR-008/FR-009, spec 084 and the
 //! design review handoffs cited there for the rounds of critique the credential boundary
 //! survived.
 
@@ -122,12 +122,8 @@ pub use deps_core::net_policy::RegistryTrust;
 /// The less-trusted of `a` and `b` — `WorkspaceDeclared` if either is, `Trusted` only if both
 /// are.
 ///
-/// Used to fold a `[source]` replace-with chain's trust (plan-1b §1.4 step 3): one workspace-tier
-/// link anywhere in the chain makes the whole chain `WorkspaceDeclared`, closing the shape where a
-/// hostile `[source.crates-io] replace-with = "corp"` in the repo borrows a `$CARGO_HOME`-defined
-/// source's credential. Also used by [`crate::registry::CargoRegistry::register_alternate`]
-/// (issue #455, C3) to fold a re-registration of the same index URL to the stricter of its old
-/// and new trust tier.
+/// Used by [`crate::registry::CargoRegistry::register_alternate`] (issue #455, C3) to fold a
+/// re-registration of the same index URL to the stricter of its old and new trust tier.
 pub(crate) const fn stricter(a: RegistryTrust, b: RegistryTrust) -> RegistryTrust {
     match (a, b) {
         (RegistryTrust::WorkspaceDeclared, _) | (_, RegistryTrust::WorkspaceDeclared) => {

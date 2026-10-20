@@ -3737,9 +3737,9 @@ mod tests {
                 crate::error::Result<Option<Box<dyn crate::Version>>>,
             > {
                 Box::pin(async move {
-                    Err(crate::error::DepsError::CacheError(
-                        "transient backend failure".to_string(),
-                    ))
+                    Err(crate::error::DepsError::Io(std::io::Error::other(
+                        "transient backend failure",
+                    )))
                 })
             }
 
@@ -3832,9 +3832,9 @@ mod tests {
             > {
                 Box::pin(async move {
                     self.fallback_calls.fetch_add(1, Ordering::SeqCst);
-                    Err(crate::error::DepsError::CacheError(
-                        "transient backend failure".to_string(),
-                    ))
+                    Err(crate::error::DepsError::Io(std::io::Error::other(
+                        "transient backend failure",
+                    )))
                 })
             }
 

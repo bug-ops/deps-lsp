@@ -1291,7 +1291,7 @@ mod tests {
         let err = paginate_tags(EcosystemId::Swift, "owner/repo", |page| async move {
             match page {
                 1..=3 => Ok(tags_page_json(100)),
-                4 => Err(DepsError::CacheError("boom from page 4".to_string())),
+                4 => Err(DepsError::Io(std::io::Error::other("boom from page 4"))),
                 5..=6 => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     Ok(tags_page_json(100))
@@ -1645,7 +1645,7 @@ mod tests {
     #[test]
     fn test_classify_release_fetch_http_error_gets_error_ttl() {
         let (dates, ttl) =
-            classify_release_fetch(Some(Err(DepsError::CacheError("boom".to_string()))));
+            classify_release_fetch(Some(Err(DepsError::Io(std::io::Error::other("boom")))));
         assert!(dates.is_empty());
         assert_eq!(ttl, RELEASE_DATES_ERROR_TTL);
     }
