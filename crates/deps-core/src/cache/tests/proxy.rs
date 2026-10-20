@@ -68,7 +68,7 @@ async fn test_workspace_proxy_egress_reaches_dns_named_proxy_with_public_target(
         port,
         lookup_for("proxy.test", "93.184.216.34:0"),
     );
-    assert!(transport.preflight.is_some());
+    assert!(transport.has_preflight());
 
     let _ = fetch_via(&transport).await;
 
@@ -106,7 +106,7 @@ async fn test_workspace_direct_egress_has_no_preflight_and_bypasses_proxy() {
     assert_matches!(route, ProxyRoute::Bypass);
     assert!(route.exempt_hosts().is_empty());
     let transport = Transport::workspace(&Arc::new(RegistryAccessPolicy::default()));
-    assert!(transport.preflight.is_none());
+    assert!(!transport.has_preflight());
 }
 
 #[test]
@@ -120,19 +120,17 @@ fn test_cache_with_proxy_egress_policy_preflights_workspace_and_pinned_transport
     ));
     let cache = HttpCache::with_policy(policy);
 
-    assert!(cache.workspace.read().unwrap().preflight.is_some());
+    assert!(cache.workspace.read().unwrap().has_preflight());
     assert!(
         cache
             .transport_for_pinned(&prefix("https://registry.test/"))
-            .preflight
-            .is_some()
+            .has_preflight()
     );
-    assert!(cache.baseline.preflight.is_none());
+    assert!(!cache.baseline.has_preflight());
     assert!(
-        HttpCache::new()
+        !HttpCache::new()
             .transport_for_pinned(&prefix("https://registry.test/"))
-            .preflight
-            .is_none()
+            .has_preflight()
     );
 }
 
@@ -267,7 +265,7 @@ async fn test_pinned_tier_preflight_refuses_a_private_target_before_the_proxy() 
         &route,
         CacheTier::Pinned { digest: 1 },
     );
-    assert!(transport.preflight.is_some());
+    assert!(transport.has_preflight());
 
     let result = fetch_via(&transport).await;
 

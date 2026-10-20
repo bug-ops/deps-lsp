@@ -53,6 +53,7 @@ pub struct RubyGemsRegistry {
     /// `Self::with_base_for_test` (mirrors `deps-npm`'s
     /// `NpmRegistry::with_public_base_for_test`, #1038).
     api_base: Cow<'static, str>,
+    endpoint: deps_core::CachedEndpoint,
 }
 
 impl RubyGemsRegistry {
@@ -62,6 +63,7 @@ impl RubyGemsRegistry {
         Self {
             cache,
             api_base: Cow::Borrowed(RUBYGEMS_API_BASE),
+            endpoint: deps_core::CachedEndpoint::new(),
         }
     }
 
@@ -75,6 +77,7 @@ impl RubyGemsRegistry {
         Self {
             cache,
             api_base: Cow::Owned(api_base),
+            endpoint: deps_core::CachedEndpoint::new(),
         }
     }
 
@@ -318,7 +321,12 @@ impl deps_core::Registry for RubyGemsRegistry {
         _name: &deps_core::PackageName,
         _source: &deps_core::DependencySource,
     ) -> deps_core::RegistryEndpoint {
-        deps_core::RegistryEndpoint::from_base_str(&self.api_base, deps_core::EgressTier::Baseline)
+        self.endpoint.get_or_compute(|| {
+            deps_core::RegistryEndpoint::from_base_str(
+                &self.api_base,
+                deps_core::EgressTier::Baseline,
+            )
+        })
     }
 
     fn get_latest_matching<'a>(

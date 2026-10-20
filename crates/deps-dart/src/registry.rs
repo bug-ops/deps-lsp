@@ -52,6 +52,7 @@ pub struct PubDevRegistry {
     /// URL in tests via `Self::with_base` (mirrors `deps-npm`'s
     /// `NpmRegistry::with_public_base_for_test`).
     base: String,
+    endpoint: deps_core::CachedEndpoint,
 }
 
 impl PubDevRegistry {
@@ -60,6 +61,7 @@ impl PubDevRegistry {
         Self {
             cache,
             base: PUB_DEV_API_BASE.to_string(),
+            endpoint: deps_core::CachedEndpoint::new(),
         }
     }
 
@@ -67,7 +69,11 @@ impl PubDevRegistry {
     /// mockito server in tests.
     #[cfg(test)]
     pub(crate) fn with_base(cache: Arc<HttpCache>, base: String) -> Self {
-        Self { cache, base }
+        Self {
+            cache,
+            base,
+            endpoint: deps_core::CachedEndpoint::new(),
+        }
     }
 
     /// Fetches all published versions of a package from pub.dev.
@@ -402,7 +408,9 @@ impl deps_core::Registry for PubDevRegistry {
         _name: &deps_core::PackageName,
         _source: &deps_core::DependencySource,
     ) -> deps_core::RegistryEndpoint {
-        deps_core::RegistryEndpoint::from_base_str(&self.base, deps_core::EgressTier::Baseline)
+        self.endpoint.get_or_compute(|| {
+            deps_core::RegistryEndpoint::from_base_str(&self.base, deps_core::EgressTier::Baseline)
+        })
     }
 
     fn get_latest_matching<'a>(

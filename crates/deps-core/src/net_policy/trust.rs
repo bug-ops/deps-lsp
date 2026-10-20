@@ -16,8 +16,9 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 use super::{
-    BlockedHost, IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy, RegistryUrlKind,
-    TrustedConstantRegistryUrl, ValidatedRegistryUrl, WorkspaceRegistryAccess, classify_host,
+    BlockedHost, CanonicalUrl, IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy,
+    RegistryUrlKind, TrustedConstantRegistryUrl, ValidatedRegistryUrl, WorkspaceRegistryAccess,
+    classify_host, enforce_policy, validate_index_url,
 };
 use crate::EgressTier;
 use crate::config_trust::OperatorPath;
@@ -79,11 +80,6 @@ pub fn floor_block(url: &url::Url, level: WorkspaceRegistryAccess) -> Option<Blo
     (class.never_a_registry() && !test_http_loopback).then(|| BlockedHost::new(class, level))
 }
 
-/// The canonical comparison form of a registry URL.
-fn canonical(url: &url::Url) -> String {
-    url.as_str().trim_end_matches('/').to_string()
-}
-
 /// The registry URLs one ecosystem's operator-owned file declares.
 ///
 /// Built only from an [`OperatorPath`], so a repository cannot populate it. Misuse-resistant, not
@@ -102,7 +98,7 @@ fn canonical(url: &url::Url) -> String {
 /// ```
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct OperatorRegistries {
-    urls: HashSet<String>,
+    urls: HashSet<CanonicalUrl>,
 }
 
 /// Prints the size only: the set can hold query strings that carry tokens, so no URL is ever
@@ -130,7 +126,7 @@ impl OperatorRegistries {
             .into_iter()
             .filter_map(|candidate| url::Url::parse(candidate.as_ref()).ok())
             .filter(|url| url.username().is_empty() && url.password().is_none())
-            .map(|url| canonical(&url))
+            .map(|url| CanonicalUrl::of(&url))
             .collect();
         Self { urls }
     }
@@ -148,7 +144,7 @@ impl OperatorRegistries {
     }
 
     fn contains(&self, url: &url::Url) -> bool {
-        self.urls.contains(&canonical(url))
+        self.urls.contains(&CanonicalUrl::of(url))
     }
 
     /// Validates `candidate` for kind `K` and classifies its trust.
@@ -200,9 +196,8 @@ impl OperatorRegistries {
         raw_for_log: &str,
         policy: &RegistryAccessPolicy,
     ) -> Result<DeclaredRegistry<K>, K::Error> {
-        let shape = ValidatedRegistryUrl::<K>::build(candidate, raw_for_log, PolicyGate::Skip)?;
-        let parsed = url::Url::parse(shape.as_str())
-            .map_err(|_| IndexUrlError::InvalidUrl(RedactedUrl::new(raw_for_log)))?;
+        let parsed = validate_index_url(candidate, raw_for_log, K::ECOSYSTEM, PolicyGate::Skip)?;
+        let shape = ValidatedRegistryUrl::<K>::from_validated(&parsed, raw_for_log)?;
         if self.contains(&parsed) {
             if let Some(block) = floor_block(&parsed, policy.get()) {
                 tracing::warn!(
@@ -218,10 +213,9 @@ impl OperatorRegistries {
                 trust: RegistryTrust::Trusted,
             });
         }
-        let url =
-            ValidatedRegistryUrl::<K>::build(candidate, raw_for_log, PolicyGate::Enforce(policy))?;
+        enforce_policy(&parsed, raw_for_log, K::ECOSYSTEM, policy)?;
         Ok(DeclaredRegistry {
-            url,
+            url: shape,
             trust: RegistryTrust::WorkspaceDeclared,
         })
     }

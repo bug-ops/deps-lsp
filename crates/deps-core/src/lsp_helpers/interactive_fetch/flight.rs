@@ -9,7 +9,6 @@ use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
 
-use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::attempt::{AttemptBudget, Attempted, InteractiveFetchError};
@@ -20,7 +19,7 @@ use super::{
     log_skipped, now,
 };
 use crate::freshness::FreshnessSettings;
-use crate::single_flight::{InFlightGuard, Slot, claim_or_follow};
+use crate::single_flight::{Claim, Follower, claim_or_follow};
 
 /// Whether a version list carries publish-time enrichment.
 ///
@@ -102,8 +101,6 @@ impl FlightResult {
     }
 }
 
-type FlightReceiver = watch::Receiver<Slot<FlightResult>>;
-
 /// Why a follower stopped waiting.
 enum Followed {
     Result(FlightResult),
@@ -120,36 +117,22 @@ impl InteractiveFetchGate {
         self.version_flights.len()
     }
 
-    /// Claims the flight for `flight`, or returns the receiver of one this request may follow.
-    fn claim_or_follow(
-        &self,
-        flight: &FlightKey,
-    ) -> Result<watch::Sender<Slot<FlightResult>>, FlightReceiver> {
+    /// Claims the flight for `flight`, or returns a follower of one this request may follow.
+    fn claim_or_follow(&self, flight: &FlightKey) -> Claim<'_, FlightKey, FlightResult> {
         if flight.shape == ListShape::Bare
             && let Some(enriched) = self
                 .version_flights
                 .get(&flight.with_shape(ListShape::Enriched))
                 .map(|entry| entry.clone())
         {
-            return Err(enriched);
+            return Claim::Follower(Follower::from(enriched));
         }
         claim_or_follow(&self.version_flights, flight.clone())
     }
 }
 
-async fn follow(mut receiver: FlightReceiver, deadline: Instant) -> Followed {
-    let wait = async {
-        loop {
-            let slot = receiver.borrow_and_update().clone();
-            if let Slot::Ready(result) = slot {
-                return Some(result);
-            }
-            if receiver.changed().await.is_err() {
-                return None;
-            }
-        }
-    };
-    match tokio::time::timeout_at(deadline, wait).await {
+async fn follow(follower: Follower<FlightResult>, deadline: Instant) -> Followed {
+    match tokio::time::timeout_at(deadline, follower.wait()).await {
         Ok(Some(result)) => Followed::Result(result),
         Ok(None) => Followed::LeaderGone,
         Err(_) => Followed::DeadlineElapsed,
@@ -178,7 +161,7 @@ pub(super) async fn await_shared<E: InteractiveFetchError>(
     let mut fetch = pin!(fetch);
     loop {
         match gate.claim_or_follow(&flight) {
-            Err(receiver) => match follow(receiver, deadline).await {
+            Claim::Follower(follower) => match follow(follower, deadline).await {
                 Followed::Result(result) => return result.into_fetch(),
                 Followed::LeaderGone => {}
                 Followed::DeadlineElapsed => {
@@ -186,9 +169,7 @@ pub(super) async fn await_shared<E: InteractiveFetchError>(
                     return InteractiveFetch::Degraded(NoLiveList::Unverified);
                 }
             },
-            Ok(sender) => {
-                // Declared after `sender`, so the claim is released before followers wake.
-                let _claim = InFlightGuard::new(&gate.version_flights, flight.clone());
+            Claim::Leader(leader) => {
                 match lead(
                     gate,
                     fetch.as_mut(),
@@ -201,7 +182,7 @@ pub(super) async fn await_shared<E: InteractiveFetchError>(
                 .await
                 {
                     Led::Answered(result) => {
-                        sender.send_replace(Slot::Ready(FlightResult::of(&result)));
+                        leader.publish(FlightResult::of(&result));
                         return result;
                     }
                     // Dropping the claim unanswered makes each follower take over with its

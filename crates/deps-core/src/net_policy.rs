@@ -941,28 +941,55 @@ pub fn validate_index_url(
     if !url.username().is_empty() || url.password().is_some() {
         return Err(IndexUrlError::UserInfoPresent);
     }
-    if let PolicyGate::Enforce(policy) = gate
-        && !policy.permits_url(&url)
-    {
-        let class = classify_host(&url);
-        let block = BlockedHost::new(class, policy.get());
-        match block.policy() {
-            BlockingPolicy::Floor => tracing::warn!(
-                url = %RedactedUrl::new(raw_for_log),
-                ?class,
-                %ecosystem,
-                "workspace-declared registry index host is never a registry; rejected"
-            ),
-            BlockingPolicy::WorkspaceRegistries(_) => tracing::warn!(
-                url = %RedactedUrl::new(raw_for_log),
-                ?class,
-                %ecosystem,
-                "workspace-declared registry index host blocked by registries.workspace_registries policy"
-            ),
-        }
-        return Err(IndexUrlError::BlockedHost { block });
+    if let PolicyGate::Enforce(policy) = gate {
+        enforce_policy(&url, raw_for_log, ecosystem, policy)?;
     }
     Ok(url)
+}
+
+/// Refuses a `url` whose host `policy` does not permit, logging the redacted `raw_for_log`.
+fn enforce_policy(
+    url: &url::Url,
+    raw_for_log: &str,
+    ecosystem: EcosystemId,
+    policy: &RegistryAccessPolicy,
+) -> Result<(), IndexUrlError> {
+    if policy.permits_url(url) {
+        return Ok(());
+    }
+    let class = classify_host(url);
+    let block = BlockedHost::new(class, policy.get());
+    match block.policy() {
+        BlockingPolicy::Floor => tracing::warn!(
+            url = %RedactedUrl::new(raw_for_log),
+            ?class,
+            %ecosystem,
+            "workspace-declared registry index host is never a registry; rejected"
+        ),
+        BlockingPolicy::WorkspaceRegistries(_) => tracing::warn!(
+            url = %RedactedUrl::new(raw_for_log),
+            ?class,
+            %ecosystem,
+            "workspace-declared registry index host blocked by registries.workspace_registries policy"
+        ),
+    }
+    Err(IndexUrlError::BlockedHost { block })
+}
+
+/// The one canonical comparison form of a registry URL: its serialization without a trailing
+/// `/`. Shared by [`ValidatedRegistryUrl`] and the operator-declared set so the trust rule and
+/// the validated URL cannot disagree on what "the same URL" means.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CanonicalUrl(String);
+
+impl CanonicalUrl {
+    fn of(url: &url::Url) -> Self {
+        Self(url.as_str().trim_end_matches('/').to_string())
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Soft-sealing mechanism for [`RegistryUrlKind`]/[`TrustedConstantRegistryUrl`], shared by
@@ -1082,7 +1109,7 @@ pub trait TrustedConstantRegistryUrl: RegistryUrlKind {}
 /// `PhantomData<fn() -> K>` (rather than `PhantomData<K>`) keeps [`Send`]/[`Sync`] unconditional
 /// regardless of `K`.
 pub struct ValidatedRegistryUrl<K> {
-    normalized: String,
+    normalized: CanonicalUrl,
     kind: PhantomData<fn() -> K>,
 }
 
@@ -1104,7 +1131,7 @@ impl<K> Clone for ValidatedRegistryUrl<K> {
 impl<K: RegistryUrlKind> std::fmt::Debug for ValidatedRegistryUrl<K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple(K::ECOSYSTEM.id())
-            .field(&self.normalized)
+            .field(&self.normalized.as_str())
             .finish()
     }
 }
@@ -1125,7 +1152,7 @@ impl<K> std::hash::Hash for ValidatedRegistryUrl<K> {
 
 impl<K> std::fmt::Display for ValidatedRegistryUrl<K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.normalized)
+        f.write_str(self.normalized.as_str())
     }
 }
 
@@ -1204,12 +1231,17 @@ impl<K: RegistryUrlKind> ValidatedRegistryUrl<K> {
     /// exists to close. Only this module's own two public constructors may choose a gate.
     fn build(candidate: &str, raw_for_log: &str, gate: PolicyGate<'_>) -> Result<Self, K::Error> {
         let url = validate_index_url(candidate, raw_for_log, K::ECOSYSTEM, gate)?;
+        Self::from_validated(&url, raw_for_log)
+    }
+
+    /// Wraps a `url` that already passed [`validate_index_url`], applying only the kind's
+    /// query/fragment rule.
+    fn from_validated(url: &url::Url, raw_for_log: &str) -> Result<Self, K::Error> {
         if K::REJECT_QUERY_FRAGMENT && (url.query().is_some() || url.fragment().is_some()) {
             return Err(IndexUrlError::InvalidUrl(RedactedUrl::new(raw_for_log)).into());
         }
-        let normalized = url.as_str().trim_end_matches('/').to_string();
         Ok(Self {
-            normalized,
+            normalized: CanonicalUrl::of(url),
             kind: PhantomData,
         })
     }
@@ -1217,7 +1249,7 @@ impl<K: RegistryUrlKind> ValidatedRegistryUrl<K> {
     /// The normalized URL. Never carries a trailing `/`.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.normalized
+        self.normalized.as_str()
     }
 }
 

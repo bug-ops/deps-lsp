@@ -45,7 +45,7 @@ impl HttpCache {
     /// Tells the policy a request is about to leave over a guarded transport, so the startup
     /// proxy notice is shown only to setups that actually connect directly.
     fn note_guarded(&self, transport: &Transport) {
-        match transport.tier {
+        match transport.tier() {
             CacheTier::Baseline => {}
             CacheTier::WorkspaceDeclared(_) | CacheTier::Pinned { .. } => {
                 self.policy.note_guarded_request();
@@ -465,7 +465,7 @@ impl HttpCache {
 
         // Computed once and threaded through every call — recomputing mid-request could read
         // and write under different keys (see `Self::cache_key`'s docs).
-        let cache_key = self.cache_key(url, transport.tier, auth);
+        let cache_key = self.cache_key(url, transport.tier(), auth);
 
         if !cache_enabled {
             // Explicit, not `Empty`: an empty `cache` field would be indistinguishable from
@@ -603,7 +603,7 @@ impl HttpCache {
         let note = note_request();
         self.note_guarded(transport);
         transport.preflight(url).await?;
-        let mut request = apply_request_headers(transport.client.get(url), extra_headers);
+        let mut request = apply_request_headers(transport.client().get(url), extra_headers);
         if let Some(etag) = &cached.etag {
             request = request.header(header::IF_NONE_MATCH, etag);
         }
@@ -669,7 +669,7 @@ impl HttpCache {
             RedactedUrl::new(url)
         );
 
-        let request = apply_request_headers(transport.client.get(url), extra_headers);
+        let request = apply_request_headers(transport.client().get(url), extra_headers);
 
         let response = send_noted(request, url, note).await?;
 
@@ -766,7 +766,7 @@ impl HttpCache {
         self.note_guarded(transport);
         transport.preflight(url).await?;
 
-        let response = send_noted(transport.client.post(url).json(body), url, note).await?;
+        let response = send_noted(transport.client().post(url).json(body), url, note).await?;
 
         if !response.status().is_success() {
             return Err(http_status_error(
@@ -899,7 +899,7 @@ impl HttpCache {
         self.note_guarded(transport);
         transport.preflight(url).await?;
 
-        let request = apply_request_headers(transport.client.get(url), extra_headers);
+        let request = apply_request_headers(transport.client().get(url), extra_headers);
 
         let response = send_noted(request, url, note).await?;
 

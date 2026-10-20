@@ -17,7 +17,7 @@ use tokio::sync::watch;
 
 use super::FetchCompleteness;
 use crate::cache_policy::evict_expired_then_oldest;
-use crate::single_flight::{InFlightGuard, Slot, claim_or_follow};
+use crate::single_flight::{Claim, FlightMap, Slot, claim_or_follow};
 
 /// The outcome of one deps.dev call evaluation, carrying its own completeness rather than a
 /// completeness flag stored alongside a plain value.
@@ -215,16 +215,12 @@ static COALESCE_FOLLOWER_JOINED: tokio::sync::Notify = tokio::sync::Notify::cons
 /// `AbortHandle::abort()`-ed by something outside this function — takes over as the new leader
 /// and calls `fetch` itself instead of silently giving up (issue #1455 critic S2). Bounded by
 /// [`MAX_COALESCE_TAKEOVER_ATTEMPTS`]; `in_flight`'s entry for `key` is removed on every path
-/// (including a panic or abort), via [`InFlightGuard`]'s `Drop` impl.
+/// (including a panic or abort), by dropping its leader handle.
 ///
 /// Returns `None` when every takeover attempt was exhausted without ever resolving a real
 /// outcome — the caller ([`CoalescedMemo::get_or_fetch`]) maps that explicitly to a degraded
 /// fallback rather than relying on a `Default` value to silently mean failure.
-async fn coalesce<K, T, F, Fut>(
-    in_flight: &DashMap<K, watch::Receiver<Slot<T>>>,
-    key: K,
-    fetch: F,
-) -> Option<T>
+async fn coalesce<K, T, F, Fut>(in_flight: &FlightMap<K, T>, key: K, fetch: F) -> Option<T>
 where
     K: Hash + Eq + Clone + Send + Sync,
     T: Clone + Send + Sync,
@@ -233,29 +229,22 @@ where
 {
     for attempt in 0..=MAX_COALESCE_TAKEOVER_ATTEMPTS {
         match claim_or_follow(in_flight, key.clone()) {
-            Ok(tx) => {
-                let _guard = InFlightGuard::new(in_flight, key);
+            Claim::Leader(leader) => {
                 let value = fetch().await;
-                let _ = tx.send(Slot::Ready(value.clone()));
+                leader.publish(value.clone());
                 return Some(value);
             }
-            Err(mut rx) => {
+            Claim::Follower(follower) => {
                 #[cfg(test)]
                 COALESCE_FOLLOWER_JOINED.notify_one();
-                loop {
-                    let slot = rx.borrow_and_update().clone();
-                    if let Slot::Ready(value) = slot {
-                        return Some(value);
-                    }
-                    if rx.changed().await.is_err() {
-                        tracing::debug!(
-                            attempt,
-                            "coalesce: in-flight leader was cancelled before completing; taking \
-                             over as leader"
-                        );
-                        break;
-                    }
+                if let Some(value) = follower.wait().await {
+                    return Some(value);
                 }
+                tracing::debug!(
+                    attempt,
+                    "coalesce: in-flight leader was cancelled before completing; taking over as \
+                     leader"
+                );
             }
         }
     }

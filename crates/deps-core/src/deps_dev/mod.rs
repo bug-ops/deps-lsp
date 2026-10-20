@@ -59,6 +59,7 @@ use crate::EcosystemId;
 use crate::cache::{BodyLimit, HttpCache};
 use crate::error::DepsError;
 use crate::lsp_helpers::{is_dot_segment, warn_rejected_value};
+use crate::single_flight::InFlightGuard;
 
 const DEPS_DEV_API: &str = "https://api.deps.dev";
 
@@ -260,21 +261,11 @@ struct GossipVersionMemoKey {
     version: String,
 }
 
-/// Releases a `DashSet`-backed in-flight claim on drop — including on panic — for the
-/// skip-and-defer (not coalesce-joined) GOSSIP dedup sets (issue #1456, spec 072 C1/M21d): a
-/// name already claimed elsewhere is skipped this round, not awaited, so this guard's cleanup is
-/// the minimal mechanism that design needs, independent of [`memo::CoalescedMemo`]'s true-join
-/// in-flight tracking.
-struct DashSetInFlightGuard<'a, K: std::hash::Hash + Eq> {
-    set: &'a DashSet<K>,
-    key: K,
-}
-
-impl<K: std::hash::Hash + Eq> Drop for DashSetInFlightGuard<'_, K> {
-    fn drop(&mut self) {
-        self.set.remove(&self.key);
-    }
-}
+/// The release-on-drop claim of the skip-and-defer (not coalesce-joined) GOSSIP dedup sets
+/// (issue #1456, spec 072 C1/M21d): a name already claimed elsewhere is skipped this round, not
+/// awaited, so a guard's cleanup is the minimal mechanism that design needs, independent of
+/// [`memo::CoalescedMemo`]'s true-join in-flight tracking.
+type GossipClaim<'a> = InFlightGuard<'a, GossipMemoKey, DashSet<GossipMemoKey>>;
 
 /// Maps a deps-lsp [`EcosystemId`] to deps.dev's `system` path segment.
 ///
@@ -1133,20 +1124,16 @@ impl DepsDevClient {
         // this future mid-`.await`, and a manual `self.gossip_in_flight.remove(..)` placed
         // after the fetch would then never run, permanently leaking the claim for that
         // package (every later call sees it as still in-flight and skips it forever, and
-        // the memo is never written either). `DashSetInFlightGuard`'s `Drop` impl runs on
+        // the memo is never written either). `GossipClaim`'s `Drop` impl runs on
         // cancellation too, exactly like every other in-flight tracker in this client relies
-        // on — `memo::InFlightGuard` for `Self::signals`/`Self::similarity`/`Self::popularity`
+        // on — `single_flight::Leader` for `Self::signals`/`Self::similarity`/`Self::popularity`
         // (each a [`memo::CoalescedMemo`] wrapping its own `DashMap`-backed in-flight join),
-        // and this same `DashSetInFlightGuard` for `Self::gossip_version_in_flight`.
-        let mut guards: Vec<DashSetInFlightGuard<'_, GossipMemoKey>> =
-            Vec::with_capacity(misses.len());
+        // and this same `GossipClaim` for `Self::gossip_version_in_flight`.
+        let mut guards: Vec<GossipClaim<'_>> = Vec::with_capacity(misses.len());
         for name in misses {
             let key = self.gossip_key(system, &name);
             if self.gossip_in_flight.insert(key.clone()) {
-                guards.push(DashSetInFlightGuard {
-                    set: &self.gossip_in_flight,
-                    key,
-                });
+                guards.push(InFlightGuard::new(&self.gossip_in_flight, key));
                 claimed.push(name);
             }
         }
@@ -1223,8 +1210,7 @@ impl DepsDevClient {
         names: &[String],
     ) -> HashMap<String, GossipFindings> {
         let mut eligible: Vec<String> = Vec::with_capacity(names.len());
-        let mut guards: Vec<DashSetInFlightGuard<'_, GossipMemoKey>> =
-            Vec::with_capacity(names.len());
+        let mut guards: Vec<GossipClaim<'_>> = Vec::with_capacity(names.len());
         let now = Instant::now();
 
         for name in names {
@@ -1232,10 +1218,7 @@ impl DepsDevClient {
             if !self.gossip_refresh_in_flight.insert(key.clone()) {
                 continue;
             }
-            let guard = DashSetInFlightGuard {
-                set: &self.gossip_refresh_in_flight,
-                key: key.clone(),
-            };
+            let guard = InFlightGuard::new(&self.gossip_refresh_in_flight, key.clone());
 
             let throttled = self
                 .gossip_last_refresh_attempt
@@ -1430,10 +1413,7 @@ impl DepsDevClient {
         if !self.gossip_version_in_flight.insert(key.clone()) {
             return None;
         }
-        let _guard = DashSetInFlightGuard {
-            set: &self.gossip_version_in_flight,
-            key: key.clone(),
-        };
+        let _guard = InFlightGuard::new(&self.gossip_version_in_flight, key.clone());
 
         let outcome = self.fetch_gossip_version(system, name, version).await;
         let findings = outcome.clone().into_value();

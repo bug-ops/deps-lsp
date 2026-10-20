@@ -1,15 +1,16 @@
 //! Crate-private plumbing for joining concurrent callers on one in-flight computation.
 //!
-//! A leader installs a [`watch`] channel under its key, every other caller for that key
-//! follows the same channel, and the leader's [`InFlightGuard`] removes the claim on every exit
-//! path. Shared by the deps.dev memo (`deps_dev::memo`) and the interactive registry await
-//! (`lsp_helpers::interactive_fetch`), which differ only in the payload and in what a follower
-//! does with it.
+//! [`claim_or_follow`] makes the first caller for a key its [`Leader`] and every other caller a
+//! [`Follower`] of the leader's [`watch`] channel. The leader handle owns both halves of the
+//! claim, so the entry is released before followers wake on every exit path, and no caller can
+//! get that order wrong. Shared by the deps.dev memo (`deps_dev::memo`) and the interactive
+//! registry await (`lsp_helpers::interactive_fetch`), which differ only in the payload and in
+//! what a follower does with it.
 
 use std::hash::Hash;
 
-use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use dashmap::{DashMap, DashSet};
 use tokio::sync::watch;
 
 /// A watch-channel payload: "leader hasn't finished yet" vs. "leader finished with `T`". A
@@ -23,113 +24,214 @@ pub(crate) enum Slot<T> {
     Ready(T),
 }
 
-/// Releases an in-flight claim on drop — including on panic or cancellation — so a claim can
+/// The in-flight claims of one flight kind: key to the leader's channel.
+pub(crate) type FlightMap<K, T> = DashMap<K, watch::Receiver<Slot<T>>>;
+
+/// A collection of in-flight claims an [`InFlightGuard`] can release a key from.
+pub(crate) trait ReleaseClaim<K> {
+    /// Removes `key`'s claim.
+    fn release(&self, key: &K);
+}
+
+impl<K: Hash + Eq, W> ReleaseClaim<K> for DashMap<K, W> {
+    fn release(&self, key: &K) {
+        self.remove(key);
+    }
+}
+
+impl<K: Hash + Eq> ReleaseClaim<K> for DashSet<K> {
+    fn release(&self, key: &K) {
+        self.remove(key);
+    }
+}
+
+/// Releases an in-flight claim on drop, including on panic or cancellation, so a claim can
 /// never leak and permanently block later callers for the same key.
-///
-/// Declare it after the claim's [`watch::Sender`]: locals drop in reverse order, so the entry is
-/// removed before the sender wakes followers, and a promoted follower never re-joins the dead
-/// channel.
-pub(crate) struct InFlightGuard<'a, K: Hash + Eq, W> {
-    map: &'a DashMap<K, W>,
+pub(crate) struct InFlightGuard<'a, K, C: ReleaseClaim<K>> {
+    claims: &'a C,
     key: K,
 }
 
-impl<'a, K: Hash + Eq, W> InFlightGuard<'a, K, W> {
-    /// Guards the claim `key` holds in `map`.
-    pub(crate) const fn new(map: &'a DashMap<K, W>, key: K) -> Self {
-        Self { map, key }
+impl<'a, K, C: ReleaseClaim<K>> InFlightGuard<'a, K, C> {
+    /// Guards the claim `key` holds in `claims`.
+    pub(crate) const fn new(claims: &'a C, key: K) -> Self {
+        Self { claims, key }
     }
 }
 
-impl<K: Hash + Eq, W> Drop for InFlightGuard<'_, K, W> {
+impl<K, C: ReleaseClaim<K>> Drop for InFlightGuard<'_, K, C> {
     fn drop(&mut self) {
-        self.map.remove(&self.key);
+        self.claims.release(&self.key);
     }
+}
+
+/// The caller that runs the work for a key.
+///
+/// Dropping it, finished or not, releases the claim first and then drops the sender, so a
+/// follower woken by the vanished leader finds the key free and a promoted follower never
+/// re-joins the dead channel. The field order is that drop order.
+pub(crate) struct Leader<'a, K: Hash + Eq, T> {
+    _claim: InFlightGuard<'a, K, FlightMap<K, T>>,
+    sender: watch::Sender<Slot<T>>,
+}
+
+impl<K: Hash + Eq, T> Leader<'_, K, T> {
+    /// Hands `value` to every follower and releases the claim.
+    pub(crate) fn publish(self, value: T) {
+        self.sender.send_replace(Slot::Ready(value));
+    }
+}
+
+/// A caller waiting on a leader's result.
+pub(crate) struct Follower<T>(watch::Receiver<Slot<T>>);
+
+impl<T> From<watch::Receiver<Slot<T>>> for Follower<T> {
+    fn from(receiver: watch::Receiver<Slot<T>>) -> Self {
+        Self(receiver)
+    }
+}
+
+impl<T: Clone + Send + Sync> Follower<T> {
+    /// Waits for the leader's value, or returns `None` when the leader vanished (panicked or
+    /// was cancelled) without publishing one.
+    pub(crate) async fn wait(mut self) -> Option<T> {
+        loop {
+            if let Slot::Ready(value) = &*self.0.borrow_and_update() {
+                return Some(value.clone());
+            }
+            if self.0.changed().await.is_err() {
+                return None;
+            }
+        }
+    }
+}
+
+/// Whether the caller leads `key` or follows whoever already does.
+pub(crate) enum Claim<'a, K: Hash + Eq, T> {
+    Leader(Leader<'a, K, T>),
+    Follower(Follower<T>),
 }
 
 /// Either claims `key` as the leader (installing a fresh, `Pending` channel) or joins as a
-/// follower of whichever channel the current leader already installed — a plain, synchronous
-/// function so the returned [`Entry`] guard is dropped before the caller ever reaches an
-/// `.await` (this workspace's `clippy.toml` denies holding one across an await point on
-/// principle, regardless of whether a given case is provably safe).
-pub(crate) fn claim_or_follow<K, T>(
-    in_flight: &DashMap<K, watch::Receiver<Slot<T>>>,
-    key: K,
-) -> Result<watch::Sender<Slot<T>>, watch::Receiver<Slot<T>>>
+/// follower of whichever channel the current leader already installed. A plain, synchronous
+/// function so the map's [`Entry`] guard is dropped before the caller ever reaches an `.await`
+/// (this workspace's `clippy.toml` denies holding one across an await point on principle,
+/// regardless of whether a given case is provably safe).
+pub(crate) fn claim_or_follow<K, T>(in_flight: &FlightMap<K, T>, key: K) -> Claim<'_, K, T>
 where
-    K: Hash + Eq,
+    K: Hash + Eq + Clone,
 {
-    match in_flight.entry(key) {
-        Entry::Occupied(occupied) => Err(occupied.get().clone()),
+    match in_flight.entry(key.clone()) {
+        Entry::Occupied(occupied) => Claim::Follower(Follower(occupied.get().clone())),
         Entry::Vacant(vacant) => {
-            let (tx, rx) = watch::channel(Slot::Pending);
-            vacant.insert(rx);
-            Ok(tx)
+            let (sender, receiver) = watch::channel(Slot::Pending);
+            vacant.insert(receiver);
+            Claim::Leader(Leader {
+                _claim: InFlightGuard::new(in_flight, key),
+                sender,
+            })
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches;
-
     use super::*;
 
-    type Flights = DashMap<&'static str, watch::Receiver<Slot<u32>>>;
+    type Flights = FlightMap<&'static str, u32>;
 
-    #[test]
-    fn the_first_caller_leads_and_later_callers_follow_the_same_channel() {
+    fn leader<'a>(flights: &'a Flights, key: &'static str) -> Leader<'a, &'static str, u32> {
+        match claim_or_follow(flights, key) {
+            Claim::Leader(leader) => leader,
+            Claim::Follower(_) => panic!("expected to lead {key}"),
+        }
+    }
+
+    fn follower(flights: &Flights, key: &'static str) -> Follower<u32> {
+        match claim_or_follow(flights, key) {
+            Claim::Follower(follower) => follower,
+            Claim::Leader(_) => panic!("expected to follow {key}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_first_caller_leads_and_later_callers_receive_its_value() {
         let flights = Flights::new();
 
-        let sender = claim_or_follow(&flights, "key").expect("the first caller claims the key");
-        let receiver = claim_or_follow(&flights, "key").expect_err("a second caller follows");
+        let leader = leader(&flights, "key");
+        let first = follower(&flights, "key");
+        let second = follower(&flights, "key");
+        leader.publish(7);
 
-        assert_matches!(&*receiver.borrow(), Slot::Pending);
-        sender.send_replace(Slot::Ready(7));
-        assert_matches!(&*receiver.borrow(), Slot::Ready(7));
+        assert_eq!(first.wait().await, Some(7));
+        assert_eq!(second.wait().await, Some(7));
+        assert!(flights.is_empty(), "publishing releases the claim");
     }
 
     #[test]
     fn distinct_keys_each_get_a_leader() {
         let flights = Flights::new();
 
-        assert!(claim_or_follow(&flights, "a").is_ok());
-        assert!(claim_or_follow(&flights, "b").is_ok());
+        let _a = leader(&flights, "a");
+        let _b = leader(&flights, "b");
         assert_eq!(flights.len(), 2);
     }
 
     #[tokio::test]
-    async fn dropping_the_guard_and_sender_wakes_followers_and_frees_the_key() {
+    async fn dropping_the_leader_wakes_followers_after_freeing_the_key() {
         let flights = Flights::new();
-        let sender = claim_or_follow(&flights, "key").expect("leader");
-        let mut receiver = claim_or_follow(&flights, "key").expect_err("follower");
-        {
-            let _guard = InFlightGuard::new(&flights, "key");
-            drop(sender);
-        }
+        let leader = leader(&flights, "key");
+        let follower = follower(&flights, "key");
+        drop(leader);
 
-        assert!(
-            receiver.changed().await.is_err(),
+        assert_eq!(
+            follower.wait().await,
+            None,
             "a follower sees its leader vanish"
         );
         assert!(flights.is_empty(), "the claim was released");
         assert!(
-            claim_or_follow(&flights, "key").is_ok(),
+            matches!(claim_or_follow(&flights, "key"), Claim::Leader(_)),
             "a promoted follower can claim the key again"
         );
     }
 
-    #[test]
-    fn the_guard_releases_its_claim_on_drop_even_when_the_leader_panics() {
+    #[tokio::test]
+    async fn the_claim_is_free_by_the_time_a_waiting_follower_wakes() {
         let flights = Flights::new();
-        let _sender = claim_or_follow(&flights, "key").expect("leader");
+        let leader = leader(&flights, "key");
+        let waiting = follower(&flights, "key");
+        let woken = async {
+            let value = waiting.wait().await;
+            (value, claim_or_follow(&flights, "key"))
+        };
+
+        let ((value, reclaimed), ()) = tokio::join!(woken, async { drop(leader) });
+
+        assert_eq!(value, None);
+        assert!(matches!(reclaimed, Claim::Leader(_)));
+    }
+
+    #[test]
+    fn the_leader_releases_its_claim_even_when_it_panics() {
+        let flights = Flights::new();
 
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = InFlightGuard::new(&flights, "key");
+            let _leader = leader(&flights, "key");
             panic!("leader failed");
         }));
 
         assert!(outcome.is_err());
         assert!(flights.is_empty());
+    }
+
+    #[test]
+    fn a_guard_releases_a_set_claim_on_drop() {
+        let claims: DashSet<&str> = DashSet::new();
+        claims.insert("key");
+        {
+            let _guard = InFlightGuard::new(&claims, "key");
+        }
+        assert!(claims.is_empty());
     }
 }

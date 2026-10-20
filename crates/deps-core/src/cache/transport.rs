@@ -138,21 +138,35 @@ pub(super) fn build_guarded_client_with_lookup(guard: AddrGuard, lookup: TestLoo
 /// [`Self::baseline`], [`Self::workspace`] and [`Self::origin_pinned`] are the only sanctioned
 /// way to build one: each derives its redirect policy, its resolver and its tier from a single
 /// [`AddrGuard`] value, so a mismatched pairing (e.g. a baseline-guarded client keyed under the
-/// workspace cache namespace) never arises through normal construction — though `cache.rs` is
-/// one module, so a hand-written `Transport { .. }` literal elsewhere in this file could still
-/// mismatch them; the three constructors are what make that a deliberate act, not an accident
-/// reachable by passing the wrong argument to an existing function.
+/// workspace cache namespace) never arises through normal construction. The fields are private
+/// to this module, so those constructors are the only way to build one and a mismatched
+/// `Transport { .. }` literal cannot be written elsewhere in `cache`.
 #[derive(Clone)]
 pub(super) struct Transport {
-    pub(super) client: Client,
-    pub(super) tier: CacheTier,
+    client: Client,
+    tier: CacheTier,
     /// Resolves each request's target name through the transport's own guard before the send,
     /// set only for guarded traffic that goes through the system proxy: the proxy resolves the
     /// target itself, so the client's own resolver never sees it.
-    pub(super) preflight: Option<BlockedAddrResolver>,
+    preflight: Option<BlockedAddrResolver>,
 }
 
 impl Transport {
+    /// The client whose guard this transport's [`Self::tier`] names.
+    pub(super) const fn client(&self) -> &Client {
+        &self.client
+    }
+
+    /// The cache namespace this transport's requests are keyed under.
+    pub(super) const fn tier(&self) -> CacheTier {
+        self.tier
+    }
+
+    #[cfg(test)]
+    pub(super) const fn has_preflight(&self) -> bool {
+        self.preflight.is_some()
+    }
+
     /// The shared, unauthenticated transport used by every non-workspace request.
     pub(super) fn baseline() -> Self {
         Self::standard(

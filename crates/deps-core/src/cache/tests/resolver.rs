@@ -224,7 +224,7 @@ async fn test_build_client_wires_in_blocked_addr_resolver() {
         .await;
     let port = server.socket_address().port();
 
-    let client = Transport::baseline().client;
+    let client = Transport::baseline().client().clone();
     let result = client.get(format!("http://localhost:{port}/")).send().await;
 
     let err = result.expect_err(
