@@ -11,8 +11,10 @@ tags:
   - competitive-parity
   - priority/p3
 created: 2026-10-06
-status: draft
+status: specify
 related:
+  - "[[plan]]"
+  - "[[tasks]]"
   - "[[MOC-specs]]"
   - "[[046-pnpm-catalogs/spec]]"
   - "[[052-pnpm-lockfile-provider/spec]]"
@@ -28,8 +30,9 @@ related:
 > [!info] Metadata
 > **Author**: continuous-improvement research cycle (2026-10-06), competitive-parity finding
 > **Type / priority**: enhancement, P3
-> **Branch**: not started (spec stage). Tracking issue: see OQ-9.
-> **Phase**: specify only (WHAT/WHY; no implementation design)
+> **Branch**: suggested `feat/1788-pnpm-workspace-catalog-entries`
+> **Issue**: #1788 (P3, enhancement, research, cross-ecosystem)
+> **Phase**: specify, plan and tasks. All nine former open questions are resolved in section 9 (design vetted by architect and critic review, 2026-10-21).
 
 > [!abstract]
 > deps-lsp already resolves `catalog:` / `catalog:<name>` specifiers in `package.json` against
@@ -99,8 +102,12 @@ between the two files and no weakening of the existing resource caps.
 > - Editing `pnpm-workspace.yaml` settings that are not dependency version specifiers (`packages:`
 >   globs, `onlyBuiltDependencies`, `minimumReleaseAge` and similar).
 > - Changing how `package.json` resolves `catalog:` specifiers, except the de-duplication
->   decision in OQ-2.
-> - Any edit under `crates/deps-zed` (a separate repository and PR workflow; see OQ-8).
+>   decision in D-2.
+> - Any edit under `crates/deps-zed` (a separate repository and PR workflow; see D-8).
+> - `overrides:` and every other non-catalog section of `pnpm-workspace.yaml` (D-3); follow-up issue F-1.
+> - A "used by N packages" consumer list on hover (D-7); follow-up issue F-2.
+> - Parsing the `catalogs:` section of `pnpm-lock.yaml` (D-4).
+> - Registering the YAML language for this file in the Zed extension (D-8); follow-up issue F-3 in `bug-ops/deps-zed`.
 
 ## 2. User Stories
 
@@ -150,7 +157,7 @@ SO THAT I am not shown the same finding twice at different locations with differ
 ```
 GIVEN package.json (`"react": "catalog:"`) and pnpm-workspace.yaml (`catalog: {react: ^16.0.0}`) both open
 WHEN diagnostics are published for both
-THEN the reporting follows the policy chosen in OQ-2 and is identical on every run
+THEN the reporting follows the policy of D-2 (FR-031) and is identical on every run
 ```
 
 ## 3. Functional Requirements
@@ -161,7 +168,7 @@ EARS notation. Priority: must / should / could.
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | WHEN a document whose file name is `pnpm-workspace.yaml` is opened or changed THE SYSTEM SHALL treat it as a dependency file and run the dependency pipeline on its catalog entries (see OQ-1 for the routing mechanism) | must |
+| FR-001 | WHEN a document whose file name is `pnpm-workspace.yaml` is opened or changed THE SYSTEM SHALL treat it as a dependency file and run the dependency pipeline on its catalog entries (routing per D-1: one npm ecosystem, content-dispatched by manifest kind) | must |
 | FR-002 | THE SYSTEM SHALL NOT attempt to parse a `pnpm-workspace.yaml` document with the `package.json` (JSON) parser, nor a `package.json` document with the YAML parser | must |
 | FR-003 | WHEN `pnpm-workspace.yaml` is both an open dependency file and a watched config of open `package.json` documents THE SYSTEM SHALL do both: refresh the file's own results and refresh every referencing `package.json` | must |
 | FR-004 | WHEN a document has a non-`file:` URI (untitled, virtual) THE SYSTEM SHALL still produce entry-level results from the supplied text and SHALL NOT read the filesystem for ancestor config lookups it cannot anchor | should |
@@ -177,7 +184,7 @@ EARS notation. Priority: must / should / could.
 | FR-009 | WHEN an entry's specifier is a non-registry form already classified for `package.json` (`npm:` alias, `git`, `file:`, `link:`, URL) THE SYSTEM SHALL apply the same classification, not silently treat it as a registry range | must |
 | FR-010 | WHEN an entry's value is a non-scalar (mapping, sequence) THE SYSTEM SHALL skip that entry without failing the rest of the file | must |
 | FR-011 | WHEN the same package name appears in more than one catalog (default and `legacy`) THE SYSTEM SHALL report each entry independently at its own location | must |
-| FR-012 | WHEN `catalog:` and `catalogs.default:` are both present THE SYSTEM SHALL keep surfacing entries per FR-005/FR-007 and SHALL handle the pnpm-rejected duplicate-default state per OQ-6 | must |
+| FR-012 | WHEN `catalog:` and `catalogs.default:` are both present THE SYSTEM SHALL keep surfacing entries per FR-005/FR-007 and SHALL handle the pnpm-rejected duplicate-default state per FR-030 | must |
 
 ### 3.3 LSP capabilities on catalog entries
 
@@ -197,8 +204,8 @@ EARS notation. Priority: must / should / could.
 | ID | Requirement | Priority |
 |----|------------|----------|
 | FR-021 | WHEN several `package.json` files in a workspace reference the same catalog entry THE SYSTEM SHALL report that entry at most once in `pnpm-workspace.yaml` (one finding per entry, not per consumer) | must |
-| FR-022 | WHEN both files are open and an entry is flagged THE SYSTEM SHALL apply the duplicate-reporting policy decided in OQ-2 deterministically | must |
-| FR-023 | WHEN a catalog entry's text is edited in an open `pnpm-workspace.yaml` THE SYSTEM SHALL refresh the diagnostics of referencing open `package.json` documents without requiring them to be re-edited | should |
+| FR-022 | WHEN both files are open and an entry is flagged THE SYSTEM SHALL apply the duplicate-reporting policy of D-2 deterministically (see FR-031) | must |
+| FR-023 | WHEN an open `pnpm-workspace.yaml` is saved with a changed catalog entry THE SYSTEM SHALL refresh the diagnostics of referencing open `package.json` documents without requiring them to be re-edited. The refresh reads the on-disk file through the existing watched-config path, so unsaved keystrokes do not propagate (disk is the single source for LSP and CLI) | should |
 
 ### 3.5 Positions and YAML fidelity
 
@@ -206,15 +213,26 @@ EARS notation. Priority: must / should / could.
 |----|------------|----------|
 | FR-024 | THE SYSTEM SHALL compute each entry's key range and version range from YAML source marks so that LSP ranges are correct for plain, single-quoted and double-quoted scalars (version range covers exactly the text a replacement must overwrite), for numeric-looking unquoted scalars (`react: 1.2`, cf. closed #721), and for flow-style mappings (`catalog: {react: ^16}`) | must |
 | FR-025 | WHEN the file uses CRLF line endings, a BOM, non-ASCII content, comments between entries, or multiple YAML documents THE SYSTEM SHALL still produce correct UTF-16 LSP positions for every entry of the first document pnpm reads | must |
-| FR-026 | WHEN an entry's value is a YAML alias or anchor, or a block scalar THE SYSTEM SHALL behave as specified in OQ-5 and SHALL NEVER emit an edit whose range does not exactly cover the scalar it was computed from | must |
+| FR-026 | WHEN an entry's value is a YAML alias or anchor, or a block scalar THE SYSTEM SHALL behave as specified in FR-032 and SHALL NEVER emit an edit whose range does not exactly cover the scalar it was computed from | must |
 | FR-027 | WHEN the file is syntactically invalid YAML THE SYSTEM SHALL publish no entry-level findings, SHALL NOT panic, and SHALL leave `package.json` diagnostics behavior unchanged from today's defective-workspace messages | must |
 
 ### 3.6 Overrides and related sections
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-028 | WHEN the document has an `overrides:` mapping whose key is a bare package name and whose value is a registry range THE SYSTEM SHALL treat it as a dependency under the scope decided in OQ-3 | could |
-| FR-029 | WHEN an `overrides:` key or value uses selector syntax (`parent>child`, `pkg@range`, `catalog:` references) THE SYSTEM SHALL handle it as decided in OQ-3 and SHALL NOT mis-parse the selector as a package name | could |
+| FR-028 | THE SYSTEM SHALL ignore the `overrides:` subtree and every section other than `catalog:` and `catalogs:` (D-3); it produces no dependency, finding or edit | must |
+| FR-029 | WHEN the document contains `overrides:` selector syntax (`parent>child`, `pkg@range`) THE SYSTEM SHALL NOT mis-parse it as a catalog entry | must |
+
+### 3.7 Resolved behavior (from section 9 decisions)
+
+| ID | Requirement | Priority |
+|----|------------|----------|
+| FR-030 | WHEN both `catalog:` and `catalogs.default:` are present THE SYSTEM SHALL publish one Error-severity diagnostic of kind `DuplicateDefaultCatalog` (code `pnpm-duplicate-default-catalog`) in the YAML file, anchored on the `catalogs.default` key, stating that pnpm rejects the workspace, AND SHALL still surface the entries per FR-005/FR-007. `package.json` defect messages are unchanged | must |
+| FR-031 | WHEN a `package.json` dependency uses a `catalog:` specifier and the referenced entry is located in `pnpm-workspace.yaml` THE SYSTEM SHALL keep the existing finding on the reference, append the suffix `(set in pnpm-workspace.yaml, catalog <id>)` to its message, and attach `related_information` pointing at that entry's version range (canonical file URI per spec 066). THE SYSTEM SHALL NOT offer a rewrite on the reference | must |
+| FR-032 | WHEN an entry value is an alias (`react: *r`) THE SYSTEM SHALL anchor findings on the alias token span (including `*`) and offer no edit, update-all membership or completion. WHEN it is an anchor-defining scalar (`react: &r ^18`) THE SYSTEM SHALL treat it as an ordinary literal whose range excludes `&r`. WHEN it is a block scalar or a tagged non-string scalar THE SYSTEM SHALL produce findings only, no edit (same policy as [[056-gitlab-ci-yaml-scalar-anchor-alias/spec\|spec 056]]) | must |
+| FR-033 | THE SYSTEM SHALL resolve the in-use version of an entry from the root `pnpm-lock.yaml` found by walking up from the YAML file, selecting the lock version that satisfies the entry's own range (importer pool plus the #649 candidate disambiguation) | should |
+| FR-034 | WHEN `deps-cli check` or `deps-cli update` walks a workspace containing `pnpm-workspace.yaml` THE SYSTEM SHALL process it like any other manifest. An outdated entry is therefore reported once from the YAML and once from each referencing `package.json`, and `--fail-on` counts each report | must |
+| FR-035 | THE SYSTEM SHALL classify `DuplicateDefaultCatalog` as `Category::Other` in the exhaustive `deps-cli` `classify` match and SHALL NOT add it to the default `--fail-on` set (`vulnerable,yanked,unsatisfiable`), so the CLI default is unchanged. The diagnostic keeps its code `pnpm-duplicate-default-catalog` for editor filtering and as the SARIF rule id. Users can gate on it with `--fail-on other` | must |
 
 ## 4. Non-Functional Requirements
 
@@ -226,9 +244,11 @@ EARS notation. Priority: must / should / could.
 | NFR-004 | Consistency | Shared behavior (YAML bounds, scalar normalization, anchor handling, position mapping, capped reads, ancestor `.npmrc` lookup) SHALL be reused from `deps-core` and the existing catalog parser, not re-implemented; the existing `catalog.rs` parse and this feature SHALL NOT disagree about which entries exist or what their value is (single interpretation of the file) |
 | NFR-005 | Type safety | Catalog identity SHALL be a typed value that distinguishes the default catalog from a named one, so a user catalog literally named `default` cannot collide with the default catalog by string equality (the existing reserved-key string `"default"` is the anti-pattern to avoid). New enums SHALL be exhaustive with no catch-all arm. No new stringly-typed or `as_any()`-driven dispatch |
 | NFR-006 | Identity | Document identity SHALL use the canonical-identity mechanism of [[066-canonical-document-identity/spec|spec 066]] so the same file reached through different URIs does not produce divergent state |
-| NFR-007 | Compatibility | Existing `package.json` parsing, hover, completion and diagnostics SHALL NOT regress, except the single, deliberate de-duplication change decided in OQ-2 (pre-1.0: documented in CHANGELOG, no deprecation shim) |
+| NFR-007 | Compatibility | Existing `package.json` parsing, hover, completion and diagnostics SHALL NOT regress, except the additive message suffix and `related_information` of FR-031 (FR-035 changes no CLI default) (pre-1.0: documented in CHANGELOG, no deprecation shim) |
 | NFR-008 | Observability | Failures to read or parse the workspace file SHALL be logged via `tracing` with the redaction rules already applied to paths and URLs |
-| NFR-009 | Testability | Behavior SHALL be covered by unit tests, a fuzz target for the new parse path (parity with the pnpm-lock and other YAML fuzz targets, cf. #727), a snapshot or protocol-level test, and a live end-to-end run per the project's Registry Integration Gate |
+| NFR-010 | Type safety (origin) | A dependency's provenance SHALL be one exhaustive `NpmDependencyOrigin` so a catalog entry that also carries a catalog reference is unrepresentable; `NpmDependencySection` stays `Copy`. Call sites SHALL use an exhaustive `match` on the origin, with no helper that defaults a missing section to `Dependencies` (peer/optional semantics) |
+| NFR-011 | Known limitation | Because FR-023 is save-only, a related-information range may be stale against an unsaved YAML buffer until the next save. This is documented in the book |
+| NFR-009 | Testability | Behavior SHALL be covered by unit tests, the existing YAML fuzz target retargeted at the new parser (cf. #727), a snapshot or protocol-level test, CLI `check`/`update` tests, and a live end-to-end run per the project's Registry Integration Gate |
 
 ## 5. Data Model
 
@@ -245,6 +265,7 @@ Conceptual only; representation is a plan-phase decision.
 > [!note]
 > Today's catalog parser keeps only a name-to-range map and discards source positions, so entry
 > locations do not exist anywhere yet. That is the central new information this feature needs.
+> The typed representation is in [[plan]]: `CatalogId`, `CatalogSite`, `NpmDependencyOrigin`.
 
 ## 6. Edge Cases and Error Handling
 
@@ -257,16 +278,16 @@ Conceptual only; representation is a plan-phase decision.
 | `react: ${REACT_VERSION}`, `{{ X }}` placeholders | Treated as unresolved placeholder; no rewrite action (FR-018) |
 | `react: npm:preact@^10` | Non-registry classification (FR-009), no registry lookup for `react` |
 | `react: {version: ^18}` (mapping leaf) | Entry skipped (FR-010); rest of file unaffected |
-| `catalog:` and `catalogs.default:` both present | Per OQ-6; no panic; consumers' existing defect diagnostics unchanged |
+| `catalog:` and `catalogs.default:` both present | FR-030: one `DuplicateDefaultCatalog` Error on the `catalogs.default` key, entries still surfaced; no panic; consumers' existing defect diagnostics unchanged |
 | `catalog:` key present but null (commented-out block) | No entries, no finding, not malformed |
-| YAML anchors/aliases in values | Per OQ-5 |
+| YAML anchors/aliases in values | FR-032 |
 | 7 MB crafted file / deep nesting / alias bomb | Rejected by existing bounds with a defective-file outcome; no memory spike |
 | More than 5000 entries | Truncated at the cap with the standard truncation notice |
 | Invalid YAML mid-edit (user is typing) | Previous stable results are not replaced by a flood of errors; no entry-level findings until the file parses (FR-027) |
 | Scoped package `@scope/pkg` with a scoped registry in an ancestor `.npmrc` | Registry routing resolved from the YAML file's own directory, same as for a sibling `package.json` |
 | Registry unreachable | Same degradation as `package.json`: no false "outdated", cached data used where available |
 | File opened but no `catalog`/`catalogs` section | Silent: no diagnostics, no errors |
-| Editor not attached to the server for YAML files | Out of server control; see OQ-8 |
+| Editor not attached to the server for YAML files | Out of server control; see D-8 |
 
 ## 7. Success Criteria
 
@@ -276,8 +297,9 @@ Conceptual only; representation is a plan-phase decision.
 | SC-002 | Update code action on `react: ^16.0.0` | Resulting YAML differs from the original only in that scalar; re-parse yields the new range; idempotent on a second run |
 | SC-003 | Position accuracy matrix (plain / single / double quoted, numeric, flow mapping, CRLF, BOM, non-ASCII, comments) | 100% of entries have exact ranges in a table-driven test |
 | SC-004 | Resource-cap regression: 7 MB `pnpm-workspace.yaml`, deep nesting, alias bomb | Peak RSS stays within the bounds already asserted for #1483; handler returns without panic |
-| SC-005 | Duplicate-reporting scenario (both files open) | Exactly the outcome specified by OQ-2, verified live |
-| SC-006 | `package.json` regression | Existing `deps-npm` and `deps-lsp` tests pass unchanged except the OQ-2 expectation |
+| SC-005 | Duplicate-reporting scenario (both files open) | Exactly the outcome specified by FR-031 (finding in both files, suffix plus related information on the reference, one finding per entry in the YAML), verified live |
+| SC-006 | `package.json` regression | Existing `deps-npm` and `deps-lsp` tests pass unchanged except the FR-031 message-suffix expectation |
+| SC-008 | CLI: `deps-cli check` and `update` on the fixture workspace | The YAML is processed; an outdated entry is reported once from the YAML and once per referencing `package.json`; a duplicate-default fixture is reported as `other` and does not change the exit code under the default `--fail-on` |
 | SC-007 | Cross-ecosystem consistency check | Hover, diagnostics and inlay hints for a catalog entry match those of the same package in a `package.json` (same wording, category, version badge format) |
 
 ## 8. Agent Boundaries
@@ -289,10 +311,10 @@ Conceptual only; representation is a plan-phase decision.
 - Update `CHANGELOG.md` (one line, PR link), the mdBook ecosystem reference for npm, and the testing knowledge base (`coverage.md`, npm playbook).
 
 ### Ask first
-- Introducing a new `EcosystemId` variant or a second `Ecosystem` implementation (OQ-1).
-- Changing what `package.json` reports for `catalog:` references (OQ-2).
+- Introducing a new `EcosystemId` variant or a second `Ecosystem` implementation (rejected in D-1).
+- Removing or rewording `package.json` findings for `catalog:` references beyond FR-031 (D-2 keeps them).
 - Adding any dependency, or any new YAML parsing approach beyond the existing `yaml-rust2` stack.
-- Touching `deps-cli` in the same PR (OQ-6).
+- Widening scope to `overrides:` or consumer discovery (D-3, D-7).
 
 ### Never
 - Edit files under `crates/deps-zed`.
@@ -301,28 +323,38 @@ Conceptual only; representation is a plan-phase decision.
 - Use `serde_yaml` / `serde_yml`.
 - Introduce stringly-typed catalog identity.
 
-## 9. Open Questions
+## 9. Resolved Decisions
 
-> [!question] Open `[NEEDS CLARIFICATION]` items (9)
-> Resolve before `/sdd plan`.
+> [!success] All nine former `[NEEDS CLARIFICATION]` items are resolved (architect design 2026-10-21, critic-reviewed). Open items: 0.
 
-- [NEEDS CLARIFICATION: OQ-1 Routing. Should `pnpm-workspace.yaml` be added to the npm `Ecosystem`'s `manifest_filenames()` (one ecosystem, two document formats, content-dispatched), or be handled by a second `Ecosystem` implementation? Constraints to weigh: `EcosystemId` is exhaustive (a new variant forces every `match` to be updated); the `ecosystem_conformance!` macro pins exact `manifest_filenames`; the registry already maps this basename as a watched config, so precedence between manifest routing and `for_watched_config` must be defined; the npm parse path is JSON-only today. Suggested default: keep one ecosystem identity (npm) and avoid a 15th `EcosystemId`, decide the mechanism in plan.]
-- [NEEDS CLARIFICATION: OQ-2 Duplicate reporting. When both `package.json` (`"react": "catalog:"`) and `pnpm-workspace.yaml` are open, should the same outdated/vulnerable finding appear (a) in both files, (b) only on the catalog entry with `package.json` keeping only reference-level diagnostics (unresolved/missing catalog, malformed entry), or (c) in both but with the `package.json` message explicitly pointing at the catalog entry? Suggested default: (c) for the first release, since (b) removes a shipped behavior; revisit after live feedback.]
-- [NEEDS CLARIFICATION: OQ-3 `overrides` scope. pnpm 10 accepts `overrides` (and other settings formerly in `package.json`'s `pnpm` field) in `pnpm-workspace.yaml`; verify against the pnpm docs which sections accept version specifiers. Include simple `name: range` overrides in v1, include selector forms (`parent>child`, `pkg@range`), or defer all of `overrides` to a follow-up? Suggested default: catalog and catalogs only in v1; overrides as a separate follow-up spec, since selector parsing is a different grammar.]
-- [NEEDS CLARIFICATION: OQ-4 Lockfile in-use version. Should catalog entries show the resolved version from `pnpm-lock.yaml` (its `catalogs:` section) as the in-use version, via the lock-file provider of [[052-pnpm-lockfile-provider/spec|spec 052]]? That provider is keyed on `package.json` importers today; whether the lockfile's catalog section is a usable source (and which lockfile format versions) is unverified. Suggested default: no in-use version for catalog entries in v1; show latest/outdated against the declared range only.]
-- [NEEDS CLARIFICATION: OQ-5 Anchors, aliases and block scalars. When a catalog value is an alias (`react: *r`) or defines an anchor (`react: &r ^18`), or is a block scalar, should the system (a) skip edits and show findings read-only, (b) edit the anchor definition, or (c) skip the entry? The GitHub Actions and GitLab CI specs ([[056-gitlab-ci-yaml-scalar-anchor-alias/spec|spec 056]]) already made this choice for their YAML; consistency says reuse it. Suggested default: findings anchored on the scalar, no rewriting action for aliased/anchored values.]
-- [NEEDS CLARIFICATION: OQ-6 Surface scope and duplicate-default. (a) Does this land for `deps-lsp` only, or also `deps-cli check`/`update` ([[062-cli-check-mode/spec|spec 062]], the competitor shipped it in "LSP and scan")? deps-cli must reach it through `deps-engine` re-exports only ([[064-deps-cli-lsp-isolation/spec|spec 064]]). (b) For a file with both `catalog:` and `catalogs.default:` (pnpm rejects the whole workspace), should the YAML file itself get a diagnostic naming the conflict, or only keep today's package.json-side defect messages? Suggested default: LSP first with CLI parity as an immediate follow-up issue (per the no-partial-proxy rule); diagnostic on the YAML file is a should, not a must.]
-- [NEEDS CLARIFICATION: OQ-7 Consumers surfacing. Should hover on a catalog entry list the workspace packages that reference it ("used by N packages"), given a bump affects all of them? It requires workspace-wide discovery of referencing `package.json` files, which deps-lsp does not do today. Suggested default: out of v1; FR-021/FR-023 only concern open documents.]
-- [NEEDS CLARIFICATION: OQ-8 Client attachment. LSP servers do not choose which files a client sends; VS Code-style clients and the Zed extension (separate repo, `bug-ops/deps-zed`) must associate `pnpm-workspace.yaml` with deps-lsp (Zed attaches servers per language, and the file is YAML, which other servers also claim). Who owns the client-side change, and does the spec's "done" include a deps-zed follow-up issue? Suggested default: server-side done here; file a deps-zed follow-up issue and document the editor configuration in the mdBook.]
-- [NEEDS CLARIFICATION: OQ-9 Tracking. No GitHub issue exists yet for this spec (searched `pnpm` in issues; only #587, #590, #721, #1483, #1490 and related closed items). File one with labels `enhancement`, `P3` (and `cross-ecosystem` only if OQ-6 pulls deps-cli in) and record the number in the MOC row.]
+| ID | Former question | Decision |
+|----|-----------------|----------|
+| D-1 | OQ-1 Routing | One ecosystem, two formats. Add `pnpm-workspace.yaml` to npm `manifest_filenames()`; no 15th `EcosystemId`. `parse_manifest` dispatches on the exhaustive `NpmManifestKind { PackageJson, PnpmWorkspace }` (precedent: `PypiManifestKind::from_uri`). Manifest routing (`for_uri`) and `for_watched_config` are independent pipelines, so both keep running and FR-003 holds with no precedence logic. The npm `ecosystem_conformance!` pin is updated. A second `Ecosystem` was rejected: it forces a new `EcosystemId` arm everywhere and duplicates registry and formatter wiring. |
+| D-2 | OQ-2 Duplicate reporting | Option (c): `package.json` keeps its findings for `catalog:` references and gains the message suffix plus `related_information` (FR-031); the YAML gets one finding per entry (FR-021). Removing the `package.json` findings (b) would drop shipped behavior for users who never open the YAML. CLI duplicates are accepted and documented (FR-034). |
+| D-3 | OQ-3 `overrides` | Out of v1. Selector grammar is a different parser; the receiver classifies the subtree as irrelevant (FR-028). Follow-up F-1. |
+| D-4 | OQ-4 Lockfile | In-use version from the existing pnpm-lock provider: `locate_lockfile` walks up from the YAML file to the root `pnpm-lock.yaml`; importer pool plus #649 candidates select the version satisfying each entry's own range (FR-033). No `catalogs:` lockfile section parsing, so no new lockfile code. |
+| D-5 | OQ-5 Anchors | Same policy as spec 056 (FR-032). |
+| D-6 | OQ-6 Surface | (a) CLI parity is in this PR: `deps-cli` routes through `registry.for_uri` so it picks the file up automatically, and excluding it would need a deliberate filter (FR-034). (b) Duplicate default yields one YAML diagnostic (FR-030) with its own kind and code, classified `Other` with no CLI default change (FR-035). |
+| D-7 | OQ-7 Consumers | No "used by N packages" in v1 (needs workspace-wide discovery). Follow-up F-2. |
+| D-8 | OQ-8 Client | Server side is done here. The mdBook npm page documents client association (VS Code `documentSelector`, Neovim filetypes/root). The Zed side is follow-up F-3 in `bug-ops/deps-zed`. |
+| D-9 | OQ-9 Tracking | Tracking issue is #1788. |
+
+### Follow-up issues to file (by the lead; links to external repositories wrapped in backticks)
+
+| ID | Title | Labels |
+|----|-------|--------|
+| F-1 | pnpm-workspace.yaml: dependency hints for `overrides:` entries (selector grammar `a>b`, `pkg@range`) | `enhancement`, `P4` |
+| F-2 | Hover on a catalog entry: "used by N packages" via workspace-wide discovery of referencing `package.json` files | `enhancement`, `P4` |
+| F-3 | (`bug-ops/deps-zed`) Associate `pnpm-workspace.yaml` with deps-lsp in the Zed extension (the YAML language is also claimed by other servers) | `enhancement`, `P3` |
 
 ## 10. See Also
 
 - [[MOC-specs]] — all specifications
+- [[plan]] and [[tasks]] — technical design and implementation tasks for this spec
 - [[046-pnpm-catalogs/spec|046 pnpm catalogs]] — the read side this spec extends; its Out of Scope explicitly excluded write-back to `pnpm-workspace.yaml`, which this spec reverses for entry-level edits
-- [[052-pnpm-lockfile-provider/spec|052 pnpm lockfile provider]] — in-use version source (OQ-4)
+- [[052-pnpm-lockfile-provider/spec|052 pnpm lockfile provider]] — in-use version source (D-4)
 - [[014-github-actions-ecosystem/spec|014 GitHub Actions ecosystem]] and [[056-gitlab-ci-yaml-scalar-anchor-alias/spec|056 GitLab CI anchors/aliases]] — prior YAML-as-manifest precedents in this workspace
-- [[062-cli-check-mode/spec|062 CLI check mode]] and [[064-deps-cli-lsp-isolation/spec|064 CLI/LSP isolation]] — CLI parity constraints (OQ-6)
+- [[062-cli-check-mode/spec|062 CLI check mode]] and [[064-deps-cli-lsp-isolation/spec|064 CLI/LSP isolation]] — CLI parity constraints (D-6)
 - [[066-canonical-document-identity/spec|066 canonical document identity]] — NFR-006
 - Closed issues: #587, #590 (catalog resolution and watch), #721 (YAML numeric scalar positions), #1483, #1490 (CWE-400 range caps)
 - [pnpm catalogs](https://pnpm.io/catalogs), [Dependabot catalog support](https://github.blog/changelog/2025-02-04-dependabot-now-supports-pnpm-workspace-catalogs-ga/)
