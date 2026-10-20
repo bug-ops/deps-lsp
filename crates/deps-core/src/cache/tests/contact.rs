@@ -1,5 +1,6 @@
 use super::*;
 use crate::endpoint_contact::{ContactLedger, ResponseSeen};
+use std::time::Duration;
 
 #[tokio::test]
 async fn a_live_fetch_records_request_and_response() {
@@ -22,7 +23,7 @@ async fn a_live_fetch_records_request_and_response() {
 
     let contact = ledger.snapshot(tokio::time::Instant::now());
     assert_eq!(contact.response, ResponseSeen::Yes);
-    assert_eq!(contact.stall, None);
+    assert_eq!(contact.stall, Duration::ZERO);
 }
 
 #[tokio::test]
@@ -82,7 +83,7 @@ async fn only_a_guarded_request_earns_the_proxy_notice() {
 }
 
 #[tokio::test]
-async fn a_refused_connection_leaves_the_request_pending_without_a_response() {
+async fn a_refused_connection_closes_the_request_without_a_response() {
     let port = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
@@ -99,5 +100,8 @@ async fn a_refused_connection_leaves_the_request_pending_without_a_response() {
 
     let contact = ledger.snapshot(tokio::time::Instant::now());
     assert_eq!(contact.response, ResponseSeen::No);
-    assert!(contact.stall.is_some(), "a transport error clears nothing");
+    assert!(
+        contact.stall < Duration::from_secs(1),
+        "a fast transport error accumulates no stall"
+    );
 }

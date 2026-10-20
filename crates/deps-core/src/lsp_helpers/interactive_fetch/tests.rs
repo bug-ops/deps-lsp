@@ -13,7 +13,7 @@ use super::key::{
 };
 use super::memo::{Decision, FastFail, INTERACTIVE_FAILURE_TTL, INTERACTIVE_MEMO_CAP};
 use super::*;
-use crate::endpoint_contact::{Contact, ResponseSeen, note_request, note_response};
+use crate::endpoint_contact::{Contact, RequestNote, ResponseSeen, note_request};
 use crate::lsp_helpers::DependencyOutcomes;
 use crate::lsp_helpers::REGISTRY_FETCH_BUDGET;
 use crate::test_util::{MockRegistry, MockVersion};
@@ -135,23 +135,21 @@ impl Fixture {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 match fetch {
                     Fetch::Succeed => {
-                        note_request();
-                        note_response();
+                        note_request().answered();
                         Ok(1)
                     }
                     Fetch::Fail => {
-                        note_request();
-                        note_response();
+                        note_request().answered();
                         Err(Failure(ErrorOrigin::Endpoint))
                     }
                     Fetch::FailLocal => Err(Failure(ErrorOrigin::Unattributed)),
                     Fetch::FailLocalSlow => {
-                        note_request();
+                        let _note = note_request();
                         tokio::time::sleep(Duration::from_secs(6)).await;
                         Err(Failure(ErrorOrigin::Unattributed))
                     }
                     Fetch::Stall => {
-                        note_request();
+                        let _note = note_request();
                         tokio::time::sleep(REGISTRY_FETCH_BUDGET + Duration::from_secs(5)).await;
                         Ok(1)
                     }
@@ -598,9 +596,7 @@ impl Fixture {
             .unwrap();
         let fetch = async {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            if !matches!(behavior, Versions::Untouched(_)) {
-                note_request();
-            }
+            let mut note = (!matches!(behavior, Versions::Untouched(_))).then(note_request);
             match behavior {
                 Versions::Untouched(delay) => {
                     tokio::time::sleep(delay).await;
@@ -608,27 +604,27 @@ impl Fixture {
                 }
                 Versions::AnswerThenStall => {
                     tokio::time::sleep(secs(1)).await;
-                    note_response();
-                    note_request();
+                    answered(note.take());
+                    let _next = note_request();
                     tokio::time::sleep(secs(60)).await;
                     Ok(list())
                 }
                 Versions::Paging => {
                     for _ in 0..20 {
                         tokio::time::sleep(secs(3)).await;
-                        note_response();
-                        note_request();
+                        answered(note.take());
+                        note = Some(note_request());
                     }
                     Ok(list())
                 }
                 Versions::Succeed(delay) => {
                     tokio::time::sleep(delay).await;
-                    note_response();
+                    answered(note.take());
                     Ok(list())
                 }
                 Versions::Fail(delay) => {
                     tokio::time::sleep(delay).await;
-                    note_response();
+                    answered(note.take());
                     Err(())
                 }
                 Versions::Transport(delay) => {
@@ -917,26 +913,32 @@ fn scoped_endpoint(manifest: &url::Url) -> EndpointKey {
     }
 }
 
+fn answered(note: Option<RequestNote>) {
+    if let Some(note) = note {
+        note.answered();
+    }
+}
+
 fn is_open(health: Option<EndpointHealth>) -> bool {
     matches!(health, Some(EndpointHealth::Open { .. }))
 }
 
 const ANSWERED: Contact = Contact {
     response: ResponseSeen::Yes,
-    stall: None,
+    stall: Duration::ZERO,
 };
 
 const fn stalled_for(stall: Duration) -> Contact {
     Contact {
         response: ResponseSeen::No,
-        stall: Some(stall),
+        stall,
     }
 }
 
 const fn answered_then_stalled_for(stall: Duration) -> Contact {
     Contact {
         response: ResponseSeen::Yes,
-        stall: Some(stall),
+        stall,
     }
 }
 

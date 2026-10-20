@@ -70,10 +70,11 @@ pub(super) enum AttemptEvidence {
 ///   cache entry or a local error never touched the endpoint. A `Live` near the budget is
 ///   inconclusive: the HTTP cache serves stale data after a failed revalidation, so it may come
 ///   from a dead host.
-/// - An ending with a request outstanding for at least half the budget, by elapse, cancel or
-///   any error, is [`AttemptEvidence::Slow`]. The stall clock restarts at each request after a
-///   response, so a chain whose first hop answers fast and whose second hangs is slow, while a
-///   paginating fetch that keeps receiving responses is not.
+/// - An ending after a request was outstanding for at least half the budget, by elapse, cancel
+///   or any error, is [`AttemptEvidence::Slow`]. The stall is busy time since the last response,
+///   so a chain whose first hop answers fast and whose second hangs is slow, a request that
+///   fails after a long wait still counts, and a paginating fetch that keeps receiving
+///   responses is not slow.
 /// - Everything else is [`AttemptEvidence::Inconclusive`]: a promoted request with little
 ///   budget left, an early cancel, a fast local failure, a lookup that only waited on another
 ///   task's lock or single-flight (it sent nothing, so while a background fetch holds one the
@@ -87,7 +88,7 @@ pub(super) fn evidence(
 ) -> AttemptEvidence {
     let responsive = waited < budget.saturating_sub(MARGIN);
     let answered = contact.response == ResponseSeen::Yes;
-    let stalled = contact.stall.is_some_and(|stall| stall >= budget / 2);
+    let stalled = contact.stall >= budget / 2;
     match end {
         AttemptEnd::Live if responsive && answered => AttemptEvidence::Answered,
         AttemptEnd::Live => AttemptEvidence::Inconclusive,
