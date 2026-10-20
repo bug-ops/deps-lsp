@@ -205,7 +205,8 @@ Consumes: `ProbePhase::PreFetch`, `ProbeReport`/`ProbeEffect::Reparse`, `Ecosyst
 | SC-002 | Trust gate | Workspace-declared default never queried; mock asserts zero hits |
 | SC-003 | Credential test (NFR-001) | Mock never sees `TOKEN` |
 | SC-004 | Convergence test (NFR-002) | Zero reparse/events over N cycles |
-| SC-005 | Same OSV advisory before/after swizzle; license deny-list fires through the real lookup path | Pass |
+| SC-005 | Same OSV advisory before/after swizzle; license deny-list fires, tested end to end through the real tier-3 lookup and hover/diagnostic path (not a unit test of the license map in isolation) | Pass |
+| SC-009 | Mixed-case repository path (`https://github.com/Apple/Swift-NIO`) | `public_content` name is `Apple/Swift-NIO` (case preserved); OSV query is `github.com/Apple/Swift-NIO` and the advisory matches (SwiftURL matching is case-sensitive) |
 | SC-006 | Latest verdict after swizzle | `Unverified` until phase B commits |
 | SC-007 | CLI vs LSP on the same fixtures | Identical output; incomplete-lookup stderr note |
 | SC-008 | Live: user-tier default registry (or a local SE-0292 stub) with `Replace` | Registry versions shown for an eligible URL dependency |
