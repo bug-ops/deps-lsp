@@ -19,10 +19,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `BlockedHost::reason` names the rule that refused a host (#PR)
 - **deps-core**: `CachedEndpoint::new`, a constant empty-cache constructor (#PR)
 
-### Fixed
-- **deps-core, deps-nuget, deps-github-actions**: the endpoint breaker opens again for hovers that wait on a background fetch's request (#PR)
-- **deps-core, deps-gitlab-ci**: floor-blocked registry hosts read "is never a registry host" instead of blaming `registries.workspace_registries` (#PR)
-
 ### Changed
 - **deps**: update `Cargo.lock` (tokio 1.54.0, serde_json 1.0.154, aws-lc-sys 0.46.0, related patch drift) (#PR)
 - **deps-core, deps-nuget**: a non-https request URL is an actionable `InsecureScheme`, and a non-https `@id` in the public NuGet service index is refused as a bad feed (#PR)
@@ -33,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: the operator-registry trust rule parses each URL once with one canonical form (#PR)
 - **deps-bundler, deps-dart, deps-composer**: registries cache their endpoint like the other ecosystems (#PR)
 - **release**: crates.io publishing runs through `scripts/publish-crates.sh`, which publishes in dependency order (#1868)
+
+### Fixed
+- **deps-core, deps-nuget, deps-github-actions**: the endpoint breaker opens again for hovers that wait on a background fetch's request (#PR)
+- **deps-core, deps-gitlab-ci**: floor-blocked registry hosts read "is never a registry host" instead of blaming `registries.workspace_registries` (#PR)
 
 ## [3.0.0] - 2026-10-19
 
