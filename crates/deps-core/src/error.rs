@@ -321,6 +321,10 @@ pub enum DepsError {
     /// configuration fault that no retry resolves, so it is [`FetchFailure::Actionable`] with a
     /// fixed, URL-free message.
     ///
+    /// Only a configured or operator-declared URL can reach that check: URLs a registry supplies
+    /// (service-index resources, pagination links) are vetted by their ecosystem first, so this
+    /// never blames the user for a registry's own bad data.
+    ///
     /// `#[non_exhaustive]` on the variant itself: only `deps-core`'s cache builds it.
     #[error("URL must use HTTPS: {url}")]
     #[non_exhaustive]

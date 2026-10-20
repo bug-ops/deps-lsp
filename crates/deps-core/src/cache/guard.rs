@@ -42,8 +42,12 @@ pub(super) fn is_loopback_host(url: &str) -> bool {
 
 /// Validates that a URL uses HTTPS protocol.
 ///
-/// Returns an error if the URL doesn't start with "https://".
+/// Returns [`DepsError::InsecureScheme`] if the URL doesn't start with "https://".
 /// This ensures all network requests are encrypted.
+///
+/// Callers pass only URLs built from a configured or operator-declared base; a URL a registry
+/// supplies must be vetted by its ecosystem before it reaches here, so this error stays a
+/// configuration fault.
 ///
 /// A loopback HTTP URL (`127.0.0.1`/`localhost`/`::1`, the shape every `mockito::Server`
 /// binds to) is allowed in `deps-core`'s own test builds (`cfg(test)`) and in other

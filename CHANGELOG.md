@@ -8,24 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
-- **deps-core and every formatter**: the override hook is `PackageNaming::normalized_spelling`, and `normalize_package_name` moves to the sealed `NormalizeName` trait (add `use deps_core::NormalizeName`), returning the new `NormalizedName` (#PR)
+- **deps-core and every formatter**: formatters override `PackageNaming::normalized_spelling`, and `normalize_package_name` moves to the sealed `NormalizeName` trait returning `NormalizedName` (#PR)
 - **deps-core, deps-engine, deps-lsp**: `DependencyOutcomes` getters, setters and `with_*` builders take `NormalizedName` instead of strings (#PR)
 - **deps-core**: `InteractiveFetchRequest::new` takes `&NormalizedName` as its normalized name (#PR)
 
 ### Added
-- **deps-core**: `observe_ecosystem` and `observe_endpoint` tag orchestration fetches so interactive hovers can see requests another task has on the wire (#PR)
-- **deps-core**: `CachedEndpoint::new`, a constant constructor for an empty endpoint cache, and `BlockedHost::reason`, the clause naming the rule that refused a host (#PR)
-- **deps-core**: `NormalizedName`, the formatter-normalized lookup key that only `NormalizeName::normalize_package_name` builds (#PR)
-- **deps-core**: `DepsError::{InsecureScheme, BudgetExceeded, RecentlyFailed}` and `error::LookupBudget` give the non-cache failures that used `CacheError` their own variants (#PR)
+- **deps-core**: `observe_ecosystem` and `observe_endpoint` let orchestration code tag fetches so hovers see requests another task has on the wire (#PR)
+- **deps-core**: `NormalizedName`, the key only `NormalizeName::normalize_package_name` builds (#PR)
+- **deps-core**: `DepsError::{InsecureScheme, BudgetExceeded, RecentlyFailed}` and `error::LookupBudget` replace `CacheError` for non-cache failures (#PR)
+- **deps-core**: `BlockedHost::reason` names the rule that refused a host (#PR)
+- **deps-core**: `CachedEndpoint::new`, a constant empty-cache constructor (#PR)
 
 ### Fixed
-- **deps-core, deps-nuget, deps-github-actions**: the endpoint circuit breaker opens again for hovers that wait on a background fetch's request (NuGet service index, GitHub Actions per-repository lock); stall is measured as busy time (#PR)
-- **deps-core**: the blocked-registry diagnostic and warning say "is never a registry host" for floor-blocked hosts instead of blaming `registries.workspace_registries`, in the GitLab instance host warning too (#PR)
+- **deps-core, deps-nuget, deps-github-actions**: the endpoint breaker opens again for hovers that wait on a background fetch's request (#PR)
+- **deps-core, deps-gitlab-ci**: floor-blocked registry hosts read "is never a registry host" instead of blaming `registries.workspace_registries` (#PR)
 
 ### Changed
-- **deps**: update `Cargo.lock` (tokio 1.54.0, serde_json 1.0.154, aws-lc-sys 0.46.0 and related patch drift) (#PR)
-- **deps-core, deps-cargo, deps-maven, deps-swift, deps-lsp**: a non-https request URL is `InsecureScheme` and now reads as an actionable configuration fault, malformed index and metadata responses are `ParseError`, budget overruns and search suppression have typed variants, and document size limits are `Io` errors of kind `FileTooLarge`; `CacheError` stays only for Cargo's fail-closed credential arm (#PR)
-- **deps-core, deps-bundler, deps-dart, deps-composer**: single-flight claims are held by a `Leader` handle, `cache::Transport` fields are private, the operator-registry trust rule parses each URL once with one canonical form, and Bundler, Dart and Composer cache their endpoint (#PR)
+- **deps**: update `Cargo.lock` (tokio 1.54.0, serde_json 1.0.154, aws-lc-sys 0.46.0, related patch drift) (#PR)
+- **deps-core, deps-nuget**: a non-https request URL is an actionable `InsecureScheme`, and a non-https `@id` in the public NuGet service index is refused as a bad feed (#PR)
+- **deps-cargo, deps-maven, deps-swift**: malformed index and metadata responses are `ParseError`, and budget overruns and search suppression have typed errors (#PR)
+- **deps-lsp**: document size and file-kind limits are `Io` errors of kind `FileTooLarge` or `InvalidInput` (#PR)
+- **deps-core**: single-flight claims are held by a `Leader` handle (#PR)
+- **deps-core**: `cache::Transport` fields are private (#PR)
+- **deps-core**: the operator-registry trust rule parses each URL once with one canonical form (#PR)
+- **deps-bundler, deps-dart, deps-composer**: registries cache their endpoint like the other ecosystems (#PR)
 - **release**: crates.io publishing runs through `scripts/publish-crates.sh`, which publishes in dependency order (#1868)
 
 ## [3.0.0] - 2026-10-19

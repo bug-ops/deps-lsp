@@ -303,7 +303,7 @@ fn pick_resource(resources: &[ServiceResource], type_preference: &[&str]) -> Opt
 /// new tier cannot silently inherit another's check.
 #[derive(Clone, Copy)]
 enum ResourceCheck {
-    /// The public registry's own index: trusted unconditionally.
+    /// The public registry's own index: no policy or floor check, only the https shape.
     Open,
     /// A trusted (operator-declared) feed: shape plus the never-a-registry floor, no policy.
     Floor,
@@ -327,7 +327,13 @@ impl ResourceCheck {
     ) -> std::result::Result<(), ResourceRejection> {
         use deps_core::net_policy::{IndexUrlError, floor_block, validate_index_url};
         match self {
-            Self::Open => Ok(()),
+            // A service index is registry-supplied data, so a non-https `@id` is refused here as
+            // a bad feed (transient) rather than reaching the egress chokepoint, which reports
+            // a configuration fault. Any other shape problem is left to `assemble`.
+            Self::Open => match validate_index_url(id, id, EcosystemId::NuGet, PolicyGate::Skip) {
+                Err(error @ IndexUrlError::NotHttps(_)) => Err(ResourceRejection::Invalid(error)),
+                Ok(_) | Err(_) => Ok(()),
+            },
             Self::Policy => {
                 validate_index_url(id, id, EcosystemId::NuGet, PolicyGate::Enforce(policy))
                     .map(drop)
@@ -1748,6 +1754,23 @@ mod tests {
             index.search_query_service.as_ref().map(IndexResource::base),
             Some("https://azuresearch-usnc.nuget.org/query")
         );
+    }
+
+    /// A non-https `@id` in the public registry's own (registry-supplied) service index is a bad
+    /// feed (transient parse error), never a user-facing `InsecureScheme` configuration fault.
+    #[test]
+    fn test_service_index_resolve_public_tier_refuses_a_non_https_id_as_a_transient_parse_error() {
+        let response: ServiceIndexResponse = serde_json::from_str(&service_index_body(
+            "http://api.nuget.org/v3-flatcontainer/",
+            "https://azuresearch-usnc.nuget.org/query",
+        ))
+        .unwrap();
+
+        let error = ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy())
+            .unwrap_err();
+
+        assert!(matches!(error, DepsError::ParseError { .. }), "{error:?}");
+        assert_eq!(error.fetch_failure(), deps_core::FetchFailure::Transient);
     }
 
     #[test]
