@@ -781,7 +781,7 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
 /// soft ranking hint, not a security gate, so an approximate (not exact PEP 503)
 /// equivalence is an acceptable trade for staying ecosystem-agnostic —
 /// [`build_package_completion`] has no access to any ecosystem's
-/// `PackageNaming::normalize_package_name`. Compares `char`-by-`char` rather than
+/// `NormalizeName::normalize_package_name`. Compares `char`-by-`char` rather than
 /// byte-slicing `candidate` at `prefix.len()`, which would panic when that byte offset
 /// falls inside a multi-byte `char` in `candidate`.
 ///
@@ -1794,9 +1794,11 @@ pub async fn complete_versions_generic_replacing(
         return vec![];
     }
 
-    let versions = match registry
-        .get_versions_from(package_name, source, freshness)
-        .await
+    let versions = match crate::observe_endpoint(
+        registry.endpoint_for(package_name, source),
+        registry.get_versions_from(package_name, source, freshness),
+    )
+    .await
     {
         Ok(v) => v,
         Err(e) => {
@@ -2060,6 +2062,9 @@ pub async fn complete_versions_at_position(
     )
     .await
 }
+
+#[cfg(test)]
+mod wiring_tests;
 
 #[cfg(test)]
 mod tests {

@@ -13,7 +13,7 @@ use super::key::{
 };
 use super::memo::{Decision, FastFail, INTERACTIVE_FAILURE_TTL, INTERACTIVE_MEMO_CAP};
 use super::*;
-use crate::endpoint_contact::{Contact, ResponseSeen, note_request, note_response};
+use crate::endpoint_contact::{Contact, RequestNote, ResponseSeen, note_request};
 use crate::lsp_helpers::DependencyOutcomes;
 use crate::lsp_helpers::REGISTRY_FETCH_BUDGET;
 use crate::test_util::{MockRegistry, MockVersion};
@@ -44,6 +44,7 @@ impl InteractiveFetchError for Failure {
 }
 
 struct Fixture {
+    ecosystem: EcosystemId,
     gate: InteractiveFetchGate,
     cached: HashMap<PackageName, crate::PackageVersions>,
     resolved: HashMap<PackageName, ConcreteVersion>,
@@ -60,6 +61,7 @@ fn manifest(path: &str) -> url::Url {
 impl Fixture {
     fn new() -> Self {
         Self {
+            ecosystem: EcosystemId::Cargo,
             gate: InteractiveFetchGate::new(NonZeroUsize::new(4).unwrap()),
             cached: HashMap::new(),
             resolved: HashMap::new(),
@@ -72,6 +74,11 @@ impl Fixture {
 
     fn with_endpoint(mut self, endpoint: RegistryEndpoint) -> Self {
         self.registry = MockRegistry::new().with_endpoint(endpoint);
+        self
+    }
+
+    fn with_ecosystem(mut self, ecosystem: EcosystemId) -> Self {
+        self.ecosystem = ecosystem;
         self
     }
 
@@ -116,15 +123,16 @@ impl Fixture {
     ) -> InteractiveFetch<u8> {
         let package = PackageName::new(name);
         let versions = VersionData::new(&self.cached, &self.resolved)
-            .with_ecosystem(EcosystemId::Cargo)
+            .with_ecosystem(self.ecosystem)
             .with_network(network)
             .with_outcomes(outcomes)
             .with_interactive_fetch_gate(&self.gate);
+        let normalized = crate::NormalizedName::for_test(name);
         let request = InteractiveFetchRequest::new(
             versions,
             manifest,
             &package,
-            name,
+            &normalized,
             source,
             FetchContext::Hover,
         );
@@ -135,23 +143,21 @@ impl Fixture {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 match fetch {
                     Fetch::Succeed => {
-                        note_request();
-                        note_response();
+                        note_request().answered();
                         Ok(1)
                     }
                     Fetch::Fail => {
-                        note_request();
-                        note_response();
+                        note_request().answered();
                         Err(Failure(ErrorOrigin::Endpoint))
                     }
                     Fetch::FailLocal => Err(Failure(ErrorOrigin::Unattributed)),
                     Fetch::FailLocalSlow => {
-                        note_request();
+                        let _note = note_request();
                         tokio::time::sleep(Duration::from_secs(6)).await;
                         Err(Failure(ErrorOrigin::Unattributed))
                     }
                     Fetch::Stall => {
-                        note_request();
+                        let _note = note_request();
                         tokio::time::sleep(REGISTRY_FETCH_BUDGET + Duration::from_secs(5)).await;
                         Ok(1)
                     }
@@ -182,7 +188,7 @@ impl Fixture {
 }
 
 fn failing(name: &str, failure: FetchFailure) -> DependencyOutcomes {
-    DependencyOutcomes::new().with_fetch_failure(name, failure)
+    DependencyOutcomes::new().with_fetch_failure(crate::NormalizedName::for_test(name), failure)
 }
 
 fn assert_degraded<T>(result: &InteractiveFetch<T>, expected: NoLiveList) {
@@ -279,6 +285,7 @@ async fn seeding_is_discarded_when_the_gate_was_invalidated_after_the_read() {
     let package = PackageName::new("serde");
     let source = DependencySource::Registry;
     let outcomes = failing("serde", FetchFailure::Transient);
+    let normalized = crate::NormalizedName::for_test("serde");
     let request = InteractiveFetchRequest::new(
         VersionData::new(&fixture.cached, &fixture.resolved)
             .with_ecosystem(EcosystemId::Cargo)
@@ -286,7 +293,7 @@ async fn seeding_is_discarded_when_the_gate_was_invalidated_after_the_read() {
             .with_interactive_fetch_gate(&fixture.gate),
         &fixture.manifest,
         &package,
-        "serde",
+        &normalized,
         &source,
         FetchContext::Hover,
     );
@@ -491,13 +498,14 @@ async fn request_without_a_gate_is_the_plain_bounded_await() {
     let source = DependencySource::Registry;
     let outcomes = failing("serde", FetchFailure::Transient);
     let document = manifest("/project/Cargo.toml");
+    let normalized = crate::NormalizedName::for_test("serde");
     let request = InteractiveFetchRequest::new(
         VersionData::new(&cached, &resolved)
             .with_ecosystem(EcosystemId::Cargo)
             .with_outcomes(&outcomes),
         &document,
         &package,
-        "serde",
+        &normalized,
         &source,
         FetchContext::CodeAction,
     );
@@ -543,6 +551,8 @@ enum Versions {
     /// Served after the delay without any request: a memo, a fresh cache entry, or a wait on
     /// another task's lock.
     Untouched(Duration),
+    /// Waits on another task for the delay, then sends a request of its own that never answers.
+    WaitThenStall(Duration),
     /// A chain whose first hop answers in 1 s and whose second hop never does.
     AnswerThenStall,
     /// Pages that each answer in 3 s, for far longer than the budget.
@@ -582,14 +592,15 @@ impl Fixture {
         let package = PackageName::new(name);
         let source = DependencySource::Registry;
         let outcomes = DependencyOutcomes::new();
+        let normalized = crate::NormalizedName::for_test(name);
         let request = InteractiveFetchRequest::new(
             VersionData::new(&self.cached, &self.resolved)
-                .with_ecosystem(EcosystemId::Cargo)
+                .with_ecosystem(self.ecosystem)
                 .with_outcomes(&outcomes)
                 .with_interactive_fetch_gate(&self.gate),
             &self.manifest,
             &package,
-            name,
+            &normalized,
             &source,
             context,
         );
@@ -598,37 +609,45 @@ impl Fixture {
             .unwrap();
         let fetch = async {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            if !matches!(behavior, Versions::Untouched(_)) {
-                note_request();
-            }
+            let mut note = (!matches!(
+                behavior,
+                Versions::Untouched(_) | Versions::WaitThenStall(_)
+            ))
+            .then(note_request);
             match behavior {
                 Versions::Untouched(delay) => {
                     tokio::time::sleep(delay).await;
                     Ok(list())
                 }
+                Versions::WaitThenStall(delay) => {
+                    tokio::time::sleep(delay).await;
+                    let _own = note_request();
+                    tokio::time::sleep(secs(60)).await;
+                    Ok(list())
+                }
                 Versions::AnswerThenStall => {
                     tokio::time::sleep(secs(1)).await;
-                    note_response();
-                    note_request();
+                    answered(note.take());
+                    let _next = note_request();
                     tokio::time::sleep(secs(60)).await;
                     Ok(list())
                 }
                 Versions::Paging => {
                     for _ in 0..20 {
                         tokio::time::sleep(secs(3)).await;
-                        note_response();
-                        note_request();
+                        answered(note.take());
+                        note = Some(note_request());
                     }
                     Ok(list())
                 }
                 Versions::Succeed(delay) => {
                     tokio::time::sleep(delay).await;
-                    note_response();
+                    answered(note.take());
                     Ok(list())
                 }
                 Versions::Fail(delay) => {
                     tokio::time::sleep(delay).await;
-                    note_response();
+                    answered(note.take());
                     Err(())
                 }
                 Versions::Transport(delay) => {
@@ -854,6 +873,7 @@ async fn public_entry_point_shares_the_registry_list() {
     let package = PackageName::new("serde");
     let source = DependencySource::Registry;
     let outcomes = DependencyOutcomes::new();
+    let normalized = crate::NormalizedName::for_test("serde");
     let request = InteractiveFetchRequest::new(
         VersionData::new(&fixture.cached, &fixture.resolved)
             .with_ecosystem(EcosystemId::Cargo)
@@ -861,7 +881,7 @@ async fn public_entry_point_shares_the_registry_list() {
             .with_interactive_fetch_gate(&fixture.gate),
         &fixture.manifest,
         &package,
-        "serde",
+        &normalized,
         &source,
         FetchContext::CodeAction,
     );
@@ -917,26 +937,32 @@ fn scoped_endpoint(manifest: &url::Url) -> EndpointKey {
     }
 }
 
+fn answered(note: Option<RequestNote>) {
+    if let Some(note) = note {
+        note.answered();
+    }
+}
+
 fn is_open(health: Option<EndpointHealth>) -> bool {
     matches!(health, Some(EndpointHealth::Open { .. }))
 }
 
 const ANSWERED: Contact = Contact {
     response: ResponseSeen::Yes,
-    stall: None,
+    stall: Duration::ZERO,
 };
 
 const fn stalled_for(stall: Duration) -> Contact {
     Contact {
         response: ResponseSeen::No,
-        stall: Some(stall),
+        stall,
     }
 }
 
 const fn answered_then_stalled_for(stall: Duration) -> Contact {
     Contact {
         response: ResponseSeen::Yes,
-        stall: Some(stall),
+        stall,
     }
 }
 
@@ -1855,6 +1881,7 @@ fn route_of(
     let package = PackageName::new(name);
     let source = DependencySource::Registry;
     let outcomes = DependencyOutcomes::new();
+    let normalized = crate::NormalizedName::for_test(name);
     let request = InteractiveFetchRequest::new(
         VersionData::new(&fixture.cached, &fixture.resolved)
             .with_ecosystem(ecosystem)
@@ -1862,7 +1889,7 @@ fn route_of(
             .with_interactive_fetch_gate(&fixture.gate),
         &fixture.manifest,
         &package,
-        name,
+        &normalized,
         &source,
         FetchContext::Hover,
     );
@@ -2407,3 +2434,6 @@ async fn a_latest_fallback_is_not_starved_by_a_saturated_gate() {
 
     assert_matches!(fallback, InteractiveFetch::Live(1));
 }
+
+mod coalesced;
+mod normalized_key;

@@ -333,6 +333,7 @@ impl OsvNaming for GradleFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::NormalizeName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::{RequirementGate, RequirementStatus};
 
@@ -732,7 +733,7 @@ mod tests {
         let f = GradleFormatter;
         assert_eq!(
             f.normalize_package_name(&PackageName::new("com.google.guava:guava")),
-            "com.google.guava:guava"
+            deps_core::NormalizedName::for_test("com.google.guava:guava")
         );
     }
 

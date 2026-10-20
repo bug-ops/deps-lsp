@@ -278,7 +278,7 @@ impl GitlabCiFormatter {
 }
 
 impl PackageNaming for GitlabCiFormatter {
-    fn normalize_package_name(&self, name: &PackageName) -> String {
+    fn normalized_spelling(&self, name: &PackageName) -> String {
         name.as_str().to_lowercase()
     }
 

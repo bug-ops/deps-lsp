@@ -169,18 +169,21 @@ pub(crate) async fn fetch_registry_versions_for_change(
     let attempted_names: Vec<PackageName> =
         dep_sources.iter().map(|(name, _)| name.clone()).collect();
     let registry = ecosystem.registry();
-    let fetch_result = fetch_latest_versions_parallel(
-        registry,
-        dep_sources,
-        &in_use,
-        progress_sender,
-        freshness_settings,
-        fetch_timeout,
-        max_concurrent_fetches,
-        &selection_context,
-        // See `lifecycle.rs`'s identical call site — deps-lsp's own GOSSIP surfacing (spec
-        // 072) does not go through this fetch-level filter.
-        None,
+    let fetch_result = deps_core::observe_ecosystem(
+        ecosystem.ecosystem_id(),
+        fetch_latest_versions_parallel(
+            registry,
+            dep_sources,
+            &in_use,
+            progress_sender,
+            freshness_settings,
+            fetch_timeout,
+            max_concurrent_fetches,
+            &selection_context,
+            // See `lifecycle.rs`'s identical call site — deps-lsp's own GOSSIP surfacing (spec
+            // 072) does not go through this fetch-level filter.
+            None,
+        ),
     )
     .await;
 
@@ -254,6 +257,8 @@ mod tests {
     use deps_core::DependencyOutcomes;
     #[cfg(feature = "pypi")]
     use deps_core::EcosystemId;
+    #[cfg(feature = "pypi")]
+    use deps_core::NormalizeName;
     #[cfg(feature = "pypi")]
     use deps_core::Registry;
     #[cfg(feature = "pypi")]
@@ -559,7 +564,7 @@ dependencies = ["requests>=2.0.0"]
             pinned_version: &'static str,
         ) -> (
             Vec<deps_core::diagnostic::Diagnostic>,
-            HashMap<String, (ConcreteVersion, RemovalStatus)>,
+            HashMap<deps_core::NormalizedName, (ConcreteVersion, RemovalStatus)>,
         ) {
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/pyproject.toml");
@@ -624,7 +629,10 @@ dependencies = ["requests>=2.0.0"]
             )
             .await;
 
-            let yanked_versions: HashMap<String, (ConcreteVersion, RemovalStatus)> = fetch_result
+            let yanked_versions: HashMap<
+                deps_core::NormalizedName,
+                (ConcreteVersion, RemovalStatus),
+            > = fetch_result
                 .yanked_versions
                 .into_iter()
                 .map(|(name, v)| (formatter.normalize_package_name(&name), v))
@@ -663,7 +671,7 @@ dependencies = ["requests>=2.0.0"]
             let (diagnostics, yanked_versions) = run_pipeline("typing_extensions", "4.9.0").await;
 
             assert_eq!(
-                yanked_versions.get("typing-extensions"),
+                yanked_versions.get(&deps_core::NormalizedName::for_test("typing-extensions")),
                 Some(&(ConcreteVersion::new("4.9.0"), RemovalStatus::Yanked)),
                 "must be keyed by the normalized (dash) name, not the raw manifest name"
             );
@@ -678,7 +686,7 @@ dependencies = ["requests>=2.0.0"]
             let (diagnostics, yanked_versions) = run_pipeline("zope.interface", "5.0.0").await;
 
             assert_eq!(
-                yanked_versions.get("zope-interface"),
+                yanked_versions.get(&deps_core::NormalizedName::for_test("zope-interface")),
                 Some(&(ConcreteVersion::new("5.0.0"), RemovalStatus::Yanked)),
                 "must be keyed by the normalized (dotted -> dash) name"
             );

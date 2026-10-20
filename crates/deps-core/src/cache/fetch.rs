@@ -23,7 +23,7 @@ use super::response::CredentialPartition;
 use super::response::ResponseValidators;
 use super::response::RevalidationFailure;
 use super::transport::Transport;
-use crate::endpoint_contact::{note_request, note_response};
+use crate::endpoint_contact::{RequestNote, note_request};
 use crate::error::{DepsError, Result};
 use crate::net_policy::TrustedPrefix;
 use crate::redact::RedactedUrl;
@@ -32,12 +32,12 @@ use reqwest::{RequestBuilder, Response, StatusCode, header};
 use serde::Serialize;
 use std::sync::atomic::Ordering;
 
-/// Sends `request`, recording the arrival of any response for the interactive fetch gate's
-/// breaker evidence (see [`crate::endpoint_contact`]).
-async fn send_noted(request: RequestBuilder, url: &str) -> Result<Response> {
+/// Sends `request`, recording the arrival of any response on `note` for the interactive fetch
+/// gate's breaker evidence (see [`crate::endpoint_contact`]).
+async fn send_noted(request: RequestBuilder, url: &str, note: RequestNote) -> Result<Response> {
     // TODO(#1857): a stalled body after headers reads as Responded; track body progress if mirrors stall mid-stream
     let response = request.send().await.map_err(|e| send_error(url, e))?;
-    note_response();
+    note.answered();
     Ok(response)
 }
 
@@ -45,7 +45,7 @@ impl HttpCache {
     /// Tells the policy a request is about to leave over a guarded transport, so the startup
     /// proxy notice is shown only to setups that actually connect directly.
     fn note_guarded(&self, transport: &Transport) {
-        match transport.tier {
+        match transport.tier() {
             CacheTier::Baseline => {}
             CacheTier::WorkspaceDeclared(_) | CacheTier::Pinned { .. } => {
                 self.policy.note_guarded_request();
@@ -465,7 +465,7 @@ impl HttpCache {
 
         // Computed once and threaded through every call — recomputing mid-request could read
         // and write under different keys (see `Self::cache_key`'s docs).
-        let cache_key = self.cache_key(url, transport.tier, auth);
+        let cache_key = self.cache_key(url, transport.tier(), auth);
 
         if !cache_enabled {
             // Explicit, not `Empty`: an empty `cache` field would be indistinguishable from
@@ -600,10 +600,10 @@ impl HttpCache {
     ) -> Result<Option<CachedResponse>> {
         self.ensure_online(url)?;
         ensure_https(url)?;
-        note_request();
+        let note = note_request();
         self.note_guarded(transport);
         transport.preflight(url).await?;
-        let mut request = apply_request_headers(transport.client.get(url), extra_headers);
+        let mut request = apply_request_headers(transport.client().get(url), extra_headers);
         if let Some(etag) = &cached.etag {
             request = request.header(header::IF_NONE_MATCH, etag);
         }
@@ -611,7 +611,7 @@ impl HttpCache {
             request = request.header(header::IF_MODIFIED_SINCE, last_modified);
         }
 
-        let response = send_noted(request, url).await?;
+        let response = send_noted(request, url, note).await?;
 
         if response.status() == StatusCode::NOT_MODIFIED {
             return Ok(None);
@@ -656,7 +656,7 @@ impl HttpCache {
     ) -> Result<CachedResponse> {
         self.ensure_online(url)?;
         ensure_https(url)?;
-        note_request();
+        let note = note_request();
         self.note_guarded(transport);
         transport.preflight(url).await?;
         // #756 security follow-up (S-A): `RedactedUrl`, not the raw `url` — this is the
@@ -669,9 +669,9 @@ impl HttpCache {
             RedactedUrl::new(url)
         );
 
-        let request = apply_request_headers(transport.client.get(url), extra_headers);
+        let request = apply_request_headers(transport.client().get(url), extra_headers);
 
-        let response = send_noted(request, url).await?;
+        let response = send_noted(request, url, note).await?;
 
         if !response.status().is_success() {
             return Err(http_status_error(
@@ -762,11 +762,11 @@ impl HttpCache {
     ) -> Result<Bytes> {
         self.ensure_online(url)?;
         ensure_https(url)?;
-        note_request();
+        let note = note_request();
         self.note_guarded(transport);
         transport.preflight(url).await?;
 
-        let response = send_noted(transport.client.post(url).json(body), url).await?;
+        let response = send_noted(transport.client().post(url).json(body), url, note).await?;
 
         if !response.status().is_success() {
             return Err(http_status_error(
@@ -895,13 +895,13 @@ impl HttpCache {
     ) -> Result<CachedResponse> {
         self.ensure_online(url)?;
         ensure_https(url)?;
-        note_request();
+        let note = note_request();
         self.note_guarded(transport);
         transport.preflight(url).await?;
 
-        let request = apply_request_headers(transport.client.get(url), extra_headers);
+        let request = apply_request_headers(transport.client().get(url), extra_headers);
 
-        let response = send_noted(request, url).await?;
+        let response = send_noted(request, url, note).await?;
 
         if !response.status().is_success() {
             return Err(http_status_error(

@@ -22,6 +22,7 @@
 use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
+use deps_core::NormalizeName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::resolve_in_use_version;
 use deps_core::policy_config::{FetchConcurrency, FetchTimeout};

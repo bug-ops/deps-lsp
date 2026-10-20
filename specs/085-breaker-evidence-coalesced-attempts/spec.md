@@ -190,16 +190,16 @@ holder blocked on something that is not a request) is not evidence in either dir
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| FR-001 | WHEN an interactive attempt ends by elapse, cancel or error AND, during its own wait, a wire request that its result depends on, issued by another task, was outstanding with no response for at least half of the lookup kind's budget THE SYSTEM SHALL report the attempt as `Slow`, exactly as for an attempt that issued the request itself | must |
+| FR-001 | WHEN an interactive attempt ends by elapse, cancel or error AND received no response of its own AND, during its own wait, a wire request issued by another task on the same `(ecosystem, endpoint)` was outstanding with no response for at least half of the lookup kind's budget, measured as busy time (the time at least one request was outstanding) clipped to the attempt's own wait THE SYSTEM SHALL report the attempt as `Slow`, exactly as for an attempt that issued the request itself. Evidence is scoped to the endpoint, not to the request the attempt waits on | must |
 | FR-002 | WHEN an interactive attempt waits on another task's request AND a response to that request arrives during the wait THE SYSTEM SHALL clear the shared pending state for that attempt as a response clears it for a sender, so a paginating fetch is not `Slow` | must |
-| FR-003 | WHEN an interactive attempt waits on a lock, cell or shared future that is not backed by an outstanding wire request THE SYSTEM SHALL report it as `Inconclusive` (it neither accuses nor vouches) | must |
+| FR-003 | WHEN an interactive attempt waits on a lock, cell or shared future that is not backed by an outstanding wire request AND no request on the same `(ecosystem, endpoint)` is outstanding with no response for at least half of the lookup kind's budget during the attempt's wait THE SYSTEM SHALL report it as `Inconclusive` (it neither accuses nor vouches); while such a request is outstanding, FR-001 applies instead | must |
 | FR-004 | WHEN an interactive attempt is served from a memo, a fresh cache entry or a local error THE SYSTEM SHALL keep reporting it as `Inconclusive` (not `Answered`) | must |
 | FR-005 | THE SYSTEM SHALL implement the coalesced-attempt evidence once in `deps-core` so that no ecosystem crate must call the contact hooks itself for its coalescing layer to count, and SHALL NOT add per-ecosystem copies | must |
 | FR-006 | WHEN two distinct packages of one endpoint each produce `Slow` evidence from coalescing onto the same shared request (the NuGet service index) THE SYSTEM SHALL count them as two distinct slow packages and open the breaker | must |
 | FR-007 | WHEN the breaker is open for an endpoint THE SYSTEM SHALL refuse a hover version-list await on a not-yet-memoized package of that endpoint without polling, for every ecosystem, whether or not a background fetch for that URL is in flight | must |
 | FR-008 | WHEN a half-open probe attempt is coalesced onto another task's request THE SYSTEM SHALL apply the same evidence rules as for any attempt (a stalled wait re-arms the breaker; an inconclusive one releases the probe as today) | should |
 | FR-009 | THE SYSTEM SHALL leave `Decoration` lookups ignored for breaker evidence | must |
-| FR-010 | THE SYSTEM SHALL keep every existing `evidence()` outcome for an attempt that issues its own request unchanged (Cargo, npm, PyPI, Go, Bundler, Dart, Maven, Composer, Gradle, Swift, GitLab CI, Deno) | must |
+| FR-010 | THE SYSTEM SHALL keep every existing `evidence()` outcome for an attempt that issues its own request unchanged (Cargo, npm, PyPI, Go, Bundler, Dart, Maven, Composer, Gradle, Swift, GitLab CI, Deno), with one amendment: `Contact.stall` is busy time (a `Duration`, zero for none) instead of the age of the oldest request since the last response, so a request that failed fast no longer leaves a stall that keeps growing while the attempt idles. A slow failed request still reads as `Slow`; a fast transport error followed by an idle holder accumulates nothing (the section 7 row now holds literally) | must |
 
 ## 5. Non-Functional Requirements
 
@@ -235,7 +235,10 @@ All use paused time. "Stalled" means no response for at least `budget / 2` (5 s 
 
 | Scenario | Expected Behavior |
 |----------|-------------------|
-| Background fetch finishes with a fast transport error while a hover waits | The waiter receives the shared result; no stalled request remains, so `Inconclusive` (a fast transport error is not an answer, per breaker policy) |
+| Background fetch finishes with a fast transport error while a hover waits | The waiter receives the shared result; no stalled request remains, so `Inconclusive` (a fast transport error is not an answer, per breaker policy). Holds because stall is busy time: the closed request stops accumulating |
+| The background holder is dropped at its own timeout and the waiter then sends its own request | Busy time stays continuous across the hand-over, so a waiter that joined at 0.5 s and is cancelled at 6.0 s reads 5.5 s and is `Slow` (the holder's 5 s plus the waiter's own 1 s) |
+| `Decoration` lookup under a resolved endpoint | Never writes or reads the shared ledger (FR-009); its requests feed only its own attempt ledger |
+| Name-completion search whose host differs from the version host (NuGet search, crates.io API, Maven solrsearch) | Not tagged with the endpoint, so it cannot feed the version host's ledger; a search holder dropped at its own timeout is still covered by the takeover rule. Untagged holders (code lens, the untagged fallback search, and a `Decoration` attempt that is the first to initialize a shared cell such as NuGet's service index: it writes only its own ledger, so waiters see nothing until its 5 s budget drops it) give false negatives only |
 | Background request answers, then the next page hangs | The stall clock restarts at the next request (FR-002); a hang of at least half the budget after the response is `Slow` |
 | Waiter joins a request that has already been outstanding for 59 s and is cancelled 0.1 s later | Not `Slow` by default (the waiter's own wait is below half the budget); see OQ-3 |
 | Two ecosystems in one workspace share a registry host | Unchanged: the breaker key is `(ecosystem, endpoint)`; evidence never crosses ecosystems |
@@ -264,7 +267,7 @@ All use paused time. "Stalled" means no response for at least `budget / 2` (5 s 
 - Verify the final behavior with the live harness (`s7_breaker_sweep.py`) for gha and nuget plus at least Cargo and npm, per `.claude/rules/continuous-improvement.md`.
 
 ### Ask First
-- Changing the `Contact` or `AttemptEvidence` shape in a way that alters `evidence()` for senders.
+- Changing the `Contact` or `AttemptEvidence` shape in a way that alters `evidence()` for senders. (Approved once for FR-010: `Contact.stall` is busy time. Awaiting the user's sign-off in the PR.)
 - Adding any ecosystem-crate dependency on `deps-core::endpoint_contact` internals.
 - Altering breaker thresholds, durations or the `Enforce` / `ObserveOnly` split.
 
@@ -274,12 +277,12 @@ All use paused time. "Stalled" means no response for at least `budget / 2` (5 s 
 - Add a per-ecosystem copy of the evidence logic, or a catch-all arm over `EcosystemId`.
 - Edit `crates/deps-zed`.
 
-## 10. Open Questions
+## 10. Resolved Questions
 
-> [!question] Open
-> - [NEEDS CLARIFICATION: OQ-1 mechanism] How does a waiter learn that the request it waits on is outstanding? Candidates: (a) an `HttpCache`-level registry of the oldest unanswered request per endpoint that an attempt consults at snapshot time; (b) a shared-wait primitive in `deps-core` that `OnceCell`/mutex/shared-future sites route through and that links the waiter's ledger to the holder's; (c) propagating the holder's ledger into the waiter. Plan-level decision; (a) is the least invasive for FR-005 because the ecosystem crates already go through `HttpCache`.
-> - [NEEDS CLARIFICATION: OQ-2 coalesced vouching] Should a coalesced attempt that receives a shared result fast count as `Answered` when a response arrived during its wait? Default: no, `Inconclusive` as today, because the response may predate the attempt and a stale answer must not close a breaker that real slow evidence opened.
-> - [NEEDS CLARIFICATION: OQ-3 stall clock] Is a coalesced attempt's stall measured from its own wait start (default, conservative, consistent with "an attempt that waited at least half the budget") or from the age of the request it waits on (stronger evidence when joining late)?
+> [!success] Resolved
+> - **OQ-1 mechanism**: a ledger shared by every task of one `(ecosystem, endpoint)`, held weakly in a process-wide map. Orchestration code tags the task that sends (`observe_ecosystem`, `observe_endpoint`), the HTTP send sites feed every ledger of the task's scope, and an interactive attempt on a resolved endpoint reads the shared ledger over its own wait. Ecosystem crates need no hook (FR-005).
+> - **OQ-2 coalesced vouching**: no. An attempt that received no response of its own is never `Answered`; only its own responses vouch.
+> - **OQ-3 stall clock**: the stall is measured over the attempt's own wait, as the shared ledger's busy time between the attempt's start and end marks (restarting from zero at a response), so a late joiner is not `Slow` for a request that was already old.
 
 ## 11. See Also
 

@@ -8,11 +8,11 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::breaker::{Admission, ProbeId};
-use super::key::{BreakerEvidence, LookupKey, LookupKind};
+use super::key::{BreakerEvidence, EndpointKey, LookupKey, LookupKind};
 use super::memo::RecordState;
 use super::{InteractiveFetch, InteractiveFetchGate, InteractiveFetchRequest, NoLiveList};
 use crate::ErrorOrigin;
-use crate::endpoint_contact::{Contact, ContactLedger, ResponseSeen};
+use crate::endpoint_contact::{AttemptContact, Contact, ResponseSeen};
 
 /// Margin below the budget within which an answer may be a stale-serve or a race against the
 /// 10 s connect timeout rather than proof the endpoint is responsive.
@@ -70,15 +70,19 @@ pub(super) enum AttemptEvidence {
 ///   cache entry or a local error never touched the endpoint. A `Live` near the budget is
 ///   inconclusive: the HTTP cache serves stale data after a failed revalidation, so it may come
 ///   from a dead host.
-/// - An ending with a request outstanding for at least half the budget, by elapse, cancel or
-///   any error, is [`AttemptEvidence::Slow`]. The stall clock restarts at each request after a
-///   response, so a chain whose first hop answers fast and whose second hangs is slow, while a
-///   paginating fetch that keeps receiving responses is not.
+/// - An ending after a request was outstanding for at least half the budget, by elapse, cancel
+///   or any error, is [`AttemptEvidence::Slow`]. The stall is busy time since the last response,
+///   so a chain whose first hop answers fast and whose second hangs is slow, a request that
+///   fails after a long wait still counts, and a paginating fetch that keeps receiving
+///   responses is not slow. An attempt that received no response of its own also counts the
+///   time another task's request on the same endpoint was outstanding during its wait (see
+///   [`AttemptContact::observe`]), so a lookup coalesced onto a background fetch's request
+///   accuses the endpoint just as one that sent it would.
 /// - Everything else is [`AttemptEvidence::Inconclusive`]: a promoted request with little
-///   budget left, an early cancel, a fast local failure, a lookup that only waited on another
-///   task's lock or single-flight (it sent nothing, so while a background fetch holds one the
-///   breaker cannot open), and an attempt whose concurrent requests were partially answered (a
-///   response clears the pending request even if a sibling still hangs).
+///   budget left, an early cancel, a fast local failure, a lookup that waited on another task's
+///   lock or single-flight with no request outstanding behind it, and an attempt whose
+///   concurrent requests were partially answered (a response clears the busy time even if a
+///   sibling still hangs).
 pub(super) fn evidence(
     end: AttemptEnd,
     contact: Contact,
@@ -87,7 +91,7 @@ pub(super) fn evidence(
 ) -> AttemptEvidence {
     let responsive = waited < budget.saturating_sub(MARGIN);
     let answered = contact.response == ResponseSeen::Yes;
-    let stalled = contact.stall.is_some_and(|stall| stall >= budget / 2);
+    let stalled = contact.stall >= budget / 2;
     match end {
         AttemptEnd::Live if responsive && answered => AttemptEvidence::Answered,
         AttemptEnd::Live => AttemptEvidence::Inconclusive,
@@ -99,6 +103,24 @@ pub(super) fn evidence(
         }
         AttemptEnd::Err(_) | AttemptEnd::Elapsed | AttemptEnd::Cancelled => {
             AttemptEvidence::Inconclusive
+        }
+    }
+}
+
+/// The wire view of an attempt: it joins its endpoint's shared ledger only when its evidence
+/// counts and the endpoint is resolved. A decoration never writes shared state, since its
+/// host may differ from the base fetch's.
+fn attempt_contact(counts: BreakerEvidence, endpoint: EndpointKey) -> AttemptContact {
+    match (counts, endpoint) {
+        (
+            BreakerEvidence::Counts,
+            EndpointKey::Resolved {
+                ecosystem,
+                endpoint,
+            },
+        ) => AttemptContact::on_endpoint(ecosystem, endpoint),
+        (BreakerEvidence::Counts, EndpointKey::Scoped { .. }) | (BreakerEvidence::Ignored, _) => {
+            AttemptContact::own_only()
         }
     }
 }
@@ -116,7 +138,7 @@ struct AttemptGuard<'a> {
     probe: Option<ProbeId>,
     settled: bool,
     counts: BreakerEvidence,
-    ledger: Arc<ContactLedger>,
+    contact: AttemptContact,
 }
 
 impl AttemptGuard<'_> {
@@ -132,8 +154,15 @@ impl AttemptGuard<'_> {
         }
         let now = Instant::now();
         let waited = now.saturating_duration_since(self.started);
-        let contact = self.ledger.snapshot(now);
+        let (contact, view) = self.contact.observe(now);
         let evidence = evidence(end, contact, waited, self.lookup.kind().budget());
+        tracing::debug!(
+            ?evidence,
+            view = view.as_str(),
+            stall_ms = u64::try_from(contact.stall.as_millis()).unwrap_or(u64::MAX),
+            lookup = self.lookup.kind().as_str(),
+            "interactive attempt breaker evidence"
+        );
         if self.gate.generation() != self.generation {
             return;
         }
@@ -172,8 +201,8 @@ impl Drop for AttemptGuard<'_> {
 /// use deps_core::DepsError;
 /// use deps_core::lsp_helpers::InteractiveFetchError;
 ///
-/// let error = DepsError::CacheError("poisoned lock".into());
-/// assert_eq!(error.log_cause(), (None, "cache"));
+/// let error = DepsError::RecentlyFailed;
+/// assert_eq!(error.log_cause(), (None, "recently-failed"));
 /// assert_eq!(InteractiveFetchError::origin(&error), deps_core::ErrorOrigin::Unattributed);
 /// ```
 pub trait InteractiveFetchError {
@@ -272,7 +301,8 @@ impl InteractiveFetchGate {
         generation: u64,
     ) -> Attempted<T> {
         let counts = lookup.kind().breaker_evidence();
-        let probe = match self.admit(&lookup.route.endpoint(), request.context, counts) {
+        let endpoint = lookup.route.endpoint();
+        let probe = match self.admit(&endpoint, request.context, counts) {
             Admission::Refused => {
                 super::log_skipped(request, "registry endpoint circuit open");
                 return Attempted::Refused;
@@ -293,9 +323,9 @@ impl InteractiveFetchGate {
             probe,
             settled: false,
             counts,
-            ledger: ContactLedger::new(),
+            contact: attempt_contact(counts, endpoint),
         };
-        let scoped = guard.ledger.scope(fetch);
+        let scoped = guard.contact.scope(fetch);
         let (result, end) = bounded_await_until(scoped, deadline, request, lookup.kind()).await;
         guard.finish(end);
         let result = match result {

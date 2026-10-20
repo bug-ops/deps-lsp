@@ -58,7 +58,7 @@ fn is_non_github_registry_url(name: &str) -> bool {
 pub struct SwiftFormatter;
 
 impl PackageNaming for SwiftFormatter {
-    fn normalize_package_name(&self, name: &PackageName) -> String {
+    fn normalized_spelling(&self, name: &PackageName) -> String {
         name.as_str().to_lowercase()
     }
 
@@ -216,7 +216,7 @@ impl SourcePolicy for SwiftFormatter {
 }
 
 impl OsvNaming for SwiftFormatter {
-    /// Raw `dep.name()`, NOT [`Self::normalize_package_name`]: that
+    /// Raw `dep.name()`, NOT [`deps_core::lsp_helpers::NormalizeName::normalize_package_name`]: that
     /// lowercases, and OSV's `SwiftURL` matching is case-sensitive, so
     /// lowercasing would mangle mixed-case repos. Gated on the dependency's
     /// source host being `github.com`: only that host is populated in OSV's
@@ -237,6 +237,7 @@ impl OsvNaming for SwiftFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::NormalizeName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
 
@@ -388,7 +389,7 @@ mod tests {
         let fmt = SwiftFormatter;
         assert_eq!(
             fmt.normalize_package_name(&PackageName::new("Apple/Swift-NIO")),
-            "apple/swift-nio"
+            deps_core::NormalizedName::for_test("apple/swift-nio")
         );
     }
 
@@ -541,7 +542,7 @@ mod tests {
         );
         assert_eq!(
             fmt.normalize_package_name(&dep.name),
-            "apple/swift-nio".to_string()
+            deps_core::NormalizedName::for_test("apple/swift-nio".to_string())
         );
     }
 

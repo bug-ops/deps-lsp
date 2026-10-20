@@ -18,6 +18,8 @@
 //! package from `cached_versions`), so no special-casing is needed here.
 
 #[cfg(feature = "lsp-responses")]
+use deps_core::NormalizeName;
+#[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
 use deps_core::hover::Hover;
@@ -364,7 +366,7 @@ impl Ecosystem for NuGetEcosystem {
                     versions,
                     parse_result.uri(),
                     dep.name(),
-                    normalized_name.as_str(),
+                    &normalized_name,
                     &dep_source,
                     FetchContext::Hover,
                 ),

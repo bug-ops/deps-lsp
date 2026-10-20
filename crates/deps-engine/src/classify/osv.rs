@@ -10,6 +10,7 @@
 
 use deps_core::ConcreteVersion;
 use deps_core::EcosystemId;
+use deps_core::NormalizeName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::{
     CandidateSiblings, CandidateSiblingsUnknown, CandidateTagSource, OsvNameAvailability,
@@ -360,7 +361,7 @@ pub fn build_scan_targets(
         // `manifest_requirement_is_resolved_version`).
         let versions = resolve_in_use_versions(
             dep,
-            &normalized_name,
+            normalized_name.as_str(),
             resolved_versions,
             Some(resolved_version_candidates),
             formatter,

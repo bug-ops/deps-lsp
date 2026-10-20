@@ -178,7 +178,7 @@ impl SanitizedRegistryError {
 ///
 /// let status = DepsError::HttpStatus { url: "https://registry.example/x".into(), status: 503 };
 /// assert_eq!(status.origin(), ErrorOrigin::Endpoint);
-/// assert_eq!(DepsError::CacheError("poisoned".into()).origin(), ErrorOrigin::Unattributed);
+/// assert_eq!(DepsError::RecentlyFailed.origin(), ErrorOrigin::Unattributed);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorOrigin {
@@ -311,9 +311,36 @@ pub enum DepsError {
         source: SanitizedRegistryError,
     },
 
-    /// The cache layer itself failed (e.g. a poisoned lock), independent of any registry request.
+    /// A failure with no typed home: today only Cargo's fail-closed credential-on-a-workspace-
+    /// declared-index arm (`deps-cargo`'s `IndexTransport::Refused`), which #1855 removes by
+    /// making that state unrepresentable. Every other former producer has its own variant.
     #[error("cache error: {0}")]
     CacheError(String),
+
+    /// A request URL was not `https`, refused at the egress chokepoint before any send. A
+    /// configuration fault that no retry resolves, so it is [`FetchFailure::Actionable`] with a
+    /// fixed, URL-free message.
+    ///
+    /// Only a configured or operator-declared URL can reach that check: URLs a registry supplies
+    /// (service-index resources, pagination links) are vetted by their ecosystem first, so this
+    /// never blames the user for a registry's own bad data.
+    ///
+    /// `#[non_exhaustive]` on the variant itself: only `deps-core`'s cache builds it.
+    #[error("URL must use HTTPS: {url}")]
+    #[non_exhaustive]
+    InsecureScheme {
+        /// The request URL, stored redacted.
+        url: RedactedUrl,
+    },
+
+    /// A bounded lookup gave up on its own budget before the registry finished answering.
+    #[error("{0}")]
+    BudgetExceeded(LookupBudget),
+
+    /// A repeated lookup was skipped because an identical one failed moments ago, sparing the
+    /// registry a duplicate live attempt.
+    #[error("an identical lookup failed recently; skipping the duplicate live attempt")]
+    RecentlyFailed,
 
     /// A registry request was rejected for exceeding a rate limit. Unlike other variants,
     /// `message` is a pre-vetted, IP-free, actionable hint safe to surface verbatim in a
@@ -512,6 +539,35 @@ pub enum DepsError {
     },
 }
 
+/// Which budget a bounded lookup exceeded ([`DepsError::BudgetExceeded`]).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::error::LookupBudget;
+///
+/// assert_eq!(
+///     LookupBudget::Time.to_string(),
+///     "registry did not answer within the time budget"
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupBudget {
+    /// The registry did not answer within the lookup's time budget.
+    Time,
+    /// The response exceeded the bounded scan the parser allows itself.
+    Scan,
+}
+
+impl std::fmt::Display for LookupBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Time => "registry did not answer within the time budget",
+            Self::Scan => "registry response exceeded the version scan budget",
+        })
+    }
+}
+
 /// Why following a registry's paginated release list stopped before its last page.
 ///
 /// # Examples
@@ -572,6 +628,11 @@ impl std::fmt::Debug for DepsError {
                 .field("source", source)
                 .finish(),
             Self::CacheError(message) => f.debug_tuple("CacheError").field(message).finish(),
+            Self::InsecureScheme { url } => {
+                f.debug_struct("InsecureScheme").field("url", url).finish()
+            }
+            Self::BudgetExceeded(budget) => f.debug_tuple("BudgetExceeded").field(budget).finish(),
+            Self::RecentlyFailed => f.write_str("RecentlyFailed"),
             Self::RateLimited {
                 message,
                 verified,
@@ -775,8 +836,8 @@ impl DepsError {
     /// };
     /// assert!(!outage.is_not_found());
     ///
-    /// let cache_err = DepsError::CacheError("connection reset".into());
-    /// assert!(!cache_err.is_not_found());
+    /// let skipped = DepsError::RecentlyFailed;
+    /// assert!(!skipped.is_not_found());
     /// ```
     #[must_use]
     pub const fn is_not_found(&self) -> bool {
@@ -816,7 +877,7 @@ impl DepsError {
     ///     FetchFailure::Actionable("set GITHUB_TOKEN".into())
     /// );
     ///
-    /// let other = DepsError::CacheError("connection reset".into());
+    /// let other = DepsError::RecentlyFailed;
     /// assert_eq!(other.fetch_failure(), FetchFailure::Transient);
     /// ```
     #[must_use]
@@ -849,6 +910,9 @@ impl DepsError {
                     ),
                 })
             }
+            Self::InsecureScheme { .. } => {
+                FetchFailure::Actionable("registry URL must use https".to_string())
+            }
             // A configuration fault that no retry resolves, so it must not read as a transient
             // lookup failure (and must not let a last-good fallback paper over it). The
             // message is fixed: the request URL is never interpolated (#1841).
@@ -869,6 +933,8 @@ impl DepsError {
             | Self::ParseError { .. }
             | Self::RegistryError { .. }
             | Self::CacheError(_)
+            | Self::BudgetExceeded(_)
+            | Self::RecentlyFailed
             | Self::PackageNotFound { .. }
             | Self::HttpStatus { .. }
             | Self::ApiResponse { .. }
@@ -898,7 +964,7 @@ impl DepsError {
     /// let offline = DepsError::Offline { url: "https://crates.io/".into() };
     /// assert!(offline.is_offline());
     ///
-    /// let other = DepsError::CacheError("connection reset".into());
+    /// let other = DepsError::RecentlyFailed;
     /// assert!(!other.is_offline());
     /// ```
     #[must_use]
@@ -917,7 +983,7 @@ impl DepsError {
     /// ```
     /// use deps_core::DepsError;
     ///
-    /// let halted = DepsError::CacheError("reset".into()).into_chain_halt();
+    /// let halted = DepsError::RecentlyFailed.into_chain_halt();
     /// assert!(matches!(halted, DepsError::ChainResolutionHalted));
     /// ```
     #[must_use]
@@ -927,6 +993,9 @@ impl DepsError {
             Self::ParseError { .. }
             | Self::RegistryError { .. }
             | Self::CacheError(_)
+            | Self::InsecureScheme { .. }
+            | Self::BudgetExceeded(_)
+            | Self::RecentlyFailed
             | Self::RateLimited { .. }
             | Self::PackageNotFound { .. }
             | Self::HttpStatus { .. }
@@ -970,6 +1039,9 @@ impl DepsError {
             Self::HttpStatus { status, .. } => (Some(*status), "http-status"),
             Self::RegistryError { .. } => (None, "transport"),
             Self::CacheError(_) => (None, "cache"),
+            Self::InsecureScheme { .. } => (None, "insecure-scheme"),
+            Self::BudgetExceeded(_) => (None, "budget-exceeded"),
+            Self::RecentlyFailed => (None, "recently-failed"),
             Self::Offline { .. } => (None, "offline"),
             Self::ResponseTooLarge { .. } => (None, "response-too-large"),
             // Split by `verified` (#1295 critic S2): a human triaging logs can tell a
@@ -1048,6 +1120,9 @@ impl DepsError {
             }
             | Self::ParseError { .. }
             | Self::CacheError(_)
+            | Self::InsecureScheme { .. }
+            | Self::BudgetExceeded(_)
+            | Self::RecentlyFailed
             | Self::InvalidVersionReq(_)
             | Self::InvalidPackageName(_)
             | Self::Io(_)
@@ -1102,7 +1177,7 @@ pub enum FetchFailure {
 ///
 /// fn get_version(name: &str) -> Result<String> {
 ///     if name.is_empty() {
-///         return Err(deps_core::error::DepsError::CacheError("empty name".into()));
+///         return Err(deps_core::error::DepsError::parse_error("name", &"empty name"));
 ///     }
 ///     Ok("1.0.0".into())
 /// }
@@ -1657,6 +1732,37 @@ mod tests {
             err.safe_tracing_summary(),
             (None, "paginated-list-incomplete")
         );
+    }
+
+    #[test]
+    fn typed_variants_that_replaced_cache_error_classify_per_variant() {
+        let insecure = DepsError::InsecureScheme {
+            url: "http://example.com/pkg?token=secret".into(),
+        };
+        assert_eq!(
+            insecure.fetch_failure(),
+            FetchFailure::Actionable("registry URL must use https".into())
+        );
+        assert_eq!(insecure.origin(), ErrorOrigin::Unattributed);
+        assert_eq!(insecure.safe_tracing_summary(), (None, "insecure-scheme"));
+        assert_matches!(insecure.into_chain_halt(), DepsError::ChainResolutionHalted);
+
+        let transient = [
+            (
+                DepsError::BudgetExceeded(LookupBudget::Time),
+                "budget-exceeded",
+            ),
+            (
+                DepsError::BudgetExceeded(LookupBudget::Scan),
+                "budget-exceeded",
+            ),
+            (DepsError::RecentlyFailed, "recently-failed"),
+        ];
+        for (error, label) in transient {
+            assert_eq!(error.fetch_failure(), FetchFailure::Transient, "{error:?}");
+            assert_eq!(error.origin(), ErrorOrigin::Unattributed, "{error:?}");
+            assert_eq!(error.safe_tracing_summary(), (None, label), "{error:?}");
+        }
     }
 
     #[test]

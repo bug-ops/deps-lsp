@@ -94,6 +94,9 @@ impl RateLimitRevocation {
             | DepsError::ParseError { .. }
             | DepsError::RegistryError { .. }
             | DepsError::CacheError(_)
+            | DepsError::InsecureScheme { .. }
+            | DepsError::BudgetExceeded(_)
+            | DepsError::RecentlyFailed
             | DepsError::PackageNotFound { .. }
             | DepsError::ApiResponse { .. }
             | DepsError::ResponseTooLarge { .. }

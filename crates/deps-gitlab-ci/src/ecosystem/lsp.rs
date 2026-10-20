@@ -9,6 +9,7 @@
 //! module (which globs `use super::*;`) keeps referencing them unqualified, unchanged from
 //! before the move.
 
+use deps_core::NormalizeName;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit, WorkspaceEdit};
 
 use deps_core::PackageName;
@@ -19,8 +20,7 @@ use deps_core::lsp_helpers::{
 
 use super::{
     GitlabCiDependency, GitlabCiFormatter, GitlabCiRegistry, MAX_DIAGNOSTIC_VALUE_CHARS,
-    PackageNaming, PackageRendering, ParseResultTrait, ShaPinQuickfixKind, Url,
-    sha_pin_quickfix_kind,
+    PackageRendering, ParseResultTrait, ShaPinQuickfixKind, Url, sha_pin_quickfix_kind,
 };
 use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 
@@ -205,7 +205,7 @@ pub(super) async fn build_dynamic_component_pin_action(
             versions,
             uri,
             dep.name(),
-            normalized_name.as_str(),
+            &normalized_name,
             &dep_source,
             FetchContext::CodeAction,
         ),

@@ -7,6 +7,7 @@ pub mod ignore;
 pub mod security;
 
 use deps_core::ConcreteVersion;
+use deps_core::NormalizeName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
 use deps_core::edit::{
@@ -572,7 +573,10 @@ pub fn is_requested(
 ) -> bool {
     package_filter.is_empty()
         || package_filter.iter().any(|name| {
-            formatter.normalize_package_name(&PackageName::new(name.clone())) == normalized_name
+            formatter
+                .normalize_package_name(&PackageName::new(name.clone()))
+                .as_str()
+                == normalized_name
         })
 }
 
@@ -844,7 +848,7 @@ pub fn plan_updates(
     for dep in analysis.parse_result.dependencies() {
         deps_by_name_range
             .entry((
-                formatter.normalize_package_name(dep.name()),
+                formatter.normalize_package_name(dep.name()).into_string(),
                 dep.name_range(),
             ))
             .or_default()

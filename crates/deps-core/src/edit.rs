@@ -9,6 +9,7 @@
 //! adapters — the extraction shape spec 064 already applied to [`crate::diagnostic::Diagnostic`]
 //! and spec 063 applied to [`crate::Dependency`]/[`crate::lockfile::LockFileCache`].
 
+use crate::lsp_helpers::NormalizeName;
 use crate::lsp_helpers::{
     EcosystemFormatter, LineOffsetTable, PackageVersions, RequirementGate, RequirementStatus,
     VersionData, is_safe_version_string, literal_span_matches, requirement_is_oversized,
@@ -242,7 +243,7 @@ impl PlannedCurrent {
 pub struct PlannedUpdate {
     /// The dependency's declared (raw) name.
     pub name: String,
-    /// [`crate::lsp_helpers::PackageNaming::normalize_package_name`]'s output for `name`.
+    /// [`crate::lsp_helpers::NormalizeName::normalize_package_name`]'s output for `name`.
     pub normalized_name: String,
     /// The dependency name's span in the manifest source.
     pub name_range: crate::position::Range,
@@ -738,7 +739,7 @@ pub enum UpdateCandidate {
     Unplannable {
         /// The dependency's declared (raw) name.
         name: String,
-        /// [`crate::lsp_helpers::PackageNaming::normalize_package_name`]'s output for `name`.
+        /// [`crate::lsp_helpers::NormalizeName::normalize_package_name`]'s output for `name`.
         normalized_name: String,
         /// The dependency name's span in the manifest source.
         name_range: crate::position::Range,
@@ -836,7 +837,7 @@ pub fn collect_update_candidates(
             );
             candidates.push(UpdateCandidate::Unplannable {
                 name,
-                normalized_name,
+                normalized_name: normalized_name.as_str().to_string(),
                 name_range,
                 reason: UnplannableReason::UnsafeLatestVersion,
             });
@@ -853,7 +854,7 @@ pub fn collect_update_candidates(
             versions.latest_status,
             dep,
             vuln_keys.as_ref(),
-            &normalized_name,
+            normalized_name.as_str(),
             latest.as_str(),
             formatter,
         ) {
@@ -862,7 +863,7 @@ pub fn collect_update_candidates(
             crate::lsp_helpers::LatestVerdict::Flagged { .. } => {
                 candidates.push(UpdateCandidate::Unplannable {
                     name,
-                    normalized_name,
+                    normalized_name: normalized_name.as_str().to_string(),
                     name_range,
                     reason: UnplannableReason::LatestFlaggedByOsv,
                 });
@@ -871,7 +872,7 @@ pub fn collect_update_candidates(
             crate::lsp_helpers::LatestVerdict::Unverified => {
                 candidates.push(UpdateCandidate::Unplannable {
                     name,
-                    normalized_name,
+                    normalized_name: normalized_name.as_str().to_string(),
                     name_range,
                     reason: UnplannableReason::LatestUnverified,
                 });
@@ -889,7 +890,7 @@ pub fn collect_update_candidates(
         if !literal_span_matches(slice, literal_target) {
             candidates.push(UpdateCandidate::Unplannable {
                 name,
-                normalized_name,
+                normalized_name: normalized_name.as_str().to_string(),
                 name_range,
                 reason: UnplannableReason::NonLiteralSpan,
             });
@@ -903,7 +904,7 @@ pub fn collect_update_candidates(
         if strip_whitespace(&new_text) == strip_whitespace(literal_target) {
             candidates.push(UpdateCandidate::Unplannable {
                 name,
-                normalized_name,
+                normalized_name: normalized_name.as_str().to_string(),
                 name_range,
                 reason: UnplannableReason::NoOpRewrite,
             });
@@ -918,7 +919,7 @@ pub fn collect_update_candidates(
         let current = versions.ecosystem.and_then(|ecosystem| {
             resolve_in_use_version(
                 dep,
-                &normalized_name,
+                normalized_name.as_str(),
                 versions.resolved,
                 versions.resolved_version_candidates,
                 formatter,
@@ -939,7 +940,7 @@ pub fn collect_update_candidates(
 
         candidates.push(UpdateCandidate::Planned(PlannedUpdate {
             name,
-            normalized_name,
+            normalized_name: normalized_name.as_str().to_string(),
             name_range,
             current,
             target: latest.clone(),
@@ -1560,7 +1561,7 @@ pub fn plan_verified_fix(
     let normalized_name = formatter.normalize_package_name(dep.name());
     Ok(PlannedUpdate {
         name: dep.name().as_str().to_string(),
-        normalized_name,
+        normalized_name: normalized_name.into_string(),
         name_range: dep.name_range(),
         // `current` here is the requirement text passed in for placeholder/no-op checks
         // above, not a resolved pinned version — `PlannedUpdate::current` documents only the

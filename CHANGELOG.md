@@ -7,8 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+- **deps-core and every formatter**: formatters override `PackageNaming::normalized_spelling`, and `normalize_package_name` moves to the sealed `NormalizeName` trait returning `NormalizedName` (#1872)
+- **deps-core, deps-engine, deps-lsp**: `DependencyOutcomes` getters, setters and `with_*` builders take `NormalizedName` instead of strings (#1872)
+- **deps-core**: `InteractiveFetchRequest::new` takes `&NormalizedName` as its normalized name (#1872)
+
+### Added
+- **deps-core**: `observe_ecosystem` and `observe_endpoint` let orchestration code tag fetches so hovers see requests another task has on the wire (#1872)
+- **deps-core**: `NormalizedName`, the key only `NormalizeName::normalize_package_name` builds (#1872)
+- **deps-core**: `DepsError::{InsecureScheme, BudgetExceeded, RecentlyFailed}` and `error::LookupBudget` replace `CacheError` for non-cache failures (#1872)
+- **deps-core**: `BlockedHost::reason` names the rule that refused a host (#1872)
+- **deps-core**: `CachedEndpoint::new`, a constant empty-cache constructor (#1872)
+
 ### Changed
+- **deps**: update `Cargo.lock` (tokio 1.54.0, serde_json 1.0.154, aws-lc-sys 0.46.0, related patch drift) (#1872)
+- **deps-core, deps-nuget**: a non-https request URL is an actionable `InsecureScheme`, and a non-https `@id` in the public NuGet service index is refused as a bad feed (#1872)
+- **deps-cargo, deps-maven, deps-swift**: malformed index and metadata responses are `ParseError`, and budget overruns and search suppression have typed errors (#1872)
+- **deps-lsp**: document size and file-kind limits are `Io` errors of kind `FileTooLarge` or `InvalidInput` (#1872)
+- **deps-core**: single-flight claims are held by a `Leader` handle (#1872)
+- **deps-core**: `cache::Transport` fields are private (#1872)
+- **deps-core**: the operator-registry trust rule parses each URL once with one canonical form (#1872)
+- **deps-bundler, deps-dart, deps-composer**: registries cache their endpoint like the other ecosystems (#1872)
 - **release**: crates.io publishing runs through `scripts/publish-crates.sh`, which publishes in dependency order (#1868)
+
+### Fixed
+- **deps-core, deps-nuget, deps-github-actions**: the endpoint breaker opens again for hovers that wait on a background fetch's request (#1872)
+- **deps-core, deps-gitlab-ci**: floor-blocked registry hosts read "is never a registry host" instead of blaming `registries.workspace_registries` (#1872)
 
 ## [3.0.0] - 2026-10-19
 

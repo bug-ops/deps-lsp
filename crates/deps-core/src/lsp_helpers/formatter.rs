@@ -15,20 +15,27 @@ use super::{
     BoundedVersionReq, RequirementMatcher, RequirementStatus, is_same_major_minor,
     position_in_range,
 };
+use crate::package::NormalizedName;
 use crate::{
     ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName, VersionReq,
 };
 
 /// Ecosystem-specific package name normalization and validation.
 ///
-/// Implementors guarantee that [`normalize_package_name`](Self::normalize_package_name)
+/// Implementors guarantee that [`normalized_spelling`](Self::normalized_spelling)
 /// produces a stable lookup key for the same logical package regardless of how its name is
 /// spelled in a manifest, and that [`validate_package_name`](Self::validate_package_name) is a
 /// diagnostic lint only — never a construction-time gate. Callers may assume both methods are
 /// cheap, side-effect-free, and safe to call on unvalidated, manifest-sourced input.
+///
+/// Callers do not read the spelling directly: [`NormalizeName::normalize_package_name`] wraps it
+/// in a [`NormalizedName`], the type every normalized-key API takes.
 pub trait PackageNaming: Send + Sync {
-    /// Normalize package name for lookup (default: identity).
-    fn normalize_package_name(&self, name: &PackageName) -> String {
+    /// The ecosystem's normalized spelling of `name` (default: identity).
+    ///
+    /// Override this to fold case or separators; call
+    /// [`NormalizeName::normalize_package_name`] to obtain the typed key.
+    fn normalized_spelling(&self, name: &PackageName) -> String {
         name.as_str().to_string()
     }
 
@@ -61,6 +68,40 @@ pub trait PackageNaming: Send + Sync {
     /// ```
     fn validate_package_name(&self, _name: &str) -> Result<(), InvalidPackageName> {
         Ok(())
+    }
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl<T: super::PackageNaming + ?Sized> Sealed for T {}
+}
+
+/// The only way to obtain a [`NormalizedName`]: normalizes a declared name through a
+/// formatter's [`PackageNaming::normalized_spelling`].
+///
+/// Sealed with a blanket implementation over every [`PackageNaming`] (including
+/// `dyn EcosystemFormatter`), so it can neither be implemented nor overridden elsewhere.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::PackageName;
+/// use deps_core::lsp_helpers::{NormalizeName, PackageNaming};
+///
+/// struct Identity;
+/// impl PackageNaming for Identity {}
+///
+/// let key = Identity.normalize_package_name(&PackageName::new("serde"));
+/// assert_eq!(key.as_str(), "serde");
+/// ```
+pub trait NormalizeName: sealed::Sealed {
+    /// The typed normalized lookup key for `name`.
+    fn normalize_package_name(&self, name: &PackageName) -> NormalizedName;
+}
+
+impl<T: PackageNaming + ?Sized> NormalizeName for T {
+    fn normalize_package_name(&self, name: &PackageName) -> NormalizedName {
+        NormalizedName::new(self.normalized_spelling(name))
     }
 }
 
@@ -2311,7 +2352,7 @@ pub trait OsvNaming: Send + Sync {
     /// OSV.dev's canonical spelling for `dep`'s package name, or `None` if
     /// this dependency cannot be mapped (e.g. a non-GitHub Swift package).
     ///
-    /// Deliberately **not** routed through [`PackageNaming::normalize_package_name`]:
+    /// Deliberately **not** routed through [`NormalizeName::normalize_package_name`]:
     /// that method produces this project's internal lookup key, while this
     /// one produces the name sent on the wire to OSV. They coincide for most
     /// ecosystems and diverge for NuGet (case-preserving; normalizing would

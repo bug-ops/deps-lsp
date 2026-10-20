@@ -1,3 +1,4 @@
+use crate::lsp_helpers::NormalizeName;
 use std::collections::HashSet;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, Range, WorkspaceEdit};
 
@@ -71,7 +72,7 @@ fn build_vulnerability_fix_action(
     });
     let outcome = versions
         .vulnerabilities
-        .and_then(|m| resolve_scan_outcome(m, dep, vuln_keys.as_ref(), &normalized_name))?;
+        .and_then(|m| resolve_scan_outcome(m, dep, vuln_keys.as_ref(), normalized_name.as_str()))?;
     let ScanOutcome::Vulnerable(dv) = outcome else {
         return None;
     };
@@ -80,7 +81,7 @@ fn build_vulnerability_fix_action(
     // calls below rather than re-deriving it twice.
     let latest = versions
         .latest_status
-        .and_then(|m| resolve_latest_status(m, dep, vuln_keys.as_ref(), &normalized_name));
+        .and_then(|m| resolve_latest_status(m, dep, vuln_keys.as_ref(), normalized_name.as_str()));
 
     // Planning core (the no-op guard, `is_safe_version_string`, `osv_version_to_native`,
     // `format_version_replacing_for`, and the #462 fix-target-verification gate) lives in
@@ -549,7 +550,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                 versions,
                 uri,
                 dep.name(),
-                normalized_name.as_str(),
+                &normalized_name,
                 &dep_source,
                 FetchContext::CodeAction,
             ),
@@ -679,7 +680,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                     versions.latest_status,
                     dep,
                     latest_vuln_keys.as_ref(),
-                    &normalized_name,
+                    normalized_name.as_str(),
                     item.version.as_str(),
                     formatter,
                 )
@@ -688,7 +689,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                     versions.candidate_status,
                     dep,
                     latest_vuln_keys.as_ref(),
-                    &normalized_name,
+                    normalized_name.as_str(),
                     item.version.as_str(),
                     formatter,
                 )
@@ -2438,8 +2439,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_generate_code_actions_seeded_failure_drops_fix_without_live_call() {
         let gate = InteractiveFetchGate::new(std::num::NonZeroUsize::new(4).unwrap());
-        let outcomes =
-            DependencyOutcomes::new().with_fetch_failure("pkg", crate::FetchFailure::Transient);
+        let outcomes = DependencyOutcomes::new().with_fetch_failure(
+            crate::NormalizedName::for_test("pkg"),
+            crate::FetchFailure::Transient,
+        );
         let registry = CountingRegistry::new(CountingMode::Succeed);
 
         let titles = gated_fix_titles(&gate, &outcomes, &registry).await;
@@ -3565,7 +3568,7 @@ mod tests {
         struct NormalizingExactFormatter;
 
         impl PackageNaming for NormalizingExactFormatter {
-            fn normalize_package_name(&self, name: &PackageName) -> String {
+            fn normalized_spelling(&self, name: &PackageName) -> String {
                 format!("normalized-{}", name.as_str())
             }
         }

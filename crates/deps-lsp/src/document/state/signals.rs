@@ -8,6 +8,7 @@
 //! reach [`super::ResolvedGeneration`]'s private `INITIAL` constant — module-private
 //! items are visible to descendant modules, and `signals` is a descendant of `state`.
 
+use deps_core::NormalizeName;
 use deps_core::lsp_helpers::EcosystemFormatter;
 use deps_core::osv::{CandidateStatusMap, LatestStatusMap, VulnerabilityMap};
 use deps_core::policy_config::{CheckState, OsvChecks};
@@ -300,10 +301,10 @@ impl PackageSignals {
             typosquats.remove(removed_dep);
             gossip_findings.remove(removed_dep);
             let normalized = formatter.normalize_package_name(removed_dep);
-            vulnerabilities.retain(|key, _| key.as_str() != normalized);
-            osv_scan_plan.retain_not_named(&normalized);
-            latest_status.retain(|key, _| key.as_str() != normalized);
-            candidate_status.retain(|key, _| key.as_str() != normalized);
+            vulnerabilities.retain(|key, _| key.as_str() != normalized.as_str());
+            osv_scan_plan.retain_not_named(normalized.as_str());
+            latest_status.retain(|key, _| key.as_str() != normalized.as_str());
+            candidate_status.retain(|key, _| key.as_str() != normalized.as_str());
             outcomes.remove(&normalized);
         }
     }
@@ -629,11 +630,11 @@ mod tests {
             .insert(vuln_key("other"), ScanOutcome::Clean);
         signals.outcomes = DependencyOutcomes::new()
             .with_yanked(
-                "mypkg",
+                deps_core::NormalizedName::for_test("mypkg"),
                 (ConcreteVersion::new("1.0.0"), RemovalStatus::Yanked),
             )
             .with_yanked(
-                "other",
+                deps_core::NormalizedName::for_test("other"),
                 (ConcreteVersion::new("2.0.0"), RemovalStatus::Yanked),
             );
         signals.typosquat_checked_names =
@@ -685,8 +686,18 @@ mod tests {
         assert!(!signals.vulnerabilities.contains_key(&vuln_key("mypkg")));
         assert!(signals.vulnerabilities.contains_key(&vuln_key("MyPkg")));
         assert!(signals.vulnerabilities.contains_key(&vuln_key("other")));
-        assert!(signals.outcomes.yanked("mypkg").is_none());
-        assert!(signals.outcomes.yanked("other").is_some());
+        assert!(
+            signals
+                .outcomes
+                .yanked(&deps_core::NormalizedName::for_test("mypkg"))
+                .is_none()
+        );
+        assert!(
+            signals
+                .outcomes
+                .yanked(&deps_core::NormalizedName::for_test("other"))
+                .is_some()
+        );
     }
 
     #[test]
@@ -741,7 +752,9 @@ mod tests {
         assert_eq!(data.resolved_version_candidates.map(HashMap::len), Some(2));
         assert_eq!(data.vulnerabilities.map(HashMap::len), Some(3));
         assert_eq!(
-            data.outcomes.map(|o| o.yanked("mypkg").is_some()),
+            data.outcomes.map(|o| o
+                .yanked(&deps_core::NormalizedName::for_test("mypkg"))
+                .is_some()),
             Some(true)
         );
         assert_eq!(data.license_prefetch.map(HashMap::len), Some(2));

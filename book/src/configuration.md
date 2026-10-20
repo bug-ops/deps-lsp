@@ -329,7 +329,9 @@ already cached, so a registry outage never freezes the editor.
 - **Endpoint circuit breaker.** Once two *different* packages are slow on the same registry
   endpoint with no answer from it in between, hover skips that endpoint for 30 seconds, then lets
   one probe request through. A single slow package never trips it, and any registry answer
-  (including a genuine "not found") keeps it closed.
+  (including a genuine "not found") keeps it closed. A hover that waits on a request another
+  fetch already sent to the endpoint (a shared NuGet service index, a GitHub repository fetch)
+  counts the time that request has been unanswered during its own wait.
 
 The breaker is keyed by the real network path, not the ecosystem. One dead npm scope, Maven
 repository, NuGet feed or alternate Cargo index does not block the public packages in the same

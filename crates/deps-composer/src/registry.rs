@@ -223,6 +223,7 @@ pub(crate) fn effective_minimum_stability(
 pub struct PackagistRegistry {
     cache: Arc<HttpCache>,
     base: String,
+    endpoint: deps_core::CachedEndpoint,
 }
 
 impl PackagistRegistry {
@@ -239,7 +240,11 @@ impl PackagistRegistry {
     /// crate (e.g. `crate::ecosystem`'s completion tests, #1171) can also point a
     /// `PackagistRegistry` at a mock server, not just this module's own `tests` submodule.
     pub(crate) fn with_base(cache: Arc<HttpCache>, base: String) -> Self {
-        Self { cache, base }
+        Self {
+            cache,
+            base,
+            endpoint: deps_core::CachedEndpoint::new(),
+        }
     }
 
     /// Fetches all versions for a package from the Packagist v2 API.
@@ -565,7 +570,9 @@ impl deps_core::Registry for PackagistRegistry {
         _name: &deps_core::PackageName,
         _source: &deps_core::DependencySource,
     ) -> deps_core::RegistryEndpoint {
-        deps_core::RegistryEndpoint::from_base_str(&self.base, deps_core::EgressTier::Baseline)
+        self.endpoint.get_or_compute(|| {
+            deps_core::RegistryEndpoint::from_base_str(&self.base, deps_core::EgressTier::Baseline)
+        })
     }
 
     /// Routes to [`PackagistRegistry::get_latest_matching`]'s inherent counterpart — see that

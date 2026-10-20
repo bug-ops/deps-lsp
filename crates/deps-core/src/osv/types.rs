@@ -6,6 +6,7 @@
 //! schema evolves, and a missing field must never fail the whole response
 //! (see `architecture.md` §6).
 
+use crate::lsp_helpers::NormalizeName;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -2160,7 +2161,7 @@ pub fn vuln_key_for(
     formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
 ) -> VulnKey {
     keys.and_then(|k| k.get(&dep.name_range()).cloned())
-        .unwrap_or_else(|| VulnKey(formatter.normalize_package_name(dep.name())))
+        .unwrap_or_else(|| VulnKey(formatter.normalize_package_name(dep.name()).into_string()))
 }
 
 /// Computes the [`VulnerabilityMap`] key each occurrence in `parse_result`
@@ -2319,7 +2320,7 @@ pub fn vulnerability_keys(
             let signature = if formatter.source_is_public_registry_content(&dep.source()) {
                 match resolve_in_use_versions(
                     *dep,
-                    &name,
+                    name.as_str(),
                     resolved,
                     resolved_candidates,
                     formatter,
@@ -2347,7 +2348,7 @@ pub fn vulnerability_keys(
             } else {
                 "n".to_string()
             };
-            (name, signature)
+            (name.into_string(), signature)
         })
         .collect();
 

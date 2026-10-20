@@ -5,6 +5,7 @@
 use crate::config::DepsConfig;
 use crate::document::{ServerState, ensure_document_loaded};
 use deps_core::EcosystemId;
+use deps_core::NormalizeName;
 use deps_core::completion::{
     COMPLETION_SEARCH_TIMEOUT, CompletionOrigin, is_valid_completion_prefix_len,
 };
@@ -139,11 +140,14 @@ pub async fn handle_completion(
                 // `documents.get_mut` on the same shard for the duration (#319).
                 let completion_result = tokio::time::timeout(
                     COMPLETION_SEARCH_TIMEOUT,
-                    ecosystem.generate_completions(
-                        parse_result.as_ref(),
-                        position,
-                        &content,
-                        freshness,
+                    deps_core::observe_ecosystem(
+                        ecosystem_id,
+                        ecosystem.generate_completions(
+                            parse_result.as_ref(),
+                            position,
+                            &content,
+                            freshness,
+                        ),
                     ),
                 )
                 .await;
@@ -376,7 +380,7 @@ fn apply_osv_latest_verdict_to_completions(
                                 latest_status,
                                 dep,
                                 Some(&vuln_keys),
-                                &normalized_name,
+                                normalized_name.as_str(),
                                 version,
                                 formatter,
                             )
@@ -385,7 +389,7 @@ fn apply_osv_latest_verdict_to_completions(
                                 candidate_status,
                                 dep,
                                 Some(&vuln_keys),
-                                &normalized_name,
+                                normalized_name.as_str(),
                                 version,
                                 formatter,
                             )
@@ -2885,6 +2889,145 @@ ser"
         // Empty items collapse to `None` (see `handle_completion`'s tail); reaching
         // this at all (rather than hanging or panicking) is what this test checks.
         assert!(result.is_none());
+    }
+
+    /// #1863: a version completion must feed the endpoint breaker's evidence, so hovers that
+    /// only wait on its request count it. Drives the real `handle_completion`, which scopes the
+    /// ecosystem, and the shared version-completion helper, which scopes the endpoint.
+    #[tokio::test(start_paused = true)]
+    async fn test_handle_completion_feeds_the_endpoint_breaker() {
+        use deps_core::{Dependency, Ecosystem, EcosystemFormatter, ParseResult};
+        use std::any::Any;
+        use std::path::Path;
+
+        struct StalledCompletionEcosystem {
+            registry: Arc<deps_core::test_util::StalledCoalescingRegistry>,
+        }
+        impl deps_core::ecosystem::private::Sealed for StalledCompletionEcosystem {}
+        impl Ecosystem for StalledCompletionEcosystem {
+            fn ecosystem_id(&self) -> deps_core::EcosystemId {
+                deps_core::EcosystemId::Cargo
+            }
+            fn display_name(&self) -> &'static str {
+                "Cargo (stalled mock)"
+            }
+            fn manifest_filenames(&self) -> &[&'static str] {
+                &["Cargo.toml"]
+            }
+            fn parse_manifest<'a>(
+                &'a self,
+                _content: &'a str,
+                _uri: &'a url::Url,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
+            {
+                Box::pin(async move { unimplemented!() })
+            }
+            fn registry(&self) -> Arc<dyn deps_core::Registry> {
+                Arc::clone(&self.registry) as Arc<dyn deps_core::Registry>
+            }
+            fn formatter(&self) -> &dyn EcosystemFormatter {
+                &deps_core::test_util::StubFormatter::DEFAULT
+            }
+            fn generate_completions<'a>(
+                &'a self,
+                _parse_result: &'a dyn ParseResult,
+                _position: tower_lsp_server::ls_types::Position,
+                _content: &'a str,
+                freshness: deps_core::FreshnessSettings,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions>
+            {
+                Box::pin(async move {
+                    let items = deps_core::completion::complete_versions_generic_replacing(
+                        self.registry.as_ref(),
+                        &deps_core::test_util::StubFormatter::DEFAULT,
+                        &deps_core::PackageName::new("serde"),
+                        &deps_core::DependencySource::Registry,
+                        "",
+                        &[],
+                        freshness,
+                        None,
+                        &deps_core::SelectionContext::none(),
+                    )
+                    .await;
+                    let mut completions = deps_core::completion::Completions::default();
+                    completions.items = items;
+                    completions
+                })
+            }
+            fn complete_version<'a>(
+                &'a self,
+                _request: deps_core::completion::CompletionRequest<'a>,
+                _package_name: deps_core::PackageName,
+                _prefix: String,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions>
+            {
+                unimplemented!()
+            }
+            fn completion_insert_text(
+                &self,
+                _metadata: &dyn deps_core::Metadata,
+            ) -> Option<String> {
+                unimplemented!()
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockParseResult {
+            uri: url::Url,
+        }
+        impl ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                vec![]
+            }
+            fn workspace_root(&self) -> Option<&Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let state = Arc::new(ServerState::new());
+        let stalled = Arc::new(deps_core::test_util::StalledCoalescingRegistry::new());
+        state
+            .ecosystem_registry
+            .register(Arc::new(StalledCompletionEcosystem {
+                registry: Arc::clone(&stalled),
+            }));
+        let url = deps_core::test_util::test_uri("/test/stalled-completion/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
+        let doc = DocumentState::new_from_parse_result(
+            EcosystemId::Cargo,
+            "[dependencies]\nserde = \"1\"\n".to_string(),
+            parse_result,
+        );
+        state.update_document(uri.clone(), doc);
+        let params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: Position::new(1, 5),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+        let (client, config) = create_test_client_and_config();
+
+        let background = async {
+            let _ = handle_completion(state, params, client, config).await;
+        };
+
+        assert!(
+            stalled
+                .waiters_open_the_breaker_while(deps_core::EcosystemId::Cargo, background)
+                .await
+        );
     }
 
     /// #419 C1 regression, now driven by a per-call [`Completions::is_incomplete`]

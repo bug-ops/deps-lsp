@@ -80,7 +80,7 @@ pub struct UpdateConfig {
 #[serde(deny_unknown_fields)]
 pub struct IgnoreRule {
     /// The dependency name this rule matches, after
-    /// [`deps_core::lsp_helpers::PackageNaming::normalize_package_name`] is applied to both
+    /// [`deps_core::lsp_helpers::NormalizeName::normalize_package_name`] is applied to both
     /// sides (FR-006).
     pub name: String,
     /// The update kinds this rule matches. `None` matches every kind, including

@@ -389,6 +389,7 @@ impl OsvNaming for BundlerFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::NormalizeName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
 
@@ -465,11 +466,11 @@ mod tests {
         let formatter = BundlerFormatter;
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("rails")),
-            "rails"
+            deps_core::NormalizedName::for_test("rails")
         );
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("rspec-rails")),
-            "rspec-rails"
+            deps_core::NormalizedName::for_test("rspec-rails")
         );
     }
 

@@ -23,6 +23,7 @@ use deps_core::ConcreteVersion;
 use deps_core::DependencyOutcomes;
 use deps_core::Ecosystem;
 use deps_core::FetchFailure;
+use deps_core::NormalizeName;
 use deps_core::PackageName;
 use deps_core::Result;
 use deps_core::VersionReq;
@@ -49,7 +50,8 @@ use tracing::Instrument;
 ///
 /// # Errors
 ///
-/// Returns `Err(DepsError::CacheError)` if `content` exceeds `MAX_FILE_SIZE`.
+/// Returns `Err(DepsError::Io)` of kind [`std::io::ErrorKind::FileTooLarge`] if `content`
+/// exceeds `MAX_FILE_SIZE`.
 fn check_content_size(content: &str, uri: &Uri) -> Result<()> {
     let size = content.len() as u64;
     if size > MAX_FILE_SIZE {
@@ -59,8 +61,9 @@ fn check_content_size(content: &str, uri: &Uri) -> Result<()> {
             MAX_FILE_SIZE,
             uri
         );
-        return Err(deps_core::error::DepsError::CacheError(format!(
-            "document too large: {size} bytes (max: {MAX_FILE_SIZE} bytes)"
+        return Err(deps_core::error::DepsError::Io(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("document too large: {size} bytes (max: {MAX_FILE_SIZE} bytes)"),
         )));
     }
     Ok(())
@@ -371,17 +374,20 @@ async fn run_document_open_background_task(
     tracing::debug!("progress started, fetching versions");
 
     let registry = ecosystem.registry();
-    let fetch_result = fetch_latest_versions_parallel(
-        registry,
-        dep_sources,
-        &in_use,
-        progress_sender,
-        diagnostics_snapshot.freshness,
-        diagnostics_snapshot.fetch_timeout,
-        diagnostics_snapshot.max_concurrent_fetches,
-        &selection_context,
-        // deps-lsp surfaces GOSSIP via its own prefetch (spec 072), not this filter (spec 074).
-        None,
+    let fetch_result = deps_core::observe_ecosystem(
+        ecosystem.ecosystem_id(),
+        fetch_latest_versions_parallel(
+            registry,
+            dep_sources,
+            &in_use,
+            progress_sender,
+            diagnostics_snapshot.freshness,
+            diagnostics_snapshot.fetch_timeout,
+            diagnostics_snapshot.max_concurrent_fetches,
+            &selection_context,
+            // deps-lsp surfaces GOSSIP via its own prefetch (spec 072), not this filter (spec 074).
+            None,
+        ),
     )
     .await;
     drop(fetch_permit);
@@ -2438,9 +2444,12 @@ mod tests {
             );
             doc.replace_outcomes(
                 DependencyOutcomes::new()
-                    .with_fetch_failure("serde", FetchFailure::Transient)
+                    .with_fetch_failure(
+                        deps_core::NormalizedName::for_test("serde"),
+                        FetchFailure::Transient,
+                    )
                     .with_yanked(
-                        "other",
+                        deps_core::NormalizedName::for_test("other"),
                         (ConcreteVersion::new("2.0.0"), RemovalStatus::Yanked),
                     ),
             );
@@ -2456,14 +2465,19 @@ mod tests {
                 "cached_versions must be dropped"
             );
             assert_eq!(
-                doc.signals.outcomes.fetch_failure("serde"),
+                doc.signals
+                    .outcomes
+                    .fetch_failure(&deps_core::NormalizedName::for_test("serde")),
                 Some(&FetchFailure::NotAttempted),
                 "the stale fetch-failure finding must be replaced with a NotAttempted \
                  placeholder, not left absent (S1: an absent entry surviving into a \
                  concurrent empty-diff commit renders as the misleading 'Unknown package')"
             );
             assert!(
-                doc.signals.outcomes.yanked("other").is_some(),
+                doc.signals
+                    .outcomes
+                    .yanked(&deps_core::NormalizedName::for_test("other"))
+                    .is_some(),
                 "a yanked finding on a different package must survive untouched"
             );
             assert_eq!(
@@ -2488,7 +2502,10 @@ mod tests {
 
             assert!(doc.signals.cached_versions.is_empty());
             assert!(
-                doc.signals.outcomes.fetch_failure("serde").is_none(),
+                doc.signals
+                    .outcomes
+                    .fetch_failure(&deps_core::NormalizedName::for_test("serde"))
+                    .is_none(),
                 "a dependency outside deps_to_fetch must not be given a placeholder"
             );
         }
@@ -2813,7 +2830,7 @@ mod tests {
         }
 
         struct SlowFetchEcosystem {
-            registry: Arc<SlowRegistry>,
+            registry: Arc<dyn Registry>,
         }
         impl Sealed for SlowFetchEcosystem {}
         impl Ecosystem for SlowFetchEcosystem {
@@ -3028,6 +3045,90 @@ mod tests {
                 );
             }
         }
+
+        /// #1863: the open path's background fetch must feed the endpoint breaker, so hovers
+        /// that only wait on its request count it. Drives the real `handle_document_open`.
+        #[tokio::test(start_paused = true)]
+        async fn the_open_path_background_fetch_feeds_the_endpoint_breaker() {
+            let state = Arc::new(ServerState::new());
+            let stalled = Arc::new(deps_core::test_util::StalledCoalescingRegistry::new());
+            state
+                .ecosystem_registry
+                .register(Arc::new(SlowFetchEcosystem {
+                    registry: Arc::clone(&stalled) as Arc<dyn Registry>,
+                }));
+            let (client, config) = crate::test_utils::test_helpers::create_test_client_and_config();
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/stalled-open/Cargo.toml",
+            ));
+
+            let background = async {
+                handle_document_open(uri, "x".to_string(), Some(1), state, client, config)
+                    .await
+                    .unwrap()
+                    .await
+                    .unwrap();
+            };
+
+            assert!(
+                stalled
+                    .waiters_open_the_breaker_while(deps_core::EcosystemId::Cargo, background)
+                    .await
+            );
+        }
+
+        /// #1863: the change path's background fetch feeds the endpoint breaker too. Drives the
+        /// real `fetch_registry_versions_for_change`.
+        #[tokio::test(start_paused = true)]
+        async fn the_change_path_background_fetch_feeds_the_endpoint_breaker() {
+            let state = ServerState::new();
+            let stalled = Arc::new(deps_core::test_util::StalledCoalescingRegistry::new());
+            let ecosystem = SlowFetchEcosystem {
+                registry: Arc::clone(&stalled) as Arc<dyn Registry>,
+            };
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+            let url = deps_core::test_util::test_uri("/test/stalled-change/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let parse_result: Box<dyn deps_core::ParseResult> = Box::new(FakeParseResult {
+                uri: url,
+                dep: FakeDependency {
+                    name: PackageName::new("pkg"),
+                    version_requirement: VersionReq::new("*"),
+                },
+            });
+            state.update_document(
+                uri.clone(),
+                DocumentState::new_from_parse_result(
+                    deps_core::EcosystemId::Cargo,
+                    "x".to_string(),
+                    parse_result,
+                ),
+            );
+
+            let background = async {
+                let _ = fetch_registry_versions_for_change(
+                    &uri,
+                    &state,
+                    &client,
+                    &ecosystem,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    vec![PackageName::new("pkg")],
+                    FreshnessSettings::Disabled,
+                    FetchTimeout::constant::<60>(),
+                    deps_core::policy_config::FetchConcurrency::constant::<4>(),
+                    RefetchPolicy::Diff,
+                )
+                .await;
+            };
+
+            assert!(
+                stalled
+                    .waiters_open_the_breaker_while(deps_core::EcosystemId::Cargo, background)
+                    .await
+            );
+        }
     }
 
     // Generic tests (no feature flag required)
@@ -3054,10 +3155,10 @@ mod tests {
         let content = "a".repeat(MAX_FILE_SIZE as usize + 1);
         let result = check_content_size(&content, &uri);
         match result {
-            Err(deps_core::error::DepsError::CacheError(msg)) => {
-                assert!(msg.contains("too large"), "unexpected message: {msg}");
+            Err(deps_core::error::DepsError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
             }
-            other => panic!("Expected CacheError, got {other:?}"),
+            other => panic!("Expected an Io error, got {other:?}"),
         }
     }
 
@@ -3394,13 +3495,10 @@ serde = "1.0""#;
 
             assert!(result.is_err(), "Oversized content should be rejected");
             match result {
-                Err(deps_core::error::DepsError::CacheError(msg)) => {
-                    assert!(
-                        msg.contains("too large"),
-                        "Error message should indicate size issue: {msg}"
-                    );
+                Err(deps_core::error::DepsError::Io(error)) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
                 }
-                other => panic!("Expected CacheError for oversized content, got {other:?}"),
+                other => panic!("Expected an Io error for oversized content, got {other:?}"),
             }
             assert_eq!(
                 state.document_count(),
@@ -3452,13 +3550,10 @@ serde = "1.0"
 
             assert!(result.is_err(), "Oversized content should be rejected");
             match result {
-                Err(deps_core::error::DepsError::CacheError(msg)) => {
-                    assert!(
-                        msg.contains("too large"),
-                        "Error message should indicate size issue: {msg}"
-                    );
+                Err(deps_core::error::DepsError::Io(error)) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
                 }
-                other => panic!("Expected CacheError for oversized content, got {other:?}"),
+                other => panic!("Expected an Io error for oversized content, got {other:?}"),
             }
             assert_eq!(
                 state.document_count(),

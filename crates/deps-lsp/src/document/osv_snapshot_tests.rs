@@ -19,6 +19,7 @@
 
 #![cfg(test)]
 
+use deps_core::NormalizeName;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -79,7 +80,7 @@ async fn diagnostics_snapshot_for(
 
     let mut vulnerabilities = VulnerabilityMap::new();
     vulnerabilities.insert(
-        deps_core::test_util::vuln_key(&normalized_key),
+        deps_core::test_util::vuln_key(normalized_key.as_str()),
         ScanOutcome::Vulnerable(DependencyVulnerabilities::new(Capped::new(
             vec![sample_advisory()],
             6,

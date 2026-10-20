@@ -70,6 +70,21 @@ impl std::fmt::Debug for EndpointFingerprint {
 pub struct CachedEndpoint(std::sync::OnceLock<RegistryEndpoint>);
 
 impl CachedEndpoint {
+    /// An empty cache, usable in `const` constructors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::CachedEndpoint;
+    ///
+    /// const EMPTY: CachedEndpoint = CachedEndpoint::new();
+    /// # let _ = EMPTY;
+    /// ```
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+
     /// The cached endpoint, computing it with `compute` on the first call only.
     pub fn get_or_compute(&self, compute: impl FnOnce() -> RegistryEndpoint) -> RegistryEndpoint {
         *self.0.get_or_init(compute)

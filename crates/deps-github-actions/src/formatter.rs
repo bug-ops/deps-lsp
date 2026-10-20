@@ -159,7 +159,7 @@ impl deps_core::lsp_helpers::ShaPinning for GithubActionsFormatter {
 }
 
 impl PackageNaming for GithubActionsFormatter {
-    fn normalize_package_name(&self, name: &PackageName) -> String {
+    fn normalized_spelling(&self, name: &PackageName) -> String {
         name.as_str().to_lowercase()
     }
 
@@ -621,6 +621,7 @@ impl OsvNaming for GithubActionsFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::NormalizeName;
     use deps_core::lsp_helpers::{CommentMismatch, CommitSha, RequirementGate, ResolvedPin};
     use deps_core::osv::SiblingCoverage;
     use deps_core::pagination::ListCoverage;
@@ -2720,7 +2721,7 @@ mod tests {
         let fmt = formatter();
         assert_eq!(
             fmt.normalize_package_name(&PackageName::new("Actions/Checkout")),
-            "actions/checkout"
+            deps_core::NormalizedName::for_test("actions/checkout")
         );
     }
 

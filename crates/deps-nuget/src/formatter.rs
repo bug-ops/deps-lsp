@@ -96,7 +96,7 @@ impl PackageNaming for NuGetFormatter {
     }
 
     /// NuGet package ids are case-insensitive and every V3 API path segment is lowercased.
-    fn normalize_package_name(&self, name: &PackageName) -> String {
+    fn normalized_spelling(&self, name: &PackageName) -> String {
         name.as_str().to_lowercase()
     }
 }
@@ -324,6 +324,7 @@ impl OsvNaming for NuGetFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::NormalizeName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
 
@@ -558,7 +559,7 @@ mod tests {
         let f = NuGetFormatter;
         assert_eq!(
             f.normalize_package_name(&PackageName::new("Newtonsoft.Json")),
-            "newtonsoft.json"
+            deps_core::NormalizedName::for_test("newtonsoft.json")
         );
     }
 
@@ -591,7 +592,7 @@ mod tests {
         );
         assert_ne!(
             f.osv_package_name(&dep).unwrap().as_str(),
-            f.normalize_package_name(&dep.name)
+            f.normalize_package_name(&dep.name).as_str()
         );
     }
 

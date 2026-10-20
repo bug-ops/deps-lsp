@@ -28,6 +28,8 @@
 //! `./local`/`docker://` — because the referenced workflow's version and the host repo's
 //! release tags are not reliably the same thing (see `parser` module docs).
 
+#[cfg(test)]
+mod breaker_tests;
 pub mod ecosystem;
 pub mod formatter;
 pub mod parser;

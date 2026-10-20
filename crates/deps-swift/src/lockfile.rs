@@ -195,6 +195,7 @@ pub fn fuzz_parse_package_resolved(content: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::NormalizeName;
     use deps_core::lockfile::LockFileProvider;
     use std::assert_matches;
 
@@ -520,11 +521,9 @@ mod tests {
             &deps_core::test_util::test_uri("/test/Package.swift"),
         )
         .unwrap();
-        let key = deps_core::lsp_helpers::PackageNaming::normalize_package_name(
-            &crate::formatter::SwiftFormatter,
-            &manifest.dependencies[0].name,
-        );
-        assert_eq!(resolved.version(&key), Some("1.2.0"));
+        let key =
+            crate::formatter::SwiftFormatter.normalize_package_name(&manifest.dependencies[0].name);
+        assert_eq!(resolved.version(key.as_str()), Some("1.2.0"));
     }
 
     /// Regression for #979: a v2/v3 pin on a non-GitHub host (`location`) must never be
