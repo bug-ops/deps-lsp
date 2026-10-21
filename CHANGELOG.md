@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `PackageKey`, the declared and normalized spellings of one dependency name behind a single `find_in` lookup (#1874)
 
 ### Changed
+- **deps**: bump workspace crate requirements (jsonc-parser 0.34, jsonschema 0.59, tokio 1.54, and others) and SHA-pinned GitHub Actions (#1886)
 - **deps**: update `Cargo.lock` (tokio 1.54.0, serde_json 1.0.154, aws-lc-sys 0.46.0, related patch drift) (#1872)
 - **deps-core, deps-nuget**: a non-https request URL is an actionable `InsecureScheme`, and a non-https `@id` in the public NuGet service index is refused as a bad feed (#1872)
 - **deps-cargo, deps-maven, deps-swift**: malformed index and metadata responses are `ParseError`, and budget overruns and search suppression have typed errors (#1872)
