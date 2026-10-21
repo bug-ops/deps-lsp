@@ -101,5 +101,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 deps-core = { workspace = true, features = ["test-util"] }
+deps-swift = { workspace = true, features = ["test-util"] }
+mockito = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util", "time"] }

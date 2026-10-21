@@ -57,9 +57,10 @@ false "up to date" result just because the comment text looked current.
 
 A full-SHA pin that no release tag points at (with no comment, or a non-version one like
 `# cargo-deny`) is reported as outdated once the repository's tags are loaded; a pin to a
-non-release commit is therefore offered the latest release. This includes a commentless pin on a
-non-release commit newer than the latest release: it is reported outdated and update-all re-pins
-it to the latest release (effectively a downgrade).
+non-release commit is therefore offered the latest release. The one exception is a commentless pin
+on a commit that the forge proves is newer than the latest release and part of the default branch:
+it is up to date and update-all leaves it alone (see
+[Commits ahead of the latest release](#commits-ahead-of-the-latest-release-issue-1725)).
 
 A pin whose SHA is absent from the loaded tag index is reported outdated even when it carries a
 version comment, since the comment cannot make a non-release commit the latest release. The
@@ -82,8 +83,43 @@ while the latest is `v1.1.0` on another commit) is reported outdated (issue #173
 above the latest release, including `v3.0.0-rc1`, counts as up to date.
 
 **Trade-off.** A non-release commit newer than the latest release that carries only a floating tag
-is also reported outdated, and update-all re-pins it to the latest release. Making that case
-distinguishable is tracked in #1725.
+follows the same rule as any other commentless non-release pin: it is up to date only when the
+forge proves it descends from the latest release and belongs to the default branch, as described
+next.
+
+### Commits ahead of the latest release (issue #1725)
+
+Pinning `actions/checkout` to the current `main` HEAD, which is newer than the latest release, used
+to be reported outdated, and update-all would re-pin it to the older release. `deps-lsp` now asks
+GitHub two questions in the background, using the compare API:
+
+1. **Lineage**: does the pinned commit descend from the latest release's commit?
+2. **Membership**: is the pinned commit reachable from the default branch?
+
+Only when both answers are yes is the pin up to date. Hover then adds the line
+`commit 12 ahead of latest release v4.2.2`, the diagnostic and update quickfix disappear, and
+update-all skips the pin.
+
+```yaml
+steps:
+  # HEAD of main, newer than the latest release v4.2.2: up to date
+  - uses: actions/checkout@<sha-of-main-head>
+```
+
+Both proofs are required because lineage alone does not prove the commit belongs to the project: a
+commit that exists only in a fork of the repository also compares as "ahead" of a release. Every
+other outcome keeps the previous behavior, so a pin on a release branch (a commit that has
+diverged from the default branch), a fork-only commit, an unknown SHA, a rate-limited answer or a
+timeout is reported outdated and offered the latest release as before.
+
+Evidence is collected in the background, so the first diagnostics after opening a workflow can still
+show the pin as outdated; they refresh as soon as the answer arrives. A proof that a commit is ahead
+of one release is not reused after a newer release is published, and a default-branch membership
+answer expires with the tag index. The requests share the budget described in
+[Unpublished refs](#unpublished-refs-and-the-unknown-ref-diagnostic-issue-1766), so setting
+`GITHUB_TOKEN` also makes this check available for more pins. `deps-cli check` and `deps-cli update`
+wait for the evidence before classifying, so they agree with the editor, and skip it with
+`--offline`.
 
 When the update target is not version-shaped (a release named `stable`), the SHA is rewritten
 without a `# tag` comment; any words after the old tag stay in the comment
@@ -142,18 +178,54 @@ ref, and what it means depends on its shape:
   branch: `ruby/setup-ruby@v1`, `pnpm/action-setup@v3`,
   `aws-actions/configure-aws-credentials@v3-node20` and `codecov/codecov-action@v5.x` are
   documented branch pins. They keep the rule above (unresolved only when ahead of the latest
-  release) and are never reported by `unknown-ref`, so a ref such as `@v40` gets an unresolved
-  status but no diagnostic.
+  release). They are reported by `unknown-ref` only once a background branch check confirms that
+  the ref is neither a published tag nor a branch (see below), so a ref such as `@v40` gets an
+  unresolved status at once and the diagnostic as soon as the check completes.
 
 Nothing is reported while the tag index is cold, empty or truncated. `deps-cli check
 --fail-on unknown-ref` fails on the diagnostic regardless of its severity; it is not part of the
 default `--fail-on` set.
 
+#### Branch check for partial refs
+
+For a partial or suffixed ref, `deps-lsp` asks GitHub in the background whether a branch of that
+name exists (`GET /repos/{owner}/{repo}/git/ref/heads/{ref}`). The verdict decides the diagnostic:
+
+| Ref | Tag list | Branch check | Result |
+|---|---|---|---|
+| `ruby/setup-ruby@v1` | no tag `v1` | branch exists | silent: a documented branch pin |
+| `actions/checkout@v40` | no tag `v40` | no such branch | `` `v40` is neither a published tag nor a branch of actions/checkout `` |
+| `actions/checkout@v40` | no tag `v40` | rate-limited, timed out, or skipped | silent |
+
+The check runs only for a repository whose tag list is complete, because a readable tag list proves
+the repository is reachable and a 404 for the ref is therefore authoritative. Refs that are not
+plain tag-shaped names (for instance containing `/`, `..`, `?` or `#`) are never sent anywhere.
+Only a definite answer produces a diagnostic: a rate limit, a timeout, a server error or an empty
+repository leaves the pin silent rather than guessing.
+
+Because the check is a request of its own, it is rationed. Without a token, `deps-lsp` allows a
+handful of branch checks per hour and never spends the last 20 requests of your GitHub quota; with
+`GITHUB_TOKEN` the allowance is far larger. The tag-list fetches that the rest of the extension
+needs are never starved by it. Answers are remembered for as long as the tag list is, and
+`Actions/Checkout` and `actions/checkout` share one answer.
+
+**Tip:** export `GITHUB_TOKEN` in CI and in the environment of your editor. Without it, in a
+workspace with many workflows, some refs stay unchecked until the allowance refills.
+
+In `deps-cli`, branch checks are skipped with `--offline`. When `--fail-on unknown-ref` is set and
+some checks were skipped or inconclusive, `deps-cli` prints one note on stderr and leaves the exit
+code unchanged:
+
+```text
+N ref probes skipped (rate budget/inconclusive); set GITHUB_TOKEN/GITLAB_TOKEN in CI
+```
+
 When exactly one published tag matches the written ref after normalization (`4.3.1` beside tag
 `v4.3.1`), the `Change ref to published tag <tag>` quickfix rewrites the ref to that spelling
 (issue #1781). It is withheld when no tag or several differently-targeted tags match.
 
-In the editor the verdict is only as fresh as the last tags fetch of that repository. Every
+In the editor the verdict is only as fresh as the last tags fetch of that repository and the last
+branch check. Every
 document open or edit that uses it re-requests the tags (a conditional request, so an unchanged
 list is cheap) and refreshes the diagnostics, so a pin bumped to a tag published after the last
 fetch can show the warning until the next open or edit of a workflow using that repository.

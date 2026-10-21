@@ -2085,6 +2085,7 @@ mod tests {
     }
 
     struct IdentityNaming;
+    impl crate::lsp_helpers::SourcePolicy for IdentityNaming {}
     impl crate::lsp_helpers::OsvNaming for IdentityNaming {}
 
     fn with_sibling_tags(target: ScanTarget, primary: &str, siblings: &[&str]) -> ScanTarget {

@@ -17,7 +17,7 @@ use crate::endpoint_contact::{Contact, RequestNote, ResponseSeen, note_request};
 use crate::lsp_helpers::DependencyOutcomes;
 use crate::lsp_helpers::REGISTRY_FETCH_BUDGET;
 use crate::test_util::{MockRegistry, MockVersion};
-use crate::{ConcreteVersion, EcosystemId, ErrorOrigin, FetchFailure};
+use crate::{ConcreteVersion, EcosystemId, ErrorOrigin, FetchFailure, NormalizedName};
 use crate::{EgressTier, RegistryEndpoint};
 
 #[derive(Clone, Copy)]
@@ -46,8 +46,8 @@ impl InteractiveFetchError for Failure {
 struct Fixture {
     ecosystem: EcosystemId,
     gate: InteractiveFetchGate,
-    cached: HashMap<PackageName, crate::PackageVersions>,
-    resolved: HashMap<PackageName, ConcreteVersion>,
+    cached: HashMap<NormalizedName, crate::PackageVersions>,
+    resolved: HashMap<NormalizedName, ConcreteVersion>,
     calls: AtomicUsize,
     kind: std::sync::Mutex<AuxiliaryLookup>,
     manifest: url::Url,

@@ -11,7 +11,10 @@
 
 use crate::error::{DepsError, RateLimitEvidence, Result};
 use crate::freshness::PublishTime;
-use crate::lsp_helpers::{is_dot_segment, warn_rejected_value};
+use crate::lsp_helpers::{
+    COMPARE_BODY_LIMIT, CommitSha, ProbeRef, is_dot_segment, warn_rejected_value,
+};
+use crate::rate_limit::{ProbeCredential, QuotaHeaders, QuotaMeter};
 use bytes::Bytes;
 use dashmap::DashMap;
 use serde::Deserialize;
@@ -22,7 +25,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::EcosystemId;
-use crate::cache::{CredentialHeader, HttpCache, RateLimitRevocation, RequestAuth};
+use crate::cache::{
+    CredentialHeader, HttpCache, RateLimitRevocation, RequestAuth, RevalidationFailure,
+};
 use crate::net_policy::TrustedPrefix;
 
 /// Base URL for the GitHub REST API.
@@ -235,6 +240,8 @@ pub struct GithubTagsClient {
     /// The endpoint [`Self::endpoint`] reports, computed on first use (the fingerprint hashes
     /// URL text, which the gate would otherwise redo for every lookup).
     endpoint: crate::CachedEndpoint,
+    /// Fed by every live response of this client, tag-index and probe alike.
+    quota: Arc<QuotaMeter>,
 }
 
 /// `{base}/` as a [`TrustedPrefix`]; the trailing slash is load-bearing (see
@@ -279,6 +286,7 @@ impl GithubTagsClient {
             trusted_origin: api_prefix(GITHUB_API),
             api_base: GITHUB_API.to_string(),
             endpoint: crate::CachedEndpoint::default(),
+            quota: Arc::new(QuotaMeter::new(QuotaHeaders::GitHub)),
         }
     }
 
@@ -304,6 +312,7 @@ impl GithubTagsClient {
             trusted_origin: api_prefix(&api_base),
             api_base,
             endpoint: crate::CachedEndpoint::default(),
+            quota: Arc::new(QuotaMeter::new(QuotaHeaders::GitHub)),
         }
     }
 
@@ -356,6 +365,26 @@ impl GithubTagsClient {
                 )
                 .with_rate_limit(RateLimitRevocation::Throttles)
             })
+            .with_quota_meter(&self.quota)
+    }
+
+    /// The meter every live response of this client feeds, for the [`ProbeAllowance`] that
+    /// guards optional probes against the same host.
+    ///
+    /// [`ProbeAllowance`]: crate::rate_limit::ProbeAllowance
+    #[must_use]
+    pub const fn quota_meter(&self) -> &Arc<QuotaMeter> {
+        &self.quota
+    }
+
+    /// Which [`ProbeCredential`] parameters apply to probes against this client's host.
+    #[must_use]
+    pub const fn probe_credential(&self) -> ProbeCredential {
+        if self.has_token {
+            ProbeCredential::Token
+        } else {
+            ProbeCredential::Anonymous
+        }
     }
 
     /// The shared HTTP cache this client fetches through.
@@ -422,6 +451,104 @@ impl GithubTagsClient {
             self.api_base
         );
         self.fetch_authenticated(&url).await
+    }
+
+    /// Asks whether `name` (`owner/repo`, already validated) has a branch called `git_ref`:
+    /// `GET {api_base}/repos/{name}/git/ref/heads/{git_ref}`.
+    ///
+    /// Takes a [`ProbeRef`], whose constructor admits only a plain ref charset, and
+    /// percent-encodes it as a path segment on top, so no manifest text can retarget the
+    /// token-bearing request. A `200` is a branch; a `404` surfaces as
+    /// [`DepsError::HttpStatus`] with status 404 and means no such branch. A failed
+    /// revalidation fails the call instead of serving a stored `200`, so a rate limit or a
+    /// server error can never be recorded as an existing branch.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying HTTP/cache error unchanged.
+    #[tracing::instrument(
+        skip(self),
+        fields(name = %crate::redact::redact_declaration_key(name))
+    )]
+    pub async fn fetch_branch_ref(&self, name: &str, git_ref: &ProbeRef) -> Result<Bytes> {
+        let url = format!(
+            "{}/repos/{name}/git/ref/heads/{}",
+            self.api_base,
+            git_ref.as_path_segment()
+        );
+        self.cache
+            .get_cached_trusted_origin_limited(
+                &url,
+                &self.trusted_origin,
+                self.auth(),
+                None,
+                RevalidationFailure::Fail,
+                COMPARE_BODY_LIMIT,
+            )
+            .await
+            .map(|response| response.body)
+    }
+
+    /// Compares `base...head` in `name` (`owner/repo`, already validated) and returns the
+    /// summary response:
+    /// `GET {api_base}/repos/{name}/compare/{base}...{head}?per_page=1&page=2`.
+    ///
+    /// `page=2` with `per_page=1` makes the forge omit the `files` list, which shrinks the answer
+    /// from about 220 KB to about 13 KB; the body is capped at [`COMPARE_BODY_LIMIT`], and an
+    /// overflow is [`DepsError::ResponseTooLarge`]. Both commits are typed, so no written text
+    /// reaches the URL. A failed revalidation fails the call instead of serving a stale
+    /// answer. Read the result with [`CompareSummary::parse`](crate::lsp_helpers::CompareSummary::parse).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying HTTP/cache error unchanged: `404` for an unknown commit or an
+    /// inaccessible repository, [`DepsError::ResponseTooLarge`] past the limit.
+    #[tracing::instrument(
+        skip(self, base, head),
+        fields(name = %crate::redact::redact_declaration_key(name))
+    )]
+    pub async fn fetch_compare(
+        &self,
+        name: &str,
+        base: CompareBase<'_>,
+        head: &CommitSha,
+    ) -> Result<Bytes> {
+        let url = format!(
+            "{}/repos/{name}/compare/{base}...{head}?per_page=1&page=2",
+            self.api_base
+        );
+        self.cache
+            .get_cached_trusted_origin_limited(
+                &url,
+                &self.trusted_origin,
+                self.auth(),
+                None,
+                RevalidationFailure::Fail,
+                COMPARE_BODY_LIMIT,
+            )
+            .await
+            .map(|response| response.body)
+    }
+}
+
+/// The base commit of a compare request.
+///
+/// Typed so the only texts that reach the URL are a validated commit SHA and the fixed `HEAD`
+/// literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareBase<'a> {
+    /// The default branch's HEAD, spelled `HEAD`.
+    DefaultBranchHead,
+    /// A specific commit.
+    Commit(&'a CommitSha),
+}
+
+impl std::fmt::Display for CompareBase<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DefaultBranchHead => f.write_str("HEAD"),
+            Self::Commit(sha) => f.write_str(sha.as_str()),
+        }
     }
 }
 
@@ -983,6 +1110,7 @@ impl ReleaseDatesCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp_helpers::{CompareStatus, CompareSummary};
     #[cfg(feature = "test-util")]
     use crate::test_util::{capture_tracing_output, capture_tracing_output_async};
     use std::assert_matches;
@@ -1432,7 +1560,13 @@ mod tests {
         let client =
             GithubTagsClient::for_test(Arc::new(HttpCache::new()), "http://example", false);
         assert!(!client.has_token());
-        assert_matches!(client.auth(), RequestAuth::Anonymous { partition: None });
+        assert_matches!(
+            client.auth(),
+            RequestAuth::Anonymous {
+                partition: None,
+                ..
+            }
+        );
     }
 
     // --- ApiToken redaction (bare-type coverage lives in `crate::secret`'s own tests) ---
@@ -1476,6 +1610,145 @@ mod tests {
         client.fetch_tags_page("owner/repo", 1).await.unwrap();
 
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_branch_ref_requests_the_encoded_heads_ref_with_the_token() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/repos/owner/repo/git/ref/heads/v1%2B2")
+            .match_header("authorization", "Bearer test-token")
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let client = GithubTagsClient::for_test(Arc::new(HttpCache::new()), server.url(), true);
+        let git_ref = ProbeRef::parse("v1+2").unwrap();
+        client
+            .fetch_branch_ref("owner/repo", &git_ref)
+            .await
+            .unwrap();
+
+        mock.assert_async().await;
+    }
+
+    /// A stored `200` must not survive a failed revalidation: it would be recorded as an
+    /// authoritative `Exists`.
+    #[tokio::test]
+    async fn test_fetch_branch_ref_failed_revalidation_is_an_error_not_a_stale_200() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock("GET", "/repos/owner/repo/git/ref/heads/v1")
+            .with_status(200)
+            .with_header("etag", "\"b1\"")
+            .with_body("{}")
+            .create_async()
+            .await;
+        let client = GithubTagsClient::for_test(Arc::new(HttpCache::new()), server.url(), false);
+        let git_ref = ProbeRef::parse("v1").unwrap();
+        client
+            .fetch_branch_ref("owner/repo", &git_ref)
+            .await
+            .unwrap();
+        first.remove_async().await;
+
+        for status in [403, 404, 500] {
+            let _again = server
+                .mock("GET", "/repos/owner/repo/git/ref/heads/v1")
+                .with_status(status)
+                .create_async()
+                .await;
+            let result = client.fetch_branch_ref("owner/repo", &git_ref).await;
+            assert!(result.is_err(), "{status} must not serve the stored 200");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_branch_ref_404_is_an_http_status_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/repos/owner/repo/git/ref/heads/v40")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let client = GithubTagsClient::for_test(Arc::new(HttpCache::new()), server.url(), false);
+        let git_ref = ProbeRef::parse("v40").unwrap();
+        let err = client
+            .fetch_branch_ref("owner/repo", &git_ref)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DepsError::HttpStatus { status: 404, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_compare_builds_the_summary_url_and_caps_the_body() {
+        let latest = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let pin = CommitSha::parse(&"b".repeat(40)).unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let path = format!("/repos/owner/repo/compare/{latest}...{pin}");
+        let ok = server
+            .mock("GET", path.as_str())
+            .match_query(mockito::Matcher::UrlEncoded("page".into(), "2".into()))
+            .match_query(mockito::Matcher::UrlEncoded("per_page".into(), "1".into()))
+            .with_status(200)
+            .with_body(r#"{"status":"ahead","ahead_by":3}"#)
+            .create_async()
+            .await;
+        let head_path = format!("/repos/owner/repo/compare/HEAD...{pin}");
+        let _huge = server
+            .mock("GET", head_path.as_str())
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(vec![b'x'; COMPARE_BODY_LIMIT.bytes() + 1])
+            .create_async()
+            .await;
+
+        let client = GithubTagsClient::for_test(Arc::new(HttpCache::new()), server.url(), false);
+        let body = client
+            .fetch_compare("owner/repo", CompareBase::Commit(&latest), &pin)
+            .await
+            .unwrap();
+        ok.assert_async().await;
+        assert_eq!(
+            CompareSummary::parse(&body).unwrap().status,
+            CompareStatus::Ahead
+        );
+
+        let err = client
+            .fetch_compare("owner/repo", CompareBase::DefaultBranchHead, &pin)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DepsError::ResponseTooLarge { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_client_responses_feed_its_quota_meter_only_when_live() {
+        let reset = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600)
+            .to_string();
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/repos/owner/repo/tags?per_page=100&page=1")
+            .with_status(200)
+            .with_header("x-ratelimit-remaining", "41")
+            .with_header("x-ratelimit-reset", &reset)
+            .with_body("[]")
+            .create_async()
+            .await;
+
+        let client = GithubTagsClient::for_test(Arc::new(HttpCache::new()), server.url(), false);
+        assert!(client.quota_meter().current().is_none());
+        client.fetch_tags_page("owner/repo", 1).await.unwrap();
+        assert_eq!(client.quota_meter().current().unwrap().remaining, 41);
+        assert_eq!(client.probe_credential(), ProbeCredential::Anonymous);
     }
 
     #[tokio::test]

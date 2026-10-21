@@ -7,8 +7,8 @@ use crate::test_util::StubFormatter;
 fn hover_request<'a>(
     outcomes: &'a DependencyOutcomes,
     maps: (
-        &'a HashMap<PackageName, crate::PackageVersions>,
-        &'a HashMap<PackageName, ConcreteVersion>,
+        &'a HashMap<NormalizedName, crate::PackageVersions>,
+        &'a HashMap<NormalizedName, ConcreteVersion>,
     ),
     manifest: &'a url::Url,
     key: PackageKey,

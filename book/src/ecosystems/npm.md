@@ -7,7 +7,7 @@ Yarn — all three read the same `package.json` format.
 
 | | |
 |---|---|
-| Manifest file | `package.json` |
+| Manifest file | `package.json`; `pnpm-workspace.yaml` for [catalog entries](#editing-pnpm-workspaceyaml-catalog-entries) |
 | Lock file (in-use version) | `package-lock.json` (versions 2 and 3) or `pnpm-lock.yaml` |
 | Registry | npm registry — packument API (`registry.npmjs.org/{package}`) for versions, search API (`registry.npmjs.org/-/v1/search`) for package-name search |
 | Version syntax | node-semver ranges: `^`, `~`, `=`, `<`, `>`, `*` |
@@ -203,6 +203,79 @@ never per-key-merges the two sections.
   The same applies to any `package.json` under the workspace root that isn't
   itself a registered importer: it inherits whichever importer's version the
   ancestor lock file search happens to attach to.
+
+## Editing `pnpm-workspace.yaml` Catalog Entries
+
+Catalog versions live in `pnpm-workspace.yaml`, so that is where you edit them. Open the file and
+every registry-resolvable entry under `catalog:` or `catalogs.<name>:` gets the same inlay hints,
+diagnostics, hover, completion, code actions and code lens as a `package.json` dependency,
+positioned on the entry's own version text:
+
+```yaml
+packages:
+  - "packages/*"
+
+catalog:
+  react: ^16.0.0        # outdated hint and diagnostic on ^16.0.0
+  lodash: 4.17.0
+
+catalogs:
+  legacy:
+    left-pad: ^1.0.0
+```
+
+- **Outdated, deprecated, yanked, vulnerable, unknown and unsatisfiable** findings use the same
+  wording, severities and version-comparison rules as `package.json`.
+- **Update code actions** replace only the version text of that entry and keep its quoting style
+  (`react: "^16.0.0"` stays quoted). One edit updates every workspace package that references the
+  catalog. "Update all outdated" covers every catalog in the file.
+- **Completion** offers package names on the key and registry versions on the value.
+- **In-use versions** come from the root `pnpm-lock.yaml`, found by walking up from the YAML file.
+- `catalogs.default:` is read as the default catalog, exactly like a top-level `catalog:`.
+  A catalog named `default` therefore can never be confused with another named catalog.
+
+An entry that is not a registry range is classified like its `package.json` counterpart: an
+`npm:` alias, a git URL or a `file:` path is not looked up, and an entry whose value is a mapping is
+skipped without affecting the rest of the file. A placeholder such as `${REACT_VERSION}` and a YAML
+alias (`react: *r`) get findings only; no rewrite is offered because there is no literal text to
+replace safely. Other sections of the file, including `overrides:`, are ignored.
+
+### Duplicate default catalog
+
+pnpm rejects a workspace that defines both a top-level `catalog:` and `catalogs.default:`.
+`deps-lsp` reports one error, `pnpm-duplicate-default-catalog`, anchored on the `catalogs.default`
+key, and still shows findings for the entries of both sections. In `deps-cli` the finding is
+classified as `other` and is not part of the default `--fail-on` set; gate on it with
+`--fail-on other`.
+
+### How the two files relate
+
+An outdated catalog entry is a finding in two places: on the entry in `pnpm-workspace.yaml`, and on
+each `"react": "catalog:"` reference in a `package.json`. To make this readable, the reference keeps
+its finding, appends `(set in pnpm-workspace.yaml, catalog default)` to the message and links to the
+entry through the diagnostic's related information. No rewrite is offered on the reference, since
+rewriting it would replace the catalog specifier with a literal version. If three packages reference
+the same entry, the YAML file still reports it once.
+
+Saving `pnpm-workspace.yaml` refreshes the diagnostics of open `package.json` files that reference
+it. The refresh reads the saved file, so an edit you have not saved yet does not propagate, and the
+related-information location can be stale until the next save.
+
+`deps-cli check` and `deps-cli update` process `pnpm-workspace.yaml` like any other manifest. An
+outdated entry is therefore reported once from the YAML file and once from each referencing
+`package.json`, and `--fail-on` counts each report.
+
+### Connecting your editor
+
+The server handles the file; your editor must send it to `deps-lsp`. In Neovim, `yaml` is already
+in the `filetypes` list shown in [Editor Setup](../editor-setup.md#neovim). In VS Code, add
+`pnpm-workspace.yaml` to your client's document selector (for example
+`{ "language": "yaml", "pattern": "**/pnpm-workspace.yaml" }`). The Zed extension does not
+associate the file with `deps-lsp` yet, because other language servers also claim the YAML language
+there.
+
+A syntactically invalid file produces no entry-level findings while you type, and the same size and
+nesting limits as for other YAML manifests apply.
 
 ## Package Name Validation
 

@@ -39,6 +39,7 @@ control, see [Conventions](cross-ecosystem/conventions.md).
 | `registries` | `workspace_registries` | `"public_only"` | Which workspace-declared registry index hosts are ever fetched, across every ecosystem (Cargo's `.cargo/config.toml`/`[source]`, npm's `.npmrc`, PyPI's `--index-url`/Poetry/uv sources, NuGet's `NuGet.Config`, Swift's `registries.json`) — `"public_only"`, `"off"`, or `"all"`. A registry you declared yourself is exempt: Go's `$GOENV` `GOPROXY`, your user `~/.npmrc`, your user-profile `NuGet.Config` and your user-level `registries.json`, and any repository URL equal to one of them, ignore this setting (see [Operator-owned registries](#operator-owned-registries)). See [Cargo Custom/Private Registries](ecosystems/cargo.md#customprivate-registries), [npm Custom/Private Registries](ecosystems/npm.md#customprivate-registries), [PyPI Custom/Private Indexes](ecosystems/pypi.md#customprivate-indexes), [Go GOPROXY/GOPRIVATE Support](ecosystems/go.md#goproxygoprivate-support), [NuGet Private/Custom Feeds](ecosystems/nuget.md#privatecustom-feeds), and [Swift Package Registries](ecosystems/swift.md#package-registries-se-0292). |
 | `registries` | `nuget_user_profile_sources` | `false` | Whether a NuGet user-profile-tier `NuGet.Config` source with no repo-declared counterpart becomes a routing hop (`AlternateRegistry`-sourced — OSV/deps.dev/hover-trust suppressed for it), instead of only ever supplying credentials for a matching repo-declared source; see [NuGet Private/Custom Feeds](ecosystems/nuget.md#privatecustom-feeds) |
 | `registries` | `swift_keychain_credentials` | `"disabled"` | `"enabled"` also reads macOS Keychain credentials for user-declared Swift SE-0292 registries (may show a macOS access prompt; ignored by `deps-cli`); see [Swift macOS Keychain credentials](ecosystems/swift.md#macos-keychain-credentials) |
+| `registries` | `swift_scm_to_registry` | `"disabled"` | `"replace"` looks up each eligible Swift `url:` dependency in your trusted user-level default registry (SE-0292 `identifiers` endpoint, credentials stripped from the URL) and shows that registry's versions when exactly one identity matches; see [Replacing Source Control with a Registry](ecosystems/swift.md#replacing-source-control-with-a-registry-issue-1757) |
 | `registries` | `gitlab_instance_host` | `""` | The self-hosted GitLab instance host that a `project:` include and a `$CI_SERVER_FQDN`-relative `component:` include resolve against, which never receives `GITLAB_TOKEN` (the token goes only to `gitlab.com` or the host in the `GITLAB_TOKEN_HOST` environment variable). Unset (`""`) means neither form is version-resolved; see [GitLab CI/CD Self-Hosted Instances](ecosystems/gitlab-ci.md#self-hosted-instances) |
 | `network` | `offline` | `false` | Block every outbound registry/OSV/GitHub request; already-cached data still serves, uncached dependencies show an offline marker |
 | `supply_chain` | `enabled` | `true` | Show the [OpenSSF Scorecard/build-provenance hover line](cross-ecosystem/yanked-and-vulnerabilities.md#supply-chain-trust-signal-issue-543), backed by deps.dev requests; `false` disables the requests and the section entirely |
@@ -62,6 +63,7 @@ are therefore never bound to a settings value; they come from your process envir
 | `registries.workspace_registries` | Set `"all"`. Alone this reaches no private host: the private hosts and CIDR ranges in your `DEPS_LSP_PRIVATE_REGISTRY_HOSTS` environment variable are the effective control. Once you export that variable, any repository you open can send unauthenticated, blind GET requests to the listed hosts, on any port. Loopback, link-local, cloud-metadata, unspecified and reserved hosts are never reachable |
 | `registries.nuget_user_profile_sources` | Add user-profile NuGet sources as routing hops; credentials stay bound to the URL declared in your own user-level `NuGet.Config` |
 | `registries.swift_keychain_credentials` | Trigger a macOS Keychain access prompt; the credential goes only to registries declared in your user-level `registries.json` |
+| `registries.swift_scm_to_registry` | Send the repository URLs of your `Package.swift` dependencies (userinfo, query and fragment removed) to the default registry in your user-level `registries.json`; a registry declared by the repository is never asked |
 | `diagnostics.vulnerabilities_enabled`, `network.offline` | Hide vulnerability findings or all registry data in the editor |
 
 > **Warning:** If your editor lets a repository's settings change the server's environment or
@@ -230,7 +232,8 @@ An invalid `GITLAB_TOKEN_HOST` disables the token entirely. See
     "workspace_registries": "public_only",
     "nuget_user_profile_sources": false,
     "gitlab_instance_host": "",
-    "swift_keychain_credentials": "disabled"
+    "swift_keychain_credentials": "disabled",
+    "swift_scm_to_registry": "disabled"
   },
   "network": {
     "offline": false

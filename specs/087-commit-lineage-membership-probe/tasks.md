@@ -29,5 +29,5 @@ graph TD
 | T2 | GitHub Actions compare client, `CompareStatus`, 256 KiB limit, lineage then membership | FR-001..003, 008..011 | `deps-github-actions` | T1 | M |
 | T3 | GitLab CI merge-base client and mapping | FR-002, 003 | `deps-gitlab-ci` | T1 | M |
 | T4 | Engine ordering (lineage, membership, branch), CLI parity, offline skip | FR-011..013 | `deps-engine` | T2, T3 | S |
-| T5 | Tests: mockito matrix, LRU hit zero-request, key change on new release, TTL vs no-TTL, update-all exclusion; docs (book, CHANGELOG, testing KB) | section 8, FR-014 | crates, `book/src` | T4 | M |
+| T5 | Tests: mockito matrix, LRU hit zero-request, key change on new release, freshness window vs no window, update-all exclusion; docs (book, CHANGELOG, testing KB) | section 8, FR-014 | crates, `book/src` | T4 | M |
 | T6 | Live gate SC-001, SC-002; full CI suite | SC-001..004 | n/a | T5 | S |

@@ -430,7 +430,7 @@ mod tests {
             RemovalStatus::AdvisoryDeprecated,
         )]);
         let cached = std::collections::HashMap::from([(
-            PackageName::new("npm:lodash"),
+            deps_core::NormalizedName::for_test("npm:lodash"),
             PackageVersions::new(ConcreteVersion::new("4.18.1"), available).with_yanked(flagged),
         )]);
         let advisory = Arc::new(

@@ -1212,7 +1212,7 @@ mod tests {
     /// restriction used to still allow through.
     #[test]
     fn test_yanked_diagnostic_applies_to_always_false() {
-        use crate::types::{NpmDependency, NpmDependencySection};
+        use crate::types::{NpmDependency, NpmDependencyOrigin, NpmDependencySection};
 
         let formatter = NpmFormatter;
         for requirement in ["1.2.3", "^1.2.3", "~1.2.3", ">=1.0.0 <2.0.0", "*", "1.x"] {
@@ -1222,9 +1222,11 @@ mod tests {
                 name_range: deps_core::Range::default(),
                 version_req: Some(VersionReq::new(requirement)),
                 version_range: None,
-                section: NpmDependencySection::Dependencies,
+                origin: NpmDependencyOrigin::Manifest {
+                    section: NpmDependencySection::Dependencies,
+                    catalog_ref: None,
+                },
                 source: deps_core::parser::DependencySource::Registry,
-                catalog: None,
                 package: None,
             };
             assert!(

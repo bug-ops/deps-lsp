@@ -15,7 +15,7 @@ use deps_core::edit::{
     dedup_overlapping_edits,
 };
 use deps_core::lsp_helpers::{
-    CooldownDisposition, EcosystemFormatter, FallbackEditVerdict, LatestVerdict, PackageVersions,
+    CachedVersionsMap, CooldownDisposition, EcosystemFormatter, FallbackEditVerdict, LatestVerdict,
     cooldown_disposition, fallback_edit_excludes_newer, latest_verdict,
 };
 use deps_core::{NormalizedName, PackageKey, PackageName};
@@ -585,7 +585,9 @@ fn gossip_excluded_version(
     analysis: &ManifestAnalysis,
     key: &PackageKey,
 ) -> Option<deps_core::ConcreteVersion> {
-    key.find_in(&analysis.cached_versions)
+    analysis
+        .cached_versions
+        .get(key.normalized())
         .and_then(|v| v.gossip_excluded_version.clone())
 }
 
@@ -613,7 +615,7 @@ fn resolve_cooldown_fallback_view(
     analysis: &ManifestAnalysis,
     freshness: deps_core::FreshnessSettings,
     now: deps_core::PublishTime,
-) -> Option<HashMap<PackageName, PackageVersions>> {
+) -> Option<CachedVersionsMap> {
     if let Some(view) = analysis.cooldown_fallback_view.as_ref() {
         return Some(view.clone());
     }
@@ -697,7 +699,7 @@ fn resolve_cooldown_fallback_view(
 ///
 /// let content = r#"serde = "1.0.0""#;
 /// let mut cached_versions = HashMap::new();
-/// cached_versions.insert(PackageName::new("serde"), PackageVersions::latest_only("1.2.0"));
+/// cached_versions.insert(deps_core::NormalizedName::for_test("serde"), PackageVersions::latest_only("1.2.0"));
 ///
 /// let analysis = ManifestAnalysis {
 ///     parse_result: Box::new(MockParseResult {
@@ -727,6 +729,7 @@ fn resolve_cooldown_fallback_view(
 ///     fetch_failed: HashSet::new(),
 ///     registry_unreachable: false,
 ///     license_fetch_incomplete: false,
+///     probe_report: deps_core::lsp_helpers::ProbeReport::default(),
 /// };
 ///
 /// // Freshness is disabled by default, so this fixture never reaches the fallback-edit guard
@@ -1119,13 +1122,11 @@ fn resolve_occurrence(
         );
     }
 
-    let package_versions = package_key.find_in(&analysis.cached_versions);
-    // Security M1: the RAW name — matches `gossip_findings`/`apply_outdated_rule`'s own keying;
-    // the normalized name silently hid GOSSIP data for case-changing ecosystems (#1529).
+    let package_versions = analysis.cached_versions.get(package_key.normalized());
     let disposition = package_versions.map_or(CooldownDisposition::NotEvaluated, |versions| {
         cooldown_disposition(
             versions,
-            package_key.declared(),
+            package_key.normalized(),
             freshness,
             Some(&analysis.gossip_findings),
             now,
@@ -1750,10 +1751,7 @@ mod tests {
         )
     }
 
-    fn test_analysis(
-        deps: Vec<TestDep>,
-        cached: HashMap<PackageName, PackageVersions>,
-    ) -> ManifestAnalysis {
+    fn test_analysis(deps: Vec<TestDep>, cached: CachedVersionsMap) -> ManifestAnalysis {
         ManifestAnalysis {
             parse_result: Box::new(TestParseResult {
                 deps,
@@ -1778,12 +1776,16 @@ mod tests {
             fetch_failed: HashSet::new(),
             registry_unreachable: false,
             license_fetch_incomplete: false,
+            probe_report: deps_core::lsp_helpers::ProbeReport::default(),
         }
     }
 
-    fn cached(name: &str, latest: &str) -> HashMap<PackageName, PackageVersions> {
+    fn cached(name: &str, latest: &str) -> CachedVersionsMap {
         let mut map = HashMap::new();
-        map.insert(PackageName::new(name), PackageVersions::latest_only(latest));
+        map.insert(
+            NormalizedName::for_test(name),
+            PackageVersions::latest_only(latest),
+        );
         map
     }
 
@@ -1797,7 +1799,7 @@ mod tests {
         let published_at = deps_core::PublishTime::from_unix_secs(9_000); // 1000s old
         let mut versions = cached("serde", "1.2.0");
         versions.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             PackageVersions::latest_only("1.2.0").with_published_at(published_at),
         );
         let analysis = test_analysis(
@@ -1846,7 +1848,7 @@ mod tests {
         let published_at = deps_core::PublishTime::from_unix_secs(9_000);
         let mut versions = cached("serde", "1.2.0");
         versions.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             PackageVersions::latest_only("1.2.0").with_published_at(published_at),
         );
         let analysis = test_analysis(
@@ -1880,7 +1882,7 @@ mod tests {
         let content = "serde = \"1.0.0\"\n";
         let mut versions = cached("serde", "1.2.0");
         versions.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             PackageVersions::latest_only("1.2.0")
                 .with_gossip_excluded_version(deps_core::ConcreteVersion::new("2.0.0")),
         );
@@ -1927,7 +1929,7 @@ mod tests {
         let published_at = deps_core::PublishTime::from_unix_secs(9_000); // 1000s old
         let mut versions = cached("serde", "1.2.0");
         versions.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             PackageVersions::latest_only("1.2.0")
                 .with_published_at(published_at)
                 .with_gossip_excluded_version(deps_core::ConcreteVersion::new("2.0.0")),
@@ -1981,11 +1983,11 @@ mod tests {
         let content = "serde = \"1.0.0\"\ntokio = \"1.0.0\"\nlibc = \"1.2.0\"\n";
         let mut versions = cached("serde", "1.2.0");
         versions.insert(
-            PackageName::new("tokio"),
+            NormalizedName::for_test("tokio"),
             PackageVersions::latest_only("1.3.0"),
         );
         versions.insert(
-            PackageName::new("libc"),
+            NormalizedName::for_test("libc"),
             PackageVersions::latest_only("1.2.0"),
         );
         let analysis = test_analysis(
@@ -2158,7 +2160,7 @@ mod tests {
         let published_at = deps_core::PublishTime::from_unix_secs(9_000); // 1000s old, in-window
         let mut versions = cached("serde", "1.2.0");
         versions.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             PackageVersions::latest_only("1.2.0").with_published_at(published_at),
         );
         let mut analysis = test_analysis(
@@ -2233,7 +2235,7 @@ mod tests {
         let published_at = deps_core::PublishTime::from_unix_secs(9_000); // 1000s old, in-window
         let mut versions = cached("serde", "1.2.0");
         versions.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             PackageVersions::latest_only("1.2.0").with_published_at(published_at),
         );
         let mut analysis = test_analysis(
@@ -2292,7 +2294,7 @@ mod tests {
         let versions_map = {
             let mut map = cached("tokio", "2.0.0");
             map.insert(
-                PackageName::new("tokio"),
+                NormalizedName::for_test("tokio"),
                 PackageVersions::latest_only("2.0.0").with_published_at(published_at),
             );
             map
@@ -2390,7 +2392,7 @@ mod tests {
         let content = "serde = \"1.0.0\"\ntokio = \"1.0.0\"\n";
         let mut versions = cached("serde", "1.2.0");
         versions.insert(
-            PackageName::new("tokio"),
+            NormalizedName::for_test("tokio"),
             PackageVersions::latest_only("1.3.0"),
         );
         let analysis = test_analysis(
@@ -3031,7 +3033,7 @@ mod tests {
         let published_at = deps_core::PublishTime::from_unix_secs(9_900); // 100s old, within cooldown
         let mut versions = cached("pkg", "2.0.0");
         versions.insert(
-            PackageName::new("pkg"),
+            NormalizedName::for_test("pkg"),
             // `available` must list both the exact-pin R0's own floor ("1.0.0") and the
             // fallback candidate itself, or `fallback_edit_excludes_newer`'s fail-closed
             // `FallbackUnlisted`/floor checks reject before ever reaching a test's own
@@ -3089,7 +3091,7 @@ mod tests {
             available.iter().map(|v| (*v).into()).collect();
         let mut versions = HashMap::new();
         versions.insert(
-            PackageName::new("pkg"),
+            NormalizedName::for_test("pkg"),
             PackageVersions::new(latest.into(), available_arc)
                 .with_published_at(published_at)
                 .with_cooldown_fallback(deps_core::lsp_helpers::CooldownFallback::new(
@@ -3448,7 +3450,7 @@ mod tests {
 
         let mut divergent_view = HashMap::new();
         divergent_view.insert(
-            PackageName::new("pkg"),
+            NormalizedName::for_test("pkg"),
             PackageVersions::latest_only("1.9.0"),
         );
         analysis.cooldown_fallback_view = Some(divergent_view);
@@ -3866,13 +3868,11 @@ mod tests {
         );
     }
 
-    /// Fix-cycle item 5/security M1: the GOSSIP lookup in `resolve_occurrence` must use the
-    /// RAW package name — `analysis.gossip_findings` (from `fetch_gossip_findings_batch`) is
-    /// keyed by the raw name, matching `diagnostics::apply_outdated_rule`/hover. Using the
-    /// *normalized* name instead made the planner blind to GOSSIP data for any formatter whose
-    /// normalization changes case, reopening the check/update divergence #1529 closed.
+    /// #1873: `analysis.gossip_findings` and `cached_versions` are keyed by the normalized
+    /// name, so the planner finds GOSSIP data for a declared `Django` under `django` — the
+    /// same key `check` and hover use, with no declared-spelling fallback.
     #[test]
-    fn test_plan_updates_gossip_lookup_uses_raw_name_not_normalized() {
+    fn test_plan_updates_gossip_lookup_uses_normalized_name() {
         let lowercase_formatter: deps_core::test_util::StubFormatter =
             deps_core::test_util::StubFormatter::new().with_lowercase_names();
         let content = "Django = \"1.0.0\"\n";
@@ -3882,7 +3882,7 @@ mod tests {
         let old_published_at = deps_core::PublishTime::from_unix_secs(10_000 - 30 * 24 * 60 * 60);
         let mut versions = HashMap::new();
         versions.insert(
-            PackageName::new("Django"),
+            NormalizedName::for_test("django"),
             PackageVersions::latest_only("2.0.0").with_published_at(old_published_at),
         );
         let mut analysis = test_analysis(
@@ -3895,7 +3895,7 @@ mod tests {
         );
         let mut gossip = HashMap::new();
         gossip.insert(
-            PackageName::new("Django"), // raw name — must NOT be looked up as "django"
+            NormalizedName::for_test("django"),
             deps_core::test_util::stub_gossip_findings(
                 "2.0.0",
                 Some(deps_core::GossipCooldown::new(
@@ -3926,8 +3926,7 @@ mod tests {
                 reason: SkipReason::WithinFreshnessCooldown,
                 ..
             },
-            "the GOSSIP-Active cooldown for the raw name 'Django' must be detected even though \
-             normalize_package_name lowercases it to 'django': {:?}",
+            "the GOSSIP-Active cooldown keyed 'django' must be detected for declared 'Django': {:?}",
             plan.items[0].outcome
         );
     }
@@ -3949,7 +3948,7 @@ mod tests {
         // test's own point (no cross-occurrence swap) is about.
         let mut versions = HashMap::new();
         versions.insert(
-            PackageName::new("alpha"),
+            NormalizedName::for_test("alpha"),
             // `available` must list both the exact-pin R0's own floor ("1.0.0") and the
             // fallback itself ("1.1.0"), or the guard's fail-closed `FallbackUnlisted`/floor
             // checks reject before this test's own cross-occurrence scenario is exercised.
@@ -3968,7 +3967,7 @@ mod tests {
             )),
         );
         versions.insert(
-            PackageName::new("beta"),
+            NormalizedName::for_test("beta"),
             PackageVersions::new(
                 deps_core::ConcreteVersion::new("10.0.0"),
                 std::sync::Arc::from(vec![
@@ -4058,7 +4057,7 @@ mod tests {
 
         let mut versions = HashMap::new();
         versions.insert(
-            PackageName::new("pkg"),
+            NormalizedName::for_test("pkg"),
             PackageVersions::latest_only("1.2.0")
                 .with_published_at(published_at)
                 .with_cooldown_fallback(deps_core::lsp_helpers::CooldownFallback::new(
@@ -4136,7 +4135,7 @@ mod tests {
 
         let mut versions = HashMap::new();
         versions.insert(
-            PackageName::new("pkg"),
+            NormalizedName::for_test("pkg"),
             PackageVersions::latest_only("1.2.0")
                 .with_published_at(published_at)
                 .with_cooldown_fallback(deps_core::lsp_helpers::CooldownFallback::new(
@@ -4208,7 +4207,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/test/.github/workflows/ci.yml");
         let parse_result = parse_workflow_yaml(content, &uri).expect("valid workflow");
         let commit = CommitSha::parse(&"a".repeat(40)).unwrap();
-        let tag_index = std::sync::Arc::new(dashmap::DashMap::new());
+        let tag_index = std::sync::Arc::new(deps_engine::setup::RepositoryIndexes::default());
         tag_index.insert(
             PackageName::new("actions/checkout"),
             std::sync::Arc::new(TagIndex::from_tags([

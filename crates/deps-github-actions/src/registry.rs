@@ -5,21 +5,91 @@
 
 use dashmap::DashMap;
 use deps_core::github::{
-    CanonicalRepoName, GithubTag, GithubTagsClient, ReleaseDatesCache, normalize_tag,
+    CanonicalRepoName, CompareBase, GithubTag, GithubTagsClient, ReleaseDatesCache, normalize_tag,
     paginate_tags, semver_tags_newest_first, validate_owner_repo,
 };
-use deps_core::lsp_helpers::{CommitSha, TagIndex};
+use deps_core::lsp_helpers::{
+    BranchEvidence, CommitLineage, CommitSha, CompareSummary, DefaultBranchMembership,
+    LatestRelease, LowercaseNaming, NormalizeName, ProbeAnswer, ProbeBackend, ProbeOutcome,
+    ProbePlan, ProbeRef, ProbeStores, TagIndex, run_probe_pass,
+};
 use deps_core::pagination::ListCoverage;
-use deps_core::rate_limit::{DEFAULT_COOLDOWN_SECS, RateLimitGate};
+use deps_core::rate_limit::{DEFAULT_COOLDOWN_SECS, ProbeAllowance, RateLimitGate};
 use deps_core::{
-    DepsError, EcosystemId, HttpCache, PackageName, PublishTime, RateLimitEvidence, Result,
-    TagIndexRefreshSender, TagIndexRefreshes,
+    DepsError, EcosystemId, HttpCache, NormalizedName, PackageName, PublishTime, RateLimitEvidence,
+    RefreshEvents, RefreshSender, Result,
 };
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::types::GithubActionsVersion;
+
+/// The tag index of every fetched repository, keyed by the repository's normalized spelling.
+///
+/// `Actions/Checkout` and `actions/checkout` name one repository, and the registry fetches it
+/// once under whichever spelling it sees first. Every reader and writer goes through this type,
+/// which owns the normalization, so no caller can look an index up under a different key space
+/// than it was stored under.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use deps_core::PackageName;
+/// use deps_core::lsp_helpers::TagIndex;
+/// use deps_github_actions::registry::RepositoryIndexes;
+///
+/// let indexes = RepositoryIndexes::default();
+/// indexes.insert(PackageName::new("Actions/Checkout"), Arc::new(TagIndex::default()));
+/// assert!(indexes.get(&PackageName::new("actions/checkout")).is_some());
+/// ```
+#[derive(Debug, Default)]
+pub struct RepositoryIndexes(DashMap<NormalizedName, Arc<TagIndex>>);
+
+impl RepositoryIndexes {
+    /// The index of the repository `name` spells, in any casing.
+    #[must_use]
+    pub fn get(&self, name: &PackageName) -> Option<Arc<TagIndex>> {
+        self.0
+            .get(&LowercaseNaming.normalize_package_name(name))
+            .map(|index| Arc::clone(&index))
+    }
+
+    /// Stores `index` for the repository `name` spells, returning the one it replaced.
+    pub fn insert(&self, name: PackageName, index: Arc<TagIndex>) -> Option<Arc<TagIndex>> {
+        self.0
+            .insert(LowercaseNaming.normalize_package_name(&name), index)
+    }
+
+    /// Whether the repository `name` spells has an index.
+    #[must_use]
+    pub fn contains_key(&self, name: &PackageName) -> bool {
+        self.0
+            .contains_key(&LowercaseNaming.normalize_package_name(name))
+    }
+
+    /// Number of repositories with an index.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether no repository has an index.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Forgets every index.
+    pub fn clear(&self) {
+        self.0.clear();
+    }
+
+    fn raw(&self) -> &DashMap<NormalizedName, Arc<TagIndex>> {
+        &self.0
+    }
+}
 
 /// Display name for the registry backing GitHub Actions version lookups, used in
 /// not-found and API-response error messages.
@@ -62,7 +132,7 @@ fn evict_in_flight_if_full(map: &DashMap<PackageName, Arc<tokio::sync::Mutex<()>
 #[derive(Clone)]
 pub struct GithubActionsRegistry {
     github: GithubTagsClient,
-    tag_index: Arc<DashMap<PackageName, Arc<TagIndex>>>,
+    tag_index: Arc<RepositoryIndexes>,
     in_flight: Arc<DashMap<PackageName, Arc<tokio::sync::Mutex<()>>>>,
     /// `in_flight` only coalesces concurrent waiters on the *same* repository; it stores
     /// nothing on a failed fetch, so each `get_versions` call for a different repository
@@ -75,7 +145,12 @@ pub struct GithubActionsRegistry {
     /// reason `github`'s cache is an `Arc`.
     release_dates: Arc<ReleaseDatesCache>,
     /// Fed by [`Self::populate_tag_index`]; clones of the registry share one channel.
-    tag_refreshes: TagIndexRefreshSender,
+    tag_refreshes: RefreshSender,
+    /// Branch and commit evidence gathered by background probes, and the latest release each
+    /// tags fetch saw. Shared with the formatter, which reads it synchronously.
+    probe_stores: Arc<ProbeStores>,
+    /// The budget of optional probes against the GitHub API, beside `rate_limit`.
+    probe_allowance: Arc<ProbeAllowance>,
 }
 
 impl GithubActionsRegistry {
@@ -87,13 +162,18 @@ impl GithubActionsRegistry {
     /// `deps-swift` traffic in the same process.
     #[must_use]
     pub fn new(cache: Arc<HttpCache>) -> Self {
+        let github = GithubTagsClient::new(cache);
+        let rate_limit = Arc::new(RateLimitGate::new(DEFAULT_COOLDOWN_SECS));
+        let probe_allowance = Self::allowance(&github, &rate_limit);
         Self {
-            github: GithubTagsClient::new(cache),
-            tag_index: Arc::new(DashMap::new()),
+            github,
+            tag_index: Arc::new(RepositoryIndexes::default()),
             in_flight: Arc::new(DashMap::new()),
-            rate_limit: Arc::new(RateLimitGate::new(DEFAULT_COOLDOWN_SECS)),
+            rate_limit,
             release_dates: Arc::new(ReleaseDatesCache::new()),
-            tag_refreshes: TagIndexRefreshSender::new(),
+            tag_refreshes: RefreshSender::new(),
+            probe_stores: Arc::new(ProbeStores::default()),
+            probe_allowance,
         }
     }
 
@@ -110,14 +190,60 @@ impl GithubActionsRegistry {
         api_base: impl Into<String>,
         has_token: bool,
     ) -> Self {
+        let github = GithubTagsClient::for_test(cache, api_base, has_token);
+        let rate_limit = Arc::new(RateLimitGate::new(DEFAULT_COOLDOWN_SECS));
+        let probe_allowance = Self::allowance(&github, &rate_limit);
         Self {
-            github: GithubTagsClient::for_test(cache, api_base, has_token),
-            tag_index: Arc::new(DashMap::new()),
+            github,
+            tag_index: Arc::new(RepositoryIndexes::default()),
             in_flight: Arc::new(DashMap::new()),
-            rate_limit: Arc::new(RateLimitGate::new(DEFAULT_COOLDOWN_SECS)),
+            rate_limit,
             release_dates: Arc::new(ReleaseDatesCache::new()),
-            tag_refreshes: TagIndexRefreshSender::new(),
+            tag_refreshes: RefreshSender::new(),
+            probe_stores: Arc::new(ProbeStores::default()),
+            probe_allowance,
         }
+    }
+
+    fn allowance(
+        github: &GithubTagsClient,
+        rate_limit: &Arc<RateLimitGate>,
+    ) -> Arc<ProbeAllowance> {
+        Arc::new(ProbeAllowance::new(
+            github.probe_credential(),
+            Arc::clone(github.quota_meter()),
+            Arc::clone(rate_limit),
+        ))
+    }
+
+    /// The probe evidence this registry fills, shared with a
+    /// [`crate::formatter::GithubActionsFormatter`] through
+    /// [`crate::formatter::GithubActionsFormatter::with_probe_stores`].
+    #[must_use]
+    pub fn probe_stores(&self) -> Arc<ProbeStores> {
+        Arc::clone(&self.probe_stores)
+    }
+
+    /// Runs `plan` against the GitHub API within the probe budget and announces every
+    /// repository whose evidence changed as a [`deps_core::RefreshEvent::ProbeEvidence`].
+    ///
+    /// A probe neither trips nor consults anything but the budget: the tag-index gate only
+    /// denies probes, never the reverse.
+    pub(crate) async fn run_probes(&self, plan: &ProbePlan) -> ProbeOutcome {
+        let outcome = run_probe_pass(
+            plan,
+            &GithubProbeBackend(&self.github),
+            &self.probe_allowance,
+            &self.probe_stores,
+        )
+        .await;
+        let mut announced = std::collections::HashSet::new();
+        for repository in &outcome.changed {
+            if announced.insert(repository) {
+                self.tag_refreshes.send_probe_evidence(repository.clone());
+            }
+        }
+        outcome
     }
 
     /// Shares this registry's [`TagIndex`] map with a [`crate::formatter::GithubActionsFormatter`],
@@ -129,7 +255,7 @@ impl GithubActionsRegistry {
     /// repository's [`TagIndex`] entry directly, without going through a mocked HTTP
     /// fetch that path never calls.
     #[must_use]
-    pub fn tag_index(&self) -> Arc<DashMap<PackageName, Arc<TagIndex>>> {
+    pub fn tag_index(&self) -> Arc<RepositoryIndexes> {
         Arc::clone(&self.tag_index)
     }
 
@@ -146,7 +272,7 @@ impl GithubActionsRegistry {
     /// created. A receiver that falls more than 256 events behind gets
     /// `RecvError::Lagged` and must treat every repository as refreshed.
     #[must_use]
-    pub fn subscribe_tag_refreshes(&self) -> TagIndexRefreshes {
+    pub fn subscribe_tag_refreshes(&self) -> RefreshEvents {
         self.tag_refreshes.subscribe()
     }
 
@@ -240,8 +366,27 @@ impl GithubActionsRegistry {
         let index = TagIndex::from_tags(valid.iter().map(|(name, sha)| (*name, sha)))
             .with_canonical_repo_name(canonical)
             .with_coverage(coverage);
-        self.tag_refreshes
-            .replace(&self.tag_index, name.clone(), index, MAX_TAG_INDEX_ENTRIES);
+        let repository = LowercaseNaming.normalize_package_name(name);
+        self.tag_refreshes.replace(
+            self.tag_index.raw(),
+            repository.clone(),
+            &repository,
+            index,
+            MAX_TAG_INDEX_ENTRIES,
+        );
+    }
+
+    /// Remembers the newest stable release of `name`, the commit a SHA pin is proven ahead of.
+    fn record_latest_release(&self, name: &PackageName, versions: &[GithubActionsVersion]) {
+        if let Some(latest) = versions.iter().find(|version| !version.prerelease) {
+            self.probe_stores.record_latest(
+                LowercaseNaming.normalize_package_name(name),
+                LatestRelease {
+                    tag: latest.version.as_str().to_string(),
+                    commit: latest.sha.clone(),
+                },
+            );
+        }
     }
 
     /// Fetches all semver-tagged versions for `name` (`owner/repo`).
@@ -283,7 +428,9 @@ impl GithubActionsRegistry {
         .map_err(|e| self.map_tags_error(name, e))?;
 
         self.populate_tag_index(&package_name, &tags.items, tags.coverage);
-        Ok(tags_to_versions(tags.items))
+        let versions = tags_to_versions(tags.items);
+        self.record_latest_release(&package_name, &versions);
+        Ok(versions)
     }
 
     /// Like [`GithubActionsRegistry::get_versions`], but also attaches GitHub Release
@@ -357,6 +504,76 @@ impl GithubActionsRegistry {
             semver::Version::parse(normalize_tag(v.version.as_str()))
                 .is_ok_and(|ver| req.matches(&ver))
         }))
+    }
+}
+
+/// Asks the GitHub API the three probe questions.
+///
+/// `404` on the ref endpoint is the only authoritative negative; every other failure
+/// (rate limit, `409` empty repository, `5xx`, timeout, body over the compare cap) is
+/// inconclusive and stores nothing.
+struct GithubProbeBackend<'a>(&'a GithubTagsClient);
+
+impl GithubProbeBackend<'_> {
+    async fn compare(
+        &self,
+        package: &PackageName,
+        base: CompareBase<'_>,
+        pin: &CommitSha,
+    ) -> Option<CompareSummary> {
+        let body = self
+            .0
+            .fetch_compare(package.as_str(), base, pin)
+            .await
+            .ok()?;
+        CompareSummary::parse(&body)
+    }
+}
+
+impl ProbeBackend for GithubProbeBackend<'_> {
+    fn branch<'a>(
+        &'a self,
+        package: &'a PackageName,
+        git_ref: &'a ProbeRef,
+    ) -> deps_core::ecosystem::BoxFuture<'a, ProbeAnswer<BranchEvidence>> {
+        Box::pin(async move {
+            match self.0.fetch_branch_ref(package.as_str(), git_ref).await {
+                Ok(_) => ProbeAnswer::Answer(BranchEvidence::Exists),
+                Err(DepsError::HttpStatus { status: 404, .. }) => {
+                    ProbeAnswer::Answer(BranchEvidence::Absent)
+                }
+                Err(_) => ProbeAnswer::Inconclusive,
+            }
+        })
+    }
+
+    fn lineage<'a>(
+        &'a self,
+        package: &'a PackageName,
+        latest: &'a CommitSha,
+        pin: &'a CommitSha,
+    ) -> deps_core::ecosystem::BoxFuture<'a, ProbeAnswer<CommitLineage>> {
+        Box::pin(async move {
+            self.compare(package, CompareBase::Commit(latest), pin)
+                .await
+                .map_or(ProbeAnswer::Inconclusive, |summary| {
+                    ProbeAnswer::Answer(CommitLineage::from_compare(summary))
+                })
+        })
+    }
+
+    fn membership<'a>(
+        &'a self,
+        package: &'a PackageName,
+        pin: &'a CommitSha,
+    ) -> deps_core::ecosystem::BoxFuture<'a, ProbeAnswer<DefaultBranchMembership>> {
+        Box::pin(async move {
+            self.compare(package, CompareBase::DefaultBranchHead, pin)
+                .await
+                .map_or(ProbeAnswer::Inconclusive, |summary| {
+                    ProbeAnswer::Answer(DefaultBranchMembership::from_compare(summary))
+                })
+        })
     }
 }
 
@@ -488,6 +705,10 @@ impl deps_core::Registry for GithubActionsRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tag_index_event(name: &PackageName) -> deps_core::RefreshEvent {
+        deps_core::RefreshEvent::TagIndex(LowercaseNaming.normalize_package_name(name))
+    }
 
     use std::assert_matches;
     use tokio::sync::broadcast;
@@ -632,7 +853,7 @@ mod tests {
         let (sha_a, sha_b) = ("a".repeat(40), "b".repeat(40));
 
         registry.populate_tag_index(&name, &[github_tag("v4", &sha_a)], ListCoverage::Complete);
-        assert_eq!(refreshes.try_recv().ok(), Some(name.clone()));
+        assert_eq!(refreshes.try_recv().ok(), Some(tag_index_event(&name)));
 
         registry.populate_tag_index(&name, &[github_tag("v4", &sha_a)], ListCoverage::Complete);
         assert_matches!(
@@ -641,14 +862,14 @@ mod tests {
         );
 
         registry.populate_tag_index(&name, &[github_tag("v4", &sha_b)], ListCoverage::Complete);
-        assert_eq!(refreshes.try_recv().ok(), Some(name.clone()));
+        assert_eq!(refreshes.try_recv().ok(), Some(tag_index_event(&name)));
 
         registry.populate_tag_index(
             &name,
             &[github_tag("v4", &sha_b), github_tag("v4.1.0", &sha_b)],
             ListCoverage::Complete,
         );
-        assert_eq!(refreshes.try_recv().ok(), Some(name));
+        assert_eq!(refreshes.try_recv().ok(), Some(tag_index_event(&name)));
     }
 
     #[test]
@@ -660,8 +881,8 @@ mod tests {
 
         registry.populate_tag_index(&name, &[github_tag("v4", &sha)], ListCoverage::Complete);
 
-        let refreshed = refreshes.try_recv().unwrap();
-        let index = registry.tag_index().get(&refreshed).map(|e| Arc::clone(&e));
+        assert_eq!(refreshes.try_recv().unwrap(), tag_index_event(&name));
+        let index = registry.tag_index().get(&name).map(|e| Arc::clone(&e));
         assert_eq!(
             index.and_then(|index| index.sha_for_tag("v4").cloned()),
             CommitSha::parse(&sha)
@@ -691,7 +912,7 @@ mod tests {
             &[github_tag("v4", &"e".repeat(40))],
             ListCoverage::Complete,
         );
-        assert_eq!(refreshes.try_recv().ok(), Some(name));
+        assert_eq!(refreshes.try_recv().ok(), Some(tag_index_event(&name)));
     }
 
     #[tokio::test]
@@ -711,7 +932,7 @@ mod tests {
 
         assert_eq!(
             refreshes.try_recv().ok(),
-            Some(PackageName::new("actions/checkout"))
+            Some(tag_index_event(&PackageName::new("actions/checkout")))
         );
     }
 
@@ -742,7 +963,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(refreshes.try_recv().ok(), Some(name));
+        assert_eq!(refreshes.try_recv().ok(), Some(tag_index_event(&name)));
     }
 
     #[tokio::test]

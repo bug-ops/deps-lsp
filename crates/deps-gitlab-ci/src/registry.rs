@@ -7,21 +7,100 @@
 use dashmap::DashMap;
 use deps_core::error::{DepsError, RateLimitEvidence, Result};
 use deps_core::github::{normalize_tag, semver_tags_newest_first};
-use deps_core::lsp_helpers::{CommitSha, TagIndex};
+use deps_core::lsp_helpers::{
+    BranchEvidence, CommitLineage, CommitSha, DefaultBranchMembership, LatestRelease,
+    LowercaseNaming, NormalizeName, ProbeAnswer, ProbeBackend, ProbeEffect, ProbePlan, ProbeRef,
+    ProbeReport, ProbeStores, TagIndex, run_probe_pass,
+};
 use deps_core::pagination::ListCoverage;
-use deps_core::rate_limit::{DEFAULT_COOLDOWN_SECS, RateLimitGate};
+use deps_core::rate_limit::{DEFAULT_COOLDOWN_SECS, ProbeAllowance, RateLimitGate};
 use deps_core::registry::{CapResult, KeyShape, register_capped};
-use deps_core::{EcosystemId, PackageName, PublishTime, TagIndexRefreshSender, TagIndexRefreshes};
+use deps_core::{
+    EcosystemId, NormalizedName, PackageName, PublishTime, RefreshEvents, RefreshSender,
+};
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::client::{
-    GitlabApiClient, GitlabRelease, GitlabTag, MAX_GITLAB_PAGES, gitlab_rate_limit_error,
-    parse_releases_page, parse_tags_page,
+    GitlabApiClient, GitlabRelease, GitlabTag, MAX_GITLAB_PAGES, MergeBaseRef,
+    gitlab_rate_limit_error, parse_merge_base, parse_releases_page, parse_tags_page,
 };
+use crate::host::GitlabHost;
 use crate::types::{EndpointKind, GitlabCiVersion, GitlabRoute, PinStyle};
 use deps_core::RegistryEndpoint;
+
+/// The tag or release index of every fetched project, keyed by the endpoint and the project's
+/// normalized spelling.
+///
+/// Two spellings of one project share an entry, and the registry fetches the project once under
+/// whichever it sees first. Every reader and writer goes through this type, which owns the
+/// normalization, so no caller can look an index up under a different key space than it was
+/// stored under.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use deps_core::PackageName;
+/// use deps_core::lsp_helpers::TagIndex;
+/// use deps_gitlab_ci::EndpointKind;
+/// use deps_gitlab_ci::registry::ProjectIndexes;
+///
+/// let indexes = ProjectIndexes::default();
+/// indexes.insert(
+///     (EndpointKind::Tags, PackageName::new("GitLab.com/Org/Proj")),
+///     Arc::new(TagIndex::default()),
+/// );
+/// assert!(indexes.get(&(EndpointKind::Tags, PackageName::new("gitlab.com/org/proj"))).is_some());
+/// assert!(indexes.get(&(EndpointKind::Releases, PackageName::new("gitlab.com/org/proj"))).is_none());
+/// ```
+#[derive(Debug, Default)]
+pub struct ProjectIndexes(DashMap<(EndpointKind, NormalizedName), Arc<TagIndex>>);
+
+impl ProjectIndexes {
+    fn key(key: &(EndpointKind, PackageName)) -> (EndpointKind, NormalizedName) {
+        (key.0, LowercaseNaming.normalize_package_name(&key.1))
+    }
+
+    /// The index of the project `key` spells under its endpoint.
+    #[must_use]
+    pub fn get(&self, key: &(EndpointKind, PackageName)) -> Option<Arc<TagIndex>> {
+        self.0.get(&Self::key(key)).map(|index| Arc::clone(&index))
+    }
+
+    /// Stores `index`, returning the one it replaced.
+    pub fn insert(
+        &self,
+        key: (EndpointKind, PackageName),
+        index: Arc<TagIndex>,
+    ) -> Option<Arc<TagIndex>> {
+        self.0.insert(Self::key(&key), index)
+    }
+
+    /// Whether the project `key` spells has an index under its endpoint.
+    #[must_use]
+    pub fn contains_key(&self, key: &(EndpointKind, PackageName)) -> bool {
+        self.0.contains_key(&Self::key(key))
+    }
+
+    /// Number of indexes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether there is no index.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Forgets every index.
+    pub fn clear(&self) {
+        self.0.clear();
+    }
+}
 
 /// Display name for the registry backing GitLab CI version lookups.
 pub const REGISTRY: &str = "GitLab";
@@ -47,8 +126,8 @@ const MAX_TAG_INDEX_ENTRIES: usize = 256;
 /// changes (the payload is the project name, not the endpoint: a rescan triggered for the
 /// other endpoint's unchanged index is harmless).
 pub(crate) fn populate_tag_index_entries<'a>(
-    refreshes: &TagIndexRefreshSender,
-    index: &DashMap<(EndpointKind, PackageName), Arc<TagIndex>>,
+    refreshes: &RefreshSender,
+    index: &ProjectIndexes,
     key: (EndpointKind, PackageName),
     entries: impl Iterator<Item = (&'a str, &'a str)>,
     coverage: ListCoverage,
@@ -58,7 +137,14 @@ pub(crate) fn populate_tag_index_entries<'a>(
         .collect();
     let built =
         TagIndex::from_tags(valid.iter().map(|(name, sha)| (*name, sha))).with_coverage(coverage);
-    refreshes.replace(index, key, built, MAX_TAG_INDEX_ENTRIES);
+    let normalized = ProjectIndexes::key(&key);
+    refreshes.replace(
+        &index.0,
+        normalized.clone(),
+        &normalized.1,
+        built,
+        MAX_TAG_INDEX_ENTRIES,
+    );
 }
 
 /// Converts a fetched tags page into a newest-first, semver-filtered version list.
@@ -145,8 +231,99 @@ pub struct GitlabCiRegistry {
     /// Per-host (not process-wide, spec §9.3) gate: one self-hosted instance rate-limiting
     /// must not disable lookups against `gitlab.com` or any other host.
     rate_limits: Arc<DashMap<String, Arc<RateLimitGate>>>,
-    tag_index: Arc<DashMap<(EndpointKind, PackageName), Arc<TagIndex>>>,
-    tag_refreshes: TagIndexRefreshSender,
+    tag_index: Arc<ProjectIndexes>,
+    tag_refreshes: RefreshSender,
+    /// Branch and commit evidence gathered by background probes, and the latest release each
+    /// tags fetch saw. Shared with the formatter, which reads it synchronously.
+    probe_stores: Arc<ProbeStores>,
+    /// One probe budget per host (spec 086 FR-021), created on first use from that host's
+    /// quota meter, token binding and rate-limit gate.
+    probe_allowances: Arc<DashMap<String, Arc<ProbeAllowance>>>,
+}
+
+/// What one document asks one GitLab host: the plan, and the project path of each project the
+/// plan names (the plan itself carries the host-qualified name).
+pub(crate) struct HostProbePlan {
+    pub(crate) host: GitlabHost,
+    pub(crate) plan: ProbePlan,
+    pub(crate) projects: HashMap<PackageName, String>,
+}
+
+/// Asks one GitLab host the probe questions.
+///
+/// `404` on the branch endpoint is the only authoritative negative; every other failure is
+/// inconclusive and stores nothing.
+struct GitlabProbeBackend<'a> {
+    client: &'a GitlabApiClient,
+    host: &'a GitlabHost,
+    projects: &'a HashMap<PackageName, String>,
+}
+
+impl GitlabProbeBackend<'_> {
+    async fn merge_base(
+        &self,
+        package: &PackageName,
+        first: MergeBaseRef<'_>,
+        pin: &CommitSha,
+    ) -> Option<CommitSha> {
+        let path = self.projects.get(package)?;
+        let body = self
+            .client
+            .fetch_merge_base(self.host, path, first, pin)
+            .await
+            .ok()?;
+        parse_merge_base(&body)
+    }
+}
+
+impl ProbeBackend for GitlabProbeBackend<'_> {
+    fn branch<'a>(
+        &'a self,
+        package: &'a PackageName,
+        git_ref: &'a ProbeRef,
+    ) -> deps_core::ecosystem::BoxFuture<'a, ProbeAnswer<BranchEvidence>> {
+        Box::pin(async move {
+            let Some(path) = self.projects.get(package) else {
+                return ProbeAnswer::Inconclusive;
+            };
+            match self.client.fetch_branch(self.host, path, git_ref).await {
+                Ok(_) => ProbeAnswer::Answer(BranchEvidence::Exists),
+                Err(DepsError::HttpStatus { status: 404, .. }) => {
+                    ProbeAnswer::Answer(BranchEvidence::Absent)
+                }
+                Err(_) => ProbeAnswer::Inconclusive,
+            }
+        })
+    }
+
+    fn lineage<'a>(
+        &'a self,
+        package: &'a PackageName,
+        latest: &'a CommitSha,
+        pin: &'a CommitSha,
+    ) -> deps_core::ecosystem::BoxFuture<'a, ProbeAnswer<CommitLineage>> {
+        Box::pin(async move {
+            self.merge_base(package, MergeBaseRef::Commit(latest), pin)
+                .await
+                .map_or(ProbeAnswer::Inconclusive, |base| {
+                    ProbeAnswer::Answer(CommitLineage::from_merge_base(&base, latest, pin))
+                })
+        })
+    }
+
+    fn membership<'a>(
+        &'a self,
+        package: &'a PackageName,
+        pin: &'a CommitSha,
+    ) -> deps_core::ecosystem::BoxFuture<'a, ProbeAnswer<DefaultBranchMembership>> {
+        Box::pin(async move {
+            self.merge_base(package, MergeBaseRef::DefaultBranchHead, pin)
+                .await
+                .map_or(ProbeAnswer::Inconclusive, |base| {
+                    ProbeAnswer::Answer(DefaultBranchMembership::from_merge_base(&base, pin))
+                })
+        })
+    }
 }
 
 impl GitlabCiRegistry {
@@ -157,8 +334,78 @@ impl GitlabCiRegistry {
             client,
             routes: Arc::new(DashMap::new()),
             rate_limits: Arc::new(DashMap::new()),
-            tag_index: Arc::new(DashMap::new()),
-            tag_refreshes: TagIndexRefreshSender::new(),
+            tag_index: Arc::new(ProjectIndexes::default()),
+            tag_refreshes: RefreshSender::new(),
+            probe_stores: Arc::new(ProbeStores::default()),
+            probe_allowances: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// The probe evidence this registry fills, shared with a
+    /// [`crate::formatter::GitlabCiFormatter`] through
+    /// [`crate::formatter::GitlabCiFormatter::with_probe_stores`].
+    #[must_use]
+    pub fn probe_stores(&self) -> Arc<ProbeStores> {
+        Arc::clone(&self.probe_stores)
+    }
+
+    fn probe_allowance(&self, host: &GitlabHost) -> Arc<ProbeAllowance> {
+        Arc::clone(
+            self.probe_allowances
+                .entry(host.origin().to_string())
+                .or_insert_with(|| {
+                    Arc::new(ProbeAllowance::new(
+                        self.client.probe_credential(host),
+                        self.client.quota_meter(host),
+                        self.rate_limit_gate(host.origin()),
+                    ))
+                })
+                .value(),
+        )
+    }
+
+    /// Runs each host's plan within that host's probe budget and announces every project whose
+    /// evidence changed as a [`deps_core::RefreshEvent::ProbeEvidence`].
+    pub(crate) async fn run_probes(&self, plans: &[HostProbePlan]) -> ProbeReport {
+        let mut report = ProbeReport::default();
+        let mut announced = HashSet::new();
+        for host_plan in plans {
+            let backend = GitlabProbeBackend {
+                client: &self.client,
+                host: &host_plan.host,
+                projects: &host_plan.projects,
+            };
+            let outcome = run_probe_pass(
+                &host_plan.plan,
+                &backend,
+                &self.probe_allowance(&host_plan.host),
+                &self.probe_stores,
+            )
+            .await;
+            report = report.merge(outcome.report);
+            for repository in outcome.changed {
+                if announced.insert(repository.clone()) {
+                    self.tag_refreshes.send_probe_evidence(repository);
+                }
+            }
+        }
+        if announced.is_empty() {
+            report.effect = ProbeEffect::Unchanged;
+        }
+        report
+    }
+
+    /// Remembers the newest stable release of `name`, the commit a SHA pin is proven ahead of.
+    fn record_latest_release(&self, name: &PackageName, versions: &[GitlabCiVersion]) {
+        let latest = versions.iter().find(|version| !version.prerelease);
+        if let Some((version, commit)) = latest.and_then(|v| Some((v, v.sha.clone()?))) {
+            self.probe_stores.record_latest(
+                LowercaseNaming.normalize_package_name(name),
+                LatestRelease {
+                    tag: version.version.as_str().to_string(),
+                    commit,
+                },
+            );
         }
     }
 
@@ -166,13 +413,13 @@ impl GitlabCiRegistry {
     /// tags or releases fetch first populates its index or observably changes it
     /// ([`TagIndex::observably_differs`]), after the index has been replaced.
     #[must_use]
-    pub fn subscribe_tag_refreshes(&self) -> TagIndexRefreshes {
+    pub fn subscribe_tag_refreshes(&self) -> RefreshEvents {
         self.tag_refreshes.subscribe()
     }
 
     /// Shares this registry's [`TagIndex`] map with [`crate::formatter::GitlabCiFormatter`].
     #[must_use]
-    pub fn tag_index(&self) -> Arc<DashMap<(EndpointKind, PackageName), Arc<TagIndex>>> {
+    pub fn tag_index(&self) -> Arc<ProjectIndexes> {
         Arc::clone(&self.tag_index)
     }
 
@@ -350,7 +597,9 @@ impl GitlabCiRegistry {
                         .map(|t| (t.name.as_str(), t.commit.id.as_str())),
                     tags.coverage,
                 );
-                tags_to_versions(tags.items)
+                let versions = tags_to_versions(tags.items);
+                self.record_latest_release(name, &versions);
+                versions
             }
             EndpointKind::Releases => {
                 let client = &self.client;
@@ -412,7 +661,7 @@ impl GitlabCiRegistry {
         pin: &PinStyle,
         raw: &str,
     ) -> Result<Option<GitlabCiVersion>> {
-        let releases = self.fetch_route(name, route).await?;
+        let releases = Box::pin(self.fetch_route(name, route)).await?;
         Ok(crate::component::resolve_component_pin(pin, raw, &releases))
     }
 }
@@ -558,6 +807,11 @@ impl deps_core::Registry for GitlabCiRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tag_index_event(name: &PackageName) -> deps_core::RefreshEvent {
+        deps_core::RefreshEvent::TagIndex(LowercaseNaming.normalize_package_name(name))
+    }
+
     use deps_core::Registry;
     use deps_core::parser::DependencySource;
     use std::assert_matches;
@@ -963,7 +1217,7 @@ mod tests {
         ));
 
         registry.fetch_route(&name, &gitlab_route).await.unwrap();
-        assert_eq!(refreshes.try_recv().ok(), Some(name.clone()));
+        assert_eq!(refreshes.try_recv().ok(), Some(tag_index_event(&name)));
 
         registry.fetch_route(&name, &gitlab_route).await.unwrap();
         assert!(refreshes.try_recv().is_err());

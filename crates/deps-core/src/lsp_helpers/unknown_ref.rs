@@ -3,14 +3,18 @@
 //!
 //! Reports a tag pin whose ref is a full release no published tag matches
 //! ([`super::UnpublishedRef::Release`]): the workflow would fail to resolve it at runtime. A
-//! partial shape (`v1`, `v5.x`, `v3-node20`) may be a documented branch pin, so it is never
-//! reported; the status of such a pin is decided separately (see
-//! [`super::UnpublishedRef::cap_status`]).
+//! partial shape (`v1`, `v5.x`, `v3-node20`) may be a documented branch pin, so it is reported
+//! only once a background probe proved no branch carries that name either
+//! ([`super::UnpublishedRef::NotABranch`], see [`super::BranchEvidence`]); the status of such a
+//! pin is decided separately (see [`super::UnpublishedRef::cap_status`]).
 
 use std::sync::Arc;
 
 use super::sanitize_and_truncate_for_diagnostic;
-use super::{MAX_DIAGNOSTIC_VALUE_CHARS, TagIndex, UnpublishedRef, redact_name_for_diagnostic};
+use super::{
+    BranchEvidence, MAX_DIAGNOSTIC_VALUE_CHARS, TagIndex, UnpublishedRef,
+    redact_name_for_diagnostic,
+};
 use crate::PackageName;
 use crate::diagnostic::{Diagnostic, DiagnosticKind, Severity};
 use crate::position::{Position, Range};
@@ -52,21 +56,37 @@ pub fn unknown_ref_diagnostic(
     written: &str,
     severity: Severity,
 ) -> Diagnostic {
+    build_diagnostic(range, name, written, severity, UnpublishedRef::Release)
+}
+
+/// The diagnostic for a ref of `kind` that names nothing: the message differs only in whether a
+/// branch was ruled out as well.
+fn build_diagnostic(
+    range: Range,
+    name: &PackageName,
+    written: &str,
+    severity: Severity,
+    kind: UnpublishedRef,
+) -> Diagnostic {
     let name = redact_name_for_diagnostic(name);
     let written = sanitize_and_truncate_for_diagnostic(written, MAX_DIAGNOSTIC_VALUE_CHARS);
-    Diagnostic::new(
-        DiagnosticKind::UnknownRef,
-        range,
-        format!("`{written}` is not a published tag of {name}"),
-    )
-    .with_severity(severity)
+    let message = match kind {
+        UnpublishedRef::NotABranch => {
+            format!("`{written}` is neither a published tag nor a branch of {name}")
+        }
+        UnpublishedRef::Release | UnpublishedRef::Partial => {
+            format!("`{written}` is not a published tag of {name}")
+        }
+    };
+    Diagnostic::new(DiagnosticKind::UnknownRef, range, message).with_severity(severity)
 }
 
 /// The unknown-ref [`Diagnostic`] for a tag pin `written` at `range`, when `index` proves it
 /// unpublished.
 ///
-/// Only a full release ([`UnpublishedRef::Release`]) is reported; `None` for a partial shape (it
-/// may be a branch), a listed tag, and an index that cannot prove absence.
+/// A full release ([`UnpublishedRef::Release`]) is reported, and so is a partial shape that
+/// `branch` evidence proves is no branch either ([`UnpublishedRef::NotABranch`]); `None` for a
+/// partial shape that may be a branch, a listed tag, and an index that cannot prove absence.
 ///
 /// The shared tail of every git-tags ecosystem's diagnostics pass: the ecosystem only decides
 /// which pins are tag pins and which index serves them.
@@ -76,18 +96,21 @@ pub fn unknown_ref_diagnostic(
 /// ```
 /// use deps_core::PackageName;
 /// use deps_core::diagnostic::Severity;
-/// use deps_core::lsp_helpers::{CommitSha, TagIndex, unknown_ref_diagnostic_for};
+/// use deps_core::lsp_helpers::{BranchEvidence, CommitSha, TagIndex, unknown_ref_diagnostic_for};
 /// use deps_core::position::Range;
 ///
 /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
 /// let index = TagIndex::from_tags([("v4.3.1", &sha)]);
 /// let name = PackageName::new("actions/checkout");
-/// let report = |written| {
-///     unknown_ref_diagnostic_for(&index, &name, written, Range::default(), Severity::Warning)
+/// let report = |written, branch| {
+///     unknown_ref_diagnostic_for(&index, &name, written, Range::default(), Severity::Warning, branch)
 /// };
-/// assert!(report("4.3.1").is_some());
-/// assert!(report("v40").is_none());
-/// assert!(report("v4.3.1").is_none());
+/// assert!(report("4.3.1", None).is_some());
+/// assert!(report("v40", None).is_none());
+/// assert!(report("v40", Some(BranchEvidence::Exists)).is_none());
+/// let unknown = report("v40", Some(BranchEvidence::Absent)).unwrap();
+/// assert!(unknown.message().contains("neither a published tag nor a branch"));
+/// assert!(report("v4.3.1", Some(BranchEvidence::Absent)).is_none());
 /// ```
 #[must_use]
 pub fn unknown_ref_diagnostic_for(
@@ -96,9 +119,13 @@ pub fn unknown_ref_diagnostic_for(
     written: &str,
     range: Range,
     severity: Severity,
+    branch: Option<BranchEvidence>,
 ) -> Option<Diagnostic> {
-    match index.unpublished_tag_ref(written)? {
-        UnpublishedRef::Release => Some(unknown_ref_diagnostic(range, name, written, severity)),
+    let kind = index.unpublished_tag_ref(written)?.refine(branch);
+    match kind {
+        UnpublishedRef::Release | UnpublishedRef::NotABranch => {
+            Some(build_diagnostic(range, name, written, severity, kind))
+        }
         UnpublishedRef::Partial => None,
     }
 }
@@ -147,6 +174,7 @@ pub struct UnknownRefTarget<'a> {
     index: Arc<TagIndex>,
     written: &'a str,
     range: Range,
+    branch: Option<BranchEvidence>,
 }
 
 impl<'a> UnknownRefTarget<'a> {
@@ -157,14 +185,36 @@ impl<'a> UnknownRefTarget<'a> {
             index,
             written,
             range,
+            branch: None,
         }
+    }
+
+    /// Adds the stored branch evidence for this ref, read from the evidence store, so a partial
+    /// shape no branch carries is reported as well.
+    #[must_use]
+    pub const fn with_branch_evidence(mut self, branch: Option<BranchEvidence>) -> Self {
+        self.branch = branch;
+        self
+    }
+
+    /// The ref as written.
+    #[must_use]
+    pub const fn written(&self) -> &'a str {
+        self.written
     }
 
     /// The unknown-ref [`Diagnostic`] for this pin, when its index proves it unpublished. See
     /// [`unknown_ref_diagnostic_for`].
     #[must_use]
     pub fn diagnostic(&self, name: &PackageName, severity: Severity) -> Option<Diagnostic> {
-        unknown_ref_diagnostic_for(&self.index, name, self.written, self.range, severity)
+        unknown_ref_diagnostic_for(
+            &self.index,
+            name,
+            self.written,
+            self.range,
+            severity,
+            self.branch,
+        )
     }
 
     /// The quick fix for [`Self::diagnostic`], when exactly one published tag matches. See
@@ -173,7 +223,7 @@ impl<'a> UnknownRefTarget<'a> {
     #[cfg_attr(docsrs, doc(cfg(feature = "lsp-responses")))]
     #[must_use]
     pub fn fix_action(&self, uri: &url::Url) -> Option<CodeAction> {
-        build_unknown_ref_fix_action(uri, self.range, &self.index, self.written)
+        build_unknown_ref_fix_action(uri, self.range, &self.index, self.written, self.branch)
     }
 }
 
@@ -245,7 +295,9 @@ pub fn unknown_ref_diagnostics(
 /// The edit replaces the whole ref with the published spelling resolved through
 /// [`TagIndex::release_tag`] (`4.3.1` -> `v4.3.1`). `None` unless all of these hold, so the fix
 /// is offered exactly where [`unknown_ref_diagnostic_for`] reports and never guesses:
-/// - the index proves `written` is an unpublished full release ([`UnpublishedRef::Release`]);
+/// - the index proves `written` is an unpublished full release ([`UnpublishedRef::Release`]),
+///   or an unpublished partial shape that `branch` evidence proves is no branch
+///   ([`UnpublishedRef::NotABranch`]);
 /// - exactly one published tag matches (`release_tag` is `None` when the matching spellings
 ///   point at different commits);
 /// - the tag differs from `written`, is tag-shaped, and survives sanitization unchanged.
@@ -261,10 +313,10 @@ pub fn unknown_ref_diagnostics(
 /// let index = TagIndex::from_tags([("v4.3.1", &sha)]);
 /// let range = Range::new(Position::new(0, 25), Position::new(0, 30));
 ///
-/// let action = build_unknown_ref_fix_action(&uri, range, &index, "4.3.1").unwrap();
+/// let action = build_unknown_ref_fix_action(&uri, range, &index, "4.3.1", None).unwrap();
 /// assert_eq!(action.title, "Change ref to published tag `v4.3.1`");
-/// assert!(build_unknown_ref_fix_action(&uri, range, &index, "v4.3.1").is_none());
-/// assert!(build_unknown_ref_fix_action(&uri, range, &index, "v9.9.9").is_none());
+/// assert!(build_unknown_ref_fix_action(&uri, range, &index, "v4.3.1", None).is_none());
+/// assert!(build_unknown_ref_fix_action(&uri, range, &index, "v9.9.9", None).is_none());
 /// ```
 #[cfg(feature = "lsp-responses")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lsp-responses")))]
@@ -274,9 +326,11 @@ pub fn build_unknown_ref_fix_action(
     version_range: Range,
     index: &TagIndex,
     written: &str,
+    branch: Option<BranchEvidence>,
 ) -> Option<CodeAction> {
-    if index.unpublished_tag_ref(written) != Some(UnpublishedRef::Release) {
-        return None;
+    match index.unpublished_tag_ref(written)?.refine(branch) {
+        UnpublishedRef::Release | UnpublishedRef::NotABranch => {}
+        UnpublishedRef::Partial => return None,
     }
     let tag = index.release_tag(written)?;
     if tag == written
@@ -406,6 +460,79 @@ mod tests {
         assert!(!bidi.message().contains('\u{202E}'), "{}", bidi.message());
     }
 
+    mod branch_evidence {
+        use super::*;
+        use crate::lsp_helpers::CommitSha;
+
+        fn index() -> TagIndex {
+            let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+            TagIndex::from_tags([("v4.3.1", &sha)])
+        }
+
+        fn report(written: &str, branch: Option<BranchEvidence>) -> Option<Diagnostic> {
+            unknown_ref_diagnostic_for(
+                &index(),
+                &PackageName::new("owner/repo"),
+                written,
+                Range::default(),
+                Severity::Warning,
+                branch,
+            )
+        }
+
+        #[test]
+        fn partial_ref_is_reported_only_when_no_branch_exists() {
+            assert!(report("v40", None).is_none());
+            assert!(report("v40", Some(BranchEvidence::Exists)).is_none());
+            let d = report("v40", Some(BranchEvidence::Absent)).unwrap();
+            assert_eq!(d.code(), Some(UNKNOWN_REF_DIAGNOSTIC_CODE));
+            assert_eq!(
+                d.message(),
+                "`v40` is neither a published tag nor a branch of owner/repo"
+            );
+        }
+
+        #[test]
+        fn release_ref_keeps_its_message_whatever_the_evidence() {
+            for branch in [
+                None,
+                Some(BranchEvidence::Exists),
+                Some(BranchEvidence::Absent),
+            ] {
+                assert_eq!(
+                    report("4.3.1", branch).unwrap().message(),
+                    "`4.3.1` is not a published tag of owner/repo"
+                );
+            }
+        }
+
+        #[test]
+        fn listed_tag_is_never_reported_even_with_absent_branch_evidence() {
+            assert!(report("v4.3.1", Some(BranchEvidence::Absent)).is_none());
+        }
+
+        #[test]
+        fn target_carries_the_evidence_into_its_diagnostic() {
+            let target = UnknownRefTarget::new(Arc::new(index()), "v40", Range::default());
+            let name = PackageName::new("owner/repo");
+            assert!(target.diagnostic(&name, Severity::Warning).is_none());
+            let target = target.with_branch_evidence(Some(BranchEvidence::Absent));
+            assert!(target.diagnostic(&name, Severity::Warning).is_some());
+        }
+
+        #[cfg(feature = "lsp-responses")]
+        #[test]
+        fn quickfix_for_not_a_branch_needs_exactly_one_matching_tag() {
+            let uri = url::Url::parse("file:///repo/ci.yml").unwrap();
+            let fix = |written, branch| {
+                build_unknown_ref_fix_action(&uri, Range::default(), &index(), written, branch)
+            };
+            assert!(fix("v40", None).is_none());
+            assert!(fix("v40", Some(BranchEvidence::Absent)).is_none());
+            assert!(fix("4.3.1", Some(BranchEvidence::Absent)).is_some());
+        }
+    }
+
     #[cfg(feature = "lsp-responses")]
     mod fix_action {
         use super::*;
@@ -420,7 +547,7 @@ mod tests {
         }
 
         fn fix(index: &TagIndex, written: &str) -> Option<CodeAction> {
-            build_unknown_ref_fix_action(&uri(), Range::default(), index, written)
+            build_unknown_ref_fix_action(&uri(), Range::default(), index, written, None)
         }
 
         #[test]

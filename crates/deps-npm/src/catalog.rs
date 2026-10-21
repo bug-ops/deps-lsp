@@ -45,13 +45,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use yaml_rust2::{Yaml, YamlLoader};
+use deps_core::position::Range;
+use url::Url;
 
-use crate::types::NpmDependency;
-
-/// Reserved catalog-name key the default catalog (from either a top-level `catalog:` block or
-/// a `catalogs.default:` section) is stored under in [`PnpmWorkspaceConfig`]'s map.
-const DEFAULT_CATALOG_KEY: &str = "default";
+use crate::types::{CatalogId, NpmDependency, NpmDependencyOrigin};
+use crate::workspace::{EntryValue, WorkspaceDocument};
 
 /// Why a `pnpm-workspace.yaml`, once found, cannot resolve any catalog specifier at all.
 #[non_exhaustive]
@@ -78,15 +76,37 @@ enum CatalogValue {
     Malformed,
 }
 
+/// A catalog entry as the `package.json` side sees it: its value and, when known, where in
+/// `pnpm-workspace.yaml` its version text sits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigEntry {
+    value: CatalogValue,
+    range: Option<Range>,
+}
+
+/// Where a catalog entry's version text lives, for pointing a `package.json` finding at it
+/// (spec 078 FR-031).
+///
+/// `file` is the workspace file's `file:` URL as found by the ancestor walk; deps-lsp
+/// canonicalizes it (spec 066) when it converts the finding to an LSP diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogEntryLocation {
+    /// The `pnpm-workspace.yaml` containing the entry.
+    pub file: Url,
+    /// Range of the entry's version text in `file`.
+    pub range: Range,
+}
+
 /// Parsed, catalog-relevant contents of one `pnpm-workspace.yaml`.
 ///
-/// Keyed by catalog name, with the default catalog (from either definition site) stored under
-/// the reserved key `"default"`. `defect` being set means the file is unusable for *any* catalog
+/// Keyed by typed catalog identity so a catalog literally named `default` cannot collide with
+/// the default catalog. `defect` being set means the file is unusable for *any* catalog
 /// specifier — see [`ConfigDefect`].
 #[derive(Debug, Default)]
 pub struct PnpmWorkspaceConfig {
-    catalogs: HashMap<String, HashMap<String, CatalogValue>>,
+    catalogs: HashMap<CatalogId, HashMap<String, ConfigEntry>>,
     defect: Option<ConfigDefect>,
+    file: Option<Url>,
 }
 
 impl PnpmWorkspaceConfig {
@@ -94,54 +114,27 @@ impl PnpmWorkspaceConfig {
         Self {
             catalogs: HashMap::new(),
             defect: Some(defect),
+            file: None,
         }
     }
-}
 
-/// Classifies a `catalog:`/`catalogs.<name>` YAML node into its flat dependency-name to
-/// [`CatalogValue`] map.
-///
-/// `Ok(None)` — absent (missing key, indexed via [`Yaml`]'s `Index<&str>`, which collapses a
-/// missing key to [`Yaml::BadValue`]) or an explicit null value (M2: a common result of
-/// commenting a catalog block out, and *not* malformed — matches pnpm's own `!= null` gate).
-/// `Ok(Some(map))` — a mapping; each leaf is classified independently so one bad leaf can't
-/// fail the whole node. `Err(())` — anything else (a scalar or a sequence): the caller treats
-/// this as the whole workspace file being malformed.
-fn classify_catalog_node(node: &Yaml) -> Result<Option<HashMap<String, CatalogValue>>, ()> {
-    match node {
-        Yaml::BadValue | Yaml::Null => Ok(None),
-        Yaml::Hash(map) => Ok(Some(
-            map.iter()
-                .filter_map(|(key, value)| {
-                    key.as_str()
-                        .map(|name| (name.to_string(), classify_entry(value)))
-                })
-                .collect(),
-        )),
-        _ => Err(()),
-    }
-}
-
-/// Classifies one catalog entry's leaf value.
-///
-/// Goes through [`deps_core::yaml_scalar_string`] rather than `Yaml::as_str` directly
-/// (issue #721): an unquoted, numeric-looking range (`react: 1.2`, parsed as
-/// `Yaml::Real`) is a valid pnpm catalog entry, and `as_str` alone would misclassify it
-/// as [`CatalogValue::Malformed`].
-fn classify_entry(value: &Yaml) -> CatalogValue {
-    match deps_core::yaml_scalar_string(value) {
-        Some(range) => CatalogValue::Range(range),
-        None => CatalogValue::Malformed,
-    }
-}
-
-/// Classifies the top-level `catalogs:` node — a mapping of catalog name to its own flat
-/// entry map — using the same absent/null/wrong-shape rule as [`classify_catalog_node`].
-fn classify_catalogs_section(node: &Yaml) -> Result<Option<&yaml_rust2::yaml::Hash>, ()> {
-    match node {
-        Yaml::BadValue | Yaml::Null => Ok(None),
-        Yaml::Hash(map) => Ok(Some(map)),
-        _ => Err(()),
+    fn from_document(document: WorkspaceDocument, file: Option<Url>) -> Self {
+        let mut catalogs: HashMap<CatalogId, HashMap<String, ConfigEntry>> = HashMap::new();
+        for entry in document.entries {
+            let (value, range) = match entry.value {
+                EntryValue::Text { text, range } => (CatalogValue::Range(text), range),
+                EntryValue::Empty { .. } | EntryValue::Unusable => (CatalogValue::Malformed, None),
+            };
+            catalogs
+                .entry(entry.id)
+                .or_default()
+                .insert(entry.name, ConfigEntry { value, range });
+        }
+        Self {
+            catalogs,
+            defect: document.defect,
+            file,
+        }
     }
 }
 
@@ -153,73 +146,22 @@ fn classify_catalogs_section(node: &Yaml) -> Result<Option<&yaml_rust2::yaml::Ha
 /// [`PnpmWorkspaceConfig`] with [`ConfigDefect::Malformed`] rather than propagating an error,
 /// so a broken workspace file degrades this dependency's resolution instead of panicking or
 /// blocking the rest of the document's diagnostics (NFR-003).
-fn parse_pnpm_workspace(content: &str) -> PnpmWorkspaceConfig {
-    // Discards the `Result` since this fn must stay infallible (NFR-003).
-    if deps_core::check_yaml_bounds(content, "pnpm-workspace.yaml").is_err() {
-        return PnpmWorkspaceConfig::defective(ConfigDefect::Malformed);
-    }
-
-    let Ok(docs) = YamlLoader::load_from_str(content) else {
-        return PnpmWorkspaceConfig::defective(ConfigDefect::Malformed);
-    };
-    let Some(doc) = docs.first() else {
-        return PnpmWorkspaceConfig::default();
-    };
-
-    let top_level_catalog = match classify_catalog_node(&doc["catalog"]) {
-        Ok(entries) => entries,
-        Err(()) => return PnpmWorkspaceConfig::defective(ConfigDefect::Malformed),
-    };
-    let named_catalogs = match classify_catalogs_section(&doc["catalogs"]) {
-        Ok(section) => section,
-        Err(()) => return PnpmWorkspaceConfig::defective(ConfigDefect::Malformed),
-    };
-
-    let mut catalogs: HashMap<String, HashMap<String, CatalogValue>> = HashMap::new();
-    let mut named_default = None;
-
-    if let Some(named_catalogs) = named_catalogs {
-        for (name, value) in named_catalogs {
-            let Some(name) = name.as_str() else { continue };
-            let entries = match classify_catalog_node(value) {
-                Ok(entries) => entries,
-                Err(()) => return PnpmWorkspaceConfig::defective(ConfigDefect::Malformed),
-            };
-            let Some(entries) = entries else { continue };
-            if name == DEFAULT_CATALOG_KEY {
-                named_default = Some(entries);
-            } else {
-                catalogs.insert(name.to_string(), entries);
-            }
+fn parse_pnpm_workspace(content: &str, path: &Path) -> PnpmWorkspaceConfig {
+    match crate::workspace::parse_workspace_document(content) {
+        Ok(document) => {
+            PnpmWorkspaceConfig::from_document(document, Url::from_file_path(path).ok())
         }
-    }
-
-    // M1: a top-level `catalog:` block and a `catalogs.default:` section both present is
-    // unresolvable, matching pnpm's `checkDefaultCatalogIsDefinedOnce` — never per-key merged.
-    let default_entries = match (top_level_catalog, named_default) {
-        (Some(_), Some(_)) => {
-            return PnpmWorkspaceConfig::defective(ConfigDefect::DuplicateDefaultCatalog);
-        }
-        (Some(entries), None) | (None, Some(entries)) => Some(entries),
-        (None, None) => None,
-    };
-    if let Some(entries) = default_entries {
-        catalogs.insert(DEFAULT_CATALOG_KEY.to_string(), entries);
-    }
-
-    PnpmWorkspaceConfig {
-        catalogs,
-        defect: None,
+        Err(_) => PnpmWorkspaceConfig::defective(ConfigDefect::Malformed),
     }
 }
 
-/// Fuzz-only entry point for [`parse_pnpm_workspace`], the `pnpm-workspace.yaml` catalog
-/// parser (issue #727). Gated on the `fuzzing` Cargo feature (never enabled by this crate's
-/// own default set) so this stays out of the crate's public API surface in a normal build.
+/// Fuzz-only entry point for the `pnpm-workspace.yaml` catalog parser (issue #727). Gated on
+/// the `fuzzing` Cargo feature (never enabled by this crate's own default set) so this stays
+/// out of the crate's public API surface in a normal build.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn fuzz_parse_pnpm_workspace(content: &str) {
-    let _ = parse_pnpm_workspace(content);
+    let _ = parse_pnpm_workspace(content, Path::new("/pnpm-workspace.yaml"));
 }
 
 /// Per-path memoization of `pnpm-workspace.yaml` parses, invalidated by mtime.
@@ -249,7 +191,8 @@ impl PnpmWorkspaceCache {
     /// re-reading and re-parsing. `None` if `path` does not exist, is not a regular file
     /// (including a directory sharing the name), or cannot be read.
     fn get_or_parse(&self, path: &Path) -> Option<Arc<PnpmWorkspaceConfig>> {
-        self.0.get_or_parse(path, parse_pnpm_workspace)
+        self.0
+            .get_or_parse(path, |content| parse_pnpm_workspace(content, path))
     }
 }
 
@@ -277,7 +220,7 @@ impl<'a> CatalogSpecifier<'a> {
     fn parse(value: &'a str) -> Option<Self> {
         let name = value.strip_prefix("catalog:")?;
         match name {
-            "" | DEFAULT_CATALOG_KEY => Some(Self::Default),
+            "" | "default" => Some(Self::Default),
             other => Some(Self::Named(other)),
         }
     }
@@ -364,7 +307,8 @@ impl std::fmt::Debug for CatalogOutcome {
 
 /// Where a catalog-referencing dependency's resolution came from, and what happened.
 ///
-/// Stored on [`NpmDependency::catalog`], `None` for every non-catalog dependency.
+/// Stored in [`crate::types::NpmDependencyOrigin::Manifest::catalog_ref`], `None` for every
+/// non-catalog dependency.
 ///
 /// Output-only: constructed internally by this module's own catalog resolution, never by
 /// external code — no constructor is provided.
@@ -373,15 +317,18 @@ impl std::fmt::Debug for CatalogOutcome {
 pub struct CatalogOrigin {
     /// The raw `catalog:...` text as written in the manifest (e.g. `"catalog:react17"`).
     pub specifier: String,
-    /// The referenced catalog's name, or `None` for the default catalog.
-    pub catalog: Option<String>,
+    /// The referenced catalog.
+    pub id: CatalogId,
     /// What resolving `specifier` against the workspace's catalog map produced.
     pub outcome: CatalogOutcome,
+    /// Where the resolved entry's version text sits in `pnpm-workspace.yaml`, when the
+    /// entry exists and its position is known (spec 078 FR-031).
+    pub entry: Option<CatalogEntryLocation>,
 }
 
 impl std::fmt::Debug for CatalogOrigin {
     /// Manual, not derived: `specifier` is the raw `catalog:...` text as written, which can
-    /// carry a credential-shaped value — and `catalog` is `specifier`'s own
+    /// carry a credential-shaped value — and `id` is `specifier`'s own
     /// `strip_prefix("catalog:")` tail, so it must be redacted too or the same credential
     /// leaks through the adjacent field (CWE-532, #1222).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -390,14 +337,9 @@ impl std::fmt::Debug for CatalogOrigin {
                 "specifier",
                 &deps_core::net_policy::redact_declaration_key(&self.specifier),
             )
-            .field(
-                "catalog",
-                &self
-                    .catalog
-                    .as_deref()
-                    .map(deps_core::net_policy::redact_declaration_key),
-            )
+            .field("id", &self.id)
             .field("outcome", &self.outcome)
+            .field("entry", &self.entry)
             .finish()
     }
 }
@@ -451,6 +393,17 @@ impl CatalogOrigin {
             sanitize_then(|s: &str| format!("`{s}`")),
             sanitize_then(str::to_string),
         )
+    }
+
+    /// The message suffix naming where a resolved `catalog:` reference's version is set,
+    /// e.g. `(set in pnpm-workspace.yaml, catalog react17)` (spec 078 FR-031).
+    ///
+    /// Plain text, sanitized and length-bounded like [`Self::diagnostic_message`], because the
+    /// catalog name is attacker-controlled.
+    #[must_use]
+    pub fn workspace_entry_note(&self) -> String {
+        let name = sanitize_then(str::to_string)(&bounded(self.id.name()));
+        format!("(set in pnpm-workspace.yaml, catalog {name})")
     }
 
     /// Markdown-safe rendering of this outcome for the hover `**Catalog**` line.
@@ -519,9 +472,9 @@ impl CatalogOrigin {
     ) -> Option<String> {
         let specifier = code(&bounded(&self.specifier));
         let dependency_name = text(&bounded(dependency_name));
-        let catalog_phrase = match self.catalog.as_deref() {
-            None => "the default catalog".to_string(),
-            Some(name) => format!("catalog '{}'", text(&bounded(name))),
+        let catalog_phrase = match &self.id {
+            CatalogId::Default => "the default catalog".to_string(),
+            CatalogId::Named(name) => format!("catalog '{}'", text(&bounded(name.as_str()))),
         };
 
         match &self.outcome {
@@ -538,7 +491,7 @@ impl CatalogOrigin {
                 deps_core::lsp_helpers::MAX_REQUIREMENT_LEN
             )),
             CatalogOutcome::UnknownCatalog => {
-                let name = text(&bounded(self.catalog.as_deref().unwrap_or_default()));
+                let name = text(&bounded(self.id.name()));
                 Some(format!(
                     "{specifier} refers to catalog '{name}', which is not defined in pnpm-workspace.yaml"
                 ))
@@ -557,40 +510,44 @@ impl CatalogOrigin {
     }
 }
 
-/// Resolves one dependency's already-parsed `specifier` against `config`.
+/// Resolves one dependency's already-parsed catalog `id` against `config`, returning the
+/// outcome and, when the entry exists and was located, its position in the workspace file.
 fn resolve(
     config: Option<&PnpmWorkspaceConfig>,
-    specifier: CatalogSpecifier<'_>,
+    id: &CatalogId,
     dependency_name: &str,
-) -> CatalogOutcome {
+) -> (CatalogOutcome, Option<CatalogEntryLocation>) {
     let Some(config) = config else {
-        return CatalogOutcome::NoWorkspaceFile;
+        return (CatalogOutcome::NoWorkspaceFile, None);
     };
     if let Some(defect) = config.defect {
-        return match defect {
+        let outcome = match defect {
             ConfigDefect::Malformed => CatalogOutcome::MalformedWorkspaceFile,
             ConfigDefect::DuplicateDefaultCatalog => CatalogOutcome::DuplicateDefaultCatalog,
         };
+        return (outcome, None);
     }
 
-    let (key, is_default) = match specifier {
-        CatalogSpecifier::Default => (DEFAULT_CATALOG_KEY, true),
-        CatalogSpecifier::Named(name) => (name, false),
-    };
-
-    let Some(catalog) = config.catalogs.get(key) else {
+    let Some(catalog) = config.catalogs.get(id) else {
         // Spec §6: no `catalog:`/`catalogs:` at all is "no entry" for default, not "unknown".
-        return if is_default {
-            CatalogOutcome::MissingEntry
-        } else {
-            CatalogOutcome::UnknownCatalog
+        let outcome = match id {
+            CatalogId::Default => CatalogOutcome::MissingEntry,
+            CatalogId::Named(_) => CatalogOutcome::UnknownCatalog,
         };
+        return (outcome, None);
     };
 
-    match catalog.get(dependency_name) {
-        None => CatalogOutcome::MissingEntry,
-        Some(CatalogValue::Malformed) => CatalogOutcome::MalformedEntry,
-        Some(CatalogValue::Range(range)) => match crate::formatter::parse_range_safe(range) {
+    let Some(entry) = catalog.get(dependency_name) else {
+        return (CatalogOutcome::MissingEntry, None);
+    };
+    let location = config
+        .file
+        .clone()
+        .zip(entry.range)
+        .map(|(file, range)| CatalogEntryLocation { file, range });
+    let outcome = match &entry.value {
+        CatalogValue::Malformed => CatalogOutcome::MalformedEntry,
+        CatalogValue::Range(range) => match crate::formatter::parse_range_safe(range) {
             Ok(_) => CatalogOutcome::Resolved(range.clone()),
             Err(crate::RangeParseError::TooLong { .. }) => CatalogOutcome::RequirementTooLong,
             Err(crate::RangeParseError::Malformed(_) | crate::RangeParseError::Panicked) => {
@@ -599,7 +556,8 @@ fn resolve(
                 }
             }
         },
-    }
+    };
+    (outcome, location)
 }
 
 /// Walks up from `manifest_dir` looking for the nearest-ancestor `pnpm-workspace.yaml` — the
@@ -670,6 +628,9 @@ pub fn load(
 /// limitations".
 pub fn apply(deps: &mut [NpmDependency], config: Option<&PnpmWorkspaceConfig>) {
     for dep in deps {
+        let NpmDependencyOrigin::Manifest { catalog_ref, .. } = &mut dep.origin else {
+            continue;
+        };
         let Some(raw) = dep.version_req.as_ref().map(deps_core::VersionReq::as_str) else {
             continue;
         };
@@ -678,20 +639,21 @@ pub fn apply(deps: &mut [NpmDependency], config: Option<&PnpmWorkspaceConfig>) {
         };
 
         let specifier_text = raw.to_string();
-        let catalog_name = match specifier {
-            CatalogSpecifier::Default => None,
-            CatalogSpecifier::Named(name) => Some(name.to_string()),
+        let id = match specifier {
+            CatalogSpecifier::Default => CatalogId::Default,
+            CatalogSpecifier::Named(name) => CatalogId::from_name(name),
         };
 
-        let outcome = resolve(config, specifier, dep.name.as_str());
+        let (outcome, entry) = resolve(config, &id, dep.name.as_str());
         dep.version_req = match &outcome {
             CatalogOutcome::Resolved(range) => Some(deps_core::VersionReq::from(range.clone())),
             _ => None,
         };
-        dep.catalog = Some(CatalogOrigin {
+        *catalog_ref = Some(CatalogOrigin {
             specifier: specifier_text,
-            catalog: catalog_name,
+            id,
             outcome,
+            entry,
         });
     }
 }
@@ -709,9 +671,11 @@ mod tests {
             name_range: Range::default(),
             version_req: Some(version_req.into()),
             version_range: Some(Range::default()),
-            section: NpmDependencySection::Dependencies,
+            origin: NpmDependencyOrigin::Manifest {
+                section: NpmDependencySection::Dependencies,
+                catalog_ref: None,
+            },
             source: deps_core::parser::DependencySource::Registry,
-            catalog: None,
             package: None,
         }
     }
@@ -720,13 +684,125 @@ mod tests {
         std::fs::write(dir.join("pnpm-workspace.yaml"), content).unwrap();
     }
 
+    #[test]
+    fn test_apply_resolved_entry_carries_its_workspace_location() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        workspace(
+            root.path(),
+            "catalogs:\n  legacy:\n    react: \"^16.0.0\"\n",
+        );
+        let cache = PnpmWorkspaceCache::new();
+        let config = load(Some(root.path()), &cache);
+
+        let mut deps = vec![dep("react", "catalog:legacy")];
+        apply(&mut deps, config.as_deref());
+
+        let origin = deps[0].catalog_ref().unwrap();
+        assert_eq!(origin.id, CatalogId::from_name("legacy"));
+        let location = origin.entry.as_ref().expect("entry located");
+        assert_eq!(
+            location.file,
+            Url::from_file_path(root.path().join("pnpm-workspace.yaml")).unwrap()
+        );
+        assert_eq!(location.range.start.line, 2);
+        assert_eq!(location.range.start.character, 12);
+        assert_eq!(location.range.end.character, 19);
+    }
+
+    #[test]
+    fn test_apply_empty_entry_is_a_malformed_entry_for_package_json() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        workspace(root.path(), "catalog:\n  react:\n");
+        let cache = PnpmWorkspaceCache::new();
+        let config = load(Some(root.path()), &cache);
+
+        let mut deps = vec![dep("react", "catalog:")];
+        apply(&mut deps, config.as_deref());
+
+        assert_eq!(
+            deps[0].catalog_ref().unwrap().outcome,
+            CatalogOutcome::MalformedEntry
+        );
+    }
+
+    #[test]
+    fn test_oversized_workspace_file_degrades_to_malformed() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        let filler = "# padding padding padding padding padding padding padding\n";
+        let mut content = String::from("catalog:\n  react: ^18.0.0\n");
+        while content.len()
+            <= usize::try_from(deps_core::mtime_cache::MAX_CACHED_FILE_BYTES).unwrap()
+        {
+            content.push_str(filler);
+        }
+        workspace(root.path(), &content);
+        let cache = PnpmWorkspaceCache::new();
+        let config = load(Some(root.path()), &cache);
+
+        let mut deps = vec![dep("react", "catalog:")];
+        apply(&mut deps, config.as_deref());
+
+        assert_eq!(
+            deps[0].catalog_ref().unwrap().outcome,
+            CatalogOutcome::MalformedWorkspaceFile
+        );
+    }
+
+    #[test]
+    fn test_apply_missing_entry_has_no_location() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        workspace(root.path(), "catalog:\n  vue: ^3.0.0\n");
+        let cache = PnpmWorkspaceCache::new();
+        let config = load(Some(root.path()), &cache);
+
+        let mut deps = vec![dep("react", "catalog:")];
+        apply(&mut deps, config.as_deref());
+
+        assert_eq!(deps[0].catalog_ref().unwrap().entry, None);
+    }
+
+    #[test]
+    fn test_catalog_named_default_resolves_as_the_default_catalog() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        workspace(root.path(), "catalogs:\n  default:\n    react: ^18.0.0\n");
+        let cache = PnpmWorkspaceCache::new();
+        let config = load(Some(root.path()), &cache);
+
+        let mut deps = vec![dep("react", "catalog:"), dep("react", "catalog:default")];
+        apply(&mut deps, config.as_deref());
+
+        for dep in &deps {
+            assert_eq!(dep.catalog_ref().unwrap().id, CatalogId::Default);
+            assert_eq!(dep.version_req, Some("^18.0.0".into()));
+        }
+    }
+
+    #[test]
+    fn test_catalog_entry_dependency_is_never_rewritten_by_apply() {
+        let mut entry = dep("react", "catalog:");
+        entry.origin = NpmDependencyOrigin::CatalogEntry {
+            id: CatalogId::Default,
+            site: crate::types::CatalogSite::TopLevelCatalog,
+        };
+        let mut deps = vec![entry];
+        apply(&mut deps, None);
+        assert_eq!(deps[0].version_req, Some("catalog:".into()));
+        assert_eq!(deps[0].catalog_ref(), None);
+    }
+
     deps_core::debug_redaction_conformance!(
         test_catalog_origin_debug_redacts_credentials,
         2,
         CatalogOrigin {
             specifier: deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string(),
-            catalog: Some(deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string()),
+            id: CatalogId::from_name(deps_core::conformance::CREDENTIAL_PROBE_KEY),
             outcome: CatalogOutcome::MissingEntry,
+            entry: None,
         },
     );
 
@@ -788,7 +864,7 @@ mod tests {
 
         assert_eq!(deps[0].version_req, Some("^18.3.0".into()));
         assert_matches!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::Resolved(ref r) if r == "^18.3.0"
         );
     }
@@ -855,13 +931,12 @@ mod tests {
 
         assert_eq!(deps[0].version_req, None);
         assert_eq!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::MissingEntry
         );
         assert!(
             deps[0]
-                .catalog
-                .as_ref()
+                .catalog_ref()
                 .unwrap()
                 .diagnostic_message("left-pad")
                 .unwrap()
@@ -883,7 +958,7 @@ mod tests {
 
         assert_eq!(deps[0].version_req, None);
         assert_eq!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::UnknownCatalog
         );
     }
@@ -901,7 +976,7 @@ mod tests {
 
         assert_eq!(deps[0].version_req, None);
         assert_eq!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::NoWorkspaceFile
         );
     }
@@ -918,7 +993,7 @@ mod tests {
 
         assert_eq!(deps[0].version_req, None);
         assert_eq!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::NoWorkspaceFile
         );
     }
@@ -936,7 +1011,7 @@ mod tests {
         apply(&mut deps, config.as_deref());
 
         assert_eq!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::MissingEntry
         );
     }
@@ -959,7 +1034,7 @@ mod tests {
         for d in &deps {
             assert_eq!(d.version_req, None);
             assert_eq!(
-                d.catalog.as_ref().unwrap().outcome,
+                d.catalog_ref().unwrap().outcome,
                 CatalogOutcome::DuplicateDefaultCatalog
             );
         }
@@ -978,7 +1053,7 @@ mod tests {
         apply(&mut deps, config.as_deref());
 
         assert_eq!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::MalformedWorkspaceFile
         );
     }
@@ -996,7 +1071,7 @@ mod tests {
         apply(&mut deps, config.as_deref());
 
         assert_eq!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::MalformedWorkspaceFile
         );
     }
@@ -1035,7 +1110,7 @@ mod tests {
 
         assert_eq!(deps[0].version_req, None);
         assert_eq!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::MalformedWorkspaceFile
         );
     }
@@ -1054,12 +1129,11 @@ mod tests {
 
         assert_eq!(deps[0].version_req, None);
         assert_eq!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::MalformedEntry
         );
         let message = deps[0]
-            .catalog
-            .as_ref()
+            .catalog_ref()
             .unwrap()
             .diagnostic_message("react")
             .unwrap();
@@ -1085,7 +1159,7 @@ mod tests {
 
         assert_eq!(deps[0].version_req, Some("1.2".into()));
         assert_matches!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::Resolved(ref r) if r == "1.2"
         );
     }
@@ -1108,7 +1182,7 @@ mod tests {
 
         assert_eq!(deps[0].version_req, Some("~*".into()));
         assert_matches!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::Resolved(ref r) if r == "~*"
         );
     }
@@ -1134,12 +1208,11 @@ mod tests {
 
         assert_eq!(deps[0].version_req, None);
         assert_eq!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::RequirementTooLong
         );
         let message = deps[0]
-            .catalog
-            .as_ref()
+            .catalog_ref()
             .unwrap()
             .diagnostic_message("react")
             .unwrap();
@@ -1164,7 +1237,7 @@ mod tests {
         apply(&mut deps, config.as_deref());
 
         assert_eq!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::NonSemverEntry { value: at_cap }
         );
     }
@@ -1197,7 +1270,7 @@ mod tests {
 
         assert_eq!(deps[0].version_req, Some(at_cap_valid.clone().into()));
         assert_matches!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::Resolved(ref r) if *r == at_cap_valid
         );
     }
@@ -1216,15 +1289,14 @@ mod tests {
 
         assert_eq!(deps[0].version_req, None);
         assert_eq!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::NonSemverEntry {
                 value: "workspace:*".to_string()
             }
         );
         assert!(
             deps[0]
-                .catalog
-                .as_ref()
+                .catalog_ref()
                 .unwrap()
                 .diagnostic_message("left-pad")
                 .is_none()
@@ -1265,7 +1337,7 @@ mod tests {
         apply(&mut deps, config.as_deref());
 
         assert_eq!(deps[0].version_req, Some("^4.18.2".into()));
-        assert!(deps[0].catalog.is_none());
+        assert!(deps[0].catalog_ref().is_none());
     }
 
     /// M4: a directory named `pnpm-workspace.yaml` exercises the "found but unreadable"
@@ -1285,7 +1357,7 @@ mod tests {
 
         assert_eq!(deps[0].version_req, None);
         assert_eq!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::MalformedWorkspaceFile
         );
     }
@@ -1308,7 +1380,7 @@ mod tests {
         apply(&mut deps, config.as_deref());
 
         assert_eq!(
-            deps[0].catalog.as_ref().unwrap().outcome,
+            deps[0].catalog_ref().unwrap().outcome,
             CatalogOutcome::MalformedWorkspaceFile
         );
     }
@@ -1322,8 +1394,8 @@ mod tests {
 
         assert_eq!(deps[0].version_req, Some("^4.18.2".into()));
         assert_eq!(deps[1].version_req, Some("^4.17.21".into()));
-        assert!(deps[0].catalog.is_none());
-        assert!(deps[1].catalog.is_none());
+        assert!(deps[0].catalog_ref().is_none());
+        assert!(deps[1].catalog_ref().is_none());
     }
 
     // --- Security audit HIGH finding: Markdown injection in hover_detail/diagnostic_message ---
@@ -1331,8 +1403,9 @@ mod tests {
     fn origin(specifier: &str, catalog: Option<&str>, outcome: CatalogOutcome) -> CatalogOrigin {
         CatalogOrigin {
             specifier: specifier.to_string(),
-            catalog: catalog.map(str::to_string),
+            id: catalog.map_or(CatalogId::Default, CatalogId::from_name),
             outcome,
+            entry: None,
         }
     }
 

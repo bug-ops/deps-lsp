@@ -22,7 +22,10 @@ are resolved from the same host the `url:` points at: **GitHub's tags API**, via
 `deps_core::github`'s shared client (also used by GitHub Actions — see below). A `.branch`/
 `.revision` dependency is not version-resolvable at all and is shown as a non-registry `Git`
 source with no hover version data. When a `Package.resolved` lock file is present alongside
-the manifest, it is read to show each dependency's actual pinned (in-use) revision/version.
+the manifest, it is read to show each dependency's actual pinned (in-use) revision/version. A pin
+is matched even when `Package.resolved` spells the repository with different letter case than the
+manifest (`Apple/swift-argument-parser` against `apple/swift-argument-parser`) for GitHub-hosted
+URLs.
 
 A `traits:` argument (SwiftPM 6.1) of any shape is accepted after the requirement; its value is
 never parsed. A `.package(id: "scope.name", from: "1.0.0")` registry dependency (SE-0292) is
@@ -231,6 +234,82 @@ A `401` never triggers a new lookup, and without a found item no credential is s
 
 `Package.resolved` `registry` pins are shown as registry sources, and a pin of an unrecognized
 `kind` is skipped instead of being treated as a source-control pin.
+
+## Replacing Source Control with a Registry (issue #1757)
+
+SwiftPM can resolve a `.package(url:)` dependency from a registry instead of its git repository
+(`--replace-scm-with-registry`). The flag exists only on the `swift` and `xcodebuild` command
+line, so `deps-lsp` cannot detect it from your files; you opt in with a setting:
+
+```json
+{ "registries": { "swift_scm_to_registry": "replace" } }
+```
+
+| Value | Behavior |
+|---|---|
+| `"disabled"` (default) | `url:` dependencies show source-control tags, as before |
+| `"replace"` | an eligible `url:` dependency is looked up in your default registry and, if it is registered there, shown with the registry's versions |
+
+Take this manifest, with `swift_scm_to_registry` set to `"replace"` and a default registry in your
+user-level `registries.json`:
+
+```swift
+.package(url: "https://github.com/apple/swift-nio", from: "2.0.0")
+```
+
+`deps-lsp` asks the registry's SE-0292 identifiers endpoint
+(`GET {default}/identifiers?url=https://github.com/apple/swift-nio`). When exactly one identity
+comes back (`apple.swift-nio`), the dependency is treated as `.package(id: "apple.swift-nio", ...)`:
+hover, inlay hints, completion, diagnostics and `Package.resolved` registry pins all behave as for
+an `id:` dependency, and hover adds the line
+`Resolved via registry identity apple.swift-nio (from https://github.com/apple/swift-nio)`. The
+vulnerability section keeps showing advisories filed against the source repository, and license
+checks and your `license_policy` rules still apply.
+
+**Which dependencies are eligible.** Only version requirements (`from:`, `.upToNextMajor`,
+`.upToNextMinor`, `.exact`, ranges) on an `https` or `http` URL. `branch:` and `revision:`
+dependencies are never replaced, as in SwiftPM, because a registry has only versions. scp-like and
+`ssh` URLs are not replaced either; SwiftPM would replace them, so this is a deliberate
+difference.
+
+**What happens when the lookup does not give a single answer.**
+
+| Registry answer | Result |
+|---|---|
+| exactly one identity | registry versions |
+| not registered (404 or empty) | source-control versions, no diagnostic |
+| several identities, or an identity that is not a valid `scope.name` | source-control versions |
+| transport error, 5xx, rate limit | source-control versions plus an information notice: `registry identity lookup failed; showing source-control versions` |
+
+A known answer is kept for an hour and is refreshed in the background without changing what you
+see; a failed refresh never replaces an earlier answer. The first time a manifest is opened the
+lookups run before the version fetch; a document opened while another one is still warming the
+same URL is re-parsed once the answer arrives.
+
+**Trust.** Only the `[default]` registry of your **user-level** `registries.json` is asked, and
+only when it is [trusted](#trust-and-credentials). A project-level `registries.json` is never
+consulted for this feature, even though SwiftPM would, because a cloned repository controls it.
+With `"replace"` set and no trusted user-level default, `deps-lsp` logs one warning and behaves as
+if the setting were `"disabled"`. A returned identity must also map to a registry through your
+user-level scope table or that default.
+
+**Privacy.** The repository URL is sent to your registry with any username, password, query string
+and fragment removed (`https://oauth2:TOKEN@gitlab.example.com/x.git?private_token=y` is sent as
+`https://gitlab.example.com/x`), and the host is lowercased while the path keeps its case. If the
+registry does not know the URL as written, one retry is made with the form that drops a trailing
+`.git`. The credentials you configured for that registry are attached by the usual rules in
+[Trust and credentials](#trust-and-credentials).
+
+**`deps-cli`.** `check` and `update` wait for all lookups, so they show the same result as the
+editor. If some lookups do not complete, `deps-cli` prints one note on stderr and uses
+source-control versions for those dependencies:
+
+```text
+N registry identity lookups incomplete; using source-control versions
+```
+
+Changing the setting re-parses every open `Package.swift`. Reading the Xcode default
+`IDEPackageDependencySCMToRegistryTransformation` is not supported; set the value yourself.
 
 ## Non-GitHub Package Hosts (issues #979, #983, #924)
 

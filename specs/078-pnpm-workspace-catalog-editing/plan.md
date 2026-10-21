@@ -63,7 +63,7 @@ pub struct CatalogOrigin { /* existing */ pub entry: Option<CatalogEntryLocation
 - `DEFAULT_CATALOG_KEY` is removed; catalog maps key on `CatalogId`.
 - `DiagnosticKind::DuplicateDefaultCatalog` (deps-core): code `pnpm-duplicate-default-catalog`, severity Error. The
   exhaustive `deps-cli` `classify` match maps it to `Category::Other`; the default fail set is unchanged, so there is
-  no CLI behavior change and no `### Changed` entry. The code stays for editor filtering and the SARIF rule id.
+  no CLI behavior change and no `### Changed` entry. The code is the LSP diagnostic code only (editor filtering); the SARIF rule id keeps the existing category mapping (`other`), `sarif_rule_id` unchanged.
 
 ## 3. Parser
 
@@ -73,7 +73,7 @@ pub struct CatalogOrigin { /* existing */ pub entry: Option<CatalogEntryLocation
 
 - Reads only `catalog:` and `catalogs:`; every other key (`packages`, `overrides`, settings) is skipped by the walker.
 - Entry value classes: plain / quoted literal, numeric-looking scalar (string `1.2`, cf. #721), alias (finding on the
-  `*r` span, `version_literal = None`), anchor-defining scalar (range excludes `&r`), block scalar / tagged scalar
+  `*r` span, `version_literal = None`), anchor-defining scalar (range excludes `&r`), block scalar (findings anchored on the header indicator token, version text trimmed, no edit) / tagged non-string or escape-bearing quoted scalar
   (findings only), mapping / sequence (skipped).
 - Capture the quoting style so edits preserve it; apply `MAX_REQUIREMENT_LEN` and `MAX_DEPENDENCIES_PER_DOCUMENT`.
 - A syntactically invalid document yields a defect and zero entries (FR-027).

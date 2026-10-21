@@ -27,7 +27,7 @@ pub use key::{
     MAX_PARSE_ERROR_LOG_BYTES, is_credential_or_query_bearing, parse_error_source,
     redact_declaration_key, redact_parse_error_for_log, sanitize_invisible,
 };
-pub use url::{redact_userinfo, url_for_tracing};
+pub use url::{redact_userinfo, strip_url_credentials, url_for_tracing};
 pub use wrapper::{
     NameRedaction, RedactedName, RedactedText, RedactedUrl, RedactionKind, UrlRedaction,
 };

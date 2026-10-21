@@ -2,7 +2,7 @@
 //!
 //! A floating tag pin (`@v4`) is rescanned after a registry fetch only for the document whose
 //! fetch refreshed the tag index. An ecosystem that exposes
-//! [`Ecosystem::tag_index_refreshes`] emits the repository name on every refresh, from any
+//! [`Ecosystem::refresh_events`] emits the repository name on every refresh, from any
 //! source (lifecycle fetch, completion), and the listener here, for every other open document
 //! that uses that repository, re-evaluates the OSV scan-plan predicate
 //! ([`rescan_osv_if_tag_index_now_warm`], which applies the vulnerability/offline gate itself)
@@ -15,7 +15,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use deps_core::{Dependency, Ecosystem, EcosystemId, PackageName, TagIndexRefreshes};
+use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::{
+    Dependency, Ecosystem, EcosystemId, NormalizedName, PackageKey, RefreshEvent, RefreshEvents,
+};
 use tokio::sync::{RwLock, broadcast::error::RecvError};
 use tokio::task::JoinSet;
 use tower_lsp_server::Client;
@@ -30,7 +33,7 @@ use crate::handlers::diagnostics::{self, DiagnosticsSnapshot};
 
 /// Window over which refresh events are merged into one sweep, so a manifest fetch that
 /// refreshes many repositories triggers one pass over the open documents, not one per event.
-const COALESCE_WINDOW: Duration = Duration::from_millis(250);
+pub(super) const COALESCE_WINDOW: Duration = Duration::from_millis(250);
 
 /// Upper bound on documents rescanned at once, so one slow OSV phase A (up to
 /// `fetch_timeout`) cannot stall the others.
@@ -38,33 +41,43 @@ const RESCAN_CONCURRENCY: usize = 4;
 
 /// Which repositories' tag indexes were refreshed within one coalescing window.
 #[derive(Debug, PartialEq, Eq)]
-enum RefreshedRepos {
-    Only(HashSet<PackageName>),
+pub(super) enum RefreshedRepos {
+    Only(HashSet<NormalizedName>),
     /// The receiver lagged and events were dropped: every repository must be assumed refreshed.
     All,
 }
 
 impl RefreshedRepos {
-    fn add(&mut self, name: PackageName) {
+    /// No repository refreshed yet.
+    pub(super) fn none() -> Self {
+        Self::Only(HashSet::new())
+    }
+
+    pub(super) fn add(&mut self, name: NormalizedName) {
         if let Self::Only(names) = self {
             names.insert(name);
         }
     }
 
-    fn covers(&self, dependencies: &[&dyn Dependency]) -> bool {
+    fn covers(&self, dependencies: &[&dyn Dependency], formatter: &dyn EcosystemFormatter) -> bool {
         match self {
-            Self::Only(names) => dependencies.iter().any(|dep| names.contains(dep.name())),
+            Self::Only(names) => dependencies
+                .iter()
+                .any(|dep| names.contains(PackageKey::new(dep.name(), formatter).normalized())),
             Self::All => true,
         }
     }
 }
 
 /// URIs of the open documents of `ecosystem` that use a repository in `refreshed`.
-fn affected_documents(
+pub(super) fn affected_documents(
     state: &ServerState,
     ecosystem: EcosystemId,
     refreshed: &RefreshedRepos,
 ) -> Vec<Uri> {
+    let Some(eco) = state.ecosystem_registry.get(ecosystem) else {
+        return Vec::new();
+    };
     state
         .documents
         .iter()
@@ -73,7 +86,7 @@ fn affected_documents(
             doc.ecosystem == ecosystem
                 && doc
                     .parse_result()
-                    .is_some_and(|parsed| refreshed.covers(&parsed.dependencies()))
+                    .is_some_and(|parsed| refreshed.covers(&parsed.dependencies(), eco.formatter()))
         })
         .map(|entry| entry.key().clone())
         .collect()
@@ -145,7 +158,7 @@ where
 async fn drain_refreshes<F, Fut>(
     state: &ServerState,
     ecosystem: EcosystemId,
-    mut refreshes: TagIndexRefreshes,
+    mut refreshes: RefreshEvents,
     rescan: F,
     after_sweep: impl Fn(),
 ) where
@@ -154,7 +167,10 @@ async fn drain_refreshes<F, Fut>(
 {
     loop {
         let mut pending = match refreshes.recv().await {
-            Ok(name) => RefreshedRepos::Only(HashSet::from([name])),
+            Ok(RefreshEvent::TagIndex(name)) => RefreshedRepos::Only(HashSet::from([name])),
+            Ok(RefreshEvent::ProbeEvidence(_) | RefreshEvent::ReparseOpenDocuments { .. }) => {
+                continue;
+            }
             Err(RecvError::Lagged(_)) => RefreshedRepos::All,
             Err(RecvError::Closed) => return,
         };
@@ -163,7 +179,10 @@ async fn drain_refreshes<F, Fut>(
         loop {
             match tokio::time::timeout_at(deadline, refreshes.recv()).await {
                 Err(_elapsed) => break,
-                Ok(Ok(name)) => pending.add(name),
+                Ok(Ok(RefreshEvent::TagIndex(name))) => pending.add(name),
+                Ok(Ok(
+                    RefreshEvent::ProbeEvidence(_) | RefreshEvent::ReparseOpenDocuments { .. },
+                )) => {}
                 Ok(Err(RecvError::Lagged(_))) => pending = RefreshedRepos::All,
                 Ok(Err(RecvError::Closed)) => {
                     closed = true;
@@ -213,7 +232,7 @@ async fn run_listener(
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
     ecosystem: Arc<dyn Ecosystem>,
-    refreshes: TagIndexRefreshes,
+    refreshes: RefreshEvents,
 ) {
     drain_refreshes(
         &state,
@@ -254,7 +273,7 @@ async fn run_listener(
 
 /// Tag-refresh receivers taken at server construction, before any document can open, so no
 /// first-populate event is lost between construction and the listener starting.
-pub(crate) struct TagRefreshSubscriptions(Vec<(Arc<dyn Ecosystem>, TagIndexRefreshes)>);
+pub(crate) struct TagRefreshSubscriptions(Vec<(Arc<dyn Ecosystem>, RefreshEvents)>);
 
 impl std::fmt::Debug for TagRefreshSubscriptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -274,7 +293,7 @@ impl TagRefreshSubscriptions {
                 .into_iter()
                 .filter_map(|id| state.ecosystem_registry.get(id))
                 .filter_map(|ecosystem| {
-                    let refreshes = ecosystem.tag_index_refreshes()?;
+                    let refreshes = ecosystem.refresh_events()?;
                     Some((ecosystem, refreshes))
                 })
                 .collect(),
@@ -292,13 +311,15 @@ impl TagRefreshSubscriptions {
         TagRefreshTasks(
             self.0
                 .into_iter()
-                .map(|(ecosystem, refreshes)| {
-                    spawn_supervised(
+                .flat_map(|(ecosystem, refreshes)| {
+                    let probe_events = refreshes.resubscribe();
+                    let reparse_events = refreshes.resubscribe();
+                    let rescans = spawn_supervised(
                         run_listener(
                             Arc::clone(state),
                             client.clone(),
                             Arc::clone(config),
-                            ecosystem,
+                            Arc::clone(&ecosystem),
                             refreshes,
                         )
                         .instrument(tracing::Span::current()),
@@ -308,7 +329,40 @@ impl TagRefreshSubscriptions {
                                  refreshed tag index are rescanned only on their own next fetch"
                             );
                         },
-                    )
+                    );
+                    let reparses = spawn_supervised(
+                        super::reparse_events::run_reparse_listener(
+                            Arc::clone(state),
+                            client.clone(),
+                            Arc::clone(config),
+                            ecosystem.ecosystem_id(),
+                            reparse_events,
+                        )
+                        .instrument(tracing::Span::current()),
+                        |e| {
+                            tracing::error!(
+                                "reparse listener panicked ({e}); documents re-parse on their \
+                                 own next edit"
+                            );
+                        },
+                    );
+                    let probes = spawn_supervised(
+                        super::probes::run_probe_listener(
+                            Arc::clone(state),
+                            client.clone(),
+                            Arc::clone(config),
+                            ecosystem,
+                            probe_events,
+                        )
+                        .instrument(tracing::Span::current()),
+                        |e| {
+                            tracing::error!(
+                                "probe listener panicked ({e}); documents are probed again on \
+                                 their own next fetch"
+                            );
+                        },
+                    );
+                    [rescans, probes, reparses]
                 })
                 .collect(),
         )
@@ -405,6 +459,11 @@ mod tests {
 
     use super::*;
     use crate::document::DocumentState;
+    use deps_core::PackageName;
+
+    fn tag_event(name: impl AsRef<str>) -> RefreshEvent {
+        RefreshEvent::TagIndex(NormalizedName::for_test(name.as_ref()))
+    }
 
     async fn open_document(state: &ServerState, path: &str, content: &str) -> Uri {
         let url = deps_core::test_util::test_uri(path);
@@ -454,7 +513,7 @@ mod tests {
         let needs_refresh = sweep(
             &state,
             EcosystemId::GithubActions,
-            &RefreshedRepos::Only(HashSet::from([PackageName::new("o/shared")])),
+            &RefreshedRepos::Only(HashSet::from([NormalizedName::for_test("o/shared")])),
             counting_rescan(&seen, RescanOutcome::Unchanged),
         )
         .await;
@@ -506,7 +565,7 @@ mod tests {
         sweep(
             &state,
             EcosystemId::GitlabCi,
-            &RefreshedRepos::Only(HashSet::from([project])),
+            &RefreshedRepos::Only(HashSet::from([NormalizedName::for_test(project.as_str())])),
             counting_rescan(&seen, RescanOutcome::Unchanged),
         )
         .await;
@@ -636,7 +695,7 @@ mod tests {
         let (tx, rx) = tokio::sync::broadcast::channel(16);
         let refreshes = AtomicUsize::new(0);
         for repo in repos {
-            tx.send(PackageName::new(*repo)).unwrap();
+            tx.send(tag_event(*repo)).unwrap();
         }
         drop(tx);
         drain_refreshes(
@@ -717,8 +776,8 @@ mod tests {
         let (tx, rx) = tokio::sync::broadcast::channel(16);
         let seen = Arc::default();
 
-        tx.send(PackageName::new("o/shared")).unwrap();
-        tx.send(PackageName::new("o/shared")).unwrap();
+        tx.send(tag_event("o/shared")).unwrap();
+        tx.send(tag_event("o/shared")).unwrap();
         drop(tx);
         drain_refreshes(
             &state,
@@ -741,7 +800,7 @@ mod tests {
         let seen = Arc::default();
 
         for i in 0..5 {
-            tx.send(PackageName::new(format!("o/other{i}"))).unwrap();
+            tx.send(tag_event(format!("o/other{i}"))).unwrap();
         }
         drop(tx);
         drain_refreshes(
@@ -778,7 +837,7 @@ mod tests {
         });
 
         tokio::time::sleep(Duration::from_secs(10)).await;
-        tx.send(PackageName::new("o/shared")).unwrap();
+        tx.send(tag_event("o/shared")).unwrap();
         tokio::time::sleep(COALESCE_WINDOW * 2).await;
         assert_eq!(*seen.lock().unwrap(), vec![peer]);
 
@@ -852,7 +911,7 @@ mod tests {
             Arc::clone(&ecosystem),
             rx,
         ));
-        tx.send(PackageName::new("actions/checkout")).unwrap();
+        tx.send(tag_event("actions/checkout")).unwrap();
         drop(tx);
         tokio::time::timeout(Duration::from_secs(10), listener)
             .await
@@ -949,9 +1008,9 @@ mod tests {
             || {},
         );
         let producer = async {
-            tx.send(PackageName::new("o/shared")).unwrap();
+            tx.send(tag_event("o/shared")).unwrap();
             tokio::time::sleep(COALESCE_WINDOW * 4).await;
-            tx.send(PackageName::new("o/shared")).unwrap();
+            tx.send(tag_event("o/shared")).unwrap();
             drop(tx);
         };
         tokio::join!(drain, producer);

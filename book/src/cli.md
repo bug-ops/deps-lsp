@@ -138,7 +138,8 @@ replaces that default list rather than extending it. `sha-comment-mismatch` sele
 (GitHub Actions/GitLab CI) whose trailing version comment is not confirmed by the repository's
 tag index; it matches regardless of the finding's severity and is never part of the default
 policy. `unknown-ref` selects tag pins whose ref is a full release that no published tag of the
-repository matches (see [GitHub Actions](ecosystems/github-actions.md#unpublished-refs-and-the-unknown-ref-diagnostic-issue-1766));
+repository matches, and partial refs such as `@v40` that are neither a published tag nor a branch
+(see [GitHub Actions](ecosystems/github-actions.md#unpublished-refs-and-the-unknown-ref-diagnostic-issue-1766));
 it is likewise severity-agnostic and never part of the default policy. `other` covers every
 finding that matches none of the nine specific categories and is never part of the default
 policy.
@@ -148,6 +149,21 @@ notice, the skipped-lookup notice for any manifest without a lock file, an unres
 self-hosted GitLab host, the dependency-ceiling notice, and collapsed registry-fetch failures.
 It therefore fails the run on any manifest without a lock file and on every `--offline` run,
 and cannot target one of these findings alone.
+
+**Branch checks and the stderr note.** Deciding that `@v40` names neither a tag nor a branch takes
+one request per ref to the forge (GitHub or GitLab), rationed by a per-host allowance: without
+`GITHUB_TOKEN`/`GITLAB_TOKEN` only a few checks run per hour, with a token many more. Checks that
+are skipped for budget reasons or end inconclusively never produce a finding. With
+`--fail-on unknown-ref`, `deps-cli` then prints exactly one line on stderr, and the exit code is
+unaffected:
+
+```text
+N ref probes skipped (rate budget/inconclusive); set GITHUB_TOKEN/GITLAB_TOKEN in CI
+```
+
+In CI, set the token so a mistyped ref cannot slip through unchecked. `--offline` skips every
+check, and the same checks also decide whether a commit-pinned action ahead of its latest release is
+up to date (see [GitHub Actions](ecosystems/github-actions.md#commits-ahead-of-the-latest-release-issue-1725)).
 
 | Exit code | Meaning |
 |---|---|
@@ -261,6 +277,12 @@ typosquat diagnostic is `deps-lsp` only, and a non-default `[typosquat]` section
 > **Note:** `registries.swift_keychain_credentials` is not supported in `deps-cli`, which cannot
 > answer a macOS Keychain access prompt: an explicit `--config` with it enabled prints a warning
 > and runs with it disabled. See [Swift macOS Keychain credentials](ecosystems/swift.md#macos-keychain-credentials).
+
+> **Note:** `registries.swift_scm_to_registry = "replace"` works in `deps-cli` only from an explicit
+> `--config` (an auto-discovered `deps.toml` has its `registries` section reset, like the other
+> settings above). `check` and `update` wait for every identity lookup and print one stderr note
+> when some did not complete. See
+> [Replacing Source Control with a Registry](ecosystems/swift.md#replacing-source-control-with-a-registry-issue-1757).
 
 ## `update` usage
 

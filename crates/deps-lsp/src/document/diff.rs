@@ -2,13 +2,13 @@
 //! parses of a manifest.
 
 use super::state::{DocumentState, ServerState};
-use deps_core::ConcreteVersion;
 use deps_core::Dependency;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::FetchFailure;
-use deps_core::NormalizeName;
-use deps_core::PackageName;
+use deps_core::NormalizedName;
+use deps_core::ResolvedCandidatesMap;
+use deps_core::ResolvedVersionsMap;
 use deps_core::VersionReq;
 use std::collections::{HashMap, HashSet};
 use tower_lsp_server::ls_types::Uri;
@@ -62,31 +62,74 @@ pub(crate) fn preserve_cache(new_state: &mut DocumentState, old_state: &Document
 /// placeholder guards regardless of what `outcomes` still says.
 pub(crate) fn drop_cache_for_forced_refetch(
     doc: &mut DocumentState,
-    deps_to_fetch: &[PackageName],
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+    deps_to_fetch: &[NormalizedName],
 ) {
     doc.signals.cached_versions.clear();
     doc.signals.outcomes.clear_all_fetch_failures();
     for name in deps_to_fetch {
-        doc.signals.outcomes.set_fetch_failure_if_absent(
-            formatter.normalize_package_name(name),
-            FetchFailure::NotAttempted,
-        );
+        doc.signals
+            .outcomes
+            .set_fetch_failure_if_absent(name.clone(), FetchFailure::NotAttempted);
     }
 }
 
-/// Diff between old and new dependency sets.
+/// Package keys no longer declared under any spelling after an edit.
+///
+/// Built only by [`DependencyDiff::compute`] (its `removed` set), so a prune can never be
+/// driven by a hand-assembled or re-derived list of names. Deliberately has no `Default`: an
+/// empty value is obtained by diffing, not by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrphanedKeys(Vec<NormalizedName>);
+
+impl OrphanedKeys {
+    /// The orphaned package keys.
+    pub(crate) fn as_slice(&self) -> &[NormalizedName] {
+        &self.0
+    }
+
+    /// Number of orphaned packages.
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, name: &NormalizedName) -> bool {
+        self.0.contains(name)
+    }
+}
+
+/// Orphans exactly `names`, by diffing a manifest that declared them against an empty one —
+/// the same path production takes, so tests cannot mint a prune list the diff would not.
+#[cfg(test)]
+pub(crate) fn orphaned_for_test(names: &[&str]) -> OrphanedKeys {
+    let old = names
+        .iter()
+        .map(|n| (NormalizedName::for_test(*n), Vec::new()))
+        .collect();
+    DependencyDiff::compute(&old, &HashMap::new()).removed
+}
+
+/// Diff between old and new dependency sets, in [`NormalizedName`] space.
+///
+/// Every spelling of a package collapses to one key, so a pure rename (`Django` -> `django`)
+/// is a no-op and deleting one of two spellings changes the survivor's requirement list
+/// (`version_changed`) instead of removing the package.
 ///
 /// `version_changed` exists because [`Self::added`]/[`Self::removed`] alone
 /// are name-set diffs: editing a dependency's version requirement in place
 /// (e.g. `time = "0.1.43"` -> `"0.1.44"`) changes neither set, so gating the
 /// OSV rescan on `added` alone would silently skip re-scanning the one
 /// dependency whose version just changed (critique S1).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct DependencyDiff {
-    pub(crate) added: Vec<PackageName>,
-    pub(crate) removed: Vec<PackageName>,
-    pub(crate) version_changed: Vec<PackageName>,
+    pub(crate) added: Vec<NormalizedName>,
+    pub(crate) removed: OrphanedKeys,
+    pub(crate) version_changed: Vec<NormalizedName>,
 }
 
 impl DependencyDiff {
@@ -111,20 +154,22 @@ impl DependencyDiff {
     /// `dependency_version_map`'s doc for the consequence of reordering
     /// across an edit.
     pub(crate) fn compute(
-        old: &HashMap<PackageName, Vec<Option<VersionReq>>>,
-        new: &HashMap<PackageName, Vec<Option<VersionReq>>>,
+        old: &HashMap<NormalizedName, Vec<Option<VersionReq>>>,
+        new: &HashMap<NormalizedName, Vec<Option<VersionReq>>>,
     ) -> Self {
-        let old_names: HashSet<&PackageName> = old.keys().collect();
-        let new_names: HashSet<&PackageName> = new.keys().collect();
+        let old_names: HashSet<&NormalizedName> = old.keys().collect();
+        let new_names: HashSet<&NormalizedName> = new.keys().collect();
 
         let added = new_names
             .difference(&old_names)
             .map(|s| (*s).clone())
             .collect();
-        let removed = old_names
-            .difference(&new_names)
-            .map(|s| (*s).clone())
-            .collect();
+        let removed = OrphanedKeys(
+            old_names
+                .difference(&new_names)
+                .map(|s| (*s).clone())
+                .collect(),
+        );
         let version_changed = new_names
             .intersection(&old_names)
             .filter(|name| old.get(**name) != new.get(**name))
@@ -185,13 +230,13 @@ impl DependencyDiff {
 /// just moved can no longer vouch for its previously cached license.
 pub(crate) fn resolved_versions_changed(
     deps: &[&dyn Dependency],
-    old_resolved: &HashMap<PackageName, ConcreteVersion>,
-    old_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
-    new_resolved: &HashMap<PackageName, ConcreteVersion>,
-    new_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
+    old_resolved: &ResolvedVersionsMap,
+    old_candidates: &ResolvedCandidatesMap,
+    new_resolved: &ResolvedVersionsMap,
+    new_candidates: &ResolvedCandidatesMap,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem_id: EcosystemId,
-) -> Vec<PackageName> {
+) -> Vec<NormalizedName> {
     deps.iter()
         .filter_map(|dep| {
             let key = deps_core::PackageKey::new(dep.name(), formatter);
@@ -211,7 +256,7 @@ pub(crate) fn resolved_versions_changed(
                 formatter,
                 ecosystem_id,
             );
-            (old != new).then(|| dep.name().clone())
+            (old != new).then(|| key.normalized().clone())
         })
         .collect()
 }
@@ -267,10 +312,10 @@ pub(crate) fn reload_resolved_versions(
     uri: &Uri,
     state: &ServerState,
     ecosystem: &dyn Ecosystem,
-    resolved_versions: &HashMap<PackageName, ConcreteVersion>,
-    resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
+    resolved_versions: &ResolvedVersionsMap,
+    resolved_version_candidates: &ResolvedCandidatesMap,
 ) -> bool {
-    let changed_names: Vec<PackageName> = state
+    let changed_names: Vec<NormalizedName> = state
         .with_document(uri, |doc| {
             doc.parse_result().map(|parse_result| {
                 let deps = parse_result.dependencies();
@@ -312,6 +357,7 @@ mod tests {
     use deps_core::DependencyOutcomes;
     use deps_core::Deprecation;
     use deps_core::EcosystemId;
+    use deps_core::PackageName;
     use deps_core::PackageVersions;
     use deps_core::RemovalStatus;
     use deps_engine::classify::resolved::dependency_version_map;
@@ -350,18 +396,20 @@ tokio = "1.0"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.signals
-                    .cached_versions
-                    .insert("serde".into(), PackageVersions::latest_only("1.0.210"));
-                doc.signals
-                    .cached_versions
-                    .insert("tokio".into(), PackageVersions::latest_only("1.40.0"));
+                doc.signals.cached_versions.insert(
+                    NormalizedName::for_test("serde"),
+                    PackageVersions::latest_only("1.0.210"),
+                );
+                doc.signals.cached_versions.insert(
+                    NormalizedName::for_test("tokio"),
+                    PackageVersions::latest_only("1.40.0"),
+                );
                 doc.signals
                     .resolved_versions
-                    .insert("serde".into(), "1.0.195".into());
+                    .insert(NormalizedName::for_test("serde"), "1.0.195".into());
                 doc.signals
                     .resolved_versions
-                    .insert("tokio".into(), "1.35.0".into());
+                    .insert(NormalizedName::for_test("tokio"), "1.35.0".into());
             }
 
             {
@@ -398,7 +446,7 @@ tokio = "1.0"
                 assert_eq!(
                     doc.signals
                         .cached_versions
-                        .get("serde")
+                        .get(&NormalizedName::for_test("serde"))
                         .map(|v| v.latest.as_str()),
                     Some("1.0.210"),
                     "serde cache preserved"
@@ -406,7 +454,7 @@ tokio = "1.0"
                 assert_eq!(
                     doc.signals
                         .cached_versions
-                        .get("tokio")
+                        .get(&NormalizedName::for_test("tokio"))
                         .map(|v| v.latest.as_str()),
                     Some("1.40.0"),
                     "tokio cache preserved"
@@ -454,10 +502,11 @@ serde_old = { package = "serde", version = "0.9" }
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.signals
                     .resolved_versions
-                    .insert("serde".into(), "1.0.219".into());
-                doc.signals
-                    .resolved_version_candidates
-                    .insert("serde".into(), vec!["0.9.15".into(), "1.0.219".into()]);
+                    .insert(NormalizedName::for_test("serde"), "1.0.219".into());
+                doc.signals.resolved_version_candidates.insert(
+                    NormalizedName::for_test("serde"),
+                    vec!["0.9.15".into(), "1.0.219".into()],
+                );
             }
 
             // Trivial re-edit (whitespace-only) — this must not reset the candidates map.
@@ -478,7 +527,10 @@ serde_old = { package = "serde", version = "0.9" }
             }
 
             assert_eq!(
-                doc_state2.signals.resolved_version_candidates.get("serde"),
+                doc_state2
+                    .signals
+                    .resolved_version_candidates
+                    .get(&NormalizedName::for_test("serde")),
                 Some(&vec![
                     ConcreteVersion::from("0.9.15"),
                     ConcreteVersion::from("1.0.219")
@@ -519,7 +571,10 @@ serde = "1.0"
             let generation_before = {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.update_resolved_versions(
-                    HashMap::from([(PackageName::new("serde"), ConcreteVersion::from("1.0.210"))]),
+                    HashMap::from([(
+                        NormalizedName::for_test("serde"),
+                        ConcreteVersion::from("1.0.210"),
+                    )]),
                     HashMap::new(),
                     state.next_resolved_versions_generation(),
                 );
@@ -775,15 +830,15 @@ time = "0.1.43"
             let content2 = r#"[dependencies]
 serde = "1.0"
 "#;
-            let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
+            let old_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> =
                 [("serde", None), ("time", None)]
                     .into_iter()
-                    .map(|(n, r)| (PackageName::new(n), vec![r]))
+                    .map(|(n, r)| (NormalizedName::for_test(n), vec![r]))
                     .collect();
-            let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
-                std::iter::once((PackageName::new("serde"), vec![None])).collect();
+            let new_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> =
+                std::iter::once((NormalizedName::for_test("serde"), vec![None])).collect();
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
-            assert_eq!(diff.removed, vec![PackageName::new("time")]);
+            assert_eq!(diff.removed.as_slice(), [NormalizedName::for_test("time")]);
 
             let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
@@ -796,12 +851,8 @@ serde = "1.0"
                 preserve_cache(&mut doc_state2, &old_doc);
             }
 
-            let formatter = ecosystem.formatter();
-            for removed_dep in &diff.removed {
-                doc_state2
-                    .signals
-                    .outcomes
-                    .remove(&formatter.normalize_package_name(removed_dep));
+            for removed_dep in diff.removed.as_slice() {
+                doc_state2.signals.outcomes.remove(removed_dep);
             }
 
             state.update_document(uri.clone(), doc_state2);
@@ -817,7 +868,7 @@ serde = "1.0"
         }
 
         /// Regression guard for issue #649 critic finding S1: `resolved_version_candidates`
-        /// is raw-`dep.name()`-keyed exactly like `resolved_versions`, so it must be pruned
+        /// is normalized-name-keyed exactly like `resolved_versions`, so it must be pruned
         /// on dependency removal the same way, not left holding a stale candidates list for
         /// a name no longer in the manifest.
         #[tokio::test]
@@ -848,20 +899,21 @@ serde_old = { package = "serde", version = "0.9" }
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.signals
                     .resolved_versions
-                    .insert("serde".into(), "1.0.219".into());
-                doc.signals
-                    .resolved_version_candidates
-                    .insert("serde".into(), vec!["0.9.15".into(), "1.0.219".into()]);
+                    .insert(NormalizedName::for_test("serde"), "1.0.219".into());
+                doc.signals.resolved_version_candidates.insert(
+                    NormalizedName::for_test("serde"),
+                    vec!["0.9.15".into(), "1.0.219".into()],
+                );
             }
 
             // Both manifest entries removed — `serde`'s candidates must be pruned along
             // with `resolved_versions`, not left behind as stale data.
             let content2 = "[dependencies]\n";
-            let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
-                std::iter::once((PackageName::new("serde"), vec![None])).collect();
-            let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> = HashMap::new();
+            let old_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> =
+                std::iter::once((NormalizedName::for_test("serde"), vec![None])).collect();
+            let new_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> = HashMap::new();
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
-            assert_eq!(diff.removed, vec![PackageName::new("serde")]);
+            assert_eq!(diff.removed.as_slice(), [NormalizedName::for_test("serde")]);
 
             let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
@@ -873,7 +925,7 @@ serde_old = { package = "serde", version = "0.9" }
             if let Some(old_doc) = state.get_document(&uri) {
                 preserve_cache(&mut doc_state2, &old_doc);
             }
-            for removed_dep in &diff.removed {
+            for removed_dep in diff.removed.as_slice() {
                 doc_state2.signals.cached_versions.remove(removed_dep);
                 doc_state2.signals.resolved_versions.remove(removed_dep);
                 doc_state2
@@ -886,7 +938,7 @@ serde_old = { package = "serde", version = "0.9" }
                 !doc_state2
                     .signals
                     .resolved_version_candidates
-                    .contains_key("serde"),
+                    .contains_key(&NormalizedName::for_test("serde")),
                 "removed dependency's candidates entry must be pruned"
             );
         }
@@ -1039,6 +1091,7 @@ time = "0.1.43"
                     .await
                     .unwrap()
                     .as_ref(),
+                ecosystem.formatter(),
             );
             let new_deps = dependency_version_map(
                 ecosystem
@@ -1046,9 +1099,10 @@ time = "0.1.43"
                     .await
                     .unwrap()
                     .as_ref(),
+                ecosystem.formatter(),
             );
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
-            assert_eq!(diff.version_changed, vec![PackageName::new("time")]);
+            assert_eq!(diff.version_changed, vec![NormalizedName::for_test("time")]);
 
             let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
@@ -1061,11 +1115,9 @@ time = "0.1.43"
                 preserve_cache(&mut doc_state2, &old_doc);
             }
 
-            let formatter = ecosystem.formatter();
             for changed_dep in &diff.version_changed {
-                let normalized = formatter.normalize_package_name(changed_dep);
-                doc_state2.signals.outcomes.clear_yanked(&normalized);
-                doc_state2.signals.outcomes.clear_fetch_failure(&normalized);
+                doc_state2.signals.outcomes.clear_yanked(changed_dep);
+                doc_state2.signals.outcomes.clear_fetch_failure(changed_dep);
             }
 
             state.update_document(uri.clone(), doc_state2);
@@ -1132,15 +1184,15 @@ time = "0.1.43"
             let content2 = r#"[dependencies]
 serde = "1.0"
 "#;
-            let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
+            let old_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> =
                 [("serde", None), ("time", None)]
                     .into_iter()
-                    .map(|(n, r)| (PackageName::new(n), vec![r]))
+                    .map(|(n, r)| (NormalizedName::for_test(n), vec![r]))
                     .collect();
-            let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
-                std::iter::once((PackageName::new("serde"), vec![None])).collect();
+            let new_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> =
+                std::iter::once((NormalizedName::for_test("serde"), vec![None])).collect();
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
-            assert_eq!(diff.removed, vec![PackageName::new("time")]);
+            assert_eq!(diff.removed.as_slice(), [NormalizedName::for_test("time")]);
 
             let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
@@ -1153,12 +1205,8 @@ serde = "1.0"
                 preserve_cache(&mut doc_state2, &old_doc);
             }
 
-            let formatter = ecosystem.formatter();
-            for removed_dep in &diff.removed {
-                doc_state2
-                    .signals
-                    .outcomes
-                    .remove(&formatter.normalize_package_name(removed_dep));
+            for removed_dep in diff.removed.as_slice() {
+                doc_state2.signals.outcomes.remove(removed_dep);
             }
 
             state.update_document(uri.clone(), doc_state2);
@@ -1222,6 +1270,7 @@ time = "=0.1.44"
                     .await
                     .unwrap()
                     .as_ref(),
+                ecosystem.formatter(),
             );
             let new_deps = dependency_version_map(
                 ecosystem
@@ -1229,11 +1278,12 @@ time = "=0.1.44"
                     .await
                     .unwrap()
                     .as_ref(),
+                ecosystem.formatter(),
             );
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
             assert!(diff.added.is_empty());
             assert!(diff.removed.is_empty());
-            assert_eq!(diff.version_changed, vec![PackageName::new("time")]);
+            assert_eq!(diff.version_changed, vec![NormalizedName::for_test("time")]);
 
             let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
@@ -1246,12 +1296,8 @@ time = "=0.1.44"
                 preserve_cache(&mut doc_state2, &old_doc);
             }
 
-            let formatter = ecosystem.formatter();
             for changed_dep in &diff.version_changed {
-                doc_state2
-                    .signals
-                    .outcomes
-                    .clear_yanked(&formatter.normalize_package_name(changed_dep));
+                doc_state2.signals.outcomes.clear_yanked(changed_dep);
             }
 
             state.update_document(uri.clone(), doc_state2);
@@ -1304,15 +1350,15 @@ time = "0.1.43"
             let content2 = r#"[dependencies]
 serde = "1.0"
 "#;
-            let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
+            let old_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> =
                 [("serde", None), ("time", None)]
                     .into_iter()
-                    .map(|(n, r)| (PackageName::new(n), vec![r]))
+                    .map(|(n, r)| (NormalizedName::for_test(n), vec![r]))
                     .collect();
-            let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
-                std::iter::once((PackageName::new("serde"), vec![None])).collect();
+            let new_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> =
+                std::iter::once((NormalizedName::for_test("serde"), vec![None])).collect();
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
-            assert_eq!(diff.removed, vec![PackageName::new("time")]);
+            assert_eq!(diff.removed.as_slice(), [NormalizedName::for_test("time")]);
 
             let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
@@ -1337,12 +1383,8 @@ serde = "1.0"
                 "preserve_cache must carry fetch_failed across an edit"
             );
 
-            let formatter = ecosystem.formatter();
-            for removed_dep in &diff.removed {
-                doc_state2
-                    .signals
-                    .outcomes
-                    .remove(&formatter.normalize_package_name(removed_dep));
+            for removed_dep in diff.removed.as_slice() {
+                doc_state2.signals.outcomes.remove(removed_dep);
             }
 
             state.update_document(uri.clone(), doc_state2);
@@ -1370,7 +1412,7 @@ serde = "1.0"
 
             let diff = DependencyDiff::compute(&old, &new);
             assert!(diff.added.is_empty());
-            assert_eq!(diff.version_changed, vec![PackageName::new("time")]);
+            assert_eq!(diff.version_changed, vec![NormalizedName::for_test("time")]);
             assert!(
                 diff.needs_fetch(),
                 "a version-only edit must trigger the registry fetch"
@@ -1382,7 +1424,7 @@ serde = "1.0"
             deps_to_fetch.extend(diff.version_changed);
             assert_eq!(
                 deps_to_fetch,
-                vec![PackageName::new("time")],
+                vec![NormalizedName::for_test("time")],
                 "the version-changed dependency must be included in the fetch list"
             );
         }
@@ -1512,9 +1554,10 @@ serde = "1.0"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.signals
-                    .cached_versions
-                    .insert("serde".into(), PackageVersions::latest_only("1.0.210"));
+                doc.signals.cached_versions.insert(
+                    NormalizedName::for_test("serde"),
+                    PackageVersions::latest_only("1.0.210"),
+                );
             }
 
             let content2 = r#"[dependencies
@@ -1545,7 +1588,7 @@ serde = "1.0"
             assert_eq!(
                 doc.signals
                     .cached_versions
-                    .get("serde")
+                    .get(&NormalizedName::for_test("serde"))
                     .map(|v| v.latest.as_str()),
                 Some("1.0.210")
             );
@@ -1553,10 +1596,15 @@ serde = "1.0"
 
         fn versions(
             pairs: &[(&str, Option<&str>)],
-        ) -> HashMap<PackageName, Vec<Option<VersionReq>>> {
+        ) -> HashMap<NormalizedName, Vec<Option<VersionReq>>> {
             pairs
                 .iter()
-                .map(|(name, req)| (PackageName::new(*name), vec![req.map(VersionReq::new)]))
+                .map(|(name, req)| {
+                    (
+                        NormalizedName::for_test(*name),
+                        vec![req.map(VersionReq::new)],
+                    )
+                })
                 .collect()
         }
 
@@ -1572,7 +1620,7 @@ serde = "1.0"
             let diff = DependencyDiff::compute(&old, &new);
 
             assert_eq!(diff.added.len(), 1);
-            assert!(diff.added.contains(&PackageName::new("anyhow")));
+            assert!(diff.added.contains(&NormalizedName::for_test("anyhow")));
             assert!(diff.removed.is_empty());
             assert!(diff.needs_fetch());
             assert!(diff.needs_osv_rescan());
@@ -1591,7 +1639,7 @@ serde = "1.0"
 
             assert!(diff.added.is_empty());
             assert_eq!(diff.removed.len(), 1);
-            assert!(diff.removed.contains(&PackageName::new("anyhow")));
+            assert!(diff.removed.contains(&NormalizedName::for_test("anyhow")));
             assert!(!diff.needs_fetch());
             assert!(!diff.needs_osv_rescan());
         }
@@ -1612,7 +1660,7 @@ serde = "1.0"
 
         #[test]
         fn test_dependency_diff_empty_to_new() {
-            let old: HashMap<PackageName, Vec<Option<VersionReq>>> = HashMap::new();
+            let old: HashMap<NormalizedName, Vec<Option<VersionReq>>> = HashMap::new();
             let new = versions(&[("serde", Some("1.0")), ("tokio", Some("1.0"))]);
 
             let diff = DependencyDiff::compute(&old, &new);
@@ -1633,7 +1681,7 @@ serde = "1.0"
 
             assert!(diff.added.is_empty());
             assert!(diff.removed.is_empty());
-            assert_eq!(diff.version_changed, vec![PackageName::new("time")]);
+            assert_eq!(diff.version_changed, vec![NormalizedName::for_test("time")]);
             assert!(
                 diff.needs_fetch(),
                 "a version-only edit must still trigger the registry fetch, \
@@ -1651,7 +1699,7 @@ serde = "1.0"
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             // Regression guard for #394: `time` appears under both
             // `[dependencies]` and `[dev-dependencies]` with different
-            // requirements. A name-keyed `HashMap<PackageName, Option<VersionReq>>`
+            // requirements. A name-keyed `HashMap<NormalizedName, Option<VersionReq>>`
             // would silently collapse this to one entry (whichever section's
             // entry iterates last); `dependency_version_map` must instead
             // keep one requirement per occurrence.
@@ -1675,9 +1723,9 @@ time = "0.1.44"
                 "both `[dependencies]` and `[dev-dependencies]` occurrences of `time` must parse"
             );
 
-            let deps = dependency_version_map(parse_result.as_ref());
+            let deps = dependency_version_map(parse_result.as_ref(), ecosystem.formatter());
             let time_reqs = deps
-                .get(&PackageName::new("time"))
+                .get(&NormalizedName::for_test("time"))
                 .expect("duplicated name must still be present in the map");
             assert_eq!(
                 time_reqs,
@@ -1719,6 +1767,7 @@ time = "0.1.44"
                     .await
                     .unwrap()
                     .as_ref(),
+                ecosystem.formatter(),
             );
 
             let content2 = r#"[dependencies]
@@ -1733,6 +1782,7 @@ time = "0.1.44"
                     .await
                     .unwrap()
                     .as_ref(),
+                ecosystem.formatter(),
             );
 
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
@@ -1740,7 +1790,7 @@ time = "0.1.44"
             assert!(diff.removed.is_empty());
             assert_eq!(
                 diff.version_changed,
-                vec![PackageName::new("time")],
+                vec![NormalizedName::for_test("time")],
                 "editing the losing (first) occurrence of a duplicated name must be detected"
             );
             assert!(diff.needs_fetch());
@@ -1774,6 +1824,7 @@ time = "0.1.44"
                     .await
                     .unwrap()
                     .as_ref(),
+                ecosystem.formatter(),
             );
 
             let content2 = r#"[dependencies]
@@ -1788,6 +1839,7 @@ time = "0.1.60"
                     .await
                     .unwrap()
                     .as_ref(),
+                ecosystem.formatter(),
             );
 
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
@@ -1795,7 +1847,7 @@ time = "0.1.60"
             assert!(diff.removed.is_empty());
             assert_eq!(
                 diff.version_changed,
-                vec![PackageName::new("time")],
+                vec![NormalizedName::for_test("time")],
                 "editing the winning (second) occurrence of a duplicated name must be detected"
             );
             assert!(diff.needs_fetch());
@@ -1834,9 +1886,11 @@ time = "0.1.43"
                 2,
                 "both target-block occurrences of `time` must parse"
             );
-            let old_deps = dependency_version_map(parse_result1.as_ref());
+            let old_deps = dependency_version_map(parse_result1.as_ref(), ecosystem.formatter());
             assert_eq!(
-                old_deps.get(&PackageName::new("time")).map(Vec::len),
+                old_deps
+                    .get(&NormalizedName::for_test("time"))
+                    .map(Vec::len),
                 Some(2),
                 "duplicate-name occurrences under different target blocks must be tracked \
                  per-occurrence, not collapsed to one entry"
@@ -1855,6 +1909,7 @@ time = "0.1.50"
                     .await
                     .unwrap()
                     .as_ref(),
+                ecosystem.formatter(),
             );
 
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
@@ -1862,7 +1917,7 @@ time = "0.1.50"
             assert!(diff.removed.is_empty());
             assert_eq!(
                 diff.version_changed,
-                vec![PackageName::new("time")],
+                vec![NormalizedName::for_test("time")],
                 "editing one target-block occurrence of a duplicated name must still \
                  produce a non-empty diff, even though the other occurrence's \
                  requirement (\"0.1.44\") is unchanged"
@@ -1900,15 +1955,15 @@ anyhow = "1.0"
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.signals.cached_versions.insert(
-                    PackageName::new("serde"),
+                    NormalizedName::for_test("serde"),
                     PackageVersions::latest_only("1.0.210"),
                 );
                 doc.signals.cached_versions.insert(
-                    PackageName::new("tokio"),
+                    NormalizedName::for_test("tokio"),
                     PackageVersions::latest_only("1.40.0"),
                 );
                 doc.signals.cached_versions.insert(
-                    PackageName::new("anyhow"),
+                    NormalizedName::for_test("anyhow"),
                     PackageVersions::latest_only("1.0.89"),
                 );
             }
@@ -1918,14 +1973,14 @@ serde = "1.0"
 tokio = "1.0"
 "#;
 
-            let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
+            let old_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> =
                 ["serde", "tokio", "anyhow"]
                     .iter()
-                    .map(|s| (PackageName::new(*s), vec![None]))
+                    .map(|s| (NormalizedName::for_test(*s), vec![None]))
                     .collect();
-            let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> = ["serde", "tokio"]
+            let new_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> = ["serde", "tokio"]
                 .iter()
-                .map(|s| (PackageName::new(*s), vec![None]))
+                .map(|s| (NormalizedName::for_test(*s), vec![None]))
                 .collect();
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
 
@@ -1940,9 +1995,7 @@ tokio = "1.0"
                 preserve_cache(&mut doc_state2, &old_doc);
             }
 
-            for removed_dep in &diff.removed {
-                doc_state2.signals.cached_versions.remove(removed_dep);
-            }
+            doc_state2.signals.prune_removed(&diff.removed);
 
             state.update_document(uri.clone(), doc_state2);
 
@@ -1952,9 +2005,21 @@ tokio = "1.0"
                 2,
                 "anyhow should be removed from cache"
             );
-            assert!(doc.signals.cached_versions.contains_key("serde"));
-            assert!(doc.signals.cached_versions.contains_key("tokio"));
-            assert!(!doc.signals.cached_versions.contains_key("anyhow"));
+            assert!(
+                doc.signals
+                    .cached_versions
+                    .contains_key(&NormalizedName::for_test("serde"))
+            );
+            assert!(
+                doc.signals
+                    .cached_versions
+                    .contains_key(&NormalizedName::for_test("tokio"))
+            );
+            assert!(
+                !doc.signals
+                    .cached_versions
+                    .contains_key(&NormalizedName::for_test("anyhow"))
+            );
         }
 
         /// Issue #1424 (impl-critic round 2, S1): for a `RegistryDeclaredSpdx` ecosystem
@@ -1987,20 +2052,23 @@ time = "0.1"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.signals
-                    .resolved_versions
-                    .insert(PackageName::new("time"), ConcreteVersion::from("0.1.43"));
+                doc.signals.resolved_versions.insert(
+                    NormalizedName::for_test("time"),
+                    ConcreteVersion::from("0.1.43"),
+                );
                 doc.merge_licenses(HashMap::from([(
-                    PackageName::new("time"),
+                    NormalizedName::for_test("time"),
                     vec!["MIT".to_string()],
                 )]));
             }
 
             // `cargo update` moves `time` to a new resolved version.
-            let new_resolved: HashMap<PackageName, ConcreteVersion> =
-                std::iter::once((PackageName::new("time"), ConcreteVersion::from("0.1.44")))
-                    .collect();
-            let no_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = HashMap::new();
+            let new_resolved: HashMap<NormalizedName, ConcreteVersion> = std::iter::once((
+                NormalizedName::for_test("time"),
+                ConcreteVersion::from("0.1.44"),
+            ))
+            .collect();
+            let no_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
 
             let changed = reload_resolved_versions(
                 &uri,
@@ -2013,7 +2081,9 @@ time = "0.1"
             assert!(changed, "the version move must be detected");
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.signals.licenses.contains_key(&PackageName::new("time")),
+                doc.signals
+                    .licenses
+                    .contains_key(&NormalizedName::for_test("time")),
                 "Cargo's registry-declared license must survive a resolved-version move, \
                  since it isn't tied to the resolved version and nothing would repopulate \
                  it if evicted here"
@@ -2050,11 +2120,12 @@ time = "0.1"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.signals
-                    .resolved_versions
-                    .insert(PackageName::new("http"), ConcreteVersion::from("1.2.0"));
+                doc.signals.resolved_versions.insert(
+                    NormalizedName::for_test("http"),
+                    ConcreteVersion::from("1.2.0"),
+                );
                 doc.merge_licenses(HashMap::from([(
-                    PackageName::new("http"),
+                    NormalizedName::for_test("http"),
                     vec!["BSD-3-Clause".to_string()],
                 )]));
             }
@@ -2063,10 +2134,12 @@ time = "0.1"
             // license re-fetch this move would trigger is never simulated here (and, in
             // particular, never called again) — exactly the "re-fetch fails/doesn't run
             // this round" half of the bug.
-            let new_resolved: HashMap<PackageName, ConcreteVersion> =
-                std::iter::once((PackageName::new("http"), ConcreteVersion::from("1.3.0")))
-                    .collect();
-            let no_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = HashMap::new();
+            let new_resolved: HashMap<NormalizedName, ConcreteVersion> = std::iter::once((
+                NormalizedName::for_test("http"),
+                ConcreteVersion::from("1.3.0"),
+            ))
+            .collect();
+            let no_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
 
             let changed = reload_resolved_versions(
                 &uri,
@@ -2079,7 +2152,9 @@ time = "0.1"
             assert!(changed, "the version move must be detected");
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                !doc.signals.licenses.contains_key(&PackageName::new("http")),
+                !doc.signals
+                    .licenses
+                    .contains_key(&NormalizedName::for_test("http")),
                 "a moved dependency's stale license must be evicted for a tier-3 \
                  (dedicated-fetch) ecosystem, not left misattributed to its new resolved \
                  version"
@@ -2136,15 +2211,17 @@ time = "0.1"
             };
             let deps: Vec<&dyn Dependency> = vec![&time, &serde];
             let formatter = IDENTITY_FORMATTER;
-            let no_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = HashMap::new();
+            let no_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
 
             // `time` newly resolved (no lock file entry before `cargo generate-lockfile`).
-            let old: HashMap<PackageName, ConcreteVersion> =
-                std::iter::once((PackageName::new("serde"), ConcreteVersion::from("1.0.210")))
-                    .collect();
-            let new: HashMap<PackageName, ConcreteVersion> = [
-                (PackageName::new("serde"), "1.0.210".into()),
-                (PackageName::new("time"), "0.1.43".into()),
+            let old: HashMap<NormalizedName, ConcreteVersion> = std::iter::once((
+                NormalizedName::for_test("serde"),
+                ConcreteVersion::from("1.0.210"),
+            ))
+            .collect();
+            let new: HashMap<NormalizedName, ConcreteVersion> = [
+                (NormalizedName::for_test("serde"), "1.0.210".into()),
+                (NormalizedName::for_test("time"), "0.1.43".into()),
             ]
             .into_iter()
             .collect();
@@ -2163,15 +2240,15 @@ time = "0.1"
             );
 
             // `cargo update` moves `time` to a different resolved version.
-            let old: HashMap<PackageName, ConcreteVersion> = [
-                (PackageName::new("serde"), "1.0.210".into()),
-                (PackageName::new("time"), "0.1.43".into()),
+            let old: HashMap<NormalizedName, ConcreteVersion> = [
+                (NormalizedName::for_test("serde"), "1.0.210".into()),
+                (NormalizedName::for_test("time"), "0.1.43".into()),
             ]
             .into_iter()
             .collect();
-            let new: HashMap<PackageName, ConcreteVersion> = [
-                (PackageName::new("serde"), "1.0.210".into()),
-                (PackageName::new("time"), "0.1.44".into()),
+            let new: HashMap<NormalizedName, ConcreteVersion> = [
+                (NormalizedName::for_test("serde"), "1.0.210".into()),
+                (NormalizedName::for_test("time"), "0.1.44".into()),
             ]
             .into_iter()
             .collect();
@@ -2206,17 +2283,17 @@ time = "0.1"
 
             // An unrelated package (not one of `deps`) changing must not trigger a rescan,
             // since only entries for this document's own dependencies are consulted.
-            let old: HashMap<PackageName, ConcreteVersion> = [
-                (PackageName::new("serde"), "1.0.210".into()),
-                (PackageName::new("time"), "0.1.43".into()),
-                (PackageName::new("unrelated"), "2.0.0".into()),
+            let old: HashMap<NormalizedName, ConcreteVersion> = [
+                (NormalizedName::for_test("serde"), "1.0.210".into()),
+                (NormalizedName::for_test("time"), "0.1.43".into()),
+                (NormalizedName::for_test("unrelated"), "2.0.0".into()),
             ]
             .into_iter()
             .collect();
-            let new: HashMap<PackageName, ConcreteVersion> = [
-                (PackageName::new("serde"), "1.0.210".into()),
-                (PackageName::new("time"), "0.1.43".into()),
-                (PackageName::new("unrelated"), "3.0.0".into()),
+            let new: HashMap<NormalizedName, ConcreteVersion> = [
+                (NormalizedName::for_test("serde"), "1.0.210".into()),
+                (NormalizedName::for_test("time"), "0.1.43".into()),
+                (NormalizedName::for_test("unrelated"), "3.0.0".into()),
             ]
             .into_iter()
             .collect();
@@ -2247,12 +2324,14 @@ time = "0.1"
             };
             let deps: Vec<&dyn Dependency> = vec![&time];
             let formatter = IDENTITY_FORMATTER;
-            let no_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = HashMap::new();
+            let no_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
 
-            let old: HashMap<PackageName, ConcreteVersion> =
-                std::iter::once((PackageName::new("time"), ConcreteVersion::from("0.1.43")))
-                    .collect();
-            let new: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+            let old: HashMap<NormalizedName, ConcreteVersion> = std::iter::once((
+                NormalizedName::for_test("time"),
+                ConcreteVersion::from("0.1.43"),
+            ))
+            .collect();
+            let new: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
 
             assert!(
                 !resolved_versions_changed(
@@ -2283,15 +2362,17 @@ time = "0.1"
             };
             let deps: Vec<&dyn Dependency> = vec![&django];
             let formatter = LOWERCASE_FORMATTER;
-            let no_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = HashMap::new();
+            let no_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
 
             // The lock file resolves under the normalized key, never the raw manifest
             // spelling — a raw `old.get(dep.name())`/`new.get(dep.name())` lookup would
             // see `None` on both sides forever and never detect this.
-            let old: HashMap<PackageName, ConcreteVersion> = HashMap::new();
-            let new: HashMap<PackageName, ConcreteVersion> =
-                std::iter::once((PackageName::new("django"), ConcreteVersion::from("4.2.0")))
-                    .collect();
+            let old: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
+            let new: HashMap<NormalizedName, ConcreteVersion> = std::iter::once((
+                NormalizedName::for_test("django"),
+                ConcreteVersion::from("4.2.0"),
+            ))
+            .collect();
 
             assert!(
                 !resolved_versions_changed(
@@ -2327,12 +2408,14 @@ time = "0.1"
 
             // The collapsed value is always the highest retained entry (0.3.36, a
             // transitive dependency's pin) and never changes across the update below.
-            let resolved: HashMap<PackageName, ConcreteVersion> =
-                std::iter::once((PackageName::new("time"), ConcreteVersion::from("0.3.36")))
-                    .collect();
+            let resolved: HashMap<NormalizedName, ConcreteVersion> = std::iter::once((
+                NormalizedName::for_test("time"),
+                ConcreteVersion::from("0.3.36"),
+            ))
+            .collect();
 
-            let old_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = std::iter::once((
-                PackageName::new("time"),
+            let old_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = std::iter::once((
+                NormalizedName::for_test("time"),
                 vec![
                     ConcreteVersion::from("0.1.43"),
                     ConcreteVersion::from("0.3.36"),
@@ -2340,8 +2423,8 @@ time = "0.1"
             ))
             .collect();
             // `cargo update -p time@0.1.43` moves only the direct dependency's own entry.
-            let new_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = std::iter::once((
-                PackageName::new("time"),
+            let new_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = std::iter::once((
+                NormalizedName::for_test("time"),
                 vec![
                     ConcreteVersion::from("0.1.45"),
                     ConcreteVersion::from("0.3.36"),

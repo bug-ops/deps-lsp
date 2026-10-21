@@ -10,7 +10,6 @@
 //! type's documentation for details.
 
 use std::borrow::Borrow;
-use std::collections::HashMap;
 use std::fmt;
 
 use crate::lsp_helpers::{NormalizeName, PackageNaming};
@@ -267,8 +266,8 @@ impl fmt::Debug for NormalizedName {
 
 /// A dependency's two lookup spellings, bound together at construction.
 ///
-/// Every cache the LSP and CLI layers consult is keyed by either the declared spelling or the
-/// ecosystem-normalized one, depending on which producer filled it. A `PackageKey` carries both
+/// Every per-package cache the LSP and CLI layers consult is keyed by the ecosystem-normalized
+/// spelling, while registry requests and edits use the declared one. A `PackageKey` carries both
 /// halves, derived from one [`PackageName`] through one formatter in a single call, so a
 /// consumer can no longer pair one dependency's declared name with another's normalized key.
 /// Functions that need the normalized spelling take a `&PackageKey` (or a
@@ -283,7 +282,7 @@ impl fmt::Debug for NormalizedName {
 ///
 /// ```
 /// use deps_core::lsp_helpers::PackageNaming;
-/// use deps_core::{PackageKey, PackageName};
+/// use deps_core::{NormalizedName, PackageKey, PackageName};
 /// use std::collections::HashMap;
 ///
 /// struct Lowercase;
@@ -297,9 +296,9 @@ impl fmt::Debug for NormalizedName {
 /// assert_eq!(key.declared().as_str(), "Flask");
 /// assert_eq!(key.normalized().as_str(), "flask");
 ///
-/// let mut cache: HashMap<PackageName, u32> = HashMap::new();
-/// cache.insert(PackageName::new("flask"), 3);
-/// assert_eq!(key.find_in(&cache), Some(&3));
+/// let mut cache: HashMap<NormalizedName, u32> = HashMap::new();
+/// cache.insert(key.normalized().clone(), 3);
+/// assert_eq!(cache.get(key.normalized()), Some(&3));
 /// ```
 ///
 /// A struct literal does not compile, so a key cannot be assembled from unrelated halves:
@@ -343,19 +342,6 @@ impl PackageKey {
     #[must_use]
     pub const fn normalized(&self) -> &NormalizedName {
         &self.normalized
-    }
-
-    /// Looks the package up in a map keyed by [`PackageName`]: the normalized spelling first,
-    /// the declared one second.
-    ///
-    /// The workspace's only dual probe. Producers of these maps disagree on which spelling
-    /// they key by, and a case-folding ecosystem must resolve a dependency the same way on
-    /// every surface (#1832).
-    // TODO(#1873): re-key these maps to `NormalizedName` at the producers; drop the declared probe.
-    #[must_use]
-    pub fn find_in<'m, V>(&self, map: &'m HashMap<PackageName, V>) -> Option<&'m V> {
-        map.get(self.normalized.as_str())
-            .or_else(|| map.get(self.declared.as_str()))
     }
 }
 
@@ -711,15 +697,18 @@ mod tests {
     }
 
     #[test]
-    fn find_in_prefers_the_normalized_spelling_over_the_declared_one() {
-        let key = PackageKey::new(&PackageName::new("Flask"), &Lowercase);
-        let mut map = HashMap::new();
-        map.insert(PackageName::new("Flask"), "declared");
-        map.insert(PackageName::new("flask"), "normalized");
-        assert_eq!(key.find_in(&map), Some(&"normalized"));
+    fn case_variant_declared_names_share_one_normalized_key() {
+        let upper = PackageKey::new(&PackageName::new("Flask"), &Lowercase);
+        let lower = PackageKey::new(&PackageName::new("flask"), &Lowercase);
+        assert_ne!(
+            upper, lower,
+            "PackageKey equality includes the declared spelling"
+        );
+        assert_eq!(upper.normalized(), lower.normalized());
 
-        map.remove("flask");
-        assert_eq!(key.find_in(&map), Some(&"declared"));
+        let mut map = HashMap::new();
+        map.insert(upper.normalized().clone(), "value");
+        assert_eq!(map.get(lower.normalized()), Some(&"value"));
     }
 
     #[test]

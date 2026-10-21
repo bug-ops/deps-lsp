@@ -506,6 +506,7 @@ require github.com/gin-gonic/gin v1.9.1
     #[cfg(feature = "lsp-responses")]
     mod lsp_tests {
         use super::*;
+        use deps_core::NormalizedName;
 
         use deps_core::parser::DependencySource;
 
@@ -575,14 +576,17 @@ require github.com/gin-gonic/gin v1.9.1
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                "github.com/gin-gonic/gin".into(),
+                NormalizedName::for_test("github.com/gin-gonic/gin"),
                 PackageVersions::latest_only("v1.9.1"),
             );
 
             let config = EcosystemConfig::default();
 
             let mut resolved_versions = HashMap::new();
-            resolved_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".into());
+            resolved_versions.insert(
+                NormalizedName::for_test("github.com/gin-gonic/gin"),
+                "v1.9.1".into(),
+            );
             let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions),
@@ -614,7 +618,7 @@ require github.com/gin-gonic/gin v1.9.1
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                "github.com/gin-gonic/gin".into(),
+                NormalizedName::for_test("github.com/gin-gonic/gin"),
                 PackageVersions::latest_only("v1.9.1"),
             );
 
@@ -652,14 +656,17 @@ require github.com/gin-gonic/gin v1.9.1
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                "github.com/gin-gonic/gin".into(),
+                NormalizedName::for_test("github.com/gin-gonic/gin"),
                 PackageVersions::latest_only("v1.9.1"),
             );
 
             let config = EcosystemConfig::default().with_show_up_to_date_hints(false);
 
             let mut resolved_versions = HashMap::new();
-            resolved_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".into());
+            resolved_versions.insert(
+                NormalizedName::for_test("github.com/gin-gonic/gin"),
+                "v1.9.1".into(),
+            );
             let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions),
@@ -686,7 +693,7 @@ require github.com/gin-gonic/gin v1.9.1
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                "github.com/gin-gonic/gin".into(),
+                NormalizedName::for_test("github.com/gin-gonic/gin"),
                 PackageVersions::latest_only("v1.9.1"),
             );
 

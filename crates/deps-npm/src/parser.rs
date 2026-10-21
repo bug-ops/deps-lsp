@@ -4,7 +4,7 @@
 //! source positions for LSP operations.
 
 use crate::config::{DeclaredNpmRegistry, NpmConfig, NpmParseContext};
-use crate::types::{NpmDependency, NpmDependencySection};
+use crate::types::{NpmDependency, NpmDependencyOrigin, NpmDependencySection};
 use deps_core::Result;
 use deps_core::json_ast::{JsonAst, JsonSection};
 use deps_core::json_helpers::string_valued_entries;
@@ -50,6 +50,18 @@ pub struct NpmParseResult {
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
     pub dependency_truncation: Option<(usize, usize)>,
+    /// `Some(range of the `catalogs.default` key)` when a parsed `pnpm-workspace.yaml` defines
+    /// the default catalog twice (a top-level `catalog:` and `catalogs.default:`), which pnpm
+    /// rejects for the whole workspace (spec 078 FR-030). Always `None` for a `package.json`.
+    pub duplicate_default_catalog: Option<deps_core::position::Range>,
+}
+
+/// The `.npmrc`-derived registry bookkeeping of one parse, as returned by
+/// [`resolve_dependency_sources`].
+pub(crate) struct ResolvedRegistries {
+    pub(crate) resolved: Vec<DeclaredNpmRegistry>,
+    pub(crate) blocked: Vec<deps_core::BlockedRegistryOccurrence>,
+    pub(crate) rejected: Vec<deps_core::RejectedRegistryOccurrence>,
 }
 
 deps_core::impl_parse_result!(
@@ -156,26 +168,63 @@ pub fn parse_package_json_with_context(
         }
     }
 
-    // FR-002: a non-`file:` URI (or one `to_file_path` can't resolve) has no directory to walk
-    // `.npmrc`/pnpm-workspace discovery from — falls back to the empty `NpmConfig` (every
-    // dependency resolves to `Registry`, NFR-005) rather than failing the whole parse; this is
-    // also what makes catalog resolution land on `CatalogOutcome::NoWorkspaceFile` (S3).
-    //
-    // #1071/#1090: resolving through `deps_core::lockfile::resolve_manifest_file_path` makes
-    // the scheme check explicit rather than relying solely on `Url::to_file_path`'s internal
-    // validation — left unguarded, `untitled:package.json` would resolve `manifest_dir` to a
-    // *relative* path, and discovery would probe the server process's own CWD instead of the
-    // document's workspace. Both `.npmrc` resolution and the catalog gate share this guard.
-    let manifest_dir = deps_core::lockfile::resolve_manifest_file_path(uri)
-        .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
+    let manifest_dir = manifest_directory(uri);
+    let registries = resolve_dependency_sources(&mut dependencies, uri, ctx);
 
-    let npm_config: NpmConfig = manifest_dir
+    // Fast path: a non-pnpm manifest pays one string check per dependency and no filesystem
+    // calls. `apply` always runs once this fires, even if `load` returns `None`.
+    if dependencies.iter().any(|dep| {
+        dep.version_req
+            .as_ref()
+            .is_some_and(|req| req.as_str().starts_with("catalog:"))
+    }) {
+        let workspace_config = crate::catalog::load(manifest_dir.as_deref(), &ctx.workspace_cache);
+        crate::catalog::apply(&mut dependencies, workspace_config.as_deref());
+    }
+
+    Ok(NpmParseResult {
+        dependencies,
+        uri: uri.clone(),
+        resolved_registries: registries.resolved,
+        blocked_registries: registries.blocked,
+        rejected_registries: registries.rejected,
+        dependency_truncation: budget.truncation(),
+        duplicate_default_catalog: None,
+    })
+}
+
+/// The directory `.npmrc` and `pnpm-workspace.yaml` discovery walks up from, or `None` for a
+/// URI with no filesystem anchor.
+///
+/// FR-002: a non-`file:` URI (or one `to_file_path` can't resolve) falls back to the empty
+/// `NpmConfig` (every dependency resolves to `Registry`, NFR-005) rather than failing the
+/// whole parse; this is also what makes catalog resolution land on
+/// `CatalogOutcome::NoWorkspaceFile` (S3).
+///
+/// #1071/#1090: resolving through `deps_core::lockfile::resolve_manifest_file_path` makes the
+/// scheme check explicit rather than relying solely on `Url::to_file_path`'s internal
+/// validation — left unguarded, `untitled:package.json` would resolve `manifest_dir` to a
+/// *relative* path, and discovery would probe the server process's own CWD instead of the
+/// document's workspace. Both `.npmrc` resolution and the catalog gate share this guard.
+fn manifest_directory(uri: &Url) -> Option<std::path::PathBuf> {
+    deps_core::lockfile::resolve_manifest_file_path(uri)
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+}
+
+/// Resolves every dependency's registry source from the `.npmrc` governing `uri`, shared by
+/// the `package.json` and `pnpm-workspace.yaml` parsers.
+pub(crate) fn resolve_dependency_sources(
+    dependencies: &mut [NpmDependency],
+    uri: &Url,
+    ctx: &NpmParseContext,
+) -> ResolvedRegistries {
+    let npm_config: NpmConfig = manifest_directory(uri)
         .as_deref()
         .map_or_default(|dir| crate::config::resolve(dir, &ctx.config_cache, &ctx.policy));
 
     let mut blocked_registries = Vec::new();
     let mut rejected_registries = Vec::new();
-    for dep in &mut dependencies {
+    for dep in dependencies {
         // #1202: a `git+`/`file:`/`link:`/`portal:`/`github:`/`workspace:` specifier is not a
         // registry reference at all — `.npmrc` scope/registry resolution has no meaning for
         // it, and applying it anyway would silently reclassify a non-registry dependency back
@@ -200,26 +249,11 @@ pub fn parse_package_json_with_context(
         }
     }
 
-    // FR-001/NFR-002: cheap fast-path — a non-pnpm manifest pays one string check per
-    // dependency and zero filesystem calls. `apply` always runs once this fires, never
-    // short-circuited by `load` returning `None`.
-    if dependencies.iter().any(|dep| {
-        dep.version_req
-            .as_ref()
-            .is_some_and(|req| req.as_str().starts_with("catalog:"))
-    }) {
-        let workspace_config = crate::catalog::load(manifest_dir.as_deref(), &ctx.workspace_cache);
-        crate::catalog::apply(&mut dependencies, workspace_config.as_deref());
+    ResolvedRegistries {
+        resolved: npm_config.resolved_registries(),
+        blocked: blocked_registries,
+        rejected: rejected_registries,
     }
-
-    Ok(NpmParseResult {
-        dependencies,
-        uri: uri.clone(),
-        resolved_registries: npm_config.resolved_registries(),
-        blocked_registries,
-        rejected_registries,
-        dependency_truncation: budget.truncation(),
-    })
 }
 
 /// Parses a single dependency section and extracts positions.
@@ -259,12 +293,14 @@ fn parse_dependency_section(
             name_range,
             version_req: Some(version_req.into()),
             version_range,
-            section,
+            // `catalog_ref` is filled by the catalog post-pass when the `catalog:` gate fires.
+            origin: NpmDependencyOrigin::Manifest {
+                section,
+                catalog_ref: None,
+            },
             // Overwritten once `.npmrc` resolution runs; `Registry` is correct for a
             // manifest with none (NFR-005) and for this function's own unit tests.
             source: deps_core::parser::DependencySource::Registry,
-            // Overwritten by the catalog post-pass when the `catalog:` gate fires.
-            catalog: None,
             package,
         });
     }
@@ -417,9 +453,9 @@ fn split_committish(value: &str) -> (&str, Option<String>) {
 }
 
 /// The real registry package name and version requirement parsed out of an `npm:` alias value.
-struct NpmAlias {
-    package: String,
-    version_req: String,
+pub(crate) struct NpmAlias {
+    pub(crate) package: String,
+    pub(crate) version_req: String,
 }
 
 /// Parses an `npm:` alias specifier (issue #654): npm/pnpm/yarn let a manifest install a
@@ -457,7 +493,7 @@ struct NpmAlias {
 // `name_len` comes from `npm_style_name_boundary` (ASCII-find derived), so it is always a
 // char boundary.
 #[allow(clippy::string_slice)]
-fn parse_npm_alias(value: &str) -> Option<NpmAlias> {
+pub(crate) fn parse_npm_alias(value: &str) -> Option<NpmAlias> {
     let rest = value.trim().strip_prefix("npm:")?;
 
     let Some(name_len) = deps_core::package::npm_style_name_boundary(rest) else {
@@ -530,6 +566,16 @@ fn parse_npm_alias(value: &str) -> Option<NpmAlias> {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::NpmDependencyOrigin;
+
+    fn section_of(dep: &NpmDependency) -> NpmDependencySection {
+        match &dep.origin {
+            NpmDependencyOrigin::Manifest { section, .. } => *section,
+            NpmDependencyOrigin::CatalogEntry { .. } => {
+                panic!("expected a package.json dependency, got a catalog entry")
+            }
+        }
+    }
     use super::*;
 
     use deps_core::Range;
@@ -554,7 +600,7 @@ mod tests {
         let express = &result.dependencies[0];
         assert_eq!(express.name, "express");
         assert_eq!(express.version_req, Some("^4.18.2".into()));
-        assert_matches!(express.section, NpmDependencySection::Dependencies);
+        assert_matches!(section_of(express), NpmDependencySection::Dependencies);
 
         let lodash = &result.dependencies[1];
         assert_eq!(lodash.name, "lodash");
@@ -577,7 +623,7 @@ mod tests {
             result
                 .dependencies
                 .iter()
-                .all(|d| matches!(d.section, NpmDependencySection::DevDependencies))
+                .all(|d| matches!(section_of(d), NpmDependencySection::DevDependencies))
         );
     }
 
@@ -592,7 +638,7 @@ mod tests {
         let result = parse_package_json(json, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert_matches!(
-            result.dependencies[0].section,
+            section_of(&result.dependencies[0]),
             NpmDependencySection::PeerDependencies
         );
     }
@@ -608,7 +654,7 @@ mod tests {
         let result = parse_package_json(json, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert_matches!(
-            result.dependencies[0].section,
+            section_of(&result.dependencies[0]),
             NpmDependencySection::OptionalDependencies
         );
     }
@@ -630,12 +676,12 @@ mod tests {
         let deps_count = result
             .dependencies
             .iter()
-            .filter(|d| matches!(d.section, NpmDependencySection::Dependencies))
+            .filter(|d| matches!(section_of(d), NpmDependencySection::Dependencies))
             .count();
         let dev_deps_count = result
             .dependencies
             .iter()
-            .filter(|d| matches!(d.section, NpmDependencySection::DevDependencies))
+            .filter(|d| matches!(section_of(d), NpmDependencySection::DevDependencies))
             .count();
 
         assert_eq!(deps_count, 1);
@@ -1758,7 +1804,7 @@ mod tests {
         let react = &result.dependencies[0];
         assert_eq!(react.version_req, None);
         assert_matches!(
-            react.catalog.as_ref().map(|origin| &origin.outcome),
+            react.catalog_ref().map(|origin| &origin.outcome),
             Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
         );
     }
@@ -1787,7 +1833,7 @@ mod tests {
         let react = &result.dependencies[0];
         assert_eq!(react.version_req, None);
         assert_matches!(
-            react.catalog.as_ref().map(|origin| &origin.outcome),
+            react.catalog_ref().map(|origin| &origin.outcome),
             Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
         );
     }
@@ -1822,7 +1868,7 @@ mod tests {
         let react = &result.dependencies[0];
         assert_eq!(react.version_req, None);
         assert_matches!(
-            react.catalog.as_ref().map(|origin| &origin.outcome),
+            react.catalog_ref().map(|origin| &origin.outcome),
             Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
         );
         // The same guard protects `.npmrc` registry resolution, sharing `manifest_dir`.
@@ -1867,7 +1913,7 @@ mod tests {
         let react = &result.dependencies[0];
         assert_eq!(react.version_req, None);
         assert_matches!(
-            react.catalog.as_ref().map(|origin| &origin.outcome),
+            react.catalog_ref().map(|origin| &origin.outcome),
             Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
         );
     }
@@ -1918,7 +1964,7 @@ mod tests {
             "a remote-host file: URI must never resolve a real workspace file"
         );
         assert_matches!(
-            react.catalog.as_ref().map(|origin| &origin.outcome),
+            react.catalog_ref().map(|origin| &origin.outcome),
             Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
         );
         assert_eq!(react.source, deps_core::parser::DependencySource::Registry);
@@ -2002,7 +2048,7 @@ mod tests {
 
         let mut cached = std::collections::HashMap::new();
         cached.insert(
-            deps_core::PackageName::new("react"),
+            deps_core::NormalizedName::for_test("react"),
             deps_core::lsp_helpers::PackageVersions::latest_only("19.0.0"),
         );
         let resolved = std::collections::HashMap::new();
@@ -2034,7 +2080,7 @@ mod tests {
         let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
 
         assert_eq!(result.dependencies[0].version_req, Some("^4.18.2".into()));
-        assert!(result.dependencies[0].catalog.is_none());
+        assert!(result.dependencies[0].catalog_ref().is_none());
     }
 
     // --- #605: duplicate dependency names across sections ---
@@ -2061,13 +2107,15 @@ mod tests {
         let deps_lodash = result
             .dependencies
             .iter()
-            .find(|d| d.name == "lodash" && matches!(d.section, NpmDependencySection::Dependencies))
+            .find(|d| {
+                d.name == "lodash" && matches!(section_of(d), NpmDependencySection::Dependencies)
+            })
             .expect("lodash in dependencies");
         let dev_lodash = result
             .dependencies
             .iter()
             .find(|d| {
-                d.name == "lodash" && matches!(d.section, NpmDependencySection::DevDependencies)
+                d.name == "lodash" && matches!(section_of(d), NpmDependencySection::DevDependencies)
             })
             .expect("lodash in devDependencies");
 
@@ -2107,17 +2155,17 @@ mod tests {
         let dep = result
             .dependencies
             .iter()
-            .find(|d| matches!(d.section, NpmDependencySection::Dependencies))
+            .find(|d| matches!(section_of(d), NpmDependencySection::Dependencies))
             .expect("shared-lib in dependencies");
         let dev = result
             .dependencies
             .iter()
-            .find(|d| matches!(d.section, NpmDependencySection::DevDependencies))
+            .find(|d| matches!(section_of(d), NpmDependencySection::DevDependencies))
             .expect("shared-lib in devDependencies");
         let opt = result
             .dependencies
             .iter()
-            .find(|d| matches!(d.section, NpmDependencySection::OptionalDependencies))
+            .find(|d| matches!(section_of(d), NpmDependencySection::OptionalDependencies))
             .expect("shared-lib in optionalDependencies");
 
         assert_eq!(dep.version_req, Some("^1.0.0".into()));
@@ -2149,13 +2197,15 @@ mod tests {
         let deps_weird = result
             .dependencies
             .iter()
-            .find(|d| d.name == "weird" && matches!(d.section, NpmDependencySection::Dependencies))
+            .find(|d| {
+                d.name == "weird" && matches!(section_of(d), NpmDependencySection::Dependencies)
+            })
             .expect("weird in dependencies");
         let dev_weird = result
             .dependencies
             .iter()
             .find(|d| {
-                d.name == "weird" && matches!(d.section, NpmDependencySection::DevDependencies)
+                d.name == "weird" && matches!(section_of(d), NpmDependencySection::DevDependencies)
             })
             .expect("weird in devDependencies");
         let after_weird = result
@@ -2169,7 +2219,7 @@ mod tests {
             Some("pkg@file:../{unbalanced".into())
         );
         assert_eq!(dev_weird.version_req, Some("^2.0.0".into()));
-        assert_matches!(after_weird.section, NpmDependencySection::Dependencies);
+        assert_matches!(section_of(after_weird), NpmDependencySection::Dependencies);
         assert_eq!(after_weird.version_req, Some("^1.0.0".into()));
         assert!(after_weird.version_range.is_some());
 
@@ -2200,7 +2250,7 @@ mod tests {
         let express = &result.dependencies[0];
         assert_eq!(express.name, "express");
         assert_eq!(express.version_req, Some("^4.18.2".into()));
-        assert_matches!(express.section, NpmDependencySection::Dependencies);
+        assert_matches!(section_of(express), NpmDependencySection::Dependencies);
         assert_ne!(express.name_range, Range::default());
         assert!(express.version_range.is_some());
     }
@@ -2228,7 +2278,7 @@ mod tests {
         let express = &result.dependencies[0];
         assert_eq!(express.name, "express");
         assert_eq!(express.version_req, Some("^4.18.2".into()));
-        assert_matches!(express.section, NpmDependencySection::Dependencies);
+        assert_matches!(section_of(express), NpmDependencySection::Dependencies);
         assert_ne!(express.name_range, Range::default());
         assert!(express.version_range.is_some());
     }
@@ -2252,7 +2302,7 @@ mod tests {
         let express = &result.dependencies[0];
         assert_eq!(express.name, "express");
         assert_eq!(express.version_req, Some("^4.18.2".into()));
-        assert_matches!(express.section, NpmDependencySection::Dependencies);
+        assert_matches!(section_of(express), NpmDependencySection::Dependencies);
         assert_eq!(express.name_range.start.line, 5);
         assert!(express.version_range.is_some());
     }

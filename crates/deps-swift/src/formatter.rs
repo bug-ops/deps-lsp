@@ -6,12 +6,16 @@ use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::is_dot_segment;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
-    compile_semver_requirement, requirement_contains_template_placeholder, warn_rejected_value,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, HoverProvenance, OsvNaming,
+    PackageNaming, PackageRendering, PublicContent, RequirementMatcher, RequirementResolution,
+    SourcePolicy, compile_semver_requirement, requirement_contains_template_placeholder,
+    warn_rejected_value,
 };
 use deps_core::osv::OsvPackageName;
+use deps_core::redact::RedactedUrl;
+use std::borrow::Cow;
 
+use crate::scm::SwiftOrigin;
 use crate::types::SwiftDependency;
 
 /// Whether `requirement` contains an unresolved Swift string-interpolation placeholder
@@ -122,6 +126,19 @@ impl PackageRendering for SwiftFormatter {
         }
     }
 
+    /// A swizzled dependency (spec 088) says which registry identity it was swapped to and from
+    /// which repository.
+    fn hover_provenance(&self, dep: &dyn Dependency) -> Option<HoverProvenance> {
+        let swift_dep = dep.as_any().downcast_ref::<SwiftDependency>()?;
+        match &swift_dep.origin {
+            SwiftOrigin::Swizzled { scm } => Some(HoverProvenance::ResolvedViaRegistryIdentity {
+                identity: swift_dep.name.clone(),
+                scm: RedactedUrl::new(scm.wire()),
+            }),
+            SwiftOrigin::Declared => None,
+        }
+    }
+
     // Since #1391, neither `format_version_replacing` nor `format_version_replacing_for`
     // needs its own placeholder guard: `deps_core::edit::requirement_is_placeholder_for`
     // checks both `current` and `dep.version_literal()` centrally (folding in exactly the
@@ -224,19 +241,54 @@ impl OsvNaming for SwiftFormatter {
     /// cannot distinguish a GitHub coordinate from a same-shaped GitLab/self-hosted
     /// one — attributing a GitHub project's advisories to an unrelated
     /// same-named repo elsewhere would be a false positive, not just a miss.
+    ///
+    /// A swizzled dependency (spec 088) is described by its source repository instead:
+    /// `dep.name()` is then the registry identity, which OSV has never heard of.
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<OsvPackageName> {
         let swift_dep = dep.as_any().downcast_ref::<SwiftDependency>()?;
-        let host = reqwest::Url::parse(&swift_dep.url).ok()?;
-        host.host_str()
-            .is_some_and(crate::is_github_host)
-            .then(|| format!("github.com/{}", dep.name().as_str()))
-            .and_then(OsvPackageName::new_or_skip)
+        match &swift_dep.origin {
+            SwiftOrigin::Swizzled { .. } => self
+                .public_content(dep)
+                .map(|content| format!("github.com/{}", content.name.as_str()))
+                .and_then(OsvPackageName::new_or_skip),
+            SwiftOrigin::Declared => {
+                let host = reqwest::Url::parse(&swift_dep.url).ok()?;
+                host.host_str()
+                    .is_some_and(crate::is_github_host)
+                    .then(|| format!("github.com/{}", dep.name().as_str()))
+                    .and_then(OsvPackageName::new_or_skip)
+            }
+        }
+    }
+
+    /// A swizzled GitHub dependency is the content of its `owner/repo`, case preserved (OSV's
+    /// `SwiftURL` matching is case-sensitive); a swizzled dependency on any other host has no
+    /// public content OSV or license data could describe. Every other dependency follows the
+    /// source gate.
+    fn public_content<'d>(&self, dep: &'d dyn Dependency) -> Option<PublicContent<'d>> {
+        match dep
+            .as_any()
+            .downcast_ref::<SwiftDependency>()
+            .map(|swift_dep| &swift_dep.origin)
+        {
+            Some(SwiftOrigin::Swizzled { scm }) => crate::parser::url_to_identity(scm.wire())
+                .filter(|repository| is_valid_owner_repo(repository))
+                .map(|repository| PublicContent {
+                    name: Cow::Owned(PackageName::new(repository)),
+                }),
+            Some(SwiftOrigin::Declared) | None => self
+                .source_is_public_registry_content(&dep.source())
+                .then(|| PublicContent {
+                    name: Cow::Borrowed(dep.name()),
+                }),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scm::SwiftRequirementForm;
     use deps_core::NormalizeName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
@@ -466,6 +518,8 @@ mod tests {
             version_literal: None,
             url: url.to_string(),
             source: DependencySource::Registry,
+            requirement_form: SwiftRequirementForm::Version,
+            origin: SwiftOrigin::Declared,
         }
     }
 
@@ -477,6 +531,85 @@ mod tests {
             fmt.osv_package_name(&dep),
             Some(OsvPackageName::new("github.com/apple/swift-nio").unwrap())
         );
+    }
+
+    fn swizzled_dep(scm: &str) -> SwiftDependency {
+        SwiftDependency {
+            name: "apple.swift-nio".into(),
+            source: deps_core::parser::DependencySource::AlternateRegistry {
+                index: "https://registry.example/api".to_string(),
+                mirrors_crates_io: false,
+            },
+            origin: SwiftOrigin::Swizzled {
+                scm: crate::scm::ScmLookupUrl::parse(scm).unwrap(),
+            },
+            ..dep_with_url("apple.swift-nio", scm)
+        }
+    }
+
+    #[test]
+    fn test_swizzled_public_content_is_the_repository_with_its_case_preserved() {
+        let fmt = SwiftFormatter;
+        let dep = swizzled_dep("https://GitHub.com/Apple/Swift-NIO.git");
+
+        let content = fmt.public_content(&dep).unwrap();
+        assert_eq!(content.name.as_str(), "Apple/Swift-NIO");
+        assert_eq!(
+            fmt.osv_package_name(&dep),
+            Some(OsvPackageName::new("github.com/Apple/Swift-NIO").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_swizzled_dependency_never_uses_the_registry_identity_for_osv() {
+        let fmt = SwiftFormatter;
+        let dep = swizzled_dep("https://github.com/apple/swift-nio");
+        let osv = fmt.osv_package_name(&dep).unwrap();
+        assert!(!osv.as_str().contains("apple.swift-nio"));
+    }
+
+    #[test]
+    fn test_swizzled_dependency_on_another_host_has_no_public_content() {
+        let fmt = SwiftFormatter;
+        let dep = swizzled_dep("https://gitlab.example.com/group/repo");
+        assert!(fmt.public_content(&dep).is_none());
+        assert!(fmt.osv_package_name(&dep).is_none());
+    }
+
+    #[test]
+    fn test_declared_public_content_follows_the_source_gate() {
+        let fmt = SwiftFormatter;
+        let registry = dep_with_url("apple/swift-nio", "https://github.com/apple/swift-nio");
+        assert_eq!(
+            fmt.public_content(&registry).map(|c| c.name.into_owned()),
+            Some(registry.name.clone())
+        );
+        let pinned = SwiftDependency {
+            source: deps_core::parser::DependencySource::Git {
+                url: registry.url.clone(),
+                rev: Some("main".into()),
+            },
+            ..registry
+        };
+        assert_eq!(
+            fmt.public_content(&pinned).is_some(),
+            fmt.source_is_public_registry_content(&pinned.source())
+        );
+    }
+
+    #[test]
+    fn test_hover_provenance_names_the_identity_and_the_redacted_repository() {
+        let fmt = SwiftFormatter;
+        let dep = swizzled_dep("https://oauth2:TOKEN@github.com/apple/swift-nio?x=1");
+        assert_eq!(
+            fmt.hover_provenance(&dep),
+            Some(HoverProvenance::ResolvedViaRegistryIdentity {
+                identity: PackageName::new("apple.swift-nio"),
+                scm: RedactedUrl::new("https://github.com/apple/swift-nio"),
+            })
+        );
+        let declared = dep_with_url("apple/swift-nio", "https://github.com/apple/swift-nio");
+        assert_eq!(fmt.hover_provenance(&declared), None);
     }
 
     #[test]
@@ -653,6 +786,8 @@ mod tests {
             version_literal: None,
             url: "https://github.com/apple/swift-nio".to_string(),
             source: DependencySource::Registry,
+            requirement_form: SwiftRequirementForm::Version,
+            origin: SwiftOrigin::Declared,
         };
         assert_eq!(
             replacement_text(&fmt, &dep, &ConcreteVersion::new("9.9.9"), "\\(v)"),
@@ -686,6 +821,8 @@ mod tests {
             version_literal: Some("\\(v)".to_string()),
             url: "https://github.com/apple/swift-nio".to_string(),
             source: DependencySource::Registry,
+            requirement_form: SwiftRequirementForm::Version,
+            origin: SwiftOrigin::Declared,
         };
         let current = dep.version_req.as_ref().unwrap().as_str();
         assert_eq!(
@@ -711,6 +848,8 @@ mod tests {
             version_literal: Some("1.5.0".to_string()),
             url: "https://github.com/apple/swift-nio".to_string(),
             source: DependencySource::Registry,
+            requirement_form: SwiftRequirementForm::Version,
+            origin: SwiftOrigin::Declared,
         };
         let rewritten =
             fmt.format_version_replacing_for(&dep, &ConcreteVersion::new("2.40.0"), "1.5.0");

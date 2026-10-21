@@ -15,9 +15,9 @@ use crate::position::{Position, Range};
 use crate::redact::{RedactedUrl, redact_declaration_key, sanitize_invisible};
 use crate::{
     BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, DepsDevClient,
-    EcosystemId, FetchCompleteness, FetchFailure, PackageKey, PackageName, ParseResult,
-    PublishTime, RegistryOccurrence, RejectedRegistryOccurrence, RemovalStatus, TyposquatSignal,
-    VersionReq, format_relative_age,
+    EcosystemId, FetchCompleteness, FetchFailure, NormalizedName, PackageKey, PackageName,
+    ParseResult, PublishTime, RegistryOccurrence, RejectedRegistryOccurrence, RemovalStatus,
+    TyposquatSignal, VersionReq, format_relative_age,
 };
 
 use super::{
@@ -1901,7 +1901,7 @@ fn apply_vulnerability_rule<'a>(
 /// generate_diagnostics_internal` attaches this unconditionally at every diagnostics-
 /// generation call site (pull *and* push paths alike — see
 /// [`super::VersionData::license_policy`]'s doc comment), so this is a no-op only when no
-/// policy is actually configured. `ctx.versions.license_prefetch`, keyed by raw (unnormalized)
+/// policy is actually configured. `ctx.versions.license_prefetch`, keyed by normalized
 /// package name — today populated for tier-3 ecosystems only (Dart/Swift/Gradle/Deno, see
 /// that field's own doc comment), but this rule makes no ecosystem-specific assumption and
 /// needs no change as coverage widens. A dependency with no entry in `license_prefetch` is
@@ -1934,7 +1934,7 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
     let Some(license) = ctx
         .versions
         .license_prefetch
-        .and_then(|prefetch| prefetch.get(ctx.dep.name()))
+        .and_then(|prefetch| prefetch.get(ctx.key.normalized()))
     else {
         return;
     };
@@ -1980,7 +1980,7 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
 /// this function directly, as `deps-npm`'s catalog-diagnostics override does, must not be
 /// able to bypass the typosquat signal, exactly the same "picked up automatically by every
 /// caller" contract [`apply_license_policy_rule`] already has via `license_prefetch`). Keyed
-/// by raw (unnormalized) declared package name. A dependency with no entry — the feature
+/// by normalized package name. A dependency with no entry — the feature
 /// disabled, the ecosystem not deps.dev-covered, offline, or no candidate clearing the ratio
 /// gate — is silently skipped (NFR-003 graceful degradation), mirroring
 /// [`apply_license_policy_rule`].
@@ -1998,7 +1998,7 @@ fn apply_typosquat_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'_>
     let Some(signal) = ctx
         .versions
         .typosquat_prefetch
-        .and_then(|signals| signals.get(ctx.dep.name()))
+        .and_then(|signals| signals.get(ctx.key.normalized()))
     else {
         return;
     };
@@ -2041,15 +2041,18 @@ const TYPOSQUAT_FETCH_CONCURRENCY: usize = 8;
 /// unreachable for at least one of them".
 #[derive(Debug, Clone, PartialEq)]
 pub struct TyposquatFetchOutcome {
-    /// The positive signals resolved, keyed by the declared (raw, unnormalized) package name.
-    pub signals: HashMap<PackageName, TyposquatSignal>,
+    /// The positive signals resolved, keyed by the ecosystem-normalized package name.
+    pub signals: HashMap<NormalizedName, TyposquatSignal>,
     /// [`FetchCompleteness::Complete`] only if every eligible dependency's evaluation — every
     /// deps.dev call it needed — returned a definitive answer, fresh or memoized.
     pub completeness: FetchCompleteness,
 }
 
 /// Resolves a [`TyposquatSignal`] for every distinct direct dependency name declared in
-/// `parse_result` (issue #1437, spec 071), keyed by that raw (unnormalized) name.
+/// `parse_result` (issue #1437, spec 071).
+///
+/// The result is keyed by the name's ecosystem-normalized spelling; the deps.dev request
+/// carries the declared spelling of the first occurrence.
 ///
 /// Also reports whether the fan-out actually completed (issue #1463) — see
 /// [`TyposquatFetchOutcome`].
@@ -2100,25 +2103,19 @@ pub async fn fetch_typosquat_signals(
         return complete;
     };
 
-    let mut seen = HashSet::new();
-    let names: Vec<PackageName> = parse_result
-        .dependencies()
-        .into_iter()
-        .filter(|dep| formatter.source_is_public_registry_content(&dep.source()))
-        .map(|dep| dep.name().clone())
-        .filter(|name| seen.insert(name.clone()))
-        .collect();
-
-    if names.is_empty() {
+    let keys = public_registry_keys(parse_result, formatter);
+    if keys.is_empty() {
         return complete;
     }
 
-    let resolved = stream::iter(names)
-        .map(|name| {
+    let resolved = stream::iter(keys)
+        .map(|key| {
             let client = Arc::clone(client);
             async move {
-                let (signal, completeness) = client.typosquat_signal(system, name.as_str()).await;
-                (name, signal, completeness)
+                let (signal, completeness) = client
+                    .typosquat_signal(system, key.declared().as_str())
+                    .await;
+                (key, signal, completeness)
             }
         })
         .buffer_unordered(TYPOSQUAT_FETCH_CONCURRENCY)
@@ -2127,10 +2124,10 @@ pub async fn fetch_typosquat_signals(
 
     let mut signals = HashMap::new();
     let mut completeness = FetchCompleteness::Complete;
-    for (name, signal, name_completeness) in resolved {
-        completeness = completeness.combine(name_completeness);
+    for (key, signal, key_completeness) in resolved {
+        completeness = completeness.combine(key_completeness);
         if let Some(signal) = signal {
-            signals.insert(name, signal);
+            signals.insert(key.normalized().clone(), signal);
         }
     }
     TyposquatFetchOutcome {
@@ -2168,40 +2165,28 @@ pub async fn fetch_gossip_findings_batch(
     formatter: &dyn EcosystemFormatter,
     network: crate::NetworkMode,
     client: Option<&Arc<DepsDevClient>>,
-) -> HashMap<PackageName, crate::GossipFindings> {
-    let mut result = HashMap::new();
-
+) -> HashMap<NormalizedName, crate::GossipFindings> {
     let Some(client) = client else {
-        return result;
+        return HashMap::new();
     };
     if network.is_offline() {
-        return result;
+        return HashMap::new();
     }
     let Some(system) = deps_dev_system(ecosystem_id) else {
-        return result;
+        return HashMap::new();
     };
 
-    let mut seen = HashSet::new();
-    let names: Vec<String> = parse_result
-        .dependencies()
-        .into_iter()
-        .filter(|dep| formatter.source_is_public_registry_content(&dep.source()))
-        .map(|dep| dep.name().as_str().to_string())
-        .filter(|name| seen.insert(name.clone()))
-        .collect();
-
-    if names.is_empty() {
-        return result;
+    let keys = public_registry_keys(parse_result, formatter);
+    if keys.is_empty() {
+        return HashMap::new();
     }
 
+    let names = declared_spellings(&keys);
     let batch = client.gossip_findings_batch(system, &names).await;
-    for (name, findings) in batch {
-        result.insert(PackageName::new(&name), findings);
-    }
-    result
+    rekey_by_declared(&keys, batch)
 }
 
-/// Force-refetches GOSSIP findings for `names` under `ecosystem_id`'s deps.dev system,
+/// Force-refetches GOSSIP findings for `keys` under `ecosystem_id`'s deps.dev system,
 /// bypassing the per-package memo (issue #1456, spec 072 FR-011/M21).
 ///
 /// The deps-lsp-facing counterpart of [`fetch_gossip_findings_batch`] (which encapsulates
@@ -2210,27 +2195,69 @@ pub async fn fetch_gossip_findings_batch(
 /// mismatch (FR-008) via `DocumentState::signals.gossip_findings` and knows the normal
 /// memo-respecting path would just return the same stale answer.
 ///
+/// The request carries each key's declared spelling; the result is keyed by the normalized
+/// one, and a response for a name the request did not send is dropped.
+///
 /// Returns an empty map immediately, with no network call, when `ecosystem_id` isn't one of
 /// the seven `deps_dev_system`-covered ecosystems — the sole caller,
 /// `deps-lsp::document::gossip_prefetch`'s mismatch-detection function, is only ever able to
-/// populate `names` from an ecosystem that already had `gossip_findings` entries in the
+/// populate `keys` from an ecosystem that already had `gossip_findings` entries in the
 /// first place, so this early-out is defensive, not expected to fire in practice.
 pub async fn force_refresh_gossip_findings(
     ecosystem_id: EcosystemId,
-    names: &[String],
+    keys: &[PackageKey],
     client: &Arc<DepsDevClient>,
-) -> HashMap<PackageName, crate::GossipFindings> {
-    let mut result = HashMap::new();
-
+) -> HashMap<NormalizedName, crate::GossipFindings> {
     let Some(system) = deps_dev_system(ecosystem_id) else {
-        return result;
+        return HashMap::new();
     };
 
-    let refreshed = client.force_refresh_gossip_findings(system, names).await;
-    for (name, findings) in refreshed {
-        result.insert(PackageName::new(&name), findings);
-    }
-    result
+    let names = declared_spellings(keys);
+    let refreshed = client.force_refresh_gossip_findings(system, &names).await;
+    rekey_by_declared(keys, refreshed)
+}
+
+/// One [`PackageKey`] per distinct normalized name among `parse_result`'s public-registry
+/// dependencies, in first-occurrence order — the privacy-gated fan-out set shared by the
+/// typosquat and GOSSIP prefetches.
+fn public_registry_keys(
+    parse_result: &dyn ParseResult,
+    formatter: &dyn EcosystemFormatter,
+) -> Vec<PackageKey> {
+    let mut seen = HashSet::new();
+    parse_result
+        .dependencies()
+        .into_iter()
+        .filter(|dep| formatter.source_is_public_registry_content(&dep.source()))
+        .map(|dep| PackageKey::new(dep.name(), formatter))
+        .filter(|key| seen.insert(key.normalized().clone()))
+        .collect()
+}
+
+fn declared_spellings(keys: &[PackageKey]) -> Vec<String> {
+    keys.iter()
+        .map(|key| key.declared().as_str().to_string())
+        .collect()
+}
+
+/// Re-keys a deps.dev response (keyed by the spelling the request sent) by normalized name,
+/// dropping any entry whose name was not requested.
+fn rekey_by_declared<V>(
+    keys: &[PackageKey],
+    response: HashMap<String, V>,
+) -> HashMap<NormalizedName, V> {
+    let by_declared: HashMap<&str, &NormalizedName> = keys
+        .iter()
+        .map(|key| (key.declared().as_str(), key.normalized()))
+        .collect();
+    response
+        .into_iter()
+        .filter_map(|(name, value)| {
+            by_declared
+                .get(name.as_str())
+                .map(|normalized| ((*normalized).clone(), value))
+        })
+        .collect()
 }
 
 /// R3 — package-level deprecation finding (#205, I4).
@@ -2942,7 +2969,7 @@ fn apply_outdated_rule(
         LatestVerdict::Verified | LatestVerdict::NotApplicable => {
             let disposition = cooldown_disposition(
                 package_versions,
-                dep.name(),
+                ctx.key.normalized(),
                 ctx.freshness,
                 ctx.versions.gossip_prefetch,
                 ctx.now,
@@ -5066,7 +5093,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "dep".into(),
+            NormalizedName::for_test("dep"),
             PackageVersions {
                 latest: "1.0.0\u{202E}evil".into(),
                 available: Arc::from(vec!["1.0.0\u{202E}evil".into()]),
@@ -5168,7 +5195,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions::latest_only("2.0.0\u{202E}evil"),
         );
 
@@ -5211,7 +5238,7 @@ mod tests {
         let overlong_latest = format!("2.0.0-{}", "X".repeat(MAX_VERSION_DIAGNOSTIC_CHARS + 50));
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions::latest_only(overlong_latest.clone()),
         );
 
@@ -5256,7 +5283,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("left-pad".into(), PackageVersions::latest_only("1.3.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("left-pad"),
+            PackageVersions::latest_only("1.3.0"),
+        );
         let resolved_versions = HashMap::new();
         let overlong_reason = "X".repeat(MAX_DIAGNOSTIC_PROSE_CHARS + 50);
         let outcomes = DependencyOutcomes::new().with_deprecation(
@@ -5426,7 +5456,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("serde"),
+            PackageVersions::latest_only("1.0.0"),
+        );
         let resolved_versions = HashMap::new();
 
         let diagnostics = generate_diagnostics_from_cache(
@@ -5470,7 +5503,10 @@ mod tests {
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("serde"),
+            PackageVersions::latest_only("1.0.0"),
+        );
         let resolved_versions = HashMap::new();
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
@@ -6605,7 +6641,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("2.0.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("serde"),
+            PackageVersions::latest_only("2.0.0"),
+        );
 
         let resolved_versions = HashMap::new();
 
@@ -6646,7 +6685,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -6705,7 +6744,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -6722,7 +6761,7 @@ mod tests {
 
         let mut gossip = HashMap::new();
         gossip.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             crate::GossipFindings {
                 version: "2.0.0".to_string(),
                 cooldown: Some(crate::GossipCooldown {
@@ -6773,7 +6812,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -6789,7 +6828,7 @@ mod tests {
 
         let mut gossip = HashMap::new();
         gossip.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             crate::GossipFindings {
                 // Stale: the prefetch's own defaultVersion (1.9.0) doesn't match `latest`
                 // (2.0.0) at this call site.
@@ -6846,7 +6885,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "feed-widget-helper".into(),
+            NormalizedName::for_test("feed-widget-helper"),
             PackageVersions {
                 latest: "1.0.8".into(),
                 available: Arc::from(vec!["1.0.8".into()]),
@@ -6871,7 +6910,7 @@ mod tests {
 
         let mut gossip = HashMap::new();
         gossip.insert(
-            PackageName::new("feed-widget-helper"),
+            NormalizedName::for_test("feed-widget-helper"),
             crate::GossipFindings {
                 version: "1.0.8".to_string(),
                 cooldown: Some(crate::GossipCooldown {
@@ -6926,7 +6965,10 @@ mod tests {
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("pkg".into(), PackageVersions::latest_only(latest));
+        cached_versions.insert(
+            NormalizedName::for_test("pkg"),
+            PackageVersions::latest_only(latest),
+        );
         let resolved_versions = HashMap::new();
         let mut latest_status = LatestStatusMap::new();
         latest_status.insert(
@@ -6996,7 +7038,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "pkg".into(),
+            NormalizedName::for_test("pkg"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -7058,7 +7100,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "feed-widget-helper".into(),
+            NormalizedName::for_test("feed-widget-helper"),
             PackageVersions {
                 latest: "1.0.8".into(),
                 available: Arc::from(vec!["1.0.8".into()]),
@@ -7126,7 +7168,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.5.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("pkg"),
+            PackageVersions::latest_only("1.5.0"),
+        );
         let resolved_versions = HashMap::new();
 
         let mut latest_status = LatestStatusMap::new();
@@ -7186,7 +7231,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "feed-widget-helper".into(),
+            NormalizedName::for_test("feed-widget-helper"),
             PackageVersions {
                 latest: "1.0.8".into(),
                 available: Arc::from(vec!["1.0.8".into()]),
@@ -7198,7 +7243,10 @@ mod tests {
         );
         // The lock file resolves this dependency to exactly the flagged `latest`.
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert(PackageName::new("feed-widget-helper"), "1.0.8".into());
+        resolved_versions.insert(
+            NormalizedName::for_test("feed-widget-helper"),
+            "1.0.8".into(),
+        );
 
         let mut latest_status = LatestStatusMap::new();
         latest_status.insert(
@@ -7280,7 +7328,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "feed-widget-helper".into(),
+            NormalizedName::for_test("feed-widget-helper"),
             PackageVersions {
                 latest: "1.0.8".into(),
                 available: Arc::from(vec!["1.0.8".into()]),
@@ -7292,7 +7340,10 @@ mod tests {
         );
         // The lock file resolves this dependency to exactly the flagged `latest`.
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert(PackageName::new("feed-widget-helper"), "1.0.8".into());
+        resolved_versions.insert(
+            NormalizedName::for_test("feed-widget-helper"),
+            "1.0.8".into(),
+        );
 
         let mut latest_status = LatestStatusMap::new();
         latest_status.insert(
@@ -7376,7 +7427,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "feed-widget-helper".into(),
+            NormalizedName::for_test("feed-widget-helper"),
             PackageVersions {
                 latest: "1.0.8".into(),
                 available: Arc::from(vec!["1.0.8".into()]),
@@ -7388,7 +7439,10 @@ mod tests {
         );
         // The lock file resolves this dependency to an older version than the flagged latest.
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert(PackageName::new("feed-widget-helper"), "1.0.4".into());
+        resolved_versions.insert(
+            NormalizedName::for_test("feed-widget-helper"),
+            "1.0.4".into(),
+        );
 
         let mut latest_status = LatestStatusMap::new();
         latest_status.insert(
@@ -7463,7 +7517,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.5.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("pkg"),
+            PackageVersions::latest_only("1.5.0"),
+        );
         let resolved_versions = HashMap::new();
 
         let mut latest_status = LatestStatusMap::new();
@@ -7524,7 +7581,10 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         // The registry now reports a newer `latest` than the stale entry below describes.
-        cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.6.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("pkg"),
+            PackageVersions::latest_only("1.6.0"),
+        );
         let resolved_versions = HashMap::new();
 
         let mut latest_status = LatestStatusMap::new();
@@ -7577,9 +7637,12 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.5.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("pkg"),
+            PackageVersions::latest_only("1.5.0"),
+        );
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert(PackageName::new("pkg"), "1.2.0".into());
+        resolved_versions.insert(NormalizedName::for_test("pkg"), "1.2.0".into());
 
         let mut latest_status = LatestStatusMap::new();
         latest_status.insert(
@@ -7653,7 +7716,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.5.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("pkg"),
+            PackageVersions::latest_only("1.5.0"),
+        );
         let resolved_versions = HashMap::new();
         // Empty map, not `None`: the pre-phase-B window attaches `Some(&empty_map)`.
         let latest_status = LatestStatusMap::new();
@@ -7694,7 +7760,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.5.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("pkg"),
+            PackageVersions::latest_only("1.5.0"),
+        );
         let resolved_versions = HashMap::new();
 
         let mut latest_status = LatestStatusMap::new();
@@ -7742,7 +7811,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "pkg".into(),
+            NormalizedName::for_test("pkg"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -7806,7 +7875,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -7824,7 +7893,7 @@ mod tests {
 
         let mut gossip = HashMap::new();
         gossip.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             crate::GossipFindings {
                 version: "2.0.0".to_string(),
                 cooldown: None,
@@ -7873,7 +7942,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -7923,7 +7992,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -7978,7 +8047,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -8034,7 +8103,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -8084,7 +8153,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
+        cached_versions.insert(
+            NormalizedName::for_test("serde"),
+            PackageVersions::latest_only("1.0.214"),
+        );
 
         let resolved_versions = HashMap::new();
 
@@ -8136,8 +8208,14 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
-        cached_versions.insert("tokio".into(), PackageVersions::latest_only("2.0.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("serde"),
+            PackageVersions::latest_only("1.0.214"),
+        );
+        cached_versions.insert(
+            NormalizedName::for_test("tokio"),
+            PackageVersions::latest_only("2.0.0"),
+        );
 
         let resolved_versions = HashMap::new();
 
@@ -8181,7 +8259,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "spring-boot-starter".into(),
+            NormalizedName::for_test("spring-boot-starter"),
             PackageVersions::latest_only("3.2.0"),
         );
 
@@ -8312,7 +8390,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.5"));
+        cached_versions.insert(
+            NormalizedName::for_test("serde"),
+            PackageVersions::latest_only("1.0.5"),
+        );
         let resolved_versions = HashMap::new();
 
         let diagnostics = generate_diagnostics_from_cache(
@@ -8354,7 +8435,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("2.0.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("serde"),
+            PackageVersions::latest_only("2.0.0"),
+        );
         let resolved_versions = HashMap::new();
         let outcomes = DependencyOutcomes::new().with_yanked(
             crate::NormalizedName::for_test("serde"),
@@ -8411,7 +8495,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("left-pad".into(), PackageVersions::latest_only("1.3.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("left-pad"),
+            PackageVersions::latest_only("1.3.0"),
+        );
         let resolved_versions = HashMap::new();
         let outcomes = DependencyOutcomes::new()
             .with_yanked(
@@ -8470,7 +8557,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.0.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("pkg"),
+            PackageVersions::latest_only("1.0.0"),
+        );
         let resolved_versions = HashMap::new();
         let outcomes = DependencyOutcomes::new()
             .with_yanked(
@@ -8537,7 +8627,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("left-pad".into(), PackageVersions::latest_only("1.3.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("left-pad"),
+            PackageVersions::latest_only("1.3.0"),
+        );
         let resolved_versions = HashMap::new();
         let outcomes = DependencyOutcomes::new()
             .with_yanked(
@@ -8593,7 +8686,10 @@ mod tests {
         use crate::parser::DependencySource;
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("dep".into(), PackageVersions::latest_only("1.0.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("dep"),
+            PackageVersions::latest_only("1.0.0"),
+        );
         let resolved_versions = HashMap::new();
         let outcomes = DependencyOutcomes::new().with_deprecation(
             crate::NormalizedName::for_test("dep"),
@@ -8871,7 +8967,7 @@ mod tests {
         let cached_versions = {
             let mut m = HashMap::new();
             m.insert(
-                "dep".into(),
+                NormalizedName::for_test("dep"),
                 PackageVersions {
                     latest: "1.5.0".into(),
                     available: Arc::from(vec!["2.0.0-rc.1".into(), "1.5.0".into(), "1.4.0".into()]),
@@ -8923,7 +9019,7 @@ mod tests {
         let cached_versions = {
             let mut m = HashMap::new();
             m.insert(
-                "dep".into(),
+                NormalizedName::for_test("dep"),
                 PackageVersions {
                     latest: "1.5.0".into(),
                     available: Arc::from(vec![
@@ -8976,7 +9072,7 @@ mod tests {
         let cached_versions = {
             let mut m = HashMap::new();
             m.insert(
-                "dep".into(),
+                NormalizedName::for_test("dep"),
                 PackageVersions {
                     latest: "1.5.0".into(),
                     available: Arc::from(vec!["1.5.0".into(), "1.4.0".into()]),
@@ -9031,7 +9127,7 @@ mod tests {
         let cached_versions = {
             let mut m = HashMap::new();
             m.insert(
-                "dep".into(),
+                NormalizedName::for_test("dep"),
                 PackageVersions {
                     latest: "1.5.0".into(),
                     available: Arc::from(vec!["2.0.0-rc.1".into(), "1.5.0".into(), "1.4.0".into()]),
@@ -9110,7 +9206,7 @@ mod tests {
         let cached_versions = {
             let mut m = HashMap::new();
             m.insert(
-                "dep".into(),
+                NormalizedName::for_test("dep"),
                 PackageVersions {
                     latest: "1.5.0".into(),
                     available: Arc::from(vec!["2.0.0-rc.1".into(), "1.5.0".into(), "1.4.0".into()]),
@@ -9168,7 +9264,10 @@ mod tests {
 
         let cached_versions = {
             let mut m = HashMap::new();
-            m.insert("dep".into(), PackageVersions::latest_only("9.9.9"));
+            m.insert(
+                NormalizedName::for_test("dep"),
+                PackageVersions::latest_only("9.9.9"),
+            );
             m
         };
         let resolved_versions = HashMap::new();
@@ -9340,7 +9439,10 @@ mod tests {
         // to share a name with an unrelated published crate.
         let cached_versions = {
             let mut m = HashMap::new();
-            m.insert("dep".into(), PackageVersions::latest_only("9.9.9"));
+            m.insert(
+                NormalizedName::for_test("dep"),
+                PackageVersions::latest_only("9.9.9"),
+            );
             m
         };
         let resolved_versions = HashMap::new();
@@ -9941,10 +10043,13 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), ConcreteVersion::from("1.0.219"));
+        resolved_versions.insert(
+            NormalizedName::for_test("serde"),
+            ConcreteVersion::from("1.0.219"),
+        );
         let mut resolved_version_candidates = HashMap::new();
         resolved_version_candidates.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             vec![
                 ConcreteVersion::from("0.9.15"),
                 ConcreteVersion::from("1.0.219"),
@@ -10019,7 +10124,10 @@ mod tests {
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("git-pkg".into(), PackageVersions::latest_only("1.0.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("git-pkg"),
+            PackageVersions::latest_only("1.0.0"),
+        );
         let resolved_versions = HashMap::new();
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
@@ -10869,7 +10977,7 @@ mod tests {
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 PackageVersions {
                     latest: "2.0.0".into(),
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
@@ -10925,7 +11033,7 @@ mod tests {
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 PackageVersions {
                     latest: "2.0.0".into(),
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
@@ -10999,7 +11107,7 @@ mod tests {
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 PackageVersions {
                     latest: "2.0.0".into(),
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
@@ -11072,7 +11180,7 @@ mod tests {
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 PackageVersions {
                     latest: "2.0.0".into(),
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
@@ -11155,7 +11263,7 @@ mod tests {
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 PackageVersions {
                     latest: "2.0.0".into(),
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
@@ -11224,7 +11332,7 @@ mod tests {
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 PackageVersions {
                     latest: "1.2.1".into(),
                     available: Arc::from(vec!["1.2.1".into()]),
@@ -11274,7 +11382,7 @@ mod tests {
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 PackageVersions {
                     latest: "2.0.0".into(),
                     available: Arc::from(vec!["2.0.0".into(), "1.0.1".into(), "1.0.0".into()]),
@@ -11373,7 +11481,7 @@ mod tests {
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                "dep".into(),
+                NormalizedName::for_test("dep"),
                 PackageVersions {
                     latest: "2.0.0".into(),
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
@@ -11438,7 +11546,7 @@ mod tests {
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 PackageVersions {
                     latest: "2.0.0".into(),
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
@@ -11493,12 +11601,15 @@ mod tests {
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
             let mut license_prefetch = HashMap::new();
-            license_prefetch.insert(PackageName::from("serde"), vec!["GPL-3.0".to_string()]);
+            license_prefetch.insert(
+                NormalizedName::for_test("serde"),
+                vec!["GPL-3.0".to_string()],
+            );
 
             let diagnostics = generate_diagnostics_from_cache(
                 &parse_result,
@@ -11523,7 +11634,7 @@ mod tests {
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
@@ -11552,12 +11663,15 @@ mod tests {
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
             let mut license_prefetch = HashMap::new();
-            license_prefetch.insert(PackageName::from("serde"), vec!["GPL-3.0".to_string()]);
+            license_prefetch.insert(
+                NormalizedName::for_test("serde"),
+                vec!["GPL-3.0".to_string()],
+            );
             let policy = LicensePolicy::new(vec![], vec!["GPL-3.0".to_string()]);
 
             let diagnostics = generate_diagnostics_from_cache(
@@ -11604,13 +11718,13 @@ mod tests {
             };
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from(credential_name),
+                NormalizedName::for_test(credential_name),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
             let mut license_prefetch = HashMap::new();
             license_prefetch.insert(
-                PackageName::from(credential_name),
+                NormalizedName::for_test(credential_name),
                 vec!["GPL-3.0".to_string()],
             );
             let policy = LicensePolicy::new(vec![], vec!["GPL-3.0".to_string()]);
@@ -11638,12 +11752,12 @@ mod tests {
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
             let mut license_prefetch = HashMap::new();
-            license_prefetch.insert(PackageName::from("serde"), vec!["ISC".to_string()]);
+            license_prefetch.insert(NormalizedName::for_test("serde"), vec!["ISC".to_string()]);
             let policy = LicensePolicy::new(vec!["MIT".to_string()], vec![]);
 
             let diagnostics = generate_diagnostics_from_cache(
@@ -11677,13 +11791,13 @@ mod tests {
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
             let mut license_prefetch = HashMap::new();
             license_prefetch.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 vec!["ISC\u{202E}evil".to_string()],
             );
             let policy = LicensePolicy::new(vec!["MIT".to_string()], vec![]);
@@ -11711,12 +11825,12 @@ mod tests {
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
             let mut license_prefetch = HashMap::new();
-            license_prefetch.insert(PackageName::from("serde"), vec!["MIT".to_string()]);
+            license_prefetch.insert(NormalizedName::for_test("serde"), vec!["MIT".to_string()]);
             let policy = LicensePolicy::new(vec!["MIT".to_string()], vec!["GPL-3.0".to_string()]);
 
             let diagnostics = generate_diagnostics_from_cache(
@@ -11744,7 +11858,10 @@ mod tests {
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
             let mut license_prefetch = HashMap::new();
-            license_prefetch.insert(PackageName::from("serde"), vec!["GPL-3.0".to_string()]);
+            license_prefetch.insert(
+                NormalizedName::for_test("serde"),
+                vec!["GPL-3.0".to_string()],
+            );
             let policy = LicensePolicy::new(vec![], vec!["GPL-3.0".to_string()]);
 
             let diagnostics = generate_diagnostics_from_cache(
@@ -11787,13 +11904,13 @@ mod tests {
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
             let mut license_prefetch = HashMap::new();
             license_prefetch.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 vec!["The Apache Software License, Version 2.0".to_string()],
             );
             let policy = LicensePolicy::new(vec!["Apache-2.0".to_string()], vec![]);
@@ -11828,13 +11945,13 @@ mod tests {
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
             let mut license_prefetch = HashMap::new();
             license_prefetch.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 vec!["GNU General Public License v3".to_string()],
             );
             let policy = LicensePolicy::new(vec![], vec!["GPL-3.0".to_string()]);
@@ -11871,13 +11988,13 @@ mod tests {
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
             let mut license_prefetch = HashMap::new();
             license_prefetch.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 vec!["Some Bespoke Corporate License".to_string()],
             );
             let policy = LicensePolicy::new(vec!["Apache-2.0".to_string()], vec![]);
@@ -11915,13 +12032,13 @@ mod tests {
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
             let mut license_prefetch = HashMap::new();
             license_prefetch.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 vec![
                     "Eclipse Public License 2.0".to_string(),
                     "Some Custom OEM License Addendum".to_string(),
@@ -11964,13 +12081,13 @@ mod tests {
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
             let mut license_prefetch = HashMap::new();
             license_prefetch.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 vec![
                     "GNU General Public License v3".to_string(),
                     "Some Custom OEM License Addendum".to_string(),
@@ -12012,13 +12129,13 @@ mod tests {
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
             let mut license_prefetch = HashMap::new();
             license_prefetch.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 vec![
                     "Apache License, Version 2.0".to_string(),
                     "GNU General Public License v3".to_string(),
@@ -12056,13 +12173,13 @@ mod tests {
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
             let mut license_prefetch = HashMap::new();
             license_prefetch.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 vec![
                     "Apache License, Version 2.0".to_string(),
                     "GNU General Public License v3".to_string(),
@@ -12107,13 +12224,13 @@ mod tests {
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
             let overlong = "X".repeat(MAX_DIAGNOSTIC_VALUE_CHARS + 50);
             let mut license_prefetch = HashMap::new();
-            license_prefetch.insert(PackageName::from("serde"), vec![overlong.clone()]);
+            license_prefetch.insert(NormalizedName::for_test("serde"), vec![overlong.clone()]);
             let policy = LicensePolicy::new(vec!["MIT".to_string()], vec![]);
 
             let diagnostics = generate_diagnostics_from_cache(
@@ -12146,13 +12263,13 @@ mod tests {
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
             let many: Vec<String> = (0..50).map(|i| format!("License-{i}")).collect();
             let mut license_prefetch = HashMap::new();
-            license_prefetch.insert(PackageName::from("serde"), many);
+            license_prefetch.insert(NormalizedName::for_test("serde"), many);
             let policy = LicensePolicy::new(vec!["MIT".to_string()], vec![]);
 
             let diagnostics = generate_diagnostics_from_cache(
@@ -12240,11 +12357,11 @@ mod tests {
             let parse_result = single_dep_parse_result("serde");
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
-            let typosquat: HashMap<PackageName, TyposquatSignal> = HashMap::new();
+            let typosquat: HashMap<NormalizedName, TyposquatSignal> = HashMap::new();
 
             let diagnostics = generate_diagnostics_from_cache(
                 &parse_result,
@@ -12269,7 +12386,7 @@ mod tests {
             let parse_result = single_dep_parse_result("crossenv");
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("crossenv"),
+                NormalizedName::for_test("crossenv"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
@@ -12296,12 +12413,12 @@ mod tests {
             let parse_result = single_dep_parse_result("crossenv");
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("crossenv"),
+                NormalizedName::for_test("crossenv"),
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
-            let mut typosquat: HashMap<PackageName, TyposquatSignal> = HashMap::new();
-            typosquat.insert(PackageName::from("crossenv"), crossenv_signal());
+            let mut typosquat: HashMap<NormalizedName, TyposquatSignal> = HashMap::new();
+            typosquat.insert(NormalizedName::for_test("crossenv"), crossenv_signal());
 
             let diagnostics = generate_diagnostics_from_cache(
                 &parse_result,
@@ -12337,8 +12454,8 @@ mod tests {
             };
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
-            let mut typosquat: HashMap<PackageName, TyposquatSignal> = HashMap::new();
-            typosquat.insert(PackageName::from("crossenv"), crossenv_signal());
+            let mut typosquat: HashMap<NormalizedName, TyposquatSignal> = HashMap::new();
+            typosquat.insert(NormalizedName::for_test("crossenv"), crossenv_signal());
 
             let diagnostics = generate_diagnostics_from_cache(
                 &parse_result,
@@ -12510,7 +12627,7 @@ mod tests {
             assert_eq!(outcome.completeness, FetchCompleteness::Complete);
             let signal = outcome
                 .signals
-                .get(&PackageName::from("crossenv"))
+                .get(&NormalizedName::for_test("crossenv"))
                 .expect("signal expected");
             assert_eq!(signal.suspected_name, "cross-env");
         }
@@ -12583,6 +12700,62 @@ mod tests {
             assert!(outcome.signals.is_empty());
             assert_eq!(outcome.completeness, FetchCompleteness::Complete);
             package_call.assert_async().await;
+        }
+    }
+
+    mod producer_key_tests {
+        use super::*;
+        use crate::PackageName;
+        use crate::lsp_helpers::PackageNaming;
+
+        struct Lowercase;
+
+        impl PackageNaming for Lowercase {
+            fn normalized_spelling(&self, name: &PackageName) -> String {
+                name.as_str().to_lowercase()
+            }
+        }
+
+        fn key(name: &str) -> PackageKey {
+            PackageKey::new(&PackageName::new(name), &Lowercase)
+        }
+
+        #[test]
+        fn rekey_by_declared_normalizes_requested_names_and_drops_the_rest() {
+            let keys = [key("Django"), key("Flask")];
+            let response = HashMap::from([
+                ("Django".to_string(), 1),
+                ("Flask".to_string(), 2),
+                ("django".to_string(), 3),
+                ("unrequested".to_string(), 4),
+            ]);
+
+            let rekeyed = rekey_by_declared(&keys, response);
+
+            assert_eq!(rekeyed.len(), 2);
+            assert_eq!(rekeyed[key("django").normalized()], 1);
+            assert_eq!(rekeyed[key("flask").normalized()], 2);
+        }
+
+        #[test]
+        fn public_registry_keys_dedupes_by_first_occurrence() {
+            let parse_result = MockParseResult {
+                deps: ["serde", "tokio", "serde"]
+                    .into_iter()
+                    .map(|name| MockDep {
+                        name: name.into(),
+                        version_req: "1.0.0".into(),
+                        version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                        name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    })
+                    .collect(),
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let keys = public_registry_keys(&parse_result, &MOCK_FORMATTER);
+
+            let declared: Vec<&str> = keys.iter().map(|k| k.declared().as_str()).collect();
+            assert_eq!(declared, ["serde", "tokio"]);
         }
     }
 }

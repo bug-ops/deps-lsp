@@ -12,11 +12,13 @@ use crate::progress::ProgressSender;
 use deps_core::ConcreteVersion;
 use deps_core::Deprecation;
 use deps_core::FetchFailure;
-use deps_core::NormalizeName;
-use deps_core::PackageName;
+use deps_core::NormalizedName;
+use deps_core::PackageKey;
 use deps_core::PackageVersions;
 use deps_core::Registry;
 use deps_core::RemovalStatus;
+use deps_core::ResolvedCandidatesMap;
+use deps_core::ResolvedVersionsMap;
 use deps_core::Version;
 use deps_core::VersionReq;
 use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
@@ -25,12 +27,17 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// A dependency name paired with the resolved source to route its registry fetch through
+/// A dependency paired with the resolved source to route its registry fetch through
 /// (spec FR-001), as built by [`dedup_dependencies_by_source`].
-pub type DepSources = Vec<(PackageName, deps_core::parser::DependencySource)>;
+///
+/// The [`PackageKey`] carries the declared spelling the registry request uses and the
+/// normalized one every result map is keyed by. Its derived `Eq`/`Hash` include the declared
+/// spelling, so dedup and collision detection key on [`PackageKey::normalized`], never on the
+/// key itself.
+pub type DepSources = Vec<(PackageKey, deps_core::parser::DependencySource)>;
 
-/// Pairs each distinct dependency name in `parse_result` with the source its occurrence(s)
-/// resolve to.
+/// Pairs each distinct dependency (by normalized name) in `parse_result` with the source its
+/// occurrence(s) resolve to.
 ///
 /// For the background registry fetch to route through
 /// `Registry::get_versions_from`/`get_latest_matching_from` (spec FR-001).
@@ -51,10 +58,13 @@ pub type DepSources = Vec<(PackageName, deps_core::parser::DependencySource)>;
 ///    producing two distinct index URLs for what should be one registry — both are dropped
 ///    from the map and the name is added to the returned collision set instead of being
 ///    fetched. The fetch result is shared across every occurrence of a name
-///    (`FetchResult::versions` is name-keyed), so silently picking a source here would
-///    silently apply it to occurrences whose author may have intended a different
+///    (`FetchResult::versions` is keyed by normalized name), so silently picking a source
+///    here would silently apply it to occurrences whose author may have intended a different
 ///    registry. A `tracing::warn!` names both resolved sources, using message text
 ///    distinguishable from `deps-cargo`'s own FR-003 unresolved-alias warning.
+///
+/// Spellings that normalize alike (`Django`/`django`) are one name: they dedupe to a single
+/// fetch that uses the first occurrence's declared spelling, and differing sources collide.
 ///
 /// Returns `(sources, collided)`: `sources` is ready to fetch as-is; `collided` must be
 /// merged into `DocumentState::signals.outcomes`' fetch-failure channel by the caller so
@@ -98,30 +108,32 @@ pub fn dedup_dependencies_by_source(
     parse_result: &dyn deps_core::ParseResult,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> (
-    HashMap<PackageName, deps_core::parser::DependencySource>,
-    HashSet<PackageName>,
+    HashMap<NormalizedName, (PackageKey, deps_core::parser::DependencySource)>,
+    HashSet<NormalizedName>,
 ) {
     use std::collections::hash_map::Entry;
 
-    let mut by_name: HashMap<PackageName, deps_core::parser::DependencySource> = HashMap::new();
-    let mut collided: HashSet<PackageName> = HashSet::new();
+    let mut by_name: HashMap<NormalizedName, (PackageKey, deps_core::parser::DependencySource)> =
+        HashMap::new();
+    let mut collided: HashSet<NormalizedName> = HashSet::new();
 
     for dep in parse_result
         .dependencies()
         .into_iter()
         .filter(|dep| formatter.can_resolve_source(&dep.source()))
     {
-        let name = dep.name().clone();
+        let key = PackageKey::new(dep.name(), formatter);
         let source = dep.source();
-        match by_name.entry(name.clone()) {
+        match by_name.entry(key.normalized().clone()) {
             Entry::Vacant(entry) => {
-                entry.insert(source);
+                entry.insert((key, source));
             }
             Entry::Occupied(entry) => {
-                if *entry.get() != source && collided.insert(name.clone()) {
+                let (first_key, first_source) = entry.get();
+                if *first_source != source && collided.insert(key.normalized().clone()) {
                     tracing::warn!(
-                        package = %name.for_tracing(),
-                        source_a = ?entry.get(),
+                        package = %first_key.declared().for_tracing(),
+                        source_a = ?first_source,
                         source_b = ?source,
                         "dependency declared against two different resolved registries; \
                          skipping version resolution for all occurrences"
@@ -154,14 +166,14 @@ pub struct FetchPreparation {
     /// `fetch_registry_versions_for_change`, which fetches only added/version-changed
     /// dependencies).
     pub dep_sources: DepSources,
-    /// `dep_name -> [in_use_version, ...]`, from [`crate::classify::resolved::collect_in_use_versions`].
-    pub in_use: HashMap<PackageName, Vec<ConcreteVersion>>,
+    /// `normalized_name -> [in_use_version, ...]`, from [`crate::classify::resolved::collect_in_use_versions`].
+    pub in_use: HashMap<NormalizedName, Vec<ConcreteVersion>>,
     /// The manifest's own [`deps_core::SelectionContext`], from
     /// [`deps_core::ParseResult::selection_context`].
     pub selection_context: deps_core::SelectionContext,
     /// Names dropped by [`dedup_dependencies_by_source`]'s collision gate — must be merged
     /// into `DocumentState::signals.outcomes`' fetch-failure channel by the caller (spec FR-011).
-    pub collided_names: HashSet<PackageName>,
+    pub collided_names: HashSet<NormalizedName>,
 }
 
 /// Builds a [`FetchPreparation`] from a parsed manifest and its resolved lock-file state.
@@ -210,11 +222,11 @@ pub fn prepare_fetch(
     parse_result: &dyn deps_core::ParseResult,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem: deps_core::EcosystemId,
-    resolved_versions: &HashMap<PackageName, ConcreteVersion>,
-    resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
+    resolved_versions: &ResolvedVersionsMap,
+    resolved_version_candidates: &ResolvedCandidatesMap,
 ) -> FetchPreparation {
     let (sources_map, collided_names) = dedup_dependencies_by_source(parse_result, formatter);
-    let dep_sources: DepSources = sources_map.into_iter().collect();
+    let dep_sources: DepSources = sources_map.into_values().collect();
     let in_use = crate::classify::resolved::collect_in_use_versions(
         parse_result,
         resolved_versions,
@@ -233,35 +245,29 @@ pub fn prepare_fetch(
 /// Result of parallel version fetching.
 #[non_exhaustive]
 pub struct FetchResult {
-    /// Successfully fetched versions (package -> latest + full version list)
-    pub versions: HashMap<PackageName, PackageVersions>,
-    /// Yanked-version findings, keyed by **raw** package name (unlike
-    /// `DocumentState::signals.outcomes`, which is normalized-keyed — see
-    /// §3.1 of the design), to (the version string found yanked, its
+    /// Successfully fetched versions (normalized package name -> latest + full version list)
+    pub versions: HashMap<NormalizedName, PackageVersions>,
+    /// Yanked-version findings, keyed by normalized package name like
+    /// `DocumentState::signals.outcomes`, to (the version string found yanked, its
     /// `RemovalStatus`). The status rides alongside so #205's package-level
     /// deprecation diagnostic can gate its yanked-check suppression on
     /// `AdvisoryDeprecated` specifically, never a genuine `Yanked` finding.
-    /// Callers must re-key through `EcosystemFormatter::normalize_package_name`
-    /// before merging into document state.
-    pub yanked_versions: HashMap<PackageName, (ConcreteVersion, RemovalStatus)>,
-    /// Package-level deprecation findings (issue #205), keyed by **raw** package name
-    /// (same raw/normalized split as `yanked_versions` above). Derived from the
-    /// `resolved`/"latest" pick in the fetch loop below, not by scanning the full
-    /// `versions` list — see that loop's comments for why.
-    pub deprecations: HashMap<PackageName, Deprecation>,
-    /// Packages whose registry fetch errored or timed out, keyed by **raw**
-    /// package name (same raw/normalized split as `yanked_versions` above).
-    /// Lets diagnostic generation (#267) distinguish "the registry said this
+    pub yanked_versions: HashMap<NormalizedName, (ConcreteVersion, RemovalStatus)>,
+    /// Package-level deprecation findings (issue #205), keyed by normalized package name.
+    /// Derived from the `resolved`/"latest" pick in the fetch loop below, not by scanning
+    /// the full `versions` list — see that loop's comments for why.
+    pub deprecations: HashMap<NormalizedName, Deprecation>,
+    /// Packages whose registry fetch errored or timed out, keyed by normalized package
+    /// name. Lets diagnostic generation (#267) distinguish "the registry said this
     /// package doesn't exist" from "the registry couldn't be asked" instead
     /// of conflating both into a misleading "Unknown package" diagnostic.
-    pub fetch_failed: HashMap<PackageName, FetchFailure>,
+    pub fetch_failed: HashMap<NormalizedName, FetchFailure>,
     /// Packages whose registry fetch succeeded but produced zero comparable versions
-    /// (#550), keyed by **raw** package name (same raw/normalized split as
-    /// `yanked_versions` above). Distinct from `fetch_failed`: the registry was
+    /// (#550), keyed by normalized package name. Distinct from `fetch_failed`: the registry was
     /// successfully asked and the package demonstrably exists — it just has nothing a
     /// version-comparison rule can use — so `generate_diagnostics_from_cache` must
     /// report neither "Registry lookup failed" nor "Unknown package" for it.
-    pub no_comparable_versions: HashSet<PackageName>,
+    pub no_comparable_versions: HashSet<NormalizedName>,
     /// Toast-ready summary of this round's failures, or `None` when every package either
     /// resolved or fetched cleanly with no comparable versions. Replaces the previously
     /// independent `failed_count`/`first_error` field pair (#480, #490): both bugs were
@@ -281,12 +287,13 @@ pub struct FetchResult {
     /// constructed identically across ~40 call sites throughout the workspace,
     /// including files outside this crate's ownership for this change) —
     /// `merge_registry_fetch_result` merges this map directly into
-    /// `deps-lsp`'s `DocumentState::signals.licenses` instead, the same map the tier-3
+    /// `deps-lsp`'s `DocumentState::signals.licenses` instead (both are keyed by normalized
+    /// package name), the same map the tier-3
     /// background pre-fetch (`run_license_prefetch`) already populates for
     /// Dart/Swift/Gradle/Deno. A merge (not replace), since the two sources are
     /// always disjoint per document (one ecosystem per document) but run as
     /// independent, non-ordered background tasks.
-    pub licenses: HashMap<PackageName, Vec<String>>,
+    pub licenses: HashMap<NormalizedName, Vec<String>>,
 }
 
 /// Toast-ready summary of a fetch batch's failures: how many packages did not resolve and
@@ -363,7 +370,7 @@ impl FetchResult {
     ///
     /// Parameters, in declaration order (see each field's own doc above for the full
     /// rationale — this is a quick cross-check against accidental transposition, several
-    /// share the same `HashMap<PackageName, _>`/`HashSet<PackageName>` shape):
+    /// share the same `HashMap<NormalizedName, _>`/`HashSet<NormalizedName>` shape):
     /// `versions` (successful fetches), `yanked_versions` (yank findings),
     /// `deprecations` (package-level deprecation findings), `fetch_failed` (errored/timed-out
     /// packages), `no_comparable_versions` (fetched clean but nothing to compare),
@@ -371,13 +378,13 @@ impl FetchResult {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        versions: HashMap<PackageName, PackageVersions>,
-        yanked_versions: HashMap<PackageName, (ConcreteVersion, RemovalStatus)>,
-        deprecations: HashMap<PackageName, Deprecation>,
-        fetch_failed: HashMap<PackageName, FetchFailure>,
-        no_comparable_versions: HashSet<PackageName>,
+        versions: HashMap<NormalizedName, PackageVersions>,
+        yanked_versions: HashMap<NormalizedName, (ConcreteVersion, RemovalStatus)>,
+        deprecations: HashMap<NormalizedName, Deprecation>,
+        fetch_failed: HashMap<NormalizedName, FetchFailure>,
+        no_comparable_versions: HashSet<NormalizedName>,
         failure_summary: Option<FailureSummary>,
-        licenses: HashMap<PackageName, Vec<String>>,
+        licenses: HashMap<NormalizedName, Vec<String>>,
     ) -> Self {
         Self {
             versions,
@@ -432,7 +439,7 @@ impl FetchResult {
 ///
 /// * `registry` - Package registry to fetch from
 /// * `package_names` - List of package names to fetch
-/// * `in_use` - Raw dependency name -> the version(s) this project actually
+/// * `in_use` - Normalized dependency name -> the version(s) this project actually
 ///   has (lockfile-resolved or a concrete pin) for every occurrence of that
 ///   name in the manifest, checked against the fetched version list for
 ///   yank status
@@ -459,8 +466,10 @@ impl FetchResult {
 /// ```
 /// use deps_core::parser::DependencySource;
 /// use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
+/// use deps_core::test_util::package_key;
 /// use deps_core::{
-///     ConcreteVersion, Metadata, PackageName, Registry, SelectionContext, Version, VersionReq,
+///     ConcreteVersion, Metadata, NormalizedName, PackageName, Registry, SelectionContext,
+///     Version, VersionReq,
 /// };
 /// use deps_engine::classify::fetch::fetch_latest_versions_parallel;
 /// use std::any::Any;
@@ -521,7 +530,7 @@ impl FetchResult {
 ///
 /// #[tokio::main]
 /// async fn main() {
-///     let sources = vec![(PackageName::new("time"), DependencySource::Registry)];
+///     let sources = vec![(package_key("time"), DependencySource::Registry)];
 ///
 ///     let result = fetch_latest_versions_parallel(
 ///         deps_core::EcosystemId::Cargo,
@@ -538,7 +547,7 @@ impl FetchResult {
 ///     .await;
 ///
 ///     assert_eq!(
-///         result.versions.get(&PackageName::new("time")).map(|v| v.latest.to_string()),
+///         result.versions.get(&NormalizedName::for_test("time")).map(|v| v.latest.to_string()),
 ///         Some("1.0.0".to_string())
 ///     );
 /// }
@@ -553,13 +562,13 @@ pub async fn fetch_latest_versions_parallel(
     ecosystem: deps_core::EcosystemId,
     registry: Arc<dyn Registry>,
     package_sources: DepSources,
-    in_use: &HashMap<PackageName, Vec<ConcreteVersion>>,
+    in_use: &HashMap<NormalizedName, Vec<ConcreteVersion>>,
     progress_sender: Option<ProgressSender>,
     freshness: deps_core::freshness::FreshnessSettings,
     fetch_timeout: FetchTimeout,
     max_concurrent: FetchConcurrency,
     selection_context: &deps_core::SelectionContext,
-    gossip: Option<&HashMap<PackageName, deps_core::GossipFindings>>,
+    gossip: Option<&HashMap<NormalizedName, deps_core::GossipFindings>>,
 ) -> FetchResult {
     use futures::stream::{self, StreamExt};
 
@@ -571,13 +580,13 @@ pub async fn fetch_latest_versions_parallel(
     let mut observers: HashMap<deps_core::RegistryEndpoint, deps_core::EndpointObserver> =
         HashMap::new();
     let results: Vec<_> = stream::iter(package_sources)
-        .map(|(name, source)| {
+        .map(|(key, source)| {
             let registry = Arc::clone(&registry);
             let fetched = Arc::clone(&fetched);
             let progress_sender = progress_sender.clone();
             let wildcard_req = &wildcard_req;
-            let in_use_versions = in_use.get(&name).cloned().unwrap_or_default();
-            let endpoint = registry.endpoint_for(&name, &source);
+            let in_use_versions = in_use.get(key.normalized()).cloned().unwrap_or_default();
+            let endpoint = registry.endpoint_for(key.declared(), &source);
             let observer = observers
                 .entry(endpoint)
                 .or_insert_with(|| deps_core::EndpointObserver::new(ecosystem, endpoint))
@@ -586,7 +595,7 @@ pub async fn fetch_latest_versions_parallel(
                 observer
                     .observe(fetch_and_classify_package(
                         registry.as_ref(),
-                        name,
+                        key,
                         source,
                         in_use_versions,
                         wildcard_req,
@@ -726,7 +735,7 @@ enum PackageStatus {
 /// when the subsequent `get_latest_matching_from` fallback pick fails — so a package can be
 /// both [`PackageStatus::Failed`] and carry a yanked in-use-version finding at once.
 struct PackageOutcome {
-    name: PackageName,
+    name: NormalizedName,
     status: PackageStatus,
     yanked: Option<(ConcreteVersion, RemovalStatus)>,
 }
@@ -780,7 +789,7 @@ impl Pick {
 )]
 async fn fetch_and_classify_package(
     registry: &dyn Registry,
-    name: PackageName,
+    key: PackageKey,
     source: deps_core::parser::DependencySource,
     in_use_versions: Vec<ConcreteVersion>,
     wildcard_req: &VersionReq,
@@ -788,10 +797,11 @@ async fn fetch_and_classify_package(
     timeout: Duration,
     selection_context: &deps_core::SelectionContext,
     check_yanked: bool,
-    gossip: Option<&HashMap<PackageName, deps_core::GossipFindings>>,
+    gossip: Option<&HashMap<NormalizedName, deps_core::GossipFindings>>,
     fetched: &std::sync::atomic::AtomicUsize,
     progress_sender: Option<&ProgressSender>,
 ) -> PackageOutcome {
+    let name = key.declared();
     // Single round trip: the full version list is fetched once and "latest" is a pure
     // in-memory pick over it, no second registry call. `get_versions_from` (source-aware,
     // spec FR-001) over `get_versions`: populates `published_at` where supported (#339) and
@@ -799,7 +809,7 @@ async fn fetch_and_classify_package(
     // either way for registries with no override.
     let result = tokio::time::timeout(
         timeout,
-        registry.get_versions_from(&name, &source, freshness),
+        registry.get_versions_from(name, &source, freshness),
     )
     .await;
 
@@ -867,8 +877,12 @@ async fn fetch_and_classify_package(
             // Shared gate (spec 075 FR-005/T000, DRY) — already required `Some` + active, so
             // behavior here is unchanged; only the ad-hoc closure is replaced.
             let unfiltered_pick_flagged = unfiltered_pick_version.as_ref().is_some_and(|version| {
-                deps_core::lsp_helpers::gossip_cooldown_for(gossip, &name, version.as_str(), now)
-                    == deps_core::lsp_helpers::GossipCooldownLookup::Active
+                deps_core::lsp_helpers::gossip_cooldown_for(
+                    gossip,
+                    key.normalized(),
+                    version.as_str(),
+                    now,
+                ) == deps_core::lsp_helpers::GossipCooldownLookup::Active
             });
 
             // Spec 075 FR-001/FR-002 (T001): computed unconditionally whenever freshness is
@@ -880,7 +894,7 @@ async fn fetch_and_classify_package(
             let cooldown_fallback = compute_cooldown_fallback(
                 registry,
                 &versions,
-                &name,
+                key.normalized(),
                 &in_use_versions,
                 wildcard_req,
                 *selection_context,
@@ -902,7 +916,7 @@ async fn fetch_and_classify_package(
                 unfiltered_pick_version,
                 unfiltered_pick_flagged,
                 gossip,
-                &name,
+                key.normalized(),
                 now,
             );
 
@@ -924,7 +938,7 @@ async fn fetch_and_classify_package(
                 // (Go's `/@latest`). Costs a second network call, only in this rare case.
                 get_latest_matching_fallback(
                     registry,
-                    &name,
+                    name,
                     &source,
                     wildcard_req,
                     *selection_context,
@@ -1039,7 +1053,7 @@ async fn fetch_and_classify_package(
     }
 
     PackageOutcome {
-        name,
+        name: key.normalized().clone(),
         status,
         yanked,
     }
@@ -1071,8 +1085,8 @@ fn gossip_floor_protected_pick(
     unfiltered_pick_idx: Option<usize>,
     unfiltered_pick_version: Option<ConcreteVersion>,
     unfiltered_pick_flagged: bool,
-    gossip: Option<&HashMap<PackageName, deps_core::GossipFindings>>,
-    name: &PackageName,
+    gossip: Option<&HashMap<NormalizedName, deps_core::GossipFindings>>,
+    name: &NormalizedName,
     now: deps_core::freshness::PublishTime,
 ) -> (Option<Box<dyn Version>>, Option<ConcreteVersion>) {
     if !unfiltered_pick_flagged {
@@ -1170,7 +1184,7 @@ fn gossip_floor_protected_pick(
 /// case.
 async fn get_latest_matching_fallback(
     registry: &dyn Registry,
-    name: &PackageName,
+    name: &deps_core::PackageName,
     source: &deps_core::parser::DependencySource,
     wildcard_req: &VersionReq,
     selection_context: deps_core::SelectionContext,
@@ -1359,12 +1373,12 @@ fn in_use_floor(in_use_versions: &[ConcreteVersion], versions: &[Box<dyn Version
 fn compute_cooldown_fallback(
     registry: &dyn Registry,
     versions: &[Box<dyn Version>],
-    name: &PackageName,
+    name: &NormalizedName,
     in_use_versions: &[ConcreteVersion],
     wildcard_req: &VersionReq,
     selection_context: deps_core::SelectionContext,
     freshness: deps_core::freshness::FreshnessSettings,
-    gossip: Option<&HashMap<PackageName, deps_core::GossipFindings>>,
+    gossip: Option<&HashMap<NormalizedName, deps_core::GossipFindings>>,
     now: deps_core::freshness::PublishTime,
     unfiltered_pick_idx: Option<usize>,
 ) -> Option<deps_core::lsp_helpers::CooldownFallback> {
@@ -1455,8 +1469,7 @@ fn compute_cooldown_fallback(
     })
 }
 
-/// Re-keys a completed fetch's yanked/fetch-failure findings from raw to normalized package
-/// names and applies them to `outcomes`.
+/// Applies a completed fetch's yanked/fetch-failure findings to `outcomes`.
 ///
 /// Also records every collided name (two occurrences resolving to different sources,
 /// [`dedup_dependencies_by_source`]) as not-attempted.
@@ -1468,45 +1481,20 @@ fn compute_cooldown_fallback(
 /// # Examples
 ///
 /// ```
-/// use deps_core::lsp_helpers::{
-///     DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy, NormalizeName, OsvNaming,
-///     PackageNaming, PackageRendering, RequirementResolution, SourcePolicy,
-/// };
-/// use deps_core::{ConcreteVersion, PackageName, RemovalStatus};
+/// use deps_core::lsp_helpers::DependencyOutcomes;
+/// use deps_core::{ConcreteVersion, NormalizedName, RemovalStatus};
 /// use deps_engine::classify::fetch::apply_fetch_outcomes;
 /// use std::collections::{HashMap, HashSet};
 ///
-/// struct SimpleFormatter;
-/// impl PackageNaming for SimpleFormatter {}
-/// impl PackageRendering for SimpleFormatter {
-///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-///         version.to_string()
-///     }
-///     fn package_url(&self, name: &PackageName) -> String {
-///         name.as_str().to_string()
-///     }
-/// }
-/// impl RequirementResolution for SimpleFormatter {}
-/// impl DiagnosticMessages for SimpleFormatter {}
-/// impl DiagnosticPolicy for SimpleFormatter {}
-/// impl SourcePolicy for SimpleFormatter {}
-/// impl OsvNaming for SimpleFormatter {}
-///
-/// let time = SimpleFormatter.normalize_package_name(&PackageName::new("time"));
+/// let time = NormalizedName::for_test("time");
 /// let mut outcomes = DependencyOutcomes::new();
 /// let mut yanked = HashMap::new();
 /// yanked.insert(
-///     PackageName::new("time"),
+///     time.clone(),
 ///     (ConcreteVersion::from("0.1.43"), RemovalStatus::Yanked),
 /// );
 ///
-/// apply_fetch_outcomes(
-///     &mut outcomes,
-///     yanked,
-///     HashMap::new(),
-///     HashSet::new(),
-///     &SimpleFormatter,
-/// );
+/// apply_fetch_outcomes(&mut outcomes, yanked, HashMap::new(), HashSet::new());
 ///
 /// assert_eq!(
 ///     outcomes.yanked(&time).map(|(v, _)| v.to_string()),
@@ -1515,22 +1503,18 @@ fn compute_cooldown_fallback(
 /// ```
 pub fn apply_fetch_outcomes(
     outcomes: &mut deps_core::lsp_helpers::DependencyOutcomes,
-    yanked_versions: HashMap<PackageName, (ConcreteVersion, RemovalStatus)>,
-    fetch_failed: HashMap<PackageName, FetchFailure>,
-    collided_names: HashSet<PackageName>,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+    yanked_versions: HashMap<NormalizedName, (ConcreteVersion, RemovalStatus)>,
+    fetch_failed: HashMap<NormalizedName, FetchFailure>,
+    collided_names: HashSet<NormalizedName>,
 ) {
     for (name, version) in yanked_versions {
-        outcomes.set_yanked(formatter.normalize_package_name(&name), version);
+        outcomes.set_yanked(name, version);
     }
     for (name, failure) in fetch_failed {
-        outcomes.set_fetch_failure(formatter.normalize_package_name(&name), failure);
+        outcomes.set_fetch_failure(name, failure);
     }
     for name in collided_names {
-        outcomes.set_fetch_failure_if_absent(
-            formatter.normalize_package_name(&name),
-            FetchFailure::NotAttempted,
-        );
+        outcomes.set_fetch_failure_if_absent(name, FetchFailure::NotAttempted);
     }
 }
 
@@ -1540,6 +1524,8 @@ mod wiring_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::PackageName;
+    use deps_core::test_util::package_key;
 
     fn secs(seconds: u64) -> FetchTimeout {
         FetchTimeout::try_from_secs(seconds).expect("test timeout inside the accepted range")
@@ -1555,17 +1541,16 @@ mod tests {
     /// `fetch_latest_versions_parallel` test used before that function became source-aware
     /// (spec FR-001). Production call sites build real `(name, source)` pairs from a
     /// parsed manifest via `dedup_dependencies_by_source` instead.
-    fn with_registry_source(names: Vec<PackageName>) -> Vec<(PackageName, DependencySource)> {
+    fn with_registry_source(names: Vec<PackageName>) -> DepSources {
         names
             .into_iter()
-            .map(|name| (name, DependencySource::Registry))
+            .map(|name| (package_key(name.as_str()), DependencySource::Registry))
             .collect()
     }
 
     #[cfg(feature = "cargo")]
     mod apply_fetch_outcomes_tests {
         use super::*;
-        use crate::setup::CargoFormatter;
         use deps_core::lsp_helpers::DependencyOutcomes;
 
         #[test]
@@ -1573,7 +1558,7 @@ mod tests {
             let mut outcomes = DependencyOutcomes::new();
             let mut yanked_versions = HashMap::new();
             yanked_versions.insert(
-                PackageName::new("time"),
+                NormalizedName::for_test("time"),
                 ("0.1.43".into(), RemovalStatus::Yanked),
             );
 
@@ -1582,7 +1567,6 @@ mod tests {
                 yanked_versions,
                 HashMap::new(),
                 HashSet::new(),
-                &CargoFormatter,
             );
 
             assert_eq!(
@@ -1598,17 +1582,11 @@ mod tests {
         fn apply_fetch_outcomes_collided_name_does_not_clobber_existing_fetch_failure() {
             let mut outcomes = DependencyOutcomes::new();
             let mut fetch_failed = HashMap::new();
-            fetch_failed.insert(PackageName::new("serde"), FetchFailure::Transient);
+            fetch_failed.insert(NormalizedName::for_test("serde"), FetchFailure::Transient);
             let mut collided_names = HashSet::new();
-            collided_names.insert(PackageName::new("serde"));
+            collided_names.insert(NormalizedName::for_test("serde"));
 
-            apply_fetch_outcomes(
-                &mut outcomes,
-                HashMap::new(),
-                fetch_failed,
-                collided_names,
-                &CargoFormatter,
-            );
+            apply_fetch_outcomes(&mut outcomes, HashMap::new(), fetch_failed, collided_names);
 
             assert_eq!(
                 outcomes.fetch_failure(&deps_core::NormalizedName::for_test("serde")),
@@ -1623,14 +1601,13 @@ mod tests {
         fn apply_fetch_outcomes_collided_name_alone_is_recorded_as_not_attempted() {
             let mut outcomes = DependencyOutcomes::new();
             let mut collided_names = HashSet::new();
-            collided_names.insert(PackageName::new("serde"));
+            collided_names.insert(NormalizedName::for_test("serde"));
 
             apply_fetch_outcomes(
                 &mut outcomes,
                 HashMap::new(),
                 HashMap::new(),
                 collided_names,
-                &CargoFormatter,
             );
 
             assert_eq!(
@@ -1728,11 +1705,11 @@ mod tests {
                 dedup_dependencies_by_source(&parse_result, &ALTERNATE_AWARE_FORMATTER);
 
             assert!(
-                !sources.contains_key(&PackageName::new("shared-name")),
+                !sources.contains_key(&NormalizedName::for_test("shared-name")),
                 "a colliding name must not be fetched under either source"
             );
             assert!(
-                collided.contains(&PackageName::new("shared-name")),
+                collided.contains(&NormalizedName::for_test("shared-name")),
                 "the collision must be recorded so the caller can mark it fetch_failed"
             );
         }
@@ -1759,7 +1736,9 @@ mod tests {
 
             assert!(collided.is_empty());
             assert_eq!(
-                sources.get(&PackageName::new("shared-name")),
+                sources
+                    .get(&NormalizedName::for_test("shared-name"))
+                    .map(|(_, source)| source),
                 Some(&DependencySource::Registry)
             );
         }
@@ -1820,8 +1799,8 @@ mod tests {
             let log = deps_core::test_util::capture_tracing_output(|| {
                 let (sources, collided) =
                     dedup_dependencies_by_source(&parse_result, &ALTERNATE_AWARE_FORMATTER);
-                assert!(!sources.contains_key(&PackageName::new("shared-name")));
-                assert!(collided.contains(&PackageName::new("shared-name")));
+                assert!(!sources.contains_key(&NormalizedName::for_test("shared-name")));
+                assert!(collided.contains(&NormalizedName::for_test("shared-name")));
             });
 
             assert!(
@@ -1909,7 +1888,10 @@ mod tests {
         // be recorded the same way as a hard registry error.
         assert_eq!(
             result.fetch_failed,
-            HashMap::from([(PackageName::new("slow-package"), FetchFailure::Transient)]),
+            HashMap::from([(
+                NormalizedName::for_test("slow-package"),
+                FetchFailure::Transient
+            )]),
             "timed-out package must be recorded in fetch_failed"
         );
     }
@@ -2212,17 +2194,21 @@ mod tests {
         assert_eq!(
             result
                 .versions
-                .get("package-fast")
+                .get(&NormalizedName::for_test("package-fast"))
                 .map(|v| v.latest.as_str()),
             Some("1.0.0"),
             "Fast package should have correct version"
         );
         assert!(
-            !result.versions.contains_key("package-slow"),
+            !result
+                .versions
+                .contains_key(&NormalizedName::for_test("package-slow")),
             "Slow package should not be in results (timeout)"
         );
         assert!(
-            !result.versions.contains_key("package-error"),
+            !result
+                .versions
+                .contains_key(&NormalizedName::for_test("package-error")),
             "Error package should not be in results"
         );
     }
@@ -2260,7 +2246,7 @@ mod tests {
 
         let serde = result
             .versions
-            .get("serde")
+            .get(&NormalizedName::for_test("serde"))
             .expect("serde should be fetched");
         assert_eq!(serde.latest, "1.0.214", "latest must skip the yanked entry");
         assert_eq!(
@@ -2321,7 +2307,7 @@ mod tests {
 
         let serde = result
             .versions
-            .get("serde")
+            .get(&NormalizedName::for_test("serde"))
             .expect("serde should be fetched");
         assert_eq!(serde.latest, "1.0.214");
         assert_eq!(
@@ -2421,13 +2407,15 @@ mod tests {
         .await;
 
         assert_eq!(
-            result.licenses.get(&PackageName::new("licensed-pkg")),
+            result
+                .licenses
+                .get(&NormalizedName::for_test("licensed-pkg")),
             Some(&vec!["MIT".to_string()])
         );
         assert!(
             !result
                 .licenses
-                .contains_key(&PackageName::new("unlicensed-pkg")),
+                .contains_key(&NormalizedName::for_test("unlicensed-pkg")),
             "an empty Version::license() must produce no entry, not an empty-vec one"
         );
     }
@@ -2528,7 +2516,7 @@ mod tests {
 
         let widget = result
             .versions
-            .get("widget")
+            .get(&NormalizedName::for_test("widget"))
             .expect("widget should be fetched");
         assert_eq!(
             widget.published_at,
@@ -2633,7 +2621,9 @@ mod tests {
             "select_latest_matching must receive the caller's minimum_stability"
         );
         assert!(
-            result.versions.contains_key("vendor/pkg"),
+            result
+                .versions
+                .contains_key(&NormalizedName::for_test("vendor/pkg")),
             "the pick must still succeed"
         );
     }
@@ -2726,7 +2716,7 @@ mod tests {
         );
         let widget = result
             .versions
-            .get("vendor/pkg")
+            .get(&NormalizedName::for_test("vendor/pkg"))
             .expect("fallback pick should succeed");
         assert_eq!(widget.latest, "2.0.0-beta1");
     }
@@ -2807,7 +2797,7 @@ mod tests {
         assert_eq!(
             result
                 .versions
-                .get("golang.org/x/exp")
+                .get(&NormalizedName::for_test("golang.org/x/exp"))
                 .map(|v| v.latest.as_str()),
             Some("v0.0.0-20191109021931-daa7c04131f5"),
             "must fall back to get_latest_matching instead of reporting no version found"
@@ -2898,9 +2888,18 @@ mod tests {
         assert_eq!(
             result.fetch_failed,
             HashMap::from([
-                (PackageName::new("package-1"), FetchFailure::Transient),
-                (PackageName::new("package-2"), FetchFailure::Transient),
-                (PackageName::new("package-3"), FetchFailure::Transient),
+                (
+                    NormalizedName::for_test("package-1"),
+                    FetchFailure::Transient
+                ),
+                (
+                    NormalizedName::for_test("package-2"),
+                    FetchFailure::Transient
+                ),
+                (
+                    NormalizedName::for_test("package-3"),
+                    FetchFailure::Transient
+                ),
             ]),
             "every errored package must be recorded in fetch_failed"
         );
@@ -3143,7 +3142,7 @@ mod tests {
         assert!(
             result
                 .no_comparable_versions
-                .contains(&PackageName::new("dtolnay/rust-toolchain")),
+                .contains(&NormalizedName::for_test("dtolnay/rust-toolchain")),
             "a package whose fetch succeeded with zero comparable versions must be \
              recorded in no_comparable_versions, or R5 would misreport it as Unknown \
              package; got: {:?}",
@@ -3307,7 +3306,7 @@ mod tests {
         assert!(result.versions.is_empty());
         assert_eq!(
             result.fetch_failed,
-            HashMap::from([(PackageName::new("flaky"), FetchFailure::Transient)]),
+            HashMap::from([(NormalizedName::for_test("flaky"), FetchFailure::Transient)]),
             "the fallback's own non-not-found error must be recorded in fetch_failed, \
              but its not-found error must not"
         );
@@ -3385,7 +3384,10 @@ mod tests {
         assert!(result.versions.is_empty());
         assert_eq!(
             result.fetch_failed,
-            HashMap::from([(PackageName::new("slow-fallback"), FetchFailure::Transient)])
+            HashMap::from([(
+                NormalizedName::for_test("slow-fallback"),
+                FetchFailure::Transient
+            )])
         );
         assert_eq!(result.failed_count(), 1);
     }
@@ -3820,14 +3822,14 @@ mod tests {
             });
             let mut in_use = HashMap::new();
             in_use.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 vec![ConcreteVersion::from("1.0.0")],
             );
 
             let result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 registry,
-                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                vec![(package_key("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -3853,14 +3855,14 @@ mod tests {
             });
             let mut in_use = HashMap::new();
             in_use.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 vec![ConcreteVersion::from("1.0.0")],
             );
 
             let result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 registry,
-                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                vec![(package_key("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -3888,7 +3890,7 @@ mod tests {
             let result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 registry,
-                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                vec![(package_key("pkg"), DependencySource::Registry)],
                 &HashMap::new(),
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -3920,14 +3922,14 @@ mod tests {
             });
             let mut in_use = HashMap::new();
             in_use.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 vec![ConcreteVersion::from("1.0.0")],
             );
 
             let result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 registry,
-                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                vec![(package_key("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -3940,7 +3942,7 @@ mod tests {
 
             assert_eq!(fetch_calls.load(Ordering::Relaxed), 1);
             assert_eq!(
-                result.yanked_versions.get(&PackageName::new("pkg")),
+                result.yanked_versions.get(&NormalizedName::for_test("pkg")),
                 Some(&(ConcreteVersion::new("1.0.0"), RemovalStatus::Yanked))
             );
         }
@@ -3959,14 +3961,14 @@ mod tests {
             });
             let mut in_use = HashMap::new();
             in_use.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 vec![ConcreteVersion::from("1.0.0")],
             );
 
             let result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 registry,
-                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                vec![(package_key("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -3998,14 +4000,14 @@ mod tests {
             });
             let mut in_use = HashMap::new();
             in_use.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 vec![ConcreteVersion::from("1.0.0")],
             );
 
             let result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 registry,
-                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                vec![(package_key("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -4017,7 +4019,7 @@ mod tests {
             .await;
 
             assert_eq!(
-                result.yanked_versions.get(&PackageName::new("pkg")),
+                result.yanked_versions.get(&NormalizedName::for_test("pkg")),
                 Some(&(ConcreteVersion::new("1.0.0"), RemovalStatus::Yanked))
             );
             assert!(result.versions.is_empty());
@@ -4039,14 +4041,14 @@ mod tests {
             });
             let mut in_use = HashMap::new();
             in_use.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 vec![ConcreteVersion::from("1.0.0")],
             );
 
             let result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 registry,
-                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                vec![(package_key("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -4061,12 +4063,12 @@ mod tests {
             assert_eq!(
                 result
                     .versions
-                    .get(&PackageName::new("pkg"))
+                    .get(&NormalizedName::for_test("pkg"))
                     .map(|v| v.latest.as_str()),
                 Some("2.0.0")
             );
             assert_eq!(
-                result.yanked_versions.get(&PackageName::new("pkg")),
+                result.yanked_versions.get(&NormalizedName::for_test("pkg")),
                 Some(&(ConcreteVersion::new("1.0.0"), RemovalStatus::Yanked))
             );
         }
@@ -4139,14 +4141,14 @@ mod tests {
         async fn fallback_error_does_not_suppress_an_already_found_yanked_in_use_version() {
             let mut in_use = HashMap::new();
             in_use.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 vec![ConcreteVersion::from("1.0.0")],
             );
 
             let result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 Arc::new(YankedThenFallbackErrorRegistry),
-                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                vec![(package_key("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -4162,12 +4164,12 @@ mod tests {
                 "the fallback errored, so no version was resolved"
             );
             assert_eq!(
-                result.yanked_versions.get(&PackageName::new("pkg")),
+                result.yanked_versions.get(&NormalizedName::for_test("pkg")),
                 Some(&(ConcreteVersion::new("1.0.0"), RemovalStatus::Yanked)),
                 "the yanked in-use finding must survive even though the fallback pick failed"
             );
             assert_eq!(
-                result.fetch_failed.get(&PackageName::new("pkg")),
+                result.fetch_failed.get(&NormalizedName::for_test("pkg")),
                 Some(&FetchFailure::Transient)
             );
             assert_eq!(result.failed_count(), 1);
@@ -4195,7 +4197,7 @@ mod tests {
             });
             let mut in_use = HashMap::new();
             in_use.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 vec![
                     ConcreteVersion::from("1.0.0"),
                     ConcreteVersion::from("2.0.0"),
@@ -4205,7 +4207,7 @@ mod tests {
             let result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 registry,
-                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                vec![(package_key("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -4217,7 +4219,7 @@ mod tests {
             .await;
 
             assert_eq!(
-                result.yanked_versions.get(&PackageName::new("pkg")),
+                result.yanked_versions.get(&NormalizedName::for_test("pkg")),
                 Some(&(ConcreteVersion::new("2.0.0"), RemovalStatus::Yanked)),
                 "the yanked occurrence must be found even though a name-keyed \
                  single-value map could have kept only the non-yanked \"1.0.0\" pin"
@@ -4241,7 +4243,7 @@ mod tests {
             let result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 registry,
-                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                vec![(package_key("pkg"), DependencySource::Registry)],
                 &HashMap::new(),
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -4253,7 +4255,7 @@ mod tests {
             .await;
 
             assert_eq!(
-                result.yanked_versions.get(&PackageName::new("pkg")),
+                result.yanked_versions.get(&NormalizedName::for_test("pkg")),
                 Some(&(ConcreteVersion::new("1.0.0"), RemovalStatus::Yanked))
             );
         }
@@ -4277,7 +4279,7 @@ mod tests {
             let result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 registry,
-                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                vec![(package_key("pkg"), DependencySource::Registry)],
                 &HashMap::new(),
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -4296,7 +4298,7 @@ mod tests {
             assert!(
                 result
                     .versions
-                    .get(&PackageName::new("pkg"))
+                    .get(&NormalizedName::for_test("pkg"))
                     .expect("pkg was fetched")
                     .yanked
                     .is_empty(),
@@ -4320,14 +4322,14 @@ mod tests {
             });
             let mut in_use = HashMap::new();
             in_use.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 vec![ConcreteVersion::from("1.0.0")],
             );
 
             let result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 registry,
-                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                vec![(package_key("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -4354,14 +4356,14 @@ mod tests {
             });
             let mut in_use = HashMap::new();
             in_use.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 vec![ConcreteVersion::from("1.0.0")],
             );
 
             let result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 registry,
-                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                vec![(package_key("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -4473,7 +4475,7 @@ mod tests {
             let result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 registry,
-                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                vec![(package_key("pkg"), DependencySource::Registry)],
                 &HashMap::new(),
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -4485,7 +4487,7 @@ mod tests {
             .await;
 
             assert_eq!(
-                result.deprecations.get(&PackageName::new("pkg")),
+                result.deprecations.get(&NormalizedName::for_test("pkg")),
                 Some(&Deprecation {
                     reason: Some("archived".to_string()),
                     replacement: Some("other/pkg".to_string()),
@@ -4500,7 +4502,7 @@ mod tests {
             let result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 registry,
-                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                vec![(package_key("pkg"), DependencySource::Registry)],
                 &HashMap::new(),
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -4662,13 +4664,13 @@ mod tests {
         async fn fetch_pkg(
             registry: Arc<FixedListRegistry>,
             in_use: Vec<&'static str>,
-            gossip: HashMap<PackageName, deps_core::GossipFindings>,
+            gossip: HashMap<NormalizedName, deps_core::GossipFindings>,
         ) -> Option<PackageVersions> {
             let registry: Arc<dyn Registry> = registry;
             let mut in_use_map = HashMap::new();
             if !in_use.is_empty() {
                 in_use_map.insert(
-                    PackageName::new("pkg"),
+                    NormalizedName::for_test("pkg"),
                     in_use.into_iter().map(ConcreteVersion::from).collect(),
                 );
             }
@@ -4685,7 +4687,10 @@ mod tests {
                 Some(&gossip),
             )
             .await;
-            result.versions.get(&PackageName::new("pkg")).cloned()
+            result
+                .versions
+                .get(&NormalizedName::for_test("pkg"))
+                .cloned()
         }
 
         /// GOSSIP-only exclusion, floor-protected (round 2): a real in-use version (`1.0.0`)
@@ -4697,7 +4702,7 @@ mod tests {
         async fn active_cooldown_on_the_latest_version_excludes_it() {
             let mut gossip = HashMap::new();
             gossip.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 stub_gossip_findings("2.0.0", Some(active_cooldown())),
             );
 
@@ -4740,7 +4745,10 @@ mod tests {
         #[tokio::test]
         async fn finding_without_a_cooldown_is_a_no_op() {
             let mut gossip = HashMap::new();
-            gossip.insert(PackageName::new("pkg"), stub_gossip_findings("2.0.0", None));
+            gossip.insert(
+                NormalizedName::for_test("pkg"),
+                stub_gossip_findings("2.0.0", None),
+            );
 
             let versions = fetch_pkg(
                 Arc::new(FixedListRegistry::new(vec!["2.0.0", "1.0.0"])),
@@ -4760,7 +4768,7 @@ mod tests {
         async fn expired_cooldown_is_a_no_op() {
             let mut gossip = HashMap::new();
             gossip.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 stub_gossip_findings("2.0.0", Some(expired_cooldown())),
             );
 
@@ -4783,7 +4791,7 @@ mod tests {
         async fn version_string_mismatch_is_a_no_op() {
             let mut gossip = HashMap::new();
             gossip.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 stub_gossip_findings("3.0.0", Some(active_cooldown())),
             );
 
@@ -4809,7 +4817,7 @@ mod tests {
         async fn in_use_version_itself_flagged_neutralizes_the_exclusion() {
             let mut gossip = HashMap::new();
             gossip.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 stub_gossip_findings("2.0.0", Some(active_cooldown())),
             );
 
@@ -4841,7 +4849,7 @@ mod tests {
         async fn safe_intermediate_release_above_the_floor_is_picked() {
             let mut gossip = HashMap::new();
             gossip.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 stub_gossip_findings("3.0.0", Some(active_cooldown())),
             );
 
@@ -4890,7 +4898,7 @@ mod tests {
         async fn no_in_use_version_at_all_is_a_deliberate_no_op() {
             let mut gossip = HashMap::new();
             gossip.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 stub_gossip_findings("2.0.0", Some(active_cooldown())),
             );
 
@@ -4927,7 +4935,7 @@ mod tests {
         async fn floor_exists_but_ecosystem_selection_rejects_the_remainder_is_a_no_op() {
             let mut gossip = HashMap::new();
             gossip.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 stub_gossip_findings("1.0.0", Some(active_cooldown())),
             );
 
@@ -4969,7 +4977,7 @@ mod tests {
         async fn filtered_pick_below_the_floor_is_rejected_in_favor_of_the_unfiltered_pick() {
             let mut gossip = HashMap::new();
             gossip.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 stub_gossip_findings("1.0.0", Some(active_cooldown())),
             );
 
@@ -5084,7 +5092,7 @@ mod tests {
             let mut in_use_map = HashMap::new();
             if !in_use.is_empty() {
                 in_use_map.insert(
-                    PackageName::new("pkg"),
+                    NormalizedName::for_test("pkg"),
                     in_use.into_iter().map(ConcreteVersion::from).collect(),
                 );
             }
@@ -5103,7 +5111,10 @@ mod tests {
                 None,
             )
             .await;
-            result.versions.get(&PackageName::new("pkg")).cloned()
+            result
+                .versions
+                .get(&NormalizedName::for_test("pkg"))
+                .cloned()
         }
 
         /// A registry whose list-based `select_latest_matching` rejects the ACTUAL fetched
@@ -5491,7 +5502,7 @@ mod tests {
 
             let disposition = deps_core::lsp_helpers::cooldown_disposition(
                 &package_versions,
-                &PackageName::new("pkg"),
+                &NormalizedName::for_test("pkg"),
                 deps_core::freshness::FreshnessSettings::Enabled {
                     cooldown: deps_core::CooldownWindow::from_secs(cooldown_secs),
                 },
@@ -5534,7 +5545,7 @@ mod tests {
             let narrowed_cooldown_secs = 2 * 24 * 60 * 60;
             let disposition = deps_core::lsp_helpers::cooldown_disposition(
                 &package_versions,
-                &PackageName::new("pkg"),
+                &NormalizedName::for_test("pkg"),
                 deps_core::freshness::FreshnessSettings::Enabled {
                     cooldown: deps_core::CooldownWindow::from_secs(narrowed_cooldown_secs),
                 },
@@ -5580,7 +5591,7 @@ mod tests {
 
             let disposition = deps_core::lsp_helpers::cooldown_disposition(
                 &package_versions,
-                &PackageName::new("pkg"),
+                &NormalizedName::for_test("pkg"),
                 deps_core::freshness::FreshnessSettings::Enabled {
                     cooldown: deps_core::CooldownWindow::from_secs(cooldown_secs),
                 },
@@ -5627,7 +5638,7 @@ mod tests {
             ];
             let mut gossip = HashMap::new();
             gossip.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 deps_core::test_util::stub_gossip_findings(
                     "3.0.0",
                     Some(deps_core::GossipCooldown::new(
@@ -5640,7 +5651,7 @@ mod tests {
             let registry: Arc<dyn Registry> = Arc::new(FixedRegistry(versions));
             let mut in_use_map = HashMap::new();
             in_use_map.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 vec![ConcreteVersion::from("1.0.0")],
             );
             let result = fetch_latest_versions_parallel(
@@ -5660,7 +5671,7 @@ mod tests {
             .await;
             let package_versions = result
                 .versions
-                .get(&PackageName::new("pkg"))
+                .get(&NormalizedName::for_test("pkg"))
                 .cloned()
                 .expect("pkg must resolve");
 
@@ -5684,7 +5695,7 @@ mod tests {
 
             let disposition = deps_core::lsp_helpers::cooldown_disposition(
                 &package_versions,
-                &PackageName::new("pkg"),
+                &NormalizedName::for_test("pkg"),
                 deps_core::freshness::FreshnessSettings::Enabled {
                     cooldown: deps_core::CooldownWindow::from_secs(cooldown_secs),
                 },
@@ -5708,6 +5719,209 @@ mod tests {
                      substituted latest, got {other:?}"
                 ),
             }
+        }
+    }
+
+    /// #1873: spellings that normalize alike are one dependency to the fetch — one request
+    /// carrying the first occurrence's declared spelling, every result keyed normalized.
+    mod normalized_key_tests {
+        use super::*;
+        use deps_core::position::{Position, Range};
+        use deps_core::test_util::{MockVersion, StubFormatter};
+        use deps_core::{Dependency, Metadata, Registry, Version};
+        use std::any::Any;
+        use std::sync::Mutex;
+
+        const LOWERCASE_FORMATTER: StubFormatter = StubFormatter::new()
+            .with_alternate_registry_resolution()
+            .with_lowercase_names();
+
+        struct MockDep {
+            name: PackageName,
+            source: DependencySource,
+            addr_tag: u32,
+        }
+
+        impl Dependency for MockDep {
+            fn name(&self) -> &PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                Range::new(
+                    Position::new(0, self.addr_tag),
+                    Position::new(0, self.addr_tag + 1),
+                )
+            }
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                None
+            }
+            fn version_range(&self) -> Option<Range> {
+                None
+            }
+            fn source(&self) -> DependencySource {
+                self.source.clone()
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockParseResult {
+            deps: Vec<MockDep>,
+        }
+
+        impl deps_core::ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                static URI: std::sync::OnceLock<url::Url> = std::sync::OnceLock::new();
+                URI.get_or_init(|| deps_core::test_util::test_uri("/test/requirements.txt"))
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        fn registry_dep(name: &str, addr_tag: u32) -> MockDep {
+            MockDep {
+                name: PackageName::new(name),
+                source: DependencySource::Registry,
+                addr_tag,
+            }
+        }
+
+        struct RecordingRegistry {
+            requested: Mutex<Vec<String>>,
+        }
+
+        impl Registry for RecordingRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                name: &'a PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                self.requested
+                    .lock()
+                    .expect("test mutex is never poisoned")
+                    .push(name.as_str().to_string());
+                Box::pin(async move {
+                    Ok(vec![Box::new(MockVersion::new("1.0.0")) as Box<dyn Version>])
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a PackageName,
+                _req: &'a VersionReq,
+                _selection_context: &'a SelectionContext,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Ok(Some(Box::new(MockVersion::new("1.0.0")) as Box<dyn Version>))
+                })
+            }
+
+            fn search_raw<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        #[test]
+        fn case_variant_spellings_dedupe_to_the_first_occurrence() {
+            let parse_result = MockParseResult {
+                deps: vec![registry_dep("Django", 0), registry_dep("django", 1)],
+            };
+
+            let (sources, collided) =
+                dedup_dependencies_by_source(&parse_result, &LOWERCASE_FORMATTER);
+
+            assert!(collided.is_empty());
+            assert_eq!(sources.len(), 1);
+            let (key, _) = &sources[&NormalizedName::for_test("django")];
+            assert_eq!(key.declared().as_str(), "Django");
+        }
+
+        #[test]
+        fn case_variant_spellings_with_different_sources_collide_under_the_normalized_name() {
+            let parse_result = MockParseResult {
+                deps: vec![
+                    registry_dep("Django", 0),
+                    MockDep {
+                        name: PackageName::new("django"),
+                        source: DependencySource::AlternateRegistry {
+                            index: "https://index.mycorp.dev".into(),
+                            mirrors_crates_io: false,
+                        },
+                        addr_tag: 1,
+                    },
+                ],
+            };
+
+            let (sources, collided) =
+                dedup_dependencies_by_source(&parse_result, &LOWERCASE_FORMATTER);
+
+            assert!(sources.is_empty());
+            assert_eq!(
+                collided,
+                HashSet::from([NormalizedName::for_test("django")])
+            );
+        }
+
+        #[tokio::test]
+        async fn fetch_requests_the_declared_spelling_and_keys_results_normalized() {
+            let parse_result = MockParseResult {
+                deps: vec![registry_dep("Django", 0), registry_dep("django", 1)],
+            };
+            let prep = prepare_fetch(
+                &parse_result,
+                &LOWERCASE_FORMATTER,
+                deps_core::EcosystemId::Cargo,
+                &HashMap::new(),
+                &HashMap::new(),
+            );
+            let registry = Arc::new(RecordingRegistry {
+                requested: Mutex::new(Vec::new()),
+            });
+
+            let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
+                Arc::clone(&registry) as Arc<dyn Registry>,
+                prep.dep_sources,
+                &prep.in_use,
+                None,
+                deps_core::freshness::FreshnessSettings::default(),
+                secs(5),
+                conc(4),
+                &SelectionContext::none(),
+                None,
+            )
+            .await;
+
+            assert_eq!(
+                *registry
+                    .requested
+                    .lock()
+                    .expect("test mutex is never poisoned"),
+                ["Django"],
+                "one request, carrying the first occurrence's declared spelling"
+            );
+            assert_eq!(
+                result.versions.keys().collect::<Vec<_>>(),
+                [&NormalizedName::for_test("django")]
+            );
         }
     }
 }

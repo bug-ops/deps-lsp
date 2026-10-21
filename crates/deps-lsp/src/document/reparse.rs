@@ -3,7 +3,7 @@
 //! a [`ReparseScope`], reusing the version-guarded, sequential-await machinery
 //! [`handle_document_change_guarded`] already provides against a concurrent `did_change`.
 
-use super::lifecycle::{CommitGuard, handle_document_change_guarded};
+use super::lifecycle::{CommitGuard, ParseTrigger, handle_document_change_guarded};
 use super::resolved::RefetchPolicy;
 use super::state::{RefreshKind, ServerState, refresh_with_timeout};
 use crate::config::{DepsConfig, ReparseScope};
@@ -114,6 +114,7 @@ pub(crate) async fn reparse_open_documents(
             content,
             version,
             CommitGuard::ExpectVersion(version),
+            ParseTrigger::Config,
             refetch,
             Arc::clone(&state),
             client.clone(),

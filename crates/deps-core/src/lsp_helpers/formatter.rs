@@ -242,10 +242,44 @@ pub trait PackageRendering: Send + Sync {
         !matches!(source, crate::parser::DependencySource::Registry)
     }
 
+    /// An extra line explaining where `dep`'s data comes from, shown in its hover (a SHA pin
+    /// proven newer than the latest release, a source dependency served by a registry
+    /// identity).
+    ///
+    /// Default: `None`, no extra line.
+    fn hover_provenance(
+        &self,
+        dep: &dyn Dependency,
+    ) -> Option<crate::lsp_helpers::HoverProvenance> {
+        let _ = dep;
+        None
+    }
+
     /// Detect if cursor position is on a dependency for code actions.
     fn is_position_on_dependency(&self, dep: &dyn Dependency, position: Position) -> bool {
         dep.version_range()
             .is_some_and(|r| position_in_range(position, r))
+    }
+}
+
+/// The naming of ecosystems whose package or repository identity is case-insensitive and
+/// otherwise verbatim (GitHub Actions, GitLab CI): the lowercased name.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::PackageName;
+/// use deps_core::lsp_helpers::{LowercaseNaming, NormalizeName};
+///
+/// let key = LowercaseNaming.normalize_package_name(&PackageName::new("Actions/Checkout"));
+/// assert_eq!(key.as_str(), "actions/checkout");
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LowercaseNaming;
+
+impl PackageNaming for LowercaseNaming {
+    fn normalized_spelling(&self, name: &PackageName) -> String {
+        name.as_str().to_lowercase()
     }
 }
 
@@ -2342,13 +2376,83 @@ pub enum OsvNameAvailability {
     },
 }
 
+/// The public package whose content a dependency is, as returned by
+/// [`OsvNaming::public_content`].
+///
+/// Its `name` is what OSV and license lookups are keyed by; it is the dependency's own name
+/// except where an ecosystem serves a dependency from one place and describes it by another
+/// (a SwiftPM dependency swapped to a registry identity, described by its GitHub repository).
+///
+/// # Examples
+///
+/// ```
+/// use std::borrow::Cow;
+/// use deps_core::PackageName;
+/// use deps_core::lsp_helpers::PublicContent;
+///
+/// let content = PublicContent { name: Cow::Owned(PackageName::new("apple/swift-nio")) };
+/// assert_eq!(content.name.as_str(), "apple/swift-nio");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicContent<'d> {
+    /// The name the dependency's public content is known by.
+    pub name: std::borrow::Cow<'d, PackageName>,
+}
+
 /// Native <-> OSV.dev namespace bridging for package names and version strings.
 ///
 /// Implementors guarantee every method is the identity transform unless this ecosystem's
 /// native naming/versioning genuinely diverges from OSV.dev's own convention for it — callers
 /// (the OSV scan-target builder and advisory matcher) rely on the defaults being safe no-ops
 /// for the common case of an ecosystem with no such divergence.
-pub trait OsvNaming: Send + Sync {
+pub trait OsvNaming: SourcePolicy + Send + Sync {
+    /// The public package content `dep` is, when OSV and license data about that content apply
+    /// to it, or `None` when they do not (a path, git or private-registry dependency).
+    ///
+    /// Replaces a bare [`SourcePolicy::source_is_public_registry_content`] check at every OSV
+    /// and tier-3 license gate, so an ecosystem can answer for a dependency whose registry
+    /// source and public content differ. The lifetime is tied to `dep`, so the default can
+    /// borrow its name.
+    ///
+    /// Default: [`SourcePolicy::source_is_public_registry_content`] of `dep`'s source, with
+    /// `dep`'s own name. Every ecosystem that does not override this is bit-identical to the
+    /// source gate. Gates that concern deps.dev or registry semantics (typosquat, GOSSIP,
+    /// trust, in-use fetch) keep using the source gate and are not routed through here.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{OsvNaming, SourcePolicy};
+    /// use deps_core::parser::DependencySource;
+    /// use deps_core::{Dependency, PackageName, VersionReq};
+    /// use deps_core::position::Range;
+    ///
+    /// struct DefaultFormatter;
+    /// impl SourcePolicy for DefaultFormatter {}
+    /// impl OsvNaming for DefaultFormatter {}
+    ///
+    /// struct Dep(PackageName, DependencySource);
+    /// impl Dependency for Dep {
+    ///     fn name(&self) -> &PackageName { &self.0 }
+    ///     fn name_range(&self) -> Range { Range::default() }
+    ///     fn version_requirement(&self) -> Option<&VersionReq> { None }
+    ///     fn version_range(&self) -> Option<Range> { None }
+    ///     fn source(&self) -> DependencySource { self.1.clone() }
+    ///     fn as_any(&self) -> &dyn std::any::Any { self }
+    /// }
+    ///
+    /// let public = Dep(PackageName::new("serde"), DependencySource::Registry);
+    /// assert_eq!(DefaultFormatter.public_content(&public).unwrap().name.as_str(), "serde");
+    /// let local = Dep(PackageName::new("local"), DependencySource::Path { path: "../x".into() });
+    /// assert!(DefaultFormatter.public_content(&local).is_none());
+    /// ```
+    fn public_content<'d>(&self, dep: &'d dyn Dependency) -> Option<PublicContent<'d>> {
+        self.source_is_public_registry_content(&dep.source())
+            .then(|| PublicContent {
+                name: std::borrow::Cow::Borrowed(dep.name()),
+            })
+    }
+
     /// OSV.dev's canonical spelling for `dep`'s package name, or `None` if
     /// this dependency cannot be mapped (e.g. a non-GitHub Swift package).
     ///
@@ -2394,10 +2498,11 @@ pub trait OsvNaming: Send + Sync {
     ///
     /// ```
     /// use deps_core::ConcreteVersion;
-    /// use deps_core::lsp_helpers::OsvNaming;
+    /// use deps_core::lsp_helpers::{OsvNaming, SourcePolicy};
     /// use deps_core::osv::OsvVersion;
     ///
     /// struct DefaultFormatter;
+    /// impl SourcePolicy for DefaultFormatter {}
     /// impl OsvNaming for DefaultFormatter {}
     ///
     /// assert_eq!(
@@ -2435,9 +2540,10 @@ pub trait OsvNaming: Send + Sync {
     ///
     /// ```
     /// use deps_core::ConcreteVersion;
-    /// use deps_core::lsp_helpers::OsvNaming;
+    /// use deps_core::lsp_helpers::{OsvNaming, SourcePolicy};
     ///
     /// struct DefaultFormatter;
+    /// impl SourcePolicy for DefaultFormatter {}
     /// impl OsvNaming for DefaultFormatter {}
     ///
     /// assert_eq!(
@@ -3920,5 +4026,41 @@ mod tests {
         };
         assert_eq!(MOCK_FORMATTER.osv_package_name(&dep("")), None);
         assert!(MOCK_FORMATTER.osv_package_name(&dep("serde")).is_some());
+    }
+
+    /// An override that answers for a dependency by another name (spec 088): the hook's lifetime
+    /// admits both a borrowed default and an owned replacement.
+    #[test]
+    fn test_public_content_default_borrows_and_override_may_own() {
+        use crate::lsp_helpers::test_support::MockDep;
+        use crate::position::Range;
+        use std::borrow::Cow;
+
+        struct Swapped;
+        impl SourcePolicy for Swapped {}
+        impl OsvNaming for Swapped {
+            fn public_content<'d>(&self, dep: &'d dyn Dependency) -> Option<PublicContent<'d>> {
+                (dep.name().as_str() == "scope.name").then(|| PublicContent {
+                    name: Cow::Owned(PackageName::new("Owner/Repo")),
+                })
+            }
+        }
+
+        let dep = |name: &str| MockDep {
+            name: name.into(),
+            version_req: "1.0".into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+        let own = dep("serde");
+        let content = MOCK_FORMATTER.public_content(&own).unwrap();
+        assert!(matches!(content.name, Cow::Borrowed(_)));
+        assert_eq!(content.name.as_str(), "serde");
+
+        let swapped = dep("scope.name");
+        let content = Swapped.public_content(&swapped).unwrap();
+        assert!(matches!(content.name, Cow::Owned(_)));
+        assert_eq!(content.name.as_str(), "Owner/Repo");
+        assert!(Swapped.public_content(&own).is_none());
     }
 }

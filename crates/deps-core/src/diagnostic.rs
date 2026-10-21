@@ -33,6 +33,9 @@ pub const GITLAB_CI_MUTABLE_REF_PIN_DIAGNOSTIC_CODE: &str = "gitlab-ci-mutable-r
 /// Wire code of GitLab CI's unresolved-instance-host notice.
 pub const GITLAB_CI_UNRESOLVED_HOST_DIAGNOSTIC_CODE: &str = "unresolved-gitlab-host";
 
+/// Wire code of the duplicate-default-catalog diagnostic of `pnpm-workspace.yaml`.
+pub const PNPM_DUPLICATE_DEFAULT_CATALOG_DIAGNOSTIC_CODE: &str = "pnpm-duplicate-default-catalog";
+
 /// Git-tag-pinning CI platform a mutable-ref-pin diagnostic was raised for.
 ///
 /// A dedicated two-variant enum rather than [`crate::EcosystemId`], which would admit
@@ -102,6 +105,9 @@ pub enum DiagnosticKind {
     UnknownRef,
     /// GitLab CI's instance host is unset or invalid.
     UnresolvedGitlabHost,
+    /// A `pnpm-workspace.yaml` declares both `catalog:` and `catalogs.default:`, which pnpm
+    /// rejects for the whole workspace.
+    DuplicateDefaultCatalog,
     /// An informational or failure notice with no machine-readable code: unknown package, fetch
     /// failure, offline/blocked-registry/dependency-count notices.
     Notice,
@@ -135,6 +141,7 @@ impl DiagnosticKind {
             Self::ShaCommentMismatch => Some(SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE),
             Self::UnknownRef => Some(UNKNOWN_REF_DIAGNOSTIC_CODE),
             Self::UnresolvedGitlabHost => Some(GITLAB_CI_UNRESOLVED_HOST_DIAGNOSTIC_CODE),
+            Self::DuplicateDefaultCatalog => Some(PNPM_DUPLICATE_DEFAULT_CATALOG_DIAGNOSTIC_CODE),
             Self::Outdated
             | Self::FlaggedLatest
             | Self::UnverifiedLatest
@@ -717,6 +724,10 @@ mod tests {
             Some("sha-comment-mismatch")
         );
         assert_eq!(DiagnosticKind::UnknownRef.code(), Some("unknown-ref"));
+        assert_eq!(
+            DiagnosticKind::DuplicateDefaultCatalog.code(),
+            Some("pnpm-duplicate-default-catalog")
+        );
         assert_eq!(
             DiagnosticKind::LicensePolicy.code(),
             Some("license-policy-violation")

@@ -146,7 +146,7 @@ async fn test_workspace_transport_stops_loopback_redirect_baseline_follows() {
             &Transport::baseline(),
             KeyAuth::ANONYMOUS,
             RevalidationFailure::ServeStale,
-            RateLimitRevocation::default(),
+            LivePolicy::default(),
         )
         .await
         .unwrap();
@@ -163,7 +163,7 @@ async fn test_workspace_transport_stops_loopback_redirect_baseline_follows() {
             &Transport::workspace(&policy),
             KeyAuth::ANONYMOUS,
             RevalidationFailure::ServeStale,
-            RateLimitRevocation::default(),
+            LivePolicy::default(),
         )
         .await;
     assert_matches!(
@@ -199,7 +199,7 @@ async fn test_workspace_transport_stops_redirect_to_private_literal() {
             &Transport::workspace(&policy),
             KeyAuth::ANONYMOUS,
             RevalidationFailure::ServeStale,
-            RateLimitRevocation::default(),
+            LivePolicy::default(),
         )
         .await;
 

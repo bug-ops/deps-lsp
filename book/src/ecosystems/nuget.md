@@ -27,7 +27,10 @@ Every dependency resolves against **nuget.org**'s V3 API (`api.nuget.org/v3/inde
 service-index indirection that then points at further per-capability resource URLs — see
 below) by default, unless a `NuGet.Config` redirects it to a private feed (see "Private/Custom
 Feeds"). When a `packages.lock.json` (or per-project `packages.<name>.lock.json`) file is
-present, it is read to resolve each dependency's in-use version. NuGet versions follow
+present, it is read to resolve each dependency's in-use version; package ids compare
+case-insensitively, as NuGet does, so a lock file entry `newtonsoft.json` matches a manifest
+`Newtonsoft.Json`, and two spellings of one id in a manifest are fetched from the registry once.
+NuGet versions follow
 `Major.Minor.Patch[.Revision]` (1–4 numeric components) with SemVer2 prerelease precedence,
 compared case-insensitively — no maintained Rust crate implements this scheme, so `deps-nuget`
 hand-rolls its own comparator (the same pattern `deps-maven` uses for Maven's own scheme).

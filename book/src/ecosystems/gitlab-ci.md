@@ -92,8 +92,9 @@ matching — `~1.2` matches `>=1.2.0, <1.3.0`).
 its tags (or releases) are loaded, the same way as in GitHub Actions: a SHA on the latest
 release's commit is up to date; a SHA at an older tag, or that no tag points at, is reported
 outdated and update-all re-pins it to the latest release's full SHA (never to a bare tag).
-Before the index is populated the pin stays unresolved. This includes a pin on a non-release
-commit newer than the latest release, which is reported outdated (effectively a downgrade).
+Before the index is populated the pin stays unresolved. A pin on a non-release commit is
+outdated unless GitLab proves it is newer than the latest release and on the default branch (see
+[below](#commits-ahead-of-the-latest-release-issue-1725)).
 
 ### SHA-pin trailing comments (issue #1743)
 
@@ -120,9 +121,10 @@ include:
 - A `project:` tag `ref:` that is a full release no tag of the complete Tags list matches
   (`ref: 1.117.0` beside tag `v1.117.0`) is unresolved instead of up to date and raises
   `unknown-ref` (severity `diagnostics.unknown_ref_severity`). A partial or suffixed ref
-  (`v1`, `v1.x`, `v3-node20`) may be a branch, so it keeps the ahead-of-latest rule and is never
-  reported; a `component:` include is never reported either, since a version without a release is
-  not a missing tag. An exact tag `ref:` that a truncated Tags list does not reach is unresolved
+  (`v1`, `v1.x`, `v3-node20`) may be a branch, so it keeps the ahead-of-latest rule and is reported
+  only after a background check confirms that the project has no branch of that name either (see
+  [Branch check for partial refs](#branch-check-for-partial-refs)); a `component:` include is never
+  reported, since a version without a release is not a missing tag. An exact tag `ref:` that a truncated Tags list does not reach is unresolved
   as well, never up to date. A partial `project:` ref (`1.2`) is read as a branch, so the
   truncated-list rule for floating partial pins described there does not apply. See [GitHub Actions](github-actions.md#unpublished-refs-and-the-unknown-ref-diagnostic-issue-1766)
   for the shape rules. The `Change ref to published tag <tag>` quickfix rewrites the `ref:` to
@@ -147,8 +149,31 @@ include:
 A SHA pin tagged only by a floating tag below the latest release (`v1.1` while the latest is
 `v1.1.0` on another commit) is reported outdated. SHA pins and tag pins are compared by the same
 tag order, so a pre-release above the latest release (`v2.0.0-rc1` against latest `1.9.0`) is up
-to date either way. As in GitHub Actions, a non-release commit newer than the latest release that
-carries only a floating tag is reported outdated (tracked in #1725).
+to date either way.
+
+### Commits ahead of the latest release (issue #1725)
+
+As in [GitHub Actions](github-actions.md#commits-ahead-of-the-latest-release-issue-1725), a
+commentless SHA pin on a `project:` include that no tag names is up to date, and skipped by
+update-all, when two background checks both succeed: the pinned commit descends from the latest
+release's commit, and it is reachable from the project's default branch. A commit that fails
+either check, or whose check is inconclusive, keeps the outdated report.
+
+GitLab answers both questions through the `merge_base` endpoint, which returns no commit count, so
+hover reads `commit ahead of latest release <tag>` without a number. `component:` includes are not
+checked: their versions name releases, not commits.
+
+### Branch check for partial refs
+
+A partial or suffixed `project:` tag `ref:` (`v1`, `v1.x`) that matches no tag of a complete Tags
+list is checked against the project's branches (`GET /projects/:id/repository/branches/:ref`) in
+the background. A `ref:` that is neither a tag nor a branch raises `unknown-ref`
+(`` `v40` is neither a published tag nor a branch of my-group/my-project ``); an existing branch, a
+rate limit, a timeout or an unreachable project leaves it silent. Requests carry `GITLAB_TOKEN`
+only to the host it is bound to, and share the rationing rules described for
+[GitHub Actions](github-actions.md#branch-check-for-partial-refs): a small hourly allowance without
+a token, a larger one with it. In `deps-cli`, `--offline` skips the check, and with
+`--fail-on unknown-ref` one stderr note reports skipped checks (set `GITLAB_TOKEN` in CI).
 
 A `project:` tag pin resolves through the project's Tags list exactly like a GitHub Actions tag
 pin (an exact release, a floating partial version, or unresolved), so hover and sibling-tag checks

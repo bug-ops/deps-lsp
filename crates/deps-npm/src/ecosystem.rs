@@ -1,7 +1,8 @@
 //! npm ecosystem implementation for deps-lsp.
 //!
 //! This module implements the `Ecosystem` trait for npm/JavaScript projects,
-//! providing LSP functionality for `package.json` files.
+//! providing LSP functionality for `package.json` files and for the catalog entries of
+//! `pnpm-workspace.yaml` (spec 078).
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
@@ -21,8 +22,9 @@ use url::Url;
 
 use crate::config::NpmParseContext;
 use crate::formatter::NpmFormatter;
+use crate::parser::NpmParseResult;
 use crate::registry::NpmRegistry;
-use crate::types::NpmDependency;
+use crate::types::{NpmDependency, NpmManifestKind};
 
 #[cfg(feature = "lsp-responses")]
 mod lsp;
@@ -133,7 +135,7 @@ impl Ecosystem for NpmEcosystem {
     }
 
     fn manifest_filenames(&self) -> &[&'static str] {
-        &["package.json"]
+        &["package.json", NpmManifestKind::PNPM_WORKSPACE_FILENAME]
     }
 
     fn lockfile_filenames(&self) -> &[&'static str] {
@@ -150,8 +152,14 @@ impl Ecosystem for NpmEcosystem {
         uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
-            let result =
-                crate::parser::parse_package_json_with_context(content, uri, &self.context)?;
+            let result = match NpmManifestKind::from_uri(uri) {
+                NpmManifestKind::PackageJson => {
+                    crate::parser::parse_package_json_with_context(content, uri, &self.context)?
+                }
+                NpmManifestKind::PnpmWorkspace => {
+                    crate::workspace::parse_pnpm_workspace_manifest(content, uri, &self.context)?
+                }
+            };
             // Registers every `.npmrc`-resolved alternate index (FR-002–004) into the shared
             // router. See `NpmParseResult::resolved_registries`.
             for index in result.resolved_registries.clone() {
@@ -261,7 +269,9 @@ impl Ecosystem for NpmEcosystem {
                 severities,
                 deps_core::PublishTime::now(),
             );
+            annotate_catalog_references(parse_result, &mut diagnostics);
             diagnostics.extend(catalog_diagnostics(parse_result, severities.unknown));
+            diagnostics.extend(duplicate_default_catalog_diagnostic(parse_result));
             diagnostics
         })
     }
@@ -359,12 +369,71 @@ fn catalog_diagnostics(parse_result: &dyn ParseResultTrait, severity: Severity) 
         .into_iter()
         .filter_map(|dep| {
             let npm_dep = dep.as_any().downcast_ref::<NpmDependency>()?;
-            let origin = npm_dep.catalog.as_ref()?;
+            let origin = npm_dep.catalog_ref()?;
             let range = npm_dep.version_range?;
             let message = origin.diagnostic_message(npm_dep.name.as_str())?;
             Some(Diagnostic::new(DiagnosticKind::Notice, range, message).with_severity(severity))
         })
         .collect()
+}
+
+/// Marks every finding anchored on a `catalog:` reference whose entry was located in
+/// `pnpm-workspace.yaml` with a `(set in pnpm-workspace.yaml, catalog <id>)` message suffix and
+/// a related location pointing at that entry (spec 078 FR-031). The finding itself stays on the
+/// reference; no rewrite is offered there.
+fn annotate_catalog_references(
+    parse_result: &dyn ParseResultTrait,
+    diagnostics: &mut [Diagnostic],
+) {
+    for dep in parse_result.dependencies() {
+        let Some(npm_dep) = dep.as_any().downcast_ref::<NpmDependency>() else {
+            continue;
+        };
+        let (Some(origin), Some(range)) = (npm_dep.catalog_ref(), npm_dep.version_range) else {
+            continue;
+        };
+        let Some(location) = origin.entry.as_ref() else {
+            continue;
+        };
+        let suffix = origin.workspace_entry_note();
+        for diagnostic in diagnostics.iter_mut().filter(|d| d.range == range) {
+            let mut annotated = Diagnostic::new(
+                diagnostic.kind().clone(),
+                diagnostic.range,
+                format!("{} {suffix}", diagnostic.message()),
+            );
+            annotated.severity = diagnostic.severity;
+            annotated
+                .code_description
+                .clone_from(&diagnostic.code_description);
+            let mut related = diagnostic.related_information.take().unwrap_or_default();
+            related.push(deps_core::diagnostic::RelatedInformation::new(
+                location.file.clone(),
+                location.range,
+                "catalog entry in pnpm-workspace.yaml",
+            ));
+            annotated.related_information = Some(related);
+            *diagnostic = annotated;
+        }
+    }
+}
+
+/// The single Error finding for a `pnpm-workspace.yaml` defining the default catalog twice
+/// (spec 078 FR-030), anchored on the `catalogs.default` key.
+fn duplicate_default_catalog_diagnostic(parse_result: &dyn ParseResultTrait) -> Option<Diagnostic> {
+    let range = parse_result
+        .as_any()
+        .downcast_ref::<NpmParseResult>()?
+        .duplicate_default_catalog?;
+    Some(
+        Diagnostic::new(
+            DiagnosticKind::DuplicateDefaultCatalog,
+            range,
+            "pnpm-workspace.yaml defines the default catalog twice (top-level `catalog:` and \
+             `catalogs.default:`); pnpm rejects the whole workspace",
+        )
+        .with_severity(Severity::Error),
+    )
 }
 
 #[cfg(test)]
@@ -464,7 +533,7 @@ mod tests {
         ty: NpmEcosystem;
         id: "npm";
         display_name: "npm (JavaScript)";
-        manifest_filenames: &["package.json"];
+        manifest_filenames: &["package.json", "pnpm-workspace.yaml"];
         lockfile_filenames: &["package-lock.json", "pnpm-lock.yaml"];
         non_registry_fixture: "package.json" => r#"{"dependencies": {"acme-internal-secret": "git+ssh://git@github.com/acme/internal-secret.git"}}"#;
     }
@@ -684,7 +753,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            pkg("crossenv"),
+            deps_core::NormalizedName::for_test("crossenv"),
             deps_core::lsp_helpers::PackageVersions::latest_only("1.0.0"),
         );
         let resolved_versions = HashMap::new();
@@ -752,7 +821,7 @@ mod tests {
         // "unknown package" rule, independent of the catalog outcome under test.
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            pkg("left-pad"),
+            deps_core::NormalizedName::for_test("left-pad"),
             deps_core::lsp_helpers::PackageVersions::latest_only("1.3.0"),
         );
         let resolved_versions = HashMap::new();
@@ -906,9 +975,11 @@ mod tests {
                 version_range: Some(
                     Range::new(Position::new(line, 0), Position::new(line, 10)).into(),
                 ),
-                section: crate::types::NpmDependencySection::Dependencies,
+                origin: crate::types::NpmDependencyOrigin::Manifest {
+                    section: crate::types::NpmDependencySection::Dependencies,
+                    catalog_ref: None,
+                },
                 source,
-                catalog: None,
                 package: None,
             }
         }
@@ -1421,7 +1492,7 @@ mod tests {
 
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                pkg("react"),
+                deps_core::NormalizedName::for_test("react"),
                 deps_core::lsp_helpers::PackageVersions::latest_only("18.2.0"),
             );
             let resolved_versions = HashMap::new();
@@ -1850,5 +1921,395 @@ mod tests {
             let position = Position::new(2, line.chars().count() as u32);
             assert!(!eco.fallback_completion_is_bare(content, position.into()));
         }
+    }
+}
+
+/// Spec 078: `pnpm-workspace.yaml` catalog entries as dependencies, end to end through the
+/// ecosystem's `parse_manifest` / `generate_*` surface.
+#[cfg(test)]
+#[cfg(feature = "lsp-responses")]
+mod pnpm_workspace_tests {
+    use super::*;
+    use deps_core::VersionData;
+    use deps_core::lsp_helpers::PackageVersions;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    fn ecosystem() -> NpmEcosystem {
+        NpmEcosystem::new(Arc::new(deps_core::HttpCache::new()))
+    }
+
+    fn latest(name: &str, version: &str) -> HashMap<deps_core::NormalizedName, PackageVersions> {
+        HashMap::from([(
+            deps_core::NormalizedName::for_test(name),
+            PackageVersions::latest_only(version),
+        )])
+    }
+
+    async fn diagnostics_for(
+        ecosystem: &NpmEcosystem,
+        content: &str,
+        uri: &Url,
+        cached: &HashMap<deps_core::NormalizedName, PackageVersions>,
+    ) -> Vec<Diagnostic> {
+        let parse_result = ecosystem.parse_manifest(content, uri).await.unwrap();
+        let resolved = HashMap::new();
+        ecosystem
+            .generate_diagnostics(
+                parse_result.as_ref(),
+                VersionData::new(cached, &resolved),
+                uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
+            )
+            .await
+    }
+
+    fn workspace_uri(dir: &Path) -> Url {
+        Url::from_file_path(dir.join("pnpm-workspace.yaml")).unwrap()
+    }
+
+    #[test]
+    fn test_lockfile_is_located_from_the_workspace_file() {
+        use deps_core::lockfile::LockFileProvider;
+
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        let lock = root.path().join("pnpm-lock.yaml");
+        std::fs::write(&lock, "lockfileVersion: '9.0'\n").unwrap();
+        assert_eq!(
+            crate::lockfile::NpmLockParser.locate_lockfile(&workspace_uri(root.path())),
+            Some(lock)
+        );
+    }
+
+    #[test]
+    fn test_manifest_filenames_include_the_workspace_file() {
+        assert!(
+            ecosystem()
+                .manifest_filenames()
+                .contains(&"pnpm-workspace.yaml")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_file_is_not_parsed_as_json() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let uri = workspace_uri(root.path());
+        let result = ecosystem()
+            .parse_manifest("catalog:\n  react: ^16.0.0\n", &uri)
+            .await
+            .unwrap();
+        assert_eq!(result.dependencies().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_package_json_is_not_parsed_as_yaml() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let uri = Url::from_file_path(root.path().join("package.json")).unwrap();
+        let result = ecosystem()
+            .parse_manifest(r#"{"dependencies": {"react": "^16.0.0"}}"#, &uri)
+            .await
+            .unwrap();
+        assert_eq!(result.dependencies().len(), 1);
+        assert!(
+            ecosystem()
+                .parse_manifest("catalog:\n  react: ^16.0.0\n", &uri)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_outdated_entry_is_flagged_on_its_own_version_text() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let uri = workspace_uri(root.path());
+        let content = "catalog:\n  react: ^16.0.0\n";
+        let diagnostics =
+            diagnostics_for(&ecosystem(), content, &uri, &latest("react", "19.3.0")).await;
+        let outdated = diagnostics
+            .iter()
+            .find(|d| d.message().contains("19.3.0"))
+            .unwrap_or_else(|| panic!("expected a version finding, got {diagnostics:?}"));
+        assert_eq!(outdated.range.start.line, 1);
+        assert_eq!(outdated.range.start.character, 9);
+        assert_eq!(outdated.range.end.character, 16);
+        assert!(
+            outdated.related_information.is_none(),
+            "a catalog entry itself carries no workspace-entry suffix"
+        );
+        assert!(!outdated.message().contains("set in pnpm-workspace.yaml"));
+    }
+
+    #[tokio::test]
+    async fn test_update_action_replaces_only_the_scalar_and_keeps_quotes() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let uri = workspace_uri(root.path());
+        let ecosystem = ecosystem();
+        for (content, expected) in [
+            (
+                "catalog:\n  react: ^16.0.0\n",
+                "catalog:\n  react: 19.3.0\n",
+            ),
+            (
+                "catalog:\n  react: \"^16.0.0\"\n",
+                "catalog:\n  react: \"19.3.0\"\n",
+            ),
+            (
+                "catalog:\n  react: '^16.0.0'\n",
+                "catalog:\n  react: '19.3.0'\n",
+            ),
+        ] {
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let cached = latest("react", "19.3.0");
+            let resolved = HashMap::new();
+            let actions = ecosystem
+                .generate_code_actions(
+                    parse_result.as_ref(),
+                    Position::new(1, 12),
+                    &uri,
+                    VersionData::new(&cached, &resolved),
+                    content,
+                )
+                .await;
+            let edits: Vec<_> = actions
+                .iter()
+                .filter_map(|a| a.edit.as_ref())
+                .filter_map(|e| e.changes.as_ref())
+                .flat_map(|changes| changes.values().flatten())
+                .collect();
+            assert!(!edits.is_empty(), "no update edit for {content:?}");
+            let edit = edits[0];
+            let line = content
+                .split('\n')
+                .nth(edit.range.start.line as usize)
+                .unwrap();
+            let rewritten = format!(
+                "{}{}{}",
+                line.get(..edit.range.start.character as usize).unwrap(),
+                edit.new_text,
+                line.get(edit.range.end.character as usize..).unwrap()
+            );
+            assert_eq!(
+                content.replacen(line, &rewritten, 1),
+                expected,
+                "only the scalar may change"
+            );
+            let reparsed = ecosystem.parse_manifest(expected, &uri).await.unwrap();
+            assert_eq!(
+                reparsed.dependencies()[0]
+                    .version_requirement()
+                    .map(deps_core::VersionReq::as_str),
+                Some("19.3.0")
+            );
+            let again = ecosystem
+                .generate_code_actions(
+                    reparsed.as_ref(),
+                    Position::new(1, 12),
+                    &uri,
+                    VersionData::new(&cached, &resolved),
+                    expected,
+                )
+                .await;
+            assert!(
+                again
+                    .iter()
+                    .filter(|a| a.kind == Some(tower_lsp_server::ls_types::CodeActionKind::QUICKFIX))
+                    .filter_map(|a| a.edit.as_ref())
+                    .filter_map(|e| e.changes.as_ref())
+                    .all(|changes| changes.values().flatten().next().is_none()),
+                "a second update quickfix on the rewritten file must be a no-op: {again:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_version_completion_is_offered_on_an_empty_catalog_entry() {
+        use deps_core::completion::{CompletionContext, detect_completion_context};
+
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let uri = workspace_uri(root.path());
+        let content = "catalog:\n  lodash: \n";
+        let parse_result = ecosystem().parse_manifest(content, &uri).await.unwrap();
+
+        let value = detect_completion_context(parse_result.as_ref(), Position::new(1, 10), content);
+        assert!(
+            matches!(
+                &value,
+                CompletionContext::Version { package_name, prefix }
+                    if package_name.as_str() == "lodash" && prefix.is_empty()
+            ),
+            "{value:?}"
+        );
+        let key = detect_completion_context(parse_result.as_ref(), Position::new(1, 4), content);
+        assert!(
+            matches!(&key, CompletionContext::PackageName { prefix, .. } if prefix == "lo"),
+            "{key:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_catalog_entry_has_no_findings_and_no_edit() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let uri = workspace_uri(root.path());
+        let ecosystem = ecosystem();
+        let content = "catalog:\n  lodash: \n";
+        let cached = latest("lodash", "4.17.21");
+        let diagnostics = diagnostics_for(&ecosystem, content, &uri, &cached).await;
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let resolved = HashMap::new();
+        let actions = ecosystem
+            .generate_code_actions(
+                parse_result.as_ref(),
+                Position::new(1, 10),
+                &uri,
+                VersionData::new(&cached, &resolved),
+                content,
+            )
+            .await;
+        assert!(actions.is_empty(), "{actions:?}");
+    }
+
+    #[tokio::test]
+    async fn test_block_scalar_entry_gets_findings_on_its_indicator_but_no_rewrite() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let uri = workspace_uri(root.path());
+        let ecosystem = ecosystem();
+        let content = "catalog:\n  semver: >-\n    ^5.0.0\n";
+        let cached = latest("semver", "7.6.0");
+
+        let diagnostics = diagnostics_for(&ecosystem, content, &uri, &cached).await;
+        let finding = diagnostics
+            .iter()
+            .find(|d| d.message().contains("7.6.0"))
+            .unwrap_or_else(|| panic!("expected a version finding, got {diagnostics:?}"));
+        assert_eq!(finding.range.start.line, 1);
+        assert_eq!(
+            (finding.range.start.character, finding.range.end.character),
+            (10, 12)
+        );
+
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let resolved = HashMap::new();
+        let actions = ecosystem
+            .generate_code_actions(
+                parse_result.as_ref(),
+                Position::new(1, 11),
+                &uri,
+                VersionData::new(&cached, &resolved),
+                content,
+            )
+            .await;
+        assert!(
+            actions
+                .iter()
+                .filter(|a| a.kind == Some(tower_lsp_server::ls_types::CodeActionKind::QUICKFIX))
+                .all(|a| a.edit.is_none()),
+            "{actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alias_entry_gets_findings_but_no_rewrite() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let uri = workspace_uri(root.path());
+        let ecosystem = ecosystem();
+        let content = "catalog:\n  react: &r ^16.0.0\n  preact: *r\n";
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let cached = latest("preact", "10.0.0");
+        let resolved = HashMap::new();
+        let actions = ecosystem
+            .generate_code_actions(
+                parse_result.as_ref(),
+                Position::new(2, 11),
+                &uri,
+                VersionData::new(&cached, &resolved),
+                content,
+            )
+            .await;
+        assert!(actions.is_empty(), "alias must offer no edit: {actions:?}");
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_default_catalog_is_one_error_on_the_catalogs_default_key() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let uri = workspace_uri(root.path());
+        let content = "catalog:\n  react: ^18.0.0\ncatalogs:\n  default:\n    vue: ^3.0.0\n";
+        let mut cached = latest("react", "18.0.0");
+        cached.extend(latest("vue", "3.0.0"));
+        let diagnostics = diagnostics_for(&ecosystem(), content, &uri, &cached).await;
+        let duplicates: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| matches!(d.kind(), DiagnosticKind::DuplicateDefaultCatalog))
+            .collect();
+        assert_eq!(duplicates.len(), 1, "{diagnostics:?}");
+        assert_eq!(duplicates[0].severity, Some(Severity::Error));
+        assert_eq!(duplicates[0].code(), Some("pnpm-duplicate-default-catalog"));
+        assert_eq!(duplicates[0].range.start.line, 3);
+    }
+
+    #[tokio::test]
+    async fn test_package_json_finding_points_at_the_catalog_entry() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("pnpm-workspace.yaml"),
+            "catalogs:\n  legacy:\n    react: ^16.0.0\n",
+        )
+        .unwrap();
+        let uri = Url::from_file_path(root.path().join("package.json")).unwrap();
+        let content = "{\n  \"dependencies\": {\n    \"react\": \"catalog:legacy\"\n  }\n}\n";
+        let diagnostics =
+            diagnostics_for(&ecosystem(), content, &uri, &latest("react", "19.3.0")).await;
+        let outdated = diagnostics
+            .iter()
+            .find(|d| d.message().contains("19.3.0"))
+            .unwrap_or_else(|| panic!("expected a version finding, got {diagnostics:?}"));
+        assert_eq!(
+            outdated.range.start.line, 2,
+            "finding stays on the reference"
+        );
+        assert!(
+            outdated
+                .message()
+                .ends_with("(set in pnpm-workspace.yaml, catalog legacy)"),
+            "{}",
+            outdated.message()
+        );
+        let related = outdated
+            .related_information
+            .as_ref()
+            .expect("related entry");
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].uri, workspace_uri(root.path()));
+        assert_eq!(related[0].range.start.line, 2);
+        assert_eq!(related[0].range.start.character, 11);
+    }
+
+    #[tokio::test]
+    async fn test_package_json_finding_has_no_suffix_without_a_located_entry() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let uri = Url::from_file_path(root.path().join("package.json")).unwrap();
+        let content = r#"{"dependencies": {"react": "^16.0.0"}}"#;
+        let diagnostics =
+            diagnostics_for(&ecosystem(), content, &uri, &latest("react", "19.3.0")).await;
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !d.message().contains("pnpm-workspace.yaml"))
+        );
+        assert!(diagnostics.iter().all(|d| d.related_information.is_none()));
     }
 }

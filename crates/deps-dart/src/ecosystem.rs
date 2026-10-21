@@ -213,6 +213,7 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::NormalizedName;
 
     /// #1687 e2e: a `pubspec.lock`-resolved `0.8.13+1` against pub.dev latest `0.8.13+23`
     /// must render as outdated, not up to date.
@@ -231,11 +232,14 @@ mod tests {
 
         let mut cached = HashMap::new();
         cached.insert(
-            "image_picker_android".into(),
+            NormalizedName::for_test("image_picker_android"),
             PackageVersions::latest_only("0.8.13+23"),
         );
         let mut resolved = HashMap::new();
-        resolved.insert("image_picker_android".into(), "0.8.13+1".into());
+        resolved.insert(
+            NormalizedName::for_test("image_picker_android"),
+            "0.8.13+1".into(),
+        );
 
         let hints = ecosystem
             .generate_inlay_hints(

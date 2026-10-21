@@ -3,9 +3,11 @@
 use super::response::CredentialPartition;
 use crate::error::{DepsError, Result};
 use crate::net_policy::TrustedPrefix;
+use crate::rate_limit::QuotaMeter;
 use crate::redact::RedactedUrl;
 use crate::secret::{AuthorizationValue, Redacted, auth_digest};
 use reqwest::{Url, header};
+use std::sync::Arc;
 
 /// A non-credential header an [`HttpCache`](crate::cache::HttpCache) request carries.
 ///
@@ -133,7 +135,7 @@ impl RateLimitRevocation {
 /// let token = bearer_auth_header(&Redacted::new("secret-token".to_string()));
 /// let auth = RequestAuth::credential(CredentialHeader::Authorization(&token), &prefix);
 /// assert!(!format!("{auth:?}").contains("secret-token"));
-/// let _anonymous = RequestAuth::Anonymous { partition: Some(CredentialPartition::new(1)) };
+/// let _anonymous = RequestAuth::anonymous(Some(CredentialPartition::new(1)));
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub enum RequestAuth<'a> {
@@ -141,6 +143,8 @@ pub enum RequestAuth<'a> {
     Anonymous {
         /// The caller's credential-state partition, `None` for the plain per-URL entry.
         partition: Option<CredentialPartition>,
+        /// The meter fed from the live responses of this request, if any.
+        quota: Option<&'a Arc<QuotaMeter>>,
     },
     /// A credential, always cached under its own partition.
     Credential {
@@ -150,12 +154,23 @@ pub enum RequestAuth<'a> {
         partition: CredentialPartition,
         /// What a confirmed rate limit on revalidation means for this credential.
         on_rate_limit: RateLimitRevocation,
+        /// The meter fed from the live responses of this request, if any.
+        quota: Option<&'a Arc<QuotaMeter>>,
     },
 }
 
 impl<'a> RequestAuth<'a> {
     /// A request with no credential and no partition.
-    pub const ANONYMOUS: Self = Self::Anonymous { partition: None };
+    pub const ANONYMOUS: Self = Self::anonymous(None);
+
+    /// An anonymous request stored under `partition`.
+    #[must_use]
+    pub const fn anonymous(partition: Option<CredentialPartition>) -> Self {
+        Self::Anonymous {
+            partition,
+            quota: None,
+        }
+    }
 
     /// A credentialed request whose partition is a salted digest of `prefix` and the secret.
     #[must_use]
@@ -176,6 +191,7 @@ impl<'a> RequestAuth<'a> {
             header,
             partition,
             on_rate_limit: RateLimitRevocation::Revokes,
+            quota: None,
         }
     }
 
@@ -185,19 +201,55 @@ impl<'a> RequestAuth<'a> {
     pub const fn with_rate_limit(self, on_rate_limit: RateLimitRevocation) -> Self {
         match self {
             Self::Credential {
-                header, partition, ..
+                header,
+                partition,
+                quota,
+                ..
             } => Self::Credential {
                 header,
                 partition,
                 on_rate_limit,
+                quota,
             },
             Self::Anonymous { .. } => self,
         }
     }
 
+    /// Feeds `meter` from the rate-limit headers of every response this request receives over
+    /// the network, whichever variant it is.
+    ///
+    /// Recording happens inside the fetch layer when a response arrives, never from a stored
+    /// cache entry, so a stale reading cannot be replayed into the meter.
+    #[must_use]
+    pub const fn with_quota_meter(self, meter: &'a Arc<QuotaMeter>) -> Self {
+        match self {
+            Self::Anonymous { partition, .. } => Self::Anonymous {
+                partition,
+                quota: Some(meter),
+            },
+            Self::Credential {
+                header,
+                partition,
+                on_rate_limit,
+                ..
+            } => Self::Credential {
+                header,
+                partition,
+                on_rate_limit,
+                quota: Some(meter),
+            },
+        }
+    }
+
+    pub(super) const fn quota(&self) -> Option<&'a Arc<QuotaMeter>> {
+        match *self {
+            Self::Anonymous { quota, .. } | Self::Credential { quota, .. } => quota,
+        }
+    }
+
     pub(super) fn key_auth(&self) -> KeyAuth {
         match *self {
-            Self::Anonymous { partition } => KeyAuth::Anonymous(partition),
+            Self::Anonymous { partition, .. } => KeyAuth::Anonymous(partition),
             Self::Credential { partition, .. } => KeyAuth::Credential(partition),
         }
     }

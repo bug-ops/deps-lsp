@@ -73,6 +73,7 @@ deps-core = { workspace = true, features = ["test-util"] }
 # `lsp-responses` weak-dependency forwarding (which only fires for an ecosystem `deps-engine`
 # itself optionally enabled) never reaches them.
 deps-deno = { workspace = true, features = ["lsp-responses"] }
+deps-engine = { workspace = true, features = ["lsp-responses", "test-util"] }
 deps-github-actions = { workspace = true, features = ["lsp-responses"] }
 deps-gitlab-ci = { workspace = true, features = ["lsp-responses"] }
 deps-npm = { workspace = true, features = ["lsp-responses"] }

@@ -28,6 +28,7 @@ use crate::auth::{KeychainAuthorization, RegistryAuth};
 use crate::config::{RegistryTrust, ResolvedSwiftRegistry};
 use crate::package_location::{CanonicalIdentity, RegistryIdentity};
 use crate::published_at::{PublishedAtCache, ReleaseVersion};
+use crate::scm::{IdentityLookup, ScmLookupUrl, classify_identifiers};
 use crate::types::SwiftVersion;
 
 const ACCEPT: &str = "application/vnd.swift.registry.v1+json";
@@ -100,6 +101,11 @@ pub(crate) const fn transport_for(trust: RegistryTrust) -> TransportKind {
         RegistryTrust::Trusted => TransportKind::TrustedOrigin,
         RegistryTrust::WorkspaceDeclared => TransportKind::Pinned,
     }
+}
+
+#[derive(Deserialize)]
+struct IdentifiersResponse {
+    identifiers: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -429,9 +435,7 @@ impl PackageRegistryClient {
                                 CredentialHeader::Authorization(auth.as_authorization()),
                                 partition,
                             ),
-                            None => RequestAuth::Anonymous {
-                                partition: Some(partition),
-                            },
+                            None => RequestAuth::anonymous(Some(partition)),
                         }
                     }
                     Some(RegistryAuth::Keychain(credential)) => {
@@ -441,9 +445,9 @@ impl PackageRegistryClient {
                             CredentialPresence::Credentialed => {
                                 return self.cache.peek_credentialed_trusted_origin(url, partition);
                             }
-                            CredentialPresence::Anonymous => RequestAuth::Anonymous {
-                                partition: Some(partition),
-                            },
+                            CredentialPresence::Anonymous => {
+                                RequestAuth::anonymous(Some(partition))
+                            }
                         }
                     }
                     None => RequestAuth::ANONYMOUS,
@@ -464,6 +468,51 @@ impl PackageRegistryClient {
                     .await
             }
         }
+    }
+
+    /// Asks this registry which package identity serves the repository `scm`
+    /// (`GET {base}/identifiers?url=`), sending the credential-stripped URL as written.
+    ///
+    /// A registry indexes the exact URL a package was published with, so when the written URL
+    /// differs from the canonical one and the registry does not know it, the canonical form is
+    /// asked once more. Never returns an error: every outcome is an [`IdentityLookup`].
+    #[tracing::instrument(skip_all, level = "debug")]
+    pub(crate) async fn identifiers(&self, scm: &ScmLookupUrl) -> IdentityLookup {
+        let first = self.identifiers_for(scm.wire()).await;
+        if first == IdentityLookup::NotRegistered && scm.wire() != scm.canonical().as_str() {
+            return self.identifiers_for(scm.canonical().as_str()).await;
+        }
+        first
+    }
+
+    async fn identifiers_for(&self, repository: &str) -> IdentityLookup {
+        let Some(url) = self.identifiers_url(repository) else {
+            return IdentityLookup::Failed;
+        };
+        let response = match self
+            .fetch_page(url.as_str(), RevalidationFailure::Fail)
+            .await
+        {
+            Ok(response) => response,
+            Err(e) if e.is_not_found() => return IdentityLookup::NotRegistered,
+            Err(e) => {
+                tracing::debug!(error = %e, "identifiers lookup failed");
+                return IdentityLookup::Failed;
+            }
+        };
+        match deps_core::parse_json_checked::<IdentifiersResponse>(&response.body) {
+            Ok(body) => classify_identifiers(&body.identifiers),
+            Err(e) => {
+                tracing::debug!(error = %e, "identifiers response is not valid");
+                IdentityLookup::Failed
+            }
+        }
+    }
+
+    fn identifiers_url(&self, repository: &str) -> Option<Url> {
+        let mut url = Url::parse(&format!("{}/identifiers", self.registry.url.as_str())).ok()?;
+        url.query_pairs_mut().append_pair("url", repository);
+        Some(url)
     }
 
     fn recent_pagination_failure(&self, package: &CanonicalIdentity) -> Option<PaginationStop> {
@@ -861,6 +910,105 @@ mod tests {
         }
         let root = client("https://r.example", RegistryTrust::Trusted, None);
         assert_eq!(root.releases_url(&identity()), "https://r.example/acme/net");
+    }
+
+    async fn identifiers_answer(status: usize, body: &str) -> (IdentityLookup, usize) {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/identifiers")
+            .match_query(mockito::Matcher::Any)
+            .with_status(status)
+            .with_body(body)
+            .create_async()
+            .await;
+        let c = client(
+            &format!("{}/api", server.url()),
+            RegistryTrust::Trusted,
+            None,
+        );
+        let scm = ScmLookupUrl::parse("https://github.com/apple/swift-nio").unwrap();
+        let answer = c.identifiers(&scm).await;
+        let hits = usize::from(mock.matched_async().await);
+        (answer, hits)
+    }
+
+    #[tokio::test]
+    async fn test_identifiers_maps_every_registry_answer() {
+        let unique = IdentityLookup::Unique(
+            crate::package_location::RegistryIdentityBuf::parse("apple.swift-nio").unwrap(),
+        );
+        let cases = [
+            (200, r#"{"identifiers": ["apple.swift-nio"]}"#, unique),
+            (
+                200,
+                r#"{"identifiers": ["apple.swift-nio", "x.y"]}"#,
+                IdentityLookup::Ambiguous,
+            ),
+            (200, r#"{"identifiers": []}"#, IdentityLookup::NotRegistered),
+            (404, "", IdentityLookup::NotRegistered),
+            (
+                200,
+                r#"{"identifiers": ["../etc"]}"#,
+                IdentityLookup::Rejected,
+            ),
+            (500, "oops", IdentityLookup::Failed),
+            (429, "slow down", IdentityLookup::Failed),
+            (200, "not json", IdentityLookup::Failed),
+            (200, r#"{"other": []}"#, IdentityLookup::Failed),
+        ];
+        for (status, body, expected) in cases {
+            let (answer, hits) = identifiers_answer(status, body).await;
+            assert_eq!(answer, expected, "{status} {body}");
+            assert_eq!(hits, 1, "{status} {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_identifiers_request_encodes_the_url_and_carries_accept_and_authorization() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/identifiers")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "url".into(),
+                "https://github.com/apple/swift-nio".into(),
+            ))
+            .match_header("accept", ACCEPT)
+            .match_header("authorization", "Bearer t0k")
+            .with_status(200)
+            .with_body(r#"{"identifiers": []}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let c = client(
+            &format!("{}/api", server.url()),
+            RegistryTrust::Trusted,
+            Some("t0k"),
+        );
+        let scm = ScmLookupUrl::parse("https://github.com/apple/swift-nio").unwrap();
+
+        assert_eq!(c.identifiers(&scm).await, IdentityLookup::NotRegistered);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_identifiers_failure_is_not_retried_on_the_canonical_form() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/identifiers")
+            .match_query(mockito::Matcher::Any)
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+        let c = client(
+            &format!("{}/api", server.url()),
+            RegistryTrust::Trusted,
+            None,
+        );
+        let scm = ScmLookupUrl::parse("https://github.com/apple/swift-nio.git").unwrap();
+
+        assert_eq!(c.identifiers(&scm).await, IdentityLookup::Failed);
+        mock.assert_async().await;
     }
 
     #[tokio::test]

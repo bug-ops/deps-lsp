@@ -784,6 +784,7 @@ dependencies = [
  "deps-pypi",
  "deps-swift",
  "futures",
+ "mockito",
  "tempfile",
  "tokio",
  "tracing",

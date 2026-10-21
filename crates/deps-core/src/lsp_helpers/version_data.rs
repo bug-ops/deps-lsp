@@ -11,23 +11,40 @@ use super::{
     DependencyOutcome, REGISTRY_FETCH_BUDGET, await_interactive_fetch, candidate_verdict,
     generate_diagnostics_from_cache, latest_verdict, local_cooldown_precedence,
 };
-use super::{DependencyOutcomes, GossipFindings, InteractiveFetchGate, PackageVersions};
+use super::{DependencyOutcomes, GossipFindings, InteractiveFetchGate};
 use crate::licenses::LicensePolicy;
 use crate::osv::{CandidateStatusMap, LatestStatusMap, VulnerabilityMap};
 use crate::{
-    ConcreteVersion, DepsDevClient, EcosystemId, LicenseSource, PackageKey, PackageName,
-    TyposquatSignal,
+    ConcreteVersion, DepsDevClient, EcosystemId, LicenseSource, NormalizedName, PackageKey,
+    PackageVersions, TyposquatSignal,
 };
+
+/// Registry data per package, keyed by the ecosystem-normalized name.
+///
+/// A declared name cannot probe it:
+///
+/// ```compile_fail
+/// use deps_core::{CachedVersionsMap, PackageName};
+///
+/// let cached = CachedVersionsMap::new();
+/// let _ = cached.get(&PackageName::new("serde"));
+/// ```
+pub type CachedVersionsMap = HashMap<NormalizedName, PackageVersions>;
+
+/// Lock-file-resolved version per package, keyed by the ecosystem-normalized name.
+pub type ResolvedVersionsMap = HashMap<NormalizedName, ConcreteVersion>;
+
+/// Every retained lock-file version per package, keyed by the ecosystem-normalized name.
+pub type ResolvedCandidatesMap = HashMap<NormalizedName, Vec<ConcreteVersion>>;
 
 /// Bundles the per-package version maps (`cached`, `resolved`, the optional lock-file
 /// candidates) that LSP handlers pass together everywhere.
 ///
 /// Grouping them prevents accidentally swapping the map arguments at a call site, since the
-/// compiler can no longer typecheck them positionally. The maps are private: they are keyed by
-/// whichever spelling their producer chose, so every read goes through a lookup that takes a
-/// [`PackageKey`] ([`Self::cached_for`], [`Self::resolved_for`],
-/// [`Self::resolved_candidates_for`], [`Self::is_resolved`]), which probes both spellings in one
-/// place.
+/// compiler can no longer typecheck them positionally. Every per-package map is keyed by
+/// [`NormalizedName`], so a read takes a [`PackageKey`] ([`Self::cached_for`],
+/// [`Self::resolved_for`], [`Self::resolved_candidates_for`], [`Self::is_resolved`]) and a
+/// declared [`crate::PackageName`] cannot probe one by accident.
 ///
 /// # Examples
 ///
@@ -39,14 +56,15 @@ use crate::{
 /// struct Identity;
 /// impl PackageNaming for Identity {}
 ///
+/// let key = PackageKey::new(&PackageName::new("serde"), &Identity);
+///
 /// let mut cached = HashMap::new();
-/// cached.insert(PackageName::new("serde"), PackageVersions::latest_only("1.0.214"));
+/// cached.insert(key.normalized().clone(), PackageVersions::latest_only("1.0.214"));
 ///
 /// let mut resolved = HashMap::new();
-/// resolved.insert(PackageName::new("serde"), ConcreteVersion::new("1.0.200"));
+/// resolved.insert(key.normalized().clone(), ConcreteVersion::new("1.0.200"));
 ///
 /// let versions = VersionData::new(&cached, &resolved);
-/// let key = PackageKey::new(&PackageName::new("serde"), &Identity);
 ///
 /// assert_eq!(versions.cached_for(&key).map(|v| v.latest.as_str()), Some("1.0.214"));
 /// assert_eq!(versions.resolved_for(&key).map(ConcreteVersion::as_str), Some("1.0.200"));
@@ -66,11 +84,11 @@ use crate::{
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct VersionData<'a> {
-    /// Latest known versions and full version lists from the registry, keyed by package name.
-    cached: &'a HashMap<PackageName, PackageVersions>,
-    /// Versions actually resolved in the lock file, keyed by package name.
-    resolved: &'a HashMap<PackageName, ConcreteVersion>,
-    /// Every lock-file-resolved version for a package name, when more than one is retained
+    /// Latest known versions and full version lists from the registry, keyed by normalized package name.
+    cached: &'a CachedVersionsMap,
+    /// Versions actually resolved in the lock file, keyed by normalized package name.
+    resolved: &'a ResolvedVersionsMap,
+    /// Every lock-file-resolved version for a normalized package name, when more than one is retained
     /// (issue #649) — additive alongside [`Self::resolved_for`], which stays the single
     /// collapsed value for the common case. `None` by default (most call sites have no such
     /// map); [`crate::lsp_helpers::resolve_in_use_version`] and [`crate::osv::vulnerability_keys`]
@@ -78,7 +96,7 @@ pub struct VersionData<'a> {
     /// Cargo `package = "..."` rename pinning an older major) by each occurrence's own
     /// `version_requirement()`, falling back to [`Self::resolved_for`] when a name has at most
     /// one candidate.
-    resolved_version_candidates: Option<&'a HashMap<PackageName, Vec<ConcreteVersion>>>,
+    resolved_version_candidates: Option<&'a ResolvedCandidatesMap>,
     /// OSV scan results, keyed by normalized package name. `None` when no
     /// scan has run yet (e.g. the feature is disabled) — distinct from an
     /// empty map, which would mean "scanned, nothing found".
@@ -123,8 +141,8 @@ pub struct VersionData<'a> {
     pub trust: Option<&'a Arc<DepsDevClient>>,
     /// Background-pre-fetched license data for ecosystems `deps_dev_system` doesn't
     /// cover and whose hot-path registry response carries no license field — Dart,
-    /// Swift, Gradle, Deno (issue #660, spec 010 plan §1 tier 3), keyed by raw
-    /// (unnormalized) package name. `None` by default. Populated from `DocumentState`'s
+    /// Swift, Gradle, Deno (issue #660, spec 010 plan §1 tier 3), keyed by normalized
+    /// package name. `None` by default. Populated from `DocumentState`'s
     /// per-document pre-fetch cache (`document::osv_scan::run_license_prefetch` on
     /// document open/change — mirrors [`Self::vulnerabilities`]'s "populated by a
     /// background task, read synchronously here" shape) by `handlers/hover.rs` (deps-lsp)
@@ -144,7 +162,7 @@ pub struct VersionData<'a> {
     /// on a version having been resolved at all (no in-use version means nothing to
     /// look up), but only Gradle/Deno are actually version-*specific* in what they
     /// return.
-    pub license_prefetch: Option<&'a HashMap<PackageName, Vec<String>>>,
+    pub license_prefetch: Option<&'a HashMap<NormalizedName, Vec<String>>>,
     /// How [`Self::license_prefetch`]'s (and, for a resolved-version match, the
     /// registry-declared) license strings are sourced (issue #688), consulted by
     /// [`generate_hover`] for the "(detected)" qualifier and by
@@ -179,7 +197,7 @@ pub struct VersionData<'a> {
     /// ecosystem-agnostic and need no change as `license_prefetch`'s coverage widens.
     pub license_policy: Option<&'a LicensePolicy>,
     /// Background-pre-fetched typosquat-suspect signal per declared dependency (issue
-    /// #1437, spec 071), keyed by raw (unnormalized) package name — mirrors
+    /// #1437, spec 071), keyed by normalized package name — mirrors
     /// [`Self::license_prefetch`]'s exact shape and rationale (NFR-002: this must never be
     /// an inline `.await` on the diagnostics-generation path, so it is resolved ahead of
     /// time by a document-lifecycle background task,
@@ -194,9 +212,9 @@ pub struct VersionData<'a> {
     /// override does, must never be able to silently bypass this). `None` when the feature
     /// is disabled, the ecosystem isn't deps.dev-covered, offline, or no dependency in the
     /// document cleared the ratio gate.
-    pub typosquat_prefetch: Option<&'a HashMap<PackageName, TyposquatSignal>>,
+    pub typosquat_prefetch: Option<&'a HashMap<NormalizedName, TyposquatSignal>>,
     /// Background-pre-fetched deps.dev GOSSIP cooldown/low-usage findings per declared
-    /// dependency (issue #1456, spec 072), keyed by raw (unnormalized) package name —
+    /// dependency (issue #1456, spec 072), keyed by normalized package name —
     /// mirrors [`Self::typosquat_prefetch`]'s exact shape and rationale: populated by
     /// `deps-lsp::document::gossip_prefetch`, via `DocumentState::signals.gossip_findings`, and
     /// merely read synchronously here — never fetched inline on the hover/diagnostics-
@@ -209,7 +227,7 @@ pub struct VersionData<'a> {
     /// treated as a cache miss and falls back to [`local_cooldown_precedence`]. `None`
     /// when the feature is disabled, offline, the ecosystem isn't deps.dev-covered, or no
     /// dependency in the document has a prefetch result yet.
-    pub gossip_prefetch: Option<&'a HashMap<PackageName, GossipFindings>>,
+    pub gossip_prefetch: Option<&'a HashMap<NormalizedName, GossipFindings>>,
     /// The deps.dev client to fetch hover's live GOSSIP low-usage signal through (issue
     /// #1456, spec 072 FR-005/FR-009), when the caller wants hover to attempt one. `None`
     /// by default, mirroring [`Self::trust`]'s exact "presence is the gate" shape (FR-010's
@@ -262,10 +280,7 @@ impl<'a> VersionData<'a> {
     /// let versions = VersionData::new(&cached, &resolved);
     /// assert!(versions.vulnerabilities.is_none());
     /// ```
-    pub fn new(
-        cached: &'a HashMap<PackageName, PackageVersions>,
-        resolved: &'a HashMap<PackageName, ConcreteVersion>,
-    ) -> Self {
+    pub fn new(cached: &'a CachedVersionsMap, resolved: &'a ResolvedVersionsMap) -> Self {
         Self {
             cached,
             resolved,
@@ -287,8 +302,7 @@ impl<'a> VersionData<'a> {
         }
     }
 
-    /// The registry entry for `key`, probing the normalized spelling first and the declared one
-    /// second.
+    /// The registry entry for `key`.
     ///
     /// # Examples
     ///
@@ -300,29 +314,28 @@ impl<'a> VersionData<'a> {
     /// struct Identity;
     /// impl PackageNaming for Identity {}
     ///
+    /// let hit = PackageKey::new(&PackageName::new("serde"), &Identity);
     /// let mut cached = HashMap::new();
-    /// cached.insert(PackageName::new("serde"), PackageVersions::latest_only("1.0.214"));
+    /// cached.insert(hit.normalized().clone(), PackageVersions::latest_only("1.0.214"));
     /// let resolved = HashMap::new();
     /// let versions = VersionData::new(&cached, &resolved);
     ///
-    /// let hit = PackageKey::new(&PackageName::new("serde"), &Identity);
     /// let miss = PackageKey::new(&PackageName::new("tokio"), &Identity);
     /// assert!(versions.cached_for(&hit).is_some());
     /// assert!(versions.cached_for(&miss).is_none());
     /// ```
     #[must_use]
     pub fn cached_for(&self, key: &PackageKey) -> Option<&'a PackageVersions> {
-        key.find_in(self.cached)
+        self.cached.get(key.normalized())
     }
 
-    /// The lock-file-resolved version for `key`, probing the normalized spelling first and the
-    /// declared one second.
+    /// The lock-file-resolved version for `key`.
     #[must_use]
     pub fn resolved_for(&self, key: &PackageKey) -> Option<&'a ConcreteVersion> {
-        key.find_in(self.resolved)
+        self.resolved.get(key.normalized())
     }
 
-    /// Whether the lock file resolved `key` under either spelling.
+    /// Whether the lock file resolved `key`.
     #[must_use]
     pub fn is_resolved(&self, key: &PackageKey) -> bool {
         self.resolved_for(key).is_some()
@@ -330,23 +343,21 @@ impl<'a> VersionData<'a> {
 
     /// Every lock-file-resolved version retained for `key` (see
     /// [`Self::with_resolved_version_candidates`]), or `None` when no candidates map is attached
-    /// or it has no entry under either spelling.
+    /// or it has no entry for the package.
     #[must_use]
     pub fn resolved_candidates_for(&self, key: &PackageKey) -> Option<&'a [ConcreteVersion]> {
         self.resolved_version_candidates
-            .and_then(|candidates| key.find_in(candidates))
+            .and_then(|candidates| candidates.get(key.normalized()))
             .map(Vec::as_slice)
     }
 
     /// The whole lock-file map, for deps-core helpers that take the raw map.
-    pub(crate) const fn resolved_map(&self) -> &'a HashMap<PackageName, ConcreteVersion> {
+    pub(crate) const fn resolved_map(&self) -> &'a ResolvedVersionsMap {
         self.resolved
     }
 
     /// The whole candidates map, for deps-core helpers that take the raw map.
-    pub(crate) const fn candidates_map(
-        &self,
-    ) -> Option<&'a HashMap<PackageName, Vec<ConcreteVersion>>> {
+    pub(crate) const fn candidates_map(&self) -> Option<&'a ResolvedCandidatesMap> {
         self.resolved_version_candidates
     }
 
@@ -388,17 +399,17 @@ impl<'a> VersionData<'a> {
     ///
     /// let cached = HashMap::new();
     /// let resolved = HashMap::new();
+    /// let key = PackageKey::new(&PackageName::new("serde"), &Identity);
     /// let mut candidates = HashMap::new();
-    /// candidates.insert(PackageName::new("serde"), vec![ConcreteVersion::new("1.0.200")]);
+    /// candidates.insert(key.normalized().clone(), vec![ConcreteVersion::new("1.0.200")]);
     /// let versions =
     ///     VersionData::new(&cached, &resolved).with_resolved_version_candidates(&candidates);
-    /// let key = PackageKey::new(&PackageName::new("serde"), &Identity);
     /// assert_eq!(versions.resolved_candidates_for(&key).map(<[_]>::len), Some(1));
     /// ```
     #[must_use]
     pub const fn with_resolved_version_candidates(
         mut self,
-        candidates: &'a HashMap<PackageName, Vec<ConcreteVersion>>,
+        candidates: &'a ResolvedCandidatesMap,
     ) -> Self {
         self.resolved_version_candidates = Some(candidates);
         self
@@ -572,7 +583,7 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub const fn with_license_prefetch(
         mut self,
-        licenses: &'a HashMap<PackageName, Vec<String>>,
+        licenses: &'a HashMap<NormalizedName, Vec<String>>,
     ) -> Self {
         self.license_prefetch = Some(licenses);
         self
@@ -635,7 +646,7 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub const fn with_typosquat_prefetch(
         mut self,
-        typosquat_prefetch: &'a HashMap<PackageName, TyposquatSignal>,
+        typosquat_prefetch: &'a HashMap<NormalizedName, TyposquatSignal>,
     ) -> Self {
         self.typosquat_prefetch = Some(typosquat_prefetch);
         self
@@ -658,7 +669,7 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub const fn with_gossip_prefetch(
         mut self,
-        gossip_prefetch: &'a HashMap<PackageName, GossipFindings>,
+        gossip_prefetch: &'a HashMap<NormalizedName, GossipFindings>,
     ) -> Self {
         self.gossip_prefetch = Some(gossip_prefetch);
         self

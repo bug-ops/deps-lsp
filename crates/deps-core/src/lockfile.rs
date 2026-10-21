@@ -579,10 +579,12 @@ pub(crate) fn compare_lockfile_versions(a: &str, b: &str) -> std::cmp::Ordering 
     }
 }
 
-/// Returns the package with the highest semver version from a slice.
-fn best_package(packages: &[ResolvedPackage]) -> Option<&ResolvedPackage> {
+/// Returns the package with the highest semver version.
+fn best_package<'a>(
+    packages: impl IntoIterator<Item = &'a ResolvedPackage>,
+) -> Option<&'a ResolvedPackage> {
     packages
-        .iter()
+        .into_iter()
         .max_by(|a, b| compare_lockfile_versions(&a.version, &b.version))
 }
 
@@ -604,7 +606,7 @@ impl ResolvedPackages {
 
     /// Gets the resolved package with the highest semver version.
     pub fn get(&self, name: &str) -> Option<&ResolvedPackage> {
-        self.packages.get(name).and_then(|v| best_package(v))
+        self.packages.get(name).and_then(best_package)
     }
 
     /// Gets the highest resolved version string for a package.
@@ -649,6 +651,98 @@ impl ResolvedPackages {
                 .get(name)
                 .and_then(|v| best_package(v).map(|p| (name, p)))
         })
+    }
+
+    /// Splits the lock file into the two per-package maps `VersionData` reads, keyed by the
+    /// ecosystem-normalized name.
+    ///
+    /// Lock-file spellings that normalize to one name (e.g. NuGet's `Newtonsoft.Json` and
+    /// `newtonsoft.json` across target frameworks) are unioned: the resolved version is the
+    /// best over the union, and the candidates map holds an entry only when the union has
+    /// more than one *distinct* version. Candidates are listed in lock-file-name order, then
+    /// insertion order, so the result is deterministic.
+    ///
+    /// Versions are compared with the semver-first comparator `best_package` uses, with a
+    /// string fallback for non-semver ones. An ecosystem whose lock versions are not
+    /// semver-ordered must therefore collapse its own case variants in its lock-file parser
+    /// before they reach this union.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::PackageName;
+    /// use deps_core::lockfile::{ResolvedPackage, ResolvedPackages, ResolvedSource};
+    /// use deps_core::lsp_helpers::{NormalizeName, PackageNaming};
+    ///
+    /// struct Lowercase;
+    /// impl PackageNaming for Lowercase {
+    ///     fn normalized_spelling(&self, name: &PackageName) -> String {
+    ///         name.as_str().to_lowercase()
+    ///     }
+    /// }
+    ///
+    /// let mut resolved = ResolvedPackages::new();
+    /// for (name, version) in [("Django", "4.0.0"), ("django", "4.1.0")] {
+    ///     resolved.insert(ResolvedPackage::new(
+    ///         name.into(),
+    ///         version.into(),
+    ///         ResolvedSource::Registry { url: String::new(), checksum: String::new() },
+    ///     ));
+    /// }
+    ///
+    /// let (versions, candidates) = resolved.split_normalized(&Lowercase);
+    /// let key = Lowercase.normalize_package_name(&PackageName::new("Django"));
+    /// assert_eq!(versions.get(&key).map(|v| v.as_str()), Some("4.1.0"));
+    /// assert_eq!(candidates.get(&key).map(Vec::len), Some(2));
+    /// ```
+    pub fn split_normalized(
+        &self,
+        naming: &(impl crate::lsp_helpers::PackageNaming + ?Sized),
+    ) -> (
+        crate::lsp_helpers::ResolvedVersionsMap,
+        crate::lsp_helpers::ResolvedCandidatesMap,
+    ) {
+        use crate::lsp_helpers::NormalizeName;
+
+        let mut entries: Vec<(&String, &Vec<ResolvedPackage>)> = self.packages.iter().collect();
+        entries.sort_unstable_by_key(|(name, _)| *name);
+
+        let mut union: HashMap<crate::NormalizedName, Vec<&ResolvedPackage>> = HashMap::new();
+        for (name, packages) in entries {
+            let key = naming.normalize_package_name(&crate::PackageName::new(name.as_str()));
+            union.entry(key).or_default().extend(packages);
+        }
+
+        let mut versions = HashMap::with_capacity(union.len());
+        let mut candidates = HashMap::new();
+        for (key, packages) in union {
+            if let Some(best) = best_package(packages.iter().copied()) {
+                versions.insert(
+                    key.clone(),
+                    crate::ConcreteVersion::from(best.version.clone()),
+                );
+            }
+            let mut distinct: Vec<&str> = Vec::new();
+            for package in &packages {
+                let version = package.version.as_str();
+                if !distinct
+                    .iter()
+                    .any(|seen| compare_lockfile_versions(seen, version).is_eq())
+                {
+                    distinct.push(version);
+                }
+            }
+            if distinct.len() > 1 {
+                candidates.insert(
+                    key,
+                    distinct
+                        .into_iter()
+                        .map(crate::ConcreteVersion::from)
+                        .collect(),
+                );
+            }
+        }
+        (versions, candidates)
     }
 
     /// Converts into a HashMap with the best version per package name.
@@ -726,6 +820,19 @@ pub trait LockFileProvider: Send + Sync {
         &'a self,
         lockfile_path: &'a Path,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>>;
+
+    /// Extra packages to resolve alongside what [`Self::parse_lockfile`] returned, derived at
+    /// load time from state outside the lock file.
+    ///
+    /// `parsed` is the (cached) parse result, so what this returns is recomputed on every load
+    /// and never goes stale in the cache. Swift uses it to name a source-control pin by the
+    /// registry identity a dependency was swapped to (spec 088).
+    ///
+    /// Default: none.
+    fn derived_packages(&self, parsed: &ResolvedPackages) -> Vec<ResolvedPackage> {
+        let _ = parsed;
+        Vec::new()
+    }
 }
 
 /// Upper bound on a [`LockFileCache`]'s entry count.
@@ -2129,5 +2236,79 @@ mod tests {
             4,
             "expected 2 redacted map keys + 2 redacted ResolvedPackage.name fields, found: {rendered}"
         );
+    }
+
+    struct Lowercase;
+
+    impl crate::lsp_helpers::PackageNaming for Lowercase {
+        fn normalized_spelling(&self, name: &crate::PackageName) -> String {
+            name.as_str().to_lowercase()
+        }
+    }
+
+    fn registry_pkg(name: &str, version: &str) -> ResolvedPackage {
+        ResolvedPackage::new(
+            name.to_string(),
+            version.to_string(),
+            ResolvedSource::Registry {
+                url: String::new(),
+                checksum: String::new(),
+            },
+        )
+    }
+
+    fn normalized(name: &str) -> crate::NormalizedName {
+        use crate::lsp_helpers::NormalizeName;
+        Lowercase.normalize_package_name(&crate::PackageName::new(name))
+    }
+
+    #[test]
+    fn split_normalized_unions_case_variants_and_picks_the_best_version() {
+        let mut packages = ResolvedPackages::new();
+        packages.insert(registry_pkg("Django", "4.0.0"));
+        packages.insert(registry_pkg("django", "4.1.0"));
+
+        let (versions, candidates) = packages.split_normalized(&Lowercase);
+
+        assert_eq!(versions.len(), 1);
+        assert_eq!(
+            versions.get(&normalized("Django")).map(|v| v.as_str()),
+            Some("4.1.0")
+        );
+        let union: Vec<&str> = candidates[&normalized("django")]
+            .iter()
+            .map(|v| v.as_str())
+            .collect();
+        assert_eq!(union, ["4.0.0", "4.1.0"]);
+    }
+
+    #[test]
+    fn split_normalized_has_no_candidates_entry_for_one_distinct_version() {
+        let mut packages = ResolvedPackages::new();
+        packages.insert(registry_pkg("Django", "4.0.0"));
+        packages.insert(registry_pkg("django", "4.0.0"));
+        packages.insert(registry_pkg("django", "4.0.0"));
+
+        let (versions, candidates) = packages.split_normalized(&Lowercase);
+
+        assert_eq!(
+            versions.get(&normalized("django")).map(|v| v.as_str()),
+            Some("4.0.0")
+        );
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn split_normalized_keeps_candidates_within_one_spelling() {
+        let mut packages = ResolvedPackages::new();
+        packages.insert(registry_pkg("serde", "0.9.15"));
+        packages.insert(registry_pkg("serde", "1.0.219"));
+        packages.insert(registry_pkg("tokio", "1.0.0"));
+
+        let (versions, candidates) = packages.split_normalized(&Lowercase);
+
+        assert_eq!(versions.len(), 2);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[&normalized("serde")].len(), 2);
     }
 }

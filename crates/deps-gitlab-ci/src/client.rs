@@ -7,11 +7,13 @@
 //! every choice below.
 
 use bytes::Bytes;
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use deps_core::EgressTier;
 use deps_core::RegistryEndpoint;
-use deps_core::cache::{CredentialHeader, HttpCache, RequestAuth};
+use deps_core::cache::{BodyLimit, CredentialHeader, HttpCache, RequestAuth, RevalidationFailure};
 use deps_core::error::{DepsError, RateLimitEvidence, Result};
+use deps_core::lsp_helpers::{COMPARE_BODY_LIMIT, CommitSha, ProbeRef};
+use deps_core::rate_limit::{ProbeCredential, QuotaHeaders, QuotaMeter};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -167,6 +169,52 @@ pub struct GitlabApiClient {
     /// discovered once, not rediscovered (and repaid with a wasted round trip) on every
     /// page of every subsequent fetch against that host.
     degraded_order_by_hosts: Arc<DashSet<String>>,
+    /// One rate-limit meter per origin, fed by every live response from that origin.
+    quota_meters: Arc<DashMap<String, Arc<QuotaMeter>>>,
+}
+
+/// The first commit of a `merge_base` request.
+///
+/// Typed so the only texts that reach the URL are a validated commit SHA and the fixed `HEAD`
+/// literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeBaseRef<'a> {
+    /// The default branch's HEAD, spelled `HEAD`.
+    DefaultBranchHead,
+    /// A specific commit.
+    Commit(&'a CommitSha),
+}
+
+impl std::fmt::Display for MergeBaseRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DefaultBranchHead => f.write_str("HEAD"),
+            Self::Commit(sha) => f.write_str(sha.as_str()),
+        }
+    }
+}
+
+/// The merge-base commit of a `merge_base` response, or `None` when the body is not a commit
+/// object with a valid `id`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_gitlab_ci::client::parse_merge_base;
+///
+/// let id = "a".repeat(40);
+/// let body = format!(r#"{{"id":"{id}","short_id":"aaaaaaaa"}}"#);
+/// assert_eq!(parse_merge_base(body.as_bytes()).unwrap().as_str(), id);
+/// assert!(parse_merge_base(b"{}").is_none());
+/// ```
+#[must_use]
+pub fn parse_merge_base(body: &[u8]) -> Option<CommitSha> {
+    #[derive(Deserialize)]
+    struct Wire<'a> {
+        id: &'a str,
+    }
+    let wire: Wire<'_> = serde_json::from_slice(body).ok()?;
+    CommitSha::parse(wire.id)
 }
 
 impl GitlabApiClient {
@@ -185,6 +233,7 @@ impl GitlabApiClient {
             cache,
             token,
             degraded_order_by_hosts: Arc::new(DashSet::new()),
+            quota_meters: Arc::new(DashMap::new()),
         }
     }
 
@@ -204,7 +253,82 @@ impl GitlabApiClient {
             cache,
             token,
             degraded_order_by_hosts: Arc::new(DashSet::new()),
+            quota_meters: Arc::new(DashMap::new()),
         }
+    }
+
+    /// The meter every live response from `host` feeds (`RateLimit-Remaining`/`-Reset`).
+    ///
+    /// A self-hosted instance without those headers leaves it empty, which hands probe
+    /// governance to the token bucket and the gate alone.
+    #[must_use]
+    pub fn quota_meter(&self, host: &GitlabHost) -> Arc<QuotaMeter> {
+        Arc::clone(
+            self.quota_meters
+                .entry(host.origin().to_string())
+                .or_insert_with(|| Arc::new(QuotaMeter::new(QuotaHeaders::GitLab)))
+                .value(),
+        )
+    }
+
+    /// Which probe parameters apply to `host`: a token is sent only to the bound origin.
+    #[must_use]
+    pub fn probe_credential(&self, host: &GitlabHost) -> ProbeCredential {
+        if self.sends_token_to(host.origin()) {
+            ProbeCredential::Token
+        } else {
+            ProbeCredential::Anonymous
+        }
+    }
+
+    /// Asks whether `project_path` on `host` has a branch named `git_ref`:
+    /// `GET /api/v4/projects/:id/repository/branches/:ref`.
+    ///
+    /// The ref is a [`ProbeRef`] and is percent-encoded again as a path segment. A `404` is
+    /// [`DepsError::HttpStatus`] and means no such branch.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying HTTP/cache error unchanged.
+    pub async fn fetch_branch(
+        &self,
+        host: &GitlabHost,
+        project_path: &str,
+        git_ref: &ProbeRef,
+    ) -> Result<Bytes> {
+        let enc = urlencoding::encode(project_path);
+        let url = format!(
+            "{}/api/v4/projects/{enc}/repository/branches/{}",
+            host.origin(),
+            git_ref.as_path_segment()
+        );
+        self.fetch_pinned_with(host, &url, COMPARE_BODY_LIMIT, RevalidationFailure::Fail)
+            .await
+    }
+
+    /// Asks for the merge base of `first` and `pin`:
+    /// `GET /api/v4/projects/:id/repository/merge_base?refs[]=first&refs[]=pin`.
+    ///
+    /// Both commits are typed, so no written text reaches the URL. Read the result with
+    /// [`parse_merge_base`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying HTTP/cache error unchanged.
+    pub async fn fetch_merge_base(
+        &self,
+        host: &GitlabHost,
+        project_path: &str,
+        first: MergeBaseRef<'_>,
+        pin: &CommitSha,
+    ) -> Result<Bytes> {
+        let enc = urlencoding::encode(project_path);
+        let url = format!(
+            "{}/api/v4/projects/{enc}/repository/merge_base?refs%5B%5D={first}&refs%5B%5D={pin}",
+            host.origin()
+        );
+        self.fetch_pinned_with(host, &url, COMPARE_BODY_LIMIT, RevalidationFailure::Fail)
+            .await
     }
 
     /// Fetches one page of `host`'s repository-tags API for `project_path`.
@@ -285,8 +409,27 @@ impl GitlabApiClient {
     /// Fetches `url` through the origin-pinned transport [`Self::route_for`] picks, attaching
     /// `PRIVATE-TOKEN` only when `host` is the env-bound token host.
     async fn fetch_pinned(&self, host: &GitlabHost, url: &str) -> Result<Bytes> {
+        self.fetch_pinned_with(
+            host,
+            url,
+            BodyLimit::DEFAULT,
+            RevalidationFailure::ServeStale,
+        )
+        .await
+    }
+
+    /// [`Self::fetch_pinned`] with an explicit body cap and revalidation policy. Every live
+    /// response feeds `host`'s [`QuotaMeter`], whichever transport tier carried it.
+    async fn fetch_pinned_with(
+        &self,
+        host: &GitlabHost,
+        url: &str,
+        limit: BodyLimit,
+        on_revalidation_failure: RevalidationFailure,
+    ) -> Result<Bytes> {
         let prefix = host.trusted_prefix();
-        match self.route_for(host) {
+        let meter = self.quota_meter(host);
+        let response = match self.route_for(host) {
             GitlabTransport::OperatorTrusted => {
                 let auth = self
                     .token
@@ -296,17 +439,33 @@ impl GitlabApiClient {
                             CredentialHeader::GitlabPrivateToken(t.as_redacted()),
                             prefix,
                         )
-                    });
+                    })
+                    .with_quota_meter(&meter);
                 self.cache
-                    .get_cached_trusted_origin(url, prefix, auth, None)
-                    .await
+                    .get_cached_trusted_origin_limited(
+                        url,
+                        prefix,
+                        auth,
+                        None,
+                        on_revalidation_failure,
+                        limit,
+                    )
+                    .await?
             }
             GitlabTransport::WorkspaceDeclared => {
                 self.cache
-                    .get_cached_pinned(url, prefix, RequestAuth::ANONYMOUS, None)
-                    .await
+                    .get_cached_pinned_limited(
+                        url,
+                        prefix,
+                        RequestAuth::ANONYMOUS.with_quota_meter(&meter),
+                        None,
+                        on_revalidation_failure,
+                        limit,
+                    )
+                    .await?
             }
-        }
+        };
+        Ok(response.body)
     }
 
     /// The network path every request to `host` travels: its trusted prefix through the egress

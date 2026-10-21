@@ -13,7 +13,9 @@ use super::state::ServerState;
 use crate::progress::RegistryProgress;
 use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
-use deps_core::PackageName;
+use deps_core::NormalizedName;
+use deps_core::ResolvedCandidatesMap;
+use deps_core::ResolvedVersionsMap;
 use deps_core::policy_config::FetchConcurrency;
 use deps_core::policy_config::FetchTimeout;
 use deps_engine::classify::diff::{
@@ -58,6 +60,15 @@ pub(crate) fn fetch_failure_toast(
     ))
 }
 
+/// Keeps only the sources whose package is in `requested`.
+///
+/// Matches on the normalized name: dedup keeps one source per package under the first
+/// occurrence's declared spelling, which need not be the spelling the edit touched.
+fn retain_requested(dep_sources: &mut DepSources, requested: &[NormalizedName]) {
+    let requested: HashSet<&NormalizedName> = requested.iter().collect();
+    dep_sources.retain(|(key, _)| requested.contains(key.normalized()));
+}
+
 /// Fans the registry fetch out for the added/version-changed dependencies determined by the
 /// caller's diff: marks the document loading, opens an LSP progress notification when the
 /// client supports it, resolves each dependency occurrence to a fetchable source (deduping
@@ -70,9 +81,9 @@ pub(crate) async fn fetch_registry_versions_for_change(
     state: &ServerState,
     client: &Client,
     ecosystem: &dyn Ecosystem,
-    resolved_versions: &HashMap<PackageName, ConcreteVersion>,
-    resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
-    deps_to_fetch: Vec<PackageName>,
+    resolved_versions: &ResolvedVersionsMap,
+    resolved_version_candidates: &ResolvedCandidatesMap,
+    deps_to_fetch: Vec<NormalizedName>,
     freshness_settings: deps_core::FreshnessSettings,
     fetch_timeout: FetchTimeout,
     max_concurrent_fetches: FetchConcurrency,
@@ -80,8 +91,8 @@ pub(crate) async fn fetch_registry_versions_for_change(
 ) -> (
     Option<RegistryProgress>,
     FetchResult,
-    Vec<PackageName>,
-    HashSet<PackageName>,
+    Vec<NormalizedName>,
+    HashSet<NormalizedName>,
 ) {
     tracing::info!(
         count = deps_to_fetch.len(),
@@ -96,7 +107,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
     // between two independent `get_mut` acquisitions).
     if let Some(mut doc) = state.documents.get_mut(uri) {
         if refetch == RefetchPolicy::AllDependencies {
-            drop_cache_for_forced_refetch(&mut doc, &deps_to_fetch, ecosystem.formatter());
+            drop_cache_for_forced_refetch(&mut doc, &deps_to_fetch);
         }
         doc.set_loading();
     }
@@ -119,10 +130,10 @@ pub(crate) async fn fetch_registry_versions_for_change(
     // and the added/changed dependencies' resolved sources (spec FR-001/FR-011) from the
     // freshly-committed parse result and the resolved versions just loaded above.
     let (in_use, selection_context, dep_sources, collided_names): (
-        HashMap<PackageName, Vec<ConcreteVersion>>,
+        HashMap<NormalizedName, Vec<ConcreteVersion>>,
         deps_core::SelectionContext,
         DepSources,
-        HashSet<PackageName>,
+        HashSet<NormalizedName>,
     ) = match state.get_document(uri) {
         Some(doc) => match doc.parse_result() {
             Some(pr) => {
@@ -135,8 +146,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
                 );
                 // This call only fetches the added/version-changed subset the caller's diff
                 // determined, unlike `prepare_fetch`'s default full-manifest set.
-                let to_fetch: HashSet<&PackageName> = deps_to_fetch.iter().collect();
-                prep.dep_sources.retain(|(name, _)| to_fetch.contains(name));
+                retain_requested(&mut prep.dep_sources, &deps_to_fetch);
                 (
                     prep.in_use,
                     prep.selection_context,
@@ -159,15 +169,17 @@ pub(crate) async fn fetch_registry_versions_for_change(
         ),
     };
 
-    // Captured before `dep_sources` is moved into the call below: every raw name a
+    // Captured before `dep_sources` is moved into the call below: every normalized name a
     // fetch was actually attempted for this round, used by the #550
     // no-comparable-versions merge further down to distinguish "attempted and
     // resolved fine this round" (clear any stale marker) from "not attempted this
     // round" (leave any existing marker untouched) — unlike `fetched_names` in the
     // merge step, this can't be derived from `fetch_result.versions`'s keys, since a
     // no-comparable-versions package is by definition never one of them.
-    let attempted_names: Vec<PackageName> =
-        dep_sources.iter().map(|(name, _)| name.clone()).collect();
+    let attempted_names: Vec<NormalizedName> = dep_sources
+        .iter()
+        .map(|(key, _)| key.normalized().clone())
+        .collect();
     let registry = ecosystem.registry();
     let fetch_result = fetch_latest_versions_parallel(
         ecosystem.ecosystem_id(),
@@ -189,7 +201,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
 }
 
 /// Merges a completed registry fetch into the document's cache and outcome maps —
-/// newly fetched versions, yanked/fetch-failure markers (re-keyed raw -> normalized),
+/// newly fetched versions, yanked/fetch-failure markers,
 /// collided names recorded as not-attempted, and deprecation / no-comparable-versions
 /// bookkeeping — then marks the document loaded or failed depending on `success`. Returns
 /// `fetch_result.failure_summary`, the one `FetchResult` field this function does not
@@ -198,10 +210,9 @@ pub(crate) async fn fetch_registry_versions_for_change(
 pub(crate) fn merge_registry_fetch_result(
     state: &ServerState,
     uri: &Uri,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     fetch_result: FetchResult,
-    attempted_names: &[PackageName],
-    collided_names: HashSet<PackageName>,
+    attempted_names: &[NormalizedName],
+    collided_names: HashSet<NormalizedName>,
     success: bool,
 ) -> Option<FailureSummary> {
     if let Some(mut doc) = state.documents.get_mut(uri) {
@@ -209,7 +220,7 @@ pub(crate) fn merge_registry_fetch_result(
         // successfully fetched this round, used by the S1 deprecation-clearing
         // loop further down to distinguish "fetched and clean" from "not fetched
         // this round" — only the former may clear a stale finding.
-        let fetched_names: Vec<PackageName> = fetch_result.versions.keys().cloned().collect();
+        let fetched_names: Vec<NormalizedName> = fetch_result.versions.keys().cloned().collect();
         for (name, version) in fetch_result.versions {
             doc.signals.cached_versions.insert(name, version);
         }
@@ -222,19 +233,16 @@ pub(crate) fn merge_registry_fetch_result(
             fetch_result.yanked_versions,
             fetch_result.fetch_failed,
             collided_names,
-            formatter,
         );
         merge_deprecations_after_fetch(
             &mut doc.signals.outcomes,
             &fetched_names,
             fetch_result.deprecations,
-            formatter,
         );
         merge_no_comparable_versions_after_fetch(
             &mut doc.signals.outcomes,
             attempted_names,
             fetch_result.no_comparable_versions,
-            formatter,
         );
         if success {
             doc.set_loaded();
@@ -257,6 +265,8 @@ mod tests {
     use deps_core::EcosystemId;
     #[cfg(feature = "pypi")]
     use deps_core::NormalizeName;
+    use deps_core::PackageKey;
+    use deps_core::PackageName;
     #[cfg(feature = "pypi")]
     use deps_core::Registry;
     #[cfg(feature = "pypi")]
@@ -264,17 +274,32 @@ mod tests {
     #[cfg(feature = "pypi")]
     use deps_core::VersionReq;
     use deps_core::parser::DependencySource;
+    use deps_core::test_util::package_key;
     use std::sync::Arc;
 
     /// Pairs every name with the plain `Registry` source — the shape every pre-existing
     /// `fetch_latest_versions_parallel` test used before that function became source-aware
     /// (spec FR-001). Production call sites build real `(name, source)` pairs from a
     /// parsed manifest via `dedup_dependencies_by_source` instead.
-    fn with_registry_source(names: Vec<PackageName>) -> Vec<(PackageName, DependencySource)> {
-        names
-            .into_iter()
-            .map(|name| (name, DependencySource::Registry))
+    fn with_registry_source(keys: Vec<PackageKey>) -> DepSources {
+        keys.into_iter()
+            .map(|key| (key, DependencySource::Registry))
             .collect()
+    }
+
+    /// `Django==4.0` (first) and `django==4.1` share one deduped source keyed by the first
+    /// spelling; editing only `django` must still select it.
+    #[test]
+    fn retain_requested_matches_on_the_normalized_name_not_the_declared_spelling() {
+        let formatter = deps_core::test_util::StubFormatter::new().with_lowercase_names();
+        let upper = PackageKey::new(&PackageName::new("Django"), &formatter);
+        let other = PackageKey::new(&PackageName::new("flask"), &formatter);
+        let mut sources = with_registry_source(vec![upper, other]);
+
+        retain_requested(&mut sources, &[NormalizedName::for_test("django")]);
+
+        let kept: Vec<&str> = sources.iter().map(|(k, _)| k.declared().as_str()).collect();
+        assert_eq!(kept, ["Django"]);
     }
 
     /// Issue #483: `fetch_failure_toast` is the pure decision both `handle_document_open`
@@ -380,7 +405,7 @@ mod tests {
         }
 
         let registry: Arc<dyn Registry> = Arc::new(FallbackErrorRegistry);
-        let packages = vec![PackageName::new("flaky"), PackageName::new("not-found")];
+        let packages = vec![package_key("flaky"), package_key("not-found")];
 
         let result = fetch_latest_versions_parallel(
             deps_core::EcosystemId::Cargo,
@@ -458,16 +483,16 @@ dependencies = ["requests>=2.0.0"]
 
     /// End-to-end PyPI key guard (critic S4): drives the *real* pypi parser
     /// and formatter (not a hand-rolled mock) through the full
-    /// fetch -> re-key -> store -> diagnostic pipeline for an `==`-pinned
+    /// fetch -> store -> diagnostic pipeline for an `==`-pinned
     /// dependency with no lock file, declared as a Poetry
     /// `[tool.poetry.dependencies]` table key. Poetry's table-key path keeps
     /// `Dependency::name()` exactly as written in the manifest (unlike a PEP
     /// 508 requirement *string* — `pyproject.toml`'s PEP 621 array or
     /// `requirements.txt` — where `pep508_rs::PackageName` already
-    /// PEP 503-normalizes at construction, so raw and normalized already
+    /// PEP 503-normalizes at construction, so declared and normalized already
     /// coincide there and could not exercise this guard); the Poetry path is
     /// therefore the one place a manifest-declared underscore/dotted name
-    /// genuinely reaches `FetchResult::yanked_versions` unnormalized (§3.1).
+    /// differs from the key `FetchResult::yanked_versions` is stored under.
     /// Asserts BOTH that `DocumentState::yanked_versions` ends up keyed by
     /// the *normalized* name and that the diagnostic actually reaches
     /// `generate_diagnostics_from_cache`'s output — either alone would miss
@@ -595,10 +620,10 @@ dependencies = ["requests>=2.0.0"]
             );
 
             let resolved_versions = HashMap::new();
-            let dep_names: Vec<PackageName> = parse_result
+            let dep_keys: Vec<PackageKey> = parse_result
                 .dependencies()
                 .into_iter()
-                .map(|d| d.name().clone())
+                .map(|d| PackageKey::new(d.name(), formatter))
                 .collect();
             let in_use = collect_in_use_versions(
                 parse_result.as_ref(),
@@ -610,7 +635,7 @@ dependencies = ["requests>=2.0.0"]
             // Sanity check on the fix this guard exists for: the pep440
             // `==` comparator must already be stripped here.
             assert_eq!(
-                in_use.get(&PackageName::new(raw_name)),
+                in_use.get(&formatter.normalize_package_name(&PackageName::new(raw_name))),
                 Some(&vec![ConcreteVersion::from(pinned_version)])
             );
 
@@ -618,7 +643,7 @@ dependencies = ["requests>=2.0.0"]
             let fetch_result = fetch_latest_versions_parallel(
                 deps_core::EcosystemId::Cargo,
                 registry,
-                with_registry_source(dep_names),
+                with_registry_source(dep_keys),
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -632,11 +657,7 @@ dependencies = ["requests>=2.0.0"]
             let yanked_versions: HashMap<
                 deps_core::NormalizedName,
                 (ConcreteVersion, RemovalStatus),
-            > = fetch_result
-                .yanked_versions
-                .into_iter()
-                .map(|(name, v)| (formatter.normalize_package_name(&name), v))
-                .collect();
+            > = fetch_result.yanked_versions.into_iter().collect();
 
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Pypi,

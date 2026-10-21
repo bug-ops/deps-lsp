@@ -669,11 +669,12 @@ impl ScanTarget {
     ///
     /// ```
     /// use deps_core::ConcreteVersion;
-    /// use deps_core::lsp_helpers::OsvNaming;
+    /// use deps_core::lsp_helpers::{OsvNaming, SourcePolicy};
     /// use deps_core::osv::{OsvPackageName, OsvQueryName, ScanTarget};
     /// use deps_core::test_util::vuln_key;
     ///
     /// struct DefaultFormatter;
+    /// impl SourcePolicy for DefaultFormatter {}
     /// impl OsvNaming for DefaultFormatter {}
     ///
     /// let target = ScanTarget::from_native(
@@ -2034,12 +2035,6 @@ impl VulnKey {
         Self(name.as_str().to_string())
     }
 
-    /// Builds the plain key under a dependency's declared spelling, the last step of
-    /// [`crate::lsp_helpers::resolve_scan_outcome`]'s fallback chain.
-    pub(crate) fn from_declared(name: &crate::PackageName) -> Self {
-        Self(name.as_str().to_string())
-    }
-
     /// A key spelled as given, for fixtures that stand in for a derived key.
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn from_spelling(spelling: String) -> Self {
@@ -2090,7 +2085,7 @@ impl VulnKeys {
     /// Looks up the [`VulnKey`] for one occurrence's name range — `pub(crate)` only: the
     /// public entry points are [`vuln_key_for`] (produces a key, falling back to the
     /// normalized name) and [`crate::lsp_helpers::resolve_scan_outcome`] (looks an outcome
-    /// up, falling back further to the declared name).
+    /// up by that key).
     pub(crate) fn get(&self, range: &crate::position::Range) -> Option<&VulnKey> {
         self.0.get(range)
     }
@@ -2217,7 +2212,7 @@ pub fn vuln_key_for(
 /// };
 /// use deps_core::osv::vulnerability_keys;
 /// use deps_core::position::{Position, Range};
-/// use deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageName, ParseResult, VersionReq};
+/// use deps_core::{ConcreteVersion, Dependency, EcosystemId, NormalizedName, PackageName, ParseResult, VersionReq};
 /// use std::any::Any;
 /// use std::collections::HashMap;
 /// use url::Url;
@@ -2301,7 +2296,7 @@ pub fn vuln_key_for(
 ///     ],
 ///     uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
 /// };
-/// let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+/// let resolved: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
 ///
 /// let keys = vulnerability_keys(&parse_result, &resolved, None, &SimpleFormatter, EcosystemId::Cargo);
 /// let deps = parse_result.dependencies();
@@ -2311,8 +2306,8 @@ pub fn vuln_key_for(
 /// ```
 pub fn vulnerability_keys(
     parse_result: &dyn crate::ParseResult,
-    resolved: &HashMap<crate::PackageName, crate::ConcreteVersion>,
-    resolved_candidates: Option<&HashMap<crate::PackageName, Vec<crate::ConcreteVersion>>>,
+    resolved: &HashMap<crate::NormalizedName, crate::ConcreteVersion>,
+    resolved_candidates: Option<&HashMap<crate::NormalizedName, Vec<crate::ConcreteVersion>>>,
     formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     ecosystem: crate::EcosystemId,
 ) -> VulnKeys {
@@ -2331,7 +2326,7 @@ pub fn vulnerability_keys(
         .iter()
         .map(|dep| {
             let key = crate::PackageKey::new(dep.name(), formatter);
-            let signature = if formatter.source_is_public_registry_content(&dep.source()) {
+            let signature = if formatter.public_content(*dep).is_some() {
                 match resolve_in_use_versions(
                     *dep,
                     &key,
@@ -3890,7 +3885,9 @@ mod vulnerability_keys_candidates_tests {
     use super::*;
     use crate::lsp_helpers::test_support::{MOCK_FORMATTER, MockDep};
     use crate::position::{Position, Range};
-    use crate::{ConcreteVersion, EcosystemId, PackageName, ParseResult, VersionReq};
+    use crate::{
+        ConcreteVersion, EcosystemId, NormalizedName, PackageName, ParseResult, VersionReq,
+    };
 
     #[test]
     fn distinct_signatures_for_two_occurrences_resolving_to_different_candidates() {
@@ -3938,10 +3935,13 @@ mod vulnerability_keys_candidates_tests {
         };
 
         let mut resolved = std::collections::HashMap::new();
-        resolved.insert(PackageName::new("serde"), ConcreteVersion::from("1.0.219"));
+        resolved.insert(
+            NormalizedName::for_test("serde"),
+            ConcreteVersion::from("1.0.219"),
+        );
         let mut candidates = std::collections::HashMap::new();
         candidates.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             vec![
                 ConcreteVersion::from("0.9.15"),
                 ConcreteVersion::from("1.0.219"),

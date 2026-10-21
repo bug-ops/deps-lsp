@@ -1,14 +1,16 @@
 //! GitHub Actions ecosystem formatter.
 
-use dashmap::DashMap;
+use crate::registry::RepositoryIndexes;
+#[cfg(doc)]
+use deps_core::lsp_helpers::TagIndex;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, CandidateTagSource, CommentCheck, CommentSlot, CommitRewrite, CommitSha,
-    DiagnosticMessages, DiagnosticPolicy, GitPinView, OsvNameAvailability, OsvNaming,
-    PackageNaming, PackageRendering, PartialTagPolicy, PinResolution, RequirementResolution,
-    RequirementStatus, ShaPinLookup, ShaPinTail, SourcePolicy, TagIndex, concrete_pin_version,
-    git_candidate_tag_source, git_commit_rewrite, git_tag_replacement, is_partial_semver_shaped,
-    requirement_contains_template_placeholder, resolve_git_pin, sha_pin_rewrite,
-    tag_has_precedence, tag_pin_is_up_to_date,
+    AheadProof, BoundedVersionReq, BranchEvidence, CandidateTagSource, CommentCheck, CommentSlot,
+    CommitRewrite, CommitSha, DiagnosticMessages, DiagnosticPolicy, GitPinView, NormalizeName,
+    OsvNameAvailability, OsvNaming, PackageNaming, PackageRendering, PartialTagPolicy,
+    PinResolution, ProbeRef, ProbeStores, RequirementResolution, RequirementStatus, ShaPinLookup,
+    ShaPinTail, SourcePolicy, concrete_pin_version, git_candidate_tag_source, git_commit_rewrite,
+    git_tag_replacement, is_partial_semver_shaped, requirement_contains_template_placeholder,
+    resolve_git_pin, sha_pin_rewrite, tag_has_precedence, tag_pin_is_up_to_date,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
@@ -25,7 +27,11 @@ pub struct GithubActionsFormatter {
     /// Shared handle to [`crate::registry::GithubActionsRegistry`]'s tag/SHA
     /// cross-reference — read-only from here (`format_version_replacing_for`'s
     /// `PinStyle::Sha` branch and [`Self::sha_pin_replacement_for`]).
-    pub(crate) tag_index: Arc<DashMap<PackageName, Arc<TagIndex>>>,
+    pub(crate) tag_index: Arc<RepositoryIndexes>,
+    /// Probe evidence filled by [`crate::registry::GithubActionsRegistry`]'s background
+    /// probes, read synchronously by diagnostics, status and hover. Empty unless shared with
+    /// the registry through [`Self::with_probe_stores`].
+    pub(crate) probe_stores: Arc<ProbeStores>,
 }
 
 impl GithubActionsFormatter {
@@ -41,13 +47,13 @@ impl GithubActionsFormatter {
     /// # Examples
     ///
     /// ```
-    /// use dashmap::DashMap;
+    /// use deps_github_actions::registry::RepositoryIndexes;
     /// use deps_github_actions::GithubActionsFormatter;
     /// use deps_core::lsp_helpers::{CommitSha, TagIndex};
     /// use deps_core::PackageName;
     /// use std::sync::Arc;
     ///
-    /// let tag_index = Arc::new(DashMap::new());
+    /// let tag_index = Arc::new(RepositoryIndexes::default());
     /// let index = TagIndex::from_tags([("v4", &CommitSha::parse(&"a".repeat(40)).unwrap())]);
     /// tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
     ///
@@ -58,8 +64,46 @@ impl GithubActionsFormatter {
     /// );
     /// ```
     #[must_use]
-    pub fn new(tag_index: Arc<DashMap<PackageName, Arc<TagIndex>>>) -> Self {
-        Self { tag_index }
+    pub fn new(tag_index: Arc<RepositoryIndexes>) -> Self {
+        Self {
+            tag_index,
+            probe_stores: Arc::new(ProbeStores::default()),
+        }
+    }
+
+    /// Reads probe evidence from `probe_stores`, the handle
+    /// [`crate::registry::GithubActionsRegistry::probe_stores`] returns.
+    #[must_use]
+    pub fn with_probe_stores(mut self, probe_stores: Arc<ProbeStores>) -> Self {
+        self.probe_stores = probe_stores;
+        self
+    }
+
+    /// The stored answer to "is `written` a branch of `name`", for a ref a probe may ask about.
+    pub(crate) fn branch_evidence(
+        &self,
+        name: &PackageName,
+        written: &str,
+    ) -> Option<BranchEvidence> {
+        let git_ref = ProbeRef::parse(written)?;
+        self.probe_stores
+            .branches
+            .get(&self.normalize_package_name(name), &git_ref)
+    }
+
+    /// The proof that a commentless SHA pin is ahead of the latest release and on the default
+    /// branch, when probes stored both facts.
+    fn commit_proof(&self, dep: &dyn Dependency) -> Option<AheadProof> {
+        let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+        let Some(PinStyle::Sha { sha, comment: None }) = &gha_dep.pin else {
+            return None;
+        };
+        let index = self.tag_index.get(&gha_dep.name)?;
+        self.probe_stores.proof_for_untagged(
+            &self.normalize_package_name(&gha_dep.name),
+            &index,
+            sha,
+        )
     }
 
     /// Looks up `tag`'s commit SHA for `name` in the shared [`TagIndex`], returning the
@@ -77,13 +121,13 @@ impl GithubActionsFormatter {
     /// # Examples
     ///
     /// ```
-    /// use dashmap::DashMap;
+    /// use deps_github_actions::registry::RepositoryIndexes;
     /// use deps_github_actions::GithubActionsFormatter;
     /// use deps_core::lsp_helpers::{CommitSha, TagIndex};
     /// use deps_core::PackageName;
     /// use std::sync::Arc;
     ///
-    /// let tag_index = Arc::new(DashMap::new());
+    /// let tag_index = Arc::new(RepositoryIndexes::default());
     /// let index = TagIndex::from_tags([("v4", &CommitSha::parse(&"a".repeat(40)).unwrap())]);
     /// tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
     ///
@@ -160,7 +204,7 @@ impl deps_core::lsp_helpers::ShaPinning for GithubActionsFormatter {
 
 impl PackageNaming for GithubActionsFormatter {
     fn normalized_spelling(&self, name: &PackageName) -> String {
-        name.as_str().to_lowercase()
+        deps_core::lsp_helpers::LowercaseNaming.normalized_spelling(name)
     }
 
     /// Accepts `crate::is_valid_github_identity`'s `owner/repo` shape, or either of the
@@ -214,6 +258,15 @@ impl PackageRendering for GithubActionsFormatter {
         version.as_str().to_string()
     }
 
+    /// "Commit N ahead of latest release" for a commentless SHA pin that probes proved ahead of
+    /// the latest release and on the default branch.
+    fn hover_provenance(
+        &self,
+        dep: &dyn Dependency,
+    ) -> Option<deps_core::lsp_helpers::HoverProvenance> {
+        self.commit_proof(dep).map(|proof| proof.hover_provenance())
+    }
+
     /// Tag → the latest tag, preserving `current`'s `v`-prefix style. SHA → looks up the
     /// new SHA for `version`'s tag in the shared [`TagIndex`] and rewrites the pin through
     /// [`sha_pin_rewrite`]: `{sha}{closers} # {tag}` for a comment-annotated pin (the closing
@@ -236,7 +289,7 @@ impl PackageRendering for GithubActionsFormatter {
         match &gha_dep.pin {
             Some(PinStyle::Tag) => {
                 let index = self.tag_index.get(dep.name());
-                git_tag_replacement(current, version, index.as_deref().map(AsRef::as_ref))
+                git_tag_replacement(current, version, index.as_deref())
             }
             Some(PinStyle::Sha { .. }) => gha_dep
                 .sha_pin_tail()
@@ -355,7 +408,14 @@ impl RequirementResolution for GithubActionsFormatter {
             self.cap_unlisted_tag_pin(dep, requirement, status)
         };
         match self.sha_pin_lookup(dep, latest) {
-            Some(lookup) => lookup.status_or_text(text),
+            Some(lookup) => {
+                let untagged = lookup == ShaPinLookup::NotIndexed;
+                let status = lookup.status_or_text(text);
+                match self.commit_proof(dep).filter(|_| untagged) {
+                    Some(proof) => proof.override_status(status),
+                    None => status,
+                }
+            }
             None => text(),
         }
     }
@@ -365,7 +425,7 @@ impl RequirementResolution for GithubActionsFormatter {
             return CommitRewrite::NotACommitPin;
         };
         let index = self.tag_index.get(dep.name());
-        git_commit_rewrite(pin, index.as_deref().map(AsRef::as_ref), version)
+        git_commit_rewrite(pin, index.as_deref(), version)
     }
 
     /// #1556: a SHA pin's registry-confirmed tag (`TagIndex.sha_to_tag`) is a real,
@@ -396,11 +456,7 @@ impl RequirementResolution for GithubActionsFormatter {
             return PinResolution::Unresolved;
         };
         let index = self.tag_index.get(dep.name());
-        resolve_git_pin(
-            pin,
-            index.as_deref().map(AsRef::as_ref),
-            EcosystemId::GithubActions,
-        )
+        resolve_git_pin(pin, index.as_deref(), EcosystemId::GithubActions)
     }
 
     /// `tag_index` is populated as a side effect of [`GithubActionsRegistry`]'s own tags
@@ -522,6 +578,7 @@ impl GithubActionsFormatter {
                 latest.as_str(),
                 PartialTagPolicy::MovingLine,
                 status,
+                self.branch_evidence(dep.name(), requirement.as_str()),
             )
         })
     }
@@ -554,7 +611,7 @@ impl GithubActionsFormatter {
         };
         let index = self.tag_index.get(dep.name());
         Some(ShaPinLookup::resolve(
-            index.as_deref().map(AsRef::as_ref),
+            index.as_deref(),
             sha,
             latest,
             comment.as_ref().map(ShaComment::comment_tag),
@@ -572,7 +629,7 @@ impl GithubActionsFormatter {
         };
         let index = self.tag_index.get(&gha_dep.name);
         Some(CommentCheck::evaluate(
-            index.as_deref().map(AsRef::as_ref),
+            index.as_deref(),
             sha,
             comment.as_ref().map(ShaComment::pin_comment),
         ))
@@ -622,6 +679,8 @@ impl OsvNaming for GithubActionsFormatter {
 mod tests {
     use super::*;
     use deps_core::NormalizeName;
+    use deps_core::NormalizedName;
+    use deps_core::lsp_helpers::TagIndex;
     use deps_core::lsp_helpers::{CommentMismatch, CommitSha, RequirementGate, ResolvedPin};
     use deps_core::osv::SiblingCoverage;
     use deps_core::pagination::ListCoverage;
@@ -630,9 +689,7 @@ mod tests {
     use std::assert_matches;
 
     fn formatter() -> GithubActionsFormatter {
-        GithubActionsFormatter {
-            tag_index: Arc::new(DashMap::new()),
-        }
+        GithubActionsFormatter::new(Arc::new(RepositoryIndexes::default()))
     }
 
     /// #1347 C1 empirical guard: proves the real `GithubActionsFormatter`'s
@@ -1050,7 +1107,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "actions/checkout".into(),
+            NormalizedName::for_test("actions/checkout"),
             deps_core::PackageVersions::latest_only("v7.0.1"),
         );
         let resolved_versions = HashMap::new();
@@ -1095,7 +1152,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "obi1kenobi/cargo-semver-checks-action".into(),
+            NormalizedName::for_test("obi1kenobi/cargo-semver-checks-action"),
             deps_core::PackageVersions::latest_only("v3.1.0"),
         );
         let resolved_versions = HashMap::new();
@@ -2017,6 +2074,50 @@ mod tests {
         );
     }
 
+    /// #1873: `Actions/Checkout@v4` is the spelling the fetch used; a SHA pin written
+    /// `actions/checkout@<sha>` in the same workflow must see the same index, not stay cold.
+    #[test]
+    fn test_tag_index_is_shared_by_every_spelling_of_a_repository() {
+        let sha = "c".repeat(40);
+        let fmt = formatter();
+        let mut index = TagIndex::default();
+        index.insert_sha_pin(
+            CommitSha::parse(&sha).unwrap(),
+            ResolvedPin::most_specific(ConcreteVersion::new("v4.2.0")),
+        );
+        fmt.tag_index
+            .insert(PackageName::new("Actions/Checkout"), Arc::new(index));
+
+        let mut lower = dep(Some(PinStyle::sha_for_test(&sha, None)), "actions/checkout");
+        lower.version_req = Some(sha.clone().into());
+        let mut upper = dep(Some(PinStyle::sha_for_test(&sha, None)), "ACTIONS/CHECKOUT");
+        upper.version_req = Some(sha.into());
+
+        for d in [&lower, &upper] {
+            assert_eq!(
+                fmt.resolved_pin_version(d),
+                resolved_complete(ResolvedPin::most_specific(ConcreteVersion::new("v4.2.0"))),
+                "{}",
+                d.name.as_str()
+            );
+        }
+    }
+
+    /// A rename-only edit is no change to the fetched repository: the index stays reachable.
+    #[test]
+    fn test_renaming_the_spelling_of_a_fetched_repository_keeps_its_index() {
+        let fmt = formatter();
+        fmt.tag_index.insert(
+            PackageName::new("Actions/Checkout"),
+            Arc::new(TagIndex::default()),
+        );
+        assert!(
+            fmt.tag_index
+                .contains_key(&PackageName::new("actions/checkout"))
+        );
+        assert_eq!(fmt.tag_index.len(), 1);
+    }
+
     fn resolved_complete(pin: ResolvedPin) -> PinResolution {
         PinResolution::Resolved {
             pin,
@@ -2898,7 +2999,7 @@ mod tests {
         );
         let mut cached = std::collections::HashMap::new();
         cached.insert(
-            PackageName::new("actions/checkout"),
+            NormalizedName::for_test("actions/checkout"),
             deps_core::PackageVersions::latest_only(tags[0]),
         );
         let resolved = std::collections::HashMap::new();
@@ -3619,8 +3720,8 @@ mod tests {
         );
     }
 
-    /// #1683: the same action written in two casings is keyed separately in the tag index;
-    /// each occurrence is `Ready` only once its own key holds a confirmed canonical name.
+    /// #1683, #1873: the same action written in two casings shares one tag index, so one
+    /// confirmed canonical name makes every spelling of it `Ready`.
     #[test]
     fn test_osv_package_name_same_action_in_two_casings() {
         use deps_core::ParseResult;
@@ -3651,10 +3752,10 @@ mod tests {
                     .insert(PackageName::new(*key), canonical());
             }
             for dep in &deps {
-                let expected = if populated.contains(&dep.name().as_str()) {
-                    Some("Azure/setup-kubectl")
-                } else {
+                let expected = if populated.is_empty() {
                     None
+                } else {
+                    Some("Azure/setup-kubectl")
                 };
                 assert_eq!(
                     formatter

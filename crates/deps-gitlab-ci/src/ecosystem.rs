@@ -37,7 +37,13 @@ use crate::host::GitlabInstanceHost;
 #[cfg(feature = "lsp-responses")]
 use crate::host::is_valid_gitlab_coordinate;
 use crate::registry::GitlabCiRegistry;
-use crate::types::{GitlabCiDependency, HostRef, IncludeKind, PinStyle};
+use crate::registry::HostProbePlan;
+use crate::types::{EndpointKind, GitlabCiDependency, HostRef, IncludeKind, PinStyle};
+use deps_core::lsp_helpers::{
+    BranchProbe, CommitProbe, NormalizeName, PinResolution, ProbePhase, ProbePlan, ProbeRef,
+    ProbeReport, TagIndex, UnpublishedRef,
+};
+use std::collections::HashMap;
 
 #[cfg(feature = "lsp-responses")]
 mod lsp;
@@ -171,7 +177,8 @@ impl GitlabCiEcosystem {
         ));
         let client = Arc::new(GitlabApiClient::new(cache));
         let registry = Arc::new(GitlabCiRegistry::new(client));
-        let formatter = GitlabCiFormatter::new(registry.routes(), registry.tag_index());
+        let formatter = GitlabCiFormatter::new(registry.routes(), registry.tag_index())
+            .with_probe_stores(registry.probe_stores());
         Self {
             registry,
             formatter,
@@ -260,7 +267,23 @@ impl Ecosystem for GitlabCiEcosystem {
 
     /// Emits a project's name whenever a tags or releases fetch first populates its tag index
     /// or observably changes it; see [`GitlabCiRegistry::subscribe_tag_refreshes`].
-    fn tag_index_refreshes(&self) -> Option<deps_core::TagIndexRefreshes> {
+    fn background_probes<'a>(
+        &'a self,
+        parse_result: &'a dyn deps_core::ParseResult,
+        phase: ProbePhase,
+    ) -> deps_core::ecosystem::BoxFuture<'a, ProbeReport> {
+        let plans = (phase == ProbePhase::PostFetch)
+            .then(|| probe_plans(&self.registry, &self.formatter, parse_result))
+            .filter(|plans| !plans.is_empty());
+        Box::pin(async move {
+            match plans {
+                Some(plans) => self.registry.run_probes(&plans).await,
+                None => ProbeReport::default(),
+            }
+        })
+    }
+
+    fn refresh_events(&self) -> Option<deps_core::RefreshEvents> {
         Some(self.registry.subscribe_tag_refreshes())
     }
 
@@ -822,7 +845,114 @@ pub(crate) fn unknown_ref_target<'a>(
     }
     let written = gl_dep.version_req.as_ref()?.as_str();
     let index = formatter.tag_list_index(gl_dep)?;
-    Some(UnknownRefTarget::new(index, written, gl_dep.version_range?))
+    Some(
+        UnknownRefTarget::new(index, written, gl_dep.version_range?)
+            .with_branch_evidence(formatter.branch_evidence(gl_dep, written)),
+    )
+}
+
+/// One question a `project:` include asks its GitLab host.
+enum ProbeWork {
+    Branch(BranchProbe),
+    Commit(CommitProbe),
+}
+
+/// The question `gl_dep` asks, if any: a partial tag ref that the complete tag list does not
+/// list asks for the branch; a commentless SHA pin that no tag names asks to be proven ahead of
+/// the latest release. Anything the shared safety checks refuse (`ProbeRef::parse`) asks nothing.
+fn probe_work(
+    formatter: &GitlabCiFormatter,
+    gl_dep: &GitlabCiDependency,
+    index: &TagIndex,
+) -> Option<ProbeWork> {
+    let repository = formatter.normalize_package_name(&gl_dep.name);
+    match gl_dep.pin.as_ref()? {
+        PinStyle::Tag => {
+            let written = gl_dep.version_req.as_ref()?.as_str();
+            if index.unpublished_tag_ref(written) != Some(UnpublishedRef::Partial) {
+                return None;
+            }
+            Some(ProbeWork::Branch(BranchProbe {
+                repository,
+                package: gl_dep.name.clone(),
+                git_ref: ProbeRef::parse(written)?,
+            }))
+        }
+        PinStyle::Sha { sha, tail } if tail.comment().is_none() => {
+            if index.pin_resolution(sha, None) != PinResolution::Untagged {
+                return None;
+            }
+            let latest = formatter.probe_stores.latest(&repository)?;
+            Some(ProbeWork::Commit(CommitProbe {
+                repository,
+                package: gl_dep.name.clone(),
+                latest: latest.commit,
+                pin: sha.clone(),
+            }))
+        }
+        PinStyle::Sha { .. } | PinStyle::Branch | PinStyle::Latest | PinStyle::Partial => None,
+    }
+}
+
+/// What a document's `project:` includes ask their GitLab hosts, grouped per host because each
+/// host has its own probe budget.
+///
+/// Only the Tags endpoint is ever probed: a `component:` include is backed by a Releases index,
+/// which never proves a tag absent, so an existing non-release tag could yield a false
+/// `NotABranch`.
+fn probe_plans(
+    registry: &GitlabCiRegistry,
+    formatter: &GitlabCiFormatter,
+    parse_result: &dyn deps_core::ParseResult,
+) -> Vec<HostProbePlan> {
+    let mut plans: Vec<HostProbePlan> = Vec::new();
+    for dep in parse_result.dependencies() {
+        let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
+            continue;
+        };
+        if gl_dep.kind.endpoint() != EndpointKind::Tags {
+            continue;
+        }
+        let Some(route) = registry.route(&gl_dep.source) else {
+            continue;
+        };
+        let Some(index) = formatter.tag_list_index(gl_dep) else {
+            continue;
+        };
+        let Some(work) = probe_work(formatter, gl_dep, &index) else {
+            continue;
+        };
+        let Some(project_path) = gl_dep
+            .name
+            .as_str()
+            .strip_prefix(route.host().host())
+            .and_then(|rest| rest.strip_prefix('/'))
+        else {
+            continue;
+        };
+        let position = plans
+            .iter()
+            .position(|existing| existing.host.origin() == route.host().origin())
+            .unwrap_or(plans.len());
+        if position == plans.len() {
+            plans.push(HostProbePlan {
+                host: route.host().clone(),
+                plan: ProbePlan::default(),
+                projects: HashMap::new(),
+            });
+        }
+        let Some(host_plan) = plans.get_mut(position) else {
+            continue;
+        };
+        host_plan
+            .projects
+            .insert(gl_dep.name.clone(), project_path.to_string());
+        match work {
+            ProbeWork::Branch(probe) => host_plan.plan.branches.push(probe),
+            ProbeWork::Commit(probe) => host_plan.plan.commits.push(probe),
+        }
+    }
+    plans
 }
 
 /// [`unknown_ref_target`] for a type-erased dependency of this ecosystem.
@@ -837,6 +967,9 @@ fn tag_pin_target<'a>(
 }
 
 #[cfg(test)]
+mod probe_tests;
+
+#[cfg(test)]
 // Fixtures are single-line ASCII literals with hand-computed byte offsets.
 #[allow(clippy::string_slice)]
 mod tests {
@@ -848,7 +981,7 @@ mod tests {
     #[test]
     fn test_ecosystem_exposes_tag_index_refreshes() {
         let ecosystem = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-        assert!(ecosystem.tag_index_refreshes().is_some());
+        assert!(ecosystem.refresh_events().is_some());
     }
 
     /// Spec 076 FR-025/SC-018 (T005): GitLab CI has no compiled requirement model at all —
@@ -960,7 +1093,7 @@ mod tests {
     // forms this fixture already covers.
     deps_core::unresolved_requirement_conformance! {
         mod gitlab_ci_unresolved_requirement_conformance;
-        formatter_guarded: GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()));
+        formatter_guarded: GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(crate::registry::ProjectIndexes::default()));
         placeholders: [
             "$DEPLOY_VERSION", "${DEPLOY_VERSION}", "%DEPLOY_VERSION%", "v1.2-$BUILD",
             "{{ DEPLOY_VERSION }}", "@DEPLOY_VERSION@", "<%= DEPLOY_VERSION %>",
@@ -1418,7 +1551,10 @@ mod tests {
             dependency_truncation: None,
             blocked_registries: Vec::new(),
         };
-        let formatter = GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()));
+        let formatter = GitlabCiFormatter::new(
+            Arc::new(DashMap::new()),
+            Arc::new(crate::registry::ProjectIndexes::default()),
+        );
 
         let diagnostics = mutable_ref_pin_diagnostics(&parse_result, Severity::Hint, &formatter);
 
@@ -1623,7 +1759,10 @@ mod tests {
                 endpoint: EndpointKind::Releases,
             },
         );
-        let formatter = GitlabCiFormatter::new(Arc::clone(&routes), Arc::new(DashMap::new()));
+        let formatter = GitlabCiFormatter::new(
+            Arc::clone(&routes),
+            Arc::new(crate::registry::ProjectIndexes::default()),
+        );
 
         let make_dep = |kind: IncludeKind,
                         pin: PinStyle,
@@ -1835,7 +1974,10 @@ mod tests {
     /// always classify `Some(StaticTagIndex)`.
     #[test]
     fn test_sha_pin_quickfix_kind_withholds_for_alias_occurrence() {
-        let formatter = GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()));
+        let formatter = GitlabCiFormatter::new(
+            Arc::new(DashMap::new()),
+            Arc::new(crate::registry::ProjectIndexes::default()),
+        );
         let range = deps_core::position::Range::default();
         let gl_dep = alias_dispatch_test_dep(range, range, Some(PinStyle::Tag));
         assert!(sha_pin_quickfix_kind(&gl_dep, &gl_dep, &formatter).is_none());
@@ -2030,11 +2172,11 @@ mod tests {
                     .unwrap();
             assert_eq!(parse_result.dependencies[0].pin, Some(PinStyle::Branch));
 
-            let tag_index: Arc<DashMap<(EndpointKind, PackageName), Arc<TagIndex>>> =
-                Arc::new(DashMap::new());
+            let tag_index: Arc<crate::registry::ProjectIndexes> =
+                Arc::new(crate::registry::ProjectIndexes::default());
             let sha = "a".repeat(40);
             crate::registry::populate_tag_index_entries(
-                &deps_core::TagIndexRefreshSender::new(),
+                &deps_core::RefreshSender::new(),
                 &tag_index,
                 (
                     EndpointKind::Tags,
@@ -2061,7 +2203,10 @@ mod tests {
         }
 
         fn test_formatter() -> GitlabCiFormatter {
-            GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()))
+            GitlabCiFormatter::new(
+                Arc::new(DashMap::new()),
+                Arc::new(crate::registry::ProjectIndexes::default()),
+            )
         }
 
         /// Exercises `build_sha_pin_action` directly rather than through
@@ -2791,10 +2936,7 @@ mod tests {
 
         // --- issue #640: bulk "Pin all to SHA" collector ---
 
-        fn empty_versions() -> (
-            std::collections::HashMap<PackageName, deps_core::PackageVersions>,
-            std::collections::HashMap<PackageName, deps_core::ConcreteVersion>,
-        ) {
+        fn empty_versions() -> (deps_core::CachedVersionsMap, deps_core::ResolvedVersionsMap) {
             (
                 std::collections::HashMap::new(),
                 std::collections::HashMap::new(),
@@ -2895,7 +3037,10 @@ mod tests {
                 .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
 
             let mut cached = std::collections::HashMap::new();
-            cached.insert(name, deps_core::PackageVersions::latest_only("2.0.0"));
+            cached.insert(
+                deps_core::NormalizedName::for_test(name.as_str()),
+                deps_core::PackageVersions::latest_only("2.0.0"),
+            );
             let resolved = std::collections::HashMap::new();
             let versions = deps_core::VersionData::new(&cached, &resolved);
 
@@ -2929,7 +3074,7 @@ mod tests {
             let available: Vec<deps_core::ConcreteVersion> =
                 vec!["1.2.0".into(), "1.2.5".into(), "1.3.0".into()];
             cached.insert(
-                name,
+                deps_core::NormalizedName::for_test(name.as_str()),
                 deps_core::PackageVersions::new("1.3.0".into(), std::sync::Arc::from(available)),
             );
             let resolved = std::collections::HashMap::new();
@@ -2970,7 +3115,7 @@ mod tests {
             let mut cached = std::collections::HashMap::new();
             let available: Vec<deps_core::ConcreteVersion> = vec!["1.0.0".into(), "2.0.0".into()];
             cached.insert(
-                name,
+                deps_core::NormalizedName::for_test(name.as_str()),
                 deps_core::PackageVersions::new("2.0.0".into(), std::sync::Arc::from(available)),
             );
             let resolved = std::collections::HashMap::new();
@@ -3014,7 +3159,7 @@ mod tests {
             // "1.2.0" and "v1.2.0" normalize to the identical semver — order decides the tie.
             let available: Vec<deps_core::ConcreteVersion> = vec!["1.2.0".into(), "v1.2.0".into()];
             cached.insert(
-                name,
+                deps_core::NormalizedName::for_test(name.as_str()),
                 deps_core::PackageVersions::new("v1.2.0".into(), std::sync::Arc::from(available)),
             );
             let resolved = std::collections::HashMap::new();
@@ -3426,7 +3571,7 @@ mod tests {
             let mut cached = std::collections::HashMap::new();
             for dep in &deps {
                 cached.insert(
-                    dep.name().clone(),
+                    deps_core::NormalizedName::for_test(dep.name().as_str()),
                     deps_core::PackageVersions::latest_only("v1.1.0"),
                 );
             }
@@ -3483,7 +3628,7 @@ mod tests {
                     .tag_index
                     .insert((endpoint, dep.name().clone()), Arc::new(index));
                 cached.insert(
-                    dep.name().clone(),
+                    deps_core::NormalizedName::for_test(dep.name().as_str()),
                     deps_core::PackageVersions::latest_only("v1.1.0"),
                 );
             }
@@ -3570,7 +3715,7 @@ mod tests {
             uri: Url,
             content: String,
             parse_result: Box<dyn ParseResultTrait>,
-            cached: std::collections::HashMap<PackageName, deps_core::PackageVersions>,
+            cached: deps_core::CachedVersionsMap,
         }
 
         impl CommentFixture {
@@ -3598,7 +3743,7 @@ mod tests {
                         .tag_index
                         .insert((kind.endpoint(), dep.name().clone()), Arc::new(index));
                     cached.insert(
-                        dep.name().clone(),
+                        deps_core::NormalizedName::for_test(dep.name().as_str()),
                         deps_core::PackageVersions::latest_only(latest),
                     );
                 }

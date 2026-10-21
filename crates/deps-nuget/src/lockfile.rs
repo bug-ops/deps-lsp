@@ -29,12 +29,15 @@
 //! file of its own must resolve to `None` rather than picking up an unrelated ancestor
 //! project's lock file (#1357).
 
+use crate::formatter::NuGetFormatter;
+use deps_core::PackageName;
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
     locate_lockfile_for_manifest_with_max_depth, read_and_parse_lockfile,
     resolve_manifest_file_path,
 };
+use deps_core::lsp_helpers::PackageNaming;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -80,6 +83,13 @@ struct LockEntry {
     #[serde(default)]
     resolved: Option<String>,
     #[serde(default, rename = "contentHash")]
+    content_hash: Option<String>,
+}
+
+/// One target framework's resolution of a package, before the cross-TFM tie-break.
+struct LockCandidate {
+    name: String,
+    version: String,
     content_hash: Option<String>,
 }
 
@@ -130,37 +140,42 @@ fn parse_packages_lock_json(content: String) -> Result<ResolvedPackages> {
     let lock_data: PackagesLock = deps_core::parse_json_checked(content.as_bytes())
         .map_err(|e| DepsError::parse_error("packages.lock.json", &e))?;
 
-    // Collect every TFM's resolved version per package name, then resolve the
-    // cross-TFM tie-break with the crate's own `compare_versions` (S6) instead of
-    // `deps_core::lockfile::best_package`, whose `semver::Version::parse` fallback
-    // always fails on NuGet's 4-component versions and degrades to string
-    // comparison (e.g. "1.10.0" < "1.9.0"). Only the single winner is ever handed
-    // to `ResolvedPackages`, so that broken comparator is never reached.
-    let mut candidates: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+    // Collapse case variants and pick the newest with NuGet's own comparator: the shared
+    // string fallback mis-orders 4-component versions (#1873).
+    let mut candidates: HashMap<String, Vec<LockCandidate>> = HashMap::new();
     for packages in lock_data.dependencies.into_values() {
         for (name, entry) in packages {
             // "type": "Project" / "CentralTransitive" entries carry no `resolved`
-            // at all — skip rather than aborting the whole file (S2).
+            // at all - skip rather than aborting the whole file (S2).
             if let Some(resolved) = entry.resolved {
-                candidates
-                    .entry(name)
-                    .or_default()
-                    .push((resolved, entry.content_hash));
+                let id = NuGetFormatter.normalized_spelling(&PackageName::new(name.as_str()));
+                candidates.entry(id).or_default().push(LockCandidate {
+                    name,
+                    version: resolved,
+                    content_hash: entry.content_hash,
+                });
             }
         }
     }
 
     let mut packages = ResolvedPackages::new();
-    for (name, versions) in candidates {
-        let best = versions
-            .into_iter()
-            .max_by(|a, b| crate::version::compare_versions(&a.0, &b.0));
-        if let Some((version, content_hash)) = best {
+    for versions in candidates.into_values() {
+        // The spelling tie-break keeps the winner independent of `HashMap` iteration order.
+        let best = versions.into_iter().max_by(|a, b| {
+            crate::version::compare_versions(&a.version, &b.version)
+                .then_with(|| b.name.cmp(&a.name))
+        });
+        if let Some(LockCandidate {
+            name,
+            version,
+            content_hash,
+        }) = best
+        {
             packages.insert(ResolvedPackage::new(
                 name,
                 version,
                 ResolvedSource::Registry {
-                    // Informational only — nothing in `deps-lsp`/`deps-core::lsp_helpers`
+                    // Informational only - nothing in `deps-lsp`/`deps-core::lsp_helpers`
                     // reads `ResolvedSource`, and this path makes no network request, so
                     // it never routes a lockfile-resolved version against a private feed
                     // (issue #523's config resolution intentionally stops at
@@ -265,6 +280,62 @@ mod tests {
         let parser = NuGetLockParser;
         let resolved = parser.parse_lockfile(&path).await.unwrap();
         assert_eq!(resolved.version("Foo"), Some("1.10.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_case_variants_across_tfms_collapse_before_normalized_split() {
+        // See the comment in `test_parse_single_tfm` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        // "1.10.0.0" vs "1.9.0.0" is the pair a string comparison orders backwards, so the
+        // newest version only wins if the NuGet comparator decides before `split_normalized`.
+        let content = r#"{
+  "version": 1,
+  "dependencies": {
+    "net472": {
+      "Newtonsoft.Json": { "type": "Direct", "resolved": "1.9.0.0" }
+    },
+    "net8.0": {
+      "newtonsoft.json": { "type": "Direct", "resolved": "1.10.0.0" }
+    }
+  }
+}"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("packages.lock.json");
+        tokio::fs::write(&path, content).await.unwrap();
+
+        let resolved = NuGetLockParser.parse_lockfile(&path).await.unwrap();
+        assert_eq!(resolved.len(), 1);
+
+        let (versions, candidates) = resolved.split_normalized(&NuGetFormatter);
+        let key = deps_core::NormalizedName::for_test("newtonsoft.json");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions.get(&key).map(|v| v.as_str()), Some("1.10.0.0"));
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_equal_versions_under_different_spellings_pick_the_same_winner() {
+        // See the comment in `test_parse_single_tfm` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let tmp = tempfile::tempdir().unwrap();
+        for (first, second) in [("net472", "net8.0"), ("net8.0", "net472")] {
+            let spelling = |tfm: &str| if tfm == "net472" { "Foo" } else { "foo" };
+            let content = format!(
+                r#"{{"version": 1, "dependencies": {{
+  "{first}": {{ "{}": {{ "type": "Direct", "resolved": "1.0.0.0" }} }},
+  "{second}": {{ "{}": {{ "type": "Direct", "resolved": "1.0.0.0" }} }}
+}}}}"#,
+                spelling(first),
+                spelling(second)
+            );
+            let path = tmp.path().join("packages.lock.json");
+            tokio::fs::write(&path, content).await.unwrap();
+
+            let resolved = NuGetLockParser.parse_lockfile(&path).await.unwrap();
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved.version("Foo"), Some("1.0.0.0"));
+            assert_eq!(resolved.version("foo"), None);
+        }
     }
 
     #[tokio::test]

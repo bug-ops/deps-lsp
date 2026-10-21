@@ -9,13 +9,13 @@
 
 use deps_core::licenses::LicensePolicy;
 use deps_core::lsp_helpers::{
-    CooldownDisposition, DependencyOutcomes, LatestVerdict, PackageVersions, RequirementGate,
-    cooldown_disposition, latest_verdict,
+    CachedVersionsMap, CooldownDisposition, DependencyOutcomes, LatestVerdict, RequirementGate,
+    ResolvedCandidatesMap, ResolvedVersionsMap, cooldown_disposition, latest_verdict,
 };
 use deps_core::osv::{LatestStatusMap, VulnerabilityMap};
 use deps_core::{
-    ConcreteVersion, Ecosystem, EcosystemId, FreshnessSettings, GossipFindings, LicenseSource,
-    PackageName, PublishTime, VersionData,
+    Ecosystem, EcosystemId, FreshnessSettings, GossipFindings, LicenseSource, NormalizedName,
+    PublishTime, VersionData,
 };
 use deps_engine::classify::diff::{
     merge_deprecations_after_fetch, merge_no_comparable_versions_after_fetch,
@@ -175,12 +175,12 @@ pub struct ManifestAnalysis {
     /// The manifest's ecosystem.
     pub ecosystem_id: EcosystemId,
     /// Latest known versions and full version lists from the registry.
-    pub cached_versions: HashMap<PackageName, deps_core::lsp_helpers::PackageVersions>,
+    pub cached_versions: CachedVersionsMap,
     /// Versions actually resolved in the lock file.
-    pub resolved_versions: HashMap<PackageName, ConcreteVersion>,
+    pub resolved_versions: ResolvedVersionsMap,
     /// Every lock-file-resolved version for a package name, when more than one is retained
     /// (issue #649).
-    pub resolved_version_candidates: HashMap<PackageName, Vec<ConcreteVersion>>,
+    pub resolved_version_candidates: ResolvedCandidatesMap,
     /// Yanked/deprecation/fetch-failure/no-comparable-versions findings from the fetch.
     pub outcomes: DependencyOutcomes,
     /// OSV scan results, when the scan ran (enabled and not offline).
@@ -206,32 +206,35 @@ pub struct ManifestAnalysis {
     /// #1551 finding 3). Same gate as [`Self::fallback_status`]: `None` when
     /// [`AnalysisScope::cooldown_fallback`] is `false`, or no dependency's [`cooldown_disposition`]
     /// actually differs from [`Self::cached_versions`] (NFR-004: nothing to substitute).
-    pub cooldown_fallback_view: Option<HashMap<PackageName, PackageVersions>>,
+    pub cooldown_fallback_view: Option<CachedVersionsMap>,
     /// Already-computed GOSSIP findings (spec 074/075 FR-006), retained here instead of being
     /// discarded after the registry fetch — fixes `check`'s dead `with_gossip_prefetch` branch
     /// (`ManifestAnalysis::version_data` never called it before this field existed), so `check`
     /// and `update` consult the same [`deps_core::lsp_helpers::cooldown_disposition`] precedence
     /// end to end. Empty when GOSSIP is disabled/offline/unsupported, never absent.
-    pub gossip_findings: HashMap<PackageName, deps_core::GossipFindings>,
+    pub gossip_findings: HashMap<NormalizedName, GossipFindings>,
     /// License data backfilled from the registry fetch (tier 1) and the tier-3 prefetch,
-    /// keyed by raw package name.
-    pub licenses: HashMap<PackageName, Vec<String>>,
+    /// keyed by normalized package name.
+    pub licenses: HashMap<NormalizedName, Vec<String>>,
     /// The resolved SPDX allow/deny license policy for this run.
     pub license_policy: LicensePolicy,
     /// How license strings were sourced (registry-declared SPDX vs. free text).
     pub license_source: LicenseSource,
     /// The [`deps_core::NetworkMode`] set for this run.
     pub network: deps_core::NetworkMode,
-    /// Raw package names whose registry fetch errored or timed out (`FetchResult::fetch_failed`,
+    /// Normalized package names whose registry fetch errored or timed out (`FetchResult::fetch_failed`,
     /// captured before [`apply_fetch_outcomes`] consumes it) — the two-signal input
     /// `deps-cli update --security-only`'s `Unfixable` classification needs (FR-011): a
     /// dependency is `Unfixable` when it appears here **or** has no [`Self::cached_versions`]
     /// entry.
-    pub fetch_failed: HashSet<PackageName>,
+    pub fetch_failed: HashSet<NormalizedName>,
     /// Whether at least one dependency's *version* registry fetch failed while not offline.
     pub registry_unreachable: bool,
     /// Whether at least one dependency's tier-3 license fetch timed out while not offline.
     pub license_fetch_incomplete: bool,
+    /// The pre-fetch and post-fetch ref-probe passes taken together (specs 086/087); empty
+    /// when offline or when the ecosystem has no probes.
+    pub probe_report: deps_core::lsp_helpers::ProbeReport,
 }
 
 impl ManifestAnalysis {
@@ -299,7 +302,11 @@ impl ManifestAnalysis {
             {
                 return false;
             }
-            let Some(latest) = key.find_in(&self.cached_versions).map(|v| &v.latest) else {
+            let Some(latest) = self
+                .cached_versions
+                .get(key.normalized())
+                .map(|v| &v.latest)
+            else {
                 return false;
             };
             let Some(version_req) = dep.version_requirement() else {
@@ -335,11 +342,11 @@ impl ManifestAnalysis {
 /// `PackageVersions::latest` as they always do — so a fallback candidate is verified and
 /// planned against identically, with no separate code path to drift out of sync.
 pub(crate) fn cooldown_fallback_view(
-    cached_versions: &HashMap<PackageName, PackageVersions>,
-    gossip_prefetch: Option<&HashMap<PackageName, GossipFindings>>,
+    cached_versions: &CachedVersionsMap,
+    gossip_prefetch: Option<&HashMap<NormalizedName, GossipFindings>>,
     freshness: FreshnessSettings,
     now: PublishTime,
-) -> HashMap<PackageName, PackageVersions> {
+) -> CachedVersionsMap {
     cached_versions
         .iter()
         .map(|(name, versions)| {
@@ -386,12 +393,14 @@ pub async fn analyze_manifest(
     let uri = crate::report::path_to_uri(manifest_path).ok_or_else(|| CheckError::InvalidPath {
         path: manifest_path.to_path_buf(),
     })?;
-    let parse_result = deps_core::parse_manifest_blocking(ecosystem, content, &uri)
-        .await
-        .map_err(|source| CheckError::Parse {
-            path: manifest_path.to_path_buf(),
-            source,
-        })?;
+    let network = ctx.policy.network.mode();
+    let (parse_result, pre_fetch_report) =
+        deps_engine::probe::parse_with_pre_fetch_probes(ecosystem, content, &uri, network)
+            .await
+            .map_err(|source| CheckError::Parse {
+                path: manifest_path.to_path_buf(),
+                source,
+            })?;
     let formatter = ecosystem.formatter();
     let ecosystem_id = ecosystem.ecosystem_id();
 
@@ -411,10 +420,10 @@ pub async fn analyze_manifest(
         &resolved_version_candidates,
     );
     let collided_names = prep.collided_names;
-    let attempted_names: Vec<PackageName> = prep
+    let attempted_names: Vec<NormalizedName> = prep
         .dep_sources
         .iter()
-        .map(|(name, _)| name.clone())
+        .map(|(key, _)| key.normalized().clone())
         .collect();
 
     // Spec 074 FR-002: one batch prefetch per manifest, mirroring `prefetch_tier3_licenses`'s
@@ -424,7 +433,6 @@ pub async fn analyze_manifest(
     // Issue #1521 item 4: also `None` under `scope.gossip == false` (`update --security-only`,
     // whose fix target never reads a GOSSIP-filtered `latest` at all) — see `AnalysisScope::gossip`'s
     // doc for why this is *not* additionally gated on `ctx.policy.freshness.enabled`.
-    let network = ctx.policy.network.mode();
     let gossip_client = (scope.gossip && ctx.policy.gossip.enabled).then_some(&ctx.deps_dev);
     let gossip_findings = deps_core::lsp_helpers::fetch_gossip_findings_batch(
         ecosystem_id,
@@ -448,34 +456,34 @@ pub async fn analyze_manifest(
         Some(&gossip_findings),
     )
     .await;
+    let post_fetch_report = deps_engine::probe::run_background_probes(
+        ecosystem.as_ref(),
+        parse_result.as_ref(),
+        deps_core::lsp_helpers::ProbePhase::PostFetch,
+        network,
+    )
+    .await;
     // `fetch_failed` (genuine failures only), not `failure_summary`'s count, which also
     // includes not-found lookups — using that here made a typo'd dependency exit 2 every run.
     let registry_unreachable = network.is_online() && !fetch_result.fetch_failed.is_empty();
     // Captured before `apply_fetch_outcomes` consumes `fetch_result.fetch_failed` below —
     // `deps-cli update --security-only`'s FR-011 two-signal `Unfixable` rule needs the raw
     // set independently of the yanked/deprecation-merged `DependencyOutcomes`.
-    let fetch_failed: HashSet<PackageName> = fetch_result.fetch_failed.keys().cloned().collect();
+    let fetch_failed: HashSet<NormalizedName> = fetch_result.fetch_failed.keys().cloned().collect();
 
     let mut outcomes = DependencyOutcomes::new();
-    let fetched_names: Vec<PackageName> = fetch_result.versions.keys().cloned().collect();
+    let fetched_names: Vec<NormalizedName> = fetch_result.versions.keys().cloned().collect();
     apply_fetch_outcomes(
         &mut outcomes,
         fetch_result.yanked_versions,
         fetch_result.fetch_failed,
         collided_names,
-        formatter,
     );
-    merge_deprecations_after_fetch(
-        &mut outcomes,
-        &fetched_names,
-        fetch_result.deprecations,
-        formatter,
-    );
+    merge_deprecations_after_fetch(&mut outcomes, &fetched_names, fetch_result.deprecations);
     merge_no_comparable_versions_after_fetch(
         &mut outcomes,
         &attempted_names,
         fetch_result.no_comparable_versions,
-        formatter,
     );
     let cached_versions = fetch_result.versions;
     // Tier-1 license backfill (issue #660/#661 precedent): populated for native-list
@@ -714,6 +722,7 @@ pub async fn analyze_manifest(
         fetch_failed,
         registry_unreachable,
         license_fetch_incomplete,
+        probe_report: pre_fetch_report.merge(post_fetch_report),
     })
 }
 
@@ -727,7 +736,9 @@ mod has_unverified_latest_check_tests {
     use deps_core::parser::DependencySource;
     use deps_core::position::{Position, Range};
     use deps_core::test_util::StubFormatter;
-    use deps_core::{Dependency, EcosystemId, PackageName, ParseResult, VersionReq};
+    use deps_core::{
+        Dependency, EcosystemId, NormalizedName, PackageName, ParseResult, VersionReq,
+    };
     use std::any::Any;
     use std::collections::{HashMap, HashSet};
 
@@ -783,7 +794,7 @@ mod has_unverified_latest_check_tests {
         let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             PackageVersions::latest_only("1.2.0"),
         );
 
@@ -815,6 +826,7 @@ mod has_unverified_latest_check_tests {
             fetch_failed: HashSet::new(),
             registry_unreachable: false,
             license_fetch_incomplete: false,
+            probe_report: deps_core::lsp_helpers::ProbeReport::default(),
         }
     }
 

@@ -3,6 +3,8 @@
 use deps_core::parser::DependencySource;
 use deps_core::position::Range;
 
+use crate::scm::{SwiftOrigin, SwiftRequirementForm};
+
 /// Parsed dependency from Package.swift with position tracking.
 ///
 /// Package names use `owner/repo` format derived from the Git URL.
@@ -35,6 +37,14 @@ pub struct SwiftDependency {
     /// Dependency source (registry, git, or path)
     #[raw]
     pub source: DependencySource,
+    /// How the requirement is written; only a `Version` requirement can be swizzled to a
+    /// registry identity
+    #[raw]
+    pub requirement_form: SwiftRequirementForm,
+    /// Whether the manifest declares this identity or it was swapped in from a repository URL
+    /// (`url` then still holds the URL as written)
+    #[raw]
+    pub origin: SwiftOrigin,
 }
 
 deps_core::impl_dependency!(SwiftDependency {
@@ -171,6 +181,8 @@ mod tests {
             version_literal: Some("2.0.0".into()),
             url: "https://github.com/apple/swift-nio.git".into(),
             source: DependencySource::Registry,
+            requirement_form: SwiftRequirementForm::Version,
+            origin: SwiftOrigin::Declared,
         };
 
         assert_eq!(dep.name(), "apple/swift-nio");
@@ -192,6 +204,8 @@ mod tests {
             version_literal: None,
             url: deps_core::conformance::CREDENTIAL_PROBE_URL.into(),
             source: DependencySource::Registry,
+            requirement_form: SwiftRequirementForm::Version,
+            origin: SwiftOrigin::Declared,
         },
     );
 
@@ -207,6 +221,8 @@ mod tests {
             version_literal: None,
             url: "git@github.com:apple/swift-nio.git".into(),
             source: DependencySource::Registry,
+            requirement_form: SwiftRequirementForm::Version,
+            origin: SwiftOrigin::Declared,
         };
         let rendered = format!("{dep:?}");
         assert!(rendered.contains(r#"url: "***@github.com:***/swift-nio.git""#));

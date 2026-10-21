@@ -1347,6 +1347,7 @@ fn compare_versions(a: &str, b: &str) -> Ordering {
 mod tests {
     use super::*;
     use crate::types::{ComposerDependency, ComposerSection};
+    use deps_core::NormalizedName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
     use deps_core::position::{Position as DomainPosition, Range};
@@ -3764,7 +3765,7 @@ mod tests {
             RemovalStatus::AdvisoryDeprecated,
         )]);
         let cached = HashMap::from([(
-            PackageName::new("monolog/monolog"),
+            NormalizedName::for_test("monolog/monolog"),
             PackageVersions::new(ConcreteVersion::new("6.5.1"), available).with_yanked(flagged),
         )]);
 

@@ -20,6 +20,7 @@ pub(crate) mod listener_lifecycle;
 mod loader;
 mod osv_scan;
 mod prefetch_support;
+pub(crate) mod probes;
 mod typosquat;
 // Every snapshot test inside is gated on one of these ecosystem features; with none
 // enabled, the module's shared fixtures/helpers would otherwise be dead code.
@@ -42,6 +43,7 @@ mod typosquat;
 ))]
 mod osv_snapshot_tests;
 pub(crate) mod reparse;
+pub(crate) mod reparse_events;
 pub(crate) mod republish;
 mod resolved;
 mod state;

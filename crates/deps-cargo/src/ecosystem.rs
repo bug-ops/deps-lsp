@@ -396,6 +396,7 @@ mod tests {
     #[cfg(feature = "lsp-responses")]
     mod lsp_tests {
         use super::*;
+        use deps_core::NormalizedName;
 
         use crate::registry::CratesIoRegistry;
 
@@ -544,12 +545,15 @@ mod tests {
             };
 
             let mut cached_versions = HashMap::new();
-            cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
+            cached_versions.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.0.214"),
+            );
 
             let config = EcosystemConfig::default();
 
             let mut resolved_versions = HashMap::new();
-            resolved_versions.insert("serde".into(), "1.0.214".into());
+            resolved_versions.insert(NormalizedName::for_test("serde"), "1.0.214".into());
             let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions),
@@ -574,12 +578,15 @@ mod tests {
             };
 
             let mut cached_versions = HashMap::new();
-            cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
+            cached_versions.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.0.214"),
+            );
 
             let config = EcosystemConfig::default();
 
             let mut resolved_versions = HashMap::new();
-            resolved_versions.insert("serde".into(), "1.0.214".into());
+            resolved_versions.insert(NormalizedName::for_test("serde"), "1.0.214".into());
             let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions),
@@ -604,7 +611,10 @@ mod tests {
             };
 
             let mut cached_versions = HashMap::new();
-            cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
+            cached_versions.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.0.214"),
+            );
 
             let config = EcosystemConfig::default();
 
@@ -633,13 +643,16 @@ mod tests {
             };
 
             let mut cached_versions = HashMap::new();
-            cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
+            cached_versions.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.0.214"),
+            );
 
             let config = EcosystemConfig::default().with_show_up_to_date_hints(false);
 
             // Up to date, but show_up_to_date_hints is false — hint must still be suppressed.
             let mut resolved_versions = HashMap::new();
-            resolved_versions.insert("serde".into(), "1.0.214".into());
+            resolved_versions.insert(NormalizedName::for_test("serde"), "1.0.214".into());
             let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions),
@@ -663,7 +676,10 @@ mod tests {
             };
 
             let mut cached_versions = HashMap::new();
-            cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
+            cached_versions.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.0.214"),
+            );
 
             let config = EcosystemConfig::default();
 
@@ -691,7 +707,10 @@ mod tests {
             };
 
             let mut cached_versions = HashMap::new();
-            cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
+            cached_versions.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.0.214"),
+            );
 
             let config = EcosystemConfig::default();
 

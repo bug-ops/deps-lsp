@@ -40,7 +40,7 @@ CLI: parse -> PreFetch -> at most one reparse -> fetch -> PostFetch -> classify 
 |-------|------|
 | deps-core `rate_limit.rs` | `TokenBucket`, `QuotaMeter`, `ProbeAllowance`, `ProbePermit` next to `RateLimitGate` |
 | deps-core `cache/fetch.rs` | live-response hook: `RequestAuth::with_quota_meter` records `X-RateLimit-*` / `RateLimit-*` from network responses only via `QuotaMeter::observe_live`; never reads `CachedResponse`; `get_cached_trusted_origin_response` path used by `GithubTagsClient` |
-| deps-core `lsp_helpers/git_probe.rs` (new) | `ProbeRef`, `BranchEvidence`, evidence store (LRU 4096, TTL = tag-index TTL, `NormalizedName` keys), `ProbeReport`, `ProbeEffect` |
+| deps-core `lsp_helpers/git_probe.rs` (new) | `ProbeRef`, `BranchEvidence`, evidence store (LRU 4096, 1 h freshness window (stale answers still served, re-verified on next trigger), `NormalizedName` keys), `ProbeReport`, `ProbeEffect` |
 | deps-core `lsp_helpers/git_ref.rs` | `UnpublishedRef::NotABranch`, `unpublished_tag_ref().refine()`, `UnknownRefTarget::with_branch_evidence`, message text; `cap_status`/`unknown_ref_diagnostic_for` arms |
 | deps-core `ecosystem.rs` | `background_probes` default no-op (sealed trait unchanged) |
 | deps-core `tag_index_refresh.rs` | typed `RefreshEvent { TagIndex, ProbeEvidence, ReparseOpenDocuments }` (rename of `TagIndexRefreshSender` to `RefreshSender`, `NormalizedName` payloads) |
@@ -72,4 +72,4 @@ Exhaustive enums, newtypes with private constructors, typed errors, `///` docs w
 
 Single PR after #1873 deps-core work merges; Phase 0 (deps-core) lands first, per-crate work in parallel (see [[tasks]]).
 Risks: unauthenticated 60 req/h (mitigated by bucket 4 + 6/h, reserve 20, silence on inconclusive); a documented branch pin
-probes once per TTL. Docs: book GitHub Actions, GitLab CI, CLI; CHANGELOG `### Added` plus `### Changed` (help text).
+probes once per freshness window. Docs: book GitHub Actions, GitLab CI, CLI; CHANGELOG `### Added` plus `### Changed` (help text).

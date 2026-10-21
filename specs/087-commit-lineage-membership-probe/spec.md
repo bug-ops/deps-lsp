@@ -97,9 +97,9 @@ THEN the pin is reported exactly as today (outdated, rewrite to latest release)
 | FR-001 | WHEN a SHA pin has `CommitRewrite::NoReleaseTag`, the repository's tag index is `Complete`, and a latest release commit `S_L` is known, THE SYSTEM SHALL gather lineage then membership evidence through the 086 `background_probes` hook | must |
 | FR-002 | Lineage on GitHub: `GET /repos/{o}/{r}/compare/{S_L}...{P}?per_page=1&page=2`; status `ahead` yields `CommitLineage::AheadOfLatest { ahead_by }`, any other status yields `NotAhead`. Lineage on GitLab: `repository/merge_base?refs[]={S_L}&refs[]={P}` with `id == S_L` and `P != S_L` yields `AheadOfLatest` (no count: `ahead_by` is unavailable and hover omits N) | must |
 | FR-003 | Membership on GitHub: `GET /repos/{o}/{r}/compare/HEAD...{P}?per_page=1&page=2`; status `behind` or `identical` yields `DefaultBranchMembership::Reachable`, `ahead`, `diverged` or anything else yields `NotProven`. On GitLab: `merge_base(HEAD, P) == P` yields `Reachable` | must |
-| FR-004 | WHEN lineage is `AheadOfLatest` AND membership is `Reachable`, THE SYSTEM SHALL set the pin's status to `UpToDate`, exclude it from the update quickfix and update-all, and add the hover line `commit N ahead of latest release <tag>` | must |
+| FR-004 | WHEN lineage is `AheadOfLatest` AND membership is `Reachable`, THE SYSTEM SHALL set the pin's status to `UpToDate`, exclude it from update-all, and withhold the single-entry plain `Update to` code action (and so its preferred flag) for it; security-fix actions are unaffected, and add the hover line `commit N ahead of latest release <tag>` | must |
 | FR-005 | WHEN either proof is missing, `NotAhead`/`NotProven`, inconclusive or over budget, THE SYSTEM SHALL keep today's behavior unchanged | must |
-| FR-006 | Lineage evidence (both SHAs fixed) SHALL be memoized in a bounded LRU of 4096 entries with no TTL, keyed by (normalized repository, `S_L`, `P`). Membership (HEAD moves) SHALL be a bounded LRU of 4096 with TTL equal to the tag-index TTL, never memoized forever. Keys use `NormalizedName` (GitHub Actions and GitLab lowercase) | must |
+| FR-006 | Lineage evidence (both SHAs fixed) SHALL be memoized in a bounded LRU of 4096 entries with no TTL, keyed by (normalized repository, `S_L`, `P`). Membership (HEAD moves) SHALL be a bounded LRU of 4096 with a freshness window of 1 hour (the tag index has no TTL); after the window the stored answer is still served and re-verified on the next trigger (open, change, `TagIndex` event); an inconclusive answer never overwrites it; idle documents have no timer; it is never memoized forever. Keys use `NormalizedName` (GitHub Actions and GitLab lowercase) | must |
 | FR-007 | A new latest release changes `S_L`, so the lineage key changes and the proof is re-evaluated; a pin proven ahead of an older release is not assumed ahead of the new one | must |
 | FR-008 | Compare requests SHALL use a dedicated `BodyLimit` of 256 KiB; overflow SHALL be inconclusive and store nothing | must |
 | FR-009 | Only authoritative answers are stored; 403/429, 5xx, timeout, breaker-open, 404 (unknown SHA or inaccessible repository) and overflow are inconclusive | must |
@@ -144,7 +144,7 @@ impl CommitEvidence { pub fn proven_ahead(&self) -> Option<AheadProof> } // Some
 | Compare response over 256 KiB | Inconclusive |
 | Budget exhausted | Today's behavior; counted in `skipped_over_budget` |
 | New release published | `S_L` changes; lineage re-probed |
-| Force-pushed default branch | Membership TTL expiry re-evaluates |
+| Force-pushed default branch | After the freshness window the next trigger re-verifies membership |
 
 ## 7. Success Criteria
 
@@ -158,7 +158,7 @@ impl CommitEvidence { pub fn proven_ahead(&self) -> Option<AheadProof> } // Some
 ## 8. Test Plan
 
 - mockito: compare `ahead`, `behind`, `diverged`, `identical`, overflow, 403/429, 404; GitLab merge-base cases.
-- Unit: `proven_ahead` truth table; cache key changes with `S_L`; membership TTL expiry vs lineage no-TTL; case-insensitive repo key shares one entry.
+- Unit: `proven_ahead` truth table; cache key changes with `S_L`; membership freshness window (stale served, re-verified, inconclusive never overwrites) vs lineage no-window; case-insensitive repo key shares one entry.
 - Integration: update-all excludes the proven pin; hover line; CLI `check` agrees after awaiting probes.
 - Live: SC-001, SC-002; record in `.local/testing`.
 

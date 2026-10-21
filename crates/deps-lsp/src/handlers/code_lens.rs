@@ -140,6 +140,7 @@ mod tests {
     #[cfg(feature = "github-actions")]
     use deps_core::ConcreteVersion;
     use deps_core::EcosystemId;
+    use deps_core::NormalizedName;
     // Only `cargo_tests` and `cross_ecosystem_tests`' per-ecosystem cases consume this.
     #[cfg(any(
         feature = "cargo",
@@ -273,7 +274,10 @@ mod tests {
             state: &Arc<ServerState>,
             uri: &tower_lsp_server::ls_types::Uri,
             content: &str,
-            cached: std::collections::HashMap<deps_core::PackageName, deps_core::PackageVersions>,
+            cached: std::collections::HashMap<
+                deps_core::NormalizedName,
+                deps_core::PackageVersions,
+            >,
         ) {
             // Held per fs_probe::snapshot_guard's doc: parse_manifest touches fs_probe and
             // this test shares a binary with document/loader.rs's diffing test.
@@ -341,7 +345,10 @@ mod tests {
             ));
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = std::collections::HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.2.0"),
+            );
             seed(&state, &uri, content, cached).await;
             state.documents.get_mut(&uri).unwrap().set_loading();
 
@@ -360,7 +367,10 @@ mod tests {
             ));
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = std::collections::HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.2.0"),
+            );
             seed(&state, &uri, content, cached).await;
             state.documents.get_mut(&uri).unwrap().set_version(None);
 
@@ -377,7 +387,10 @@ mod tests {
             ));
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = std::collections::HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("1.0.0"));
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
             seed(&state, &uri, content, cached).await;
 
             let (client, config) = create_test_client_and_config();
@@ -393,7 +406,10 @@ mod tests {
             ));
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = std::collections::HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.2.0"),
+            );
             seed(&state, &uri, content, cached).await;
 
             let (client, config) = create_test_client_and_config();
@@ -443,7 +459,10 @@ mod tests {
             );
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = std::collections::HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.2.0"),
+            );
             seed(&state, &uri, content, cached).await;
 
             let (client, config) = create_test_client_and_config();
@@ -556,7 +575,7 @@ mod tests {
             ecosystem: &dyn deps_core::Ecosystem,
             uri: &url::Url,
             content: &str,
-            cached: HashMap<deps_core::PackageName, deps_core::PackageVersions>,
+            cached: HashMap<deps_core::NormalizedName, deps_core::PackageVersions>,
             expected_fragment: &str,
         ) {
             // Held per fs_probe::snapshot_guard's doc: several ecosystems under test here
@@ -597,7 +616,7 @@ mod tests {
             ecosystem: &dyn deps_core::Ecosystem,
             uri: &url::Url,
             content: &str,
-            cached: HashMap<deps_core::PackageName, deps_core::PackageVersions>,
+            cached: HashMap<deps_core::NormalizedName, deps_core::PackageVersions>,
         ) {
             // See the comment in `assert_single_edit_produces_valid_declaration` on why
             // this guard is needed here.
@@ -630,7 +649,10 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.2.0"),
+            );
 
             assert_single_edit_produces_valid_declaration(
                 ecosystem.as_ref(),
@@ -653,7 +675,10 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/package.json");
             let content = r#"{"dependencies": {"express": "^4.0.0"}}"#;
             let mut cached = HashMap::new();
-            cached.insert("express".into(), PackageVersions::latest_only("5.0.0"));
+            cached.insert(
+                NormalizedName::for_test("express"),
+                PackageVersions::latest_only("5.0.0"),
+            );
 
             assert_single_edit_produces_valid_declaration(
                 ecosystem.as_ref(),
@@ -678,7 +703,10 @@ mod tests {
             // would. `format_version_replacing` preserves the `==` style (§6.1), not a range.
             let content = "[project]\ndependencies = [\"requests==2.0.0\"]\n";
             let mut cached = HashMap::new();
-            cached.insert("requests".into(), PackageVersions::latest_only("2.5.0"));
+            cached.insert(
+                NormalizedName::for_test("requests"),
+                PackageVersions::latest_only("2.5.0"),
+            );
 
             assert_single_edit_produces_valid_declaration(
                 ecosystem.as_ref(),
@@ -703,7 +731,7 @@ mod tests {
                 "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.1\n";
             let mut cached = HashMap::new();
             cached.insert(
-                "github.com/gin-gonic/gin".into(),
+                NormalizedName::for_test("github.com/gin-gonic/gin"),
                 PackageVersions::latest_only("v1.10.0"),
             );
 
@@ -729,7 +757,10 @@ mod tests {
             // A major-version bump: "^1.0.0" does not accept "2.0.0".
             let content = "dependencies:\n  http: ^1.0.0\n";
             let mut cached = HashMap::new();
-            cached.insert("http".into(), PackageVersions::latest_only("2.0.0"));
+            cached.insert(
+                NormalizedName::for_test("http"),
+                PackageVersions::latest_only("2.0.0"),
+            );
 
             assert_single_edit_produces_valid_declaration(
                 ecosystem.as_ref(),
@@ -753,7 +784,7 @@ mod tests {
             let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="12.0.3" /></ItemGroup></Project>"#;
             let mut cached = HashMap::new();
             cached.insert(
-                "Newtonsoft.Json".into(),
+                NormalizedName::for_test("newtonsoft.json"),
                 PackageVersions::latest_only("13.0.3"),
             );
 
@@ -779,7 +810,7 @@ mod tests {
             let content = "{\n  \"require\": {\n    \"symfony/console\": \"^6.0\"\n  }\n}";
             let mut cached = HashMap::new();
             cached.insert(
-                "symfony/console".into(),
+                NormalizedName::for_test("symfony/console"),
                 PackageVersions::latest_only("7.0.0"),
             );
 
@@ -804,7 +835,10 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/Gemfile");
             let content = "source 'https://rubygems.org'\ngem 'rails', '~> 7.0'";
             let mut cached = HashMap::new();
-            cached.insert("rails".into(), PackageVersions::latest_only("8.0.0"));
+            cached.insert(
+                NormalizedName::for_test("rails"),
+                PackageVersions::latest_only("8.0.0"),
+            );
 
             assert_single_edit_produces_valid_declaration(
                 ecosystem.as_ref(),
@@ -837,7 +871,7 @@ mod tests {
 ";
             let mut cached = HashMap::new();
             cached.insert(
-                "org.apache.commons:commons-lang3".into(),
+                NormalizedName::for_test("org.apache.commons:commons-lang3"),
                 PackageVersions::latest_only("3.14.0"),
             );
 
@@ -875,7 +909,7 @@ mod tests {
 ";
             let mut cached = HashMap::new();
             cached.insert(
-                "org.slf4j:slf4j-api".into(),
+                NormalizedName::for_test("org.slf4j:slf4j-api"),
                 PackageVersions::latest_only("2.1.0"),
             );
 
@@ -906,7 +940,7 @@ mod tests {
 
             let mut cached = HashMap::new();
             cached.insert(
-                "org.jetbrains.kotlin:kotlin-stdlib".into(),
+                NormalizedName::for_test("org.jetbrains.kotlin:kotlin-stdlib"),
                 PackageVersions::latest_only("2.2.0"),
             );
 
@@ -925,7 +959,7 @@ mod tests {
             let content = "[versions]\nspring = \"3.2.0\"\n\n[libraries]\nspring-boot = { module = \"org.springframework.boot:spring-boot-starter\", version.ref = \"spring\" }\n";
             let mut cached = HashMap::new();
             cached.insert(
-                "org.springframework.boot:spring-boot-starter".into(),
+                NormalizedName::for_test("org.springframework.boot:spring-boot-starter"),
                 PackageVersions::latest_only("3.3.0"),
             );
 
@@ -953,7 +987,7 @@ let package = Package(
 "#;
             let mut cached = HashMap::new();
             cached.insert(
-                "apple/swift-nio".into(),
+                NormalizedName::for_test("apple/swift-nio"),
                 PackageVersions::latest_only("3.0.0"),
             );
 
@@ -987,8 +1021,14 @@ let package = Package(
                 r#".package(url: "https://github.com/baz/qux", "1.0.0"..."1.9.9")"#,
             ] {
                 let mut cached = HashMap::new();
-                cached.insert("foo/bar".into(), PackageVersions::latest_only("3.5.0"));
-                cached.insert("baz/qux".into(), PackageVersions::latest_only("3.5.0"));
+                cached.insert(
+                    NormalizedName::for_test("foo/bar"),
+                    PackageVersions::latest_only("3.5.0"),
+                );
+                cached.insert(
+                    NormalizedName::for_test("baz/qux"),
+                    PackageVersions::latest_only("3.5.0"),
+                );
 
                 assert_guard_skips(ecosystem.as_ref(), &uri, content, cached).await;
             }
@@ -1006,7 +1046,7 @@ let package = Package(
             let content = "steps:\n  - uses: actions/checkout@v4.2.0\n";
             let mut cached = HashMap::new();
             cached.insert(
-                "actions/checkout".into(),
+                NormalizedName::for_test("actions/checkout"),
                 PackageVersions::latest_only("v4.3.0"),
             );
 
@@ -1036,7 +1076,7 @@ let package = Package(
             let content = format!("steps:\n  - uses: actions/checkout@{old_sha} # v4.2.0\n");
             let mut cached = HashMap::new();
             cached.insert(
-                "actions/checkout".into(),
+                NormalizedName::for_test("actions/checkout"),
                 PackageVersions::latest_only("v4.3.0"),
             );
 
@@ -1075,7 +1115,7 @@ let package = Package(
                 format!("steps:\n  - uses: github/codeql-action/init@{old_sha} # v3.0.0\n");
             let mut cached = HashMap::new();
             cached.insert(
-                "github/codeql-action".into(),
+                NormalizedName::for_test("github/codeql-action"),
                 PackageVersions::latest_only("v3.1.0"),
             );
 
@@ -1107,7 +1147,7 @@ let package = Package(
             let content = format!("steps:\n  - uses: actions/checkout@{old_sha} # v4.2.0\n");
             let mut cached = HashMap::new();
             cached.insert(
-                "actions/checkout".into(),
+                NormalizedName::for_test("actions/checkout"),
                 PackageVersions::latest_only("v4.3.0"),
             );
 
@@ -1193,7 +1233,7 @@ let package = Package(
             );
             let mut cached = std::collections::HashMap::new();
             cached.insert(
-                deps_core::PackageName::new("actions/checkout"),
+                NormalizedName::for_test("actions/checkout"),
                 deps_core::PackageVersions::latest_only("v4"),
             );
             doc_state.update_cached_versions(cached);

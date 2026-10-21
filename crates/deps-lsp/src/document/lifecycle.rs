@@ -13,27 +13,30 @@ use super::osv_scan::{
     OsvScanResult, rescan_osv_if_tag_index_now_warm, run_license_prefetch,
     run_osv_phase_b_and_commit, run_osv_scan_phase_a,
 };
+use super::probes::spawn_background_probes;
 use super::resolved::RefetchPolicy;
 use super::state::{DocumentState, ServerState, spawn_supervised};
 use super::typosquat::{current_declared_names, run_typosquat_prefetch};
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
 use crate::progress::RegistryProgress;
-use deps_core::ConcreteVersion;
 use deps_core::DependencyOutcomes;
 use deps_core::Ecosystem;
 use deps_core::FetchFailure;
 use deps_core::NormalizeName;
-use deps_core::PackageName;
+use deps_core::NormalizedName;
+use deps_core::ResolvedVersionsMap;
 use deps_core::Result;
 use deps_core::VersionReq;
+use deps_core::lsp_helpers::{ProbeEffect, ProbePhase};
 use deps_core::policy_config::{FetchTimeout, OsvChecks};
 use deps_engine::classify::fetch::{fetch_latest_versions_parallel, prepare_fetch};
 use deps_engine::classify::resolved::{
     cached_versions_from_lockfile, dependency_version_map, load_resolved_versions,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tower_lsp_server::Client;
@@ -188,6 +191,9 @@ async fn run_document_open_background_task(
 ) {
     tracing::debug!("background task started");
 
+    // Pre-fetch probes run first; a re-parse they ask for is committed in place.
+    apply_pre_fetch_reparse(&uri, &state, &ecosystem).await;
+
     // `handle_document_open` already validated this exact `uri` converts successfully
     // before spawning this task, so `None` here is unreachable in practice — handled
     // defensively rather than unwrapped.
@@ -225,16 +231,17 @@ async fn run_document_open_background_task(
         // `resolved` value during the cold-open window before the
         // registry fetch completes (critique S1).
         let formatter = ecosystem.formatter();
-        let instant_resolved: HashMap<PackageName, ConcreteVersion> = match doc.parse_result() {
+        let instant_resolved: ResolvedVersionsMap = match doc.parse_result() {
             Some(parse_result) => {
-                let deps = parse_result.dependencies();
+                let pinned_by_manifest: HashSet<NormalizedName> = parse_result
+                    .dependencies()
+                    .into_iter()
+                    .filter(|d| formatter.manifest_requirement_is_resolved_version(*d))
+                    .map(|d| formatter.normalize_package_name(d.name()))
+                    .collect();
                 resolved_versions
                     .iter()
-                    .filter(|(name, _)| {
-                        deps.iter()
-                            .find(|d| d.name() == *name)
-                            .is_none_or(|d| !formatter.manifest_requirement_is_resolved_version(*d))
-                    })
+                    .filter(|(name, _)| !pinned_by_manifest.contains(*name))
                     .map(|(name, version)| (name.clone(), version.clone()))
                     .collect()
             }
@@ -400,21 +407,18 @@ async fn run_document_open_background_task(
 
     if let Some(mut doc) = state.documents.get_mut(&uri) {
         doc.update_cached_versions(fetch_result.versions);
-        // Re-key raw -> normalized (§3.1): `FetchResult`'s three fields are
-        // raw-keyed, `PackageSignals::outcomes` is normalized.
-        let formatter = ecosystem.formatter();
         let mut outcomes = DependencyOutcomes::new();
         for (name, d) in fetch_result.deprecations {
-            outcomes.set_deprecation(formatter.normalize_package_name(&name), d);
+            outcomes.set_deprecation(name, d);
         }
         for (name, v) in fetch_result.yanked_versions {
-            outcomes.set_yanked(formatter.normalize_package_name(&name), v);
+            outcomes.set_yanked(name, v);
         }
         for (name, failure) in fetch_result.fetch_failed {
-            outcomes.set_fetch_failure(formatter.normalize_package_name(&name), failure);
+            outcomes.set_fetch_failure(name, failure);
         }
         for name in fetch_result.no_comparable_versions {
-            outcomes.set_no_comparable_versions(formatter.normalize_package_name(&name));
+            outcomes.set_no_comparable_versions(name);
         }
         // `collided_names` (spec FR-011) are merged in alongside genuine fetch
         // failures so `generate_diagnostics_from_cache` reports "lookup could not
@@ -425,10 +429,7 @@ async fn run_document_open_background_task(
         // same key as a genuine `Actionable`/`Transient` failure never clobbers it
         // (impl-critic M2).
         for name in collided_names {
-            outcomes.set_fetch_failure_if_absent(
-                formatter.normalize_package_name(&name),
-                FetchFailure::NotAttempted,
-            );
+            outcomes.set_fetch_failure_if_absent(name, FetchFailure::NotAttempted);
         }
         doc.replace_outcomes(outcomes);
         if success {
@@ -512,6 +513,91 @@ async fn run_document_open_background_task(
 
     // Publish diagnostics (may be slower, runs after hints are already visible)
     diagnostics::publish_document_diagnostics(&state, &client, &uri, &config, dep_count).await;
+
+    // The fetch populated the tag index the probes need.
+    spawn_background_probes(&state, &uri, &ecosystem);
+}
+
+/// What caused a parse, which decides whether the pre-fetch probes run before it is committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParseTrigger {
+    /// The document's own content changed: pre-fetch probes run and may ask for one re-parse
+    /// (spec 088 FR-017).
+    Content,
+    /// A config or watched-file change re-parses unchanged content: the pre-fetch probes run
+    /// too, because the change may be what makes them applicable (Swift's SCM-to-registry
+    /// setting going from `Disabled` to `Replace` finds a cold memo). Still one re-parse at
+    /// most, and that re-parse runs no probe, so this cannot loop.
+    Config,
+    /// An announcement that a probe input changed ([`deps_core::RefreshEvent::ReparseOpenDocuments`])
+    /// re-parses unchanged content: no probe runs, since the probe is what announced it.
+    Memo,
+}
+
+impl ParseTrigger {
+    /// Whether the pre-fetch probes may run for a parse caused by this trigger.
+    const fn runs_pre_fetch_probes(self) -> bool {
+        match self {
+            Self::Content | Self::Config => true,
+            Self::Memo => false,
+        }
+    }
+}
+
+/// Runs the pre-fetch probes of `uri`'s ecosystem and, when one asks for it, re-parses and
+/// commits the document once (spec 088 FR-017).
+///
+/// Returns the diff of that re-parse (names added or whose version changed, whether an OSV
+/// rescan is due) so the caller can fetch what the re-parse introduced. `None` when nothing
+/// changed, the document moved on, or the network is off. A re-parse runs no probe, so this
+/// cannot loop.
+async fn apply_pre_fetch_reparse(
+    uri: &Uri,
+    state: &ServerState,
+    ecosystem: &Arc<dyn Ecosystem>,
+) -> Option<PreFetchReparse> {
+    if state.cache.is_offline() {
+        return None;
+    }
+    let (parsed, version) = state
+        .get_document(uri)
+        .and_then(|doc| Some((doc.parse_result_arc()?, doc.version)))?;
+    let report = ecosystem
+        .background_probes(parsed.as_ref(), ProbePhase::PreFetch)
+        .await;
+    // Taken once the probe has decided: every input announced before now is reflected in what
+    // this document parses to from here on, so the re-parse listener need not redo it.
+    state.pre_fetch_stamps.insert(uri.clone(), Instant::now());
+    if report.effect != ProbeEffect::Reparse {
+        return None;
+    }
+    let content = state.get_document(uri)?.content.clone();
+    let (reparsed, diff, _) = parse_and_diff_manifest(uri, &content, state, ecosystem).await;
+    let needs_osv_rescan = diff.needs_osv_rescan();
+    let mut fetch = diff.added.clone();
+    fetch.extend(diff.version_changed.iter().cloned());
+    commit_parsed_document(
+        uri,
+        ecosystem.as_ref(),
+        content,
+        reparsed,
+        version,
+        state,
+        CommitOptions {
+            diff: &diff,
+            guard: CommitGuard::ExpectVersion(version),
+        },
+    )
+    .then_some(PreFetchReparse {
+        fetch,
+        needs_osv_rescan,
+    })
+}
+
+/// What a pre-fetch re-parse introduced, see [`apply_pre_fetch_reparse`].
+struct PreFetchReparse {
+    fetch: Vec<NormalizedName>,
+    needs_osv_rescan: bool,
 }
 
 /// Parses the freshly-edited manifest content and diffs its dependencies against the
@@ -539,12 +625,15 @@ async fn parse_and_diff_manifest(
     bool,
 ) {
     let (old_deps, old_selection_context): (
-        HashMap<PackageName, Vec<Option<VersionReq>>>,
+        HashMap<NormalizedName, Vec<Option<VersionReq>>>,
         deps_core::SelectionContext,
     ) = state.get_document(uri).map_or_else(
         || (HashMap::new(), deps_core::SelectionContext::none()),
         |doc| match doc.parse_result() {
-            Some(pr) => (dependency_version_map(pr), pr.selection_context()),
+            Some(pr) => (
+                dependency_version_map(pr, ecosystem.formatter()),
+                pr.selection_context(),
+            ),
             None => (HashMap::new(), deps_core::SelectionContext::none()),
         },
     );
@@ -569,9 +658,9 @@ async fn parse_and_diff_manifest(
         }
     };
 
-    let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> = parse_result
+    let new_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> = parse_result
         .as_ref()
-        .map_or_default(|pr| dependency_version_map(pr.as_ref()));
+        .map_or_default(|pr| dependency_version_map(pr.as_ref(), ecosystem.formatter()));
     let new_selection_context = parse_result
         .as_deref()
         .map_or_else(deps_core::SelectionContext::none, |pr| {
@@ -669,13 +758,8 @@ fn commit_parsed_document(
         preserve_cache(&mut doc_state, old_doc.get());
     }
 
-    // Prune stale cache entries for removed dependencies. `vulnerabilities`/`outcomes`
-    // are keyed by the *normalized* name (unlike the other maps here, which are
-    // raw-`dep.name()`-keyed) — `PackageSignals::prune_removed` normalizes for those two
-    // internally, so pruning never silently no-ops for Composer/Swift/NuGet-style
-    // ecosystems where normalization changes the string (critique M4).
-    let formatter = ecosystem.formatter();
-    doc_state.signals.prune_removed(&diff.removed, formatter);
+    // Prune stale cache entries for packages no longer declared under any spelling.
+    doc_state.signals.prune_removed(&diff.removed);
 
     // A version-only edit (name unchanged, requirement changed) invalidates
     // any yanked finding recorded against the dependency's *old* version —
@@ -692,9 +776,8 @@ fn commit_parsed_document(
     // version — editing which version is pinned does not make the package
     // any less (or more) deprecated, so there is nothing stale to drop here.
     for changed_dep in &diff.version_changed {
-        let normalized = formatter.normalize_package_name(changed_dep);
-        doc_state.signals.outcomes.clear_yanked(&normalized);
-        doc_state.signals.outcomes.clear_fetch_failure(&normalized);
+        doc_state.signals.outcomes.clear_yanked(changed_dep);
+        doc_state.signals.outcomes.clear_fetch_failure(changed_dep);
     }
 
     // Issue #1424 (impl-critic round 2, S2): a manifest edit that changes a dependency's
@@ -702,8 +785,7 @@ fn commit_parsed_document(
     // Gradle/Deno (no `LockFileProvider`, so `document::diff::reload_resolved_versions`'s
     // lock-file-driven eviction never runs for them) and can also race a Dart/Swift
     // lock-file-driven eviction for the same dependency. Same tier-3-only gate and rationale
-    // as `document::diff::reload_resolved_versions`'s own license eviction — raw-name-keyed,
-    // like `PackageSignals::licenses` itself.
+    // as `document::diff::reload_resolved_versions`'s own license eviction.
     if ecosystem.license_source().requires_dedicated_fetch() {
         for changed_dep in &diff.version_changed {
             doc_state.signals.licenses.remove(changed_dep);
@@ -747,6 +829,7 @@ pub async fn handle_document_change(
         content,
         version,
         CommitGuard::Unconditional,
+        ParseTrigger::Content,
         RefetchPolicy::Diff,
         state,
         client,
@@ -794,6 +877,7 @@ pub(crate) async fn handle_document_change_guarded(
     content: String,
     version: Option<i32>,
     guard: CommitGuard,
+    trigger: ParseTrigger,
     mut refetch: RefetchPolicy,
     state: Arc<ServerState>,
     client: Client,
@@ -837,11 +921,13 @@ pub(crate) async fn handle_document_change_guarded(
     // dependency in the new manifest rather than only what `diff` calls for: a
     // routing-only config change leaves the manifest's dependency set unchanged, so `diff`
     // alone would see nothing to fetch.
-    let all_dependency_names: Vec<PackageName> = match refetch {
+    let all_dependency_names: Vec<NormalizedName> = match refetch {
         RefetchPolicy::Diff => Vec::new(),
-        RefetchPolicy::AllDependencies => parse_result
-            .as_deref()
-            .map_or_default(|pr| dependency_version_map(pr).into_keys().collect()),
+        RefetchPolicy::AllDependencies => parse_result.as_deref().map_or_default(|pr| {
+            dependency_version_map(pr, ecosystem.formatter())
+                .into_keys()
+                .collect()
+        }),
     };
 
     if !commit_parsed_document(
@@ -889,6 +975,7 @@ pub(crate) async fn handle_document_change_guarded(
             ChangeTaskConfig {
                 diagnostics: diagnostics_snapshot,
                 refetch,
+                trigger,
             },
             Arc::clone(&config),
             needs_osv_rescan,
@@ -913,6 +1000,8 @@ pub(crate) async fn handle_document_change_guarded(
 struct ChangeTaskConfig {
     diagnostics: diagnostics::DiagnosticsSnapshot,
     refetch: RefetchPolicy,
+    /// Whether the pre-fetch probes may run (only for the document's own content events).
+    trigger: ParseTrigger,
 }
 
 /// Debounce window before [`run_document_change_task`] starts its fetch work. This is a
@@ -1140,10 +1229,18 @@ async fn run_document_change_task(
     // use in this task deliberately reads only `config: ChangeTaskConfig`, preserving that
     // struct's own "the task never needs to hold the config lock itself" property.
     live_config: Arc<RwLock<DepsConfig>>,
-    needs_osv_rescan: bool,
-    deps_to_fetch: Vec<PackageName>,
+    mut needs_osv_rescan: bool,
+    mut deps_to_fetch: Vec<NormalizedName>,
 ) {
     tokio::time::sleep(DID_CHANGE_DEBOUNCE).await;
+
+    // Only a content event runs the pre-fetch probes; a re-parse from anything else does not.
+    if config.trigger.runs_pre_fetch_probes()
+        && let Some(reparsed) = apply_pre_fetch_reparse(&uri, &state, &ecosystem).await
+    {
+        needs_osv_rescan |= reparsed.needs_osv_rescan;
+        deps_to_fetch.extend(reparsed.fetch);
+    }
 
     // `handle_document_change_guarded` already validated this exact `uri` converts
     // successfully before spawning this task, so `None` here is unreachable in
@@ -1336,6 +1433,7 @@ async fn run_document_change_task(
         await_license_prefetch(license_task).await;
 
         diagnostics::publish_document_diagnostics(&state, &client, &uri, &live_config, 0).await;
+        spawn_background_probes(&state, &uri, &ecosystem);
         return;
     }
 
@@ -1375,7 +1473,6 @@ async fn run_document_change_task(
     let failure_summary = merge_registry_fetch_result(
         &state,
         &uri,
-        ecosystem.formatter(),
         fetch_result,
         &attempted_names,
         collided_names,
@@ -1438,6 +1535,8 @@ async fn run_document_change_task(
     await_license_prefetch(license_task).await;
 
     diagnostics::publish_document_diagnostics(&state, &client, &uri, &live_config, dep_count).await;
+
+    spawn_background_probes(&state, &uri, &ecosystem);
 }
 
 /// Awaits the concurrently-spawned OSV phase-A scan, if one was started, and — when it
@@ -1927,11 +2026,17 @@ pub async fn ensure_document_loaded(
     }
 }
 
+#[cfg(all(test, feature = "pypi"))]
+#[path = "lifecycle_rekey_signals_tests.rs"]
+mod rekey_signals_tests;
+
 #[cfg(test)]
 mod tests {
     use super::super::diff::drop_cache_for_forced_refetch;
     use super::*;
+    use deps_core::ConcreteVersion;
     use deps_core::EcosystemId;
+    use deps_core::PackageName;
     #[cfg(feature = "cargo")]
     use deps_core::Registry;
     use deps_core::RemovalStatus;
@@ -2419,12 +2524,6 @@ mod tests {
         use super::*;
         use deps_core::PackageVersions;
 
-        /// A no-op formatter with identity name normalization and a bare (unprefixed)
-        /// package URL — no ecosystem-specific behavior is under test here, just
-        /// `drop_cache_for_forced_refetch`'s own bookkeeping.
-        const IDENTITY_FORMATTER: deps_core::test_util::StubFormatter =
-            deps_core::test_util::StubFormatter::new().with_package_url_prefix("");
-
         /// Critic S1 fix: a dependency about to be refetched is marked
         /// `FetchFailure::NotAttempted` (a placeholder, not left absent) — see
         /// `drop_cache_for_forced_refetch`'s doc for why an absent entry is unsafe.
@@ -2433,11 +2532,14 @@ mod tests {
             let mut doc =
                 DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
             doc.update_cached_versions(HashMap::from([(
-                PackageName::new("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             )]));
             doc.set_resolved_versions_without_bump(
-                HashMap::from([(PackageName::new("serde"), ConcreteVersion::new("1.0.0"))]),
+                HashMap::from([(
+                    NormalizedName::for_test("serde"),
+                    ConcreteVersion::new("1.0.0"),
+                )]),
                 HashMap::new(),
             );
             doc.replace_outcomes(
@@ -2452,11 +2554,7 @@ mod tests {
                     ),
             );
 
-            drop_cache_for_forced_refetch(
-                &mut doc,
-                &[PackageName::new("serde")],
-                &IDENTITY_FORMATTER,
-            );
+            drop_cache_for_forced_refetch(&mut doc, &[NormalizedName::for_test("serde")]);
 
             assert!(
                 doc.signals.cached_versions.is_empty(),
@@ -2492,11 +2590,11 @@ mod tests {
             let mut doc =
                 DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
             doc.update_cached_versions(HashMap::from([(
-                PackageName::new("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.0"),
             )]));
 
-            drop_cache_for_forced_refetch(&mut doc, &[], &IDENTITY_FORMATTER);
+            drop_cache_for_forced_refetch(&mut doc, &[]);
 
             assert!(doc.signals.cached_versions.is_empty());
             assert!(
@@ -2536,18 +2634,14 @@ mod tests {
             // conflated with fresh data, and must not leak into the "not found" path
             // either once dropped.
             doc_state.update_cached_versions(HashMap::from([(
-                PackageName::new("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.999"),
             )]));
             state.update_document(uri.clone(), doc_state);
 
             // Simulate `fetch_registry_versions_for_change`'s `AllDependencies` drop.
             if let Some(mut doc) = state.documents.get_mut(&uri) {
-                drop_cache_for_forced_refetch(
-                    &mut doc,
-                    &[PackageName::new("serde")],
-                    ecosystem.formatter(),
-                );
+                drop_cache_for_forced_refetch(&mut doc, &[NormalizedName::for_test("serde")]);
             }
 
             // Simulate a total registry outage: the one dependency in the manifest failed,
@@ -2557,7 +2651,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::new(),
-                HashMap::from([(PackageName::new("serde"), FetchFailure::Transient)]),
+                HashMap::from([(NormalizedName::for_test("serde"), FetchFailure::Transient)]),
                 HashSet::new(),
                 Some(FailureSummary::new(
                     std::num::NonZeroUsize::new(1).unwrap(),
@@ -2569,9 +2663,8 @@ mod tests {
             let failure_summary = merge_registry_fetch_result(
                 &state,
                 &uri,
-                ecosystem.formatter(),
                 fetch_result,
-                &[PackageName::new("serde")],
+                &[NormalizedName::for_test("serde")],
                 HashSet::new(),
                 false,
             );
@@ -2646,7 +2739,7 @@ mod tests {
             );
             doc_state.set_version(Some(1));
             doc_state.update_cached_versions(HashMap::from([(
-                PackageName::new("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.999"),
             )]));
             state.update_document(uri.clone(), doc_state);
@@ -2655,11 +2748,7 @@ mod tests {
             // never gets a chance to complete before step 2 lands — the exact race S1
             // describes.
             if let Some(mut doc) = state.documents.get_mut(&uri) {
-                drop_cache_for_forced_refetch(
-                    &mut doc,
-                    &[PackageName::new("serde")],
-                    ecosystem.formatter(),
-                );
+                drop_cache_for_forced_refetch(&mut doc, &[NormalizedName::for_test("serde")]);
             }
 
             // Step 2: a plain edit with unchanged content commits — empty diff, so
@@ -2672,6 +2761,7 @@ mod tests {
                 content,
                 Some(2),
                 CommitGuard::Unconditional,
+                ParseTrigger::Config,
                 RefetchPolicy::Diff,
                 Arc::clone(&state),
                 client,
@@ -3112,7 +3202,7 @@ mod tests {
                     &ecosystem,
                     &HashMap::new(),
                     &HashMap::new(),
-                    vec![PackageName::new("pkg")],
+                    vec![NormalizedName::for_test("pkg")],
                     FreshnessSettings::Disabled,
                     FetchTimeout::constant::<60>(),
                     deps_core::policy_config::FetchConcurrency::constant::<4>(),
@@ -3160,7 +3250,7 @@ mod tests {
         }
     }
 
-    /// Round 3 code-review finding #5: `licenses` (raw-name-keyed, same as
+    /// Round 3 code-review finding #5: `licenses` (normalized-name-keyed, same as
     /// `resolved_version_candidates`) was missing from `commit_parsed_document`'s
     /// removed-dependency pruning loop entirely — a document with dependencies
     /// repeatedly added and removed while staying open would accumulate an
@@ -3197,23 +3287,27 @@ anyhow = "1.0"
             let mut doc = state.documents.get_mut(&uri).unwrap();
             doc.signals
                 .licenses
-                .insert(PackageName::new("serde"), vec!["MIT".to_string()]);
-            doc.signals
-                .licenses
-                .insert(PackageName::new("anyhow"), vec!["Apache-2.0".to_string()]);
+                .insert(NormalizedName::for_test("serde"), vec!["MIT".to_string()]);
+            doc.signals.licenses.insert(
+                NormalizedName::for_test("anyhow"),
+                vec!["Apache-2.0".to_string()],
+            );
         }
 
         // `anyhow` removed from the manifest — its license entry must be pruned
         // along with it, not left behind as an orphaned entry.
         let content2 = "[dependencies]\nserde = \"1.0\"\n";
-        let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> = ["serde", "anyhow"]
+        let old_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> = ["serde", "anyhow"]
             .iter()
-            .map(|s| (PackageName::new(*s), vec![None]))
+            .map(|s| (NormalizedName::for_test(*s), vec![None]))
             .collect();
-        let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
-            std::iter::once((PackageName::new("serde"), vec![None])).collect();
+        let new_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> =
+            std::iter::once((NormalizedName::for_test("serde"), vec![None])).collect();
         let diff = DependencyDiff::compute(&old_deps, &new_deps);
-        assert_eq!(diff.removed, vec![PackageName::new("anyhow")]);
+        assert_eq!(
+            diff.removed.as_slice(),
+            [NormalizedName::for_test("anyhow")]
+        );
 
         let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
         let committed = commit_parsed_document(
@@ -3234,12 +3328,12 @@ anyhow = "1.0"
         assert!(
             !doc.signals
                 .licenses
-                .contains_key(&PackageName::new("anyhow")),
+                .contains_key(&NormalizedName::for_test("anyhow")),
             "removed dependency's license entry must be pruned, got: {:?}",
             doc.signals.licenses
         );
         assert_eq!(
-            doc.signals.licenses.get(&PackageName::new("serde")),
+            doc.signals.licenses.get(&NormalizedName::for_test("serde")),
             Some(&vec!["MIT".to_string()]),
             "surviving dependency's license entry must be preserved"
         );
@@ -4122,7 +4216,7 @@ tokio = "1.0"
                     .unwrap()
                     .signals
                     .resolved_versions
-                    .get(&PackageName::new("alpha-dep")),
+                    .get(&NormalizedName::for_test("alpha-dep")),
                 Some(&ConcreteVersion::new("0.1.0")),
                 "sanity check: the open path must have resolved the original locked version"
             );
@@ -4178,7 +4272,7 @@ tokio = "1.0"
             assert_eq!(
                 doc.signals
                     .resolved_versions
-                    .get(&PackageName::new("alpha-dep")),
+                    .get(&NormalizedName::for_test("alpha-dep")),
                 Some(&ConcreteVersion::new("0.2.0")),
                 "the lock-file rewrite must have been picked up by the debounced edit's own \
                  reload — otherwise the generation assertion below would be vacuous"
@@ -4439,6 +4533,154 @@ tokio = "1.0"
         }
     }
 
+    /// Two spellings of one PyPI package (`Django`/`django`, Poetry table keys keep the
+    /// declared spelling) must behave as one package in the diff, the prune and the
+    /// outcome clears (#1873).
+    #[cfg(feature = "pypi")]
+    mod normalized_rekey_tests {
+        use super::*;
+        use deps_core::FetchFailure;
+        use deps_core::PackageVersions;
+        use deps_core::osv::ScanOutcome;
+        use deps_core::test_util::vuln_key;
+
+        fn manifest(deps: &[(&str, &str)]) -> String {
+            let mut out = String::from("[tool.poetry.dependencies]\n");
+            for (name, req) in deps {
+                out.push_str(&format!("\"{name}\" = \"{req}\"\n"));
+            }
+            out
+        }
+
+        fn django() -> NormalizedName {
+            NormalizedName::for_test("django")
+        }
+
+        /// Opens `content` and seeds every per-package signal for `django`.
+        async fn open_seeded(content: &str) -> (Arc<ServerState>, Uri, Arc<dyn Ecosystem>) {
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/pyproject.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let ecosystem = state.ecosystem_registry.for_uri(&url).expect("pypi");
+            let parse = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let mut doc =
+                DocumentState::new_from_parse_result(EcosystemId::Pypi, content.to_string(), parse);
+            doc.update_cached_versions(HashMap::from([(
+                django(),
+                PackageVersions::latest_only("5.0"),
+            )]));
+            doc.signals
+                .resolved_versions
+                .insert(django(), ConcreteVersion::new("4.1"));
+            doc.signals
+                .vulnerabilities
+                .insert(vuln_key("django"), ScanOutcome::Clean);
+            doc.signals
+                .vulnerabilities
+                .insert(vuln_key("django\u{0}v:4.0"), ScanOutcome::Clean);
+            doc.replace_outcomes(
+                DependencyOutcomes::new()
+                    .with_yanked(
+                        django(),
+                        (ConcreteVersion::new("4.0"), RemovalStatus::Yanked),
+                    )
+                    .with_fetch_failure(django(), FetchFailure::Transient),
+            );
+            state.update_document(uri.clone(), doc);
+            (state, uri, ecosystem)
+        }
+
+        async fn edit(
+            state: &ServerState,
+            uri: &Uri,
+            ecosystem: &Arc<dyn Ecosystem>,
+            content: &str,
+        ) -> DependencyDiff {
+            let (parse, diff, _) = parse_and_diff_manifest(uri, content, state, ecosystem).await;
+            assert!(commit_parsed_document(
+                uri,
+                ecosystem.as_ref(),
+                content.to_string(),
+                parse,
+                None,
+                state,
+                CommitOptions {
+                    diff: &diff,
+                    guard: CommitGuard::Unconditional,
+                },
+            ));
+            diff
+        }
+
+        #[tokio::test]
+        async fn deleting_one_spelling_keeps_the_survivor_and_refetches_it() {
+            let (state, uri, ecosystem) =
+                open_seeded(&manifest(&[("Django", "==4.0"), ("django", "==4.1")])).await;
+
+            let diff = edit(&state, &uri, &ecosystem, &manifest(&[("django", "==4.1")])).await;
+
+            assert!(diff.added.is_empty());
+            assert!(diff.removed.is_empty(), "the package is still declared");
+            assert_eq!(diff.version_changed, vec![django()]);
+            assert!(diff.needs_osv_rescan());
+            assert!(diff.needs_fetch());
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(doc.signals.cached_versions.contains_key(&django()));
+            assert!(doc.signals.resolved_versions.contains_key(&django()));
+            assert!(
+                doc.signals
+                    .vulnerabilities
+                    .contains_key(&vuln_key("django"))
+            );
+            assert!(doc.signals.outcomes.yanked(&django()).is_none());
+            assert!(doc.signals.outcomes.fetch_failure(&django()).is_none());
+        }
+
+        #[tokio::test]
+        async fn renaming_the_spelling_is_a_no_op() {
+            let (state, uri, ecosystem) = open_seeded(&manifest(&[("Django", "==4.1")])).await;
+
+            let diff = edit(&state, &uri, &ecosystem, &manifest(&[("django", "==4.1")])).await;
+
+            assert!(diff.added.is_empty());
+            assert!(diff.removed.is_empty());
+            assert!(diff.version_changed.is_empty());
+            assert!(!diff.needs_osv_rescan());
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(doc.signals.cached_versions.contains_key(&django()));
+            assert!(doc.signals.outcomes.yanked(&django()).is_some());
+        }
+
+        #[tokio::test]
+        async fn removing_every_spelling_prunes_plain_and_version_qualified_keys() {
+            let (state, uri, ecosystem) =
+                open_seeded(&manifest(&[("Django", "==4.0"), ("django", "==4.1")])).await;
+
+            let diff = edit(&state, &uri, &ecosystem, &manifest(&[])).await;
+
+            assert_eq!(diff.removed.as_slice(), [django()]);
+            let doc = state.get_document(&uri).unwrap();
+            assert!(doc.signals.cached_versions.is_empty());
+            assert!(doc.signals.resolved_versions.is_empty());
+            assert!(doc.signals.vulnerabilities.is_empty());
+            assert!(doc.signals.outcomes.yanked(&django()).is_none());
+        }
+
+        #[tokio::test]
+        async fn renaming_with_a_version_change_clears_stale_outcomes() {
+            let (state, uri, ecosystem) = open_seeded(&manifest(&[("Django", "==4.0")])).await;
+
+            let diff = edit(&state, &uri, &ecosystem, &manifest(&[("django", "==4.1")])).await;
+
+            assert_eq!(diff.version_changed, vec![django()]);
+            let doc = state.get_document(&uri).unwrap();
+            assert!(doc.signals.outcomes.yanked(&django()).is_none());
+            assert!(doc.signals.outcomes.fetch_failure(&django()).is_none());
+        }
+    }
+
     #[cfg(feature = "npm")]
     mod npm_tests {
         use super::*;
@@ -4528,6 +4770,7 @@ tokio = "1.0"
                 stale_content,
                 Some(3),
                 CommitGuard::ExpectVersion(Some(1)),
+                ParseTrigger::Config,
                 RefetchPolicy::Diff,
                 Arc::clone(&state),
                 client,
@@ -4578,6 +4821,7 @@ tokio = "1.0"
                 new_content.clone(),
                 Some(1),
                 CommitGuard::ExpectVersion(Some(1)),
+                ParseTrigger::Config,
                 RefetchPolicy::Diff,
                 Arc::clone(&state),
                 client,
@@ -4642,6 +4886,7 @@ tokio = "1.0"
                 stale_content,
                 Some(2),
                 CommitGuard::ExpectVersion(Some(999)),
+                ParseTrigger::Config,
                 RefetchPolicy::Diff,
                 Arc::clone(&state),
                 client,
@@ -4765,7 +5010,7 @@ github.com/gorilla/mux v1.8.1 h1:hash2=
             .await
             .expect("go.mod should open successfully");
 
-            let dep_name = PackageName::new("github.com/gorilla/mux");
+            let dep_name = NormalizedName::for_test("github.com/gorilla/mux");
 
             // The instant-cache seed is disk-only (go.sum read) and runs before any
             // registry network call, but it happens in a spawned background task — poll
@@ -4799,6 +5044,147 @@ github.com/gorilla/mux v1.8.1 h1:hash2=
                  doing so would desync it against the go.mod-accurate resolved value and produce \
                  a false 'outdated, update to the version you downgraded away from' signal"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pre_fetch_tests {
+    use super::*;
+    use crate::test_utils::test_helpers::create_test_client_and_config;
+    use deps_core::lsp_helpers::ProbePhase;
+    use deps_engine::test_util::{ProbeScript, TestTier3Ecosystem};
+
+    const REPARSE: ProbeScript = ProbeScript {
+        pre_fetch: ProbeEffect::Reparse,
+        post_fetch: ProbeEffect::Unchanged,
+    };
+
+    async fn open_stub(
+        state: &ServerState,
+        ecosystem: &Arc<TestTier3Ecosystem>,
+        version: Option<i32>,
+    ) -> Uri {
+        let url = deps_core::test_util::test_uri("/test/pubspec.yaml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+        let dynamic: Arc<dyn Ecosystem> = ecosystem.clone();
+        let parsed = deps_core::parse_manifest_blocking(&dynamic, "x", &url)
+            .await
+            .unwrap();
+        let mut doc =
+            DocumentState::new_from_parse_result(deps_core::EcosystemId::Dart, "x".into(), parsed);
+        doc.set_version(version);
+        state.update_document(uri.clone(), doc);
+        uri
+    }
+
+    #[tokio::test]
+    async fn a_reparse_effect_re_parses_and_commits_the_document_once() {
+        let state = ServerState::new();
+        let ecosystem = Arc::new(TestTier3Ecosystem::returning(vec![]).with_probes(REPARSE));
+        let uri = open_stub(&state, &ecosystem, Some(3)).await;
+        let dynamic: Arc<dyn Ecosystem> = ecosystem.clone();
+        let parses_before = ecosystem.parse_count();
+
+        let reparsed = apply_pre_fetch_reparse(&uri, &state, &dynamic).await;
+
+        assert!(reparsed.is_some());
+        assert_eq!(ecosystem.probe_calls(), [ProbePhase::PreFetch]);
+        assert_eq!(
+            ecosystem.parse_count(),
+            parses_before + 1,
+            "exactly one re-parse"
+        );
+        assert_eq!(state.with_document(&uri, |doc| doc.version), Some(Some(3)));
+        assert!(
+            state.pre_fetch_stamps.contains_key(&uri),
+            "the re-parse listener must be able to tell this document is current"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_effect_neither_re_parses_nor_commits() {
+        let state = ServerState::new();
+        let ecosystem = Arc::new(TestTier3Ecosystem::returning(vec![]));
+        let uri = open_stub(&state, &ecosystem, None).await;
+        let dynamic: Arc<dyn Ecosystem> = ecosystem.clone();
+        let parses_before = ecosystem.parse_count();
+
+        assert!(
+            apply_pre_fetch_reparse(&uri, &state, &dynamic)
+                .await
+                .is_none()
+        );
+        assert_eq!(ecosystem.probe_calls(), [ProbePhase::PreFetch]);
+        assert_eq!(ecosystem.parse_count(), parses_before);
+        assert!(state.pre_fetch_stamps.contains_key(&uri));
+    }
+
+    #[tokio::test]
+    async fn offline_runs_no_probe() {
+        let state = ServerState::new();
+        state.cache.set_offline(deps_core::NetworkMode::Offline);
+        let ecosystem = Arc::new(TestTier3Ecosystem::returning(vec![]).with_probes(REPARSE));
+        let uri = open_stub(&state, &ecosystem, None).await;
+        let dynamic: Arc<dyn Ecosystem> = ecosystem.clone();
+
+        assert!(
+            apply_pre_fetch_reparse(&uri, &state, &dynamic)
+                .await
+                .is_none()
+        );
+        assert!(ecosystem.probe_calls().is_empty());
+        assert!(!state.pre_fetch_stamps.contains_key(&uri));
+    }
+
+    #[tokio::test]
+    async fn a_closed_document_is_not_probed() {
+        let state = ServerState::new();
+        let ecosystem = Arc::new(TestTier3Ecosystem::returning(vec![]).with_probes(REPARSE));
+        let uri = open_stub(&state, &ecosystem, None).await;
+        state.documents.remove(&uri);
+        let dynamic: Arc<dyn Ecosystem> = ecosystem.clone();
+
+        assert!(
+            apply_pre_fetch_reparse(&uri, &state, &dynamic)
+                .await
+                .is_none()
+        );
+        assert!(ecosystem.probe_calls().is_empty());
+    }
+
+    /// FR-017: the pre-fetch probe runs for a content event and never for a reparse.
+    #[tokio::test]
+    async fn the_change_task_probes_only_for_content_events() {
+        for (trigger, expected) in [
+            (ParseTrigger::Content, vec![ProbePhase::PreFetch]),
+            (ParseTrigger::Memo, vec![]),
+            (ParseTrigger::Config, vec![ProbePhase::PreFetch]),
+        ] {
+            let state = Arc::new(ServerState::new());
+            let ecosystem = Arc::new(TestTier3Ecosystem::returning(vec![]));
+            let uri = open_stub(&state, &ecosystem, Some(1)).await;
+            let dynamic: Arc<dyn Ecosystem> = ecosystem.clone();
+            let (client, config) = create_test_client_and_config();
+            let snapshot = diagnostics::DiagnosticsSnapshot::capture(&state, &uri, &config).await;
+
+            run_document_change_task(
+                uri,
+                Arc::clone(&state),
+                dynamic,
+                client,
+                ChangeTaskConfig {
+                    diagnostics: snapshot,
+                    refetch: RefetchPolicy::Diff,
+                    trigger,
+                },
+                config,
+                false,
+                Vec::new(),
+            )
+            .await;
+
+            assert_eq!(ecosystem.probe_calls(), expected, "{trigger:?}");
         }
     }
 }

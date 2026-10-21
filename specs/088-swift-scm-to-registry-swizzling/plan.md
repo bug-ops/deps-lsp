@@ -53,6 +53,7 @@ OSV / license: OsvNaming::public_content(dep) at 5 sites
 
 - `swizzle_decision` is a pure function in deps-swift; unit-tested with an exhaustive truth table.
 - Detached lookups: the single-flight owns a spawned task per `ScmLookupUrl`; waiters hold a `watch`/`Shared` handle; aborting a waiter never cancels the task.
+- `ParseTrigger { Content, Config, Memo }` selects whether PreFetch and probes run (never for Memo). Memo key is `(lookup registry URL, canonical SCM URL)`.
 - Generation guard: `(content_version, generation)` applied at most once per document.
 - `public_content` default preserves behavior; Swift override returns `Owned` with case-preserving `owner/repo` from `url_to_identity`.
 - License: request by `public_content.name`, store by `PackageKey::new(dep.name(), formatter).normalized()`.

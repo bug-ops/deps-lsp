@@ -321,6 +321,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_github_pin_in_different_case_resolves_under_the_manifest_key() {
+        let resolved = resolve_pins(
+            r#"{"identity": "swift-nio", "kind": "remoteSourceControl",
+                "location": "https://github.com/Apple/Swift-NIO.git",
+                "state": {"version": "2.62.0"}}"#,
+        )
+        .await;
+
+        let (versions, candidates) = resolved.split_normalized(&crate::formatter::SwiftFormatter);
+        let manifest_key = deps_core::PackageKey::new(
+            &deps_core::PackageName::new("apple/swift-nio"),
+            &crate::formatter::SwiftFormatter,
+        );
+        assert_eq!(
+            versions.get(manifest_key.normalized()).map(|v| v.as_str()),
+            Some("2.62.0")
+        );
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_registry_pin_maps_to_registry_source() {
         let resolved = resolve_pins(&pin(r#""kind": "registry","#)).await;
         assert_matches!(

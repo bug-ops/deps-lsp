@@ -8,16 +8,15 @@
 //! reach [`super::ResolvedGeneration`]'s private `INITIAL` constant — module-private
 //! items are visible to descendant modules, and `signals` is a descendant of `state`.
 
-use deps_core::NormalizeName;
-use deps_core::lsp_helpers::EcosystemFormatter;
 use deps_core::osv::{CandidateStatusMap, LatestStatusMap, VulnerabilityMap};
 use deps_core::policy_config::{CheckState, OsvChecks};
 use deps_core::{
-    ConcreteVersion, DependencyOutcomes, GossipFindings, PackageName, PackageVersions,
-    TyposquatSignal, VersionData,
+    CachedVersionsMap, DependencyOutcomes, GossipFindings, NormalizedName, ResolvedCandidatesMap,
+    ResolvedVersionsMap, TyposquatSignal, VersionData,
 };
 use std::collections::HashMap;
 
+use super::super::diff::OrphanedKeys;
 use super::super::osv_scan::OsvScanPlan;
 use super::super::typosquat::TyposquatGate;
 use super::ResolvedGeneration;
@@ -34,16 +33,16 @@ use super::ResolvedGeneration;
 #[derive(Clone)]
 pub struct PackageSignals {
     /// Latest known version and full version list per package, fetched together in a
-    /// single registry round trip (see [`PackageVersions`]).
-    pub cached_versions: HashMap<PackageName, PackageVersions>,
+    /// single registry round trip (see [`deps_core::PackageVersions`]).
+    pub cached_versions: CachedVersionsMap,
     /// Resolved versions from lock file
-    pub resolved_versions: HashMap<PackageName, ConcreteVersion>,
+    pub resolved_versions: ResolvedVersionsMap,
     /// Every lock-file-resolved version for a package name with more than one retained
     /// entry (issue #649), built alongside [`Self::resolved_versions`] by the same lock
     /// file load. Additive: only names with more than one occurrence get an entry here —
     /// see [`deps_core::VersionData::resolved_candidates_for`] for the per-occurrence
     /// disambiguation this enables.
-    pub resolved_version_candidates: HashMap<PackageName, Vec<ConcreteVersion>>,
+    pub resolved_version_candidates: ResolvedCandidatesMap,
     /// Set by every `DocumentState::update_resolved_versions` call (issue #1395 critic S3):
     /// distinguishes two resolved-version snapshots taken at the same `DocumentState::content`
     /// (a lock-file-only reload never changes content, so that guard alone cannot order two
@@ -82,16 +81,14 @@ pub struct PackageSignals {
     /// [`Self::latest_status`]'s own unconditional attach.
     pub candidate_status: CandidateStatusMap,
     /// Yanked, deprecation, and fetch-failure findings from the lifecycle's registry
-    /// fetch, keyed by **normalized** package name. This is deliberately a different
-    /// type from `FetchResult`'s raw-keyed triple: the split makes a forgotten
-    /// normalization at a store/merge site a compile error rather than a silent bug for
-    /// ecosystems where normalization changes the name (e.g. PyPI). See
+    /// fetch, keyed by **normalized** package name like every other per-package map here.
+    /// See
     /// [`DependencyOutcome`](deps_core::DependencyOutcome) for what each of the three
     /// channels means. Empty until the first fetch completes; carried across document
     /// edits by `preserve_cache` so it doesn't flicker off on every keystroke.
     pub outcomes: DependencyOutcomes,
     /// License data available *synchronously* for this document's dependencies (issue
-    /// #660/#661), keyed by raw (unnormalized) package name — the map #661's policy
+    /// #660/#661), keyed by normalized package name — the map #661's policy
     /// diagnostics reads, since diagnostics generation is sync/cache-only by design and
     /// cannot await hover's live per-request fetch. Two disjoint populating sources,
     /// which can coexist safely because a document has exactly one ecosystem, so only
@@ -119,9 +116,9 @@ pub struct PackageSignals {
     ///
     /// Empty until the relevant fetch completes; carried across document edits by
     /// `preserve_cache` so it doesn't flicker off on every keystroke.
-    pub licenses: HashMap<PackageName, Vec<String>>,
+    pub licenses: HashMap<NormalizedName, Vec<String>>,
     /// Background-pre-fetched typosquat-suspect signal per declared dependency (issue
-    /// #1437), keyed by raw (unnormalized) package name — mirrors [`Self::licenses`]'s exact
+    /// #1437), keyed by normalized package name — mirrors [`Self::licenses`]'s exact
     /// shape and rationale. Populated by `document::typosquat::run_typosquat_prefetch`, via
     /// `DocumentState::merge_typosquats` (never a full replace, for the same "one dependency's
     /// transient failure must not drop another's still-valid signal" reason
@@ -131,7 +128,7 @@ pub struct PackageSignals {
     /// prefetch completes or when `policy.typosquat.enabled` is `false`; carried across
     /// document edits by `preserve_cache` so the diagnostic doesn't flicker off on every
     /// keystroke.
-    pub typosquats: HashMap<PackageName, TyposquatSignal>,
+    pub typosquats: HashMap<NormalizedName, TyposquatSignal>,
     /// The declared (name, source-eligibility) set as of the last typosquat pre-fetch this
     /// document actually spawned (issue #1455 batch item 1, critic S1; the eligibility half of
     /// the key added by issue #1462) — compared against the *current* set by
@@ -162,7 +159,7 @@ pub struct PackageSignals {
     /// interchangeable with `Some(<empty set>)`, exactly reproducing the pre-#1468 behavior.
     pub(crate) typosquat_checked_names: TyposquatGate,
     /// GOSSIP-sourced cooldown/low-usage findings per declared dependency (issue #1456,
-    /// spec 072), keyed by raw (unnormalized) package name — mirrors [`Self::typosquats`]'s
+    /// spec 072), keyed by normalized package name — mirrors [`Self::typosquats`]'s
     /// exact shape and rationale. Populated by `document::gossip_prefetch::run_gossip_prefetch`
     /// (see `DocumentState::merge_gossip_findings`), whose single call per prefetch cycle combines
     /// the per-package `DepsDevClient` memo's hits with this document's own
@@ -177,7 +174,7 @@ pub struct PackageSignals {
     /// never fetched inline on either generation path. Empty until the prefetch completes
     /// or when `policy.gossip.enabled` is `false`; carried across document edits by
     /// `preserve_cache` so the signal doesn't flicker off on every keystroke.
-    pub gossip_findings: HashMap<PackageName, GossipFindings>,
+    pub gossip_findings: HashMap<NormalizedName, GossipFindings>,
 }
 
 impl std::fmt::Debug for PackageSignals {
@@ -257,27 +254,20 @@ impl Default for PackageSignals {
 }
 
 impl PackageSignals {
-    /// Drops every raw-name-keyed entry for `removed`, and the corresponding
-    /// normalized-name-keyed entry from [`Self::vulnerabilities`]/[`Self::outcomes`] —
+    /// Drops every entry for the `orphaned` packages from each per-package map, including
+    /// the version-qualified [`deps_core::osv::VulnKey`]s of [`Self::vulnerabilities`] —
     /// replaces the pruning loop that used to live inline in
     /// `document::lifecycle::commit_parsed_document` (issue #1477).
     ///
-    /// Deliberately mirrors *only* the `diff.removed` loop, not a `retain_keys(current)`
-    /// full resync: [`Self::vulnerabilities`] also holds version-qualified
-    /// [`deps_core::osv::VulnKey`]s for dependencies no longer declared, which a
-    /// resync-to-current-names approach would additionally drop (a behavior change out of
-    /// scope for this refactor — see #1477's tracked follow-up).
+    /// Takes [`OrphanedKeys`], which only `DependencyDiff::compute` can produce, so a
+    /// package still declared under another spelling is never pruned.
     ///
     /// [`Self::resolved_versions_generation`] and [`Self::typosquat_checked_names`] are
     /// never pruned here: the generation is a document-wide scalar epoch, not
     /// per-package data, and pruning the checked-names set would make the very next
     /// debounced edit see a name/eligibility mismatch and re-spawn a typosquat pre-fetch
     /// for names that never actually changed (issue #1455 critic S1).
-    pub(crate) fn prune_removed(
-        &mut self,
-        removed: &[PackageName],
-        formatter: &dyn EcosystemFormatter,
-    ) {
+    pub(crate) fn prune_removed(&mut self, orphaned: &OrphanedKeys) {
         let Self {
             cached_versions,
             resolved_versions,
@@ -293,19 +283,18 @@ impl PackageSignals {
             typosquat_checked_names: _,
             gossip_findings,
         } = self;
-        for removed_dep in removed {
+        for removed_dep in orphaned.as_slice() {
             cached_versions.remove(removed_dep);
             resolved_versions.remove(removed_dep);
             resolved_version_candidates.remove(removed_dep);
             licenses.remove(removed_dep);
             typosquats.remove(removed_dep);
             gossip_findings.remove(removed_dep);
-            let normalized = formatter.normalize_package_name(removed_dep);
-            vulnerabilities.retain(|key, _| key.as_str() != normalized.as_str());
-            osv_scan_plan.retain_not_named(&normalized);
-            latest_status.retain(|key, _| key.as_str() != normalized.as_str());
-            candidate_status.retain(|key, _| key.as_str() != normalized.as_str());
-            outcomes.remove(&normalized);
+            vulnerabilities.retain(|key, _| !key.is_for_name(removed_dep));
+            osv_scan_plan.retain_not_named(removed_dep);
+            latest_status.retain(|key, _| !key.is_for_name(removed_dep));
+            candidate_status.retain(|key, _| !key.is_for_name(removed_dep));
+            outcomes.remove(removed_dep);
         }
     }
 
@@ -370,16 +359,16 @@ impl PrefetchVisibility {
 /// finished [`SignalsSnapshot`], and its clone is never performed.
 pub(crate) struct SignalsSnapshotBuilder<'a> {
     signals: &'a PackageSignals,
-    cached: HashMap<PackageName, PackageVersions>,
-    resolved: HashMap<PackageName, ConcreteVersion>,
-    candidates: Option<HashMap<PackageName, Vec<ConcreteVersion>>>,
+    cached: CachedVersionsMap,
+    resolved: ResolvedVersionsMap,
+    candidates: Option<ResolvedCandidatesMap>,
     vulnerabilities: Option<VulnerabilityMap>,
     latest_status: Option<LatestStatusMap>,
     candidate_status: Option<CandidateStatusMap>,
     outcomes: Option<DependencyOutcomes>,
-    licenses: Option<HashMap<PackageName, Vec<String>>>,
-    typosquats: Option<HashMap<PackageName, TyposquatSignal>>,
-    gossip: Option<HashMap<PackageName, GossipFindings>>,
+    licenses: Option<HashMap<NormalizedName, Vec<String>>>,
+    typosquats: Option<HashMap<NormalizedName, TyposquatSignal>>,
+    gossip: Option<HashMap<NormalizedName, GossipFindings>>,
 }
 
 impl SignalsSnapshotBuilder<'_> {
@@ -511,16 +500,16 @@ impl SignalsSnapshotBuilder<'_> {
 /// dimensions it uses (e.g. `.with_outcomes()`), and every dimension it doesn't
 /// request simply isn't cloned.
 pub(crate) struct SignalsSnapshot {
-    cached: HashMap<PackageName, PackageVersions>,
-    resolved: HashMap<PackageName, ConcreteVersion>,
-    candidates: Option<HashMap<PackageName, Vec<ConcreteVersion>>>,
+    cached: CachedVersionsMap,
+    resolved: ResolvedVersionsMap,
+    candidates: Option<ResolvedCandidatesMap>,
     vulnerabilities: Option<VulnerabilityMap>,
     latest_status: Option<LatestStatusMap>,
     candidate_status: Option<CandidateStatusMap>,
     outcomes: Option<DependencyOutcomes>,
-    licenses: Option<HashMap<PackageName, Vec<String>>>,
-    typosquats: Option<HashMap<PackageName, TyposquatSignal>>,
-    gossip: Option<HashMap<PackageName, GossipFindings>>,
+    licenses: Option<HashMap<NormalizedName, Vec<String>>>,
+    typosquats: Option<HashMap<NormalizedName, TyposquatSignal>>,
+    gossip: Option<HashMap<NormalizedName, GossipFindings>>,
 }
 
 impl SignalsSnapshot {
@@ -561,22 +550,25 @@ impl SignalsSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::diff::orphaned_for_test;
     use super::*;
     use deps_core::osv::ScanOutcome;
-    use deps_core::test_util::{StubFormatter, vuln_key};
+    use deps_core::test_util::vuln_key;
+    use deps_core::{ConcreteVersion, PackageName, PackageVersions};
     use deps_core::{DependencyOutcomes, RemovalStatus};
-
-    const LOWERCASE_FORMATTER: StubFormatter = StubFormatter::new().with_lowercase_names();
 
     fn eligible() -> crate::document::typosquat::TyposquatSourceEligibility {
         crate::document::typosquat::TyposquatSourceEligibility::Eligible
     }
 
-    /// One entry for `"MyPkg"` (the name every test below asks `prune_removed` to remove)
-    /// and one for `"Other"` (a survivor) in each map `prune_removed` actually prunes.
-    /// `vulnerabilities`/`outcomes` additionally get a `"mypkg"` (already-normalized-cased)
-    /// entry, since those two are normalized-name-keyed — mirroring a Composer/PyPI-style
-    /// ecosystem where `normalize_package_name` changes the string.
+    fn name(spelling: &str) -> NormalizedName {
+        NormalizedName::for_test(spelling)
+    }
+
+    /// One entry for `"mypkg"` (the package every test below orphans) and one for `"other"`
+    /// (a survivor) in each map `prune_removed` prunes. `vulnerabilities` additionally holds
+    /// a version-qualified key for each, plus `"mypkg2"` to prove a longer name that merely
+    /// shares the prefix survives.
     ///
     /// `typosquats`/`gossip_findings` are deliberately left empty here: their value types
     /// (`TyposquatSignal`, `GossipFindings`) are `#[non_exhaustive]` with no public or
@@ -587,54 +579,35 @@ mod tests {
     /// `map.remove(removed_dep)` call this fixture already exercises for `licenses` below.
     fn fixture() -> PackageSignals {
         let mut signals = PackageSignals::default();
-        signals.cached_versions.insert(
-            PackageName::new("MyPkg"),
-            PackageVersions::latest_only("1.0.0"),
-        );
-        signals.cached_versions.insert(
-            PackageName::new("Other"),
-            PackageVersions::latest_only("2.0.0"),
-        );
-        signals
-            .resolved_versions
-            .insert(PackageName::new("MyPkg"), ConcreteVersion::new("1.0.0"));
-        signals
-            .resolved_versions
-            .insert(PackageName::new("Other"), ConcreteVersion::new("2.0.0"));
-        signals.resolved_version_candidates.insert(
-            PackageName::new("MyPkg"),
-            vec![ConcreteVersion::new("1.0.0")],
-        );
-        signals.resolved_version_candidates.insert(
-            PackageName::new("Other"),
-            vec![ConcreteVersion::new("2.0.0")],
-        );
+        for (pkg, latest) in [("mypkg", "1.0.0"), ("other", "2.0.0")] {
+            signals
+                .cached_versions
+                .insert(name(pkg), PackageVersions::latest_only(latest));
+            signals
+                .resolved_versions
+                .insert(name(pkg), ConcreteVersion::new(latest));
+            signals
+                .resolved_version_candidates
+                .insert(name(pkg), vec![ConcreteVersion::new(latest)]);
+        }
         signals
             .licenses
-            .insert(PackageName::new("MyPkg"), vec!["MIT".to_string()]);
+            .insert(name("mypkg"), vec!["MIT".to_string()]);
         signals
             .licenses
-            .insert(PackageName::new("Other"), vec!["Apache-2.0".to_string()]);
-        // Normalized-keyed: an entry under the *normalized* ("mypkg") form must be pruned; one
-        // under the raw-cased ("MyPkg") form must NOT be — a different key from
-        // `prune_removed`'s point of view, proving normalization (not the raw name) drives the
-        // comparison.
-        signals
-            .vulnerabilities
-            .insert(vuln_key("mypkg"), ScanOutcome::Clean);
-        signals
-            .vulnerabilities
-            .insert(vuln_key("MyPkg"), ScanOutcome::Clean);
-        signals
-            .vulnerabilities
-            .insert(vuln_key("other"), ScanOutcome::Clean);
+            .insert(name("other"), vec!["Apache-2.0".to_string()]);
+        for key in ["mypkg", "mypkg\u{0}v:1.0.0", "mypkg2", "other"] {
+            signals
+                .vulnerabilities
+                .insert(vuln_key(key), ScanOutcome::Clean);
+        }
         signals.outcomes = DependencyOutcomes::new()
             .with_yanked(
-                deps_core::NormalizedName::for_test("mypkg"),
+                name("mypkg"),
                 (ConcreteVersion::new("1.0.0"), RemovalStatus::Yanked),
             )
             .with_yanked(
-                deps_core::NormalizedName::for_test("other"),
+                name("other"),
                 (ConcreteVersion::new("2.0.0"), RemovalStatus::Yanked),
             );
         signals.typosquat_checked_names =
@@ -643,61 +616,37 @@ mod tests {
     }
 
     #[test]
-    fn prune_removed_drops_raw_and_normalized_entries_for_removed_name_only() {
+    fn prune_removed_drops_plain_and_version_qualified_entries_for_orphaned_name_only() {
         let mut signals = fixture();
-        signals.prune_removed(&[PackageName::new("MyPkg")], &LOWERCASE_FORMATTER);
+        signals.prune_removed(&orphaned_for_test(&["mypkg"]));
 
-        // Raw-name-keyed maps: the removed name's entry is gone, the survivor's is not.
-        assert!(
-            !signals
-                .cached_versions
-                .contains_key(&PackageName::new("MyPkg"))
-        );
-        assert!(
-            signals
-                .cached_versions
-                .contains_key(&PackageName::new("Other"))
-        );
-        assert!(
-            !signals
-                .resolved_versions
-                .contains_key(&PackageName::new("MyPkg"))
-        );
-        assert!(
-            signals
-                .resolved_versions
-                .contains_key(&PackageName::new("Other"))
-        );
+        assert!(!signals.cached_versions.contains_key(&name("mypkg")));
+        assert!(signals.cached_versions.contains_key(&name("other")));
+        assert!(!signals.resolved_versions.contains_key(&name("mypkg")));
+        assert!(signals.resolved_versions.contains_key(&name("other")));
         assert!(
             !signals
                 .resolved_version_candidates
-                .contains_key(&PackageName::new("MyPkg"))
+                .contains_key(&name("mypkg"))
         );
         assert!(
             signals
                 .resolved_version_candidates
-                .contains_key(&PackageName::new("Other"))
+                .contains_key(&name("other"))
         );
-        assert!(!signals.licenses.contains_key(&PackageName::new("MyPkg")));
-        assert!(signals.licenses.contains_key(&PackageName::new("Other")));
+        assert!(!signals.licenses.contains_key(&name("mypkg")));
+        assert!(signals.licenses.contains_key(&name("other")));
 
-        // Normalized-name-keyed maps: only the entry matching the *normalized* removed name
-        // is dropped; a raw-cased key that differs from the normalized form survives.
         assert!(!signals.vulnerabilities.contains_key(&vuln_key("mypkg")));
-        assert!(signals.vulnerabilities.contains_key(&vuln_key("MyPkg")));
+        assert!(
+            !signals
+                .vulnerabilities
+                .contains_key(&vuln_key("mypkg\u{0}v:1.0.0"))
+        );
+        assert!(signals.vulnerabilities.contains_key(&vuln_key("mypkg2")));
         assert!(signals.vulnerabilities.contains_key(&vuln_key("other")));
-        assert!(
-            signals
-                .outcomes
-                .yanked(&deps_core::NormalizedName::for_test("mypkg"))
-                .is_none()
-        );
-        assert!(
-            signals
-                .outcomes
-                .yanked(&deps_core::NormalizedName::for_test("other"))
-                .is_some()
-        );
+        assert!(signals.outcomes.yanked(&name("mypkg")).is_none());
+        assert!(signals.outcomes.yanked(&name("other")).is_some());
     }
 
     #[test]
@@ -706,7 +655,7 @@ mod tests {
         let generation_before = signals.resolved_versions_generation;
         let checked_before = signals.typosquat_checked_names.clone();
 
-        signals.prune_removed(&[PackageName::new("MyPkg")], &LOWERCASE_FORMATTER);
+        signals.prune_removed(&orphaned_for_test(&["mypkg"]));
 
         assert_eq!(signals.resolved_versions_generation, generation_before);
         assert_eq!(signals.typosquat_checked_names, checked_before);
@@ -731,7 +680,7 @@ mod tests {
         let snapshot = signals.snapshot().finish();
         let data = snapshot.version_data();
         assert!(
-            data.resolved_candidates_for(&deps_core::test_util::package_key("MyPkg"))
+            data.resolved_candidates_for(&deps_core::test_util::package_key("mypkg"))
                 .is_none()
         );
         assert!(data.vulnerabilities.is_none());
@@ -752,18 +701,16 @@ mod tests {
             .with_license_prefetch()
             .finish();
         let data = snapshot.version_data();
-        for name in ["MyPkg", "Other"] {
+        for pkg in ["mypkg", "other"] {
             assert_eq!(
-                data.resolved_candidates_for(&deps_core::test_util::package_key(name))
+                data.resolved_candidates_for(&deps_core::test_util::package_key(pkg))
                     .map(<[_]>::len),
                 Some(1)
             );
         }
-        assert_eq!(data.vulnerabilities.map(HashMap::len), Some(3));
+        assert_eq!(data.vulnerabilities.map(HashMap::len), Some(4));
         assert_eq!(
-            data.outcomes.map(|o| o
-                .yanked(&deps_core::NormalizedName::for_test("mypkg"))
-                .is_some()),
+            data.outcomes.map(|o| o.yanked(&name("mypkg")).is_some()),
             Some(true)
         );
         assert_eq!(data.license_prefetch.map(HashMap::len), Some(2));

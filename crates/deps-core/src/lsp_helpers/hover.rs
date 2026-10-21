@@ -23,10 +23,10 @@ use super::diagnostics::{MAX_DIAGNOSTIC_PROSE_CHARS, MAX_VERSION_DIAGNOSTIC_CHAR
 use super::hover_markdown::{FieldKind, HoverMarkdown};
 use super::{
     AuxiliaryLookup, CooldownBlocker, CooldownPrecedence, DiagnosticMessages, EcosystemFormatter,
-    FetchContext, HOVER_RECENT_VERSIONS, InteractiveFetchRequest, LatestVerdict, SiblingMatchNote,
-    VersionData, await_interactive_fetch, await_interactive_versions, cooldown_precedence,
-    escape_markdown, in_use_version, latest_verdict, markdown_code_span, position_in_range,
-    resolve_in_use_version, resolve_scan_outcome,
+    FetchContext, HOVER_RECENT_VERSIONS, HoverProvenance, InteractiveFetchRequest, LatestVerdict,
+    SiblingMatchNote, VersionData, await_interactive_fetch, await_interactive_versions,
+    cooldown_precedence, escape_markdown, in_use_version, latest_verdict, markdown_code_span,
+    position_in_range, resolve_in_use_version, resolve_scan_outcome,
 };
 use crate::github::normalize_tag;
 
@@ -171,6 +171,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         .map(ConcreteVersion::as_str)
     };
     push_current_or_requirement_hover_section(&mut markdown, dep, resolved);
+    push_provenance_hover_section(&mut markdown, formatter.hover_provenance(dep).as_ref());
 
     push_markers_hover_section(&mut markdown, dep);
 
@@ -249,7 +250,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             Some((latest_ver, published_at)),
         ) => cooldown_precedence(
             versions.gossip_prefetch,
-            dep.name(),
+            key.normalized(),
             latest_ver,
             published_at,
             cooldown,
@@ -390,7 +391,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         .or_else(|| {
             versions
                 .license_prefetch
-                .and_then(|m| m.get(dep.name()))
+                .and_then(|m| m.get(key.normalized()))
                 .filter(|raw| !raw.is_empty())
                 .map(|raw| resolve_license_entries_for_display(license_source, raw))
         })
@@ -632,6 +633,40 @@ fn push_current_or_requirement_hover_section(
         markdown.push_static("**Requirement**: ");
         markdown.push_code(version_req.as_str(), FieldKind::Version);
         markdown.push_static("\n\n");
+    }
+}
+
+/// Appends the line explaining where a dependency's data comes from, when its formatter
+/// supplies one (see [`super::PackageRendering::hover_provenance`]).
+///
+/// Every field is formatter- or registry-controlled text, so each goes through the
+/// bounded, escaped `push_code`.
+fn push_provenance_hover_section(
+    markdown: &mut HoverMarkdown,
+    provenance: Option<&HoverProvenance>,
+) {
+    match provenance {
+        None => {}
+        Some(HoverProvenance::CommitAheadOfLatestRelease {
+            ahead_by,
+            latest_tag,
+        }) => {
+            markdown.push_static("Commit ");
+            if let Some(ahead_by) = ahead_by {
+                markdown.push_number(u64::from(*ahead_by));
+                markdown.push_static(" ");
+            }
+            markdown.push_static("ahead of latest release ");
+            markdown.push_code(latest_tag, FieldKind::Version);
+            markdown.push_static("\n\n");
+        }
+        Some(HoverProvenance::ResolvedViaRegistryIdentity { identity, scm }) => {
+            markdown.push_static("Resolved via registry identity ");
+            markdown.push_code(identity.as_str(), FieldKind::Name);
+            markdown.push_static(" (from ");
+            markdown.push_code(scm.as_ref(), FieldKind::Name);
+            markdown.push_static(")\n\n");
+        }
     }
 }
 
@@ -1638,6 +1673,54 @@ mod tests {
     }
 
     #[test]
+    fn push_provenance_hover_section_renders_both_provenance_lines() {
+        let render = |provenance: HoverProvenance| {
+            let mut markdown = HoverMarkdown::new();
+            push_provenance_hover_section(&mut markdown, Some(&provenance));
+            markdown.as_str().to_string()
+        };
+        assert_eq!(
+            render(HoverProvenance::CommitAheadOfLatestRelease {
+                ahead_by: Some(3),
+                latest_tag: "v4.2.2".into(),
+            }),
+            "Commit 3 ahead of latest release `v4.2.2`\n\n"
+        );
+        assert_eq!(
+            render(HoverProvenance::CommitAheadOfLatestRelease {
+                ahead_by: None,
+                latest_tag: "v4.2.2".into(),
+            }),
+            "Commit ahead of latest release `v4.2.2`\n\n"
+        );
+        let swizzled = render(HoverProvenance::ResolvedViaRegistryIdentity {
+            identity: crate::PackageName::new("apple.swift-nio"),
+            scm: crate::redact::RedactedUrl::new("https://user:hunter2@github.com/apple/swift-nio"),
+        });
+        assert!(swizzled.starts_with("Resolved via registry identity `apple.swift-nio` (from `"));
+        assert!(!swizzled.contains("hunter2"), "{swizzled}");
+
+        let mut none = HoverMarkdown::new();
+        push_provenance_hover_section(&mut none, None);
+        assert!(none.as_str().is_empty());
+    }
+
+    #[test]
+    fn push_provenance_hover_section_bounds_a_hostile_tag() {
+        let mut markdown = HoverMarkdown::new();
+        let hostile = HoverProvenance::CommitAheadOfLatestRelease {
+            ahead_by: None,
+            latest_tag: format!("v1`\n[x](http://evil){}", "y".repeat(5000)),
+        };
+        push_provenance_hover_section(&mut markdown, Some(&hostile));
+        assert!(markdown.as_str().len() < 1000, "{markdown}");
+        assert!(
+            !markdown.as_str().contains("[x](http://evil)\n"),
+            "{markdown}"
+        );
+    }
+
+    #[test]
     fn push_markers_hover_section_truncates_overlong_marker_expr() {
         let long = "x".repeat(5000);
         let dep = MockMarkedDep {
@@ -2270,7 +2353,7 @@ mod tests {
         };
         let parse_result = freshness_test_parse_result("example");
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("example".into(), "1.0.0".into());
+        resolved_versions.insert(NormalizedName::for_test("example"), "1.0.0".into());
 
         let hover = generate_hover(
             &parse_result,
@@ -2426,7 +2509,7 @@ mod tests {
         };
         let parse_result = freshness_test_parse_result("example");
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("example".into(), "1.0.0".into());
+        resolved_versions.insert(NormalizedName::for_test("example"), "1.0.0".into());
 
         let hover = generate_hover(
             &parse_result,
@@ -2519,10 +2602,10 @@ mod tests {
 
         let parse_result = freshness_test_parse_result("example");
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("example".into(), "1.0.0".into());
+        resolved_versions.insert(NormalizedName::for_test("example"), "1.0.0".into());
         let mut licenses = HashMap::new();
         licenses.insert(
-            crate::PackageName::new("example"),
+            NormalizedName::for_test("example"),
             vec!["BSD-3-Clause".to_string()],
         );
 
@@ -2561,10 +2644,10 @@ mod tests {
 
         let parse_result = freshness_test_parse_result("example");
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("example".into(), "1.0.0".into());
+        resolved_versions.insert(NormalizedName::for_test("example"), "1.0.0".into());
         let mut licenses = HashMap::new();
         licenses.insert(
-            crate::PackageName::new("example"),
+            NormalizedName::for_test("example"),
             vec!["Apache-2.0".to_string()],
         );
 
@@ -2600,10 +2683,10 @@ mod tests {
 
         let parse_result = freshness_test_parse_result("example");
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("example".into(), "1.0.0".into());
+        resolved_versions.insert(NormalizedName::for_test("example"), "1.0.0".into());
         let mut licenses = HashMap::new();
         licenses.insert(
-            crate::PackageName::new("example"),
+            NormalizedName::for_test("example"),
             vec!["Apache-2.0".to_string()],
         );
 
@@ -2645,10 +2728,10 @@ mod tests {
 
         let parse_result = freshness_test_parse_result("example");
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("example".into(), "1.0.0".into());
+        resolved_versions.insert(NormalizedName::for_test("example"), "1.0.0".into());
         let mut licenses = HashMap::new();
         licenses.insert(
-            crate::PackageName::new("example"),
+            NormalizedName::for_test("example"),
             vec!["The Apache Software License, Version 2.0".to_string()],
         );
 
@@ -2690,10 +2773,10 @@ mod tests {
 
         let parse_result = freshness_test_parse_result("example");
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("example".into(), "1.0.0".into());
+        resolved_versions.insert(NormalizedName::for_test("example"), "1.0.0".into());
         let mut licenses = HashMap::new();
         licenses.insert(
-            crate::PackageName::new("example"),
+            NormalizedName::for_test("example"),
             vec!["Some Bespoke Corporate License".to_string()],
         );
 
@@ -2732,10 +2815,10 @@ mod tests {
 
         let parse_result = freshness_test_parse_result("example");
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("example".into(), "1.0.0".into());
+        resolved_versions.insert(NormalizedName::for_test("example"), "1.0.0".into());
         let mut licenses = HashMap::new();
         licenses.insert(
-            crate::PackageName::new("example"),
+            NormalizedName::for_test("example"),
             vec!["GNU General Public License v3".to_string()],
         );
 
@@ -2778,10 +2861,10 @@ mod tests {
 
         let parse_result = freshness_test_parse_result("example");
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("example".into(), "1.0.0".into());
+        resolved_versions.insert(NormalizedName::for_test("example"), "1.0.0".into());
         let mut licenses = HashMap::new();
         licenses.insert(
-            crate::PackageName::new("example"),
+            NormalizedName::for_test("example"),
             vec!["CDDL + GPLv2 with classpath exception".to_string()],
         );
 
@@ -3373,7 +3456,10 @@ mod tests {
         };
         let parse_result = freshness_test_parse_result("example");
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("example".into(), PackageVersions::latest_only("1.5.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("example"),
+            PackageVersions::latest_only("1.5.0"),
+        );
 
         let hover = generate_hover(
             &parse_result,
@@ -4003,7 +4089,7 @@ mod tests {
         // records the higher v0.9.1 and sorts last, so it would win naive
         // last-occurrence-wins parsing if hover trusted `versions.resolved` here.
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("example.com/mod".into(), "v0.9.1".into());
+        resolved_versions.insert(NormalizedName::for_test("example.com/mod"), "v0.9.1".into());
         let cached_versions = HashMap::new();
 
         let hover = generate_hover(
@@ -4046,7 +4132,7 @@ mod tests {
         };
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "1.2.0".into());
+        resolved_versions.insert(NormalizedName::for_test("serde"), "1.2.0".into());
         let cached_versions = HashMap::new();
 
         let hover = generate_hover(
@@ -4157,7 +4243,7 @@ mod tests {
         let parse_result = freshness_test_parse_result("serde");
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -4208,7 +4294,7 @@ mod tests {
         let parse_result = freshness_test_parse_result("serde");
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -4255,7 +4341,7 @@ mod tests {
         let parse_result = freshness_test_parse_result("serde");
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -4269,7 +4355,7 @@ mod tests {
         let resolved_versions = HashMap::new();
         let mut gossip_prefetch = HashMap::new();
         gossip_prefetch.insert(
-            crate::PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             crate::GossipFindings {
                 version: "2.0.0".to_string(),
                 // Expired cooldown: GOSSIP has an authoritative "not active" answer.
@@ -4311,7 +4397,7 @@ mod tests {
         let parse_result = freshness_test_parse_result("serde");
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -4354,7 +4440,7 @@ mod tests {
         let parse_result = freshness_test_parse_result("serde");
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -4367,7 +4453,7 @@ mod tests {
         let resolved_versions = HashMap::new();
         let mut gossip_prefetch = HashMap::new();
         gossip_prefetch.insert(
-            crate::PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             crate::GossipFindings {
                 version: "2.0.0".to_string(),
                 cooldown: Some(crate::GossipCooldown::new(
@@ -4406,7 +4492,10 @@ mod tests {
 
         let parse_result = freshness_test_parse_result("serde");
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("2.0.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("serde"),
+            PackageVersions::latest_only("2.0.0"),
+        );
         let resolved_versions = HashMap::new();
 
         let hover = generate_hover(
@@ -4436,7 +4525,7 @@ mod tests {
         let parse_result = freshness_test_parse_result("serde");
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -4484,7 +4573,7 @@ mod tests {
         let parse_result = freshness_test_parse_result("serde");
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -4531,7 +4620,7 @@ mod tests {
         let parse_result = freshness_test_parse_result("serde");
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
@@ -4600,7 +4689,7 @@ mod tests {
         // Stale Ch1 entry: an older version, with an even older publish time, standing in
         // for a background fetch that ran before 1.0.214 was published.
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions {
                 latest: "1.0.213".into(),
                 available: Arc::from(vec!["1.0.213".into()]),
@@ -5369,7 +5458,10 @@ mod tests {
         };
         let cached_versions = {
             let mut m = HashMap::new();
-            m.insert("dep".into(), PackageVersions::latest_only("9.9.9"));
+            m.insert(
+                NormalizedName::for_test("dep"),
+                PackageVersions::latest_only("9.9.9"),
+            );
             m
         };
         let resolved_versions = HashMap::new();
@@ -6192,10 +6284,13 @@ mod tests {
         };
         let cached_versions = HashMap::new();
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), ConcreteVersion::from("1.0.219"));
+        resolved_versions.insert(
+            NormalizedName::for_test("serde"),
+            ConcreteVersion::from("1.0.219"),
+        );
         let mut resolved_version_candidates = HashMap::new();
         resolved_version_candidates.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             vec![
                 ConcreteVersion::from("0.9.15"),
                 ConcreteVersion::from("1.0.219"),
@@ -6419,7 +6514,10 @@ mod tests {
         };
         let cached_versions = {
             let mut m = HashMap::new();
-            m.insert("local-action".into(), PackageVersions::latest_only("9.9.9"));
+            m.insert(
+                NormalizedName::for_test("local-action"),
+                PackageVersions::latest_only("9.9.9"),
+            );
             m
         };
         let resolved_versions = HashMap::new();
@@ -6592,7 +6690,10 @@ mod tests {
         };
         let cached_versions = {
             let mut m = HashMap::new();
-            m.insert("local-action".into(), PackageVersions::latest_only("9.9.9"));
+            m.insert(
+                NormalizedName::for_test("local-action"),
+                PackageVersions::latest_only("9.9.9"),
+            );
             m
         };
         let resolved_versions = HashMap::new();
@@ -6896,11 +6997,11 @@ mod tests {
     /// `resolved_versions`, ready to attach to `VersionData::with_trust`.
     fn express_fixture() -> (
         MockParseResult,
-        HashMap<crate::PackageName, ConcreteVersion>,
+        HashMap<crate::NormalizedName, ConcreteVersion>,
     ) {
         let parse_result = freshness_test_parse_result("express");
         let resolved_versions = HashMap::from([(
-            crate::PackageName::new("express"),
+            NormalizedName::for_test("express"),
             ConcreteVersion::new("4.19.2"),
         )]);
         (parse_result, resolved_versions)
@@ -7166,7 +7267,7 @@ mod tests {
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
         let resolved_versions = HashMap::from([(
-            crate::PackageName::new("internal-pkg"),
+            NormalizedName::for_test("internal-pkg"),
             ConcreteVersion::new("1.0.0"),
         )]);
         let registry = MockRegistryWithVersions { versions: vec![] };

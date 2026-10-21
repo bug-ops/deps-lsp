@@ -32,7 +32,7 @@ sync diagnostics/hover/code actions read the stores:
 
 | Crate | Item |
 |-------|------|
-| deps-core `lsp_helpers/git_probe.rs` | `CommitLineage`, `DefaultBranchMembership`, `CommitEvidence`, `AheadProof`; lineage LRU (no TTL) and membership LRU (TTL) |
+| deps-core `lsp_helpers/git_probe.rs` | `CommitLineage`, `DefaultBranchMembership`, `CommitEvidence`, `AheadProof`; lineage LRU (no TTL) and membership LRU (1 h freshness window) |
 | deps-core `lsp_helpers/git_ref.rs` | status override hook next to `commit_rewrite_to`; update-all exclusion; hover line |
 | deps-github-actions | compare client (`page=2`, 256 KiB limit), status mapping |
 | deps-gitlab-ci | `merge_base` client (`refs[]=`), mapping |
@@ -42,7 +42,7 @@ sync diagnostics/hover/code actions read the stores:
 ## 3. Design notes
 
 - Compare status mapping is a pure function over a typed `CompareStatus { Ahead, Behind, Diverged, Identical }` (exhaustive; unknown string is inconclusive, not a variant).
-- Lineage key `(NormalizedName, CommitSha S_L, CommitSha P)`; membership key `(NormalizedName, CommitSha P)` with TTL.
+- Lineage key `(NormalizedName, CommitSha S_L, CommitSha P)`; membership key `(NormalizedName, CommitSha P)` with a 1 h freshness window.
 - Membership request is conditional on lineage so a `NotAhead` pin costs one request.
 - `ahead_by` is carried only for GitHub; GitLab hover omits the count.
 
@@ -52,4 +52,4 @@ Only validated `CommitSha` values and the literal `HEAD` enter URLs. Trusted-ori
 
 ## 5. Risks
 
-Rate budget shared with 086 (priority favors lineage). Release-branch pins are conservative (not proven). A force-push is covered by the membership TTL.
+Rate budget shared with 086 (priority favors lineage). Release-branch pins are conservative (not proven). A force-push is covered by the membership freshness window.

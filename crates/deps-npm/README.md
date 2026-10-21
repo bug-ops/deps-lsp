@@ -13,6 +13,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 ## Features
 
 - **JSON parsing** — Parse `package.json` with position tracking for `dependencies`, `devDependencies`, and `peerDependencies`
+- **pnpm catalog entries** — Opening `pnpm-workspace.yaml` gives each `catalog:`/`catalogs.<name>:` entry the same hints, diagnostics, hover, completion and update code actions as a `package.json` dependency, with `catalog:` references in `package.json` pointing back at the entry (see the [deps-lsp book](https://bug-ops.github.io/deps-lsp/ecosystems/npm.html#editing-pnpm-workspaceyaml-catalog-entries))
 - **Lock file parsing** — Extract resolved versions from `package-lock.json` (v2/v3) or, aggregated across every pnpm workspace importer, `pnpm-lock.yaml`; `package-lock.json` takes precedence when both are present
 - **npm registry** — Client for npm registry API with metadata caching
 - **Custom/private registries** — Resolves project/user-tier `.npmrc` `registry=`/`@scope:registry=` overrides to live registry data, failing closed on a bad entry instead of falling back to `registry.npmjs.org`; a `${VAR}` in a project-tier `.npmrc` registry value is rejected rather than expanded from the process environment

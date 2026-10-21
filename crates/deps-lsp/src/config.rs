@@ -500,6 +500,10 @@ const NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS: &[deps_core::EcosystemId] =
 pub(crate) const SWIFT_KEYCHAIN_CREDENTIALS_ECOSYSTEMS: &[deps_core::EcosystemId] =
     &[deps_core::EcosystemId::Swift];
 
+/// The only ecosystem `registries.swift_scm_to_registry` affects.
+const SWIFT_SCM_TO_REGISTRY_ECOSYSTEMS: &[deps_core::EcosystemId] =
+    &[deps_core::EcosystemId::Swift];
+
 /// The only ecosystem `registries.gitlab_instance_host` affects.
 ///
 /// Same single-ecosystem-scoped shape as [`NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS`], not a
@@ -575,6 +579,7 @@ pub(crate) fn reparse_scope(
         workspace_registries_changed,
         nuget_user_profile_sources_changed,
         swift_keychain_credentials_changed,
+        swift_scm_to_registry_changed,
         gitlab_instance_host_changed,
     } = PolicyConfig::diff(&old.policy, new_policy);
 
@@ -602,6 +607,12 @@ pub(crate) fn reparse_scope(
         union_in(
             &mut scope,
             ReparseScope::Ecosystems(SWIFT_KEYCHAIN_CREDENTIALS_ECOSYSTEMS.to_vec()),
+        );
+    }
+    if swift_scm_to_registry_changed.is_changed() {
+        union_in(
+            &mut scope,
+            ReparseScope::Ecosystems(SWIFT_SCM_TO_REGISTRY_ECOSYSTEMS.to_vec()),
         );
     }
     if gitlab_instance_host_changed.is_changed() {
