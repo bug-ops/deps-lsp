@@ -455,6 +455,8 @@ impl ScmToRegistryHandle {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     #[test]
@@ -541,10 +543,10 @@ mod tests {
 
     #[test]
     fn test_classify_identifiers_treats_case_variants_as_one_identity() {
-        assert!(matches!(
+        assert_matches!(
             classify_identifiers(&ids(&["Apple.Swift-NIO", "apple.swift-nio"])),
             IdentityLookup::Unique(_)
-        ));
+        );
     }
 
     #[test]

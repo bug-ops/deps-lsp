@@ -2036,7 +2036,6 @@ mod tests {
     use super::*;
     use deps_core::ConcreteVersion;
     use deps_core::EcosystemId;
-    use deps_core::PackageName;
     #[cfg(feature = "cargo")]
     use deps_core::Registry;
     use deps_core::RemovalStatus;
@@ -2809,6 +2808,7 @@ mod tests {
     #[cfg(feature = "cargo")]
     mod open_path_semaphore_e2e_tests {
         use super::*;
+        use deps_core::PackageName;
         use deps_core::ecosystem::BoxFuture;
         use deps_core::ecosystem::private::Sealed;
         use deps_core::{

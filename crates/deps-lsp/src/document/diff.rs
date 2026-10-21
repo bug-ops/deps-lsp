@@ -92,12 +92,12 @@ impl OrphanedKeys {
         self.0.len()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(feature = "cargo", feature = "composer", feature = "pypi")))]
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cargo"))]
     pub(crate) fn contains(&self, name: &NormalizedName) -> bool {
         self.0.contains(name)
     }
@@ -191,7 +191,7 @@ impl DependencyDiff {
     /// re-probed against its new in-use version, and any stale finding
     /// against the *old* version must not linger (security F1 / impl-critic
     /// S1).
-    #[cfg(all(test, feature = "cargo"))]
+    #[cfg(all(test, any(feature = "cargo", feature = "pypi")))]
     pub(crate) fn needs_fetch(&self) -> bool {
         !self.added.is_empty() || !self.version_changed.is_empty()
     }

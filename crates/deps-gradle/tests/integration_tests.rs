@@ -1,5 +1,6 @@
 //! Integration tests for deps-gradle parsers using fixture files.
 
+#[cfg(feature = "lsp-responses")]
 use deps_core::NormalizedName;
 #[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::{generate_diagnostics_from_cache, generate_inlay_hints};

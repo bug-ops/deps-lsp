@@ -1932,6 +1932,7 @@ mod pnpm_workspace_tests {
     use super::*;
     use deps_core::VersionData;
     use deps_core::lsp_helpers::PackageVersions;
+    use std::assert_matches;
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -2138,17 +2139,16 @@ mod pnpm_workspace_tests {
         let parse_result = ecosystem().parse_manifest(content, &uri).await.unwrap();
 
         let value = detect_completion_context(parse_result.as_ref(), Position::new(1, 10), content);
-        assert!(
-            matches!(
-                &value,
-                CompletionContext::Version { package_name, prefix }
-                    if package_name.as_str() == "lodash" && prefix.is_empty()
-            ),
+        assert_matches!(
+            &value,
+            CompletionContext::Version { package_name, prefix }
+                if package_name.as_str() == "lodash" && prefix.is_empty(),
             "{value:?}"
         );
         let key = detect_completion_context(parse_result.as_ref(), Position::new(1, 4), content);
-        assert!(
-            matches!(&key, CompletionContext::PackageName { prefix, .. } if prefix == "lo"),
+        assert_matches!(
+            &key,
+            CompletionContext::PackageName { prefix, .. } if prefix == "lo",
             "{key:?}"
         );
     }

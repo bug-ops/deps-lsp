@@ -213,6 +213,7 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lsp-responses")]
     use deps_core::NormalizedName;
 
     /// #1687 e2e: a `pubspec.lock`-resolved `0.8.13+1` against pub.dev latest `0.8.13+23`

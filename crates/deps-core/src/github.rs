@@ -1679,10 +1679,7 @@ mod tests {
             .fetch_branch_ref("owner/repo", &git_ref)
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, DepsError::HttpStatus { status: 404, .. }),
-            "{err:?}"
-        );
+        assert_matches!(err, DepsError::HttpStatus { status: 404, .. }, "{err:?}");
     }
 
     #[tokio::test]
@@ -1723,7 +1720,7 @@ mod tests {
             .fetch_compare("owner/repo", CompareBase::DefaultBranchHead, &pin)
             .await
             .unwrap_err();
-        assert!(matches!(err, DepsError::ResponseTooLarge { .. }), "{err:?}");
+        assert_matches!(err, DepsError::ResponseTooLarge { .. }, "{err:?}");
     }
 
     #[tokio::test]

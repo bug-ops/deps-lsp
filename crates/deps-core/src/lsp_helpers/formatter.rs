@@ -2599,6 +2599,7 @@ impl<
 mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::MOCK_FORMATTER;
+    use std::assert_matches;
 
     /// #1472 defense-in-depth: an oversized requirement must not reach `is_requirement_up_to_date`
     /// at all — the default `requirement_status` suppresses it as `Unresolved`, same as an
@@ -4054,12 +4055,12 @@ mod tests {
         };
         let own = dep("serde");
         let content = MOCK_FORMATTER.public_content(&own).unwrap();
-        assert!(matches!(content.name, Cow::Borrowed(_)));
+        assert_matches!(content.name, Cow::Borrowed(_));
         assert_eq!(content.name.as_str(), "serde");
 
         let swapped = dep("scope.name");
         let content = Swapped.public_content(&swapped).unwrap();
-        assert!(matches!(content.name, Cow::Owned(_)));
+        assert_matches!(content.name, Cow::Owned(_));
         assert_eq!(content.name.as_str(), "Owner/Repo");
         assert!(Swapped.public_content(&own).is_none());
     }

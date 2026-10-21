@@ -679,6 +679,7 @@ impl OsvNaming for GithubActionsFormatter {
 mod tests {
     use super::*;
     use deps_core::NormalizeName;
+    #[cfg(feature = "lsp-responses")]
     use deps_core::NormalizedName;
     use deps_core::lsp_helpers::TagIndex;
     use deps_core::lsp_helpers::{CommentMismatch, CommitSha, RequirementGate, ResolvedPin};

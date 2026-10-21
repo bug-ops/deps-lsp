@@ -277,8 +277,6 @@ pub(crate) async fn run_probe_listener(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use deps_engine::test_util::TestTier3Ecosystem;
 
     use super::*;
@@ -418,6 +416,8 @@ mod tests {
 
     #[cfg(feature = "github-actions")]
     mod listener {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         use super::*;
         use crate::document::DocumentState;
         use deps_core::NormalizedName;

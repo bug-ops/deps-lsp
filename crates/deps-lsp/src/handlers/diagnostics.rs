@@ -533,6 +533,7 @@ pub(crate) async fn generate_diagnostics_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "cargo", feature = "npm", feature = "deno"))]
     use deps_core::NormalizedName;
 
     fn secs(seconds: u64) -> FetchTimeout {

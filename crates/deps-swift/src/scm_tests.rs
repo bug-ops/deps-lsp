@@ -1,5 +1,6 @@
 //! End-to-end tests of SCM-to-registry swizzling (spec 088): parser, decision, probe, notices.
 
+use std::assert_matches;
 use std::sync::Arc;
 
 use deps_core::Ecosystem;
@@ -169,7 +170,7 @@ async fn test_prefetch_warms_the_memo_then_the_reparse_swaps_the_dependency() {
             mirrors_crates_io: false,
         }
     );
-    assert!(matches!(&swapped.origin, SwiftOrigin::Swizzled { scm } if scm.wire() == NIO_URL));
+    assert_matches!(&swapped.origin, SwiftOrigin::Swizzled { scm } if scm.wire() == NIO_URL);
     assert_eq!(swapped.url, NIO_URL);
     assert_eq!(swapped.name_range, dependency(&first).name_range);
     assert_eq!(swapped.version_range, dependency(&first).version_range);
@@ -417,10 +418,10 @@ async fn test_removing_the_trusted_default_converges_without_reparse_or_events()
     let _lookup = identifiers(&mut server, NIO_URL, UNIQUE, 200);
     let warm = Fixture::with_default(&server.url(), ScmToRegistry::Replace);
     warm.prefetch(&warm.parse(NIO).await).await;
-    assert!(matches!(
+    assert_matches!(
         dependency(&warm.parse(NIO).await).origin,
         SwiftOrigin::Swizzled { .. }
-    ));
+    );
 
     let context = SwiftParseContext::default().with_scm_to_registry(Arc::clone(&warm.mode));
     let without_default = SwiftEcosystem::with_context(Arc::clone(&warm.registry), context);
@@ -459,10 +460,7 @@ async fn test_a_stale_entry_is_served_and_refreshed_in_the_background() {
         .record(&fixture.key(&scm), known, long_ago);
 
     let parsed = fixture.parse(NIO).await;
-    assert!(matches!(
-        dependency(&parsed).origin,
-        SwiftOrigin::Swizzled { .. }
-    ));
+    assert_matches!(dependency(&parsed).origin, SwiftOrigin::Swizzled { .. });
     let report = fixture.prefetch(&parsed).await;
     assert_eq!(report.effect, ProbeEffect::Unchanged);
     assert_eq!(report.issued, 1);
@@ -514,7 +512,7 @@ fn test_swizzle_decision_truth_table() {
         Some(&scm),
         Some(&unique),
     );
-    assert!(matches!(swapped, SwiftForm::RegistryIdentity { .. }));
+    assert_matches!(swapped, SwiftForm::RegistryIdentity { .. });
 
     assert_eq!(
         decide(

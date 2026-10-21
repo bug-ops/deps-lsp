@@ -150,7 +150,9 @@ struct ConfigSideEffects {
     osv_checks: OsvChecks,
     /// `cache.fetch_timeout_secs` / `cache.max_concurrent_fetches`, which also bound Swift's
     /// registry identity lookups.
+    #[cfg(feature = "swift")]
     fetch_timeout: deps_core::policy_config::FetchTimeout,
+    #[cfg(feature = "swift")]
     max_concurrent_fetches: deps_core::policy_config::FetchConcurrency,
 }
 
@@ -173,7 +175,9 @@ impl ConfigSideEffects {
             typosquat_checks: config.policy.typosquat_checks(),
             gossip_checks: config.policy.gossip_checks(),
             osv_checks: config.policy.osv_checks(),
+            #[cfg(feature = "swift")]
             fetch_timeout: config.policy.cache.fetch_timeout,
+            #[cfg(feature = "swift")]
             max_concurrent_fetches: config.policy.cache.max_concurrent_fetches,
         }
     }
@@ -252,7 +256,7 @@ struct ConfigNotices {
 }
 
 impl Backend {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "npm"))]
     pub(crate) const fn state(&self) -> &Arc<ServerState> {
         &self.state
     }
@@ -1853,6 +1857,13 @@ fn build_batch_workspace_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(
+        feature = "cargo",
+        feature = "dart",
+        feature = "deno",
+        feature = "npm",
+        feature = "swift"
+    ))]
     use deps_core::NormalizedName;
     #[cfg(feature = "cargo")]
     use deps_core::policy_config::FetchConcurrency;

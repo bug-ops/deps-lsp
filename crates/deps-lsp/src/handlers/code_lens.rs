@@ -140,7 +140,6 @@ mod tests {
     #[cfg(feature = "github-actions")]
     use deps_core::ConcreteVersion;
     use deps_core::EcosystemId;
-    use deps_core::NormalizedName;
     // Only `cargo_tests` and `cross_ecosystem_tests`' per-ecosystem cases consume this.
     #[cfg(any(
         feature = "cargo",
@@ -156,7 +155,7 @@ mod tests {
         feature = "swift",
         feature = "github-actions"
     ))]
-    use deps_core::PackageVersions;
+    use deps_core::{NormalizedName, PackageVersions};
     use tower_lsp_server::ls_types::TextDocumentIdentifier;
 
     fn params(uri: tower_lsp_server::ls_types::Uri) -> CodeLensParams {

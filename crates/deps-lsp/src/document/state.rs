@@ -2030,7 +2030,6 @@ impl Default for ServerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::PackageVersions;
 
     use std::assert_matches;
 
@@ -3268,6 +3267,7 @@ mod tests {
     #[cfg(feature = "cargo")]
     mod cargo_tests {
         use super::*;
+        use deps_core::PackageVersions;
 
         #[test]
         fn test_document_state_creation() {

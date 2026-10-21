@@ -1,6 +1,7 @@
 //! Which `identifiers` answer maps to which memoized outcome, and which identity a swizzled
 //! dependency adopts (spec 088 FR-003/FR-004).
 
+use std::assert_matches;
 use std::time::Instant;
 
 use deps_core::lsp_helpers::{ProbeEffect, ProbeReport};
@@ -112,7 +113,7 @@ async fn test_a_swizzled_dependency_adopts_the_identity_the_registry_returned() 
     let reparsed = fixture.parse(NIO).await;
     let dependency = &reparsed.dependencies[0];
     assert_eq!(dependency.name, "mona.nio-fork");
-    assert!(matches!(dependency.origin, SwiftOrigin::Swizzled { .. }));
+    assert_matches!(dependency.origin, SwiftOrigin::Swizzled { .. });
 }
 
 #[tokio::test]
