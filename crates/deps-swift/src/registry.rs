@@ -10,6 +10,8 @@ use crate::package_location::RegistryIdentity;
 use crate::package_registry::{
     PackageRegistryClient, PublishedAtLookup, REGISTRY as SE_0292_REGISTRY,
 };
+use crate::scm::{MemoKey, ScmLookupUrl};
+use crate::scm_memo::{LookupHandle, ScmIdentityMemo};
 use crate::types::{SwiftPackage, SwiftVersion};
 use dashmap::DashMap;
 use deps_core::github::{
@@ -42,6 +44,8 @@ pub struct SwiftRegistry {
     cache: Arc<HttpCache>,
     /// SE-0292 clients keyed by normalized registry URL; `Arc` for the same sharing reason.
     alternates: Arc<DashMap<String, Arc<PackageRegistryClient>>>,
+    /// Identities the trusted default registry returned for repository URLs (spec 088).
+    identity_memo: Arc<ScmIdentityMemo>,
 }
 
 impl SwiftRegistry {
@@ -55,7 +59,48 @@ impl SwiftRegistry {
             release_dates: Arc::new(ReleaseDatesCache::new()),
             cache,
             alternates: Arc::new(DashMap::new()),
+            identity_memo: Arc::default(),
         }
+    }
+
+    /// Creates a registry whose GitHub requests go to `github_api_base` (a mock server URL)
+    /// without a token, regardless of the ambient `GITHUB_TOKEN`.
+    ///
+    /// For other crates' end-to-end tests; enabled by the `test-util` feature.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn for_test(cache: Arc<HttpCache>, github_api_base: &str) -> Self {
+        Self {
+            github: GithubTagsClient::for_test(Arc::clone(&cache), github_api_base, false),
+            release_dates: Arc::new(ReleaseDatesCache::new()),
+            cache,
+            alternates: Arc::new(DashMap::new()),
+            identity_memo: Arc::default(),
+        }
+    }
+
+    /// The memo of repository-URL identities shared by every document of this registry.
+    pub(crate) const fn identity_memo(&self) -> &Arc<ScmIdentityMemo> {
+        &self.identity_memo
+    }
+
+    /// Starts (or joins) the identifiers lookup of `scm` against the client registered for the
+    /// registry `key` names, cutting it off after `timeout`; `None` when no client is registered
+    /// for it.
+    ///
+    /// The request runs detached: the answer reaches the memo even if the returned handle is
+    /// dropped. Only the trusted user-tier default registry may be named by `key`.
+    pub(crate) fn lookup_identity(
+        &self,
+        key: &MemoKey,
+        timeout: std::time::Duration,
+        scm: &ScmLookupUrl,
+    ) -> Option<LookupHandle> {
+        let client = self.alternate(key.registry().as_str())?;
+        let repository = scm.clone();
+        Some(self.identity_memo.start(key, timeout, async move {
+            client.identifiers(&repository).await
+        }))
     }
 
     /// Registers (or refreshes) the SE-0292 client for `registry`'s URL.
@@ -888,6 +933,7 @@ mod tests {
             release_dates: Arc::new(deps_core::github::ReleaseDatesCache::new()),
             cache,
             alternates: Arc::new(DashMap::new()),
+            identity_memo: Arc::default(),
         }
     }
 

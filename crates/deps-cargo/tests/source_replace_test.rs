@@ -202,9 +202,7 @@ fn test_mirror_counts_as_public_registry_content_for_osv_gating() {
 #[test]
 fn test_mirror_distinct_pinned_versions_produce_distinct_vulnerability_keys() {
     use deps_core::position::{Position, Range};
-    use deps_core::{
-        ConcreteVersion, Dependency, EcosystemId, PackageName, ParseResult, VersionReq,
-    };
+    use deps_core::{Dependency, EcosystemId, PackageName, ParseResult, VersionReq};
     use std::any::Any;
     use std::collections::HashMap;
     use url::Url;
@@ -274,7 +272,7 @@ fn test_mirror_distinct_pinned_versions_produce_distinct_vulnerability_keys() {
 
     // No lockfile-resolved versions; `resolve_in_use_version` falls back to the manifest
     // requirement, which is already concrete (`=X.Y.Z`) for both occurrences.
-    let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+    let resolved: deps_core::ResolvedVersionsMap = HashMap::new();
     let formatter = CargoFormatter;
 
     let keys = deps_core::osv::vulnerability_keys(

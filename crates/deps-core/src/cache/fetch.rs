@@ -26,10 +26,12 @@ use super::transport::Transport;
 use crate::endpoint_contact::{BodyNote, RequestNote, note_request};
 use crate::error::{DepsError, Result};
 use crate::net_policy::TrustedPrefix;
+use crate::rate_limit::QuotaMeter;
 use crate::redact::RedactedUrl;
 use bytes::Bytes;
 use reqwest::{RequestBuilder, Response, StatusCode, header};
 use serde::Serialize;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 /// Sends `request`, recording the arrival of the response headers on `note` for the interactive
@@ -42,6 +44,48 @@ async fn send_noted(
 ) -> Result<(Response, BodyNote)> {
     let response = request.send().await.map_err(|e| send_error(url, e))?;
     Ok((response, note.headers()))
+}
+
+/// What a cached read does with the live responses it receives: how a confirmed rate limit
+/// counts against the credential, which meter their quota headers feed, and how large a body
+/// may be.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LivePolicy<'a> {
+    pub(super) rate_limit: RateLimitRevocation,
+    pub(super) quota: Option<&'a Arc<QuotaMeter>>,
+    pub(super) limit: BodyLimit,
+}
+
+impl Default for LivePolicy<'_> {
+    fn default() -> Self {
+        Self {
+            rate_limit: RateLimitRevocation::default(),
+            quota: None,
+            limit: BodyLimit::DEFAULT,
+        }
+    }
+}
+
+impl<'a> LivePolicy<'a> {
+    pub(super) fn of(auth: &RequestAuth<'a>, limit: BodyLimit) -> Self {
+        Self {
+            rate_limit: auth.rate_limit(),
+            quota: auth.quota(),
+            limit,
+        }
+    }
+}
+
+/// Feeds `quota` from `response`, which was just received over the network.
+///
+/// The only place a [`QuotaMeter`] is written: a cache entry or a replayed header never reaches
+/// it. A 5xx carries no trustworthy quota and is skipped.
+fn observe_live_quota(quota: Option<&Arc<QuotaMeter>>, response: &Response) {
+    if let Some(meter) = quota
+        && !response.status().is_server_error()
+    {
+        meter.observe_headers(response.headers());
+    }
 }
 
 impl HttpCache {
@@ -161,7 +205,7 @@ impl HttpCache {
             &self.baseline,
             KeyAuth::ANONYMOUS,
             RevalidationFailure::ServeStale,
-            RateLimitRevocation::default(),
+            LivePolicy::default(),
         )
         .await
         .map(|response| response.body)
@@ -248,6 +292,36 @@ impl HttpCache {
         accept: Option<&'static str>,
         on_revalidation_failure: RevalidationFailure,
     ) -> Result<CachedResponse> {
+        self.get_cached_trusted_origin_limited(
+            url,
+            trusted_origin,
+            auth,
+            accept,
+            on_revalidation_failure,
+            BodyLimit::DEFAULT,
+        )
+        .await
+    }
+
+    /// Like [`Self::get_cached_trusted_origin_response`], but caps the response body at `limit`
+    /// instead of [`BodyLimit::DEFAULT`], for an endpoint whose legitimate answer is small and
+    /// whose overflow must read as an error (a probe), not as a large cached body.
+    ///
+    /// A body over `limit` fails with [`DepsError::ResponseTooLarge`] and stores nothing.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_cached_trusted_origin_response`], plus
+    /// [`DepsError::ResponseTooLarge`] past `limit`.
+    pub async fn get_cached_trusted_origin_limited(
+        &self,
+        url: &str,
+        trusted_origin: &TrustedPrefix,
+        auth: RequestAuth<'_>,
+        accept: Option<&'static str>,
+        on_revalidation_failure: RevalidationFailure,
+        limit: BodyLimit,
+    ) -> Result<CachedResponse> {
         auth.ensure_within(url, trusted_origin)?;
         let transport = self.transport_for_origin(trusted_origin);
         let headers = wire_headers(&accept_headers(accept), &auth);
@@ -257,7 +331,7 @@ impl HttpCache {
             &transport,
             auth.key_auth(),
             on_revalidation_failure,
-            auth.rate_limit(),
+            LivePolicy::of(&auth, limit),
         )
         .await
     }
@@ -330,6 +404,33 @@ impl HttpCache {
         accept: Option<&'static str>,
         on_revalidation_failure: RevalidationFailure,
     ) -> Result<CachedResponse> {
+        self.get_cached_pinned_limited(
+            url,
+            trusted_origin,
+            auth,
+            accept,
+            on_revalidation_failure,
+            BodyLimit::DEFAULT,
+        )
+        .await
+    }
+
+    /// Like [`Self::get_cached_pinned_response`], but caps the response body at `limit`, the
+    /// pinned-tier counterpart of [`Self::get_cached_trusted_origin_limited`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_cached_pinned_response`], plus [`DepsError::ResponseTooLarge`] past
+    /// `limit`.
+    pub async fn get_cached_pinned_limited(
+        &self,
+        url: &str,
+        trusted_origin: &TrustedPrefix,
+        auth: RequestAuth<'_>,
+        accept: Option<&'static str>,
+        on_revalidation_failure: RevalidationFailure,
+        limit: BodyLimit,
+    ) -> Result<CachedResponse> {
         auth.ensure_within(url, trusted_origin)?;
         let transport = self.transport_for_pinned(trusted_origin);
         let headers = wire_headers(&accept_headers(accept), &auth);
@@ -339,7 +440,7 @@ impl HttpCache {
             &transport,
             auth.key_auth(),
             on_revalidation_failure,
-            auth.rate_limit(),
+            LivePolicy::of(&auth, limit),
         )
         .await
     }
@@ -432,7 +533,7 @@ impl HttpCache {
             &transport,
             KeyAuth::ANONYMOUS,
             RevalidationFailure::ServeStale,
-            RateLimitRevocation::default(),
+            LivePolicy::default(),
         )
         .await
         .map(|response| response.body)
@@ -442,7 +543,7 @@ impl HttpCache {
     /// [`CacheTier::Baseline`] — every other tier ignores it (see [`Self::cache_key`]'s docs).
     #[tracing::instrument(
         name = "get_cached_via",
-        skip(self, extra_headers, transport, auth, on_revalidation_failure, rate_limit),
+        skip(self, extra_headers, transport, auth, on_revalidation_failure, policy),
         fields(url = %RedactedUrl::new(url), cache = tracing::field::Empty)
     )]
     pub(super) async fn get_cached_via(
@@ -452,7 +553,7 @@ impl HttpCache {
         transport: &Transport,
         auth: KeyAuth,
         on_revalidation_failure: RevalidationFailure,
-        rate_limit: RateLimitRevocation,
+        policy: LivePolicy<'_>,
     ) -> Result<CachedResponse> {
         if self.entries.len() >= MAX_CACHE_ENTRIES
             || self.total_bytes.load(Ordering::Relaxed) >= MAX_CACHE_BYTES
@@ -475,7 +576,13 @@ impl HttpCache {
             // broken instrumentation (#756 S3) on a path that's neither a hit nor a miss.
             tracing::Span::current().record("cache", "disabled");
             return self
-                .transport_only_response_via(url, extra_headers, BodyLimit::DEFAULT, transport)
+                .transport_only_response_via(
+                    url,
+                    extra_headers,
+                    policy.limit,
+                    transport,
+                    policy.quota,
+                )
                 .await;
         }
 
@@ -497,6 +604,7 @@ impl HttpCache {
                     extra_headers,
                     transport,
                     &cache_key,
+                    policy,
                 )
                 .await
             {
@@ -544,7 +652,7 @@ impl HttpCache {
                     // on 429 would drop a still-good cached body the client can no longer
                     // re-fetch until the throttle clears, purely because of a signal unrelated
                     // to the credential's validity.
-                    if auth.is_credentialed() && rate_limit.revokes_credential(&e) {
+                    if auth.is_credentialed() && policy.rate_limit.revokes_credential(&e) {
                         if let Some((_, old)) = self.entries.remove(cache_key.as_ref()) {
                             self.total_bytes
                                 .fetch_sub(old.body.len(), Ordering::Relaxed);
@@ -579,7 +687,7 @@ impl HttpCache {
         }
 
         tracing::Span::current().record("cache", "miss");
-        self.fetch_and_store_with_headers(url, extra_headers, transport, &cache_key)
+        self.fetch_and_store_with_headers(url, extra_headers, transport, &cache_key, policy)
             .await
     }
 
@@ -600,6 +708,7 @@ impl HttpCache {
         extra_headers: &[WireHeader<'_>],
         transport: &Transport,
         cache_key: &str,
+        policy: LivePolicy<'_>,
     ) -> Result<Option<CachedResponse>> {
         self.ensure_online(url)?;
         ensure_https(url)?;
@@ -615,6 +724,7 @@ impl HttpCache {
         }
 
         let (response, body_note) = send_noted(request, url, note).await?;
+        observe_live_quota(policy.quota, &response);
 
         if response.status() == StatusCode::NOT_MODIFIED {
             body_note.finished();
@@ -631,7 +741,7 @@ impl HttpCache {
         }
 
         let validators = ResponseValidators::from_headers(response.headers());
-        let body = read_body_capped(url, response, BodyLimit::DEFAULT, body_note).await?;
+        let body = read_body_capped(url, response, policy.limit, body_note).await?;
         let fresh = validators.into_response(body);
         self.store_entry(cache_key.to_string(), fresh.clone());
 
@@ -658,6 +768,7 @@ impl HttpCache {
         extra_headers: &[WireHeader<'_>],
         transport: &Transport,
         cache_key: &str,
+        policy: LivePolicy<'_>,
     ) -> Result<CachedResponse> {
         self.ensure_online(url)?;
         ensure_https(url)?;
@@ -677,6 +788,7 @@ impl HttpCache {
         let request = apply_request_headers(transport.client().get(url), extra_headers);
 
         let (response, body_note) = send_noted(request, url, note).await?;
+        observe_live_quota(policy.quota, &response);
 
         if !response.status().is_success() {
             body_note.finished();
@@ -688,7 +800,7 @@ impl HttpCache {
         }
 
         let validators = ResponseValidators::from_headers(response.headers());
-        let body = read_body_capped(url, response, BodyLimit::DEFAULT, body_note).await?;
+        let body = read_body_capped(url, response, policy.limit, body_note).await?;
         let fresh = validators.into_response(body);
         self.store_entry(cache_key.to_string(), fresh.clone());
 
@@ -888,9 +1000,15 @@ impl HttpCache {
         limit: BodyLimit,
         transport: &Transport,
     ) -> Result<Bytes> {
-        self.transport_only_response_via(url, &wire_accept_headers(extra_headers), limit, transport)
-            .await
-            .map(|response| response.body)
+        self.transport_only_response_via(
+            url,
+            &wire_accept_headers(extra_headers),
+            limit,
+            transport,
+            None,
+        )
+        .await
+        .map(|response| response.body)
     }
 
     /// [`Self::transport_only_via`] that also keeps the response validators and `Link` header.
@@ -900,6 +1018,7 @@ impl HttpCache {
         extra_headers: &[WireHeader<'_>],
         limit: BodyLimit,
         transport: &Transport,
+        quota: Option<&Arc<QuotaMeter>>,
     ) -> Result<CachedResponse> {
         self.ensure_online(url)?;
         ensure_https(url)?;
@@ -910,6 +1029,7 @@ impl HttpCache {
         let request = apply_request_headers(transport.client().get(url), extra_headers);
 
         let (response, body_note) = send_noted(request, url, note).await?;
+        observe_live_quota(quota, &response);
 
         if !response.status().is_success() {
             body_note.finished();

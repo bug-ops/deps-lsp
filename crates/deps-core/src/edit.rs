@@ -603,7 +603,7 @@ fn parse_leading_dotted_numeric(s: &str) -> Option<(u64, u64, u64)> {
 ///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
 ///     PackageVersions, RequirementResolution, SourcePolicy, VersionData,
 /// };
-/// use deps_core::{ConcreteVersion, Dependency, ParseResult, PackageName, VersionReq};
+/// use deps_core::{ConcreteVersion, Dependency, NormalizedName, ParseResult, PackageName, VersionReq};
 /// use std::any::Any;
 /// use std::collections::HashMap;
 /// use deps_core::position::{Position, Range};
@@ -663,7 +663,7 @@ fn parse_leading_dotted_numeric(s: &str) -> Option<(u64, u64, u64)> {
 /// };
 ///
 /// let mut cached = HashMap::new();
-/// cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
+/// cached.insert(NormalizedName::for_test("serde"), PackageVersions::latest_only("1.2.0"));
 /// let resolved = HashMap::new();
 ///
 /// let planned = collect_update_edits(
@@ -1561,6 +1561,7 @@ pub fn plan_verified_fix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NormalizedName;
     use crate::position::Position;
 
     fn range(sl: u32, sc: u32, el: u32, ec: u32) -> crate::position::Range {
@@ -1837,11 +1838,14 @@ mod tests {
                 dep("serde", "1.0", range(1, 9, 1, 12)),
             ]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
-            let resolved_versions: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.2.0"),
+            );
+            let resolved_versions: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
             let mut candidates = HashMap::new();
             candidates.insert(
-                pkg("serde"),
+                NormalizedName::for_test("serde"),
                 vec![
                     ConcreteVersion::from("0.9.15"),
                     ConcreteVersion::from("1.0.219"),
@@ -1872,8 +1876,11 @@ mod tests {
             let content = "<version>${slf4j.version}</version>";
             let pr = parse_result(vec![dep("slf4j-api", "2.0.16", range(0, 9, 0, 25))]);
             let mut cached = HashMap::new();
-            cached.insert("slf4j-api".into(), PackageVersions::latest_only("2.1.0"));
-            let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+            cached.insert(
+                NormalizedName::for_test("slf4j-api"),
+                PackageVersions::latest_only("2.1.0"),
+            );
+            let resolved: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
             let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
@@ -1904,10 +1911,10 @@ mod tests {
             )]);
             let mut cached = HashMap::new();
             cached.insert(
-                "feed-widget-helper".into(),
+                NormalizedName::for_test("feed-widget-helper"),
                 PackageVersions::latest_only("1.0.8"),
             );
-            let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+            let resolved: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
             let mut latest_status = crate::osv::LatestStatusMap::new();
             latest_status.insert(
                 crate::test_util::vuln_key("feed-widget-helper"),
@@ -1946,8 +1953,11 @@ mod tests {
             let content = "pkg = \"1.0.0\"\n";
             let pr = parse_result(vec![dep("pkg", "1.0.0", range(0, 6, 0, 13))]);
             let mut cached = HashMap::new();
-            cached.insert("pkg".into(), PackageVersions::latest_only("2.0.0"));
-            let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+            cached.insert(
+                NormalizedName::for_test("pkg"),
+                PackageVersions::latest_only("2.0.0"),
+            );
+            let resolved: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
             // Empty map, not `None`: the pre-phase-B window attaches `Some(&empty_map)`.
             let latest_status = crate::osv::LatestStatusMap::new();
             let versions = VersionData::new(&cached, &resolved).with_latest_status(&latest_status);
@@ -1999,8 +2009,11 @@ mod tests {
             let content = "pkg = \"1.0.0\"\n";
             let pr = parse_result(vec![dep("pkg", "1.0.0", range(0, 7, 0, 12))]);
             let mut cached = HashMap::new();
-            cached.insert("pkg".into(), PackageVersions::latest_only("1.2.0"));
-            let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+            cached.insert(
+                NormalizedName::for_test("pkg"),
+                PackageVersions::latest_only("1.2.0"),
+            );
+            let resolved: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
             let candidates = collect_update_candidates(&pr, content, versions, &NoOpFormatter);
@@ -2020,10 +2033,10 @@ mod tests {
             let pr = parse_result(vec![dep("serde", "1.0.0", range(0, 8, 0, 15))]);
             let mut cached = HashMap::new();
             cached.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.2.0\", \"evil\": \"true"),
             );
-            let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+            let resolved: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
             let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
@@ -2044,8 +2057,11 @@ mod tests {
             let content = "serde = \"^1.0\"\n";
             let pr = parse_result(vec![dep("serde", "^1.0", range(0, 8, 0, 14))]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
-            let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.2.0"),
+            );
+            let resolved: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
             let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
@@ -2110,10 +2126,10 @@ mod tests {
             )]);
             let mut cached = HashMap::new();
             cached.insert(
-                "actions/checkout".into(),
+                NormalizedName::for_test("actions/checkout"),
                 PackageVersions::latest_only("v1.4.0"),
             );
-            let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+            let resolved: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
             let versions =
                 VersionData::new(&cached, &resolved).with_ecosystem(EcosystemId::GithubActions);
 
@@ -2195,10 +2211,10 @@ mod tests {
                 )]);
                 let mut cached = HashMap::new();
                 cached.insert(
-                    "actions/checkout".into(),
+                    NormalizedName::for_test("actions/checkout"),
                     PackageVersions::latest_only("v7.0.1"),
                 );
-                let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+                let resolved: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
                 let versions =
                     VersionData::new(&cached, &resolved).with_ecosystem(EcosystemId::GithubActions);
 

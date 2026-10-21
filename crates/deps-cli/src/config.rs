@@ -384,6 +384,7 @@ fn ignored_sections(policy: &PolicyConfig, required: bool) -> Vec<&'static str> 
             || policy.registries.swift_keychain_credentials
                 != default.registries.swift_keychain_credentials
             || policy.registries.gitlab_instance_host != default.registries.gitlab_instance_host
+            || policy.registries.swift_scm_to_registry != default.registries.swift_scm_to_registry
         {
             sections.push("registries");
         }
@@ -484,6 +485,17 @@ mod tests {
         let mut policy = PolicyConfig::default();
         policy.gossip.enabled = true;
         assert!(ignored_sections(&policy, false).contains(&"gossip"));
+    }
+
+    /// Spec 088 FR-003: `registries.swift_scm_to_registry` is reset for an auto-discovered
+    /// `deps.toml` like every other `registries` key, so it must trigger the `[registries]`
+    /// warning there, and stay silent for an explicit `--config` where it is honored.
+    #[test]
+    fn test_ignored_sections_includes_registries_for_swift_scm_to_registry_when_auto_discovered() {
+        let mut policy = PolicyConfig::default();
+        policy.registries.swift_scm_to_registry = deps_core::policy_config::ScmToRegistry::Replace;
+        assert!(ignored_sections(&policy, false).contains(&"registries"));
+        assert!(!ignored_sections(&policy, true).contains(&"registries"));
     }
 
     #[test]

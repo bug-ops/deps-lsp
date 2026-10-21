@@ -2,12 +2,13 @@
 
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, CandidateTagSource, CommentCheck, CommentSlot, CommitRewrite, CommitSha,
-    DiagnosticMessages, DiagnosticPolicy, GitPinView, OsvNaming, PackageNaming, PackageRendering,
-    PartialTagPolicy, PinResolution, RequirementResolution, RequirementStatus, ShaPinComment,
-    ShaPinLookup, ShaPinTail, SourcePolicy, TagIndex, git_candidate_tag_source, git_commit_rewrite,
-    git_tag_replacement, requirement_contains_template_placeholder, resolve_git_pin,
-    sha_pin_rewrite, tag_pin_is_up_to_date, warn_rejected_value,
+    AheadProof, BoundedVersionReq, BranchEvidence, CandidateTagSource, CommentCheck, CommentSlot,
+    CommitRewrite, CommitSha, DiagnosticMessages, DiagnosticPolicy, GitPinView, NormalizeName,
+    OsvNaming, PackageNaming, PackageRendering, PartialTagPolicy, PinResolution, ProbeRef,
+    ProbeStores, RequirementResolution, RequirementStatus, ShaPinComment, ShaPinLookup, ShaPinTail,
+    SourcePolicy, TagIndex, git_candidate_tag_source, git_commit_rewrite, git_tag_replacement,
+    requirement_contains_template_placeholder, resolve_git_pin, sha_pin_rewrite,
+    tag_pin_is_up_to_date, warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName};
@@ -29,7 +30,11 @@ pub struct GitlabCiFormatter {
     /// S2, see [`crate::types::IncludeKind::endpoint`]'s doc) — so an unrelated `project:`
     /// and `component:` include can never share one entry even when their host-qualified
     /// names collide textually.
-    pub(crate) tag_index: Arc<DashMap<(EndpointKind, PackageName), Arc<TagIndex>>>,
+    pub(crate) tag_index: Arc<crate::registry::ProjectIndexes>,
+    /// Probe evidence filled by [`crate::registry::GitlabCiRegistry`]'s background probes, read
+    /// synchronously by diagnostics, status and hover. Empty unless shared with the registry
+    /// through [`Self::with_probe_stores`].
+    pub(crate) probe_stores: Arc<ProbeStores>,
 }
 
 impl GitlabCiFormatter {
@@ -37,9 +42,50 @@ impl GitlabCiFormatter {
     #[must_use]
     pub fn new(
         routes: Arc<DashMap<String, GitlabRoute>>,
-        tag_index: Arc<DashMap<(EndpointKind, PackageName), Arc<TagIndex>>>,
+        tag_index: Arc<crate::registry::ProjectIndexes>,
     ) -> Self {
-        Self { routes, tag_index }
+        Self {
+            routes,
+            tag_index,
+            probe_stores: Arc::new(ProbeStores::default()),
+        }
+    }
+
+    /// Reads probe evidence from `probe_stores`, the handle
+    /// [`crate::registry::GitlabCiRegistry::probe_stores`] returns.
+    #[must_use]
+    pub fn with_probe_stores(mut self, probe_stores: Arc<ProbeStores>) -> Self {
+        self.probe_stores = probe_stores;
+        self
+    }
+
+    /// The stored answer to "is `written` a branch of `gl_dep`'s project".
+    pub(crate) fn branch_evidence(
+        &self,
+        gl_dep: &GitlabCiDependency,
+        written: &str,
+    ) -> Option<BranchEvidence> {
+        let git_ref = ProbeRef::parse(written)?;
+        self.probe_stores
+            .branches
+            .get(&self.normalize_package_name(&gl_dep.name), &git_ref)
+    }
+
+    /// The proof that a commentless `project:` SHA pin is ahead of the latest release and on
+    /// the default branch, when probes stored both facts.
+    fn commit_proof(&self, gl_dep: &GitlabCiDependency) -> Option<AheadProof> {
+        let Some(PinStyle::Sha { sha, tail }) = &gl_dep.pin else {
+            return None;
+        };
+        if gl_dep.kind.endpoint() != EndpointKind::Tags || tail.comment().is_some() {
+            return None;
+        }
+        let index = self.tag_list_index(gl_dep)?;
+        self.probe_stores.proof_for_untagged(
+            &self.normalize_package_name(&gl_dep.name),
+            &index,
+            sha,
+        )
     }
 
     /// Looks up `pin`'s commit SHA for `name` under `endpoint` in the shared tag index,
@@ -83,7 +129,7 @@ impl GitlabCiFormatter {
     /// use deps_core::PackageName;
     /// use std::sync::Arc;
     ///
-    /// let tag_index = Arc::new(DashMap::new());
+    /// let tag_index = Arc::new(deps_gitlab_ci::registry::ProjectIndexes::default());
     /// let index = TagIndex::from_tags([("v1.0.0", &CommitSha::parse(&"a".repeat(40)).unwrap())]);
     /// tag_index.insert(
     ///     (EndpointKind::Tags, PackageName::new("gitlab.com/org/proj")),
@@ -155,7 +201,7 @@ impl GitlabCiFormatter {
             .tag_index
             .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()));
         Some(CommentCheck::evaluate(
-            index.as_deref().map(AsRef::as_ref),
+            index.as_deref(),
             sha,
             tail.comment(),
         ))
@@ -229,6 +275,7 @@ impl GitlabCiFormatter {
                 latest.as_str(),
                 PartialTagPolicy::Exact,
                 status,
+                self.branch_evidence(gl_dep, requirement.as_str()),
             );
             index.cap_status_if_tag_unlisted(requirement.as_str(), status)
         })
@@ -269,7 +316,7 @@ impl GitlabCiFormatter {
             .tag_index
             .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()));
         ShaPinLookup::resolve(
-            index.as_deref().map(AsRef::as_ref),
+            index.as_deref(),
             sha,
             latest,
             gl_dep.sha_comment().map(|comment| &comment.tag),
@@ -279,7 +326,7 @@ impl GitlabCiFormatter {
 
 impl PackageNaming for GitlabCiFormatter {
     fn normalized_spelling(&self, name: &PackageName) -> String {
-        name.as_str().to_lowercase()
+        deps_core::lsp_helpers::LowercaseNaming.normalized_spelling(name)
     }
 
     /// Accepts both the bare (`org/proj[/comp]`) and host-qualified
@@ -295,6 +342,17 @@ impl PackageNaming for GitlabCiFormatter {
 impl PackageRendering for GitlabCiFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.as_str().to_string()
+    }
+
+    /// "Commit N ahead of latest release" for a commentless SHA pin that probes proved ahead of
+    /// the latest release and on the default branch (GitLab reports no count).
+    fn hover_provenance(
+        &self,
+        dep: &dyn Dependency,
+    ) -> Option<deps_core::lsp_helpers::HoverProvenance> {
+        let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
+        self.commit_proof(gl_dep)
+            .map(|proof| proof.hover_provenance())
     }
 
     /// Preserves `current`'s `v`-prefix style for a normal (Tag/unpinned) update;
@@ -455,11 +513,17 @@ impl RequirementResolution for GitlabCiFormatter {
             self.distrust_unpublished_tag(gl_dep, requirement, latest, status)
         };
         if let PinStyle::Sha { sha, tail } = pin {
-            self.sha_pin_lookup(gl_dep, sha, latest).status_or_text(|| {
+            let lookup = self.sha_pin_lookup(gl_dep, sha, latest);
+            let untagged = lookup == ShaPinLookup::NotIndexed;
+            let status = lookup.status_or_text(|| {
                 tail.comment().map_or_else(pin_text_status, |comment| {
                     Self::comment_status(gl_dep, comment, latest)
                 })
-            })
+            });
+            match self.commit_proof(gl_dep).filter(|_| untagged) {
+                Some(proof) => proof.override_status(status),
+                None => status,
+            }
         } else {
             pin_text_status()
         }
@@ -625,6 +689,7 @@ impl OsvNaming for GitlabCiFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::NormalizedName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
     use deps_core::lsp_helpers::{ResolvedPin, SiblingScope};
@@ -632,7 +697,10 @@ mod tests {
     use std::assert_matches;
 
     fn formatter() -> GitlabCiFormatter {
-        GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()))
+        GitlabCiFormatter::new(
+            Arc::new(DashMap::new()),
+            Arc::new(crate::registry::ProjectIndexes::default()),
+        )
     }
 
     fn resolved_complete(pin: ResolvedPin) -> PinResolution {
@@ -1978,7 +2046,7 @@ mod tests {
         );
         let mut cached = std::collections::HashMap::new();
         cached.insert(
-            PackageName::new("gitlab.com/org/proj"),
+            NormalizedName::for_test("gitlab.com/org/proj"),
             deps_core::PackageVersions::latest_only("v19.4.1"),
         );
         let resolved = std::collections::HashMap::new();
@@ -2311,7 +2379,10 @@ mod tests {
 
         let fmt = formatter();
         let mut cached = HashMap::new();
-        cached.insert(dep.name().clone(), PackageVersions::latest_only("16.0.1"));
+        cached.insert(
+            NormalizedName::for_test(dep.name().as_str()),
+            PackageVersions::latest_only("16.0.1"),
+        );
         let resolved = HashMap::new();
         let versions = VersionData::new(&cached, &resolved);
 

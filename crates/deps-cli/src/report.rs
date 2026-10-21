@@ -68,7 +68,7 @@ pub enum Category {
     /// (GitHub Actions/GitLab CI).
     #[value(name = "sha-comment-mismatch")]
     ShaCommentMismatch,
-    /// A tag pin's ref is a full release that no published tag of the repository matches
+    /// A tag pin's ref is neither a published tag nor a branch of the repository
     /// (GitHub Actions/GitLab CI).
     #[value(name = "unknown-ref")]
     UnknownRef,
@@ -135,7 +135,7 @@ impl Category {
                 "The version comment next to a SHA pin is not confirmed by the repository's tag index."
             }
             Self::UnknownRef => {
-                "The ref of a tag pin is a full release that no published tag of the repository matches."
+                "The ref of a tag pin is neither a published tag nor a branch of the repository."
             }
             Self::License => "The resolved license violates the configured allow/deny policy.",
             Self::Deprecated => {
@@ -411,6 +411,42 @@ impl FailOnPolicy {
     }
 }
 
+/// The stderr notes a run prints about probes that went unanswered, in print order.
+///
+/// The ref-probe note (spec 086 FR-030) appears only when the run gates on
+/// [`Category::UnknownRef`], since otherwise nothing depends on the answers; the identity
+/// lookup note (spec 088 FR-019) always appears, because the affected dependencies fall back to
+/// their source-control version whatever the gate. Neither changes the exit code.
+///
+/// # Examples
+///
+/// ```
+/// use deps_cli::report::{Category, FailOnPolicy, probe_notes};
+/// use deps_core::lsp_helpers::ProbeReport;
+/// use deps_engine::probe::ProbeSummary;
+///
+/// let mut summary = ProbeSummary::default();
+/// summary.add(&ProbeReport { inconclusive: 2, ..ProbeReport::default() });
+/// assert!(probe_notes(&summary, &FailOnPolicy::default_categories()).is_empty());
+/// let gated = FailOnPolicy::new(vec![Category::UnknownRef]);
+/// assert_eq!(probe_notes(&summary, &gated).len(), 1);
+/// ```
+#[must_use]
+pub fn probe_notes(
+    summary: &deps_engine::probe::ProbeSummary,
+    fail_on: &FailOnPolicy,
+) -> Vec<String> {
+    let ref_probes = fail_on
+        .categories()
+        .contains(&Category::UnknownRef)
+        .then(|| summary.unanswered_note())
+        .flatten();
+    ref_probes
+        .into_iter()
+        .chain(summary.incomplete_identity_lookups_note())
+        .collect()
+}
+
 impl Default for FailOnPolicy {
     fn default() -> Self {
         Self::default_categories()
@@ -483,6 +519,9 @@ pub struct ManifestCheckResult {
     /// `deps_engine::classify::license::TierThreeLicenseFetch::timed_out`'s doc for exactly
     /// which failure modes this can (and cannot) detect.
     pub license_fetch_incomplete: bool,
+    /// The manifest's ref-probe passes (specs 086/087), summed by the caller into one
+    /// [`deps_engine::probe::ProbeSummary`] for the run's single stderr note.
+    pub probe_report: deps_core::lsp_helpers::ProbeReport,
 }
 
 /// Classifies one already-routed manifest.
@@ -559,6 +598,7 @@ pub async fn check_manifest(
         findings,
         registry_unreachable: analysis.registry_unreachable,
         license_fetch_incomplete: analysis.license_fetch_incomplete,
+        probe_report: analysis.probe_report,
     })
 }
 
@@ -661,7 +701,7 @@ fn to_finding(
     diagnostic: Diagnostic,
     advisory_facts: &HashMap<(deps_core::osv::VulnKey, OsvId), AdvisoryFacts>,
     vuln_keys: &VulnKeys,
-    cached_versions: &HashMap<deps_core::PackageName, deps_core::lsp_helpers::PackageVersions>,
+    cached_versions: &deps_core::CachedVersionsMap,
 ) -> CheckFinding {
     let dep = dep_index.lookup(diagnostic.range);
     let advisory_url = diagnostic
@@ -683,14 +723,13 @@ fn to_finding(
     let advisory = facts.cloned();
     // Spec 074 FR-005: attribute an `Outdated` finding to an active GOSSIP cooldown when it
     // is the sole reason a newer version was excluded from being "latest" — matched by the
-    // occurrence's own (pre-redaction) `PackageName`, never `CheckFinding::dependency_name`
+    // occurrence's own normalized `PackageKey`, never `CheckFinding::dependency_name`
     // (already redacted by this point, and not guaranteed to equal `cached_versions`'s key). No `deps-core` change: this only reads the additive
     // `PackageVersions::gossip_excluded_version` field `deps-engine`'s fetch already set.
     let mut message = diagnostic.message().to_string();
     if classify(diagnostic.kind()) == Category::Outdated
         && let Some(dep) = dep
-        && deps_core::PackageKey::new(dep.name(), formatter)
-            .find_in(cached_versions)
+        && deps_core::lsp_helpers::cached_package_versions(cached_versions, dep, formatter)
             .is_some_and(|v| v.gossip_excluded_version.is_some())
     {
         message.push_str(
@@ -721,7 +760,10 @@ fn to_finding(
 /// category, and `Other` is the documented bucket for a finding that matches none.
 /// [`DiagnosticKind::FlaggedLatest`], [`DiagnosticKind::UnverifiedLatest`],
 /// [`DiagnosticKind::UnresolvedGitlabHost`] and [`DiagnosticKind::Notice`] are likewise `Other`;
-/// the "+N more advisories" overflow line is still a [`Category::Vulnerable`] finding.
+/// so is [`DiagnosticKind::DuplicateDefaultCatalog`] (a `pnpm-workspace.yaml` defining the
+/// default catalog twice), which is therefore outside the default `--fail-on` set and gated only
+/// by `--fail-on other`. The "+N more advisories" overflow line is still a
+/// [`Category::Vulnerable`] finding.
 const fn classify(kind: &DiagnosticKind) -> Category {
     match kind {
         DiagnosticKind::Outdated => Category::Outdated,
@@ -737,6 +779,7 @@ const fn classify(kind: &DiagnosticKind) -> Category {
         | DiagnosticKind::UnverifiedLatest
         | DiagnosticKind::Typosquat
         | DiagnosticKind::UnresolvedGitlabHost
+        | DiagnosticKind::DuplicateDefaultCatalog
         | DiagnosticKind::Notice => Category::Other,
     }
 }
@@ -782,7 +825,7 @@ pub(crate) fn kind_for(category: Category) -> DiagnosticKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::PackageName;
+    use deps_core::{NormalizedName, PackageName};
 
     fn finding(category: Category) -> CheckFinding {
         CheckFinding {
@@ -963,6 +1006,7 @@ mod tests {
             ),
             (DiagnosticKind::UnknownRef, Category::UnknownRef),
             (DiagnosticKind::UnresolvedGitlabHost, Category::Other),
+            (DiagnosticKind::DuplicateDefaultCatalog, Category::Other),
             (DiagnosticKind::Notice, Category::Other),
         ];
         for (kind, expected) in cases {
@@ -1148,7 +1192,7 @@ mod tests {
             diagnostic_with(DiagnosticKind::Outdated, "Newer version available: 1.0.0");
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             deps_core::lsp_helpers::PackageVersions::latest_only("1.0.0")
                 .with_gossip_excluded_version(deps_core::ConcreteVersion::new("2.0.0")),
         );
@@ -1180,7 +1224,7 @@ mod tests {
             diagnostic_with(DiagnosticKind::Outdated, "Newer version available: 1.0.0");
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             deps_core::lsp_helpers::PackageVersions::latest_only("1.0.0"),
         );
         let finding = to_finding(
@@ -1735,13 +1779,13 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             deps_core::lsp_helpers::PackageVersions::latest_only("2.0.0"),
         );
 
         let mut gossip_findings = HashMap::new();
         gossip_findings.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             stub_gossip_findings(
                 "2.0.0",
                 Some(GossipCooldown::new(
@@ -1772,6 +1816,7 @@ mod tests {
             fetch_failed: HashSet::new(),
             registry_unreachable: false,
             license_fetch_incomplete: false,
+            probe_report: deps_core::lsp_helpers::ProbeReport::default(),
         };
 
         let diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(

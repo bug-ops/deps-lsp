@@ -78,7 +78,7 @@ pub struct PinNoun {
 ///     collect_update_all_edits, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
 ///     PackageRendering, PackageVersions, RequirementResolution, SourcePolicy, VersionData,
 /// };
-/// use deps_core::{ConcreteVersion, Dependency, ParseResult, PackageName, VersionReq};
+/// use deps_core::{ConcreteVersion, Dependency, NormalizedName, ParseResult, PackageName, VersionReq};
 /// use std::any::Any;
 /// use std::collections::HashMap;
 /// use tower_lsp_server::ls_types::{Position, Range};
@@ -138,7 +138,7 @@ pub struct PinNoun {
 /// };
 ///
 /// let mut cached = HashMap::new();
-/// cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
+/// cached.insert(NormalizedName::for_test("serde"), PackageVersions::latest_only("1.2.0"));
 /// let resolved = HashMap::new();
 ///
 /// let edits = collect_update_all_edits(
@@ -445,7 +445,10 @@ mod tests {
             let content = r#"serde = "1.0.0""#;
             let pr = parse_result(vec![dep("serde", Some("1.0.0"), Some(range(0, 9, 0, 14)))]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("1.0.0"));
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
@@ -471,8 +474,14 @@ mod tests {
                 dep("tokio", Some("1.0.0"), Some(range(1, 9, 1, 14))),
             ]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
-            cached.insert("tokio".into(), PackageVersions::latest_only("1.3.0"));
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.2.0"),
+            );
+            cached.insert(
+                NormalizedName::for_test("tokio"),
+                PackageVersions::latest_only("1.3.0"),
+            );
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
@@ -508,7 +517,10 @@ mod tests {
             let content = r#"serde = "1.0.0""#;
             let pr = parse_result(vec![dep("serde", Some("1.0.0"), Some(range(0, 9, 0, 14)))]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.2.0"),
+            );
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
@@ -532,7 +544,10 @@ mod tests {
             let content = "serde = \"1.0.0\"\n";
             let pr = parse_result(vec![dep("serde", Some("1.0.0"), None)]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.2.0"),
+            );
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -552,7 +567,10 @@ mod tests {
             let content = "pkg = \"\"\n";
             let pr = parse_result(vec![dep("pkg", Some(""), Some(range(0, 6, 0, 6)))]);
             let mut cached = HashMap::new();
-            cached.insert("pkg".into(), PackageVersions::latest_only("1.0.0"));
+            cached.insert(
+                NormalizedName::for_test("pkg"),
+                PackageVersions::latest_only("1.0.0"),
+            );
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -594,7 +612,10 @@ mod tests {
             let content = "serde = \"1.0.0\"\n";
             let pr = parse_result(vec![dep("serde", Some("1.0.0"), Some(range(0, 9, 0, 14)))]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only(""));
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only(""),
+            );
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -614,7 +635,10 @@ mod tests {
             let content = "serde = \"1.0.0\"\n";
             let pr = parse_result(vec![dep("serde", Some("1.0.0"), Some(range(0, 9, 0, 14)))]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("   "));
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("   "),
+            );
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -634,7 +658,7 @@ mod tests {
             let pr = parse_result(vec![dep("serde", Some("1.0.0"), Some(range(0, 9, 0, 14)))]);
             let mut cached = HashMap::new();
             cached.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.2.0\", \"evil\": \"true"),
             );
             let resolved = HashMap::new();
@@ -655,7 +679,10 @@ mod tests {
             let content = "serde = \"^1.0\"\n";
             let pr = parse_result(vec![dep("serde", Some("^1.0"), Some(range(0, 9, 0, 13)))]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.2.0"),
+            );
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -675,7 +702,10 @@ mod tests {
             let content = r#"pkg = "1.0.0""#;
             let pr = parse_result(vec![dep("pkg", Some("1.0.0"), Some(range(0, 7, 0, 12)))]);
             let mut cached = HashMap::new();
-            cached.insert("pkg".into(), PackageVersions::latest_only("1.0.0"));
+            cached.insert(
+                NormalizedName::for_test("pkg"),
+                PackageVersions::latest_only("1.0.0"),
+            );
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -735,7 +765,10 @@ mod tests {
             let content = r#"pkg = "1.0.0""#;
             let pr = parse_result(vec![dep("pkg", Some("1.0.0"), Some(range(0, 7, 0, 12)))]);
             let mut cached = HashMap::new();
-            cached.insert("pkg".into(), PackageVersions::latest_only("1.2.0"));
+            cached.insert(
+                NormalizedName::for_test("pkg"),
+                PackageVersions::latest_only("1.2.0"),
+            );
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -758,7 +791,10 @@ mod tests {
                 Some(range(0, 9, 0, 25)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("slf4j-api".into(), PackageVersions::latest_only("2.1.0"));
+            cached.insert(
+                NormalizedName::for_test("slf4j-api"),
+                PackageVersions::latest_only("2.1.0"),
+            );
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -784,7 +820,10 @@ mod tests {
                 Some(range(0, 3, 0, 13)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("pkg".into(), PackageVersions::latest_only("3.0.0"));
+            cached.insert(
+                NormalizedName::for_test("pkg"),
+                PackageVersions::latest_only("3.0.0"),
+            );
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -808,7 +847,7 @@ mod tests {
             )]);
             let mut cached = HashMap::new();
             cached.insert(
-                "Newtonsoft.Json".into(),
+                NormalizedName::for_test("Newtonsoft.Json"),
                 PackageVersions::latest_only("13.0.3"),
             );
             let resolved = HashMap::new();
@@ -839,7 +878,7 @@ mod tests {
             )]);
             let mut cached = HashMap::new();
             cached.insert(
-                "Newtonsoft.Json".into(),
+                NormalizedName::for_test("Newtonsoft.Json"),
                 PackageVersions::latest_only("13.0.3"),
             );
             let resolved = HashMap::new();
@@ -869,7 +908,7 @@ mod tests {
             )]);
             let mut cached = HashMap::new();
             cached.insert(
-                "Newtonsoft.Json".into(),
+                NormalizedName::for_test("Newtonsoft.Json"),
                 PackageVersions::latest_only("13.0.3"),
             );
             let resolved = HashMap::new();
@@ -899,7 +938,7 @@ mod tests {
             )]);
             let mut cached = HashMap::new();
             cached.insert(
-                "Newtonsoft.Json".into(),
+                NormalizedName::for_test("Newtonsoft.Json"),
                 PackageVersions::latest_only("13.0.3"),
             );
             let resolved = HashMap::new();
@@ -928,7 +967,10 @@ mod tests {
                 Some(range(0, 9, 0, 18)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("interval-dep".into(), PackageVersions::latest_only("3.0.0"));
+            cached.insert(
+                NormalizedName::for_test("interval-dep"),
+                PackageVersions::latest_only("3.0.0"),
+            );
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -954,8 +996,14 @@ mod tests {
                 dep("unknown", Some("1.0.0"), Some(range(2, 11, 2, 16))),
             ]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("2.0.0"));
-            cached.insert("tokio".into(), PackageVersions::latest_only("1.9.0"));
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("2.0.0"),
+            );
+            cached.insert(
+                NormalizedName::for_test("tokio"),
+                PackageVersions::latest_only("1.9.0"),
+            );
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
@@ -988,8 +1036,14 @@ mod tests {
                 dep("aaaa-dup", Some("1.0.0"), Some(range(0, 8, 0, 13))),
             ]);
             let mut cached = HashMap::new();
-            cached.insert("aaaa".into(), PackageVersions::latest_only("2.0.0"));
-            cached.insert("aaaa-dup".into(), PackageVersions::latest_only("3.0.0"));
+            cached.insert(
+                NormalizedName::for_test("aaaa"),
+                PackageVersions::latest_only("2.0.0"),
+            );
+            cached.insert(
+                NormalizedName::for_test("aaaa-dup"),
+                PackageVersions::latest_only("3.0.0"),
+            );
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(

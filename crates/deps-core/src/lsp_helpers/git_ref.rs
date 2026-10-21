@@ -5,7 +5,8 @@
 //! defining them locally.
 
 use super::{
-    BoundedVersionReq, CommentTag, LineOffsetTable, RequirementStatus, concrete_pin_version,
+    BoundedVersionReq, BranchEvidence, CommentTag, LineOffsetTable, RequirementStatus,
+    concrete_pin_version,
 };
 use crate::EcosystemId;
 use crate::pagination::ListCoverage;
@@ -920,7 +921,9 @@ impl TagIndex {
                 sibling_coverage: self.coverage,
             },
             None => match self.unpublished_tag_ref(written) {
-                Some(UnpublishedRef::Release) => PinResolution::Unpublished,
+                Some(UnpublishedRef::Release | UnpublishedRef::NotABranch) => {
+                    PinResolution::Unpublished
+                }
                 Some(UnpublishedRef::Partial) | None => self.unlisted_or_unresolved(),
             },
         }
@@ -1009,7 +1012,9 @@ impl TagIndex {
     /// Caps an up-to-date status read from the text of a tag pin `written` that this index
     /// proves unpublished (see [`Self::unpublished_tag_ref`] and [`UnpublishedRef::cap_status`]):
     /// a full release at any position, a partial shape only when ahead of `latest`. Any other
-    /// pin, and an index that cannot prove absence, leave `status`.
+    /// pin, and an index that cannot prove absence, leave `status`. `branch` is the stored
+    /// evidence for the ref ([`UnpublishedRef::refine`]): a partial shape no branch carries is
+    /// capped like a full release.
     #[must_use]
     pub fn cap_status_if_unpublished(
         &self,
@@ -1017,9 +1022,11 @@ impl TagIndex {
         latest: &str,
         policy: PartialTagPolicy,
         status: RequirementStatus,
+        branch: Option<BranchEvidence>,
     ) -> RequirementStatus {
         self.unpublished_tag_ref(written).map_or(status, |kind| {
-            kind.cap_status(written, latest, policy, status)
+            kind.refine(branch)
+                .cap_status(written, latest, policy, status)
         })
     }
 
@@ -1166,7 +1173,7 @@ impl TagIndex {
     /// Whether `other` differs from `self` in anything a finding is derived from: the
     /// tag-to-commit mapping, the list coverage, or the canonical repository name.
     ///
-    /// Drives [`crate::TagIndexRefreshSender`]: a refetch that changes none of these cannot
+    /// Drives [`crate::RefreshSender`]: a refetch that changes none of these cannot
     /// change a finding, so it must not trigger a rescan.
     ///
     /// # Examples
@@ -1275,6 +1282,7 @@ pub enum PinResolution {
 /// assert_eq!(capped(UnpublishedRef::Release, "4.3.1"), RequirementStatus::Unresolved);
 /// assert_eq!(capped(UnpublishedRef::Partial, "v40"), RequirementStatus::Unresolved);
 /// assert_eq!(capped(UnpublishedRef::Partial, "v1"), RequirementStatus::UpToDate);
+/// assert_eq!(capped(UnpublishedRef::NotABranch, "v1"), RequirementStatus::Unresolved);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnpublishedRef {
@@ -1285,9 +1293,41 @@ pub enum UnpublishedRef {
     /// Any other tag-shaped ref (`v1`, `v5.x`, `v3-node20`, `v40`, `v3.4.0-working`): it may be a
     /// branch, so only a ref ahead of the newest release is distrusted, and it is not reported.
     Partial,
+    /// A [`Self::Partial`] ref that a branch probe proved is no branch either (see
+    /// [`Self::refine`]): it names nothing, so it is unknown at any position, exactly like a
+    /// [`Self::Release`]. [`TagIndex::unpublished_tag_ref`] never returns it; it only exists
+    /// once branch evidence refines a `Partial`.
+    NotABranch,
 }
 
 impl UnpublishedRef {
+    /// Folds branch `evidence` into the kind: a [`Self::Partial`] ref the forge says has no
+    /// branch becomes [`Self::NotABranch`]. Missing evidence, an existing branch, and the
+    /// other kinds are unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{BranchEvidence, UnpublishedRef};
+    ///
+    /// let partial = UnpublishedRef::Partial;
+    /// assert_eq!(partial.refine(Some(BranchEvidence::Absent)), UnpublishedRef::NotABranch);
+    /// assert_eq!(partial.refine(Some(BranchEvidence::Exists)), UnpublishedRef::Partial);
+    /// assert_eq!(partial.refine(None), UnpublishedRef::Partial);
+    /// assert_eq!(
+    ///     UnpublishedRef::Release.refine(Some(BranchEvidence::Absent)),
+    ///     UnpublishedRef::Release
+    /// );
+    /// ```
+    #[must_use]
+    pub const fn refine(self, evidence: Option<BranchEvidence>) -> Self {
+        match (self, evidence) {
+            (Self::Partial, Some(BranchEvidence::Absent)) => Self::NotABranch,
+            (Self::Partial, Some(BranchEvidence::Exists) | None)
+            | (Self::Release | Self::NotABranch, _) => self,
+        }
+    }
+
     /// Caps a status read from the text of an unpublished ref: it never reads as up to date when
     /// the ref is a [`Self::Release`], or a [`Self::Partial`] ahead of `latest`. An outdated
     /// status stays outdated, since the bump target is valid either way.
@@ -1303,7 +1343,7 @@ impl UnpublishedRef {
             return status;
         }
         match self {
-            Self::Release => RequirementStatus::Unresolved,
+            Self::Release | Self::NotABranch => RequirementStatus::Unresolved,
             Self::Partial => {
                 if tag_pin_position(written, latest, policy) == TagPinPosition::Ahead {
                     RequirementStatus::Unresolved
@@ -2483,6 +2523,48 @@ mod tests {
         assert_eq!(cap(Partial, "v1", Outdated), Outdated);
         assert_eq!(cap(Partial, "v3-node20", UpToDate), UpToDate);
         assert_eq!(cap(Partial, "v40", Unresolved), Unresolved);
+        assert_eq!(cap(UnpublishedRef::NotABranch, "v1", UpToDate), Unresolved);
+        assert_eq!(cap(UnpublishedRef::NotABranch, "v1", Outdated), Outdated);
+    }
+
+    /// #1778: only branch evidence of absence turns a partial ref into `NotABranch`.
+    #[test]
+    fn test_unpublished_ref_refine_matrix() {
+        use BranchEvidence::{Absent, Exists};
+        use UnpublishedRef::{NotABranch, Partial, Release};
+
+        for (kind, evidence, expected) in [
+            (Partial, Some(Absent), NotABranch),
+            (Partial, Some(Exists), Partial),
+            (Partial, None, Partial),
+            (Release, Some(Absent), Release),
+            (Release, Some(Exists), Release),
+            (Release, None, Release),
+            (NotABranch, Some(Exists), NotABranch),
+            (NotABranch, None, NotABranch),
+        ] {
+            assert_eq!(kind.refine(evidence), expected, "{kind:?} {evidence:?}");
+        }
+    }
+
+    #[test]
+    fn test_cap_status_if_unpublished_uses_branch_evidence() {
+        use RequirementStatus::{Unresolved, UpToDate};
+
+        let sha = sha_of('a');
+        let index = TagIndex::from_tags([("v4.3.1", &sha)]);
+        let cap = |branch| {
+            index.cap_status_if_unpublished(
+                "v1",
+                "v4.3.1",
+                PartialTagPolicy::MovingLine,
+                UpToDate,
+                branch,
+            )
+        };
+        assert_eq!(cap(None), UpToDate);
+        assert_eq!(cap(Some(BranchEvidence::Exists)), UpToDate);
+        assert_eq!(cap(Some(BranchEvidence::Absent)), Unresolved);
     }
 
     fn comment_tag(text: &str) -> CommentTag {

@@ -46,6 +46,9 @@ use crate::auth::{
 };
 use crate::keychain::KeychainStore;
 use crate::package_location::RegistryScope;
+use crate::scm::ScmToRegistryHandle;
+use crate::scm_memo::ScmIdentityMemo;
+use deps_core::policy_config::ScmToRegistry;
 
 const REGISTRIES_FILE: &str = "registries.json";
 
@@ -773,6 +776,23 @@ impl SwiftRegistriesConfig {
         }
     }
 
+    /// The `[default]` registry as a lookup target, when it is valid and `Trusted`.
+    ///
+    /// Meaningful only on a config merged from the user tier alone (see
+    /// [`SwiftParseContext::resolve_user_tier`]): the lookup registry must never come from a
+    /// workspace-declared file.
+    pub(crate) fn trusted_lookup(&self) -> Option<TrustedLookupRegistry<'_>> {
+        match self.default.as_ref()? {
+            Ok(default) if default.url.trust() == RegistryTrust::Trusted => {
+                Some(TrustedLookupRegistry {
+                    default,
+                    config: self,
+                })
+            }
+            Ok(_) | Err(_) => None,
+        }
+    }
+
     /// Every valid registry this config carries, deduplicated by URL.
     #[cfg(test)]
     pub(crate) fn resolved_registries(&self) -> Vec<ResolvedSwiftRegistry> {
@@ -784,6 +804,33 @@ impl SwiftRegistriesConfig {
             .filter(|resolved| seen.insert(resolved.url.as_str().to_string()))
             .cloned()
             .collect()
+    }
+}
+
+/// The user-tier `[default]` registry that identity lookups may be sent to, with the user-tier
+/// scope table that routes the identities it returns.
+///
+/// Obtainable only from [`SwiftRegistriesConfig::trusted_lookup`], so a value proves the registry
+/// is valid and `Trusted`; built from a user-tier-only config it also proves the registry is the
+/// operator's own, never one a repository declared.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TrustedLookupRegistry<'c> {
+    default: &'c ResolvedSwiftRegistry,
+    config: &'c SwiftRegistriesConfig,
+}
+
+impl<'c> TrustedLookupRegistry<'c> {
+    /// The registry identity lookups are sent to.
+    pub(crate) const fn default_registry(&self) -> &'c ResolvedSwiftRegistry {
+        self.default
+    }
+
+    /// The registry the user tier routes `scope` to (`scoped[scope] ?? default`), if it is valid
+    /// and `Trusted`.
+    pub(crate) fn route(&self, scope: &RegistryScope) -> Option<&'c ResolvedSwiftRegistry> {
+        self.config
+            .resolved_registry_for(scope)
+            .filter(|registry| registry.url.trust() == RegistryTrust::Trusted)
     }
 }
 
@@ -799,6 +846,8 @@ pub struct SwiftParseContext {
     user_config: UserConfigPath,
     credential: Option<Arc<SwiftCredentialSource>>,
     keychain: Option<KeychainWiring>,
+    scm_to_registry: Arc<ScmToRegistryHandle>,
+    identity_memo: Option<Arc<ScmIdentityMemo>>,
 }
 
 /// The opt-in Keychain source: the process-wide store, the live setting, and the platform it
@@ -858,7 +907,51 @@ impl SwiftParseContext {
             user_config,
             credential,
             keychain: None,
+            scm_to_registry: Arc::default(),
+            identity_memo: None,
         }
+    }
+
+    /// Shares the live `registries.swift_scm_to_registry` setting with this context. Without it
+    /// the setting stays `Disabled`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::policy_config::ScmToRegistry;
+    /// use deps_swift::{ScmToRegistryHandle, SwiftParseContext};
+    /// use std::sync::Arc;
+    ///
+    /// let handle = Arc::new(ScmToRegistryHandle::new(ScmToRegistry::Replace));
+    /// let context = SwiftParseContext::default().with_scm_to_registry(Arc::clone(&handle));
+    /// assert!(format!("{context:?}").contains("replace: true"));
+    /// ```
+    #[must_use]
+    pub fn with_scm_to_registry(mut self, handle: Arc<ScmToRegistryHandle>) -> Self {
+        self.scm_to_registry = handle;
+        self
+    }
+
+    /// Connects the memo of repository-URL identities that parses read; set by
+    /// `SwiftEcosystem::with_context` from its registry.
+    pub(crate) fn with_identity_memo(mut self, memo: Arc<ScmIdentityMemo>) -> Self {
+        self.identity_memo = Some(memo);
+        self
+    }
+
+    /// The live `registries.swift_scm_to_registry` setting.
+    pub(crate) fn scm_mode(&self) -> ScmToRegistry {
+        self.scm_to_registry.get()
+    }
+
+    /// The handle owning the once-per-change missing-default warning.
+    pub(crate) fn scm_handle(&self) -> &ScmToRegistryHandle {
+        &self.scm_to_registry
+    }
+
+    /// The memo parses read, when one is connected.
+    pub(crate) fn identity_memo(&self) -> Option<&Arc<ScmIdentityMemo>> {
+        self.identity_memo.as_ref()
     }
 
     /// Adds the opt-in macOS Keychain credential source, gated by `handle`. The store and its
@@ -985,6 +1078,19 @@ impl SwiftParseContext {
                 })
             })
             .map_or(TierFile::Absent, |path| self.cache.read(&path));
+        self.resolve_tiers(project)
+    }
+
+    /// The configuration of the user tier alone, ignoring any project-tier file.
+    ///
+    /// The only configuration identity lookups and swizzled dependencies are routed by: a
+    /// repository's own `registries.json` is attacker-controlled, so it must never choose where
+    /// repository URLs are sent (spec 088 FR-004).
+    pub(crate) fn resolve_user_tier(&self) -> SwiftRegistriesConfig {
+        self.resolve_tiers(TierFile::Absent)
+    }
+
+    fn resolve_tiers(&self, project: TierFile) -> SwiftRegistriesConfig {
         let user = match &self.user_config {
             UserConfigPath::Path(path) => UserInput::Read(path, self.cache.read(path.as_path())),
             UserConfigPath::InvalidXdgConfigHome => UserInput::NoFile(self.cache.unusable(

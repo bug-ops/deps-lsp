@@ -755,6 +755,18 @@ pub async fn assert_non_registry_source_yields_no_fetch(
             "non-registry source {source:?} must suppress the public-registry hover link"
         );
     }
+
+    // `public_content` must not diverge from the source gate where an ecosystem does not override it.
+    for dep in parse_result.dependencies() {
+        assert_eq!(
+            formatter.public_content(dep).is_some(),
+            formatter.source_is_public_registry_content(&dep.source()),
+            "public_content must agree with source_is_public_registry_content for {:?} \
+             (source {:?})",
+            dep.name().as_str(),
+            dep.source(),
+        );
+    }
 }
 
 // Note (M9, critic): this used to be its own standalone `non_registry_source_conformance!`

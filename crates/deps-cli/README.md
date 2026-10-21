@@ -192,7 +192,9 @@ elsewhere in the run — one malformed manifest in a large workspace never hides
 `unknown-ref`, `license`, `deprecated`, `other`. Defaults to `vulnerable,yanked,unsatisfiable`
 when the flag is omitted. `sha-comment-mismatch` selects SHA pins whose trailing version comment
 is not confirmed by the repository's tag index; `unknown-ref` selects tag pins whose ref is a
-full release that no published tag matches; neither is part of the default policy. `other`
+full release, or a partial ref such as `@v40`, that is neither a published tag nor a branch (branch
+checks are rationed; set `GITHUB_TOKEN`/`GITLAB_TOKEN` in CI, `--offline` skips them); neither is part
+of the default policy. `other`
 covers every finding that matches none of the nine specific categories and is never part of the
 default policy.
 

@@ -49,6 +49,11 @@ pub struct EcosystemRuntime {
     /// not a [`Self::new`] parameter: set it with [`Self::with_keychain_credentials`] (or
     /// derive it with [`Self::from_policy`]).
     pub keychain_credentials: Arc<deps_core::keychain_credentials::KeychainCredentialsHandle>,
+    /// `registries.swift_scm_to_registry` (spec 088, #1757) — the live setting
+    /// `register_ecosystems` hands the Swift parse context. Like [`Self::keychain_credentials`],
+    /// set it with [`Self::with_scm_to_registry`] or derive it with [`Self::from_policy`].
+    #[cfg(feature = "swift")]
+    pub scm_to_registry: Arc<deps_swift::ScmToRegistryHandle>,
 }
 
 impl EcosystemRuntime {
@@ -89,7 +94,35 @@ impl EcosystemRuntime {
             gitlab_instance_host,
             lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
             keychain_credentials: Arc::default(),
+            #[cfg(feature = "swift")]
+            scm_to_registry: Arc::default(),
         }
+    }
+
+    /// Overrides [`Self::scm_to_registry`]'s default (a handle at `Disabled`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::{ProcessEnv, RegistryEnvironment};
+    /// use deps_core::policy_config::{PolicyConfig, ScmToRegistry};
+    /// use deps_engine::setup::EcosystemRuntime;
+    /// use deps_swift::ScmToRegistryHandle;
+    /// use std::sync::Arc;
+    ///
+    /// let handle = Arc::new(ScmToRegistryHandle::new(ScmToRegistry::Replace));
+    /// let runtime = EcosystemRuntime::from_policy(&PolicyConfig::default(), &RegistryEnvironment::read(&ProcessEnv))
+    ///     .with_scm_to_registry(Arc::clone(&handle));
+    /// assert!(Arc::ptr_eq(&runtime.scm_to_registry, &handle));
+    /// ```
+    #[cfg(feature = "swift")]
+    #[must_use]
+    pub fn with_scm_to_registry(
+        mut self,
+        scm_to_registry: Arc<deps_swift::ScmToRegistryHandle>,
+    ) -> Self {
+        self.scm_to_registry = scm_to_registry;
+        self
     }
 
     /// Overrides [`Self::keychain_credentials`]'s default (a handle at `Disabled`).
@@ -171,7 +204,7 @@ impl EcosystemRuntime {
     #[must_use]
     pub fn from_policy(policy: &PolicyConfig, environment: &RegistryEnvironment) -> Self {
         let resolved = policy.registries.resolve(environment.allowlist());
-        Self::new(
+        let runtime = Self::new(
             Arc::new(
                 deps_core::net_policy::RegistryAccessPolicy::with_environment(
                     resolved.workspace_registries,
@@ -185,7 +218,12 @@ impl EcosystemRuntime {
             deps_core::keychain_credentials::KeychainCredentialsHandle::new(
                 resolved.swift_keychain_credentials,
             ),
-        ))
+        ));
+        #[cfg(feature = "swift")]
+        let runtime = runtime.with_scm_to_registry(Arc::new(deps_swift::ScmToRegistryHandle::new(
+            resolved.swift_scm_to_registry,
+        )));
+        runtime
     }
 }
 
@@ -394,6 +432,7 @@ ecosystem!(
         SwiftFormatter,
         SwiftRegistry,
         SwiftLockParser,
+        ScmToRegistryHandle,
         parse_package_swift,
     ]
 );
@@ -460,6 +499,7 @@ ecosystem!(
         GithubActionsFormatter,
         GithubActionsParseResult,
         GithubActionsRegistry,
+        RepositoryIndexes,
         GithubActionsVersion,
         parse_workflow_yaml,
     ]
@@ -658,7 +698,8 @@ pub fn register_ecosystems(
     #[cfg(feature = "swift")]
     {
         let swift_context = deps_swift::SwiftParseContext::from_environment(Arc::clone(&policy))
-            .with_keychain(Arc::clone(&runtime.keychain_credentials));
+            .with_keychain(Arc::clone(&runtime.keychain_credentials))
+            .with_scm_to_registry(Arc::clone(&runtime.scm_to_registry));
         registry.register(Arc::new(SwiftEcosystem::with_context(
             Arc::new(SwiftRegistry::new(Arc::clone(&cache))),
             swift_context,

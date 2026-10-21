@@ -36,8 +36,10 @@ provides parsing and registry integration for `.gitlab-ci.yml` and `.gitlab/ci/*
   outdated and re-pinned to the latest release's full SHA, never to a bare tag
 - **Unknown-ref diagnostic** — a `project:` tag `ref:` that is a full release no tag of the
   complete Tags list matches (`ref: 1.2.3` beside tag `v1.2.3`) is reported as `unknown-ref`
-  (`unknown_ref_severity`) and reads unresolved; partial refs that may be branches are never
-  reported
+  (`unknown_ref_severity`) and reads unresolved; a partial ref that may be a branch is reported
+  only when a background branch check finds neither a tag nor a branch
+- **Commit lineage** (issue #1725) — a commentless SHA pin proven (via `merge_base`) to descend
+  from the latest release and to be on the default branch is up to date instead of outdated
 - **Branch pins left alone** — a branch `ref:` is never offered an update that rewrites the
   branch name into a version
 - **Placeholder guard** — an unresolved `$VAR`/`${VAR}`/`%VAR%` ref and `$[[ inputs.x ]]`

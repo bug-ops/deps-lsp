@@ -67,6 +67,42 @@ fn test_update_offline_empty_plan_is_clean_and_reports_no_eligible_updates() {
     assert!(stdout.contains("No eligible updates."), "stdout: {stdout}");
 }
 
+/// Spec 078 SC-008: `update` accepts a `pnpm-workspace.yaml` as an npm manifest (an
+/// unrecognized manifest path is an execution error, see
+/// `test_update_unrecognized_manifest_path_is_execution_error`).
+#[test]
+fn test_update_recognizes_pnpm_workspace_yaml_as_an_npm_manifest() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let workspace = dir.path().join("pnpm-workspace.yaml");
+    std::fs::write(&workspace, "catalog:\n  react: ^16.0.0\n").expect("write fixture manifest");
+
+    let output = std::process::Command::new(exe())
+        .args(["update", "--offline"])
+        .arg(&workspace)
+        .output()
+        .expect("run the real deps-cli binary");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No eligible updates."), "stdout: {stdout}");
+
+    // Control: the same content under a name no ecosystem claims is refused, so exit 0 above
+    // proves the workspace file itself was routed.
+    let other = dir.path().join("workspace.yaml");
+    std::fs::write(&other, "catalog:\n  react: ^16.0.0\n").expect("write control file");
+    let control = std::process::Command::new(exe())
+        .args(["update", "--offline"])
+        .arg(&other)
+        .output()
+        .expect("run the real deps-cli binary");
+    assert_eq!(control.status.code(), Some(2));
+}
+
 /// US-005: `--format json` on an empty plan round-trips through the versioned schema, and
 /// carries the `dry_run` marker the caller passed.
 #[test]
@@ -343,7 +379,7 @@ fn plan_monolog(ignore_name: Option<&str>) -> String {
     use deps_core::lsp_helpers::{DependencyOutcomes, PackageVersions};
     use deps_core::net_policy::{MapEnv, RegistryEnvironment};
     use deps_core::policy_config::PolicyConfig;
-    use deps_core::{EcosystemId, EcosystemRegistry, HttpCache, PackageName};
+    use deps_core::{EcosystemId, EcosystemRegistry, HttpCache, NormalizedName, PackageName};
     use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -380,7 +416,7 @@ fn plan_monolog(ignore_name: Option<&str>) -> String {
 
     let mut cached = HashMap::new();
     cached.insert(
-        PackageName::new("monolog/monolog"),
+        NormalizedName::for_test("monolog/monolog"),
         PackageVersions::latest_only("3.5.0"),
     );
     let analysis = ManifestAnalysis {
@@ -404,6 +440,7 @@ fn plan_monolog(ignore_name: Option<&str>) -> String {
         fetch_failed: HashSet::new(),
         registry_unreachable: false,
         license_fetch_incomplete: false,
+        probe_report: deps_core::lsp_helpers::ProbeReport::default(),
     };
 
     let ignore_rules = match ignore_name {
@@ -458,5 +495,76 @@ fn test_update_mixed_case_ignore_rule_skips_the_declared_name() {
         document.items[0].outcome,
         deps_cli::format::json::OutcomeToken::Skipped,
         "{json}"
+    );
+}
+
+/// `deps-cli update` prints the same current column for a catalog entry as for the equivalent
+/// `package.json` dependency. The npm registry is a `mockito` server reached through the
+/// fixture's `.npmrc`; the loopback host is allowed through an explicit `--config`.
+#[tokio::test]
+async fn test_update_current_column_matches_between_catalog_entry_and_package_json() {
+    let mut server = mockito::Server::new_async().await;
+    let _packument = server
+        .mock("GET", "/react")
+        .with_status(200)
+        .with_body(r#"{"versions": {"16.0.0": {}, "19.3.0": {}}}"#)
+        .create_async()
+        .await;
+    let host = server.host_with_port();
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    std::fs::write(
+        dir.path().join(".npmrc"),
+        format!("registry=http://{host}/\n"),
+    )
+    .expect("write npmrc");
+    std::fs::write(
+        dir.path().join("deps.toml"),
+        "[registries]\nworkspace_registries = \"all\"\n[diagnostics]\nvulnerabilities_enabled = false\n",
+    )
+    .expect("write config");
+    std::fs::write(
+        dir.path().join("pnpm-workspace.yaml"),
+        "catalog:\n  react: ^16.0.0\n",
+    )
+    .expect("write workspace");
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"a","dependencies":{"react":"^16.0.0"}}"#,
+    )
+    .expect("write package.json");
+    std::fs::write(
+        dir.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      react:\n        specifier: ^16.0.0\n        version: 16.0.0\n",
+    )
+    .expect("write lockfile");
+
+    let run = |manifest: &str| {
+        let output = std::process::Command::new(exe())
+            .args(["update", "--dry-run", "--config"])
+            .arg(dir.path().join("deps.toml"))
+            .arg(dir.path().join(manifest))
+            .env(
+                "DEPS_LSP_PRIVATE_REGISTRY_HOSTS",
+                host.split(':').next().expect("host"),
+            )
+            .output()
+            .expect("run the real deps-cli binary");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let catalog = run("pnpm-workspace.yaml");
+    let package = run("package.json");
+    assert!(catalog.contains("19.3.0"), "{catalog}");
+    assert!(package.contains("19.3.0"), "{package}");
+    let current = |table: &str| {
+        table
+            .lines()
+            .find(|line| line.contains("react"))
+            .map(str::to_string)
+            .expect("react row")
+    };
+    assert_eq!(
+        current(&catalog).split_whitespace().collect::<Vec<_>>(),
+        current(&package).split_whitespace().collect::<Vec<_>>(),
     );
 }

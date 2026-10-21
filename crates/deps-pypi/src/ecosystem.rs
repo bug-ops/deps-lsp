@@ -1315,19 +1315,15 @@ dependencies = []
 
                 let lock_parser = PypiLockParser;
                 let resolved_packages = lock_parser.parse_lockfile(&lockfile_path).await.unwrap();
-                let resolved_versions: HashMap<PackageName, deps_core::ConcreteVersion> =
-                    resolved_packages
-                        .iter()
-                        .map(|(name, pkg)| {
-                            (PackageName::new(name.as_str()), pkg.version.clone().into())
-                        })
-                        .collect();
+                let (resolved_versions, _) = resolved_packages.split_normalized(&PypiFormatter);
                 // Canonical PEP 503 normalization: both the lockfile key and the
                 // formatter-normalized manifest name land on "zope-interface".
-                assert!(resolved_versions.contains_key("zope-interface"));
+                assert!(
+                    resolved_versions
+                        .contains_key(&deps_core::NormalizedName::for_test("zope-interface"))
+                );
 
-                let cached_versions: HashMap<PackageName, deps_core::PackageVersions> =
-                    HashMap::new();
+                let cached_versions = deps_core::CachedVersionsMap::new();
                 let versions = VersionData::new(&cached_versions, &resolved_versions);
                 let formatter = PypiFormatter;
 

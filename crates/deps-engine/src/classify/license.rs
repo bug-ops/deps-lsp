@@ -22,11 +22,78 @@
 use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
+use deps_core::NormalizedName;
+use deps_core::PackageKey;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::resolve_in_use_version;
 use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
 use std::collections::HashMap;
 use std::time::Duration;
+
+/// One tier-3 license fetch: which dependency it is for, which public package it asks about,
+/// and at which version.
+///
+/// The request name and the result key differ only for a dependency served from one place and
+/// described by another (a SwiftPM dependency swapped to a registry identity, whose license is
+/// the GitHub repository's): the license is requested under
+/// [`deps_core::lsp_helpers::PublicContent::name`] but stored under the dependency's own key, so
+/// hover, diagnostics and the license policy find it.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::test_util::package_key;
+/// use deps_core::{ConcreteVersion, PackageName};
+/// use deps_engine::classify::license::Tier3Target;
+///
+/// let target = Tier3Target::new(package_key("pkg"), ConcreteVersion::from("1.0.0"))
+///     .requesting(PackageName::new("owner/repo"));
+/// assert_eq!(target.key().declared(), &PackageName::new("pkg"));
+/// assert_eq!(target.request(), &PackageName::new("owner/repo"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tier3Target {
+    key: PackageKey,
+    request: PackageName,
+    version: ConcreteVersion,
+}
+
+impl Tier3Target {
+    /// A target requested and stored under `key`'s own declared name.
+    #[must_use]
+    pub fn new(key: PackageKey, version: ConcreteVersion) -> Self {
+        Self {
+            request: key.declared().clone(),
+            key,
+            version,
+        }
+    }
+
+    /// Asks for the license of `request` instead of the dependency's own name.
+    #[must_use]
+    pub fn requesting(mut self, request: PackageName) -> Self {
+        self.request = request;
+        self
+    }
+
+    /// The key the result is stored under.
+    #[must_use]
+    pub const fn key(&self) -> &PackageKey {
+        &self.key
+    }
+
+    /// The package name the license is requested for.
+    #[must_use]
+    pub const fn request(&self) -> &PackageName {
+        &self.request
+    }
+
+    /// The in-use version.
+    #[must_use]
+    pub const fn version(&self) -> &ConcreteVersion {
+        &self.version
+    }
+}
 
 /// Ceiling on the per-dependency tier-3 license fetch timeout, independent of the caller's
 /// configured `fetch_timeout`: the shared `reqwest` client behind `deps-lsp`'s
@@ -62,12 +129,12 @@ const TIER3_LICENSE_PREFETCH_TIMEOUT_FLOOR_SECS: u64 = 10;
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TierThreeLicenseFetch {
-    /// The successfully fetched licenses, keyed by (already scheme-qualified where
-    /// applicable, e.g. `jsr:@std/fs`) package name. A dependency absent from this map means
+    /// The successfully fetched licenses, keyed by the normalized form of the (already
+    /// scheme-qualified where applicable, e.g. `jsr:@std/fs`) package name. A dependency absent from this map means
     /// either its fetch found no license, or it was skipped by [`tier3_license_targets`] —
     /// the two are indistinguishable here (see [`Self::timed_out`]'s doc for why only a
     /// timeout is ever observable as a distinct failure mode).
-    pub licenses: HashMap<PackageName, Vec<String>>,
+    pub licenses: HashMap<NormalizedName, Vec<String>>,
     /// How many per-dependency fetches were cut off by this function's own
     /// `tokio::time::timeout` (issue #1133 critic S1).
     ///
@@ -101,7 +168,7 @@ impl TierThreeLicenseFetch {
     /// assert_eq!(result.timed_out, 2);
     /// ```
     #[must_use]
-    pub const fn new(licenses: HashMap<PackageName, Vec<String>>, timed_out: usize) -> Self {
+    pub const fn new(licenses: HashMap<NormalizedName, Vec<String>>, timed_out: usize) -> Self {
         Self {
             licenses,
             timed_out,
@@ -109,7 +176,7 @@ impl TierThreeLicenseFetch {
     }
 }
 
-/// Builds the `(name, in-use version)` pairs [`prefetch_tier3_licenses`] should fetch a
+/// Builds the `(key, in-use version)` pairs [`prefetch_tier3_licenses`] should fetch a
 /// license for.
 ///
 /// The pure, network-free half of that function, split out so it is unit-testable without a
@@ -125,16 +192,15 @@ impl TierThreeLicenseFetch {
 /// it forked from — the identical "is this really the same package" problem OSV's stricter
 /// filter exists to solve.
 ///
-/// Deduplicated by `(name, version)` pair (issue #1133 code-review finding #2, first
-/// occurrence wins): a manifest declaring the same dependency under two sections (e.g.
-/// Gradle's `implementation` and `testImplementation`) at the same in-use version must not
-/// fetch its license twice — wasted work that undermines the exact rate-limit concern
-/// (Swift's unauthenticated 60 req/h GitHub budget) this module elsewhere worries about. Two
-/// occurrences of the same name at *different* in-use versions are kept as separate
-/// targets, since Gradle's POM fetch and Deno's JSR API are genuinely version-specific (see
-/// [`prefetch_tier3_licenses`]'s doc) — deduplicating those would silently drop a
-/// legitimately different lookup, mirroring the main registry fetch's own
-/// name-not-name+version dedup being *wrong* for this per-version-fetch shape.
+/// Deduplicated by normalized name (issue #1133 code-review finding #2, first occurrence
+/// wins): a manifest declaring the same dependency under two sections (e.g. Gradle's
+/// `implementation` and `testImplementation`), or under two spellings that normalize alike,
+/// must not fetch its license twice — wasted work that undermines the exact rate-limit concern
+/// (Swift's unauthenticated 60 req/h GitHub budget) this module elsewhere worries about. The
+/// result map holds one license list per normalized name, so a second target for it would only
+/// race the first for the entry; the first occurrence's in-use version (parser order) is the
+/// one fetched, which keeps the outcome deterministic even where Gradle's POM fetch and Deno's
+/// JSR API are version-specific (see [`prefetch_tier3_licenses`]'s doc).
 ///
 /// # Examples
 ///
@@ -144,7 +210,7 @@ impl TierThreeLicenseFetch {
 ///     RequirementResolution, SourcePolicy,
 /// };
 /// use deps_core::test_util::stub_parse_result_with_dependencies;
-/// use deps_core::{ConcreteVersion, EcosystemId, PackageName};
+/// use deps_core::{ConcreteVersion, EcosystemId, NormalizedName, PackageName};
 /// use deps_engine::classify::license::tier3_license_targets;
 /// use std::collections::HashMap;
 ///
@@ -166,7 +232,7 @@ impl TierThreeLicenseFetch {
 ///
 /// let parsed = stub_parse_result_with_dependencies(1);
 /// let mut resolved_versions = HashMap::new();
-/// resolved_versions.insert(PackageName::new("dep-0"), ConcreteVersion::from("1.0.0"));
+/// resolved_versions.insert(NormalizedName::for_test("dep-0"), ConcreteVersion::from("1.0.0"));
 ///
 /// let targets = tier3_license_targets(
 ///     parsed.as_ref(),
@@ -176,25 +242,24 @@ impl TierThreeLicenseFetch {
 ///     EcosystemId::Dart,
 /// );
 ///
-/// assert_eq!(
-///     targets,
-///     vec![(PackageName::new("dep-0"), ConcreteVersion::from("1.0.0"))]
-/// );
+/// assert_eq!(targets.len(), 1);
+/// assert_eq!(targets[0].key().declared(), &PackageName::new("dep-0"));
+/// assert_eq!(targets[0].version(), &ConcreteVersion::from("1.0.0"));
 /// ```
 pub fn tier3_license_targets(
     parse_result: &dyn deps_core::ParseResult,
-    resolved_versions: &HashMap<PackageName, ConcreteVersion>,
-    resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
+    resolved_versions: &deps_core::ResolvedVersionsMap,
+    resolved_version_candidates: &deps_core::ResolvedCandidatesMap,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem_id: EcosystemId,
-) -> Vec<(PackageName, ConcreteVersion)> {
+) -> Vec<Tier3Target> {
     let mut seen = std::collections::HashSet::new();
     parse_result
         .dependencies()
         .into_iter()
-        .filter(|d| formatter.source_is_public_registry_content(&d.source()))
-        .filter_map(|d| {
-            let key = deps_core::PackageKey::new(d.name(), formatter);
+        .filter_map(|d| Some((d, formatter.public_content(d)?)))
+        .filter_map(|(d, content)| {
+            let key = PackageKey::new(d.name(), formatter);
             let version = resolve_in_use_version(
                 d,
                 &key,
@@ -203,9 +268,9 @@ pub fn tier3_license_targets(
                 formatter,
                 ecosystem_id,
             )?;
-            Some((d.name().clone(), version))
+            Some(Tier3Target::new(key, version).requesting(content.name.into_owned()))
         })
-        .filter(|target| seen.insert(target.clone()))
+        .filter(|target| seen.insert(target.key().normalized().clone()))
         .collect()
 }
 
@@ -274,8 +339,8 @@ pub fn tier3_license_targets(
 pub async fn prefetch_tier3_licenses(
     ecosystem: &dyn Ecosystem,
     parse_result: &dyn deps_core::ParseResult,
-    resolved_versions: &HashMap<PackageName, ConcreteVersion>,
-    resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
+    resolved_versions: &deps_core::ResolvedVersionsMap,
+    resolved_version_candidates: &deps_core::ResolvedCandidatesMap,
     license_policy: &deps_core::LicensePolicy,
     fetch_timeout: FetchTimeout,
     concurrency: FetchConcurrency,
@@ -324,14 +389,19 @@ pub async fn prefetch_tier3_licenses(
 ///
 /// ```
 /// use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
-/// use deps_core::{ConcreteVersion, PackageName};
-/// use deps_engine::classify::license::fetch_tier3_licenses;
+/// use deps_core::lsp_helpers::PackageNaming;
+/// use deps_core::{ConcreteVersion, PackageKey, PackageName};
+/// use deps_engine::classify::license::{Tier3Target, fetch_tier3_licenses};
 /// use deps_engine::test_util::TestTier3Ecosystem;
+///
+/// struct Identity;
+/// impl PackageNaming for Identity {}
 ///
 /// #[tokio::main]
 /// async fn main() {
 ///     let ecosystem = TestTier3Ecosystem::returning(vec!["MIT".to_string()]);
-///     let targets = vec![(PackageName::new("pkg"), ConcreteVersion::from("1.0.0"))];
+///     let key = PackageKey::new(&PackageName::new("pkg"), &Identity);
+///     let targets = vec![Tier3Target::new(key.clone(), ConcreteVersion::from("1.0.0"))];
 ///
 ///     let result = fetch_tier3_licenses(
 ///         &ecosystem,
@@ -342,14 +412,14 @@ pub async fn prefetch_tier3_licenses(
 ///     .await;
 ///
 ///     assert_eq!(
-///         result.licenses.get(&PackageName::new("pkg")),
+///         result.licenses.get(key.normalized()),
 ///         Some(&vec!["MIT".to_string()])
 ///     );
 /// }
 /// ```
 pub async fn fetch_tier3_licenses(
     ecosystem: &dyn Ecosystem,
-    targets: Vec<(PackageName, ConcreteVersion)>,
+    targets: Vec<Tier3Target>,
     fetch_timeout: FetchTimeout,
     concurrency: FetchConcurrency,
 ) -> TierThreeLicenseFetch {
@@ -368,20 +438,23 @@ pub async fn fetch_tier3_licenses(
     // finding #4) — no shared `Arc<AtomicUsize>`/`Ordering` needed just to count timeouts
     // across `buffer_unordered`'s concurrent futures; summing after `.collect()` is simpler
     // with no correctness difference.
-    let results: Vec<(PackageName, Vec<String>, bool)> = stream::iter(targets)
-        .map(|(name, version)| async move {
+    let results: Vec<(NormalizedName, Vec<String>, bool)> = stream::iter(targets)
+        .map(|target| async move {
             let mut timed_out = false;
             let found = tokio::time::timeout(
                 timeout_duration,
-                ecosystem.fetch_license(&name, &version),
+                ecosystem.fetch_license(target.request(), target.version()),
             )
             .await
             .unwrap_or_else(|_| {
                 timed_out = true;
-                tracing::debug!(package = %name.for_tracing(), "tier-3 license fetch timed out");
+                tracing::debug!(
+                    package = %target.request().for_tracing(),
+                    "tier-3 license fetch timed out"
+                );
                 Vec::new()
             });
-            (name, found, timed_out)
+            (target.key().normalized().clone(), found, timed_out)
         })
         .buffer_unordered(concurrency.get())
         .collect()
@@ -404,6 +477,16 @@ pub async fn fetch_tier3_licenses(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::NormalizedName;
+    use deps_core::PackageName;
+    use deps_core::test_util::package_key;
+
+    fn declared_targets(targets: &[Tier3Target]) -> Vec<(&str, &str)> {
+        targets
+            .iter()
+            .map(|target| (target.key().declared().as_str(), target.version().as_str()))
+            .collect()
+    }
 
     fn secs(seconds: u64) -> FetchTimeout {
         FetchTimeout::try_from_secs(seconds).expect("test timeout inside the accepted range")
@@ -485,7 +568,7 @@ mod tests {
             deps: vec![dep("collection", "^1.0", DependencySource::Registry)],
         };
         let mut resolved = HashMap::new();
-        resolved.insert(PackageName::new("collection"), "1.18.0".into());
+        resolved.insert(NormalizedName::for_test("collection"), "1.18.0".into());
 
         let targets = tier3_license_targets(
             &parse_result,
@@ -495,12 +578,11 @@ mod tests {
             EcosystemId::Dart,
         );
 
+        assert_eq!(declared_targets(&targets), [("collection", "1.18.0")]);
         assert_eq!(
-            targets,
-            vec![(
-                PackageName::new("collection"),
-                ConcreteVersion::from("1.18.0")
-            )]
+            targets[0].request(),
+            targets[0].key().declared(),
+            "without a public-content override the license is requested under the dependency's own name"
         );
     }
 
@@ -518,7 +600,7 @@ mod tests {
             )],
         };
         let mut resolved = HashMap::new();
-        resolved.insert(PackageName::new("local-fork"), "1.0.0".into());
+        resolved.insert(NormalizedName::for_test("local-fork"), "1.0.0".into());
 
         let targets = tier3_license_targets(
             &parse_result,
@@ -557,8 +639,8 @@ mod tests {
             ],
         };
         let mut resolved = HashMap::new();
-        resolved.insert(PackageName::new("collection"), "1.18.0".into());
-        resolved.insert(PackageName::new("path"), "1.9.0".into());
+        resolved.insert(NormalizedName::for_test("collection"), "1.18.0".into());
+        resolved.insert(NormalizedName::for_test("path"), "1.9.0".into());
 
         let targets = tier3_license_targets(
             &parse_result,
@@ -583,7 +665,7 @@ mod tests {
             ],
         };
         let mut resolved = HashMap::new();
-        resolved.insert(PackageName::new("okhttp"), "4.12.0".into());
+        resolved.insert(NormalizedName::for_test("okhttp"), "4.12.0".into());
 
         let targets = tier3_license_targets(
             &parse_result,
@@ -593,17 +675,14 @@ mod tests {
             EcosystemId::Gradle,
         );
 
-        assert_eq!(
-            targets,
-            vec![(PackageName::new("okhttp"), ConcreteVersion::from("4.12.0"))]
-        );
+        assert_eq!(declared_targets(&targets), [("okhttp", "4.12.0")]);
     }
 
-    /// The other half of finding #2: two occurrences of the same name at *different*
-    /// in-use versions must both survive — deduplicating by name alone (rather than
-    /// name+version) would silently drop a legitimately different lookup.
+    /// Two occurrences of the same name at *different* in-use versions collapse to the first
+    /// one: the result map holds one license list per normalized name, so a second target
+    /// would only race the first for that entry (#1873 N4).
     #[test]
-    fn tier3_license_targets_keeps_same_name_at_different_versions() {
+    fn tier3_license_targets_keeps_first_occurrence_for_same_name_at_different_versions() {
         let parse_result = MockParseResult {
             deps: vec![
                 dep("okhttp", "4.12.0", DependencySource::Registry),
@@ -619,12 +698,49 @@ mod tests {
             EcosystemId::Gradle,
         );
 
+        assert_eq!(declared_targets(&targets), [("okhttp", "4.12.0")]);
+    }
+
+    /// Spellings that normalize alike share one license entry, so only the first occurrence
+    /// is a target, and the lock-file lookup goes through the normalized key (#1873).
+    #[test]
+    fn tier3_license_targets_collapses_case_variants_to_the_first_occurrence() {
+        let parse_result = MockParseResult {
+            deps: vec![
+                dep("Collection", "^1.0", DependencySource::Registry),
+                dep("collection", "^1.0", DependencySource::Registry),
+            ],
+        };
+        let mut resolved = HashMap::new();
+        resolved.insert(NormalizedName::for_test("collection"), "1.18.0".into());
+
+        let targets = tier3_license_targets(
+            &parse_result,
+            &resolved,
+            &HashMap::new(),
+            &StubFormatter::new().with_lowercase_names(),
+            EcosystemId::Dart,
+        );
+
+        assert_eq!(declared_targets(&targets), [("Collection", "1.18.0")]);
+    }
+
+    /// The fetch is requested by the declared spelling but the result is keyed normalized,
+    /// the one normalization point both `deps-lsp` and `deps-cli` read (#1873).
+    #[tokio::test]
+    async fn fetch_tier3_licenses_keys_the_result_by_the_normalized_name() {
+        let ecosystem = TestTier3Ecosystem::returning(vec!["MIT".to_string()]);
+        let key = PackageKey::new(
+            &PackageName::new("Collection"),
+            &StubFormatter::new().with_lowercase_names(),
+        );
+        let targets = vec![Tier3Target::new(key, ConcreteVersion::from("1.0.0"))];
+
+        let result = fetch_tier3_licenses(&ecosystem, targets, secs(10), conc(4)).await;
+
         assert_eq!(
-            targets,
-            vec![
-                (PackageName::new("okhttp"), ConcreteVersion::from("4.12.0")),
-                (PackageName::new("okhttp"), ConcreteVersion::from("4.11.0")),
-            ]
+            result.licenses.keys().collect::<Vec<_>>(),
+            [&NormalizedName::for_test("collection")]
         );
     }
 
@@ -663,7 +779,7 @@ mod tests {
             deps: vec![dep("collection", "1.18.0", DependencySource::Registry)],
         };
         let mut resolved = HashMap::new();
-        resolved.insert(PackageName::new("collection"), "1.18.0".into());
+        resolved.insert(NormalizedName::for_test("collection"), "1.18.0".into());
 
         let result = prefetch_tier3_licenses(
             &ecosystem,
@@ -739,7 +855,7 @@ mod tests {
             deps: vec![dep("serde", "1.0.0", DependencySource::Registry)],
         };
         let mut resolved = HashMap::new();
-        resolved.insert(PackageName::new("serde"), "1.0.0".into());
+        resolved.insert(NormalizedName::for_test("serde"), "1.0.0".into());
 
         let result = prefetch_tier3_licenses(
             &ecosystem,
@@ -758,8 +874,8 @@ mod tests {
     #[tokio::test]
     async fn fetch_tier3_licenses_filters_out_empty_results() {
         let ecosystem = TestTier3Ecosystem::returning(vec![]);
-        let targets = vec![(
-            PackageName::new("no-license-found"),
+        let targets = vec![Tier3Target::new(
+            package_key("no-license-found"),
             ConcreteVersion::from("1.0.0"),
         )];
 
@@ -776,12 +892,15 @@ mod tests {
     #[tokio::test]
     async fn fetch_tier3_licenses_dispatches_and_keeps_non_empty_results() {
         let ecosystem = TestTier3Ecosystem::returning(vec!["Apache-2.0".to_string()]);
-        let targets = vec![(PackageName::new("pkg"), ConcreteVersion::from("2.0.0"))];
+        let targets = vec![Tier3Target::new(
+            package_key("pkg"),
+            ConcreteVersion::from("2.0.0"),
+        )];
 
         let result = fetch_tier3_licenses(&ecosystem, targets, secs(10), conc(4)).await;
 
         assert_eq!(
-            result.licenses.get(&PackageName::new("pkg")),
+            result.licenses.get(&NormalizedName::for_test("pkg")),
             Some(&vec!["Apache-2.0".to_string()])
         );
         assert_eq!(result.timed_out, 0);
@@ -799,8 +918,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn fetch_tier3_licenses_timeout_is_clamped_to_floor_and_counted() {
         let ecosystem = TestTier3Ecosystem::pending();
-        let targets = vec![(
-            PackageName::new("unreachable-pkg"),
+        let targets = vec![Tier3Target::new(
+            package_key("unreachable-pkg"),
             ConcreteVersion::from("1.0.0"),
         )];
 
@@ -904,8 +1023,8 @@ mod tests {
         };
         let targets: Vec<_> = (0..10)
             .map(|i| {
-                (
-                    PackageName::new(format!("pkg-{i}")),
+                Tier3Target::new(
+                    package_key(&format!("pkg-{i}")),
                     ConcreteVersion::from("1.0.0"),
                 )
             })

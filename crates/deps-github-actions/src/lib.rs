@@ -39,7 +39,7 @@ pub mod types;
 pub use ecosystem::GithubActionsEcosystem;
 pub use formatter::GithubActionsFormatter;
 pub use parser::parse_workflow_yaml;
-pub use registry::GithubActionsRegistry;
+pub use registry::{GithubActionsRegistry, RepositoryIndexes};
 pub use types::{
     GithubActionsDependency, GithubActionsParseResult, GithubActionsVersion, PinStyle, ShaComment,
 };

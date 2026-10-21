@@ -10,8 +10,9 @@ use deps_core::policy_config::{
     AtomicToggle, GossipChecks, OsvChecks, PolicyConfig, TyposquatChecks, UserProfileSources,
 };
 use deps_core::{
-    ConcreteVersion, DependencyOutcomes, DepsDevClient, EcosystemId, EcosystemRegistry,
-    GossipFindings, LicensePolicy, PackageName, PackageVersions, ParseResult, TyposquatSignal,
+    CachedVersionsMap, DependencyOutcomes, DepsDevClient, EcosystemId, EcosystemRegistry,
+    GossipFindings, LicensePolicy, NormalizedName, ParseResult, ResolvedCandidatesMap,
+    ResolvedVersionsMap, TyposquatSignal,
 };
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -458,7 +459,7 @@ impl DocumentState {
     }
 
     /// Updates the cached registry version data (new architecture).
-    pub fn update_cached_versions(&mut self, versions: HashMap<PackageName, PackageVersions>) {
+    pub fn update_cached_versions(&mut self, versions: CachedVersionsMap) {
         self.signals.cached_versions = versions;
     }
 
@@ -488,8 +489,8 @@ impl DocumentState {
     /// [`Self::set_resolved_versions_without_bump`] instead.
     pub(crate) fn update_resolved_versions(
         &mut self,
-        versions: HashMap<PackageName, ConcreteVersion>,
-        candidates: HashMap<PackageName, Vec<ConcreteVersion>>,
+        versions: ResolvedVersionsMap,
+        candidates: ResolvedCandidatesMap,
         generation: ResolvedGeneration,
     ) {
         self.set_resolved_versions_without_bump(versions, candidates);
@@ -514,8 +515,8 @@ impl DocumentState {
     /// replacement.
     pub(crate) fn set_resolved_versions_without_bump(
         &mut self,
-        versions: HashMap<PackageName, ConcreteVersion>,
-        candidates: HashMap<PackageName, Vec<ConcreteVersion>>,
+        versions: ResolvedVersionsMap,
+        candidates: ResolvedCandidatesMap,
     ) {
         self.signals.resolved_versions = versions;
         self.signals.resolved_version_candidates = candidates;
@@ -565,7 +566,7 @@ impl DocumentState {
     /// `license_race_safety_tests`, which exercises [`Self::merge_licenses`]'s
     /// non-clobbering contract against it.
     #[cfg(test)]
-    pub fn update_licenses(&mut self, licenses: HashMap<PackageName, Vec<String>>) {
+    pub fn update_licenses(&mut self, licenses: HashMap<NormalizedName, Vec<String>>) {
         self.signals.licenses = licenses;
     }
 
@@ -594,7 +595,7 @@ impl DocumentState {
     /// (`RegistryDeclaredSpdx`) ecosystem's license isn't tied to the resolved version in
     /// the first place (it's the registry's latest-matching pick), so [`Self::evict_licenses`]
     /// deliberately never evicts for one — see its own doc.
-    pub fn merge_licenses(&mut self, licenses: HashMap<PackageName, Vec<String>>) {
+    pub fn merge_licenses(&mut self, licenses: HashMap<NormalizedName, Vec<String>>) {
         self.signals.licenses.extend(licenses);
     }
 
@@ -620,7 +621,7 @@ impl DocumentState {
     /// spec 071's Agent Boundaries and `apply_typosquat_rule`'s own per-dependency-source
     /// re-check, which *does* actively clear the one staleness case that matters
     /// security-wise (a dependency whose source switched to private).
-    pub fn merge_typosquats(&mut self, typosquats: HashMap<PackageName, TyposquatSignal>) {
+    pub fn merge_typosquats(&mut self, typosquats: HashMap<NormalizedName, TyposquatSignal>) {
         self.signals.typosquats.extend(typosquats);
     }
 
@@ -640,7 +641,7 @@ impl DocumentState {
     /// [`Self::merge_typosquats`]'s identical "no separate eviction needed" reasoning — a
     /// genuinely removed dependency's entry is reclaimed by
     /// `PackageSignals::prune_removed` (called from `document::lifecycle::commit_parsed_document`).
-    pub fn merge_gossip_findings(&mut self, findings: HashMap<PackageName, GossipFindings>) {
+    pub fn merge_gossip_findings(&mut self, findings: HashMap<NormalizedName, GossipFindings>) {
         self.signals.gossip_findings.extend(findings);
     }
 
@@ -665,16 +666,17 @@ impl DocumentState {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::{EcosystemId, PackageName};
+    /// use deps_core::{EcosystemId, NormalizedName};
     /// use deps_lsp::document::DocumentState;
     /// use std::collections::HashMap;
     ///
+    /// let foo = NormalizedName::for_test("foo");
     /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
-    /// doc.merge_licenses(HashMap::from([(PackageName::new("foo"), vec!["MIT".to_string()])]));
-    /// doc.evict_licenses(&[PackageName::new("foo")]);
-    /// assert!(!doc.signals.licenses.contains_key(&PackageName::new("foo")));
+    /// doc.merge_licenses(HashMap::from([(foo.clone(), vec!["MIT".to_string()])]));
+    /// doc.evict_licenses(std::slice::from_ref(&foo));
+    /// assert!(!doc.signals.licenses.contains_key(&foo));
     /// ```
-    pub fn evict_licenses(&mut self, names: &[PackageName]) {
+    pub fn evict_licenses(&mut self, names: &[NormalizedName]) {
         for name in names {
             self.signals.licenses.remove(name);
         }
@@ -1057,6 +1059,11 @@ pub struct ServerState {
     /// `crate::register_ecosystems` hands to `SwiftParseContext::with_keychain`, bundled inside
     /// `EcosystemRuntime`, and the source of the "credential resolved" event.
     pub keychain_credentials: Arc<deps_core::keychain_credentials::KeychainCredentialsHandle>,
+    /// Live-updatable `registries.swift_scm_to_registry` setting (spec 088) — the same handle
+    /// `crate::register_ecosystems` hands to `SwiftParseContext::with_scm_to_registry`, bundled
+    /// inside `EcosystemRuntime`.
+    #[cfg(feature = "swift")]
+    pub scm_to_registry: Arc<crate::ScmToRegistryHandle>,
     /// Live-updatable `registries.gitlab_instance_host` setting (issue #466, spec
     /// FR-005a/FR-011a) — the same raw-string handle `crate::register_ecosystems` hands to
     /// `GitlabCiEcosystem::with_context`, bundled inside `EcosystemRuntime`. See that
@@ -1121,6 +1128,11 @@ pub struct ServerState {
     /// reparse, returned by that same function so the two facts can never independently
     /// drift. See [`crate::register_ecosystems`]'s doc.
     pub(crate) workspace_registry_ecosystems: Vec<EcosystemId>,
+    /// Single-flight state of the per-document background probe tasks (specs 086, 087).
+    pub(crate) probe_slots: super::probes::ProbeSlots,
+    /// When each document's pre-fetch probes last finished, so the re-parse listener skips a
+    /// document that already parsed with every probe input announced before then.
+    pub(crate) pre_fetch_stamps: dashmap::DashMap<Uri, std::time::Instant>,
     /// Cold start rate limiter
     pub cold_start_limiter: ColdStartLimiter,
     /// Background task handles, keyed by URI.
@@ -1252,6 +1264,8 @@ impl ServerState {
         let registry_policy = Arc::clone(&runtime.policy);
         let nuget_user_profile_sources = Arc::clone(&runtime.nuget_user_profile_sources);
         let keychain_credentials = Arc::clone(&runtime.keychain_credentials);
+        #[cfg(feature = "swift")]
+        let scm_to_registry = Arc::clone(&runtime.scm_to_registry);
         let gitlab_instance_host = Arc::clone(&runtime.gitlab_instance_host);
         // `HttpCache::with_policy` (not `HttpCache::new`) so this server's one long-lived cache
         // shares the same policy handle `register_ecosystems` hands to `CargoEcosystem` below —
@@ -1294,12 +1308,16 @@ impl ServerState {
             ),
             nuget_user_profile_sources,
             keychain_credentials,
+            #[cfg(feature = "swift")]
+            scm_to_registry,
             gitlab_instance_host,
             license_policy: RwLock::new(Arc::new(LicensePolicy::default())),
             typosquat_checks: AtomicToggle::new(default_policy.typosquat_checks()),
             gossip_checks: AtomicToggle::new(default_policy.gossip_checks()),
             osv_checks: AtomicToggle::new(default_policy.osv_checks()),
             workspace_registry_ecosystems,
+            probe_slots: super::probes::ProbeSlots::default(),
+            pre_fetch_stamps: dashmap::DashMap::new(),
             cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
             typosquat_tasks: SupersedingTaskRegistry::new(),
@@ -1894,12 +1912,11 @@ impl ServerState {
                     .dependencies()
                     .into_iter()
                     .filter(|dep| formatter.can_resolve_source(&dep.source()))
-                    .map(|dep| dep.name().clone())
+                    .map(|dep| formatter.normalize_package_name(dep.name()))
                     .filter(|name| {
                         !doc.signals.cached_versions.contains_key(name)
                             && !doc.signals.resolved_versions.contains_key(name)
                     })
-                    .map(|name| formatter.normalize_package_name(&name))
                     .collect()
             })
             .unwrap_or_default();
@@ -2044,13 +2061,13 @@ mod tests {
         #[test]
         fn update_then_merge_does_not_clobber_tier3_entry() {
             let mut doc = doc();
-            let tier3_name = PackageName::new("http");
+            let tier3_name = NormalizedName::for_test("http");
             doc.update_licenses(HashMap::from([(
                 tier3_name.clone(),
                 vec!["BSD-3-Clause".to_string()],
             )]));
 
-            let tier1_name = PackageName::new("some/other-package");
+            let tier1_name = NormalizedName::for_test("some/other-package");
             doc.merge_licenses(HashMap::from([(
                 tier1_name.clone(),
                 vec!["MIT".to_string()],
@@ -2074,13 +2091,13 @@ mod tests {
         #[test]
         fn merge_then_update_replaces_wholesale_per_its_own_documented_contract() {
             let mut doc = doc();
-            let tier1_name = PackageName::new("some/other-package");
+            let tier1_name = NormalizedName::for_test("some/other-package");
             doc.merge_licenses(HashMap::from([(
                 tier1_name.clone(),
                 vec!["MIT".to_string()],
             )]));
 
-            let tier3_name = PackageName::new("http");
+            let tier3_name = NormalizedName::for_test("http");
             doc.update_licenses(HashMap::from([(
                 tier3_name.clone(),
                 vec!["BSD-3-Clause".to_string()],
@@ -2108,21 +2125,21 @@ mod tests {
         fn merge_licenses_accumulates_across_calls() {
             let mut doc = doc();
             doc.merge_licenses(HashMap::from([(
-                PackageName::new("pkg-a"),
+                NormalizedName::for_test("pkg-a"),
                 vec!["MIT".to_string()],
             )]));
             doc.merge_licenses(HashMap::from([(
-                PackageName::new("pkg-b"),
+                NormalizedName::for_test("pkg-b"),
                 vec!["Apache-2.0".to_string()],
             )]));
 
             assert_eq!(doc.signals.licenses.len(), 2);
             assert_eq!(
-                doc.signals.licenses.get(&PackageName::new("pkg-a")),
+                doc.signals.licenses.get(&NormalizedName::for_test("pkg-a")),
                 Some(&vec!["MIT".to_string()])
             );
             assert_eq!(
-                doc.signals.licenses.get(&PackageName::new("pkg-b")),
+                doc.signals.licenses.get(&NormalizedName::for_test("pkg-b")),
                 Some(&vec!["Apache-2.0".to_string()])
             );
         }
@@ -3250,6 +3267,7 @@ mod tests {
     #[cfg(feature = "cargo")]
     mod cargo_tests {
         use super::*;
+        use deps_core::PackageVersions;
 
         #[test]
         fn test_document_state_creation() {
@@ -3326,13 +3344,16 @@ mod tests {
                 DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
 
             let mut resolved = HashMap::new();
-            resolved.insert("serde".into(), "1.0.195".into());
+            resolved.insert(NormalizedName::for_test("serde"), "1.0.195".into());
 
             let generation = ServerState::new().next_resolved_versions_generation();
             state.update_resolved_versions(resolved, HashMap::new(), generation);
             assert_eq!(state.signals.resolved_versions.len(), 1);
             assert_eq!(
-                state.signals.resolved_versions.get("serde"),
+                state
+                    .signals
+                    .resolved_versions
+                    .get(&NormalizedName::for_test("serde")),
                 Some(&"1.0.195".into())
             );
         }
@@ -3343,7 +3364,10 @@ mod tests {
                 DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
 
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), PackageVersions::latest_only("1.0.210"));
+            cached.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only("1.0.210"),
+            );
 
             state.update_cached_versions(cached);
             assert_eq!(state.signals.cached_versions.len(), 1);

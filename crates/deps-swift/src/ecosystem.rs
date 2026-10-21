@@ -2,13 +2,20 @@
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
+use deps_core::diagnostic::{Diagnostic, DiagnosticKind, Severity};
+use deps_core::policy_config::ScmToRegistry;
 use deps_core::{
     ConfigReach, Ecosystem, ParseResult as ParseResultTrait, Registry, Result, WatchedConfig,
     WatchedConfigEffect, is_safe_registry_url,
-    lsp_helpers::{EcosystemFormatter, warn_rejected_value},
+    lsp_helpers::{
+        DiagnosticSeverities, EcosystemFormatter, ProbeEffect, ProbePhase, ProbeReport,
+        warn_rejected_value,
+    },
 };
+use futures::StreamExt;
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Instant;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, Range as LspRange};
 #[cfg(test)]
@@ -16,10 +23,17 @@ use tower_lsp_server::ls_types::{CompletionItem, Range as LspRange};
 use tower_lsp_server::ls_types::{CompletionTextEdit, TextEdit};
 use url::Url;
 
-use crate::config::SwiftParseContext;
+use crate::config::{SwiftParseContext, TrustedLookupRegistry};
 use crate::formatter::SwiftFormatter;
 use crate::lockfile::SwiftLockParser;
+use crate::parser::SwiftParseResult;
 use crate::registry::SwiftRegistry;
+use crate::scm::{
+    IdentityLookup, MemoKey, ScmLookupUrl, SwiftForm, SwiftOrigin, SwiftRequirementForm,
+    decide_from_memo, identity_pins, parsed_form,
+};
+use crate::scm_memo::{Freshness, ScmIdentityMemo, wait_budget};
+use crate::types::SwiftDependency;
 #[cfg(test)]
 #[cfg(feature = "lsp-responses")]
 use crate::types::SwiftPackage;
@@ -56,6 +70,58 @@ fn name_completion_targets_url(
         .is_some_and(|d| is_url_source(&d.source()))
 }
 
+/// The dependencies a registry could swap for an identity: a version requirement on an `http(s)`
+/// repository URL, each with its lookup URL.
+fn eligible_dependencies(parsed: &SwiftParseResult) -> Vec<(&SwiftDependency, ScmLookupUrl)> {
+    parsed
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.requirement_form == SwiftRequirementForm::Version)
+        .filter_map(|dependency| Some((dependency, ScmLookupUrl::parse(&dependency.url)?)))
+        .collect()
+}
+
+/// [`SwiftLockParser`] that also names source-control pins by the registry identity a swapped
+/// dependency carries (spec 088 FR-018), computed at every load from the identity memo.
+struct IdentityAwareLockParser {
+    parser: SwiftLockParser,
+    context: SwiftParseContext,
+    memo: Arc<ScmIdentityMemo>,
+}
+
+impl deps_core::lockfile::LockFileProvider for IdentityAwareLockParser {
+    fn locate_lockfile(&self, manifest_uri: &Url) -> Option<std::path::PathBuf> {
+        self.parser.locate_lockfile(manifest_uri)
+    }
+
+    fn parse_lockfile<'a>(
+        &'a self,
+        lockfile_path: &'a std::path::Path,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<deps_core::lockfile::ResolvedPackages>>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.parser.parse_lockfile(lockfile_path)
+    }
+
+    fn derived_packages(
+        &self,
+        parsed: &deps_core::lockfile::ResolvedPackages,
+    ) -> Vec<deps_core::lockfile::ResolvedPackage> {
+        match self.context.scm_mode() {
+            ScmToRegistry::Replace => {}
+            ScmToRegistry::Disabled => return Vec::new(),
+        }
+        let config = self.context.resolve_user_tier();
+        config.trusted_lookup().map_or_else(Vec::new, |lookup| {
+            identity_pins(parsed, &self.memo, &lookup.default_registry().url)
+        })
+    }
+}
+
 /// Swift/SPM ecosystem implementation.
 ///
 /// Provides LSP functionality for Package.swift files, including:
@@ -68,7 +134,7 @@ fn name_completion_targets_url(
 pub struct SwiftEcosystem {
     registry: Arc<SwiftRegistry>,
     formatter: SwiftFormatter,
-    lockfile_provider: Arc<SwiftLockParser>,
+    lockfile_provider: Arc<IdentityAwareLockParser>,
     context: SwiftParseContext,
 }
 
@@ -91,12 +157,205 @@ impl SwiftEcosystem {
     /// the next parse.
     #[must_use]
     pub fn with_context(registry: Arc<SwiftRegistry>, ctx: SwiftParseContext) -> Self {
+        let memo = Arc::clone(registry.identity_memo());
+        let context = ctx.with_identity_memo(Arc::clone(&memo));
         Self {
             registry,
             formatter: SwiftFormatter,
-            lockfile_provider: Arc::new(SwiftLockParser),
-            context: ctx,
+            lockfile_provider: Arc::new(IdentityAwareLockParser {
+                parser: SwiftLockParser,
+                context: context.clone(),
+                memo,
+            }),
+            context,
         }
+    }
+
+    /// Warms the identity memo for the document's eligible `url:` dependencies and reports
+    /// whether any of them must now be parsed differently (spec 088 FR-016).
+    ///
+    /// Misses are awaited, `fetch_concurrency` at a time and each bounded by `fetch_timeout`
+    /// (the user's live settings, see [`crate::ScmToRegistryHandle::set_fetch_limits`]), so a
+    /// run that waits for every lookup (the CLI) and one that does not (a later LSP re-parse)
+    /// end on the same forms. Stale entries refresh in the background and are never awaited.
+    /// Does nothing unless `Replace` is on and the document has an eligible dependency.
+    async fn warm_identities(&self, parse_result: &dyn ParseResultTrait) -> ProbeReport {
+        let Some(parsed) = parse_result.as_any().downcast_ref::<SwiftParseResult>() else {
+            return ProbeReport::default();
+        };
+        let mode = self.context.scm_mode();
+        match mode {
+            ScmToRegistry::Replace => {}
+            ScmToRegistry::Disabled => return ProbeReport::default(),
+        }
+        let candidates = eligible_dependencies(parsed);
+        if candidates.is_empty() {
+            return ProbeReport::default();
+        }
+
+        let config = self.context.resolve_user_tier();
+        let lookup = config.trusted_lookup();
+        let mut report = ProbeReport::default();
+        match &lookup {
+            Some(lookup) => {
+                report = self.request_identities(lookup, &candidates).await;
+            }
+            None => self.context.scm_handle().warn_missing_default_once(),
+        }
+
+        let now = Instant::now();
+        let reparse = candidates.iter().any(|(dependency, scm)| {
+            self.effective_form(mode, lookup.as_ref(), dependency, scm, now)
+                != parsed_form(dependency)
+        });
+        if reparse {
+            report.effect = ProbeEffect::Reparse;
+        }
+        report
+    }
+
+    /// The form [`decide_from_memo`] gives `dependency`, except that an identity whose registry
+    /// the process cannot register (the client cap is reached) stays on source control, as the
+    /// parser leaves it.
+    fn effective_form(
+        &self,
+        mode: ScmToRegistry,
+        lookup: Option<&TrustedLookupRegistry<'_>>,
+        dependency: &SwiftDependency,
+        scm: &ScmLookupUrl,
+        now: Instant,
+    ) -> SwiftForm {
+        let form = decide_from_memo(
+            mode,
+            lookup,
+            dependency.requirement_form,
+            Some(scm),
+            Some(self.registry.identity_memo()),
+            now,
+        );
+        let SwiftForm::RegistryIdentity { identity, .. } = &form else {
+            return form;
+        };
+        let refused = lookup
+            .and_then(|lookup| lookup.route(&identity.as_identity().scope_key()))
+            .is_some_and(|routed| {
+                self.registry.register_alternate(routed.clone()) == CapResult::RefusedAtCapacity
+            });
+        if refused { SwiftForm::Scm } else { form }
+    }
+
+    /// Sends the lookups `candidates` need to the trusted default registry: awaits the misses
+    /// and starts a background refresh for the stale entries.
+    async fn request_identities(
+        &self,
+        lookup: &TrustedLookupRegistry<'_>,
+        candidates: &[(&SwiftDependency, ScmLookupUrl)],
+    ) -> ProbeReport {
+        let limits = self.context.scm_handle();
+        let (timeout, concurrency) = (
+            limits.fetch_timeout().as_duration(),
+            limits.fetch_concurrency().get(),
+        );
+        let default = lookup.default_registry();
+        if self.registry.register_alternate(default.clone()) == CapResult::RefusedAtCapacity {
+            tracing::debug!("identity lookups skipped: the registry client cap is reached");
+        }
+        let memo = self.registry.identity_memo();
+        let now = Instant::now();
+
+        let mut stale: Vec<(MemoKey, ScmLookupUrl)> = Vec::new();
+        let mut missing: Vec<(MemoKey, ScmLookupUrl)> = Vec::new();
+        for (_, scm) in candidates {
+            let key = MemoKey::new(&default.url, scm);
+            let pending = match memo.get(&key, now).map(|read| read.freshness) {
+                Some(Freshness::Fresh) => continue,
+                Some(Freshness::Stale) => &mut stale,
+                None => &mut missing,
+            };
+            if !pending.iter().any(|(seen, _)| *seen == key) {
+                pending.push((key, scm.clone()));
+            }
+        }
+
+        let mut report = ProbeReport::default();
+        let refreshing = stale.len().min(concurrency / 2);
+        for (key, scm) in stale.iter().take(refreshing) {
+            report.issued += self
+                .start_lookup(key, timeout, scm)
+                .map_or(0, |h| usize::from(h.issued()));
+        }
+        let missing_keys: Vec<MemoKey> = missing.iter().map(|(key, _)| key.clone()).collect();
+        let issued: Vec<usize> = futures::stream::iter(missing)
+            .map(|(key, scm)| async move {
+                match self.start_lookup(&key, timeout, &scm) {
+                    Some(handle) => {
+                        let issued = usize::from(handle.issued());
+                        handle.wait(wait_budget(timeout)).await;
+                        issued
+                    }
+                    None => 0,
+                }
+            })
+            .buffer_unordered((concurrency - refreshing).max(1))
+            .collect()
+            .await;
+        report.issued += issued.iter().sum::<usize>();
+
+        let now = Instant::now();
+        report.incomplete_identity_lookups = missing_keys
+            .iter()
+            .filter(|key| {
+                memo.get(key, now)
+                    .is_none_or(|read| read.answer == IdentityLookup::Failed)
+            })
+            .count();
+        report
+    }
+
+    fn start_lookup(
+        &self,
+        key: &MemoKey,
+        timeout: std::time::Duration,
+        scm: &ScmLookupUrl,
+    ) -> Option<crate::scm_memo::LookupHandle> {
+        self.registry.lookup_identity(key, timeout, scm)
+    }
+
+    /// One information notice per eligible dependency that stayed on source control because its
+    /// identity lookup failed (spec 088 US-002).
+    pub(crate) fn lookup_failed_notices(
+        &self,
+        parse_result: &dyn ParseResultTrait,
+    ) -> Vec<Diagnostic> {
+        let Some(parsed) = parse_result.as_any().downcast_ref::<SwiftParseResult>() else {
+            return Vec::new();
+        };
+        match self.context.scm_mode() {
+            ScmToRegistry::Replace => {}
+            ScmToRegistry::Disabled => return Vec::new(),
+        }
+        let config = self.context.resolve_user_tier();
+        let Some(lookup) = config.trusted_lookup() else {
+            return Vec::new();
+        };
+        let memo = self.registry.identity_memo();
+        let now = Instant::now();
+        eligible_dependencies(parsed)
+            .into_iter()
+            .filter(|(dependency, _)| dependency.origin == SwiftOrigin::Declared)
+            .filter(|(_, scm)| {
+                memo.get(&MemoKey::new(&lookup.default_registry().url, scm), now)
+                    .is_some_and(|read| read.answer == IdentityLookup::Failed)
+            })
+            .map(|(dependency, _)| {
+                Diagnostic::new(
+                    DiagnosticKind::Notice,
+                    dependency.name_range,
+                    "registry identity lookup failed; showing source-control versions",
+                )
+                .with_severity(Severity::Information)
+            })
+            .collect()
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -188,7 +447,13 @@ impl Ecosystem for SwiftEcosystem {
                 if let DependencySource::AlternateRegistry { index, .. } = &dependency.source
                     && refused.contains(index)
                 {
-                    dependency.source = DependencySource::CustomRegistry { url: index.clone() };
+                    match dependency.origin {
+                        SwiftOrigin::Swizzled { .. } => dependency.revert_to_scm(),
+                        SwiftOrigin::Declared => {
+                            dependency.source =
+                                DependencySource::CustomRegistry { url: index.clone() };
+                        }
+                    }
                 }
             }
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
@@ -197,6 +462,49 @@ impl Ecosystem for SwiftEcosystem {
 
     fn registry(&self) -> Arc<dyn Registry> {
         self.registry.clone() as Arc<dyn Registry>
+    }
+
+    /// `ReparseOpenDocuments` whenever a repository URL's identity answer changes.
+    fn refresh_events(&self) -> Option<deps_core::RefreshEvents> {
+        Some(self.registry.identity_memo().subscribe())
+    }
+
+    /// Before the fetch, warms the SCM-to-registry identity memo and reports `Reparse` when a
+    /// dependency's form changed; nothing to do after it.
+    fn background_probes<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResultTrait,
+        phase: ProbePhase,
+    ) -> deps_core::ecosystem::BoxFuture<'a, ProbeReport> {
+        match phase {
+            ProbePhase::PreFetch => Box::pin(self.warm_identities(parse_result)),
+            ProbePhase::PostFetch => Box::pin(std::future::ready(ProbeReport::default())),
+        }
+    }
+
+    /// The shared diagnostics plus a notice for each eligible dependency whose identity lookup
+    /// failed.
+    fn generate_diagnostics<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResultTrait,
+        versions: deps_core::VersionData<'a>,
+        uri: &'a Url,
+        freshness: deps_core::FreshnessSettings,
+        severities: DiagnosticSeverities,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<Diagnostic>> {
+        Box::pin(async move {
+            let mut diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
+                parse_result,
+                versions,
+                self.formatter(),
+                uri,
+                freshness,
+                severities,
+                deps_core::PublishTime::now(),
+            );
+            diagnostics.extend(self.lookup_failed_notices(parse_result));
+            diagnostics
+        })
     }
 
     fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
@@ -911,6 +1219,8 @@ mod tests {
                 version_literal: None,
                 url: "https://github.com/a".to_string(),
                 source: deps_core::parser::DependencySource::Registry,
+                requirement_form: SwiftRequirementForm::Version,
+                origin: SwiftOrigin::Declared,
             };
             let uri = deps_core::test_util::test_uri("/test/Package.swift");
             let parse_result = crate::parser::SwiftParseResult {
@@ -1073,6 +1383,8 @@ mod tests {
                 version_literal: None,
                 url: "https://github.com/apple/swift-nio".to_string(),
                 source: deps_core::parser::DependencySource::Registry,
+                requirement_form: SwiftRequirementForm::Version,
+                origin: SwiftOrigin::Declared,
             };
             let uri = deps_core::test_util::test_uri("/test/Package.swift");
             let parse_result = crate::parser::SwiftParseResult {

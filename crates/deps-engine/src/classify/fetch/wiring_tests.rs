@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
-use deps_core::test_util::StalledCoalescingRegistry;
-use deps_core::{DependencySource, EcosystemId, FreshnessSettings, PackageName, SelectionContext};
+use deps_core::test_util::{StalledCoalescingRegistry, package_key};
+use deps_core::{DependencySource, EcosystemId, FreshnessSettings, SelectionContext};
 
 use super::fetch_latest_versions_parallel;
 
@@ -14,8 +14,8 @@ use super::fetch_latest_versions_parallel;
 async fn the_background_fetch_tags_each_package_request_with_its_endpoint() {
     let registry = Arc::new(StalledCoalescingRegistry::new());
     let sources = vec![
-        (PackageName::new("bg-a"), DependencySource::Registry),
-        (PackageName::new("bg-b"), DependencySource::Registry),
+        (package_key("bg-a"), DependencySource::Registry),
+        (package_key("bg-b"), DependencySource::Registry),
     ];
     let background = async {
         let result = fetch_latest_versions_parallel(

@@ -81,7 +81,7 @@ pub(crate) mod test_helpers {
         );
         let mut cached = std::collections::HashMap::new();
         cached.insert(
-            deps_core::PackageName::from("serde"),
+            deps_core::NormalizedName::for_test("serde"),
             deps_core::PackageVersions::new(
                 "1.0.5".into(),
                 Arc::from(vec!["1.0.5".into(), "0.9.0".into()]),

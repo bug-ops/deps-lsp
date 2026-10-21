@@ -21,7 +21,7 @@ pub(super) const VERSION_OPERATOR_CHARS: &[char] = &['^', '~', '=', '<', '>', '*
 /// (including [`crate::catalog::CatalogOutcome::NonSemverEntry`], which gets no diagnostic but
 /// still deserves a hover explanation of why no version comparison ran).
 pub(super) fn catalog_hover_line(dep: &NpmDependency) -> Option<String> {
-    let origin = dep.catalog.as_ref()?;
+    let origin = dep.catalog_ref()?;
     Some(format!(
         "\n**Catalog**: {}\n",
         origin.hover_detail(dep.name.as_str())

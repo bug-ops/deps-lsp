@@ -116,6 +116,9 @@ pub struct PolicyConfigDiff {
     pub nuget_user_profile_sources_changed: SettingChange,
     /// Whether [`RegistriesConfig::swift_keychain_credentials`] changed.
     pub swift_keychain_credentials_changed: SettingChange,
+    /// Whether [`RegistriesConfig::swift_scm_to_registry`] changed. Every open Swift document
+    /// must be re-parsed, not only re-fetched: the setting decides which form the parser emits.
+    pub swift_scm_to_registry_changed: SettingChange,
     /// Whether [`RegistriesConfig::gitlab_instance_host`] changed.
     pub gitlab_instance_host_changed: SettingChange,
 }
@@ -614,12 +617,14 @@ impl PolicyConfig {
             workspace_registries: new_workspace_registries,
             nuget_user_profile_sources: new_nuget_user_profile_sources,
             swift_keychain_credentials: new_swift_keychain_credentials,
+            swift_scm_to_registry: new_swift_scm_to_registry,
             gitlab_instance_host: new_gitlab_instance_host,
         } = new_registries;
         let RegistriesConfig {
             workspace_registries: old_workspace_registries,
             nuget_user_profile_sources: old_nuget_user_profile_sources,
             swift_keychain_credentials: old_swift_keychain_credentials,
+            swift_scm_to_registry: old_swift_scm_to_registry,
             gitlab_instance_host: old_gitlab_instance_host,
         } = &old.registries;
 
@@ -635,6 +640,10 @@ impl PolicyConfig {
             swift_keychain_credentials_changed: SettingChange::of(
                 old_swift_keychain_credentials,
                 new_swift_keychain_credentials,
+            ),
+            swift_scm_to_registry_changed: SettingChange::of(
+                old_swift_scm_to_registry,
+                new_swift_scm_to_registry,
             ),
             gitlab_instance_host_changed: SettingChange::of(
                 old_gitlab_instance_host,
@@ -1490,6 +1499,35 @@ pub enum KeychainCredentials {
     Enabled,
 }
 
+/// Whether an eligible SwiftPM `.package(url:)` dependency is replaced by its registry identity,
+/// as SwiftPM's `--replace-scm-with-registry` does (spec 088, #1757).
+///
+/// Detection cannot come from files (the flags exist only on the `swift`/`xcodebuild` command
+/// line), so the signal is explicit configuration. There is deliberately no value for
+/// `--use-registry-identity-for-scm`: it keeps source control as the version source, so nothing
+/// observable would change.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::policy_config::ScmToRegistry;
+///
+/// assert_eq!(ScmToRegistry::default(), ScmToRegistry::Disabled);
+/// let setting: ScmToRegistry = serde_json::from_str("\"replace\"").unwrap();
+/// assert_eq!(setting, ScmToRegistry::Replace);
+/// assert!(serde_json::from_str::<ScmToRegistry>("\"use_identity\"").is_err());
+/// ```
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScmToRegistry {
+    /// Source-control dependencies keep their source-control versions.
+    #[default]
+    Disabled,
+    /// An eligible `url:` dependency whose repository the trusted user-tier default registry
+    /// maps to exactly one identity is shown with that identity's registry versions.
+    Replace,
+}
+
 /// Cross-ecosystem workspace-declared registry settings (spec #443/plan-1b §1.7, renamed
 /// from `cargo.workspace_registries` by `032-npm-npmrc-registry-support` FR-008/C2).
 ///
@@ -1546,6 +1584,13 @@ pub struct RegistriesConfig {
     #[serde(default)]
     #[raw]
     pub swift_keychain_credentials: KeychainCredentials,
+    /// Spec 088, #1757: whether eligible `.package(url:)` dependencies are replaced by their
+    /// registry identity. `Replace` consults only the user-tier `[default]` registry and only
+    /// when it is trusted. `#[serde(default)]`: additive-safe, same rationale as
+    /// `nuget_user_profile_sources`.
+    #[serde(default)]
+    #[raw]
+    pub swift_scm_to_registry: ScmToRegistry,
     /// Issue #466, spec FR-005a/FR-011a: the GitLab instance host that `project:` includes
     /// and `$CI_SERVER_FQDN`-relative `component:` includes resolve against. It never
     /// receives `GITLAB_TOKEN`: that is bound to `gitlab.com` or the `GITLAB_TOKEN_HOST`
@@ -1595,6 +1640,7 @@ impl RegistriesConfig {
             workspace_registries: WorkspaceRegistriesSetting::PublicOnly,
             nuget_user_profile_sources: UserProfileSources::Disabled,
             swift_keychain_credentials: KeychainCredentials::Disabled,
+            swift_scm_to_registry: ScmToRegistry::Disabled,
             gitlab_instance_host: String::new(),
         }
     }
@@ -1629,6 +1675,16 @@ impl RegistriesConfig {
         self
     }
 
+    /// Overrides [`Self::swift_scm_to_registry`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_swift_scm_to_registry(
+        mut self,
+        swift_scm_to_registry: ScmToRegistry,
+    ) -> Self {
+        self.swift_scm_to_registry = swift_scm_to_registry;
+        self
+    }
+
     /// Overrides [`Self::gitlab_instance_host`]. See [`Self::new`].
     #[must_use]
     pub fn with_gitlab_instance_host(mut self, gitlab_instance_host: impl Into<String>) -> Self {
@@ -1657,6 +1713,8 @@ pub struct RegistryRuntimeSettings {
     pub nuget_user_profile_sources: UserProfileSources,
     /// See [`RegistriesConfig::swift_keychain_credentials`].
     pub swift_keychain_credentials: KeychainCredentials,
+    /// See [`RegistriesConfig::swift_scm_to_registry`].
+    pub swift_scm_to_registry: ScmToRegistry,
     /// See [`RegistriesConfig::gitlab_instance_host`] — normalized from an empty string to
     /// `None`.
     pub gitlab_instance_host: Option<String>,
@@ -1681,6 +1739,7 @@ impl std::fmt::Debug for RegistryRuntimeSettings {
                 "swift_keychain_credentials",
                 &self.swift_keychain_credentials,
             )
+            .field("swift_scm_to_registry", &self.swift_scm_to_registry)
             .field(
                 "gitlab_instance_host",
                 &self
@@ -1791,6 +1850,7 @@ impl RegistriesConfig {
             ),
             nuget_user_profile_sources: self.nuget_user_profile_sources,
             swift_keychain_credentials: self.swift_keychain_credentials,
+            swift_scm_to_registry: self.swift_scm_to_registry,
             gitlab_instance_host: (!self.gitlab_instance_host.is_empty())
                 .then(|| self.gitlab_instance_host.clone()),
         }
@@ -2361,6 +2421,7 @@ mod tests {
             workspace_registries: WorkspaceRegistriesSetting::All,
             nuget_user_profile_sources: UserProfileSources::Enabled,
             swift_keychain_credentials: KeychainCredentials::Enabled,
+            swift_scm_to_registry: ScmToRegistry::Replace,
             gitlab_instance_host: "gitlab.corp".to_string(),
         };
 
@@ -2378,6 +2439,7 @@ mod tests {
             resolved.swift_keychain_credentials,
             KeychainCredentials::Enabled
         );
+        assert_eq!(resolved.swift_scm_to_registry, ScmToRegistry::Replace);
         assert_eq!(
             resolved.gitlab_instance_host.as_deref(),
             Some("gitlab.corp")
@@ -2656,6 +2718,41 @@ mod tests {
     }
 
     #[test]
+    fn test_policy_config_diff_swift_scm_to_registry_change() {
+        let old = PolicyConfig::default();
+        let mut new = PolicyConfig::default();
+        new.registries.swift_scm_to_registry = ScmToRegistry::Replace;
+
+        let diff = PolicyConfig::diff(&old, &new);
+        assert!(diff.swift_scm_to_registry_changed.is_changed());
+        assert!(!diff.swift_keychain_credentials_changed.is_changed());
+        assert!(!diff.workspace_registries_changed.is_changed());
+        assert!(
+            !PolicyConfig::diff(&new, &new)
+                .swift_scm_to_registry_changed
+                .is_changed()
+        );
+    }
+
+    #[test]
+    fn test_registries_config_parses_scm_to_registry_and_rejects_unknown_value() {
+        let config: RegistriesConfig =
+            serde_json::from_str(r#"{"swift_scm_to_registry": "replace"}"#).unwrap();
+        assert_eq!(config.swift_scm_to_registry, ScmToRegistry::Replace);
+        assert_eq!(
+            RegistriesConfig::default().swift_scm_to_registry,
+            ScmToRegistry::Disabled
+        );
+        for bad in [r#""use_identity""#, r#""yes""#, "true"] {
+            let json = format!(r#"{{"swift_scm_to_registry": {bad}}}"#);
+            assert!(
+                serde_json::from_str::<RegistriesConfig>(&json).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn test_policy_config_diff_gitlab_instance_host_change() {
         let old = PolicyConfig::default();
         let mut new = PolicyConfig::default();
@@ -2694,6 +2791,7 @@ mod tests {
             workspace_registries_effect: WorkspaceRegistriesEffect::AsConfigured,
             nuget_user_profile_sources: UserProfileSources::Disabled,
             swift_keychain_credentials: KeychainCredentials::Disabled,
+            swift_scm_to_registry: ScmToRegistry::Disabled,
             gitlab_instance_host: Some(crate::conformance::CREDENTIAL_PROBE_URL.to_string()),
         },
     );

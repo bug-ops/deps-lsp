@@ -254,8 +254,8 @@ pub use deps_dev::{
 pub use ecosystem::{
     BlockedRegistryOccurrence, BlockedSourceClass, ConfigOwner, ConfigReach, Dependency, Ecosystem,
     EcosystemConfig, EcosystemId, LicenseSource, OwnerReach, ParseResult, RegistryOccurrence,
-    RejectedRegistryOccurrence, RejectedSourceClass, TagIndexRefreshes, UserHome, WatchedConfig,
-    WatchedConfigEffect, parse_manifest_blocking, parse_manifest_now,
+    RejectedRegistryOccurrence, RejectedSourceClass, UserHome, WatchedConfig, WatchedConfigEffect,
+    parse_manifest_blocking, parse_manifest_now,
 };
 pub use ecosystem_registry::{EcosystemRegistry, WatchedConfigMatch};
 pub use edit::{
@@ -283,14 +283,15 @@ pub use lockfile::{
     read_lockfile_content,
 };
 pub use lsp_helpers::{
-    DependencyOutcome, DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy,
+    CachedVersionsMap, DependencyOutcome, DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy,
     DiagnosticSeverities, EcosystemFormatter, HOVER_RECENT_VERSIONS,
     LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE, LineOffsetTable, NormalizeName, OsvNaming,
     PackageNaming, PackageRendering, PackageVersions, RequirementMatcher, RequirementResolution,
-    RequirementStatus, SourcePolicy, UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, is_dot_segment,
-    is_safe_feature_name, is_safe_maven_coordinate_segment, is_safe_package_name,
-    is_safe_registry_url, is_safe_version_string, is_same_major_minor, maven_coordinate_path,
-    position_in_range, requirement_is_unsatisfiable, warn_rejected_value,
+    RequirementStatus, ResolvedCandidatesMap, ResolvedVersionsMap, SourcePolicy,
+    UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, is_dot_segment, is_safe_feature_name,
+    is_safe_maven_coordinate_segment, is_safe_package_name, is_safe_registry_url,
+    is_safe_version_string, is_same_major_minor, maven_coordinate_path, position_in_range,
+    requirement_is_unsatisfiable, warn_rejected_value,
 };
 /// LSP-response-shaped re-exports, present only when the `lsp-responses` feature is enabled.
 #[cfg(feature = "lsp-responses")]
@@ -323,7 +324,7 @@ pub use registry_endpoint::{CachedEndpoint, EgressTier, EndpointFingerprint, Reg
 pub use selection::{
     InvalidStabilityOccurrence, SelectionContext, StabilityFloor, UnknownStability,
 };
-pub use tag_index_refresh::{TagIndexKey, TagIndexRefreshSender};
+pub use tag_index_refresh::{RefreshEvent, RefreshEvents, RefreshSender};
 pub use version_matcher::{
     Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,
     normalize_and_parse_version, normalize_operator_spacing,

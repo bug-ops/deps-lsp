@@ -1,6 +1,160 @@
 use deps_core::position::Range;
+use url::Url;
 
 use crate::catalog::CatalogOrigin;
+
+/// Which kind of file an npm-ecosystem document is, decided from its file name.
+///
+/// One npm `Ecosystem` serves both formats (spec 078 D-1): `parse_manifest` dispatches on this
+/// enum so a `pnpm-workspace.yaml` is never handed to the JSON parser and a `package.json`
+/// is never handed to the YAML parser. Exhaustive so a third format forces every dispatch
+/// site to be revisited.
+///
+/// # Examples
+///
+/// ```
+/// use deps_npm::types::NpmManifestKind;
+/// use url::Url;
+///
+/// let yaml = Url::parse("file:///repo/pnpm-workspace.yaml").unwrap();
+/// let json = Url::parse("file:///repo/package.json").unwrap();
+/// assert_eq!(NpmManifestKind::from_uri(&yaml), NpmManifestKind::PnpmWorkspace);
+/// assert_eq!(NpmManifestKind::from_uri(&json), NpmManifestKind::PackageJson);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NpmManifestKind {
+    /// A `package.json` manifest.
+    PackageJson,
+    /// A `pnpm-workspace.yaml` whose `catalog:`/`catalogs:` entries are dependencies.
+    PnpmWorkspace,
+}
+
+impl NpmManifestKind {
+    /// File name of a pnpm workspace file.
+    pub const PNPM_WORKSPACE_FILENAME: &'static str = "pnpm-workspace.yaml";
+
+    /// Classifies `uri` by its final path segment; anything but a pnpm workspace file is
+    /// treated as a `package.json`, mirroring how the registry only routes known manifest
+    /// file names to this ecosystem.
+    #[must_use]
+    pub fn from_uri(uri: &Url) -> Self {
+        let basename = uri.path().rsplit('/').next().unwrap_or_default();
+        if basename == Self::PNPM_WORKSPACE_FILENAME {
+            Self::PnpmWorkspace
+        } else {
+            Self::PackageJson
+        }
+    }
+}
+
+/// Name of a user-defined pnpm catalog (`catalogs.<name>`), guaranteed not to be `default`.
+///
+/// The `default` catalog is [`CatalogId::Default`]; making `CatalogName("default")`
+/// unrepresentable means a catalog literally named `default` can never collide with the
+/// default catalog by string equality (spec 078 NFR-005). Construct one via
+/// [`CatalogId::from_name`].
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct CatalogName(String);
+
+impl CatalogName {
+    /// The catalog name as written in `pnpm-workspace.yaml`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for CatalogName {
+    /// Redacted: a catalog name is attacker-controlled text that can be credential-shaped
+    /// (CWE-532, #1222).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CatalogName")
+            .field(&deps_core::net_policy::redact_declaration_key(&self.0))
+            .finish()
+    }
+}
+
+/// Identity of a pnpm catalog: the default one, or a named one.
+///
+/// # Examples
+///
+/// ```
+/// use deps_npm::types::CatalogId;
+///
+/// assert_eq!(CatalogId::from_name("default"), CatalogId::Default);
+/// assert_ne!(CatalogId::from_name("react17"), CatalogId::Default);
+/// assert_eq!(CatalogId::from_name("react17").name(), "react17");
+/// assert_eq!(CatalogId::Default.name(), "default");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CatalogId {
+    /// The default catalog (`catalog:` or `catalogs.default:`).
+    Default,
+    /// A named catalog (`catalogs.<name>:`).
+    Named(CatalogName),
+}
+
+impl CatalogId {
+    /// The catalog a name written in a `catalogs:` key or a `catalog:<name>` specifier refers to:
+    /// `default` is [`Self::Default`], any other name is [`Self::Named`].
+    #[must_use]
+    pub fn from_name(name: &str) -> Self {
+        if name == "default" {
+            Self::Default
+        } else {
+            Self::Named(CatalogName(name.to_string()))
+        }
+    }
+
+    /// The name as it is written in a `catalog:<name>` specifier (`default` for the default
+    /// catalog).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Default => "default",
+            Self::Named(name) => name.as_str(),
+        }
+    }
+}
+
+/// Where in `pnpm-workspace.yaml` a catalog is defined.
+///
+/// Distinguishes the two spellings of the default catalog so an edit or a diagnostic can
+/// say which one it is attached to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogSite {
+    /// A top-level `catalog:` mapping (always the default catalog).
+    TopLevelCatalog,
+    /// A `catalogs.default:` mapping.
+    CatalogsDefault,
+    /// A `catalogs.<name>:` mapping for a non-default name.
+    CatalogsNamed,
+}
+
+/// Where an [`NpmDependency`] was declared.
+///
+/// One exhaustive enum instead of a `section` field plus an optional catalog reference, so a
+/// catalog entry that also carries a catalog reference (or a `package.json` dependency with
+/// no section) is unrepresentable (spec 078 NFR-010). Match it exhaustively; there is no
+/// helper that defaults a missing section to `Dependencies`, because that would silently
+/// apply peer/optional semantics to a catalog entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NpmDependencyOrigin {
+    /// A `package.json` dependency, possibly a `catalog:` reference into `pnpm-workspace.yaml`.
+    Manifest {
+        /// Which `package.json` section declares it.
+        section: NpmDependencySection,
+        /// `Some` when the value is a `catalog:`/`catalog:<name>` specifier (spec 046).
+        catalog_ref: Option<CatalogOrigin>,
+    },
+    /// An entry of a catalog in `pnpm-workspace.yaml` (spec 078).
+    CatalogEntry {
+        /// The catalog the entry belongs to.
+        id: CatalogId,
+        /// The definition site of that catalog.
+        site: CatalogSite,
+    },
+}
 
 /// Parsed dependency from package.json with position tracking.
 ///
@@ -21,7 +175,13 @@ use crate::catalog::CatalogOrigin;
 /// let dep = &result.dependencies[0];
 ///
 /// assert_eq!(dep.name, "express");
-/// assert!(matches!(dep.section, NpmDependencySection::Dependencies));
+/// assert!(matches!(
+///     dep.origin,
+///     deps_npm::types::NpmDependencyOrigin::Manifest {
+///         section: NpmDependencySection::Dependencies,
+///         ..
+///     }
+/// ));
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,15 +196,12 @@ pub struct NpmDependency {
     pub version_req: Option<deps_core::VersionReq>,
     /// Document range of the version requirement string.
     pub version_range: Option<Range>,
-    /// Which `package.json` section this dependency was declared under.
-    pub section: NpmDependencySection,
+    /// Where this dependency was declared: a `package.json` section (possibly via a
+    /// `catalog:` reference) or a `pnpm-workspace.yaml` catalog entry.
+    pub origin: NpmDependencyOrigin,
     /// Resolved by `.npmrc` lookup (spec `032-npm-npmrc-registry-support`) — `Registry`
     /// (the public default) unless a `registry=`/`@scope:registry=` entry applies.
     pub source: deps_core::parser::DependencySource,
-    /// `Some` when `version_req` (before/after resolution) came from a pnpm
-    /// `catalog:`/`catalog:<name>` specifier (spec `046-pnpm-catalogs`); `None` for every
-    /// ordinary literal-range dependency.
-    pub catalog: Option<CatalogOrigin>,
     /// The real registry package name from an
     /// [`npm:` alias value](https://docs.npmjs.com/cli/v10/configuring-npm/package-json#dependencies)
     /// (`"my-react": "npm:react@^18.0.0"`), when present. `None` for an ordinary, non-aliased
@@ -58,6 +215,18 @@ pub struct NpmDependency {
     /// fix/refactor edit for an aliased dependency rather than writing a version literal
     /// over the whole alias text and destroying it.
     pub package: Option<deps_core::PackageName>,
+}
+
+impl NpmDependency {
+    /// The `catalog:` reference this dependency was declared with (spec 046), or `None` for a
+    /// literal-range dependency and for a catalog entry itself.
+    #[must_use]
+    pub const fn catalog_ref(&self) -> Option<&CatalogOrigin> {
+        match &self.origin {
+            NpmDependencyOrigin::Manifest { catalog_ref, .. } => catalog_ref.as_ref(),
+            NpmDependencyOrigin::CatalogEntry { .. } => None,
+        }
+    }
 }
 
 // Hand-implemented, not via `impl_dependency!`: `name()` needs `package.unwrap_or(&name)`,
@@ -411,9 +580,11 @@ mod tests {
             name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             version_req: Some("^18.0.0".into()),
             version_range: Some(Range::new(Position::new(0, 8), Position::new(0, 16))),
-            section: NpmDependencySection::Dependencies,
+            origin: NpmDependencyOrigin::Manifest {
+                section: NpmDependencySection::Dependencies,
+                catalog_ref: None,
+            },
             source: deps_core::parser::DependencySource::Registry,
-            catalog: None,
             package: None,
         };
 

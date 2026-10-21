@@ -1,6 +1,8 @@
 //! Integration tests for deps-gradle parsers using fixture files.
 
 #[cfg(feature = "lsp-responses")]
+use deps_core::NormalizedName;
+#[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::{generate_diagnostics_from_cache, generate_inlay_hints};
 #[cfg(feature = "lsp-responses")]
 use deps_core::{EcosystemConfig, LoadingState, PackageVersions, VersionData};
@@ -223,7 +225,7 @@ spring-boot = { module = "org.springframework.boot:spring-boot-starter", version
 
     let mut cached_versions = HashMap::new();
     cached_versions.insert(
-        "org.springframework.boot:spring-boot-starter".into(),
+        NormalizedName::for_test("org.springframework.boot:spring-boot-starter"),
         PackageVersions::latest_only("3.2.0"),
     );
     let resolved_versions = HashMap::new();

@@ -461,9 +461,7 @@ async fn test_same_partition_credential_and_anonymous_use_distinct_entries_on_bo
 
     let cache = HttpCache::new();
     let origin = prefix(&trusted_origin);
-    let anonymous = RequestAuth::Anonymous {
-        partition: Some(partition(5)),
-    };
+    let anonymous = RequestAuth::anonymous(Some(partition(5)));
     cache
         .get_cached_trusted_origin(&url, &origin, cred_in(5), None)
         .await
@@ -581,3 +579,30 @@ async fn test_set_registry_policy_purges_pinned_tier_entries() {
 }
 
 // --- #1816: guarded egress, proxy-host exemption, preflight ---
+
+#[tokio::test]
+async fn test_limited_trusted_origin_fetch_rejects_an_oversized_body_and_stores_nothing() {
+    let mut server = mockito::Server::new_async().await;
+    let url = format!("{}/api/data", server.url());
+    let origin = format!("{}/", server.url());
+    let _m = server
+        .mock("GET", "/api/data")
+        .with_status(200)
+        .with_body(vec![b'x'; 2048])
+        .create_async()
+        .await;
+    let cache = HttpCache::new();
+    let err = cache
+        .get_cached_trusted_origin_limited(
+            &url,
+            &prefix(&origin),
+            RequestAuth::ANONYMOUS,
+            None,
+            RevalidationFailure::ServeStale,
+            BodyLimit::new(1024),
+        )
+        .await
+        .unwrap_err();
+    assert_matches!(err, DepsError::ResponseTooLarge { limit: 1024, .. });
+    assert!(cache.is_empty());
+}

@@ -179,7 +179,7 @@ async fn test_auth_id_partitions_baseline_entries_and_eviction_reaches_them() {
             .get_cached_trusted_origin_response(
                 &url,
                 &prefix(&origin),
-                RequestAuth::Anonymous { partition },
+                RequestAuth::anonymous(partition),
                 None,
                 RevalidationFailure::ServeStale,
             )

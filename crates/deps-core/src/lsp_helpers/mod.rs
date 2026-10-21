@@ -15,7 +15,7 @@ use crate::package::NormalizedName;
 use crate::position::{Position, Range};
 use crate::{
     ConcreteVersion, CooldownWindow, Dependency, Deprecation, FetchFailure, GossipFindings,
-    PackageKey, PackageName, PublishTime, RemovalStatus, VersionReq,
+    PackageKey, PublishTime, RemovalStatus, VersionReq,
 };
 
 mod candidate_tags;
@@ -26,6 +26,9 @@ mod code_lenses;
 mod diagnostics;
 mod formatter;
 mod git_pin;
+mod git_probe;
+#[cfg(test)]
+mod git_probe_lineage_tests;
 mod git_ref;
 #[cfg(feature = "lsp-responses")]
 mod hover;
@@ -35,6 +38,7 @@ mod in_use_version;
 #[cfg(feature = "lsp-responses")]
 mod inlay_hints;
 mod interactive_fetch;
+mod probe_pass;
 mod sha_comment;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -86,13 +90,20 @@ pub use diagnostics::requirement_is_oversized;
 pub(crate) use diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
 pub use formatter::{
     BareMeaning, BuildMetadataPolicy, DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter,
-    NormalizeName, OsvNameAvailability, OsvNaming, PackageNaming, PackageRendering,
-    RequirementGate, RequirementResolution, RequirementRewriteShape, SourcePolicy, bare_meaning,
-    classify_requirement_rewrite_shape, format_version_replacing_by_shape, requirement_is_compound,
+    LowercaseNaming, NormalizeName, OsvNameAvailability, OsvNaming, PackageNaming,
+    PackageRendering, PublicContent, RequirementGate, RequirementResolution,
+    RequirementRewriteShape, SourcePolicy, bare_meaning, classify_requirement_rewrite_shape,
+    format_version_replacing_by_shape, requirement_is_compound,
     up_to_date_for_comparators_via_compiled_matcher, up_to_date_via_compiled_matcher,
 };
 pub use git_pin::{
     GitPinView, git_candidate_tag_source, git_commit_rewrite, git_tag_replacement, resolve_git_pin,
+};
+pub use git_probe::{
+    AheadProof, BranchEvidence, BranchEvidenceStore, COMPARE_BODY_LIMIT, CommitEvidence,
+    CommitEvidenceStore, CommitLineage, CompareStatus, CompareSummary, DefaultBranchMembership,
+    EVIDENCE_STORE_CAPACITY, EvidenceStore, HoverProvenance, PercentEncoded, ProbeEffect,
+    ProbePhase, ProbeRef, ProbeReport,
 };
 pub use git_ref::{
     CommitRewrite, CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, PartialTagPolicy,
@@ -121,6 +132,10 @@ pub use interactive_fetch::{
     InteractiveFetchRequest, NoLiveList, SharedVersions, await_interactive_fetch,
     await_interactive_versions,
 };
+pub use probe_pass::{
+    BranchProbe, CommitProbe, EVIDENCE_TTL, LatestRelease, PROBE_CONCURRENCY, ProbeAnswer,
+    ProbeBackend, ProbeOutcome, ProbePlan, ProbeStores, run_probe_pass,
+};
 #[cfg(feature = "lsp-responses")]
 pub use sha_comment::build_sha_comment_fix_action;
 pub use sha_comment::{
@@ -135,7 +150,9 @@ pub use unknown_ref::{
     UNKNOWN_REF_DIAGNOSTIC_CODE, UnknownRefTarget, dependency_at_position, unknown_ref_diagnostic,
     unknown_ref_diagnostic_for, unknown_ref_diagnostics,
 };
-pub use version_data::VersionData;
+pub use version_data::{
+    CachedVersionsMap, ResolvedCandidatesMap, ResolvedVersionsMap, VersionData,
+};
 
 /// Maximum number of recent versions hover's "Recent versions" section renders.
 ///
@@ -249,11 +266,11 @@ pub enum CooldownPrecedence {
 ///
 /// ```
 /// use deps_core::lsp_helpers::{CooldownPrecedence, cooldown_precedence};
-/// use deps_core::{CooldownWindow, PackageName, PublishTime};
+/// use deps_core::{CooldownWindow, NormalizedName, PublishTime};
 ///
 /// let cleared = cooldown_precedence(
 ///     None,
-///     &PackageName::new("left-pad"),
+///     &NormalizedName::for_test("left-pad"),
 ///     "2.0.0",
 ///     Some(PublishTime::from_unix_secs(1_000)),
 ///     CooldownWindow::from_secs(500),
@@ -263,7 +280,7 @@ pub enum CooldownPrecedence {
 ///
 /// let blocked = cooldown_precedence(
 ///     None,
-///     &PackageName::new("left-pad"),
+///     &NormalizedName::for_test("left-pad"),
 ///     "2.0.0",
 ///     Some(PublishTime::from_unix_secs(1_000)),
 ///     CooldownWindow::from_secs(5_000),
@@ -273,8 +290,8 @@ pub enum CooldownPrecedence {
 /// ```
 #[must_use]
 pub fn cooldown_precedence(
-    gossip_prefetch: Option<&HashMap<PackageName, GossipFindings>>,
-    name: &PackageName,
+    gossip_prefetch: Option<&HashMap<NormalizedName, GossipFindings>>,
+    name: &NormalizedName,
     version: &str,
     published_at: Option<PublishTime>,
     cooldown: CooldownWindow,
@@ -349,7 +366,7 @@ pub fn local_cooldown_precedence(
 ///
 /// ```
 /// use deps_core::lsp_helpers::{CooldownDisposition, PackageVersions, cooldown_disposition};
-/// use deps_core::{FreshnessSettings, PackageName, PublishTime};
+/// use deps_core::{FreshnessSettings, NormalizedName, PublishTime};
 /// use std::sync::Arc;
 ///
 /// let versions = PackageVersions::new(
@@ -360,7 +377,7 @@ pub fn local_cooldown_precedence(
 ///
 /// let disposition = cooldown_disposition(
 ///     &versions,
-///     &PackageName::new("left-pad"),
+///     &NormalizedName::for_test("left-pad"),
 ///     FreshnessSettings::Enabled {
 ///         cooldown: deps_core::CooldownWindow::from_secs(500),
 ///     },
@@ -371,7 +388,7 @@ pub fn local_cooldown_precedence(
 ///
 /// let blocked = cooldown_disposition(
 ///     &versions,
-///     &PackageName::new("left-pad"),
+///     &NormalizedName::for_test("left-pad"),
 ///     FreshnessSettings::Enabled {
 ///         cooldown: deps_core::CooldownWindow::from_secs(5_000),
 ///     },
@@ -383,9 +400,9 @@ pub fn local_cooldown_precedence(
 #[must_use]
 pub fn cooldown_disposition<'a>(
     versions: &'a PackageVersions,
-    name: &PackageName,
+    name: &NormalizedName,
     freshness: crate::freshness::FreshnessSettings,
-    gossip_prefetch: Option<&HashMap<PackageName, GossipFindings>>,
+    gossip_prefetch: Option<&HashMap<NormalizedName, GossipFindings>>,
     now: PublishTime,
 ) -> CooldownDisposition<'a> {
     let crate::freshness::FreshnessSettings::Enabled { cooldown } = freshness else {
@@ -1001,8 +1018,7 @@ impl PackageVersions {
     }
 }
 
-/// Looks up `dep` in the registry cache under its normalized name first and its declared name
-/// second ([`PackageKey::find_in`]).
+/// Looks up `dep` in the registry cache under its normalized name.
 ///
 /// The lookup for a caller that holds a raw cache map plus the dependency and its formatter
 /// (the fix-target snapshot, `deps-engine`'s OSV classification). A case-folding ecosystem such
@@ -1013,8 +1029,7 @@ impl PackageVersions {
 /// ```
 /// use deps_core::lsp_helpers::{PackageNaming, PackageVersions, cached_package_versions};
 /// use deps_core::position::Range;
-/// use deps_core::{Dependency, PackageName, VersionReq};
-/// use std::collections::HashMap;
+/// use deps_core::{CachedVersionsMap, Dependency, PackageKey, PackageName, VersionReq};
 ///
 /// struct Lowercase;
 /// impl PackageNaming for Lowercase {
@@ -1034,20 +1049,23 @@ impl PackageVersions {
 /// #     }
 /// #     fn as_any(&self) -> &dyn std::any::Any { self }
 /// # }
-/// let mut cached: HashMap<PackageName, PackageVersions> = HashMap::new();
-/// cached.insert("monolog/monolog".into(), PackageVersions::latest_only("3.0.0"));
-///
 /// let dep = Dep(PackageName::new("Monolog/Monolog"));
+/// let mut cached = CachedVersionsMap::new();
+/// cached.insert(
+///     PackageKey::new(dep.name(), &Lowercase).normalized().clone(),
+///     PackageVersions::latest_only("3.0.0"),
+/// );
+///
 /// let hit = cached_package_versions(&cached, &dep, &Lowercase);
 /// assert_eq!(hit.map(|v| v.latest.as_str()), Some("3.0.0"));
 /// ```
 #[must_use]
 pub fn cached_package_versions<'m>(
-    cached: &'m HashMap<PackageName, PackageVersions>,
+    cached: &'m CachedVersionsMap,
     dep: &dyn Dependency,
     naming: &(impl PackageNaming + ?Sized),
 ) -> Option<&'m PackageVersions> {
-    PackageKey::new(dep.name(), naming).find_in(cached)
+    cached.get(PackageKey::new(dep.name(), naming).normalized())
 }
 
 /// Everything the lifecycle fetch learned about one package, keyed by its normalized name.
@@ -1342,14 +1360,14 @@ pub enum GossipCooldownLookup {
 /// # Examples
 ///
 /// ```
-/// use deps_core::PackageName;
+/// use deps_core::NormalizedName;
 /// use deps_core::deps_dev::{GossipCooldown, GossipRiskLevel};
 /// use deps_core::lsp_helpers::{GossipCooldownLookup, gossip_cooldown_for};
 /// use deps_core::test_util::stub_gossip_findings;
 /// use deps_core::PublishTime;
 /// use std::collections::HashMap;
 ///
-/// let name = PackageName::new("left-pad");
+/// let name = NormalizedName::for_test("left-pad");
 /// let mut prefetch = HashMap::new();
 /// prefetch.insert(
 ///     name.clone(),
@@ -1377,8 +1395,8 @@ pub enum GossipCooldownLookup {
 /// ```
 #[must_use]
 pub fn gossip_cooldown_for(
-    gossip_prefetch: Option<&HashMap<PackageName, GossipFindings>>,
-    name: &PackageName,
+    gossip_prefetch: Option<&HashMap<NormalizedName, GossipFindings>>,
+    name: &NormalizedName,
     comparand: &str,
     now: PublishTime,
 ) -> GossipCooldownLookup {
@@ -1633,8 +1651,8 @@ pub fn resolve_scan_outcome<'a>(
     resolve_by_vuln_key(vulnerabilities, dep, keys, key)
 }
 
-/// Shared per-occurrence [`VulnKey`] lookup chain (version-qualified key, then normalized name,
-/// then declared name) underlying both [`resolve_scan_outcome`] and [`resolve_latest_status`] —
+/// Shared per-occurrence [`VulnKey`] lookup chain (version-qualified key, then normalized name)
+/// underlying both [`resolve_scan_outcome`] and [`resolve_latest_status`] —
 /// the two maps [`VulnerabilityMap`] and [`crate::osv::LatestStatusMap`] share this exact key
 /// space (#1517), so the fallback chain only needs writing once.
 fn resolve_by_vuln_key<'a, V>(
@@ -1646,11 +1664,10 @@ fn resolve_by_vuln_key<'a, V>(
     keys.and_then(|k| k.get(&dep.name_range()))
         .and_then(|vuln_key| map.get(vuln_key))
         .or_else(|| map.get(&VulnKey::from_name(key.normalized())))
-        .or_else(|| map.get(&VulnKey::from_declared(key.declared())))
 }
 
 /// Looks up `dep`'s entry in phase B's per-key "latest" status map, using the same
-/// version-qualified-key-then-normalized-name-then-declared-name fallback chain as
+/// version-qualified-key-then-normalized-name fallback chain as
 /// [`resolve_scan_outcome`] (#1517).
 ///
 /// # Examples
@@ -1847,7 +1864,7 @@ pub fn latest_verdict(
 /// window would otherwise read as the fail-open [`LatestVerdict::NotApplicable`] for a dependency
 /// that is now registry-resolvable and simply hasn't been checked yet, this re-checks `dep`'s
 /// *current* source before trusting a cached `NonRegistrySource` skip (issue #1531). The check
-/// goes through `formatter.source_is_public_registry_content` — the same predicate phase B itself
+/// goes through `formatter.public_content` — the same predicate phase B itself
 /// uses to classify `NonRegistrySource` in the first place (`deps-engine`'s `classify::osv`) —
 /// rather than a bare `DependencySource::Registry` match, so an ecosystem that widens what counts
 /// as registry content (e.g. `deps-cargo`'s `AlternateRegistry { mirrors_crates_io: true }` for a
@@ -1864,7 +1881,7 @@ fn upgrade_status_to_verdict(
         None | Some(UpgradeStatus::NotChecked) => LatestVerdict::Unverified,
         Some(UpgradeStatus::StructurallyUnchecked(reason)) => {
             let stale_non_registry_skip = *reason == StructuralSkipReason::NonRegistrySource
-                && formatter.source_is_public_registry_content(&dep.source());
+                && formatter.public_content(dep).is_some();
             if stale_non_registry_skip {
                 LatestVerdict::Unverified
             } else {
@@ -3795,7 +3812,7 @@ mod tests {
 
     #[test]
     fn gossip_cooldown_for_none_prefetch_is_unavailable() {
-        let name = PackageName::new("vite");
+        let name = NormalizedName::for_test("vite");
         assert_matches!(
             gossip_cooldown_for(None, &name, "8.3.1", PublishTime::now()),
             GossipCooldownLookup::Unavailable
@@ -3804,7 +3821,7 @@ mod tests {
 
     #[test]
     fn gossip_cooldown_for_matching_active_version_is_active() {
-        let name = PackageName::new("vite");
+        let name = NormalizedName::for_test("vite");
         let mut prefetch = HashMap::new();
         prefetch.insert(name.clone(), gossip_findings_fixture("8.3.1", 2_000));
 
@@ -3819,7 +3836,7 @@ mod tests {
 
     #[test]
     fn gossip_cooldown_for_version_mismatch_is_unavailable() {
-        let name = PackageName::new("vite");
+        let name = NormalizedName::for_test("vite");
         let mut prefetch = HashMap::new();
         prefetch.insert(name.clone(), gossip_findings_fixture("8.3.1", 2_000));
 
@@ -3837,7 +3854,7 @@ mod tests {
 
     #[test]
     fn gossip_cooldown_for_ended_cooldown_self_clears_to_not_active_at_read_time() {
-        let name = PackageName::new("vite");
+        let name = NormalizedName::for_test("vite");
         let mut prefetch = HashMap::new();
         prefetch.insert(name.clone(), gossip_findings_fixture("8.3.1", 1_000));
 
@@ -3862,7 +3879,7 @@ mod tests {
     /// authoritative "not in cooldown" answer (the old mapping was fail-open for a write path).
     #[test]
     fn gossip_cooldown_for_present_but_no_cooldown_data_is_unavailable() {
-        let name = PackageName::new("vite");
+        let name = NormalizedName::for_test("vite");
         let mut prefetch = HashMap::new();
         prefetch.insert(
             name.clone(),
@@ -3875,8 +3892,8 @@ mod tests {
 
     #[test]
     fn gossip_cooldown_for_absent_name_is_unavailable() {
-        let name = PackageName::new("vite");
-        let other = PackageName::new("left-pad");
+        let name = NormalizedName::for_test("vite");
+        let other = NormalizedName::for_test("left-pad");
         let mut prefetch = HashMap::new();
         prefetch.insert(other, gossip_findings_fixture("1.3.0", 2_000));
 
@@ -3901,7 +3918,7 @@ mod tests {
                 "1.9.0".into(),
                 PublishTime::from_unix_secs(9_800), // 200s old at read time
             ));
-        let name = PackageName::new("pkg");
+        let name = NormalizedName::for_test("pkg");
 
         // At fetch time, a 150s cooldown window: latest (100s old) is blocked, the fallback
         // (200s old) already clears it.

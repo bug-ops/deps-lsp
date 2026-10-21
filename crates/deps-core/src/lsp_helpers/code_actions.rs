@@ -632,10 +632,16 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     });
 
     let mut latest_refactor_idx = None;
+    // A pin proved ahead of the latest release would be downgraded by "Update to X".
+    let proven_ahead = matches!(
+        formatter.hover_provenance(dep),
+        Some(crate::lsp_helpers::HoverProvenance::CommitAheadOfLatestRelease { .. })
+    );
     // #1370: central placeholder gate — an unexpanded placeholder has no concrete version
     // text a REFACTOR "Update to X" action could ever replace, so the whole loop is skipped
     // rather than relying on every generated edit happening to dedup away as a no-op.
-    if !requirement_is_placeholder_for(formatter, dep, version_req.as_str())
+    if !proven_ahead
+        && !requirement_is_placeholder_for(formatter, dep, version_req.as_str())
         && let Some(registry_versions) = &registry_versions
     {
         // Same registry-delegated pick hover's `live_latest_idx` uses (see
@@ -1663,6 +1669,79 @@ mod tests {
         );
     }
 
+    /// A formatter differing from the identity one only in what it says about the pin.
+    struct ProvenAheadFormatter {
+        proven: bool,
+    }
+
+    impl PackageNaming for ProvenAheadFormatter {}
+
+    impl PackageRendering for ProvenAheadFormatter {
+        fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+            version.to_string()
+        }
+
+        fn package_url(&self, name: &PackageName) -> String {
+            format!("https://example.com/{}", name.as_str())
+        }
+
+        fn hover_provenance(&self, _dep: &dyn Dependency) -> Option<HoverProvenance> {
+            self.proven
+                .then(|| HoverProvenance::CommitAheadOfLatestRelease {
+                    ahead_by: Some(2),
+                    latest_tag: "1.2.0".into(),
+                })
+        }
+    }
+
+    impl RequirementResolution for ProvenAheadFormatter {}
+    impl DiagnosticMessages for ProvenAheadFormatter {}
+    impl DiagnosticPolicy for ProvenAheadFormatter {}
+    impl SourcePolicy for ProvenAheadFormatter {}
+    impl OsvNaming for ProvenAheadFormatter {}
+
+    /// Spec 087 SC-004 at code-action level: the plain update is offered for an ordinary pin and
+    /// withheld for one proven ahead of the latest release.
+    #[tokio::test]
+    async fn test_generate_code_actions_withholds_update_for_a_proven_ahead_pin() {
+        for (proven, offered) in [(false, true), (true, false)] {
+            let (dep, version_range, content) = vulnerable_dep("1.0.0");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            let registry = FixedVersionRegistry {
+                versions: vec![("1.2.0", false), ("1.1.0", false)],
+            };
+
+            let actions = generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                VersionData::new(&cached, &resolved),
+                &content,
+                &registry,
+                &ProvenAheadFormatter { proven },
+            )
+            .await;
+
+            let titles = refactor_titles(&actions);
+            assert_eq!(
+                titles.iter().any(|t| t.starts_with("1.2.0")),
+                offered,
+                "proven={proven}: {titles:?}"
+            );
+            if proven {
+                assert!(
+                    actions.iter().all(|a| a.is_preferred != Some(true)),
+                    "no preferred update for a proven pin"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_generate_code_actions_refactor_loop_no_op_guard_ignores_whitespace() {
         // Whitespace-only divergence between the declared requirement and the
@@ -1840,7 +1919,7 @@ mod tests {
         (parse_result, version_range, content, vulnerabilities)
     }
 
-    fn deprecated_4_18_0() -> HashMap<PackageName, PackageVersions> {
+    fn deprecated_4_18_0() -> HashMap<NormalizedName, PackageVersions> {
         let flagged: Arc<[(ConcreteVersion, RemovalStatus)]> = Arc::from(vec![(
             ConcreteVersion::new("4.18.0"),
             RemovalStatus::AdvisoryDeprecated,
@@ -1850,7 +1929,7 @@ mod tests {
             ConcreteVersion::new("4.18.0"),
         ]);
         HashMap::from([(
-            PackageName::new("pkg"),
+            NormalizedName::for_test("pkg"),
             PackageVersions::new(ConcreteVersion::new("4.18.1"), available).with_yanked(flagged),
         )])
     }
@@ -2204,7 +2283,7 @@ mod tests {
 
         let cached = HashMap::new();
         let mut resolved = HashMap::new();
-        resolved.insert(pkg("pkg"), "1.0.1".into());
+        resolved.insert(NormalizedName::for_test("pkg"), "1.0.1".into());
         let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
 
         let actions = generate_code_actions(
@@ -3643,10 +3722,10 @@ mod tests {
             key: &str,
             latest: &str,
             available: &[&str],
-        ) -> HashMap<PackageName, PackageVersions> {
+        ) -> HashMap<NormalizedName, PackageVersions> {
             let mut m = HashMap::new();
             m.insert(
-                pkg(key),
+                NormalizedName::for_test(key),
                 PackageVersions {
                     latest: latest.into(),
                     available: Arc::from(
@@ -3667,7 +3746,7 @@ mod tests {
         fn cached_versions(
             latest: &str,
             available: &[&str],
-        ) -> HashMap<PackageName, PackageVersions> {
+        ) -> HashMap<NormalizedName, PackageVersions> {
             cached_versions_keyed("pkg", latest, available)
         }
 
@@ -3861,18 +3940,16 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_unsat_fix_resolves_cache_entry_via_raw_name_fallback() {
-            // Critic M1: mirrors the diagnostic's `.get(normalized).or_else(|| .get(raw))`
-            // lookup — an ecosystem whose `normalize_package_name` is not the identity
-            // must still resolve a cache entry keyed by the raw declared name.
+        async fn test_unsat_fix_resolves_cache_entry_keyed_by_normalized_name() {
+            // An ecosystem whose `normalize_package_name` is not the identity must resolve
+            // the cache entry keyed by the normalized spelling.
             let (dep, version_range, content) = vulnerable_dep("1.0.0");
             let parse_result = MockParseResult {
                 deps: vec![dep],
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
 
-            // Keyed by the raw name "pkg", not "normalized-pkg".
-            let cached = cached_versions_keyed("pkg", "9.9.9", &["9.9.9"]);
+            let cached = cached_versions_keyed("normalized-pkg", "9.9.9", &["9.9.9"]);
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 

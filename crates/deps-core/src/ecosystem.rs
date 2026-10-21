@@ -48,10 +48,6 @@ pub mod private {
 /// A boxed, type-erased future used throughout the [`Ecosystem`] trait's async methods.
 pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
-/// Receiver of the package names whose tag index was refreshed, see
-/// [`Ecosystem::tag_index_refreshes`].
-pub type TagIndexRefreshes = tokio::sync::broadcast::Receiver<crate::PackageName>;
-
 /// Runs `ecosystem.parse_manifest(content, uri)` on the blocking-thread pool instead of the
 /// calling tokio worker.
 ///
@@ -1641,19 +1637,50 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         None
     }
 
-    /// Subscribes to tag-index refresh events of this ecosystem.
+    /// Subscribes to the [`RefreshEvent`](crate::RefreshEvent)s of this ecosystem.
     ///
     /// An ecosystem whose registry keeps a shared [`TagIndex`](crate::lsp_helpers::TagIndex)
-    /// sends the package name on the returned channel whenever a fetch first populates that
-    /// package's index or changes its tag-to-commit mapping. A document that did not trigger
-    /// the fetch uses it to re-evaluate findings that depend on the index (a vulnerability
-    /// scan of a SHA pin only resolves once the index is warm). Each call returns an
-    /// independent receiver; a lagged receiver must treat every package as refreshed.
+    /// sends [`RefreshEvent::TagIndex`](crate::RefreshEvent::TagIndex) for a repository
+    /// whenever a fetch first populates its index or changes its tag-to-commit mapping. A
+    /// document that did not trigger the fetch uses it to re-evaluate findings that depend on
+    /// the index (a vulnerability scan of a SHA pin only resolves once the index is warm).
+    /// Background probes add [`RefreshEvent::ProbeEvidence`](crate::RefreshEvent::ProbeEvidence)
+    /// (republish only) and identity changes add
+    /// [`RefreshEvent::ReparseOpenDocuments`](crate::RefreshEvent::ReparseOpenDocuments). Each
+    /// call returns an independent receiver; a lagged receiver must treat every repository as
+    /// refreshed.
     ///
-    /// The default is `None`: the ecosystem has no tag index, or its findings cannot change
-    /// when one refreshes.
-    fn tag_index_refreshes(&self) -> Option<TagIndexRefreshes> {
+    /// The default is `None`: the ecosystem announces nothing, or its findings cannot change
+    /// when anything it could announce happens.
+    fn refresh_events(&self) -> Option<crate::RefreshEvents> {
         None
+    }
+
+    /// Gathers evidence in the background that synchronous, network-free diagnostics cannot
+    /// (a branch of a partial tag ref, the lineage of a SHA pin, a registry identity of a
+    /// source dependency), and reports whether anything changed.
+    ///
+    /// Called by the server from a spawned task after a document opens or changes and after a
+    /// [`RefreshEvent::TagIndex`](crate::RefreshEvent::TagIndex) for a repository the document
+    /// references, and by the CLI once per run. `phase` says whether the registry fetch of the
+    /// document has run: a probe that decides what to fetch belongs to
+    /// [`ProbePhase::PreFetch`](crate::lsp_helpers::ProbePhase::PreFetch), one that needs the
+    /// fetched tag index to
+    /// [`ProbePhase::PostFetch`](crate::lsp_helpers::ProbePhase::PostFetch). An implementor
+    /// stores only authoritative answers, draws every optional request from its rate budget
+    /// and never blocks a handler.
+    ///
+    /// The default does nothing and reports
+    /// [`ProbeEffect::Unchanged`](crate::lsp_helpers::ProbeEffect::Unchanged).
+    fn background_probes<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResult,
+        phase: crate::lsp_helpers::ProbePhase,
+    ) -> BoxFuture<'a, crate::lsp_helpers::ProbeReport> {
+        let _ = (parse_result, phase);
+        Box::pin(std::future::ready(
+            crate::lsp_helpers::ProbeReport::default(),
+        ))
     }
 
     /// Get the ecosystem-specific formatter for LSP response generation.
@@ -2733,13 +2760,13 @@ mod tests {
     }
 
     #[test]
-    fn test_tag_index_refreshes_defaults_to_none() {
+    fn test_refresh_events_defaults_to_none() {
         let ecosystem = StubEcosystem {
             calling_thread: std::thread::current().id(),
             should_panic: false,
             dep_count: 0,
         };
-        assert!(ecosystem.tag_index_refreshes().is_none());
+        assert!(ecosystem.refresh_events().is_none());
     }
 
     /// #796: `parse_manifest_blocking` is the single chokepoint every ecosystem's parse

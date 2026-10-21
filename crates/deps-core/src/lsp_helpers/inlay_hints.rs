@@ -382,7 +382,7 @@ mod tests {
         };
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("com.example:foo".into(), "1.2.3".into());
+        resolved_versions.insert(NormalizedName::for_test("com.example:foo"), "1.2.3".into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -479,10 +479,13 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("2.1.1"));
+        cached_versions.insert(
+            NormalizedName::for_test("serde"),
+            PackageVersions::latest_only("2.1.1"),
+        );
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "2.0.12".into());
+        resolved_versions.insert(NormalizedName::for_test("serde"), "2.0.12".into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -527,9 +530,12 @@ mod tests {
             uri: crate::test_util::test_uri("/test/pubspec.yaml"),
         };
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("pkg".into(), PackageVersions::latest_only(latest));
+        cached_versions.insert(
+            NormalizedName::for_test("pkg"),
+            PackageVersions::latest_only(latest),
+        );
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("pkg".into(), resolved.into());
+        resolved_versions.insert(NormalizedName::for_test("pkg"), resolved.into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -593,7 +599,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "feed-widget-helper".into(),
+            NormalizedName::for_test("feed-widget-helper"),
             PackageVersions::latest_only("1.0.8"),
         );
         let resolved_versions = HashMap::new();
@@ -663,7 +669,10 @@ mod tests {
             uri: crate::test_util::test_uri("/test/package.json"),
         };
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("widget".into(), PackageVersions::latest_only("1.0.8"));
+        cached_versions.insert(
+            NormalizedName::for_test("widget"),
+            PackageVersions::latest_only("1.0.8"),
+        );
         let resolved_versions = HashMap::new();
         let mut latest_status = LatestStatusMap::new();
         latest_status.insert(
@@ -747,7 +756,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "feed-widget-helper".into(),
+            NormalizedName::for_test("feed-widget-helper"),
             PackageVersions::latest_only("1.0.8"),
         );
         // No lock file / resolved version — status comes from `requirement_status_for`
@@ -819,10 +828,13 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("2.1.1"));
+        cached_versions.insert(
+            NormalizedName::for_test("serde"),
+            PackageVersions::latest_only("2.1.1"),
+        );
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "2.1.1".into());
+        resolved_versions.insert(NormalizedName::for_test("serde"), "2.1.1".into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -872,7 +884,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "example.com/mod".into(),
+            NormalizedName::for_test("example.com/mod"),
             PackageVersions::latest_only("v0.9.1"),
         );
 
@@ -880,7 +892,7 @@ mod tests {
         // semver, so it sorts last and would win naive last-occurrence-wins parsing
         // even though go.mod's `require` line was downgraded back to v0.8.1 (#235).
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("example.com/mod".into(), "v0.9.1".into());
+        resolved_versions.insert(NormalizedName::for_test("example.com/mod"), "v0.9.1".into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -931,10 +943,13 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
+        cached_versions.insert(
+            NormalizedName::for_test("serde"),
+            PackageVersions::latest_only("1.2.0"),
+        );
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "1.2.0".into());
+        resolved_versions.insert(NormalizedName::for_test("serde"), "1.2.0".into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -983,11 +998,11 @@ mod tests {
         };
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions::latest_only("1.2.0+build.7"),
         );
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "1.2.0+build.3".into());
+        resolved_versions.insert(NormalizedName::for_test("serde"), "1.2.0+build.3".into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -1032,9 +1047,12 @@ mod tests {
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
             let mut cached_versions = HashMap::new();
-            cached_versions.insert("serde".into(), PackageVersions::latest_only(latest));
+            cached_versions.insert(
+                NormalizedName::for_test("serde"),
+                PackageVersions::latest_only(latest),
+            );
             let mut resolved_versions = HashMap::new();
-            resolved_versions.insert("serde".into(), resolved.into());
+            resolved_versions.insert(NormalizedName::for_test("serde"), resolved.into());
 
             let hints = generate_inlay_hints(
                 &parse_result,
@@ -1312,11 +1330,14 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
+        cached_versions.insert(
+            NormalizedName::for_test("serde"),
+            PackageVersions::latest_only("1.0.214"),
+        );
 
         // Lock file has the latest version
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "1.0.214".into());
+        resolved_versions.insert(NormalizedName::for_test("serde"), "1.0.214".into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -1365,7 +1386,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("criterion".into(), PackageVersions::latest_only("0.5.1"));
+        cached_versions.insert(
+            NormalizedName::for_test("criterion"),
+            PackageVersions::latest_only("0.5.1"),
+        );
 
         // Not in lock file (empty resolved_versions)
         let resolved_versions = HashMap::new();
@@ -1417,7 +1441,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("criterion".into(), PackageVersions::latest_only("0.5.1"));
+        cached_versions.insert(
+            NormalizedName::for_test("criterion"),
+            PackageVersions::latest_only("0.5.1"),
+        );
 
         // Not in lock file (empty resolved_versions)
         let resolved_versions = HashMap::new();
@@ -1470,7 +1497,7 @@ mod tests {
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "spring-boot-starter".into(),
+            NormalizedName::for_test("spring-boot-starter"),
             PackageVersions::latest_only("3.2.0"),
         );
 
@@ -1568,7 +1595,7 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "2.0.12".into());
+        resolved_versions.insert(NormalizedName::for_test("serde"), "2.0.12".into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -1615,10 +1642,13 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("2.1.1"));
+        cached_versions.insert(
+            NormalizedName::for_test("serde"),
+            PackageVersions::latest_only("2.1.1"),
+        );
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "2.0.12".into());
+        resolved_versions.insert(NormalizedName::for_test("serde"), "2.0.12".into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -1668,7 +1698,7 @@ mod tests {
         let malicious_resolved = "2.0.12\u{202E}deifidom ton";
         let cached_versions = HashMap::new();
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), malicious_resolved.into());
+        resolved_versions.insert(NormalizedName::for_test("serde"), malicious_resolved.into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -1722,7 +1752,10 @@ mod tests {
         // Not in the registry cache (empty), only lockfile-resolved.
         let cached_versions = HashMap::new();
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("criterion".into(), malicious_resolved.into());
+        resolved_versions.insert(
+            NormalizedName::for_test("criterion"),
+            malicious_resolved.into(),
+        );
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -1775,11 +1808,11 @@ mod tests {
         let malicious_resolved = "2.1.1\u{202E}deifidom ton";
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions::latest_only(malicious_resolved),
         );
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), malicious_resolved.into());
+        resolved_versions.insert(NormalizedName::for_test("serde"), malicious_resolved.into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -1832,12 +1865,12 @@ mod tests {
         let malicious_latest = "2.1.1\u{202E}live.tsr";
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions::latest_only(malicious_latest),
         );
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "2.0.12".into());
+        resolved_versions.insert(NormalizedName::for_test("serde"), "2.0.12".into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -1889,12 +1922,12 @@ mod tests {
         let oversized_latest = format!("2.0.0-{}", "X".repeat(MAX_VERSION_DIAGNOSTIC_CHARS + 50));
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
-            "serde".into(),
+            NormalizedName::for_test("serde"),
             PackageVersions::latest_only(oversized_latest),
         );
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "2.0.12".into());
+        resolved_versions.insert(NormalizedName::for_test("serde"), "2.0.12".into());
 
         let hints = generate_inlay_hints(
             &parse_result,

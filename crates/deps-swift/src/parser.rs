@@ -5,14 +5,19 @@
 //! comment stripping for accurate LSP position tracking.
 
 use crate::config::{ResolvedSwiftRegistry, SwiftParseContext, SwiftRegistriesConfig};
-use crate::package_location::{PackageLocation, RegistryIdentity};
+use crate::package_location::{PackageLocation, RegistryIdentity, RegistryIdentityBuf};
+use crate::scm::{
+    RegistryIndexUrl, ScmLookupUrl, SwiftForm, SwiftOrigin, SwiftRequirementForm, decide_from_memo,
+};
 use crate::types::SwiftDependency;
 use deps_core::Result;
 use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use deps_core::parser::DependencySource;
+use deps_core::policy_config::ScmToRegistry;
 use deps_core::position::Range;
 use regex::Regex;
 use std::sync::LazyLock;
+use std::time::Instant;
 use url::Url;
 
 /// Result of parsing a Package.swift file.
@@ -200,23 +205,67 @@ pub(crate) fn parse_git_url(url: &str) -> Option<reqwest::Url> {
 ///
 /// An `id:` dependency (SE-0292) resolves through `resolver`: to an `AlternateRegistry` when its
 /// scope maps to a valid registry, otherwise to a `CustomRegistry` that is shown but never queried.
+///
+/// A `url:` dependency the SCM-to-registry setting swaps (spec 088) resolves exactly like an
+/// `id:` dependency served by the user-tier registry and carries [`SwiftOrigin::Swizzled`].
 fn resolve_registry_source(
     location: PackageLocation<'_>,
     name_range: Range,
     resolver: &mut IdResolver<'_>,
-) -> (String, DependencySource) {
+) -> (String, DependencySource, SwiftOrigin) {
     match location {
-        PackageLocation::Url(url_str) => match url_to_identity(url_str) {
-            Some(identity) => (identity, DependencySource::Registry),
-            None => (
-                url_str.to_string(),
-                DependencySource::Git {
-                    url: url_str.to_string(),
+        PackageLocation::Url(url_str) => {
+            if let Some((identity, index, scm)) = resolver.swizzle(ScmLookupUrl::parse(url_str)) {
+                return (
+                    identity.to_string(),
+                    DependencySource::AlternateRegistry {
+                        index: index.into_string(),
+                        mirrors_crates_io: false,
+                    },
+                    SwiftOrigin::Swizzled { scm },
+                );
+            }
+            match url_to_identity(url_str) {
+                Some(identity) => (identity, DependencySource::Registry, SwiftOrigin::Declared),
+                None => (
+                    url_str.to_string(),
+                    DependencySource::Git {
+                        url: url_str.to_string(),
+                        rev: None,
+                    },
+                    SwiftOrigin::Declared,
+                ),
+            }
+        }
+        PackageLocation::Id(id) => (
+            id.to_string(),
+            resolver.resolve(&id, name_range),
+            SwiftOrigin::Declared,
+        ),
+    }
+}
+
+impl SwiftDependency {
+    /// Puts a swizzled dependency back on its source-control form, as if it had never been
+    /// swapped. A declared dependency is left alone.
+    pub(crate) fn revert_to_scm(&mut self) {
+        if self.origin == SwiftOrigin::Declared {
+            return;
+        }
+        match url_to_identity(&self.url) {
+            Some(identity) => {
+                self.name = identity.into();
+                self.source = DependencySource::Registry;
+            }
+            None => {
+                self.name = self.url.clone().into();
+                self.source = DependencySource::Git {
+                    url: self.url.clone(),
                     rev: None,
-                },
-            ),
-        },
-        PackageLocation::Id(id) => (id.to_string(), resolver.resolve(&id, name_range)),
+                };
+            }
+        }
+        self.origin = SwiftOrigin::Declared;
     }
 }
 
@@ -225,6 +274,8 @@ fn resolve_registry_source(
 struct IdResolver<'c> {
     context: Option<(&'c SwiftParseContext, &'c Url)>,
     config: std::cell::OnceCell<SwiftRegistriesConfig>,
+    /// The user tier alone, read on the first swizzle candidate (never the project tier).
+    user_config: std::cell::OnceCell<SwiftRegistriesConfig>,
     used: Vec<ResolvedSwiftRegistry>,
     blocked: Vec<deps_core::BlockedRegistryOccurrence>,
     rejected: Vec<deps_core::RejectedRegistryOccurrence>,
@@ -236,6 +287,7 @@ impl<'c> IdResolver<'c> {
         Self {
             context: None,
             config: std::cell::OnceCell::new(),
+            user_config: std::cell::OnceCell::new(),
             used: Vec::new(),
             blocked: Vec::new(),
             rejected: Vec::new(),
@@ -246,9 +298,55 @@ impl<'c> IdResolver<'c> {
         Self {
             context: Some((context, uri)),
             config: std::cell::OnceCell::new(),
+            user_config: std::cell::OnceCell::new(),
             used: Vec::new(),
             blocked: Vec::new(),
             rejected: Vec::new(),
+        }
+    }
+
+    /// The registry identity `scm` is swapped to, when the SCM-to-registry setting is on, the
+    /// trusted user-tier default registry maps the repository to one identity and the user tier
+    /// routes its scope. Reads only the memo; never touches the network.
+    ///
+    /// The registry the identity resolves through is recorded in `used`, so it is registered
+    /// like the registry of an `id:` dependency.
+    fn swizzle(
+        &mut self,
+        scm: Option<ScmLookupUrl>,
+    ) -> Option<(RegistryIdentityBuf, RegistryIndexUrl, ScmLookupUrl)> {
+        let (context, _) = self.context?;
+        let mode = context.scm_mode();
+        match mode {
+            ScmToRegistry::Replace => {}
+            ScmToRegistry::Disabled => return None,
+        }
+        let scm = scm?;
+        let config = self.user_config.get_or_init(|| context.resolve_user_tier());
+        let lookup = config.trusted_lookup();
+        if lookup.is_none() {
+            context.scm_handle().warn_missing_default_once();
+        }
+        let form = decide_from_memo(
+            mode,
+            lookup.as_ref(),
+            SwiftRequirementForm::Version,
+            Some(&scm),
+            context.identity_memo().map(std::sync::Arc::as_ref),
+            Instant::now(),
+        );
+        match form {
+            SwiftForm::Scm => None,
+            SwiftForm::RegistryIdentity { identity, index } => {
+                let routed =
+                    lookup.and_then(|lookup| lookup.route(&identity.as_identity().scope_key()));
+                if let Some(resolved) = routed
+                    && !self.used.iter().any(|used| used.url == resolved.url)
+                {
+                    self.used.push(resolved.clone());
+                }
+                Some((identity, index, scm))
+            }
         }
     }
 
@@ -424,7 +522,7 @@ fn parse_with_resolver(
             continue;
         }
         let name_range = make_range(url_span.start, url_span.end);
-        let (name, source) = resolve_registry_source(location, name_range, &mut resolver);
+        let (name, source, origin) = resolve_registry_source(location, name_range, &mut resolver);
         dependencies.push(SwiftDependency {
             name: name.into(),
             name_range,
@@ -433,6 +531,8 @@ fn parse_with_resolver(
             version_literal: Some(ver_str.to_string()),
             url: location.url().to_string(),
             source,
+            requirement_form: SwiftRequirementForm::Version,
+            origin,
         });
         matched.insert(full.start()..full.end());
     }
@@ -461,7 +561,7 @@ fn parse_with_resolver(
             continue;
         }
         let name_range = make_range(url_span.start, url_span.end);
-        let (name, source) = resolve_registry_source(location, name_range, &mut resolver);
+        let (name, source, origin) = resolve_registry_source(location, name_range, &mut resolver);
         dependencies.push(SwiftDependency {
             name: name.into(),
             name_range,
@@ -470,6 +570,8 @@ fn parse_with_resolver(
             version_literal: Some(ver_str.to_string()),
             url: location.url().to_string(),
             source,
+            requirement_form: SwiftRequirementForm::Version,
+            origin,
         });
         matched.insert(full.start()..full.end());
     }
@@ -498,7 +600,7 @@ fn parse_with_resolver(
             continue;
         }
         let name_range = make_range(url_span.start, url_span.end);
-        let (name, source) = resolve_registry_source(location, name_range, &mut resolver);
+        let (name, source, origin) = resolve_registry_source(location, name_range, &mut resolver);
         dependencies.push(SwiftDependency {
             name: name.into(),
             name_range,
@@ -507,6 +609,8 @@ fn parse_with_resolver(
             version_literal: Some(ver_str.to_string()),
             url: location.url().to_string(),
             source,
+            requirement_form: SwiftRequirementForm::Version,
+            origin,
         });
         matched.insert(full.start()..full.end());
     }
@@ -534,7 +638,7 @@ fn parse_with_resolver(
             continue;
         }
         let name_range = make_range(url_span.start, url_span.end);
-        let (name, source) = resolve_registry_source(location, name_range, &mut resolver);
+        let (name, source, origin) = resolve_registry_source(location, name_range, &mut resolver);
         dependencies.push(SwiftDependency {
             name: name.into(),
             name_range,
@@ -549,6 +653,8 @@ fn parse_with_resolver(
             version_literal: None,
             url: location.url().to_string(),
             source,
+            requirement_form: SwiftRequirementForm::Version,
+            origin,
         });
         matched.insert(full.start()..full.end());
     }
@@ -576,7 +682,7 @@ fn parse_with_resolver(
             continue;
         }
         let name_range = make_range(url_span.start, url_span.end);
-        let (name, source) = resolve_registry_source(location, name_range, &mut resolver);
+        let (name, source, origin) = resolve_registry_source(location, name_range, &mut resolver);
         dependencies.push(SwiftDependency {
             name: name.into(),
             name_range,
@@ -588,6 +694,8 @@ fn parse_with_resolver(
             version_literal: None,
             url: location.url().to_string(),
             source,
+            requirement_form: SwiftRequirementForm::Version,
+            origin,
         });
         matched.insert(full.start()..full.end());
     }
@@ -613,7 +721,7 @@ fn parse_with_resolver(
             continue;
         }
         let name_range = make_range(url_span.start, url_span.end);
-        let (name, source) = resolve_registry_source(location, name_range, &mut resolver);
+        let (name, source, origin) = resolve_registry_source(location, name_range, &mut resolver);
         dependencies.push(SwiftDependency {
             name: name.into(),
             name_range,
@@ -622,6 +730,8 @@ fn parse_with_resolver(
             version_literal: Some(ver_str.to_string()),
             url: location.url().to_string(),
             source,
+            requirement_form: SwiftRequirementForm::Version,
+            origin,
         });
         matched.insert(full.start()..full.end());
     }
@@ -658,6 +768,8 @@ fn parse_with_resolver(
                 url: url_str.to_string(),
                 rev: Some(branch_str.to_string()),
             },
+            requirement_form: SwiftRequirementForm::Branch,
+            origin: SwiftOrigin::Declared,
         });
         matched.insert(full.start()..full.end());
     }
@@ -694,6 +806,8 @@ fn parse_with_resolver(
                 url: url_str.to_string(),
                 rev: Some(rev_str.to_string()),
             },
+            requirement_form: SwiftRequirementForm::Revision,
+            origin: SwiftOrigin::Declared,
         });
         matched.insert(full.start()..full.end());
     }
@@ -727,6 +841,8 @@ fn parse_with_resolver(
             source: DependencySource::Path {
                 path: path_str.to_string(),
             },
+            requirement_form: SwiftRequirementForm::Path,
+            origin: SwiftOrigin::Declared,
         });
         matched.insert(full.start()..full.end());
     }

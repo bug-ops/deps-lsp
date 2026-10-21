@@ -6,7 +6,6 @@ use super::state::{ResolvedGeneration, ServerState};
 use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
-use deps_core::PackageName;
 use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -400,7 +399,7 @@ pub(crate) async fn run_license_prefetch(
     let (content_snapshot, resolved_generation, targets): (
         String,
         ResolvedGeneration,
-        Vec<(PackageName, ConcreteVersion)>,
+        Vec<deps_engine::classify::license::Tier3Target>,
     ) = {
         let Some(doc) = state.get_document(&uri) else {
             return;
@@ -822,6 +821,8 @@ async fn run_osv_fix_target_verification(
 
 #[cfg(test)]
 mod tests {
+    use deps_core::NormalizedName;
+    use deps_core::PackageName;
     // Only `license_prefetch_tests`' dart/swift/gradle/deno-gated cases consume this.
     #[cfg(any(
         feature = "dart",
@@ -949,7 +950,7 @@ mod tests {
                 parse_result,
             );
             doc_state.update_resolved_versions(
-                HashMap::from([(PackageName::new("http"), "1.2.0".into())]),
+                HashMap::from([(NormalizedName::for_test("http"), "1.2.0".into())]),
                 HashMap::new(),
                 state.next_resolved_versions_generation(),
             );
@@ -965,7 +966,9 @@ mod tests {
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.signals.licenses.contains_key(&PackageName::new("http")),
+                doc.signals
+                    .licenses
+                    .contains_key(&NormalizedName::for_test("http")),
                 "expected a pre-fetched license for 'http', got: {:?}",
                 doc.signals.licenses
             );
@@ -997,7 +1000,7 @@ mod tests {
                 parse_result,
             );
             doc_state.update_resolved_versions(
-                HashMap::from([(PackageName::new("apple/swift-nio"), "2.65.0".into())]),
+                HashMap::from([(NormalizedName::for_test("apple/swift-nio"), "2.65.0".into())]),
                 HashMap::new(),
                 state.next_resolved_versions_generation(),
             );
@@ -1016,7 +1019,7 @@ mod tests {
             // Scoped so the `DashMap` shard-lock guard `get_document` returns is dropped
             // before the probe below ever awaits (`clippy::await_holding_invalid_type`).
             let licenses = state.get_document(&uri).unwrap().signals.licenses.clone();
-            let has_license = licenses.contains_key(&PackageName::new("apple/swift-nio"));
+            let has_license = licenses.contains_key(&NormalizedName::for_test("apple/swift-nio"));
             // #1283 S2: `run_license_prefetch` swallows *any* fetch error to "no license
             // populated", so a missing entry alone can't tell an expected rate limit apart
             // from a real bug — see `should_skip_on_empty_result`'s doc.
@@ -1068,7 +1071,7 @@ mod tests {
             );
             doc_state.update_resolved_versions(
                 HashMap::from([(
-                    PackageName::new("com.squareup.okhttp3:okhttp"),
+                    NormalizedName::for_test("com.squareup.okhttp3:okhttp"),
                     "4.12.0".into(),
                 )]),
                 HashMap::new(),
@@ -1088,7 +1091,7 @@ mod tests {
             assert!(
                 doc.signals
                     .licenses
-                    .contains_key(&PackageName::new("com.squareup.okhttp3:okhttp")),
+                    .contains_key(&NormalizedName::for_test("com.squareup.okhttp3:okhttp")),
                 "expected a pre-fetched license for 'com.squareup.okhttp3:okhttp', got: {:?}",
                 doc.signals.licenses
             );
@@ -1125,7 +1128,7 @@ mod tests {
             );
             doc_state.update_resolved_versions(
                 HashMap::from([(
-                    PackageName::new("com.google.guava:guava"),
+                    NormalizedName::for_test("com.google.guava:guava"),
                     "32.0.1-jre".into(),
                 )]),
                 HashMap::new(),
@@ -1145,7 +1148,7 @@ mod tests {
             let license = doc
                 .signals
                 .licenses
-                .get(&PackageName::new("com.google.guava:guava"));
+                .get(&NormalizedName::for_test("com.google.guava:guava"));
             assert!(
                 license.is_some_and(|l| !l.is_empty()),
                 "expected a pre-fetched license for 'com.google.guava:guava' via its \
@@ -1178,7 +1181,7 @@ mod tests {
                 parse_result,
             );
             doc_state.update_resolved_versions(
-                HashMap::from([(PackageName::new("jsr:@std/fs"), "1.0.24".into())]),
+                HashMap::from([(NormalizedName::for_test("jsr:@std/fs"), "1.0.24".into())]),
                 HashMap::new(),
                 state.next_resolved_versions_generation(),
             );
@@ -1196,7 +1199,7 @@ mod tests {
             assert!(
                 doc.signals
                     .licenses
-                    .contains_key(&PackageName::new("jsr:@std/fs")),
+                    .contains_key(&NormalizedName::for_test("jsr:@std/fs")),
                 "expected a pre-fetched license for 'jsr:@std/fs', got: {:?}",
                 doc.signals.licenses
             );
@@ -1471,7 +1474,7 @@ mod tests {
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.signals.licenses.get(&PackageName::new("dep-0")),
+                doc.signals.licenses.get(&NormalizedName::for_test("dep-0")),
                 Some(&vec!["MIT".to_string()]),
                 "no intervening bump occurred, so the fetch's result must commit: {:?}",
                 doc.signals.licenses
@@ -1534,12 +1537,12 @@ mod tests {
             let mut doc_state =
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             doc_state.update_resolved_versions(
-                HashMap::from([(PackageName::new("serde"), "1.0.0".into())]),
+                HashMap::from([(NormalizedName::for_test("serde"), "1.0.0".into())]),
                 HashMap::new(),
                 state.next_resolved_versions_generation(),
             );
             doc_state.update_cached_versions(HashMap::from([(
-                PackageName::new("serde"),
+                NormalizedName::for_test("serde"),
                 deps_core::lsp_helpers::PackageVersions::latest_only("1.2.0"),
             )]));
             state.update_document(uri.clone(), doc_state);
@@ -1759,7 +1762,7 @@ mod tests {
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.update_resolved_versions(
-                    HashMap::from([(PackageName::new("alpha-dep"), "0.1.0".into())]),
+                    HashMap::from([(NormalizedName::for_test("alpha-dep"), "0.1.0".into())]),
                     HashMap::new(),
                     state.next_resolved_versions_generation(),
                 );
@@ -1781,7 +1784,7 @@ mod tests {
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.update_resolved_versions(
-                    HashMap::from([(PackageName::new("alpha-dep"), "0.2.0".into())]),
+                    HashMap::from([(NormalizedName::for_test("alpha-dep"), "0.2.0".into())]),
                     HashMap::new(),
                     state.next_resolved_versions_generation(),
                 );
@@ -2280,6 +2283,7 @@ mod tests {
             use deps_core::osv::{OsvPackageName, OsvQueryName, ScanTarget};
 
             struct Identity;
+            impl deps_core::lsp_helpers::SourcePolicy for Identity {}
             impl deps_core::lsp_helpers::OsvNaming for Identity {}
 
             let target = |siblings: &[&str]| {
@@ -2632,7 +2636,9 @@ mod tests {
             let mut doc = state.documents.get_mut(&uri).unwrap();
             assert_eq!(doc.signals.osv_scan_plan.len(), 2);
             doc.signals
-                .prune_removed(&[PackageName::new("actions/cache")], ecosystem.formatter());
+                .prune_removed(&crate::document::diff::orphaned_for_test(&[
+                    "actions/cache",
+                ]));
 
             assert_eq!(doc.signals.osv_scan_plan.len(), 1);
             assert!(

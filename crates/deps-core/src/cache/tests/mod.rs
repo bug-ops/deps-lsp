@@ -12,6 +12,7 @@ use super::body::MAX_RESPONSE_BYTES;
 use super::errors::confirmed_rate_limit_exhaustion;
 use super::errors::preflight_error;
 use super::errors::send_error;
+use super::fetch::LivePolicy;
 use super::guard::AddrGuard;
 use super::guard::ensure_https;
 use super::guard::hop_targets_blocked_host;
@@ -50,6 +51,7 @@ mod errors;
 mod guard;
 mod offline;
 mod proxy;
+mod quota;
 mod redirect;
 mod resolver;
 mod revalidation;
@@ -204,7 +206,7 @@ async fn fetch_url_via(url: &str, transport: &Transport) -> Result<CachedRespons
             transport,
             KeyAuth::ANONYMOUS,
             RevalidationFailure::ServeStale,
-            RateLimitRevocation::default(),
+            LivePolicy::default(),
         )
         .await
 }

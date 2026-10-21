@@ -52,7 +52,7 @@ install and keep in sync.
 | Language | Ecosystem | Manifest file |
 | ---------- | ----------- | --------------- |
 | Rust | Cargo | `Cargo.toml` |
-| JavaScript | npm | `package.json` |
+| JavaScript | npm | `package.json`, `pnpm-workspace.yaml` (catalog entries) |
 | JavaScript/TypeScript | Deno (JSR/npm) | `deno.json`, `deno.jsonc` |
 | Python | PyPI | `pyproject.toml`, `requirements.txt`, `constraints.txt` |
 | Go | Go Modules | `go.mod` |
@@ -204,6 +204,8 @@ requests/hour**:
 ```bash
 export GITHUB_TOKEN=$(gh auth token)   # or a PAT from https://github.com/settings/tokens — no scopes required
 ```
+
+The token also raises the allowance for GitHub Actions branch checks and commit-lineage checks (`unknown-ref` for refs like `@v40`, SHA pins ahead of the latest release); set it in CI for `deps-cli check --fail-on unknown-ref`.
 
 ### GitLab API token
 

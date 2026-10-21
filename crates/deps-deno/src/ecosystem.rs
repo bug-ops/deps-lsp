@@ -303,8 +303,8 @@ mod tests {
     use std::assert_matches;
     use std::collections::HashMap;
 
-    fn pkg(s: &str) -> deps_core::PackageName {
-        deps_core::PackageName::new(s)
+    fn pkg(s: &str) -> deps_core::NormalizedName {
+        deps_core::NormalizedName::for_test(s)
     }
 
     #[test]

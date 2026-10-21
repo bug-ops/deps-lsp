@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::lsp_helpers::{BoundedVersionReq, EcosystemFormatter, PinResolution, ResolvedPin};
 use crate::osv::SiblingCoverage;
-use crate::{ConcreteVersion, Dependency, EcosystemId, PackageKey, PackageName};
+use crate::{ConcreteVersion, Dependency, EcosystemId, NormalizedName, PackageKey};
 
 /// How a *bare* (no explicit pin marker) version requirement should be treated when
 /// deciding whether it denotes a single concrete version.
@@ -436,17 +436,18 @@ fn best_candidate_for_requirement<'a>(
 pub(crate) fn resolve_occurrence_version<'a>(
     dep: &dyn Dependency,
     key: &PackageKey,
-    resolved_versions: &'a HashMap<PackageName, ConcreteVersion>,
-    resolved_version_candidates: Option<&'a HashMap<PackageName, Vec<ConcreteVersion>>>,
+    resolved_versions: &'a HashMap<NormalizedName, ConcreteVersion>,
+    resolved_version_candidates: Option<&'a HashMap<NormalizedName, Vec<ConcreteVersion>>>,
     formatter: &dyn EcosystemFormatter,
 ) -> Option<&'a ConcreteVersion> {
-    let candidates = resolved_version_candidates.and_then(|candidates| key.find_in(candidates));
+    let candidates =
+        resolved_version_candidates.and_then(|candidates| candidates.get(key.normalized()));
 
     match (candidates, dep.version_requirement()) {
         (Some(candidates), Some(req)) if candidates.len() > 1 => {
             best_candidate_for_requirement(candidates, req, formatter)
         }
-        _ => key.find_in(resolved_versions),
+        _ => resolved_versions.get(key.normalized()),
     }
 }
 
@@ -480,7 +481,7 @@ pub(crate) fn resolve_occurrence_version<'a>(
 ///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
 ///     RequirementResolution, SourcePolicy, resolve_in_use_version,
 /// };
-/// use deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageKey, PackageName, VersionReq};
+/// use deps_core::{ConcreteVersion, Dependency, EcosystemId, NormalizedName, PackageKey, PackageName, VersionReq};
 /// use std::any::Any;
 /// use std::collections::HashMap;
 /// use deps_core::position::Range;
@@ -531,7 +532,7 @@ pub(crate) fn resolve_occurrence_version<'a>(
 ///     name: PackageName::new("time"),
 ///     version_req: Some(VersionReq::new("=0.1.43")),
 /// };
-/// let resolved_versions: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+/// let resolved_versions: HashMap<NormalizedName, ConcreteVersion> = HashMap::new();
 ///
 /// // No lock file, but the requirement is already an exact pin — falls
 /// // back to it, stripped of its `=` marker.
@@ -550,8 +551,8 @@ pub(crate) fn resolve_occurrence_version<'a>(
 pub fn resolve_in_use_version(
     dep: &dyn Dependency,
     key: &PackageKey,
-    resolved_versions: &HashMap<PackageName, ConcreteVersion>,
-    resolved_version_candidates: Option<&HashMap<PackageName, Vec<ConcreteVersion>>>,
+    resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
+    resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
     formatter: &dyn EcosystemFormatter,
     ecosystem: EcosystemId,
 ) -> Option<ConcreteVersion> {
@@ -678,7 +679,7 @@ impl InUseVersions {
 ///     RequirementResolution, SourcePolicy, resolve_in_use_versions,
 /// };
 /// use deps_core::position::Range;
-/// use deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageKey, PackageName, VersionReq};
+/// use deps_core::{ConcreteVersion, Dependency, EcosystemId, NormalizedName, PackageKey, PackageName, VersionReq};
 /// use std::any::Any;
 /// use std::collections::HashMap;
 ///
@@ -743,8 +744,8 @@ impl InUseVersions {
 pub fn resolve_in_use_versions(
     dep: &dyn Dependency,
     key: &PackageKey,
-    resolved_versions: &HashMap<PackageName, ConcreteVersion>,
-    resolved_version_candidates: Option<&HashMap<PackageName, Vec<ConcreteVersion>>>,
+    resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
+    resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
     formatter: &dyn EcosystemFormatter,
     ecosystem: EcosystemId,
 ) -> Option<InUseVersions> {
@@ -856,6 +857,7 @@ pub fn has_unqueryable_resolved_pin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PackageName;
     use crate::pagination::ListCoverage;
     use crate::position::Range;
 
@@ -1036,7 +1038,7 @@ mod tests {
 
         let mut resolved_versions = HashMap::new();
         resolved_versions.insert(
-            PackageName::new("actions/checkout"),
+            NormalizedName::for_test("actions/checkout"),
             ConcreteVersion::from("v9.9.9"),
         );
 
@@ -1665,10 +1667,13 @@ mod tests {
         };
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert(PackageName::new("serde"), ConcreteVersion::from("1.0.219"));
+        resolved_versions.insert(
+            NormalizedName::for_test("serde"),
+            ConcreteVersion::from("1.0.219"),
+        );
         let mut candidates = HashMap::new();
         candidates.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             vec![
                 ConcreteVersion::from("0.9.15"),
                 ConcreteVersion::from("1.0.219"),
@@ -1714,7 +1719,7 @@ mod tests {
         let resolved_versions = HashMap::new();
         let mut candidates = HashMap::new();
         candidates.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             vec![
                 ConcreteVersion::from("1.0.219"),
                 ConcreteVersion::from("1.1.0"),
@@ -1747,10 +1752,13 @@ mod tests {
         };
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert(PackageName::new("serde"), ConcreteVersion::from("1.0.219"));
+        resolved_versions.insert(
+            NormalizedName::for_test("serde"),
+            ConcreteVersion::from("1.0.219"),
+        );
         let mut candidates = HashMap::new();
         candidates.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             vec![
                 ConcreteVersion::from("0.9.15"),
                 ConcreteVersion::from("1.0.219"),
@@ -1785,10 +1793,13 @@ mod tests {
         };
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert(PackageName::new("serde"), ConcreteVersion::from("1.0.219"));
+        resolved_versions.insert(
+            NormalizedName::for_test("serde"),
+            ConcreteVersion::from("1.0.219"),
+        );
         let mut candidates = HashMap::new();
         candidates.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             vec![ConcreteVersion::from("1.0.219")],
         );
 
@@ -1919,7 +1930,7 @@ mod tests {
         let resolved_versions = HashMap::new();
         let mut candidates = HashMap::new();
         candidates.insert(
-            PackageName::new("pkg"),
+            NormalizedName::for_test("pkg"),
             vec![
                 ConcreteVersion::from("1.0.1"),
                 ConcreteVersion::from("1.0.5"),
@@ -2142,7 +2153,7 @@ mod tests {
     fn resolve_in_use_versions_lockfile_version_has_no_siblings() {
         let formatter = FixedResolvedPinFormatter::from_index(&["v4.8.0", "v4.9.0"]);
         let resolved = HashMap::from([(
-            PackageName::new("actions/checkout"),
+            NormalizedName::for_test("actions/checkout"),
             ConcreteVersion::new("4.7.0"),
         )]);
         let versions = resolve_in_use_versions(

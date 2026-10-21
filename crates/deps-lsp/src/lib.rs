@@ -32,6 +32,8 @@ pub mod progress;
 /// The `tower-lsp-server` [`LanguageServer`](tower_lsp_server::LanguageServer) implementation.
 pub mod server;
 
+#[cfg(all(test, feature = "npm"))]
+mod pnpm_catalog_tests;
 #[cfg(test)]
 mod test_utils;
 

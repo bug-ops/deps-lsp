@@ -1,6 +1,6 @@
 //! GitHub Actions ecosystem implementation for deps-lsp.
 
-use dashmap::DashMap;
+use crate::registry::RepositoryIndexes;
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
@@ -8,7 +8,7 @@ use deps_core::hover::Hover;
 #[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::ShaPinning;
 use deps_core::{
-    Dependency, Ecosystem, PackageName, ParseResult as ParseResultTrait, Registry, Result,
+    Dependency, Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
     diagnostic::{Diagnostic, DiagnosticKind, GitTagsPlatform, Severity},
     lsp_helpers::{EcosystemFormatter, unknown_ref_diagnostics},
 };
@@ -21,7 +21,10 @@ use url::Url;
 use crate::formatter::GithubActionsFormatter;
 use crate::registry::GithubActionsRegistry;
 use crate::types::{GithubActionsDependency, PinStyle};
-use deps_core::lsp_helpers::{CommentCheck, TagIndex, UnknownRefTarget};
+use deps_core::lsp_helpers::{
+    BranchProbe, CommentCheck, CommitProbe, NormalizeName, PinResolution, ProbePhase, ProbePlan,
+    ProbeRef, ProbeReport, UnknownRefTarget, UnpublishedRef,
+};
 
 #[cfg(feature = "lsp-responses")]
 mod lsp;
@@ -46,7 +49,7 @@ use lsp::{
 /// a fetch resolves it one way or the other.
 fn is_registry_confirmed_tag(
     gha_dep: &GithubActionsDependency,
-    tag_index: &DashMap<PackageName, Arc<TagIndex>>,
+    tag_index: &RepositoryIndexes,
 ) -> bool {
     match &gha_dep.pin {
         Some(PinStyle::Tag) => true,
@@ -82,7 +85,8 @@ impl GithubActionsEcosystem {
     #[must_use]
     pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
         let registry = Arc::new(GithubActionsRegistry::new(cache));
-        let formatter = GithubActionsFormatter::new(registry.tag_index());
+        let formatter = GithubActionsFormatter::new(registry.tag_index())
+            .with_probe_stores(registry.probe_stores());
         Self {
             registry,
             formatter,
@@ -154,8 +158,27 @@ impl Ecosystem for GithubActionsEcosystem {
 
     /// Emits a repository's name whenever its tag index is first populated or its tag-to-commit
     /// mapping changes; see [`GithubActionsRegistry::subscribe_tag_refreshes`] for the contract.
-    fn tag_index_refreshes(&self) -> Option<deps_core::TagIndexRefreshes> {
+    fn refresh_events(&self) -> Option<deps_core::RefreshEvents> {
         Some(self.registry.subscribe_tag_refreshes())
+    }
+
+    /// Branch probes for partial tag refs and lineage/membership probes for commentless SHA
+    /// pins, within the registry's probe budget (specs 086, 087). Needs the fetched tag
+    /// index, so [`ProbePhase::PreFetch`] does nothing.
+    fn background_probes<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResultTrait,
+        phase: ProbePhase,
+    ) -> deps_core::ecosystem::BoxFuture<'a, ProbeReport> {
+        let plan = (phase == ProbePhase::PostFetch)
+            .then(|| probe_plan(&self.formatter, parse_result))
+            .filter(|plan| !plan.is_empty());
+        Box::pin(async move {
+            match plan {
+                Some(plan) => self.registry.run_probes(&plan).await.report,
+                None => ProbeReport::default(),
+            }
+        })
     }
 
     // No `complete_package_name` override: GHA has no package-name search endpoint, so
@@ -307,7 +330,7 @@ impl Ecosystem for GithubActionsEcosystem {
 
     /// One documented NFR-004 divergence (S3): appends a `**Resolved**` line naming the
     /// tag a SHA pin's commit actually corresponds to, per
-    /// [`crate::registry::GithubActionsRegistry`]'s [`TagIndex`].
+    /// [`crate::registry::GithubActionsRegistry`]'s `TagIndex`.
     ///
     /// Necessary, not merely additive: `versions.resolved` (the shared helper's
     /// `**Current**` source) is keyed by package name and is unconditionally empty for
@@ -531,7 +554,7 @@ pub(crate) fn is_sha_pinnable_tag(gha_dep: &GithubActionsDependency) -> bool {
 fn mutable_ref_pin_diagnostics(
     parse_result: &dyn ParseResultTrait,
     severity: Severity,
-    tag_index: &DashMap<PackageName, Arc<TagIndex>>,
+    tag_index: &RepositoryIndexes,
 ) -> Vec<Diagnostic> {
     parse_result
         .dependencies()
@@ -626,11 +649,83 @@ pub(crate) fn unknown_ref_target<'a>(
         .tag_index
         .get(&gha_dep.name)
         .map(|index| Arc::clone(&index))?;
-    Some(UnknownRefTarget::new(
-        index,
-        written,
-        gha_dep.version_range?,
-    ))
+    Some(
+        UnknownRefTarget::new(index, written, gha_dep.version_range?)
+            .with_branch_evidence(formatter.branch_evidence(&gha_dep.name, written)),
+    )
+}
+
+/// What a document's pins ask the GitHub API, built from the tag index each repository
+/// already has.
+///
+/// A partial tag ref that a complete index does not list may be a branch, so it asks for the
+/// branch; a commentless SHA pin that no tag names asks to be proven ahead of the latest
+/// release. Anything the shared safety checks refuse (`ProbeRef::parse`, `owner/repo`
+/// validation) is not asked at all.
+fn probe_plan(
+    formatter: &GithubActionsFormatter,
+    parse_result: &dyn ParseResultTrait,
+) -> ProbePlan {
+    let mut plan = ProbePlan::default();
+    for dep in parse_result.dependencies() {
+        let Some(gha_dep) = dep.as_any().downcast_ref::<GithubActionsDependency>() else {
+            continue;
+        };
+        if deps_core::github::validate_owner_repo(gha_dep.name.as_str()).is_err() {
+            continue;
+        }
+        let Some(index) = formatter
+            .tag_index
+            .get(&gha_dep.name)
+            .map(|i| Arc::clone(&i))
+        else {
+            continue;
+        };
+        let repository = formatter.normalize_package_name(&gha_dep.name);
+        match &gha_dep.pin {
+            Some(PinStyle::Tag) => {
+                let Some(written) = gha_dep
+                    .version_req
+                    .as_ref()
+                    .map(deps_core::VersionReq::as_str)
+                else {
+                    continue;
+                };
+                if index.unpublished_tag_ref(written) != Some(UnpublishedRef::Partial) {
+                    continue;
+                }
+                if let Some(git_ref) = ProbeRef::parse(written) {
+                    plan.branches.push(BranchProbe {
+                        repository,
+                        package: gha_dep.name.clone(),
+                        git_ref,
+                    });
+                }
+            }
+            Some(PinStyle::Sha { sha, comment: None }) => {
+                if index.pin_resolution(sha, None) != PinResolution::Untagged {
+                    continue;
+                }
+                let Some(latest) = formatter.probe_stores.latest(&repository) else {
+                    continue;
+                };
+                plan.commits.push(CommitProbe {
+                    repository,
+                    package: gha_dep.name.clone(),
+                    latest: latest.commit,
+                    pin: sha.clone(),
+                });
+            }
+            Some(
+                PinStyle::Sha {
+                    comment: Some(_), ..
+                }
+                | PinStyle::Branch,
+            )
+            | None => {}
+        }
+    }
+    plan
 }
 
 /// [`unknown_ref_target`] for a type-erased dependency of this ecosystem.
@@ -645,10 +740,21 @@ fn tag_pin_target<'a>(
 }
 
 #[cfg(test)]
+mod probe_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::lsp_helpers::{LowercaseNaming, NormalizeName};
+
+    fn tag_index_event(name: &PackageName) -> deps_core::RefreshEvent {
+        deps_core::RefreshEvent::TagIndex(LowercaseNaming.normalize_package_name(name))
+    }
+
     #[cfg(feature = "lsp-responses")]
     use crate::SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE;
+    use deps_core::PackageName;
+    use deps_core::lsp_helpers::TagIndex;
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -674,13 +780,13 @@ mod tests {
             registry: Arc::new(registry),
             formatter,
         };
-        let mut refreshes = eco.tag_index_refreshes().expect("GHA has a tag index");
+        let mut refreshes = eco.refresh_events().expect("GHA has a tag index");
 
         eco.registry.get_versions("actions/checkout").await.unwrap();
 
         assert_eq!(
             refreshes.try_recv().ok(),
-            Some(PackageName::new("actions/checkout"))
+            Some(tag_index_event(&PackageName::new("actions/checkout")))
         );
     }
 
@@ -1114,7 +1220,7 @@ mod tests {
 
         let mut cached = HashMap::new();
         cached.insert(
-            deps_core::PackageName::new("actions/checkout"),
+            deps_core::NormalizedName::for_test("actions/checkout"),
             deps_core::PackageVersions::new("v4".into(), Arc::from(vec!["v4".into(), "v3".into()])),
         );
         let resolved = HashMap::new();
@@ -1292,10 +1398,7 @@ mod tests {
         assert_eq!(result.dependencies().len(), 1);
     }
 
-    fn empty_versions() -> (
-        HashMap<deps_core::PackageName, deps_core::PackageVersions>,
-        HashMap<deps_core::PackageName, deps_core::ConcreteVersion>,
-    ) {
+    fn empty_versions() -> (deps_core::CachedVersionsMap, deps_core::ResolvedVersionsMap) {
         (HashMap::new(), HashMap::new())
     }
 
@@ -1441,9 +1544,7 @@ mod tests {
             let content = "steps:\n  - uses: actions/checkout@v4\n";
             let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
 
-            let formatter = GithubActionsFormatter {
-                tag_index: Arc::new(dashmap::DashMap::new()),
-            };
+            let formatter = GithubActionsFormatter::new(Arc::new(RepositoryIndexes::default()));
             let index = TagIndex::from_tags([(
                 "v4",
                 &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
@@ -1483,9 +1584,7 @@ mod tests {
             let content = "steps:\n  - uses: actions/checkout@v4\n";
             let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
 
-            let formatter = GithubActionsFormatter {
-                tag_index: Arc::new(dashmap::DashMap::new()),
-            };
+            let formatter = GithubActionsFormatter::new(Arc::new(RepositoryIndexes::default()));
             let index = TagIndex::from_tags([(
                 "v4",
                 &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
@@ -1510,9 +1609,7 @@ mod tests {
             let content = "steps:\n  - uses: actions/checkout@v4\n";
             let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
 
-            let formatter = GithubActionsFormatter {
-                tag_index: Arc::new(dashmap::DashMap::new()),
-            };
+            let formatter = GithubActionsFormatter::new(Arc::new(RepositoryIndexes::default()));
 
             let position = deps_core::ParseResult::dependencies(&parse_result)[0]
                 .version_range()
@@ -1531,9 +1628,7 @@ mod tests {
             let content = "steps:\n  - uses: some-org/some-action@main\n";
             let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
 
-            let formatter = GithubActionsFormatter {
-                tag_index: Arc::new(dashmap::DashMap::new()),
-            };
+            let formatter = GithubActionsFormatter::new(Arc::new(RepositoryIndexes::default()));
             let index = TagIndex::from_tags([(
                 "main",
                 &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
@@ -1562,9 +1657,7 @@ mod tests {
             let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
             assert!(!parse_result.dependencies[0].is_plain_scalar);
 
-            let formatter = GithubActionsFormatter {
-                tag_index: Arc::new(dashmap::DashMap::new()),
-            };
+            let formatter = GithubActionsFormatter::new(Arc::new(RepositoryIndexes::default()));
             let index = TagIndex::from_tags([(
                 "v4",
                 &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
@@ -1598,9 +1691,7 @@ mod tests {
             let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
             assert!(!parse_result.dependencies[0].is_last_on_line);
 
-            let formatter = GithubActionsFormatter {
-                tag_index: Arc::new(dashmap::DashMap::new()),
-            };
+            let formatter = GithubActionsFormatter::new(Arc::new(RepositoryIndexes::default()));
             let index = TagIndex::from_tags([(
                 "v4",
                 &deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
@@ -2238,7 +2329,7 @@ mod tests {
 
             let mut cached = HashMap::new();
             cached.insert(
-                deps_core::PackageName::new("actions/checkout"),
+                deps_core::NormalizedName::for_test("actions/checkout"),
                 deps_core::PackageVersions::latest_only("v4.3.1"),
             );
             let resolved = HashMap::new();
@@ -2294,7 +2385,9 @@ mod tests {
             let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
             let mut cached = HashMap::new();
             cached.insert(
-                deps_core::PackageName::new(name),
+                deps_core::PackageKey::new(&deps_core::PackageName::new(name), &eco.formatter)
+                    .normalized()
+                    .clone(),
                 deps_core::PackageVersions::latest_only("v2.87.22"),
             );
             let resolved = HashMap::new();
@@ -2394,7 +2487,7 @@ mod tests {
 
             let mut cached = HashMap::new();
             cached.insert(
-                deps_core::PackageName::new(name),
+                deps_core::NormalizedName::for_test(name),
                 deps_core::PackageVersions::latest_only("v4.3.1"),
             );
             let resolved = HashMap::new();
@@ -2718,7 +2811,7 @@ mod tests {
             let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
             let mut cached = HashMap::new();
             cached.insert(
-                deps_core::PackageName::new("owner/action"),
+                deps_core::NormalizedName::for_test("owner/action"),
                 deps_core::PackageVersions::latest_only("v2.87.22"),
             );
             let resolved = HashMap::new();
@@ -2994,7 +3087,7 @@ mod tests {
             );
             let mut cached = HashMap::new();
             cached.insert(
-                deps_core::PackageName::new(name),
+                deps_core::NormalizedName::for_test(name),
                 deps_core::PackageVersions::latest_only("v4.3.1"),
             );
             let resolved = HashMap::new();
@@ -3044,7 +3137,7 @@ mod tests {
             let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
             let mut cached = HashMap::new();
             cached.insert(
-                deps_core::PackageName::new(&name),
+                deps_core::NormalizedName::for_test(&name),
                 deps_core::PackageVersions::latest_only("v2.87.22"),
             );
             let resolved = HashMap::new();
@@ -3097,7 +3190,7 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let mut cached = HashMap::new();
             cached.insert(
-                deps_core::PackageName::new(&name),
+                deps_core::NormalizedName::for_test(&name),
                 deps_core::PackageVersions::latest_only("v2.87.22"),
             );
             let resolved = HashMap::new();
@@ -3151,7 +3244,7 @@ mod tests {
             let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
             let mut cached = HashMap::new();
             cached.insert(
-                deps_core::PackageName::new("octo-org/repo"),
+                deps_core::NormalizedName::for_test("octo-org/repo"),
                 deps_core::PackageVersions::latest_only("v1.0.0"),
             );
             let resolved = HashMap::new();

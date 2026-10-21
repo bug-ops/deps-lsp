@@ -148,6 +148,12 @@ struct ConfigSideEffects {
     /// condition `document::lifecycle`'s phase-A spawn gate and every renderer's
     /// `with_latest_status` attach already check (critique S3).
     osv_checks: OsvChecks,
+    /// `cache.fetch_timeout_secs` / `cache.max_concurrent_fetches`, which also bound Swift's
+    /// registry identity lookups.
+    #[cfg(feature = "swift")]
+    fetch_timeout: deps_core::policy_config::FetchTimeout,
+    #[cfg(feature = "swift")]
+    max_concurrent_fetches: deps_core::policy_config::FetchConcurrency,
 }
 
 impl ConfigSideEffects {
@@ -169,6 +175,10 @@ impl ConfigSideEffects {
             typosquat_checks: config.policy.typosquat_checks(),
             gossip_checks: config.policy.gossip_checks(),
             osv_checks: config.policy.osv_checks(),
+            #[cfg(feature = "swift")]
+            fetch_timeout: config.policy.cache.fetch_timeout,
+            #[cfg(feature = "swift")]
+            max_concurrent_fetches: config.policy.cache.max_concurrent_fetches,
         }
     }
 }
@@ -246,6 +256,11 @@ struct ConfigNotices {
 }
 
 impl Backend {
+    #[cfg(all(test, feature = "npm"))]
+    pub(crate) const fn state(&self) -> &Arc<ServerState> {
+        &self.state
+    }
+
     /// Creates a new backend bound to the given LSP client handle.
     pub fn new(client: Client) -> Self {
         Self::with_state(client, ServerState::new())
@@ -296,6 +311,14 @@ impl Backend {
         self.state
             .keychain_credentials
             .set(effects.registries.swift_keychain_credentials);
+        #[cfg(feature = "swift")]
+        self.state
+            .scm_to_registry
+            .set(effects.registries.swift_scm_to_registry);
+        #[cfg(feature = "swift")]
+        self.state
+            .scm_to_registry
+            .set_fetch_limits(effects.fetch_timeout, effects.max_concurrent_fetches);
         let notices = ConfigNotices {
             #[cfg(feature = "gitlab-ci")]
             gitlab_instance_host: effects.registries.gitlab_instance_host.clone(),
@@ -534,6 +557,7 @@ impl Backend {
         let load = deps_engine::classify::resolved::parse_known_lockfile(
             &self.state.lockfile_cache,
             lock_provider.as_ref(),
+            ecosystem_impl.formatter(),
             lockfile_path,
         )
         .await;
@@ -1833,6 +1857,14 @@ fn build_batch_workspace_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(
+        feature = "cargo",
+        feature = "dart",
+        feature = "deno",
+        feature = "npm",
+        feature = "swift"
+    ))]
+    use deps_core::NormalizedName;
     #[cfg(feature = "cargo")]
     use deps_core::policy_config::FetchConcurrency;
     #[cfg(feature = "cargo")]
@@ -2388,7 +2420,7 @@ mod tests {
         // and this test shares a binary with other diffing/fs_probe tests.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use crate::document::DocumentState;
-        use deps_core::{EcosystemId, PackageName, PackageVersions};
+        use deps_core::{EcosystemId, PackageVersions};
         use tower_lsp_server::ls_types::{FileChangeType, FileEvent};
 
         let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
@@ -2415,7 +2447,7 @@ mod tests {
         // the `.npmrc` change fired below, so `DependencyDiff` sees nothing added or
         // version-changed — the routing-only case `RefetchPolicy::Diff` cannot detect.
         deno_doc.update_cached_versions(HashMap::from([(
-            PackageName::new("@acme-corp/secretpkg"),
+            NormalizedName::for_test("@acme-corp/secretpkg"),
             PackageVersions::latest_only("1.0.0"),
         )]));
         backend.state.update_document(deno_uri.clone(), deno_doc);
@@ -2462,7 +2494,7 @@ mod tests {
     async fn test_npmrc_reparses_only_manifests_in_its_subtree_1793() {
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use crate::document::DocumentState;
-        use deps_core::{EcosystemId, PackageName, PackageVersions};
+        use deps_core::{EcosystemId, PackageVersions};
         use tower_lsp_server::ls_types::{FileChangeType, FileEvent};
 
         let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
@@ -2480,7 +2512,7 @@ mod tests {
         let mut doc = DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse);
         doc.set_version(Some(1));
         doc.update_cached_versions(HashMap::from([(
-            PackageName::new("@acme-corp/secretpkg"),
+            NormalizedName::for_test("@acme-corp/secretpkg"),
             PackageVersions::latest_only("1.0.0"),
         )]));
         backend.state.update_document(uri.clone(), doc);
@@ -2530,7 +2562,7 @@ mod tests {
     #[tokio::test]
     async fn test_swift_registries_json_watch_is_project_tier_only_1759() {
         use crate::document::DocumentState;
-        use deps_core::{EcosystemId, PackageName, PackageVersions};
+        use deps_core::{EcosystemId, PackageVersions};
         use tower_lsp_server::ls_types::{FileChangeType, FileEvent};
 
         let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
@@ -2560,7 +2592,7 @@ let package = Package(
         let mut doc = DocumentState::new_from_parse_result(EcosystemId::Swift, content, parse);
         doc.set_version(Some(1));
         doc.update_cached_versions(HashMap::from([(
-            PackageName::new("acme/pkg"),
+            NormalizedName::for_test("acme/pkg"),
             PackageVersions::latest_only("1.0.0"),
         )]));
         backend.state.update_document(manifest_uri.clone(), doc);
@@ -2610,7 +2642,7 @@ let package = Package(
     #[tokio::test]
     async fn test_swift_nested_registries_json_reparses_only_its_own_package_1793() {
         use crate::document::DocumentState;
-        use deps_core::{EcosystemId, PackageName, PackageVersions};
+        use deps_core::{EcosystemId, PackageVersions};
         use tower_lsp_server::ls_types::{FileChangeType, FileEvent};
 
         let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
@@ -2639,7 +2671,7 @@ let package = Package(
                 DocumentState::new_from_parse_result(EcosystemId::Swift, content.clone(), parse);
             doc.set_version(Some(1));
             doc.update_cached_versions(HashMap::from([(
-                PackageName::new("acme/pkg"),
+                NormalizedName::for_test("acme/pkg"),
                 PackageVersions::latest_only("1.0.0"),
             )]));
             backend.state.update_document(uri.clone(), doc);
@@ -2689,7 +2721,7 @@ let package = Package(
         backend.state.update_document(nested.clone(), {
             let mut doc = backend.state.get_document_clone(&nested).unwrap();
             doc.update_cached_versions(HashMap::from([(
-                PackageName::new("acme/pkg"),
+                NormalizedName::for_test("acme/pkg"),
                 PackageVersions::latest_only("1.0.0"),
             )]));
             doc
@@ -3270,10 +3302,10 @@ let package = Package(
         let mut doc_state =
             DocumentState::new_from_parse_result(EcosystemId::Cargo, content.clone(), parse_result);
         // Already resolved, matching the lock file above — the reload is a no-op for this name.
-        doc_state
-            .signals
-            .resolved_versions
-            .insert("alpha-dep".into(), ConcreteVersion::from("0.1.0"));
+        doc_state.signals.resolved_versions.insert(
+            NormalizedName::for_test("alpha-dep"),
+            ConcreteVersion::from("0.1.0"),
+        );
         // Deliberately WRONG: if the rescan incorrectly ran, phase B would overwrite this
         // with the correct `NonRegistrySource` outcome.
         let mut stale = VulnerabilityMap::new();
@@ -3352,10 +3384,10 @@ let package = Package(
             DocumentState::new_from_parse_result(EcosystemId::Cargo, content.clone(), parse_result);
         // A previously-successful resolution/scan, which the reload error's empty-map
         // fallback would otherwise make look like a lost resolution.
-        doc_state
-            .signals
-            .resolved_versions
-            .insert("alpha-dep".into(), ConcreteVersion::from("0.1.0"));
+        doc_state.signals.resolved_versions.insert(
+            NormalizedName::for_test("alpha-dep"),
+            ConcreteVersion::from("0.1.0"),
+        );
         let mut existing = VulnerabilityMap::new();
         existing.insert(
             deps_core::test_util::vuln_key("alpha-dep"),
@@ -3371,7 +3403,9 @@ let package = Package(
 
         let doc = backend.state.get_document(&uri).unwrap();
         assert_eq!(
-            doc.signals.resolved_versions.get("alpha-dep"),
+            doc.signals
+                .resolved_versions
+                .get(&NormalizedName::for_test("alpha-dep")),
             Some(&ConcreteVersion::from("0.1.0")),
             "a lock-file reload error must leave previously-resolved versions untouched \
              (issue #1424 impl-critic M1), not wipe them with the reload's empty fallback \
@@ -3466,7 +3500,7 @@ let package = Package(
         assert_eq!(
             doc.signals
                 .resolved_versions
-                .get("alpha-dep")
+                .get(&NormalizedName::for_test("alpha-dep"))
                 .map(ConcreteVersion::as_str),
             Some("0.1.0"),
             "resolved_versions must still update regardless of vulnerabilities_enabled"
@@ -3552,7 +3586,7 @@ let package = Package(
         assert_eq!(
             doc.signals
                 .resolved_versions
-                .get("alpha-dep")
+                .get(&NormalizedName::for_test("alpha-dep"))
                 .map(ConcreteVersion::as_str),
             Some("0.1.0"),
             "resolved_versions must still update regardless of offline"
@@ -3571,7 +3605,7 @@ let package = Package(
     async fn test_offline_lockfile_move_cold_cache_leaves_license_absent_1750() {
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use crate::document::DocumentState;
-        use deps_core::{EcosystemId, NetworkMode, PackageName};
+        use deps_core::{EcosystemId, NetworkMode};
 
         fn lock(version: &str) -> String {
             format!(
@@ -3616,7 +3650,7 @@ let package = Package(
         backend
             .handle_lockfile_change(&lockfile_path, EcosystemId::Dart)
             .await;
-        let http = PackageName::new("http");
+        let http = NormalizedName::for_test("http");
         backend
             .state
             .documents
@@ -5053,7 +5087,7 @@ let package = Package(
             // test transitively touch fs_probe).
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             use crate::document::DocumentState;
-            use deps_core::{EcosystemId, PackageName, PackageVersions};
+            use deps_core::{EcosystemId, PackageVersions};
 
             let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
@@ -5082,7 +5116,7 @@ let package = Package(
             );
             cargo_doc.set_version(Some(1));
             cargo_doc.update_cached_versions(HashMap::from([(
-                PackageName::new("serde"),
+                NormalizedName::for_test("serde"),
                 PackageVersions::latest_only("1.0.999"),
             )]));
             backend.state.update_document(cargo_uri.clone(), cargo_doc);
@@ -5106,7 +5140,7 @@ let package = Package(
             );
             nuget_doc.set_version(Some(1));
             nuget_doc.update_cached_versions(HashMap::from([(
-                PackageName::new("Newtonsoft.Json"),
+                NormalizedName::for_test("newtonsoft.json"),
                 PackageVersions::latest_only("99.0.0"),
             )]));
             backend.state.update_document(nuget_uri.clone(), nuget_doc);
@@ -5306,7 +5340,7 @@ let package = Package(
             assert!(doc_state.is_ready_for_batch_update());
             let mut cached = HashMap::new();
             cached.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 deps_core::PackageVersions::latest_only("1.2.0"),
             );
             doc_state.update_cached_versions(cached);
@@ -5367,7 +5401,7 @@ let package = Package(
                 .unwrap();
             let mut cached = HashMap::new();
             cached.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 deps_core::PackageVersions::latest_only("1.2.0"),
             );
             // Pin the precondition this test actually exercises (impl-critic M2): without
@@ -5480,7 +5514,7 @@ let package = Package(
             doc_state.set_loaded();
             let mut cached = HashMap::new();
             cached.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 deps_core::PackageVersions::latest_only("1.2.0"),
             );
             doc_state.update_cached_versions(cached);

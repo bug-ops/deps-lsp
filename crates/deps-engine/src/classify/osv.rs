@@ -10,7 +10,7 @@
 
 use deps_core::ConcreteVersion;
 use deps_core::EcosystemId;
-use deps_core::PackageName;
+
 use deps_core::lsp_helpers::{
     CandidateSiblings, CandidateSiblingsUnknown, CandidateTagSource, OsvNameAvailability,
     TaggedVersions, has_unqueryable_resolved_pin, resolve_in_use_versions,
@@ -102,7 +102,7 @@ impl FixTargetRegistry {
 /// let registry = fix_target_registry(
 ///     parsed.as_ref(),
 ///     &vuln_keys,
-///     &HashMap::<PackageName, PackageVersions>::new(),
+///     &HashMap::new(),
 ///     &SimpleFormatter,
 /// );
 /// assert!(registry.is_empty());
@@ -111,7 +111,7 @@ impl FixTargetRegistry {
 pub fn fix_target_registry(
     parse_result: &dyn deps_core::ParseResult,
     vuln_keys: &deps_core::osv::VulnKeys,
-    cached_versions: &HashMap<PackageName, deps_core::lsp_helpers::PackageVersions>,
+    cached_versions: &deps_core::CachedVersionsMap,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> FixTargetRegistry {
     let snapshot = parse_result
@@ -284,7 +284,7 @@ pub fn candidate_tag_sources(
 ///     RequirementResolution, SourcePolicy,
 /// };
 /// use deps_core::test_util::stub_parse_result_with_dependencies;
-/// use deps_core::{ConcreteVersion, EcosystemId, PackageName};
+/// use deps_core::{ConcreteVersion, EcosystemId, NormalizedName, PackageName};
 /// use deps_engine::classify::osv::build_scan_targets;
 /// use std::collections::HashMap;
 ///
@@ -308,7 +308,7 @@ pub fn candidate_tag_sources(
 /// // step 1 of the ladder above.
 /// let parsed = stub_parse_result_with_dependencies(1);
 /// let mut resolved_versions = HashMap::new();
-/// resolved_versions.insert(PackageName::new("dep-0"), ConcreteVersion::from("1.0.0"));
+/// resolved_versions.insert(NormalizedName::for_test("dep-0"), ConcreteVersion::from("1.0.0"));
 ///
 /// let (targets, skipped) = build_scan_targets(
 ///     parsed.as_ref(),
@@ -323,8 +323,8 @@ pub fn candidate_tag_sources(
 /// ```
 pub fn build_scan_targets(
     parse_result: &dyn deps_core::ParseResult,
-    resolved_versions: &HashMap<PackageName, ConcreteVersion>,
-    resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
+    resolved_versions: &deps_core::ResolvedVersionsMap,
+    resolved_version_candidates: &deps_core::ResolvedCandidatesMap,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem: EcosystemId,
 ) -> (
@@ -349,7 +349,7 @@ pub fn build_scan_targets(
         let package_key = deps_core::PackageKey::new(dep.name(), formatter);
         let key = deps_core::osv::vuln_key_for(dep, Some(&keys), formatter);
 
-        if !formatter.source_is_public_registry_content(&dep.source()) {
+        if formatter.public_content(dep).is_none() {
             skipped.insert(key, ScanOutcome::Skipped(SkipReason::NonRegistrySource));
             continue;
         }
@@ -461,14 +461,15 @@ enum DepCheckClassification<'a> {
 /// type's doc.
 fn classify_dep_for_check_targets<'a>(
     dep: &dyn deps_core::Dependency,
-    cached_versions: &'a HashMap<PackageName, deps_core::lsp_helpers::PackageVersions>,
+    cached_versions: &'a deps_core::CachedVersionsMap,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> DepCheckClassification<'a> {
-    if !formatter.source_is_public_registry_content(&dep.source()) {
+    if formatter.public_content(dep).is_none() {
         return DepCheckClassification::NonRegistrySource;
     }
 
-    let Some(cached) = deps_core::PackageKey::new(dep.name(), formatter).find_in(cached_versions)
+    let Some(cached) =
+        cached_versions.get(deps_core::PackageKey::new(dep.name(), formatter).normalized())
     else {
         return DepCheckClassification::NoCachedVersions;
     };
@@ -521,7 +522,7 @@ fn classify_dep_for_check_targets<'a>(
 /// };
 /// use deps_core::osv::{UpgradeStatus, vulnerability_keys};
 /// use deps_core::test_util::stub_parse_result_with_dependencies;
-/// use deps_core::{ConcreteVersion, EcosystemId, PackageName};
+/// use deps_core::{ConcreteVersion, EcosystemId, NormalizedName, PackageName};
 /// use deps_engine::classify::osv::{build_latest_check_targets, candidate_tag_sources};
 /// use std::collections::HashMap;
 ///
@@ -544,7 +545,7 @@ fn classify_dep_for_check_targets<'a>(
 /// let parsed = stub_parse_result_with_dependencies(1);
 /// let mut cached_versions = HashMap::new();
 /// cached_versions.insert(
-///     PackageName::new("dep-0"),
+///     NormalizedName::for_test("dep-0"),
 ///     PackageVersions::latest_only("2.0.0"),
 /// );
 /// let vuln_keys = vulnerability_keys(
@@ -576,7 +577,7 @@ fn classify_dep_for_check_targets<'a>(
 /// ```
 pub fn build_latest_check_targets(
     parse_result: &dyn deps_core::ParseResult,
-    cached_versions: &HashMap<PackageName, deps_core::lsp_helpers::PackageVersions>,
+    cached_versions: &deps_core::CachedVersionsMap,
     vuln_keys: &deps_core::osv::VulnKeys,
     candidate_tags: &CandidateTagSources,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
@@ -692,7 +693,7 @@ const MAX_CANDIDATE_CHECK_VERSIONS: usize = 6;
 /// never under-conservative.
 pub fn build_candidate_check_targets(
     parse_result: &dyn deps_core::ParseResult,
-    cached_versions: &HashMap<PackageName, deps_core::lsp_helpers::PackageVersions>,
+    cached_versions: &deps_core::CachedVersionsMap,
     vuln_keys: &deps_core::osv::VulnKeys,
     candidate_tags: &CandidateTagSources,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
@@ -1156,6 +1157,8 @@ pub fn osv_name_by_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::NormalizedName;
+    use deps_core::PackageName;
 
     use crate::classify::resolved::collect_in_use_versions;
     use deps_core::VersionReq;
@@ -1304,7 +1307,7 @@ mod tests {
                 }],
             };
             let mut resolved = HashMap::new();
-            resolved.insert(PackageName::new("time"), "0.1.43".into());
+            resolved.insert(NormalizedName::for_test("time"), "0.1.43".into());
 
             let (targets, skipped) = build_scan_targets(
                 &parse_result,
@@ -1330,7 +1333,7 @@ mod tests {
                 }],
             };
             let mut resolved = HashMap::new();
-            resolved.insert(PackageName::new("serde"), "1.0.195".into());
+            resolved.insert(NormalizedName::for_test("serde"), "1.0.195".into());
 
             let (targets, skipped) = build_scan_targets(
                 &parse_result,
@@ -1392,7 +1395,7 @@ mod tests {
             };
             let mut resolved = HashMap::new();
             resolved.insert(
-                PackageName::new("github.com/gin-gonic/gin"),
+                NormalizedName::for_test("github.com/gin-gonic/gin"),
                 "v1.9.0".into(),
             );
 
@@ -1424,7 +1427,7 @@ mod tests {
                 }],
             };
             let mut resolved = HashMap::new();
-            resolved.insert(PackageName::new("serde"), "1.0.195".into());
+            resolved.insert(NormalizedName::for_test("serde"), "1.0.195".into());
 
             let (targets, skipped) = build_scan_targets(
                 &parse_result,
@@ -1457,7 +1460,10 @@ mod tests {
             // Stale entry: go.sum still records v0.9.1 from before a
             // downgrade back to v0.8.1 that only `go get` (not `go mod
             // tidy`) performed.
-            resolved.insert(PackageName::new("github.com/pkg/errors"), "v0.9.1".into());
+            resolved.insert(
+                NormalizedName::for_test("github.com/pkg/errors"),
+                "v0.9.1".into(),
+            );
 
             let (targets, skipped) = build_scan_targets(
                 &parse_result,
@@ -2073,7 +2079,7 @@ mod tests {
                     }],
                 };
                 let mut resolved = HashMap::new();
-                resolved.insert(PackageName::new("pkg"), "1.0.0".into());
+                resolved.insert(NormalizedName::for_test("pkg"), "1.0.0".into());
 
                 let (targets, skipped) = build_scan_targets(
                     &parse_result,
@@ -2153,7 +2159,7 @@ mod tests {
                 }],
             };
             let mut resolved = HashMap::new();
-            resolved.insert(PackageName::new("serde"), "1.0.195".into());
+            resolved.insert(NormalizedName::for_test("serde"), "1.0.195".into());
 
             let in_use = collect_in_use_versions(
                 &parse_result,
@@ -2163,7 +2169,7 @@ mod tests {
                 EcosystemId::Cargo,
             );
             assert_eq!(
-                in_use.get(&PackageName::new("serde")),
+                in_use.get(&NormalizedName::for_test("serde")),
                 Some(&vec![ConcreteVersion::from("1.0.195")])
             );
         }
@@ -2189,7 +2195,7 @@ mod tests {
                 EcosystemId::Maven,
             );
             assert_eq!(
-                in_use.get(&PackageName::new("log4j-core")),
+                in_use.get(&NormalizedName::for_test("log4j-core")),
                 Some(&vec![ConcreteVersion::from("2.14.1")])
             );
         }
@@ -2217,7 +2223,7 @@ mod tests {
                 EcosystemId::Pypi,
             );
             assert_eq!(
-                in_use.get(&PackageName::new("typing_extensions")),
+                in_use.get(&NormalizedName::for_test("typing_extensions")),
                 Some(&vec![ConcreteVersion::from("4.9.0")]),
                 "pep440 '==' comparator must be stripped, not carried into the in-use version"
             );
@@ -2259,7 +2265,7 @@ mod tests {
                 }],
             };
             let mut resolved = HashMap::new();
-            resolved.insert(PackageName::new("time"), "0.1.43".into());
+            resolved.insert(NormalizedName::for_test("time"), "0.1.43".into());
 
             let in_use = collect_in_use_versions(
                 &parse_result,
@@ -2300,7 +2306,7 @@ mod tests {
                 EcosystemId::Cargo,
             );
             assert_eq!(
-                in_use.get(&PackageName::new("time")),
+                in_use.get(&NormalizedName::for_test("time")),
                 Some(&vec![
                     ConcreteVersion::from("0.1.43"),
                     ConcreteVersion::from("0.1.44")
@@ -2437,7 +2443,7 @@ mod tests {
         fn awaiting_name_fixture() -> (
             MockParseResult,
             deps_core::osv::VulnKeys,
-            HashMap<PackageName, PackageVersions>,
+            HashMap<NormalizedName, PackageVersions>,
         ) {
             let parse_result = MockParseResult {
                 deps: vec![MockDep {
@@ -2448,7 +2454,7 @@ mod tests {
             let vuln_keys = vuln_keys_for(&parse_result, &AwaitingNameFormatter::default());
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::new("gha-action"),
+                NormalizedName::for_test("gha-action"),
                 PackageVersions::latest_only("1.0.0"),
             );
             (parse_result, vuln_keys, cached_versions)
@@ -2679,7 +2685,7 @@ mod tests {
             };
             let mut resolved = HashMap::new();
             resolved.insert(
-                PackageName::new("gha-action"),
+                NormalizedName::for_test("gha-action"),
                 ConcreteVersion::new("1.0.0"),
             );
 
@@ -2743,7 +2749,10 @@ mod tests {
             use deps_core::osv::OsvQueryName;
 
             let mut resolved = HashMap::new();
-            resolved.insert(PackageName::new("dup"), ConcreteVersion::new("1.0.0"));
+            resolved.insert(
+                NormalizedName::for_test("dup"),
+                ConcreteVersion::new("1.0.0"),
+            );
             let name = deps_core::osv::OsvPackageName::new("dup").unwrap();
 
             for (ready, expected) in [
@@ -2789,7 +2798,7 @@ mod tests {
             )
         }
 
-        fn gha_like_fixture() -> (MockParseResult, HashMap<PackageName, PackageVersions>) {
+        fn gha_like_fixture() -> (MockParseResult, HashMap<NormalizedName, PackageVersions>) {
             let parse_result = MockParseResult {
                 deps: vec![MockDep {
                     name: PackageName::new("gha-action"),
@@ -2798,7 +2807,7 @@ mod tests {
             };
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::new("gha-action"),
+                NormalizedName::for_test("gha-action"),
                 PackageVersions::latest_only("v4.8.0"),
             );
             (parse_result, cached_versions)
@@ -3009,7 +3018,7 @@ mod tests {
             let vuln_keys = vuln_keys_for(&parse_result, &UnmappableNameFormatter);
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::new("jsr-pinned"),
+                NormalizedName::for_test("jsr-pinned"),
                 PackageVersions::latest_only("1.0.0"),
             );
 
@@ -3054,7 +3063,7 @@ mod tests {
             let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::new("lodash"),
+                NormalizedName::for_test("lodash"),
                 PackageVersions::latest_only("4.17.21"),
             );
 
@@ -3084,7 +3093,7 @@ mod tests {
                 ConcreteVersion::new("1.0.0"),
             ]);
             cached_versions.insert(
-                PackageName::new("lodash"),
+                NormalizedName::for_test("lodash"),
                 PackageVersions::new(ConcreteVersion::new("2.0.0"), available),
             );
 
@@ -3116,11 +3125,11 @@ mod tests {
             let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::new("dup"),
+                NormalizedName::for_test("dup"),
                 PackageVersions::latest_only("2.0.0"),
             );
             cached_versions.insert(
-                PackageName::new("other"),
+                NormalizedName::for_test("other"),
                 PackageVersions::latest_only("3.0.0"),
             );
 
@@ -3153,7 +3162,7 @@ mod tests {
                 let available: Arc<[ConcreteVersion]> =
                     Arc::from(vec![ConcreteVersion::new(newest)]);
                 cached_versions.insert(
-                    PackageName::new(name),
+                    NormalizedName::for_test(name),
                     PackageVersions::new(ConcreteVersion::new(newest), available),
                 );
             }
@@ -3195,7 +3204,7 @@ mod tests {
                 ConcreteVersion::new("1.0.0"),
             ]);
             cached_versions.insert(
-                PackageName::new("pkg"),
+                NormalizedName::for_test("pkg"),
                 PackageVersions::new(ConcreteVersion::new("3.0.0"), available),
             );
 

@@ -31,9 +31,10 @@ use deps_core::Registry;
 use deps_core::VersionReq;
 use deps_core::ecosystem::BoxFuture;
 use deps_core::ecosystem::private::Sealed;
-use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::lsp_helpers::{EcosystemFormatter, ProbeEffect, ProbePhase, ProbeReport};
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// No-op [`Registry`]: every method returns an empty/`None` success immediately, for an
 /// [`Ecosystem`] test double whose registry is never meant to be exercised.
@@ -134,14 +135,15 @@ impl ParseResult for StubParseResult {
 ///
 /// ```
 /// use deps_core::policy_config::{FetchConcurrency, FetchTimeout};
-/// use deps_core::{ConcreteVersion, PackageName};
-/// use deps_engine::classify::license::fetch_tier3_licenses;
+/// use deps_core::{ConcreteVersion, NormalizedName};
+/// use deps_core::test_util::package_key;
+/// use deps_engine::classify::license::{Tier3Target, fetch_tier3_licenses};
 /// use deps_engine::test_util::TestTier3Ecosystem;
 ///
 /// #[tokio::main]
 /// async fn main() {
 ///     let ecosystem = TestTier3Ecosystem::returning(vec!["MIT".to_string()]);
-///     let targets = vec![(PackageName::new("pkg"), ConcreteVersion::from("1.0.0"))];
+///     let targets = vec![Tier3Target::new(package_key("pkg"), ConcreteVersion::from("1.0.0"))];
 ///
 ///     let result = fetch_tier3_licenses(
 ///         &ecosystem,
@@ -152,7 +154,7 @@ impl ParseResult for StubParseResult {
 ///     .await;
 ///
 ///     assert_eq!(
-///         result.licenses.get(&PackageName::new("pkg")),
+///         result.licenses.get(&NormalizedName::for_test("pkg")),
 ///         Some(&vec!["MIT".to_string()])
 ///     );
 ///     assert_eq!(result.timed_out, 0);
@@ -160,6 +162,18 @@ impl ParseResult for StubParseResult {
 /// ```
 pub struct TestTier3Ecosystem {
     fetch_license_result: FetchLicenseBehavior,
+    probe_script: ProbeScript,
+    probe_calls: Mutex<Vec<ProbePhase>>,
+    parses: AtomicUsize,
+}
+
+/// The [`ProbeEffect`] [`TestTier3Ecosystem::background_probes`] reports per phase.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProbeScript {
+    /// Reported for [`ProbePhase::PreFetch`].
+    pub pre_fetch: ProbeEffect,
+    /// Reported for [`ProbePhase::PostFetch`].
+    pub post_fetch: ProbeEffect,
 }
 
 /// What [`TestTier3Ecosystem::fetch_license`] does when called — see
@@ -180,7 +194,40 @@ impl TestTier3Ecosystem {
     pub const fn returning(license: Vec<String>) -> Self {
         Self {
             fetch_license_result: FetchLicenseBehavior::Returns(license),
+            probe_script: ProbeScript {
+                pre_fetch: ProbeEffect::Unchanged,
+                post_fetch: ProbeEffect::Unchanged,
+            },
+            probe_calls: Mutex::new(Vec::new()),
+            parses: AtomicUsize::new(0),
         }
+    }
+
+    /// Makes [`Ecosystem::background_probes`] report `script`'s effects and record each call.
+    #[must_use]
+    pub const fn with_probes(mut self, script: ProbeScript) -> Self {
+        self.probe_script = script;
+        self
+    }
+
+    /// The phases [`Ecosystem::background_probes`] was called with, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a previous caller panicked while holding the record.
+    #[must_use]
+    pub fn probe_calls(&self) -> Vec<ProbePhase> {
+        #[expect(
+            clippy::expect_used,
+            reason = "test double; a poisoned lock is a test bug"
+        )]
+        self.probe_calls.lock().expect("probe record lock").clone()
+    }
+
+    /// How many times [`Ecosystem::parse_manifest`] ran.
+    #[must_use]
+    pub fn parse_count(&self) -> usize {
+        self.parses.load(Ordering::Relaxed)
     }
 
     /// [`Ecosystem::fetch_license`] never resolves, for exercising a caller's own
@@ -189,6 +236,12 @@ impl TestTier3Ecosystem {
     pub const fn pending() -> Self {
         Self {
             fetch_license_result: FetchLicenseBehavior::Pending,
+            probe_script: ProbeScript {
+                pre_fetch: ProbeEffect::Unchanged,
+                post_fetch: ProbeEffect::Unchanged,
+            },
+            probe_calls: Mutex::new(Vec::new()),
+            parses: AtomicUsize::new(0),
         }
     }
 }
@@ -214,6 +267,7 @@ impl Ecosystem for TestTier3Ecosystem {
         uri: &'a url::Url,
     ) -> BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>> {
         let uri = uri.clone();
+        self.parses.fetch_add(1, Ordering::Relaxed);
         Box::pin(async move {
             Ok(Box::new(StubParseResult {
                 dep: StubDependency {
@@ -263,6 +317,29 @@ impl Ecosystem for TestTier3Ecosystem {
 
     fn license_source(&self) -> LicenseSource {
         LicenseSource::DetectedSpdx
+    }
+
+    fn background_probes<'a>(
+        &'a self,
+        _parse_result: &'a dyn ParseResult,
+        phase: ProbePhase,
+    ) -> BoxFuture<'a, ProbeReport> {
+        #[expect(
+            clippy::expect_used,
+            reason = "test double; a poisoned lock is a test bug"
+        )]
+        self.probe_calls
+            .lock()
+            .expect("probe record lock")
+            .push(phase);
+        let effect = match phase {
+            ProbePhase::PreFetch => self.probe_script.pre_fetch,
+            ProbePhase::PostFetch => self.probe_script.post_fetch,
+        };
+        Box::pin(std::future::ready(ProbeReport {
+            effect,
+            ..ProbeReport::default()
+        }))
     }
 
     fn as_any(&self) -> &dyn Any {

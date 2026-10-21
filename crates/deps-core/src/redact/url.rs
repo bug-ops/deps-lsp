@@ -2231,10 +2231,101 @@ pub(super) fn is_authority_bearing_url(raw: &str) -> Option<url::Url> {
     url::Url::parse(raw).ok().filter(|url| url.host().is_some())
 }
 
+/// Whether a URL path segment looks like it carries a credential, literally or percent-encoded.
+fn path_segment_is_credential_shaped(segment: &str) -> bool {
+    let decoded = urlencoding::decode(segment).unwrap_or(std::borrow::Cow::Borrowed(segment));
+    segment_has_credential_colon(segment)
+        || segment_has_credential_colon(&decoded)
+        || decoded.contains('@')
+        || TOKEN_PREFIXES
+            .iter()
+            .any(|prefix| decoded.starts_with(prefix))
+}
+
+/// Parses `raw` as an authority-bearing URL and returns it with every credential-bearing part
+/// removed: userinfo, query and fragment.
+///
+/// `None` when `raw` does not parse, has no host, or carries a credential in its path: a
+/// segment shaped like `user:token@host` (see [`redact_userinfo`]), the same shape
+/// percent-encoded (`user%3Atoken%40host`), an `@`, or a bare segment starting with a
+/// well-known token prefix (`ghp_...`). Such a value cannot be made safe by stripping and must
+/// not be sent anywhere. The scheme is left to the caller.
+///
+/// For a caller that sends a user-written repository URL to a third party (the SE-0292
+/// `identifiers` lookup) and must never forward a token written into it.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::redact::strip_url_credentials;
+///
+/// let stripped = strip_url_credentials(
+///     "https://oauth2:TOKEN@gitlab.example.com/group/repo.git?private_token=y#frag",
+/// )
+/// .unwrap();
+/// assert_eq!(stripped.as_str(), "https://gitlab.example.com/group/repo.git");
+/// assert!(strip_url_credentials("https://host.example/api/user:glpat-SECRET@internal").is_none());
+/// assert!(strip_url_credentials("https://host.example/user%3Aglpat-SECRET%40internal/r").is_none());
+/// assert!(strip_url_credentials("https://host.example/ghp_SECRET/r").is_none());
+/// assert!(strip_url_credentials("not a url").is_none());
+/// ```
+#[must_use]
+pub fn strip_url_credentials(raw: &str) -> Option<url::Url> {
+    let mut url = is_authority_bearing_url(raw)?;
+    if url.path_segments()?.any(path_segment_is_credential_shaped) {
+        return None;
+    }
+    url.set_username("").ok()?;
+    url.set_password(None).ok()?;
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_util::scaling::{ExpectedGrowth, assert_scaling};
+
+    #[test]
+    fn strip_url_credentials_removes_userinfo_query_and_fragment() {
+        let stripped =
+            strip_url_credentials("https://user:hunter2@host.example/o/r?token=abc#x").unwrap();
+        assert_eq!(stripped.as_str(), "https://host.example/o/r");
+        assert!(!stripped.as_str().contains("hunter2"));
+    }
+
+    #[test]
+    fn strip_url_credentials_keeps_path_case_and_port() {
+        let stripped = strip_url_credentials("https://Host.Example:8443/Apple/Swift-NIO").unwrap();
+        assert_eq!(
+            stripped.as_str(),
+            "https://host.example:8443/Apple/Swift-NIO"
+        );
+    }
+
+    #[test]
+    fn strip_url_credentials_rejects_percent_encoded_and_bare_token_segments() {
+        for raw in [
+            "https://host.example/u%3Atoken%40x/repo",
+            "https://host.example/u%3atoken/repo",
+            "https://host.example/org/%40token/repo",
+            "https://host.example/ghp_0123456789abcdef/repo",
+            "https://host.example/org/glpat-SECRET",
+            "https://host.example/github_pat_X%2Frepo",
+        ] {
+            assert!(strip_url_credentials(raw).is_none(), "{raw}");
+        }
+        assert!(strip_url_credentials("https://host.example/Apple/Swift-NIO.git").is_some());
+    }
+
+    #[test]
+    fn strip_url_credentials_rejects_credential_shaped_path_and_hostless_input() {
+        assert!(strip_url_credentials("https://host.example/user:glpat-SECRET@internal").is_none());
+        assert!(strip_url_credentials("file:///etc/passwd").is_none());
+        assert!(strip_url_credentials("git@github.com:o/r.git").is_none());
+        assert!(strip_url_credentials("").is_none());
+    }
 
     fn redact_userinfo_scaling(
         label: &str,

@@ -63,7 +63,7 @@ async fn test_fetch_and_store_http_error() {
     let cache = HttpCache::new();
     let url = format!("{}/api/missing", server.url());
     let result: Result<CachedResponse> = cache
-        .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url)
+        .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url, LivePolicy::default())
         .await;
 
     assert!(result.is_err());
@@ -92,7 +92,7 @@ async fn test_fetch_and_store_403_with_confirmed_evidence_is_verified_rate_limit
     let cache = HttpCache::new();
     let url = format!("{}/repos/owner/repo/tags", server.url());
     let result: Result<CachedResponse> = cache
-        .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url)
+        .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url, LivePolicy::default())
         .await;
 
     match result {
@@ -121,7 +121,7 @@ async fn test_fetch_and_store_403_without_evidence_stays_http_status() {
     let cache = HttpCache::new();
     let url = format!("{}/repos/owner/repo/tags", server.url());
     let result: Result<CachedResponse> = cache
-        .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url)
+        .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url, LivePolicy::default())
         .await;
 
     match result {
@@ -146,7 +146,7 @@ async fn test_fetch_and_store_403_with_nonzero_remaining_stays_http_status() {
     let cache = HttpCache::new();
     let url = format!("{}/repos/owner/repo/tags", server.url());
     let result: Result<CachedResponse> = cache
-        .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url)
+        .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url, LivePolicy::default())
         .await;
 
     match result {
@@ -277,7 +277,7 @@ async fn test_fetch_and_store_fetching_fresh_log_redacts_query_string_token() {
     let cache = HttpCache::new();
     let output = crate::test_util::capture_tracing_output_async_at(tracing::Level::DEBUG, async {
         let result: CachedResponse = cache
-            .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url)
+            .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url, LivePolicy::default())
             .await
             .unwrap();
         assert_eq!(result.body.as_ref(), b"ok");

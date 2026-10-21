@@ -458,6 +458,7 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::NormalizedName;
 
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
     // test_ecosystem_id/test_ecosystem_display_name/test_lockfile_filenames/test_as_any
@@ -679,7 +680,7 @@ mod tests {
         let parse_result = eco.parse_manifest(content, uri).await.unwrap();
         let mut cached = std::collections::HashMap::new();
         cached.insert(
-            "newtonsoft.json".into(),
+            NormalizedName::for_test("newtonsoft.json"),
             PackageVersions::latest_only(latest),
         );
         let resolved = std::collections::HashMap::new();
@@ -915,6 +916,7 @@ mod tests {
     #[cfg(feature = "lsp-responses")]
     mod lsp_tests {
         use super::*;
+        use deps_core::NormalizedName;
         use std::assert_matches;
 
         use crate::types::NuGetDependency;
@@ -1414,7 +1416,7 @@ mod tests {
             let parse_result = eco.parse_manifest(content, uri).await.unwrap();
             let mut cached = std::collections::HashMap::new();
             cached.insert(
-                "newtonsoft.json".into(),
+                NormalizedName::for_test("newtonsoft.json"),
                 PackageVersions::latest_only(latest),
             );
             let resolved = std::collections::HashMap::new();
@@ -1669,14 +1671,8 @@ mod tests {
         }
 
         fn gated_versions<'a>(
-            cached: &'a std::collections::HashMap<
-                deps_core::PackageName,
-                deps_core::PackageVersions,
-            >,
-            resolved: &'a std::collections::HashMap<
-                deps_core::PackageName,
-                deps_core::ConcreteVersion,
-            >,
+            cached: &'a deps_core::CachedVersionsMap,
+            resolved: &'a deps_core::ResolvedVersionsMap,
             gate: &'a deps_core::lsp_helpers::InteractiveFetchGate,
         ) -> deps_core::VersionData<'a> {
             deps_core::VersionData::new(cached, resolved)

@@ -334,7 +334,7 @@ async fn test_fetch_and_store_stores_headers() {
     let cache = HttpCache::new();
     let url = format!("{}/api/data", server.url());
     let _: CachedResponse = cache
-        .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url)
+        .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url, LivePolicy::default())
         .await
         .unwrap();
 
@@ -361,7 +361,7 @@ async fn test_fetch_and_store_rejects_oversized_response() {
     let cache = HttpCache::new();
     let url = format!("{}/api/huge", server.url());
     let result: Result<CachedResponse> = cache
-        .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url)
+        .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url, LivePolicy::default())
         .await;
 
     match result {
@@ -391,7 +391,7 @@ async fn test_fetch_and_store_accepts_response_at_exact_cap() {
     let cache = HttpCache::new();
     let url = format!("{}/api/exact", server.url());
     let result: CachedResponse = cache
-        .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url)
+        .fetch_and_store_with_headers(&url, &[], &cache.baseline, &url, LivePolicy::default())
         .await
         .unwrap();
 

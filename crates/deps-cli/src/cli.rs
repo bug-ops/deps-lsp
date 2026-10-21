@@ -75,7 +75,10 @@ pub struct CheckArgs {
     /// Defaults to `vulnerable,yanked,unsatisfiable` when omitted (FR-010); an explicit
     /// value replaces that default. `sha-comment-mismatch` selects SHA pins whose version
     /// comment is not confirmed by the repository's tag index. `unknown-ref` selects tag pins
-    /// whose ref is a full release that no published tag of the repository matches. `other`
+    /// whose ref is neither a published tag nor a branch of the repository (a full release
+    /// no tag matches, or a partial tag such as `v40` that is not a branch either); branch
+    /// existence is probed against the GitHub/GitLab API, so set `GITHUB_TOKEN`/`GITLAB_TOKEN`
+    /// in CI to avoid probes being skipped on the anonymous rate budget. `other`
     /// covers every finding matching none of the nine specific categories, including informational notices:
     /// offline, skipped lookups for manifests without a lock file, unresolved GitLab hosts,
     /// dependency-ceiling and registry-fetch failures. It therefore fails any manifest

@@ -470,6 +470,383 @@ fn test_fail_on_other_exits_one_on_other_finding_and_default_policy_exits_zero()
     );
 }
 
+/// Spec 078 FR-034/FR-035, SC-008: a `pnpm-workspace.yaml` is walked and checked like any other
+/// manifest (it is routed to the npm ecosystem by `EcosystemRegistry::for_uri`), and a
+/// duplicate default catalog surfaces as an `Other` finding that leaves the default exit code
+/// alone.
+const DUPLICATE_DEFAULT_WORKSPACE: &str =
+    "catalog:\n  react: ^18.0.0\ncatalogs:\n  default:\n    vue: ^3.0.0\n";
+
+#[tokio::test]
+async fn test_pnpm_workspace_yaml_is_checked_as_an_npm_manifest() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    std::fs::write(
+        dir.path().join("pnpm-workspace.yaml"),
+        DUPLICATE_DEFAULT_WORKSPACE,
+    )
+    .expect("write workspace file");
+
+    let (report, had_error) = run_pipeline(dir.path()).await;
+
+    let duplicate: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.kind,
+                deps_core::diagnostic::DiagnosticKind::DuplicateDefaultCatalog
+            )
+        })
+        .collect();
+    assert_eq!(duplicate.len(), 1, "{:?}", report.findings);
+    assert_eq!(duplicate[0].ecosystem, deps_core::EcosystemId::Npm);
+    assert_eq!(duplicate[0].category(), deps_cli::report::Category::Other);
+    assert_eq!(duplicate[0].code(), Some("pnpm-duplicate-default-catalog"));
+    assert!(duplicate[0].manifest_path.ends_with("pnpm-workspace.yaml"));
+    assert_eq!(
+        exit_code(
+            &report,
+            &FailOnPolicy::default_categories(),
+            ExecutionOutcome::from_had_execution_error(had_error)
+        ),
+        EXIT_CLEAN,
+        "the default --fail-on set must not include the duplicate-default finding"
+    );
+}
+
+#[test]
+fn test_fail_on_other_gates_a_duplicate_default_catalog_through_the_real_binary() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    std::fs::write(
+        dir.path().join("pnpm-workspace.yaml"),
+        DUPLICATE_DEFAULT_WORKSPACE,
+    )
+    .expect("write workspace file");
+
+    let run = |format: &str, extra: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_deps-cli"))
+            .args(["check", "--offline", "--format", format])
+            .args(extra)
+            .arg(dir.path())
+            .output()
+            .expect("run the real deps-cli binary")
+    };
+
+    let default = run("json", &[]);
+    let stdout = String::from_utf8_lossy(&default.stdout);
+    assert!(
+        stdout.contains("defines the default catalog twice"),
+        "json output must carry the finding — stdout: {stdout} stderr: {}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+    assert_eq!(default.status.code(), Some(0), "stdout: {stdout}");
+    assert_eq!(run("json", &["--fail-on", "other"]).status.code(), Some(1));
+}
+
+/// Spec 086 FR-008/FR-030: `--offline` skips every ref probe, so a run gating on `unknown-ref`
+/// prints no "probes skipped" note and its exit code is unaffected.
+#[test]
+fn test_offline_unknown_ref_run_prints_no_probe_note() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    std::fs::create_dir_all(dir.path().join(".github/workflows")).expect("create workflows dir");
+    std::fs::write(
+        dir.path().join(".github/workflows/ci.yml"),
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v40\n",
+    )
+    .expect("write workflow");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_deps-cli"))
+        .args(["check", "--offline", "--fail-on", "unknown-ref"])
+        .arg(dir.path())
+        .output()
+        .expect("run the real deps-cli binary");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("ref probes skipped"), "stderr: {stderr}");
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+}
+
+/// Spec 078 FR-034/SC-008: an outdated catalog entry is reported once from the
+/// `pnpm-workspace.yaml` and once from each referencing `package.json`. The npm registry is a
+/// `mockito` server reached through the fixture's own `.npmrc` (loopback allowed via the
+/// private-registry allowlist), so no ecosystem crate is needed.
+mod catalog_duplicate_reporting {
+    use super::*;
+    use deps_core::policy_config::{
+        DiagnosticsConfig, RegistriesConfig, WorkspaceRegistriesSetting,
+    };
+
+    #[tokio::test]
+    async fn outdated_catalog_entry_is_reported_once_from_the_yaml_and_once_per_package_json() {
+        let mut server = mockito::Server::new_async().await;
+        let _packument = server
+            .mock("GET", "/react")
+            .with_status(200)
+            .with_body(r#"{"versions": {"16.0.0": {}, "19.3.0": {}}}"#)
+            .create_async()
+            .await;
+        let host = server.host_with_port();
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            dir.path().join(".npmrc"),
+            format!("registry=http://{host}/\n"),
+        )
+        .expect("write npmrc");
+        std::fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\ncatalog:\n  react: ^16.0.0\n",
+        )
+        .expect("write workspace");
+        for package in ["a", "b"] {
+            let package_dir = dir.path().join("packages").join(package);
+            std::fs::create_dir_all(&package_dir).expect("create package dir");
+            std::fs::write(
+                package_dir.join("package.json"),
+                format!("{{\"name\":\"{package}\",\"dependencies\":{{\"react\":\"catalog:\"}}}}"),
+            )
+            .expect("write package.json");
+        }
+
+        let policy = PolicyConfig {
+            diagnostics: DiagnosticsConfig::new().with_vulnerabilities_enabled(false),
+            registries: RegistriesConfig::new()
+                .with_workspace_registries(WorkspaceRegistriesSetting::All),
+            ..PolicyConfig::default()
+        };
+        let env = MapEnv::new().with_var(
+            "DEPS_LSP_PRIVATE_REGISTRY_HOSTS",
+            host.split(':').next().expect("host"),
+        );
+        let runtime = EcosystemRuntime::from_policy(&policy, &RegistryEnvironment::read(&env));
+        let cache = Arc::new(HttpCache::with_policy(Arc::clone(&runtime.policy)));
+        let registry = EcosystemRegistry::new();
+        let _ = register_ecosystems(&registry, Arc::clone(&cache), &runtime);
+        let ctx = CheckContext {
+            cache: Arc::clone(&cache),
+            osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
+            deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
+            lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            policy,
+        };
+
+        let outcome = walk::walk(
+            &[dir.path().to_path_buf()],
+            &registry,
+            walk::GitignorePolicy::Ignore,
+            walk::SymlinkPolicy::Skip,
+        );
+        let mut per_manifest = std::collections::BTreeMap::new();
+        for manifest in outcome.manifests() {
+            let content = std::fs::read_to_string(&manifest.path).expect("read manifest");
+            let result = check_manifest(
+                &manifest.ecosystem,
+                &manifest.uri_path,
+                &manifest.display_path,
+                &content,
+                &ctx,
+            )
+            .await
+            .expect("check_manifest");
+            let version_findings = result
+                .findings
+                .iter()
+                .filter(|f| f.message.contains("19.3.0"))
+                .count();
+            per_manifest.insert(manifest.display_path.clone(), version_findings);
+        }
+
+        assert_eq!(per_manifest.len(), 3, "{per_manifest:?}");
+        for (path, count) in &per_manifest {
+            assert_eq!(
+                *count,
+                1,
+                "{} must report the entry once: {per_manifest:?}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Specs 086 FR-030 / 088 FR-019: the stderr notes about unanswered probes and incomplete
+/// identity lookups, and the policy for when each is printed.
+mod probe_notes {
+    use super::*;
+    use deps_cli::report::{Category, probe_notes};
+    use deps_core::lsp_helpers::ProbeReport;
+    use deps_engine::probe::ProbeSummary;
+
+    fn summary(report: ProbeReport) -> ProbeSummary {
+        let mut summary = ProbeSummary::default();
+        summary.add(&report);
+        summary
+    }
+
+    #[test]
+    fn test_unanswered_ref_probes_are_noted_only_when_gating_on_unknown_ref() {
+        let unanswered = summary(ProbeReport {
+            skipped_over_budget: 3,
+            inconclusive: 1,
+            ..ProbeReport::default()
+        });
+        let gated = probe_notes(&unanswered, &FailOnPolicy::new(vec![Category::UnknownRef]));
+        assert_eq!(
+            gated,
+            [
+                "4 ref probes skipped (rate budget/inconclusive); set GITHUB_TOKEN/GITLAB_TOKEN in CI"
+            ]
+        );
+        assert!(probe_notes(&unanswered, &FailOnPolicy::default_categories()).is_empty());
+    }
+
+    #[test]
+    fn test_incomplete_identity_lookups_are_noted_whatever_the_gate() {
+        let incomplete = summary(ProbeReport {
+            incomplete_identity_lookups: 2,
+            ..ProbeReport::default()
+        });
+        for policy in [
+            FailOnPolicy::default_categories(),
+            FailOnPolicy::new(vec![Category::UnknownRef]),
+        ] {
+            assert_eq!(
+                probe_notes(&incomplete, &policy),
+                ["2 registry identity lookups incomplete; using source-control versions"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_both_notes_print_in_order_and_a_clean_run_prints_none() {
+        let both = summary(ProbeReport {
+            inconclusive: 1,
+            incomplete_identity_lookups: 1,
+            ..ProbeReport::default()
+        });
+        let notes = probe_notes(&both, &FailOnPolicy::new(vec![Category::UnknownRef]));
+        assert_eq!(notes.len(), 2);
+        assert!(notes[0].contains("ref probes skipped"));
+        assert!(notes[1].contains("identity lookups incomplete"));
+        assert!(
+            probe_notes(
+                &ProbeSummary::default(),
+                &FailOnPolicy::new(vec![Category::UnknownRef])
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_notes_never_change_the_exit_code() {
+        let report = CheckReport { findings: vec![] };
+        let notes = summary(ProbeReport {
+            inconclusive: 5,
+            incomplete_identity_lookups: 5,
+            ..ProbeReport::default()
+        });
+        let policy = FailOnPolicy::new(vec![Category::UnknownRef]);
+        assert!(!probe_notes(&notes, &policy).is_empty());
+        assert_eq!(
+            exit_code(
+                &report,
+                &policy,
+                ExecutionOutcome::from_had_execution_error(false)
+            ),
+            EXIT_CLEAN
+        );
+    }
+}
+
+/// #1873: two spellings of one package (`Django` / `django`, PEP 503 equivalent) fetch the
+/// registry once, and both declarations get the same finding through the CLI's
+/// `analyze_manifest` → `generate_diagnostics` path. The index is a `mockito` server reached
+/// through the requirements file's own `--index-url`.
+mod case_variant_names {
+    use super::*;
+    use deps_core::policy_config::{
+        DiagnosticsConfig, RegistriesConfig, WorkspaceRegistriesSetting,
+    };
+
+    #[tokio::test]
+    async fn both_spellings_share_one_fetch_and_each_gets_a_finding() {
+        let mut server = mockito::Server::new_async().await;
+        let simple = server
+            .mock("GET", "/simple/django/")
+            .with_status(200)
+            .with_header("content-type", "application/vnd.pypi.simple.v1+json")
+            .with_body(
+                r#"{"meta":{"api-version":"1.0"},"name":"django","versions":["3.0.0","5.0.0"],"files":[
+                    {"filename":"Django-3.0.0.tar.gz","url":"http://files.invalid/Django-3.0.0.tar.gz","hashes":{}},
+                    {"filename":"Django-5.0.0.tar.gz","url":"http://files.invalid/Django-5.0.0.tar.gz","hashes":{}}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let host = server.host_with_port();
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            dir.path().join("requirements.txt"),
+            format!("--index-url http://{host}/simple/\nDjango==3.0.0\ndjango==3.0.0\n"),
+        )
+        .expect("write requirements");
+
+        let policy = PolicyConfig {
+            diagnostics: DiagnosticsConfig::new().with_vulnerabilities_enabled(false),
+            registries: RegistriesConfig::new()
+                .with_workspace_registries(WorkspaceRegistriesSetting::All),
+            ..PolicyConfig::default()
+        };
+        let env = MapEnv::new().with_var(
+            "DEPS_LSP_PRIVATE_REGISTRY_HOSTS",
+            host.split(':').next().expect("host"),
+        );
+        let runtime = EcosystemRuntime::from_policy(&policy, &RegistryEnvironment::read(&env));
+        let cache = Arc::new(HttpCache::with_policy(Arc::clone(&runtime.policy)));
+        let registry = EcosystemRegistry::new();
+        let _ = register_ecosystems(&registry, Arc::clone(&cache), &runtime);
+        let ctx = CheckContext {
+            cache: Arc::clone(&cache),
+            osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
+            deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
+            lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            policy,
+        };
+
+        let outcome = walk::walk(
+            &[dir.path().to_path_buf()],
+            &registry,
+            walk::GitignorePolicy::Ignore,
+            walk::SymlinkPolicy::Skip,
+        );
+        let manifest = &outcome.manifests()[0];
+        let content = std::fs::read_to_string(&manifest.path).expect("read manifest");
+        let result = check_manifest(
+            &manifest.ecosystem,
+            &manifest.uri_path,
+            &manifest.display_path,
+            &content,
+            &ctx,
+        )
+        .await
+        .expect("check_manifest");
+
+        simple.assert_async().await;
+        let lines: std::collections::BTreeSet<u32> = result
+            .findings
+            .iter()
+            .filter(|f| f.message.contains("5.0.0"))
+            .map(|f| f.range.start.line)
+            .collect();
+        assert_eq!(
+            lines,
+            [1, 2].into(),
+            "both spellings must be reported: {:?}",
+            result.findings
+        );
+    }
+}
+
 /// Issue #1124's own repro, exercised through the real binary (mirroring reviewer follow-up
 /// #5's rationale above for `--respect-gitignore`): a manifest replaced by a broken symlink
 /// must not be silently dropped from the scan, and the warning must distinguish this case

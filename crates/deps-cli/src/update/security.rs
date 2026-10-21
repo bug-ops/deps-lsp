@@ -79,6 +79,7 @@ const OSV_CHECK_TIMEOUT_CEILING_SECS: u64 = 30;
 ///     fetch_failed: HashSet::new(),
 ///     registry_unreachable: false,
 ///     license_fetch_incomplete: false,
+///     probe_report: deps_core::lsp_helpers::ProbeReport::default(),
 /// };
 ///
 /// let plan = plan_security_updates(
@@ -280,8 +281,8 @@ fn classify_vulnerable_dependency(
     // stricter than `deps-lsp` (`code_actions.rs:590-604`), which fails closed only on a
     // *timed-out* fetch and leaves a plain fetch failure unfiltered — the CLI's broader rule
     // is intentional (the safe direction) and must not be narrowed to match `deps-lsp`.
-    let cached = key.find_in(&analysis.cached_versions);
-    if analysis.fetch_failed.contains(dep.name()) || cached.is_none() {
+    let cached = analysis.cached_versions.get(key.normalized());
+    if analysis.fetch_failed.contains(key.normalized()) || cached.is_none() {
         return unfixable_item(
             dep,
             current,
@@ -633,8 +634,8 @@ mod tests {
     use deps_core::parser::DependencySource;
     use deps_core::position::{Position, Range};
     use deps_core::{
-        ConcreteVersion, Dependency, EcosystemId, PackageName, PackageVersions, RemovalStatus,
-        VersionReq,
+        CachedVersionsMap, ConcreteVersion, Dependency, EcosystemId, NormalizedName, PackageName,
+        PackageVersions, RemovalStatus, VersionReq,
     };
     use std::any::Any;
     use std::assert_matches;
@@ -964,8 +965,8 @@ mod tests {
     }
 
     fn test_analysis(
-        cached_versions: HashMap<PackageName, PackageVersions>,
-        fetch_failed: HashSet<PackageName>,
+        cached_versions: CachedVersionsMap,
+        fetch_failed: HashSet<NormalizedName>,
     ) -> ManifestAnalysis {
         ManifestAnalysis {
             parse_result: deps_core::test_util::stub_parse_result_with_dependencies(0),
@@ -988,12 +989,16 @@ mod tests {
             fetch_failed,
             registry_unreachable: false,
             license_fetch_incomplete: false,
+            probe_report: deps_core::lsp_helpers::ProbeReport::default(),
         }
     }
 
-    fn cached_with(name: &str, latest: &str) -> HashMap<PackageName, PackageVersions> {
+    fn cached_with(name: &str, latest: &str) -> CachedVersionsMap {
         let mut map = HashMap::new();
-        map.insert(PackageName::new(name), PackageVersions::latest_only(latest));
+        map.insert(
+            NormalizedName::for_test(name),
+            PackageVersions::latest_only(latest),
+        );
         map
     }
 
@@ -1023,7 +1028,7 @@ mod tests {
         );
     }
 
-    fn deprecated_4_18_0_cache() -> HashMap<PackageName, PackageVersions> {
+    fn deprecated_4_18_0_cache() -> CachedVersionsMap {
         let available: std::sync::Arc<[ConcreteVersion]> = std::sync::Arc::from(vec![
             ConcreteVersion::new("4.18.1"),
             ConcreteVersion::new("4.18.0"),
@@ -1034,7 +1039,7 @@ mod tests {
                 deps_core::RemovalStatus::AdvisoryDeprecated,
             )]);
         HashMap::from([(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             PackageVersions::new(ConcreteVersion::new("4.18.1"), available).with_yanked(flagged),
         )])
     }
@@ -1364,7 +1369,7 @@ mod tests {
         let dep = dep("serde", "0.9");
         let dv = verified_dv("1.0.2");
         let mut fetch_failed = HashSet::new();
-        fetch_failed.insert(PackageName::new("serde"));
+        fetch_failed.insert(NormalizedName::for_test("serde"));
         let analysis = test_analysis(cached_with("serde", "1.0.2"), fetch_failed);
         let formatter = TestFormatter {
             requirement_already_admits_fix: false,
@@ -1604,7 +1609,7 @@ mod tests {
         ));
         let mut cached = HashMap::new();
         cached.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             PackageVersions::new("1.0.2".into(), std::sync::Arc::from([])).with_yanked(
                 std::sync::Arc::from([("1.0.2".into(), RemovalStatus::from_yanked(true))]),
             ),
@@ -1640,7 +1645,7 @@ mod tests {
         let dv = verified_dv("1.0.2");
         let mut cached = HashMap::new();
         cached.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             PackageVersions::new("1.0.2".into(), std::sync::Arc::from([])).with_yanked(
                 std::sync::Arc::from([("1.0.2".into(), RemovalStatus::from_yanked(true))]),
             ),
@@ -1690,7 +1695,7 @@ mod tests {
         let dv = verified_dv("1.0.2");
         let mut cached = HashMap::new();
         cached.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             PackageVersions::new("1.0.2".into(), std::sync::Arc::from([])).with_yanked(
                 std::sync::Arc::from([("1.0.2".into(), RemovalStatus::from_yanked(true))]),
             ),
@@ -1734,7 +1739,7 @@ mod tests {
         });
         let mut cached = HashMap::new();
         cached.insert(
-            PackageName::new("serde"),
+            NormalizedName::for_test("serde"),
             PackageVersions::new("v1.0.2".into(), std::sync::Arc::from([])).with_yanked(
                 std::sync::Arc::from([("v1.0.2".into(), RemovalStatus::from_yanked(true))]),
             ),
@@ -1956,7 +1961,7 @@ mod tests {
         );
         let uri = deps_core::test_util::test_uri("/test/.github/workflows/ci.yml");
         let parse_result = parse_workflow_yaml(&yaml, &uri).expect("valid workflow");
-        let tag_index = std::sync::Arc::new(dashmap::DashMap::new());
+        let tag_index = std::sync::Arc::new(deps_engine::setup::RepositoryIndexes::default());
         if let Some(index) = index {
             tag_index.insert(PackageName::new("owner/action"), std::sync::Arc::new(index));
         }
@@ -2081,7 +2086,7 @@ mod tests {
             ("v1.0.0", &old_sha),
             ("v1.2.0", &new_sha),
         ]);
-        let tag_index = std::sync::Arc::new(dashmap::DashMap::new());
+        let tag_index = std::sync::Arc::new(deps_engine::setup::RepositoryIndexes::default());
         tag_index.insert(PackageName::new("owner/action"), std::sync::Arc::new(index));
         let formatter = GithubActionsFormatter::new(tag_index);
 

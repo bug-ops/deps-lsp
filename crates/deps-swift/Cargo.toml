@@ -18,6 +18,10 @@ workspace = true
 # `deps-gradle`/`deps-npm`'s identical `fuzzing` feature.
 fuzzing = []
 
+# Exposes `SwiftRegistry::for_test` so other crates' tests can point the GitHub client at a mock
+# server. Never enabled outside dev-dependencies (CI's `check` job guards `deps-lsp`'s tree).
+test-util = ["deps-core/test-util"]
+
 # Gates this crate's own `tower-lsp-server` dependency and LSP-response-shaped code,
 # forwarding to `deps-core`'s identically-named feature (issue #1083, spec 064). Not
 # `default`: Cargo does not allow a `workspace = true` dependency edge to turn off a

@@ -533,6 +533,8 @@ pub(crate) async fn generate_diagnostics_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "cargo", feature = "npm", feature = "deno"))]
+    use deps_core::NormalizedName;
 
     fn secs(seconds: u64) -> FetchTimeout {
         FetchTimeout::try_from_secs(seconds).expect("test timeout inside the accepted range")
@@ -587,7 +589,7 @@ mod tests {
     async fn resolve_test_crossenv_typosquat_signal(
         ecosystem: &dyn deps_core::Ecosystem,
         parse_result: &dyn deps_core::ParseResult,
-    ) -> std::collections::HashMap<deps_core::PackageName, deps_core::TyposquatSignal> {
+    ) -> std::collections::HashMap<deps_core::NormalizedName, deps_core::TyposquatSignal> {
         let mut server = mockito::Server::new_async().await;
         let _similarity = server
             .mock(
@@ -764,7 +766,7 @@ mod tests {
             DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse_result);
         let mut cached = std::collections::HashMap::new();
         cached.insert(
-            "crossenv".into(),
+            NormalizedName::for_test("crossenv"),
             deps_core::PackageVersions::latest_only("1.0.0"),
         );
         doc_state.update_cached_versions(cached);
@@ -838,7 +840,7 @@ mod tests {
             DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse_result);
         let mut cached = std::collections::HashMap::new();
         cached.insert(
-            "crossenv".into(),
+            NormalizedName::for_test("crossenv"),
             deps_core::PackageVersions::latest_only("1.0.0"),
         );
         doc_state.update_cached_versions(cached);
@@ -902,7 +904,7 @@ mod tests {
             DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse_result);
         let mut cached = std::collections::HashMap::new();
         cached.insert(
-            "crossenv".into(),
+            NormalizedName::for_test("crossenv"),
             deps_core::PackageVersions::latest_only("1.0.0"),
         );
         doc_state.update_cached_versions(cached);
@@ -966,7 +968,7 @@ mod tests {
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             let mut cached = std::collections::HashMap::new();
             cached.insert(
-                deps_core::PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 deps_core::PackageVersions::latest_only("0.9.0"),
             );
             doc_state.update_cached_versions(cached);
@@ -1549,7 +1551,7 @@ serde = "1.0.0"
             // `available` must include "1.0.0" alongside "2.0.0" — a `latest_only` list with
             // just "2.0.0" would make "1.0.0" look unsatisfiable and fire WARNING instead of HINT/ERROR.
             cached.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 deps_core::PackageVersions::new(
                     "2.0.0".into(),
                     std::sync::Arc::from(vec!["2.0.0".into(), "1.0.0".into()]),
@@ -1594,7 +1596,7 @@ serde = "1.0.0"
             // See the sibling test above for why `available` must include "1.0.0", not
             // just "2.0.0".
             cached.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 deps_core::PackageVersions::new(
                     "2.0.0".into(),
                     std::sync::Arc::from(vec!["2.0.0".into(), "1.0.0".into()]),
@@ -1633,7 +1635,7 @@ serde = "1.0.0"
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             let mut cached = HashMap::new();
             cached.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 deps_core::PackageVersions::new(
                     "1.0.214".into(),
                     std::sync::Arc::from(vec!["1.0.214".into(), "1.0.213".into()]),
@@ -1775,7 +1777,7 @@ serde = "1.0.0"
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             let mut cached = std::collections::HashMap::new();
             cached.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 deps_core::PackageVersions::new(
                     "2.0.0".into(),
                     std::sync::Arc::from(vec!["2.0.0".into(), "1.0.0".into()]),
@@ -1951,7 +1953,7 @@ serde = "1.0.0"
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             let mut cached = std::collections::HashMap::new();
             cached.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 deps_core::PackageVersions::new(
                     "1.0.214".into(),
                     std::sync::Arc::from(vec!["1.0.214".into(), "1.0.213".into()]),
@@ -2003,7 +2005,7 @@ serde = "1.0.0"
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             let mut cached = std::collections::HashMap::new();
             cached.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 deps_core::PackageVersions::latest_without_list("1.0.214"),
             );
             doc_state.update_cached_versions(cached);
@@ -2043,14 +2045,14 @@ serde = "1.0.0"
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             let mut cached = std::collections::HashMap::new();
             cached.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 deps_core::PackageVersions::new(
                     "1.0.214".into(),
                     std::sync::Arc::from(vec!["1.0.214".into()]),
                 ),
             );
             cached.insert(
-                "tokio".into(),
+                NormalizedName::for_test("tokio"),
                 deps_core::PackageVersions::new(
                     "2.0.0".into(),
                     // Includes an older version satisfying "^1.0" so this is genuinely
@@ -2105,7 +2107,7 @@ serde = "1.0.0"
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             let mut cached = std::collections::HashMap::new();
             cached.insert(
-                "serde".into(),
+                NormalizedName::for_test("serde"),
                 deps_core::PackageVersions::new(
                     "1.0.214".into(),
                     std::sync::Arc::from(vec!["1.0.214".into(), "1.0.213".into()]),
@@ -2202,7 +2204,7 @@ serde = "1.0.0"
 
             let mut cached = std::collections::HashMap::new();
             cached.insert(
-                "left-pad".into(),
+                NormalizedName::for_test("left-pad"),
                 deps_core::PackageVersions::new(
                     "1.0.2".into(),
                     std::sync::Arc::from(vec!["1.0.2".into(), "1.0.1".into(), "1.0.0".into()]),
@@ -2214,7 +2216,7 @@ serde = "1.0.0"
             // itself is clean, so this is only reachable via the lockfile-resolved
             // in-use-version check (#263), not the manifest-requirement check (#247).
             let mut resolved = std::collections::HashMap::new();
-            resolved.insert("left-pad".into(), "1.0.1".into());
+            resolved.insert(NormalizedName::for_test("left-pad"), "1.0.1".into());
             doc_state
                 .set_resolved_versions_without_bump(resolved, std::collections::HashMap::new());
 
@@ -2276,7 +2278,7 @@ serde = "1.0.0"
 
             let mut cached = std::collections::HashMap::new();
             cached.insert(
-                "old-pkg".into(),
+                NormalizedName::for_test("old-pkg"),
                 // The pin is satisfiable only by a flagged version — pre-#436, this
                 // exact shape fired the #247 "yanked" diagnostic.
                 deps_core::PackageVersions::new(
@@ -2339,7 +2341,7 @@ serde = "1.0.0"
 
             let mut cached = std::collections::HashMap::new();
             cached.insert(
-                "npm:lodash".into(),
+                NormalizedName::for_test("npm:lodash"),
                 // The pin is satisfiable only by a flagged version — for `package.json`
                 // this exact shape used to fire the #247 "yanked" diagnostic pre-#436.
                 deps_core::PackageVersions::new(
@@ -2392,7 +2394,7 @@ serde = "1.0.0"
 
             let mut cached = std::collections::HashMap::new();
             cached.insert(
-                "jsr:@std/fs".into(),
+                NormalizedName::for_test("jsr:@std/fs"),
                 deps_core::PackageVersions::new(
                     "1.0.1".into(),
                     std::sync::Arc::from(vec!["1.0.1".into(), "1.0.0".into()]),
@@ -2451,7 +2453,7 @@ serde = "1.0.0"
 
             let mut cached = std::collections::HashMap::new();
             cached.insert(
-                "jsr:@std/fs".into(),
+                NormalizedName::for_test("jsr:@std/fs"),
                 // Every version matching "^1.0.0" is yanked — the concrete #454 bug
                 // scenario, which previously produced zero diagnostic signal.
                 deps_core::PackageVersions::new(
@@ -2527,7 +2529,7 @@ dependencies = ["requests>=2.0.0"]
         use super::*;
         use crate::config::LicensePolicyConfig;
         use crate::document::DocumentState;
-        use deps_core::{EcosystemId, PackageName, ParseResult};
+        use deps_core::{EcosystemId, ParseResult};
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{DiagnosticSeverity, NumberOrString};
 
@@ -2574,12 +2576,12 @@ dependencies = ["requests>=2.0.0"]
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 deps_core::PackageVersions::latest_only("1.0.0"),
             );
             doc_state.update_cached_versions(cached_versions);
             let mut licenses = HashMap::new();
-            licenses.insert(PackageName::from("serde"), vec![license.to_string()]);
+            licenses.insert(NormalizedName::for_test("serde"), vec![license.to_string()]);
             doc_state.update_licenses(licenses);
             state.update_document(uri.clone(), doc_state);
 
@@ -2663,7 +2665,7 @@ dependencies = ["requests>=2.0.0"]
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 deps_core::PackageVersions::latest_only("1.0.0"),
             );
             doc_state.update_cached_versions(cached_versions);
@@ -2697,12 +2699,15 @@ dependencies = ["requests>=2.0.0"]
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
-                PackageName::from("serde"),
+                NormalizedName::for_test("serde"),
                 deps_core::PackageVersions::latest_only("1.0.0"),
             );
             doc_state.update_cached_versions(cached_versions);
             let mut licenses = HashMap::new();
-            licenses.insert(PackageName::from("serde"), vec!["GPL-3.0".to_string()]);
+            licenses.insert(
+                NormalizedName::for_test("serde"),
+                vec!["GPL-3.0".to_string()],
+            );
             doc_state.update_licenses(licenses);
             state.update_document(uri.clone(), doc_state);
 

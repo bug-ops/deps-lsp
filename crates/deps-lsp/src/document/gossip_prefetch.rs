@@ -8,7 +8,7 @@ use super::state::ServerState;
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
 use deps_core::policy_config::FetchTimeout;
-use deps_core::{Ecosystem, GossipFindings, PackageName};
+use deps_core::{Ecosystem, GossipFindings, NormalizeName, NormalizedName, PackageKey};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -105,17 +105,18 @@ pub(crate) async fn run_gossip_prefetch(
             // open-triggered prefetch claims all names, a change-triggered prefetch racing
             // it skips those already-claimed names and merges nothing, and the original
             // prefetch then finishes only to drop its own (otherwise-good) result here.
-            let current_names: std::collections::HashSet<PackageName> = doc
+            let formatter = ecosystem.formatter();
+            let current_names: std::collections::HashSet<NormalizedName> = doc
                 .parse_result()
                 .map(|parse_result| {
                     parse_result
                         .dependencies()
                         .into_iter()
-                        .map(|dep| dep.name().clone())
+                        .map(|dep| formatter.normalize_package_name(dep.name()))
                         .collect()
                 })
                 .unwrap_or_default();
-            let filtered: HashMap<PackageName, GossipFindings> = findings
+            let filtered: HashMap<NormalizedName, GossipFindings> = findings
                 .into_iter()
                 .filter(|(name, _)| current_names.contains(name))
                 .collect();
@@ -176,37 +177,32 @@ pub(crate) fn spawn_gossip_mismatch_refetch_if_needed(
     }
 
     let formatter = ecosystem.formatter();
-    let mismatched: Vec<String> = state
+    let mismatched: Vec<PackageKey> = state
         .with_document(uri, |doc| {
+            let Some(parse_result) = doc.parse_result() else {
+                return Vec::new();
+            };
+            let mut seen = std::collections::HashSet::new();
             // Code-review finding #2: a name's *current* declared source, not whatever it
             // was when `gossip_findings` was last populated — a dependency edited to point
             // at a private/scoped source under the same name must not be force-refreshed
             // (the normal prefetch path, `fetch_gossip_findings_batch`, already applies
             // this same `source_is_public_registry_content` gate per-dependency).
-            let dep_sources: HashMap<PackageName, deps_core::DependencySource> = doc
-                .parse_result()
-                .map(|parse_result| {
-                    parse_result
-                        .dependencies()
-                        .into_iter()
-                        .map(|dep| (dep.name().clone(), dep.source()))
-                        .collect()
+            parse_result
+                .dependencies()
+                .into_iter()
+                .filter(|dep| formatter.source_is_public_registry_content(&dep.source()))
+                .map(|dep| PackageKey::new(dep.name(), formatter))
+                .filter(|key| {
+                    let Some(findings) = doc.signals.gossip_findings.get(key.normalized()) else {
+                        return false;
+                    };
+                    doc.signals
+                        .cached_versions
+                        .get(key.normalized())
+                        .is_some_and(|cached| cached.latest.as_str() != findings.version)
                 })
-                .unwrap_or_default();
-
-            doc.signals
-                .gossip_findings
-                .iter()
-                .filter_map(|(name, findings)| {
-                    let latest = &doc.signals.cached_versions.get(name)?.latest;
-                    if latest.as_str() == findings.version {
-                        return None;
-                    }
-                    let source = dep_sources.get(name)?;
-                    formatter
-                        .source_is_public_registry_content(source)
-                        .then(|| name.as_str().to_string())
-                })
+                .filter(|key| seen.insert(key.normalized().clone()))
                 .collect()
         })
         .unwrap_or_default();
@@ -236,7 +232,7 @@ async fn run_gossip_mismatch_refetch(
     client: Client,
     ecosystem_id: deps_core::EcosystemId,
     config: Arc<RwLock<DepsConfig>>,
-    mismatched: Vec<String>,
+    mismatched: Vec<PackageKey>,
 ) {
     // Code-review finding #5: the caller's own enabled/offline gate was checked once,
     // synchronously, before this body was ever spawned — a config reload disabling GOSSIP
@@ -247,7 +243,7 @@ async fn run_gossip_mismatch_refetch(
         return;
     }
 
-    let keyed: HashMap<PackageName, GossipFindings> =
+    let keyed: HashMap<NormalizedName, GossipFindings> =
         deps_core::lsp_helpers::force_refresh_gossip_findings(
             ecosystem_id,
             &mismatched,
@@ -307,7 +303,7 @@ mod tests {
     use crate::document::DocumentState;
     use deps_core::EcosystemId;
     use deps_core::policy_config::FetchTimeout;
-    use deps_core::test_util::test_uri;
+    use deps_core::test_util::{package_key, test_uri};
 
     /// Default `ServerState` starts with `policy.gossip.enabled == false` — no document
     /// inserted for `uri` at all, so if the enabled-gate didn't short-circuit first,
@@ -396,7 +392,7 @@ mod tests {
         for uri in [&uri_a, &uri_b] {
             let mut doc = DocumentState::new_without_parse_result(EcosystemId::Npm, String::new());
             doc.update_cached_versions(HashMap::from([(
-                PackageName::new("vite"),
+                NormalizedName::for_test("vite"),
                 deps_core::PackageVersions::latest_only("8.4.0"),
             )]));
             state.documents.insert(uri.clone(), doc);
@@ -409,7 +405,7 @@ mod tests {
             client,
             EcosystemId::Npm,
             config,
-            vec!["vite".to_string()],
+            vec![package_key("vite")],
         )
         .await;
 
@@ -418,7 +414,7 @@ mod tests {
                 .with_document(uri, |doc| {
                     doc.signals
                         .gossip_findings
-                        .contains_key(&PackageName::new("vite"))
+                        .contains_key(&NormalizedName::for_test("vite"))
                 })
                 .unwrap_or(false);
             assert!(
@@ -468,7 +464,7 @@ mod tests {
         let mut doc_declares_vite =
             DocumentState::new_without_parse_result(EcosystemId::Npm, String::new());
         doc_declares_vite.update_cached_versions(HashMap::from([(
-            PackageName::new("vite"),
+            NormalizedName::for_test("vite"),
             deps_core::PackageVersions::latest_only("8.4.0"),
         )]));
         state
@@ -480,7 +476,7 @@ mod tests {
         let mut doc_other_npm_package =
             DocumentState::new_without_parse_result(EcosystemId::Npm, String::new());
         doc_other_npm_package.update_cached_versions(HashMap::from([(
-            PackageName::new("left-pad"),
+            NormalizedName::for_test("left-pad"),
             deps_core::PackageVersions::latest_only("1.3.0"),
         )]));
         state
@@ -492,7 +488,7 @@ mod tests {
         let mut doc_cargo_same_name =
             DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
         doc_cargo_same_name.update_cached_versions(HashMap::from([(
-            PackageName::new("vite"),
+            NormalizedName::for_test("vite"),
             deps_core::PackageVersions::latest_only("1.0.0"),
         )]));
         state
@@ -506,7 +502,7 @@ mod tests {
             client,
             EcosystemId::Npm,
             config,
-            vec!["vite".to_string()],
+            vec![package_key("vite")],
         )
         .await;
 
@@ -514,7 +510,7 @@ mod tests {
             .with_document(&uri_declares_vite, |doc| {
                 doc.signals
                     .gossip_findings
-                    .contains_key(&PackageName::new("vite"))
+                    .contains_key(&NormalizedName::for_test("vite"))
             })
             .unwrap_or(false);
         assert!(
@@ -581,7 +577,7 @@ mod tests {
         let uri = crate::lsp_types_interop::to_lsp_uri(&test_uri("/test/package.json"));
         let mut doc = DocumentState::new_without_parse_result(EcosystemId::Npm, String::new());
         doc.update_cached_versions(HashMap::from([(
-            PackageName::new("vite"),
+            NormalizedName::for_test("vite"),
             deps_core::PackageVersions::latest_only("8.4.0"),
         )]));
         state.documents.insert(uri.clone(), doc);
@@ -593,7 +589,7 @@ mod tests {
             client,
             EcosystemId::Npm,
             config,
-            vec!["vite".to_string()],
+            vec![package_key("vite")],
         )
         .await;
 
@@ -700,13 +696,13 @@ mod tests {
         assert!(
             doc.signals
                 .gossip_findings
-                .contains_key(&PackageName::new("vite")),
+                .contains_key(&NormalizedName::for_test("vite")),
             "still-declared \"vite\" must survive the content-change filter"
         );
         assert!(
             !doc.signals
                 .gossip_findings
-                .contains_key(&PackageName::new("left-pad")),
+                .contains_key(&NormalizedName::for_test("left-pad")),
             "removed \"left-pad\" must not be merged in despite being in the fetch result"
         );
     }
@@ -766,7 +762,7 @@ mod tests {
             parse_result_registry,
         );
         doc.update_cached_versions(HashMap::from([(
-            PackageName::new("vite"),
+            NormalizedName::for_test("vite"),
             deps_core::PackageVersions::latest_only("8.4.0"),
         )]));
         state.documents.insert(uri.clone(), doc);
@@ -785,7 +781,7 @@ mod tests {
             .with_document(&uri, |doc| {
                 doc.signals
                     .gossip_findings
-                    .contains_key(&PackageName::new("vite"))
+                    .contains_key(&NormalizedName::for_test("vite"))
             })
             .unwrap_or(false);
         assert!(
@@ -811,7 +807,7 @@ mod tests {
                 .clone_from(&old_doc.signals.gossip_findings);
         }
         new_doc.update_cached_versions(HashMap::from([(
-            PackageName::new("vite"),
+            NormalizedName::for_test("vite"),
             deps_core::PackageVersions::latest_only("9.0.0"),
         )]));
         state.documents.insert(uri.clone(), new_doc);
@@ -923,7 +919,7 @@ mod tests {
         assert!(
             doc.signals
                 .gossip_findings
-                .contains_key(&PackageName::new("vite")),
+                .contains_key(&NormalizedName::for_test("vite")),
             "P1's findings must be merged despite P2 superseding it mid-fetch"
         );
     }

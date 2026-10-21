@@ -43,8 +43,12 @@ or `.github/actions/<name>/`, issue #706), and implements `deps_core::Ecosystem`
   `sha_comment_mismatch_severity`
 - **Unknown-ref diagnostic** (issue #1766; shared with GitLab CI/CD) — a tag pin that is a full
   release (`@4.3.1`, `@v4.3.10`) no published tag matches gets a warning diagnostic and an
-  unresolved status; partial refs that may be branches (`@v1`, `@v3-node20`) are not reported;
+  unresolved status; a partial ref that may be a branch (`@v1`, `@v3-node20`) is reported only
+  when a rationed background branch check confirms it is neither a tag nor a branch (`@v40`);
   severity via `unknown_ref_severity`
+- **Commit lineage** (issue #1725; shared with GitLab CI/CD) — a commentless SHA pin that the
+  forge proves descends from the latest release and is on the default branch is up to date, shown
+  as `commit N ahead of latest release` in hover and skipped by update-all
 - **Bulk "Pin all to SHA" code lens** (issue #633) — a "Pin N actions to commit SHA" lens
   applies the per-step quick fix above to every resolvable mutable-tag step in one edit,
   reusing the same `TagIndex` lookup at zero additional network cost

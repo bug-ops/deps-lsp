@@ -1,18 +1,22 @@
 //! Lock-file and in-use dependency version resolution.
 
+use deps_core::CachedVersionsMap;
 use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
-use deps_core::PackageName;
+use deps_core::NormalizedName;
+use deps_core::PackageKey;
 use deps_core::PackageVersions;
+use deps_core::ResolvedCandidatesMap;
+use deps_core::ResolvedVersionsMap;
 use deps_core::VersionReq;
 use deps_core::lockfile::{LockFileCache, LockFileProvider};
-use deps_core::lsp_helpers::resolve_in_use_version;
+use deps_core::lsp_helpers::{PackageNaming, resolve_in_use_version};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Builds `dep_name -> [in_use_version, ...]` (§4.5/§4.6) for every dependency with a known
+/// Builds `normalized_name -> [in_use_version, ...]` (§4.5/§4.6) for every dependency with a known
 /// in-use version, for the yanked-check probe in `fetch_latest_versions_parallel`.
 ///
 /// Skips non-registry dependencies (git/path forks, step 0 of `build_scan_targets`'s ladder)
@@ -33,7 +37,7 @@ use std::sync::Arc;
 ///     RequirementResolution, SourcePolicy,
 /// };
 /// use deps_core::test_util::stub_parse_result_with_dependencies;
-/// use deps_core::{ConcreteVersion, EcosystemId, PackageName};
+/// use deps_core::{ConcreteVersion, EcosystemId, NormalizedName, PackageName};
 /// use deps_engine::classify::resolved::collect_in_use_versions;
 /// use std::collections::HashMap;
 ///
@@ -56,7 +60,7 @@ use std::sync::Arc;
 /// // A single registry-sourced dependency ("dep-0"), with a lock-file-resolved version.
 /// let parsed = stub_parse_result_with_dependencies(1);
 /// let mut resolved_versions = HashMap::new();
-/// resolved_versions.insert(PackageName::new("dep-0"), ConcreteVersion::from("1.0.0"));
+/// resolved_versions.insert(NormalizedName::for_test("dep-0"), ConcreteVersion::from("1.0.0"));
 ///
 /// let in_use = collect_in_use_versions(
 ///     parsed.as_ref(),
@@ -66,24 +70,24 @@ use std::sync::Arc;
 ///     EcosystemId::Cargo,
 /// );
 /// assert_eq!(
-///     in_use.get(&PackageName::new("dep-0")),
+///     in_use.get(&NormalizedName::for_test("dep-0")),
 ///     Some(&vec![ConcreteVersion::from("1.0.0")])
 /// );
 /// ```
 pub fn collect_in_use_versions(
     parse_result: &dyn deps_core::ParseResult,
-    resolved_versions: &HashMap<PackageName, ConcreteVersion>,
-    resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
+    resolved_versions: &ResolvedVersionsMap,
+    resolved_version_candidates: &ResolvedCandidatesMap,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem: EcosystemId,
-) -> HashMap<PackageName, Vec<ConcreteVersion>> {
-    let mut map: HashMap<PackageName, Vec<ConcreteVersion>> = HashMap::new();
+) -> HashMap<NormalizedName, Vec<ConcreteVersion>> {
+    let mut map: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
     for dep in parse_result
         .dependencies()
         .into_iter()
         .filter(|dep| formatter.source_is_public_registry_content(&dep.source()))
     {
-        let key = deps_core::PackageKey::new(dep.name(), formatter);
+        let key = PackageKey::new(dep.name(), formatter);
         if let Some(v) = resolve_in_use_version(
             dep,
             &key,
@@ -92,18 +96,20 @@ pub fn collect_in_use_versions(
             formatter,
             ecosystem,
         ) {
-            map.entry(dep.name().clone()).or_default().push(v);
+            map.entry(key.normalized().clone()).or_default().push(v);
         }
     }
     map
 }
 
-/// Builds `name -> [version_requirement, ...]` for every dependency in `pr`, one entry per
-/// occurrence — the shape `DependencyDiff::compute` needs.
+/// Builds `normalized_name -> [version_requirement, ...]` for every dependency in `pr`, one
+/// entry per occurrence across every spelling of the name — the shape `DependencyDiff::compute`
+/// needs.
 ///
-/// A `HashMap<PackageName, Option<VersionReq>>` (single value per name) would silently
-/// collapse a duplicate name to its last occurrence, losing any edit made to an earlier one
-/// (#394).
+/// A single value per name would silently collapse a duplicate name to its last occurrence,
+/// losing any edit made to an earlier one (#394). Keying by the normalized name makes a
+/// pure spelling change (`Django` -> `django`) compare equal, and deleting one of two
+/// spellings change the survivor's list.
 ///
 /// Occurrence order is whatever `pr.dependencies()` returns, which for
 /// `deps-cargo` is *not* document order for multiple `[target.*]` blocks
@@ -118,22 +124,23 @@ pub fn collect_in_use_versions(
 /// # Examples
 ///
 /// ```
-/// use deps_core::PackageName;
-/// use deps_core::test_util::stub_parse_result_with_dependencies;
+/// use deps_core::NormalizedName;
+/// use deps_core::test_util::{StubFormatter, stub_parse_result_with_dependencies};
 /// use deps_engine::classify::resolved::dependency_version_map;
 ///
 /// let parsed = stub_parse_result_with_dependencies(2);
-/// let map = dependency_version_map(parsed.as_ref());
+/// let map = dependency_version_map(parsed.as_ref(), &StubFormatter::new());
 ///
 /// assert_eq!(map.len(), 2);
-/// assert_eq!(map.get(&PackageName::new("dep-0")), Some(&vec![None]));
+/// assert_eq!(map.get(&NormalizedName::for_test("dep-0")), Some(&vec![None]));
 /// ```
 pub fn dependency_version_map(
     pr: &dyn deps_core::ParseResult,
-) -> HashMap<PackageName, Vec<Option<VersionReq>>> {
-    let mut map: HashMap<PackageName, Vec<Option<VersionReq>>> = HashMap::new();
+    naming: &(impl PackageNaming + ?Sized),
+) -> HashMap<NormalizedName, Vec<Option<VersionReq>>> {
+    let mut map: HashMap<NormalizedName, Vec<Option<VersionReq>>> = HashMap::new();
     for d in pr.dependencies() {
-        map.entry(d.name().clone())
+        map.entry(PackageKey::new(d.name(), naming).normalized().clone())
             .or_default()
             .push(d.version_requirement().cloned());
     }
@@ -153,22 +160,20 @@ pub fn dependency_version_map(
 /// # Examples
 ///
 /// ```
-/// use deps_core::PackageName;
+/// use deps_core::NormalizedName;
 /// use deps_engine::classify::resolved::cached_versions_from_lockfile;
 /// use std::collections::HashMap;
 ///
 /// let mut resolved = HashMap::new();
-/// resolved.insert(PackageName::new("serde"), "1.0.195".into());
+/// resolved.insert(NormalizedName::for_test("serde"), "1.0.195".into());
 ///
 /// let cached = cached_versions_from_lockfile(&resolved);
 ///
-/// let serde = cached.get(&PackageName::new("serde")).unwrap();
+/// let serde = cached.get(&NormalizedName::for_test("serde")).unwrap();
 /// assert_eq!(serde.latest, "1.0.195");
 /// assert!(serde.available.is_empty());
 /// ```
-pub fn cached_versions_from_lockfile(
-    resolved: &HashMap<PackageName, ConcreteVersion>,
-) -> HashMap<PackageName, PackageVersions> {
+pub fn cached_versions_from_lockfile(resolved: &ResolvedVersionsMap) -> CachedVersionsMap {
     resolved
         .iter()
         .map(|(name, version)| {
@@ -180,13 +185,15 @@ pub fn cached_versions_from_lockfile(
         .collect()
 }
 
-/// Splits a parsed [`deps_core::lockfile::ResolvedPackages`] into two maps.
+/// Splits a parsed [`deps_core::lockfile::ResolvedPackages`] into two maps keyed by the
+/// ecosystem-normalized name.
 ///
-/// The collapsed `dep_name -> version` map (`ResolvedPackages::iter`, unchanged FR-005 fast
-/// path) and a sibling `dep_name -> [version, ...]` map (issue #649) holding every retained
-/// lock-file entry for names with more than one — built from `ResolvedPackages::iter_all`,
-/// and deliberately omitting a single-occurrence name entirely (NFR-003: the common case
-/// never pays for a candidates-map lookup).
+/// The collapsed `normalized_name -> version` map (FR-005 fast path) and a sibling
+/// `normalized_name -> [version, ...]` map (issue #649) holding every distinct retained
+/// lock-file version for names with more than one — and deliberately omitting a name with a
+/// single distinct version entirely (NFR-003: the common case never pays for a
+/// candidates-map lookup). Lock-file spellings that normalize alike are unioned; see
+/// [`deps_core::ResolvedPackages::split_normalized`] for the collision rule.
 ///
 /// Shared by both [`LockfileLoad::Loaded`] constructors: [`parse_known_lockfile`] (and thus
 /// [`load_resolved_versions`]) and `deps-lsp`'s watched-lock-file-change handler, which calls
@@ -197,6 +204,7 @@ pub fn cached_versions_from_lockfile(
 ///
 /// ```
 /// use deps_core::lockfile::{ResolvedPackage, ResolvedPackages, ResolvedSource};
+/// use deps_core::test_util::StubFormatter;
 /// use deps_engine::classify::resolved::split_resolved_packages;
 ///
 /// let mut resolved = ResolvedPackages::new();
@@ -209,7 +217,7 @@ pub fn cached_versions_from_lockfile(
 ///     },
 /// ));
 ///
-/// let (versions, candidates) = split_resolved_packages(&resolved);
+/// let (versions, candidates) = split_resolved_packages(&resolved, &StubFormatter::new());
 /// assert_eq!(versions.len(), 1);
 /// assert!(
 ///     candidates.is_empty(),
@@ -218,28 +226,9 @@ pub fn cached_versions_from_lockfile(
 /// ```
 pub fn split_resolved_packages(
     resolved: &deps_core::lockfile::ResolvedPackages,
-) -> (
-    HashMap<PackageName, ConcreteVersion>,
-    HashMap<PackageName, Vec<ConcreteVersion>>,
-) {
-    let versions = resolved
-        .iter()
-        .map(|(name, pkg)| (PackageName::new(name.as_str()), pkg.version.clone().into()))
-        .collect();
-    let candidates = resolved
-        .iter_all()
-        .filter(|(_, versions)| versions.len() > 1)
-        .map(|(name, versions)| {
-            (
-                PackageName::new(name.as_str()),
-                versions
-                    .iter()
-                    .map(|pkg| ConcreteVersion::from(pkg.version.clone()))
-                    .collect(),
-            )
-        })
-        .collect();
-    (versions, candidates)
+    naming: &(impl PackageNaming + ?Sized),
+) -> (ResolvedVersionsMap, ResolvedCandidatesMap) {
+    resolved.split_normalized(naming)
 }
 
 /// Outcome of loading (or reloading) a lock file's resolved-version data.
@@ -259,12 +248,12 @@ pub fn split_resolved_packages(
 /// # Examples
 ///
 /// ```
-/// use deps_core::{ConcreteVersion, PackageName};
+/// use deps_core::{ConcreteVersion, NormalizedName};
 /// use deps_engine::classify::resolved::LockfileLoad;
 /// use std::collections::HashMap;
 ///
 /// let load = LockfileLoad::Loaded {
-///     versions: HashMap::from([(PackageName::new("serde"), ConcreteVersion::from("1.0.210"))]),
+///     versions: HashMap::from([(NormalizedName::for_test("serde"), ConcreteVersion::from("1.0.210"))]),
 ///     candidates: HashMap::new(),
 /// };
 /// assert!(load.reload_ok());
@@ -281,10 +270,11 @@ pub enum LockfileLoad {
     Absent,
     /// A lock file was found and parsed successfully, possibly to zero packages.
     Loaded {
-        /// `dep_name -> version`, one entry per name (see [`split_resolved_packages`]).
-        versions: HashMap<PackageName, ConcreteVersion>,
-        /// `dep_name -> [version, ...]`, only for names with more than one retained entry.
-        candidates: HashMap<PackageName, Vec<ConcreteVersion>>,
+        /// `normalized_name -> version`, one entry per name (see [`split_resolved_packages`]).
+        versions: ResolvedVersionsMap,
+        /// `normalized_name -> [version, ...]`, only for names with more than one distinct
+        /// retained version.
+        candidates: ResolvedCandidatesMap,
     },
     /// A lock file was found but failed to parse (e.g. caught mid-rewrite by the package
     /// manager), or its discovery task panicked. Conservative: a panic is not a definitive
@@ -311,12 +301,7 @@ impl LockfileLoad {
     /// Extracts the resolved-version maps, falling back to a pair of empty maps for
     /// [`Self::Absent`]/[`Self::Failed`].
     #[must_use]
-    pub fn into_maps(
-        self,
-    ) -> (
-        HashMap<PackageName, ConcreteVersion>,
-        HashMap<PackageName, Vec<ConcreteVersion>>,
-    ) {
+    pub fn into_maps(self) -> (ResolvedVersionsMap, ResolvedCandidatesMap) {
         match self {
             Self::Loaded {
                 versions,
@@ -335,6 +320,9 @@ impl LockfileLoad {
 /// file-watcher event for a path it already knows. Never returns [`LockfileLoad::Absent`] —
 /// only [`load_resolved_versions`]'s discovery step (no lock file located at all) can
 /// conclude that; a known path means discovery already succeeded.
+///
+/// `naming` is the document's formatter: the maps are keyed by the names it normalizes the
+/// lock file's spellings to.
 ///
 /// Shared by [`load_resolved_versions`] and `deps-lsp`'s watched-lock-file-change handler
 /// (issue #1424) — both need the identical get-or-parse-then-split sequence, previously
@@ -360,6 +348,7 @@ impl LockfileLoad {
 ///     let load = parse_known_lockfile(
 ///         &lockfile_cache,
 ///         lock_provider.as_ref(),
+///         ecosystem.formatter(),
 ///         Path::new("/nonexistent-for-doctest/Cargo.lock"),
 ///     )
 ///     .await;
@@ -369,6 +358,7 @@ impl LockfileLoad {
 pub async fn parse_known_lockfile(
     lockfile_cache: &LockFileCache,
     lock_provider: &dyn LockFileProvider,
+    naming: &(impl PackageNaming + ?Sized),
     lockfile_path: &Path,
 ) -> LockfileLoad {
     match lockfile_cache
@@ -381,7 +371,16 @@ pub async fn parse_known_lockfile(
                 resolved.len(),
                 lockfile_path.display()
             );
-            let (versions, candidates) = split_resolved_packages(&resolved);
+            let derived = lock_provider.derived_packages(&resolved);
+            let (versions, candidates) = if derived.is_empty() {
+                split_resolved_packages(&resolved, naming)
+            } else {
+                let mut merged = resolved;
+                for package in derived {
+                    merged.insert(package);
+                }
+                split_resolved_packages(&merged, naming)
+            };
             LockfileLoad::Loaded {
                 versions,
                 candidates,
@@ -459,7 +458,13 @@ pub async fn load_resolved_versions(
         }
     };
 
-    parse_known_lockfile(lockfile_cache, lock_provider.as_ref(), &lockfile_path).await
+    parse_known_lockfile(
+        lockfile_cache,
+        lock_provider.as_ref(),
+        ecosystem.formatter(),
+        &lockfile_path,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -476,13 +481,13 @@ mod tests {
     #[test]
     fn test_cached_versions_from_lockfile_has_empty_available() {
         let mut resolved = HashMap::new();
-        resolved.insert(PackageName::new("serde"), "1.0.195".into());
-        resolved.insert(PackageName::new("tokio"), "1.35.0".into());
+        resolved.insert(NormalizedName::for_test("serde"), "1.0.195".into());
+        resolved.insert(NormalizedName::for_test("tokio"), "1.35.0".into());
 
         let cached = cached_versions_from_lockfile(&resolved);
 
         assert_eq!(cached.len(), 2);
-        let serde = cached.get(&PackageName::new("serde")).unwrap();
+        let serde = cached.get(&NormalizedName::for_test("serde")).unwrap();
         assert_eq!(serde.latest, "1.0.195");
         assert!(
             serde.available.is_empty(),
@@ -491,7 +496,7 @@ mod tests {
         );
         // #227 C3: a pinned version's age isn't actionable — never attach `published_at` here.
         assert_eq!(serde.published_at, None);
-        let tokio = cached.get(&PackageName::new("tokio")).unwrap();
+        let tokio = cached.get(&NormalizedName::for_test("tokio")).unwrap();
         assert_eq!(tokio.latest, "1.35.0");
         assert!(tokio.available.is_empty());
         assert_eq!(tokio.published_at, None);
@@ -531,6 +536,144 @@ mod tests {
         assert_ne!(LockfileLoad::Absent, LockfileLoad::Failed);
     }
 
+    mod spelling_tests {
+        use super::*;
+        use deps_core::position::{Position, Range};
+        use deps_core::test_util::StubFormatter;
+        use deps_core::{Dependency, PackageName};
+        use std::any::Any;
+
+        const LOWERCASE: StubFormatter = StubFormatter::new().with_lowercase_names();
+
+        struct MockDep {
+            name: PackageName,
+            version_req: VersionReq,
+            addr_tag: u32,
+        }
+
+        impl Dependency for MockDep {
+            fn name(&self) -> &PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                Range::new(
+                    Position::new(0, self.addr_tag),
+                    Position::new(0, self.addr_tag + 1),
+                )
+            }
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                Some(&self.version_req)
+            }
+            fn version_range(&self) -> Option<Range> {
+                None
+            }
+            fn source(&self) -> deps_core::parser::DependencySource {
+                deps_core::parser::DependencySource::Registry
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockParseResult(Vec<MockDep>);
+
+        impl deps_core::ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.0.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                static URI: std::sync::OnceLock<url::Url> = std::sync::OnceLock::new();
+                URI.get_or_init(|| deps_core::test_util::test_uri("/test/requirements.txt"))
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        fn parse_result(deps: &[(&str, &str)]) -> MockParseResult {
+            MockParseResult(
+                deps.iter()
+                    .zip(0u32..)
+                    .map(|((name, req), addr_tag)| MockDep {
+                        name: PackageName::new(*name),
+                        version_req: VersionReq::new(*req),
+                        addr_tag,
+                    })
+                    .collect(),
+            )
+        }
+
+        #[test]
+        fn dependency_version_map_treats_a_pure_rename_as_equal() {
+            let before = dependency_version_map(&parse_result(&[("Django", "==4.0")]), &LOWERCASE);
+            let after = dependency_version_map(&parse_result(&[("django", "==4.0")]), &LOWERCASE);
+
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn dependency_version_map_changes_the_survivor_when_one_spelling_is_deleted() {
+            let both = dependency_version_map(
+                &parse_result(&[("Django", "==4.0"), ("django", "==4.1")]),
+                &LOWERCASE,
+            );
+            let survivor =
+                dependency_version_map(&parse_result(&[("django", "==4.1")]), &LOWERCASE);
+
+            let key = NormalizedName::for_test("django");
+            assert_eq!(both[&key].len(), 2);
+            assert_ne!(both[&key], survivor[&key]);
+        }
+
+        #[test]
+        fn collect_in_use_versions_is_keyed_by_the_normalized_name() {
+            let resolved = ResolvedVersionsMap::from([(
+                NormalizedName::for_test("django"),
+                ConcreteVersion::from("4.1.0"),
+            )]);
+
+            let in_use = collect_in_use_versions(
+                &parse_result(&[("Django", "==4.0")]),
+                &resolved,
+                &ResolvedCandidatesMap::new(),
+                &LOWERCASE,
+                EcosystemId::Pypi,
+            );
+
+            assert_eq!(
+                in_use.get(&NormalizedName::for_test("django")),
+                Some(&vec![ConcreteVersion::from("4.1.0")])
+            );
+        }
+
+        #[test]
+        fn split_resolved_packages_unions_lock_file_spellings() {
+            use deps_core::lockfile::{ResolvedPackage, ResolvedPackages, ResolvedSource};
+
+            let mut packages = ResolvedPackages::new();
+            for (name, version) in [("Newtonsoft.Json", "1.9.0"), ("newtonsoft.json", "1.10.0")] {
+                packages.insert(ResolvedPackage::new(
+                    name.into(),
+                    version.into(),
+                    ResolvedSource::Registry {
+                        url: String::new(),
+                        checksum: String::new(),
+                    },
+                ));
+            }
+
+            let (versions, candidates) = split_resolved_packages(&packages, &LOWERCASE);
+
+            let key = NormalizedName::for_test("newtonsoft.json");
+            assert_eq!(versions.len(), 1);
+            assert_eq!(candidates[&key].len(), 2);
+            assert!(versions.contains_key(&key));
+        }
+    }
+
     /// `parse_known_lockfile` end to end against a real `Cargo.lock`, not just the
     /// nonexistent-path `Failed` case its own doctest covers.
     #[cfg(feature = "cargo")]
@@ -554,10 +697,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         let provider = deps_cargo::lockfile::CargoLockParser;
         let cache = LockFileCache::new();
 
-        match parse_known_lockfile(&cache, &provider, &lockfile_path).await {
+        match parse_known_lockfile(
+            &cache,
+            &provider,
+            &deps_core::test_util::StubFormatter::new(),
+            &lockfile_path,
+        )
+        .await
+        {
             LockfileLoad::Loaded { versions, .. } => {
                 assert_eq!(
-                    versions.get(&PackageName::new("serde")),
+                    versions.get(&NormalizedName::for_test("serde")),
                     Some(&ConcreteVersion::from("1.0.195"))
                 );
             }

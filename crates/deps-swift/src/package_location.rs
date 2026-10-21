@@ -74,6 +74,42 @@ impl<'a> RegistryIdentity<'a> {
     }
 }
 
+/// An owned, validated SE-0292 registry identity, for answers that outlive the string they were
+/// parsed from (the identity a registry returned for a repository URL).
+///
+/// Fields are private, so a value can only be produced by [`Self::parse`] and is always
+/// grammatically valid; [`Self::as_identity`] is infallible for that reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegistryIdentityBuf {
+    scope: String,
+    name: String,
+}
+
+impl RegistryIdentityBuf {
+    /// Parses `id` on the SE-0292 identity grammar; `None` if it does not conform.
+    pub(crate) fn parse(id: &str) -> Option<Self> {
+        let parsed = RegistryIdentity::parse(id)?;
+        Some(Self {
+            scope: parsed.scope.to_string(),
+            name: parsed.name.to_string(),
+        })
+    }
+
+    /// The borrowed form every registry request is built from.
+    pub(crate) fn as_identity(&self) -> RegistryIdentity<'_> {
+        RegistryIdentity {
+            scope: &self.scope,
+            name: &self.name,
+        }
+    }
+}
+
+impl fmt::Display for RegistryIdentityBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.as_identity(), f)
+    }
+}
+
 /// A lowercase `scope.name` identity, usable as a map key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CanonicalIdentity(String);

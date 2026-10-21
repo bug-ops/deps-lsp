@@ -19,8 +19,10 @@ pub mod parser;
 pub mod registry;
 /// Domain types for npm dependencies (parsed `package.json` entries, registry versions).
 pub mod types;
+/// Position-aware `pnpm-workspace.yaml` parsing: catalog entries as dependencies.
+pub mod workspace;
 
-pub use catalog::{CatalogOrigin, CatalogOutcome, PnpmWorkspaceCache};
+pub use catalog::{CatalogEntryLocation, CatalogOrigin, CatalogOutcome, PnpmWorkspaceCache};
 pub use config::{
     DeclaredNpmRegistry, NpmConfig, NpmConfigCache, NpmParseContext, NpmRegistryIndex,
 };
@@ -40,4 +42,8 @@ pub use lockfile::fuzz_parse_package_lock_json_content;
 pub use lockfile::fuzz_parse_pnpm_lock_yaml;
 pub use parser::{NpmParseResult, parse_package_json, parse_package_json_with_context};
 pub use registry::{NpmRegistry, package_url};
-pub use types::{NpmDependency, NpmDependencySection, NpmPackage, NpmVersion};
+pub use types::{
+    CatalogId, CatalogName, CatalogSite, NpmDependency, NpmDependencyOrigin, NpmDependencySection,
+    NpmManifestKind, NpmPackage, NpmVersion,
+};
+pub use workspace::parse_pnpm_workspace_manifest;

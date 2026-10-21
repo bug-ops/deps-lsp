@@ -180,12 +180,15 @@ fn run_check_command(
         FailOnPolicy::new(args.fail_on.clone())
     };
 
-    let (report, had_execution_error) = runtime.block_on(run_check(
+    let (report, had_execution_error, probe_summary) = runtime.block_on(run_check(
         walk_paths,
         cli_config,
         args.gitignore_policy(),
         args.symlink_policy(),
     ));
+    for note in deps_cli::report::probe_notes(&probe_summary, &fail_on) {
+        eprintln!("deps-cli: note: {note}");
+    }
 
     let rendered = match args.format {
         OutputFormat::Table => format::table::render(&report),
@@ -225,7 +228,7 @@ async fn run_check(
     cli_config: CliConfig,
     gitignore_policy: walk::GitignorePolicy,
     symlink_policy: walk::SymlinkPolicy,
-) -> (CheckReport, bool) {
+) -> (CheckReport, bool, deps_engine::probe::ProbeSummary) {
     let policy = cli_config.policy;
     let handles = build_runtime_handles(&policy, &ProcessEnv);
     let _egress_notice = EgressNoticeOnExit(Arc::clone(handles.cache.registry_policy()));
@@ -300,6 +303,7 @@ async fn run_check(
     }
 
     let mut findings = Vec::new();
+    let mut probe_summary = deps_engine::probe::ProbeSummary::default();
 
     // Deviation #4 (spec 062 tasks.md T024 / spec.md NFR-004): manifests are processed
     // sequentially, not fanned out via `buffer_unordered`, deliberately — per-manifest fetch
@@ -330,6 +334,7 @@ async fn run_check(
                         // doc (issue #1133 code-review finding #1).
                         had_execution_error |=
                             result.registry_unreachable || result.license_fetch_incomplete;
+                        probe_summary.add(&result.probe_report);
                         findings.extend(result.findings);
                     }
                     Err(error) => {
@@ -355,7 +360,7 @@ async fn run_check(
         }
     }
 
-    (CheckReport { findings }, had_execution_error)
+    (CheckReport { findings }, had_execution_error, probe_summary)
 }
 
 /// Directory `config::load` resolves its default `deps.toml` lookup against when `--config`
