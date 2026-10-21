@@ -542,6 +542,7 @@ mod tests {
 
     /// #1765: the sweep is ecosystem-generic, so a GitLab peer document that uses a refreshed
     /// project is rescanned too.
+    #[cfg(feature = "gitlab-ci")]
     #[tokio::test]
     async fn sweep_rescans_a_gitlab_peer_document_using_a_refreshed_project() {
         let state = ServerState::new();

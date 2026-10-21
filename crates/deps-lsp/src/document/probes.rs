@@ -402,8 +402,7 @@ mod tests {
         let state = Arc::new(ServerState::new());
         state.cache.set_offline(deps_core::NetworkMode::Offline);
         let a = uri("/a.yml");
-        let id = *state.ecosystem_registry.ecosystem_ids().first().unwrap();
-        let ecosystem = state.ecosystem_registry.get(id).unwrap();
+        let ecosystem: Arc<dyn Ecosystem> = Arc::new(TestTier3Ecosystem::returning(vec![]));
 
         spawn_background_probes(&state, &a, &ecosystem);
 
