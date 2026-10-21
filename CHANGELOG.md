@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
+- **deps-core, deps-engine, deps-lsp, deps-cli**: per-package `VersionData` maps, `FetchResult` and the gossip, typosquat and license producers are keyed by `NormalizedName`; `PackageKey::find_in` and `VulnKey::from_declared` are removed (#1880)
+- **deps-core**: `TagIndexRefreshSender` and `Ecosystem::tag_index_refreshes` become `RefreshSender` and `refresh_events`, `RequestAuth` carries a quota meter, and `OsvNaming` requires `SourcePolicy` (#1880)
 - **deps-core and every formatter**: formatters override `PackageNaming::normalized_spelling`, and `normalize_package_name` moves to the sealed `NormalizeName` trait returning `NormalizedName` (#1872)
 - **deps-core, deps-engine, deps-lsp**: `DependencyOutcomes` getters, setters and `with_*` builders take `NormalizedName` instead of strings (#1872)
 - **deps-core**: `InteractiveFetchRequest::new` takes `&NormalizedName` as its normalized name (#1872)
@@ -18,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cargo**: `RegistryIndex` carries its own credential, so `RegistryIndex::new`, `with_auth` and the `auth` fields are removed, `AuthToken` is `pub(crate)`, `SparseIndexClient::new` takes a display name, and index URLs lose their trailing slash (#1874)
 
 ### Added
+- **deps-npm, deps-cli**: `pnpm-workspace.yaml` catalog entries get hints, diagnostics, hover, completion and updates, and a duplicate default catalog is reported (#1880)
+- **deps-github-actions, deps-gitlab-ci, deps-engine, deps-cli**: a rate-budgeted branch probe makes `unknown-ref` fire for refs that are neither a tag nor a branch, such as `@v40` (#1880)
+- **deps-github-actions, deps-gitlab-ci**: a commentless SHA pin ahead of the latest release on the default branch is no longer reported outdated or downgraded by update-all (#1880)
+- **deps-swift, deps-core**: opt-in `registries.swift_scm_to_registry` resolves Swift `url:` dependencies through the user-tier registry identity lookup (#1880)
 - **deps-core**: `observe_ecosystem` and `observe_endpoint` let orchestration code tag fetches so hovers see requests another task has on the wire (#1872)
 - **deps-core**: `NormalizedName`, the key only `NormalizeName::normalize_package_name` builds (#1872)
 - **deps-core**: `DepsError::{InsecureScheme, BudgetExceeded, RecentlyFailed}` and `error::LookupBudget` replace `CacheError` for non-cache failures (#1872)
@@ -27,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **deps**: bump workspace crate requirements (jsonc-parser 0.34, jsonschema 0.59, tokio 1.54, and others) and SHA-pinned GitHub Actions (#1886)
+- **deps-engine, deps-lsp**: spellings of one package that differ only in case are fetched once, identical duplicate lockfile entries add no candidates entry, and tier-3 license targets are one per normalized name (#1880)
+- **deps-cli**: the update planner looks up GOSSIP and cooldown data by the normalized name, like `check` and the language server (#1880)
 - **deps**: update `Cargo.lock` (tokio 1.54.0, serde_json 1.0.154, aws-lc-sys 0.46.0, related patch drift) (#1872)
 - **deps-core, deps-nuget**: a non-https request URL is an actionable `InsecureScheme`, and a non-https `@id` in the public NuGet service index is refused as a bad feed (#1872)
 - **deps-cargo, deps-maven, deps-swift**: malformed index and metadata responses are `ParseError`, and budget overruns and search suppression have typed errors (#1872)
@@ -47,6 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-nuget, deps-github-actions**: the endpoint breaker opens again for hovers that wait on a background fetch's request (#1872)
 - **deps-core, deps-gitlab-ci**: floor-blocked registry hosts read "is never a registry host" instead of blaming `registries.workspace_registries` (#1872)
 - **deps-core**: the flaky `deps_dev::memo` coalesce tests no longer share a static `Notify` under plain `cargo test` (#1874)
+- **deps-nuget, deps-swift, deps-engine**: the in-use version is found when the lockfile spelling of a package differs in case from the manifest (Swift: GitHub-hosted URLs) (#1880)
+- **deps-lsp**: deleting or renaming one spelling of a package no longer prunes or leaves stale data for a case variant that stays (#1880)
 
 ## [3.0.0] - 2026-10-19
 
