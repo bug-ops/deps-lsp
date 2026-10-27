@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `PackageKey`, the declared and normalized spellings of one dependency name behind a single `find_in` lookup (#1874)
 
 ### Changed
+- **deps**: update `Cargo.lock` tokio 1.54.0 to 1.54.1 (RUSTSEC-2026-0384, yanked release) (#1889)
 - **deps**: bump workspace crate requirements (jsonc-parser 0.34, jsonschema 0.59, tokio 1.54, and others) and SHA-pinned GitHub Actions (#1886)
 - **deps-engine, deps-lsp**: spellings of one package that differ only in case are fetched once, identical duplicate lockfile entries add no candidates entry, and tier-3 license targets are one per normalized name (#1880)
 - **deps-cli**: the update planner looks up GOSSIP and cooldown data by the normalized name, like `check` and the language server (#1880)
