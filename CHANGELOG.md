@@ -58,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: the flaky `deps_dev::memo` coalesce tests no longer share a static `Notify` under plain `cargo test` (#1874)
 - **deps-nuget, deps-swift, deps-engine**: the in-use version is found when the lockfile spelling of a package differs in case from the manifest (Swift: GitHub-hosted URLs) (#1880)
 - **deps-lsp**: deleting or renaming one spelling of a package no longer prunes or leaves stale data for a case variant that stays (#1880)
+- **fuzz**: `body-parser` in the `package-lock.json` seed is bumped to 1.20.9 (Dependabot alert, #1890)
 
 ## [3.0.0] - 2026-10-19
 
