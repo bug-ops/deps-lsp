@@ -200,6 +200,8 @@ impl WorkspaceMembers {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     #[test]
@@ -237,10 +239,10 @@ mod tests {
 
     #[test]
     fn test_package_glob_negation_requires_valid_remainder() {
-        assert!(matches!(
+        assert_matches!(
             PackageGlob::parse("!**/test/**"),
             Some(PackageGlob::Exclude(_))
-        ));
+        );
         assert!(PackageGlob::parse("!").is_none());
         assert!(PackageGlob::parse("!../a").is_none());
         assert!(PackageGlob::parse("!/a").is_none());
@@ -276,6 +278,6 @@ mod tests {
     fn test_defaults_select_everything_recursively() {
         let defaults = PackageGlob::defaults();
         assert_eq!(defaults.len(), 1);
-        assert!(matches!(&defaults[0], PackageGlob::Include(g) if g.is_recursive()));
+        assert_matches!(&defaults[0], PackageGlob::Include(g) if g.is_recursive());
     }
 }
