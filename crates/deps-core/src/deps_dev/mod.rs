@@ -251,15 +251,15 @@ struct GossipMemoKey {
     name: NormalizedName,
 }
 
-/// Key for [`DepsDevClient`]'s version-scoped GOSSIP memo (issue #1456, spec 072) — backs
+/// Key for [`DepsDevClient`]'s version-scoped GOSSIP memo (issue #1456, spec 072; keyed by
+/// [`NormalizedName`] since #1893, like [`GossipMemoKey`]) — backs
 /// [`DepsDevClient::gossip_findings_for_version`], hover's live low-usage fetch for the
 /// pinned/resolved version, which is not necessarily the package's `defaultVersion` and so
 /// cannot share [`GossipMemoKey`]'s package-level scope.
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct GossipVersionMemoKey {
     system: DepsDevSystem,
-    // TODO(#1893): still the declared spelling; key by NormalizedName like GossipMemoKey.
-    name: String,
+    name: NormalizedName,
     version: String,
 }
 
@@ -1422,12 +1422,12 @@ impl DepsDevClient {
     pub async fn gossip_findings_for_version(
         &self,
         system: DepsDevSystem,
-        name: &str,
+        package: &PackageKey,
         version: &str,
     ) -> Option<GossipFindings> {
         let key = GossipVersionMemoKey {
             system,
-            name: name.to_string(),
+            name: package.normalized().clone(),
             version: version.to_string(),
         };
 
@@ -1440,7 +1440,9 @@ impl DepsDevClient {
         }
         let _guard = InFlightGuard::new(&self.gossip_version_in_flight, key.clone());
 
-        let outcome = self.fetch_gossip_version(system, name, version).await;
+        let outcome = self
+            .fetch_gossip_version(system, package.declared().as_str(), version)
+            .await;
         let findings = outcome.clone().into_value();
         self.gossip_versions.insert(key, outcome);
         findings
@@ -3966,7 +3968,7 @@ mod tests {
             .await;
 
         let findings = client
-            .gossip_findings_for_version(DepsDevSystem::Npm, "vite", "8.3.1")
+            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("vite"), "8.3.1")
             .await
             .expect("findings expected");
         assert_eq!(findings.version, "8.3.1");
@@ -3995,7 +3997,7 @@ mod tests {
             .await;
 
         let findings = client
-            .gossip_findings_for_version(DepsDevSystem::Npm, "slopsquat-pkg", "1.0.0")
+            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("slopsquat-pkg"), "1.0.0")
             .await
             .expect("findings expected");
         let low_usage = findings.low_usage.expect("low-usage finding expected");
@@ -4023,12 +4025,43 @@ mod tests {
             .await;
 
         client
-            .gossip_findings_for_version(DepsDevSystem::Npm, "vite", "8.3.1")
+            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("vite"), "8.3.1")
             .await;
         client
-            .gossip_findings_for_version(DepsDevSystem::Npm, "vite", "8.3.1")
+            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("vite"), "8.3.1")
             .await;
 
+        findings.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn gossip_findings_for_version_case_variants_share_one_request() {
+        let (mut server, client) = mock_client().await;
+        let findings = server
+            .mock("GET", "/v3alpha/systems/npm/packages/Vite/versions/8.3.1:findings")
+            .with_status(200)
+            .with_body(
+                r#"{"versionKey":{"system":"NPM","name":"Vite","version":"8.3.1"},
+                    "recommendedVersions":[],
+                    "requestedVersion":{"versionKey":{"system":"NPM","name":"Vite","version":"8.3.1"},
+                        "isDefault":true,"findings":[]}}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        client
+            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("Vite"), "8.3.1")
+            .await;
+        let second = client
+            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("vite"), "8.3.1")
+            .await;
+
+        assert!(
+            second.is_some(),
+            "second spelling must hit the first's memo entry"
+        );
+        assert_eq!(client.gossip_versions.len(), 1);
         findings.assert_async().await;
     }
 
@@ -4062,7 +4095,7 @@ mod tests {
         let spawn_client = Arc::clone(&client);
         let handle = tokio::spawn(async move {
             spawn_client
-                .gossip_findings_for_version(DepsDevSystem::Npm, "vite", "8.3.1")
+                .gossip_findings_for_version(DepsDevSystem::Npm, &pk("vite"), "8.3.1")
                 .await
         });
         // Deliberately much shorter than the mock's 60ms response — this must reliably
@@ -4079,7 +4112,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         let second = client
-            .gossip_findings_for_version(DepsDevSystem::Npm, "vite", "8.3.1")
+            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("vite"), "8.3.1")
             .await;
         assert!(
             second.is_some(),
@@ -4100,13 +4133,13 @@ mod tests {
 
         assert!(
             client
-                .gossip_findings_for_version(DepsDevSystem::Npm, ".", "1.0.0")
+                .gossip_findings_for_version(DepsDevSystem::Npm, &pk("."), "1.0.0")
                 .await
                 .is_none()
         );
         assert!(
             client
-                .gossip_findings_for_version(DepsDevSystem::Npm, "left-pad", "..")
+                .gossip_findings_for_version(DepsDevSystem::Npm, &pk("left-pad"), "..")
                 .await
                 .is_none()
         );
@@ -4126,7 +4159,7 @@ mod tests {
             .await;
 
         let findings = client
-            .gossip_findings_for_version(DepsDevSystem::Npm, "missing", "1.0.0")
+            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("missing"), "1.0.0")
             .await;
         assert!(findings.is_none());
     }
@@ -4156,7 +4189,7 @@ mod tests {
             .await;
 
         let findings = client
-            .gossip_findings_for_version(DepsDevSystem::Npm, "vite", "7.0.0")
+            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("vite"), "7.0.0")
             .await;
         assert!(
             findings.is_none(),

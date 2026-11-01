@@ -140,6 +140,19 @@ pub trait PackageRendering: Send + Sync {
         self.format_version_for_text_edit(version)
     }
 
+    /// Renders `version` as an exact pin in the ecosystem's own grammar, for the update
+    /// flow's fallback retry (#1892): when the operator-preserving rewrite of a fallback
+    /// version would still admit a newer, withheld version (a caret range), an exact pin
+    /// narrows the requirement to the fallback alone.
+    ///
+    /// Default: `None` — the ecosystem has no rendering known to be a pure narrowing, so the
+    /// rejected edit is not retried. Override only where a bare version is an exact pin
+    /// (npm, Deno).
+    fn format_version_exact_pin(&self, version: &ConcreteVersion) -> Option<String> {
+        let _ = version;
+        None
+    }
+
     /// Like [`format_version_replacing`](Self::format_version_replacing), but also
     /// carries the dependency identity `version`/`current` apply to.
     ///
@@ -163,6 +176,25 @@ pub trait PackageRendering: Send + Sync {
         current: &str,
     ) -> String {
         self.format_version_replacing(version, current)
+    }
+
+    /// Like [`format_version_replacing_for`](Self::format_version_replacing_for), but for a
+    /// version that is a security or cooldown-fallback *target*: the rendering must never lower
+    /// the requirement's floor below `version`, because the target was chosen to exclude older
+    /// affected releases.
+    ///
+    /// Default: delegates to [`format_version_replacing_for`](Self::format_version_replacing_for)
+    /// -- correct wherever the plain rewrite already keeps the floor at `version` (every
+    /// operator-preserving or exact rendering). Override only where the plain rewrite may
+    /// widen downward, as npm and Deno do for a bare partial requirement (`3` -> `4` would
+    /// admit `4.0.0`).
+    fn format_version_replacing_floor_for(
+        &self,
+        dep: &dyn Dependency,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        self.format_version_replacing_for(dep, version, current)
     }
 
     /// Adjusts a candidate version's presentation before a completion item's
@@ -1193,6 +1225,18 @@ pub trait RequirementResolution: Send + Sync {
     /// through it rather than drop build metadata itself.
     fn build_metadata_policy(&self) -> BuildMetadataPolicy {
         BuildMetadataPolicy::Ignored
+    }
+
+    /// Whether `requirement` opts in to pre-releases through this ecosystem's own grammar:
+    /// a pre-release named on an exact or lower bound, or a stability flag. Lets the REFACTOR
+    /// "Update to X" items keep offering pre-releases for shapes the shared SemVer-text
+    /// recognition misses (#1894).
+    ///
+    /// Default: `false` -- the shared recognition (published pre-release comparators, strict
+    /// SemVer tags) is the only opt-in. Upper bounds (`<2.0.0-0`) must never opt in.
+    fn requirement_opts_into_prereleases(&self, requirement: BoundedVersionReq<'_>) -> bool {
+        let _ = requirement;
+        false
     }
 
     /// Check if a version satisfies a requirement string.

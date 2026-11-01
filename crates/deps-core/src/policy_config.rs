@@ -1515,6 +1515,8 @@ pub enum KeychainCredentials {
 /// assert_eq!(ScmToRegistry::default(), ScmToRegistry::Disabled);
 /// let setting: ScmToRegistry = serde_json::from_str("\"replace\"").unwrap();
 /// assert_eq!(setting, ScmToRegistry::Replace);
+/// let setting: ScmToRegistry = serde_json::from_str("\"from_xcode\"").unwrap();
+/// assert_eq!(setting, ScmToRegistry::FromXcode);
 /// assert!(serde_json::from_str::<ScmToRegistry>("\"use_identity\"").is_err());
 /// ```
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
@@ -1526,6 +1528,11 @@ pub enum ScmToRegistry {
     /// An eligible `url:` dependency whose repository the trusted user-tier default registry
     /// maps to exactly one identity is shown with that identity's registry versions.
     Replace,
+    /// Follow Xcode's own `IDEPackageDependencySCMToRegistryTransformation` user default: behave
+    /// as [`Self::Replace`] when it is `useRegistryIdentityAndSources`, otherwise as
+    /// [`Self::Disabled`]. Read once per process, off the request path, on macOS only; a change
+    /// in Xcode takes effect after the server restarts.
+    FromXcode,
 }
 
 /// Cross-ecosystem workspace-declared registry settings (spec #443/plan-1b §1.7, renamed

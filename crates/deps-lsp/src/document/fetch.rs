@@ -19,12 +19,13 @@ use deps_core::ResolvedVersionsMap;
 use deps_core::policy_config::FetchConcurrency;
 use deps_core::policy_config::FetchTimeout;
 use deps_engine::classify::diff::{
-    merge_deprecations_after_fetch, merge_no_comparable_versions_after_fetch,
+    merge_deprecations_after_fetch, merge_lookup_misses_after_fetch,
 };
 use deps_engine::classify::fetch::{
     DepSources, FailureSummary, FetchResult, apply_fetch_outcomes, fetch_latest_versions_parallel,
     prepare_fetch,
 };
+use deps_engine::classify::resolved::forget_local_locked_misses;
 use std::collections::{HashMap, HashSet};
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::Uri;
@@ -181,7 +182,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
         .map(|(key, _)| key.normalized().clone())
         .collect();
     let registry = ecosystem.registry();
-    let fetch_result = fetch_latest_versions_parallel(
+    let mut fetch_result = fetch_latest_versions_parallel(
         ecosystem.ecosystem_id(),
         registry,
         dep_sources,
@@ -196,6 +197,15 @@ pub(crate) async fn fetch_registry_versions_for_change(
         None,
     )
     .await;
+    if let Some(domain_uri) = crate::lsp_types_interop::from_lsp_uri(uri) {
+        forget_local_locked_misses(
+            &mut fetch_result,
+            &domain_uri,
+            &state.lockfile_cache,
+            ecosystem,
+        )
+        .await;
+    }
 
     (progress, fetch_result, attempted_names, collided_names)
 }
@@ -239,10 +249,10 @@ pub(crate) fn merge_registry_fetch_result(
             &fetched_names,
             fetch_result.deprecations,
         );
-        merge_no_comparable_versions_after_fetch(
+        merge_lookup_misses_after_fetch(
             &mut doc.signals.outcomes,
             attempted_names,
-            fetch_result.no_comparable_versions,
+            fetch_result.lookup_misses,
         );
         if success {
             doc.set_loaded();

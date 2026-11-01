@@ -501,7 +501,7 @@ pub(crate) const SWIFT_KEYCHAIN_CREDENTIALS_ECOSYSTEMS: &[deps_core::EcosystemId
     &[deps_core::EcosystemId::Swift];
 
 /// The only ecosystem `registries.swift_scm_to_registry` affects.
-const SWIFT_SCM_TO_REGISTRY_ECOSYSTEMS: &[deps_core::EcosystemId] =
+pub(crate) const SWIFT_SCM_TO_REGISTRY_ECOSYSTEMS: &[deps_core::EcosystemId] =
     &[deps_core::EcosystemId::Swift];
 
 /// The only ecosystem `registries.gitlab_instance_host` affects.

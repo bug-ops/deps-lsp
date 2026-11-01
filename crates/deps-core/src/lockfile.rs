@@ -9,7 +9,7 @@
 use crate::error::{DepsError, Result};
 use crate::fs_probe;
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 use url::Url;
@@ -475,6 +475,18 @@ pub enum ResolvedSource {
     RegistryPin,
 }
 
+impl ResolvedSource {
+    /// True when the package was served by a registry (including a registry pin whose lock
+    /// format records no URL), as opposed to a git checkout or a local path.
+    #[must_use]
+    pub const fn is_registry(&self) -> bool {
+        match self {
+            Self::Registry { .. } | Self::RegistryPin => true,
+            Self::Git { .. } | Self::Path { .. } => false,
+        }
+    }
+}
+
 impl std::fmt::Debug for ResolvedSource {
     /// Manual, not derived: `Registry`/`Git`'s `url` is copied verbatim from the lock file
     /// (e.g. Cargo's `git+https://user:token@host/repo`, npm's `resolved`) and can carry a
@@ -651,6 +663,46 @@ impl ResolvedPackages {
                 .get(name)
                 .and_then(|v| best_package(v).map(|p| (name, p)))
         })
+    }
+
+    /// Normalized names whose every lock entry is a git checkout or a local path (for example
+    /// an npm workspace `link` member), so a registry lookup miss for them says nothing
+    /// about the locked version (#1891).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lockfile::{ResolvedPackage, ResolvedPackages, ResolvedSource};
+    /// use deps_core::test_util::StubFormatter;
+    ///
+    /// let mut resolved = ResolvedPackages::new();
+    /// resolved.insert(ResolvedPackage::new(
+    ///     "member".into(),
+    ///     "1.0.0".into(),
+    ///     ResolvedSource::Path { path: "packages/member".into() },
+    /// ));
+    /// let local = resolved.local_only_names(&StubFormatter::new());
+    /// assert_eq!(local.len(), 1);
+    /// ```
+    #[must_use]
+    pub fn local_only_names(
+        &self,
+        naming: &(impl crate::lsp_helpers::PackageNaming + ?Sized),
+    ) -> HashSet<crate::NormalizedName> {
+        use crate::lsp_helpers::NormalizeName;
+
+        let mut registry_served: HashSet<crate::NormalizedName> = HashSet::new();
+        let mut local: HashSet<crate::NormalizedName> = HashSet::new();
+        for (name, packages) in &self.packages {
+            let key = naming.normalize_package_name(&crate::PackageName::new(name.as_str()));
+            if packages.iter().any(|package| package.source.is_registry()) {
+                registry_served.insert(key);
+            } else {
+                local.insert(key);
+            }
+        }
+        local.retain(|key| !registry_served.contains(key));
+        local
     }
 
     /// Splits the lock file into the two per-package maps `VersionData` reads, keyed by the
@@ -2260,6 +2312,39 @@ mod tests {
     fn normalized(name: &str) -> crate::NormalizedName {
         use crate::lsp_helpers::NormalizeName;
         Lowercase.normalize_package_name(&crate::PackageName::new(name))
+    }
+
+    #[test]
+    fn local_only_names_excludes_names_with_any_registry_entry() {
+        let mut packages = ResolvedPackages::new();
+        packages.insert(ResolvedPackage::new(
+            "Member".into(),
+            "1.0.0".into(),
+            ResolvedSource::Path {
+                path: "packages/member".into(),
+            },
+        ));
+        packages.insert(ResolvedPackage::new(
+            "forked".into(),
+            "1.0.0".into(),
+            ResolvedSource::Git {
+                url: "https://example.invalid/forked".into(),
+                rev: "abc".into(),
+            },
+        ));
+        packages.insert(registry_pkg("mixed", "1.0.0"));
+        packages.insert(ResolvedPackage::new(
+            "Mixed".into(),
+            "2.0.0".into(),
+            ResolvedSource::Path {
+                path: "vendor/mixed".into(),
+            },
+        ));
+        packages.insert(registry_pkg("serde", "1.0.0"));
+
+        let local = packages.local_only_names(&Lowercase);
+
+        assert_eq!(local, [normalized("member"), normalized("forked")].into());
     }
 
     #[test]

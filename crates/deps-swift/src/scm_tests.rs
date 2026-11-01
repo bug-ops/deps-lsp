@@ -17,8 +17,8 @@ use crate::ecosystem::SwiftEcosystem;
 use crate::parser::SwiftParseResult;
 use crate::registry::SwiftRegistry;
 use crate::scm::{
-    IdentityLookup, MemoKey, ScmLookupUrl, ScmToRegistryHandle, SwiftForm, SwiftOrigin,
-    SwiftRequirementForm, SwizzleInput, swizzle_decision,
+    IdentityLookup, MemoKey, ScmLookupUrl, ScmSwizzleMode, ScmToRegistryHandle, SwiftForm,
+    SwiftOrigin, SwiftRequirementForm, SwizzleInput, swizzle_decision,
 };
 use crate::types::SwiftDependency;
 
@@ -491,7 +491,7 @@ fn test_swizzle_decision_truth_table() {
     );
 
     fn decide<'a>(
-        mode: ScmToRegistry,
+        mode: ScmSwizzleMode,
         lookup: Option<&'a TrustedLookupRegistry<'a>>,
         form: SwiftRequirementForm,
         scm: Option<&'a ScmLookupUrl>,
@@ -506,7 +506,7 @@ fn test_swizzle_decision_truth_table() {
         })
     }
     let swapped = decide(
-        ScmToRegistry::Replace,
+        ScmSwizzleMode::Replace,
         Some(&lookup),
         SwiftRequirementForm::Version,
         Some(&scm),
@@ -516,7 +516,7 @@ fn test_swizzle_decision_truth_table() {
 
     assert_eq!(
         decide(
-            ScmToRegistry::Disabled,
+            ScmSwizzleMode::Disabled,
             Some(&lookup),
             SwiftRequirementForm::Version,
             Some(&scm),
@@ -526,7 +526,7 @@ fn test_swizzle_decision_truth_table() {
     );
     assert_eq!(
         decide(
-            ScmToRegistry::Replace,
+            ScmSwizzleMode::Replace,
             None,
             SwiftRequirementForm::Version,
             Some(&scm),
@@ -541,7 +541,7 @@ fn test_swizzle_decision_truth_table() {
     ] {
         assert_eq!(
             decide(
-                ScmToRegistry::Replace,
+                ScmSwizzleMode::Replace,
                 Some(&lookup),
                 form,
                 Some(&scm),
@@ -552,7 +552,7 @@ fn test_swizzle_decision_truth_table() {
     }
     assert_eq!(
         decide(
-            ScmToRegistry::Replace,
+            ScmSwizzleMode::Replace,
             Some(&lookup),
             SwiftRequirementForm::Version,
             None,
@@ -569,7 +569,7 @@ fn test_swizzle_decision_truth_table() {
     ] {
         assert_eq!(
             decide(
-                ScmToRegistry::Replace,
+                ScmSwizzleMode::Replace,
                 Some(&lookup),
                 SwiftRequirementForm::Version,
                 Some(&scm),

@@ -15,8 +15,9 @@ use deps_core::edit::{
     dedup_overlapping_edits,
 };
 use deps_core::lsp_helpers::{
-    CachedVersionsMap, CooldownDisposition, EcosystemFormatter, FallbackEditVerdict, LatestVerdict,
-    cooldown_disposition, fallback_edit_excludes_newer, latest_verdict,
+    CachedVersionsMap, CooldownDisposition, EcosystemFormatter, FallbackEditRejection,
+    FallbackEditVerdict, LatestVerdict, cooldown_disposition, fallback_edit_excludes_newer,
+    latest_verdict,
 };
 use deps_core::{NormalizedName, PackageKey, PackageName};
 use std::collections::HashMap;
@@ -1061,6 +1062,74 @@ fn osv_verdict_details(
     }
 }
 
+/// `candidate` re-rendered so its requirement keeps the floor at the fallback `target`
+/// (a bare partial such as `5` must not become `6`, which admits older `6.x`); `None` for an
+/// unexpanded placeholder.
+fn floor_safe_candidate(
+    formatter: &dyn EcosystemFormatter,
+    dep: &dyn deps_core::Dependency,
+    candidate: &ManifestEdit,
+    target: &ConcreteVersion,
+) -> Option<ManifestEdit> {
+    let current = dep.version_requirement()?;
+    let new_text =
+        deps_core::edit::floor_safe_replacement_text(formatter, dep, target, current.as_str())?;
+    Some(ManifestEdit {
+        range: candidate.range,
+        new_text,
+    })
+}
+
+/// The edit to write for a cooldown/OSV fallback `target`, or `None` when the fail-closed
+/// guard rejects every rendering of it.
+///
+/// The operator-preserving `candidate` goes through [`fallback_edit_excludes_newer`] first. Only
+/// an `EditedAdmitsNewer` rejection (a caret range that would admit the withheld newer version)
+/// triggers one retry with the ecosystem's exact-pin rendering
+/// (`PackageRendering::format_version_exact_pin`), re-validated by the same guard (#1892).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors fallback_edit_excludes_newer's own parameter list plus the log key"
+)]
+fn writable_fallback_edit(
+    formatter: &dyn EcosystemFormatter,
+    reparse: &dyn ManifestReparse,
+    content: &str,
+    dep: &dyn deps_core::Dependency,
+    candidate: &ManifestEdit,
+    target: &ConcreteVersion,
+    available: &[ConcreteVersion],
+    package_key: &PackageKey,
+) -> Option<ManifestEdit> {
+    let candidate = &floor_safe_candidate(formatter, dep, candidate, target)?;
+    let verdict = fallback_edit_excludes_newer(
+        formatter, reparse, content, dep, candidate, target, available,
+    );
+    let reason = match verdict {
+        FallbackEditVerdict::Writable => return Some(candidate.clone()),
+        FallbackEditVerdict::Rejected(reason) => reason,
+    };
+    tracing::debug!(
+        package = ?package_key.normalized(),
+        fallback = %target,
+        ?reason,
+        "fallback edit rejected by fallback_edit_excludes_newer"
+    );
+    if reason != FallbackEditRejection::EditedAdmitsNewer {
+        return None;
+    }
+    let exact_text = formatter
+        .format_version_exact_pin(target)
+        .filter(|text| *text != candidate.new_text)?;
+    let exact = ManifestEdit {
+        range: candidate.range,
+        new_text: exact_text,
+    };
+    let retry =
+        fallback_edit_excludes_newer(formatter, reparse, content, dep, &exact, target, available);
+    matches!(retry, FallbackEditVerdict::Writable).then_some(exact)
+}
+
 /// Spec 075 FR-007: the unified per-occurrence planner pipeline. Builds `latest_candidate`'s
 /// identity once, resolves this occurrence's [`CooldownDisposition`], and — only when it is
 /// `Blocked` — consults `fallback_by_key` (removed so each fallback occurrence is used at most
@@ -1234,21 +1303,19 @@ fn resolve_occurrence(
                     // in-use version) and `Absent` (spec 076's no-lockfile) paths — no per-
                     // ecosystem override, no Go exception (removed, FR-022: `ExactMatcher`
                     // alone is sufficient once this guard ships).
-                    let requirement_ok = dep_by_key.get(&key).copied().is_some_and(|dep| {
-                        let verdict = fallback_edit_excludes_newer(
-                            formatter, reparse, content, dep, &fb.edit, &fb.target, available,
-                        );
-                        if let FallbackEditVerdict::Rejected(reason) = verdict {
-                            tracing::debug!(
-                                package = ?package_key.normalized(),
-                                fallback = %fb.target,
-                                ?reason,
-                                "fallback edit rejected by fallback_edit_excludes_newer"
-                            );
-                        }
-                        matches!(verdict, FallbackEditVerdict::Writable)
+                    let writable_edit = dep_by_key.get(&key).copied().and_then(|dep| {
+                        writable_fallback_edit(
+                            formatter,
+                            reparse,
+                            content,
+                            dep,
+                            &fb.edit,
+                            &fb.target,
+                            available,
+                            &package_key,
+                        )
                     });
-                    if requirement_ok {
+                    if let Some(edit) = writable_edit {
                         // Rows 7 & 9 (fix-cycle item 3/S3): `ignore_rules` now runs against
                         // the SELECTED (fallback) target unconditionally, regardless of
                         // whether latest is OSV-blocked — previously row 7 wrote the fallback
@@ -1285,7 +1352,7 @@ fn resolve_occurrence(
                             build(
                                 current,
                                 Outcome::Applied {
-                                    edit: fb.edit,
+                                    edit,
                                     target: fb.target,
                                 },
                                 advisory_ids,
@@ -1297,7 +1364,7 @@ fn resolve_occurrence(
                             build(
                                 current,
                                 Outcome::Applied {
-                                    edit: fb.edit,
+                                    edit,
                                     target: fb.target,
                                 },
                                 Vec::new(),
@@ -2936,6 +3003,168 @@ mod tests {
             "d0 passes (0.22.6's own floor is not newer than 0.22.7), but the written 0.22.7 \
              caret still auto-follows into the fresh 0.22.8 — d1 must reject: {verdict:?}"
         );
+    }
+
+    /// [`RealSemverFormatter`] plus the npm/Deno-style exact-pin rendering hook (#1892).
+    struct ExactPinSemverFormatter;
+    impl deps_core::lsp_helpers::PackageNaming for ExactPinSemverFormatter {}
+    impl deps_core::lsp_helpers::PackageRendering for ExactPinSemverFormatter {
+        fn format_version_for_text_edit(&self, v: &deps_core::ConcreteVersion) -> String {
+            v.to_string()
+        }
+        fn format_version_exact_pin(&self, v: &deps_core::ConcreteVersion) -> Option<String> {
+            Some(format!("={v}"))
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.as_str().to_string()
+        }
+    }
+    impl deps_core::lsp_helpers::RequirementResolution for ExactPinSemverFormatter {
+        fn compile_bounded_requirement(
+            &self,
+            requirement: deps_core::lsp_helpers::BoundedVersionReq<'_>,
+        ) -> Option<Box<dyn deps_core::lsp_helpers::RequirementMatcher>> {
+            deps_core::lsp_helpers::compile_semver_requirement(requirement.get())
+        }
+    }
+    impl deps_core::lsp_helpers::DiagnosticMessages for ExactPinSemverFormatter {}
+    impl deps_core::lsp_helpers::DiagnosticPolicy for ExactPinSemverFormatter {}
+    impl deps_core::lsp_helpers::SourcePolicy for ExactPinSemverFormatter {}
+    impl deps_core::lsp_helpers::OsvNaming for ExactPinSemverFormatter {}
+
+    /// npm-style partial-precision plain rewrite, floor-safe rendering for fix targets.
+    struct PartialSemverFormatter;
+    impl deps_core::lsp_helpers::PackageNaming for PartialSemverFormatter {}
+    impl deps_core::lsp_helpers::PackageRendering for PartialSemverFormatter {
+        fn format_version_for_text_edit(&self, v: &deps_core::ConcreteVersion) -> String {
+            v.to_string()
+        }
+        fn format_version_replacing(&self, v: &deps_core::ConcreteVersion, _: &str) -> String {
+            v.as_str().split('.').next().unwrap_or_default().to_owned()
+        }
+        fn format_version_replacing_floor_for(
+            &self,
+            _dep: &dyn deps_core::Dependency,
+            v: &deps_core::ConcreteVersion,
+            _current: &str,
+        ) -> String {
+            v.to_string()
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.as_str().to_string()
+        }
+    }
+    impl deps_core::lsp_helpers::RequirementResolution for PartialSemverFormatter {
+        fn compile_bounded_requirement(
+            &self,
+            requirement: deps_core::lsp_helpers::BoundedVersionReq<'_>,
+        ) -> Option<Box<dyn deps_core::lsp_helpers::RequirementMatcher>> {
+            deps_core::lsp_helpers::compile_semver_requirement(requirement.get())
+        }
+    }
+    impl deps_core::lsp_helpers::DiagnosticMessages for PartialSemverFormatter {}
+    impl deps_core::lsp_helpers::DiagnosticPolicy for PartialSemverFormatter {}
+    impl deps_core::lsp_helpers::SourcePolicy for PartialSemverFormatter {}
+    impl deps_core::lsp_helpers::OsvNaming for PartialSemverFormatter {}
+
+    #[test]
+    fn test_writable_fallback_edit_never_lowers_floor_with_partial_rendering() {
+        let range = Range::new(Position::new(0, 7), Position::new(0, 8));
+        let dep = test_dep("pkg", "5", range);
+        let partial_candidate = ManifestEdit {
+            range,
+            new_text: "6".to_string(),
+        };
+        let available: Vec<deps_core::ConcreteVersion> = vec![
+            "7.0.0".into(),
+            "6.2.1".into(),
+            "6.1.0".into(),
+            "5.0.0".into(),
+        ];
+        let reparse = reparse_quoted_deps(vec![("pkg", Position::new(0, 7))]);
+        let formatter = PartialSemverFormatter;
+        let edit = writable_fallback_edit(
+            &formatter,
+            &reparse,
+            "pkg = \"5\"\n",
+            &dep,
+            &partial_candidate,
+            &deps_core::ConcreteVersion::new("6.2.1"),
+            &available,
+            &PackageKey::new(&PackageName::new("pkg"), &formatter),
+        )
+        .expect("floor-safe fallback is writable");
+        assert_eq!(edit.new_text, "6.2.1");
+    }
+
+    /// An exact-pin hook that still admits the withheld newer version (a tilde range).
+    struct LeakyPinSemverFormatter;
+    impl deps_core::lsp_helpers::PackageNaming for LeakyPinSemverFormatter {}
+    impl deps_core::lsp_helpers::PackageRendering for LeakyPinSemverFormatter {
+        fn format_version_for_text_edit(&self, v: &deps_core::ConcreteVersion) -> String {
+            v.to_string()
+        }
+        fn format_version_exact_pin(&self, v: &deps_core::ConcreteVersion) -> Option<String> {
+            Some(format!("~{v}"))
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.as_str().to_string()
+        }
+    }
+    impl deps_core::lsp_helpers::RequirementResolution for LeakyPinSemverFormatter {
+        fn compile_bounded_requirement(
+            &self,
+            requirement: deps_core::lsp_helpers::BoundedVersionReq<'_>,
+        ) -> Option<Box<dyn deps_core::lsp_helpers::RequirementMatcher>> {
+            deps_core::lsp_helpers::compile_semver_requirement(requirement.get())
+        }
+    }
+    impl deps_core::lsp_helpers::DiagnosticMessages for LeakyPinSemverFormatter {}
+    impl deps_core::lsp_helpers::DiagnosticPolicy for LeakyPinSemverFormatter {}
+    impl deps_core::lsp_helpers::SourcePolicy for LeakyPinSemverFormatter {}
+    impl deps_core::lsp_helpers::OsvNaming for LeakyPinSemverFormatter {}
+
+    #[test]
+    fn test_writable_fallback_edit_retry_that_still_admits_newer_is_not_written_1892() {
+        assert_eq!(writable_edit_for(&LeakyPinSemverFormatter), None);
+    }
+
+    fn writable_edit_for(formatter: &dyn EcosystemFormatter) -> Option<ManifestEdit> {
+        let range = Range::new(Position::new(0, 7), Position::new(0, 14));
+        let dep = test_dep("pkg", "^0.21.0", range);
+        let candidate = ManifestEdit {
+            range,
+            new_text: "^0.22.7".to_string(),
+        };
+        let available: Vec<deps_core::ConcreteVersion> = vec![
+            "0.22.8".into(),
+            "0.22.7".into(),
+            "0.22.6".into(),
+            "0.21.0".into(),
+        ];
+        let reparse = reparse_quoted_deps(vec![("pkg", Position::new(0, 7))]);
+        writable_fallback_edit(
+            formatter,
+            &reparse,
+            "pkg = \"^0.21.0\"\n",
+            &dep,
+            &candidate,
+            &deps_core::ConcreteVersion::new("0.22.7"),
+            &available,
+            &PackageKey::new(&PackageName::new("pkg"), formatter),
+        )
+    }
+
+    #[test]
+    fn test_writable_fallback_edit_retries_caret_as_exact_pin_1892() {
+        let edit =
+            writable_edit_for(&ExactPinSemverFormatter).expect("exact-pin retry is writable");
+        assert_eq!(edit.new_text, "=0.22.7");
+    }
+
+    #[test]
+    fn test_writable_fallback_edit_without_exact_pin_hook_stays_rejected_1892() {
+        assert_eq!(writable_edit_for(&RealSemverFormatter), None);
     }
 
     /// Issue #1561 repro (CWE-1284), adapted: the declared exact pin (`=1.5.0`) is absent from

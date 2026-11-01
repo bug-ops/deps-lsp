@@ -467,6 +467,40 @@ pub async fn load_resolved_versions(
     .await
 }
 
+/// Removes lookup misses for packages whose lock entry is not registry-served (a workspace
+/// `link` member, a git checkout) from `fetch_result`, so they never surface as "not found in
+/// the registry" (#1891).
+///
+/// A no-op without touching the lock file when no miss was recorded, which is the common case.
+pub async fn forget_local_locked_misses(
+    fetch_result: &mut super::fetch::FetchResult,
+    uri: &url::Url,
+    lockfile_cache: &Arc<LockFileCache>,
+    ecosystem: &dyn Ecosystem,
+) {
+    if fetch_result.lookup_misses.is_empty() {
+        return;
+    }
+    let Some(lock_provider) = ecosystem.lockfile_provider() else {
+        return;
+    };
+    let provider_for_locate = Arc::clone(&lock_provider);
+    let uri_for_locate = uri.clone();
+    let Ok(Some(lockfile_path)) =
+        tokio::task::spawn_blocking(move || provider_for_locate.locate_lockfile(&uri_for_locate))
+            .await
+    else {
+        return;
+    };
+    let Ok(resolved) = lockfile_cache
+        .get_or_parse(lock_provider.as_ref(), &lockfile_path)
+        .await
+    else {
+        return;
+    };
+    fetch_result.forget_lookup_misses(&resolved.local_only_names(ecosystem.formatter()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,5 +747,59 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             }
             other => panic!("expected Loaded, got {other:?}"),
         }
+    }
+
+    /// #1891 S1: a lookup miss for a package whose lock entry is a local path (a workspace
+    /// member) is dropped, while a miss for a registry-served package is kept.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_forget_local_locked_misses_keeps_only_registry_served_names() {
+        use crate::classify::fetch::FetchResult;
+        use deps_core::lsp_helpers::LookupMiss;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write Cargo.toml");
+        std::fs::write(
+            dir.path().join("Cargo.lock"),
+            r#"version = 4
+
+[[package]]
+name = "member"
+version = "0.1.0"
+
+[[package]]
+name = "serde"
+version = "1.0.195"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#,
+        )
+        .expect("write Cargo.lock");
+
+        let ecosystem = crate::setup::CargoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let cache = Arc::new(LockFileCache::new());
+        let uri = url::Url::from_file_path(dir.path().join("Cargo.toml")).expect("file uri");
+        let mut fetch_result = FetchResult::new(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (NormalizedName::for_test("member"), LookupMiss::NotFound),
+                (NormalizedName::for_test("serde"), LookupMiss::NotFound),
+            ]),
+            None,
+            HashMap::new(),
+        );
+
+        forget_local_locked_misses(&mut fetch_result, &uri, &cache, &ecosystem).await;
+
+        assert_eq!(
+            fetch_result.lookup_misses,
+            HashMap::from([(NormalizedName::for_test("serde"), LookupMiss::NotFound)])
+        );
     }
 }

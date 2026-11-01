@@ -6,6 +6,7 @@
 //! [`swizzle_decision`], so a parse can never disagree with the probe that warms its inputs.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use deps_core::lockfile::{ResolvedPackage, ResolvedPackages, ResolvedSource};
@@ -16,6 +17,7 @@ use crate::config::{SwiftRegistryUrl, TrustedLookupRegistry};
 use crate::package_location::RegistryIdentityBuf;
 use crate::scm_memo::ScmIdentityMemo;
 use crate::types::SwiftDependency;
+use crate::xcode_defaults::XcodeDefaultsCell;
 
 /// How a dependency's version requirement is written, as set by the parser.
 ///
@@ -199,7 +201,7 @@ pub(crate) enum SwiftForm {
 
 /// Every input of [`swizzle_decision`].
 pub(crate) struct SwizzleInput<'a> {
-    pub mode: ScmToRegistry,
+    pub mode: ScmSwizzleMode,
     pub lookup: Option<&'a TrustedLookupRegistry<'a>>,
     pub form: SwiftRequirementForm,
     pub scm: Option<&'a ScmLookupUrl>,
@@ -221,8 +223,8 @@ pub(crate) fn swizzle_decision(input: SwizzleInput<'_>) -> SwiftForm {
         answer,
     } = input;
     match mode {
-        ScmToRegistry::Replace => {}
-        ScmToRegistry::Disabled => return SwiftForm::Scm,
+        ScmSwizzleMode::Replace => {}
+        ScmSwizzleMode::Disabled => return SwiftForm::Scm,
     }
     let Some(lookup) = lookup else {
         return SwiftForm::Scm;
@@ -256,7 +258,7 @@ pub(crate) fn swizzle_decision(input: SwizzleInput<'_>) -> SwiftForm {
 /// [`swizzle_decision`] with the answer read from `memo` at `now`; the one call both the parser
 /// and the probe make.
 pub(crate) fn decide_from_memo(
-    mode: ScmToRegistry,
+    mode: ScmSwizzleMode,
     lookup: Option<&TrustedLookupRegistry<'_>>,
     form: SwiftRequirementForm,
     scm: Option<&ScmLookupUrl>,
@@ -264,14 +266,14 @@ pub(crate) fn decide_from_memo(
     now: Instant,
 ) -> SwiftForm {
     let answer = match mode {
-        ScmToRegistry::Replace => lookup
+        ScmSwizzleMode::Replace => lookup
             .zip(scm)
             .zip(memo)
             .and_then(|((lookup, scm), memo)| {
                 memo.get(&MemoKey::new(&lookup.default_registry().url, scm), now)
             })
             .map(|read| read.answer),
-        ScmToRegistry::Disabled => None,
+        ScmSwizzleMode::Disabled => None,
     };
     swizzle_decision(SwizzleInput {
         mode,
@@ -359,26 +361,42 @@ pub(crate) fn classify_identifiers(identifiers: &[String]) -> IdentityLookup {
     )
 }
 
+/// The swizzle behavior in effect, after [`ScmToRegistry::FromXcode`] is resolved.
+///
+/// Unlike the user-facing [`ScmToRegistry`], this has no value that still depends on an outside
+/// source, so `swizzle_decision` can match it exhaustively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScmSwizzleMode {
+    /// Source-control dependencies keep their source-control versions.
+    Disabled,
+    /// An eligible `url:` dependency may be swapped to its registry identity.
+    Replace,
+}
+
 /// The live `registries.swift_scm_to_registry` setting, shared between the server's
 /// configuration handling and the Swift parse context.
 ///
 /// A change takes effect on the next parse; the server must re-parse open Swift documents when
-/// it calls [`Self::set`].
+/// it calls [`Self::set`]. [`Self::get`] never blocks: with
+/// [`ScmToRegistry::FromXcode`] it reads the Xcode default that a background thread started at
+/// [`Self::set`] (once per process), and stays [`ScmSwizzleMode::Disabled`] until that read ends.
+/// The PreFetch probe notices the flip and asks for a re-parse.
 ///
 /// # Examples
 ///
 /// ```
 /// use deps_core::policy_config::ScmToRegistry;
-/// use deps_swift::ScmToRegistryHandle;
+/// use deps_swift::{ScmSwizzleMode, ScmToRegistryHandle};
 ///
 /// let handle = ScmToRegistryHandle::default();
-/// assert_eq!(handle.get(), ScmToRegistry::Disabled);
+/// assert_eq!(handle.get(), ScmSwizzleMode::Disabled);
 /// handle.set(ScmToRegistry::Replace);
-/// assert_eq!(handle.get(), ScmToRegistry::Replace);
+/// assert_eq!(handle.get(), ScmSwizzleMode::Replace);
 /// ```
 #[derive(Debug)]
 pub struct ScmToRegistryHandle {
-    replace: AtomicBool,
+    setting: Mutex<ScmToRegistry>,
+    xcode: Arc<XcodeDefaultsCell>,
     warned_missing_default: AtomicBool,
     fetch_timeout_secs: AtomicU64,
     fetch_concurrency: AtomicUsize,
@@ -386,16 +404,22 @@ pub struct ScmToRegistryHandle {
 
 impl Default for ScmToRegistryHandle {
     fn default() -> Self {
+        Self::with_xcode(XcodeDefaultsCell::process())
+    }
+}
+
+impl ScmToRegistryHandle {
+    /// A disabled handle that resolves `FromXcode` through `xcode`.
+    pub(crate) fn with_xcode(xcode: Arc<XcodeDefaultsCell>) -> Self {
         Self {
-            replace: AtomicBool::new(false),
+            setting: Mutex::new(ScmToRegistry::Disabled),
+            xcode,
             warned_missing_default: AtomicBool::new(false),
             fetch_timeout_secs: AtomicU64::new(FetchTimeout::DEFAULT.as_secs()),
             fetch_concurrency: AtomicUsize::new(FetchConcurrency::DEFAULT.get()),
         }
     }
-}
 
-impl ScmToRegistryHandle {
     /// A handle holding `mode`.
     #[must_use]
     pub fn new(mode: ScmToRegistry) -> Self {
@@ -404,24 +428,67 @@ impl ScmToRegistryHandle {
         handle
     }
 
-    /// The current setting.
+    /// The stored setting, before `FromXcode` is resolved.
+    fn setting(&self) -> ScmToRegistry {
+        // A `Copy` enum is replaced in one assignment, so a poisoned lock still holds a valid value.
+        *self
+            .setting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The swizzle behavior in effect now; never blocks.
     #[must_use]
-    pub fn get(&self) -> ScmToRegistry {
-        if self.replace.load(Ordering::Relaxed) {
-            ScmToRegistry::Replace
-        } else {
-            ScmToRegistry::Disabled
+    pub fn get(&self) -> ScmSwizzleMode {
+        match self.setting() {
+            ScmToRegistry::Disabled => ScmSwizzleMode::Disabled,
+            ScmToRegistry::Replace => ScmSwizzleMode::Replace,
+            ScmToRegistry::FromXcode => self
+                .xcode
+                .cached()
+                .map_or(ScmSwizzleMode::Disabled, |value| value.swizzle_mode()),
         }
     }
 
-    /// Stores `mode`; a change re-arms the one-time "no trusted default registry" warning.
+    /// Stores `mode`; a change re-arms the one-time "no trusted default registry" warning, and
+    /// `FromXcode` starts the background read of the Xcode default.
     pub fn set(&self, mode: ScmToRegistry) {
-        let replace = match mode {
-            ScmToRegistry::Replace => true,
-            ScmToRegistry::Disabled => false,
-        };
-        if self.replace.swap(replace, Ordering::Relaxed) != replace {
+        if mode == ScmToRegistry::FromXcode {
+            self.xcode.prime();
+        }
+        let previous = std::mem::replace(
+            &mut *self
+                .setting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            mode,
+        );
+        if previous != mode {
             self.warned_missing_default.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the setting is `FromXcode` and the background read has not finished, so
+    /// [`Self::get`] may still change by itself.
+    #[must_use]
+    pub fn xcode_pending(&self) -> bool {
+        self.setting() == ScmToRegistry::FromXcode && self.xcode.cached().is_none()
+    }
+
+    /// Resolves once the background Xcode read has finished, with whether [`Self::get`] is now
+    /// [`ScmSwizzleMode::Replace`], i.e. whether open documents parsed meanwhile are stale. Call
+    /// it only after [`Self::set`] with `FromXcode` started the read.
+    pub async fn xcode_settled(&self) -> bool {
+        self.xcode.wait().await;
+        self.get() == ScmSwizzleMode::Replace
+    }
+
+    /// Blocks until the Xcode read finishes or `timeout` passes; does nothing unless the
+    /// setting is `FromXcode`. For one-shot CLI runs before the first parse; never call it from
+    /// a request handler.
+    pub fn wait_for_xcode(&self, timeout: std::time::Duration) {
+        if self.setting() == ScmToRegistry::FromXcode {
+            self.xcode.wait_blocking(timeout);
         }
     }
 
@@ -580,13 +647,13 @@ mod tests {
     #[test]
     fn test_handle_round_trips_and_rearms_the_warning_on_change() {
         let handle = ScmToRegistryHandle::new(ScmToRegistry::Replace);
-        assert_eq!(handle.get(), ScmToRegistry::Replace);
+        assert_eq!(handle.get(), ScmSwizzleMode::Replace);
         handle.warn_missing_default_once();
         assert!(handle.warned_missing_default.load(Ordering::Relaxed));
         handle.set(ScmToRegistry::Replace);
         assert!(handle.warned_missing_default.load(Ordering::Relaxed));
         handle.set(ScmToRegistry::Disabled);
         assert!(!handle.warned_missing_default.load(Ordering::Relaxed));
-        assert_eq!(handle.get(), ScmToRegistry::Disabled);
+        assert_eq!(handle.get(), ScmSwizzleMode::Disabled);
     }
 }

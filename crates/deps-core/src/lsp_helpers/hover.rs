@@ -573,10 +573,10 @@ fn spawn_gossip_low_usage_fetch(
             ecosystem,
         )?;
         let client = Arc::clone(client);
-        let name = dep.name().as_str().to_string();
+        let key = key.clone();
         Some(tokio::spawn(async move {
             client
-                .gossip_findings_for_version(system, &name, version.as_str())
+                .gossip_findings_for_version(system, &key, version.as_str())
                 .await
         }))
     })

@@ -125,6 +125,17 @@ impl EcosystemRuntime {
         self
     }
 
+    /// Blocks until `registries.swift_scm_to_registry = "from_xcode"` has read Xcode's default
+    /// (at most its own 2 s timeout plus a margin); a no-op for every other setting.
+    ///
+    /// For one-shot runs such as `deps-cli`, so the first parse already sees the final mode.
+    /// A long-lived server must not call it; it re-parses when the read finishes instead.
+    #[cfg(feature = "swift")]
+    pub fn wait_for_scm_to_registry(&self) {
+        self.scm_to_registry
+            .wait_for_xcode(std::time::Duration::from_secs(3));
+    }
+
     /// Overrides [`Self::keychain_credentials`]'s default (a handle at `Disabled`).
     ///
     /// # Examples

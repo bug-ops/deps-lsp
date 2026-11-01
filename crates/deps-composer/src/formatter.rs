@@ -945,7 +945,42 @@ impl PackageRendering for ComposerFormatter {
     }
 }
 
+/// Whether the Composer constraint `requirement` opts in to pre-releases: a non-`@stable`
+/// stability flag on any term, or a non-upper-bound comparator whose version carries a
+/// pre-release qualifier.
+fn composer_requirement_opts_into_prereleases(requirement: &str) -> bool {
+    split_or_branches(requirement).into_iter().any(|branch| {
+        let mut after_hyphen = false;
+        branch
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|token| !token.is_empty())
+            .any(|token| {
+                if token == "-" {
+                    after_hyphen = true;
+                    return false;
+                }
+                let upper_of_hyphen_range = std::mem::take(&mut after_hyphen);
+                let (bare, flag) = strip_stability_flag(token);
+                if flag.is_some_and(|floor| floor < StabilityFloor::Stable) {
+                    return true;
+                }
+                if upper_of_hyphen_range || bare.starts_with(['<', '!']) {
+                    return false;
+                }
+                let version = bare.trim_start_matches(['>', '=', '^', '~', 'v', 'V']);
+                composer_version_stability(version) < StabilityFloor::Stable
+            })
+    })
+}
+
 impl RequirementResolution for ComposerFormatter {
+    /// A `@dev`/`@alpha`/`@beta`/`@RC` stability flag on any term, or a comparator that
+    /// itself names a pre-release (`2.0RC1`, `1.0-beta`). `@stable` and upper bounds
+    /// (`<`, `<=`, `!=`) never opt in.
+    fn requirement_opts_into_prereleases(&self, requirement: BoundedVersionReq<'_>) -> bool {
+        composer_requirement_opts_into_prereleases(requirement.as_str())
+    }
+
     /// Checks if a version satisfies a Composer version requirement.
     ///
     /// Handles Composer-specific operators:
@@ -4087,5 +4122,37 @@ mod tests {
             source: deps_core::parser::DependencySource::Registry,
         };
         assert_eq!(f.osv_package_name(&dep), None);
+    }
+
+    #[test]
+    fn test_requirement_opts_into_prereleases_stability_flags_and_qualifiers() {
+        let opts = |req: &str| {
+            ComposerFormatter.requirement_opts_into_prereleases(
+                BoundedVersionReq::new(&VersionReq::new(req)).unwrap(),
+            )
+        };
+        for opted in [
+            "^2.0@beta",
+            "^2.0@dev",
+            "^1.0 || ^2.0@RC",
+            ">=1.0@alpha <3.0",
+            "2.0RC1",
+            "^2.0.0-beta1",
+            "1.0-beta - 2.0",
+            ">=1.0-beta,<2.0",
+        ] {
+            assert!(opts(opted), "{opted} should opt in");
+        }
+        for stable in [
+            "^2.0",
+            "^2.0@stable",
+            "<2.0.0-beta1",
+            ">=1.0 <2.0",
+            "!=2.0RC1",
+            "1.0 - 2.0-beta",
+            ">=1.0,<2.0-beta",
+        ] {
+            assert!(!opts(stable), "{stable} should not opt in");
+        }
     }
 }

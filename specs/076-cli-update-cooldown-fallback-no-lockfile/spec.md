@@ -499,3 +499,12 @@ tracking proxy):
 - [[MOC-specs]] — all specifications.
 - `plan.md` (this feature) — exact call-site line numbers and integration order.
 - `tasks.md` (this feature) — ordered implementation tasks.
+
+## Amendment (#1892): exact-pin retry for npm and deno
+
+FR-025's "no per-ecosystem retry or alternative rendering" is relaxed for one case. Since #1885 npm and deno keep the requirement operator on rewrite, so a caret range's fallback edit is rejected as `EditedAdmitsNewer`, where before #1885 the default rendering was a bare exact pin.
+
+- `PackageRendering::format_version_exact_pin` returns `None` by default; npm and deno return the bare version.
+- `deps-cli update` retries ONCE with that rendering after an `EditedAdmitsNewer` rejection, through the full guard (FR-023/FR-024) at the same single call site. An exact pin only narrows the range, so it cannot admit the withheld version.
+- Vulnerability-fix and fallback targets render without partial-precision truncation (`3` with fix `4.17.21` writes `4.17.21`, #1895).
+- NFR-008(a) is unchanged for Cargo, Dart, PyPI-default and Swift `from:`: they return `None` and keep today's behavior.

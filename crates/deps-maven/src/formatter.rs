@@ -1,5 +1,7 @@
 //! Version formatting for Maven ecosystem.
 
+use std::ops::Bound;
+
 use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
     PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
@@ -202,6 +204,23 @@ impl PackageRendering for MavenFormatter {
 }
 
 impl RequirementResolution for MavenFormatter {
+    /// A pre-release qualifier on the bare version, or on an interval's lower or exact bound
+    /// (`[1.0-beta,)`, `[2.0-RC1]`); upper bounds never opt in.
+    fn requirement_opts_into_prereleases(&self, requirement: BoundedVersionReq<'_>) -> bool {
+        let requirement = requirement.as_str().trim();
+        if !crate::range::is_range(requirement) {
+            return crate::version::is_prerelease(requirement);
+        }
+        crate::range::parse_range(requirement).is_some_and(|ranges| {
+            ranges.iter().any(|range| {
+                matches!(
+                    range.lower_edge(),
+                    Bound::Included(v) | Bound::Excluded(v) if crate::version::is_prerelease(v)
+                )
+            })
+        })
+    }
+
     // #249 review (M4): this branch order (unresolved → range → exact) is a separate copy
     // from `compile_bounded_requirement`'s below — kept apart deliberately (see `MavenMatcher`'s
     // docs for the two precision differences), but any reordering here must be checked
@@ -819,5 +838,20 @@ mod tests {
         )
         .expect("a resolved requirement must still be rewritten to the fix version");
         assert_eq!(planned.edit.new_text, "1.2.0");
+    }
+
+    #[test]
+    fn test_requirement_opts_into_prereleases_lower_and_exact_bounds_only() {
+        let opts = |req: &str| {
+            MavenFormatter.requirement_opts_into_prereleases(
+                BoundedVersionReq::new(&deps_core::VersionReq::new(req)).unwrap(),
+            )
+        };
+        for opted in ["[1.0-beta,)", "[2.0-RC1]", "(1.0-alpha-1,2.0)", "1.0-beta"] {
+            assert!(opts(opted), "{opted} should opt in");
+        }
+        for stable in ["[1.0,2.0)", "[1.0,2.0-beta)", "(,2.0-RC1]", "1.0"] {
+            assert!(!opts(stable), "{stable} should not opt in");
+        }
     }
 }

@@ -1087,31 +1087,49 @@ pub struct DependencyOutcome {
     pub deprecation: Option<Deprecation>,
     /// Registry fetch errored, timed out, or was never attempted (#267). See [`FetchFailure`].
     pub fetch_failure: Option<FetchFailure>,
-    /// The registry fetch succeeded (no [`Self::fetch_failure`]) but produced zero
-    /// comparable versions — e.g. a real GitHub repository whose only tags don't parse
-    /// as full `major.minor.patch` semver (`dtolnay/rust-toolchain`'s sole tag `v1`,
-    /// issue #550). Distinct from both an absent [`DependencyOutcome`] entry ("never
-    /// fetched") and [`Self::fetch_failure`] ("couldn't be asked"): this package
-    /// demonstrably exists, so [R5](crate::lsp_helpers::generate_diagnostics_from_cache)
-    /// must not claim it is unknown.
-    pub no_comparable_versions: bool,
+    /// The registry answered, but the lookup produced nothing usable: see [`LookupMiss`].
+    /// Distinct from both an absent [`DependencyOutcome`] entry ("never fetched") and
+    /// [`Self::fetch_failure`] ("couldn't be asked"). The two [`LookupMiss`] variants are
+    /// mutually exclusive by construction.
+    pub lookup_miss: Option<LookupMiss>,
+}
+
+/// Why a successfully answered registry lookup yielded no usable "latest" version.
+///
+/// Neither variant is a [`FetchFailure`]: the registry was reachable and replied.
+/// Exhaustive on purpose so every consumer must handle a new variant.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::LookupMiss;
+///
+/// assert_ne!(LookupMiss::NotFound, LookupMiss::NoComparableVersions);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupMiss {
+    /// The registry endpoint itself answered "no such package" (e.g. HTTP 404).
+    NotFound,
+    /// The fetch succeeded but no published version is comparable with the requirement,
+    /// e.g. a GitHub repository whose only tag `v1` is not full semver (#550).
+    NoComparableVersions,
 }
 
 impl DependencyOutcome {
-    /// True when none of the four channels are set.
+    /// True when none of the channels are set.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.yanked.is_none()
             && self.deprecation.is_none()
             && self.fetch_failure.is_none()
-            && !self.no_comparable_versions
+            && self.lookup_miss.is_none()
     }
 }
 
 /// Normalized-package-name -> [`DependencyOutcome`] map.
 ///
 /// A newtype rather than a bare `HashMap` so the empty-entry pruning invariant (an entry is
-/// removed once all three of its channels are cleared) lives in one place, and so test
+/// removed once all of its channels are cleared) lives in one place, and so test
 /// fixtures get chainable `with_*` constructors instead of building three ad-hoc `HashMap`s.
 /// Keyed by plain normalized name — unlike [`crate::osv::VulnerabilityMap`], which is keyed by
 /// [`crate::osv::VulnKey`] to disambiguate multiple occurrences of one name.
@@ -1149,11 +1167,10 @@ impl DependencyOutcomes {
         self.0.get(name)?.fetch_failure.as_ref()
     }
 
-    /// True when the registry fetch for `name` succeeded but produced zero comparable
-    /// versions (#550). See [`DependencyOutcome::no_comparable_versions`].
+    /// Looks up why the registry lookup for `name` yielded no usable version (#550, #1891).
     #[must_use]
-    pub fn no_comparable_versions(&self, name: &NormalizedName) -> bool {
-        self.0.get(name).is_some_and(|o| o.no_comparable_versions)
+    pub fn lookup_miss(&self, name: &NormalizedName) -> Option<LookupMiss> {
+        self.0.get(name)?.lookup_miss
     }
 
     /// Records a yanked-version finding for `name`, creating the entry if absent.
@@ -1181,17 +1198,16 @@ impl DependencyOutcomes {
             .get_or_insert(failure);
     }
 
-    /// Records that `name`'s registry fetch succeeded but produced zero comparable
-    /// versions (#550), creating the entry if absent.
-    pub fn set_no_comparable_versions(&mut self, name: NormalizedName) {
-        self.0.entry(name).or_default().no_comparable_versions = true;
+    /// Records why `name`'s registry lookup yielded no usable version, creating the entry
+    /// if absent and replacing any previous [`LookupMiss`].
+    pub fn set_lookup_miss(&mut self, name: NormalizedName, miss: LookupMiss) {
+        self.0.entry(name).or_default().lookup_miss = Some(miss);
     }
 
-    /// Clears the no-comparable-versions channel for `name`, pruning the entry if it
-    /// becomes empty.
-    pub fn clear_no_comparable_versions(&mut self, name: &NormalizedName) {
+    /// Clears the lookup-miss channel for `name`, pruning the entry if it becomes empty.
+    pub fn clear_lookup_miss(&mut self, name: &NormalizedName) {
         if let Some(entry) = self.0.get_mut(name) {
-            entry.no_comparable_versions = false;
+            entry.lookup_miss = None;
             self.prune(name);
         }
     }
@@ -1303,11 +1319,11 @@ impl DependencyOutcomes {
         self
     }
 
-    /// Chainable builder recording a no-comparable-versions finding (#550). Test/fixture
+    /// Chainable builder recording a lookup-miss finding (#550, #1891). Test/fixture
     /// ergonomics.
     #[must_use]
-    pub fn with_no_comparable_versions(mut self, name: NormalizedName) -> Self {
-        self.set_no_comparable_versions(name);
+    pub fn with_lookup_miss(mut self, name: NormalizedName, miss: LookupMiss) -> Self {
+        self.set_lookup_miss(name, miss);
         self
     }
 }

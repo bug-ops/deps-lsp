@@ -6,12 +6,12 @@ use crate::osv::ScanOutcome;
 use crate::{ConcreteVersion, Dependency, PackageKey, ParseResult, Registry, VersionReq};
 
 use super::{
-    DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, FetchContext, InteractiveFetch,
-    InteractiveFetchRequest, LatestVerdict, LineOffsetTable, NoLiveList, RequirementGate,
-    UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, await_interactive_versions, candidate_verdict,
-    is_safe_version_string, latest_verdict, literal_span_matches, requirement_is_unsatisfiable,
-    requirement_len_exceeds_cap, resolve_latest_status, resolve_scan_outcome, single_file_edit,
-    slice_for_range, strip_whitespace, warn_rejected_value,
+    BoundedVersionReq, DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, FetchContext,
+    InteractiveFetch, InteractiveFetchRequest, LatestVerdict, LineOffsetTable, NoLiveList,
+    RequirementGate, UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, await_interactive_versions,
+    candidate_verdict, is_safe_version_string, latest_verdict, literal_span_matches,
+    requirement_is_unsatisfiable, requirement_len_exceeds_cap, resolve_latest_status,
+    resolve_scan_outcome, single_file_edit, slice_for_range, strip_whitespace, warn_rejected_value,
 };
 
 /// Whether REFACTOR "Update to X" items may offer pre-release versions (#1885).
@@ -33,8 +33,11 @@ impl PrereleasePolicy {
     /// 3. a lower-bound/exact comparator of the requirement names a published pre-release;
     /// 4. a strict-SemVer matcher's requirement carries a pre-release tag on such a comparator.
     ///
+    /// 5. the ecosystem's own grammar says the requirement opts in
+    ///    (`RequirementResolution::requirement_opts_into_prereleases`: Composer stability
+    ///    flags, Maven/NuGet intervals, PEP 440 spellings).
+    ///
     /// Upper bounds (`<2.0.0-0`) never opt in: they exist to exclude pre-releases.
-    // TODO(#1894): Composer @beta/@dev/@RC flags, Maven/NuGet intervals and exact-text compares should opt in to prerelease update offers
     fn for_dependency(
         prereleases: &HashSet<&str>,
         pick: Option<&ConcreteVersion>,
@@ -58,7 +61,15 @@ impl PrereleasePolicy {
                     .iter()
                     .any(|c| c.split('+').next().is_some_and(|core| core.contains('-')))
         };
-        if pick_is_prerelease || in_use_is_prerelease || names_published_prerelease || strict_tag()
+        let ecosystem_opt_in = || {
+            BoundedVersionReq::new(requirement)
+                .is_some_and(|bounded| formatter.requirement_opts_into_prereleases(bounded))
+        };
+        if pick_is_prerelease
+            || in_use_is_prerelease
+            || names_published_prerelease
+            || strict_tag()
+            || ecosystem_opt_in()
         {
             Self::IncludePrereleases
         } else {
@@ -3144,6 +3155,112 @@ mod tests {
         };
         assert_eq!(policy(&within_cap), PrereleasePolicy::IncludePrereleases);
         assert_eq!(policy(&oversized), PrereleasePolicy::StableOnly);
+    }
+
+    #[test]
+    fn test_requirement_opts_into_prereleases_defaults_to_false() {
+        use crate::lsp_helpers::RequirementResolution;
+        for requirement in ["^2.0@beta", "1.0.0-rc1", ">=2.0.0-beta", "[1.0-beta,)"] {
+            let requirement = VersionReq::new(requirement);
+            let bounded = BoundedVersionReq::new(&requirement).unwrap();
+            assert!(!MOCK_FORMATTER.requirement_opts_into_prereleases(bounded));
+        }
+    }
+
+    struct FlagOptInFormatter;
+
+    impl crate::lsp_helpers::PackageNaming for FlagOptInFormatter {}
+
+    impl crate::lsp_helpers::PackageRendering for FlagOptInFormatter {
+        fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+            version.to_string()
+        }
+
+        fn package_url(&self, name: &crate::PackageName) -> String {
+            name.as_str().to_string()
+        }
+    }
+
+    impl crate::lsp_helpers::RequirementResolution for FlagOptInFormatter {
+        fn requirement_opts_into_prereleases(&self, requirement: BoundedVersionReq<'_>) -> bool {
+            requirement.as_str().contains("@beta")
+        }
+    }
+
+    impl crate::lsp_helpers::DiagnosticMessages for FlagOptInFormatter {}
+    impl crate::lsp_helpers::DiagnosticPolicy for FlagOptInFormatter {}
+    impl crate::lsp_helpers::SourcePolicy for FlagOptInFormatter {}
+    impl crate::lsp_helpers::OsvNaming for FlagOptInFormatter {}
+
+    struct MajorOnlyFormatter;
+
+    impl crate::lsp_helpers::PackageNaming for MajorOnlyFormatter {}
+
+    impl crate::lsp_helpers::PackageRendering for MajorOnlyFormatter {
+        fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+            version.to_string()
+        }
+
+        fn format_version_replacing(&self, version: &ConcreteVersion, _current: &str) -> String {
+            version
+                .as_str()
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        }
+
+        fn package_url(&self, name: &crate::PackageName) -> String {
+            name.as_str().to_string()
+        }
+    }
+
+    impl crate::lsp_helpers::RequirementResolution for MajorOnlyFormatter {}
+    impl crate::lsp_helpers::DiagnosticMessages for MajorOnlyFormatter {}
+    impl crate::lsp_helpers::DiagnosticPolicy for MajorOnlyFormatter {}
+    impl crate::lsp_helpers::SourcePolicy for MajorOnlyFormatter {}
+    impl crate::lsp_helpers::OsvNaming for MajorOnlyFormatter {}
+
+    #[tokio::test]
+    async fn test_refactor_partial_bucket_keeps_newest_version_title() {
+        let titles = refactor_titles_for(
+            "5",
+            vec![("6.2.1", false), ("6.1.0", false), ("5.4.0", false)],
+            None,
+            &MajorOnlyFormatter,
+        )
+        .await;
+        assert_eq!(titles, vec!["6.2.1 (latest)".to_owned()], "{titles:?}");
+    }
+
+    #[test]
+    fn test_prerelease_policy_ecosystem_hook_opts_in_but_never_when_oversized() {
+        let prereleases: HashSet<&str> = HashSet::new();
+        let policy = |req: &VersionReq, formatter: &dyn EcosystemFormatter| {
+            PrereleasePolicy::for_dependency(&prereleases, None, None, req, formatter)
+        };
+        let flagged = VersionReq::new("^2.0@beta");
+        assert_eq!(
+            policy(&flagged, &FlagOptInFormatter),
+            PrereleasePolicy::IncludePrereleases
+        );
+        assert_eq!(
+            policy(&flagged, &MOCK_FORMATTER),
+            PrereleasePolicy::StableOnly
+        );
+        let plain = VersionReq::new("^2.0");
+        assert_eq!(
+            policy(&plain, &FlagOptInFormatter),
+            PrereleasePolicy::StableOnly
+        );
+        let oversized = VersionReq::new(format!(
+            "^2.0@beta {}",
+            "1".repeat(crate::lsp_helpers::MAX_REQUIREMENT_LEN)
+        ));
+        assert_eq!(
+            policy(&oversized, &FlagOptInFormatter),
+            PrereleasePolicy::StableOnly
+        );
     }
 
     #[test]

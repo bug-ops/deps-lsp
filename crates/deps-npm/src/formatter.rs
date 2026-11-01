@@ -569,21 +569,89 @@ impl PackageNaming for NpmFormatter {
     }
 }
 
+/// The precision a bare partial node-semver requirement (`5`, `1.2`) was written at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartialPrecision {
+    Major,
+    MajorMinor,
+}
+
+impl PartialPrecision {
+    /// `Some` only for a bare 1- or 2-component all-digit requirement (an x-range), never for
+    /// an operator-bearing, wildcard, or full `X.Y.Z` requirement.
+    fn of(current: &str) -> Option<Self> {
+        let mut parts = current.trim().split('.');
+        let all_digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+        parts.next().filter(|p| all_digits(p))?;
+        match (parts.next(), parts.next()) {
+            (None, _) => Some(Self::Major),
+            (Some(minor), None) if all_digits(minor) => Some(Self::MajorMinor),
+            _ => None,
+        }
+    }
+
+    fn render(self, version: &node_semver::Version) -> String {
+        match self {
+            Self::Major => version.major.to_string(),
+            Self::MajorMinor => format!("{}.{}", version.major, version.minor),
+        }
+    }
+}
+
+/// Renders a security-fix or fallback target for the node-semver requirement `current`.
+///
+/// Same as [`format_node_semver_replacing`] without the bare-partial precision rule, because
+/// `5` -> `6` would admit older, possibly affected `6.x` releases below the target.
+#[must_use]
+pub fn format_node_semver_replacing_floor(version: &ConcreteVersion, current: &str) -> String {
+    format_version_replacing_by_shape(version, current, bare_meaning(EcosystemId::Npm), || {
+        version.as_str().to_string()
+    })
+}
+
+/// Renders `version` as a replacement for the node-semver requirement `current` (npm and Deno).
+///
+/// A bare partial requirement (`5`, `1.2`) keeps its precision (`6`, `1.3`) so the rewrite
+/// preserves the x-range meaning (#1895); a pre-release target falls back to the full exact
+/// version, because a truncated form would not select it. Every other shape follows
+/// [`format_version_replacing_by_shape`]: an explicit `^`/`~`/`=` operator is kept and the rest
+/// collapse to a bare exact pin (#1576, #1885).
+#[must_use]
+pub fn format_node_semver_replacing(version: &ConcreteVersion, current: &str) -> String {
+    let exact = || version.as_str().to_string();
+    if let Some(precision) = PartialPrecision::of(current)
+        && let Ok(parsed) = node_semver::Version::parse(version.as_str())
+        && !parsed.is_prerelease()
+    {
+        return precision.render(&parsed);
+    }
+    format_version_replacing_by_shape(version, current, bare_meaning(EcosystemId::Npm), exact)
+}
+
 impl PackageRendering for NpmFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         let version = version.as_str();
         version.to_string()
     }
 
-    /// Keeps an explicit `^`/`~`/`=` operator and collapses every other shape (bare, compound,
-    /// wildcard, single-bound) to a bare version, which node-semver reads as an exact pin — a
-    /// narrowing, never a widening (#1576). Dropping the caret instead silently changed the
-    /// user's update policy (#1885).
-    // TODO(#1895): npm/deno bare partial ("5", "1.2") is a node-semver range; rewrite at the same precision instead of an exact pin
+    /// See [`format_node_semver_replacing`].
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        format_version_replacing_by_shape(version, current, bare_meaning(EcosystemId::Npm), || {
-            self.format_version_for_text_edit(version)
-        })
+        format_node_semver_replacing(version, current)
+    }
+
+    fn format_version_replacing_floor_for(
+        &self,
+        _dep: &dyn Dependency,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        format_node_semver_replacing_floor(version, current)
+    }
+
+    /// A bare version is an exact pin for node-semver, so it is the narrowest rendering that
+    /// excludes a newer withheld version from a caret/tilde range (#1892).
+    fn format_version_exact_pin(&self, version: &ConcreteVersion) -> Option<String> {
+        Some(self.format_version_for_text_edit(version))
     }
 
     fn package_url(&self, name: &PackageName) -> String {
@@ -844,6 +912,83 @@ mod tests {
         assert_eq!(formatter.format_version_replacing(&new, "~1.5.0"), "~2.0.0");
         assert_eq!(formatter.format_version_replacing(&new, "=1.5.0"), "=2.0.0");
         assert_eq!(formatter.format_version_replacing(&new, "*"), "2.0.0");
+    }
+
+    #[test]
+    fn test_format_version_replacing_bare_partial_keeps_precision_1895() {
+        let formatter = NpmFormatter;
+        let new = ConcreteVersion::new("6.2.1");
+        assert_eq!(formatter.format_version_replacing(&new, "5"), "6");
+        assert_eq!(formatter.format_version_replacing(&new, " 5 "), "6");
+        assert_eq!(formatter.format_version_replacing(&new, "1.2"), "6.2");
+        assert_eq!(formatter.format_version_replacing(&new, "1.2.3"), "6.2.1");
+        assert_eq!(formatter.format_version_replacing(&new, "1.x"), "6.2.1");
+        assert_eq!(formatter.format_version_replacing(&new, "^5"), "^6.2.1");
+    }
+
+    #[test]
+    fn test_format_version_replacing_wildcards_and_full_versions_collapse_to_exact_1895() {
+        let formatter = NpmFormatter;
+        let new = ConcreteVersion::new("6.2.1");
+        for current in ["*", "x", "1.x", "1.*", "1.2.x", "1.2.3", "0.0.1"] {
+            assert_eq!(
+                formatter.format_version_replacing(&new, current),
+                "6.2.1",
+                "{current}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_version_replacing_bare_partial_prerelease_target_is_exact_1895() {
+        let formatter = NpmFormatter;
+        let new = ConcreteVersion::new("6.0.0-beta.1");
+        assert_eq!(
+            formatter.format_version_replacing(&new, "5"),
+            "6.0.0-beta.1"
+        );
+        assert_eq!(
+            formatter.format_version_replacing(&new, "1.2"),
+            "6.0.0-beta.1"
+        );
+    }
+
+    /// Real node-semver semantics for the #1892 retry: the caret rendering of a fallback admits
+    /// the withheld newer version, the bare exact pin does not.
+    #[test]
+    fn test_exact_pin_excludes_withheld_version_where_caret_admits_it() {
+        let withheld = ConcreteVersion::new("2.2.0");
+        let fallback = ConcreteVersion::new("2.1.0");
+        let admits = |requirement: &str| {
+            let requirement = VersionReq::new(requirement);
+            NpmFormatter.requirement_already_resolves_to(&requirement, &withheld)
+        };
+        let caret = NpmFormatter.format_version_replacing(&fallback, "^1.0.0");
+        assert_eq!(caret, "^2.1.0");
+        assert!(admits(&caret));
+        let exact = NpmFormatter.format_version_exact_pin(&fallback).unwrap();
+        assert!(!admits(&exact));
+    }
+
+    #[test]
+    fn test_floor_safe_rendering_never_truncates_partial_requirement() {
+        let fix = ConcreteVersion::new("4.17.21");
+        assert_eq!(format_node_semver_replacing_floor(&fix, "3"), "4.17.21");
+        assert_eq!(format_node_semver_replacing_floor(&fix, "1.2"), "4.17.21");
+        assert_eq!(format_node_semver_replacing_floor(&fix, "^3"), "^4.17.21");
+        assert_eq!(
+            format_node_semver_replacing_floor(&fix, "~3.1.0"),
+            "~4.17.21"
+        );
+    }
+
+    #[test]
+    fn test_format_version_exact_pin_is_bare_version_1892() {
+        let new = ConcreteVersion::new("1.4.0");
+        assert_eq!(
+            NpmFormatter.format_version_exact_pin(&new).as_deref(),
+            Some("1.4.0")
+        );
     }
 
     #[test]

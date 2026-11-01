@@ -46,9 +46,8 @@ use crate::auth::{
 };
 use crate::keychain::KeychainStore;
 use crate::package_location::RegistryScope;
-use crate::scm::ScmToRegistryHandle;
+use crate::scm::{ScmSwizzleMode, ScmToRegistryHandle};
 use crate::scm_memo::ScmIdentityMemo;
-use deps_core::policy_config::ScmToRegistry;
 
 const REGISTRIES_FILE: &str = "registries.json";
 
@@ -919,12 +918,12 @@ impl SwiftParseContext {
     ///
     /// ```
     /// use deps_core::policy_config::ScmToRegistry;
-    /// use deps_swift::{ScmToRegistryHandle, SwiftParseContext};
+    /// use deps_swift::{ScmSwizzleMode, ScmToRegistryHandle, SwiftParseContext};
     /// use std::sync::Arc;
     ///
     /// let handle = Arc::new(ScmToRegistryHandle::new(ScmToRegistry::Replace));
-    /// let context = SwiftParseContext::default().with_scm_to_registry(Arc::clone(&handle));
-    /// assert!(format!("{context:?}").contains("replace: true"));
+    /// let _context = SwiftParseContext::default().with_scm_to_registry(Arc::clone(&handle));
+    /// assert_eq!(handle.get(), ScmSwizzleMode::Replace);
     /// ```
     #[must_use]
     pub fn with_scm_to_registry(mut self, handle: Arc<ScmToRegistryHandle>) -> Self {
@@ -940,7 +939,7 @@ impl SwiftParseContext {
     }
 
     /// The live `registries.swift_scm_to_registry` setting.
-    pub(crate) fn scm_mode(&self) -> ScmToRegistry {
+    pub(crate) fn scm_mode(&self) -> ScmSwizzleMode {
         self.scm_to_registry.get()
     }
 

@@ -29,7 +29,10 @@ use crate::types::{NpmDependency, NpmManifestKind};
 #[cfg(feature = "lsp-responses")]
 mod lsp;
 #[cfg(feature = "lsp-responses")]
-use lsp::{VERSION_OPERATOR_CHARS, catalog_hover_line};
+use lsp::{
+    CATALOG_USAGE_WAIT_BUDGET, VERSION_OPERATOR_CHARS, catalog_hover_line, catalog_usage_line,
+    override_hover_line,
+};
 
 /// npm ecosystem implementation.
 ///
@@ -50,6 +53,9 @@ pub struct NpmEcosystem {
     /// one process-wide policy handle with `ServerState` (mirrors
     /// `deps_cargo::ecosystem::CargoEcosystem`'s identical `context` field).
     context: NpmParseContext,
+    /// Memoized `pnpm-workspace.yaml` catalog reference counts for the hover "Used by" line.
+    #[cfg(feature = "lsp-responses")]
+    catalog_usage: crate::catalog_usage::CatalogUsageCache,
 }
 
 impl NpmEcosystem {
@@ -86,6 +92,8 @@ impl NpmEcosystem {
             registry,
             formatter: NpmFormatter,
             context: ctx,
+            #[cfg(feature = "lsp-responses")]
+            catalog_usage: crate::catalog_usage::CatalogUsageCache::default(),
         }
     }
 
@@ -220,7 +228,7 @@ impl Ecosystem for NpmEcosystem {
             )
             .await?;
 
-            let catalog_line = parse_result
+            let hovered = parse_result
                 .dependencies()
                 .into_iter()
                 .find(|dep| {
@@ -229,11 +237,36 @@ impl Ecosystem for NpmEcosystem {
                             .version_range()
                             .is_some_and(|r| deps_core::position_in_range(position.into(), r))
                 })
-                .and_then(|dep| dep.as_any().downcast_ref::<NpmDependency>())
-                .and_then(catalog_hover_line);
+                .and_then(|dep| dep.as_any().downcast_ref::<NpmDependency>());
 
-            if let Some(catalog_line) = catalog_line {
+            if let Some(catalog_line) = hovered.and_then(catalog_hover_line) {
                 hover.push_markdown(&catalog_line);
+            }
+            if let Some(override_line) = hovered.and_then(override_hover_line) {
+                hover.push_markdown(&override_line);
+            }
+            if let (Some(dep), Some(members)) = (
+                hovered.filter(|dep| {
+                    matches!(
+                        dep.origin,
+                        crate::types::NpmDependencyOrigin::CatalogEntry { .. }
+                    )
+                }),
+                parse_result
+                    .as_any()
+                    .downcast_ref::<NpmParseResult>()
+                    .and_then(|result| result.workspace_members.as_ref()),
+            ) {
+                let usage = self
+                    .catalog_usage
+                    .usage(members, CATALOG_USAGE_WAIT_BUDGET)
+                    .await;
+                if let Some(line) = usage
+                    .as_deref()
+                    .and_then(|index| catalog_usage_line(dep, index))
+                {
+                    hover.push_markdown(&line);
+                }
             }
 
             Some(hover)
@@ -317,7 +350,7 @@ impl Ecosystem for NpmEcosystem {
 }
 
 /// npm's `package.json` dependency-like section keys.
-const DEPENDENCY_KEYS: &[&str] = &[
+pub(crate) const DEPENDENCY_KEYS: &[&str] = &[
     "dependencies",
     "devDependencies",
     "peerDependencies",
@@ -447,11 +480,10 @@ mod tests {
     }
 
     /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against npm's REAL
-    /// formatter and a real `EcosystemReparse`. npm's default rendering writes a bare EXACT
-    /// version (not an auto-following range), so FR-025's rule is unconditional — one
-    /// assertion suffices (round-4 critic M5's "both sub-cases" requirement only applies to
-    /// the auto-following ecosystems). US-003's own `Absent`-path acceptance-criterion
-    /// fixture: `^1.0.0` with 2.0.0 cooled/fallback, 2.1.0 fresh.
+    /// formatter and a real `EcosystemReparse`. npm's default rendering keeps the written
+    /// operator (#1885), so a caret or tilde requirement rewritten to the fallback still admits
+    /// the withheld newer version and is rejected, while a bare exact requirement stays
+    /// writable. Fixture: `^1.0.0` with 2.0.0 cooled/fallback, 2.1.0 fresh.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_pins_writable_bare_exact_rendering() {
         let ecosystem = NpmEcosystem::new(Arc::new(deps_core::HttpCache::new()));
@@ -1979,6 +2011,99 @@ mod pnpm_workspace_tests {
 
     fn workspace_uri(dir: &Path) -> Url {
         Url::from_file_path(dir.join("pnpm-workspace.yaml")).unwrap()
+    }
+
+    async fn hover_at(
+        ecosystem: &NpmEcosystem,
+        content: &str,
+        uri: &Url,
+        position: Position,
+    ) -> String {
+        let parse_result = ecosystem.parse_manifest(content, uri).await.unwrap();
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        ecosystem
+            .generate_hover(
+                parse_result.as_ref(),
+                position,
+                VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover on a catalog entry")
+            .markdown()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_catalog_entry_hover_reports_workspace_usage() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        for (dir, deps) in [
+            ("packages/a", r#"{"dependencies":{"react":"catalog:"}}"#),
+            (
+                "packages/b",
+                r#"{"devDependencies":{"react":"catalog:default"}}"#,
+            ),
+            ("packages/c", r#"{"dependencies":{"react":"^18"}}"#),
+        ] {
+            std::fs::create_dir_all(root.path().join(dir)).unwrap();
+            std::fs::write(root.path().join(dir).join("package.json"), deps).unwrap();
+        }
+        let content = "packages:\n  - packages/*\ncatalog:\n  react: ^18.0.0\n  vue: ^3.0.0\n";
+        let uri = workspace_uri(root.path());
+        let ecosystem = ecosystem();
+
+        let used = hover_at(&ecosystem, content, &uri, Position::new(3, 4)).await;
+        assert!(used.contains("**Used by** 2 workspace packages"), "{used}");
+
+        let unused = hover_at(&ecosystem, content, &uri, Position::new(4, 4)).await;
+        assert!(
+            unused.contains("Not referenced by any workspace package"),
+            "{unused}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_override_entry_hover_names_its_scope() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let root = tempfile::tempdir().unwrap();
+        let content = "overrides:\n  \"bar>foo@<2\": ^2.0.0\n  plain: ^1.0.0\n";
+        let uri = workspace_uri(root.path());
+        let ecosystem = ecosystem();
+
+        let scoped = hover_at(&ecosystem, content, &uri, Position::new(1, 4)).await;
+        assert!(scoped.contains("**Override**"), "{scoped}");
+        assert!(scoped.contains("bar > foo@<2"), "{scoped}");
+
+        let plain = hover_at(&ecosystem, content, &uri, Position::new(2, 4)).await;
+        assert!(plain.contains("**Override**"), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn test_catalog_entry_hover_never_walks_outside_the_workspace_root() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("ws");
+        std::fs::create_dir_all(outer.path().join("sibling")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            outer.path().join("sibling/package.json"),
+            r#"{"dependencies":{"react":"catalog:"}}"#,
+        )
+        .unwrap();
+        let content = "packages:\n  - ../sibling\n  - ../*\ncatalog:\n  react: ^18.0.0\n";
+        let hover = hover_at(
+            &ecosystem(),
+            content,
+            &workspace_uri(&root),
+            Position::new(4, 4),
+        )
+        .await;
+        assert!(
+            hover.contains("Not referenced by any workspace package"),
+            "{hover}"
+        );
     }
 
     #[test]

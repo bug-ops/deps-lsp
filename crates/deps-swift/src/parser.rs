@@ -7,13 +7,13 @@
 use crate::config::{ResolvedSwiftRegistry, SwiftParseContext, SwiftRegistriesConfig};
 use crate::package_location::{PackageLocation, RegistryIdentity, RegistryIdentityBuf};
 use crate::scm::{
-    RegistryIndexUrl, ScmLookupUrl, SwiftForm, SwiftOrigin, SwiftRequirementForm, decide_from_memo,
+    RegistryIndexUrl, ScmLookupUrl, ScmSwizzleMode, SwiftForm, SwiftOrigin, SwiftRequirementForm,
+    decide_from_memo,
 };
 use crate::types::SwiftDependency;
 use deps_core::Result;
 use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use deps_core::parser::DependencySource;
-use deps_core::policy_config::ScmToRegistry;
 use deps_core::position::Range;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -318,8 +318,8 @@ impl<'c> IdResolver<'c> {
         let (context, _) = self.context?;
         let mode = context.scm_mode();
         match mode {
-            ScmToRegistry::Replace => {}
-            ScmToRegistry::Disabled => return None,
+            ScmSwizzleMode::Replace => {}
+            ScmSwizzleMode::Disabled => return None,
         }
         let scm = scm?;
         let config = self.user_config.get_or_init(|| context.resolve_user_tier());

@@ -316,6 +316,8 @@ impl Backend {
             .scm_to_registry
             .set(effects.registries.swift_scm_to_registry);
         #[cfg(feature = "swift")]
+        self.spawn_reparse_when_xcode_settles();
+        #[cfg(feature = "swift")]
         self.state
             .scm_to_registry
             .set_fetch_limits(effects.fetch_timeout, effects.max_concurrent_fetches);
@@ -349,6 +351,38 @@ impl Backend {
         // Issue #1517 critique S5: same rationale, for the OSV latest-check's effective state.
         self.state.set_osv_checks(effects.osv_checks);
         notices
+    }
+
+    /// With `swift_scm_to_registry = "from_xcode"` the effective mode is unknown until the
+    /// background Xcode read ends, after the setting-change reparse already ran with `Disabled`;
+    /// re-parses open Swift documents once it settles (#1879). Never blocks the caller.
+    #[cfg(feature = "swift")]
+    fn spawn_reparse_when_xcode_settles(&self) {
+        let handle = Arc::clone(&self.state.scm_to_registry);
+        if !handle.xcode_pending() {
+            return;
+        }
+        let (state, client, config) = (
+            Arc::clone(&self.state),
+            self.client.clone(),
+            Arc::clone(&self.config),
+        );
+        tokio::spawn(async move {
+            if !handle.xcode_settled().await {
+                return;
+            }
+            crate::document::reparse::reparse_open_documents(
+                crate::config::ReparseScope::Ecosystems(
+                    crate::config::SWIFT_SCM_TO_REGISTRY_ECOSYSTEMS.to_vec(),
+                ),
+                crate::document::RefetchPolicy::AllDependencies,
+                "xcode scm-to-registry default read",
+                state,
+                client,
+                config,
+            )
+            .await;
+        });
     }
 
     /// Delivers the notices [`Self::apply_resolved_config`] deferred.

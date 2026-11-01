@@ -10,6 +10,8 @@
 //! for JavaScript/TypeScript projects.
 
 pub mod catalog;
+#[cfg(feature = "lsp-responses")]
+pub mod catalog_usage;
 pub mod config;
 pub mod ecosystem;
 /// Version formatting and comparison for npm (node-semver ranges).
@@ -21,6 +23,7 @@ pub mod registry;
 pub mod types;
 /// Position-aware `pnpm-workspace.yaml` parsing: catalog entries as dependencies.
 pub mod workspace;
+pub mod workspace_members;
 
 pub use catalog::{CatalogEntryLocation, CatalogOrigin, CatalogOutcome, PnpmWorkspaceCache};
 pub use config::{
@@ -44,6 +47,7 @@ pub use parser::{NpmParseResult, parse_package_json, parse_package_json_with_con
 pub use registry::{NpmRegistry, package_url};
 pub use types::{
     CatalogId, CatalogName, CatalogSite, NpmDependency, NpmDependencyOrigin, NpmDependencySection,
-    NpmManifestKind, NpmPackage, NpmVersion,
+    NpmManifestKind, NpmPackage, NpmVersion, OverrideSelector, OverrideValue,
 };
 pub use workspace::parse_pnpm_workspace_manifest;
+pub use workspace_members::{PackageGlob, WorkspaceGlob, WorkspaceMembers};
