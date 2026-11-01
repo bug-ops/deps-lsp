@@ -128,7 +128,8 @@ pub fn parse_package_json_with_context(
     uri: &Url,
     ctx: &NpmParseContext,
 ) -> Result<NpmParseResult> {
-    let root: Value = deps_core::parse_json_checked(content.as_bytes())?;
+    let root: Value = deps_core::parse_json_checked(content.as_bytes())
+        .map_err(|e| e.into_deps_error("package.json"))?;
 
     // Build line offset table once for O(log n) position lookups
     let line_table = LineOffsetTable::new(content);
@@ -757,11 +758,14 @@ mod tests {
     #[test]
     fn test_parse_deeply_nested_json_rejected_before_parse() {
         // #430: a deeply nested `package.json` must be rejected by the depth guard, reported
-        // as the same `DepsError::Json` variant a genuinely malformed manifest produces.
+        // as a `NestingTooDeep` parse failure (#1905).
         let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
         let json = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
-        let result = parse_package_json(&json, &test_uri());
-        assert_matches!(result, Err(deps_core::DepsError::Json(_)));
+        let err = parse_package_json(&json, &test_uri()).expect_err("must be rejected");
+        assert_eq!(
+            err.parse_failure_kind(),
+            Some(deps_core::ParseFailureKind::NestingTooDeep)
+        );
     }
 
     #[test]

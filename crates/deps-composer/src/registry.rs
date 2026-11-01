@@ -515,7 +515,7 @@ fn deprecation_from_abandoned(abandoned: Option<&serde_json::Value>) -> Option<D
 /// Parses Packagist v2 API response JSON.
 fn parse_package_metadata(name: &str, data: &[u8]) -> Result<Vec<ComposerVersion>> {
     let response: PackagistResponse =
-        deps_core::parse_json_checked(data).map_err(DepsError::Json)?;
+        deps_core::parse_json_checked(data).map_err(|e| DepsError::Json(e.into_serde_json()))?;
 
     // Packagist uses lowercase package names as keys
     let key = name.to_lowercase();
@@ -546,7 +546,8 @@ struct SearchResult {
 
 /// Parses Packagist search API response.
 fn parse_search_response(data: &[u8]) -> Result<Vec<ComposerPackage>> {
-    let response: SearchResponse = deps_core::parse_json_checked(data).map_err(DepsError::Json)?;
+    let response: SearchResponse =
+        deps_core::parse_json_checked(data).map_err(|e| DepsError::Json(e.into_serde_json()))?;
 
     Ok(response
         .results

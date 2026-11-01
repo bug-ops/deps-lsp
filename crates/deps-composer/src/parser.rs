@@ -282,7 +282,8 @@ pub async fn parse_composer_json_with_lockfile(
 /// `artifact` repository (see [`has_bare_non_registry_repository`]) so the async wrapper knows
 /// whether consulting `composer.lock` is even worth the I/O.
 fn parse_composer_json_inner(content: &str, uri: &Url) -> Result<(ComposerParseResult, bool)> {
-    let root: Value = deps_core::parse_json_checked(content.as_bytes())?;
+    let root: Value = deps_core::parse_json_checked(content.as_bytes())
+        .map_err(|e| e.into_deps_error("composer.json"))?;
 
     let line_table = LineOffsetTable::new(content);
     let ast = JsonAst::parse(content);
@@ -1672,13 +1673,15 @@ mod tests {
     #[test]
     fn test_parse_deeply_nested_json_rejected_before_parse() {
         // #430: a deeply nested `composer.json` must be rejected by the
-        // depth guard rather than handed to `serde_json::from_str`. Reported
-        // as `DepsError::Json`, the same variant a genuinely malformed
-        // `composer.json` produces (unified via `deps_core::parse_json_checked`).
+        // depth guard rather than handed to `serde_json::from_str`, and reported
+        // as a `NestingTooDeep` parse failure (#1905).
         let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
         let json = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
-        let result = parse_composer_json(&json, &test_uri());
-        assert_matches!(result, Err(deps_core::DepsError::Json(_)));
+        let err = parse_composer_json(&json, &test_uri()).expect_err("must be rejected");
+        assert_eq!(
+            err.parse_failure_kind(),
+            Some(deps_core::ParseFailureKind::NestingTooDeep)
+        );
     }
 
     #[test]

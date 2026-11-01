@@ -1108,7 +1108,7 @@ fn parse_simple_api_response(package_name: &str, data: &[u8]) -> Result<Vec<Pypi
         deps_core::parse_json_checked(data).map_err(|e| DepsError::ApiResponse {
             package: package_name.to_string().into(),
             registry: REGISTRY,
-            source: e,
+            source: e.into_serde_json(),
         })?;
 
     let normalized_name = crate::name::normalize(package_name);
@@ -1145,7 +1145,7 @@ fn parse_package_info(package_name: &str, data: &[u8]) -> Result<PypiPackage> {
         deps_core::parse_json_checked(data).map_err(|e| DepsError::ApiResponse {
             package: package_name.to_string().into(),
             registry: REGISTRY,
-            source: e,
+            source: e.into_serde_json(),
         })?;
 
     let project_urls = response

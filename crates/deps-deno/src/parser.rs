@@ -20,6 +20,7 @@ use deps_core::{
     DepsError, MAX_JSON_NESTING_DEPTH, PackageName, Result, VersionReq, json_depth_error_message,
 };
 use jsonc_parser::ast::{Object, StringLit, Value};
+use jsonc_parser::errors::ParseErrorKind;
 use jsonc_parser::{CollectOptions, ParseOptions, parse_to_ast};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -211,7 +212,14 @@ pub fn parse_deno_json_with_context(
         &CollectOptions::default(),
         &ParseOptions::default(),
     )
-    .map_err(|e| DepsError::parse_error("deno.json", &e))?;
+    .map_err(|e| {
+        let kind = if matches!(e.kind(), ParseErrorKind::NestingDepthExceeded) {
+            deps_core::ParseFailureKind::NestingTooDeep
+        } else {
+            deps_core::ParseFailureKind::Malformed
+        };
+        DepsError::parse_error_of_kind("deno.json", kind, &e)
+    })?;
 
     if let Some(value) = &ast.value
         && let Err(depth) = check_ast_nesting_depth(value, MAX_JSON_NESTING_DEPTH)
@@ -793,6 +801,27 @@ mod tests {
         assert_matches!(
             result,
             Err(DepsError::ParseError { file_type, .. }) if file_type == "deno.json"
+        );
+    }
+
+    #[test]
+    fn test_parse_beyond_jsonc_parser_native_cap_is_nesting_too_deep() {
+        // #1905: 513 levels trips jsonc-parser's own cap before the AST depth guard runs.
+        let depth = 513;
+        let json = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        let err = parse_deno_json(&json, &test_uri()).expect_err("must be rejected");
+        assert_eq!(
+            err.parse_failure_kind(),
+            Some(deps_core::ParseFailureKind::NestingTooDeep)
+        );
+    }
+
+    #[test]
+    fn test_parse_syntax_error_is_malformed() {
+        let err = parse_deno_json("{", &test_uri()).expect_err("must be rejected");
+        assert_eq!(
+            err.parse_failure_kind(),
+            Some(deps_core::ParseFailureKind::Malformed)
         );
     }
 

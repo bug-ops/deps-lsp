@@ -494,7 +494,7 @@ fn parse_index(body: &[u8]) -> Result<PackageIndex> {
         deps_core::parse_json_checked(body).map_err(|e| DepsError::ApiResponse {
             package: "<pypi-simple-index>".to_string().into(),
             registry: REGISTRY,
-            source: e,
+            source: e.into_serde_json(),
         })?;
 
     let mut names = index.projects;

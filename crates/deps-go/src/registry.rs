@@ -909,7 +909,7 @@ fn parse_version_info(module_path: &str, data: &[u8]) -> Result<GoVersion> {
         deps_core::parse_json_checked(data).map_err(|e| DepsError::ApiResponse {
             package: module_path.to_string().into(),
             registry: REGISTRY,
-            source: e,
+            source: e.into_serde_json(),
         })?;
 
     let is_pseudo = is_pseudo_version(&info.version);

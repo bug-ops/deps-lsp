@@ -592,7 +592,7 @@ impl PackageRegistryClient {
                     DepsError::ApiResponse {
                         package: package.as_str().into(),
                         registry: REGISTRY,
-                        source,
+                        source: source.into_serde_json(),
                     }
                 })?;
             for (key, mut release) in page.releases {

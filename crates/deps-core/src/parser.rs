@@ -1024,8 +1024,8 @@ pub fn check_json_nesting_depth(
 /// Message text for a JSON payload rejected for nesting deeper than [`MAX_JSON_NESTING_DEPTH`].
 ///
 /// The single shared wording for every workspace call site that rejects on JSON nesting depth,
-/// whether it reports the rejection via `serde_json::Error` (as `json_depth_error` does, for
-/// [`parse_json_checked`]'s callers) or via its own error type (a caller whose depth check runs
+/// whether it reports the rejection via [`CheckedJsonError`] (for [`parse_json_checked`]'s
+/// callers) or via its own error type (a caller whose depth check runs
 /// against an already-parsed AST rather than raw bytes, and so cannot route through
 /// `parse_json_checked` itself, e.g. `deps-deno`'s `parse_deno_json`) — kept as one function so
 /// the two paths cannot silently drift apart.
@@ -1045,15 +1045,64 @@ pub fn json_depth_error_message(depth: usize) -> String {
     format!("JSON nesting depth {depth} exceeds maximum of {MAX_JSON_NESTING_DEPTH}")
 }
 
-/// Builds the `serde_json::Error` reporting a too-deep payload.
+/// Error returned by [`parse_json_checked`]: either the payload nests deeper than
+/// [`MAX_JSON_NESTING_DEPTH`] or `serde_json` rejects it.
 ///
-/// Shared internally by [`parse_json_checked`]'s two failure paths (too-deep vs. genuinely
-/// malformed) so both produce the exact same error type. Synthesized via
-/// `serde::de::Error::custom` so it is indistinguishable, to a caller's existing
-/// malformed-JSON handling, from an error `serde_json` itself would have produced.
-#[must_use]
-fn json_depth_error(depth: usize) -> serde_json::Error {
-    serde::de::Error::custom(json_depth_error_message(depth))
+/// Distinct from a bare `serde_json::Error` so callers can branch on "too deep" vs.
+/// "malformed" without string-matching a message, mirroring [`CheckedTomlError`].
+#[derive(Debug, thiserror::Error)]
+pub enum CheckedJsonError {
+    /// The payload nests deeper than [`MAX_JSON_NESTING_DEPTH`].
+    #[error("{}", json_depth_error_message(*depth))]
+    NestingTooDeep {
+        /// Depth reached the instant the limit was exceeded.
+        depth: usize,
+    },
+    /// The payload passed the depth guard but `serde_json` rejected it.
+    #[error(transparent)]
+    Syntax(serde_json::Error),
+}
+
+impl CheckedJsonError {
+    /// The [`ParseFailureKind`] this error maps to.
+    #[must_use]
+    pub const fn kind(&self) -> ParseFailureKind {
+        match self {
+            Self::NestingTooDeep { .. } => ParseFailureKind::NestingTooDeep,
+            Self::Syntax(_) => ParseFailureKind::Malformed,
+        }
+    }
+
+    /// Flattens into a `serde_json::Error` for sites whose error type is fixed to it (for
+    /// instance [`DepsError::ApiResponse`]); a depth rejection is synthesized via
+    /// `serde::de::Error::custom`, indistinguishable from a `serde_json`-produced one.
+    #[must_use]
+    pub fn into_serde_json(self) -> serde_json::Error {
+        match self {
+            Self::NestingTooDeep { .. } => serde::de::Error::custom(self.to_string()),
+            Self::Syntax(source) => source,
+        }
+    }
+
+    /// Converts into a [`DepsError`], naming `file_type` (for instance `"package.json"`) in a
+    /// depth rejection's message. A depth rejection becomes [`DepsError::ParseError`] of kind
+    /// [`ParseFailureKind::NestingTooDeep`]; a syntax error stays [`DepsError::Json`].
+    #[must_use]
+    pub fn into_deps_error(self, file_type: &str) -> DepsError {
+        match self {
+            Self::NestingTooDeep { .. } => {
+                DepsError::parse_error_of_kind(file_type, self.kind(), &self)
+            }
+            Self::Syntax(source) => DepsError::Json(source),
+        }
+    }
+}
+
+impl From<CheckedJsonError> for DepsError {
+    /// Same as [`CheckedJsonError::into_deps_error`] with the generic file type `"JSON"`.
+    fn from(error: CheckedJsonError) -> Self {
+        error.into_deps_error("JSON")
+    }
 }
 
 /// Deserializes `bytes` into `T`, first rejecting payloads whose JSON nesting exceeds
@@ -1061,14 +1110,15 @@ fn json_depth_error(depth: usize) -> serde_json::Error {
 ///
 /// The single shared entry point for every untrusted-JSON parse site in this workspace —
 /// collapses what would otherwise be a per-crate copy of [`check_json_nesting_depth`] +
-/// [`serde_json::from_slice`] into one call, and returns a `serde_json::Error` so a
-/// too-deep payload converts into a caller's `DepsError` exactly like any other
-/// malformed-JSON failure (via `?`, `.map_err(..)`, or `.ok()`).
+/// [`serde_json::from_slice`] into one call, and returns a [`CheckedJsonError`] that converts
+/// into [`DepsError`] via `?`: a too-deep payload becomes a
+/// [`ParseFailureKind::NestingTooDeep`] parse error, any other failure stays [`DepsError::Json`].
 ///
 /// # Errors
 ///
-/// Returns an error if `bytes` nests deeper than [`MAX_JSON_NESTING_DEPTH`], or
-/// `serde_json`'s own error if `bytes` is not valid JSON matching `T`.
+/// Returns [`CheckedJsonError::NestingTooDeep`] if `bytes` nests deeper than
+/// [`MAX_JSON_NESTING_DEPTH`], or [`CheckedJsonError::Syntax`] if `bytes` is not valid JSON
+/// matching `T`.
 ///
 /// # Examples
 ///
@@ -1079,15 +1129,18 @@ fn json_depth_error(depth: usize) -> serde_json::Error {
 /// assert_eq!(value["a"], 1);
 ///
 /// let deeply_nested = format!("{}1{}", "[".repeat(100), "]".repeat(100));
-/// assert!(parse_json_checked::<serde_json::Value>(deeply_nested.as_bytes()).is_err());
+/// assert!(matches!(
+///     parse_json_checked::<serde_json::Value>(deeply_nested.as_bytes()),
+///     Err(deps_core::parser::CheckedJsonError::NestingTooDeep { .. })
+/// ));
 /// ```
 pub fn parse_json_checked<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
-) -> std::result::Result<T, serde_json::Error> {
+) -> std::result::Result<T, CheckedJsonError> {
     if let Err(depth) = check_json_nesting_depth(bytes, MAX_JSON_NESTING_DEPTH) {
-        return Err(json_depth_error(depth));
+        return Err(CheckedJsonError::NestingTooDeep { depth });
     }
-    serde_json::from_slice(bytes)
+    serde_json::from_slice(bytes).map_err(CheckedJsonError::Syntax)
 }
 
 /// Dependency source location (shared across all ecosystems).
@@ -2464,6 +2517,67 @@ dev_dependencies:
         assert_eq!(
             check_json_nesting_depth(over_max.as_bytes(), depth),
             Err(depth + 1)
+        );
+    }
+
+    #[test]
+    fn test_checked_json_error_kind_maps_each_variant() {
+        let depth = MAX_JSON_NESTING_DEPTH + 1;
+        let deep = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        let Err(too_deep) = parse_json_checked::<serde_json::Value>(deep.as_bytes()) else {
+            panic!("expected a depth rejection");
+        };
+        assert!(matches!(
+            too_deep,
+            CheckedJsonError::NestingTooDeep { depth: d } if d == depth
+        ));
+        assert_eq!(too_deep.kind(), ParseFailureKind::NestingTooDeep);
+        let from_deep = DepsError::from(too_deep);
+        assert_eq!(
+            from_deep.parse_failure_kind(),
+            Some(ParseFailureKind::NestingTooDeep)
+        );
+
+        let Err(syntax) = parse_json_checked::<serde_json::Value>(b"{bad}") else {
+            panic!("expected a syntax error");
+        };
+        assert_eq!(syntax.kind(), ParseFailureKind::Malformed);
+        assert!(matches!(DepsError::from(syntax), DepsError::Json(_)));
+    }
+
+    #[test]
+    fn test_parse_json_checked_boundary_at_max_depth() {
+        let at_max = format!(
+            "{}1{}",
+            "[".repeat(MAX_JSON_NESTING_DEPTH),
+            "]".repeat(MAX_JSON_NESTING_DEPTH)
+        );
+        assert!(parse_json_checked::<serde_json::Value>(at_max.as_bytes()).is_ok());
+
+        let over = MAX_JSON_NESTING_DEPTH + 1;
+        let over_max = format!("{}1{}", "[".repeat(over), "]".repeat(over));
+        assert!(matches!(
+            parse_json_checked::<serde_json::Value>(over_max.as_bytes()),
+            Err(CheckedJsonError::NestingTooDeep { depth }) if depth == over
+        ));
+    }
+
+    #[test]
+    fn test_checked_json_error_into_deps_error_names_file_type() {
+        let err = CheckedJsonError::NestingTooDeep { depth: 65 }.into_deps_error("package.json");
+        assert!(err.to_string().contains("package.json"));
+        assert_eq!(
+            err.parse_failure_kind(),
+            Some(ParseFailureKind::NestingTooDeep)
+        );
+    }
+
+    #[test]
+    fn test_checked_json_error_into_serde_json_keeps_depth_message() {
+        let err = CheckedJsonError::NestingTooDeep { depth: 65 };
+        assert_eq!(
+            err.into_serde_json().to_string(),
+            json_depth_error_message(65)
         );
     }
 
