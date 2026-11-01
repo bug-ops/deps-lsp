@@ -1596,7 +1596,8 @@ mod tests {
     fn test_workspace_members_are_rooted_at_the_workspace_file_directory() {
         let result = manifest("packages:\n  - apps/*\n");
         let members = result.workspace_members.unwrap();
-        assert_eq!(members.root(), std::path::Path::new("/repo"));
+        let expected = uri().to_file_path().unwrap();
+        assert_eq!(members.root(), expected.parent().unwrap());
     }
 
     #[test]
