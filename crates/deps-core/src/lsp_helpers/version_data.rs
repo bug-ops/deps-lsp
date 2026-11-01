@@ -12,6 +12,7 @@ use super::{
     generate_diagnostics_from_cache, latest_verdict, local_cooldown_precedence,
 };
 use super::{DependencyOutcomes, GossipFindings, InteractiveFetchGate};
+use crate::error::FetchFailure;
 use crate::licenses::LicensePolicy;
 use crate::osv::{CandidateStatusMap, LatestStatusMap, VulnerabilityMap};
 use crate::{
@@ -333,6 +334,13 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub fn resolved_for(&self, key: &PackageKey) -> Option<&'a ConcreteVersion> {
         self.resolved.get(key.normalized())
+    }
+
+    /// The recorded registry fetch failure for `key`, if any.
+    #[must_use]
+    pub fn fetch_failure_for(&self, key: &PackageKey) -> Option<&'a FetchFailure> {
+        self.outcomes
+            .and_then(|outcomes| outcomes.fetch_failure(key.normalized()))
     }
 
     /// Whether the lock file resolved `key`.

@@ -657,7 +657,7 @@ fn push_provenance_hover_section(
                 markdown.push_static(" ");
             }
             markdown.push_static("ahead of latest release ");
-            markdown.push_code(latest_tag, FieldKind::Version);
+            markdown.push_code(latest_tag.as_str(), FieldKind::Version);
             markdown.push_static("\n\n");
         }
         Some(HoverProvenance::ResolvedViaRegistryIdentity { identity, scm }) => {
@@ -1710,7 +1710,10 @@ mod tests {
         let mut markdown = HoverMarkdown::new();
         let hostile = HoverProvenance::CommitAheadOfLatestRelease {
             ahead_by: None,
-            latest_tag: format!("v1`\n[x](http://evil){}", "y".repeat(5000)),
+            latest_tag: TagName::from_published(format!(
+                "v1`\n[x](http://evil){}",
+                "y".repeat(5000)
+            )),
         };
         push_provenance_hover_section(&mut markdown, Some(&hostile));
         assert!(markdown.as_str().len() < 1000, "{markdown}");

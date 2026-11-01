@@ -684,7 +684,7 @@ mod tests {
                 &uri,
                 content,
                 cached,
-                "\"express\": \"5.0.0\"",
+                "\"express\": \"^5.0.0\"",
             )
             .await;
         }

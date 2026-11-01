@@ -51,7 +51,7 @@ fn fixture(server: &mockito::ServerGuard) -> Fixture {
     eco.registry.probe_stores().record_latest(
         eco.formatter.normalize_package_name(&name),
         LatestRelease {
-            tag: "v1.0.0".into(),
+            tag: deps_core::lsp_helpers::TagName::from_published("v1.0.0".to_string()),
             commit: CommitSha::parse(&sha(RELEASE)).unwrap(),
         },
     );
@@ -258,7 +258,7 @@ async fn commit_ahead_of_release_and_on_default_branch_is_up_to_date() {
         Some(
             deps_core::lsp_helpers::HoverProvenance::CommitAheadOfLatestRelease {
                 ahead_by: None,
-                latest_tag: "v1.0.0".into(),
+                latest_tag: deps_core::lsp_helpers::TagName::from_published("v1.0.0".to_string()),
             }
         )
     );

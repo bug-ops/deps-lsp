@@ -28,10 +28,11 @@ const CHANNEL_CAPACITY: usize = 256;
 /// # Examples
 ///
 /// ```
-/// use deps_core::RefreshEvent;
+/// use deps_core::{ParseInputKey, RefreshEvent};
 ///
-/// let event = RefreshEvent::ReparseOpenDocuments { generation: 3 };
-/// assert_eq!(event, RefreshEvent::ReparseOpenDocuments { generation: 3 });
+/// let input = ParseInputKey::new("https://github.com/apple/swift-nio");
+/// let event = RefreshEvent::ReparseOpenDocuments { generation: 3, input: input.clone() };
+/// assert_eq!(event, RefreshEvent::ReparseOpenDocuments { generation: 3, input });
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefreshEvent {
@@ -43,11 +44,49 @@ pub enum RefreshEvent {
     /// the probe's own event would trigger it again.
     ProbeEvidence(NormalizedName),
     /// The identity decisions the ecosystem's parser consults changed (a new `generation`), so
-    /// its open documents must be re-parsed, at most once per content version and generation.
+    /// its open documents that depend on `input` must be re-parsed, at most once per content
+    /// version and generation.
     ReparseOpenDocuments {
         /// The monotonically increasing generation of the changed decisions.
         generation: u64,
+        /// The parse input whose decision changed; a document is re-parsed only when
+        /// [`Ecosystem::parse_depends_on`](crate::Ecosystem::parse_depends_on) holds for it.
+        input: ParseInputKey,
     },
+}
+
+/// Identifies one input of an ecosystem's parser whose decision changed, so an announcement
+/// reaches only the open documents that consult it.
+///
+/// Opaque to everything but the ecosystem: only the ecosystem that sends
+/// [`RefreshEvent::ReparseOpenDocuments`] mints a key, from its own canonical form of the input
+/// (Swift: a canonicalized repository URL), and only its own
+/// [`Ecosystem::parse_depends_on`](crate::Ecosystem::parse_depends_on) interprets it.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::ParseInputKey;
+///
+/// let key = ParseInputKey::new("https://github.com/apple/swift-nio");
+/// assert_eq!(key.as_str(), "https://github.com/apple/swift-nio");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParseInputKey(String);
+
+impl ParseInputKey {
+    /// Wraps the canonical form of a parse input; call it only from the ecosystem that owns the
+    /// input and sends the event.
+    #[must_use]
+    pub fn new(canonical: impl Into<String>) -> Self {
+        Self(canonical.into())
+    }
+
+    /// The canonical form the ecosystem minted the key from.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Receiver of an ecosystem's [`RefreshEvent`]s, see
@@ -144,9 +183,10 @@ impl RefreshSender {
         self.send(RefreshEvent::ProbeEvidence(repository));
     }
 
-    /// Announces that the ecosystem's open documents must be re-parsed for `generation`.
-    pub fn send_reparse_open_documents(&self, generation: u64) {
-        self.send(RefreshEvent::ReparseOpenDocuments { generation });
+    /// Announces that the open documents depending on `input` must be re-parsed for
+    /// `generation`.
+    pub fn send_reparse_open_documents(&self, generation: u64, input: ParseInputKey) {
+        self.send(RefreshEvent::ReparseOpenDocuments { generation, input });
     }
 
     fn send(&self, event: RefreshEvent) {
@@ -286,14 +326,18 @@ mod tests {
     fn probe_evidence_and_reparse_events_are_distinct_from_tag_index() {
         let mut f = Fixture::new();
         f.sender.send_probe_evidence(f.repository.clone());
-        f.sender.send_reparse_open_documents(7);
+        f.sender
+            .send_reparse_open_documents(7, ParseInputKey::new("input"));
         assert_eq!(
             f.rx.try_recv().unwrap(),
             RefreshEvent::ProbeEvidence(f.repository.clone())
         );
         assert_eq!(
             f.rx.try_recv().unwrap(),
-            RefreshEvent::ReparseOpenDocuments { generation: 7 }
+            RefreshEvent::ReparseOpenDocuments {
+                generation: 7,
+                input: ParseInputKey::new("input"),
+            }
         );
         assert!(f.rx.try_recv().is_err());
     }

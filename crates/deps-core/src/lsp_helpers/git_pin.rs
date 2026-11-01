@@ -184,7 +184,7 @@ pub fn git_tag_replacement(
     }
     index
         .release_tag(version.as_str())
-        .map_or(styled, str::to_string)
+        .map_or(styled, |tag| tag.as_str().to_string())
 }
 
 #[cfg(test)]

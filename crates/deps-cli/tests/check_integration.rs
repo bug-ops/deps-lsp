@@ -196,6 +196,36 @@ async fn test_table_and_json_formatters_render_the_same_pipeline_output() {
     assert_eq!(document.findings.len(), report.findings.len());
 }
 
+/// #1884: offline mode is a configured state, not a registry outage, so a dependency with a
+/// lock-file version must not be reported as a failed registry lookup.
+#[tokio::test]
+async fn test_offline_lockfile_dependency_is_not_reported_as_registry_lookup_failure() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0\"\n",
+    )
+    .expect("write fixture manifest");
+    std::fs::write(
+        dir.path().join("Cargo.lock"),
+        "version = 3\n\n[[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\n\
+         dependencies = [\"serde\"]\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.100\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+    )
+    .expect("write fixture lock file");
+
+    let (report, _had_error) = run_pipeline(dir.path()).await;
+
+    assert!(
+        report
+            .findings
+            .iter()
+            .all(|finding| !finding.message.contains("Registry lookup failed")),
+        "{:?}",
+        report.findings
+    );
+}
+
 #[tokio::test]
 async fn test_sarif_formatter_renders_the_same_pipeline_output() {
     // Directory name needs percent-encoding (`#` reads as a URI fragment separator, space is

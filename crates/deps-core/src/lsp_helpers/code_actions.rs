@@ -3,16 +3,107 @@ use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, Range, Wo
 
 use crate::edit::{FixTargetContext, replacement_text, requirement_is_placeholder_for};
 use crate::osv::ScanOutcome;
-use crate::{Dependency, PackageKey, ParseResult, Registry, VersionReq};
+use crate::{ConcreteVersion, Dependency, PackageKey, ParseResult, Registry, VersionReq};
 
 use super::{
     DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, FetchContext, InteractiveFetch,
-    InteractiveFetchRequest, LatestVerdict, LineOffsetTable, NoLiveList,
+    InteractiveFetchRequest, LatestVerdict, LineOffsetTable, NoLiveList, RequirementGate,
     UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, await_interactive_versions, candidate_verdict,
     is_safe_version_string, latest_verdict, literal_span_matches, requirement_is_unsatisfiable,
-    resolve_latest_status, resolve_scan_outcome, single_file_edit, slice_for_range,
-    strip_whitespace, warn_rejected_value,
+    requirement_len_exceeds_cap, resolve_latest_status, resolve_scan_outcome, single_file_edit,
+    slice_for_range, strip_whitespace, warn_rejected_value,
 };
+
+/// Whether REFACTOR "Update to X" items may offer pre-release versions (#1885).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrereleasePolicy {
+    /// Only the registry's own pick may be a pre-release; every other item must be stable.
+    StableOnly,
+    /// The dependency is already on a pre-release line, so pre-release items stay offered.
+    IncludePrereleases,
+}
+
+impl PrereleasePolicy {
+    /// Resolves the policy from ecosystem semantics rather than a blanket text check, so a
+    /// dependency already on a pre-release line never loses its pre-release offers:
+    ///
+    /// 1. the registry pick is itself a pre-release (Composer `minimum-stability`, npm's
+    ///    all-prerelease fallback);
+    /// 2. the in-use version (lock file, or a concrete pin) is a published pre-release;
+    /// 3. a lower-bound/exact comparator of the requirement names a published pre-release;
+    /// 4. a strict-SemVer matcher's requirement carries a pre-release tag on such a comparator.
+    ///
+    /// Upper bounds (`<2.0.0-0`) never opt in: they exist to exclude pre-releases.
+    // TODO(#1894): Composer @beta/@dev/@RC flags, Maven/NuGet intervals and exact-text compares should opt in to prerelease update offers
+    fn for_dependency(
+        prereleases: &HashSet<&str>,
+        pick: Option<&ConcreteVersion>,
+        in_use: Option<&ConcreteVersion>,
+        requirement: &VersionReq,
+        formatter: &dyn EcosystemFormatter,
+    ) -> Self {
+        if requirement_len_exceeds_cap(requirement.as_str()) {
+            return Self::StableOnly;
+        }
+        let published_prerelease = |text: &str| prereleases.contains(text);
+        let pick_is_prerelease = pick.is_some_and(|v| published_prerelease(v.as_str()));
+        let in_use_is_prerelease = in_use.is_some_and(|v| published_prerelease(v.as_str()));
+        let comparators = opt_in_comparator_versions(requirement.as_str());
+        let names_published_prerelease = comparators.iter().any(|c| published_prerelease(c));
+        let strict_tag = || {
+            formatter
+                .compile_requirement(requirement)
+                .is_some_and(|m| m.strict_prerelease_exclusion())
+                && comparators
+                    .iter()
+                    .any(|c| c.split('+').next().is_some_and(|core| core.contains('-')))
+        };
+        if pick_is_prerelease || in_use_is_prerelease || names_published_prerelease || strict_tag()
+        {
+            Self::IncludePrereleases
+        } else {
+            Self::StableOnly
+        }
+    }
+}
+
+/// Version texts of the comparators in `requirement` that can opt a dependency in to
+/// pre-releases: exact, lower-bound, caret and tilde comparators. `<`, `<=` and `!=` bounds
+/// (and the upper end of a hyphen range) are skipped, since they never admit a pre-release.
+fn opt_in_comparator_versions(requirement: &str) -> Vec<&str> {
+    const OPERATOR_CHARS: &[char] = &['<', '>', '=', '~', '^', '!'];
+    let mut versions = Vec::new();
+    let mut pending_operator = "";
+    let mut skip_next = false;
+    for token in requirement.split(|c: char| c.is_whitespace() || c == ',' || c == '|') {
+        if token.is_empty() {
+            continue;
+        }
+        if token == "-" {
+            skip_next = true;
+            continue;
+        }
+        let split_at = token
+            .find(|c: char| !OPERATOR_CHARS.contains(&c))
+            .unwrap_or(token.len());
+        let (own_operator, rest) = token.split_at(split_at);
+        if rest.is_empty() {
+            pending_operator = own_operator;
+            continue;
+        }
+        let operator = if own_operator.is_empty() {
+            std::mem::take(&mut pending_operator)
+        } else {
+            pending_operator = "";
+            own_operator
+        };
+        if std::mem::take(&mut skip_next) || operator.starts_with(['<', '!']) {
+            continue;
+        }
+        versions.push(rest);
+    }
+    versions
+}
 
 /// The vulnerability-fix quickfix built by [`build_vulnerability_fix_action`],
 /// bundled with the native-namespace version it targets so callers can dedup
@@ -654,8 +745,39 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
             &crate::existence_wildcard_req(),
             &parse_result.selection_context(),
         );
-        let display_items =
+        let mut display_items =
             prepare_version_display_items(registry_versions, dep.name(), latest_idx);
+        let in_use = versions.ecosystem.and_then(|ecosystem| {
+            super::resolve_in_use_version(
+                dep,
+                &key,
+                versions.resolved_map(),
+                versions.candidates_map(),
+                formatter,
+                ecosystem,
+            )
+        });
+        let prereleases: HashSet<&str> = registry_versions
+            .iter()
+            .filter(|v| v.is_prerelease())
+            .map(|v| v.version_string().as_str())
+            .collect();
+        let pick = latest_idx
+            .and_then(|i| registry_versions.get(i))
+            .map(|v| v.version_string());
+        // The registry pick (`is_latest`) is exempt: it already carries the ecosystem's
+        // stability policy, and hover must agree with this action about "latest" (#952).
+        if PrereleasePolicy::for_dependency(
+            &prereleases,
+            pick,
+            in_use.as_ref(),
+            version_req,
+            formatter,
+        ) == PrereleasePolicy::StableOnly
+        {
+            display_items
+                .retain(|item| item.is_latest || !prereleases.contains(item.version.as_str()));
+        }
         for item in display_items {
             if !is_safe_version_string(item.version.as_str()) {
                 warn_rejected_value(
@@ -2869,8 +2991,9 @@ mod tests {
         assert!(quickfix_titles(&actions).is_empty());
         let refactor_titles = refactor_titles(&actions);
         assert!(
-            refactor_titles.contains(&"2.0.0-beta1"),
-            "the pre-release must still be offered, just unlabeled: {refactor_titles:?}"
+            !refactor_titles.contains(&"2.0.0-beta1"),
+            "a non-pick pre-release is not offered for a stable requirement (#1885): \
+             {refactor_titles:?}"
         );
         assert!(
             refactor_titles.contains(&"1.5.0 (latest)"),
@@ -2887,6 +3010,162 @@ mod tests {
             vec!["1.5.0 (latest)"],
             "the stable version must be preferred, not the raw-top pre-release: {actions:?}"
         );
+    }
+
+    /// Runs the code-action pipeline for a one-dependency manifest and returns the REFACTOR
+    /// titles (#1885 prerelease-policy fixtures).
+    async fn refactor_titles_for(
+        requirement: &str,
+        registry_versions: Vec<(&'static str, bool)>,
+        lockfile_version: Option<&str>,
+        formatter: &dyn EcosystemFormatter,
+    ) -> Vec<String> {
+        let (dep, version_range, content) = vulnerable_dep(requirement);
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached = HashMap::new();
+        let mut resolved = HashMap::new();
+        if let Some(version) = lockfile_version {
+            resolved.insert(NormalizedName::for_test("pkg"), version.into());
+        }
+        let versions =
+            VersionData::new(&cached, &resolved).with_ecosystem(crate::EcosystemId::Cargo);
+        let registry = FixedVersionRegistry {
+            versions: registry_versions,
+        };
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            formatter,
+        )
+        .await;
+        refactor_titles(&actions)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    const MIXED_HEAD: [(&str, bool); 4] = [
+        ("2.0.0-beta1", false),
+        ("1.5.0", false),
+        ("1.4.0-rc1", false),
+        ("1.0.0", false),
+    ];
+
+    #[tokio::test]
+    async fn test_refactor_stable_requirement_drops_non_pick_prereleases() {
+        let titles = refactor_titles_for("1.0.0", MIXED_HEAD.to_vec(), None, &MOCK_FORMATTER).await;
+        assert!(titles.contains(&"1.5.0 (latest)".to_owned()), "{titles:?}");
+        assert!(
+            !titles
+                .iter()
+                .any(|t| t.contains("beta1") || t.contains("rc1")),
+            "{titles:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refactor_pick_prerelease_is_exempt_and_keeps_prereleases() {
+        let titles = refactor_titles_for(
+            "1.0.0",
+            vec![("2.0.0-beta2", false), ("2.0.0-beta1", false)],
+            None,
+            &MOCK_FORMATTER,
+        )
+        .await;
+        assert!(
+            titles.contains(&"2.0.0-beta2 (latest)".to_owned()),
+            "{titles:?}"
+        );
+        assert!(titles.contains(&"2.0.0-beta1".to_owned()), "{titles:?}");
+    }
+
+    #[tokio::test]
+    async fn test_refactor_lockfile_prerelease_in_use_keeps_prereleases() {
+        let titles = refactor_titles_for(
+            "1.0.0",
+            MIXED_HEAD.to_vec(),
+            Some("1.4.0-rc1"),
+            &MOCK_FORMATTER,
+        )
+        .await;
+        assert!(titles.contains(&"2.0.0-beta1".to_owned()), "{titles:?}");
+    }
+
+    #[tokio::test]
+    async fn test_refactor_requirement_naming_published_prerelease_keeps_prereleases() {
+        let titles =
+            refactor_titles_for("1.4.0-rc1", MIXED_HEAD.to_vec(), None, &MOCK_FORMATTER).await;
+        assert!(titles.contains(&"2.0.0-beta1".to_owned()), "{titles:?}");
+    }
+
+    #[tokio::test]
+    async fn test_refactor_strict_semver_prerelease_floor_keeps_prereleases() {
+        let titles = refactor_titles_for(
+            ">=0.9.0-alpha.1",
+            MIXED_HEAD.to_vec(),
+            None,
+            &StrictSemverFormatter,
+        )
+        .await;
+        assert!(titles.contains(&"2.0.0-beta1".to_owned()), "{titles:?}");
+    }
+
+    /// N1: `<2.0.0-0` exists to exclude pre-releases, so it must not opt in.
+    #[tokio::test]
+    async fn test_refactor_strict_semver_upper_bound_does_not_opt_in() {
+        let titles = refactor_titles_for(
+            ">=1.0.0, <3.0.0-0",
+            MIXED_HEAD.to_vec(),
+            None,
+            &StrictSemverFormatter,
+        )
+        .await;
+        assert!(!titles.iter().any(|t| t.contains("beta1")), "{titles:?}");
+        assert!(titles.contains(&"1.5.0 (latest)".to_owned()), "{titles:?}");
+    }
+
+    #[test]
+    fn test_prerelease_policy_oversized_requirement_is_stable_only() {
+        let prereleases: HashSet<&str> = HashSet::from(["1.0.0-rc1"]);
+        let within_cap = VersionReq::new(">=1.0.0-rc1");
+        let oversized = VersionReq::new(format!(
+            ">=1.0.0-rc1 {}",
+            "1".repeat(crate::lsp_helpers::MAX_REQUIREMENT_LEN)
+        ));
+        let policy = |req: &VersionReq| {
+            PrereleasePolicy::for_dependency(&prereleases, None, None, req, &MOCK_FORMATTER)
+        };
+        assert_eq!(policy(&within_cap), PrereleasePolicy::IncludePrereleases);
+        assert_eq!(policy(&oversized), PrereleasePolicy::StableOnly);
+    }
+
+    #[test]
+    fn test_opt_in_comparator_versions_skips_upper_bounds() {
+        let cases: [(&str, &[&str]); 9] = [
+            ("<2.0.0-0", &[]),
+            ("<=2.0.0-rc.1", &[]),
+            ("!=1.0.0-rc1", &[]),
+            (">=1.0.0 <2.0.0-0", &["1.0.0"]),
+            (">=1.0.0, <2.0.0-0", &["1.0.0"]),
+            ("^1.0.0-rc.1", &["1.0.0-rc.1"]),
+            ("1.0.0 - 2.0.0-rc.1", &["1.0.0"]),
+            ("~> 1.0.0.beta1", &["1.0.0.beta1"]),
+            ("^1 || >= 2.0.0-beta", &["1", "2.0.0-beta"]),
+        ];
+        for (requirement, expected) in cases {
+            assert_eq!(
+                opt_in_comparator_versions(requirement),
+                expected,
+                "{requirement:?}"
+            );
+        }
     }
 
     #[tokio::test]

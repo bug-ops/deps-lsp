@@ -227,7 +227,10 @@ impl ScmIdentityMemo {
                 state.generation
             })
         };
-        generation.inspect(|generation| self.events.send_reparse_open_documents(*generation));
+        generation.inspect(|generation| {
+            self.events
+                .send_reparse_open_documents(*generation, key.repository().to_parse_input());
+        });
         generation.is_some()
     }
 
@@ -439,7 +442,10 @@ mod tests {
         memo.record(&key, unique("apple.swift-nio"), now);
         assert_eq!(
             events.try_recv().unwrap(),
-            RefreshEvent::ReparseOpenDocuments { generation: 1 }
+            RefreshEvent::ReparseOpenDocuments {
+                generation: 1,
+                input: key.repository().to_parse_input(),
+            }
         );
         assert!(events.try_recv().is_err());
     }

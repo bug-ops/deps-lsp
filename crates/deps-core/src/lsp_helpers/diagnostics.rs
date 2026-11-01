@@ -2181,9 +2181,7 @@ pub async fn fetch_gossip_findings_batch(
         return HashMap::new();
     }
 
-    let names = declared_spellings(&keys);
-    let batch = client.gossip_findings_batch(system, &names).await;
-    rekey_by_declared(&keys, batch)
+    client.gossip_findings_batch(system, &keys).await
 }
 
 /// Force-refetches GOSSIP findings for `keys` under `ecosystem_id`'s deps.dev system,
@@ -2212,9 +2210,7 @@ pub async fn force_refresh_gossip_findings(
         return HashMap::new();
     };
 
-    let names = declared_spellings(keys);
-    let refreshed = client.force_refresh_gossip_findings(system, &names).await;
-    rekey_by_declared(keys, refreshed)
+    client.force_refresh_gossip_findings(system, keys).await
 }
 
 /// One [`PackageKey`] per distinct normalized name among `parse_result`'s public-registry
@@ -2231,32 +2227,6 @@ fn public_registry_keys(
         .filter(|dep| formatter.source_is_public_registry_content(&dep.source()))
         .map(|dep| PackageKey::new(dep.name(), formatter))
         .filter(|key| seen.insert(key.normalized().clone()))
-        .collect()
-}
-
-fn declared_spellings(keys: &[PackageKey]) -> Vec<String> {
-    keys.iter()
-        .map(|key| key.declared().as_str().to_string())
-        .collect()
-}
-
-/// Re-keys a deps.dev response (keyed by the spelling the request sent) by normalized name,
-/// dropping any entry whose name was not requested.
-fn rekey_by_declared<V>(
-    keys: &[PackageKey],
-    response: HashMap<String, V>,
-) -> HashMap<NormalizedName, V> {
-    let by_declared: HashMap<&str, &NormalizedName> = keys
-        .iter()
-        .map(|key| (key.declared().as_str(), key.normalized()))
-        .collect();
-    response
-        .into_iter()
-        .filter_map(|(name, value)| {
-            by_declared
-                .get(name.as_str())
-                .map(|normalized| ((*normalized).clone(), value))
-        })
         .collect()
 }
 
@@ -2410,10 +2380,13 @@ fn apply_in_use_yanked_rule(
 /// returns `None`. Always terminal — the orchestrator `continue`s unconditionally
 /// after calling this.
 ///
-/// R5-guard `in_lockfile` (#248): if `ctx.versions.resolved` contains either key,
-/// emits nothing at all — a registry fetch may simply have been rate-limited.
-/// Name-syntax validation is unaffected by this guard: it never depends on registry
-/// data.
+/// R5-guard `in_lockfile` (#248): if `ctx.versions.resolved` contains either key, the
+/// absence of cached versions is never reported as "unknown" or "invalid name" — a
+/// registry fetch may simply have been rate-limited. The one exception (#1884) is an
+/// attempted fetch that failed ([`FetchFailure::was_attempted`]): the user still sees
+/// R5c, since otherwise the lock-file version hides that the registry was never
+/// reached. [`FetchFailure::NotAttempted`] placeholders stay silent for lock-file
+/// dependencies.
 ///
 /// `fetch_failure = can_resolve_source(&dep.source()) &&
 /// outcomes.fetch_failure(normalized_name)` — a fetch error/timeout (#267) is not
@@ -2422,24 +2395,29 @@ fn apply_in_use_yanked_rule(
 ///
 /// `match formatter.validate_package_name(dep.name())` — **arm order is
 /// load-bearing**:
-/// 1. `Err(reason)` -> R5a `Invalid package name '{name}': {reason}`. Fires regardless
-///    of `can_resolve_source`/`fetch_failure` — a fetch failure must never mask an
-///    invalid name.
-/// 2. `Ok(())` + `fetch_failure.is_some()` + `versions.offline` -> R5b emits nothing
+/// 1. `Err(reason)` without a lock-file version -> R5a
+///    `Invalid package name '{name}': {reason}`. Fires regardless of
+///    `can_resolve_source`/`fetch_failure` — a fetch failure must never mask an
+///    invalid name. With a lock-file version an invalid name stays silent.
+/// 2. `Err(_)` with a lock-file version -> nothing (the arm exists so the guarded arm 1
+///    cannot fall through to the `Ok` arms).
+/// 3. `Ok(())` + `fetch_failure.is_some()` + `versions.offline` -> R5b emits nothing
 ///    (#483 I2): this is a deliberately configured mode, not a registry outage, and
 ///    [`offline_notice`]'s file-level notice already covers this dependency.
-/// 3. `Ok(())` + `fetch_failure.is_some()` -> R5c: queued into `fetch_failed`
+/// 4. `Ok(())` + `fetch_failure` that is `Some` and (no lock-file version, or
+///    [`FetchFailure::was_attempted`]) -> R5c: queued into `fetch_failed`
 ///    (deferred, collapsed by [`push_collapsed_fetch_failures`] — R8) rather than
 ///    pushed inline, since a fetch failure is a registry-wide condition that can hit
 ///    many dependencies identically.
-/// 4. `Ok(())` + `no_comparable_versions` -> R5e emits nothing (#550): the registry
+/// 5. `Ok(())` + lock-file version -> nothing (#248; D2: a registry NotFound stays silent).
+/// 6. `Ok(())` + `no_comparable_versions` -> R5e emits nothing (#550): the registry
 ///    fetch succeeded and the package demonstrably exists, it just has zero versions
 ///    comparable to the declared requirement (e.g. `dtolnay/rust-toolchain`'s only tag
 ///    `v1` isn't full semver) — reported by neither R5c ("couldn't be asked") nor R5d
 ///    ("no evidence it exists"). Checked before R5d so it takes priority over the
 ///    "absent cache entry" heuristic that would otherwise misclassify it.
-/// 5. `Ok(())` + `can_resolve_source` -> R5d `Unknown package '{name}'`.
-/// 6. `Ok(())` -> nothing (#248: unresolvable source, absent cache entry means "never
+/// 7. `Ok(())` + `can_resolve_source` -> R5d `Unknown package '{name}'`.
+/// 8. `Ok(())` -> nothing (#248: unresolvable source, absent cache entry means "never
 ///    fetched").
 fn apply_unknown_package_rule(
     diagnostics: &mut Vec<Diagnostic>,
@@ -2448,9 +2426,6 @@ fn apply_unknown_package_rule(
 ) {
     let dep = ctx.dep;
     let in_lockfile = ctx.versions.is_resolved(ctx.key);
-    if in_lockfile {
-        return;
-    }
 
     let can_resolve_source = ctx.formatter.can_resolve_source(&dep.source());
     let fetch_failure: Option<&FetchFailure> = can_resolve_source
@@ -2466,7 +2441,7 @@ fn apply_unknown_package_rule(
             .outcomes
             .is_some_and(|o| o.no_comparable_versions(ctx.key.normalized()));
     match ctx.formatter.validate_package_name(dep.name().as_str()) {
-        Err(reason) => {
+        Err(reason) if !in_lockfile => {
             diagnostics.push(
                 Diagnostic::new(
                     DiagnosticKind::Notice,
@@ -2479,8 +2454,9 @@ fn apply_unknown_package_rule(
                 .with_severity(ctx.severities.unknown),
             );
         }
+        Err(_) => {}
         Ok(()) if fetch_failure.is_some() && ctx.versions.network.is_offline() => {}
-        Ok(()) if fetch_failure.is_some() => {
+        Ok(()) if fetch_failure.is_some_and(|f| !in_lockfile || f.was_attempted()) => {
             let redacted_name = redact_name_for_diagnostic(dep.name());
             let message = match fetch_failure {
                 Some(FetchFailure::Actionable(hint)) => {
@@ -2500,6 +2476,9 @@ fn apply_unknown_package_rule(
                 failure: fetch_failure.cloned(),
             });
         }
+        // TODO(#1891): registry NotFound with a lockfile version stays silent (#248); needs a
+        // not-found outcome channel (follow-up to #1884)
+        Ok(()) if in_lockfile => {}
         Ok(()) if no_comparable_versions => {}
         Ok(()) if can_resolve_source => {
             diagnostics.push(
@@ -6582,6 +6561,71 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message().contains("Invalid package name"));
+    }
+
+    /// #1884: diagnostics for one lock-file-resolved dependency whose registry fetch ended in
+    /// `failure` (or had no recorded outcome), rendered with `formatter`.
+    fn lockfile_dep_diagnostics(
+        formatter: &dyn EcosystemFormatter,
+        failure: Option<FetchFailure>,
+    ) -> Vec<Diagnostic> {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "locked-pkg".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 10)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let name = crate::NormalizedName::for_test("locked-pkg");
+        let cached_versions = HashMap::new();
+        let resolved_versions =
+            HashMap::from([(name.clone(), crate::ConcreteVersion::new("1.0.0"))]);
+        let mut outcomes = DependencyOutcomes::new();
+        if let Some(failure) = failure {
+            outcomes = outcomes.with_fetch_failure(name, failure);
+        }
+        generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
+            formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        )
+    }
+
+    #[test]
+    fn test_lockfile_dep_attempted_fetch_failure_emits_registry_lookup_failed() {
+        for failure in [
+            FetchFailure::Transient,
+            FetchFailure::Actionable("rate limited".to_string()),
+        ] {
+            let diagnostics = lockfile_dep_diagnostics(&MOCK_FORMATTER, Some(failure.clone()));
+            assert_eq!(diagnostics.len(), 1, "{failure:?}");
+            assert!(
+                diagnostics[0].message().contains("Registry lookup failed"),
+                "{failure:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lockfile_dep_not_attempted_or_no_outcome_is_silent() {
+        assert!(
+            lockfile_dep_diagnostics(&MOCK_FORMATTER, Some(FetchFailure::NotAttempted)).is_empty()
+        );
+        assert!(lockfile_dep_diagnostics(&MOCK_FORMATTER, None).is_empty());
+    }
+
+    #[test]
+    fn test_lockfile_dep_invalid_name_is_silent() {
+        assert!(lockfile_dep_diagnostics(&RejectingFormatter, None).is_empty());
     }
 
     #[test]
@@ -12705,38 +12749,6 @@ mod tests {
 
     mod producer_key_tests {
         use super::*;
-        use crate::PackageName;
-        use crate::lsp_helpers::PackageNaming;
-
-        struct Lowercase;
-
-        impl PackageNaming for Lowercase {
-            fn normalized_spelling(&self, name: &PackageName) -> String {
-                name.as_str().to_lowercase()
-            }
-        }
-
-        fn key(name: &str) -> PackageKey {
-            PackageKey::new(&PackageName::new(name), &Lowercase)
-        }
-
-        #[test]
-        fn rekey_by_declared_normalizes_requested_names_and_drops_the_rest() {
-            let keys = [key("Django"), key("Flask")];
-            let response = HashMap::from([
-                ("Django".to_string(), 1),
-                ("Flask".to_string(), 2),
-                ("django".to_string(), 3),
-                ("unrequested".to_string(), 4),
-            ]);
-
-            let rekeyed = rekey_by_declared(&keys, response);
-
-            assert_eq!(rekeyed.len(), 2);
-            assert_eq!(rekeyed[key("django").normalized()], 1);
-            assert_eq!(rekeyed[key("flask").normalized()], 2);
-        }
-
         #[test]
         fn public_registry_keys_dedupes_by_first_occurrence() {
             let parse_result = MockParseResult {

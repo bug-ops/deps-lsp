@@ -34,7 +34,7 @@ mod memo;
 mod types;
 mod typosquat;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -55,11 +55,11 @@ pub use types::{
 pub use typosquat::TyposquatSignal;
 use typosquat::{SimilarPackageCandidate, TYPOSQUAT_MAX_CANDIDATES_CHECKED, evaluate_candidates};
 
-use crate::EcosystemId;
 use crate::cache::{BodyLimit, HttpCache};
 use crate::error::DepsError;
 use crate::lsp_helpers::{is_dot_segment, warn_rejected_value};
 use crate::single_flight::InFlightGuard;
+use crate::{EcosystemId, NormalizedName, PackageKey};
 
 const DEPS_DEV_API: &str = "https://api.deps.dev";
 
@@ -240,14 +240,15 @@ struct PopularityMemoKey {
     name: String,
 }
 
-/// Key for [`DepsDevClient`]'s package-level GOSSIP memo (issue #1456, spec 072) — mirrors
+/// Key for [`DepsDevClient`]'s package-level GOSSIP memo (issue #1456, spec 072; keyed by
+/// [`NormalizedName`] since #1883, so spellings deps.dev canonicalizes share one entry) — mirrors
 /// [`PopularityMemoKey`]'s exact shape: `default_version`'s cooldown/low-usage data is a
 /// property of the package's own current default version, not of whatever version a
 /// caller happens to ask about, so this is keyed package-level, not version-level.
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct GossipMemoKey {
     system: DepsDevSystem,
-    name: String,
+    name: NormalizedName,
 }
 
 /// Key for [`DepsDevClient`]'s version-scoped GOSSIP memo (issue #1456, spec 072) — backs
@@ -257,6 +258,7 @@ struct GossipMemoKey {
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct GossipVersionMemoKey {
     system: DepsDevSystem,
+    // TODO(#1893): still the declared spelling; key by NormalizedName like GossipMemoKey.
     name: String,
     version: String,
 }
@@ -488,6 +490,15 @@ pub struct DepsDevClient {
     /// (the same fix already applied for [`Self::gossip_in_flight`] itself, code-review C1)
     /// — a name already claimed here is skipped this round rather than raced on.
     gossip_refresh_in_flight: DashSet<GossipMemoKey>,
+}
+
+/// First occurrence of each normalized name in `keys`, so one GOSSIP call never claims,
+/// fetches or memoizes the same package twice under different spellings.
+fn dedup_by_normalized(keys: &[PackageKey]) -> Vec<&PackageKey> {
+    let mut seen = HashSet::new();
+    keys.iter()
+        .filter(|key| seen.insert(key.normalized()))
+        .collect()
 }
 
 /// Parses one `defaultVersion`/`requestedVersion` object into the consumer-facing
@@ -1073,10 +1084,14 @@ impl DepsDevClient {
         }
     }
 
-    /// Returns GOSSIP cooldown/low-usage findings for every name in `names` whose
+    /// Returns GOSSIP cooldown/low-usage findings for every package in `keys` whose
     /// package-level `defaultVersion` carries a resolvable result (issue #1456, spec 072)
     /// — one `POST /v3alpha/findingsbatch` call for the memo-misses, never one call per
     /// name.
+    ///
+    /// Memo, in-flight claims and the result map are keyed by [`NormalizedName`] (#1883):
+    /// keys sharing a normalized name (PyPI `Foo_Bar` / `foo-bar`) are collapsed to their
+    /// first occurrence, and only that key's declared spelling is sent on the wire.
     ///
     /// A name already served from `Self::gossip`'s memo (within `GOSSIP_SUCCESS_TTL`/
     /// `GOSSIP_ERROR_TTL`) contributes nothing to the outbound request and lands directly
@@ -1097,27 +1112,26 @@ impl DepsDevClient {
     pub async fn gossip_findings_batch(
         &self,
         system: DepsDevSystem,
-        names: &[String],
-    ) -> HashMap<String, GossipFindings> {
+        keys: &[PackageKey],
+    ) -> HashMap<NormalizedName, GossipFindings> {
         let mut result = HashMap::new();
-        let mut misses: Vec<String> = Vec::new();
+        let mut misses: Vec<&PackageKey> = Vec::new();
 
-        for name in names {
-            let key = self.gossip_key(system, name);
-            if let Some(outcome) = self.gossip.get_fresh(&key) {
+        for key in dedup_by_normalized(keys) {
+            if let Some(outcome) = self.gossip.get_fresh(&self.gossip_key(system, key)) {
                 if let Some(findings) = outcome.into_value() {
-                    result.insert(name.clone(), findings);
+                    result.insert(key.normalized().clone(), findings);
                 }
                 continue;
             }
-            misses.push(name.clone());
+            misses.push(key);
         }
 
         if misses.is_empty() {
             return result;
         }
 
-        let mut claimed: Vec<String> = Vec::with_capacity(misses.len());
+        let mut claimed: Vec<&PackageKey> = Vec::with_capacity(misses.len());
         // Security review C1/impl-critic C1: held across the whole fetch below (including
         // the semaphore wait), not removed manually only on the normal-return path — a
         // `tokio::time::timeout` around this call (as `run_gossip_prefetch` uses) can drop
@@ -1130,11 +1144,11 @@ impl DepsDevClient {
         // (each a [`memo::CoalescedMemo`] wrapping its own `DashMap`-backed in-flight join),
         // and this same `GossipClaim` for `Self::gossip_version_in_flight`.
         let mut guards: Vec<GossipClaim<'_>> = Vec::with_capacity(misses.len());
-        for name in misses {
-            let key = self.gossip_key(system, &name);
-            if self.gossip_in_flight.insert(key.clone()) {
-                guards.push(InFlightGuard::new(&self.gossip_in_flight, key));
-                claimed.push(name);
+        for key in misses {
+            let memo_key = self.gossip_key(system, key);
+            if self.gossip_in_flight.insert(memo_key.clone()) {
+                guards.push(InFlightGuard::new(&self.gossip_in_flight, memo_key));
+                claimed.push(key);
             }
         }
         if claimed.is_empty() {
@@ -1162,25 +1176,25 @@ impl DepsDevClient {
         // concurrent caller waiting on the same key doesn't wait longer than necessary.
         drop(guards);
 
-        for name in claimed {
+        for key in claimed {
             // A name absent from `fetched` (the whole call failed, or this specific name
             // was missing from `responses[]`) memoizes as `Degraded` so it is retried soon;
             // a name present — even as `None`, a resolvable "no cooldown/low-usage finding"
             // answer — memoizes as `Definitive`.
-            let outcome = match fetched.get(&name) {
+            let outcome = match fetched.get(key.normalized()) {
                 Some(findings) => CallOutcome::Definitive(findings.clone()),
                 None => CallOutcome::Degraded(None),
             };
             if let Some(findings) = outcome.clone().into_value() {
-                result.insert(name.clone(), findings);
+                result.insert(key.normalized().clone(), findings);
             }
-            self.gossip.insert(self.gossip_key(system, &name), outcome);
+            self.gossip.insert(self.gossip_key(system, key), outcome);
         }
 
         result
     }
 
-    /// Force-refetches GOSSIP findings for `names`, bypassing whatever the per-package memo
+    /// Force-refetches GOSSIP findings for `keys`, bypassing whatever the per-package memo
     /// currently holds (issue #1456, spec 072 FR-011/M21a) — the counterpart to
     /// [`Self::gossip_findings_batch`]'s normal, memo-respecting path, for a caller that has
     /// already detected a genuine staleness signal (a version-equality mismatch, FR-008) and
@@ -1207,14 +1221,14 @@ impl DepsDevClient {
     pub async fn force_refresh_gossip_findings(
         &self,
         system: DepsDevSystem,
-        names: &[String],
-    ) -> HashMap<String, GossipFindings> {
-        let mut eligible: Vec<String> = Vec::with_capacity(names.len());
-        let mut guards: Vec<GossipClaim<'_>> = Vec::with_capacity(names.len());
+        keys: &[PackageKey],
+    ) -> HashMap<NormalizedName, GossipFindings> {
+        let mut eligible: Vec<&PackageKey> = Vec::with_capacity(keys.len());
+        let mut guards: Vec<GossipClaim<'_>> = Vec::with_capacity(keys.len());
         let now = Instant::now();
 
-        for name in names {
-            let key = self.gossip_key(system, name);
+        for package in dedup_by_normalized(keys) {
+            let key = self.gossip_key(system, package);
             if !self.gossip_refresh_in_flight.insert(key.clone()) {
                 continue;
             }
@@ -1237,7 +1251,7 @@ impl DepsDevClient {
                 );
             }
             self.gossip_last_refresh_attempt.insert(key, now);
-            eligible.push(name.clone());
+            eligible.push(package);
             guards.push(guard);
         }
 
@@ -1247,8 +1261,8 @@ impl DepsDevClient {
 
         // M21a: evict the main memo entry before fetching, so this call cannot serve the
         // same stale `defaultVersion` it was triggered to correct.
-        for name in &eligible {
-            self.gossip.remove(&self.gossip_key(system, name));
+        for key in &eligible {
+            self.gossip.remove(&self.gossip_key(system, key));
         }
 
         // Finding #3: same global cap `gossip_findings_batch` already applies.
@@ -1270,28 +1284,32 @@ impl DepsDevClient {
         drop(guards);
 
         let mut result = HashMap::new();
-        for name in eligible {
-            let outcome = match fetched.get(&name) {
+        for key in eligible {
+            let outcome = match fetched.get(key.normalized()) {
                 Some(findings) => CallOutcome::Definitive(findings.clone()),
                 None => CallOutcome::Degraded(None),
             };
             if let Some(findings) = outcome.clone().into_value() {
-                result.insert(name.clone(), findings);
+                result.insert(key.normalized().clone(), findings);
             }
-            self.gossip.insert(self.gossip_key(system, &name), outcome);
+            self.gossip.insert(self.gossip_key(system, key), outcome);
         }
         result
     }
 
-    fn gossip_key(&self, system: DepsDevSystem, name: &str) -> GossipMemoKey {
+    fn gossip_key(&self, system: DepsDevSystem, key: &PackageKey) -> GossipMemoKey {
         GossipMemoKey {
             system,
-            name: name.to_string(),
+            name: key.normalized().clone(),
         }
     }
 
     /// One (possibly paginated) `POST /v3alpha/findingsbatch` call for `names`
     /// (live-verified request/response shape 2026-09-26, `npm/vite` + `npm/left-pad`).
+    ///
+    /// The wire request carries each key's declared spelling; each response is mapped back
+    /// to its normalized name by the request echo (not by the canonical
+    /// `findings.packageKey.name`), and an entry for a spelling that was not sent is dropped.
     ///
     /// Maps each resolved name to `Some(findings)`, or `None` when GOSSIP reported no
     /// resolvable `defaultVersion` for it. The whole call failing (network, timeout,
@@ -1302,18 +1320,22 @@ impl DepsDevClient {
     async fn fetch_gossip_batch(
         &self,
         system: DepsDevSystem,
-        names: &[String],
-    ) -> HashMap<String, Option<GossipFindings>> {
+        keys: &[&PackageKey],
+    ) -> HashMap<NormalizedName, Option<GossipFindings>> {
         let url = format!("{}v3alpha/findingsbatch", self.origin());
         let system_upper = system.as_path_segment().to_uppercase();
-        let requests: Vec<GossipBatchRequestWire<'_>> = names
+        let requests: Vec<GossipBatchRequestWire<'_>> = keys
             .iter()
-            .map(|name| GossipBatchRequestWire {
+            .map(|key| GossipBatchRequestWire {
                 package_key: GossipPackageKeyRefWire {
                     system: &system_upper,
-                    name,
+                    name: key.declared().as_str(),
                 },
             })
+            .collect();
+        let by_declared: HashMap<&str, &NormalizedName> = keys
+            .iter()
+            .map(|key| (key.declared().as_str(), key.normalized()))
             .collect();
 
         let mut result = HashMap::new();
@@ -1364,13 +1386,16 @@ impl DepsDevClient {
             };
 
             for entry in wire.responses {
-                let name = entry.request.package_key.name;
+                let Some(normalized) = by_declared.get(entry.request.package_key.name.as_str())
+                else {
+                    continue;
+                };
                 let findings = entry
                     .findings
                     .default_version
                     .as_ref()
                     .map(gossip_findings_from_entry);
-                result.insert(name, findings);
+                result.insert((*normalized).clone(), findings);
             }
 
             if wire.next_page_token.is_empty() {
@@ -3273,6 +3298,23 @@ mod tests {
 
     // --- GOSSIP (issue #1456, spec 072) ---
 
+    fn pk(name: &str) -> PackageKey {
+        PackageKey::new(&crate::PackageName::new(name), &Lowercase)
+    }
+
+    fn nn(name: &str) -> NormalizedName {
+        pk(name).normalized().clone()
+    }
+
+    /// PyPI-style normalization (case-fold, `_` -> `-`) for the #1883 spelling tests.
+    struct Lowercase;
+
+    impl crate::lsp_helpers::PackageNaming for Lowercase {
+        fn normalized_spelling(&self, name: &crate::PackageName) -> String {
+            name.as_str().to_lowercase().replace('_', "-")
+        }
+    }
+
     /// Live-captured response shape (2026-09-26, `POST /v3alpha/findingsbatch` against
     /// `npm/vite` + `npm/left-pad`) — the regression fixture every batch test below reuses.
     /// Also the fixture that caught a real bug during implementation: `GossipRiskWire`'s
@@ -3314,13 +3356,10 @@ mod tests {
             .await;
 
         let result = client
-            .gossip_findings_batch(
-                DepsDevSystem::Npm,
-                &["vite".to_string(), "left-pad".to_string()],
-            )
+            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite"), pk("left-pad")])
             .await;
 
-        let vite = result.get("vite").expect("vite findings expected");
+        let vite = result.get(&nn("vite")).expect("vite findings expected");
         assert_eq!(vite.version, "8.3.1");
         let cooldown = vite.cooldown.expect("active cooldown expected");
         assert_eq!(cooldown.risk, GossipRiskLevel::High);
@@ -3332,7 +3371,9 @@ mod tests {
         // `cooldownEnd` field (2018, long past) rather than a `COOLDOWN` finding — this is
         // exactly the tri-state fix: GOSSIP data is present and authoritatively says "not
         // active", distinguishable from "no GOSSIP data at all".
-        let left_pad = result.get("left-pad").expect("left-pad findings expected");
+        let left_pad = result
+            .get(&nn("left-pad"))
+            .expect("left-pad findings expected");
         let left_pad_cooldown = left_pad
             .cooldown
             .expect("cooldownEnd fallback must still populate cooldown");
@@ -3357,11 +3398,11 @@ mod tests {
             .await;
 
         let result = client
-            .gossip_findings_batch(DepsDevSystem::Npm, &["missing".to_string()])
+            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("missing")])
             .await;
 
         assert!(
-            !result.contains_key("missing"),
+            !result.contains_key(&nn("missing")),
             "NFR-002: a name with no resolvable defaultVersion must be absent, not present \
              with an empty GossipFindings"
         );
@@ -3379,18 +3420,73 @@ mod tests {
             .await;
 
         client
-            .gossip_findings_batch(
-                DepsDevSystem::Npm,
-                &["vite".to_string(), "left-pad".to_string()],
-            )
+            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite"), pk("left-pad")])
             .await;
         client
-            .gossip_findings_batch(
-                DepsDevSystem::Npm,
-                &["vite".to_string(), "left-pad".to_string()],
-            )
+            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite"), pk("left-pad")])
             .await;
 
+        batch.assert_async().await;
+    }
+
+    const GOSSIP_BATCH_FOO_BAR_ECHO: &str = r#"{"responses":[
+        {"request":{"packageKey":{"system":"PYPI","name":"Foo_Bar"}},
+         "findings":{"packageKey":{"system":"PYPI","name":"foo-bar"},"recommendedVersions":[],
+             "defaultVersion":{"versionKey":{"system":"PYPI","name":"foo-bar","version":"2.0.0"},
+                 "isDefault":true,"findings":[]},
+             "packageFindings":[]}}
+    ], "nextPageToken":""}"#;
+
+    /// #1883: a second spelling of an already-memoized normalized name is a memo hit, and the
+    /// response is matched by the request echo even though deps.dev answers with the canonical
+    /// `packageKey.name`.
+    #[tokio::test]
+    async fn gossip_findings_batch_memo_is_shared_across_spellings_of_one_normalized_name() {
+        let (mut server, client) = mock_client().await;
+        let batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body(GOSSIP_BATCH_FOO_BAR_ECHO)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let first = client
+            .gossip_findings_batch(DepsDevSystem::Pypi, &[pk("Foo_Bar")])
+            .await;
+        assert_eq!(first[&nn("foo-bar")].version, "2.0.0");
+
+        let second = client
+            .gossip_findings_batch(DepsDevSystem::Pypi, &[pk("foo-bar")])
+            .await;
+        assert_eq!(second[&nn("foo-bar")].version, "2.0.0");
+
+        batch.assert_async().await;
+    }
+
+    /// #1883: two spellings of one normalized name in the same call collapse to the first
+    /// declared spelling on the wire.
+    #[tokio::test]
+    async fn gossip_findings_batch_same_call_spellings_send_one_wire_entry() {
+        let (mut server, client) = mock_client().await;
+        let batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .match_body(mockito::Matcher::Regex(
+                r#"^\{"requests":\[\{"packageKey":\{"system":"PYPI","name":"Foo_Bar"\}\}\]"#
+                    .to_string(),
+            ))
+            .with_status(200)
+            .with_body(GOSSIP_BATCH_FOO_BAR_ECHO)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = client
+            .gossip_findings_batch(DepsDevSystem::Pypi, &[pk("Foo_Bar"), pk("foo-bar")])
+            .await;
+
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key(&nn("foo-bar")));
         batch.assert_async().await;
     }
 
@@ -3433,18 +3529,15 @@ mod tests {
             .await;
 
         let result = client
-            .gossip_findings_batch(
-                DepsDevSystem::Npm,
-                &["vite".to_string(), "left-pad".to_string()],
-            )
+            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite"), pk("left-pad")])
             .await;
 
         assert!(
-            result.contains_key("vite"),
+            result.contains_key(&nn("vite")),
             "page 1's result must be included"
         );
         assert!(
-            result.contains_key("left-pad"),
+            result.contains_key(&nn("left-pad")),
             "page 2's result must be included"
         );
         assert_eq!(
@@ -3469,7 +3562,7 @@ mod tests {
             .await;
 
         let result = client
-            .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
             .await;
         assert!(result.is_empty());
     }
@@ -3484,7 +3577,7 @@ mod tests {
             .await;
 
         let result = client
-            .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
             .await;
         assert!(result.is_empty());
 
@@ -3492,7 +3585,7 @@ mod tests {
             .gossip
             .ttl_of(&GossipMemoKey {
                 system: DepsDevSystem::Npm,
-                name: "vite".to_string(),
+                name: nn("vite"),
             })
             .expect("memo entry expected even on failure");
         assert_eq!(entry_ttl, GOSSIP_ERROR_TTL);
@@ -3511,7 +3604,7 @@ mod tests {
             .await;
 
         client
-            .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
             .await;
 
         batch.assert_async().await;
@@ -3546,7 +3639,7 @@ mod tests {
                 let client = Arc::clone(&client);
                 async move {
                     client
-                        .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+                        .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
                         .await
                 }
             },
@@ -3554,7 +3647,7 @@ mod tests {
                 let client = Arc::clone(&client);
                 async move {
                     client
-                        .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+                        .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
                         .await
                 }
             }
@@ -3562,7 +3655,7 @@ mod tests {
         // The claim winner gets the real result; the loser sees the name already claimed
         // and returns without it this round (its own next prefetch trigger gets it from
         // the memo the winner warms).
-        assert!(a.contains_key("vite") || b.contains_key("vite"));
+        assert!(a.contains_key(&nn("vite")) || b.contains_key(&nn("vite")));
         assert_eq!(
             call_count.load(Ordering::SeqCst),
             1,
@@ -3596,7 +3689,7 @@ mod tests {
         let spawn_client = Arc::clone(&client);
         let handle = tokio::spawn(async move {
             spawn_client
-                .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+                .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
                 .await
         });
         // Deliberately shorter than the mock's 60ms response — cancels (drops) the
@@ -3614,10 +3707,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         let second = client
-            .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
             .await;
         assert!(
-            second.contains_key("vite"),
+            second.contains_key(&nn("vite")),
             "a leaked in-flight claim would make this call skip \"vite\" forever — got: \
              {second:?}"
         );
@@ -3657,7 +3750,7 @@ mod tests {
                 let client = Arc::clone(&client);
                 tokio::spawn(async move {
                     client
-                        .gossip_findings_batch(DepsDevSystem::Npm, &[format!("pkg-{i}")])
+                        .gossip_findings_batch(DepsDevSystem::Npm, &[pk(&format!("pkg-{i}"))])
                         .await
                 })
             })
@@ -3712,7 +3805,7 @@ mod tests {
             .await;
 
         let result = client
-            .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
             .await;
         assert!(
             result.is_empty(),
@@ -3743,14 +3836,14 @@ mod tests {
 
         // Warms the memo with a fresh (well within `GOSSIP_SUCCESS_TTL`) entry.
         client
-            .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
             .await;
 
         let refreshed = client
-            .force_refresh_gossip_findings(DepsDevSystem::Npm, &["vite".to_string()])
+            .force_refresh_gossip_findings(DepsDevSystem::Npm, &[pk("vite")])
             .await;
         assert!(
-            refreshed.contains_key("vite"),
+            refreshed.contains_key(&nn("vite")),
             "force refresh must still return a result, not just bypass the memo silently"
         );
         batch.assert_async().await;
@@ -3770,12 +3863,12 @@ mod tests {
             .await;
 
         let first = client
-            .force_refresh_gossip_findings(DepsDevSystem::Npm, &["vite".to_string()])
+            .force_refresh_gossip_findings(DepsDevSystem::Npm, &[pk("vite")])
             .await;
-        assert!(first.contains_key("vite"));
+        assert!(first.contains_key(&nn("vite")));
 
         let second = client
-            .force_refresh_gossip_findings(DepsDevSystem::Npm, &["vite".to_string()])
+            .force_refresh_gossip_findings(DepsDevSystem::Npm, &[pk("vite")])
             .await;
         assert!(
             second.is_empty(),
@@ -3800,10 +3893,10 @@ mod tests {
             .await;
 
         client
-            .force_refresh_gossip_findings(DepsDevSystem::Npm, &["vite".to_string()])
+            .force_refresh_gossip_findings(DepsDevSystem::Npm, &[pk("vite")])
             .await;
         client
-            .force_refresh_gossip_findings(DepsDevSystem::Npm, &["left-pad".to_string()])
+            .force_refresh_gossip_findings(DepsDevSystem::Npm, &[pk("left-pad")])
             .await;
 
         // The real proof: the mock's `.expect(2)` above only passes if refreshing
@@ -3822,7 +3915,7 @@ mod tests {
             client.gossip_last_refresh_attempt.insert(
                 GossipMemoKey {
                     system: DepsDevSystem::Npm,
-                    name: format!("pkg-{i}"),
+                    name: nn(&format!("pkg-{i}")),
                 },
                 now,
             );
@@ -3838,7 +3931,7 @@ mod tests {
         client.gossip_last_refresh_attempt.insert(
             GossipMemoKey {
                 system: DepsDevSystem::Npm,
-                name: "overflow".to_string(),
+                name: nn("overflow"),
             },
             now,
         );

@@ -520,7 +520,10 @@ mod tests {
                     tag_index("o/shared"),
                     evidence("o/shared"),
                     evidence("o/shared"),
-                    RefreshEvent::ReparseOpenDocuments { generation: 1 },
+                    RefreshEvent::ReparseOpenDocuments {
+                        generation: 1,
+                        input: deps_core::ParseInputKey::new("o/shared"),
+                    },
                 ],
             )
             .await;

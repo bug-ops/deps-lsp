@@ -469,6 +469,21 @@ impl Ecosystem for SwiftEcosystem {
         Some(self.registry.identity_memo().subscribe())
     }
 
+    /// A document depends on a repository's identity answer when one of its swappable
+    /// dependencies (a version requirement on an `http(s)` URL, swizzled or not) names it.
+    fn parse_depends_on(
+        &self,
+        parse_result: &dyn ParseResultTrait,
+        input: &deps_core::ParseInputKey,
+    ) -> bool {
+        let Some(parsed) = parse_result.as_any().downcast_ref::<SwiftParseResult>() else {
+            return true;
+        };
+        eligible_dependencies(parsed)
+            .iter()
+            .any(|(_, scm)| scm.canonical().to_parse_input() == *input)
+    }
+
     /// Before the fetch, warms the SCM-to-registry identity memo and reports `Reparse` when a
     /// dependency's form changed; nothing to do after it.
     fn background_probes<'a>(
@@ -855,6 +870,30 @@ mod tests {
         let result = eco.parse_manifest(content, &uri).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().dependencies().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_parse_depends_on_matches_canonical_repository_of_swappable_dependencies() {
+        let eco = SwiftEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let uri = deps_core::test_util::test_uri("/test/Package.swift");
+        let content = r#"
+            .package(url: "https://GitHub.com/apple/swift-nio.git", from: "2.40.0"),
+            .package(url: "https://github.com/apple/swift-log/", from: "1.0.0"),
+            .package(url: "https://github.com/apple/swift-branch", branch: "main"),
+            .package(url: "git@github.com:apple/swift-ssh.git", from: "1.0.0"),
+        "#;
+        let parsed = eco.parse_manifest(content, &uri).await.unwrap();
+        let input = |written: &str| {
+            ScmLookupUrl::parse(written)
+                .unwrap()
+                .canonical()
+                .to_parse_input()
+        };
+
+        assert!(eco.parse_depends_on(&*parsed, &input("https://github.com/apple/swift-nio")));
+        assert!(eco.parse_depends_on(&*parsed, &input("https://github.com/apple/swift-log.git")));
+        assert!(!eco.parse_depends_on(&*parsed, &input("https://github.com/apple/swift-branch")));
+        assert!(!eco.parse_depends_on(&*parsed, &input("https://github.com/apple/other")));
     }
 
     #[tokio::test]

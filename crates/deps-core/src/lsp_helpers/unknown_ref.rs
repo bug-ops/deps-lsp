@@ -332,7 +332,7 @@ pub fn build_unknown_ref_fix_action(
         UnpublishedRef::Release | UnpublishedRef::NotABranch => {}
         UnpublishedRef::Partial => return None,
     }
-    let tag = index.release_tag(written)?;
+    let tag = index.release_tag(written)?.as_str();
     if tag == written
         || !is_tag_shaped(tag)
         || sanitize_and_truncate_for_diagnostic(tag, MAX_DIAGNOSTIC_VALUE_CHARS) != tag

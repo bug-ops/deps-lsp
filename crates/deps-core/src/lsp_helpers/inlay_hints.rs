@@ -1,5 +1,6 @@
 use tower_lsp_server::ls_types::{InlayHint, InlayHintKind, InlayHintLabel, InlayHintTooltip};
 
+use crate::error::FetchFailure;
 use crate::{ConcreteVersion, EcosystemConfig, PackageKey, ParseResult};
 
 use super::diagnostics::{MAX_VERSION_DIAGNOSTIC_CHARS, flagged_detail};
@@ -28,6 +29,10 @@ fn sanitize_hint_version(version: &str) -> String {
 /// [`crate::ecosystem::Ecosystem::generate_inlay_hints`] implementation: one hint is
 /// emitted per dependency that has a version range, using `versions` and
 /// `loading_state` to decide whether cached data is ready to render yet.
+///
+/// Status markers (the offline `📴` and the `⚠ {resolved}` shown when the registry lookup
+/// failed for a lock-file dependency, #1884) are fixed text, not configurable through
+/// [`EcosystemConfig`], and appear regardless of `show_up_to_date_hints`.
 pub fn generate_inlay_hints(
     parse_result: &dyn ParseResult,
     versions: VersionData<'_>,
@@ -139,6 +144,35 @@ pub fn generate_inlay_hints(
                 continue;
             }
 
+            // #1884: an attempted-but-failed registry lookup must not read as "up to date".
+            // Hardcoded status marker (like the offline `📴`), shown regardless of
+            // `show_up_to_date_hints`; `NotAttempted` placeholders stay silent.
+            if let Some(resolved) = &resolved_version
+                && formatter.can_resolve_source(&dep.source())
+                && versions
+                    .fetch_failure_for(&key)
+                    .is_some_and(FetchFailure::was_attempted)
+            {
+                hints.push(InlayHint {
+                    position: version_range.end,
+                    label: InlayHintLabel::String(format!(
+                        "⚠ {}",
+                        sanitize_hint_version(resolved.as_str())
+                    )),
+                    kind: Some(InlayHintKind::TYPE),
+                    tooltip: Some(InlayHintTooltip::String(
+                        "Registry lookup failed; latest version unknown".to_string(),
+                    )),
+                    padding_left: Some(true),
+                    padding_right: None,
+                    text_edits: None,
+                    data: None,
+                });
+                continue;
+            }
+
+            // TODO(#1891): a registry NotFound / no-comparable-versions outcome still falls
+            // through to the up-to-date label below.
             if let Some(resolved) = &resolved_version
                 && config.show_up_to_date_hints
             {
@@ -1518,6 +1552,78 @@ mod tests {
             hints.is_empty(),
             "Expected no inlay hint at all for an unresolved requirement (not even 'up to date'), got: {hints:?}"
         );
+    }
+
+    /// #1884: labels for one lock-file-resolved dependency with no cached `latest`, given the
+    /// recorded fetch `failure` and `show_up_to_date_hints`.
+    fn lockfile_no_latest_labels(
+        failure: Option<FetchFailure>,
+        show_up_to_date_hints: bool,
+    ) -> Vec<String> {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let config = EcosystemConfig {
+            show_up_to_date_hints,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            network: crate::NetworkMode::Online,
+        };
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "locked-pkg".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 10)).into(),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let name = NormalizedName::for_test("locked-pkg");
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::from([(name.clone(), ConcreteVersion::new("1.0.0"))]);
+        let mut outcomes = DependencyOutcomes::new();
+        if let Some(failure) = failure {
+            outcomes = outcomes.with_fetch_failure(name, failure);
+        }
+        generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
+            crate::LoadingState::Loaded,
+            &config,
+            &MOCK_FORMATTER,
+        )
+        .into_iter()
+        .map(|hint| match hint.label {
+            InlayHintLabel::String(text) => text,
+            InlayHintLabel::LabelParts(_) => panic!("expected string label"),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn test_inlay_hint_lockfile_attempted_fetch_failure_shows_warning_marker() {
+        for show_up_to_date_hints in [true, false] {
+            for failure in [
+                FetchFailure::Transient,
+                FetchFailure::Actionable("x".into()),
+            ] {
+                assert_eq!(
+                    lockfile_no_latest_labels(Some(failure), show_up_to_date_hints),
+                    vec!["⚠ 1.0.0".to_string()]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_inlay_hint_lockfile_not_attempted_keeps_up_to_date_label() {
+        assert_eq!(
+            lockfile_no_latest_labels(Some(FetchFailure::NotAttempted), true),
+            vec!["✅ 1.0.0".to_string()]
+        );
+        assert!(lockfile_no_latest_labels(Some(FetchFailure::NotAttempted), false).is_empty());
     }
 
     /// Issue #483 I5/SEC-2 (cold, no resolved version): with no cached `latest` and no

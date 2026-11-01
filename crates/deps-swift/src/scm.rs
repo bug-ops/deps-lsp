@@ -56,6 +56,12 @@ impl CanonicalScmUrl {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The reparse key of this repository: the only way Swift mints a
+    /// [`deps_core::ParseInputKey`].
+    pub(crate) fn to_parse_input(&self) -> deps_core::ParseInputKey {
+        deps_core::ParseInputKey::new(self.0.as_str())
+    }
 }
 
 /// A repository URL that is safe to send to a registry's `identifiers` endpoint.

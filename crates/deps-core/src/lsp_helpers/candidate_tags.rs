@@ -233,7 +233,7 @@ impl CandidateTagSource {
                     .release_tag(candidate.as_str())
                     .ok_or(CandidateSiblingsUnknown)?;
                 let pin = index
-                    .resolved_release(tag, *scope)
+                    .resolved_release(tag.as_str(), *scope)
                     .ok_or(CandidateSiblingsUnknown)?;
                 Ok(CandidateSiblings(
                     queryable_siblings(&pin, ecosystem),

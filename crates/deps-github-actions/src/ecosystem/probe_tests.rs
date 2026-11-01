@@ -263,7 +263,7 @@ async fn commit_ahead_of_release_and_on_default_branch_is_up_to_date() {
         hover,
         deps_core::lsp_helpers::HoverProvenance::CommitAheadOfLatestRelease {
             ahead_by: Some(3),
-            latest_tag: "v1.0.0".into(),
+            latest_tag: deps_core::lsp_helpers::TagName::from_published("v1.0.0".to_string()),
         }
     );
 }
@@ -523,7 +523,7 @@ async fn stale_evidence_keeps_a_proven_pin_up_to_date() {
     stale.record_latest(
         repository.clone(),
         deps_core::lsp_helpers::LatestRelease {
-            tag: "v1.0.0".into(),
+            tag: deps_core::lsp_helpers::TagName::from_published("v1.0.0".to_string()),
             commit: release.clone(),
         },
     );
