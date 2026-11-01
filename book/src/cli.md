@@ -335,6 +335,11 @@ explicit choice.
   window with `--cooldown` (see below). This filter is `deps-cli update`-specific — `check`'s
   own `Outdated` diagnostic and `deps-lsp`'s "update to latest" code action still only
   *annotate* a fresh version's age, never exclude it or substitute a fallback.
+
+  For npm and Deno, the fallback edit keeps the requirement operator (`^`, `~`, `=`). When a
+  `^` range would still admit the newer version that was withheld (because it is cooling down or
+  flagged), `update` retries once with an exact pin of the fallback version instead of skipping
+  the dependency, and writes it only if that exact pin passes the same check.
 - **`--security-only`** targets only dependencies OSV reports vulnerable, rewriting to the
   advisory's own recommended fix (never a plain "latest" pick), and independently
   re-verifies that fix against OSV before writing it. When the registry marks that fix

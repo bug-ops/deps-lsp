@@ -30,7 +30,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-swift = "3.0"
+deps-swift = "4.0"
 ```
 
 > [!IMPORTANT]

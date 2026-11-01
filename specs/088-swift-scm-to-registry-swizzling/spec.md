@@ -12,7 +12,7 @@ tags:
   - deps-core
   - priority/p4
 created: 2026-10-21
-status: specify
+status: implemented
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
@@ -31,7 +31,7 @@ related:
 > **Issue**: #1757
 > **Branch**: suggested `feat/1757-swift-scm-to-registry`
 > **Depends on**: [[086-git-ref-probe-branch-evidence/spec|spec 086]] (`ProbePhase`, `ProbeReport`/`ProbeEffect`, typed `RefreshEvent`; its section 6 is the reuse interface) and #1873 (`NormalizedName` keys). May ship as its own PR after 086.
-> **Phase**: specify, plan, tasks. Open `[NEEDS CLARIFICATION]`: 0.
+> **Phase**: implemented (PR #1880; `from_xcode` PR #1898). Open `[NEEDS CLARIFICATION]`: 0.
 
 > [!abstract]
 > SwiftPM can replace a `.package(url:)` dependency by a registry identity (`--replace-scm-with-registry`,

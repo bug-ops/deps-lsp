@@ -169,7 +169,7 @@ overwrite `"react": "catalog:"` with a literal version, destroying the catalog
 reference.
 
 **Update edits keep the operator**: an update to `^16.0.0` writes `^19.3.1`, and `~` and `=`
-are kept the same way. Other range forms become the exact version. Prerelease versions are not
+are kept the same way, and a bare partial version (`16`, `16.1`) keeps its precision. Other range forms become the exact version. Prerelease versions are not
 offered unless the registry's latest is a prerelease or the dependency is already on one.
 
 A catalog entry whose value exceeds a length cap (256 bytes) is rejected
@@ -242,7 +242,7 @@ An entry that is not a registry range is classified like its `package.json` coun
 `npm:` alias, a git URL or a `file:` path is not looked up, and an entry whose value is a mapping is
 skipped without affecting the rest of the file. A placeholder such as `${REACT_VERSION}` and a YAML
 alias (`react: *r`) get findings only; no rewrite is offered because there is no literal text to
-replace safely. Other sections of the file, including `overrides:`, are ignored.
+replace safely. The `overrides:` section is read separately (see [pnpm Overrides and Catalog Usage](#pnpm-overrides-and-catalog-usage)); other sections of the file are ignored.
 
 ### Duplicate default catalog
 

@@ -29,7 +29,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-pypi = "3.0"
+deps-pypi = "4.0"
 ```
 
 > [!IMPORTANT]

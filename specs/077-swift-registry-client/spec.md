@@ -10,7 +10,7 @@ tags:
   - swift
 created: 2026-10-06
 updated: 2026-10-06
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
