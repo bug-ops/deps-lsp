@@ -72,7 +72,7 @@ thiserror = "2"
 time = { version = "0.3", default-features = false }
 tokio = "1.54"
 tokio-test = "0.4"
-toml-span = "0.7"
+toml-span = "0.7.2"
 tower = "0.5"
 tower-lsp-server = "0.23"
 tracing = "0.1"

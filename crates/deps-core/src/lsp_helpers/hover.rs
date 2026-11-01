@@ -3,15 +3,15 @@ use std::time::Duration;
 
 use tower_lsp_server::ls_types::Position;
 
-use crate::deps_dev::deps_dev_system;
+use crate::deps_dev::DepsDevScope;
 use crate::edit::requirement_is_placeholder_for;
 use crate::hover::Hover;
 use crate::licenses::resolve_license_entries_for_display;
 use crate::osv::ScanOutcome;
 use crate::{
-    ConcreteVersion, Dependency, DependencySource, Deprecation, GossipLowUsage, LicenseSource,
-    PackageKey, ParseResult, ProvenanceStatus, PublishTime, Registry, SupplyChainTrustSignal,
-    Version, VersionReq,
+    ConcreteVersion, Dependency, Deprecation, GossipLowUsage, LicenseSource, PackageKey,
+    ParseResult, ProvenanceStatus, PublishTime, Registry, SupplyChainTrustSignal, Version,
+    VersionReq,
 };
 
 use super::diagnostics::{MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_VALUE_CHARS};
@@ -120,11 +120,11 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // two requests overlap instead of stacking (spec 037, plan.md §8 M6).
     let key = PackageKey::new(dep.name(), formatter);
 
-    let trust_handle = spawn_trust_signal_fetch(dep, &dep_source, &versions, formatter, &key);
+    let trust_handle = spawn_trust_signal_fetch(dep, &versions, formatter, &key);
     // Issue #1456, spec 072 FR-005: hover's only remaining *live* GOSSIP fetch (cooldown
     // is sourced synchronously from `versions.gossip_prefetch` below instead) — spawned
     // here, alongside `trust_handle`, so the two overlap rather than stack.
-    let gossip_handle = spawn_gossip_low_usage_fetch(dep, &dep_source, &versions, formatter, &key);
+    let gossip_handle = spawn_gossip_low_usage_fetch(dep, &versions, formatter, &key);
 
     // `now` is caller-supplied (#227 M4), not `PublishTime::now()`, so tests can pin an exact
     // cooldown-boundary instant and every age in this response is aged consistently.
@@ -383,8 +383,10 @@ pub async fn generate_hover<R: Registry + ?Sized>(
                 .map(|s| s.licenses.clone())
                 .filter(|l| !l.is_empty())
         })
-        // Tier 3 (#660): Dart/Swift/Gradle/Deno have no deps.dev coverage or version-list
-        // license field, so the only source left is `DocumentState`'s pre-fetch cache.
+        // Tier 3 (#660): Dart/Swift/Deno have no deps.dev coverage or version-list license
+        // field, so the only source left is `DocumentState`'s pre-fetch cache. Gradle is
+        // deps.dev-covered (spec 080), so its POM pre-fetch is only the fallback behind the
+        // deps.dev SPDX license above, as for Maven.
         // Resolved via `resolve_license_entries_for_display` (#687 S1/S2), not the
         // policy-evaluation `resolve_license_entries`: an unrecognized Gradle POM name falls
         // back to raw text instead of vanishing.
@@ -486,12 +488,12 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 /// so can never reach deps.dev.
 ///
 /// Gated on all of: a client was handed in, `network.offline` is not set, the source
-/// resolves against a **public** registry, the ecosystem is one of the seven
-/// `deps_dev_system` maps, and a concrete in-use version exists — the last two
-/// checked with **no** network I/O, so an ecosystem `deps_dev_system` excludes
-/// (Composer, Dart, Swift, ...) spawns nothing at all.
+/// resolves against a **public** registry, the ecosystem is one of the eight
+/// `DepsDevScope` covers, the name carries no template placeholder, and a concrete
+/// in-use version exists — all checked with **no** network I/O, so an ecosystem
+/// deps.dev excludes (Composer, Dart, Swift, ...) spawns nothing at all.
 ///
-/// `formatter.source_is_public_registry_content(dep_source)`, not the weaker
+/// `DepsDevScope::target` applies `formatter.source_is_public_registry_content`, not the weaker
 /// `EcosystemFormatter::can_resolve_source`: that predicate is deliberately widened
 /// by some ecosystems (e.g. `deps-cargo`'s `AlternateRegistry`) to cover *any*
 /// configured registry, private/internal ones included — reusing it here would send
@@ -508,22 +510,17 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 /// `tokio::spawn` panics outside a Tokio runtime — every caller of [`generate_hover`]
 /// is `#[tokio::test]`-async or the real LSP server, so this is safe here, but no
 /// doc-test may call it directly. The spawned future captures only owned/`'static`
-/// data (`Arc<DepsDevClient>`, a `Copy` `DepsDevSystem`, owned `String`s) so it satisfies
+/// data (`Arc<DepsDevClient>`, an owned `DepsDevTarget`, owned `String`s) so it satisfies
 /// `Send + 'static` with no borrow from `dep`.
 fn spawn_trust_signal_fetch(
     dep: &dyn Dependency,
-    dep_source: &DependencySource,
     versions: &VersionData<'_>,
     formatter: &dyn EcosystemFormatter,
     key: &PackageKey,
 ) -> Option<tokio::task::JoinHandle<Option<SupplyChainTrustSignal>>> {
     versions.trust.and_then(|client| {
         let ecosystem = versions.ecosystem?;
-        let system = deps_dev_system(ecosystem)?;
-        if versions.network.is_offline() || !formatter.source_is_public_registry_content(dep_source)
-        {
-            return None;
-        }
+        let target = DepsDevScope::new(ecosystem, versions.network)?.target(dep, formatter)?;
         let version = resolve_in_use_version(
             dep,
             key,
@@ -533,9 +530,8 @@ fn spawn_trust_signal_fetch(
             ecosystem,
         )?;
         let client = Arc::clone(client);
-        let name = dep.name().as_str().to_string();
         Some(tokio::spawn(async move {
-            client.trust_signal(system, &name, version.as_str()).await
+            client.trust_signal(&target, version.as_str()).await
         }))
     })
 }
@@ -552,18 +548,13 @@ fn spawn_trust_signal_fetch(
 /// ecosystem is `deps_dev_system`-covered, and a concrete in-use version exists).
 fn spawn_gossip_low_usage_fetch(
     dep: &dyn Dependency,
-    dep_source: &DependencySource,
     versions: &VersionData<'_>,
     formatter: &dyn EcosystemFormatter,
     key: &PackageKey,
 ) -> Option<tokio::task::JoinHandle<Option<crate::GossipFindings>>> {
     versions.gossip_client.and_then(|client| {
         let ecosystem = versions.ecosystem?;
-        let system = deps_dev_system(ecosystem)?;
-        if versions.network.is_offline() || !formatter.source_is_public_registry_content(dep_source)
-        {
-            return None;
-        }
+        let target = DepsDevScope::new(ecosystem, versions.network)?.target(dep, formatter)?;
         let version = resolve_in_use_version(
             dep,
             key,
@@ -573,10 +564,9 @@ fn spawn_gossip_low_usage_fetch(
             ecosystem,
         )?;
         let client = Arc::clone(client);
-        let key = key.clone();
         Some(tokio::spawn(async move {
             client
-                .gossip_findings_for_version(system, &key, version.as_str())
+                .gossip_findings_for_version(&target, version.as_str())
                 .await
         }))
     })
@@ -7334,6 +7324,58 @@ mod tests {
         never_called.assert_async().await;
     }
 
+    /// Spec 080 FR-001/FR-003: Gradle hover queries the `maven` system for a real
+    /// coordinate, and sends nothing for a name with an unexpanded template placeholder
+    /// (trust signal and version-scoped GOSSIP both).
+    #[tokio::test]
+    async fn test_generate_hover_gradle_routes_maven_and_skips_placeholder_names() {
+        for (name, expected_calls) in [("com.google.guava:guava", 1), ("$grp:art", 0)] {
+            let (mut server, deps_dev) = deps_dev_mock_client().await;
+            let version_call = server
+                .mock(
+                    "GET",
+                    mockito::Matcher::Regex("^/v3/systems/maven/.*".into()),
+                )
+                .with_status(404)
+                .expect(expected_calls)
+                .create_async()
+                .await;
+            let findings_call = server
+                .mock("GET", mockito::Matcher::Regex("^/v3alpha/.*".into()))
+                .with_status(404)
+                .expect(expected_calls)
+                .create_async()
+                .await;
+            let deps_dev = Arc::new(deps_dev);
+
+            let parse_result = freshness_test_parse_result(name);
+            let resolved_versions = HashMap::from([(
+                NormalizedName::for_test(name),
+                ConcreteVersion::new("33.0.0-jre"),
+            )]);
+            let registry = MockRegistryWithVersions { versions: vec![] };
+
+            generate_hover(
+                &parse_result,
+                Position::new(0, 2).into(),
+                VersionData::new(&HashMap::new(), &resolved_versions)
+                    .with_ecosystem(crate::EcosystemId::Gradle)
+                    .with_trust(&deps_dev)
+                    .with_gossip_client(&deps_dev),
+                &registry,
+                &MOCK_FORMATTER,
+                crate::freshness::FreshnessSettings::default(),
+                PublishTime::now(),
+            )
+            .await
+            .expect("hover should be generated");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            version_call.assert_async().await;
+            findings_call.assert_async().await;
+        }
+    }
+
     /// SC-003: a deps.dev outage must leave every other hover section
     /// byte-identical to a hover generated with no trust client at all.
     #[tokio::test]
@@ -7500,7 +7542,10 @@ mod tests {
             .await;
 
         let warmed = deps_dev
-            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .trust_signal(
+                &crate::deps_dev::DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                "4.19.2",
+            )
             .await
             .expect("the direct, un-delayed call must warm the memo deterministically");
         assert!(warmed.scorecard.is_some(), "fixture includes a scorecard");

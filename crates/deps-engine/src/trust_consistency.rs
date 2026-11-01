@@ -183,6 +183,34 @@ fn operator_declared_url_is_trusted_on_every_ecosystem_even_under_off() {
     }
 }
 
+/// A `GOPROXY` exported in the process environment is operator-declared: Trusted under every
+/// policy level, like the `$GOENV` file.
+#[test]
+fn go_proxy_from_process_env_is_trusted_under_every_policy_level() {
+    use deps_core::net_policy::MapEnv;
+    use deps_go::config::{GoEnvCache, GoParseContext, GoProcessEnv, GoProxyHop};
+
+    let env = MapEnv::new().with_var("GOPROXY", OPERATOR_URL);
+    for level in [
+        WorkspaceRegistryAccess::Off,
+        WorkspaceRegistryAccess::PublicOnly,
+        WorkspaceRegistryAccess::All,
+    ] {
+        let ctx = GoParseContext::new(
+            Arc::new(policy(level)),
+            Arc::new(GoEnvCache::new()),
+            None,
+            Arc::new(GoProcessEnv::from_env(&env)),
+        );
+        let config = deps_go::config::resolve_with_context(&ctx);
+        let chain = config.goproxy_chain().expect("an env GOPROXY resolves");
+        let Some(GoProxyHop::Url(url)) = chain.hops.first() else {
+            panic!("expected a URL hop");
+        };
+        assert_eq!(url.trust(), RegistryTrust::Trusted, "{level:?}");
+    }
+}
+
 /// A repository-only URL is refused under `off` and Guarded-egress workspace-declared otherwise.
 #[test]
 fn repo_only_url_is_blocked_under_off_and_guarded_otherwise() {

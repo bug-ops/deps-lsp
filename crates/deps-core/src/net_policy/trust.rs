@@ -16,12 +16,12 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 use super::{
-    BlockedHost, CanonicalUrl, EnvSource, IndexUrlError, PolicyGate, RedactedUrl,
-    RegistryAccessPolicy, RegistryUrlKind, TrustedConstantRegistryUrl, ValidatedRegistryUrl,
-    WorkspaceRegistryAccess, classify_host, enforce_policy, validate_index_url,
+    BlockedHost, CanonicalUrl, IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy,
+    RegistryUrlKind, TrustedConstantRegistryUrl, ValidatedRegistryUrl, WorkspaceRegistryAccess,
+    classify_host, enforce_policy, validate_index_url,
 };
 use crate::EgressTier;
-use crate::config_trust::OperatorPath;
+use crate::config_trust::{OperatorEnvValue, OperatorPath};
 
 /// Whether a registry URL is the operator's own or only workspace-declared.
 ///
@@ -127,38 +127,34 @@ impl OperatorRegistries {
         }
     }
 
-    /// The URLs held by the environment variables `names`, read from `env` here so a URL in the
-    /// set provably came from the environment (for Cargo, the `CARGO_REGISTRIES_<ALIAS>_INDEX`
-    /// variables). `normalize` maps a variable's text to the URL text the ecosystem classifies
-    /// (for Cargo, removing `sparse+`).
+    /// The URLs a process environment variable declares: `urls` extracts the candidate URL texts
+    /// from `value` (one for a Cargo index, a chain for `GOPROXY`).
     ///
-    /// The environment is operator-owned: a repository cannot set it. Unparseable values and
-    /// values carrying userinfo are skipped, as in [`Self::declared_in`]. Misuse-resistant only,
-    /// not unforgeable: `env` is any [`EnvSource`], so the caller asserts it is the process
-    /// environment.
+    /// `value` is an [`OperatorEnvValue`], so the URLs provably came from the environment, which a
+    /// repository cannot set. `urls` is a non-capturing function pointer, so it cannot close over
+    /// workspace data, but it can still return literals: callers must derive the candidates
+    /// from the value (both callers, Cargo and Go, do). Unparseable candidates and candidates
+    /// carrying userinfo are skipped, as in [`Self::declared_in`].
     ///
     /// # Examples
     ///
     /// ```
+    /// use deps_core::config_trust::{OperatorEnvName, OperatorEnvValue};
     /// use deps_core::net_policy::{MapEnv, OperatorRegistries};
     ///
     /// let env = MapEnv::new().with_var("REGISTRY_INDEX", "https://index.corp.example");
-    /// let set = OperatorRegistries::declared_in_env(&env, ["REGISTRY_INDEX"], |raw| raw);
+    /// let name = OperatorEnvName::fixed("REGISTRY_INDEX");
+    /// let value = OperatorEnvValue::read(&env, &name).unwrap();
+    /// let set = OperatorRegistries::declared_by_env(&value, |raw| vec![raw]);
     /// assert!(set.contains_str("https://index.corp.example/"));
     /// ```
     #[must_use]
-    pub fn declared_in_env<N: AsRef<str>>(
-        env: &(impl EnvSource + ?Sized),
-        names: impl IntoIterator<Item = N>,
-        normalize: for<'a> fn(&'a str) -> &'a str,
+    pub fn declared_by_env(
+        value: &OperatorEnvValue,
+        urls: for<'a> fn(&'a str) -> Vec<&'a str>,
     ) -> Self {
-        let values: Vec<String> = names
-            .into_iter()
-            .filter_map(|name| env.var_os(name.as_ref()))
-            .filter_map(|value| value.into_string().ok())
-            .collect();
         Self {
-            urls: Self::canonical_urls(values.iter().map(|value| normalize(value))),
+            urls: Self::canonical_urls(urls(value.as_str())),
         }
     }
 
@@ -363,6 +359,21 @@ mod tests {
 
     use crate::EcosystemId;
     use crate::net_policy::{BlockingPolicy, HostClass, WorkspaceRegistryAccess};
+
+    #[test]
+    fn declared_by_env_collects_chain_and_skips_userinfo() {
+        use crate::net_policy::MapEnv;
+        let env = MapEnv::new().with_var(
+            "CHAIN",
+            "https://a.example,https://u:p@b.example,not a url,https://c.example/",
+        );
+        let name = crate::config_trust::OperatorEnvName::fixed("CHAIN");
+        let value = OperatorEnvValue::read(&env, &name).unwrap();
+        let set = OperatorRegistries::declared_by_env(&value, |raw| raw.split(',').collect());
+        assert!(set.contains_str("https://a.example"));
+        assert!(set.contains_str("https://c.example"));
+        assert!(!set.contains_str("https://b.example"));
+    }
 
     enum TestKind {}
     impl crate::net_policy::private::Sealed for TestKind {}

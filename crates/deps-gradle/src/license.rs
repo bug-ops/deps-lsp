@@ -1,9 +1,11 @@
 //! Best-effort license fetch from a Maven Central POM (issue #660, spec 010 plan §1
 //! tier 3).
 //!
-//! `deps_dev_system` excludes the Gradle ecosystem (unlike the Maven ecosystem crate,
-//! which shares the exact same `groupId:artifactId` coordinate format but is
-//! tier-2/deps.dev-covered), and `maven-metadata.xml` — the version-list endpoint
+//! Gradle shares deps.dev's `maven` system with the Maven ecosystem (spec 080), so on
+//! hover a deps.dev SPDX license wins and this POM fetch is only the fallback for
+//! coordinates deps.dev has no record of (for example Google Maven artifacts). The
+//! license-policy diagnostic still evaluates this POM data, unchanged. Separately,
+//! `maven-metadata.xml` — the version-list endpoint
 //! [`deps_maven::MavenCentralRegistry`] already fetches — carries no license field at
 //! all. Only a specific version's POM file's `<licenses>` block does; live-verified
 //! 2026-09-08 against `com.squareup.okhttp3:okhttp:4.12.0`, whose POM carries

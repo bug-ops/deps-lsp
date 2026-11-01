@@ -171,9 +171,30 @@ through:
 This is intentional graceful degradation (US-003), the same shape as Go's documented
 partial freshness coverage (`/@v/list` carries no per-version dates either) — not a bug.
 
+## Supply-Chain Signals (Gradle)
+
+Gradle dependencies get the same deps.dev signals as Maven, through deps.dev's `maven` system:
+OpenSSF Scorecard and build provenance on hover, plus deprecation, the opt-in typosquat
+similarity check, and the opt-in GOSSIP cooldown/low-usage signals. Library coordinates,
+version-catalog `libraries`, and `pluginManagement` plugin markers
+(`<id>:<id>.gradle.plugin`) are looked up; dependencies whose name contains an unexpanded
+`$variable` placeholder are skipped, and a plugin deps.dev does not index shows nothing (no
+warning).
+
+**Gradle coordinates, including those of internal repositories, are sent to deps.dev on hover
+by default.** A dependency served by an internal repository declared with a plain
+`repositories { maven { url = ... } }` block (no content filter) cannot be told apart from a
+public one, so its `group:artifact` and version are included. Three independent settings gate
+the deps.dev request classes: `supply_chain.enabled` (default on) covers the hover Scorecard,
+provenance and deps.dev license lookup; `typosquat.enabled` and `gossip.enabled` (both
+default off) cover the typosquat and GOSSIP lookups. Turn off whichever of them you have on to
+send no Gradle coordinate to deps.dev. See [Supply-Chain Trust
+Signal](../cross-ecosystem/yanked-and-vulnerabilities.md#supply-chain-trust-signal-issue-543).
+
 ## License Hover (Gradle)
 
-Gradle's license hover follows the Maven Central POM's `<parent>` coordinate chain when a
-dependency's own POM declares no `<licenses>` block — see [License
+Gradle's license hover shows the deps.dev SPDX license first and falls back to the Maven
+Central POM when deps.dev has no record. The POM fetch follows the POM's `<parent>` coordinate
+chain when a dependency's own POM declares no `<licenses>` block — see [License
 Hover](../cross-ecosystem/licensing.md#license-hover) for the full cross-ecosystem picture and
 the license policy diagnostic that consumes the same normalized data.

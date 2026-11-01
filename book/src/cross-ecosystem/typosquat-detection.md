@@ -6,8 +6,8 @@ typosquat (`crossenv` vs `cross-env`, `expres` vs `express`).
 
 ## How It Works
 
-For a declared dependency in one of the seven [deps.dev](https://deps.dev)-covered
-ecosystems (Cargo, npm, PyPI, Go, Bundler, Maven, NuGet), `deps-lsp` queries deps.dev's
+For a declared dependency in one of the eight [deps.dev](https://deps.dev)-covered
+ecosystems (Cargo, npm, PyPI, Go, Bundler, Maven, Gradle, NuGet), `deps-lsp` queries deps.dev's
 v3alpha `GetSimilarlyNamedPackages` endpoint. That endpoint returns identity only — no
 popularity data — so popularity is resolved separately via `GetPackage` (the package's
 default version) and `GetDependents` (that version's dependent-package count), for both
@@ -22,7 +22,7 @@ A candidate fires the diagnostic only when **both** hold:
 - its `dependentCount` is at least **50** in absolute terms, so two obscure packages
   can't trip the ratio on noise
 
-Composer, GitHub Actions, GitLab CI/CD, Dart, Swift, Gradle, and Deno have no
+Composer, GitHub Actions, GitLab CI/CD, Dart, Swift, and Deno have no
 [deps.dev](https://deps.dev) coverage and are never queried — not a deferred gap, deps.dev
 does not track those package systems at all. Only manifest-declared **direct**
 dependencies are checked, never transitive/lockfile-resolved ones.

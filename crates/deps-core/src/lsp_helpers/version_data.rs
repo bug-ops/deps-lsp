@@ -144,9 +144,11 @@ pub struct VersionData<'a> {
     /// `&'a DepsDevClient`, so [`generate_hover`] can clone the `Arc` into a
     /// detached background task.
     pub trust: Option<&'a Arc<DepsDevClient>>,
-    /// Background-pre-fetched license data for ecosystems `deps_dev_system` doesn't
-    /// cover and whose hot-path registry response carries no license field — Dart,
-    /// Swift, Gradle, Deno (issue #660, spec 010 plan §1 tier 3), keyed by normalized
+    /// Background-pre-fetched license data for ecosystems whose hot-path registry
+    /// response carries no license field — Dart, Swift, Gradle, Deno (issue #660,
+    /// spec 010 plan §1 tier 3). Gradle is also deps.dev-covered (spec 080), so on hover
+    /// its deps.dev SPDX license takes precedence and this POM data is the fallback.
+    /// Keyed by normalized
     /// package name. `None` by default. Populated from `DocumentState`'s
     /// per-document pre-fetch cache (`document::osv_scan::run_license_prefetch` on
     /// document open/change — mirrors [`Self::vulnerabilities`]'s "populated by a
@@ -197,8 +199,8 @@ pub struct VersionData<'a> {
     /// edit and was invisible to push-only clients.
     /// [`generate_diagnostics_from_cache`]'s license-policy rule reads this alongside
     /// [`Self::license_prefetch`] — so today it only actually fires for tier-3 ecosystems
-    /// (Dart/Swift/Deno; Gradle is explicitly excluded, see that rule's doc comment), the
-    /// only ones `license_prefetch` covers; this field and the rule are otherwise
+    /// (Dart/Swift/Gradle/Deno; Gradle's POM free text is normalized first, see that rule's
+    /// doc comment), the only ones `license_prefetch` covers; this field and the rule are otherwise
     /// ecosystem-agnostic and need no change as `license_prefetch`'s coverage widens.
     pub license_policy: Option<&'a LicensePolicy>,
     /// Background-pre-fetched typosquat-suspect signal per declared dependency (issue

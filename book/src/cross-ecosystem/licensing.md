@@ -4,7 +4,7 @@
 
 Hover shows the SPDX license identifier(s) for the resolved version, and flags a
 "License changed" warning when the latest version's license differs (issue #204).
-Covered for Cargo, npm, PyPI, Go, Maven, Bundler, NuGet (via the deps.dev
+Covered for Cargo, npm, PyPI, Go, Maven, Gradle, Bundler, NuGet (via the deps.dev
 supply-chain call — resolved version only, the "latest" license degrades to
 "unavailable" since no second network call is made) and Composer (via Packagist's
 own version list, which carries license for both the resolved and latest version,
@@ -14,6 +14,11 @@ a dependency, the section is omitted rather than shown as "unknown".
 Dart, Swift, Gradle, and Deno (issue #660) are covered via a per-ecosystem
 background pre-fetch (mirroring the OSV vulnerability-scan pattern — never
 blocking hover latency) instead of the deps.dev/Packagist hot-path call above.
+Gradle is also deps.dev-covered (through the `maven` system, like Maven), so on hover its
+deps.dev SPDX license is shown first and the POM pre-fetch below is only the fallback for
+coordinates deps.dev has no record of (for example Google Maven artifacts). Because that
+hover lookup sends the Gradle coordinate to deps.dev, it is governed by
+`supply_chain.enabled`; the license-policy diagnostic keeps evaluating the POM data.
 The pre-fetch only runs while `license_policy` is non-empty: with an empty policy no
 license data (hover line or diagnostic) is fetched for these ecosystems, and setting a
 non-empty policy at runtime starts it for already-open documents.

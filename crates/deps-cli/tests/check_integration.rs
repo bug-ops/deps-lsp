@@ -1563,7 +1563,7 @@ mod gossip_prefetch_wiring_regression {
     /// A GOSSIP-covered (`EcosystemId::Cargo`) `Ecosystem` double whose registry never
     /// touches the network (reuses [`StubRegistry`]). [`TestTier3Ecosystem`] can't stand in
     /// for the positive-wiring case below since it hardcodes `EcosystemId::Dart`, one of the
-    /// seven ecosystems `deps_dev_system` deliberately does *not* cover.
+    /// six ecosystems deps.dev deliberately does *not* cover.
     struct CoveredEcosystem;
     impl Sealed for CoveredEcosystem {}
     impl Ecosystem for CoveredEcosystem {

@@ -323,9 +323,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_lockfile_rejects_excessive_nesting() {
-        // Well past MAX_TOML_NESTING_DEPTH (64) but far below the depth
-        // that would actually overflow the stack, so the guard is what's
-        // being exercised here, not the crash itself.
+        // Well past MAX_TOML_NESTING_DEPTH (64) and toml-span's native limit (128);
+        // the pre-scan rejects it first, so it is what's exercised here.
         let lockfile_content = format!("a = {}1{}", "[".repeat(300), "]".repeat(300));
 
         let temp_dir = tempfile::tempdir().unwrap();

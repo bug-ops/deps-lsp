@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-engine, deps-lsp, deps-cli**: `FetchResult` and `DependencyOutcomes` carry a typed `LookupMiss` in place of the `no_comparable_versions` flag, and `PackageStatus::NotFound` carries its `ErrorOrigin` (#1898)
 - **deps-core**: `gossip_findings_for_version` takes a `&PackageKey`, and `PackageRendering`, `RequirementResolution` gain default hooks `format_version_exact_pin`, `format_version_replacing_floor_for` and `requirement_opts_into_prereleases` (#1898)
 - **deps-swift, deps-core**: `ScmSwizzleMode` is the effective swizzle decision type, and `ScmToRegistry` gains `FromXcode` (#1898)
+- **deps-core, deps-cargo, deps-go**: `OperatorRegistries::declared_in_env` becomes `declared_by_env`, `OperatorEnvValue::read` takes `&OperatorEnvName`, `GoParseContext::new` takes `Arc<GoProcessEnv>`, and `GoEnvConfig::has_goprivate` becomes `registers_bypass_chain` (#PRNUM)
+- **deps-core**: `CheckedTomlError::NestingTooDeep` carries `guard: TomlDepthGuard` instead of `depth`, `Syntax` no longer converts from `toml_span::Error`, and the `toml-span` floor is 0.7.2 (#PRNUM)
+- **deps-core**: `DepsDevClient` lookup methods take `DepsDevTarget` and `DepsDevTargets` (#PRNUM)
 
 ### Added
 - **deps-npm, deps-cli**: `pnpm-workspace.yaml` catalog entries get hints, diagnostics, hover, completion and updates, and a duplicate default catalog is reported (#1880)
@@ -40,6 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-npm**: `overrides:` entries in `pnpm-workspace.yaml` are dependencies with hints, diagnostics and update actions, and `check` and `update` treat them as targets (#1898)
 - **deps-npm**: hover on a pnpm catalog entry shows how many workspace packages reference it, from a bounded walk of the `packages:` globs (#1898)
 - **deps-swift**: `registries.swift_scm_to_registry = "from_xcode"` follows Xcode's `IDEPackageDependencySCMToRegistryTransformation` default, read once in the background on macOS (#1898)
+- **deps-go**: `GOPROXY`, `GOPRIVATE`, `GONOPROXY`, `GOSUMDB` and `GONOSUMDB` are honoured from the process environment with go-command precedence, and `GONOPROXY` is read from `$GOENV` (#PRNUM)
+- **deps-gradle, deps-core**: Gradle dependencies get deps.dev Scorecard, provenance, typosquat and GOSSIP signals through the Maven system (#PRNUM)
+- **deps-core**: `OperatorEnvName` and `OperatorEnvValue` centralize env-override-by-name trust shared by deps-go and deps-cargo (#PRNUM)
 
 ### Changed
 - **deps**: update `Cargo.lock` tokio 1.54.0 to 1.54.1 (RUSTSEC-2026-0384, yanked release) (#1889)
@@ -67,6 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-npm, deps-deno**: updates keep the precision of a bare partial version (`5` to `6`, `1.2` to `1.3`) instead of writing an exact pin (#1898)
 - **deps-cli**: `deps update` retries a cooldown or vulnerable-latest fallback as an exact pin for npm and deno caret ranges instead of skipping it (#1898)
 - **deps-core, deps-composer, deps-maven, deps-nuget, deps-pypi**: the update code action recognises prerelease opt-ins in Composer stability flags, Maven and NuGet interval bounds and PEP 440 spelling variants (#1898)
+- **deps-go**: modules behind a `GOPROXY` URL chain verified by the public checksum DB are now sent to OSV and deps.dev, including `go env -w GOPROXY` users; set `GOPRIVATE`/`GONOSUMDB` for private paths (#PRNUM)
+- **deps-go**: `GONOPROXY` overrides the `GOPRIVATE` bypass for routing, a `GOPRIVATE`/`GONOSUMDB` module without `GOPROXY` is bypassed, and an env `GOPROXY` with userinfo fails closed (#PRNUM)
+- **deps-core**: a toml-span native depth-limit error is reported as nesting-too-deep instead of a syntax error (#PRNUM)
+- **deps-gradle**: hover license precedence is registry, then deps.dev SPDX, then the POM fetch; Gradle coordinates, including internal-repository ones, go to deps.dev on hover unless `supply_chain.enabled`, `typosquat.enabled` and `gossip.enabled` are off (#PRNUM)
 
 ### Fixed
 - **deps-core, deps-npm, deps-deno**: the update code action keeps the requirement operator and offers no prerelease unless the dependency is on one (#1896)
@@ -78,6 +88,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-nuget, deps-swift, deps-engine**: the in-use version is found when the lockfile spelling of a package differs in case from the manifest (Swift: GitHub-hosted URLs) (#1880)
 - **deps-lsp**: deleting or renaming one spelling of a package no longer prunes or leaves stale data for a case variant that stays (#1880)
 - **fuzz**: `body-parser` in the `package-lock.json` seed is bumped to 1.20.9 (Dependabot alert, #1890)
+- **deps-go**: modules behind a `GOPROXY` URL chain keep OSV and deps.dev signals when the public checksum database verifies them; `off`/`direct`-only chains stay non-public (#PRNUM)
+- **deps-go**: a `GOPROXY` chain fetches `/@v/list` with `/@latest` only as a fallback, so older pins no longer get a false `unsatisfiable-requirement` and keep the newer-version hint (#PRNUM)
+- **deps-core, deps-maven, deps-gradle**: dependency names with an unexpanded template placeholder (`$grp`, `${project.groupId}`) no longer produce deps.dev lookups (#PRNUM)
 
 ## [3.0.0] - 2026-10-19
 

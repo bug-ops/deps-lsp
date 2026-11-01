@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
 
-use crate::deps_dev::deps_dev_system;
+use crate::deps_dev::DepsDevScope;
 use crate::diagnostic::{
     CodeDescription, Diagnostic, DiagnosticKind, RelatedInformation, Severity,
 };
@@ -2070,7 +2070,7 @@ pub struct TyposquatFetchOutcome {
 ///
 /// Zero HTTP requests when `client` is `None` (FR-009: `policy.typosquat.enabled` is
 /// `false`), `network` is [`NetworkMode::Offline`](crate::NetworkMode::Offline), or
-/// `ecosystem_id` is one of the seven ecosystems `deps_dev_system` doesn't cover (FR-002) —
+/// `ecosystem_id` is one of the six ecosystems deps.dev does not cover (FR-002) —
 /// all checked before any dependency name is even collected; each such early-out reports
 /// [`FetchCompleteness::Complete`], since none of them is a transient condition a retry
 /// could resolve.
@@ -2096,26 +2096,20 @@ pub async fn fetch_typosquat_signals(
     let Some(client) = client else {
         return complete;
     };
-    if network.is_offline() {
-        return complete;
-    }
-    let Some(system) = deps_dev_system(ecosystem_id) else {
+    let Some(scope) = DepsDevScope::new(ecosystem_id, network) else {
         return complete;
     };
 
-    let keys = public_registry_keys(parse_result, formatter);
-    if keys.is_empty() {
+    let Some(targets) = scope.targets(parse_result.dependencies(), formatter) else {
         return complete;
-    }
+    };
 
-    let resolved = stream::iter(keys)
-        .map(|key| {
+    let resolved = stream::iter(targets.iter())
+        .map(|target| {
             let client = Arc::clone(client);
             async move {
-                let (signal, completeness) = client
-                    .typosquat_signal(system, key.declared().as_str())
-                    .await;
-                (key, signal, completeness)
+                let (signal, completeness) = client.typosquat_signal(&target).await;
+                (target, signal, completeness)
             }
         })
         .buffer_unordered(TYPOSQUAT_FETCH_CONCURRENCY)
@@ -2124,10 +2118,10 @@ pub async fn fetch_typosquat_signals(
 
     let mut signals = HashMap::new();
     let mut completeness = FetchCompleteness::Complete;
-    for (key, signal, key_completeness) in resolved {
+    for (target, signal, key_completeness) in resolved {
         completeness = completeness.combine(key_completeness);
         if let Some(signal) = signal {
-            signals.insert(key.normalized().clone(), signal);
+            signals.insert(target.normalized().clone(), signal);
         }
     }
     TyposquatFetchOutcome {
@@ -2153,7 +2147,7 @@ pub async fn fetch_typosquat_signals(
 ///
 /// Zero HTTP requests when `client` is `None` (`policy.gossip.enabled` is `false`),
 /// `network` is [`NetworkMode::Offline`](crate::NetworkMode::Offline), or `ecosystem_id`
-/// is one of the seven ecosystems `deps_dev_system` doesn't cover — all checked before
+/// is one of the six ecosystems deps.dev does not cover — all checked before
 /// any dependency name is even collected.
 ///
 /// `formatter.source_is_public_registry_content(&dep.source())` gates each dependency
@@ -2169,19 +2163,14 @@ pub async fn fetch_gossip_findings_batch(
     let Some(client) = client else {
         return HashMap::new();
     };
-    if network.is_offline() {
+    let Some(scope) = DepsDevScope::new(ecosystem_id, network) else {
         return HashMap::new();
-    }
-    let Some(system) = deps_dev_system(ecosystem_id) else {
+    };
+    let Some(targets) = scope.targets(parse_result.dependencies(), formatter) else {
         return HashMap::new();
     };
 
-    let keys = public_registry_keys(parse_result, formatter);
-    if keys.is_empty() {
-        return HashMap::new();
-    }
-
-    client.gossip_findings_batch(system, &keys).await
+    client.gossip_findings_batch(&targets).await
 }
 
 /// Force-refetches GOSSIP findings for `keys` under `ecosystem_id`'s deps.dev system,
@@ -2197,7 +2186,7 @@ pub async fn fetch_gossip_findings_batch(
 /// one, and a response for a name the request did not send is dropped.
 ///
 /// Returns an empty map immediately, with no network call, when `ecosystem_id` isn't one of
-/// the seven `deps_dev_system`-covered ecosystems — the sole caller,
+/// the eight deps.dev-covered ecosystems — the sole caller,
 /// `deps-lsp::document::gossip_prefetch`'s mismatch-detection function, is only ever able to
 /// populate `keys` from an ecosystem that already had `gossip_findings` entries in the
 /// first place, so this early-out is defensive, not expected to fire in practice.
@@ -2206,28 +2195,14 @@ pub async fn force_refresh_gossip_findings(
     keys: &[PackageKey],
     client: &Arc<DepsDevClient>,
 ) -> HashMap<NormalizedName, crate::GossipFindings> {
-    let Some(system) = deps_dev_system(ecosystem_id) else {
+    let Some(scope) = DepsDevScope::new(ecosystem_id, crate::NetworkMode::Online) else {
+        return HashMap::new();
+    };
+    let Some(targets) = scope.readmit(keys) else {
         return HashMap::new();
     };
 
-    client.force_refresh_gossip_findings(system, keys).await
-}
-
-/// One [`PackageKey`] per distinct normalized name among `parse_result`'s public-registry
-/// dependencies, in first-occurrence order — the privacy-gated fan-out set shared by the
-/// typosquat and GOSSIP prefetches.
-fn public_registry_keys(
-    parse_result: &dyn ParseResult,
-    formatter: &dyn EcosystemFormatter,
-) -> Vec<PackageKey> {
-    let mut seen = HashSet::new();
-    parse_result
-        .dependencies()
-        .into_iter()
-        .filter(|dep| formatter.source_is_public_registry_content(&dep.source()))
-        .map(|dep| PackageKey::new(dep.name(), formatter))
-        .filter(|key| seen.insert(key.normalized().clone()))
-        .collect()
+    client.force_refresh_gossip_findings(&targets).await
 }
 
 /// R3 — package-level deprecation finding (#205, I4).
@@ -12766,6 +12741,95 @@ mod tests {
             package_call.assert_async().await;
         }
 
+        /// Spec 080 FR-003: a Gradle (or Maven) name carrying an unexpanded template
+        /// placeholder never reaches deps.dev, on both the typosquat and GOSSIP fan-outs.
+        #[tokio::test]
+        async fn deps_dev_fan_outs_skip_template_placeholder_names() {
+            let mut server = mockito::Server::new_async().await;
+            let any_get = server
+                .mock("GET", mockito::Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            let any_post = server
+                .mock("POST", mockito::Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            let client = Arc::new(DepsDevClient::for_test(
+                Arc::new(HttpCache::new()),
+                server.url(),
+            ));
+
+            for (ecosystem, name) in [
+                (EcosystemId::Gradle, "$grp:art"),
+                (EcosystemId::Maven, "${project.groupId}:x"),
+            ] {
+                let parse_result = single_dep_parse_result(name);
+                let typosquat = fetch_typosquat_signals(
+                    ecosystem,
+                    &parse_result,
+                    &MOCK_FORMATTER,
+                    crate::NetworkMode::Online,
+                    Some(&client),
+                )
+                .await;
+                assert!(typosquat.signals.is_empty());
+                assert_eq!(typosquat.completeness, FetchCompleteness::Complete);
+
+                let gossip = fetch_gossip_findings_batch(
+                    ecosystem,
+                    &parse_result,
+                    &MOCK_FORMATTER,
+                    crate::NetworkMode::Online,
+                    Some(&client),
+                )
+                .await;
+                assert!(gossip.is_empty());
+
+                let keys = [PackageKey::new(&PackageName::new(name), &MOCK_FORMATTER)];
+                assert!(
+                    force_refresh_gossip_findings(ecosystem, &keys, &client)
+                        .await
+                        .is_empty()
+                );
+            }
+            any_get.assert_async().await;
+            any_post.assert_async().await;
+        }
+
+        /// Spec 080 FR-001: a real Gradle coordinate is routed to the `maven` system.
+        #[tokio::test]
+        async fn fetch_typosquat_signals_routes_gradle_to_maven_system() {
+            let mut server = mockito::Server::new_async().await;
+            let similar = server
+                .mock(
+                    "GET",
+                    "/v3alpha/systems/maven/packages/com.google.guava%3Aguava:similarlyNamedPackages",
+                )
+                .with_status(200)
+                .with_body(r#"{"packages": []}"#)
+                .expect(1)
+                .create_async()
+                .await;
+            let client = Arc::new(DepsDevClient::for_test(
+                Arc::new(HttpCache::new()),
+                server.url(),
+            ));
+
+            let parse_result = single_dep_parse_result("com.google.guava:guava");
+            fetch_typosquat_signals(
+                EcosystemId::Gradle,
+                &parse_result,
+                &MOCK_FORMATTER,
+                crate::NetworkMode::Online,
+                Some(&client),
+            )
+            .await;
+
+            similar.assert_async().await;
+        }
+
         #[tokio::test]
         async fn fetch_typosquat_signals_unsupported_ecosystem_issues_zero_requests() {
             let mut server = mockito::Server::new_async().await;
@@ -12939,7 +13003,7 @@ mod tests {
     mod producer_key_tests {
         use super::*;
         #[test]
-        fn public_registry_keys_dedupes_by_first_occurrence() {
+        fn gated_targets_dedupe_by_first_occurrence() {
             let parse_result = MockParseResult {
                 deps: ["serde", "tokio", "serde"]
                     .into_iter()
@@ -12953,10 +13017,13 @@ mod tests {
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
 
-            let keys = public_registry_keys(&parse_result, &MOCK_FORMATTER);
+            let scope = DepsDevScope::new(EcosystemId::Cargo, crate::NetworkMode::Online)
+                .expect("cargo is deps.dev-covered");
+            let targets = scope
+                .targets(parse_result.dependencies(), &MOCK_FORMATTER)
+                .expect("public dependencies qualify");
 
-            let declared: Vec<&str> = keys.iter().map(|k| k.declared().as_str()).collect();
-            assert_eq!(declared, ["serde", "tokio"]);
+            assert_eq!(targets.declared_names(), ["serde", "tokio"]);
         }
     }
 }

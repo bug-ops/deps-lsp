@@ -1,16 +1,18 @@
-//! `$GOENV` discovery and `GOPROXY`/`GOPRIVATE` resolution.
+//! `$GOENV` and process-environment discovery, and `GOPROXY`/`GOPRIVATE`/`GONOPROXY` resolution.
 //!
 //! Go persists `go env -w`-set variables in a single `KEY=VALUE` file (`$GOENV`, defaulting to
 //! `os.UserConfigDir()/go/env`) rather than a project manifest — unlike Cargo/npm/PyPI, whose
 //! private-registry config lives inside or alongside the workspace being parsed. This module
-//! resolves that file once per process (memoized, mtime-gated — see [`GoEnvCache`]) into a
-//! [`GoEnvConfig`] consulted by every `go.mod` parse.
+//! resolves that file once per process (memoized, mtime-gated — see [`GoEnvCache`]) and layers
+//! the process environment ([`GoProcessEnv`]) over it with the go command's own precedence: per
+//! key, a non-empty process variable beats the `$GOENV` file, and an empty one falls through.
+//! The result is a [`GoEnvConfig`] consulted by every `go.mod` parse.
 //!
 //! # Security model (read before touching this module)
 //!
-//! `$GOENV` is a process-wide, user-owned file, not workspace-controlled content — but the
-//! resolved `GOPROXY` chain still names hosts a cloned repository's dependencies get resolved
-//! against, so the same discipline Cargo/npm/PyPI apply carries over:
+//! `$GOENV` and the process environment are user-owned, not workspace-controlled content — but
+//! the resolved `GOPROXY` chain still names hosts a cloned repository's dependencies get
+//! resolved against, so the same discipline Cargo/npm/PyPI apply carries over:
 //!
 //! - **No credential-shaped value is ever parsed** (FR-014/NFR-001). [`GoProxyUrl::new`]
 //!   rejects any URL carrying `username()`/`password()` outright — there is no `${VAR}`
@@ -33,7 +35,9 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use deps_core::EcosystemId;
-use deps_core::config_trust::{EnvPath, OperatorEnvVar, OperatorPath};
+use deps_core::config_trust::{
+    EnvPath, OperatorEnvName, OperatorEnvValue, OperatorEnvVar, OperatorPath,
+};
 use deps_core::net_policy::{
     BlockedHost, BlockedHostReason, DeclaredRegistry, EnvSource, OperatorRegistries, ProcessEnv,
     RedactedUrl, RegistryAccessPolicy, RegistryRejectionReason, RegistryUrlKind,
@@ -125,6 +129,7 @@ fn parse_hop(
     raw: &str,
     operator: &OperatorRegistries,
     policy: &RegistryAccessPolicy,
+    source: GoSettingSource,
 ) -> Result<GoProxyHop, InvalidEntry> {
     match raw {
         "direct" => Ok(GoProxyHop::Direct),
@@ -137,9 +142,25 @@ fn parse_hop(
                     raw,
                     reason,
                     GoProxyKind::ECOSYSTEM,
-                    "GOPROXY hop failed validation",
+                    source.hop_rejection_message(),
                 )
             }),
+    }
+}
+
+/// Where a Go setting came from, so a rejected `GOPROXY` hop names the layer to fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoSettingSource {
+    ProcessEnv,
+    GoenvFile,
+}
+
+impl GoSettingSource {
+    const fn hop_rejection_message(self) -> &'static str {
+        match self {
+            Self::ProcessEnv => "GOPROXY hop from the process environment failed validation",
+            Self::GoenvFile => "GOPROXY hop from $GOENV failed validation",
+        }
     }
 }
 
@@ -206,6 +227,14 @@ pub struct GoProxyChain {
 }
 
 impl GoProxyChain {
+    /// Whether the chain can download anything: `off`/`direct`-only chains fetch nothing, so no
+    /// checksum database ever verifies their content.
+    fn has_url_hop(&self) -> bool {
+        self.hops
+            .iter()
+            .any(|hop| matches!(hop, GoProxyHop::Url(_)))
+    }
+
     fn keyed(hops: Vec<GoProxyHop>, separators: Vec<ChainSeparator>) -> Self {
         let hop_parts = hops.iter().map(|hop| match hop {
             GoProxyHop::Url(url) => url.as_str(),
@@ -224,10 +253,10 @@ impl GoProxyChain {
 
 /// Fixed routing key for the `GOPRIVATE`-bypass chain (FR-008).
 ///
-/// A single [`GoProxyHop::Direct`] hop, registered once whenever `$GOENV` declares any
-/// `GOPRIVATE` pattern, regardless of what (if anything) `GOPROXY` is configured to. Content
-/// never varies, so a fixed key (rather than a hash) is sufficient and stable across
-/// re-parses.
+/// A single [`GoProxyHop::Direct`] hop, registered once whenever the effective `GONOPROXY`
+/// (defaulting to `GOPRIVATE`) declares a usable pattern, regardless of what (if anything)
+/// `GOPROXY` is configured to. Content never varies, so a fixed key (rather than a hash) is
+/// sufficient and stable across re-parses.
 pub const GOPRIVATE_CHAIN_KEY: &str = "go-private:direct";
 
 /// Everything captured when [`parse_goproxy`] finds no usable hop in a `GOPROXY` chain
@@ -271,6 +300,7 @@ fn parse_goproxy(
     raw: &str,
     operator: &OperatorRegistries,
     policy: &RegistryAccessPolicy,
+    source: GoSettingSource,
 ) -> Result<GoProxyChain, GoProxyChainFailure> {
     let mut hops: Vec<GoProxyHop> = Vec::new();
     let mut separators: Vec<ChainSeparator> = Vec::new();
@@ -301,7 +331,7 @@ fn parse_goproxy(
 
         let trimmed = entry.trim();
         if !trimmed.is_empty() {
-            match parse_hop(trimmed, operator, policy) {
+            match parse_hop(trimmed, operator, policy, source) {
                 Ok(hop) => {
                     let terminal = matches!(hop, GoProxyHop::Direct | GoProxyHop::Off);
                     if !hops.is_empty() {
@@ -685,86 +715,183 @@ fn tokens_match(tokens: &[GlobToken], text: &[char]) -> bool {
     ti == tokens.len()
 }
 
-/// Resolved `$GOENV` configuration (FR-001–FR-008), consulted per-dependency via
-/// [`Self::resolve_source_for`].
+/// What the effective `GOSUMDB` says about the content a proxy serves.
+///
+/// Classified by the first whitespace-separated token's name (`sum.golang.org[+key] [url]`, so the
+/// documented sumdb-proxy form stays [`Self::Public`]). Anything that is not the public
+/// checksum database, or its `sum.golang.google.cn` mirror, is conservative: a private checksum
+/// database proves nothing about public content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GoSumDb {
+    /// Unset, `sum.golang.org` or `sum.golang.google.cn`: downloads are verified against the
+    /// public checksum database.
+    #[default]
+    Public,
+    /// `off`: no checksum verification.
+    Off,
+    /// Any other checksum database.
+    Custom,
+}
+
+impl GoSumDb {
+    fn parse(value: &str) -> Self {
+        let name = value
+            .split_whitespace()
+            .next()
+            .map(|token| token.split_once('+').map_or(token, |(name, _key)| name));
+        match name {
+            Some("sum.golang.org" | "sum.golang.google.cn") => Self::Public,
+            Some("off") => Self::Off,
+            Some(_) | None => Self::Custom,
+        }
+    }
+}
+
+/// Resolved `$GOENV` + process-environment configuration (FR-001–FR-008), consulted
+/// per-dependency via [`Self::resolve_source_for`].
 #[derive(Debug, Default)]
 pub struct GoEnvConfig {
-    /// `None` when `$GOENV` declares no `GOPROXY` override (FR-003/US-005: every dependency
-    /// keeps resolving to plain [`DependencySource::Registry`], byte-identical to today).
+    /// `None` when neither the process environment nor `$GOENV` declares a `GOPROXY` override
+    /// (FR-003/US-005: every dependency keeps resolving to plain
+    /// [`DependencySource::Registry`], byte-identical to today).
     goproxy: Option<Result<GoProxyChain, GoProxyChainFailure>>,
-    /// `GOPRIVATE` glob patterns (FR-007). Empty when absent/declares nothing.
-    goprivate: Vec<GlobPattern>,
+    /// Effective `GONOPROXY` (first non-empty of env `GONOPROXY`, file `GONOPROXY`, env
+    /// `GOPRIVATE`, file `GOPRIVATE`): the modules fetched directly, bypassing `GOPROXY`.
+    noproxy: Vec<GlobPattern>,
+    /// Effective `GOPRIVATE` (env, else file): modules that never reach a public service.
+    private: Vec<GlobPattern>,
+    /// Effective `GONOSUMDB`, defaulting to `GOPRIVATE` like `GONOPROXY`.
+    nosumdb: Vec<GlobPattern>,
+    sumdb: GoSumDb,
+}
+
+/// The first non-empty pattern list of `layers` (most specific first), compiled.
+fn first_patterns<'a>(
+    layers: impl IntoIterator<Item = Option<&'a PatternList>>,
+) -> Vec<GlobPattern> {
+    layers
+        .into_iter()
+        .flatten()
+        .next()
+        .map_or_else(Vec::new, |list| list.compiled().to_vec())
+}
+
+fn any_match(patterns: &[GlobPattern], module_path: &str) -> bool {
+    patterns.iter().any(|pattern| pattern.matches(module_path))
+}
+
+fn any_usable(patterns: &[GlobPattern]) -> bool {
+    patterns.iter().any(|pattern| pattern.tokens.is_some())
 }
 
 impl GoEnvConfig {
     /// Parses the content of the operator-owned `$GOENV` file at `file` (FR-001: `KEY=VALUE`
-    /// lines, `#`-comments and blank lines ignored) into a resolved config.
+    /// lines, `#`-comments and blank lines ignored) into a resolved config. File-only: the
+    /// process environment is not consulted (see [`GoProcessEnv`] and [`resolve_with_context`]).
     ///
     /// Every `GOPROXY` hop is declared by that file, so each valid hop is
     /// [`deps_core::net_policy::RegistryTrust::Trusted`] and skips `policy` (spec 084); a hop of a
     /// host that is never a registry is still rejected.
     #[must_use]
     pub fn parse(content: &str, file: &OperatorPath, policy: &RegistryAccessPolicy) -> Self {
-        Self::from_raw(&parse_goenv_raw(content), file, policy)
+        Self::from_layers(
+            &GoProcessEnv::default(),
+            Some((&parse_goenv_raw(content), file)),
+            policy,
+        )
     }
 
-    fn from_raw(raw: &RawGoEnv, file: &OperatorPath, policy: &RegistryAccessPolicy) -> Self {
-        let goproxy = raw.goproxy.as_deref().filter(|s| !s.is_empty());
-        let operator =
-            OperatorRegistries::declared_in(file, goproxy.map_or_else(Vec::new, goproxy_urls));
+    fn from_layers(
+        process: &GoProcessEnv,
+        file: Option<(&RawGoEnv, &OperatorPath)>,
+        policy: &RegistryAccessPolicy,
+    ) -> Self {
+        let file_raw = file.map(|(raw, _)| raw);
+        let goproxy = match (&process.goproxy, file) {
+            (Some(value), _) => Some(parse_goproxy(
+                value.as_str(),
+                &OperatorRegistries::declared_by_env(value, goproxy_urls),
+                policy,
+                GoSettingSource::ProcessEnv,
+            )),
+            (None, Some((raw, path))) => raw.goproxy.as_deref().map(|goproxy| {
+                let operator = OperatorRegistries::declared_in(path, goproxy_urls(goproxy));
+                parse_goproxy(goproxy, &operator, policy, GoSettingSource::GoenvFile)
+            }),
+            (None, None) => None,
+        };
+        let file_list = |key: fn(&RawGoEnv) -> Option<&PatternList>| file_raw.and_then(key);
+        let process_private = process.goprivate.as_ref();
+        let file_private = file_list(|raw| raw.goprivate.as_ref());
         Self {
-            goproxy: goproxy.map(|raw| parse_goproxy(raw, &operator, policy)),
-            // Compiled once per distinct `RawGoEnv` (memoized on `raw` itself, see its
-            // `compiled_goprivate` doc) rather than on every `from_raw` call — GOPRIVATE glob
-            // compilation never depends on `policy`, unlike GOPROXY hop validation above, so
-            // there is nothing here that needs to re-run just because `from_raw` does.
-            goprivate: raw
-                .compiled_goprivate
-                .get_or_init(|| {
-                    raw.goprivate
-                        .as_deref()
-                        .unwrap_or_default()
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(GlobPattern::new)
-                        .collect()
-                })
-                .clone(),
+            goproxy,
+            noproxy: first_patterns([
+                process.gonoproxy.as_ref(),
+                file_list(|raw| raw.gonoproxy.as_ref()),
+                process_private,
+                file_private,
+            ]),
+            private: first_patterns([process_private, file_private]),
+            nosumdb: first_patterns([
+                process.gonosumdb.as_ref(),
+                file_list(|raw| raw.gonosumdb.as_ref()),
+                process_private,
+                file_private,
+            ]),
+            sumdb: process
+                .gosumdb
+                .or_else(|| file_raw.and_then(|raw| raw.gosumdb))
+                .unwrap_or_default(),
         }
+    }
+
+    /// Whether `module_path` is fetched through the proxy chain with its content verified against
+    /// the public checksum database: `GOSUMDB` is the public one, and neither `GONOSUMDB` nor
+    /// `GOPRIVATE` matches (a `GONOSUMDB` set explicitly replaces the `GOPRIVATE` default, so
+    /// both are consulted).
+    fn mirrors_public_content(&self, module_path: &str) -> bool {
+        self.sumdb == GoSumDb::Public
+            && !any_match(&self.nosumdb, module_path)
+            && !any_match(&self.private, module_path)
     }
 
     /// FR-002/FR-007/FR-008/FR-009: resolves one module's [`DependencySource`].
     ///
-    /// - A `GOPRIVATE`-matched module bypasses `GOPROXY` entirely, routing to the fixed
-    ///   [`GOPRIVATE_CHAIN_KEY`] chain (FR-008) — checked first, regardless of `GOPROXY`.
-    /// - No `GOPROXY` override declared -> plain [`DependencySource::Registry`] (US-005).
+    /// - A module matching the effective `GONOPROXY` (defaulting to `GOPRIVATE`) bypasses
+    ///   `GOPROXY` entirely, routing to the fixed [`GOPRIVATE_CHAIN_KEY`] chain (FR-008) —
+    ///   checked first, regardless of `GOPROXY`.
     /// - A `GOPROXY` override where every hop is invalid -> [`DependencySource::CustomRegistry`]
     ///   (FR-009, fail-closed, never a `proxy.golang.org` fallback).
-    /// - Otherwise -> [`DependencySource::AlternateRegistry`] pointing at the chain
-    ///   [`Self::goproxy_chain`] registers.
+    /// - Otherwise a `GOPROXY` override -> [`DependencySource::AlternateRegistry`] pointing at the
+    ///   chain [`Self::goproxy_chain`] registers; it counts as public registry content only when
+    ///   the checksum database verifies it (`mirrors_crates_io`, which never affects routing).
+    /// - No `GOPROXY` override: a module matching `GOPRIVATE` or `GONOSUMDB` is bypassed too, so
+    ///   it never reaches `proxy.golang.org` or a public service, even when `GONOPROXY` excludes
+    ///   it; any other module is plain [`DependencySource::Registry`] (US-005).
     #[must_use]
     pub fn resolve_source_for(&self, module_path: &str) -> DependencySource {
-        if self
-            .goprivate
-            .iter()
-            .any(|pattern| pattern.matches(module_path))
-        {
-            return DependencySource::AlternateRegistry {
-                index: GOPRIVATE_CHAIN_KEY.to_string(),
-                mirrors_crates_io: false,
-            };
+        let bypass = || DependencySource::AlternateRegistry {
+            index: GOPRIVATE_CHAIN_KEY.to_string(),
+            mirrors_crates_io: false,
+        };
+        if any_match(&self.noproxy, module_path) {
+            return bypass();
         }
 
         match &self.goproxy {
-            None => DependencySource::Registry,
             Some(Ok(chain)) => DependencySource::AlternateRegistry {
                 index: chain.key.clone(),
-                mirrors_crates_io: false,
+                mirrors_crates_io: chain.has_url_hop() && self.mirrors_public_content(module_path),
             },
             Some(Err(failure)) => DependencySource::CustomRegistry {
                 url: failure.for_resolution.raw.to_string(),
             },
+            None if any_match(&self.private, module_path)
+                || any_match(&self.nosumdb, module_path) =>
+            {
+                bypass()
+            }
+            None => DependencySource::Registry,
         }
     }
 
@@ -818,36 +945,35 @@ impl GoEnvConfig {
         }
     }
 
-    /// Whether at least one declared `GOPRIVATE` pattern actually compiled into a usable
-    /// matcher — gates whether the caller must also register the fixed
-    /// [`GOPRIVATE_CHAIN_KEY`] chain.
+    /// Whether the fixed [`GOPRIVATE_CHAIN_KEY`] bypass chain must be registered: some module can
+    /// actually be routed to it.
     ///
-    /// Checks `tokens.is_some()` rather than mere presence in `self.goprivate` (issue #566): a
-    /// pattern rejected either by F6's oversized-pattern guard or as malformed (unterminated
-    /// `[` character class, issue #568) is still stored with `tokens: None` (see
+    /// That is a usable effective `GONOPROXY` pattern, or — with no `GOPROXY` override, where
+    /// `GOPRIVATE`/`GONOSUMDB` matches are bypassed too — a usable `GOPRIVATE` or `GONOSUMDB`
+    /// pattern. Checks `tokens.is_some()` rather than mere presence (issue #566): a pattern
+    /// rejected either by F6's oversized-pattern guard or as malformed (unterminated `[`
+    /// character class, issue #568) is still stored with `tokens: None` (see
     /// `GlobPattern::tokens`'s doc) rather than removed, and can never match anything, so
-    /// counting it here would register a [`GOPRIVATE_CHAIN_KEY`] chain nothing can ever route
-    /// to.
+    /// counting it here would register a chain nothing can ever route to.
     #[must_use]
-    pub fn has_goprivate(&self) -> bool {
-        self.goprivate
-            .iter()
-            .any(|pattern| pattern.tokens.is_some())
+    pub fn registers_bypass_chain(&self) -> bool {
+        any_usable(&self.noproxy)
+            || (self.goproxy.is_none() && (any_usable(&self.private) || any_usable(&self.nosumdb)))
     }
 
     /// Every chain this config implies, ready for `GoRegistry::register_alternate` — the resolved
     /// `GOPROXY` chain (if any), plus the fixed [`GOPRIVATE_CHAIN_KEY`] bypass chain when
-    /// [`Self::has_goprivate`] holds (registered regardless of whether `GOPROXY` itself is also
-    /// declared — FR-008 applies independently of `GOPROXY`). Empty when `$GOENV` declares no
-    /// override at all, or when every declared `GOPRIVATE` pattern was rejected (US-005/#566:
-    /// nothing usable to register).
+    /// [`Self::registers_bypass_chain`] holds (registered regardless of whether `GOPROXY` itself
+    /// is also declared — FR-008 applies independently of `GOPROXY`). Empty when nothing declares
+    /// an override at all, or when every declared pattern was rejected (US-005/#566: nothing
+    /// usable to register).
     #[must_use]
     pub fn resolved_chains(&self) -> Vec<GoProxyChain> {
         let mut chains = Vec::new();
         if let Some(chain) = self.goproxy_chain() {
             chains.push(chain.clone());
         }
-        if self.has_goprivate() {
+        if self.registers_bypass_chain() {
             chains.push(GoProxyChain {
                 key: GOPRIVATE_CHAIN_KEY.to_string(),
                 hops: vec![GoProxyHop::Direct],
@@ -867,8 +993,79 @@ fn goproxy_urls(raw: &str) -> Vec<&str> {
         .collect()
 }
 
-/// One `$GOENV` file's raw (unvalidated) `GOPROXY`/`GOPRIVATE` values — see
-/// [`parse_goenv_raw`]'s doc for exactly which keys this can ever contain.
+/// The Go settings this crate reads, from the process environment and from `$GOENV`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoEnvKey {
+    Goproxy,
+    Goprivate,
+    Gonoproxy,
+    Gosumdb,
+    Gonosumdb,
+}
+
+impl GoEnvKey {
+    const ALL: [Self; 5] = [
+        Self::Goproxy,
+        Self::Goprivate,
+        Self::Gonoproxy,
+        Self::Gosumdb,
+        Self::Gonosumdb,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Goproxy => "GOPROXY",
+            Self::Goprivate => "GOPRIVATE",
+            Self::Gonoproxy => "GONOPROXY",
+            Self::Gosumdb => "GOSUMDB",
+            Self::Gonosumdb => "GONOSUMDB",
+        }
+    }
+
+    const fn env_name(self) -> OperatorEnvName {
+        OperatorEnvName::fixed(self.name())
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|key| key.name() == name)
+    }
+}
+
+/// A comma-separated glob list (`GOPRIVATE` and friends) with its compilation memoized.
+///
+/// The memo makes a malformed- or oversized-pattern warning fire once per distinct source (issue
+/// #565): [`GoEnvCache`] hands out the same `Arc<RawGoEnv>` for repeat calls against an unchanged
+/// file, and the process layer held by [`GoParseContext`] is built once at startup. A list
+/// freshly built by [`GoEnvConfig::parse`] (no cache) or by [`resolve`] (which re-reads the
+/// process environment per call) starts empty, so those entry points warn on every call.
+#[derive(Debug)]
+struct PatternList {
+    raw: String,
+    compiled: OnceLock<Vec<GlobPattern>>,
+}
+
+impl PatternList {
+    fn new(raw: String) -> Self {
+        Self {
+            raw,
+            compiled: OnceLock::new(),
+        }
+    }
+
+    fn compiled(&self) -> &[GlobPattern] {
+        self.compiled.get_or_init(|| {
+            self.raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(GlobPattern::new)
+                .collect()
+        })
+    }
+}
+
+/// One `$GOENV` file's raw (unvalidated) settings — see [`parse_goenv_raw`]'s doc for exactly
+/// which keys this can ever contain. An empty value is stored as absent.
 #[derive(Debug, Default)]
 struct RawGoEnv {
     /// Raw, unvalidated `GOPROXY` value, which may carry embedded userinfo until
@@ -879,28 +1076,19 @@ struct RawGoEnv {
     /// [`deps_core::net_policy::RedactedUrl`]'d output (userinfo and query
     /// string/fragment stripped — #767) ever leaves this module.
     goproxy: Option<String>,
-    goprivate: Option<String>,
-    /// Memoizes [`GlobPattern::new`]'s compilation of `goprivate` (and thus any `tracing::warn!`
-    /// it logs — for an oversized pattern (F6) or a malformed one with an unterminated `[`
-    /// character class, issue #568) exactly once per distinct `RawGoEnv` instance.
-    ///
-    /// [`GoEnvCache`] hands out the *same* `Arc<RawGoEnv>` for repeat calls against an
-    /// unchanged file (mtime-gated), so `from_raw`'s `get_or_init` on this field runs the
-    /// compile-and-possibly-warn work only on the first call per distinct content — fixing the
-    /// F6 warning firing once per LSP re-parse (`did_change` -> ... -> `from_raw`) instead of
-    /// once per resolved config (issue #565), and equally debouncing the malformed-pattern
-    /// warning. A freshly-`parse_goenv_raw`'d `RawGoEnv` (e.g. from [`GoEnvConfig::parse`],
-    /// which has no cache) always starts with an empty `OnceLock`, so that entry point's
-    /// behavior — warn on every call — is unchanged.
-    compiled_goprivate: OnceLock<Vec<GlobPattern>>,
+    goprivate: Option<PatternList>,
+    gonoproxy: Option<PatternList>,
+    /// Classified at ingest: a sumdb-proxy URL may carry userinfo and is never kept.
+    gosumdb: Option<GoSumDb>,
+    gonosumdb: Option<PatternList>,
 }
 
-/// Parses `$GOENV` file content into its raw `GOPROXY`/`GOPRIVATE` values (FR-001).
+/// Parses `$GOENV` file content into its raw settings (FR-001).
 ///
 /// Grammar: one `KEY=VALUE` per line (`go env -w`'s own written format); `#`-prefixed comment
 /// lines and blank lines are ignored; any other key is ignored (this crate has no use for
-/// `GONOSUMCHECK`/`GOFLAGS`/etc — see spec Out of Scope). A key declared more than once keeps
-/// its last occurrence, matching plain assignment-overwrite semantics.
+/// `GOFLAGS`/etc — see spec Out of Scope). A key declared more than once keeps its last
+/// occurrence, matching plain assignment-overwrite semantics.
 fn parse_goenv_raw(content: &str) -> RawGoEnv {
     let mut raw = RawGoEnv::default();
     for line in content.lines() {
@@ -911,13 +1099,77 @@ fn parse_goenv_raw(content: &str) -> RawGoEnv {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        match key.trim() {
-            "GOPROXY" => raw.goproxy = Some(value.trim().to_string()),
-            "GOPRIVATE" => raw.goprivate = Some(value.trim().to_string()),
-            _ => {}
+        let Some(key) = GoEnvKey::from_name(key.trim()) else {
+            continue;
+        };
+        let value = Some(value.trim()).filter(|value| !value.is_empty());
+        let text = || value.map(str::to_string);
+        let list = || value.map(|value| PatternList::new(value.to_string()));
+        match key {
+            GoEnvKey::Goproxy => raw.goproxy = text(),
+            GoEnvKey::Gosumdb => raw.gosumdb = value.map(GoSumDb::parse),
+            GoEnvKey::Goprivate => raw.goprivate = list(),
+            GoEnvKey::Gonoproxy => raw.gonoproxy = list(),
+            GoEnvKey::Gonosumdb => raw.gonosumdb = list(),
         }
     }
     raw
+}
+
+/// The Go settings read from the process environment, captured once at startup.
+///
+/// The go command lets a non-empty process variable override the same key in `$GOENV`; this is
+/// that layer. Passed to [`GoParseContext::new`] explicitly (the same rule as
+/// [`GoParseContext::goenv_path`], issue #559) so nothing in this crate reads the live host
+/// environment implicitly. The [`Default`] value declares nothing: hermetic, for tests and
+/// callers that want file-only behavior.
+///
+/// An empty variable is treated as unset (the go command's `Getenv != ""` test, applied to the
+/// raw untrimmed value): a whitespace-only `GOPROXY` is kept and fails closed rather than falling
+/// through to the file.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::MapEnv;
+/// use deps_go::config::GoProcessEnv;
+///
+/// let env = MapEnv::new().with_var("GOPRIVATE", "corp.example/*");
+/// let _ = GoProcessEnv::from_env(&env);
+/// let _ = GoProcessEnv::default();
+/// ```
+#[derive(Debug, Default)]
+pub struct GoProcessEnv {
+    goproxy: Option<OperatorEnvValue>,
+    goprivate: Option<PatternList>,
+    gonoproxy: Option<PatternList>,
+    gosumdb: Option<GoSumDb>,
+    gonosumdb: Option<PatternList>,
+}
+
+impl GoProcessEnv {
+    /// Reads the Go settings from the real process environment.
+    #[must_use]
+    pub fn from_process() -> Self {
+        Self::from_env(&ProcessEnv)
+    }
+
+    /// Reads the Go settings from `env`; tests pass a `MapEnv`.
+    #[must_use]
+    pub fn from_env(env: &(impl EnvSource + ?Sized)) -> Self {
+        let read = |key: GoEnvKey| {
+            OperatorEnvValue::read(env, &key.env_name()).filter(|value| !value.is_empty())
+        };
+        let list =
+            |key: GoEnvKey| read(key).map(|value| PatternList::new(value.as_str().to_string()));
+        Self {
+            goproxy: read(GoEnvKey::Goproxy),
+            goprivate: list(GoEnvKey::Goprivate),
+            gonoproxy: list(GoEnvKey::Gonoproxy),
+            gosumdb: read(GoEnvKey::Gosumdb).map(|value| GoSumDb::parse(value.as_str())),
+            gonosumdb: list(GoEnvKey::Gonosumdb),
+        }
+    }
 }
 
 /// Per-`$GOENV`-file-path memoization, mirroring `deps_npm::config::NpmConfigCache` exactly in
@@ -969,10 +1221,13 @@ pub struct GoParseContext {
     /// An [`OperatorPath`], never a bare path: a `GOENV` that is `off`, empty or relative names no
     /// operator-owned file and is `None` here.
     pub goenv_path: Option<OperatorPath>,
+    /// The process-environment layer over `$GOENV`, captured once at startup. The [`Default`]
+    /// value declares nothing (hermetic).
+    pub process_env: Arc<GoProcessEnv>,
 }
 
 impl GoParseContext {
-    /// Constructs a `GoParseContext` from its three fields.
+    /// Constructs a `GoParseContext` from its four fields.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate must go through this constructor instead.
@@ -981,13 +1236,14 @@ impl GoParseContext {
     ///
     /// ```
     /// use deps_core::net_policy::RegistryAccessPolicy;
-    /// use deps_go::config::{GoEnvCache, GoParseContext};
+    /// use deps_go::config::{GoEnvCache, GoParseContext, GoProcessEnv};
     /// use std::sync::Arc;
     ///
     /// let ctx = GoParseContext::new(
     ///     Arc::new(RegistryAccessPolicy::default()),
     ///     Arc::new(GoEnvCache::new()),
     ///     None,
+    ///     Arc::new(GoProcessEnv::default()),
     /// );
     /// assert!(ctx.goenv_path.is_none());
     /// ```
@@ -996,11 +1252,13 @@ impl GoParseContext {
         policy: Arc<RegistryAccessPolicy>,
         config_cache: Arc<GoEnvCache>,
         goenv_path: Option<OperatorPath>,
+        process_env: Arc<GoProcessEnv>,
     ) -> Self {
         Self {
             policy,
             config_cache,
             goenv_path,
+            process_env,
         }
     }
 }
@@ -1012,6 +1270,7 @@ impl GoParseContext {
 /// Windows). `GOENV=off` disables the file (`None`), as `go` itself does, and an empty or
 /// relative `GOENV` is ignored without falling back to the default: a relative path would
 /// resolve against a directory a repository can influence.
+// TODO(critic): the `$GOROOT/go.env` defaults layer (Go 1.21+) is not read.
 #[must_use]
 pub fn goenv_path() -> Option<OperatorPath> {
     goenv_path_with_env(&ProcessEnv)
@@ -1035,12 +1294,13 @@ fn goenv_path_with_env(env: &impl EnvSource) -> Option<OperatorPath> {
     }
 }
 
-/// Resolves `$GOENV` into a [`GoEnvConfig`] (spec FR-001–FR-008).
+/// Resolves the process environment and `$GOENV` into a [`GoEnvConfig`] (spec FR-001–FR-008).
 ///
-/// `None`/an unreadable path (no `$GOENV` file at all) resolves to [`GoEnvConfig::default`] —
-/// every dependency keeps resolving to plain [`DependencySource::Registry`] (US-005, NFR-004:
-/// no additional filesystem/network activity beyond the one `stat` `MtimeFileCache` already
-/// performs).
+/// With no process override and `None`/an unreadable path (no `$GOENV` file at all), every
+/// dependency keeps resolving to plain [`DependencySource::Registry`] (US-005, NFR-004: no
+/// additional filesystem/network activity beyond the one `stat` `MtimeFileCache` already
+/// performs). A file that is missing or unreadable still leaves the process environment in
+/// effect.
 ///
 /// # Examples
 ///
@@ -1052,7 +1312,9 @@ fn goenv_path_with_env(env: &impl EnvSource) -> Option<OperatorPath> {
 ///
 /// ```
 /// use deps_core::net_policy::RegistryAccessPolicy;
-/// use deps_go::config::{GoEnvCache, GoParseContext, resolve, resolve_with_context};
+/// use deps_go::config::{
+///     GoEnvCache, GoParseContext, GoProcessEnv, resolve, resolve_with_context,
+/// };
 /// use std::sync::Arc;
 ///
 /// let cache = GoEnvCache::new();
@@ -1063,14 +1325,20 @@ fn goenv_path_with_env(env: &impl EnvSource) -> Option<OperatorPath> {
 ///     Arc::new(RegistryAccessPolicy::default()),
 ///     Arc::new(GoEnvCache::new()),
 ///     None,
+///     Arc::new(GoProcessEnv::default()),
 /// );
 /// let config = resolve_with_context(&ctx);
-/// // No `$GOENV` path at all resolves to `GoEnvConfig::default`.
+/// // No `$GOENV` path and no process override declares nothing.
 /// assert!(config.goproxy_chain().is_none());
 /// ```
 #[must_use]
 pub fn resolve(cache: &GoEnvCache, policy: &RegistryAccessPolicy) -> GoEnvConfig {
-    resolve_at(cache, policy, goenv_path().as_ref())
+    resolve_at(
+        cache,
+        policy,
+        goenv_path().as_ref(),
+        &GoProcessEnv::from_process(),
+    )
 }
 
 /// Resolves `$GOENV` into a [`GoEnvConfig`], reading the already-resolved
@@ -1081,23 +1349,28 @@ pub fn resolve(cache: &GoEnvCache, policy: &RegistryAccessPolicy) -> GoEnvConfig
 /// path without depending on the real host `$GOENV`.
 #[must_use]
 pub fn resolve_with_context(ctx: &GoParseContext) -> GoEnvConfig {
-    resolve_at(&ctx.config_cache, &ctx.policy, ctx.goenv_path.as_ref())
+    resolve_at(
+        &ctx.config_cache,
+        &ctx.policy,
+        ctx.goenv_path.as_ref(),
+        &ctx.process_env,
+    )
 }
 
-/// [`resolve`], but taking the `$GOENV` path explicitly instead of [`goenv_path`] — lets tests
-/// inject a fixture path.
+/// [`resolve`], but taking the `$GOENV` path and process layer explicitly — lets tests inject
+/// fixtures.
 fn resolve_at(
     cache: &GoEnvCache,
     policy: &RegistryAccessPolicy,
     path: Option<&OperatorPath>,
+    process: &GoProcessEnv,
 ) -> GoEnvConfig {
-    let Some(path) = path else {
-        return GoEnvConfig::default();
-    };
-    let Some(raw) = cache.get_or_parse(path.as_path()) else {
-        return GoEnvConfig::default();
-    };
-    GoEnvConfig::from_raw(&raw, path, policy)
+    let file = path.and_then(|path| cache.get_or_parse(path.as_path()).map(|raw| (raw, path)));
+    GoEnvConfig::from_layers(
+        process,
+        file.as_ref().map(|(raw, path)| (raw.as_ref(), *path)),
+        policy,
+    )
 }
 
 #[cfg(test)]
@@ -1268,7 +1541,7 @@ mod tests {
     /// verified empirically against go1.25.5's `path.Match`, which returns `err == nil` and
     /// treats it as an always-empty range. `GlobPattern` mirrors that: the reversed entry
     /// itself never matches any character, but `tokens` stays `Some(...)` (the pattern is
-    /// still usable — `has_goprivate()` must not fail open just because it warned).
+    /// still usable — `registers_bypass_chain()` must not fail open just because it warned).
     #[test]
     fn test_glob_pattern_reversed_range_entry_never_matches_but_pattern_still_compiles() {
         let pattern = GlobPattern::new("git.mycorp.example/repo[c-a]");
@@ -1478,6 +1751,7 @@ mod tests {
                     &cache,
                     &all_policy(),
                     Some(&OperatorPath::for_test(path.clone())),
+                    &GoProcessEnv::default(),
                 );
             }
 
@@ -1499,6 +1773,7 @@ mod tests {
                     &cache,
                     &all_policy(),
                     Some(&OperatorPath::for_test(path.clone())),
+                    &GoProcessEnv::default(),
                 );
             }
         });
@@ -1521,7 +1796,7 @@ mod tests {
             DependencySource::Registry
         );
         assert!(config.goproxy_chain().is_none());
-        assert!(!config.has_goprivate());
+        assert!(!config.registers_bypass_chain());
     }
 
     #[test]
@@ -1546,7 +1821,7 @@ mod tests {
         else {
             panic!("expected AlternateRegistry");
         };
-        assert!(!mirrors_crates_io);
+        assert!(mirrors_crates_io);
         let chain = config.goproxy_chain().unwrap();
         assert_eq!(chain.key, index);
         assert_eq!(chain.hops.len(), 2);
@@ -1801,7 +2076,7 @@ mod tests {
         let public_source = config.resolve_source_for("github.com/gin-gonic/gin");
         assert_matches!(public_source, DependencySource::AlternateRegistry { .. });
         assert_ne!(private_source, public_source);
-        assert!(config.has_goprivate());
+        assert!(config.registers_bypass_chain());
     }
 
     /// FR-008: `GOPRIVATE` alone (no `GOPROXY` declared) still routes a matched module to the
@@ -1830,7 +2105,7 @@ mod tests {
     fn test_goenv_empty_goproxy_and_goprivate_values_are_absent() {
         let config = parse_fixture("GOPROXY=\nGOPRIVATE=\n", &all_policy());
         assert!(config.goproxy_chain().is_none());
-        assert!(!config.has_goprivate());
+        assert!(!config.registers_bypass_chain());
         assert_eq!(
             config.resolve_source_for("github.com/gin-gonic/gin"),
             DependencySource::Registry
@@ -1854,7 +2129,7 @@ mod tests {
             "GOPRIVATE=git.mycorp.example/*,git.mycorp.example/*",
             &all_policy(),
         );
-        assert!(config.has_goprivate());
+        assert!(config.registers_bypass_chain());
         assert_eq!(
             config.resolve_source_for("git.mycorp.example/internal/auth"),
             DependencySource::AlternateRegistry {
@@ -1900,35 +2175,35 @@ mod tests {
     }
 
     /// Issue #566: a GOPRIVATE pattern rejected by F6 (oversized) never becomes a usable
-    /// matcher, so `has_goprivate()` must not report `true` for it, and no unreachable
+    /// matcher, so `registers_bypass_chain()` must not report `true` for it, and no unreachable
     /// `GOPRIVATE_CHAIN_KEY` chain should be registered.
     #[test]
-    fn test_has_goprivate_false_when_all_patterns_rejected() {
+    fn test_registers_bypass_chain_false_when_all_patterns_rejected() {
         let long_pattern = "*".repeat(MAX_GLOB_PATTERN_LENGTH + 1);
         let config = parse_fixture(&format!("GOPRIVATE={long_pattern}"), &all_policy());
-        assert!(!config.has_goprivate());
+        assert!(!config.registers_bypass_chain());
         assert!(config.resolved_chains().is_empty());
     }
 
     /// Issue #566: as long as at least one declared GOPRIVATE pattern compiles into a usable
-    /// matcher, `has_goprivate()` still reports `true` and the bypass chain is still
+    /// matcher, `registers_bypass_chain()` still reports `true` and the bypass chain is still
     /// registered, even alongside a sibling pattern that was rejected.
     #[test]
-    fn test_has_goprivate_true_when_at_least_one_pattern_usable() {
+    fn test_registers_bypass_chain_true_when_at_least_one_pattern_usable() {
         let long_pattern = "*".repeat(MAX_GLOB_PATTERN_LENGTH + 1);
         let content = format!("GOPRIVATE={long_pattern},git.mycorp.example/*");
         let config = parse_fixture(&content, &all_policy());
-        assert!(config.has_goprivate());
+        assert!(config.registers_bypass_chain());
         assert_eq!(config.resolved_chains().len(), 1);
     }
 
     /// Issue #568: a malformed (unterminated `[`) `GOPRIVATE` pattern is the sibling rejection
-    /// path to #566's oversized-pattern one, and must be excluded from `has_goprivate()`
+    /// path to #566's oversized-pattern one, and must be excluded from `registers_bypass_chain()`
     /// (and thus `resolved_chains()`) the same way.
     #[test]
-    fn test_has_goprivate_false_for_malformed_pattern() {
+    fn test_registers_bypass_chain_false_for_malformed_pattern() {
         let config = parse_fixture("GOPRIVATE=git.corp.example/[abc", &all_policy());
-        assert!(!config.has_goprivate());
+        assert!(!config.registers_bypass_chain());
         assert!(config.resolved_chains().is_empty());
         assert_eq!(
             config.resolve_source_for("git.corp.example/abc"),
@@ -1938,13 +2213,13 @@ mod tests {
 
     /// Issue #570 (corrected): unlike the oversized/unterminated rejection paths above, a
     /// reversed `[lo-hi]` character-class range only warns — `compile_glob` keeps
-    /// `tokens: Some(...)` (see `GlobPattern::tokens`'s doc), so `has_goprivate()` must still
-    /// report `true` and the bypass chain must still be registered for a pattern containing
-    /// one.
+    /// `tokens: Some(...)` (see `GlobPattern::tokens`'s doc), so `registers_bypass_chain()` must
+    /// still report `true` and the bypass chain must still be registered for a pattern
+    /// containing one.
     #[test]
-    fn test_has_goprivate_true_for_pattern_with_reversed_range() {
+    fn test_registers_bypass_chain_true_for_pattern_with_reversed_range() {
         let config = parse_fixture("GOPRIVATE=git.corp.example/repo[c-a]", &all_policy());
-        assert!(config.has_goprivate());
+        assert!(config.registers_bypass_chain());
         assert_eq!(config.resolved_chains().len(), 1);
     }
 
@@ -1983,7 +2258,7 @@ mod tests {
                 r"GOPRIVATE=git.corp.example/pkg?token=SUPERSECRET_TOKEN\",
                 &all_policy(),
             );
-            assert!(!config.has_goprivate());
+            assert!(!config.registers_bypass_chain());
         });
         assert!(
             log.contains("trailing unescaped"),
@@ -2003,7 +2278,7 @@ mod tests {
                 "GOPRIVATE=git.corp.example/repo?token=SUPERSECRET_TOKEN[c-a]",
                 &all_policy(),
             );
-            assert!(config.has_goprivate());
+            assert!(config.registers_bypass_chain());
         });
         assert!(
             log.contains("reversed"),
@@ -2023,7 +2298,7 @@ mod tests {
                 "GOPRIVATE=git.corp.example/repo?token=SUPERSECRET_TOKEN[abc",
                 &all_policy(),
             );
-            assert!(!config.has_goprivate());
+            assert!(!config.registers_bypass_chain());
         });
         assert!(
             log.contains("unterminated"),
@@ -2051,7 +2326,7 @@ mod tests {
     #[test]
     fn test_resolve_at_no_path_is_default() {
         let cache = GoEnvCache::new();
-        let config = resolve_at(&cache, &all_policy(), None);
+        let config = resolve_at(&cache, &all_policy(), None, &GoProcessEnv::default());
         assert!(config.goproxy_chain().is_none());
     }
 
@@ -2062,6 +2337,7 @@ mod tests {
             &cache,
             &all_policy(),
             Some(&OperatorPath::for_test("/nonexistent/go/env")),
+            &GoProcessEnv::default(),
         );
         assert!(config.goproxy_chain().is_none());
     }
@@ -2073,7 +2349,12 @@ mod tests {
         std::fs::write(&path, "GOPROXY=https://goproxy.mycorp.example,direct\n").unwrap();
 
         let cache = GoEnvCache::new();
-        let config = resolve_at(&cache, &all_policy(), Some(&OperatorPath::for_test(path)));
+        let config = resolve_at(
+            &cache,
+            &all_policy(),
+            Some(&OperatorPath::for_test(path)),
+            &GoProcessEnv::default(),
+        );
         assert!(config.goproxy_chain().is_some());
     }
 
@@ -2144,5 +2425,386 @@ mod tests {
         let config = parse_fixture("GOPROXY=https://169.254.169.254/\n", &all_policy());
         assert!(config.goproxy_chain().is_none());
         assert!(config.blocked_class().is_some());
+    }
+
+    // --- process-environment layering, GONOPROXY and GOSUMDB ---
+
+    fn layered(env: &MapEnv, file: Option<&str>) -> GoEnvConfig {
+        let process = GoProcessEnv::from_env(env);
+        let raw = file.map(parse_goenv_raw);
+        let path = OperatorPath::for_test("/home/me/go/env");
+        GoEnvConfig::from_layers(
+            &process,
+            raw.as_ref().map(|raw| (raw, &path)),
+            &all_policy(),
+        )
+    }
+
+    fn bypass() -> DependencySource {
+        DependencySource::AlternateRegistry {
+            index: GOPRIVATE_CHAIN_KEY.to_string(),
+            mirrors_crates_io: false,
+        }
+    }
+
+    fn chain_source(config: &GoEnvConfig, public: bool) -> DependencySource {
+        DependencySource::AlternateRegistry {
+            index: config
+                .goproxy_chain()
+                .expect("a resolved chain")
+                .key
+                .clone(),
+            mirrors_crates_io: public,
+        }
+    }
+
+    fn chain_hop_urls(config: &GoEnvConfig) -> Vec<String> {
+        config
+            .goproxy_chain()
+            .expect("a resolved chain")
+            .hops
+            .iter()
+            .filter_map(|hop| match hop {
+                GoProxyHop::Url(url) => Some(url.as_str().to_string()),
+                GoProxyHop::Direct | GoProxyHop::Off => None,
+            })
+            .collect()
+    }
+
+    const FILE_PROXY: &str = "GOPROXY=https://file-proxy.example\n";
+
+    /// Row A: a file GOPROXY and GONOPROXY beat an env GOPRIVATE (`go env` output).
+    #[test]
+    fn test_precedence_row_a_file_gonoproxy_beats_env_goprivate() {
+        let env = MapEnv::new().with_var("GOPRIVATE", "env.example/*");
+        let config = layered(
+            &env,
+            Some("GOPROXY=https://file-proxy.example\nGONOPROXY=file.example/*\n"),
+        );
+        assert_eq!(chain_hop_urls(&config), ["https://file-proxy.example"]);
+        assert_eq!(config.resolve_source_for("file.example/x"), bypass());
+        assert_ne!(config.resolve_source_for("env.example/x"), bypass());
+    }
+
+    /// Row B: empty env values fall through to the file.
+    #[test]
+    fn test_precedence_row_b_empty_env_falls_through_to_file() {
+        let env = MapEnv::new()
+            .with_var("GOPROXY", "")
+            .with_var("GONOPROXY", "");
+        let config = layered(
+            &env,
+            Some("GOPROXY=https://file-proxy.example\nGONOPROXY=file.example/*\n"),
+        );
+        assert_eq!(chain_hop_urls(&config), ["https://file-proxy.example"]);
+        assert_eq!(config.resolve_source_for("file.example/x"), bypass());
+    }
+
+    /// Row C: env GOPRIVATE beats file GOPRIVATE.
+    #[test]
+    fn test_precedence_row_c_env_goprivate_beats_file_goprivate() {
+        let env = MapEnv::new().with_var("GOPRIVATE", "env.example/*");
+        let config = layered(&env, Some("GOPRIVATE=file.example/*\n"));
+        assert_eq!(config.resolve_source_for("env.example/x"), bypass());
+        assert_eq!(
+            config.resolve_source_for("file.example/x"),
+            DependencySource::Registry
+        );
+    }
+
+    /// Row D: a file GOPRIVATE alone is also the GONOPROXY.
+    #[test]
+    fn test_precedence_row_d_file_goprivate_is_gonoproxy() {
+        let config = layered(&MapEnv::new(), Some("GOPRIVATE=corp.example/*\n"));
+        assert_eq!(config.resolve_source_for("corp.example/x"), bypass());
+    }
+
+    /// Row E: `GOENV=off` (no file at all) still applies the process environment.
+    #[test]
+    fn test_precedence_row_e_env_applies_without_file() {
+        let env = MapEnv::new()
+            .with_var("GOPROXY", "https://env-proxy.example")
+            .with_var("GOPRIVATE", "corp.example/*");
+        let config = layered(&env, None);
+        assert_eq!(chain_hop_urls(&config), ["https://env-proxy.example"]);
+        assert_eq!(config.resolve_source_for("corp.example/x"), bypass());
+    }
+
+    /// Row F: env GONOPROXY beats file GONOPROXY.
+    #[test]
+    fn test_precedence_row_f_env_gonoproxy_beats_file_gonoproxy() {
+        let env = MapEnv::new().with_var("GONOPROXY", "env.example/*");
+        let config = layered(&env, Some("GONOPROXY=file.example/*\n"));
+        assert_eq!(config.resolve_source_for("env.example/x"), bypass());
+        assert_ne!(config.resolve_source_for("file.example/x"), bypass());
+    }
+
+    #[test]
+    fn test_env_goproxy_beats_file_goproxy() {
+        let env = MapEnv::new().with_var("GOPROXY", "https://env-proxy.example");
+        let config = layered(&env, Some(FILE_PROXY));
+        assert_eq!(chain_hop_urls(&config), ["https://env-proxy.example"]);
+        let hop = &config.goproxy_chain().unwrap().hops[0];
+        assert_matches!(hop, GoProxyHop::Url(url) if url.trust() == RegistryTrust::Trusted);
+    }
+
+    #[test]
+    fn test_env_goproxy_with_userinfo_fails_closed_and_is_redacted() {
+        let env = MapEnv::new().with_var("GOPROXY", "https://user:secret@proxy.example");
+        let config = layered(&env, Some(FILE_PROXY));
+        let DependencySource::CustomRegistry { url } = config.resolve_source_for("github.com/a/b")
+        else {
+            panic!("an env GOPROXY with userinfo must fail closed");
+        };
+        assert!(!url.contains("secret"));
+        assert!(config.goproxy_chain().is_none());
+    }
+
+    /// An env GOPROXY with every hop invalid never falls back to the file's valid chain.
+    #[test]
+    fn test_env_invalid_goproxy_does_not_fall_back_to_file() {
+        let env = MapEnv::new().with_var("GOPROXY", "http://insecure.example");
+        let config = layered(&env, Some(FILE_PROXY));
+        assert_matches!(
+            config.resolve_source_for("github.com/a/b"),
+            DependencySource::CustomRegistry { .. }
+        );
+    }
+
+    /// A whitespace-only env value is non-empty: it fails closed instead of falling through.
+    #[test]
+    fn test_whitespace_env_goproxy_is_not_empty() {
+        let env = MapEnv::new().with_var("GOPROXY", "  ");
+        let config = layered(&env, Some(FILE_PROXY));
+        assert_matches!(
+            config.resolve_source_for("github.com/a/b"),
+            DependencySource::CustomRegistry { .. }
+        );
+    }
+
+    #[test]
+    fn test_whitespace_env_gonoproxy_shadows_goprivate_and_matches_nothing() {
+        let env = MapEnv::new().with_var("GONOPROXY", " ");
+        let config = layered(&env, Some("GOPRIVATE=corp.example/*\n"));
+        assert!(!any_usable(&config.noproxy));
+        assert_ne!(
+            config.resolve_source_for("corp.example/x"),
+            DependencySource::Registry
+        );
+    }
+
+    #[test]
+    fn test_file_gonoproxy_is_read() {
+        let config = layered(&MapEnv::new(), Some("GONOPROXY=corp.example/*\n"));
+        assert_eq!(config.resolve_source_for("corp.example/x"), bypass());
+    }
+
+    /// File GOPRIVATE + GONOPROXY=none with no GOPROXY: still never `Registry`.
+    #[test]
+    fn test_gonoproxy_none_keeps_private_module_off_the_public_proxy() {
+        let config = layered(
+            &MapEnv::new(),
+            Some("GOPRIVATE=corp.example/*\nGONOPROXY=none\n"),
+        );
+        assert_eq!(config.resolve_source_for("corp.example/x"), bypass());
+        assert!(config.registers_bypass_chain());
+    }
+
+    /// Row A with no GOPROXY: an env-private module is bypassed despite a stale file GONOPROXY.
+    #[test]
+    fn test_env_private_module_bypassed_despite_file_gonoproxy() {
+        let env = MapEnv::new().with_var("GOPRIVATE", "corp.example/*");
+        let config = layered(&env, Some("GONOPROXY=other.example/*\n"));
+        assert_eq!(config.resolve_source_for("corp.example/x"), bypass());
+    }
+
+    /// GONOPROXY=none with an explicit corporate GOPROXY sends the private module to that proxy.
+    #[test]
+    fn test_gonoproxy_none_with_corporate_goproxy_uses_the_chain() {
+        let env = MapEnv::new()
+            .with_var("GOPRIVATE", "corp.example/*")
+            .with_var("GONOPROXY", "none")
+            .with_var("GOPROXY", "https://corp-proxy.example");
+        let config = layered(&env, None);
+        assert_eq!(
+            config.resolve_source_for("corp.example/x"),
+            chain_source(&config, false)
+        );
+    }
+
+    /// An explicit default chain is operator consent; an unset GOPROXY bypasses instead.
+    #[test]
+    fn test_explicit_default_chain_differs_from_unset_goproxy() {
+        let private = "GOPRIVATE=corp.example/*\nGONOPROXY=none\n";
+        let unset = layered(&MapEnv::new(), Some(private));
+        assert_eq!(unset.resolve_source_for("corp.example/x"), bypass());
+
+        let env = MapEnv::new().with_var("GOPROXY", "https://proxy.golang.org,direct");
+        let explicit = layered(&env, Some(private));
+        assert_eq!(
+            explicit.resolve_source_for("corp.example/x"),
+            chain_source(&explicit, false)
+        );
+    }
+
+    fn mirrors(config: &GoEnvConfig, module: &str) -> bool {
+        config.resolve_source_for(module) == chain_source(config, true)
+    }
+
+    #[test]
+    fn test_sumdb_verified_chain_module_is_public_content() {
+        let env = MapEnv::new()
+            .with_var("GOPROXY", "https://corp-proxy.example")
+            .with_var("GOPRIVATE", "corp.example/*");
+        let config = layered(&env, None);
+        assert!(mirrors(&config, "github.com/gin-gonic/gin"));
+        assert!(!mirrors(&config, "corp.example/x"));
+    }
+
+    #[test]
+    fn test_gonosumdb_module_behind_chain_is_not_public_content() {
+        let env = MapEnv::new()
+            .with_var("GOPROXY", "https://corp-proxy.example")
+            .with_var("GONOSUMDB", "corp.example/*");
+        let config = layered(&env, None);
+        assert!(!mirrors(&config, "corp.example/x"));
+        assert!(mirrors(&config, "github.com/gin-gonic/gin"));
+    }
+
+    /// F1: an explicit GONOSUMDB replaces the GOPRIVATE default, but a GOPRIVATE module is
+    /// still never public content.
+    #[test]
+    fn test_gonosumdb_replacing_goprivate_default_does_not_leak_private_module() {
+        let env = MapEnv::new()
+            .with_var("GOPRIVATE", "corp/*")
+            .with_var("GONOSUMDB", "other/*")
+            .with_var("GONOPROXY", "none")
+            .with_var("GOPROXY", "https://corp-proxy.example");
+        let config = layered(&env, None);
+        assert_eq!(
+            config.resolve_source_for("corp/x"),
+            chain_source(&config, false)
+        );
+    }
+
+    /// F2: with GOPROXY unset a GONOSUMDB-only module is bypassed, not `Registry`.
+    #[test]
+    fn test_gonosumdb_only_module_is_bypassed_without_goproxy() {
+        let config = layered(&MapEnv::new(), Some("GONOSUMDB=corp.example/*\n"));
+        assert_eq!(config.resolve_source_for("corp.example/x"), bypass());
+        assert!(config.registers_bypass_chain());
+        assert_eq!(
+            config.resolve_source_for("github.com/a/b"),
+            DependencySource::Registry
+        );
+    }
+
+    /// F3: classified by the first token's name.
+    #[test]
+    fn test_gosumdb_classification() {
+        for (value, expected) in [
+            ("sum.golang.org", GoSumDb::Public),
+            ("sum.golang.org+033de0ae+Ac4zctda", GoSumDb::Public),
+            ("sum.golang.google.cn", GoSumDb::Public),
+            (
+                "sum.golang.org https://sumdb-mirror.example",
+                GoSumDb::Public,
+            ),
+            ("off", GoSumDb::Off),
+            ("sumdb.corp.example", GoSumDb::Custom),
+            (
+                "sumdb.corp.example+key https://mirror.example",
+                GoSumDb::Custom,
+            ),
+            (" ", GoSumDb::Custom),
+        ] {
+            assert_eq!(GoSumDb::parse(value), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn test_off_or_custom_gosumdb_makes_chain_modules_non_public() {
+        for sumdb in ["off", "sumdb.corp.example"] {
+            let env = MapEnv::new()
+                .with_var("GOPROXY", "https://corp-proxy.example")
+                .with_var("GOSUMDB", sumdb);
+            assert!(!mirrors(&layered(&env, None), "github.com/a/b"), "{sumdb}");
+        }
+        let env = MapEnv::new()
+            .with_var("GOPROXY", "https://corp-proxy.example")
+            .with_var("GOSUMDB", "sum.golang.google.cn");
+        assert!(mirrors(&layered(&env, None), "github.com/a/b"));
+    }
+
+    #[test]
+    fn test_file_goproxy_sumdb_matrix() {
+        let file = "GOPROXY=https://corp-proxy.example\nGOPRIVATE=corp.example/*\n";
+        let config = layered(&MapEnv::new(), Some(file));
+        assert!(mirrors(&config, "github.com/a/b"));
+        assert!(!mirrors(&config, "corp.example/x"));
+        let off = layered(&MapEnv::new(), Some(&format!("{file}GOSUMDB=off\n")));
+        assert!(!mirrors(&off, "github.com/a/b"));
+    }
+
+    #[test]
+    fn test_registers_bypass_chain_follows_noproxy_patterns() {
+        let env = MapEnv::new()
+            .with_var("GOPROXY", "https://corp-proxy.example")
+            .with_var("GOPRIVATE", "corp.example/*")
+            .with_var("GONOPROXY", "none");
+        assert!(layered(&env, None).registers_bypass_chain());
+
+        let unreachable = layered(
+            &MapEnv::new()
+                .with_var("GOPROXY", "https://corp-proxy.example")
+                .with_var("GONOPROXY", ","),
+            Some("GOPRIVATE=corp.example/*\n"),
+        );
+        assert!(!unreachable.registers_bypass_chain());
+    }
+
+    /// Security M1: a chain with no URL hop downloads nothing, so it is never public content.
+    #[test]
+    fn test_off_or_direct_only_chains_are_not_public_content() {
+        for goproxy in ["off", "direct", "off,direct", "direct,off"] {
+            let env = MapEnv::new().with_var("GOPROXY", goproxy);
+            let config = layered(&env, None);
+            assert_eq!(
+                config.resolve_source_for("github.com/a/b"),
+                chain_source(&config, false),
+                "{goproxy}"
+            );
+        }
+        let url_chain = layered(
+            &MapEnv::new().with_var("GOPROXY", "https://corp-proxy.example,direct"),
+            None,
+        );
+        assert!(mirrors(&url_chain, "github.com/a/b"));
+    }
+
+    #[test]
+    fn test_gosumdb_is_classified_at_ingest_and_never_printed() {
+        let env =
+            MapEnv::new().with_var("GOSUMDB", "sum.golang.org https://user:pw@mirror.example");
+        let process = GoProcessEnv::from_env(&env);
+        assert_eq!(process.gosumdb, Some(GoSumDb::Public));
+        assert!(!format!("{process:?}").contains("pw"));
+        let raw = parse_goenv_raw("GOSUMDB=off\n");
+        assert_eq!(raw.gosumdb, Some(GoSumDb::Off));
+    }
+
+    #[test]
+    fn test_goenv_key_round_trip() {
+        for key in GoEnvKey::ALL {
+            assert_eq!(GoEnvKey::from_name(key.name()), Some(key));
+        }
+        assert_eq!(GoEnvKey::from_name("GOFLAGS"), None);
+    }
+
+    #[test]
+    fn test_process_env_default_is_hermetic() {
+        let config = GoEnvConfig::from_layers(&GoProcessEnv::default(), None, &all_policy());
+        assert!(config.goproxy_chain().is_none());
+        assert!(!config.registers_bypass_chain());
     }
 }

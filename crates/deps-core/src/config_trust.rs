@@ -18,13 +18,10 @@
 //! `User`-tier credentials, and rejects `Project`-tier credentials before expansion ever runs);
 //! covered by unit tests only.
 //!
-//! `deps-cargo` reads its operator-declared registries through the same
-//! [`OperatorRegistries`](crate::net_policy::OperatorRegistries) rule; its `CARGO_REGISTRIES_*`
-//! environment overrides are declared with
-//! [`OperatorRegistries::declared_in_env`](crate::net_policy::OperatorRegistries::declared_in_env).
-
-// TODO(#1459): centralize env-override-by-name trust (cargo CARGO_REGISTRIES_*, future
-// COMPOSER_AUTH/PIP_INDEX_URL) once a second ecosystem needs it
+//! [`OperatorEnvValue`](crate::config_trust::OperatorEnvValue) is the environment counterpart of
+//! `OperatorPath`: proof that a declaration came from the process environment. `deps-cargo`
+//! (`CARGO_REGISTRIES_*`) and `deps-go` (`GOPROXY`) declare operator registries from it with
+//! [`OperatorRegistries::declared_by_env`](crate::net_policy::OperatorRegistries::declared_by_env).
 
 use std::path::{Path, PathBuf};
 
@@ -49,6 +46,12 @@ pub enum OperatorEnvVar {
 }
 
 impl OperatorEnvVar {
+    /// The variable as an [`OperatorEnvName`].
+    #[must_use]
+    pub const fn env_name(self) -> OperatorEnvName {
+        OperatorEnvName::fixed(self.name())
+    }
+
     /// The variable's name in the process environment.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -141,6 +144,138 @@ impl OperatorPath {
     #[must_use]
     pub fn for_test(path: impl Into<PathBuf>) -> Self {
         Self(path.into())
+    }
+}
+
+/// The name of a process environment variable that a repository cannot choose.
+///
+/// Has no constructor from an arbitrary string: a name is either a compile-time constant
+/// ([`Self::fixed`]), anchored on a fixed prefix and suffix around a normalised alias
+/// ([`Self::prefixed`]), or discovered in the environment itself under a fixed prefix
+/// ([`Self::discovered`]). Workspace-influenced variables (`PWD`, `INIT_CWD`, editor CWD
+/// variables) are therefore unreachable, the same closure [`OperatorEnvVar`] gives file
+/// locations (#1822). A name is not a secret; `Debug` and `Display` print it.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::config_trust::OperatorEnvName;
+///
+/// let name = OperatorEnvName::prefixed("CARGO_REGISTRIES_", "my-corp", "INDEX");
+/// assert_eq!(name.as_str(), "CARGO_REGISTRIES_MY_CORP_INDEX");
+/// assert_eq!(OperatorEnvName::fixed("GOPROXY").as_str(), "GOPROXY");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct OperatorEnvName(std::borrow::Cow<'static, str>);
+
+impl std::fmt::Display for OperatorEnvName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl OperatorEnvName {
+    /// A compile-time constant name.
+    #[must_use]
+    pub const fn fixed(name: &'static str) -> Self {
+        Self(std::borrow::Cow::Borrowed(name))
+    }
+
+    /// `{prefix}{ALIAS}_{suffix}`, where `ALIAS` is `alias` upper-cased with `-` mapped to `_`
+    /// (the spelling Cargo derives for `CARGO_REGISTRIES_<ALIAS>_INDEX`). Distinct aliases can
+    /// derive one name; callers that care detect the collision.
+    #[must_use]
+    pub fn prefixed(prefix: &'static str, alias: &str, suffix: &'static str) -> Self {
+        let alias = alias.to_uppercase().replace('-', "_");
+        Self(std::borrow::Cow::Owned(format!("{prefix}{alias}_{suffix}")))
+    }
+
+    /// The names under `prefix` that `source` itself reports as set and ending in `suffix`,
+    /// sorted. They come from the environment, not from workspace content.
+    #[must_use]
+    pub fn discovered(
+        source: &(impl EnvSource + ?Sized),
+        prefix: &'static str,
+        suffix: &'static str,
+    ) -> Vec<Self> {
+        let mut names: Vec<Self> = source
+            .var_names_with_prefix(prefix)
+            .into_iter()
+            .filter(|name| name.ends_with(suffix))
+            .map(|name| Self(std::borrow::Cow::Owned(name)))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// This name with its trailing `old` replaced by `new`, or `None` when it does not end in
+    /// `old`. Keeps the fixed-prefix anchoring of the original name.
+    #[must_use]
+    pub fn with_suffix_replaced(&self, old: &'static str, new: &'static str) -> Option<Self> {
+        self.0
+            .strip_suffix(old)
+            .map(|stem| Self(std::borrow::Cow::Owned(format!("{stem}{new}"))))
+    }
+
+    /// The name as text, for looking it up in an [`EnvSource`].
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The text of a process environment variable, as proof that a declaration came from the
+/// operator's environment rather than from the workspace.
+///
+/// Has no public constructor besides [`Self::read`]. The value is a declaration (a registry URL,
+/// a proxy chain, a glob list), never a secret: tokens keep their own `Redacted` path. `Debug`
+/// prints the length only, because a declaration can still carry userinfo or a query string.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::config_trust::{OperatorEnvName, OperatorEnvValue};
+/// use deps_core::net_policy::MapEnv;
+///
+/// let env = MapEnv::new().with_var("GOPROXY", "https://proxy.corp.example");
+/// let value = OperatorEnvValue::read(&env, &OperatorEnvName::fixed("GOPROXY")).unwrap();
+/// assert_eq!(value.as_str(), "https://proxy.corp.example");
+/// assert!(OperatorEnvValue::read(&env, &OperatorEnvName::fixed("GOPRIVATE")).is_none());
+/// ```
+#[derive(Clone, PartialEq, Eq)]
+pub struct OperatorEnvValue(String);
+
+impl std::fmt::Debug for OperatorEnvValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperatorEnvValue")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
+impl OperatorEnvValue {
+    /// The value of variable `name` in `source`, or `None` when it is unset or not valid
+    /// Unicode. An empty value is kept: whether empty means unset is each caller's rule.
+    ///
+    /// `name` is an [`OperatorEnvName`], which cannot be built from workspace-chosen text.
+    #[must_use]
+    pub fn read(source: &(impl EnvSource + ?Sized), name: &OperatorEnvName) -> Option<Self> {
+        source
+            .var_os(name.as_str())
+            .and_then(|value| value.into_string().ok())
+            .map(Self)
+    }
+
+    /// The variable's text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether the variable is set to the empty string.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -399,6 +534,54 @@ mod tests {
 
     fn z(s: &str) -> Zeroizing<String> {
         Zeroizing::new(s.to_string())
+    }
+
+    #[test]
+    fn operator_env_value_read_keeps_empty_and_skips_unset() {
+        let env = MapEnv::new().with_var("EMPTY", "").with_var("SET", "x");
+        let read = |name| OperatorEnvValue::read(&env, &OperatorEnvName::fixed(name));
+        assert!(read("EMPTY").unwrap().is_empty());
+        assert_eq!(read("SET").unwrap().as_str(), "x");
+        assert!(read("MISSING").is_none());
+    }
+
+    #[test]
+    fn operator_env_name_prefixed_matches_cargo_spelling() {
+        let name = OperatorEnvName::prefixed("CARGO_REGISTRIES_", "my-corp.x", "INDEX");
+        assert_eq!(name.as_str(), "CARGO_REGISTRIES_MY_CORP.X_INDEX");
+        assert_eq!(name.to_string(), name.as_str());
+        assert_eq!(
+            OperatorEnvName::prefixed("P_", "a-b", "T"),
+            OperatorEnvName::prefixed("P_", "A_B", "T")
+        );
+    }
+
+    #[test]
+    fn operator_env_name_discovered_filters_sorts_and_rewrites_suffix() {
+        let env = MapEnv::new()
+            .with_var("CARGO_REGISTRIES_B_INDEX", "x")
+            .with_var("CARGO_REGISTRIES_A_INDEX", "x")
+            .with_var("CARGO_REGISTRIES_A_TOKEN", "x")
+            .with_var("PWD", "/x");
+        let names = OperatorEnvName::discovered(&env, "CARGO_REGISTRIES_", "_INDEX");
+        let texts: Vec<_> = names.iter().map(OperatorEnvName::as_str).collect();
+        assert_eq!(
+            texts,
+            ["CARGO_REGISTRIES_A_INDEX", "CARGO_REGISTRIES_B_INDEX"]
+        );
+        let token = names[0].with_suffix_replaced("_INDEX", "_TOKEN").unwrap();
+        assert_eq!(token.as_str(), "CARGO_REGISTRIES_A_TOKEN");
+        assert!(names[0].with_suffix_replaced("_TOKEN", "_X").is_none());
+        assert_eq!(OperatorEnvVar::Goenv.env_name().as_str(), "GOENV");
+    }
+
+    #[test]
+    fn operator_env_value_debug_prints_length_only() {
+        let env = MapEnv::new().with_var("V", "https://user:pw@h.example/");
+        let name = OperatorEnvName::fixed("V");
+        let rendered = format!("{:?}", OperatorEnvValue::read(&env, &name).unwrap());
+        assert!(!rendered.contains("pw"));
+        assert!(rendered.contains("len"));
     }
 
     // --- Shell syntax ---

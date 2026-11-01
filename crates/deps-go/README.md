@@ -18,7 +18,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Indirect dependencies** — Detect and mark `// indirect` annotations
 - **Pseudo-versions** — Parse and validate the `v0.0.0-YYYYMMDDHHMMSS-hash` format
 - **proxy.golang.org** — Fetch module versions from the Go module proxy
-- **`$GOENV` `GOPROXY`/`GOPRIVATE` support** — Resolves a `GOPROXY` proxy chain (with `direct`/`off` sentinels) or a `GOPRIVATE`-matched module path to live registry data (or a fail-closed, no-data terminal hop for `direct`/`off`), failing closed on a bad hop instead of falling back to `proxy.golang.org`
+- **`GOPROXY`/`GOPRIVATE`/`GONOPROXY` support** — Honours the process environment and `$GOENV` with the go command's precedence (a non-empty process variable beats the file) and resolves a `GOPROXY` proxy chain (with `direct`/`off` sentinels) or a `GOPRIVATE`-matched module path to live registry data (or a fail-closed, no-data terminal hop for `direct`/`off`), failing closed on a bad hop instead of falling back to `proxy.golang.org`
 - **Module path escaping** — Proper URL encoding for uppercase characters per Go spec
 - **License hover** — SPDX license for the resolved and latest version, flagging a "License changed" when they differ
 
