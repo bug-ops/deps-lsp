@@ -324,7 +324,7 @@ pub use registry_endpoint::{CachedEndpoint, EgressTier, EndpointFingerprint, Reg
 pub use selection::{
     InvalidStabilityOccurrence, SelectionContext, StabilityFloor, UnknownStability,
 };
-pub use tag_index_refresh::{RefreshEvent, RefreshEvents, RefreshSender};
+pub use tag_index_refresh::{ParseInputKey, RefreshEvent, RefreshEvents, RefreshSender};
 pub use version_matcher::{
     Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,
     normalize_and_parse_version, normalize_operator_spacing,

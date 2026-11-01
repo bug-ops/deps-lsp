@@ -15,7 +15,7 @@ use std::hash::Hash;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use super::{CommitSha, RequirementStatus, is_dot_segment, is_tag_shaped};
+use super::{CommitSha, RequirementStatus, TagName, is_dot_segment, is_tag_shaped};
 use crate::NormalizedName;
 use crate::cache::BodyLimit;
 
@@ -569,16 +569,17 @@ impl DefaultBranchMembership {
 /// # Examples
 ///
 /// ```
-/// use deps_core::lsp_helpers::{CommitEvidence, CommitLineage, DefaultBranchMembership};
+/// use deps_core::lsp_helpers::{CommitEvidence, CommitLineage, DefaultBranchMembership, TagName};
 ///
+/// let latest = TagName::from_published("v4.2.2".to_string());
 /// let proven = CommitEvidence {
 ///     lineage: Some(CommitLineage::AheadOfLatest { ahead_by: Some(3) }),
 ///     membership: Some(DefaultBranchMembership::Reachable),
 /// };
-/// assert_eq!(proven.proven_ahead("v4.2.2").unwrap().ahead_by, Some(3));
+/// assert_eq!(proven.proven_ahead(&latest).unwrap().ahead_by, Some(3));
 ///
 /// let imposter = CommitEvidence { membership: Some(DefaultBranchMembership::NotProven), ..proven };
-/// assert!(imposter.proven_ahead("v4.2.2").is_none());
+/// assert!(imposter.proven_ahead(&latest).is_none());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CommitEvidence {
@@ -593,12 +594,12 @@ impl CommitEvidence {
     /// `None` unless both [`CommitLineage::AheadOfLatest`] and
     /// [`DefaultBranchMembership::Reachable`] hold.
     #[must_use]
-    pub fn proven_ahead(&self, latest_tag: &str) -> Option<AheadProof> {
+    pub fn proven_ahead(&self, latest_tag: &TagName) -> Option<AheadProof> {
         match (self.lineage?, self.membership?) {
             (CommitLineage::AheadOfLatest { ahead_by }, DefaultBranchMembership::Reachable) => {
                 Some(AheadProof {
                     ahead_by,
-                    latest_tag: latest_tag.to_string(),
+                    latest_tag: latest_tag.clone(),
                 })
             }
             (CommitLineage::AheadOfLatest { .. }, DefaultBranchMembership::NotProven)
@@ -619,7 +620,7 @@ pub struct AheadProof {
     /// Commits the pin is ahead of the release, when the forge reports it.
     pub ahead_by: Option<u32>,
     /// The latest release tag the pin is ahead of.
-    pub latest_tag: String,
+    pub latest_tag: TagName,
 }
 
 impl AheadProof {
@@ -629,9 +630,10 @@ impl AheadProof {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::{AheadProof, RequirementStatus};
+    /// use deps_core::lsp_helpers::{AheadProof, RequirementStatus, TagName};
     ///
-    /// let proof = AheadProof { ahead_by: None, latest_tag: "v4.2.2".into() };
+    /// let latest_tag = TagName::from_published("v4.2.2".to_string());
+    /// let proof = AheadProof { ahead_by: None, latest_tag };
     /// assert_eq!(proof.override_status(RequirementStatus::Outdated), RequirementStatus::UpToDate);
     /// assert_eq!(proof.override_status(RequirementStatus::Unresolved), RequirementStatus::Unresolved);
     /// ```
@@ -666,7 +668,7 @@ pub enum HoverProvenance {
         /// Commits ahead of the release, when known.
         ahead_by: Option<u32>,
         /// The latest release tag.
-        latest_tag: String,
+        latest_tag: TagName,
     },
     /// A source-control dependency served by a registry identity (spec 088).
     ResolvedViaRegistryIdentity {
@@ -1002,7 +1004,7 @@ mod tests {
                 lineage,
                 membership,
             }
-            .proven_ahead("v1")
+            .proven_ahead(&"v1".into())
             .is_some()
         };
         assert!(proof(Some(AHEAD), Some(Reachable)));

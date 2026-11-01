@@ -374,7 +374,7 @@ mod seeded {
     const OUTDATED_CATALOG: &str = "catalog:\n  react: ^16.0.0\n  vue: \"^2.0.0\"\n";
 
     /// FR-017: the update rewrites only the version text of the entry and keeps its quoting. The
-    /// written version is the bare exact one, as npm writes it in `package.json` (SC-007).
+    /// requirement operator is kept, as npm does in `package.json` (SC-007, #1885).
     #[tokio::test]
     async fn catalog_entry_update_action_rewrites_only_its_scalar() {
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
@@ -396,7 +396,7 @@ mod seeded {
         };
         assert_eq!(
             apply(OUTDATED_CATALOG, edit),
-            "catalog:\n  react: 18.3.0\n  vue: \"^2.0.0\"\n"
+            "catalog:\n  react: ^18.3.0\n  vue: \"^2.0.0\"\n"
         );
 
         let vue = Range::new(Position::new(2, 9), Position::new(2, 12));
@@ -406,7 +406,7 @@ mod seeded {
         };
         assert_eq!(
             apply(OUTDATED_CATALOG, edit),
-            "catalog:\n  react: ^16.0.0\n  vue: \"3.4.0\"\n",
+            "catalog:\n  react: ^16.0.0\n  vue: \"^3.4.0\"\n",
             "quoting style is preserved"
         );
     }

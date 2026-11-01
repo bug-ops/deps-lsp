@@ -1175,6 +1175,30 @@ pub enum FetchFailure {
     NotAttempted,
 }
 
+impl FetchFailure {
+    /// Whether a registry request was actually sent and failed.
+    ///
+    /// `false` only for [`Self::NotAttempted`] placeholders (forced-refetch resets, collided
+    /// names), which say nothing about the registry and must not surface for dependencies
+    /// that already have a lock-file version.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::error::FetchFailure;
+    ///
+    /// assert!(FetchFailure::Transient.was_attempted());
+    /// assert!(!FetchFailure::NotAttempted.was_attempted());
+    /// ```
+    #[must_use]
+    pub const fn was_attempted(&self) -> bool {
+        match self {
+            Self::Actionable(_) | Self::Transient => true,
+            Self::NotAttempted => false,
+        }
+    }
+}
+
 /// Convenience type alias for `Result<T, DepsError>`.
 ///
 /// This is the standard `Result` type used throughout the deps-lsp codebase.

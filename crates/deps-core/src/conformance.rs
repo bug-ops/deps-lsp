@@ -336,7 +336,7 @@ pub fn assert_version_satisfies_requirement(
 /// This is the shared, per-`BareMeaning` half of #1602's "every ecosystem either refuses or
 /// shape-preserves a bounded-range rewrite" invariant; ecosystems whose `format_version_replacing`
 /// does not go through [`format_version_replacing_by_shape`](crate::lsp_helpers::format_version_replacing_by_shape)
-/// at all (e.g. PyPI's/Composer's/npm's own exact-pin-preserving overrides) are `BareMeaning::ExactPin`
+/// at all (e.g. PyPI's/Composer's own exact-pin-preserving overrides) are `BareMeaning::ExactPin`
 /// ecosystems by construction and are therefore exempt here by the same rule.
 pub fn assert_bare_meaning_never_widens_bounded_range(
     formatter: &dyn EcosystemFormatter,

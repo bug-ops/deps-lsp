@@ -103,6 +103,62 @@ impl std::fmt::Display for CommitSha {
     }
 }
 
+/// A tag or release name exactly as a forge's tags/releases response published it.
+///
+/// The type separates published tag text (a [`TagIndex`] key, the latest release a probe
+/// compares against) from text a user wrote in a manifest, which may name no tag at all.
+/// The only non-test constructor is [`TagName::from_published`], so holding a `TagName` means
+/// the text came from a forge. Equality and hashing match `str`, so a `HashMap<TagName, _>`
+/// is queried by a written `&str` through [`std::borrow::Borrow`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::TagName;
+///
+/// let tag = TagName::from_published("v4.2.2".to_string());
+/// assert_eq!(tag.as_str(), "v4.2.2");
+/// assert_eq!(tag.to_string(), "v4.2.2");
+/// ```
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub struct TagName(String);
+
+impl TagName {
+    /// Wraps tag text received from a forge tags/releases response.
+    ///
+    /// Call this only at the point a registry client reads the text off such a response;
+    /// never for text taken from a manifest.
+    #[must_use]
+    pub const fn from_published(tag: String) -> Self {
+        Self(tag)
+    }
+
+    /// The tag text, verbatim as published.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TagName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::borrow::Borrow<str> for TagName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for TagName {
+    fn from(tag: &str) -> Self {
+        Self(tag.to_string())
+    }
+}
+
 /// Per-repository/per-route tag/SHA cross-reference, shared by every git-tags-datasource
 /// ecosystem (GitHub Actions, GitLab CI).
 ///
@@ -121,7 +177,7 @@ impl std::fmt::Display for CommitSha {
 #[derive(Debug, Default)]
 pub struct TagIndex {
     /// Tag/release text (as published) -> the commit SHA it points at.
-    tag_to_sha: std::collections::HashMap<String, CommitSha>,
+    tag_to_sha: std::collections::HashMap<TagName, CommitSha>,
     /// Commit SHA -> the tag/release it corresponds to, classified at insertion time so a
     /// tag can never be read back without knowing whether it is a moving alias.
     sha_to_tag: std::collections::HashMap<CommitSha, ResolvedPin>,
@@ -598,7 +654,7 @@ impl TagIndex {
             names_by_sha.entry(sha).or_default().push(name);
             index
                 .tag_to_sha
-                .entry(name.to_string())
+                .entry(TagName::from_published(name.to_string()))
                 .or_insert_with(|| sha.clone());
         }
         for (sha, names) in names_by_sha {
@@ -690,7 +746,7 @@ impl TagIndex {
             .filter(|(name, other)| {
                 *other == sha
                     && match scope {
-                        SiblingScope::SameMajor => tag_components(name).next() == major,
+                        SiblingScope::SameMajor => tag_components(name.as_str()).next() == major,
                         SiblingScope::WholeCommit => true,
                     }
             })
@@ -722,36 +778,36 @@ impl TagIndex {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::{CommitSha, TagIndex};
+    /// use deps_core::lsp_helpers::{CommitSha, TagIndex, TagName};
     ///
     /// let a = CommitSha::parse(&"a".repeat(40)).unwrap();
     /// let b = CommitSha::parse(&"b".repeat(40)).unwrap();
     /// let index = TagIndex::from_tags([("v4.1.3", &a), ("v5.0.0", &a), ("5.0.0", &b)]);
-    /// assert_eq!(index.release_tag("v4.1.3"), Some("v4.1.3"));
-    /// assert_eq!(index.release_tag("4.1.3"), Some("v4.1.3"));
+    /// assert_eq!(index.release_tag("v4.1.3").map(TagName::as_str), Some("v4.1.3"));
+    /// assert_eq!(index.release_tag("4.1.3").map(TagName::as_str), Some("v4.1.3"));
     /// assert_eq!(index.release_tag("5.0.0"), None);
     /// assert_eq!(index.release_tag("v5.0.0"), None);
     /// assert_eq!(index.release_tag("v9.9.9"), None);
     /// ```
     #[must_use]
-    pub fn release_tag(&self, version: &str) -> Option<&str> {
+    pub fn release_tag(&self, version: &str) -> Option<&TagName> {
         let normalized = crate::github::normalize_tag(version);
         let mut matches = self
             .tag_to_sha
             .iter()
-            .filter(|(key, _)| crate::github::normalize_tag(key) == normalized);
+            .filter(|(key, _)| crate::github::normalize_tag(key.as_str()) == normalized);
         let (first_key, first_sha) = matches.next()?;
-        let mut chosen = first_key.as_str();
+        let mut chosen = first_key;
         for (key, sha) in matches {
             if sha != first_sha {
                 return None;
             }
-            chosen = chosen.min(key.as_str());
+            chosen = chosen.min(key);
         }
         Some(
             self.tag_to_sha
                 .get_key_value(version)
-                .map_or(chosen, |(key, _)| key.as_str()),
+                .map_or(chosen, |(key, _)| key),
         )
     }
 
@@ -787,7 +843,7 @@ impl TagIndex {
             let key = self.release_tag(version)?;
             self.tag_to_sha.get_key_value(key)
         })?;
-        Some((crate::ConcreteVersion::new(key), sha.clone()))
+        Some((crate::ConcreteVersion::new(key.as_str()), sha.clone()))
     }
 
     /// Attaches the repository's canonical casing as reported by GitHub.
@@ -964,7 +1020,7 @@ impl TagIndex {
             .tag_to_sha
             .iter()
             .filter(|(tag, sha)| {
-                *sha == commit && (tag.as_str() == written || extends_tag(tag, written))
+                *sha == commit && (tag.as_str() == written || extends_tag(tag.as_str(), written))
             })
             .map(|(tag, sha)| (tag.as_str(), sha));
         Self::from_tags(candidates)
@@ -1087,7 +1143,7 @@ impl TagIndex {
         };
         let mut named_elsewhere = false;
         for (name, commit) in &self.tag_to_sha {
-            if comparable_version(name).as_ref() == Some(&wanted) {
+            if comparable_version(name.as_str()).as_ref() == Some(&wanted) {
                 if commit == sha {
                     return false;
                 }
@@ -3212,12 +3268,30 @@ mod tests {
     }
 
     #[test]
+    fn test_tag_name_borrows_as_str_for_map_lookup() {
+        let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let index = TagIndex::from_tags([("v1.0.0", &sha)]);
+        assert_eq!(index.tag_to_sha.get("v1.0.0"), Some(&sha));
+        assert_eq!(TagName::from_published("v1".to_string()).as_str(), "v1");
+        assert_eq!(TagName::from_published("v1".to_string()).to_string(), "v1");
+    }
+
+    #[test]
     fn test_release_tag_exact_normalized_and_missing() {
         let a = CommitSha::parse(&"a".repeat(40)).unwrap();
         let index = TagIndex::from_tags([("v4.1.3", &a), ("4.2.0", &a)]);
-        assert_eq!(index.release_tag("v4.1.3"), Some("v4.1.3"));
-        assert_eq!(index.release_tag("4.1.3"), Some("v4.1.3"));
-        assert_eq!(index.release_tag("V4.2.0"), Some("4.2.0"));
+        assert_eq!(
+            index.release_tag("v4.1.3").map(TagName::as_str),
+            Some("v4.1.3")
+        );
+        assert_eq!(
+            index.release_tag("4.1.3").map(TagName::as_str),
+            Some("v4.1.3")
+        );
+        assert_eq!(
+            index.release_tag("V4.2.0").map(TagName::as_str),
+            Some("4.2.0")
+        );
         assert_eq!(index.release_tag("v9.9.9"), None);
     }
 
@@ -3237,8 +3311,14 @@ mod tests {
     fn test_release_tag_agreeing_spellings_resolve_deterministically() {
         let a = CommitSha::parse(&"a".repeat(40)).unwrap();
         let index = TagIndex::from_tags([("v4.1.3", &a), ("V4.1.3", &a)]);
-        assert_eq!(index.release_tag("4.1.3"), Some("V4.1.3"));
-        assert_eq!(index.release_tag("v4.1.3"), Some("v4.1.3"));
+        assert_eq!(
+            index.release_tag("4.1.3").map(TagName::as_str),
+            Some("V4.1.3")
+        );
+        assert_eq!(
+            index.release_tag("v4.1.3").map(TagName::as_str),
+            Some("v4.1.3")
+        );
     }
 
     #[test]

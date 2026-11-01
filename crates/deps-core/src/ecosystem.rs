@@ -1656,6 +1656,23 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         None
     }
 
+    /// Whether `parse_result` consulted the parse input `input` names, so a
+    /// [`RefreshEvent::ReparseOpenDocuments`](crate::RefreshEvent::ReparseOpenDocuments) for it
+    /// must re-parse the document.
+    ///
+    /// Only the ecosystem that mints [`ParseInputKey`](crate::ParseInputKey)s implements this
+    /// meaningfully. The default is `true`, the safe direction: an ecosystem without an
+    /// override gets every open document re-parsed, as before targeted re-parsing existed. A
+    /// lagged receiver re-parses every document without asking.
+    fn parse_depends_on(
+        &self,
+        parse_result: &dyn ParseResult,
+        input: &crate::ParseInputKey,
+    ) -> bool {
+        let _ = (parse_result, input);
+        true
+    }
+
     /// Gathers evidence in the background that synchronous, network-free diagnostics cannot
     /// (a branch of a partial tag ref, the lineage of a SHA pin, a registry identity of a
     /// source dependency), and reports whether anything changed.
@@ -2767,6 +2784,20 @@ mod tests {
             dep_count: 0,
         };
         assert!(ecosystem.refresh_events().is_none());
+    }
+
+    #[test]
+    fn test_parse_depends_on_defaults_to_reparsing_every_document() {
+        let ecosystem = StubEcosystem {
+            calling_thread: std::thread::current().id(),
+            should_panic: false,
+            dep_count: 0,
+        };
+        let parsed = StubParseResult {
+            uri: crate::test_util::test_uri("/test/manifest.toml"),
+            dep_count: 0,
+        };
+        assert!(ecosystem.parse_depends_on(&parsed, &crate::ParseInputKey::new("any")));
     }
 
     /// #796: `parse_manifest_blocking` is the single chokepoint every ecosystem's parse

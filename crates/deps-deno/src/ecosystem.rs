@@ -324,22 +324,33 @@ mod tests {
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_pins_writable_bare_exact_rendering() {
         let ecosystem = DenoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
-        let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@^1.0.0"}}"#.to_string();
         let uri = deps_core::test_util::test_uri("/test/deno.json");
-        let verdict = deps_core::test_util::fallback_edit_outcome(
-            &ecosystem,
-            &DenoFormatter,
-            &uri,
-            &content,
-            "jsr:@std/fs",
-            "2.0.0",
-            &["2.1.0", "2.0.0", "1.0.0"],
-        )
-        .await;
-        assert_eq!(
-            verdict,
-            deps_core::lsp_helpers::FallbackEditVerdict::Writable
-        );
+        for (requirement, expected) in [
+            (
+                "1.0.0",
+                deps_core::lsp_helpers::FallbackEditVerdict::Writable,
+            ),
+            // #1885: the caret is kept, so the rewritten `^2.0.0` admits the withheld 2.1.0.
+            (
+                "^1.0.0",
+                deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                    deps_core::lsp_helpers::FallbackEditRejection::EditedAdmitsNewer,
+                ),
+            ),
+        ] {
+            let content = format!(r#"{{"imports": {{"@std/fs": "jsr:@std/fs@{requirement}"}}}}"#);
+            let verdict = deps_core::test_util::fallback_edit_outcome(
+                &ecosystem,
+                &DenoFormatter,
+                &uri,
+                &content,
+                "jsr:@std/fs",
+                "2.0.0",
+                &["2.1.0", "2.0.0", "1.0.0"],
+            )
+            .await;
+            assert_eq!(verdict, expected, "{requirement}");
+        }
     }
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id/

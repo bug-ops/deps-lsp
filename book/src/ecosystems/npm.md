@@ -168,6 +168,10 @@ since that would let the "Update all outdated dependencies" quick-fix silently
 overwrite `"react": "catalog:"` with a literal version, destroying the catalog
 reference.
 
+**Update edits keep the operator**: an update to `^16.0.0` writes `^19.3.1`, and `~` and `=`
+are kept the same way. Other range forms become the exact version. Prerelease versions are not
+offered unless the registry's latest is a prerelease or the dependency is already on one.
+
 A catalog entry whose value exceeds a length cap (256 bytes) is rejected
 before it is even parsed as a semver range, closing a resource-exhaustion
 vector in an unbounded `pnpm-workspace.yaml` entry — unlike the other

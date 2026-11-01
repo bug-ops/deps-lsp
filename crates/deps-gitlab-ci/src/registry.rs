@@ -10,7 +10,7 @@ use deps_core::github::{normalize_tag, semver_tags_newest_first};
 use deps_core::lsp_helpers::{
     BranchEvidence, CommitLineage, CommitSha, DefaultBranchMembership, LatestRelease,
     LowercaseNaming, NormalizeName, ProbeAnswer, ProbeBackend, ProbeEffect, ProbePlan, ProbeRef,
-    ProbeReport, ProbeStores, TagIndex, run_probe_pass,
+    ProbeReport, ProbeStores, TagIndex, TagName, run_probe_pass,
 };
 use deps_core::pagination::ListCoverage;
 use deps_core::rate_limit::{DEFAULT_COOLDOWN_SECS, ProbeAllowance, RateLimitGate};
@@ -402,7 +402,7 @@ impl GitlabCiRegistry {
             self.probe_stores.record_latest(
                 LowercaseNaming.normalize_package_name(name),
                 LatestRelease {
-                    tag: version.version.as_str().to_string(),
+                    tag: TagName::from_published(version.version.as_str().to_string()),
                     commit,
                 },
             );

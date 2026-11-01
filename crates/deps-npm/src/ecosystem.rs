@@ -455,22 +455,33 @@ mod tests {
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_pins_writable_bare_exact_rendering() {
         let ecosystem = NpmEcosystem::new(Arc::new(deps_core::HttpCache::new()));
-        let content = r#"{"dependencies": {"pkg": "^1.0.0"}}"#.to_string();
         let uri = deps_core::test_util::test_uri("/test/package.json");
-        let verdict = deps_core::test_util::fallback_edit_outcome(
-            &ecosystem,
-            &NpmFormatter,
-            &uri,
-            &content,
-            "pkg",
-            "2.0.0",
-            &["2.1.0", "2.0.0", "1.0.0"],
-        )
-        .await;
-        assert_eq!(
-            verdict,
-            deps_core::lsp_helpers::FallbackEditVerdict::Writable
-        );
+        for (requirement, expected) in [
+            (
+                "1.0.0",
+                deps_core::lsp_helpers::FallbackEditVerdict::Writable,
+            ),
+            // #1885: the caret is kept, so the rewritten `^2.0.0` admits the withheld 2.1.0.
+            (
+                "^1.0.0",
+                deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                    deps_core::lsp_helpers::FallbackEditRejection::EditedAdmitsNewer,
+                ),
+            ),
+        ] {
+            let content = format!(r#"{{"dependencies": {{"pkg": "{requirement}"}}}}"#);
+            let verdict = deps_core::test_util::fallback_edit_outcome(
+                &ecosystem,
+                &NpmFormatter,
+                &uri,
+                &content,
+                "pkg",
+                "2.0.0",
+                &["2.1.0", "2.0.0", "1.0.0"],
+            )
+            .await;
+            assert_eq!(verdict, expected, "{requirement}");
+        }
     }
 
     /// #1601: `fallback` sits in the gap between two `||`-branches (`>=1.0.0 <1.5.0` and
@@ -2054,15 +2065,15 @@ mod pnpm_workspace_tests {
         for (content, expected) in [
             (
                 "catalog:\n  react: ^16.0.0\n",
-                "catalog:\n  react: 19.3.0\n",
+                "catalog:\n  react: ^19.3.0\n",
             ),
             (
                 "catalog:\n  react: \"^16.0.0\"\n",
-                "catalog:\n  react: \"19.3.0\"\n",
+                "catalog:\n  react: \"^19.3.0\"\n",
             ),
             (
                 "catalog:\n  react: '^16.0.0'\n",
-                "catalog:\n  react: '19.3.0'\n",
+                "catalog:\n  react: '^19.3.0'\n",
             ),
         ] {
             let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
@@ -2105,7 +2116,7 @@ mod pnpm_workspace_tests {
                 reparsed.dependencies()[0]
                     .version_requirement()
                     .map(deps_core::VersionReq::as_str),
-                Some("19.3.0")
+                Some("^19.3.0")
             );
             let again = ecosystem
                 .generate_code_actions(

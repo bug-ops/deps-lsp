@@ -107,8 +107,8 @@ pub use git_probe::{
 };
 pub use git_ref::{
     CommitRewrite, CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, PartialTagPolicy,
-    PinResolution, ResolvedPin, ShaPinLookup, SiblingScope, SiblingTags, TagIndex, TagPosition,
-    UnpublishedRef, byte_span_to_range, extends_tag, is_full_sha, is_null_tag,
+    PinResolution, ResolvedPin, ShaPinLookup, SiblingScope, SiblingTags, TagIndex, TagName,
+    TagPosition, UnpublishedRef, byte_span_to_range, extends_tag, is_full_sha, is_null_tag,
     is_partial_semver_shaped, is_plain_null, is_tag_shaped, locate_value_span, marker_byte_offset,
     match_v_prefix_style, short_sha, tag_has_precedence, tag_pin_is_up_to_date,
 };

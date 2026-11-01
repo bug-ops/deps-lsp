@@ -16,7 +16,7 @@ use futures::stream;
 
 use super::{
     AheadProof, BranchEvidence, BranchEvidenceStore, CommitEvidenceStore, CommitLineage, CommitSha,
-    DefaultBranchMembership, ProbeEffect, ProbeRef, ProbeReport, TagIndex,
+    DefaultBranchMembership, ProbeEffect, ProbeRef, ProbeReport, TagIndex, TagName,
 };
 use crate::ecosystem::BoxFuture;
 use crate::pagination::ListCoverage;
@@ -39,7 +39,7 @@ const MAX_LATEST_RELEASES: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LatestRelease {
     /// The tag name as published.
-    pub tag: String,
+    pub tag: TagName,
     /// The commit the tag points at.
     pub commit: CommitSha,
 }
@@ -592,7 +592,7 @@ mod tests {
         assert_eq!(outcome.report.effect, ProbeEffect::Republish);
         assert_eq!(
             stores.proof(&repo(), &sha('b')).unwrap().latest_tag,
-            "v1.0.0"
+            "v1.0.0".into()
         );
         assert_eq!(
             stores

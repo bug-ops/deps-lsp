@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `observe_ecosystem` is replaced by `EndpointObserver` and a typed `EcosystemId` parameter on `fetch_latest_versions_parallel` and the `complete_versions_*` helpers (#1874)
 - **deps-core**: `DepsError::CacheError` is removed, new `OperatorEnvVar::CargoHome` variant, and `EnvSource` gains `var_names_with_prefix` (#1874)
 - **deps-cargo**: `RegistryIndex` carries its own credential, so `RegistryIndex::new`, `with_auth` and the `auth` fields are removed, `AuthToken` is `pub(crate)`, `SparseIndexClient::new` takes a display name, and index URLs lose their trailing slash (#1874)
+- **deps-core**: `TagName` replaces `String` in `TagIndex` tag keys, `release_tag`, `CommitEvidence::proven_ahead`, `AheadProof::latest_tag` and `LatestRelease::tag` (#TBD)
+- **deps-core**: `DepsDevClient::gossip_findings_batch` and `force_refresh_gossip_findings` take `&[PackageKey]` and return maps keyed by `NormalizedName` (#TBD)
+- **deps-core, deps-lsp**: `RefreshEvent::ReparseOpenDocuments` carries a `ParseInputKey`, and `Ecosystem` gains `parse_depends_on` (#TBD)
+- **deps-npm, deps-deno, deps-cli**: update edits keep `^`, `~` and `=` instead of writing a bare version, so a `^` range whose latest is in cooldown or flagged no longer takes the exact-pin fallback in `deps update` (#TBD)
 
 ### Added
 - **deps-npm, deps-cli**: `pnpm-workspace.yaml` catalog entries get hints, diagnostics, hover, completion and updates, and a duplicate default catalog is reported (#1880)
@@ -51,8 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cargo**: a `$CARGO_HOME` or `CARGO_REGISTRIES_*` registry on a loopback or link-local host is rejected, a relative `CARGO_HOME` is ignored, and every `CARGO_REGISTRIES_*_INDEX` counts as operator-declared (#1874)
 - **deps-core, deps-npm, deps-go**: anonymous Trusted fetches may follow cross-origin redirects (documented), stopped hops log a WARN once per origin pair, and the shared HTTP client no longer sends `Referer` (#1874)
 - **deps-cli**: the update report now also finds the cache entry stored under the normalized name (#1874)
+- **deps-swift, deps-lsp**: a new registry identity answer re-parses only the open Swift documents that reference its repository (#TBD)
+- **deps-core**: the package-level deps.dev GOSSIP memo is keyed by normalized package name (#TBD)
 
 ### Fixed
+- **deps-core, deps-npm, deps-deno**: the update code action keeps the requirement operator and offers no prerelease unless the dependency is on one (#TBD)
+- **deps-core, deps-cli**: a failed registry fetch for a dependency with a lockfile version publishes a diagnostic and a warning inlay instead of "up to date" (#TBD)
 - **deps-core, deps-nuget, deps-github-actions**: the endpoint breaker opens again for hovers that wait on a background fetch's request (#1872)
 - **deps-core, deps-gitlab-ci**: floor-blocked registry hosts read "is never a registry host" instead of blaming `registries.workspace_registries` (#1872)
 - **deps-core**: the flaky `deps_dev::memo` coalesce tests no longer share a static `Notify` under plain `cargo test` (#1874)
