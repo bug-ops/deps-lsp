@@ -851,7 +851,7 @@ impl deps_core::Registry for NpmRegistry {
     /// Dispatches by `source` (spec FR-010): an `AlternateRegistry` whose index has a
     /// registered client routes there; one with **no** registered client is
     /// `PackageNotFound`, never a fall back to `registry.npmjs.org` (npm always sets
-    /// `mirrors_crates_io: false`, so Cargo's mirror-degradation arm is dead here and must
+    /// `mirrors_public_registry: false`, so Cargo's mirror-degradation arm is dead here and must
     /// not be written — falling back would send a private package name to the public
     /// registry, the exact #248-class leak the rest of this spec closes). Every other source
     /// keeps today's public-registry path unchanged.
@@ -2677,7 +2677,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: index.as_str().to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let versions = deps_core::Registry::get_versions_from(
             &registry,
@@ -2733,7 +2733,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: index.as_str().to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         deps_core::Registry::get_versions_from(
             &registry,
@@ -2778,7 +2778,7 @@ mod tests {
         let registry = NpmRegistry::with_public_base_for_test(cache, public_server.url());
         let source = DependencySource::AlternateRegistry {
             index: "https://never-registered.example".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
 
         let result = deps_core::Registry::get_versions_from(
@@ -2818,7 +2818,7 @@ mod tests {
         let registry = NpmRegistry::with_public_base_for_test(cache, public_server.url());
         let source = DependencySource::AlternateRegistry {
             index: "https://never-registered.example".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
 
         let result = deps_core::Registry::get_latest_matching_from(
@@ -2921,7 +2921,7 @@ mod tests {
                 &name,
                 &DependencySource::AlternateRegistry {
                     index: index.as_str().to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
             )
         };
@@ -3073,7 +3073,7 @@ mod tests {
                 &name,
                 &DependencySource::AlternateRegistry {
                     index: index.as_str().to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
             )
         };

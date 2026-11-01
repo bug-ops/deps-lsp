@@ -34,11 +34,12 @@ fn write_manifest(dir: &std::path::Path, content: &str) -> Url {
     Url::from_file_path(&path).unwrap()
 }
 
-/// (a) plain dependencies carry `mirrors_crates_io: true`, and (b) the mirror index is the
+/// (a) plain dependencies carry `mirrors_public_registry: true`, and (b) the mirror index is the
 /// one registered — the exact index a `CargoRegistry` would dispatch fetches to, proving the
 /// parser's rewrite and the router's registration would agree on the same index.
 #[tokio::test]
-async fn test_mirrored_workspace_plain_deps_carry_mirrors_crates_io_and_resolve_mirror_index() {
+async fn test_mirrored_workspace_plain_deps_carry_mirrors_public_registry_and_resolve_mirror_index()
+{
     let server = mockito::Server::new_async().await;
     let mirror_url = server.url();
 
@@ -65,10 +66,10 @@ async fn test_mirrored_workspace_plain_deps_carry_mirrors_crates_io_and_resolve_
         match &dep.source {
             DependencySource::AlternateRegistry {
                 index,
-                mirrors_crates_io,
+                mirrors_public_registry,
             } => {
                 assert!(
-                    *mirrors_crates_io,
+                    *mirrors_public_registry,
                     "{} must be marked as a crates.io mirror",
                     dep.name.as_str()
                 );
@@ -144,18 +145,18 @@ async fn test_mirrored_dependency_fetch_hits_mirror_not_crates_io() {
 }
 
 /// (c) the crates.io hover link is **not** suppressed for a verified mirror (spec FR-014/F2)
-/// — `CargoFormatter::suppress_package_url` must return `false` for a `mirrors_crates_io:
+/// — `CargoFormatter::suppress_package_url` must return `false` for a `mirrors_public_registry:
 /// true` source, unlike a genuinely different private registry.
 #[test]
 fn test_mirror_hover_link_not_suppressed() {
     let formatter = CargoFormatter;
     let mirror_source = DependencySource::AlternateRegistry {
         index: "https://mirror.corp.example".into(),
-        mirrors_crates_io: true,
+        mirrors_public_registry: true,
     };
     let private_source = DependencySource::AlternateRegistry {
         index: "https://index.mycorp.dev".into(),
-        mirrors_crates_io: false,
+        mirrors_public_registry: false,
     };
 
     assert!(
@@ -179,11 +180,11 @@ fn test_mirror_counts_as_public_registry_content_for_osv_gating() {
     let formatter = CargoFormatter;
     let mirror_source = DependencySource::AlternateRegistry {
         index: "https://mirror.corp.example".into(),
-        mirrors_crates_io: true,
+        mirrors_public_registry: true,
     };
     let private_source = DependencySource::AlternateRegistry {
         index: "https://index.mycorp.dev".into(),
-        mirrors_crates_io: false,
+        mirrors_public_registry: false,
     };
 
     assert!(
@@ -229,7 +230,7 @@ fn test_mirror_distinct_pinned_versions_produce_distinct_vulnerability_keys() {
         fn source(&self) -> DependencySource {
             DependencySource::AlternateRegistry {
                 index: "https://mirror.corp.example".into(),
-                mirrors_crates_io: true,
+                mirrors_public_registry: true,
             }
         }
         fn as_any(&self) -> &dyn Any {

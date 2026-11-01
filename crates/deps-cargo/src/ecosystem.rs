@@ -857,7 +857,7 @@ mod tests {
             let mut alternate_dep = mock_dependency("shared-name", Some("1.0"), 1, 1);
             alternate_dep.source = DependencySource::AlternateRegistry {
                 index: "https://index.mycorp.dev/never-registered".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             };
             let alternate_position = alternate_dep.version_range.unwrap().start.into();
             let parse_result = MockParseResult {
@@ -911,7 +911,7 @@ mod tests {
             let mut dep = mock_dependency("serde", Some("1.0"), 0, 0);
             dep.source = DependencySource::AlternateRegistry {
                 index: index_key,
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             };
             let position = dep.version_range.unwrap().start.into();
             let parse_result = MockParseResult {
@@ -944,7 +944,7 @@ mod tests {
             let mut alternate_dep = mock_dependency("shared-name", Some("1.0"), 1, 1);
             alternate_dep.source = DependencySource::AlternateRegistry {
                 index: "https://index.mycorp.dev".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             };
             let parse_result = MockParseResult {
                 dependencies: vec![registry_dep, alternate_dep],
@@ -1336,7 +1336,7 @@ mod tests {
             let mut dep = mock_dependency("shared-name", Some("1.0"), 0, 1);
             dep.source = DependencySource::AlternateRegistry {
                 index: "https://index.mycorp.dev/never-registered".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             };
             let position = dep.version_range.unwrap().start.into();
             let parse_result = MockParseResult {
@@ -1376,7 +1376,7 @@ mod tests {
             let mut alternate_dep = mock_dependency("shared-name", Some("1.0"), 1, 1);
             alternate_dep.source = DependencySource::AlternateRegistry {
                 index: "https://index.mycorp.dev".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             };
             // A distinct line so this doesn't fall inside `alternate_dep`'s own name/version
             // range (both on line 1) and get misdetected as `PackageName`/`Version`.

@@ -949,7 +949,7 @@ mod tests {
     fn alternate_source(index: &str) -> DependencySource {
         DependencySource::AlternateRegistry {
             index: index.to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         }
     }
 
@@ -1475,7 +1475,7 @@ mod endpoint_tests {
         let endpoint = |source: &DependencySource| registry.endpoint_for(&name, source);
         let unregistered = DependencySource::AlternateRegistry {
             index: "https://swift.example/api".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let git = DependencySource::Git {
             url: "https://example.com/r.git".to_string(),
@@ -1497,7 +1497,7 @@ mod endpoint_tests {
         );
         let unknown = DependencySource::AlternateRegistry {
             index: "https://other.example/api".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         assert_eq!(endpoint(&unknown), RegistryEndpoint::Unresolved);
         assert_eq!(endpoint(&git), RegistryEndpoint::Unresolved);

@@ -383,7 +383,7 @@ impl DepsDevScope {
 }
 
 fn name_is_addressable(key: &PackageKey) -> bool {
-    !crate::lsp_helpers::requirement_contains_template_placeholder(key.declared().as_str())
+    !crate::interpolation::package_name_is_unexpanded_template(key.declared().as_str())
 }
 
 /// A dependency that passed every deps-core deps.dev gate (covered ecosystem, online,

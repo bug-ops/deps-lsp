@@ -314,7 +314,7 @@ mod tests {
             DependencySource::Registry,
             DependencySource::AlternateRegistry {
                 index: "https://index.mycorp.dev".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             },
         ] {
             assert_eq!(
@@ -381,7 +381,7 @@ mod tests {
         assert!(F.resolves_alternate_registry());
         assert!(F.can_resolve_source(&DependencySource::AlternateRegistry {
             index: "https://index.mycorp.dev".into(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         }));
     }
 }

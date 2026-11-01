@@ -185,6 +185,49 @@ pub(crate) struct DocStamp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PublishTicket(u64);
 
+/// Why a manifest's parser rejected it, kept on the [`DocumentState`] so diagnostics can
+/// surface the cause instead of silently publishing nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseFailure {
+    /// Typed cause, for choosing the diagnostic wording.
+    pub kind: deps_core::ParseFailureKind,
+    /// The parser's already-redacted error text.
+    pub message: String,
+}
+
+impl ParseFailure {
+    /// Summarizes `error`; a non-parse error (for example an I/O failure) counts as
+    /// [`deps_core::ParseFailureKind::Malformed`].
+    pub fn from_error(error: &deps_core::DepsError) -> Self {
+        Self {
+            kind: error
+                .parse_failure_kind()
+                .unwrap_or(deps_core::ParseFailureKind::Malformed),
+            message: error.to_string(),
+        }
+    }
+}
+
+/// What parsing the document's manifest produced: a result, a rejection, or nothing yet.
+///
+/// One enum rather than two `Option`s so "has a result and a failure" cannot be represented.
+#[derive(Clone)]
+enum ManifestParse {
+    Parsed(Arc<dyn ParseResult>),
+    Failed(ParseFailure),
+    Unparsed,
+}
+
+impl std::fmt::Debug for ManifestParse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parsed(_) => f.write_str("Parsed"),
+            Self::Failed(failure) => f.debug_tuple("Failed").field(failure).finish(),
+            Self::Unparsed => f.write_str("Unparsed"),
+        }
+    }
+}
+
 /// State for a single open document.
 ///
 /// Stores the document content, parsed dependency information, and cached
@@ -232,7 +275,7 @@ pub struct DocumentState {
     /// refcount bump, not a deep copy — despite `DocumentState` being rebuilt (and cloned via
     /// `preserve_cache`/`ServerState::get_document_clone`) on every document edit. A future
     /// field added to this struct should keep the same property in mind.
-    parse_result: Option<Arc<dyn ParseResult>>,
+    manifest: ManifestParse,
     /// Per-package signal state — cached/resolved versions, vulnerabilities, outcomes,
     /// licenses, typosquat/GOSSIP findings, and the resolved-versions generation counter
     /// (issue #1477). See [`PackageSignals`] for the individual fields' own docs.
@@ -393,7 +436,7 @@ impl std::fmt::Debug for DocumentState {
         f.debug_struct("DocumentState")
             .field("ecosystem", &format_args!("{}", self.ecosystem))
             .field("content_len", &self.content.len())
-            .field("has_parse_result", &self.parse_result.is_some())
+            .field("manifest", &self.manifest)
             .field("signals", &self.signals)
             .field("parsed_at", &self.parsed_at)
             .field("load_phase", &self.load_phase)
@@ -408,15 +451,11 @@ impl DocumentState {
     /// Shared body for [`Self::new_from_parse_result`]/[`Self::new_without_parse_result`]
     /// (issue #1477): the two constructors differ only in whether they have a parse result
     /// to hand, so every other field's initial value lives here once.
-    fn new_inner(
-        ecosystem: EcosystemId,
-        content: String,
-        parse_result: Option<Arc<dyn ParseResult>>,
-    ) -> Self {
+    fn new_inner(ecosystem: EcosystemId, content: String, manifest: ManifestParse) -> Self {
         Self {
             ecosystem,
             content,
-            parse_result,
+            manifest,
             signals: PackageSignals::default(),
             parsed_at: Instant::now(),
             load_phase: LoadPhase::Idle,
@@ -432,7 +471,11 @@ impl DocumentState {
         content: String,
         parse_result: Box<dyn ParseResult>,
     ) -> Self {
-        Self::new_inner(ecosystem, content, Some(Arc::from(parse_result)))
+        Self::new_inner(
+            ecosystem,
+            content,
+            ManifestParse::Parsed(Arc::from(parse_result)),
+        )
     }
 
     /// Creates a new document state without a parse result.
@@ -440,12 +483,33 @@ impl DocumentState {
     /// Used when parsing fails but the document should still be stored
     /// to enable fallback completion and other LSP features.
     pub fn new_without_parse_result(ecosystem: EcosystemId, content: String) -> Self {
-        Self::new_inner(ecosystem, content, None)
+        Self::new_inner(ecosystem, content, ManifestParse::Unparsed)
+    }
+
+    /// Creates a document state for a manifest its parser rejected, remembering `failure` so
+    /// diagnostics can tell the user why the file produces no dependency findings.
+    pub fn new_parse_failed(
+        ecosystem: EcosystemId,
+        content: String,
+        failure: ParseFailure,
+    ) -> Self {
+        Self::new_inner(ecosystem, content, ManifestParse::Failed(failure))
+    }
+
+    /// Why the manifest has no parse result, if its parser rejected it.
+    pub const fn parse_failure(&self) -> Option<&ParseFailure> {
+        match &self.manifest {
+            ManifestParse::Failed(failure) => Some(failure),
+            ManifestParse::Parsed(_) | ManifestParse::Unparsed => None,
+        }
     }
 
     /// Gets a reference to the parse result if available.
     pub fn parse_result(&self) -> Option<&dyn ParseResult> {
-        self.parse_result.as_deref()
+        match &self.manifest {
+            ManifestParse::Parsed(result) => Some(result.as_ref()),
+            ManifestParse::Failed(_) | ManifestParse::Unparsed => None,
+        }
     }
 
     /// Returns a cheap `Arc` clone of the parse result, if available.
@@ -455,7 +519,10 @@ impl DocumentState {
     /// registry-bound `Ecosystem::generate_*` call, without deep-cloning
     /// ecosystem-specific parse data on every request (#319).
     pub fn parse_result_arc(&self) -> Option<Arc<dyn ParseResult>> {
-        self.parse_result.clone()
+        match &self.manifest {
+            ManifestParse::Parsed(result) => Some(Arc::clone(result)),
+            ManifestParse::Failed(_) | ManifestParse::Unparsed => None,
+        }
     }
 
     /// Updates the cached registry version data (new architecture).
@@ -3326,7 +3393,7 @@ mod tests {
 
             assert_eq!(doc_state.ecosystem, EcosystemId::Cargo);
             assert_eq!(doc_state.content, content);
-            assert!(doc_state.parse_result.is_some());
+            assert!(doc_state.parse_result().is_some());
         }
 
         #[test]
@@ -3335,7 +3402,7 @@ mod tests {
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
             assert_eq!(doc_state.ecosystem, EcosystemId::Cargo);
-            assert!(doc_state.parse_result.is_none());
+            assert!(doc_state.parse_result().is_none());
         }
 
         #[test]
@@ -3387,7 +3454,7 @@ mod tests {
 
             assert_eq!(cloned.ecosystem, state.ecosystem);
             assert_eq!(cloned.content, state.content);
-            assert!(cloned.parse_result.is_none());
+            assert!(cloned.parse_result().is_none());
         }
 
         /// `parse_result` is stored as `Arc<dyn ParseResult>` (#319), so — unlike the
@@ -3444,7 +3511,7 @@ mod tests {
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Npm, content);
 
             assert_eq!(doc_state.ecosystem, EcosystemId::Npm);
-            assert!(doc_state.parse_result.is_none());
+            assert!(doc_state.parse_result().is_none());
         }
     }
 
@@ -3462,7 +3529,7 @@ mod tests {
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Deno, content);
 
             assert_eq!(doc_state.ecosystem, EcosystemId::Deno);
-            assert!(doc_state.parse_result.is_none());
+            assert!(doc_state.parse_result().is_none());
         }
     }
 
@@ -3480,7 +3547,7 @@ mod tests {
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Pypi, content);
 
             assert_eq!(doc_state.ecosystem, EcosystemId::Pypi);
-            assert!(doc_state.parse_result.is_none());
+            assert!(doc_state.parse_result().is_none());
         }
     }
 
@@ -3500,7 +3567,7 @@ mod tests {
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Go, content);
 
             assert_eq!(doc_state.ecosystem, EcosystemId::Go);
-            assert!(doc_state.parse_result.is_none());
+            assert!(doc_state.parse_result().is_none());
         }
 
         #[test]
@@ -3527,7 +3594,7 @@ mod tests {
             );
 
             assert_eq!(doc_state.ecosystem, EcosystemId::Go);
-            assert!(doc_state.parse_result.is_some());
+            assert!(doc_state.parse_result().is_some());
         }
     }
 }

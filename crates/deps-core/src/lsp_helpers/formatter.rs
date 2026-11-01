@@ -2303,7 +2303,7 @@ pub trait SourcePolicy: Send + Sync {
     /// assert!(DefaultFormatter.can_resolve_source(&DependencySource::Registry));
     /// assert!(!DefaultFormatter.can_resolve_source(&DependencySource::AlternateRegistry {
     ///     index: "https://index.mycorp.dev".into(),
-    ///     mirrors_crates_io: false,
+    ///     mirrors_public_registry: false,
     /// }));
     /// ```
     fn can_resolve_source(&self, source: &crate::parser::DependencySource) -> bool {
@@ -2317,7 +2317,7 @@ pub trait SourcePolicy: Send + Sync {
 
     /// Whether this ecosystem's registry resolves version data for *any*
     /// [`DependencySource::AlternateRegistry`](crate::parser::DependencySource::AlternateRegistry)
-    /// source, regardless of `mirrors_crates_io` or any other field.
+    /// source, regardless of `mirrors_public_registry` or any other field.
     ///
     /// A single opt-in flag [`can_resolve_source`](Self::can_resolve_source) derives its
     /// widened answer from, replacing what five ecosystems (`deps-cargo`, `deps-go`,
@@ -2368,7 +2368,7 @@ pub trait SourcePolicy: Send + Sync {
     ///
     /// Default `matches!(source, DependencySource::Registry)` — every ecosystem with only
     /// one registry concept keeps its existing behavior. `deps-cargo`'s `CargoFormatter`
-    /// overrides this to also accept `AlternateRegistry { mirrors_crates_io: true, .. }`:
+    /// overrides this to also accept `AlternateRegistry { mirrors_public_registry: true, .. }`:
     /// Cargo verifies per-version checksum equality against crates.io for a
     /// `[source.crates-io] replace-with` mirror, so its content is exactly as trustworthy as
     /// crates.io's own, even though the fetch itself goes to the mirror's index, not to
@@ -2395,7 +2395,7 @@ pub trait SourcePolicy: Send + Sync {
     /// assert!(DefaultFormatter.source_is_public_registry_content(&DependencySource::Registry));
     /// assert!(!DefaultFormatter.source_is_public_registry_content(&DependencySource::AlternateRegistry {
     ///     index: "https://index.mycorp.dev".into(),
-    ///     mirrors_crates_io: true,
+    ///     mirrors_public_registry: true,
     /// }));
     /// ```
     fn source_is_public_registry_content(&self, source: &crate::parser::DependencySource) -> bool {

@@ -1130,7 +1130,7 @@ fn build_source_and_route(
             (
                 DependencySource::AlternateRegistry {
                     index: route_key.clone(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
                 Some((route_key, route)),
             )

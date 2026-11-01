@@ -174,7 +174,7 @@ never reaches a registry or a URL.
 
 | Situation | `DependencySource` | Effect |
 |---|---|---|
-| Host known, route registered | `AlternateRegistry { index: route_key, mirrors_crates_io: false }` | Routed by `GitlabCiRegistry::get_versions_from` / `get_latest_matching_from` to `(host, endpoint)` |
+| Host known, route registered | `AlternateRegistry { index: route_key, mirrors_public_registry: false }` | Routed by `GitlabCiRegistry::get_versions_from` / `get_latest_matching_from` to `(host, endpoint)` |
 | Host `Unresolved` (FR-012), or the §4.6 cap refused registration | `CustomRegistry { url: raw_host_expr }` | `can_resolve_source` is `false` by default, so the fetch loop skips it (`lifecycle.rs:92`), hover skips the registry lookup (`hover.rs:90`), and the unknown-package rule's final arm emits **nothing** (`diagnostics.rs:1023`, R5 arm 6). Exactly FR-012's skip, with no bespoke gate |
 
 `route_key = deps_core::hash_routing_key("gitlab", [origin, endpoint_kind_str].into_iter())`
@@ -204,7 +204,7 @@ hashed chain key there rather than a bare URL.
 > as the defensive fallback — after the downgrade pass no dependency should ever reach it,
 > and routes are never removed once registered.
 
-`mirrors_crates_io: false` always (a Cargo-only concept). Two stated consequences of using
+`mirrors_public_registry: false` always (a Cargo-only concept). Two stated consequences of using
 `AlternateRegistry` for every resolvable GitLab CI dependency, both correct here and both
 previously unstated:
 

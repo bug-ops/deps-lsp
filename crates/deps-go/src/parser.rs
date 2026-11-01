@@ -1191,7 +1191,7 @@ require (
             result.dependencies[0].source,
             deps_core::parser::DependencySource::AlternateRegistry {
                 index: crate::config::GOPRIVATE_CHAIN_KEY.to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
         assert!(result.blocked_registries().is_empty());
@@ -1220,7 +1220,7 @@ require (
             result.dependencies[0].source,
             deps_core::parser::DependencySource::AlternateRegistry {
                 index: crate::config::GOPRIVATE_CHAIN_KEY.to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
         assert_eq!(

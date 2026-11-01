@@ -3298,7 +3298,7 @@ mod tests {
         let root = NuGetRegistry::new(cache);
         let unregistered = DependencySource::AlternateRegistry {
             index: "missing".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let error = root
             .get_versions_from(
@@ -3553,7 +3553,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: chain.key.clone(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let sentinel = SelectionContext::with_minimum_stability(StabilityFloor::Rc);
         SelectionContextCapture::reset();
@@ -3622,7 +3622,7 @@ mod tests {
         let endpoint = |source: &DependencySource| root.endpoint_for(&name, source);
         let via = |key: &str| DependencySource::AlternateRegistry {
             index: key.to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
 
         assert_eq!(
@@ -3742,7 +3742,7 @@ mod tests {
                 &name,
                 &DependencySource::AlternateRegistry {
                     index: key.to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
             )
         };

@@ -4,7 +4,7 @@ use yaml_rust2::Event;
 use yaml_rust2::parser::{MarkedEventReceiver, Parser};
 use yaml_rust2::scanner::Marker;
 
-use crate::error::{DepsError, Result};
+use crate::error::{DepsError, ParseFailureKind, Result};
 use crate::redact::RedactedUrl;
 
 /// Maximum allowed nesting depth for TOML table/array recursion before
@@ -257,6 +257,17 @@ pub enum CheckedTomlError {
     /// `content` passed the depth guards but `toml-span` rejected it as invalid TOML.
     #[error(transparent)]
     Syntax(toml_span::Error),
+}
+
+impl CheckedTomlError {
+    /// The [`ParseFailureKind`] this error maps to.
+    #[must_use]
+    pub const fn kind(&self) -> ParseFailureKind {
+        match self {
+            Self::NestingTooDeep { .. } => ParseFailureKind::NestingTooDeep,
+            Self::Syntax(_) => ParseFailureKind::Malformed,
+        }
+    }
 }
 
 fn classify_parse_error(error: toml_span::Error) -> CheckedTomlError {
@@ -900,8 +911,9 @@ pub fn check_yaml_expansion(content: &str, max_bytes: usize) -> std::result::Res
 /// ```
 pub fn check_yaml_bounds(content: &str, file_type: &str) -> Result<()> {
     if let Err(depth) = check_yaml_nesting_depth(content, MAX_YAML_NESTING_DEPTH) {
-        return Err(DepsError::parse_error(
+        return Err(DepsError::parse_error_of_kind(
             file_type,
+            ParseFailureKind::NestingTooDeep,
             &format!("YAML nesting depth {depth} exceeds maximum of {MAX_YAML_NESTING_DEPTH}"),
         ));
     }
@@ -1156,13 +1168,10 @@ pub enum DependencySource {
         /// The resolved index URL, validated and normalized by the originating parser —
         /// redacted only when [`Debug`]-formatted (see the variant's own doc).
         index: String,
-        // TODO(critic): rename to `mirrors_public_registry`; deps-go also sets it, for GOPROXY
-        // chains whose content the public checksum database verifies.
-        /// `true` exactly when this source was reached via a `[source.crates-io]
-        /// replace-with` chain (Cargo `[source]` mirroring, spec
-        /// `.local/specs/023-cargo-custom-registries/plan-1b.md` §1.3) — as opposed to an
-        /// explicit `registry`/`registry-index` naming a genuinely different, private
-        /// registry.
+        /// `true` exactly when this source serves content a public registry vouches for: a Cargo
+        /// `[source.crates-io] replace-with` chain (`[source]` mirroring), or a Go `GOPROXY`
+        /// chain verified by the public checksum database — as opposed to an explicit
+        /// `registry`/`registry-index` naming a genuinely different, private registry.
         ///
         /// Affects **presentation and advisory gating only, never routing**: Cargo verifies
         /// per-version checksum equality against crates.io for a mirror, so its content is
@@ -1171,7 +1180,7 @@ pub enum DependencySource {
         /// `deps-go` sets it for a `GOPROXY` chain with a URL hop when `GOSUMDB` is the public
         /// checksum database and `GOPRIVATE`/`GONOSUMDB` do not match the module.
         /// See [`crate::lsp_helpers::SourcePolicy::source_is_public_registry_content`].
-        mirrors_crates_io: bool,
+        mirrors_public_registry: bool,
     },
 }
 
@@ -1207,11 +1216,11 @@ impl fmt::Debug for DependencySource {
                 .finish(),
             Self::AlternateRegistry {
                 index,
-                mirrors_crates_io,
+                mirrors_public_registry,
             } => f
                 .debug_struct("AlternateRegistry")
                 .field("index", &RedactedUrl::new(index))
-                .field("mirrors_crates_io", mirrors_crates_io)
+                .field("mirrors_public_registry", mirrors_public_registry)
                 .finish(),
         }
     }
@@ -2142,6 +2151,39 @@ dev_dependencies:
     }
 
     #[test]
+    fn test_check_yaml_bounds_depth_rejection_is_nesting_too_deep() {
+        let content = format!("{}1", "- ".repeat(MAX_YAML_NESTING_DEPTH + 1));
+        let err = check_yaml_bounds(&content, "example.yml").expect_err("must be rejected");
+        assert_eq!(
+            err.parse_failure_kind(),
+            Some(ParseFailureKind::NestingTooDeep)
+        );
+    }
+
+    #[test]
+    fn test_checked_toml_error_kind_maps_each_variant() {
+        let too_deep = format!("a = {}1{}", "[".repeat(100), "]".repeat(100));
+        let Err(deep) = parse_toml_checked(&too_deep) else {
+            panic!("expected a depth rejection");
+        };
+        assert_eq!(deep.kind(), ParseFailureKind::NestingTooDeep);
+        let Err(syntax) = parse_toml_checked("a = ") else {
+            panic!("expected a syntax error");
+        };
+        assert_eq!(syntax.kind(), ParseFailureKind::Malformed);
+    }
+
+    #[test]
+    fn test_parse_failure_kind_is_none_for_non_parse_errors() {
+        let io = DepsError::Io(std::io::Error::other("disk"));
+        assert_eq!(io.parse_failure_kind(), None);
+        assert_eq!(
+            DepsError::parse_error("x", &"bad").parse_failure_kind(),
+            Some(ParseFailureKind::Malformed)
+        );
+    }
+
+    #[test]
     fn test_check_yaml_bounds_within_limits_ok() {
         assert!(check_yaml_bounds("a:\n  b: 1\n", "example.yml").is_ok());
     }
@@ -2155,7 +2197,10 @@ dev_dependencies:
 
         let err = check_yaml_bounds(&content, "example.yml")
             .expect_err("expected the nesting-depth guard to reject this");
-        let DepsError::ParseError { file_type, source } = err else {
+        let DepsError::ParseError {
+            file_type, source, ..
+        } = err
+        else {
             panic!("expected DepsError::ParseError");
         };
         assert_eq!(file_type, "example.yml");
@@ -2178,7 +2223,10 @@ dev_dependencies:
 
         let err = check_yaml_bounds(&content, "example.yml")
             .expect_err("expected the expansion budget to reject this");
-        let DepsError::ParseError { file_type, source } = err else {
+        let DepsError::ParseError {
+            file_type, source, ..
+        } = err
+        else {
             panic!("expected DepsError::ParseError");
         };
         assert_eq!(file_type, "example.yml");
@@ -2300,7 +2348,7 @@ dev_dependencies:
     fn test_dependency_source_debug_redacts_alternate_registry_query_string() {
         let source = DependencySource::AlternateRegistry {
             index: "https://index.mycorp.dev/api?api_key=SECRET".into(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let debug_output = format!("{source:?}");
         assert!(!debug_output.contains("SECRET"), "{debug_output}");
@@ -2312,7 +2360,7 @@ dev_dependencies:
     fn test_dependency_source_alternate_registry() {
         let source = DependencySource::AlternateRegistry {
             index: "https://index.mycorp.dev".into(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         // `is_registry()` is true (it is a registry, just not the default one), but
         // the generic `Registry` trait still can't resolve it — only an ecosystem

@@ -2847,7 +2847,9 @@ mod tests {
         };
 
         match err {
-            crate::error::DepsError::ParseError { file_type, source } => {
+            crate::error::DepsError::ParseError {
+                file_type, source, ..
+            } => {
                 assert!(file_type.contains("manifest at"));
                 assert!(
                     source.to_string().contains("boom"),

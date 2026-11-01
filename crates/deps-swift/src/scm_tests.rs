@@ -167,7 +167,7 @@ async fn test_prefetch_warms_the_memo_then_the_reparse_swaps_the_dependency() {
         swapped.source,
         DependencySource::AlternateRegistry {
             index: server.url(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         }
     );
     assert_matches!(&swapped.origin, SwiftOrigin::Swizzled { scm } if scm.wire() == NIO_URL);
@@ -380,7 +380,7 @@ async fn test_a_project_tier_default_cannot_redirect_a_user_tier_lookup() {
         dependency(&swapped).source,
         DependencySource::AlternateRegistry {
             index: operator.url(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         }
     );
     asked.assert();
@@ -407,7 +407,7 @@ async fn test_the_identity_scope_routes_through_the_user_tier_table() {
         dependency(&swapped).source,
         DependencySource::AlternateRegistry {
             index: scoped.url(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         }
     );
 }
@@ -624,7 +624,7 @@ fn test_a_reverted_swizzled_dependency_is_exactly_the_declared_one() {
     swizzled.name = "apple.swift-nio".into();
     swizzled.source = DependencySource::AlternateRegistry {
         index: "https://registry.example".into(),
-        mirrors_crates_io: false,
+        mirrors_public_registry: false,
     };
     swizzled.origin = SwiftOrigin::Swizzled {
         scm: ScmLookupUrl::parse(&declared.url).unwrap(),

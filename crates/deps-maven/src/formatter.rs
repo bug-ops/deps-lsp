@@ -154,7 +154,7 @@ impl PackageNaming for MavenFormatter {
     /// never when `name` contains an unresolved `${property}`/`@property@` placeholder,
     /// which is accepted instead.
     fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
-        if is_unresolved(name) {
+        if deps_core::interpolation::package_name_is_unexpanded_template(name) {
             return Ok(());
         }
         let Some((group_id, artifact_id)) = name.split_once(':') else {

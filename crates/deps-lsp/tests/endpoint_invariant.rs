@@ -58,7 +58,7 @@ fn resolved(name: &'static str) -> Sample {
 fn unregistered_alternate() -> DependencySource {
     DependencySource::AlternateRegistry {
         index: "https://never-registered.example/".to_string(),
-        mirrors_crates_io: false,
+        mirrors_public_registry: false,
     }
 }
 

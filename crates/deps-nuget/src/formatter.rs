@@ -841,7 +841,7 @@ mod tests {
         assert!(f.can_resolve_source(&DependencySource::Registry));
         assert!(f.can_resolve_source(&DependencySource::AlternateRegistry {
             index: "nuget-chain:0".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         }));
         assert!(!f.can_resolve_source(&DependencySource::CustomRegistry {
             url: "unresolved".to_string(),
@@ -857,7 +857,7 @@ mod tests {
         assert!(
             f.suppress_package_url(&DependencySource::AlternateRegistry {
                 index: "nuget-chain:0".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             })
         );
     }

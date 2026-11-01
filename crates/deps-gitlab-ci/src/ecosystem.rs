@@ -1534,7 +1534,7 @@ mod tests {
             version_literal: None,
             source: deps_core::parser::DependencySource::AlternateRegistry {
                 index: "route".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             },
             is_plain_scalar: true,
             is_alias_occurrence: false,
@@ -1787,11 +1787,11 @@ mod tests {
 
         let resolved_source = deps_core::parser::DependencySource::AlternateRegistry {
             index: "resolved-route".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let unregistered_route_source = deps_core::parser::DependencySource::AlternateRegistry {
             index: "no-such-route".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let custom_registry_source =
             deps_core::parser::DependencySource::CustomRegistry { url: "x".into() };
@@ -2500,7 +2500,7 @@ mod tests {
                 version_literal: None,
                 source: deps_core::parser::DependencySource::AlternateRegistry {
                     index,
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
                 is_plain_scalar: true,
                 is_alias_occurrence: false,
@@ -2703,7 +2703,7 @@ mod tests {
                 version_literal: None,
                 source: deps_core::parser::DependencySource::AlternateRegistry {
                     index,
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
                 is_plain_scalar: true,
                 is_alias_occurrence: false,

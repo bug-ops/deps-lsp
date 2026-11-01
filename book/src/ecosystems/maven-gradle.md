@@ -152,6 +152,8 @@ A requirement that couldn't be resolved to a concrete version (Maven's `${proper
   guard (the tracked span covers a placeholder/variable, not a version literal), so the two
   mechanisms agree independently rather than one depending on the other.
 
+A dependency whose *name* is an unexpanded template placeholder (Maven `${grp}`, Gradle `$grp:x` or `${grp}`) is never looked up: it gets no registry link, no registry request and no OSV vulnerability claim, because the placeholder is not a real coordinate.
+
 ## Release-Freshness Coverage
 
 Hover's "Recent versions" age suffix and completion's age `label_details` (gated by

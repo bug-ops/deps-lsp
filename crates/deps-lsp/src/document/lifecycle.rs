@@ -15,7 +15,7 @@ use super::osv_scan::{
 };
 use super::probes::spawn_background_probes;
 use super::resolved::RefetchPolicy;
-use super::state::{DocumentState, ServerState, spawn_supervised};
+use super::state::{DocumentState, ParseFailure, ServerState, spawn_supervised};
 use super::typosquat::{current_declared_names, run_typosquat_prefetch};
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
@@ -123,21 +123,22 @@ pub async fn handle_document_open(
         ecosystem.display_name()
     );
 
-    let parse_result =
-        deps_core::ecosystem::parse_manifest_blocking(&ecosystem, &content, &domain_uri)
-            .await
-            .inspect_err(|e| {
-                tracing::debug!(
-                    error = %e,
-                    "Failed to parse manifest, storing document without parse result"
-                );
-            })
-            .ok();
+    let parsed =
+        deps_core::ecosystem::parse_manifest_blocking(&ecosystem, &content, &domain_uri).await;
 
-    let mut doc_state = if let Some(pr) = parse_result {
-        DocumentState::new_from_parse_result(ecosystem.ecosystem_id(), content, pr)
-    } else {
-        DocumentState::new_without_parse_result(ecosystem.ecosystem_id(), content)
+    let mut doc_state = match parsed {
+        Ok(pr) => DocumentState::new_from_parse_result(ecosystem.ecosystem_id(), content, pr),
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "Failed to parse manifest, storing document without parse result"
+            );
+            DocumentState::new_parse_failed(
+                ecosystem.ecosystem_id(),
+                content,
+                ParseFailure::from_error(&error),
+            )
+        }
     };
     doc_state.set_version(version);
 
@@ -301,6 +302,19 @@ async fn run_document_open_background_task(
         diagnostics_snapshot.fetch_timeout,
     )
     .await;
+
+    if let Some(failure) = state
+        .with_document(&uri, |doc| doc.parse_failure().cloned())
+        .flatten()
+    {
+        tracing::warn!(
+            kind = ?failure.kind,
+            "manifest rejected by its parser, aborting fetch"
+        );
+        tracing::debug!(reason = %failure.message, "manifest parse failure reason");
+        diagnostics::publish_document_diagnostics(&state, &client, &uri, &config, 0).await;
+        return;
+    }
 
     // Collect dependency names+sources, the in-use-version map (§4.6), and the manifest's own
     // `SelectionContext` (#1433) in one pass while holding the reference (can't hold across
@@ -627,11 +641,7 @@ async fn parse_and_diff_manifest(
     content: &str,
     state: &ServerState,
     ecosystem: &Arc<dyn Ecosystem>,
-) -> (
-    Option<Box<dyn deps_core::ParseResult>>,
-    DependencyDiff,
-    bool,
-) {
+) -> (ParseOutcome, DependencyDiff, bool) {
     let (old_deps, old_selection_context): (
         HashMap<NormalizedName, Vec<Option<VersionReq>>>,
         deps_core::SelectionContext,
@@ -648,29 +658,34 @@ async fn parse_and_diff_manifest(
 
     // Try to parse manifest (may fail for incomplete syntax, or for a URI shape
     // `url::Url` rejects — both are treated the same as "no parse result").
-    let parse_result = match crate::lsp_types_interop::from_lsp_uri(uri) {
+    let parse_result: ParseOutcome = match crate::lsp_types_interop::from_lsp_uri(uri) {
         Some(domain_uri) => {
             deps_core::ecosystem::parse_manifest_blocking(ecosystem, content, &domain_uri)
                 .await
-                .inspect_err(|e| {
+                .map_err(|error| {
                     tracing::debug!(
-                        error = %e,
+                        %error,
                         "Failed to parse manifest, storing document without parse result"
                     );
+                    ParseFailure::from_error(&error)
                 })
-                .ok()
         }
         None => {
             tracing::debug!("URI is not representable as a url::Url: {:?}", uri);
-            None
+            Err(ParseFailure {
+                kind: deps_core::ParseFailureKind::Malformed,
+                message: "document URI is not a valid URL".to_owned(),
+            })
         }
     };
 
     let new_deps: HashMap<NormalizedName, Vec<Option<VersionReq>>> = parse_result
         .as_ref()
+        .ok()
         .map_or_default(|pr| dependency_version_map(pr.as_ref(), ecosystem.formatter()));
     let new_selection_context = parse_result
         .as_deref()
+        .ok()
         .map_or_else(deps_core::SelectionContext::none, |pr| {
             pr.selection_context()
         });
@@ -687,6 +702,9 @@ async fn parse_and_diff_manifest(
 
     (parse_result, diff, selection_context_changed)
 }
+
+/// A manifest parse: the result, or why the parser rejected the content.
+type ParseOutcome = std::result::Result<Box<dyn deps_core::ParseResult>, ParseFailure>;
 
 /// Whether [`commit_parsed_document`] should verify the document's current version before
 /// committing — see that function's doc for why this exists.
@@ -725,7 +743,7 @@ fn commit_parsed_document(
     uri: &Uri,
     ecosystem: &dyn Ecosystem,
     content: String,
-    parse_result: Option<Box<dyn deps_core::ParseResult>>,
+    parse_result: ParseOutcome,
     version: Option<i32>,
     state: &ServerState,
     options: CommitOptions<'_>,
@@ -744,10 +762,9 @@ fn commit_parsed_document(
         }
     }
 
-    let mut doc_state = if let Some(pr) = parse_result {
-        DocumentState::new_from_parse_result(ecosystem.ecosystem_id(), content, pr)
-    } else {
-        DocumentState::new_without_parse_result(ecosystem.ecosystem_id(), content)
+    let mut doc_state = match parse_result {
+        Ok(pr) => DocumentState::new_from_parse_result(ecosystem.ecosystem_id(), content, pr),
+        Err(failure) => DocumentState::new_parse_failed(ecosystem.ecosystem_id(), content, failure),
     };
     doc_state.set_version(version);
 
@@ -931,7 +948,7 @@ pub(crate) async fn handle_document_change_guarded(
     // alone would see nothing to fetch.
     let all_dependency_names: Vec<NormalizedName> = match refetch {
         RefetchPolicy::Diff => Vec::new(),
-        RefetchPolicy::AllDependencies => parse_result.as_deref().map_or_default(|pr| {
+        RefetchPolicy::AllDependencies => parse_result.as_deref().ok().map_or_default(|pr| {
             dependency_version_map(pr, ecosystem.formatter())
                 .into_keys()
                 .collect()
@@ -3322,7 +3339,7 @@ anyhow = "1.0"
             &uri,
             ecosystem.as_ref(),
             content2.to_string(),
-            Some(parse_result2),
+            Ok(parse_result2),
             None,
             &state,
             CommitOptions {
@@ -5194,5 +5211,146 @@ mod pre_fetch_tests {
 
             assert_eq!(ecosystem.probe_calls(), expected, "{trigger:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod parse_failure_tests {
+    use super::*;
+    #[cfg(any(feature = "cargo", feature = "npm"))]
+    use crate::test_utils::test_helpers::create_test_client_and_config;
+    use deps_core::ParseFailureKind;
+
+    #[cfg(any(feature = "cargo", feature = "npm"))]
+    const TASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[cfg(feature = "cargo")]
+    fn deeply_nested_cargo_toml() -> String {
+        format!(
+            "[dependencies]\na = {}1{}\n",
+            "[".repeat(100),
+            "]".repeat(100)
+        )
+    }
+
+    #[cfg(any(feature = "cargo", feature = "npm"))]
+    async fn open(state: &Arc<ServerState>, path: &str, content: &str) -> Uri {
+        let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(path));
+        let (client, config) = create_test_client_and_config();
+        let task = handle_document_open(
+            uri.clone(),
+            content.to_owned(),
+            Some(1),
+            Arc::clone(state),
+            client,
+            config,
+        )
+        .await
+        .expect("open must accept a manifest its parser rejects");
+        tokio::time::timeout(TASK_TIMEOUT, task)
+            .await
+            .expect("open's background task must return without fetching")
+            .expect("open's background task must not panic");
+        uri
+    }
+
+    #[cfg(feature = "cargo")]
+    async fn change(state: &Arc<ServerState>, uri: &Uri, content: &str, version: i32) {
+        let (client, config) = create_test_client_and_config();
+        let task = handle_document_change(
+            uri.clone(),
+            content.to_owned(),
+            Some(version),
+            Arc::clone(state),
+            client,
+            config,
+        )
+        .await
+        .expect("change must accept a manifest its parser rejects");
+        tokio::time::timeout(TASK_TIMEOUT, task)
+            .await
+            .expect("change's background task must finish promptly")
+            .expect("change's background task must not panic");
+    }
+
+    #[cfg(any(feature = "cargo", feature = "npm"))]
+    fn failure_of(state: &ServerState, uri: &Uri) -> Option<ParseFailure> {
+        state
+            .with_document(uri, |doc| {
+                assert_eq!(doc.parse_result().is_none(), doc.parse_failure().is_some());
+                doc.parse_failure().cloned()
+            })
+            .expect("the document must be stored even when parsing fails")
+    }
+
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn open_stores_nesting_failure_for_over_nested_toml() {
+        let state = Arc::new(ServerState::new());
+        let uri = open(&state, "/test/Cargo.toml", &deeply_nested_cargo_toml()).await;
+
+        let failure = failure_of(&state, &uri).expect("parse failure must be recorded");
+        assert_eq!(failure.kind, ParseFailureKind::NestingTooDeep);
+    }
+
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn open_stores_malformed_failure_for_toml_syntax_error() {
+        let state = Arc::new(ServerState::new());
+        let uri = open(&state, "/test/Cargo.toml", "[dependencies\nserde = ").await;
+
+        let failure = failure_of(&state, &uri).expect("parse failure must be recorded");
+        assert_eq!(failure.kind, ParseFailureKind::Malformed);
+    }
+
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn change_records_failure_and_recovery_clears_it() {
+        let state = Arc::new(ServerState::new());
+        let uri = open(&state, "/test/Cargo.toml", "[dependencies]\n").await;
+        assert!(failure_of(&state, &uri).is_none());
+
+        change(&state, &uri, &deeply_nested_cargo_toml(), 2).await;
+        let failure = failure_of(&state, &uri).expect("the edit must record the failure");
+        assert_eq!(failure.kind, ParseFailureKind::NestingTooDeep);
+
+        change(&state, &uri, "[dependencies]\n", 3).await;
+        assert!(
+            failure_of(&state, &uri).is_none(),
+            "a valid edit must clear the stored failure"
+        );
+    }
+
+    #[cfg(feature = "npm")]
+    #[tokio::test]
+    async fn broken_package_json_is_malformed() {
+        let state = Arc::new(ServerState::new());
+        let uri = open(
+            &state,
+            "/test/package.json",
+            r#"{"dependencies": {"left-pad": "1.0.0",}}"#,
+        )
+        .await;
+
+        let failure = failure_of(&state, &uri).expect("parse failure must be recorded");
+        assert_eq!(failure.kind, ParseFailureKind::Malformed);
+    }
+
+    #[test]
+    fn from_error_falls_back_to_malformed_for_non_parse_errors() {
+        let io = deps_core::DepsError::Io(std::io::Error::other("disk"));
+        assert_eq!(
+            ParseFailure::from_error(&io).kind,
+            ParseFailureKind::Malformed
+        );
+        let deep = deps_core::DepsError::parse_error_of_kind(
+            "Cargo.toml",
+            ParseFailureKind::NestingTooDeep,
+            &"too deep",
+        );
+        assert_eq!(
+            ParseFailure::from_error(&deep).kind,
+            ParseFailureKind::NestingTooDeep
+        );
     }
 }

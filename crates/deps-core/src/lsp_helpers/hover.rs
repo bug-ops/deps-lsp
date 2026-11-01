@@ -114,7 +114,9 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // `can_resolve_source`, not the bare `is_version_resolvable`, so an ecosystem routing more
     // sources than the generic default (e.g. Cargo's `AlternateRegistry`) still gets hover.
     let dep_source = dep.source();
-    let resolvable = formatter.can_resolve_source(&dep_source);
+    let name_is_template =
+        crate::interpolation::package_name_is_unexpanded_template(dep.name().as_str());
+    let resolvable = !name_is_template && formatter.can_resolve_source(&dep_source);
 
     // Hoisted so the fetch is spawned before awaiting the registry fetch below, letting the
     // two requests overlap instead of stacking (spec 037, plan.md §8 M6).
@@ -151,7 +153,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // must not link to the ecosystem's default registry — misleading confirmation once live
     // version data renders below. `.filter(|u| !u.is_empty())` is defense-in-depth (#474)
     // against a dead `[name]()` link if an ecosystem forgets `suppress_package_url`.
-    let url = (!formatter.suppress_package_url(&dep_source))
+    let url = (!name_is_template && !formatter.suppress_package_url(&dep_source))
         .then(|| formatter.package_url(dep.name()))
         .filter(|u| !u.is_empty());
 
@@ -3656,6 +3658,52 @@ mod tests {
             .expect("hover must render the basic card")
             .markdown()
             .to_string()
+    }
+
+    /// #1902: an unexpanded-template name (Gradle `$grp:x`, Maven `${grp}`, NuGet `$(PkgName)`,
+    /// npm `${pkg}`) gets no registry link and no registry request; legitimate names, including
+    /// npm scopes, keep both.
+    #[tokio::test]
+    async fn test_generate_hover_template_name_has_no_link_and_no_registry_request() {
+        use std::collections::HashMap;
+
+        let cases = [
+            ("$grp:x", false),
+            ("${grp}:x", false),
+            ("${grp}", false),
+            ("$(PkgName)", false),
+            ("${pkg}", false),
+            ("@grp@", false),
+            ("org.apache.commons:commons-lang3", true),
+            ("@scope/pkg", true),
+            ("Newtonsoft.Json", true),
+        ];
+        for (name, is_real) in cases {
+            let parse_result = freshness_test_parse_result(name);
+            let registry = CountingRegistry::new(CountingMode::Succeed);
+            let (cached, resolved) = (HashMap::new(), HashMap::new());
+            let hover = generate_hover(
+                &parse_result,
+                Position::new(0, 1).into(),
+                VersionData::new(&cached, &resolved),
+                &registry,
+                &MOCK_FORMATTER,
+                crate::freshness::FreshnessSettings::default(),
+                PublishTime::now(),
+            )
+            .await;
+            let content = hover_content(hover.as_ref());
+            assert_eq!(
+                content.contains("example.com/"),
+                is_real,
+                "{name}: {content}"
+            );
+            assert_eq!(registry.calls() > 0, is_real, "{name}: registry calls");
+            assert!(
+                is_real || !content.contains("No known vulnerabilities"),
+                "{name}: {content}"
+            );
+        }
     }
 
     /// #1830: a background `Transient` failure keeps hover off the registry entirely — three
@@ -7254,7 +7302,7 @@ mod tests {
                 dep_at("internal-pkg"),
                 crate::parser::DependencySource::AlternateRegistry {
                     index: "https://index.mycorp.internal".to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
             ),
             uri: crate::test_util::test_uri("/test/Cargo.toml"),

@@ -493,3 +493,45 @@ tokio = "1.0"
 
     let _shutdown_response = client.shutdown();
 }
+
+/// #1903: an over-nested manifest publishes a `nesting-too-deep` diagnostic on open (the
+/// early-return open path), and closing the document publishes an empty set to clear it.
+#[cfg(feature = "cargo")]
+#[test]
+fn test_parse_failure_diagnostic_published_on_open_and_cleared_on_close() {
+    let mut client = LspClient::spawn();
+    let _init_response = client.initialize();
+    client.clear_notifications();
+
+    let uri = fixture_uri("Cargo.toml");
+    let nested = format!(
+        "[dependencies]\na = {}1{}\n",
+        "[".repeat(100),
+        "]".repeat(100)
+    );
+    client.did_open(&uri, "toml", &nested);
+
+    let published = client
+        .wait_for_notification(30, |n| {
+            n.method == "textDocument/publishDiagnostics" && n.params["uri"] == uri.as_str()
+        })
+        .expect("open must publish the parse-failure diagnostic");
+    assert_eq!(
+        published.params["diagnostics"][0]["code"],
+        "nesting-too-deep"
+    );
+
+    client.clear_notifications();
+    client.did_close(&uri);
+    let cleared = client
+        .wait_for_notification(30, |n| {
+            n.method == "textDocument/publishDiagnostics" && n.params["uri"] == uri.as_str()
+        })
+        .expect("close must publish an empty diagnostic set");
+    assert_eq!(
+        cleared.params["diagnostics"].as_array().map(Vec::len),
+        Some(0)
+    );
+
+    let _shutdown_response = client.shutdown();
+}

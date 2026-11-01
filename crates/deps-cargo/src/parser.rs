@@ -216,7 +216,7 @@ pub fn parse_cargo_toml_with_context(
     ctx: &CargoParseContext,
 ) -> Result<CargoParseResult> {
     let doc = deps_core::parse_toml_checked(content)
-        .map_err(|e| DepsError::parse_error("Cargo.toml", &e))?;
+        .map_err(|e| DepsError::parse_error_of_kind("Cargo.toml", e.kind(), &e))?;
 
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
@@ -303,7 +303,7 @@ type AlternateRegistryResolution = (
 /// Rewrites every `DependencySource::CustomRegistry` entry in `dependencies` into a
 /// resolved `DependencySource::AlternateRegistry` when possible (spec FR-002), and every
 /// plain `DependencySource::Registry` entry into a resolved `AlternateRegistry {
-/// mirrors_crates_io: true, .. }` when a `[source.crates-io] replace-with` chain resolves to
+/// mirrors_public_registry: true, .. }` when a `[source.crates-io] replace-with` chain resolves to
 /// a sparse mirror (spec FR-005/006/007, plan-1b §1.4). Returns the newly-resolved indexes
 /// for `crate::ecosystem::CargoEcosystem::parse_manifest` to register into the shared
 /// `CargoRegistry` router.
@@ -488,7 +488,7 @@ fn resolve_alternate_registries(
             if dep.source == DependencySource::Registry {
                 dep.source = DependencySource::AlternateRegistry {
                     index: index.as_str().to_string(),
-                    mirrors_crates_io: true,
+                    mirrors_public_registry: true,
                 };
             }
         }
@@ -501,7 +501,7 @@ fn resolve_alternate_registries(
             if let Some(index) = resolved_by_raw_value.get(url) {
                 dep.source = DependencySource::AlternateRegistry {
                     index: index.as_str().to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 };
             } else if let Some(host) = blocked_by_raw_value.get(url) {
                 blocked_registries.push(deps_core::BlockedRegistryOccurrence {
@@ -1808,7 +1808,7 @@ serde = "1.0""#;
     }
 
     /// FR-005/plan-1b §1.4: a `[source.crates-io] replace-with` chain resolving to a sparse
-    /// mirror rewrites every plain `Registry` dependency into a resolved, `mirrors_crates_io:
+    /// mirror rewrites every plain `Registry` dependency into a resolved, `mirrors_public_registry:
     /// true` `AlternateRegistry` — no `registry`/`registry-index` needed on the dependency
     /// itself.
     #[test]
@@ -1834,10 +1834,10 @@ serde = "1.0""#;
         match &result.dependencies[0].source {
             DependencySource::AlternateRegistry {
                 index,
-                mirrors_crates_io,
+                mirrors_public_registry,
             } => {
                 assert_eq!(index, "https://mirror.corp.example");
-                assert!(*mirrors_crates_io);
+                assert!(*mirrors_public_registry);
             }
             other => panic!("expected a resolved crates.io mirror, got {other:?}"),
         }

@@ -520,6 +520,16 @@ impl LspClient {
         }));
     }
 
+    /// Closes a text document.
+    #[allow(dead_code)] // Used by the parse-failure diagnostics close test
+    pub(crate) fn did_close(&mut self, uri: &str) {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didClose",
+            "params": { "textDocument": { "uri": uri } }
+        }));
+    }
+
     /// Sends a `workspace/didChangeConfiguration` notification carrying `settings`.
     #[allow(dead_code)] // Used by the #1794 push-only republish regression test
     pub(crate) fn did_change_configuration(&mut self, settings: Value) {

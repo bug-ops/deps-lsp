@@ -147,7 +147,7 @@ resolved state lands in exactly one of the three existing `deps-core` states:
 
 - `DependencySource::Registry` — no index override anywhere in the file (US-004,
   byte-identical to today).
-- `DependencySource::AlternateRegistry { index, mirrors_crates_io: false }` — a
+- `DependencySource::AlternateRegistry { index, mirrors_public_registry: false }` — a
   successfully validated, policy-permitted index or chain. Reused for
   `--index-url`, `--extra-index-url` (additively, see below), Poetry sources,
   and uv indexes.

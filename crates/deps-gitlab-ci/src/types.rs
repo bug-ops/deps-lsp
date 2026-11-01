@@ -467,7 +467,7 @@ mod tests {
             HostRef::Literal(host),
             DependencySource::AlternateRegistry {
                 index: "gitlab:deadbeef".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             },
         );
         assert_eq!(d.name(), "gitlab.com/org/proj");

@@ -425,7 +425,7 @@ pub struct CargoRegistry {
     /// [`crate::config::CargoConfig`]/[`crate::config::SourceReplacement`] resolution in hand. A
     /// fetch that lands here with an unregistered index (never resolved, or dropped for
     /// capacity) has no way to recover a token and must not fall back to crates.io unless the
-    /// dependency is a verified crates.io mirror (`mirrors_crates_io`, spec plan-1b §6 M2) — see
+    /// dependency is a verified crates.io mirror (`mirrors_public_registry`, spec plan-1b §6 M2) — see
     /// [`Self::get_versions_for_source`]/[`Self::get_latest_matching_for_source`].
     alternates: dashmap::DashMap<String, Arc<SparseIndexClient>>,
     cache: Arc<HttpCache>,
@@ -555,10 +555,10 @@ impl CargoRegistry {
         match source {
             DependencySource::AlternateRegistry {
                 index,
-                mirrors_crates_io,
+                mirrors_public_registry,
             } => match self.alternate_client(index) {
                 Some(client) => CargoRoute::Alternate(client),
-                None if *mirrors_crates_io => CargoRoute::CratesIo,
+                None if *mirrors_public_registry => CargoRoute::CratesIo,
                 None => CargoRoute::Unregistered,
             },
             _ => CargoRoute::CratesIo,
@@ -919,7 +919,7 @@ mod tests {
         let registry = CargoRegistry::new(cache);
         let source = DependencySource::AlternateRegistry {
             index: "https://index.mycorp.dev".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let name = PackageName::new("internal-crate");
         let result = registry
@@ -932,10 +932,10 @@ mod tests {
         assert_matches!(result.err(), Some(DepsError::PackageNotFound { .. }));
     }
 
-    fn alternate(index: &str, mirrors_crates_io: bool) -> DependencySource {
+    fn alternate(index: &str, mirrors_public_registry: bool) -> DependencySource {
         DependencySource::AlternateRegistry {
             index: index.to_string(),
-            mirrors_crates_io,
+            mirrors_public_registry,
         }
     }
 
@@ -1011,7 +1011,7 @@ mod tests {
         }
     }
 
-    /// M2 (plan-1b §6, N4), dispatch site 1 of 2: an unregistered `mirrors_crates_io: true`
+    /// M2 (plan-1b §6, N4), dispatch site 1 of 2: an unregistered `mirrors_public_registry: true`
     /// source must fall back to crates.io through `get_versions_for_source` — a missed
     /// registration degrades gracefully instead of blanking the whole manifest.
     #[tokio::test]
@@ -1029,7 +1029,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: "https://index.never-registered.example".to_string(),
-            mirrors_crates_io: true,
+            mirrors_public_registry: true,
         };
         let name = PackageName::new("serde");
         let versions = registry
@@ -1142,7 +1142,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: "https://index.never-registered.example".to_string(),
-            mirrors_crates_io: true,
+            mirrors_public_registry: true,
         };
         let name = PackageName::new("serde");
         let req = deps_core::VersionReq::new("^1.0");
@@ -1154,7 +1154,7 @@ mod tests {
         mock.assert_async().await;
     }
 
-    /// The non-mirror counterpart: an unregistered, genuinely private (`mirrors_crates_io:
+    /// The non-mirror counterpart: an unregistered, genuinely private (`mirrors_public_registry:
     /// false`) alternate index must keep failing `PackageNotFound` — the M2 fallback is
     /// scoped strictly to verified crates.io mirrors.
     #[tokio::test]
@@ -1163,7 +1163,7 @@ mod tests {
         let registry = CargoRegistry::new(cache);
         let source = DependencySource::AlternateRegistry {
             index: "https://index.never-registered.example".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let name = PackageName::new("internal-crate");
         let req = deps_core::VersionReq::new("^1.0");

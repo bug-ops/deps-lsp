@@ -177,7 +177,7 @@ impl SourcePolicy for GoFormatter {
     }
 
     /// A `GOPROXY`-chain module whose content the public checksum database verifies
-    /// (`AlternateRegistry { mirrors_crates_io: true, .. }`, set by
+    /// (`AlternateRegistry { mirrors_public_registry: true, .. }`, set by
     /// `GoEnvConfig::resolve_source_for` from `GOSUMDB`/`GONOSUMDB`/`GOPRIVATE`) counts as
     /// public-registry content alongside plain [`DependencySource::Registry`], so OSV and
     /// deps.dev keep covering users who set `GOPROXY`. The `GOPRIVATE` bypass and a fail-closed
@@ -187,7 +187,7 @@ impl SourcePolicy for GoFormatter {
             source,
             DependencySource::Registry
                 | DependencySource::AlternateRegistry {
-                    mirrors_crates_io: true,
+                    mirrors_public_registry: true,
                     ..
                 }
         )
@@ -413,7 +413,7 @@ mod tests {
         assert!(formatter.can_resolve_source(
             &deps_core::parser::DependencySource::AlternateRegistry {
                 index: "go-proxy:deadbeef".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         ));
         assert!(!formatter.can_resolve_source(
@@ -452,9 +452,9 @@ mod tests {
     fn test_source_is_public_registry_content() {
         use deps_core::parser::DependencySource;
         let formatter = GoFormatter;
-        let chain = |mirrors_crates_io| DependencySource::AlternateRegistry {
+        let chain = |mirrors_public_registry| DependencySource::AlternateRegistry {
             index: "go-proxy:deadbeef".to_string(),
-            mirrors_crates_io,
+            mirrors_public_registry,
         };
         assert!(formatter.source_is_public_registry_content(&DependencySource::Registry));
         assert!(formatter.source_is_public_registry_content(&chain(true)));
@@ -476,7 +476,7 @@ mod tests {
         assert!(formatter.suppress_package_url(
             &deps_core::parser::DependencySource::AlternateRegistry {
                 index: "go-proxy:deadbeef".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         ));
         assert!(formatter.suppress_package_url(

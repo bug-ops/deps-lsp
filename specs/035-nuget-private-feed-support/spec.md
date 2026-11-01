@@ -101,10 +101,10 @@ issues directly rather than relying on the previously-cached list of six.
 `deps-go` spec all establish and reuse a proven, generic pattern from
 `deps-core` that this feature needs no `deps-core` trait change to adopt:
 
-- `DependencySource::AlternateRegistry { index, mirrors_crates_io }`
+- `DependencySource::AlternateRegistry { index, mirrors_public_registry }`
   (`crates/deps-core/src/parser.rs`) — the source-agnostic "resolved to a
   concrete, fetchable feed" variant. `deps-nuget` would construct it
-  directly (`mirrors_crates_io: false`).
+  directly (`mirrors_public_registry: false`).
 - `DependencySource::CustomRegistry { url }` — the existing "present, but
   not resolved to a concrete, fetchable feed" fail-closed state.
   `is_version_resolvable()` is already `false` for it, so every existing
@@ -368,7 +368,7 @@ Use EARS notation. Prefix with FR-NNN.
 
 | Entity | Description | Key Attributes |
 |--------|-------------|----------------|
-| `DependencySource::AlternateRegistry` | Existing `deps-core` variant, reused as-is — the FR-002/FR-006 resolved state | `index: String` — for NuGet, an opaque routing key identifying the resolved source (mirrors PyPI's `ResolvedChain::key` / Go's `GoProxyChain` routing-key precedent for multi-source ecosystems), `mirrors_crates_io: bool` (always `false`) |
+| `DependencySource::AlternateRegistry` | Existing `deps-core` variant, reused as-is — the FR-002/FR-006 resolved state | `index: String` — for NuGet, an opaque routing key identifying the resolved source (mirrors PyPI's `ResolvedChain::key` / Go's `GoProxyChain` routing-key precedent for multi-source ecosystems), `mirrors_public_registry: bool` (always `false`) |
 | `DependencySource::CustomRegistry` | Existing `deps-core` variant, reused as NuGet's FR-008 fail-closed state — no new variant introduced | `url: String` — the raw value as written; `is_version_resolvable()` already `false` |
 | `NuGetConfig` | New `deps-nuget` type (`crates/deps-nuget/src/config.rs`) — the merged, root-to-leaf-accumulated view of every in-repo `NuGet.Config` ancestor file | `sources: Vec<PackageSourceEntry>` (post-accumulation, post-remove/disabled/credentialed-filtering), `cleared: bool` (sticky across the FR-001 walk), `nuget_org_removed: bool` (sticky, FR-018's `<remove key="nuget.org"/>`), `mapping: PackageSourceMapping` (FR-017) |
 | `PackageSourceEntry` | New `deps-nuget` type — one resolved `<packageSources>` entry after accumulation | `key: String` (as declared; every comparison against it goes through the FR-009 union funnel), `value: Result<NuGetFeedUrl, InvalidEntry>` |

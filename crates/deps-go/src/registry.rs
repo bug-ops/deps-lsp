@@ -36,7 +36,7 @@ use deps_core::parser::DependencySource;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
-    ChainNotFound, DepsError, EcosystemId, EgressTier, HttpCache, InvalidPackageName,
+    ChainNotFound, DepsError, EcosystemId, EgressTier, ErrorOrigin, HttpCache, InvalidPackageName,
     RegistryEndpoint, Result, is_dot_segment,
     lsp_helpers::warn_rejected_value,
     not_found_or as core_not_found_or,
@@ -70,8 +70,40 @@ enum GoRegistryTier {
     /// A [`GoProxyHop::Direct`]/[`GoProxyHop::Off`] sentinel (FR-004/FR-006) — every inherent
     /// fetch method short-circuits to [`DepsError::PackageNotFound`] before building any URL
     /// or issuing any request. Both sentinels are observably identical: phase 1 has no
-    /// direct-VCS resolution mechanism, and `off` disallows downloads outright.
-    Terminal,
+    /// direct-VCS resolution mechanism, and `off` disallows downloads outright. The
+    /// [`ProxyBypass`] records which of the reasons applies, for the reported not-found.
+    Terminal(ProxyBypass),
+}
+
+/// Why a [`GoRegistryTier::Terminal`] hop issues no proxy request.
+///
+/// Carried by the tier so the not-found a bypassed lookup reports names the real reason
+/// instead of claiming the module is missing from the proxy (#1901).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyBypass {
+    /// The module matched `GOPRIVATE`/`GONOPROXY`/`GONOSUMDB`, routing it to the bypass chain.
+    Private,
+    /// A `GOPROXY` chain ended in the `direct` sentinel.
+    Direct,
+    /// A `GOPROXY` chain ended in the `off` sentinel.
+    Off,
+}
+
+impl ProxyBypass {
+    /// The registry label for the not-found a bypassed lookup reports.
+    const fn registry_label(self) -> &'static str {
+        match self {
+            Self::Private => "Go proxy (bypassed: module matches GOPRIVATE/GONOPROXY/GONOSUMDB)",
+            Self::Direct => "Go proxy (bypassed: GOPROXY=direct)",
+            Self::Off => "Go proxy (disabled: GOPROXY=off)",
+        }
+    }
+
+    /// The not-found for `module_path`, raised locally because no request was made.
+    fn not_found(self, module_path: &str) -> DepsError {
+        tracing::debug!(bypass = ?self, "Go proxy lookup skipped: no request made");
+        DepsError::not_found_locally(module_path, self.registry_label())
+    }
 }
 
 impl GoRegistryTier {
@@ -81,7 +113,7 @@ impl GoRegistryTier {
         match self {
             Self::Public => Some(EgressTier::Baseline),
             Self::Declared(trust) => Some(trust.egress()),
-            Self::Terminal => None,
+            Self::Terminal(_) => None,
         }
     }
 }
@@ -243,6 +275,19 @@ fn record_miss(last_miss: &mut Result<Vec<GoVersion>>, miss: Result<Vec<GoVersio
     }
 }
 
+/// The not-found a chain reports after a miss on a hop of `tier`: when no hop reached an
+/// endpoint and the missing hop was a bypass, names the bypass instead of the proxy (#1901).
+fn chain_not_found(not_found: ChainNotFound, module_path: &str, tier: GoRegistryTier) -> DepsError {
+    let miss = not_found.error(module_path, REGISTRY);
+    match (tier, miss.origin()) {
+        (GoRegistryTier::Terminal(bypass), ErrorOrigin::Unattributed) => {
+            DepsError::not_found_locally(module_path, bypass.registry_label())
+        }
+        (GoRegistryTier::Terminal(_), ErrorOrigin::Endpoint)
+        | (GoRegistryTier::Public | GoRegistryTier::Declared(_), _) => miss,
+    }
+}
+
 /// Client for interacting with proxy.golang.org.
 ///
 /// Uses the Go module proxy protocol for version lookups and metadata.
@@ -342,12 +387,16 @@ impl GoRegistry {
     /// short-circuits to [`DepsError::PackageNotFound`] before ever building a URL, so
     /// `proxy_base` is left empty (never read).
     #[must_use]
-    fn terminal(cache: Arc<HttpCache>, fallback_chain: Vec<(ChainSeparator, Arc<Self>)>) -> Self {
+    fn terminal(
+        cache: Arc<HttpCache>,
+        fallback_chain: Vec<(ChainSeparator, Arc<Self>)>,
+        bypass: ProxyBypass,
+    ) -> Self {
         Self {
             cache,
             proxy_base: String::new(),
             endpoint: deps_core::CachedEndpoint::default(),
-            tier: GoRegistryTier::Terminal,
+            tier: GoRegistryTier::Terminal(bypass),
             alternates: Arc::new(DashMap::new()),
             fallback_chain,
         }
@@ -358,7 +407,13 @@ impl GoRegistry {
     fn hop_client(cache: &Arc<HttpCache>, hop: &GoProxyHop) -> Arc<Self> {
         Arc::new(match hop {
             GoProxyHop::Url(url) => Self::with_base(Arc::clone(cache), url, Vec::new()),
-            GoProxyHop::Direct | GoProxyHop::Off => Self::terminal(Arc::clone(cache), Vec::new()),
+            GoProxyHop::Direct => {
+                Self::terminal(Arc::clone(cache), Vec::new(), ProxyBypass::Direct)
+            }
+            GoProxyHop::Off => Self::terminal(Arc::clone(cache), Vec::new(), ProxyBypass::Off),
+            GoProxyHop::PrivateBypass => {
+                Self::terminal(Arc::clone(cache), Vec::new(), ProxyBypass::Private)
+            }
         })
     }
 
@@ -402,8 +457,16 @@ impl GoRegistry {
                     GoProxyHop::Url(url) => {
                         Self::with_base(Arc::clone(&root.cache), url, fallback_chain)
                     }
-                    GoProxyHop::Direct | GoProxyHop::Off => {
-                        Self::terminal(Arc::clone(&root.cache), fallback_chain)
+                    GoProxyHop::PrivateBypass => Self::terminal(
+                        Arc::clone(&root.cache),
+                        fallback_chain,
+                        ProxyBypass::Private,
+                    ),
+                    GoProxyHop::Direct => {
+                        Self::terminal(Arc::clone(&root.cache), fallback_chain, ProxyBypass::Direct)
+                    }
+                    GoProxyHop::Off => {
+                        Self::terminal(Arc::clone(&root.cache), fallback_chain, ProxyBypass::Off)
                     }
                 };
                 Arc::new(head)
@@ -476,9 +539,7 @@ impl GoRegistry {
             GoRegistryTier::Declared(RegistryTrust::WorkspaceDeclared) => {
                 self.cache.get_cached_workspace(url).await
             }
-            GoRegistryTier::Terminal => {
-                Err(DepsError::not_found_locally("direct/off hop", REGISTRY))
-            }
+            GoRegistryTier::Terminal(bypass) => Err(bypass.not_found("direct/off hop")),
         }
     }
 
@@ -532,7 +593,7 @@ impl GoRegistry {
                     not_found.record(&miss);
                     record_miss(
                         &mut last_miss,
-                        Err(not_found.error(&redacted_module_path, REGISTRY)),
+                        Err(chain_not_found(not_found, &redacted_module_path, hop.tier)),
                     );
                 }
                 Err(other) => match next_sep {
@@ -593,8 +654,8 @@ impl GoRegistry {
     /// ```
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(module_path)), level = "debug")]
     pub async fn get_versions(&self, module_path: &str) -> Result<Vec<GoVersion>> {
-        if self.tier == GoRegistryTier::Terminal {
-            return Err(DepsError::not_found_locally(module_path, REGISTRY));
+        if let GoRegistryTier::Terminal(bypass) = self.tier {
+            return Err(bypass.not_found(module_path));
         }
         validate_module_path(module_path)?;
 
@@ -636,8 +697,8 @@ impl GoRegistry {
     /// ```
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(module_path), version = ?version), level = "debug")]
     pub async fn get_version_info(&self, module_path: &str, version: &str) -> Result<GoVersion> {
-        if self.tier == GoRegistryTier::Terminal {
-            return Err(DepsError::not_found_locally(module_path, REGISTRY));
+        if let GoRegistryTier::Terminal(bypass) = self.tier {
+            return Err(bypass.not_found(module_path));
         }
         validate_module_path(module_path)?;
         validate_version_string(version)?;
@@ -688,8 +749,8 @@ impl GoRegistry {
     /// ```
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(module_path)), level = "debug")]
     pub async fn get_latest_stable(&self, module_path: &str) -> Result<GoVersion> {
-        if self.tier == GoRegistryTier::Terminal {
-            return Err(DepsError::not_found_locally(module_path, REGISTRY));
+        if let GoRegistryTier::Terminal(bypass) = self.tier {
+            return Err(bypass.not_found(module_path));
         }
         validate_module_path(module_path)?;
 
@@ -758,8 +819,8 @@ impl GoRegistry {
     /// ```
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(module_path), version = ?version), level = "debug")]
     pub async fn get_go_mod(&self, module_path: &str, version: &str) -> Result<String> {
-        if self.tier == GoRegistryTier::Terminal {
-            return Err(DepsError::not_found_locally(module_path, REGISTRY));
+        if let GoRegistryTier::Terminal(bypass) = self.tier {
+            return Err(bypass.not_found(module_path));
         }
         validate_module_path(module_path)?;
         validate_version_string(version)?;
@@ -886,7 +947,7 @@ impl deps_core::Registry for GoRegistry {
     /// Dispatches by `source` (spec 034 FR-013): an `AlternateRegistry` whose index has a
     /// registered client routes through `GoRegistry::get_versions_chained` (FR-005's chain
     /// walk); one with **no** registered client is `PackageNotFound`, never a fall back to
-    /// `proxy.golang.org` (`mirrors_crates_io` never affects routing here: there is no
+    /// `proxy.golang.org` (`mirrors_public_registry` never affects routing here: there is no
     /// mirror-degradation arm, and it must not be written — falling back would send a private
     /// module path to the public proxy, the exact class of leak FR-008/FR-009 close). Every other source keeps today's
     /// public-registry path unchanged.
@@ -1730,7 +1791,7 @@ mod tests {
         let endpoint = |source: &DependencySource| root.endpoint_for(&name, source);
         let via = |key: &str| DependencySource::AlternateRegistry {
             index: key.to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
 
         assert_eq!(
@@ -1776,7 +1837,7 @@ mod tests {
             &PackageName::new("example.com/mod"),
             &DependencySource::AlternateRegistry {
                 index: "trusted".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             },
         );
         assert_eq!(
@@ -1828,7 +1889,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let versions = root
             .get_versions_from(
@@ -1867,7 +1928,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:trusted".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         root.get_versions_from(
             &deps_core::PackageName::new("example.com/m"),
@@ -1954,7 +2015,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let sentinel = SelectionContext::with_minimum_stability(StabilityFloor::Rc);
         SelectionContextCapture::reset();
@@ -2006,7 +2067,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let versions = root
             .get_versions_from(
@@ -2051,7 +2112,7 @@ mod tests {
         let name = PackageName::new("github.com/gin-gonic/gin");
         let source = |index: &str| DependencySource::AlternateRegistry {
             index: index.to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let error = root
             .get_versions_from(
@@ -2105,7 +2166,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let versions = root
             .get_versions_from(
@@ -2151,7 +2212,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let result = root
             .get_versions_from(
@@ -2190,12 +2251,13 @@ mod tests {
             key: "go-proxy:test".to_string(),
             hops: vec![url_hop(&hop0.url(), &policy), url_hop(&hop1.url(), &policy)],
             separators: vec![ChainSeparator::AnyError],
+            ..Default::default()
         };
         GoRegistry::register_alternate(&root, &chain);
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let versions = root
             .get_versions_from(
@@ -2229,11 +2291,12 @@ mod tests {
                 url_hop(&hop1.url(), &policy),
             ],
             separators: vec![separator],
+            ..Default::default()
         };
         GoRegistry::register_alternate(&root, &chain);
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:blocked".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         root.get_versions_from(
             &deps_core::PackageName::new("github.com/gin-gonic/gin"),
@@ -2329,11 +2392,12 @@ mod tests {
                     .map(|hop| url_hop(&hop.url(), &policy))
                     .collect(),
                 separators,
+                ..Default::default()
             },
         );
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         root.get_versions_from(
             &deps_core::PackageName::new("github.com/gin-gonic/gin"),
@@ -2470,7 +2534,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let versions = root
             .get_versions_from(
@@ -2512,7 +2576,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let result = root
             .get_versions_from(
@@ -2556,7 +2620,7 @@ mod tests {
             source,
             DependencySource::AlternateRegistry {
                 index: crate::config::GOPRIVATE_CHAIN_KEY.to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
 
@@ -2578,6 +2642,90 @@ mod tests {
         public_mock.assert_async().await;
     }
 
+    /// #1901: a bypassed lookup reports the bypass reason, locally attributed, instead of
+    /// "not found on Go proxy".
+    #[tokio::test]
+    async fn test_bypass_not_found_names_reason_and_is_unattributed() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let cases = [
+            (
+                crate::config::GOPRIVATE_CHAIN_KEY,
+                GoProxyHop::PrivateBypass,
+                "GOPRIVATE",
+            ),
+            ("go-proxy:direct", GoProxyHop::Direct, "GOPROXY=direct"),
+            ("go-proxy:off", GoProxyHop::Off, "GOPROXY=off"),
+        ];
+        for (key, hop, expected) in cases {
+            let root = Arc::new(GoRegistry::new(Arc::new(HttpCache::new())));
+            GoRegistry::register_alternate(
+                &root,
+                &GoProxyChain {
+                    key: key.to_string(),
+                    hops: vec![hop],
+                    ..Default::default()
+                },
+            );
+            let source = DependencySource::AlternateRegistry {
+                index: key.to_string(),
+                mirrors_public_registry: false,
+            };
+            let err = root
+                .get_versions_from(
+                    &deps_core::PackageName::new("git.corp.example/internal/auth"),
+                    &source,
+                    FreshnessSettings::default(),
+                )
+                .await
+                .err()
+                .expect("bypassed lookup must miss");
+            assert_eq!(err.origin(), ErrorOrigin::Unattributed, "{key}");
+            assert!(err.to_string().contains(expected), "{key}: {err}");
+        }
+    }
+
+    /// #1901: a miss on a real proxy hop keeps the plain "Go proxy" label even when the chain
+    /// ends in `direct`.
+    #[tokio::test]
+    async fn test_proxy_miss_before_direct_keeps_proxy_label() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .create_async()
+            .await;
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let policy = all_policy();
+        GoRegistry::register_alternate(
+            &root,
+            &GoProxyChain {
+                key: "go-proxy:hop-direct".to_string(),
+                hops: vec![url_hop(&server.url(), &policy), GoProxyHop::Direct],
+                ..Default::default()
+            },
+        );
+        let source = DependencySource::AlternateRegistry {
+            index: "go-proxy:hop-direct".to_string(),
+            mirrors_public_registry: false,
+        };
+        let err = root
+            .get_versions_from(
+                &deps_core::PackageName::new("example.com/missing"),
+                &source,
+                FreshnessSettings::default(),
+            )
+            .await
+            .err()
+            .expect("miss");
+        assert_eq!(err.origin(), ErrorOrigin::Endpoint);
+        assert!(err.to_string().ends_with("not found on Go proxy"), "{err}");
+    }
+
     /// US-004: `GOPROXY=off` shows no data and issues zero requests.
     #[tokio::test]
     async fn test_off_hop_zero_requests() {
@@ -2594,7 +2742,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:off".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let result = root
             .get_versions_from(
@@ -2617,7 +2765,7 @@ mod tests {
         let root = Arc::new(GoRegistry::new(cache));
         let source = DependencySource::AlternateRegistry {
             index: "never-registered".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let result = root
             .get_versions_from(
@@ -2662,7 +2810,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: "go-proxy:test".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let latest = root
             .get_latest_matching_from(

@@ -65,5 +65,5 @@ pub(crate) use state::{
 };
 pub use state::{
     ColdStartLimiter, DocumentState, LSP_DISPATCH_CONCURRENCY, LoadingState, PackageSignals,
-    ServerState,
+    ParseFailure, ServerState,
 };

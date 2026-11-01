@@ -74,6 +74,11 @@ server deliberately does not, so a private path is never sent to a public servic
 `GOPROXY` set explicitly (even to `https://proxy.golang.org,direct`) and `GONOPROXY=none`,
 the module is fetched through that chain, which counts as operator consent.
 
+**Bypassed modules**: a module that is bypassed (matched by `GOPRIVATE`, `GONOPROXY` or
+`GONOSUMDB`) or that has no proxy to ask (`GOPROXY=direct` or `GOPROXY=off`) is never looked
+up. The server logs `fetch skipped: not looked up` at debug level instead of a Go-proxy 404
+warning, and shows no "Unknown package" diagnostic for it.
+
 **Vulnerability and supply-chain signals**: modules fetched through a `GOPROXY` chain keep
 OSV and deps.dev coverage when their content is verified by the public checksum
 database: `GOSUMDB` unset or `sum.golang.org`/`sum.golang.google.cn` (with an optional

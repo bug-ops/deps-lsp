@@ -371,7 +371,7 @@ impl<'a> VersionData<'a> {
         formatter: &dyn EcosystemFormatter,
     ) -> Option<LookupMiss> {
         let miss = self.lookup_miss_for(key)?;
-        if self.network.is_offline() {
+        if miss == LookupMiss::NotLookedUp || self.network.is_offline() {
             return None;
         }
         let source = dep.source();

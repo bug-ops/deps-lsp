@@ -107,6 +107,10 @@ pub enum GoProxyHop {
     /// `off`: disallow all downloads for the affected module (FR-004) — a fail-closed
     /// terminal hop, identical in observable behavior to [`Self::Direct`].
     Off,
+    /// The single hop of the fixed `GOPRIVATE`/`GONOPROXY`/`GONOSUMDB` bypass chain — behaves
+    /// like [`Self::Direct`] but is distinct so a lookup can report the real bypass reason.
+    /// Never produced by parsing a `GOPROXY` value.
+    PrivateBypass,
 }
 
 /// A present-but-unusable `GOPROXY` hop — an invalid URL or a policy-blocked host (FR-009).
@@ -240,6 +244,7 @@ impl GoProxyChain {
             GoProxyHop::Url(url) => url.as_str(),
             GoProxyHop::Direct => "direct",
             GoProxyHop::Off => "off",
+            GoProxyHop::PrivateBypass => "private-bypass",
         });
         let sep_parts = separators.iter().map(|sep| sep.as_key_str());
         let key = deps_core::hash_routing_key("go-proxy", hop_parts.chain(sep_parts));
@@ -864,7 +869,7 @@ impl GoEnvConfig {
     ///   (FR-009, fail-closed, never a `proxy.golang.org` fallback).
     /// - Otherwise a `GOPROXY` override -> [`DependencySource::AlternateRegistry`] pointing at the
     ///   chain [`Self::goproxy_chain`] registers; it counts as public registry content only when
-    ///   the checksum database verifies it (`mirrors_crates_io`, which never affects routing).
+    ///   the checksum database verifies it (`mirrors_public_registry`, which never affects routing).
     /// - No `GOPROXY` override: a module matching `GOPRIVATE` or `GONOSUMDB` is bypassed too, so
     ///   it never reaches `proxy.golang.org` or a public service, even when `GONOPROXY` excludes
     ///   it; any other module is plain [`DependencySource::Registry`] (US-005).
@@ -872,7 +877,7 @@ impl GoEnvConfig {
     pub fn resolve_source_for(&self, module_path: &str) -> DependencySource {
         let bypass = || DependencySource::AlternateRegistry {
             index: GOPRIVATE_CHAIN_KEY.to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         if any_match(&self.noproxy, module_path) {
             return bypass();
@@ -881,7 +886,8 @@ impl GoEnvConfig {
         match &self.goproxy {
             Some(Ok(chain)) => DependencySource::AlternateRegistry {
                 index: chain.key.clone(),
-                mirrors_crates_io: chain.has_url_hop() && self.mirrors_public_content(module_path),
+                mirrors_public_registry: chain.has_url_hop()
+                    && self.mirrors_public_content(module_path),
             },
             Some(Err(failure)) => DependencySource::CustomRegistry {
                 url: failure.for_resolution.raw.to_string(),
@@ -976,7 +982,7 @@ impl GoEnvConfig {
         if self.registers_bypass_chain() {
             chains.push(GoProxyChain {
                 key: GOPRIVATE_CHAIN_KEY.to_string(),
-                hops: vec![GoProxyHop::Direct],
+                hops: vec![GoProxyHop::PrivateBypass],
                 separators: Vec::new(),
             });
         }
@@ -1816,12 +1822,12 @@ mod tests {
         let source = config.resolve_source_for("github.com/gin-gonic/gin");
         let DependencySource::AlternateRegistry {
             index,
-            mirrors_crates_io,
+            mirrors_public_registry,
         } = source
         else {
             panic!("expected AlternateRegistry");
         };
-        assert!(mirrors_crates_io);
+        assert!(mirrors_public_registry);
         let chain = config.goproxy_chain().unwrap();
         assert_eq!(chain.key, index);
         assert_eq!(chain.hops.len(), 2);
@@ -2069,7 +2075,7 @@ mod tests {
             private_source,
             DependencySource::AlternateRegistry {
                 index: GOPRIVATE_CHAIN_KEY.to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
 
@@ -2089,7 +2095,7 @@ mod tests {
             config.resolve_source_for("git.mycorp.example/internal/auth"),
             DependencySource::AlternateRegistry {
                 index: GOPRIVATE_CHAIN_KEY.to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
         assert_eq!(
@@ -2134,7 +2140,7 @@ mod tests {
             config.resolve_source_for("git.mycorp.example/internal/auth"),
             DependencySource::AlternateRegistry {
                 index: GOPRIVATE_CHAIN_KEY.to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
     }
@@ -2414,7 +2420,7 @@ mod tests {
             .iter()
             .filter_map(|hop| match hop {
                 GoProxyHop::Url(url) => Some(url.trust()),
-                GoProxyHop::Direct | GoProxyHop::Off => None,
+                GoProxyHop::Direct | GoProxyHop::Off | GoProxyHop::PrivateBypass => None,
             })
             .collect();
         assert_eq!(trusts, vec![RegistryTrust::Trusted; 2]);
@@ -2443,7 +2449,7 @@ mod tests {
     fn bypass() -> DependencySource {
         DependencySource::AlternateRegistry {
             index: GOPRIVATE_CHAIN_KEY.to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         }
     }
 
@@ -2454,7 +2460,7 @@ mod tests {
                 .expect("a resolved chain")
                 .key
                 .clone(),
-            mirrors_crates_io: public,
+            mirrors_public_registry: public,
         }
     }
 
@@ -2466,7 +2472,7 @@ mod tests {
             .iter()
             .filter_map(|hop| match hop {
                 GoProxyHop::Url(url) => Some(url.as_str().to_string()),
-                GoProxyHop::Direct | GoProxyHop::Off => None,
+                GoProxyHop::Direct | GoProxyHop::Off | GoProxyHop::PrivateBypass => None,
             })
             .collect()
     }

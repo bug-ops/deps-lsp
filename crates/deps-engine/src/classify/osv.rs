@@ -377,6 +377,11 @@ pub fn build_scan_targets(
             continue;
         };
 
+        if deps_core::interpolation::package_name_is_unexpanded_template(dep.name().as_str()) {
+            skipped.insert(key, ScanOutcome::Skipped(SkipReason::TemplatedName));
+            continue;
+        }
+
         let osv_name = match formatter.osv_name_availability(dep) {
             OsvNameAvailability::Ready => match formatter.osv_package_name(dep) {
                 Some(name) => OsvQueryName::Confirmed(name),
@@ -447,6 +452,12 @@ enum DepCheckClassification<'a> {
         /// report a real (if unmappable) candidate version.
         cached: &'a deps_core::lsp_helpers::PackageVersions,
     },
+    /// A cached version list exists, but the package name is an unexpanded template
+    /// placeholder (#1902).
+    TemplatedName {
+        /// This dependency's registry-cached version list.
+        cached: &'a deps_core::lsp_helpers::PackageVersions,
+    },
     /// A real, checkable target: the resolved OSV package name and this dependency's
     /// registry-cached version list.
     Target {
@@ -473,6 +484,10 @@ fn classify_dep_for_check_targets<'a>(
     else {
         return DepCheckClassification::NoCachedVersions;
     };
+
+    if deps_core::interpolation::package_name_is_unexpanded_template(dep.name().as_str()) {
+        return DepCheckClassification::TemplatedName { cached };
+    }
 
     if matches!(
         formatter.osv_name_availability(dep),
@@ -612,6 +627,15 @@ pub fn build_latest_check_targets(
                     },
                 );
             }
+            DepCheckClassification::TemplatedName { cached } => {
+                structural.insert(
+                    key,
+                    UpgradeStatus::CandidateUnverified {
+                        version: cached.latest.clone(),
+                        reason: SkipReason::TemplatedName,
+                    },
+                );
+            }
             DepCheckClassification::UnmappableName { cached } => {
                 structural.insert(
                     key,
@@ -725,6 +749,13 @@ pub fn build_candidate_check_targets(
                 DepCheckClassification::NoCachedVersions => continue,
                 // Transient, like an absent cache: never recorded as structural.
                 DepCheckClassification::AwaitingOsvName { .. } => continue,
+                DepCheckClassification::TemplatedName { .. } => {
+                    structural.insert(
+                        key,
+                        CandidateStatuses::Structural(StructuralSkipReason::TemplatedName),
+                    );
+                    continue;
+                }
                 DepCheckClassification::UnmappableName { .. } => {
                     structural.insert(
                         key,
@@ -1481,6 +1512,36 @@ mod tests {
             assert_eq!(targets[0].version, "0.8.1");
             assert_eq!(targets[0].display_version, "v0.8.1");
             assert!(skipped.is_empty());
+        }
+
+        /// #1902: a template-named dependency (`${pkg}`, `$(PkgName)`) never reaches an OSV
+        /// query, whatever the ecosystem's `osv_package_name` would say.
+        #[test]
+        fn build_scan_targets_template_name_is_unmappable_name_skip() {
+            for name in ["${pkg}", "$(PkgName)", "$grp:x"] {
+                let parse_result = MockParseResult {
+                    deps: vec![MockDep {
+                        name: PackageName::new(name),
+                        version_req: Some(VersionReq::new("1.0.0")),
+                        source: DependencySource::Registry,
+                    }],
+                };
+
+                let (targets, skipped) = build_scan_targets(
+                    &parse_result,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &MOCK_GO_FORMATTER,
+                    EcosystemId::Go,
+                );
+
+                assert!(targets.is_empty(), "{name}");
+                assert_matches!(
+                    skipped.get(&deps_core::test_util::vuln_key(name)),
+                    Some(ScanOutcome::Skipped(SkipReason::TemplatedName)),
+                    "{name}"
+                );
+            }
         }
 
         /// #667 follow-up (impl-critic): before this reclassification, a Deno `jsr:`

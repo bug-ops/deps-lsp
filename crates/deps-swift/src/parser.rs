@@ -220,7 +220,7 @@ fn resolve_registry_source(
                     identity.to_string(),
                     DependencySource::AlternateRegistry {
                         index: index.into_string(),
-                        mirrors_crates_io: false,
+                        mirrors_public_registry: false,
                     },
                     SwiftOrigin::Swizzled { scm },
                 );
@@ -1141,7 +1141,7 @@ let package = Package(
                 result.dependencies[0].source,
                 DependencySource::AlternateRegistry {
                     index: "https://swift.acme.dev/api".into(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 }
             );
             assert_eq!(result.dependencies[0].url, "");
