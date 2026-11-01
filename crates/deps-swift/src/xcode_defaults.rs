@@ -15,7 +15,7 @@ use crate::scm::ScmSwizzleMode;
 /// What the Xcode user default says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
-    not(target_os = "macos"),
+    all(not(test), not(target_os = "macos")),
     expect(
         dead_code,
         reason = "only the macOS reader constructs the read variants"
@@ -48,7 +48,7 @@ impl XcodeScmTransformation {
 
     /// Classifies the outcome of `defaults read`: a non-zero exit means the key is unset.
     #[cfg_attr(
-        not(target_os = "macos"),
+        all(not(test), not(target_os = "macos")),
         expect(dead_code, reason = "only the macOS reader calls it")
     )]
     pub(crate) fn from_defaults_output(success: bool, stdout: &str) -> Self {
