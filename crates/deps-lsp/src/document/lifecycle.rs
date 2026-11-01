@@ -5217,9 +5217,11 @@ mod pre_fetch_tests {
 #[cfg(test)]
 mod parse_failure_tests {
     use super::*;
+    #[cfg(any(feature = "cargo", feature = "npm"))]
     use crate::test_utils::test_helpers::create_test_client_and_config;
     use deps_core::ParseFailureKind;
 
+    #[cfg(any(feature = "cargo", feature = "npm"))]
     const TASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
     #[cfg(feature = "cargo")]
