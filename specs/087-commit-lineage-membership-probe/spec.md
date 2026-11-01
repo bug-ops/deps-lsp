@@ -12,7 +12,7 @@ tags:
   - deps-core
   - priority/p4
 created: 2026-10-21
-status: specify
+status: implemented
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
@@ -29,7 +29,7 @@ related:
 > **Issue**: #1725 (follow-up to #1720 / PR #1721)
 > **Branch**: suggested `feat/1725-commit-lineage-probe`
 > **Depends on**: [[086-git-ref-probe-branch-evidence/spec|spec 086]] (hook, `ProbeAllowance`/`QuotaMeter`, evidence store, triggers, event kinds) and #1873 (`NormalizedName` keys).
-> **Phase**: specify, plan, tasks. Open `[NEEDS CLARIFICATION]`: 0.
+> **Phase**: implemented (PR #1880). Open `[NEEDS CLARIFICATION]`: 0.
 
 > [!abstract]
 > A commentless SHA pin `P` that no tag names (`CommitRewrite::NoReleaseTag`) is reported outdated and

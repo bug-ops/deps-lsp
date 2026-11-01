@@ -14,7 +14,7 @@ tags:
   - security
   - priority/p4
 created: 2026-10-21
-status: specify
+status: implemented
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
@@ -30,10 +30,10 @@ related:
 > [!info] Metadata
 > **Author**: sdd (architect design 2026-10-21, critic-reviewed twice)
 > **Type / priority**: enhancement, cross-ecosystem, P4
-> **Issue**: #1778 (follow-up to #1766). Shared infrastructure here is also consumed by [[087-commit-lineage-membership-probe/spec|spec 087]] (#1725) and by a future spec 088 (#1757, still being redesigned).
+> **Issue**: #1778 (follow-up to #1766). Shared infrastructure here is also consumed by [[087-commit-lineage-membership-probe/spec|spec 087]] (#1725) and by [[088-swift-scm-to-registry-swizzling/spec|spec 088]] (#1757).
 > **Branch**: suggested `feat/1778-git-ref-branch-probe`
 > **Depends on**: #1873 (`NormalizedName` keys); sequenced after its deps-core work.
-> **Phase**: specify, plan, tasks. Open `[NEEDS CLARIFICATION]`: 0.
+> **Phase**: implemented (PR #1880). Open `[NEEDS CLARIFICATION]`: 0.
 
 > [!abstract]
 > `unknown-ref` today fires only for full-release refs absent from a complete tag list. Partial or suffixed

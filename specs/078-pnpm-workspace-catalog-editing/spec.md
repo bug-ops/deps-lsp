@@ -11,7 +11,7 @@ tags:
   - competitive-parity
   - priority/p3
 created: 2026-10-06
-status: specify
+status: implemented
 related:
   - "[[plan]]"
   - "[[tasks]]"
@@ -32,7 +32,7 @@ related:
 > **Type / priority**: enhancement, P3
 > **Branch**: suggested `feat/1788-pnpm-workspace-catalog-entries`
 > **Issue**: #1788 (P3, enhancement, research, cross-ecosystem)
-> **Phase**: specify, plan and tasks. All nine former open questions are resolved in section 9 (design vetted by architect and critic review, 2026-10-21).
+> **Phase**: implemented (PR #1880, PR #1898); specify, plan and tasks done. All nine former open questions are resolved in section 9 (design vetted by architect and critic review, 2026-10-21).
 
 > [!abstract]
 > deps-lsp already resolves `catalog:` / `catalog:<name>` specifiers in `package.json` against

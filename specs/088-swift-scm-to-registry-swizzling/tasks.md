@@ -4,7 +4,7 @@ tags:
   - tasks
   - ecosystem/swift
 created: 2026-10-21
-status: tasks
+status: implemented
 related:
   - "[[spec]]"
   - "[[plan]]"

@@ -5,7 +5,7 @@ tags:
   - ecosystem/npm
   - pnpm
 created: 2026-10-21
-status: plan
+status: implemented
 related:
   - "[[spec]]"
   - "[[tasks]]"

@@ -182,14 +182,28 @@ manifest declares 12000 dependencies, exceeding deps-lsp's per-document limit of
 This limit is hardcoded, not configurable — the same "security limit, not a user
 preference" reasoning as the 10MB file-size cap.
 
+## Lock-File Dependencies the Registry Cannot Answer
+
+A dependency whose in-use version comes from a lock file is never shown as "up to date" just because the registry gave no answer. When the registry lookup for it fails, returns 404 or has no version comparable to the lock-file version, you get a notice (at most Information severity) and a warning inlay hint on the version, and the lock-file version stays in use:
+
+| Cause | Notice | Inlay tooltip |
+|-------|--------|---------------|
+| Registry returned not found | `'<name>' not found in the registry; lock-file version in use` | `Package not found in the registry; latest version unknown` |
+| No comparable registry version | `No registry version of '<name>' is comparable; lock-file version in use` | `No comparable registry version; latest version unknown` |
+| Decided locally, no registry asked (for example a Go `GOPRIVATE` bypass) | `'<name>' was not looked up; lock-file version in use` | `Package not looked up; latest version unknown` |
+
+The inlay hint reads `⚠ <lock-file version>`. Without a lock-file version, the same conditions follow the rules for `Unknown package` and failed lookups described in the ecosystem chapters. Transport failures and unattributed misses stay silent for lock-file dependencies.
+
 ## Unparseable Manifest Diagnostics
 
 When the parser rejects a manifest, the server publishes a single file-level diagnostic at position 0:0 instead of silently showing nothing:
 
 | Code | Severity | Cause |
 |------|----------|-------|
-| `nesting-too-deep` | ERROR | TOML, YAML or Deno JSON nesting beyond the parser's depth guard |
+| `nesting-too-deep` | ERROR | TOML, YAML or JSON nesting beyond the parser's depth guard |
 | `parse-error` | WARNING | Any other syntax error |
+
+This covers `package.json`, `composer.json` and `deno.json` as well: JSON nested deeper than the parser limit (512 levels for `deno.json`) reports `nesting-too-deep` rather than failing silently.
 
 The diagnostic is cleared as soon as the document parses again or is closed.
 
