@@ -842,8 +842,9 @@ mod tests {
     }
 
     /// Issue #660: `run_license_prefetch`'s ecosystem gate — only the four tier-3
-    /// ecosystems (no `deps_dev_system` coverage, no license in the hot-path
-    /// version-list response) should ever reach a network call.
+    /// ecosystems (no license in the hot-path version-list response; Gradle is also
+    /// deps.dev-covered, so its prefetch is the hover fallback) should ever reach a
+    /// network call.
     mod license_prefetch_tests {
         use super::*;
         // Every user is behind some ecosystem feature, so --no-default-features has none.

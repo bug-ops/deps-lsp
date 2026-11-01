@@ -159,7 +159,7 @@ pub enum ConfigError {
         /// the raw `toml_span::Error`) means every consumer of this variant is safe by
         /// construction, not just the current call site. Also used for
         /// [`deps_core::parse_toml_checked`]'s `NestingTooDeep` message (#1403) when `content`
-        /// exceeds [`deps_core::MAX_TOML_NESTING_DEPTH`] before `toml_span::parse` ever runs.
+        /// exceeds [`deps_core::MAX_TOML_NESTING_DEPTH`] or `toml-span`'s own native depth limit.
         message: String,
     },
     /// `path` parsed as TOML but does not match [`CliConfig`]'s schema (an unknown top-level

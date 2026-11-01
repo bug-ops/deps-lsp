@@ -11,7 +11,7 @@ tags:
   - deps-gradle
   - supply-chain
 created: 2026-10-06
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
@@ -202,15 +202,30 @@ THEN no deps.dev request is sent for it, and the behavior is documented rather t
 
 ## 9. Open Questions
 
-> [!question] Open items (6)
-> Resolve before moving to `plan`.
+> [!success] All resolved (2026-11-01)
+> OQ-1 and OQ-6 were confirmed by the user; the rest were resolved during implementation
+> (issue #1812). Status: implemented.
 
-- [NEEDS CLARIFICATION: OQ-1 Route or exclude? Research recommendation: route Gradle to the Maven system (option a): identical coordinate format, live evidence of coverage including plugin markers, and deps.dev's 2025-09-11 announcement of Gradle Plugins coverage in the same manner as Maven repositories. Option (b) keep excluded is acceptable only with a documented reason (FR-010). Confirm.]
-- [NEEDS CLARIFICATION: OQ-2 Which Gradle dependency shapes map to a valid Maven package name? Library coordinates are straightforward; catalog `plugins` entries, `plugins {}` block ids, settings-level plugin ids, and `id` + `version.ref` forms may need a plugin-id to `<id>:<id>.gradle.plugin` marker translation, or may be unmappable. This must be enumerated against the shapes `deps-gradle` actually parses, and verified live per shape, before deciding eligibility.]
-- [NEEDS CLARIFICATION: OQ-3 Plugin-portal-only plugins that are not mirrored to Maven Central may 404 on deps.dev. How common are they among the plugins Gradle projects actually use, and is absent-data degradation (FR-004) sufficient, or should such plugins be excluded up front? Needs a live sample of popular plugins.]
-- [NEEDS CLARIFICATION: OQ-4 Does deps.dev index Google Maven (`androidx.*`, `com.google.firebase.*`, `com.google.android.*`, `com.android.*`)? Maven is routed today, so this gap, if real, already exists for Maven; confirm whether it matters for parity and whether it warrants a note in the ecosystem reference.]
-- [NEEDS CLARIFICATION: OQ-5 Version semantics: which Gradle version forms (strict, `[1.0,2.0)`, `1.+`, `latest.release`, rich versions in catalogs) are valid inputs for version-keyed deps.dev lookups (provenance, GOSSIP cooldown), and does the Maven ecosystem's existing handling transfer unchanged?]
-- [NEEDS CLARIFICATION: OQ-6 Should the license path (`crates/deps-gradle/src/license.rs`, direct POM fetch from #660/#1479) stay as is once Gradle is deps.dev-routed, be superseded by deps.dev license data, or serve as fallback when deps.dev has no record (for example Google Maven coordinates)? Avoid two divergent license sources for one coordinate.]
+- **OQ-1 Route or exclude? Resolved: route.** Confirmed by the user (2026-11-01). `deps_dev_system` maps
+  `EcosystemId::Gradle` to `DepsDevSystem::Maven` (exhaustive match, no new variant). Because Gradle
+  coordinates, including those of internal repositories declared by a plain `repositories { maven { url } }`
+  block without a content filter, are now sent to deps.dev on hover by default, this is documented in the
+  Gradle and supply-chain book pages with the opt-out `supply_chain.enabled = false`.
+- **OQ-2 Eligible shapes. Resolved.** Every shape `deps-gradle` emits is already a structural `g:a` held in
+  typed `group_id`/`artifact_id`: string/platform coordinates, catalog `libraries`, and settings
+  `pluginManagement` markers (`<id>:<id>.gradle.plugin`). Catalog `[plugins]` and build-script `plugins {}`
+  blocks are not parsed, so they produce no request. The remaining gap is a name with an unexpanded
+  `$variable`/`${...}` placeholder; it is rejected by the single typed gate `DepsDevScope::admit`, which also
+  stops Maven `${project.groupId}:x` lookups (shared, cross-ecosystem).
+- **OQ-3 Plugin-portal-only plugins. Resolved: absent data.** A deps.dev 404 uses the existing authoritative
+  404 handling (no warning, SC-004); live confirmation is part of the manual test playbook.
+- **OQ-4 Google Maven coverage. Resolved: unchanged Maven handling.** Absent data without error; the license
+  POM fallback (OQ-6) still serves those coordinates.
+- **OQ-5 Version semantics. Resolved: unchanged.** The Maven ecosystem's existing concrete-version handling
+  transfers as is; package-level signals are unaffected by non-concrete versions.
+- **OQ-6 License source. Resolved: deps.dev SPDX first, POM fetch as fallback.** Confirmed by the user
+  (2026-11-01). Hover precedence is registry, then deps.dev SPDX, then the POM prefetch (as for Maven). The
+  license-policy diagnostic keeps evaluating the POM data unchanged.
 
 ## 10. See Also
 

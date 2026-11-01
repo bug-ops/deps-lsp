@@ -30,7 +30,7 @@ install and keep in sync.
   you can judge a dependency's health before pulling it in.
 - **Typosquat detection** *(opt-in)* — flags a declared dependency whose name deps.dev reports as
   suspiciously similar to a much more popular package, across Cargo, npm, PyPI, Go, Bundler,
-  Maven, and NuGet.
+  Maven, Gradle, and NuGet.
 - **Opt-in deps.dev signals** *(GOSSIP)* — with `gossip.enabled`, hover and diagnostics take the
   outdated-cooldown callout from deps.dev's Dynamic Cooldown data and add a low-usage /
   slopsquatting-risk warning for the pinned version.

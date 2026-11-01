@@ -2373,6 +2373,8 @@ pub trait SourcePolicy: Send + Sync {
     /// `[source.crates-io] replace-with` mirror, so its content is exactly as trustworthy as
     /// crates.io's own, even though the fetch itself goes to the mirror's index, not to
     /// crates.io (plan `.local/specs/023-cargo-custom-registries/plan-1b.md` §1.3, F1/F1b/F2).
+    /// `deps-go`'s `GoFormatter` overrides it the same way for `GOPROXY` chains whose content
+    /// the public checksum database verifies.
     ///
     /// Deliberately distinct from [`Self::can_resolve_source`]: an `AlternateRegistry` that
     /// is *not* a crates.io mirror is resolvable (this LSP can fetch its version data) but is

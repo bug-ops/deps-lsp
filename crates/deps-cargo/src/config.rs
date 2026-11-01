@@ -45,7 +45,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use toml_span::value::Table;
 
-use deps_core::config_trust::{EnvPath, OperatorEnvVar, OperatorPath};
+use deps_core::config_trust::{
+    EnvPath, OperatorEnvName, OperatorEnvValue, OperatorEnvVar, OperatorPath,
+};
 use deps_core::net_policy::{
     BlockedHost, DeclaredRegistry, EnvSource, IndexUrlError, OperatorRegistries, ProcessEnv,
     RedactedUrl, RegistryAccessPolicy, RegistryRejectionClassifier, RegistryRejectionReason,
@@ -755,9 +757,8 @@ fn parse_cargo_home_registries_raw(content: &str) -> HashMap<String, (String, Op
 /// Cargo's env-var naming convention for a registry setting: uppercase the alias and
 /// replace every `-` with `_` (Cargo does the same substitution, which is exactly why two
 /// spellings of "the same" alias can collide — see spec FR-015).
-fn env_var_name(alias: &str, suffix: &str) -> String {
-    let screaming = alias.to_uppercase().replace('-', "_");
-    format!("CARGO_REGISTRIES_{screaming}_{suffix}")
+fn env_var_name(alias: &str, suffix: &'static str) -> OperatorEnvName {
+    OperatorEnvName::prefixed(ENV_REGISTRY_PREFIX, alias, suffix)
 }
 
 /// One tier's raw registries table, plus the raw `[source]` tables from the same file —
@@ -1000,6 +1001,10 @@ fn stripped_text(raw: &str) -> &str {
     strip_sparse_prefix(raw).as_str()
 }
 
+fn cargo_index_urls(raw: &str) -> Vec<&str> {
+    vec![stripped_text(raw)]
+}
+
 /// Builds the [`CargoOperator`]: every URL declared by `$CARGO_HOME/config.toml` and by a
 /// `CARGO_REGISTRIES_*_INDEX` variable, and the credentials bound to them. Independent of any
 /// manifest, so every manifest of a process classifies a URL the same way.
@@ -1018,9 +1023,7 @@ pub(crate) fn cargo_operator_with_env(
             .map(|file| (path, file))
     });
 
-    let mut env_index_vars = env.var_names_with_prefix(ENV_REGISTRY_PREFIX);
-    env_index_vars.retain(|name| name.ends_with(ENV_INDEX_SUFFIX));
-    env_index_vars.sort();
+    let env_index_vars = OperatorEnvName::discovered(env, ENV_REGISTRY_PREFIX, ENV_INDEX_SUFFIX);
 
     let mut registries = match &file {
         Some((path, file)) => {
@@ -1028,11 +1031,14 @@ pub(crate) fn cargo_operator_with_env(
         }
         None => OperatorRegistries::default(),
     };
-    registries.extend(OperatorRegistries::declared_in_env(
-        env,
-        &env_index_vars,
-        stripped_text,
-    ));
+    for index_var in &env_index_vars {
+        if let Some(value) = OperatorEnvValue::read(env, index_var) {
+            registries.extend(OperatorRegistries::declared_by_env(
+                &value,
+                cargo_index_urls,
+            ));
+        }
+    }
     let mut operator = CargoOperator::declaring(registries);
 
     let mut covered_env_vars = HashSet::new();
@@ -1046,12 +1052,11 @@ pub(crate) fn cargo_operator_with_env(
                 continue;
             };
             let index_var = env_var_name(alias, "INDEX");
-            let token = env_string(env, &env_var_name(alias, "TOKEN"))
-                .map(AuthToken::new)
-                .or_else(|| file_token.clone());
+            let token =
+                env_token(env, &env_var_name(alias, "TOKEN")).or_else(|| file_token.clone());
             if let Some(token) = token {
-                if let Some(env_index) = env_string(env, &index_var) {
-                    operator.bind(strip_sparse_prefix(&env_index), token.clone());
+                if let Some(env_index) = OperatorEnvValue::read(env, &index_var) {
+                    operator.bind(strip_sparse_prefix(env_index.as_str()), token.clone());
                 }
                 operator.bind(strip_sparse_prefix(raw_index), token);
             }
@@ -1062,14 +1067,15 @@ pub(crate) fn cargo_operator_with_env(
         if covered_env_vars.contains(index_var) {
             continue;
         }
-        let token_var = format!(
-            "{}{ENV_TOKEN_SUFFIX}",
-            index_var.trim_end_matches(ENV_INDEX_SUFFIX)
-        );
-        if let (Some(raw_index), Some(token)) =
-            (env_string(env, index_var), env_string(env, &token_var))
-        {
-            operator.bind(strip_sparse_prefix(&raw_index), AuthToken::new(token));
+        let Some(token_var) = index_var.with_suffix_replaced(ENV_INDEX_SUFFIX, ENV_TOKEN_SUFFIX)
+        else {
+            continue;
+        };
+        if let (Some(raw_index), Some(token)) = (
+            OperatorEnvValue::read(env, index_var),
+            env_token(env, &token_var),
+        ) {
+            operator.bind(strip_sparse_prefix(raw_index.as_str()), token);
         }
     }
     operator
@@ -1080,7 +1086,7 @@ pub(crate) fn cargo_operator_with_env(
 /// must not let either pick up an override meant for the other. Detected once over the whole
 /// set — a per-alias check would have nothing to compare against.
 fn env_collided_aliases(referenced_aliases: &HashSet<String>) -> HashSet<&str> {
-    let mut env_name_to_aliases: HashMap<String, Vec<&String>> = HashMap::new();
+    let mut env_name_to_aliases: HashMap<OperatorEnvName, Vec<&String>> = HashMap::new();
     for alias in referenced_aliases {
         env_name_to_aliases
             .entry(env_var_name(alias, "INDEX"))
@@ -1113,19 +1119,22 @@ fn read_env_indexes(
     referenced_aliases: &HashSet<String>,
     env_collided: &HashSet<&str>,
     env: &(impl EnvSource + ?Sized),
-) -> HashMap<String, String> {
+) -> HashMap<String, OperatorEnvValue> {
     referenced_aliases
         .iter()
         .filter(|alias| !env_collided.contains(alias.as_str()))
         .filter_map(|alias| {
-            env_string(env, &env_var_name(alias, "INDEX")).map(|value| (alias.clone(), value))
+            OperatorEnvValue::read(env, &env_var_name(alias, "INDEX"))
+                .map(|value| (alias.clone(), value))
         })
         .collect()
 }
 
-/// The environment variable `name` as text, when set and valid Unicode.
-fn env_string(env: &(impl EnvSource + ?Sized), name: &str) -> Option<String> {
-    env.var_os(name).and_then(|value| value.into_string().ok())
+/// The registry token in environment variable `name`, when set and valid Unicode.
+fn env_token(env: &(impl EnvSource + ?Sized), name: &OperatorEnvName) -> Option<AuthToken> {
+    env.var_os(name.as_str())
+        .and_then(|value| value.into_string().ok())
+        .map(AuthToken::new)
 }
 
 /// Every index URL a `$CARGO_HOME` config file declares: its `[registries]` entries and its
@@ -1146,7 +1155,7 @@ fn resolve_registries(
     referenced_aliases: &HashSet<String>,
     tiers: &LoadedTiers,
     operator: &CargoOperator,
-    env_indexes: &HashMap<String, String>,
+    env_indexes: &HashMap<String, OperatorEnvValue>,
     policy: &RegistryAccessPolicy,
 ) -> CargoConfig {
     let mut registries = HashMap::new();
@@ -1179,7 +1188,7 @@ fn resolve_registries(
         match resolve_cargo_home_tier(
             alias,
             tiers.cargo_home.as_deref(),
-            env_indexes.get(alias).map(String::as_str),
+            env_indexes.get(alias).map(OperatorEnvValue::as_str),
             operator,
             policy,
         ) {

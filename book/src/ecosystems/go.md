@@ -38,11 +38,20 @@ mid-edit `go.mod`) collapse to whichever is parsed last, with no diagnostic.
 
 ## GOPROXY/GOPRIVATE Support
 
-A Go module dependency whose applicable proxy is overridden via a `$GOENV`
-`GOPROXY=` entry, or whose module path matches a `$GOENV` `GOPRIVATE=` glob
-pattern, gets the same hover/diagnostic/completion value a
+A Go module dependency whose applicable proxy is overridden via `GOPROXY`, or
+whose module path matches a `GOPRIVATE` or `GONOPROXY` glob pattern, set in the
+process environment or in `$GOENV`, gets the same hover/diagnostic/completion value a
 `proxy.golang.org`-resolved dependency gets — instead of showing no version
 data, or (before this feature) silently checking the wrong (public) proxy.
+
+**Precedence**: each setting (`GOPROXY`, `GOPRIVATE`, `GONOPROXY`, `GOSUMDB`,
+`GONOSUMDB`) is taken from the process environment when that variable is set and
+non-empty, otherwise from `$GOENV`, as `go env` does. An empty variable falls through to
+the file; a whitespace-only `GOPROXY` is not empty and fails closed. `GOENV=off` disables
+the file only, process variables still apply. The process environment is read once at
+startup, so a variable exported later needs a restart of the server. `GONOPROXY` defaults to
+`GOPRIVATE` (the first non-empty of env `GONOPROXY`, file `GONOPROXY`, env `GOPRIVATE`,
+file `GOPRIVATE`), so a `GONOPROXY` in the file beats a `GOPRIVATE` in the environment.
 
 **Resolution**: `$GOENV` is read once per process — the `GOENV` environment
 variable if it is an absolute path, else the platform default
@@ -54,10 +63,44 @@ influence). `GOPROXY` is
 parsed as a comma-or-pipe-separated ordered chain of hops (`go help goproxy`
 semantics), recognizing the `direct` and `off` sentinels; when absent, the
 existing hardcoded `https://proxy.golang.org` default applies unchanged.
-`GOPRIVATE` is a comma-separated list of `path.Match`-style glob patterns
-(`go help goprivate`) matched against a module's full path — a matching
-module bypasses the entire `GOPROXY` chain and routes straight to the
+`GOPRIVATE` and `GONOPROXY` are comma-separated lists of `path.Match`-style glob
+patterns (`go help goprivate`) matched against a module's full path — a module matching
+the effective `GONOPROXY` bypasses the entire `GOPROXY` chain and routes straight to the
 `direct` terminal hop, regardless of what `GOPROXY` is configured to.
+
+A module that matches `GOPRIVATE` or `GONOSUMDB` while `GOPROXY` is unset is bypassed as
+well, even when `GONOPROXY=none` excludes it: Go would ask `proxy.golang.org` for it, this
+server deliberately does not, so a private path is never sent to a public service. With
+`GOPROXY` set explicitly (even to `https://proxy.golang.org,direct`) and `GONOPROXY=none`,
+the module is fetched through that chain, which counts as operator consent.
+
+**Vulnerability and supply-chain signals**: modules fetched through a `GOPROXY` chain keep
+OSV and deps.dev coverage when their content is verified by the public checksum
+database: `GOSUMDB` unset or `sum.golang.org`/`sum.golang.google.cn` (with an optional
+`+key` and sumdb-proxy URL), and the module matches neither `GONOSUMDB` nor `GOPRIVATE`.
+`GOSUMDB=off` or a custom checksum database, combined with a `GOPROXY`, turns these
+signals off for the chain's modules, because a private checksum database proves nothing
+about public content. A chain made only of `off`/`direct` downloads nothing and is never
+treated as public content.
+
+**Disclosure**: with `GOPROXY` set to a chain that has a URL hop (from the process
+environment or from `go env -w`), the names of modules not matched by `GOPRIVATE` or
+`GONOSUMDB` are sent to OSV.dev (on by default) and, on hover, to deps.dev, exactly as for a
+user without `GOPROXY`. Set `GOPRIVATE` or `GONOSUMDB` for private module paths, or turn
+the OSV and `supply_chain` features off. Users who only had `go env -w GOPROXY=...` and no
+`GOPRIVATE` previously sent nothing for such modules; that changed with process-environment
+support, intentionally, for parity with users without `GOPROXY`.
+
+**Empty and whitespace values**: as in Go, a whitespace-only list variable (for example
+`GOPRIVATE=" "`) is set, matches nothing, and shadows the `$GOENV` list. With `GOPROXY`
+unset, private modules are then treated as public. An explicit
+`GOPROXY=https://proxy.golang.org,direct` plus a `GONOSUMDB`-only module sends that module
+to `proxy.golang.org`, while an unset `GOPROXY` bypasses it.
+
+**Version lists**: each proxy hop is asked for `/@v/list`, as the go command does, so older pins,
+"Newer version available" and the recent-versions list work as they do without a `GOPROXY`. A hop that
+answers `404`/`410` (or an empty list) for `/@v/list` falls back to `/@latest`; that one-entry list is
+too incomplete to call a pin unsatisfiable, so no `unsatisfiable-requirement` warning is raised for it.
 
 **`direct`/`off` show no data (phase 1 limitation)**: `deps-go` has no
 direct-VCS resolution mechanism (no `go-import` meta-tag discovery, no
@@ -112,19 +155,19 @@ dropped entry — a "skip on any failure" the user wrote is never silently
 narrowed to "skip only when not found" just because the hop in between
 turned out invalid.
 
-**Proxies.** The `$GOENV` `GOPROXY` chain is a file you own, so it is an
+**Proxies.** The `GOPROXY` chain comes from your `$GOENV` or process environment, which you own, so it is an
 [operator-owned registry](../configuration.md#operator-owned-registries): it follows your system
 proxy like the public registries. Workspace-guarded traffic stays direct by default (see
 [Proxies and guarded registry traffic](../configuration.md#proxies-and-guarded-registry-traffic)).
 
-**Reachability policy**: every `GOPROXY` hop comes from your `$GOENV`, so it is trusted and
+**Reachability policy**: every `GOPROXY` hop comes from your `$GOENV` or process environment, so it is trusted and
 **ignores `registries.workspace_registries`, including `"off"`**, and may resolve to a private
 address under `"public_only"` (see [Operator-owned registries](../configuration.md#operator-owned-registries)).
 A hop whose host is never a registry (loopback, link-local, cloud-metadata, unspecified,
 reserved) is still refused under every setting, by the shared
 [connect-time message](cargo.md#customprivate-registries). A hop blocked this way halts a `,`
 chain with that message; in a `|` chain a later not-found or error does not hide it. The default
-public chain (`https://proxy.golang.org,direct`) used when `$GOENV` declares no
+public chain (`https://proxy.golang.org,direct`) used when neither declares a
 `GOPROXY` override is never subject to this gate — it is the same
 ungated public-tier client `deps-go` already uses today. A hop blocked by the
 policy surfaces the same informational diagnostic every other ecosystem's
@@ -137,11 +180,12 @@ per-dependency one.
 - Editing `$GOENV` does not take effect until the affected `go.mod` is next
   reparsed (edited, or the document reopened) — there is no dedicated file
   watcher for it yet.
-- Live `GOPROXY`/`GOPRIVATE`/`GONOSUMCHECK`/`GOFLAGS` process environment
-  variables (as opposed to the `$GOENV` file) are not read.
-- `GOSUMDB`/`GONOSUMCHECK` checksum-database verification is out of scope
-  entirely — no ecosystem crate in this project performs integrity
-  verification today.
+- `GOFLAGS` and `$GOROOT/go.env` defaults (Go 1.21+) are not read.
+- A `GOPROXY` with embedded userinfo fails closed for every module, whether it comes from
+  the process environment or from `$GOENV`.
+- Checksum-database verification itself is out of scope — no ecosystem crate in this
+  project performs integrity verification; `GOSUMDB`/`GONOSUMDB` only decide whether a
+  proxied module counts as public content for OSV and deps.dev.
 - Package-*name* completion is unconditionally a no-op for a dependency
   resolved to a non-default `GOPROXY` chain or a `GOPRIVATE`-routed
   module — Go has no package-name search endpoint in its module-proxy

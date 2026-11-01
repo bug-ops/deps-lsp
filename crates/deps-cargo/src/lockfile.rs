@@ -384,9 +384,8 @@ b = 2
         // `parse_lockfile` transitively touches fs_probe (via `read_and_parse_lockfile`);
         // shares a binary with config.rs's diffing test (snapshot_guard).
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        // Well past MAX_TOML_NESTING_DEPTH (64) but far below the depth
-        // that would actually overflow the stack, so the guard is what's
-        // being exercised here, not the crash itself.
+        // Well past MAX_TOML_NESTING_DEPTH (64) and toml-span's native limit (128);
+        // the pre-scan rejects it first, so it is what's exercised here.
         let lockfile_content = format!("a = {}1{}", "[".repeat(300), "]".repeat(300));
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -409,7 +408,7 @@ b = 2
         // Regression test for impl-critic C3: this is the exact shape
         // (deeply nested inline tables inside a `[[package]]` field, on the
         // lock file path that runs inside `tokio::spawn` on a 2 MiB worker
-        // stack) that still SIGABRT'd the real debug binary when
+        // stack) that SIGABRT'd the real debug binary on toml-span 0.7.1 when
         // `MAX_TOML_NESTING_DEPTH` was 256 — nested inline tables cost more
         // stack per level than nested arrays, so an array-shaped test alone
         // does not exercise the binding constraint.

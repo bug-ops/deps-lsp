@@ -118,10 +118,11 @@ impl Ecosystem for GoEcosystem {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let result = crate::parser::parse_go_mod_with_context(content, uri, &self.context)?;
-            // Registers every `$GOENV`-resolved `GOPROXY`/`GOPRIVATE`-bypass chain this parse
-            // found (spec 034) into the shared router — the only point where a per-document
-            // `$GOENV` resolution and the long-lived `GoRegistry` this ecosystem shares across
-            // every document ever meet. See `GoParseResult::resolved_chains`.
+            // Registers every `GOPROXY`/`GOPRIVATE`-bypass chain this parse resolved from the
+            // process environment and `$GOENV` (spec 034) into the shared router — the only
+            // point where a per-document resolution and the long-lived `GoRegistry` this
+            // ecosystem shares across every document ever meet. See
+            // `GoParseResult::resolved_chains`.
             for chain in &result.resolved_chains {
                 GoRegistry::register_alternate(&self.registry, chain);
             }

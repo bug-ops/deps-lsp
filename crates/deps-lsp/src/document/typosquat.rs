@@ -199,7 +199,7 @@ impl FromIterator<(PackageName, TyposquatSourceEligibility)> for TyposquatGate {
 /// correcting this function's own original design, which mirrored `run_license_prefetch`'s
 /// join-before-first-publish shape): `run_license_prefetch`'s join is a deliberate tradeoff
 /// justified by its four small tier-3 ecosystems and license violations needing to appear
-/// immediately, but typosquat's fan-out covers all seven major deps.dev ecosystems and can be
+/// immediately, but typosquat's fan-out covers all eight major deps.dev ecosystems and can be
 /// far larger, with each dependency costing up to `2 + 2N` sequential-per-candidate deps.dev
 /// round trips — joining that before OSV/outdated diagnostics (real, non-`Hint`-severity
 /// content) would let a best-effort signal violate NFR-001's "never becomes a reliability

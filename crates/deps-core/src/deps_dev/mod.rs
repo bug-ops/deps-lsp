@@ -271,43 +271,188 @@ type GossipClaim<'a> = InFlightGuard<'a, GossipMemoKey, DashSet<GossipMemoKey>>;
 
 /// Maps a deps-lsp [`EcosystemId`] to deps.dev's `system` path segment.
 ///
-/// Exhaustive, with **no wildcard arm**: the six ecosystems deps.dev does
-/// not cover (FR-011: Composer, Dart, Swift; plus Gradle, Deno, and GitHub
-/// Actions, out of this spec's enumerated seven — plan.md §7 D8) are named
-/// explicitly rather than falling through a `_ => None`. Adding a
-/// fourteenth [`EcosystemId`] variant is therefore a compile error until
-/// someone decides which side it belongs on — stronger than a trait default
-/// that would silently opt a new ecosystem out, and this is what makes
-/// FR-005/FR-011 hold by construction rather than by convention.
+/// Exhaustive, with **no wildcard arm**: the six ecosystems deps.dev does not cover
+/// (Composer, Dart, Swift, Deno, GitHub Actions and GitLab CI/CD) are named explicitly rather
+/// than falling through a `_ => None`. Adding a new [`EcosystemId`] variant is therefore a
+/// compile error until someone decides which side it belongs on — stronger than a trait
+/// default that would silently opt a new ecosystem out.
 ///
-/// No longer `lsp-responses`-gated (issue #1437): [`DepsDevClient::typosquat_signal`]'s
-/// diagnostics-path caller (`lsp_helpers::diagnostics::fetch_typosquat_signals`, reached
-/// through `Ecosystem::generate_diagnostics`'s default impl) must compile without that
-/// feature — diagnostics generation is deliberately available to `deps-cli`, which does not
-/// enable `lsp-responses` (see that feature's own doc comment in `Cargo.toml`).
+/// Gradle shares deps.dev's `maven` system with Maven (spec 080): both address the same
+/// `groupId:artifactId` packages in the same repositories, so Gradle coordinates — library
+/// strings, catalog `libraries`, and `pluginManagement` plugin markers — are looked up
+/// exactly like Maven ones.
+///
+/// Private on purpose: [`DepsDevScope::new`] is the only way to obtain a system, so every
+/// caller passes through the same offline and name gates.
 #[must_use]
-pub(crate) const fn deps_dev_system(id: EcosystemId) -> Option<DepsDevSystem> {
+const fn deps_dev_system(id: EcosystemId) -> Option<DepsDevSystem> {
     match id {
         EcosystemId::Npm => Some(DepsDevSystem::Npm),
         EcosystemId::Cargo => Some(DepsDevSystem::Cargo),
         EcosystemId::Go => Some(DepsDevSystem::Go),
-        EcosystemId::Maven => Some(DepsDevSystem::Maven),
+        EcosystemId::Maven | EcosystemId::Gradle => Some(DepsDevSystem::Maven),
         EcosystemId::Pypi => Some(DepsDevSystem::Pypi),
         EcosystemId::Bundler => Some(DepsDevSystem::Rubygems),
         EcosystemId::NuGet => Some(DepsDevSystem::NuGet),
         EcosystemId::Composer
         | EcosystemId::Dart
         | EcosystemId::Swift
-        | EcosystemId::Gradle
         | EcosystemId::Deno
         | EcosystemId::GithubActions
         | EcosystemId::GitlabCi => None,
     }
 }
 
+/// One document's deps.dev scope: a covered [`DepsDevSystem`] while the network is online.
+///
+/// The single gate every deps.dev feature (Scorecard, provenance, deprecation, typosquat,
+/// GOSSIP) passes through: it proves the ecosystem is covered and the session is online,
+/// and it is the only constructor of [`DepsDevTarget`] / [`DepsDevTargets`], so a lookup
+/// cannot be issued for a dependency that skipped the source or name gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DepsDevScope(DepsDevSystem);
+
+impl DepsDevScope {
+    /// The scope for `ecosystem`, or `None` when deps.dev does not cover it or `network` is
+    /// offline.
+    pub(crate) fn new(ecosystem: EcosystemId, network: crate::NetworkMode) -> Option<Self> {
+        if network.is_offline() {
+            return None;
+        }
+        deps_dev_system(ecosystem).map(Self)
+    }
+
+    /// Per-dependency gate: the dependency must resolve against public registry content
+    /// (a private, git or path source is never sent to a third party), then its declared
+    /// name must pass [`Self::admit`].
+    pub(crate) fn target(
+        self,
+        dep: &dyn crate::Dependency,
+        formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
+    ) -> Option<DepsDevTarget> {
+        if !formatter.source_is_public_registry_content(&dep.source()) {
+            return None;
+        }
+        self.admit(PackageKey::new(dep.name(), formatter))
+    }
+
+    /// The gated fan-out set for a whole document: one target per distinct normalized
+    /// name among the dependencies that pass [`Self::target`], in first-occurrence order.
+    /// `None` when no dependency qualifies.
+    pub(crate) fn targets(
+        self,
+        deps: Vec<&dyn crate::Dependency>,
+        formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
+    ) -> Option<DepsDevTargets> {
+        let mut seen = HashSet::new();
+        let keys: Vec<PackageKey> = deps
+            .into_iter()
+            .filter_map(|dep| self.target(dep, formatter))
+            .map(|target| target.key)
+            .filter(|key| seen.insert(key.normalized().clone()))
+            .collect();
+        (!keys.is_empty()).then_some(DepsDevTargets {
+            system: self.0,
+            keys,
+        })
+    }
+
+    /// Force-refresh path: re-checks the name gate for keys collected earlier through the
+    /// source gate, relying on the caller having gated them by
+    /// `source_is_public_registry_content` at collection time. `None` when no key survives.
+    pub(crate) fn readmit(self, keys: &[PackageKey]) -> Option<DepsDevTargets> {
+        let keys: Vec<PackageKey> = keys
+            .iter()
+            .filter(|key| name_is_addressable(key))
+            .cloned()
+            .collect();
+        (!keys.is_empty()).then_some(DepsDevTargets {
+            system: self.0,
+            keys,
+        })
+    }
+
+    /// The only name gate: rejects a declared name with an unexpanded template placeholder
+    /// (`$grp:art`, `${project.groupId}:x`), which names no real package.
+    fn admit(self, key: PackageKey) -> Option<DepsDevTarget> {
+        name_is_addressable(&key).then_some(DepsDevTarget {
+            system: self.0,
+            key,
+        })
+    }
+}
+
+fn name_is_addressable(key: &PackageKey) -> bool {
+    !crate::lsp_helpers::requirement_contains_template_placeholder(key.declared().as_str())
+}
+
+/// A dependency that passed every deps-core deps.dev gate (covered ecosystem, online,
+/// public registry source, no unexpanded template placeholder in the name).
+///
+/// Only `DepsDevScope` builds one. `deps-lsp` keeps its own
+/// `source_is_public_registry_content` filters in front of its prefetches; they agree with
+/// these gates because they call the same formatter method.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DepsDevTarget {
+    system: DepsDevSystem,
+    key: PackageKey,
+}
+
+impl DepsDevTarget {
+    pub(crate) const fn normalized(&self) -> &NormalizedName {
+        self.key.normalized()
+    }
+
+    /// A verbatim-named target for unit tests, bypassing the gates.
+    #[cfg(test)]
+    pub(crate) fn for_test(system: DepsDevSystem, name: &str) -> Self {
+        Self {
+            system,
+            key: PackageKey::new(&crate::PackageName::new(name), &VerbatimNaming),
+        }
+    }
+}
+
+/// A non-empty set of [`DepsDevTarget`]s that share one [`DepsDevSystem`], for the batch
+/// GOSSIP paths. Homogeneous by construction, so no per-key system grouping is needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepsDevTargets {
+    system: DepsDevSystem,
+    keys: Vec<PackageKey>,
+}
+
+impl DepsDevTargets {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = DepsDevTarget> + '_ {
+        self.keys.iter().map(|key| DepsDevTarget {
+            system: self.system,
+            key: key.clone(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn declared_names(&self) -> Vec<&str> {
+        self.keys.iter().map(|k| k.declared().as_str()).collect()
+    }
+
+    /// A verbatim-named target set for unit tests, bypassing the gates.
+    #[cfg(test)]
+    pub(crate) fn for_keys_test(system: DepsDevSystem, keys: &[PackageKey]) -> Self {
+        Self {
+            system,
+            keys: keys.to_vec(),
+        }
+    }
+}
+
+#[cfg(test)]
+struct VerbatimNaming;
+
+#[cfg(test)]
+impl crate::lsp_helpers::PackageNaming for VerbatimNaming {}
+
 /// deps.dev's `system` URL path segment (issue #1455 batch item 2).
 ///
-/// Exhaustively covers the seven ecosystems `deps_dev_system` maps to it — replaces a raw
+/// Exhaustively covers the systems `deps_dev_system` maps to — replaces a raw
 /// `&'static str` threaded through every deps.dev call site and memo key, so a typo'd or
 /// copy-pasted-wrong system string is a compile error instead of a silently wrong URL or a
 /// memo key that aliases the wrong ecosystem's cache entry.
@@ -631,7 +776,7 @@ impl DepsDevClient {
     }
 
     /// Returns the supply-chain trust signal for one resolved
-    /// `(system, name, version)`, or `None` when nothing is available to
+    /// `(target, version)`, or `None` when nothing is available to
     /// render.
     ///
     /// Infallible by construction (FR-006) — every failure degrades to
@@ -641,10 +786,11 @@ impl DepsDevClient {
     /// rather than returning `None` immediately (issue #1454).
     pub async fn trust_signal(
         &self,
-        system: DepsDevSystem,
-        name: &str,
+        target: &DepsDevTarget,
         version: &str,
     ) -> Option<SupplyChainTrustSignal> {
+        let system = target.system;
+        let name = target.key.declared().as_str();
         let key = MemoKey {
             system,
             name: name.to_string(),
@@ -858,16 +1004,16 @@ impl DepsDevClient {
     /// never a propagated error. [`FetchCompleteness::Incomplete`] is the caller-facing signal
     /// that a `None`/empty degradation of *this specific* kind happened; it does not itself
     /// change what this function returns as the signal. Does **not** itself check
-    /// `system`/ecosystem coverage or any config opt-in switch; callers
+    /// any config opt-in switch; callers
     /// (`lsp_helpers::diagnostics::fetch_typosquat_signals`) are responsible for only calling
-    /// this for a `system` `deps_dev_system` actually maps to, and only when the feature is
-    /// enabled (FR-002/FR-009) — mirroring how [`Self::trust_signal`] itself never checks
-    /// ecosystem coverage either.
+    /// this when the feature is enabled (FR-002/FR-009). Ecosystem coverage, offline mode and
+    /// the privacy and name gates are proven by `target` itself.
     pub async fn typosquat_signal(
         &self,
-        system: DepsDevSystem,
-        name: &str,
+        target: &DepsDevTarget,
     ) -> (Option<TyposquatSignal>, FetchCompleteness) {
+        let system = target.system;
+        let name = target.key.declared().as_str();
         let (candidates, similarity_completeness) = self.similar_packages(system, name).await;
         if candidates.is_empty() {
             return (None, similarity_completeness);
@@ -1106,14 +1252,15 @@ impl DepsDevClient {
     /// package-level `NOT_FOUND`) is simply absent, not present with an empty
     /// [`GossipFindings`] (NFR-002).
     ///
-    /// Does **not** itself check `system`/ecosystem coverage or any config opt-in switch —
-    /// mirrors every other public method on this client (see [`Self::typosquat_signal`]'s
-    /// doc for why that's the caller's responsibility).
+    /// Does **not** itself check any config opt-in switch — mirrors every other public
+    /// method on this client (see [`Self::typosquat_signal`]'s doc for why that's the
+    /// caller's responsibility).
     pub async fn gossip_findings_batch(
         &self,
-        system: DepsDevSystem,
-        keys: &[PackageKey],
+        targets: &DepsDevTargets,
     ) -> HashMap<NormalizedName, GossipFindings> {
+        let system = targets.system;
+        let keys = targets.keys.as_slice();
         let mut result = HashMap::new();
         let mut misses: Vec<&PackageKey> = Vec::new();
 
@@ -1220,9 +1367,10 @@ impl DepsDevClient {
     /// through [`Self::gossip_findings_batch`] (which already acquires it).
     pub async fn force_refresh_gossip_findings(
         &self,
-        system: DepsDevSystem,
-        keys: &[PackageKey],
+        targets: &DepsDevTargets,
     ) -> HashMap<NormalizedName, GossipFindings> {
+        let system = targets.system;
+        let keys = targets.keys.as_slice();
         let mut eligible: Vec<&PackageKey> = Vec::with_capacity(keys.len());
         let mut guards: Vec<GossipClaim<'_>> = Vec::with_capacity(keys.len());
         let now = Instant::now();
@@ -1421,10 +1569,11 @@ impl DepsDevClient {
     /// spawn-and-warm design.
     pub async fn gossip_findings_for_version(
         &self,
-        system: DepsDevSystem,
-        package: &PackageKey,
+        target: &DepsDevTarget,
         version: &str,
     ) -> Option<GossipFindings> {
+        let system = target.system;
+        let package = &target.key;
         let key = GossipVersionMemoKey {
             system,
             name: package.normalized().clone(),
@@ -1617,7 +1766,7 @@ mod tests {
     const EXPRESS_PROJECT: &str = r#"{"scorecard": {"overallScore": 8.5}}"#;
 
     #[test]
-    fn deps_dev_system_covers_seven_ecosystems() {
+    fn deps_dev_system_covers_eight_ecosystems() {
         assert_eq!(deps_dev_system(EcosystemId::Npm), Some(DepsDevSystem::Npm));
         assert_eq!(
             deps_dev_system(EcosystemId::Cargo),
@@ -1626,6 +1775,10 @@ mod tests {
         assert_eq!(deps_dev_system(EcosystemId::Go), Some(DepsDevSystem::Go));
         assert_eq!(
             deps_dev_system(EcosystemId::Maven),
+            Some(DepsDevSystem::Maven)
+        );
+        assert_eq!(
+            deps_dev_system(EcosystemId::Gradle),
             Some(DepsDevSystem::Maven)
         );
         assert_eq!(
@@ -1658,9 +1811,60 @@ mod tests {
         assert_eq!(deps_dev_system(EcosystemId::Composer), None);
         assert_eq!(deps_dev_system(EcosystemId::Dart), None);
         assert_eq!(deps_dev_system(EcosystemId::Swift), None);
-        assert_eq!(deps_dev_system(EcosystemId::Gradle), None);
         assert_eq!(deps_dev_system(EcosystemId::Deno), None);
         assert_eq!(deps_dev_system(EcosystemId::GithubActions), None);
+        assert_eq!(deps_dev_system(EcosystemId::GitlabCi), None);
+    }
+
+    #[test]
+    fn scope_is_none_offline_or_for_uncovered_ecosystems() {
+        assert!(DepsDevScope::new(EcosystemId::Gradle, crate::NetworkMode::Online).is_some());
+        assert!(DepsDevScope::new(EcosystemId::Gradle, crate::NetworkMode::Offline).is_none());
+        assert!(DepsDevScope::new(EcosystemId::Dart, crate::NetworkMode::Online).is_none());
+    }
+
+    #[test]
+    fn admit_rejects_template_placeholder_names_and_accepts_real_coordinates() {
+        let scope = DepsDevScope::new(EcosystemId::Gradle, crate::NetworkMode::Online)
+            .expect("gradle is covered");
+        let key = |name: &str| PackageKey::new(&crate::PackageName::new(name), &VerbatimNaming);
+
+        assert!(scope.admit(key("com.google.guava:guava")).is_some());
+        assert!(scope.admit(key("$grp:art")).is_none());
+        assert!(scope.admit(key("${project.groupId}:x")).is_none());
+        assert!(scope.readmit(&[key("$grp:art")]).is_none());
+        let kept = scope
+            .readmit(&[key("$grp:art"), key("org.jetbrains.kotlin:kotlin-stdlib")])
+            .expect("the real coordinate survives");
+        assert_eq!(
+            kept.declared_names(),
+            ["org.jetbrains.kotlin:kotlin-stdlib"]
+        );
+    }
+
+    #[tokio::test]
+    async fn gradle_coordinate_is_queried_under_the_maven_system() {
+        let (mut server, client) = mock_client().await;
+        let version = server
+            .mock(
+                "GET",
+                "/v3/systems/maven/packages/com.google.guava%3Aguava/versions/33.0.0-jre",
+            )
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let scope = DepsDevScope::new(EcosystemId::Gradle, crate::NetworkMode::Online)
+            .expect("gradle is covered");
+        let key = PackageKey::new(
+            &crate::PackageName::new("com.google.guava:guava"),
+            &VerbatimNaming,
+        );
+        let target = scope.admit(key).expect("real coordinate");
+
+        client.trust_signal(&target, "33.0.0-jre").await;
+
+        version.assert_async().await;
     }
 
     #[test]
@@ -1725,7 +1929,10 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "sigstore", "2.3.1")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "sigstore"),
+                "2.3.1",
+            )
             .await
             .expect("signal expected");
         assert_eq!(signal.provenance, Some(ProvenanceStatus::Verified));
@@ -1750,7 +1957,10 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "sigstore", "2.3.1")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "sigstore"),
+                "2.3.1",
+            )
             .await
             .expect("signal expected");
         assert_eq!(
@@ -1772,7 +1982,10 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                "4.19.2",
+            )
             .await
             .expect("signal expected");
         assert!(signal.licenses.is_empty());
@@ -1799,7 +2012,10 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "left-pad", "1.0.0")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "left-pad"),
+                "1.0.0",
+            )
             .await
             .expect("signal expected");
         let scorecard = signal.scorecard.expect("scorecard expected");
@@ -1817,7 +2033,10 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                "4.19.2",
+            )
             .await;
         assert!(signal.is_none());
     }
@@ -1838,7 +2057,10 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "sigstore", "2.3.1")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "sigstore"),
+                "2.3.1",
+            )
             .await
             .expect("signal expected");
         assert_eq!(signal.provenance, Some(ProvenanceStatus::Verified));
@@ -1862,7 +2084,10 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                "4.19.2",
+            )
             .await
             .expect("signal expected");
         assert_eq!(signal.provenance, Some(ProvenanceStatus::None));
@@ -1881,7 +2106,10 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                "4.19.2",
+            )
             .await;
         assert!(signal.is_none());
     }
@@ -1897,7 +2125,10 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "missing", "1.0.0")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "missing"),
+                "1.0.0",
+            )
             .await;
         assert!(signal.is_none());
     }
@@ -1919,7 +2150,10 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                "4.19.2",
+            )
             .await
             .expect("signal expected (provenance still present)");
         assert!(signal.scorecard.is_none());
@@ -1944,10 +2178,16 @@ mod tests {
             .await;
 
         client
-            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                "4.19.2",
+            )
             .await;
         client
-            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                "4.19.2",
+            )
             .await;
 
         version.assert_async().await;
@@ -1965,10 +2205,16 @@ mod tests {
             .await;
 
         client
-            .trust_signal(DepsDevSystem::Npm, "missing", "1.0.0")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "missing"),
+                "1.0.0",
+            )
             .await;
         client
-            .trust_signal(DepsDevSystem::Npm, "missing", "1.0.0")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "missing"),
+                "1.0.0",
+            )
             .await;
 
         version.assert_async().await;
@@ -2006,10 +2252,16 @@ mod tests {
             .await;
 
         client
-            .trust_signal(DepsDevSystem::Npm, "pkg-a", "1.0.0")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "pkg-a"),
+                "1.0.0",
+            )
             .await;
         client
-            .trust_signal(DepsDevSystem::Npm, "pkg-b", "1.0.0")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "pkg-b"),
+                "1.0.0",
+            )
             .await;
 
         project.assert_async().await;
@@ -2030,7 +2282,10 @@ mod tests {
             .await;
 
         client
-            .trust_signal(DepsDevSystem::Go, "golang.org/x/text", "v0.4.0")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Go, "golang.org/x/text"),
+                "v0.4.0",
+            )
             .await;
 
         version.assert_async().await;
@@ -2051,7 +2306,10 @@ mod tests {
             .await;
 
         client
-            .trust_signal(DepsDevSystem::Npm, "@types/node", "20.0.0")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "@types/node"),
+                "20.0.0",
+            )
             .await;
 
         version.assert_async().await;
@@ -2072,7 +2330,10 @@ mod tests {
             .await;
 
         client
-            .trust_signal(DepsDevSystem::Maven, "com.google.guava:guava", "32.0.0")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Maven, "com.google.guava:guava"),
+                "32.0.0",
+            )
             .await;
 
         version.assert_async().await;
@@ -2116,7 +2377,10 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "evil", "1.0.0")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "evil"),
+                "1.0.0",
+            )
             .await
             .expect("signal expected (provenance still present)");
         assert!(signal.scorecard.is_none());
@@ -2137,13 +2401,13 @@ mod tests {
 
         assert!(
             client
-                .trust_signal(DepsDevSystem::Npm, ".", "1.0.0")
+                .trust_signal(&DepsDevTarget::for_test(DepsDevSystem::Npm, "."), "1.0.0")
                 .await
                 .is_none()
         );
         assert!(
             client
-                .trust_signal(DepsDevSystem::Npm, "..", "1.0.0")
+                .trust_signal(&DepsDevTarget::for_test(DepsDevSystem::Npm, ".."), "1.0.0")
                 .await
                 .is_none()
         );
@@ -2163,13 +2427,19 @@ mod tests {
 
         assert!(
             client
-                .trust_signal(DepsDevSystem::Npm, "left-pad", ".")
+                .trust_signal(
+                    &DepsDevTarget::for_test(DepsDevSystem::Npm, "left-pad"),
+                    "."
+                )
                 .await
                 .is_none()
         );
         assert!(
             client
-                .trust_signal(DepsDevSystem::Npm, "left-pad", "..")
+                .trust_signal(
+                    &DepsDevTarget::for_test(DepsDevSystem::Npm, "left-pad"),
+                    ".."
+                )
                 .await
                 .is_none()
         );
@@ -2206,7 +2476,10 @@ mod tests {
                 let client = Arc::clone(&client);
                 async move {
                     client
-                        .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+                        .trust_signal(
+                            &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                            "4.19.2",
+                        )
                         .await
                 }
             },
@@ -2214,7 +2487,10 @@ mod tests {
                 let client = Arc::clone(&client);
                 async move {
                     client
-                        .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+                        .trust_signal(
+                            &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                            "4.19.2",
+                        )
                         .await
                 }
             }
@@ -2256,7 +2532,10 @@ mod tests {
         let spawn_client = Arc::clone(&client);
         let handle = tokio::spawn(async move {
             spawn_client
-                .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+                .trust_signal(
+                    &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                    "4.19.2",
+                )
                 .await
         });
         // Deliberately much shorter than the mock's 60ms response — this must
@@ -2274,7 +2553,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         let second = client
-            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                "4.19.2",
+            )
             .await;
         assert!(
             second.is_some(),
@@ -2324,7 +2606,10 @@ mod tests {
 
         // A first (attested), warming the shared project memo.
         let signal_a = client
-            .trust_signal(DepsDevSystem::Npm, "pkg-a", "1.0.0")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "pkg-a"),
+                "1.0.0",
+            )
             .await
             .expect("signal expected");
         assert!(
@@ -2338,7 +2623,10 @@ mod tests {
         // B second, hitting the now-warm project memo, but with its own
         // (self-reported) relation.
         let signal_b = client
-            .trust_signal(DepsDevSystem::Npm, "pkg-b", "1.0.0")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "pkg-b"),
+                "1.0.0",
+            )
             .await
             .expect("signal expected");
         assert!(
@@ -2374,7 +2662,10 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                "4.19.2",
+            )
             .await
             .expect("signal expected (provenance still present)");
         assert!(signal.scorecard.is_none());
@@ -2418,7 +2709,10 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                "4.19.2",
+            )
             .await
             .expect("signal expected (provenance still present)");
         assert!(signal.scorecard.is_none());
@@ -2437,7 +2731,10 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                "4.19.2",
+            )
             .await;
         assert!(signal.is_none());
 
@@ -2466,7 +2763,10 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                "4.19.2",
+            )
             .await;
         assert!(signal.is_none());
 
@@ -2529,7 +2829,10 @@ mod tests {
     async fn trust_signal_real_npm_express_carries_license() {
         let client = client();
         let signal = client
-            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .trust_signal(
+                &DepsDevTarget::for_test(DepsDevSystem::Npm, "express"),
+                "4.19.2",
+            )
             .await
             .expect("signal expected for a real, well-known package");
         assert!(
@@ -2616,7 +2919,7 @@ mod tests {
             .await;
 
         let (signal, completeness) = client
-            .typosquat_signal(DepsDevSystem::Npm, "crossenv")
+            .typosquat_signal(&DepsDevTarget::for_test(DepsDevSystem::Npm, "crossenv"))
             .await;
         let signal = signal.expect("300x ratio must fire");
         assert_eq!(signal.suspected_name, "cross-env");
@@ -2673,7 +2976,7 @@ mod tests {
             .await;
 
         let (signal, completeness) = client
-            .typosquat_signal(DepsDevSystem::Npm, "coffeescript")
+            .typosquat_signal(&DepsDevTarget::for_test(DepsDevSystem::Npm, "coffeescript"))
             .await;
         assert!(
             signal.is_none(),
@@ -2702,7 +3005,9 @@ mod tests {
             .create_async()
             .await;
 
-        let (signal, completeness) = client.typosquat_signal(DepsDevSystem::Npm, "missing").await;
+        let (signal, completeness) = client
+            .typosquat_signal(&DepsDevTarget::for_test(DepsDevSystem::Npm, "missing"))
+            .await;
         assert!(signal.is_none());
         assert_eq!(
             completeness,
@@ -2736,7 +3041,9 @@ mod tests {
             .create_async()
             .await;
 
-        let (signal, completeness) = client.typosquat_signal(DepsDevSystem::Npm, "slow").await;
+        let (signal, completeness) = client
+            .typosquat_signal(&DepsDevTarget::for_test(DepsDevSystem::Npm, "slow"))
+            .await;
         assert!(signal.is_none());
         assert_eq!(completeness, FetchCompleteness::Incomplete);
     }
@@ -2754,7 +3061,9 @@ mod tests {
             .create_async()
             .await;
 
-        let (signal, completeness) = client.typosquat_signal(DepsDevSystem::Npm, "broken").await;
+        let (signal, completeness) = client
+            .typosquat_signal(&DepsDevTarget::for_test(DepsDevSystem::Npm, "broken"))
+            .await;
         assert!(signal.is_none());
         assert_eq!(completeness, FetchCompleteness::Incomplete);
     }
@@ -2892,7 +3201,9 @@ mod tests {
             .create_async()
             .await;
 
-        let (signal, completeness) = client.typosquat_signal(DepsDevSystem::Npm, "lonely").await;
+        let (signal, completeness) = client
+            .typosquat_signal(&DepsDevTarget::for_test(DepsDevSystem::Npm, "lonely"))
+            .await;
         assert!(signal.is_none());
         assert_eq!(completeness, FetchCompleteness::Complete);
         package_call.assert_async().await;
@@ -2940,7 +3251,7 @@ mod tests {
             .await;
 
         let (signal, completeness) = client
-            .typosquat_signal(DepsDevSystem::Npm, "self-echo")
+            .typosquat_signal(&DepsDevTarget::for_test(DepsDevSystem::Npm, "self-echo"))
             .await;
         assert!(signal.is_none());
         assert_eq!(completeness, FetchCompleteness::Complete);
@@ -3020,7 +3331,9 @@ mod tests {
             .create_async()
             .await;
 
-        let (signal, completeness) = client.typosquat_signal(DepsDevSystem::Npm, "tiny").await;
+        let (signal, completeness) = client
+            .typosquat_signal(&DepsDevTarget::for_test(DepsDevSystem::Npm, "tiny"))
+            .await;
         assert!(
             signal.is_some(),
             "at least one of the capped candidates should still qualify"
@@ -3171,10 +3484,10 @@ mod tests {
             .await;
 
         client
-            .typosquat_signal(DepsDevSystem::Npm, "crossenv")
+            .typosquat_signal(&DepsDevTarget::for_test(DepsDevSystem::Npm, "crossenv"))
             .await;
         client
-            .typosquat_signal(DepsDevSystem::Npm, "crossenv")
+            .typosquat_signal(&DepsDevTarget::for_test(DepsDevSystem::Npm, "crossenv"))
             .await;
 
         similarity.assert_async().await;
@@ -3275,11 +3588,19 @@ mod tests {
         let ((a, a_completeness), (b, b_completeness)) = tokio::join!(
             {
                 let client = Arc::clone(&client);
-                async move { client.typosquat_signal(DepsDevSystem::Npm, "pkg-a").await }
+                async move {
+                    client
+                        .typosquat_signal(&DepsDevTarget::for_test(DepsDevSystem::Npm, "pkg-a"))
+                        .await
+                }
             },
             {
                 let client = Arc::clone(&client);
-                async move { client.typosquat_signal(DepsDevSystem::Npm, "pkg-b").await }
+                async move {
+                    client
+                        .typosquat_signal(&DepsDevTarget::for_test(DepsDevSystem::Npm, "pkg-b"))
+                        .await
+                }
             }
         );
         // Both concurrent calls must see the real, non-degraded candidate popularity
@@ -3358,7 +3679,10 @@ mod tests {
             .await;
 
         let result = client
-            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite"), pk("left-pad")])
+            .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("vite"), pk("left-pad")],
+            ))
             .await;
 
         let vite = result.get(&nn("vite")).expect("vite findings expected");
@@ -3400,7 +3724,10 @@ mod tests {
             .await;
 
         let result = client
-            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("missing")])
+            .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("missing")],
+            ))
             .await;
 
         assert!(
@@ -3422,10 +3749,16 @@ mod tests {
             .await;
 
         client
-            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite"), pk("left-pad")])
+            .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("vite"), pk("left-pad")],
+            ))
             .await;
         client
-            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite"), pk("left-pad")])
+            .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("vite"), pk("left-pad")],
+            ))
             .await;
 
         batch.assert_async().await;
@@ -3454,12 +3787,18 @@ mod tests {
             .await;
 
         let first = client
-            .gossip_findings_batch(DepsDevSystem::Pypi, &[pk("Foo_Bar")])
+            .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Pypi,
+                &[pk("Foo_Bar")],
+            ))
             .await;
         assert_eq!(first[&nn("foo-bar")].version, "2.0.0");
 
         let second = client
-            .gossip_findings_batch(DepsDevSystem::Pypi, &[pk("foo-bar")])
+            .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Pypi,
+                &[pk("foo-bar")],
+            ))
             .await;
         assert_eq!(second[&nn("foo-bar")].version, "2.0.0");
 
@@ -3484,7 +3823,10 @@ mod tests {
             .await;
 
         let result = client
-            .gossip_findings_batch(DepsDevSystem::Pypi, &[pk("Foo_Bar"), pk("foo-bar")])
+            .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Pypi,
+                &[pk("Foo_Bar"), pk("foo-bar")],
+            ))
             .await;
 
         assert_eq!(result.len(), 1);
@@ -3531,7 +3873,10 @@ mod tests {
             .await;
 
         let result = client
-            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite"), pk("left-pad")])
+            .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("vite"), pk("left-pad")],
+            ))
             .await;
 
         assert!(
@@ -3564,7 +3909,10 @@ mod tests {
             .await;
 
         let result = client
-            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
+            .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("vite")],
+            ))
             .await;
         assert!(result.is_empty());
     }
@@ -3579,7 +3927,10 @@ mod tests {
             .await;
 
         let result = client
-            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
+            .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("vite")],
+            ))
             .await;
         assert!(result.is_empty());
 
@@ -3606,7 +3957,10 @@ mod tests {
             .await;
 
         client
-            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
+            .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("vite")],
+            ))
             .await;
 
         batch.assert_async().await;
@@ -3641,7 +3995,10 @@ mod tests {
                 let client = Arc::clone(&client);
                 async move {
                     client
-                        .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
+                        .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                            DepsDevSystem::Npm,
+                            &[pk("vite")],
+                        ))
                         .await
                 }
             },
@@ -3649,7 +4006,10 @@ mod tests {
                 let client = Arc::clone(&client);
                 async move {
                     client
-                        .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
+                        .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                            DepsDevSystem::Npm,
+                            &[pk("vite")],
+                        ))
                         .await
                 }
             }
@@ -3691,7 +4051,10 @@ mod tests {
         let spawn_client = Arc::clone(&client);
         let handle = tokio::spawn(async move {
             spawn_client
-                .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
+                .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                    DepsDevSystem::Npm,
+                    &[pk("vite")],
+                ))
                 .await
         });
         // Deliberately shorter than the mock's 60ms response — cancels (drops) the
@@ -3709,7 +4072,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         let second = client
-            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
+            .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("vite")],
+            ))
             .await;
         assert!(
             second.contains_key(&nn("vite")),
@@ -3752,7 +4118,10 @@ mod tests {
                 let client = Arc::clone(&client);
                 tokio::spawn(async move {
                     client
-                        .gossip_findings_batch(DepsDevSystem::Npm, &[pk(&format!("pkg-{i}"))])
+                        .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                            DepsDevSystem::Npm,
+                            &[pk(&format!("pkg-{i}"))],
+                        ))
                         .await
                 })
             })
@@ -3807,7 +4176,10 @@ mod tests {
             .await;
 
         let result = client
-            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
+            .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("vite")],
+            ))
             .await;
         assert!(
             result.is_empty(),
@@ -3838,11 +4210,17 @@ mod tests {
 
         // Warms the memo with a fresh (well within `GOSSIP_SUCCESS_TTL`) entry.
         client
-            .gossip_findings_batch(DepsDevSystem::Npm, &[pk("vite")])
+            .gossip_findings_batch(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("vite")],
+            ))
             .await;
 
         let refreshed = client
-            .force_refresh_gossip_findings(DepsDevSystem::Npm, &[pk("vite")])
+            .force_refresh_gossip_findings(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("vite")],
+            ))
             .await;
         assert!(
             refreshed.contains_key(&nn("vite")),
@@ -3865,12 +4243,18 @@ mod tests {
             .await;
 
         let first = client
-            .force_refresh_gossip_findings(DepsDevSystem::Npm, &[pk("vite")])
+            .force_refresh_gossip_findings(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("vite")],
+            ))
             .await;
         assert!(first.contains_key(&nn("vite")));
 
         let second = client
-            .force_refresh_gossip_findings(DepsDevSystem::Npm, &[pk("vite")])
+            .force_refresh_gossip_findings(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("vite")],
+            ))
             .await;
         assert!(
             second.is_empty(),
@@ -3895,10 +4279,16 @@ mod tests {
             .await;
 
         client
-            .force_refresh_gossip_findings(DepsDevSystem::Npm, &[pk("vite")])
+            .force_refresh_gossip_findings(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("vite")],
+            ))
             .await;
         client
-            .force_refresh_gossip_findings(DepsDevSystem::Npm, &[pk("left-pad")])
+            .force_refresh_gossip_findings(&DepsDevTargets::for_keys_test(
+                DepsDevSystem::Npm,
+                &[pk("left-pad")],
+            ))
             .await;
 
         // The real proof: the mock's `.expect(2)` above only passes if refreshing
@@ -3968,7 +4358,13 @@ mod tests {
             .await;
 
         let findings = client
-            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("vite"), "8.3.1")
+            .gossip_findings_for_version(
+                &DepsDevTarget {
+                    system: DepsDevSystem::Npm,
+                    key: pk("vite"),
+                },
+                "8.3.1",
+            )
             .await
             .expect("findings expected");
         assert_eq!(findings.version, "8.3.1");
@@ -3997,7 +4393,13 @@ mod tests {
             .await;
 
         let findings = client
-            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("slopsquat-pkg"), "1.0.0")
+            .gossip_findings_for_version(
+                &DepsDevTarget {
+                    system: DepsDevSystem::Npm,
+                    key: pk("slopsquat-pkg"),
+                },
+                "1.0.0",
+            )
             .await
             .expect("findings expected");
         let low_usage = findings.low_usage.expect("low-usage finding expected");
@@ -4025,10 +4427,22 @@ mod tests {
             .await;
 
         client
-            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("vite"), "8.3.1")
+            .gossip_findings_for_version(
+                &DepsDevTarget {
+                    system: DepsDevSystem::Npm,
+                    key: pk("vite"),
+                },
+                "8.3.1",
+            )
             .await;
         client
-            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("vite"), "8.3.1")
+            .gossip_findings_for_version(
+                &DepsDevTarget {
+                    system: DepsDevSystem::Npm,
+                    key: pk("vite"),
+                },
+                "8.3.1",
+            )
             .await;
 
         findings.assert_async().await;
@@ -4051,10 +4465,22 @@ mod tests {
             .await;
 
         client
-            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("Vite"), "8.3.1")
+            .gossip_findings_for_version(
+                &DepsDevTarget {
+                    system: DepsDevSystem::Npm,
+                    key: pk("Vite"),
+                },
+                "8.3.1",
+            )
             .await;
         let second = client
-            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("vite"), "8.3.1")
+            .gossip_findings_for_version(
+                &DepsDevTarget {
+                    system: DepsDevSystem::Npm,
+                    key: pk("vite"),
+                },
+                "8.3.1",
+            )
             .await;
 
         assert!(
@@ -4095,7 +4521,13 @@ mod tests {
         let spawn_client = Arc::clone(&client);
         let handle = tokio::spawn(async move {
             spawn_client
-                .gossip_findings_for_version(DepsDevSystem::Npm, &pk("vite"), "8.3.1")
+                .gossip_findings_for_version(
+                    &DepsDevTarget {
+                        system: DepsDevSystem::Npm,
+                        key: pk("vite"),
+                    },
+                    "8.3.1",
+                )
                 .await
         });
         // Deliberately much shorter than the mock's 60ms response — this must reliably
@@ -4112,7 +4544,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         let second = client
-            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("vite"), "8.3.1")
+            .gossip_findings_for_version(
+                &DepsDevTarget {
+                    system: DepsDevSystem::Npm,
+                    key: pk("vite"),
+                },
+                "8.3.1",
+            )
             .await;
         assert!(
             second.is_some(),
@@ -4133,13 +4571,25 @@ mod tests {
 
         assert!(
             client
-                .gossip_findings_for_version(DepsDevSystem::Npm, &pk("."), "1.0.0")
+                .gossip_findings_for_version(
+                    &DepsDevTarget {
+                        system: DepsDevSystem::Npm,
+                        key: pk(".")
+                    },
+                    "1.0.0"
+                )
                 .await
                 .is_none()
         );
         assert!(
             client
-                .gossip_findings_for_version(DepsDevSystem::Npm, &pk("left-pad"), "..")
+                .gossip_findings_for_version(
+                    &DepsDevTarget {
+                        system: DepsDevSystem::Npm,
+                        key: pk("left-pad")
+                    },
+                    ".."
+                )
                 .await
                 .is_none()
         );
@@ -4159,7 +4609,13 @@ mod tests {
             .await;
 
         let findings = client
-            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("missing"), "1.0.0")
+            .gossip_findings_for_version(
+                &DepsDevTarget {
+                    system: DepsDevSystem::Npm,
+                    key: pk("missing"),
+                },
+                "1.0.0",
+            )
             .await;
         assert!(findings.is_none());
     }
@@ -4189,7 +4645,13 @@ mod tests {
             .await;
 
         let findings = client
-            .gossip_findings_for_version(DepsDevSystem::Npm, &pk("vite"), "7.0.0")
+            .gossip_findings_for_version(
+                &DepsDevTarget {
+                    system: DepsDevSystem::Npm,
+                    key: pk("vite"),
+                },
+                "7.0.0",
+            )
             .await;
         assert!(
             findings.is_none(),

@@ -7,8 +7,8 @@ replacing, the existing local cooldown heuristic.
 
 ## How It Works
 
-For a declared dependency in one of the seven [deps.dev](https://deps.dev)-covered
-ecosystems (Cargo, npm, PyPI, Go, Bundler, Maven, NuGet), `deps-lsp` batch-fetches
+For a declared dependency in one of the eight [deps.dev](https://deps.dev)-covered
+ecosystems (Cargo, npm, PyPI, Go, Bundler, Maven, Gradle, NuGet), `deps-lsp` batch-fetches
 GOSSIP findings for every dependency in a document via deps.dev's v3alpha
 `GetFindingsBatch` endpoint (one POST per document, not one call per dependency), through a
 background, per-document pre-fetch mirroring the typosquat pre-fetch's design.
@@ -29,10 +29,10 @@ background, per-document pre-fetch mirroring the typosquat pre-fetch's design.
 - **Completion** gets its own, GOSSIP-free local cooldown baseline: every version
   candidate's relative-age label is badged (⏳) when it falls within the configured
   cooldown window, using the same locally-known publish timestamps completion already
-  collects. This works for all 14 ecosystems, including the seven GOSSIP doesn't cover, and
+  collects. This works for all 14 ecosystems, including the six GOSSIP doesn't cover, and
   needs no network call.
 
-Composer, GitHub Actions, GitLab CI/CD, Dart, Swift, Gradle, and Deno have no
+Composer, GitHub Actions, GitLab CI/CD, Dart, Swift, and Deno have no
 [deps.dev](https://deps.dev) coverage — completion's local baseline still covers them,
 hover/diagnostics fall back to the local heuristic exactly as they did before this feature.
 

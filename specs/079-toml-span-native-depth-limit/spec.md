@@ -10,7 +10,7 @@ tags:
   - deps-core
   - security/dos
 created: 2026-10-06
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
@@ -144,7 +144,7 @@ THEN at least one test fails and names the missing upstream guard
 | FR-002 | WHEN `Cargo.lock` resolves `toml-span` to 0.7.2 or later, THE SYSTEM SHALL continue to route every untrusted-TOML parse (manifests, lock files, `deps-cli` config) through the single shared `parse_toml_checked` entry point. | must |
 | FR-003 | WHEN `toml_span::parse` returns `ErrorKind::ExceededDepthLimit`, THE SYSTEM SHALL return a depth-class `CheckedTomlError` that callers can distinguish from `Syntax` without string matching. | must |
 | FR-004 | WHERE a depth-class `CheckedTomlError` is produced by the upstream layer, THE SYSTEM SHALL NOT report a fabricated nesting-depth number, since upstream does not expose the reached depth. | must |
-| FR-005 | THE SYSTEM SHALL present depth errors from the pre-scan and from upstream with the same user-visible category (and a message that names the limit in force) in `deps-lsp` diagnostics, `deps-cli` `ConfigError::Toml`, and `DepsError::ParseError` for lock files and manifests. | should |
+| FR-005 | THE SYSTEM SHALL present depth errors from the pre-scan and from upstream with the same user-visible category (deviation: the upstream-layer message names the layer, not a number, because upstream's effective depth also counts key segments and so depends on input shape; the pre-scan message keeps its numbers) in `deps-lsp` diagnostics, `deps-cli` `ConfigError::Toml`, and `DepsError::ParseError` for lock files and manifests. | should |
 | FR-006 | WHEN the lock bump to 0.7.2 has merged, THE SYSTEM SHALL update every doc or test comment that states or implies "toml-span has no recursion limit" or that attributes a stack overflow to `toml_span::parse` at depths the upstream guard now rejects: `MAX_TOML_NESTING_DEPTH`, `check_toml_nesting_depth`, `CheckedTomlError`, the `MAX_YAML_NESTING_DEPTH` cross-reference "as with `MAX_TOML_NESTING_DEPTH`", `deps-core/README.md`, `WORKER_THREAD_STACK_SIZE` doc in `deps-lsp/src/main.rs`, `deps-cli/src/config.rs`, and the regression-test comments in `deps-cargo` (`lockfile.rs`, `parser.rs`), `deps-gradle` (`parser/catalog.rs`) and `deps-pypi`. | must |
 | FR-007 | WHEN the lock bump has merged, THE SYSTEM SHALL contain at least one test that calls `toml_span::parse` directly, on a thread with a stack no larger than 2 MiB, with input nested beyond 128 levels, and asserts `ErrorKind::ExceededDepthLimit` is returned. | must |
 | FR-008 | WHERE the pre-scan is retained, THE SYSTEM SHALL keep its boundary tests at `MAX_TOML_NESTING_DEPTH` (arrays, inline tables, dotted keys, dotted headers) and SHALL add a test pinning the 65 to 128 band as rejected by our layer, so the policy gap between the two limits is explicit. | should |
@@ -159,7 +159,7 @@ THEN at least one test fails and names the missing upstream guard
 | NFR-001 | Reliability | No input within the library's accepted range SHALL abort the process on a 2 MiB-stack thread, in either debug or release builds. |
 | NFR-002 | Security | Error text surfaced through `redact_parse_error_for_log` paths SHALL remain free of attacker-controlled content; the upstream depth message is a fixed string and SHALL NOT be treated as needing a different redaction path. |
 | NFR-003 | Consistency | The mapping SHALL live in `deps-core` (shared helper), never reimplemented per ecosystem crate, per the cross-ecosystem consistency rule. |
-| NFR-004 | Type safety | The depth outcome SHALL be encoded as an enum variant (no stringly-typed discrimination, no sentinel depth value), and any `match` on `CheckedTomlError` SHALL stay exhaustive. |
+| NFR-004 | Type safety | The depth outcome SHALL be encoded as an enum variant (no stringly-typed discrimination, no sentinel depth value), and any `match` on `CheckedTomlError` (and `TomlDepthGuard`) SHALL stay exhaustive. |
 | NFR-005 | Maintainability | Each protection layer's doc SHALL state its role (safety backstop vs policy bound) and the `toml-span` versions it assumes. |
 | NFR-006 | Performance | The pre-scan is a single linear pass; retaining it SHALL NOT add measurable latency to hover/completion paths (those use cached state per the non-blocking handler rule). |
 
@@ -169,7 +169,8 @@ THEN at least one test fails and names the missing upstream guard
 |--------|-------------|----------------|
 | `MAX_TOML_NESTING_DEPTH` | Our policy/safety bound on bracket depth plus dotted-key/header segments | currently 64 |
 | Upstream limit | `toml-span` 0.7.2 `MAX_NESTING_DEPTH` | 128; counts arrays, inline tables, dotted keys, headers; inline-table effective depth about 64 because dotted-key length is added |
-| `CheckedTomlError` | Typed outcome of `parse_toml_checked` | `NestingTooDeep { depth }`, `Syntax(toml_span::Error)`; possible third depth-class source (OQ-2) |
+| `CheckedTomlError` | Typed outcome of `parse_toml_checked` | `NestingTooDeep { guard: TomlDepthGuard }`, `Syntax(toml_span::Error)` |
+| `TomlDepthGuard` | Which layer rejected the depth | `PreScan { depth }`, `Parser` (no depth, no span: upstream exposes none and `PreScan` carries no position) |
 | Layer matrix | Which layer rejects which input | see Section 6 |
 
 ## 6. Edge Cases and Error Handling
@@ -209,23 +210,22 @@ THEN at least one test fails and names the missing upstream guard
 
 ### Never
 - Edit source code as part of the continuous-improvement research session that produced this spec.
-- Add a catch-all `_ =>` arm when matching `ErrorKind` or `CheckedTomlError` to sidestep exhaustiveness.
+- Add a catch-all `_ =>` arm when matching `CheckedTomlError` to sidestep exhaustiveness. `toml_span::ErrorKind` is a foreign enum that is not `#[non_exhaustive]` and gained a variant in a patch release (0.7.2), so exhaustive arms would break `deps-core` on a downstream `cargo update`; it is read with a single-variant `if let ErrorKind::ExceededDepthLimit` extraction, which is allowed.
 - Fabricate a depth number for an error that upstream reports without one.
 - Touch files under `crates/deps-zed`.
 
 ## 9. Open Questions
 
-> [!question] Open items (8)
-> Resolve before moving to `plan`.
+> [!success] All open items resolved (8)
 
-- [NEEDS CLARIFICATION: OQ-1 Keep or remove the pre-scan after the bump? Research recommendation: keep it. It is a cheap single pass, its 64 bound is stricter than upstream's 128 and matches the corpus (deepest real bracket nesting 5, deepest dotted path 6), it mirrors the JSON and YAML guards, and it applies identically to every ecosystem. Reframe it as a policy bound plus defense-in-depth rather than the sole SIGABRT guard. Confirm.]
-- [NEEDS CLARIFICATION: OQ-2 Shape of the depth-class error for upstream rejections. `NestingTooDeep { depth: usize }` requires a number upstream does not provide. Options: (a) new variant without a depth (for example an upstream-limit variant), (b) make `depth` optional on `NestingTooDeep`, (c) leave upstream rejections as `Syntax` and accept the ambiguity. Also verify `toml_span::ErrorKind` is public and matchable (and whether it is `#[non_exhaustive]`, which would force a wildcard arm) before choosing.]
-- [NEEDS CLARIFICATION: OQ-3 Raise the workspace requirement from `toml-span = "0.7"` to `"0.7.2"`? Required if the pre-scan is removed (FR-009); optional but cheap if it is retained, since it prevents a resolver from silently selecting 0.7.1.]
-- [NEEDS CLARIFICATION: OQ-4 Does toml-span 0.7.2 raise its own MSRV or add dependencies relative to the workspace `rust-version = "1.98"`? Not checked; the lock-bump issue should confirm.]
-- [NEEDS CLARIFICATION: OQ-5 If the pre-scan is ever removed: worst-case stack usage of mixed-shape input at 128 levels (arrays of inline tables with dotted keys) on a 2 MiB stack, debug and release, is unmeasured. The 2026-10-06 evidence covers single-shape inputs in a debug build only.]
-- [NEEDS CLARIFICATION: OQ-6 Should `MAX_TOML_NESTING_DEPTH` stay 64 or be aligned to upstream's 128? Research recommendation: stay 64 (real-world maximum is single digits; aligning removes the margin for the inline-table case). Confirm.]
-- [NEEDS CLARIFICATION: OQ-7 Fuzzing: is the existing `parse_toml_checked` fuzz target plus seeds enough, or should a second target call `toml_span::parse` directly so the upstream guard is fuzzed independently of our pre-scan (which otherwise shields it from deep inputs)?]
-- [NEEDS CLARIFICATION: OQ-8 Historical bisection figures (debug 220 inline tables / 305 arrays; release about 2485 / 1805 on 0.7.1): keep in the doc as a labeled historical note, or delete? Research recommendation: keep one sentence, labeled 0.7.1, since it documents why 64 was chosen.]
+- **OQ-1** RESOLVED: keep the pre-scan as a policy bound plus defense in depth.
+- **OQ-2** RESOLVED: single `NestingTooDeep { guard: TomlDepthGuard }` variant; `Parser` carries no number. `ErrorKind` is public and not `#[non_exhaustive]`; mapped via a single-variant `if let`.
+- **OQ-3** RESOLVED: workspace floor raised to `toml-span = "0.7.2"`.
+- **OQ-4** RESOLVED: no MSRV conflict with `rust-version = "1.98"`.
+- **OQ-5** RESOLVED: not needed, the pre-scan is retained.
+- **OQ-6** RESOLVED: stays 64.
+- **OQ-7** RESOLVED: seeds only (`fuzz/seeds/parse_toml_checked/`), no second target.
+- **OQ-8** RESOLVED: kept as one sentence labeled historical (0.7.1).
 
 ## 10. See Also
 

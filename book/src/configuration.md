@@ -305,8 +305,8 @@ An invalid `GITLAB_TOKEN_HOST` disables the token entirely. See
 > diagnostics for every open document, so clients that only receive `publishDiagnostics` (no
 > `workspace/diagnostic/refresh` support) do not keep stale diagnostics.
 
-> **Note:** The supply-chain trust signal only appears for **npm, Cargo, Go, Maven, PyPI,
-> Bundler, and NuGet** (Composer, Dart, and Swift have no deps.dev coverage) and only for a
+> **Note:** The supply-chain trust signal only appears for **npm, Cargo, Go, Maven, Gradle,
+> PyPI, Bundler, and NuGet** (Composer, Dart, and Swift have no deps.dev coverage) and only for a
 > dependency with a concrete in-use version — a lock-file-resolved version, or an exact
 > requirement pin. It shows the linked source repository's OpenSSF Scorecard score and the
 > resolved version's SLSA/attestation provenance status; a Scorecard fetched via a

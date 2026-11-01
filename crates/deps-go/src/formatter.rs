@@ -3,6 +3,7 @@ use deps_core::lsp_helpers::{
     PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
     compile_requirement_unless,
 };
+use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName};
 
 use crate::types::{GoDependency, GoDirective};
@@ -93,6 +94,17 @@ impl RequirementResolution for GoFormatter {
         go_version_matches(version.as_str(), requirement.as_str())
     }
 
+    /// A one-entry `available` list is the `/@latest` fallback of a proxy that serves no
+    /// `/@v/list` (see `GoRegistry::get_versions_with_latest_fallback`), so it cannot show that
+    /// a pin is unpublished.
+    fn bounded_requirement_is_undecidable_given_available(
+        &self,
+        _requirement: BoundedVersionReq<'_>,
+        available: &[ConcreteVersion],
+    ) -> bool {
+        available.len() <= 1
+    }
+
     // #1370/#1377/#1379/#1391: `go.mod`'s own grammar has no placeholder syntax of its own (a
     // `require` line's version field is always a single, space-free token) —
     // `RequirementResolution::bounded_requirement_is_placeholder`'s shared default (the
@@ -156,12 +168,29 @@ impl DiagnosticPolicy for GoFormatter {}
 
 impl SourcePolicy for GoFormatter {
     /// FR-012 (spec 034): widens [`SourcePolicy::can_resolve_source`] to also accept
-    /// `AlternateRegistry` (a `$GOENV` `GOPROXY`-chain or `GOPRIVATE`-bypass resolution) so
+    /// `AlternateRegistry` (a `GOPROXY`-chain or `GOPRIVATE`-bypass resolution) so
     /// hover/diagnostics/code-actions gate correctly; `CustomRegistry` (FR-009's fail-closed
     /// state, every hop invalid) stays rejected via the default's `is_version_resolvable()`
     /// half, keeping the existing fail-closed gate intact.
     fn resolves_alternate_registry(&self) -> bool {
         true
+    }
+
+    /// A `GOPROXY`-chain module whose content the public checksum database verifies
+    /// (`AlternateRegistry { mirrors_crates_io: true, .. }`, set by
+    /// `GoEnvConfig::resolve_source_for` from `GOSUMDB`/`GONOSUMDB`/`GOPRIVATE`) counts as
+    /// public-registry content alongside plain [`DependencySource::Registry`], so OSV and
+    /// deps.dev keep covering users who set `GOPROXY`. The `GOPRIVATE` bypass and a fail-closed
+    /// `CustomRegistry` never do.
+    fn source_is_public_registry_content(&self, source: &DependencySource) -> bool {
+        matches!(
+            source,
+            DependencySource::Registry
+                | DependencySource::AlternateRegistry {
+                    mirrors_crates_io: true,
+                    ..
+                }
+        )
     }
 }
 
@@ -392,6 +421,49 @@ mod tests {
                 url: "not-a-valid-url".to_string(),
             }
         ));
+    }
+
+    /// A1: an older pin present in a full list is satisfiable; a one-entry (`/@latest`-only)
+    /// list proves nothing; a pin missing from a full list is still reported.
+    #[test]
+    fn test_unsatisfiable_pin_needs_a_full_version_list() {
+        use deps_core::VersionReq;
+        use deps_core::lsp_helpers::requirement_is_unsatisfiable;
+
+        let versions = |list: &[&str]| -> Vec<ConcreteVersion> {
+            list.iter().map(|v| ConcreteVersion::new(*v)).collect()
+        };
+        let pin = VersionReq::new("v1.6.0");
+        let full = versions(&["v1.12.0", "v1.9.1", "v1.6.0"]);
+        assert!(!requirement_is_unsatisfiable(&GoFormatter, &pin, &full));
+        let latest_only = versions(&["v1.12.0"]);
+        assert!(!requirement_is_unsatisfiable(
+            &GoFormatter,
+            &pin,
+            &latest_only
+        ));
+        let missing = versions(&["v1.12.0", "v1.9.1"]);
+        assert!(requirement_is_unsatisfiable(&GoFormatter, &pin, &missing));
+    }
+
+    /// Only sumdb-verified chain modules join plain `Registry` as public content; the bypass and
+    /// the fail-closed source never do.
+    #[test]
+    fn test_source_is_public_registry_content() {
+        use deps_core::parser::DependencySource;
+        let formatter = GoFormatter;
+        let chain = |mirrors_crates_io| DependencySource::AlternateRegistry {
+            index: "go-proxy:deadbeef".to_string(),
+            mirrors_crates_io,
+        };
+        assert!(formatter.source_is_public_registry_content(&DependencySource::Registry));
+        assert!(formatter.source_is_public_registry_content(&chain(true)));
+        assert!(!formatter.source_is_public_registry_content(&chain(false)));
+        assert!(
+            !formatter.source_is_public_registry_content(&DependencySource::CustomRegistry {
+                url: "https://x.example".to_string(),
+            })
+        );
     }
 
     /// S4 (spec 034 review): the `pkg.go.dev` hover link is suppressed for anything but a

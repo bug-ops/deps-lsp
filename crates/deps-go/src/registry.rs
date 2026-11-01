@@ -445,15 +445,25 @@ impl GoRegistry {
         })
     }
 
-    /// S3 (spec 034 review): tries `/@latest` first — mirrors the public-path
-    /// `Registry::get_latest_matching` fast path — falling back to `/@v/list` on an `/@latest`
-    /// miss. `/@v/list` alone is incomplete for an untagged/pseudo-version-only module (#364);
-    /// a chain hop that only ever tried `/@v/list` silently lost version data for that case.
+    /// Fetches the hop's `/@v/list` like the go command and the public path do, so exact pins,
+    /// outdated and unsatisfiable checks see every published version. Only when the list is
+    /// absent (`404`/`410`) or empty — an untagged/pseudo-version-only module (#364), or a proxy
+    /// that does not serve `/@v/list` — does it fall back to `/@latest`, yielding a one-entry
+    /// list; `GoFormatter` treats such a list as too incomplete to call a pin unsatisfiable.
+    /// When `/@latest` fails too, the list's own outcome is returned, so the chain's
+    /// fall-through semantics are those of the list request alone. Any other list error
+    /// (transport failure, policy block) is returned as is.
     async fn get_versions_with_latest_fallback(&self, module_path: &str) -> Result<Vec<GoVersion>> {
-        if let Ok(latest) = self.get_latest_stable(module_path).await {
-            return Ok(vec![latest]);
+        let list = self.get_versions(module_path).await;
+        match &list {
+            Ok(versions) if !versions.is_empty() => return list,
+            Ok(_) | Err(DepsError::PackageNotFound { .. }) => {}
+            Err(_) => return list,
         }
-        self.get_versions(module_path).await
+        match self.get_latest_stable(module_path).await {
+            Ok(latest) => Ok(vec![latest]),
+            Err(_) => list,
+        }
     }
 
     /// Fetches `url` through the transport this client's tier selects.
@@ -876,10 +886,10 @@ impl deps_core::Registry for GoRegistry {
     /// Dispatches by `source` (spec 034 FR-013): an `AlternateRegistry` whose index has a
     /// registered client routes through `GoRegistry::get_versions_chained` (FR-005's chain
     /// walk); one with **no** registered client is `PackageNotFound`, never a fall back to
-    /// `proxy.golang.org` (Go always sets `mirrors_crates_io: false`, so Cargo's
-    /// mirror-degradation arm is dead here and must not be written — falling back would send
-    /// a private module path to the public proxy, the exact class of leak FR-008/FR-009
-    /// close). Every other source keeps today's public-registry path unchanged.
+    /// `proxy.golang.org` (`mirrors_crates_io` never affects routing here: there is no
+    /// mirror-degradation arm, and it must not be written — falling back would send a private
+    /// module path to the public proxy, the exact class of leak FR-008/FR-009 close). Every other source keeps today's
+    /// public-registry path unchanged.
     fn get_versions_from<'a>(
         &'a self,
         name: &'a deps_core::PackageName,
@@ -2298,6 +2308,132 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(versions.len(), 1);
+    }
+
+    async fn chain_versions(
+        hops: &[&mockito::ServerGuard],
+        separators: Vec<ChainSeparator>,
+    ) -> Result<Vec<String>> {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let policy = all_policy();
+        GoRegistry::register_alternate(
+            &root,
+            &GoProxyChain {
+                key: "go-proxy:test".to_string(),
+                hops: hops
+                    .iter()
+                    .map(|hop| url_hop(&hop.url(), &policy))
+                    .collect(),
+                separators,
+            },
+        );
+        let source = DependencySource::AlternateRegistry {
+            index: "go-proxy:test".to_string(),
+            mirrors_crates_io: false,
+        };
+        root.get_versions_from(
+            &deps_core::PackageName::new("github.com/gin-gonic/gin"),
+            &source,
+            FreshnessSettings::default(),
+        )
+        .await
+        .map(|versions| {
+            versions
+                .iter()
+                .map(|version| version.version_string().to_string())
+                .collect()
+        })
+    }
+
+    const GIN_LIST: &str = "/github.com/gin-gonic/gin/@v/list";
+    const GIN_LATEST: &str = "/github.com/gin-gonic/gin/@latest";
+
+    /// A1: a chain hop serving `/@v/list` yields the whole list, not just `/@latest`, so an older
+    /// pin is neither unsatisfiable nor hides the newer-version hint.
+    #[tokio::test]
+    async fn test_chain_hop_returns_the_full_version_list() {
+        let mut hop = mockito::Server::new_async().await;
+        hop.mock("GET", GIN_LIST)
+            .with_status(200)
+            .with_body("v1.6.0\nv1.9.1\nv1.12.0\n")
+            .create_async()
+            .await;
+        let latest = hop
+            .mock("GET", GIN_LATEST)
+            .with_status(200)
+            .with_body(r#"{"Version":"v1.12.0","Time":"2024-01-01T00:00:00Z"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let versions = chain_versions(&[&hop], Vec::new()).await.unwrap();
+        assert_eq!(versions, ["v1.12.0", "v1.9.1", "v1.6.0"]);
+        latest.assert_async().await;
+    }
+
+    /// A1: a proxy answering `404` for `/@v/list` falls back to `/@latest` alone.
+    #[tokio::test]
+    async fn test_chain_hop_list_404_falls_back_to_latest_only() {
+        let mut hop = mockito::Server::new_async().await;
+        hop.mock("GET", GIN_LIST)
+            .with_status(404)
+            .create_async()
+            .await;
+        hop.mock("GET", GIN_LATEST)
+            .with_status(200)
+            .with_body(r#"{"Version":"v1.12.0","Time":"2024-01-01T00:00:00Z"}"#)
+            .create_async()
+            .await;
+
+        let versions = chain_versions(&[&hop], Vec::new()).await.unwrap();
+        assert_eq!(versions, ["v1.12.0"]);
+    }
+
+    /// A1: list `404` and `/@latest` `404` is an ordinary miss, so the chain falls through.
+    #[tokio::test]
+    async fn test_chain_falls_through_when_list_and_latest_both_miss() {
+        let mut first = mockito::Server::new_async().await;
+        first
+            .mock("GET", GIN_LIST)
+            .with_status(404)
+            .create_async()
+            .await;
+        first
+            .mock("GET", GIN_LATEST)
+            .with_status(404)
+            .create_async()
+            .await;
+        let mut second = mockito::Server::new_async().await;
+        second
+            .mock("GET", GIN_LIST)
+            .with_status(200)
+            .with_body("v1.9.1\n")
+            .create_async()
+            .await;
+
+        let versions = chain_versions(&[&first, &second], vec![ChainSeparator::NotFoundOnly])
+            .await
+            .unwrap();
+        assert_eq!(versions, ["v1.9.1"]);
+    }
+
+    /// A1: a `,` chain still halts on a transport error from the list request.
+    #[tokio::test]
+    async fn test_comma_chain_halts_on_list_server_error() {
+        let mut first = mockito::Server::new_async().await;
+        first
+            .mock("GET", GIN_LIST)
+            .with_status(500)
+            .create_async()
+            .await;
+        let second = mockito::Server::new_async().await;
+
+        let result = chain_versions(&[&first, &second], vec![ChainSeparator::NotFoundOnly]).await;
+        assert!(result.is_err());
     }
 
     /// S3: a chain hop whose `/@v/list` is empty (an untagged/pseudo-version-only module, the

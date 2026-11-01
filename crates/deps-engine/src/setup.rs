@@ -691,6 +691,7 @@ pub fn register_ecosystems(
             Arc::clone(&policy),
             Arc::new(deps_go::config::GoEnvCache::new()),
             deps_go::config::goenv_path(),
+            Arc::new(deps_go::config::GoProcessEnv::from_process()),
         );
         registry.register(Arc::new(GoEcosystem::with_context(
             Arc::new(GoRegistry::new(Arc::clone(&cache))),

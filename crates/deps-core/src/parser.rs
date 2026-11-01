@@ -14,38 +14,33 @@ use crate::redact::RedactedUrl;
 /// count (e.g. `a.b.c` or `[a.b.c]`), since both drive `toml-span`'s
 /// recursive descent.
 ///
-/// `toml-span` 0.7.1's recursive-descent parser has no recursion limit, so
-/// either a deeply nested `[[[...]]]` array/`{{{...}}}` inline-table
-/// literal, or a dotted key/header with many `.`-separated segments, can
-/// overflow the native thread stack and abort the whole process (SIGABRT)
-/// before `toml_span::parse` ever returns an error. As a library, `deps-core`
-/// cannot rely on its consumers raising their stack size, so this constant
-/// deliberately assumes the smallest stack any caller is likely to run on: a
-/// `tokio` worker thread's 2 MiB default (relevant since lock file parsing
-/// runs inside `tokio::spawn`), not the platform's larger 8 MiB main-thread
-/// default. `deps-lsp`, the one consumer in this workspace, additionally
-/// raises its `tokio` worker stacks to 8 MiB as defense-in-depth on top of
-/// this guard (see `WORKER_THREAD_STACK_SIZE` in `deps-lsp`'s `main.rs`), but
-/// the constant itself stays sized for the 2 MiB floor. Stack cost per level
-/// is also shape-dependent: nested inline tables (`{a={a=...}}`) cost
-/// noticeably more per level than nested arrays in a debug build.
+/// This is a policy bound and defense-in-depth layer, not the only guard:
+/// `toml-span` 0.7.2 and later enforce their own native limit (128 levels,
+/// reported as `ErrorKind::ExceededDepthLimit`, which [`parse_toml_checked`]
+/// maps to [`CheckedTomlError::NestingTooDeep`]). The workspace requires
+/// `toml-span >= 0.7.2`, so that limit is the safety backstop against stack
+/// overflow, and this stricter pre-scan keeps the accepted range uniform
+/// across ecosystems and far above anything a real manifest needs: across a
+/// corpus of thousands of real-world `.toml` files, the deepest observed
+/// bracket nesting was 5 and the deepest dotted-key path was 6 segments.
+/// The upstream limit also counts dotted-key length, so its effective
+/// inline-table depth is about 64, nearly coinciding with this bound.
 ///
-/// Bisected against the real `toml_span` 0.7.1 recursion on a 2 MiB stack:
-/// a debug build survives depth 220 for inline tables / 305 for arrays; a
-/// release build survives roughly 2485 / 1805. 64 leaves a >3x margin under
-/// the tightest of these (debug inline tables, 220) while still being far
-/// deeper than any real manifest needs — across a corpus of thousands of
-/// real-world `.toml` files, the deepest observed bracket nesting was 5 and
-/// the deepest dotted-key path was 6 segments.
+/// Historical note: `toml-span` 0.7.1 had no recursion limit, and a bisection
+/// on a 2 MiB stack (a `tokio` worker's default) showed a debug build
+/// surviving depth 220 for inline tables and 305 for arrays; 64 was chosen
+/// with a >3x margin under the tightest of those figures.
 pub const MAX_TOML_NESTING_DEPTH: usize = 64;
 
 /// Scans raw TOML text for table/array recursion deeper than `max_depth`.
 ///
-/// `toml-span::parse` has no public option to cap recursion, so callers must
-/// reject pathological input before handing it to the parser. This performs a
-/// single-pass structural scan — no actual parsing, so it cannot itself
-/// recurse or overflow — that bounds the two independent ways TOML content
-/// drives `toml-span`'s table/array recursion:
+/// `toml-span` has no public option to configure its recursion limit, so the
+/// stricter [`MAX_TOML_NESTING_DEPTH`] policy bound is enforced here, before
+/// the parser runs, as defense in depth on top of the parser's own native
+/// limit (`toml-span` 0.7.2 and later). This performs a single-pass
+/// structural scan — no actual parsing, so it cannot itself recurse or
+/// overflow — that bounds the two independent ways TOML content drives
+/// `toml-span`'s table/array recursion:
 ///
 /// - **Bracket nesting**: `[`/`{` and `]`/`}` pairs, as in `[[[1]]]` or
 ///   `{a={a=1}}`.
@@ -204,26 +199,81 @@ pub fn check_toml_nesting_depth(content: &str, max_depth: usize) -> std::result:
     Ok(())
 }
 
-/// Error returned by [`parse_toml_checked`]: either `content` nests deeper than
-/// [`MAX_TOML_NESTING_DEPTH`] or `toml-span` itself rejects it as invalid syntax.
+/// Which layer rejected a TOML document as nested too deeply.
+///
+/// Keeps the two origins distinguishable without a sentinel value: the
+/// pre-scan knows the depth it reached, while `toml-span`'s native limit does
+/// not expose one.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::parser::TomlDepthGuard;
+///
+/// assert_eq!(
+///     TomlDepthGuard::PreScan { depth: 65 }.to_string(),
+///     "array/table nesting depth 65 exceeds maximum of 64"
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TomlDepthGuard {
+    /// [`check_toml_nesting_depth`] rejected the input before parsing.
+    PreScan {
+        /// The nesting depth reached the instant it exceeded [`MAX_TOML_NESTING_DEPTH`].
+        depth: usize,
+    },
+    /// `toml-span`'s own native depth limit rejected the input.
+    Parser,
+}
+
+impl fmt::Display for TomlDepthGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PreScan { depth } => write!(
+                f,
+                "array/table nesting depth {depth} exceeds maximum of {MAX_TOML_NESTING_DEPTH}"
+            ),
+            Self::Parser => {
+                f.write_str("array/table nesting exceeds the TOML parser's own depth limit")
+            }
+        }
+    }
+}
+
+/// Error returned by [`parse_toml_checked`]: either `content` nests too deeply
+/// (rejected by the [`MAX_TOML_NESTING_DEPTH`] pre-scan or by `toml-span`'s
+/// native depth limit) or `toml-span` rejects it as invalid syntax.
 ///
 /// Distinct from a bare `toml_span::Error` so callers can branch on "too deep" vs.
 /// "malformed" without string-matching a message.
 #[derive(Debug, thiserror::Error)]
 pub enum CheckedTomlError {
-    /// `content` exceeded [`MAX_TOML_NESTING_DEPTH`] before `toml-span` ever parsed it.
-    #[error("array/table nesting depth {depth} exceeds maximum of {MAX_TOML_NESTING_DEPTH}")]
+    /// `content` nests too deeply; `guard` records which layer rejected it.
+    #[error("{guard}")]
     NestingTooDeep {
-        /// The nesting depth reached the instant it exceeded [`MAX_TOML_NESTING_DEPTH`].
-        depth: usize,
+        /// The layer that rejected the input, with its reached depth when known.
+        guard: TomlDepthGuard,
     },
-    /// `content` passed the depth guard but `toml-span` rejected it as invalid TOML.
+    /// `content` passed the depth guards but `toml-span` rejected it as invalid TOML.
     #[error(transparent)]
-    Syntax(#[from] toml_span::Error),
+    Syntax(toml_span::Error),
+}
+
+fn classify_parse_error(error: toml_span::Error) -> CheckedTomlError {
+    // ErrorKind is not #[non_exhaustive] and gained this variant in a patch release, so a
+    // full match would break on `cargo update`; extract only the one variant we map.
+    if matches!(error.kind, toml_span::ErrorKind::ExceededDepthLimit) {
+        CheckedTomlError::NestingTooDeep {
+            guard: TomlDepthGuard::Parser,
+        }
+    } else {
+        CheckedTomlError::Syntax(error)
+    }
 }
 
 /// Parses `content` as TOML, first rejecting input whose nesting exceeds
-/// [`MAX_TOML_NESTING_DEPTH`] (see that constant's doc for why).
+/// [`MAX_TOML_NESTING_DEPTH`] (see that constant's doc for why), and mapping
+/// `toml-span`'s own depth-limit error to the same error category.
 ///
 /// The single shared entry point for every untrusted-TOML parse site in this workspace —
 /// collapses what would otherwise be a per-crate copy of [`check_toml_nesting_depth`] +
@@ -232,8 +282,8 @@ pub enum CheckedTomlError {
 /// # Errors
 ///
 /// Returns [`CheckedTomlError::NestingTooDeep`] if `content` nests deeper than
-/// [`MAX_TOML_NESTING_DEPTH`], or [`CheckedTomlError::Syntax`] if `toml-span` itself rejects
-/// `content` as invalid TOML.
+/// [`MAX_TOML_NESTING_DEPTH`] or exceeds `toml-span`'s native depth limit, or
+/// [`CheckedTomlError::Syntax`] if `toml-span` rejects `content` as invalid TOML.
 ///
 /// # Examples
 ///
@@ -254,9 +304,11 @@ pub fn parse_toml_checked(
     content: &str,
 ) -> std::result::Result<toml_span::Value<'_>, CheckedTomlError> {
     if let Err(depth) = check_toml_nesting_depth(content, MAX_TOML_NESTING_DEPTH) {
-        return Err(CheckedTomlError::NestingTooDeep { depth });
+        return Err(CheckedTomlError::NestingTooDeep {
+            guard: TomlDepthGuard::PreScan { depth },
+        });
     }
-    Ok(toml_span::parse(content)?)
+    toml_span::parse(content).map_err(classify_parse_error)
 }
 
 /// Advances past a single-line TOML string (`"..."` or `'...'`), returning
@@ -326,8 +378,8 @@ fn skip_multiline_string(bytes: &[u8], mut i: usize, quote: u8) -> usize {
 /// `[[[...]]]` array parser already caps recursion, but block style and flow
 /// objects do not). A deeply nested `pubspec.yaml`/`pubspec.lock` can overflow
 /// the native thread stack and abort the whole process (SIGABRT) before
-/// `YamlLoader::load_from_str` ever returns an error. As with
-/// [`MAX_TOML_NESTING_DEPTH`], this constant assumes the smallest stack any
+/// `YamlLoader::load_from_str` ever returns an error. Unlike
+/// [`MAX_TOML_NESTING_DEPTH`] (which has an upstream backstop), this constant assumes the smallest stack any
 /// caller is likely to run on: a `tokio` worker thread's 2 MiB default, not
 /// `deps-lsp`'s own 8 MiB `WORKER_THREAD_STACK_SIZE` (defense-in-depth on top
 /// of this guard).
@@ -1104,6 +1156,8 @@ pub enum DependencySource {
         /// The resolved index URL, validated and normalized by the originating parser —
         /// redacted only when [`Debug`]-formatted (see the variant's own doc).
         index: String,
+        // TODO(critic): rename to `mirrors_public_registry`; deps-go also sets it, for GOPROXY
+        // chains whose content the public checksum database verifies.
         /// `true` exactly when this source was reached via a `[source.crates-io]
         /// replace-with` chain (Cargo `[source]` mirroring, spec
         /// `.local/specs/023-cargo-custom-registries/plan-1b.md` §1.3) — as opposed to an
@@ -1114,6 +1168,8 @@ pub enum DependencySource {
         /// per-version checksum equality against crates.io for a mirror, so its content is
         /// exactly as trustworthy as crates.io's own for vulnerability-scanning and hover-link
         /// purposes, even though the fetch itself still goes to `index`, not to crates.io.
+        /// `deps-go` sets it for a `GOPROXY` chain with a URL hop when `GOSUMDB` is the public
+        /// checksum database and `GOPRIVATE`/`GONOSUMDB` do not match the module.
         /// See [`crate::lsp_helpers::SourcePolicy::source_is_public_registry_content`].
         mirrors_crates_io: bool,
     },
@@ -1598,7 +1654,9 @@ cpu_load = 3.14
         let err = parse_toml_checked(&content).unwrap_err();
         assert_matches!(
             err,
-            CheckedTomlError::NestingTooDeep { depth } if depth == bracket_count
+            CheckedTomlError::NestingTooDeep {
+                guard: TomlDepthGuard::PreScan { depth }
+            } if depth == bracket_count
         );
         assert_eq!(
             err.to_string(),
@@ -1606,6 +1664,63 @@ cpu_load = 3.14
                 "array/table nesting depth {bracket_count} exceeds maximum of {MAX_TOML_NESTING_DEPTH}"
             )
         );
+    }
+
+    fn nested_arrays(depth: usize) -> String {
+        format!("a = {}1{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    #[test]
+    fn test_parse_toml_checked_policy_band_rejected_by_pre_scan() {
+        let content = nested_arrays(100);
+        assert_matches!(
+            parse_toml_checked(&content),
+            Err(CheckedTomlError::NestingTooDeep {
+                guard: TomlDepthGuard::PreScan { depth: 65 }
+            })
+        );
+    }
+
+    #[test]
+    fn test_upstream_toml_span_enforces_native_depth_limit_on_small_stack() {
+        // Tripwire: fails if the resolved toml-span lacks its native depth limit
+        // (< 0.7.2), which would leave the pre-scan as the only stack-overflow guard.
+        let outcome = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let content = nested_arrays(200);
+                toml_span::parse(&content).map(|_| ()).map_err(|e| e.kind)
+            })
+            .unwrap()
+            .join()
+            .expect("toml_span::parse must not overflow a 2 MiB stack at depth 200");
+        assert_matches!(outcome, Err(toml_span::ErrorKind::ExceededDepthLimit));
+    }
+
+    #[test]
+    fn test_classify_parse_error_maps_upstream_depth_limit() {
+        let error = toml_span::Error::from((
+            toml_span::ErrorKind::ExceededDepthLimit,
+            toml_span::Span::default(),
+        ));
+        assert_matches!(
+            classify_parse_error(error),
+            CheckedTomlError::NestingTooDeep {
+                guard: TomlDepthGuard::Parser
+            }
+        );
+    }
+
+    #[test]
+    fn test_classify_parse_error_keeps_other_kinds_as_syntax() {
+        let error = toml_span::parse("a = ").unwrap_err();
+        assert_matches!(classify_parse_error(error), CheckedTomlError::Syntax(_));
+    }
+
+    #[test]
+    fn test_toml_depth_guard_parser_message_names_no_number() {
+        let message = TomlDepthGuard::Parser.to_string();
+        assert!(!message.chars().any(|c| c.is_ascii_digit()), "{message}");
     }
 
     #[test]

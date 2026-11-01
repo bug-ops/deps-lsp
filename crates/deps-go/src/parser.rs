@@ -1048,6 +1048,7 @@ exclude github.com/bad/module v0.1.0
             Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::Off)),
             Arc::new(GoEnvCache::new()),
             Some(deps_core::config_trust::OperatorPath::for_test(goenv_path)),
+            Arc::new(crate::config::GoProcessEnv::default()),
         );
 
         let content = "module example.com/myapp\n\nrequire github.com/gin-gonic/gin v1.9.0\n";
@@ -1090,6 +1091,7 @@ exclude github.com/bad/module v0.1.0
             Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)),
             Arc::new(GoEnvCache::new()),
             Some(deps_core::config_trust::OperatorPath::for_test(goenv_path)),
+            Arc::new(crate::config::GoProcessEnv::default()),
         );
 
         let content = "module example.com/myapp\n\nrequire github.com/gin-gonic/gin v1.9.0\n";
@@ -1134,6 +1136,7 @@ exclude github.com/bad/module v0.1.0
             Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::Off)),
             Arc::new(GoEnvCache::new()),
             Some(deps_core::config_trust::OperatorPath::for_test(goenv_path)),
+            Arc::new(crate::config::GoProcessEnv::default()),
         );
 
         let content = r"module example.com/myapp
@@ -1177,6 +1180,7 @@ require (
             Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::Off)),
             Arc::new(GoEnvCache::new()),
             Some(deps_core::config_trust::OperatorPath::for_test(goenv_path)),
+            Arc::new(crate::config::GoProcessEnv::default()),
         );
 
         let content =
@@ -1191,5 +1195,73 @@ require (
             }
         );
         assert!(result.blocked_registries().is_empty());
+    }
+
+    /// #1897: a module matching an exported `GOPRIVATE` routes to the terminal bypass chain
+    /// (no proxy request, hence no lookup-miss finding) with no `$GOENV` file at all.
+    #[test]
+    fn test_parse_go_mod_env_goprivate_module_routes_to_bypass_chain() {
+        use crate::config::{GoEnvCache, GoProcessEnv};
+        use deps_core::net_policy::{MapEnv, RegistryAccessPolicy};
+        use std::sync::Arc;
+
+        let env = MapEnv::new().with_var("GOPRIVATE", "git.mycorp.example/*");
+        let ctx = GoParseContext::new(
+            Arc::new(RegistryAccessPolicy::default()),
+            Arc::new(GoEnvCache::new()),
+            None,
+            Arc::new(GoProcessEnv::from_env(&env)),
+        );
+
+        let content = "module example.com/myapp\n\nrequire (\n    git.mycorp.example/internal/lib v1.0.0\n    github.com/gin-gonic/gin v1.9.1\n)\n";
+        let result = parse_go_mod_with_context(content, &test_uri(), &ctx).unwrap();
+
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::AlternateRegistry {
+                index: crate::config::GOPRIVATE_CHAIN_KEY.to_string(),
+                mirrors_crates_io: false,
+            }
+        );
+        assert_eq!(
+            result.dependencies[1].source,
+            deps_core::parser::DependencySource::Registry
+        );
+        assert_eq!(result.resolved_chains.len(), 1);
+    }
+
+    /// #1897: with an exported `GOPROXY`, a checksum-verified public module stays OSV/deps.dev
+    /// eligible while a `GOPRIVATE` module does not.
+    #[test]
+    fn test_parse_go_mod_env_goproxy_keeps_public_modules_public_content() {
+        use crate::config::{GoEnvCache, GoProcessEnv};
+        use crate::formatter::GoFormatter;
+        use deps_core::lsp_helpers::OsvNaming as _;
+        use deps_core::net_policy::{MapEnv, RegistryAccessPolicy};
+        use std::sync::Arc;
+
+        let env = MapEnv::new()
+            .with_var("GOPROXY", "https://goproxy.mycorp.example")
+            .with_var("GOPRIVATE", "git.mycorp.example/*");
+        let ctx = GoParseContext::new(
+            Arc::new(RegistryAccessPolicy::default()),
+            Arc::new(GoEnvCache::new()),
+            None,
+            Arc::new(GoProcessEnv::from_env(&env)),
+        );
+
+        let content = "module example.com/myapp\n\nrequire (\n    git.mycorp.example/internal/lib v1.0.0\n    github.com/gin-gonic/gin v1.9.1\n)\n";
+        let result = parse_go_mod_with_context(content, &test_uri(), &ctx).unwrap();
+
+        assert!(
+            GoFormatter
+                .public_content(&result.dependencies[0])
+                .is_none()
+        );
+        assert!(
+            GoFormatter
+                .public_content(&result.dependencies[1])
+                .is_some()
+        );
     }
 }

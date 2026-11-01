@@ -13,11 +13,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// default (8 MiB on Linux/macOS) rather than `tokio`'s own 2 MiB default.
 ///
 /// Background work — including lock file parsing via `toml_span::parse`,
-/// which has no recursion limit of its own — runs on worker threads inside
-/// `tokio::spawn`. `deps_core::check_toml_nesting_depth` is the primary
-/// defense against a pathologically nested TOML document overflowing the
-/// stack; matching the worker stack size to the main thread is
-/// defense-in-depth on top of that guard, removing the thread-dependent
+/// whose native depth limit (128, `toml-span` 0.7.2 and later) is the safety
+/// backstop — runs on worker threads inside `tokio::spawn`.
+/// `deps_core::check_toml_nesting_depth` adds a stricter policy bound against
+/// a pathologically nested TOML document overflowing the stack; matching the
+/// worker stack size to the main thread is further defense-in-depth on top
+/// of those guards, removing the thread-dependent
 /// exposure asymmetry where identical content was safe on the 8 MiB main
 /// thread but fatal on a 2 MiB worker.
 const WORKER_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;

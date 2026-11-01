@@ -1665,7 +1665,7 @@ where
 /// design that mirrored [`await_license_prefetch`]'s join-before-publish shape for typosquat
 /// too): `run_license_prefetch`'s join is a deliberate tradeoff justified by its four small
 /// tier-3 ecosystems and license violations needing to appear immediately, but typosquat's
-/// fan-out covers all seven major deps.dev ecosystems, can cost up to `2 + 2N`
+/// fan-out covers all eight major deps.dev ecosystems, can cost up to `2 + 2N`
 /// sequential-per-candidate deps.dev round trips per dependency, and its diagnostic is only an
 /// opt-in, best-effort `Severity::Hint` — gating real OSV/outdated diagnostics on it would
 /// violate spec 071 NFR-001. `fetch_timeout` bounds the pre-fetch itself and is taken as

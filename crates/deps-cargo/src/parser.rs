@@ -965,9 +965,8 @@ b = 2
     fn test_parse_cargo_toml_rejects_excessive_nesting() {
         // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
-        // Well past MAX_TOML_NESTING_DEPTH (64) but far below the depth
-        // that would actually overflow the stack, so the guard is what's
-        // being exercised here, not the crash itself.
+        // Well past MAX_TOML_NESTING_DEPTH (64) and toml-span's native limit (128);
+        // the pre-scan rejects it first, so it is what's exercised here.
         let content = format!("a = {}1{}", "[".repeat(300), "]".repeat(300));
         let result = parse_cargo_toml(&content, &test_url());
         assert_matches!(

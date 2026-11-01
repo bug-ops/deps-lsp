@@ -343,10 +343,24 @@ unverified manifest metadata). `deps-lsp` prefers the attested link; when only a
 one exists, the score is still shown but marked `*(self-reported repo)*` — a package could
 otherwise point its metadata at an unrelated, reputable repository and borrow its Scorecard.
 
-**Coverage.** deps.dev covers **npm, Cargo, Go, Maven, PyPI, Bundler, and NuGet** — Composer,
-Dart, and Swift have no deps.dev coverage and issue zero requests for this signal. Gradle and
-Deno's `npm:` specifiers are not covered by this iteration either, though deps.dev's `maven`
-system would cover Gradle coordinates without further mapping work.
+**Coverage.** deps.dev covers **npm, Cargo, Go, Maven, Gradle, PyPI, Bundler, and NuGet** —
+Composer, Dart, and Swift have no deps.dev coverage and issue zero requests for this signal.
+Deno's `npm:` specifiers are not covered by this iteration either. Gradle is looked up in
+deps.dev's `maven` system, exactly like Maven: library coordinates, version-catalog
+`libraries`, and `pluginManagement` plugin markers all map to a `groupId:artifactId` package. A
+plugin that deps.dev does not index (for example a Plugin Portal-only plugin) simply shows no
+section, without a warning.
+
+**Privacy: Gradle coordinates go to deps.dev on hover by default.** Every Gradle dependency
+that resolves against public registry content has its `group:artifact` and resolved version
+sent to deps.dev when you hover it. This includes artifacts of an internal repository declared
+by a plain `repositories { maven { url = ... } }` block without a content filter: such
+dependencies are not distinguishable from public ones, so they stay on the public path
+(Maven behaves the same way today). A dependency whose name contains an unexpanded template
+placeholder (`$group:artifact`) is never sent. To opt out entirely, set
+`supply_chain.enabled` to `false`, which stops the hover Scorecard, provenance and deps.dev
+license lookups. The opt-in `typosquat.enabled` and `gossip.enabled` signals have their own
+gates and, when on, still send the coordinate; turn them off too for no deps.dev traffic.
 
 **Performance.** The fetch runs as a detached background task alongside the dependency's normal
 registry fetch, bounded by a short wait budget on the hover response itself — a slow or

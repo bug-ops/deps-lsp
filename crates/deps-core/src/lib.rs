@@ -307,7 +307,7 @@ pub use package::{
 };
 pub use parser::{
     CheckedTomlError, DependencySource, LoadingState, MAX_JSON_NESTING_DEPTH,
-    MAX_TOML_NESTING_DEPTH, MAX_YAML_EXPANDED_BYTES, MAX_YAML_NESTING_DEPTH,
+    MAX_TOML_NESTING_DEPTH, MAX_YAML_EXPANDED_BYTES, MAX_YAML_NESTING_DEPTH, TomlDepthGuard,
     check_json_nesting_depth, check_toml_nesting_depth, check_yaml_bounds, check_yaml_expansion,
     check_yaml_nesting_depth, json_depth_error_message, parse_json_checked, parse_toml_checked,
     yaml_scalar_string,
