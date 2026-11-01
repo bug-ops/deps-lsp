@@ -2527,10 +2527,10 @@ dev_dependencies:
         let Err(too_deep) = parse_json_checked::<serde_json::Value>(deep.as_bytes()) else {
             panic!("expected a depth rejection");
         };
-        assert!(matches!(
+        assert_matches!(
             too_deep,
             CheckedJsonError::NestingTooDeep { depth: d } if d == depth
-        ));
+        );
         assert_eq!(too_deep.kind(), ParseFailureKind::NestingTooDeep);
         let from_deep = DepsError::from(too_deep);
         assert_eq!(
@@ -2542,7 +2542,7 @@ dev_dependencies:
             panic!("expected a syntax error");
         };
         assert_eq!(syntax.kind(), ParseFailureKind::Malformed);
-        assert!(matches!(DepsError::from(syntax), DepsError::Json(_)));
+        assert_matches!(DepsError::from(syntax), DepsError::Json(_));
     }
 
     #[test]
@@ -2556,10 +2556,10 @@ dev_dependencies:
 
         let over = MAX_JSON_NESTING_DEPTH + 1;
         let over_max = format!("{}1{}", "[".repeat(over), "]".repeat(over));
-        assert!(matches!(
+        assert_matches!(
             parse_json_checked::<serde_json::Value>(over_max.as_bytes()),
             Err(CheckedJsonError::NestingTooDeep { depth }) if depth == over
-        ));
+        );
     }
 
     #[test]
