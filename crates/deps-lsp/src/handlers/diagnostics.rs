@@ -2825,6 +2825,7 @@ dependencies = ["requests>=2.0.0"]
             diagnostics_for_rejected_manifest(EcosystemId::Cargo, "/test/Cargo.toml", content).await
         }
 
+        #[cfg(any(feature = "npm", feature = "composer", feature = "deno"))]
         async fn assert_nesting_too_deep_diagnostic(
             ecosystem_id: EcosystemId,
             path: &str,
@@ -2844,6 +2845,7 @@ dependencies = ["requests>=2.0.0"]
             );
         }
 
+        #[cfg(any(feature = "npm", feature = "composer", feature = "deno"))]
         fn over_nested_json(depth: usize) -> String {
             format!("{}1{}", "[".repeat(depth), "]".repeat(depth))
         }
