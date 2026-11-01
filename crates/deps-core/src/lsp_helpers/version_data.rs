@@ -11,10 +11,14 @@ use super::{
     DependencyOutcome, REGISTRY_FETCH_BUDGET, await_interactive_fetch, candidate_verdict,
     generate_diagnostics_from_cache, latest_verdict, local_cooldown_precedence,
 };
-use super::{DependencyOutcomes, GossipFindings, InteractiveFetchGate};
+use super::{
+    DependencyOutcomes, EcosystemFormatter, GossipFindings, InteractiveFetchGate, LookupMiss,
+};
+use crate::ecosystem::Dependency;
 use crate::error::FetchFailure;
 use crate::licenses::LicensePolicy;
 use crate::osv::{CandidateStatusMap, LatestStatusMap, VulnerabilityMap};
+use crate::parser::DependencySource;
 use crate::{
     ConcreteVersion, DepsDevClient, EcosystemId, LicenseSource, NormalizedName, PackageKey,
     PackageVersions, TyposquatSignal,
@@ -341,6 +345,40 @@ impl<'a> VersionData<'a> {
     pub fn fetch_failure_for(&self, key: &PackageKey) -> Option<&'a FetchFailure> {
         self.outcomes
             .and_then(|outcomes| outcomes.fetch_failure(key.normalized()))
+    }
+
+    /// The recorded [`LookupMiss`] for `key`, regardless of whether it is reportable.
+    #[must_use]
+    pub fn lookup_miss_for(&self, key: &PackageKey) -> Option<LookupMiss> {
+        self.outcomes
+            .and_then(|outcomes| outcomes.lookup_miss(key.normalized()))
+    }
+
+    /// The [`LookupMiss`] for `dep` when it is safe to surface to the user, else `None`.
+    ///
+    /// The single gate shared by diagnostics and inlay hints. It suppresses the miss when
+    /// the session is offline (a stale miss says nothing about the registry), when the
+    /// source cannot be resolved against a registry, and for
+    /// [`DependencySource::AlternateRegistry`] sources, which are opt-in routes that are
+    /// expected to answer 404 for packages they do not mirror.
+    #[must_use]
+    pub fn reportable_lookup_miss(
+        &self,
+        dep: &dyn Dependency,
+        key: &PackageKey,
+        formatter: &dyn EcosystemFormatter,
+    ) -> Option<LookupMiss> {
+        let miss = self.lookup_miss_for(key)?;
+        if self.network.is_offline() {
+            return None;
+        }
+        let source = dep.source();
+        if !formatter.can_resolve_source(&source)
+            || matches!(source, DependencySource::AlternateRegistry { .. })
+        {
+            return None;
+        }
+        Some(miss)
     }
 
     /// Whether the lock file resolved `key`.

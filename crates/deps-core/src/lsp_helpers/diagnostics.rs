@@ -22,8 +22,8 @@ use crate::{
 
 use super::{
     CooldownBlocker, CooldownDisposition, DiagnosticMessages, EcosystemFormatter, LatestVerdict,
-    PackageVersions, RequirementGate, RequirementMatcher, RequirementStatus, VersionData,
-    cooldown_disposition, resolve_scan_outcome, version_range_is_synthetic_empty,
+    LookupMiss, PackageVersions, RequirementGate, RequirementMatcher, RequirementStatus,
+    VersionData, cooldown_disposition, resolve_scan_outcome, version_range_is_synthetic_empty,
 };
 
 /// Stable [`Diagnostic::code`] set on the unsatisfiable-requirement diagnostic.
@@ -2409,8 +2409,11 @@ fn apply_in_use_yanked_rule(
 ///    (deferred, collapsed by [`push_collapsed_fetch_failures`] — R8) rather than
 ///    pushed inline, since a fetch failure is a registry-wide condition that can hit
 ///    many dependencies identically.
-/// 5. `Ok(())` + lock-file version -> nothing (#248; D2: a registry NotFound stays silent).
-/// 6. `Ok(())` + `no_comparable_versions` -> R5e emits nothing (#550): the registry
+/// 5. `Ok(())` + lock-file version + a reportable [`LookupMiss`] (see
+///    [`VersionData::reportable_lookup_miss`]) -> R5f (`NotFound`) or R5g
+///    (`NoComparableVersions`) notice, capped at `Information` severity (#1891); otherwise
+///    nothing (#248: transport failures and unattributed misses stay silent).
+/// 6. `Ok(())` + `NoComparableVersions` without a lock-file version -> R5e emits nothing (#550): the registry
 ///    fetch succeeded and the package demonstrably exists, it just has zero versions
 ///    comparable to the declared requirement (e.g. `dtolnay/rust-toolchain`'s only tag
 ///    `v1` isn't full semver) — reported by neither R5c ("couldn't be asked") nor R5d
@@ -2435,11 +2438,11 @@ fn apply_unknown_package_rule(
                 .and_then(|o| o.fetch_failure(ctx.key.normalized()))
         })
         .flatten();
-    let no_comparable_versions = can_resolve_source
-        && ctx
-            .versions
-            .outcomes
-            .is_some_and(|o| o.no_comparable_versions(ctx.key.normalized()));
+    let lookup_miss = ctx
+        .versions
+        .reportable_lookup_miss(dep, ctx.key, ctx.formatter);
+    let no_comparable_versions =
+        ctx.versions.lookup_miss_for(ctx.key) == Some(LookupMiss::NoComparableVersions);
     match ctx.formatter.validate_package_name(dep.name().as_str()) {
         Err(reason) if !in_lockfile => {
             diagnostics.push(
@@ -2476,10 +2479,26 @@ fn apply_unknown_package_rule(
                 failure: fetch_failure.cloned(),
             });
         }
-        // TODO(#1891): registry NotFound with a lockfile version stays silent (#248); needs a
-        // not-found outcome channel (follow-up to #1884)
-        Ok(()) if in_lockfile => {}
-        Ok(()) if no_comparable_versions => {}
+        Ok(()) if in_lockfile => {
+            if let Some(miss) = lookup_miss {
+                let name = redact_name_for_diagnostic(dep.name());
+                let message = match miss {
+                    LookupMiss::NotFound => {
+                        format!("'{name}' not found in the registry; lock-file version in use")
+                    }
+                    LookupMiss::NoComparableVersions => {
+                        format!(
+                            "No registry version of '{name}' is comparable; lock-file version in use"
+                        )
+                    }
+                };
+                diagnostics.push(
+                    Diagnostic::new(DiagnosticKind::Notice, dep.name_range(), message)
+                        .with_severity(ctx.severities.unknown.max(Severity::Information)),
+                );
+            }
+        }
+        Ok(()) if can_resolve_source && no_comparable_versions => {}
         Ok(()) if can_resolve_source => {
             diagnostics.push(
                 Diagnostic::new(
@@ -3895,7 +3914,7 @@ mod tests {
     /// comparable versions (e.g. `dtolnay/rust-toolchain`, whose only tag `v1` isn't
     /// full semver, so `GithubActionsRegistry::get_versions` returns `Ok(vec![])`) must
     /// not be reported "Unknown package" — the package demonstrably exists; there is
-    /// simply nothing derivable from it. No cache entry AND no `no_comparable_versions`
+    /// simply nothing derivable from it. No cache entry AND no lookup-miss
     /// outcome would still (correctly) produce "Unknown package" — this asserts the
     /// outcome alone suppresses it.
     #[test]
@@ -3916,8 +3935,10 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let outcomes = DependencyOutcomes::new()
-            .with_no_comparable_versions(crate::NormalizedName::for_test("dtolnay/rust-toolchain"));
+        let outcomes = DependencyOutcomes::new().with_lookup_miss(
+            crate::NormalizedName::for_test("dtolnay/rust-toolchain"),
+            LookupMiss::NoComparableVersions,
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -3933,6 +3954,174 @@ mod tests {
             diagnostics.is_empty(),
             "expected no diagnostic for a package with no comparable versions, got: {diagnostics:?}"
         );
+    }
+
+    /// #1891: diagnostics for one dependency, optionally present in the lock file, given the
+    /// recorded lookup miss, source, network mode and configured `unknown` severity.
+    fn lookup_miss_diagnostics(
+        miss: Option<LookupMiss>,
+        in_lockfile: bool,
+        source: crate::parser::DependencySource,
+        network: crate::NetworkMode,
+        unknown: Severity,
+    ) -> Vec<Diagnostic> {
+        let name = crate::NormalizedName::for_test("locked-pkg");
+        let parse_result = MockMixedParseResult {
+            deps: vec![Box::new(MockSourcedDep {
+                inner: MockDep {
+                    name: "locked-pkg".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 10)),
+                },
+                source,
+            })],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = if in_lockfile {
+            HashMap::from([(name.clone(), crate::ConcreteVersion::new("1.0.0"))])
+        } else {
+            HashMap::new()
+        };
+        let mut outcomes = DependencyOutcomes::new();
+        if let Some(miss) = miss {
+            outcomes = outcomes.with_lookup_miss(name, miss);
+        }
+        generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_outcomes(&outcomes)
+                .with_network(network),
+            &MOCK_FORMATTER,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities {
+                unknown,
+                ..DiagnosticSeverities::default()
+            },
+            PublishTime::now(),
+        )
+    }
+
+    fn registry_source() -> crate::parser::DependencySource {
+        crate::parser::DependencySource::Registry
+    }
+
+    #[test]
+    fn test_lockfile_lookup_miss_emits_notice_per_kind() {
+        let not_found = lookup_miss_diagnostics(
+            Some(LookupMiss::NotFound),
+            true,
+            registry_source(),
+            crate::NetworkMode::Online,
+            Severity::Warning,
+        );
+        assert_eq!(not_found.len(), 1, "{not_found:?}");
+        assert_eq!(
+            not_found[0].message(),
+            "'locked-pkg' not found in the registry; lock-file version in use"
+        );
+
+        let no_comparable = lookup_miss_diagnostics(
+            Some(LookupMiss::NoComparableVersions),
+            true,
+            registry_source(),
+            crate::NetworkMode::Online,
+            Severity::Warning,
+        );
+        assert_eq!(no_comparable.len(), 1, "{no_comparable:?}");
+        assert_eq!(
+            no_comparable[0].message(),
+            "No registry version of 'locked-pkg' is comparable; lock-file version in use"
+        );
+    }
+
+    #[test]
+    fn test_lockfile_without_lookup_miss_stays_silent() {
+        let diagnostics = lookup_miss_diagnostics(
+            None,
+            true,
+            registry_source(),
+            crate::NetworkMode::Online,
+            Severity::Warning,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn test_lockfile_lookup_miss_suppressed_for_alternate_registry_and_offline() {
+        let alternate = crate::parser::DependencySource::AlternateRegistry {
+            index: "https://index.example.internal".to_string(),
+            mirrors_crates_io: false,
+        };
+        assert!(
+            lookup_miss_diagnostics(
+                Some(LookupMiss::NotFound),
+                true,
+                alternate,
+                crate::NetworkMode::Online,
+                Severity::Warning,
+            )
+            .is_empty()
+        );
+        assert!(
+            lookup_miss_diagnostics(
+                Some(LookupMiss::NotFound),
+                true,
+                registry_source(),
+                crate::NetworkMode::Offline,
+                Severity::Warning,
+            )
+            .iter()
+            .all(|d| !d.message().contains("lock-file version in use"))
+        );
+    }
+
+    #[test]
+    fn test_lockfile_lookup_miss_severity_is_capped_at_information() {
+        for (configured, expected) in [
+            (Severity::Error, Severity::Information),
+            (Severity::Warning, Severity::Information),
+            (Severity::Information, Severity::Information),
+            (Severity::Hint, Severity::Hint),
+        ] {
+            let diagnostics = lookup_miss_diagnostics(
+                Some(LookupMiss::NotFound),
+                true,
+                registry_source(),
+                crate::NetworkMode::Online,
+                configured,
+            );
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(
+                diagnostics[0].severity,
+                Some(expected),
+                "configured {configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_lockfile_no_comparable_versions_stays_silent_but_not_found_is_unknown() {
+        let no_comparable = lookup_miss_diagnostics(
+            Some(LookupMiss::NoComparableVersions),
+            false,
+            registry_source(),
+            crate::NetworkMode::Online,
+            Severity::Warning,
+        );
+        assert!(no_comparable.is_empty(), "{no_comparable:?}");
+
+        let not_found = lookup_miss_diagnostics(
+            Some(LookupMiss::NotFound),
+            false,
+            registry_source(),
+            crate::NetworkMode::Online,
+            Severity::Warning,
+        );
+        assert_eq!(not_found.len(), 1);
+        assert_eq!(not_found[0].message(), "Unknown package 'locked-pkg'");
     }
 
     /// Shared fixture for the `declaration_key`-redaction test family below (#993 M3): builds a

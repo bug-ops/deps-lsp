@@ -249,6 +249,9 @@ line, so `deps-lsp` cannot detect it from your files; you opt in with a setting:
 |---|---|
 | `"disabled"` (default) | `url:` dependencies show source-control tags, as before |
 | `"replace"` | an eligible `url:` dependency is looked up in your default registry and, if it is registered there, shown with the registry's versions |
+| `"from_xcode"` | follows Xcode's `IDEPackageDependencySCMToRegistryTransformation` default (macOS): only `useRegistryIdentityAndSources` behaves like `"replace"` |
+
+`"from_xcode"` reads the Xcode default once, in the background, when the server starts; open documents are re-parsed when the read finishes. Changing the Xcode setting later needs a server restart. `deps-cli` waits up to 3 seconds for the read before parsing.
 
 Take this manifest, with `swift_scm_to_registry` set to `"replace"` and a default registry in your
 user-level `registries.json`:

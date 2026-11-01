@@ -38,6 +38,54 @@ use std::path::Path;
 /// work per parse (CWE-400).
 pub const MAX_CONFIG_ANCESTOR_DEPTH: usize = 64;
 
+/// Directory basenames pruned from every bounded directory walk, before `.gitignore`/`.ignore`
+/// are ever consulted (issue #1109).
+///
+/// `.gitignore` was doing double duty in `deps-cli`'s walk: attacker-controlled suppression
+/// *and* the only thing keeping `node_modules/`, `target/`, `vendor/`, ... out of the scan. This
+/// denylist restores the pruning without reintroducing attacker control: it is baked into the
+/// binary, so a scanned repository cannot influence it. Shared with `deps-npm`'s pnpm workspace
+/// member walk so both agree on which trees are never descended into.
+///
+/// Not exhaustive; covers the common heavy dependency/build/VCS directories across the 14
+/// supported ecosystems. Dot-prefixed entries are listed too, so pruning stays uniform for
+/// walks that do descend into dot directories.
+pub const PRUNED_WALK_DIRECTORIES: &[&str] = &[
+    // Version control
+    ".git",
+    ".hg",
+    ".svn",
+    ".bzr",
+    // JavaScript / TypeScript / Deno
+    "node_modules",
+    "bower_components",
+    // Rust
+    "target",
+    // Go / PHP (Composer) / Ruby (Bundler, vendor/bundle)
+    "vendor",
+    // Python
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    // Ruby (Bundler)
+    ".bundle",
+    // Dart
+    ".dart_tool",
+    // Gradle
+    ".gradle",
+    // Swift
+    ".build",
+    "Pods",
+    "DerivedData",
+    // Generic build output, used by several ecosystems (Maven, Dart, npm builds, ...)
+    "dist",
+    "build",
+];
+
 /// Ancestor directories of `start_dir`, inclusive, capped at [`MAX_CONFIG_ANCESTOR_DEPTH`].
 ///
 /// Yields `start_dir` itself first, then each successive parent, stopping at whichever

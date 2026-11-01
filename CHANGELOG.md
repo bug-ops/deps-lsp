@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `DepsDevClient::gossip_findings_batch` and `force_refresh_gossip_findings` take `&[PackageKey]` and return maps keyed by `NormalizedName` (#1896)
 - **deps-core, deps-lsp**: `RefreshEvent::ReparseOpenDocuments` carries a `ParseInputKey`, and `Ecosystem` gains `parse_depends_on` (#1896)
 - **deps-npm, deps-deno, deps-cli**: update edits keep `^`, `~` and `=` instead of writing a bare version, so a `^` range whose latest is in cooldown or flagged no longer takes the exact-pin fallback in `deps update` (#1896)
+- **deps-core, deps-engine, deps-lsp, deps-cli**: `FetchResult` and `DependencyOutcomes` carry a typed `LookupMiss` in place of the `no_comparable_versions` flag, and `PackageStatus::NotFound` carries its `ErrorOrigin` (#1898)
+- **deps-core**: `gossip_findings_for_version` takes a `&PackageKey`, and `PackageRendering`, `RequirementResolution` gain default hooks `format_version_exact_pin`, `format_version_replacing_floor_for` and `requirement_opts_into_prereleases` (#1898)
+- **deps-swift, deps-core**: `ScmSwizzleMode` is the effective swizzle decision type, and `ScmToRegistry` gains `FromXcode` (#1898)
 
 ### Added
 - **deps-npm, deps-cli**: `pnpm-workspace.yaml` catalog entries get hints, diagnostics, hover, completion and updates, and a duplicate default catalog is reported (#1880)
@@ -34,6 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `BlockedHost::reason` names the rule that refused a host (#1872)
 - **deps-core**: `CachedEndpoint::new`, a constant empty-cache constructor (#1872)
 - **deps-core**: `PackageKey`, the declared and normalized spellings of one dependency name behind a single `find_in` lookup (#1874)
+- **deps-npm**: `overrides:` entries in `pnpm-workspace.yaml` are dependencies with hints, diagnostics and update actions, and `check` and `update` treat them as targets (#1898)
+- **deps-npm**: hover on a pnpm catalog entry shows how many workspace packages reference it, from a bounded walk of the `packages:` globs (#1898)
+- **deps-swift**: `registries.swift_scm_to_registry = "from_xcode"` follows Xcode's `IDEPackageDependencySCMToRegistryTransformation` default, read once in the background on macOS (#1898)
 
 ### Changed
 - **deps**: update `Cargo.lock` tokio 1.54.0 to 1.54.1 (RUSTSEC-2026-0384, yanked release) (#1889)
@@ -57,10 +63,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: the update report now also finds the cache entry stored under the normalized name (#1874)
 - **deps-swift, deps-lsp**: a new registry identity answer re-parses only the open Swift documents that reference its repository (#1896)
 - **deps-core**: the package-level deps.dev GOSSIP memo is keyed by normalized package name (#1896)
+- **deps-core**: the version-scoped deps.dev GOSSIP memo is keyed by normalized package name, so case variants share one entry and request (#1898)
+- **deps-npm, deps-deno**: updates keep the precision of a bare partial version (`5` to `6`, `1.2` to `1.3`) instead of writing an exact pin (#1898)
+- **deps-cli**: `deps update` retries a cooldown or vulnerable-latest fallback as an exact pin for npm and deno caret ranges instead of skipping it (#1898)
+- **deps-core, deps-composer, deps-maven, deps-nuget, deps-pypi**: the update code action recognises prerelease opt-ins in Composer stability flags, Maven and NuGet interval bounds and PEP 440 spelling variants (#1898)
 
 ### Fixed
 - **deps-core, deps-npm, deps-deno**: the update code action keeps the requirement operator and offers no prerelease unless the dependency is on one (#1896)
 - **deps-core, deps-cli**: a failed registry fetch for a dependency with a lockfile version publishes a diagnostic and a warning inlay instead of "up to date" (#1896)
+- **deps-core, deps-engine, deps-lsp, deps-cli**: a lock-file dependency whose registry answers 404 or has no comparable version gets a notice and a warning inlay instead of "up to date"; alternate registries, local lock entries and offline stay silent (#1898)
 - **deps-core, deps-nuget, deps-github-actions**: the endpoint breaker opens again for hovers that wait on a background fetch's request (#1872)
 - **deps-core, deps-gitlab-ci**: floor-blocked registry hosts read "is never a registry host" instead of blaming `registries.workspace_registries` (#1872)
 - **deps-core**: the flaky `deps_dev::memo` coalesce tests no longer share a static `Notify` under plain `cargo test` (#1874)

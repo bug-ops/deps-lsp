@@ -5,8 +5,9 @@ use crate::{ConcreteVersion, EcosystemConfig, PackageKey, ParseResult};
 
 use super::diagnostics::{MAX_VERSION_DIAGNOSTIC_CHARS, flagged_detail};
 use super::{
-    EcosystemFormatter, LatestVerdict, RequirementGate, RequirementStatus, SiblingMatchNote,
-    VersionData, in_use_version, latest_verdict, sanitize_and_truncate_for_diagnostic,
+    EcosystemFormatter, LatestVerdict, LookupMiss, RequirementGate, RequirementStatus,
+    SiblingMatchNote, VersionData, in_use_version, latest_verdict,
+    sanitize_and_truncate_for_diagnostic,
 };
 
 /// Sanitizes and caps a version-shaped string (`latest` or `resolved_version`) for
@@ -171,8 +172,33 @@ pub fn generate_inlay_hints(
                 continue;
             }
 
-            // TODO(#1891): a registry NotFound / no-comparable-versions outcome still falls
-            // through to the up-to-date label below.
+            if let Some(resolved) = &resolved_version
+                && let Some(miss) = versions.reportable_lookup_miss(dep, &key, formatter)
+            {
+                let tooltip = match miss {
+                    LookupMiss::NotFound => {
+                        "Package not found in the registry; latest version unknown"
+                    }
+                    LookupMiss::NoComparableVersions => {
+                        "No comparable registry version; latest version unknown"
+                    }
+                };
+                hints.push(InlayHint {
+                    position: version_range.end,
+                    label: InlayHintLabel::String(format!(
+                        "⚠ {}",
+                        sanitize_hint_version(resolved.as_str())
+                    )),
+                    kind: Some(InlayHintKind::TYPE),
+                    tooltip: Some(InlayHintTooltip::String(tooltip.to_string())),
+                    padding_left: Some(true),
+                    padding_right: None,
+                    text_edits: None,
+                    data: None,
+                });
+                continue;
+            }
+
             if let Some(resolved) = &resolved_version
                 && config.show_up_to_date_hints
             {
@@ -1624,6 +1650,96 @@ mod tests {
             vec!["✅ 1.0.0".to_string()]
         );
         assert!(lockfile_no_latest_labels(Some(FetchFailure::NotAttempted), false).is_empty());
+    }
+
+    fn lockfile_labels_with_miss(
+        miss: Option<LookupMiss>,
+        network: crate::NetworkMode,
+        source: crate::parser::DependencySource,
+    ) -> Vec<String> {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            network,
+        };
+        let parse_result = MockMixedParseResult {
+            deps: vec![Box::new(MockSourcedDep {
+                inner: MockDep {
+                    name: "locked-pkg".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 10)).into(),
+                },
+                source,
+            })],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let name = NormalizedName::for_test("locked-pkg");
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::from([(name.clone(), ConcreteVersion::new("1.0.0"))]);
+        let mut outcomes = DependencyOutcomes::new();
+        if let Some(miss) = miss {
+            outcomes = outcomes.with_lookup_miss(name, miss);
+        }
+        generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_outcomes(&outcomes)
+                .with_network(network),
+            crate::LoadingState::Loaded,
+            &config,
+            &MOCK_FORMATTER,
+        )
+        .into_iter()
+        .map(|hint| match hint.label {
+            InlayHintLabel::String(text) => text,
+            InlayHintLabel::LabelParts(_) => panic!("expected string label"),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn test_inlay_hint_lockfile_lookup_miss_shows_warning_marker() {
+        for miss in [LookupMiss::NotFound, LookupMiss::NoComparableVersions] {
+            assert_eq!(
+                lockfile_labels_with_miss(
+                    Some(miss),
+                    crate::NetworkMode::Online,
+                    crate::parser::DependencySource::Registry
+                ),
+                vec!["⚠ 1.0.0".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn test_inlay_hint_lockfile_lookup_miss_suppressed_for_alternate_registry_and_offline() {
+        let alternate = crate::parser::DependencySource::AlternateRegistry {
+            index: "https://index.example.internal".to_string(),
+            mirrors_crates_io: false,
+        };
+        assert_eq!(
+            lockfile_labels_with_miss(
+                Some(LookupMiss::NotFound),
+                crate::NetworkMode::Online,
+                alternate
+            ),
+            vec!["✅ 1.0.0".to_string()]
+        );
+        assert_eq!(
+            lockfile_labels_with_miss(
+                Some(LookupMiss::NotFound),
+                crate::NetworkMode::Offline,
+                crate::parser::DependencySource::Registry
+            ),
+            vec!["📴 1.0.0".to_string()]
+        );
     }
 
     /// Issue #483 I5/SEC-2 (cold, no resolved version): with no cached `latest` and no

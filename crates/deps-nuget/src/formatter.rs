@@ -132,6 +132,21 @@ impl PackageRendering for NuGetFormatter {
 }
 
 impl RequirementResolution for NuGetFormatter {
+    /// A pre-release label on the bare version, or on an interval's lower or exact bound
+    /// (`[1.0.0-beta,)`); upper bounds never opt in.
+    fn requirement_opts_into_prereleases(&self, requirement: BoundedVersionReq<'_>) -> bool {
+        let requirement = requirement.as_str().trim();
+        let lower_bound = match requirement.strip_prefix(['[', '(']) {
+            Some(inner) => inner
+                .split(',')
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches([']', ')']),
+            None => requirement,
+        };
+        crate::version::is_prerelease(lower_bound.trim())
+    }
+
     /// Overridden because the default npm caret/tilde semantics do not apply to NuGet's
     /// interval-notation ranges (`[1.0,2.0)`) and floating patterns (`1.1.*`).
     ///
@@ -1019,5 +1034,30 @@ mod tests {
             "the real NuGetFormatter must suppress the fix for #1390's unexpanded nj_version \
              template placeholder, got {planned:?}"
         );
+    }
+
+    #[test]
+    fn test_requirement_opts_into_prereleases_lower_and_exact_bounds_only() {
+        let opts = |req: &str| {
+            NuGetFormatter.requirement_opts_into_prereleases(
+                BoundedVersionReq::new(&deps_core::VersionReq::new(req)).unwrap(),
+            )
+        };
+        for opted in [
+            "[1.0.0-beta,)",
+            "[2.0.0-rc.1]",
+            "(1.0.0-alpha,2.0.0)",
+            "1.0.0-beta",
+        ] {
+            assert!(opts(opted), "{opted} should opt in");
+        }
+        for stable in [
+            "[1.0.0,2.0.0)",
+            "[1.0.0,2.0.0-beta)",
+            "(,2.0.0-rc.1]",
+            "1.0.0",
+        ] {
+            assert!(!opts(stable), "{stable} should not opt in");
+        }
     }
 }

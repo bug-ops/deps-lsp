@@ -42,16 +42,18 @@ fuzzing = []
 # `deps-engine` (see its own `lsp-responses` feature doc). `deps-lsp` requests it
 # explicitly, directly or via `deps-engine`'s own `lsp-responses`; `deps-cli` never does,
 # keeping `tower-lsp-server` out of its dependency tree.
-lsp-responses = ["dep:tower-lsp-server", "deps-core/lsp-responses"]
+lsp-responses = ["dep:ignore", "dep:tower-lsp-server", "deps-core/lsp-responses"]
 
 [dependencies]
 dashmap = { workspace = true }
 deps-core = { workspace = true }
+globset = { workspace = true }
+ignore = { workspace = true, optional = true }
 node-semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tower-lsp-server = { workspace = true, optional = true }
 tracing = { workspace = true }
 url = { workspace = true }

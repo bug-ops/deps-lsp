@@ -201,7 +201,7 @@ impl PnpmWorkspaceCache {
 /// `catalog:` and `catalog:default` are the same reference (pnpm.io/catalogs: the shorthand is
 /// documented as equivalent to the explicit long form for the default catalog only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CatalogSpecifier<'a> {
+pub(crate) enum CatalogSpecifier<'a> {
     /// `catalog:` or `catalog:default`.
     Default,
     /// `catalog:<name>` for a non-empty, non-`default` `<name>`.
@@ -217,11 +217,19 @@ impl<'a> CatalogSpecifier<'a> {
     /// pending confirmation against pnpm's own specifier-parser source, not verified pnpm
     /// behavior. A trimmed name could only ever resolve something pnpm itself rejects, never
     /// the reverse, so declining to trim is the safe direction either way.
-    fn parse(value: &'a str) -> Option<Self> {
+    pub(crate) fn parse(value: &'a str) -> Option<Self> {
         let name = value.strip_prefix("catalog:")?;
         match name {
             "" | "default" => Some(Self::Default),
             other => Some(Self::Named(other)),
+        }
+    }
+
+    /// The catalog this specifier refers to.
+    pub(crate) fn id(self) -> CatalogId {
+        match self {
+            Self::Default => CatalogId::Default,
+            Self::Named(name) => CatalogId::from_name(name),
         }
     }
 }
@@ -639,10 +647,7 @@ pub fn apply(deps: &mut [NpmDependency], config: Option<&PnpmWorkspaceConfig>) {
         };
 
         let specifier_text = raw.to_string();
-        let id = match specifier {
-            CatalogSpecifier::Default => CatalogId::Default,
-            CatalogSpecifier::Named(name) => CatalogId::from_name(name),
-        };
+        let id = specifier.id();
 
         let (outcome, entry) = resolve(config, &id, dep.name.as_str());
         dep.version_req = match &outcome {

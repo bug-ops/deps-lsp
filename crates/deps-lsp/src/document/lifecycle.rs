@@ -32,7 +32,8 @@ use deps_core::lsp_helpers::{ProbeEffect, ProbePhase};
 use deps_core::policy_config::{FetchTimeout, OsvChecks};
 use deps_engine::classify::fetch::{fetch_latest_versions_parallel, prepare_fetch};
 use deps_engine::classify::resolved::{
-    cached_versions_from_lockfile, dependency_version_map, load_resolved_versions,
+    cached_versions_from_lockfile, dependency_version_map, forget_local_locked_misses,
+    load_resolved_versions,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -381,7 +382,7 @@ async fn run_document_open_background_task(
     tracing::debug!("progress started, fetching versions");
 
     let registry = ecosystem.registry();
-    let fetch_result = fetch_latest_versions_parallel(
+    let mut fetch_result = fetch_latest_versions_parallel(
         ecosystem.ecosystem_id(),
         registry,
         dep_sources,
@@ -396,6 +397,13 @@ async fn run_document_open_background_task(
     )
     .await;
     drop(fetch_permit);
+    forget_local_locked_misses(
+        &mut fetch_result,
+        &domain_uri,
+        &state.lockfile_cache,
+        ecosystem.as_ref(),
+    )
+    .await;
 
     let success = !fetch_result.versions.is_empty();
     tracing::debug!(
@@ -417,8 +425,8 @@ async fn run_document_open_background_task(
         for (name, failure) in fetch_result.fetch_failed {
             outcomes.set_fetch_failure(name, failure);
         }
-        for name in fetch_result.no_comparable_versions {
-            outcomes.set_no_comparable_versions(name);
+        for (name, miss) in fetch_result.lookup_misses {
+            outcomes.set_lookup_miss(name, miss);
         }
         // `collided_names` (spec FR-011) are merged in alongside genuine fetch
         // failures so `generate_diagnostics_from_cache` reports "lookup could not
@@ -2651,7 +2659,7 @@ mod tests {
                 HashMap::new(),
                 HashMap::new(),
                 HashMap::from([(NormalizedName::for_test("serde"), FetchFailure::Transient)]),
-                HashSet::new(),
+                HashMap::new(),
                 Some(FailureSummary::new(
                     std::num::NonZeroUsize::new(1).unwrap(),
                     "network down".to_string(),

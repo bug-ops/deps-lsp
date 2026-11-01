@@ -18,14 +18,14 @@ use deps_core::{
     PublishTime, VersionData,
 };
 use deps_engine::classify::diff::{
-    merge_deprecations_after_fetch, merge_no_comparable_versions_after_fetch,
+    merge_deprecations_after_fetch, merge_lookup_misses_after_fetch,
 };
 use deps_engine::classify::fetch::{
     apply_fetch_outcomes, fetch_latest_versions_parallel, prepare_fetch,
 };
 use deps_engine::classify::license::prefetch_tier3_licenses;
 use deps_engine::classify::osv::{build_latest_check_targets, build_scan_targets};
-use deps_engine::classify::resolved::load_resolved_versions;
+use deps_engine::classify::resolved::{forget_local_locked_misses, load_resolved_versions};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -443,7 +443,7 @@ pub async fn analyze_manifest(
     )
     .await;
 
-    let fetch_result = fetch_latest_versions_parallel(
+    let mut fetch_result = fetch_latest_versions_parallel(
         ecosystem_id,
         ecosystem.registry(),
         prep.dep_sources,
@@ -454,6 +454,13 @@ pub async fn analyze_manifest(
         ctx.policy.cache.max_concurrent_fetches,
         &prep.selection_context,
         Some(&gossip_findings),
+    )
+    .await;
+    forget_local_locked_misses(
+        &mut fetch_result,
+        &uri,
+        &ctx.lockfile_cache,
+        ecosystem.as_ref(),
     )
     .await;
     let post_fetch_report = deps_engine::probe::run_background_probes(
@@ -480,11 +487,7 @@ pub async fn analyze_manifest(
         collided_names,
     );
     merge_deprecations_after_fetch(&mut outcomes, &fetched_names, fetch_result.deprecations);
-    merge_no_comparable_versions_after_fetch(
-        &mut outcomes,
-        &attempted_names,
-        fetch_result.no_comparable_versions,
-    );
+    merge_lookup_misses_after_fetch(&mut outcomes, &attempted_names, fetch_result.lookup_misses);
     let cached_versions = fetch_result.versions;
     // Tier-1 license backfill (issue #660/#661 precedent): populated for native-list
     // ecosystems (PyPI, Composer) whose registry response carries a license field.

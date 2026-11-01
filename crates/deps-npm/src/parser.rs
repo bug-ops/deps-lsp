@@ -54,6 +54,10 @@ pub struct NpmParseResult {
     /// the default catalog twice (a top-level `catalog:` and `catalogs.default:`), which pnpm
     /// rejects for the whole workspace (spec 078 FR-030). Always `None` for a `package.json`.
     pub duplicate_default_catalog: Option<deps_core::position::Range>,
+    /// Where the workspace is rooted and which directories its `packages:` globs select, for a
+    /// parsed `pnpm-workspace.yaml` with a filesystem location (#1878). Always `None` for a
+    /// `package.json`.
+    pub workspace_members: Option<crate::workspace_members::WorkspaceMembers>,
 }
 
 /// The `.npmrc`-derived registry bookkeeping of one parse, as returned by
@@ -190,6 +194,7 @@ pub fn parse_package_json_with_context(
         rejected_registries: registries.rejected,
         dependency_truncation: budget.truncation(),
         duplicate_default_catalog: None,
+        workspace_members: None,
     })
 }
 
@@ -206,7 +211,7 @@ pub fn parse_package_json_with_context(
 /// validation — left unguarded, `untitled:package.json` would resolve `manifest_dir` to a
 /// *relative* path, and discovery would probe the server process's own CWD instead of the
 /// document's workspace. Both `.npmrc` resolution and the catalog gate share this guard.
-fn manifest_directory(uri: &Url) -> Option<std::path::PathBuf> {
+pub(crate) fn manifest_directory(uri: &Url) -> Option<std::path::PathBuf> {
     deps_core::lockfile::resolve_manifest_file_path(uri)
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
 }
@@ -571,8 +576,8 @@ mod tests {
     fn section_of(dep: &NpmDependency) -> NpmDependencySection {
         match &dep.origin {
             NpmDependencyOrigin::Manifest { section, .. } => *section,
-            NpmDependencyOrigin::CatalogEntry { .. } => {
-                panic!("expected a package.json dependency, got a catalog entry")
+            NpmDependencyOrigin::CatalogEntry { .. } | NpmDependencyOrigin::Override { .. } => {
+                panic!("expected a package.json dependency, got a pnpm-workspace.yaml entry")
             }
         }
     }

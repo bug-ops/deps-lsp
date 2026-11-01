@@ -698,6 +698,96 @@ mod catalog_duplicate_reporting {
     }
 }
 
+/// #1891: a 404 from an opt-in alternate registry (here an `.npmrc` registry served by
+/// `mockito`) is expected for packages the registry does not mirror, so a lock-file
+/// dependency stays silent. The reportable not-found path for the default registries is
+/// covered by the `deps-engine` fold and `deps-core` diagnostics tests.
+mod alternate_registry_not_found_with_lockfile {
+    use super::*;
+    use deps_core::policy_config::{
+        DiagnosticsConfig, RegistriesConfig, WorkspaceRegistriesSetting,
+    };
+
+    #[tokio::test]
+    async fn lockfile_dependency_with_alternate_registry_404_stays_silent() {
+        let mut server = mockito::Server::new_async().await;
+        let _packument = server
+            .mock("GET", "/left-pad-private")
+            .with_status(404)
+            .create_async()
+            .await;
+        let host = server.host_with_port();
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            dir.path().join(".npmrc"),
+            format!("registry=http://{host}/\n"),
+        )
+        .expect("write npmrc");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"fixture","version":"1.0.0","dependencies":{"left-pad-private":"^1.0.0"}}"#,
+        )
+        .expect("write package.json");
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{"name":"fixture","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"fixture","version":"1.0.0","dependencies":{"left-pad-private":"^1.0.0"}},"node_modules/left-pad-private":{"version":"1.2.0"}}}"#,
+        )
+        .expect("write package-lock.json");
+
+        let policy = PolicyConfig {
+            diagnostics: DiagnosticsConfig::new().with_vulnerabilities_enabled(false),
+            registries: RegistriesConfig::new()
+                .with_workspace_registries(WorkspaceRegistriesSetting::All),
+            ..PolicyConfig::default()
+        };
+        let env = MapEnv::new().with_var(
+            "DEPS_LSP_PRIVATE_REGISTRY_HOSTS",
+            host.split(':').next().expect("host"),
+        );
+        let runtime = EcosystemRuntime::from_policy(&policy, &RegistryEnvironment::read(&env));
+        let cache = Arc::new(HttpCache::with_policy(Arc::clone(&runtime.policy)));
+        let registry = EcosystemRegistry::new();
+        let _ = register_ecosystems(&registry, Arc::clone(&cache), &runtime);
+        let ctx = CheckContext {
+            cache: Arc::clone(&cache),
+            osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
+            deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
+            lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            policy,
+        };
+
+        let outcome = walk::walk(
+            &[dir.path().to_path_buf()],
+            &registry,
+            walk::GitignorePolicy::Ignore,
+            walk::SymlinkPolicy::Skip,
+        );
+        let mut messages = Vec::new();
+        for manifest in outcome.manifests() {
+            let content = std::fs::read_to_string(&manifest.path).expect("read manifest");
+            let result = check_manifest(
+                &manifest.ecosystem,
+                &manifest.uri_path,
+                &manifest.display_path,
+                &content,
+                &ctx,
+            )
+            .await
+            .expect("check_manifest");
+            messages.extend(result.findings.into_iter().map(|f| f.message));
+        }
+
+        _packument.assert_async().await;
+        assert!(
+            messages
+                .iter()
+                .all(|m| !m.contains("not found in the registry")),
+            "{messages:?}"
+        );
+    }
+}
+
 /// Specs 086 FR-030 / 088 FR-019: the stderr notes about unanswered probes and incomplete
 /// identity lookups, and the policy for when each is printed.
 mod probe_notes {

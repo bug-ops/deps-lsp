@@ -919,6 +919,8 @@ dependencies = [
  "criterion",
  "dashmap",
  "deps-core",
+ "globset",
+ "ignore",
  "mockito",
  "node-semver",
  "serde",

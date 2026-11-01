@@ -11,7 +11,9 @@
 use crate::progress::ProgressSender;
 use deps_core::ConcreteVersion;
 use deps_core::Deprecation;
+use deps_core::ErrorOrigin;
 use deps_core::FetchFailure;
+use deps_core::LookupMiss;
 use deps_core::NormalizedName;
 use deps_core::PackageKey;
 use deps_core::PackageVersions;
@@ -262,12 +264,12 @@ pub struct FetchResult {
     /// package doesn't exist" from "the registry couldn't be asked" instead
     /// of conflating both into a misleading "Unknown package" diagnostic.
     pub fetch_failed: HashMap<NormalizedName, FetchFailure>,
-    /// Packages whose registry fetch succeeded but produced zero comparable versions
-    /// (#550), keyed by normalized package name. Distinct from `fetch_failed`: the registry was
-    /// successfully asked and the package demonstrably exists — it just has nothing a
-    /// version-comparison rule can use — so `generate_diagnostics_from_cache` must
-    /// report neither "Registry lookup failed" nor "Unknown package" for it.
-    pub no_comparable_versions: HashSet<NormalizedName>,
+    /// Packages whose registry lookup was answered but yielded no usable version, keyed by
+    /// normalized package name (#550, #1891). Distinct from `fetch_failed`: the registry was
+    /// successfully asked. [`LookupMiss::NoComparableVersions`] means the package exists but
+    /// nothing is comparable; [`LookupMiss::NotFound`] is recorded only for a 404 attributed
+    /// to the endpoint itself ([`ErrorOrigin::Endpoint`]), never for a locally raised miss.
+    pub lookup_misses: HashMap<NormalizedName, LookupMiss>,
     /// Toast-ready summary of this round's failures, or `None` when every package either
     /// resolved or fetched cleanly with no comparable versions. Replaces the previously
     /// independent `failed_count`/`first_error` field pair (#480, #490): both bugs were
@@ -354,14 +356,14 @@ impl FetchResult {
     ///
     /// ```
     /// use deps_engine::classify::fetch::FetchResult;
-    /// use std::collections::{HashMap, HashSet};
+    /// use std::collections::HashMap;
     ///
     /// let result = FetchResult::new(
     ///     HashMap::new(),
     ///     HashMap::new(),
     ///     HashMap::new(),
     ///     HashMap::new(),
-    ///     HashSet::new(),
+    ///     HashMap::new(),
     ///     None,
     ///     HashMap::new(),
     /// );
@@ -373,7 +375,7 @@ impl FetchResult {
     /// share the same `HashMap<NormalizedName, _>`/`HashSet<NormalizedName>` shape):
     /// `versions` (successful fetches), `yanked_versions` (yank findings),
     /// `deprecations` (package-level deprecation findings), `fetch_failed` (errored/timed-out
-    /// packages), `no_comparable_versions` (fetched clean but nothing to compare),
+    /// packages), `lookup_misses` (answered, but no usable version),
     /// `failure_summary`, `licenses`.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -382,7 +384,7 @@ impl FetchResult {
         yanked_versions: HashMap<NormalizedName, (ConcreteVersion, RemovalStatus)>,
         deprecations: HashMap<NormalizedName, Deprecation>,
         fetch_failed: HashMap<NormalizedName, FetchFailure>,
-        no_comparable_versions: HashSet<NormalizedName>,
+        lookup_misses: HashMap<NormalizedName, LookupMiss>,
         failure_summary: Option<FailureSummary>,
         licenses: HashMap<NormalizedName, Vec<String>>,
     ) -> Self {
@@ -391,10 +393,18 @@ impl FetchResult {
             yanked_versions,
             deprecations,
             fetch_failed,
-            no_comparable_versions,
+            lookup_misses,
             failure_summary,
             licenses,
         }
+    }
+
+    /// Drops the recorded [`LookupMiss`] for every name in `names`.
+    ///
+    /// Used for packages whose lock entry is not registry-served (a workspace link, a git
+    /// checkout): the registry answering 404 for them says nothing about the locked version.
+    pub fn forget_lookup_misses(&mut self, names: &HashSet<NormalizedName>) {
+        self.lookup_misses.retain(|name, _| !names.contains(name));
     }
 
     /// Total packages whose fetch did not succeed this round (mirrors the old
@@ -618,7 +628,7 @@ pub async fn fetch_latest_versions_parallel(
     let mut yanked_versions = HashMap::new();
     let mut fetch_failed = HashMap::new();
     let mut deprecations = HashMap::new();
-    let mut no_comparable_versions = HashSet::new();
+    let mut lookup_misses = HashMap::new();
     let mut licenses = HashMap::new();
     let mut failed_count: usize = 0;
     // `fallback_message`'s tie-break among multiple not-found-only packages is completion
@@ -650,9 +660,12 @@ pub async fn fetch_latest_versions_parallel(
                 versions.insert(name, v);
             }
             PackageStatus::NoComparableVersions => {
-                no_comparable_versions.insert(name);
+                lookup_misses.insert(name, LookupMiss::NoComparableVersions);
             }
-            PackageStatus::NotFound { message } => {
+            PackageStatus::NotFound { message, origin } => {
+                if origin == ErrorOrigin::Endpoint {
+                    lookup_misses.insert(name, LookupMiss::NotFound);
+                }
                 failed_count += 1;
                 if fallback_message.is_none() {
                     fallback_message = Some(message);
@@ -685,7 +698,7 @@ pub async fn fetch_latest_versions_parallel(
         yanked_versions,
         deprecations,
         fetch_failed,
-        no_comparable_versions,
+        lookup_misses,
         failure_summary,
         licenses,
     }
@@ -717,7 +730,12 @@ enum PackageStatus {
     NoComparableVersions,
     /// The registry answered "no such package" (#267 C1) — never counted in
     /// [`FetchResult::fetch_failed`], but still counted toward the batch's failure total.
-    NotFound { message: String },
+    /// `origin` says whether the endpoint itself answered, which decides whether the miss
+    /// is recorded as [`LookupMiss::NotFound`] (#1891).
+    NotFound {
+        message: String,
+        origin: ErrorOrigin,
+    },
     /// The fetch (or its fallback) errored for a reason other than not-found, or timed out.
     Failed {
         failure: FetchFailure,
@@ -1026,6 +1044,7 @@ async fn fetch_and_classify_package(
             if e.is_not_found() {
                 PackageStatus::NotFound {
                     message: e.to_string(),
+                    origin: e.origin(),
                 }
             } else {
                 PackageStatus::Failed {
@@ -1222,6 +1241,7 @@ async fn get_latest_matching_fallback(
             if e.is_not_found() {
                 Pick::Unresolved(PackageStatus::NotFound {
                     message: e.to_string(),
+                    origin: e.origin(),
                 })
             } else {
                 Pick::Unresolved(PackageStatus::Failed {
@@ -3033,7 +3053,27 @@ mod tests {
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
 
-        struct NotFoundRegistry;
+        struct NotFoundRegistry {
+            at_endpoint: bool,
+        }
+
+        impl NotFoundRegistry {
+            fn error(&self, name: &str) -> deps_core::error::DepsError {
+                if self.at_endpoint {
+                    deps_core::not_found_or(
+                        deps_core::error::DepsError::HttpStatus {
+                            url: "https://registry.example/x".into(),
+                            status: 404,
+                        },
+                        name,
+                        "mock",
+                        &[],
+                    )
+                } else {
+                    deps_core::error::DepsError::not_found_locally(name, "mock")
+                }
+            }
+        }
 
         impl Registry for NotFoundRegistry {
             fn get_versions<'a>(
@@ -3041,12 +3081,7 @@ mod tests {
                 name: &'a deps_core::PackageName,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
-                Box::pin(async move {
-                    Err(deps_core::error::DepsError::not_found_locally(
-                        name.as_str(),
-                        "mock",
-                    ))
-                })
+                Box::pin(async move { Err(self.error(name.as_str())) })
             }
 
             fn get_latest_matching<'a>(
@@ -3056,12 +3091,7 @@ mod tests {
                 _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
-                Box::pin(async move {
-                    Err(deps_core::error::DepsError::not_found_locally(
-                        name.as_str(),
-                        "mock",
-                    ))
-                })
+                Box::pin(async move { Err(self.error(name.as_str())) })
             }
 
             fn search_raw<'a>(
@@ -3078,41 +3108,51 @@ mod tests {
             }
         }
 
-        let registry: Arc<dyn Registry> = Arc::new(NotFoundRegistry);
-        let packages = vec![PackageName::new("typo-pkg")];
+        for at_endpoint in [false, true] {
+            let registry: Arc<dyn Registry> = Arc::new(NotFoundRegistry { at_endpoint });
+            let packages = vec![PackageName::new("typo-pkg")];
 
-        let result = fetch_latest_versions_parallel(
-            deps_core::EcosystemId::Cargo,
-            registry,
-            with_registry_source(packages),
-            &HashMap::new(),
-            None,
-            deps_core::freshness::FreshnessSettings::default(),
-            secs(5),
-            conc(10),
-            &SelectionContext::none(),
-            None,
-        )
-        .await;
+            let result = fetch_latest_versions_parallel(
+                deps_core::EcosystemId::Cargo,
+                registry,
+                with_registry_source(packages),
+                &HashMap::new(),
+                None,
+                deps_core::freshness::FreshnessSettings::default(),
+                secs(5),
+                conc(10),
+                &SelectionContext::none(),
+                None,
+            )
+            .await;
 
-        assert!(result.versions.is_empty());
-        assert!(
-            result.fetch_failed.is_empty(),
-            "a genuine not-found must not be recorded in fetch_failed, or \
+            assert!(result.versions.is_empty());
+            assert!(
+                result.fetch_failed.is_empty(),
+                "a genuine not-found must not be recorded in fetch_failed, or \
              generate_diagnostics_from_cache would report it as a registry \
              error instead of Unknown package"
-        );
+            );
+            assert_eq!(
+                result
+                    .lookup_misses
+                    .get(&NormalizedName::for_test("typo-pkg")),
+                at_endpoint.then_some(&LookupMiss::NotFound),
+                "only a not-found attributed to the endpoint is a reportable lookup miss"
+            );
+            assert_eq!(result.failed_count(), 1);
+        }
     }
 
     /// Regression for #550: a registry fetch that genuinely succeeds (no error at
     /// either the list-based pick or the `get_latest_matching` fallback) but resolves
-    /// to zero versions must be recorded in `no_comparable_versions`, distinct from
+    /// to zero versions must be recorded in `lookup_misses`, distinct from
     /// both a normal successful fetch (`versions`) and a real failure
     /// (`fetch_failed`). Mirrors `GithubActionsRegistry::get_versions("dtolnay/rust-toolchain")`,
     /// whose sole tag `v1` doesn't parse as full semver, so `tags_to_versions` filters
     /// it out and returns `Ok(vec![])`.
     #[tokio::test]
-    async fn test_fetch_success_with_zero_versions_is_recorded_as_no_comparable_versions() {
+    async fn test_fetch_success_with_zero_versions_is_recorded_as_lookup_miss() {
         use deps_core::Registry;
 
         let registry: Arc<dyn Registry> = Arc::new(deps_core::test_util::MockRegistry::new());
@@ -3141,12 +3181,13 @@ mod tests {
         );
         assert!(
             result
-                .no_comparable_versions
-                .contains(&NormalizedName::for_test("dtolnay/rust-toolchain")),
+                .lookup_misses
+                .get(&NormalizedName::for_test("dtolnay/rust-toolchain"))
+                == Some(&LookupMiss::NoComparableVersions),
             "a package whose fetch succeeded with zero comparable versions must be \
-             recorded in no_comparable_versions, or R5 would misreport it as Unknown \
+             recorded in lookup_misses, or R5 would misreport it as Unknown \
              package; got: {:?}",
-            result.no_comparable_versions
+            result.lookup_misses
         );
     }
 

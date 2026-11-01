@@ -173,6 +173,22 @@ impl PackageRendering for PypiFormatter {
 }
 
 impl RequirementResolution for PypiFormatter {
+    /// Any specifier other than `<`, `<=`, `!=` whose PEP 440 version is a pre-release or
+    /// dev release, so `2.0rc1` and `2.0.0rc1` are recognised as the same opt-in.
+    fn requirement_opts_into_prereleases(&self, requirement: BoundedVersionReq<'_>) -> bool {
+        VersionSpecifiers::from_str(requirement.as_str()).is_ok_and(|specs| {
+            specs.iter().any(|spec| {
+                !matches!(
+                    spec.operator(),
+                    Operator::LessThan
+                        | Operator::LessThanEqual
+                        | Operator::NotEqual
+                        | Operator::NotEqualStar
+                ) && spec.version().any_prerelease()
+            })
+        })
+    }
+
     fn version_satisfies_bounded_requirement(
         &self,
         version: &ConcreteVersion,
@@ -780,6 +796,27 @@ mod tests {
                 None,
                 "{invalid:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_requirement_opts_into_prereleases_non_upper_bound_specifiers() {
+        let opts = |req: &str| {
+            PypiFormatter.requirement_opts_into_prereleases(
+                BoundedVersionReq::new(&deps_core::VersionReq::new(req)).unwrap(),
+            )
+        };
+        for opted in [
+            ">=2.0rc1",
+            ">=2.0.0rc1,<3",
+            "==2.0.0b1",
+            "~=2.0a1",
+            ">=2.0.dev1",
+        ] {
+            assert!(opts(opted), "{opted} should opt in");
+        }
+        for stable in [">=2.0,<3.0rc1", "<=2.0rc1", "!=2.0rc1", ">=2.0", "invalid"] {
+            assert!(!opts(stable), "{stable} should not opt in");
         }
     }
 }

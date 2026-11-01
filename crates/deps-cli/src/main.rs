@@ -137,6 +137,8 @@ fn build_runtime_handles(policy: &PolicyConfig, source: &impl EnvSource) -> Runt
     let lockfile_cache = Arc::new(deps_core::lockfile::LockFileCache::new());
     let ecosystem_runtime = EcosystemRuntime::from_policy(policy, &environment)
         .with_lockfile_cache(Arc::clone(&lockfile_cache));
+    #[cfg(feature = "swift")]
+    ecosystem_runtime.wait_for_scm_to_registry();
     let cache = Arc::new(HttpCache::with_policy(Arc::clone(
         &ecosystem_runtime.policy,
     )));

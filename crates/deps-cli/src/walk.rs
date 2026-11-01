@@ -6,6 +6,7 @@
 //! denylist still keeps common dependency/build/VCS trees (`node_modules`, `target`, `vendor`,
 //! ...) out of the scan either way — see [`walk`]'s doc.
 
+use deps_core::fs_probe::PRUNED_WALK_DIRECTORIES as PRUNED_DIRECTORIES;
 use deps_core::{Ecosystem, EcosystemRegistry};
 use ignore::WalkBuilder;
 use std::collections::BTreeSet;
@@ -23,56 +24,6 @@ use std::sync::{Arc, Mutex};
 /// [`WalkOutcome::truncated`] is set so the caller can warn instead of silently
 /// under-reporting.
 pub const MAX_WALKED_FILES: usize = 50_000;
-
-/// Directory basenames pruned from every walk, before `.gitignore`/`.ignore` are ever
-/// consulted (critic follow-up on issue #1109's default flip, S1/S2/S4). `.gitignore` was
-/// doing double duty: attacker-controlled suppression *and* the only thing keeping
-/// `node_modules/`, `target/`, `vendor/`, ... out of the scan; disabling it by default
-/// (see [`walk`]'s doc) removed both. This denylist restores the pruning without
-/// reintroducing attacker control — it is baked into the binary, so a scanned repository has
-/// no way to influence it, unlike a `.gitignore`/`.ignore` file.
-///
-/// Not exhaustive; covers the common heavy dependency/build/VCS directories across this
-/// crate's 14 supported ecosystems. Most VCS and tool-cache directories here (`.git`, `.venv`,
-/// `.gradle`, `.dart_tool`, `.build`, `.bundle`, `.tox`, ...) are already dot-prefixed and
-/// rejected by [`DotDirs::Skip`]; they're listed again so pruning stays uniform regardless of a
-/// given walk's [`DotDirs`] policy (e.g. the ecosystem dot-directory sub-walk, which
-/// descends into dot-prefixed entries).
-const PRUNED_DIRECTORIES: &[&str] = &[
-    // Version control
-    ".git",
-    ".hg",
-    ".svn",
-    ".bzr",
-    // JavaScript / TypeScript / Deno
-    "node_modules",
-    "bower_components",
-    // Rust
-    "target",
-    // Go / PHP (Composer) / Ruby (Bundler, vendor/bundle)
-    "vendor",
-    // Python
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".tox",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    // Ruby (Bundler)
-    ".bundle",
-    // Dart
-    ".dart_tool",
-    // Gradle
-    ".gradle",
-    // Swift
-    ".build",
-    "Pods",
-    "DerivedData",
-    // Generic build output, used by several ecosystems (Maven, Dart, npm builds, ...)
-    "dist",
-    "build",
-];
 
 /// Returns `false` for a directory entry [`ignore::WalkBuilder::filter_entry`] should prune —
 /// its basename is in [`PRUNED_DIRECTORIES`]. Never prunes depth 0 (the walk root itself), so

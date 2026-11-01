@@ -361,3 +361,11 @@ Conceptual only; representation is a plan-phase decision.
 - Closed issues: #587, #590 (catalog resolution and watch), #721 (YAML numeric scalar positions), #1483, #1490 (CWE-400 range caps)
 - [pnpm catalogs](https://pnpm.io/catalogs), [Dependabot catalog support](https://github.blog/changelog/2025-02-04-dependabot-now-supports-pnpm-workspace-catalogs-ga/)
 - Competitor: `mpiton/zed-depsy` v2.1.1, PR #407
+
+## Amendment (#1877, #1878): overrides and catalog usage count
+
+FR-028, D-3 and D-7 are superseded by follow-ups F-1 and F-2, shipped in this change.
+
+- `overrides:` entries are dependencies (`NpmDependencyOrigin::Override`), with hints, diagnostics and update actions. Selector keys follow pnpm's delimiter rule (`/[^ |@]>/`); values `-`, `$ref` and `catalog:` create no dependency. A malformed `overrides` section or a duplicate key drops only that section.
+- Hover on a catalog entry shows "Used by N workspace packages" from a bounded walk of the `packages:` globs: typed `WorkspaceGlob`/`PackageGlob` (no `..`, absolute, empty or `:` components), walk starts at each glob's literal prefix confined to the canonical workspace root, pruned and dot directories skipped, symlinks not followed, caps of 20,000 entries, 1,000 `package.json` files, 1 MiB per manifest and a 2 s deadline (result reads "at least N"), 30 s stale-while-revalidate cache.
+- Known limitation: an override target with a single mismatching lock-file version shows that version as is.

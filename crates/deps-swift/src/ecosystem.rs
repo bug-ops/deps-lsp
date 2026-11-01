@@ -3,7 +3,6 @@
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 use deps_core::diagnostic::{Diagnostic, DiagnosticKind, Severity};
-use deps_core::policy_config::ScmToRegistry;
 use deps_core::{
     ConfigReach, Ecosystem, ParseResult as ParseResultTrait, Registry, Result, WatchedConfig,
     WatchedConfigEffect, is_safe_registry_url,
@@ -29,8 +28,8 @@ use crate::lockfile::SwiftLockParser;
 use crate::parser::SwiftParseResult;
 use crate::registry::SwiftRegistry;
 use crate::scm::{
-    IdentityLookup, MemoKey, ScmLookupUrl, SwiftForm, SwiftOrigin, SwiftRequirementForm,
-    decide_from_memo, identity_pins, parsed_form,
+    IdentityLookup, MemoKey, ScmLookupUrl, ScmSwizzleMode, SwiftForm, SwiftOrigin,
+    SwiftRequirementForm, decide_from_memo, identity_pins, parsed_form,
 };
 use crate::scm_memo::{Freshness, ScmIdentityMemo, wait_budget};
 use crate::types::SwiftDependency;
@@ -112,8 +111,8 @@ impl deps_core::lockfile::LockFileProvider for IdentityAwareLockParser {
         parsed: &deps_core::lockfile::ResolvedPackages,
     ) -> Vec<deps_core::lockfile::ResolvedPackage> {
         match self.context.scm_mode() {
-            ScmToRegistry::Replace => {}
-            ScmToRegistry::Disabled => return Vec::new(),
+            ScmSwizzleMode::Replace => {}
+            ScmSwizzleMode::Disabled => return Vec::new(),
         }
         let config = self.context.resolve_user_tier();
         config.trusted_lookup().map_or_else(Vec::new, |lookup| {
@@ -185,8 +184,8 @@ impl SwiftEcosystem {
         };
         let mode = self.context.scm_mode();
         match mode {
-            ScmToRegistry::Replace => {}
-            ScmToRegistry::Disabled => return ProbeReport::default(),
+            ScmSwizzleMode::Replace => {}
+            ScmSwizzleMode::Disabled => return ProbeReport::default(),
         }
         let candidates = eligible_dependencies(parsed);
         if candidates.is_empty() {
@@ -219,7 +218,7 @@ impl SwiftEcosystem {
     /// parser leaves it.
     fn effective_form(
         &self,
-        mode: ScmToRegistry,
+        mode: ScmSwizzleMode,
         lookup: Option<&TrustedLookupRegistry<'_>>,
         dependency: &SwiftDependency,
         scm: &ScmLookupUrl,
@@ -331,8 +330,8 @@ impl SwiftEcosystem {
             return Vec::new();
         };
         match self.context.scm_mode() {
-            ScmToRegistry::Replace => {}
-            ScmToRegistry::Disabled => return Vec::new(),
+            ScmSwizzleMode::Replace => {}
+            ScmSwizzleMode::Disabled => return Vec::new(),
         }
         let config = self.context.resolve_user_tier();
         let Some(lookup) = config.trusted_lookup() else {

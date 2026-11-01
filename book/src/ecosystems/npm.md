@@ -281,6 +281,12 @@ there.
 A syntactically invalid file produces no entry-level findings while you type, and the same size and
 nesting limits as for other YAML manifests apply.
 
+## pnpm Overrides and Catalog Usage
+
+Entries of the `overrides:` section in `pnpm-workspace.yaml` are dependencies like catalog entries: they get hints, diagnostics and update actions, and `deps-cli check` and `update` treat them as targets. A selector key such as `bar>foo@<2` (parent chain, then `name@range`) is split by pnpm's rule: a `>` separates parents only when it does not follow a space, `|` or `@`, so `axios@>=0.8.1 <0.28.0` stays one selector. Values `-`, `$ref` and `catalog:` produce no dependency. **Known limitation**: when the lock file holds a single version of an override target that does not satisfy the override range, that version is shown as is.
+
+Hovering a catalog entry shows `Used by N workspace packages`. The count comes from a bounded walk of the `packages:` globs (no `..`, absolute paths or symlinks, `node_modules`, `target`, `dist`, `vendor` and dot directories skipped; at most 20,000 directory entries, 1,000 `package.json` files, 1 MiB per manifest and 2 seconds). When a bound is reached the hover says `at least N`. The result is cached for 30 seconds and refreshed in the background, so hover never waits for a stale index.
+
 ## Package Name Validation
 
 When a dependency in `package.json` fails to resolve against the npm registry, the diagnostic distinguishes between two cases instead of always reporting "Unknown package":

@@ -1,4 +1,4 @@
-//! Merging a completed registry fetch's deprecation and no-comparable-versions findings
+//! Merging a completed registry fetch's deprecation and lookup-miss findings
 //! into a document's outcome map.
 //!
 //! Extracted from `deps-lsp`'s `document/diff.rs` (issue #1059): both functions here decide
@@ -8,8 +8,8 @@
 
 use deps_core::Deprecation;
 use deps_core::NormalizedName;
-use deps_core::lsp_helpers::DependencyOutcomes;
-use std::collections::{HashMap, HashSet};
+use deps_core::lsp_helpers::{DependencyOutcomes, LookupMiss};
+use std::collections::HashMap;
 
 /// Merges a partial fetch's #205 deprecation findings into `outcomes`' deprecation channel
 /// (incremental didChange path — S1).
@@ -63,8 +63,8 @@ pub fn merge_deprecations_after_fetch(
     }
 }
 
-/// Merges a partial fetch's #550 no-comparable-versions findings into `outcomes`'
-/// corresponding channel (incremental didChange path).
+/// Merges a partial fetch's lookup-miss findings (#550, #1891) into `outcomes`' corresponding
+/// channel (incremental didChange path).
 ///
 /// Package-level, like [`merge_deprecations_after_fetch`] (not tied to the declared
 /// version, unlike `yanked`/`fetch_failure` — see the `diff.version_changed` pruning
@@ -76,38 +76,42 @@ pub fn merge_deprecations_after_fetch(
 /// `attempted_names` — every normalized package name a fetch was actually attempted for this
 /// round (`dep_sources`' keys, captured before it is consumed) — rather than
 /// [`merge_deprecations_after_fetch`]'s `fetched_names` (`fetch_result.versions`'
-/// keys): a no-comparable-versions package is by definition never a member of
-/// `fetch_result.versions`, so deriving "attempted" from that map's keys would miss
-/// every package this function exists to clear or set.
+/// keys): a missed package is by definition never a member of `fetch_result.versions`, so
+/// deriving "attempted" from that map's keys would miss every package this function exists
+/// to clear or set. A name's previous miss is replaced, so `NotFound` and
+/// `NoComparableVersions` can switch between fetches.
 ///
 /// # Examples
 ///
 /// ```
 /// use deps_core::NormalizedName;
-/// use deps_core::lsp_helpers::DependencyOutcomes;
-/// use deps_engine::classify::diff::merge_no_comparable_versions_after_fetch;
-/// use std::collections::HashSet;
+/// use deps_core::lsp_helpers::{DependencyOutcomes, LookupMiss};
+/// use deps_engine::classify::diff::merge_lookup_misses_after_fetch;
+/// use std::collections::HashMap;
 ///
 /// let toolchain = NormalizedName::for_test("dtolnay-rust-toolchain");
 /// let mut outcomes = DependencyOutcomes::new();
-/// let mut fetched = HashSet::new();
-/// fetched.insert(toolchain.clone());
+/// let mut fetched = HashMap::new();
+/// fetched.insert(toolchain.clone(), LookupMiss::NoComparableVersions);
 ///
-/// merge_no_comparable_versions_after_fetch(&mut outcomes, &[toolchain.clone()], fetched);
+/// merge_lookup_misses_after_fetch(&mut outcomes, &[toolchain.clone()], fetched);
 ///
-/// assert!(outcomes.no_comparable_versions(&toolchain));
+/// assert_eq!(
+///     outcomes.lookup_miss(&toolchain),
+///     Some(LookupMiss::NoComparableVersions)
+/// );
 /// ```
-pub fn merge_no_comparable_versions_after_fetch(
+pub fn merge_lookup_misses_after_fetch(
     outcomes: &mut DependencyOutcomes,
     attempted_names: &[NormalizedName],
-    fetched_no_comparable_versions: HashSet<NormalizedName>,
+    fetched_lookup_misses: HashMap<NormalizedName, LookupMiss>,
 ) {
     for name in attempted_names {
-        outcomes.clear_no_comparable_versions(name);
+        outcomes.clear_lookup_miss(name);
     }
     for name in attempted_names {
-        if fetched_no_comparable_versions.contains(name) {
-            outcomes.set_no_comparable_versions(name.clone());
+        if let Some(miss) = fetched_lookup_misses.get(name) {
+            outcomes.set_lookup_miss(name.clone(), *miss);
         }
     }
 }
@@ -202,77 +206,60 @@ mod tests {
         );
     }
 
-    /// Regression for critic finding C3 (#550): `merge_no_comparable_versions_after_fetch`'s
-    /// `found == true` branch (`set_no_comparable_versions`) had zero coverage — mirrors
-    /// `test_merge_deprecations_after_fetch_retains_finding_for_name_not_refetched`, but
-    /// for the *first-time-set* case: a package attempted this round whose fetch
-    /// genuinely found zero comparable versions must be recorded, and an unrelated
-    /// package not attempted this round must be left untouched either way.
+    /// A package attempted this round whose lookup missed must be recorded, and an
+    /// unrelated package not attempted this round must be left untouched.
     #[test]
-    fn test_merge_no_comparable_versions_after_fetch_sets_finding_for_newly_flagged_name() {
+    fn test_merge_lookup_misses_after_fetch_sets_finding_for_newly_flagged_name() {
         let mut outcomes = DependencyOutcomes::new();
+        let mut fetched = HashMap::new();
+        fetched.insert(name("vendor/b"), LookupMiss::NoComparableVersions);
+        merge_lookup_misses_after_fetch(&mut outcomes, &[name("vendor/b")], fetched);
 
-        // "vendor/b" was attempted this round (e.g. a new dependency added by the
-        // edit) and its fetch genuinely succeeded with zero comparable versions;
-        // "vendor/a" was not attempted at all.
-        let mut fetched = HashSet::new();
-        fetched.insert(name("vendor/b"));
-        merge_no_comparable_versions_after_fetch(&mut outcomes, &[name("vendor/b")], fetched);
-
-        assert!(
-            outcomes.no_comparable_versions(&name("vendor/b")),
-            "a package whose fetch was attempted and found zero comparable versions \
-             this round must be recorded"
+        assert_eq!(
+            outcomes.lookup_miss(&name("vendor/b")),
+            Some(LookupMiss::NoComparableVersions)
         );
-        assert!(
-            !outcomes.no_comparable_versions(&name("vendor/a")),
-            "a package never attempted this round must not be flagged"
+        assert_eq!(outcomes.lookup_miss(&name("vendor/a")), None);
+    }
+
+    /// A package that later resolves a real version must have its stale miss cleared.
+    #[test]
+    fn test_merge_lookup_misses_after_fetch_clears_finding_when_refetched_with_versions() {
+        let mut outcomes = DependencyOutcomes::new();
+        outcomes.set_lookup_miss(name("vendor/a"), LookupMiss::NotFound);
+
+        merge_lookup_misses_after_fetch(&mut outcomes, &[name("vendor/a")], HashMap::new());
+
+        assert_eq!(outcomes.lookup_miss(&name("vendor/a")), None);
+    }
+
+    /// A finding for a name not attempted this round must survive untouched.
+    #[test]
+    fn test_merge_lookup_misses_after_fetch_retains_finding_for_name_not_attempted() {
+        let mut outcomes = DependencyOutcomes::new();
+        outcomes.set_lookup_miss(name("vendor/a"), LookupMiss::NotFound);
+
+        merge_lookup_misses_after_fetch(&mut outcomes, &[name("vendor/b")], HashMap::new());
+
+        assert_eq!(
+            outcomes.lookup_miss(&name("vendor/a")),
+            Some(LookupMiss::NotFound)
         );
     }
 
-    /// Regression for critic finding C3 (#550): the literal "package no longer has
-    /// zero-comparable-versions on a subsequent fetch" scenario — e.g.
-    /// `dtolnay/rust-toolchain` eventually publishes a real `v1.2.3` tag. Mirrors
-    /// `test_merge_deprecations_after_fetch_clears_finding_when_refetched_clean`.
+    /// The previous miss kind is replaced when the next fetch reports the other kind.
     #[test]
-    fn test_merge_no_comparable_versions_after_fetch_clears_finding_when_refetched_with_versions() {
+    fn test_merge_lookup_misses_after_fetch_switches_kind() {
         let mut outcomes = DependencyOutcomes::new();
-        outcomes.set_no_comparable_versions(name("vendor/a"));
+        outcomes.set_lookup_miss(name("vendor/a"), LookupMiss::NotFound);
+        let mut fetched = HashMap::new();
+        fetched.insert(name("vendor/a"), LookupMiss::NoComparableVersions);
 
-        // "vendor/a" was re-fetched this round and this time resolved a real
-        // version, so it's absent from the fetched-flags set.
-        merge_no_comparable_versions_after_fetch(
-            &mut outcomes,
-            &[name("vendor/a")],
-            HashSet::new(),
-        );
+        merge_lookup_misses_after_fetch(&mut outcomes, &[name("vendor/a")], fetched);
 
-        assert!(
-            !outcomes.no_comparable_versions(&name("vendor/a")),
-            "a package that was attempted and this time resolved a real version must \
-             have its stale marker cleared, or R5e would keep suppressing Unknown \
-             package diagnostics for a name that could now legitimately need one"
-        );
-    }
-
-    /// A finding for a name not attempted this round (e.g. an unrelated dependency
-    /// untouched by a partial didChange fetch) must survive untouched — distinct
-    /// from the clear-on-refetch case above.
-    #[test]
-    fn test_merge_no_comparable_versions_after_fetch_retains_finding_for_name_not_attempted() {
-        let mut outcomes = DependencyOutcomes::new();
-        outcomes.set_no_comparable_versions(name("vendor/a"));
-
-        // Only "vendor/b" was attempted this round; "vendor/a" was untouched.
-        merge_no_comparable_versions_after_fetch(
-            &mut outcomes,
-            &[name("vendor/b")],
-            HashSet::new(),
-        );
-
-        assert!(
-            outcomes.no_comparable_versions(&name("vendor/a")),
-            "a finding for a name not attempted this round must survive untouched"
+        assert_eq!(
+            outcomes.lookup_miss(&name("vendor/a")),
+            Some(LookupMiss::NoComparableVersions)
         );
     }
 }

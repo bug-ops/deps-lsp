@@ -231,3 +231,7 @@ mockito for identifiers (200 unique, 200 several, 404, 5xx, invalid identity, ca
 ## 12. See Also
 
 [[MOC-specs]] · [[077-swift-registry-client/spec|077]] · [[084-unified-registry-trust-rule/spec|084]] · [[086-git-ref-probe-branch-evidence/spec|086]] · issue #1757 · [[plan]] · [[tasks]]
+
+## Amendment (#1879): `from_xcode`
+
+`registries.swift_scm_to_registry` accepts `"from_xcode"`: the Xcode default `IDEPackageDependencySCMToRegistryTransformation` is read once per process on macOS through `/usr/bin/defaults` (no shell, 2 s timeout, 256-byte output cap) on a background thread; only `useRegistryIdentityAndSources` enables replacement. Until the read completes the mode is Disabled, then open Swift documents are re-parsed. The effective decision is the separate `ScmSwizzleMode` type, so `FromXcode` never reaches the swizzle decision. deps-cli waits up to 3 s for the read. A change in Xcode needs a server restart.

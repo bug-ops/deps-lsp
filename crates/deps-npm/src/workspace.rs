@@ -9,8 +9,10 @@
 //!
 //! Built on the shared `deps-core` YAML mechanics (`yaml_walk::FrameStack`,
 //! `yaml_anchor::ScalarAnchorTable`, `MarkedScalar`) like the `deps-dart` receiver. Only the
-//! first YAML document is read, matching pnpm. Every other top-level key (`packages`,
-//! `overrides`, settings) is skipped structurally.
+//! first YAML document is read, matching pnpm. The `packages` globs and `overrides` entries are
+//! read alongside the catalogs; a wrong-shaped `packages`/`overrides` section drops only that
+//! section and never marks the catalogs malformed. Every other top-level key (settings) is
+//! skipped structurally.
 //!
 //! # Known limitation
 //!
@@ -33,7 +35,10 @@ use yaml_rust2::scanner::{Marker, TScalarStyle};
 use crate::catalog::ConfigDefect;
 use crate::config::NpmParseContext;
 use crate::parser::NpmParseResult;
-use crate::types::{CatalogId, CatalogSite, NpmDependency, NpmDependencyOrigin};
+use crate::types::{
+    CatalogId, CatalogSite, NpmDependency, NpmDependencyOrigin, OverrideSelector, OverrideValue,
+};
+use crate::workspace_members::{PackageGlob, WorkspaceMembers};
 
 const FILE_LABEL: &str = "pnpm-workspace.yaml";
 
@@ -79,6 +84,17 @@ pub(crate) struct WorkspaceEntry {
     pub(crate) value: EntryValue,
 }
 
+/// One `overrides:` entry with the positions of its key and value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OverrideEntry {
+    pub(crate) key: String,
+    pub(crate) key_range: Option<Range>,
+    pub(crate) value: EntryValue,
+}
+
+/// Upper bound on `packages:` entries read from one file.
+const MAX_PACKAGE_GLOBS: usize = 1000;
+
 /// Everything catalog-relevant in one `pnpm-workspace.yaml`.
 #[derive(Debug, Default)]
 pub(crate) struct WorkspaceDocument {
@@ -89,6 +105,13 @@ pub(crate) struct WorkspaceDocument {
     pub(crate) defect: Option<ConfigDefect>,
     /// Range of the `catalogs.default` key, the anchor of the duplicate-default diagnostic.
     pub(crate) duplicate_default_key: Option<Range>,
+    /// The parsed `packages:` entries; `None` when the section is absent or wrong-shaped, in
+    /// which case pnpm's default (every subdirectory) applies.
+    pub(crate) package_globs: Option<Vec<PackageGlob>>,
+    /// Set when `packages:` listed more than `MAX_PACKAGE_GLOBS` entries and the rest were dropped.
+    pub(crate) package_globs_truncated: bool,
+    /// The `overrides:` entries, kept apart so catalog resolution never sees them.
+    pub(crate) overrides: Vec<OverrideEntry>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -96,6 +119,8 @@ enum FrameRole {
     Root,
     CatalogsSection,
     CatalogEntries,
+    PackagesSection,
+    OverridesEntries,
     Irrelevant,
 }
 
@@ -105,6 +130,8 @@ enum PendingKey {
     None,
     Catalog,
     Catalogs,
+    Packages,
+    Overrides,
 }
 
 #[derive(Default)]
@@ -139,10 +166,28 @@ struct RawEntry {
     value: RawValue,
 }
 
+/// What the receiver has seen of the root `packages` key.
+enum PackagesState {
+    Absent,
+    Listed {
+        globs: Vec<String>,
+        overflowed: bool,
+    },
+    Wrong,
+}
+
+struct RawOverride {
+    key: MarkedScalar,
+    value: RawValue,
+}
+
 struct Receiver {
     stack: Stack,
     anchors: ScalarAnchorTable<(TScalarStyle, Option<Tag>)>,
     entries: Vec<RawEntry>,
+    overrides: Vec<RawOverride>,
+    overrides_bad: bool,
+    packages: PackagesState,
     malformed: bool,
     top_level_catalog: bool,
     default_key: Option<MarkedScalar>,
@@ -157,6 +202,9 @@ impl Receiver {
                 MAX_ANCHORS,
             )),
             entries: Vec::new(),
+            overrides: Vec::new(),
+            overrides_bad: false,
+            packages: PackagesState::Absent,
             malformed: false,
             top_level_catalog: false,
             default_key: None,
@@ -175,6 +223,9 @@ impl Receiver {
                 if self.stack.depth() == 0 && kind == FrameKind::Mapping {
                     (FrameRole::Root, FramePayload::default())
                 } else {
+                    if self.stack.top_role_or(FrameRole::Irrelevant) == FrameRole::PackagesSection {
+                        self.packages = PackagesState::Wrong;
+                    }
                     irrelevant
                 }
             }
@@ -199,14 +250,33 @@ impl Receiver {
                         PendingKey::Catalogs => {
                             (FrameRole::CatalogsSection, FramePayload::default())
                         }
+                        PendingKey::Overrides => {
+                            (FrameRole::OverridesEntries, FramePayload::default())
+                        }
+                        PendingKey::Packages => {
+                            self.packages = PackagesState::Wrong;
+                            irrelevant
+                        }
                         PendingKey::None => irrelevant,
                     },
-                    (FrameRole::Root, FrameKind::Sequence) => {
-                        if pending != PendingKey::None {
-                            self.malformed = true;
+                    (FrameRole::Root, FrameKind::Sequence) => match pending {
+                        PendingKey::Packages => {
+                            self.packages = PackagesState::Listed {
+                                globs: Vec::new(),
+                                overflowed: false,
+                            };
+                            (FrameRole::PackagesSection, FramePayload::default())
                         }
-                        irrelevant
-                    }
+                        PendingKey::Overrides => {
+                            self.overrides_bad = true;
+                            irrelevant
+                        }
+                        PendingKey::Catalog | PendingKey::Catalogs => {
+                            self.malformed = true;
+                            irrelevant
+                        }
+                        PendingKey::None => irrelevant,
+                    },
                     (FrameRole::CatalogsSection, FrameKind::Mapping) => {
                         let Some(name) = name.filter(|name| !name.text().is_empty()) else {
                             return irrelevant;
@@ -236,7 +306,12 @@ impl Receiver {
                         }
                         irrelevant
                     }
-                    (FrameRole::Irrelevant, _) => irrelevant,
+                    (
+                        FrameRole::OverridesEntries
+                        | FrameRole::PackagesSection
+                        | FrameRole::Irrelevant,
+                        _,
+                    ) => irrelevant,
                 }
             }
         }
@@ -260,7 +335,7 @@ impl Receiver {
             self.anchors.record(anchor_id, &value, (style, tag.clone()));
         }
         match self.stack.scalar_position() {
-            ScalarPosition::Outside => {}
+            ScalarPosition::Outside => self.on_sequence_scalar(value),
             ScalarPosition::Key => self.on_key(value, style, marker),
             ScalarPosition::Value => {
                 let raw = classify_text(value, style, tag.as_ref(), marker, TextForm::Literal);
@@ -269,13 +344,29 @@ impl Receiver {
         }
     }
 
+    fn on_sequence_scalar(&mut self, value: String) {
+        if self.stack.top_role_or(FrameRole::Irrelevant) == FrameRole::PackagesSection
+            && let PackagesState::Listed { globs, overflowed } = &mut self.packages
+        {
+            if globs.len() < MAX_PACKAGE_GLOBS {
+                globs.push(value);
+            } else {
+                *overflowed = true;
+            }
+        }
+    }
+
     fn on_key(&mut self, value: String, style: TScalarStyle, marker: &Marker) {
         let role = self.stack.top_role_or(FrameRole::Irrelevant);
-        if role != FrameRole::Irrelevant
+        if !matches!(role, FrameRole::Irrelevant | FrameRole::PackagesSection)
             && let Some(top) = self.stack.top_mut()
             && !top.payload.keys.insert(value.clone())
         {
-            self.malformed = true;
+            if role == FrameRole::OverridesEntries {
+                self.overrides_bad = true;
+            } else {
+                self.malformed = true;
+            }
         }
         match role {
             FrameRole::Root => {
@@ -283,17 +374,23 @@ impl Receiver {
                 let key = match value.trim_start_matches('\u{feff}') {
                     "catalog" => PendingKey::Catalog,
                     "catalogs" => PendingKey::Catalogs,
+                    "packages" => PendingKey::Packages,
+                    "overrides" => PendingKey::Overrides,
                     _ => PendingKey::None,
                 };
                 self.stack.observe_key(key);
             }
-            FrameRole::CatalogsSection | FrameRole::CatalogEntries => {
+            FrameRole::CatalogsSection
+            | FrameRole::CatalogEntries
+            | FrameRole::OverridesEntries => {
                 if let Some(top) = self.stack.top_mut() {
                     top.payload.pending_name = Some(MarkedScalar::new(value, style, marker));
                 }
                 self.stack.observe_key(PendingKey::None);
             }
-            FrameRole::Irrelevant => self.stack.observe_key(PendingKey::None),
+            FrameRole::PackagesSection | FrameRole::Irrelevant => {
+                self.stack.observe_key(PendingKey::None);
+            }
         }
     }
 
@@ -306,10 +403,13 @@ impl Receiver {
                     .stack
                     .top()
                     .map_or(PendingKey::None, |frame| *frame.pending_key());
-                if pending != PendingKey::None
-                    && !matches!(raw, Classified::Null | Classified::Empty)
-                {
-                    self.malformed = true;
+                if !matches!(raw, Classified::Null | Classified::Empty) {
+                    match pending {
+                        PendingKey::Catalog | PendingKey::Catalogs => self.malformed = true,
+                        PendingKey::Packages => self.packages = PackagesState::Wrong,
+                        PendingKey::Overrides => self.overrides_bad = true,
+                        PendingKey::None => {}
+                    }
                 }
             }
             FrameRole::CatalogsSection => {
@@ -339,7 +439,21 @@ impl Receiver {
                     });
                 }
             }
-            FrameRole::Irrelevant => {}
+            FrameRole::OverridesEntries => {
+                let key = self
+                    .stack
+                    .top_mut()
+                    .and_then(|frame| frame.payload.pending_name.take());
+                if let Some(key) = key {
+                    let value = match raw {
+                        Classified::Text { scalar, form } => RawValue::Text { scalar, form },
+                        Classified::Empty => RawValue::Empty,
+                        Classified::Null | Classified::Unusable => RawValue::Unusable,
+                    };
+                    self.overrides.push(RawOverride { key, value });
+                }
+            }
+            FrameRole::PackagesSection | FrameRole::Irrelevant => {}
         }
         self.stack.consume_value();
     }
@@ -360,7 +474,10 @@ impl Receiver {
                     // An unrecorded anchor: a container (not expanded, see the module docs) or
                     // a scalar beyond the anchor bounds.
                     None => match self.stack.top_role_or(FrameRole::Irrelevant) {
-                        FrameRole::CatalogEntries | FrameRole::Irrelevant => Classified::Unusable,
+                        FrameRole::CatalogEntries
+                        | FrameRole::OverridesEntries
+                        | FrameRole::PackagesSection
+                        | FrameRole::Irrelevant => Classified::Unusable,
                         FrameRole::Root | FrameRole::CatalogsSection => {
                             self.malformed = true;
                             Classified::Null
@@ -559,15 +676,68 @@ fn empty_value_position(
     Some(byte_span_to_range(content, table, at, at))
 }
 
+/// Turns a raw value into the positioned [`EntryValue`] the consumers read.
+fn resolve_value(
+    name: &MarkedScalar,
+    value: RawValue,
+    content: &str,
+    table: &LineOffsetTable,
+) -> EntryValue {
+    match value {
+        RawValue::Unusable => EntryValue::Unusable,
+        RawValue::Empty => empty_value_position(name, content, table)
+            .map_or(EntryValue::Unusable, |at| EntryValue::Empty { at }),
+        RawValue::Text { scalar, form } => {
+            let range = match form {
+                TextForm::Literal => literal_range(&scalar, content, table),
+                TextForm::Alias => token_range(&scalar, content, table, &['*']),
+                TextForm::Block => block_indicator_range(&scalar, content, table),
+            };
+            let text = scalar.into_text();
+            EntryValue::Text {
+                text: if matches!(form, TextForm::Block) {
+                    text.trim().to_string()
+                } else {
+                    text
+                },
+                range,
+            }
+        }
+    }
+}
+
 fn finalize(receiver: Receiver, content: &str) -> WorkspaceDocument {
+    let table = LineOffsetTable::new(content);
+    let (package_globs, package_globs_truncated) = match receiver.packages {
+        PackagesState::Listed { globs, overflowed } => (
+            Some(globs.iter().filter_map(|g| PackageGlob::parse(g)).collect()),
+            overflowed,
+        ),
+        PackagesState::Absent | PackagesState::Wrong => (None, false),
+    };
+    let overrides = if receiver.overrides_bad {
+        Vec::new()
+    } else {
+        receiver
+            .overrides
+            .into_iter()
+            .map(|raw| OverrideEntry {
+                key_range: raw.key.range(content, &table),
+                value: resolve_value(&raw.key, raw.value, content, &table),
+                key: raw.key.into_text(),
+            })
+            .collect()
+    };
     if receiver.malformed {
         return WorkspaceDocument {
             entries: Vec::new(),
             defect: Some(ConfigDefect::Malformed),
             duplicate_default_key: None,
+            package_globs,
+            package_globs_truncated,
+            overrides,
         };
     }
-    let table = LineOffsetTable::new(content);
     let duplicate = receiver.top_level_catalog && receiver.default_key.is_some();
     let duplicate_default_key = duplicate
         .then(|| {
@@ -580,41 +750,21 @@ fn finalize(receiver: Receiver, content: &str) -> WorkspaceDocument {
     let entries = receiver
         .entries
         .into_iter()
-        .map(|raw| {
-            let value = match raw.value {
-                RawValue::Unusable => EntryValue::Unusable,
-                RawValue::Empty => empty_value_position(&raw.name, content, &table)
-                    .map_or(EntryValue::Unusable, |at| EntryValue::Empty { at }),
-                RawValue::Text { scalar, form } => {
-                    let range = match form {
-                        TextForm::Literal => literal_range(&scalar, content, &table),
-                        TextForm::Alias => token_range(&scalar, content, &table, &['*']),
-                        TextForm::Block => block_indicator_range(&scalar, content, &table),
-                    };
-                    let text = scalar.into_text();
-                    EntryValue::Text {
-                        text: if matches!(form, TextForm::Block) {
-                            text.trim().to_string()
-                        } else {
-                            text
-                        },
-                        range,
-                    }
-                }
-            };
-            WorkspaceEntry {
-                id: raw.id,
-                site: raw.site,
-                name_range: raw.name.range(content, &table),
-                name: raw.name.into_text(),
-                value,
-            }
+        .map(|raw| WorkspaceEntry {
+            id: raw.id,
+            site: raw.site,
+            name_range: raw.name.range(content, &table),
+            value: resolve_value(&raw.name, raw.value, content, &table),
+            name: raw.name.into_text(),
         })
         .collect();
     WorkspaceDocument {
         entries,
         defect: duplicate.then_some(ConfigDefect::DuplicateDefaultCatalog),
         duplicate_default_key,
+        package_globs,
+        package_globs_truncated,
+        overrides,
     }
 }
 
@@ -669,29 +819,36 @@ pub fn parse_pnpm_workspace_manifest(
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
     let mut dependencies = Vec::new();
     for entry in document.entries {
-        let (package, version_req, range) = match entry.value {
-            EntryValue::Text { text, range } => match crate::parser::parse_npm_alias(&text) {
-                Some(alias) => (Some(alias.package.into()), Some(alias.version_req), range),
-                None => (None, Some(text), range),
-            },
-            EntryValue::Empty { at } => (None, None, Some(at)),
-            EntryValue::Unusable => continue,
+        let origin = NpmDependencyOrigin::CatalogEntry {
+            id: entry.id,
+            site: entry.site,
         };
-        if !budget.allow() {
+        push_dependency(
+            &mut dependencies,
+            &mut budget,
+            entry.name.as_str().into(),
+            entry.name_range,
+            entry.value,
+            origin,
+        );
+    }
+    for entry in document.overrides {
+        let Some((target, selector)) = OverrideSelector::parse(&entry.key) else {
+            continue;
+        };
+        if let EntryValue::Text { text, .. } = &entry.value
+            && OverrideValue::classify(text) != OverrideValue::Range
+        {
             continue;
         }
-        dependencies.push(NpmDependency {
-            name: entry.name.as_str().into(),
-            name_range: entry.name_range.unwrap_or_default(),
-            version_req: version_req.map(Into::into),
-            version_range: range,
-            origin: NpmDependencyOrigin::CatalogEntry {
-                id: entry.id,
-                site: entry.site,
-            },
-            source: deps_core::parser::DependencySource::Registry,
-            package,
-        });
+        push_dependency(
+            &mut dependencies,
+            &mut budget,
+            target,
+            entry.key_range,
+            entry.value,
+            NpmDependencyOrigin::Override { selector },
+        );
     }
 
     let registries = crate::parser::resolve_dependency_sources(&mut dependencies, uri, ctx);
@@ -706,7 +863,49 @@ pub fn parse_pnpm_workspace_manifest(
             .defect
             .filter(|defect| *defect == ConfigDefect::DuplicateDefaultCatalog)
             .and(document.duplicate_default_key),
+        workspace_members: crate::parser::manifest_directory(uri).map(|root| {
+            let members = WorkspaceMembers::new(
+                root,
+                document.package_globs.unwrap_or_else(PackageGlob::defaults),
+            );
+            if document.package_globs_truncated {
+                members.with_truncated_globs()
+            } else {
+                members
+            }
+        }),
     })
+}
+
+/// Appends one dependency for a positioned workspace-file entry, splitting an `npm:` alias.
+fn push_dependency(
+    dependencies: &mut Vec<NpmDependency>,
+    budget: &mut deps_core::DependencyBudget,
+    name: deps_core::PackageName,
+    name_range: Option<Range>,
+    value: EntryValue,
+    origin: NpmDependencyOrigin,
+) {
+    let (package, version_req, range) = match value {
+        EntryValue::Text { text, range } => match crate::parser::parse_npm_alias(&text) {
+            Some(alias) => (Some(alias.package.into()), Some(alias.version_req), range),
+            None => (None, Some(text), range),
+        },
+        EntryValue::Empty { at } => (None, None, Some(at)),
+        EntryValue::Unusable => return,
+    };
+    if !budget.allow() {
+        return;
+    }
+    dependencies.push(NpmDependency {
+        name,
+        name_range: name_range.unwrap_or_default(),
+        version_req: version_req.map(Into::into),
+        version_range: range,
+        origin,
+        source: deps_core::parser::DependencySource::Registry,
+        package,
+    });
 }
 
 #[cfg(test)]
@@ -861,11 +1060,12 @@ mod tests {
     }
 
     #[test]
-    fn test_overrides_and_other_sections_are_ignored() {
+    fn test_overrides_stay_apart_from_catalog_entries_and_other_sections_are_ignored() {
         let content = "packages:\n  - 'pkgs/*'\noverrides:\n  'a>b': ^1.0.0\n  'pkg@^2': ^3.0.0\nonlyBuiltDependencies:\n  - esbuild\ncatalog:\n  react: ^18.0.0\n";
         let doc = document(content);
         assert_eq!(doc.entries.len(), 1);
         assert_eq!(doc.entries[0].name, "react");
+        assert_eq!(doc.overrides.len(), 2);
     }
 
     #[test]
@@ -1256,5 +1456,162 @@ mod tests {
         let content = format!("catalog:\n  react: \"{long}1.0.0\"\n");
         let doc = document(&content);
         assert_matches!(doc.entries[0].value, EntryValue::Text { .. });
+    }
+
+    fn override_deps(result: &NpmParseResult) -> Vec<&NpmDependency> {
+        result
+            .dependencies
+            .iter()
+            .filter(|dep| matches!(dep.origin, NpmDependencyOrigin::Override { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn test_override_entries_become_dependencies_positioned_on_the_value() {
+        let content = "overrides:\n  lodash: ^4.17.0\n  \"foo@<2\": 2.0.0\n  \"@s/pkg\": 'npm:other@^1.2.0'\n";
+        let result = manifest(content);
+        let deps = override_deps(&result);
+        assert_eq!(deps.len(), 3);
+
+        assert_eq!(deps[0].name, "lodash");
+        assert_eq!(text_at(content, deps[0].version_range.unwrap()), "^4.17.0");
+
+        assert_eq!(deps[1].name, "foo");
+        let NpmDependencyOrigin::Override { selector } = &deps[1].origin else {
+            panic!("override origin expected");
+        };
+        assert_eq!(selector.target_selector().unwrap().as_str(), "<2");
+        assert_eq!(text_at(content, deps[1].version_range.unwrap()), "2.0.0");
+
+        assert_eq!(deps[2].name, "@s/pkg");
+        assert_eq!(deps[2].package.as_ref().unwrap(), "other");
+    }
+
+    #[test]
+    fn test_override_values_without_a_range_are_skipped() {
+        let content = "overrides:\n  a: \"-\"\n  b: $b\n  c: \"catalog:\"\n  d: ^1.0.0\n  e: ~\n  f:\n    nested: 1\n";
+        let result = manifest(content);
+        let names: Vec<_> = override_deps(&result)
+            .iter()
+            .map(|dep| dep.name.as_str().to_string())
+            .collect();
+        assert_eq!(names, ["d"]);
+    }
+
+    #[test]
+    fn test_override_key_with_parent_chain_targets_the_last_segment() {
+        let content = "overrides:\n  \"bar@1>foo@2\": ^3.0.0\n  \"bad>\": ^1.0.0\n  \"\": ^1.0.0\n";
+        let result = manifest(content);
+        let deps = override_deps(&result);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "foo");
+        let NpmDependencyOrigin::Override { selector } = &deps[0].origin else {
+            panic!("override origin expected");
+        };
+        assert_eq!(selector.parents().len(), 1);
+        assert_eq!(selector.parents()[0], "bar");
+    }
+
+    #[test]
+    fn test_wrong_shaped_overrides_drop_only_that_section() {
+        for content in [
+            "catalog:\n  react: ^18.0.0\noverrides:\n  - a\n  - b\n",
+            "catalog:\n  react: ^18.0.0\noverrides: nope\n",
+            "catalog:\n  react: ^18.0.0\noverrides:\n  a: ^1.0.0\n  a: ^2.0.0\n",
+        ] {
+            let doc = document(content);
+            assert!(doc.defect.is_none(), "{content}");
+            assert!(doc.overrides.is_empty(), "{content}");
+            let result = manifest(content);
+            assert_eq!(result.dependencies.len(), 1, "{content}");
+            assert_matches!(
+                result.dependencies[0].origin,
+                NpmDependencyOrigin::CatalogEntry { .. }
+            );
+        }
+    }
+
+    #[test]
+    fn test_overrides_never_reach_catalog_resolution() {
+        let content = "catalog:\n  react: ^18.0.0\noverrides:\n  react: ^17.0.0\n";
+        let doc = document(content);
+        assert_eq!(doc.entries.len(), 1);
+        assert_eq!(doc.overrides.len(), 1);
+        assert_matches!(&doc.entries[0].value, EntryValue::Text { text, .. } if text == "^18.0.0");
+    }
+
+    #[test]
+    fn test_override_alias_value_is_positioned_on_the_alias_token() {
+        let content = "overrides:\n  a: &v ^1.0.0\n  b: *v\n";
+        let doc = document(content);
+        let EntryValue::Text { text, range } = &doc.overrides[1].value else {
+            panic!("alias text expected");
+        };
+        assert_eq!(text, "^1.0.0");
+        assert_eq!(text_at(content, range.unwrap()), "*v");
+    }
+
+    fn globs(content: &str) -> Option<Vec<PackageGlob>> {
+        document(content).package_globs
+    }
+
+    #[test]
+    fn test_packages_globs_are_parsed_with_negation() {
+        let parsed = globs("packages:\n  - 'apps/*'\n  - \"!**/test/**\"\n  - ./libs/\n").unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_matches!(&parsed[0], PackageGlob::Include(g) if g.as_str() == "apps/*");
+        assert_matches!(&parsed[1], PackageGlob::Exclude(g) if g.as_str() == "**/test/**");
+        assert_matches!(&parsed[2], PackageGlob::Include(g) if g.as_str() == "libs");
+    }
+
+    #[test]
+    fn test_hostile_packages_globs_are_dropped_at_parse_time() {
+        let parsed = globs("packages:\n  - ../outside\n  - /abs\n  - 'a\\b'\n  - ok/*\n").unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_matches!(&parsed[0], PackageGlob::Include(g) if g.as_str() == "ok/*");
+    }
+
+    #[test]
+    fn test_absent_or_wrong_shaped_packages_fall_back_to_the_pnpm_default() {
+        for content in [
+            "catalog:\n  a: 1.0.0\n",
+            "packages: nope\n",
+            "packages:\n  nested: 1\n",
+            "packages:\n  - [a, b]\n",
+            "packages:\n",
+        ] {
+            assert!(globs(content).is_none(), "{content}");
+            let members = manifest(content).workspace_members.unwrap();
+            assert_eq!(members.globs(), PackageGlob::defaults(), "{content}");
+        }
+    }
+
+    #[test]
+    fn test_empty_packages_list_selects_no_members() {
+        let result = manifest("packages: []\n");
+        assert!(result.workspace_members.unwrap().globs().is_empty());
+    }
+
+    #[test]
+    fn test_workspace_members_are_rooted_at_the_workspace_file_directory() {
+        let result = manifest("packages:\n  - apps/*\n");
+        let members = result.workspace_members.unwrap();
+        assert_eq!(members.root(), std::path::Path::new("/repo"));
+    }
+
+    #[test]
+    fn test_packages_cap_bounds_the_number_of_globs() {
+        let mut content = String::from("packages:\n");
+        for i in 0..(MAX_PACKAGE_GLOBS + 50) {
+            content.push_str(&format!("  - p{i}/*\n"));
+        }
+        assert_eq!(globs(&content).unwrap().len(), MAX_PACKAGE_GLOBS);
+        assert!(document(&content).package_globs_truncated);
+        assert!(
+            manifest(&content)
+                .workspace_members
+                .unwrap()
+                .globs_truncated()
+        );
     }
 }

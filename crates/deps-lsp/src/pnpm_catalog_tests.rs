@@ -487,4 +487,124 @@ mod seeded {
             "the `catalog:` key itself gets no hint"
         );
     }
+
+    const OVERRIDES: &str = "overrides:\n  lodash: ^3.0.0\n  \"foo@<2\": ^1.0.0\n";
+
+    /// #1877: an `overrides:` entry is a dependency like any other, with an outdated finding on
+    /// its target and an update edit that rewrites only the version text.
+    #[tokio::test]
+    async fn override_entry_gets_outdated_diagnostic_and_update_action() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _socket) = offline_backend();
+        let backend = service.inner();
+        let workspace = install(
+            backend,
+            &dir.path().join(WORKSPACE_FILE),
+            OVERRIDES,
+            &[("lodash", "4.17.21"), ("foo", "1.0.0")],
+        )
+        .await;
+
+        let found = messages(backend, &workspace).await;
+        assert_eq!(
+            found,
+            ["No published version satisfies requirement '^3.0.0'; latest is 4.17.21"],
+            "only the outdated override is reported"
+        );
+
+        let lodash = Range::new(Position::new(1, 11), Position::new(1, 17));
+        let edits = update_edits(backend, &workspace, lodash).await;
+        let [edit] = edits.as_slice() else {
+            panic!("exactly one edit expected for the lodash override: {edits:?}");
+        };
+        assert_eq!(
+            apply(OVERRIDES, edit),
+            "overrides:\n  lodash: ^4.17.21\n  \"foo@<2\": ^1.0.0\n"
+        );
+    }
+
+    async fn override_hover_with_lock(candidates: &[&str], collapsed: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, _socket) = offline_backend();
+        let backend = service.inner();
+        let text = "overrides:\n  foo: ^1.0.0\n";
+        let uri = install(
+            backend,
+            &dir.path().join(WORKSPACE_FILE),
+            text,
+            &[("foo", "3.1.0")],
+        )
+        .await;
+        let key = NormalizedName::for_test("foo");
+        let versions = HashMap::from([(key.clone(), deps_core::ConcreteVersion::new(collapsed))]);
+        let candidates = HashMap::from([(
+            key,
+            candidates
+                .iter()
+                .map(|v| deps_core::ConcreteVersion::new(*v))
+                .collect::<Vec<_>>(),
+        )]);
+        backend
+            .state()
+            .documents
+            .get_mut(&uri)
+            .unwrap()
+            .set_resolved_versions_without_bump(versions, candidates);
+        hover_text(backend, &uri, Position::new(1, 4))
+            .await
+            .unwrap()
+    }
+
+    /// M4: with several locked versions of the target, the one matching the override's own
+    /// range is shown, not the highest.
+    #[tokio::test]
+    async fn override_in_use_version_prefers_the_candidate_matching_its_range() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let hover = override_hover_with_lock(&["1.5.0", "3.1.0"], "3.1.0").await;
+        assert!(hover.contains("1.5.0"), "{hover}");
+    }
+
+    /// M4 known limitation: when the lock file keeps a single (other) version of the target,
+    /// that version is shown even though the override's range does not select it.
+    #[tokio::test]
+    async fn override_in_use_version_falls_back_to_the_single_locked_version() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let hover = override_hover_with_lock(&["3.1.0"], "3.1.0").await;
+        assert!(hover.contains("3.1.0"), "{hover}");
+    }
+
+    /// #1878: hovering a catalog entry reports how many workspace packages reference it.
+    #[tokio::test]
+    async fn catalog_entry_hover_reports_how_many_workspace_packages_use_it() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        for member in ["a", "b"] {
+            let path = dir.path().join("packages").join(member);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("package.json"),
+                r#"{"dependencies": {"react": "catalog:"}}"#,
+            )
+            .unwrap();
+        }
+        let (service, _socket) = offline_backend();
+        let backend = service.inner();
+        let text = "packages:\n  - packages/*\ncatalog:\n  react: ^18.0.0\n";
+        let uri = install(
+            backend,
+            &dir.path().join(WORKSPACE_FILE),
+            text,
+            &[("react", "18.3.0")],
+        )
+        .await;
+
+        let hover = hover_text(backend, &uri, Position::new(3, 4))
+            .await
+            .expect("hover on a catalog entry");
+        assert!(
+            hover.contains("**Used by** 2 workspace packages"),
+            "{hover}"
+        );
+    }
 }

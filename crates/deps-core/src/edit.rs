@@ -183,6 +183,24 @@ pub fn replacement_text(
     Some(formatter.format_version_replacing_for(dep, version, current))
 }
 
+/// [`replacement_text`] for a security-fix or cooldown-fallback target: the rendering keeps the
+/// requirement's floor at `version` (see
+/// [`PackageRendering::format_version_replacing_floor_for`](crate::lsp_helpers::PackageRendering::format_version_replacing_floor_for)).
+///
+/// Returns `None` for an unexpanded placeholder, exactly like [`replacement_text`].
+#[must_use]
+pub fn floor_safe_replacement_text(
+    formatter: &dyn EcosystemFormatter,
+    dep: &dyn Dependency,
+    version: &ConcreteVersion,
+    current: &str,
+) -> Option<String> {
+    if requirement_is_placeholder_for(formatter, dep, current) {
+        return None;
+    }
+    Some(formatter.format_version_replacing_floor_for(dep, version, current))
+}
+
 /// Protocol-agnostic replacement for `ls_types::TextEdit` — a single manifest-text
 /// replacement.
 ///
@@ -1534,7 +1552,7 @@ pub fn plan_verified_fix(
     }
 
     // Unreachable after the gate above; fails closed rather than unwrapping.
-    let Some(new_text) = replacement_text(formatter, dep, &fix_concrete, current) else {
+    let Some(new_text) = floor_safe_replacement_text(formatter, dep, &fix_concrete, current) else {
         return Err(VulnFixSkip::UnresolvedPlaceholder);
     };
     let literal_target = dep.version_literal().unwrap_or(current);
@@ -2581,6 +2599,52 @@ mod tests {
                 &StrictSemverFormatter,
             );
             assert_eq!(planned, Err(VulnFixSkip::RequirementAlreadyResolves));
+        }
+
+        /// A fix target must keep the requirement's floor at the fixed version: a formatter whose
+        /// plain rewrite lowers the floor (npm's bare partial `3` -> `4`) must not have that
+        /// rendering reach `plan_verified_fix`.
+        #[test]
+        fn test_plan_verified_fix_uses_floor_safe_rendering() {
+            struct PartialMajorFormatter;
+            impl crate::lsp_helpers::PackageNaming for PartialMajorFormatter {}
+            impl crate::lsp_helpers::PackageRendering for PartialMajorFormatter {
+                fn format_version_for_text_edit(&self, v: &ConcreteVersion) -> String {
+                    v.to_string()
+                }
+                fn format_version_replacing(&self, v: &ConcreteVersion, _current: &str) -> String {
+                    v.as_str().split('.').next().unwrap_or_default().to_owned()
+                }
+                fn format_version_replacing_floor_for(
+                    &self,
+                    _dep: &dyn Dependency,
+                    v: &ConcreteVersion,
+                    _current: &str,
+                ) -> String {
+                    v.to_string()
+                }
+                fn package_url(&self, name: &PackageName) -> String {
+                    name.as_str().to_string()
+                }
+            }
+            impl crate::lsp_helpers::RequirementResolution for PartialMajorFormatter {
+                fn compile_bounded_requirement(
+                    &self,
+                    requirement: crate::lsp_helpers::BoundedVersionReq<'_>,
+                ) -> Option<Box<dyn crate::lsp_helpers::RequirementMatcher>> {
+                    crate::lsp_helpers::compile_semver_requirement(requirement.get())
+                }
+            }
+            impl crate::lsp_helpers::DiagnosticMessages for PartialMajorFormatter {}
+            impl crate::lsp_helpers::DiagnosticPolicy for PartialMajorFormatter {}
+            impl crate::lsp_helpers::SourcePolicy for PartialMajorFormatter {}
+            impl crate::lsp_helpers::OsvNaming for PartialMajorFormatter {}
+
+            let d = dep("lodash", "3", range(0, 8, 0, 9));
+            let planned =
+                plan_verified_fix(&d, d.version_range, "3", "4.17.21", &PartialMajorFormatter)
+                    .unwrap();
+            assert_eq!(planned.edit.new_text, "4.17.21");
         }
 
         /// #1472 defense-in-depth: an oversized requirement must not trip

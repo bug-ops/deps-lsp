@@ -154,6 +154,153 @@ pub enum NpmDependencyOrigin {
         /// The definition site of that catalog.
         site: CatalogSite,
     },
+    /// An entry of the `overrides:` section in `pnpm-workspace.yaml` (#1877).
+    Override {
+        /// The parsed override key; the dependency name is its target package.
+        selector: OverrideSelector,
+    },
+}
+
+/// The parsed key of a pnpm `overrides:` entry: `foo`, `foo@<2`, `@scope/foo@^1`, `bar>foo` or
+/// `bar@1>foo@2`.
+///
+/// The target package is the dependency name; this keeps the part that narrows when the
+/// override applies. Parent version ranges are not kept.
+///
+/// # Examples
+///
+/// ```
+/// use deps_npm::types::OverrideSelector;
+///
+/// let (target, selector) = OverrideSelector::parse("bar@1>@scope/foo@<2").unwrap();
+/// assert_eq!(target, "@scope/foo");
+/// assert_eq!(selector.parents().len(), 1);
+/// assert_eq!(selector.target_selector().unwrap().as_str(), "<2");
+/// assert!(OverrideSelector::parse("bar>").is_none());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverrideSelector {
+    parents: Vec<deps_core::PackageName>,
+    target_selector: Option<deps_core::VersionReq>,
+}
+
+impl OverrideSelector {
+    /// Parses an override key into its target package name and selector, or `None` when any
+    /// segment has no package name.
+    #[must_use]
+    pub fn parse(key: &str) -> Option<(deps_core::PackageName, Self)> {
+        let mut segments = split_selector_chain(key)
+            .into_iter()
+            .map(split_selector_segment);
+        let (target, target_selector) = segments.next_back()??;
+        let parents = segments
+            .map(|segment| segment.map(|(name, _)| name))
+            .collect::<Option<Vec<_>>>()?;
+        Some((
+            target,
+            Self {
+                parents,
+                target_selector,
+            },
+        ))
+    }
+
+    /// Packages that must sit above the target for the override to apply, outermost first.
+    #[must_use]
+    pub fn parents(&self) -> &[deps_core::PackageName] {
+        &self.parents
+    }
+
+    /// The version range of the target the override is limited to, if any.
+    #[must_use]
+    pub const fn target_selector(&self) -> Option<&deps_core::VersionReq> {
+        self.target_selector.as_ref()
+    }
+}
+
+/// What an `overrides:` value asks pnpm to do, which decides whether it is a version specifier
+/// the registry pipeline can compare.
+///
+/// Non-registry specifiers (`link:`, `github:`, ...) are [`Self::Range`]: source
+/// classification already marks them unresolvable.
+///
+/// # Examples
+///
+/// ```
+/// use deps_npm::types::OverrideValue;
+///
+/// assert_eq!(OverrideValue::classify("^4.17.21"), OverrideValue::Range);
+/// assert_eq!(OverrideValue::classify("-"), OverrideValue::Removal);
+/// assert_eq!(OverrideValue::classify("$lodash"), OverrideValue::Reference);
+/// assert_eq!(OverrideValue::classify("catalog:"), OverrideValue::Catalog);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverrideValue {
+    /// A version specifier or alias; becomes a dependency.
+    Range,
+    /// `-`: removes the dependency; carries no version.
+    Removal,
+    /// `$name`: reuses the range of a direct dependency; carries no version of its own.
+    Reference,
+    /// `catalog:...`: resolved from a catalog; carries no version of its own.
+    Catalog,
+}
+
+impl OverrideValue {
+    /// Classifies the written value text.
+    #[must_use]
+    pub fn classify(value: &str) -> Self {
+        let value = value.trim();
+        if value == "-" {
+            Self::Removal
+        } else if value.starts_with('$') {
+            Self::Reference
+        } else if value.starts_with("catalog:") {
+            Self::Catalog
+        } else {
+            Self::Range
+        }
+    }
+}
+
+/// Splits an override key into its `>`-separated selectors with pnpm's delimiter rule
+/// (`/[^ |@]>/`): a `>` that follows a space, `|` or `@` belongs to a version range
+/// (`foo@>=1 <2`, `foo@1 || >2`) and is not a parent separator.
+fn split_selector_chain(key: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut previous = None;
+    for (index, c) in key.char_indices() {
+        if c == '>' && previous.is_some_and(|p| !matches!(p, ' ' | '|' | '@')) {
+            parts.extend(key.get(start..index));
+            start = index + c.len_utf8();
+        }
+        previous = Some(c);
+    }
+    parts.extend(key.get(start..));
+    parts
+}
+
+/// Splits `name` or `name@range` (scope-aware: a leading `@` belongs to the scope).
+fn split_selector_segment(
+    segment: &str,
+) -> Option<(deps_core::PackageName, Option<deps_core::VersionReq>)> {
+    let segment = segment.trim();
+    let (scope, rest) = segment
+        .strip_prefix('@')
+        .map_or(("", segment), |rest| ("@", rest));
+    let (bare_name, range) = match rest.split_once('@') {
+        Some((name, range)) => (name, Some(range.trim())),
+        None => (rest, None),
+    };
+    let name = format!("{scope}{bare_name}");
+    if bare_name.is_empty() || bare_name.contains(['>', ' ', '|']) {
+        return None;
+    }
+    let range = range
+        .filter(|r| !r.is_empty())
+        .map(deps_core::VersionReq::from);
+    Some((deps_core::PackageName::from(name.as_str()), range))
 }
 
 /// Parsed dependency from package.json with position tracking.
@@ -224,7 +371,7 @@ impl NpmDependency {
     pub const fn catalog_ref(&self) -> Option<&CatalogOrigin> {
         match &self.origin {
             NpmDependencyOrigin::Manifest { catalog_ref, .. } => catalog_ref.as_ref(),
-            NpmDependencyOrigin::CatalogEntry { .. } => None,
+            NpmDependencyOrigin::CatalogEntry { .. } | NpmDependencyOrigin::Override { .. } => None,
         }
     }
 }
@@ -729,5 +876,65 @@ mod tests {
         assert_eq!(pkg.repository(), Some("axios/axios"));
         assert_eq!(pkg.documentation(), Some("https://axios-http.com"));
         assert_eq!(pkg.latest_version(), "1.6.0");
+    }
+
+    #[test]
+    fn test_override_selector_forms() {
+        let parse = |key: &str| OverrideSelector::parse(key).unwrap();
+
+        let (name, sel) = parse("foo");
+        assert_eq!(name, "foo");
+        assert!(sel.parents().is_empty() && sel.target_selector().is_none());
+
+        let (name, sel) = parse("foo@<2");
+        assert_eq!(
+            (name.as_str(), sel.target_selector().unwrap().as_str()),
+            ("foo", "<2")
+        );
+
+        let (name, sel) = parse("@scope/foo@^1");
+        assert_eq!(name, "@scope/foo");
+        assert_eq!(sel.target_selector().unwrap().as_str(), "^1");
+
+        let (name, sel) = parse("@scope/foo");
+        assert_eq!(name, "@scope/foo");
+        assert!(sel.target_selector().is_none());
+
+        let (name, sel) = parse("@a/bar@1>@b/foo@2");
+        assert_eq!(name, "@b/foo");
+        assert_eq!(sel.parents()[0], "@a/bar");
+    }
+
+    #[test]
+    fn test_override_selector_keeps_comparator_arrows_inside_ranges() {
+        let (name, sel) = OverrideSelector::parse("axios@>=0.8.1 <0.28.0").unwrap();
+        assert_eq!(name, "axios");
+        assert!(sel.parents().is_empty());
+        assert_eq!(sel.target_selector().unwrap().as_str(), ">=0.8.1 <0.28.0");
+
+        let (name, sel) = OverrideSelector::parse("foo@1 || >2").unwrap();
+        assert_eq!(name, "foo");
+        assert_eq!(sel.target_selector().unwrap().as_str(), "1 || >2");
+
+        let (name, sel) = OverrideSelector::parse("bar@^1>foo@>=2").unwrap();
+        assert_eq!(name, "foo");
+        assert_eq!(sel.parents()[0], "bar");
+        assert_eq!(sel.target_selector().unwrap().as_str(), ">=2");
+    }
+
+    #[test]
+    fn test_override_selector_nested_parent_chain() {
+        let (name, sel) = OverrideSelector::parse("a>b>c").unwrap();
+        assert_eq!(name, "c");
+        assert_eq!(sel.parents().len(), 2);
+        assert_eq!(sel.parents()[1], "b");
+    }
+
+    #[test]
+    fn test_override_selector_rejects_segments_without_a_name() {
+        for key in ["", "@", ">foo", "foo>", "foo>>bar", "a> @"] {
+            let parsed = OverrideSelector::parse(key);
+            assert!(parsed.is_none(), "{key:?} parsed as {parsed:?}");
+        }
     }
 }

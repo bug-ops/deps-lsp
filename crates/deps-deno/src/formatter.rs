@@ -10,13 +10,11 @@
 use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
 use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
-    format_version_replacing_by_shape, up_to_date_via_compiled_matcher, warn_rejected_value,
+    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
+    up_to_date_via_compiled_matcher, warn_rejected_value,
 };
 use deps_core::osv::OsvPackageName;
-use deps_core::{
-    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName, VersionReq,
-};
+use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 
 /// Conservative cap on a `jsr:` scope/package-name segment's length (S-L1). JSR's own
 /// limits are narrower (32/58); this single cap is all the URL-shape concern below needs —
@@ -79,12 +77,22 @@ impl PackageRendering for DenoFormatter {
         version.to_string()
     }
 
-    /// Same shape-preserving policy as `deps-npm` (#1885): an explicit `^`/`~`/`=` operator is
-    /// kept; every other shape collapses to a bare (exact-pin) version.
+    /// Same shape-preserving policy as `deps-npm` (#1885, #1895).
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        format_version_replacing_by_shape(version, current, bare_meaning(EcosystemId::Deno), || {
-            self.format_version_for_text_edit(version)
-        })
+        deps_npm::NpmFormatter.format_version_replacing(version, current)
+    }
+
+    fn format_version_replacing_floor_for(
+        &self,
+        dep: &dyn Dependency,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        deps_npm::NpmFormatter.format_version_replacing_floor_for(dep, version, current)
+    }
+
+    fn format_version_exact_pin(&self, version: &ConcreteVersion) -> Option<String> {
+        Some(self.format_version_for_text_edit(version))
     }
 
     fn package_url(&self, name: &PackageName) -> String {
@@ -268,6 +276,33 @@ mod tests {
         assert_eq!(
             DenoFormatter.format_version_replacing(&new, ">=1.0.0 <2.0.0"),
             "2.0.0"
+        );
+    }
+
+    #[test]
+    fn test_format_version_replacing_bare_partial_keeps_precision_1895() {
+        let new = ConcreteVersion::new("6.2.1");
+        assert_eq!(DenoFormatter.format_version_replacing(&new, "5"), "6");
+        assert_eq!(DenoFormatter.format_version_replacing(&new, "1.2"), "6.2");
+    }
+
+    #[test]
+    fn test_floor_safe_rendering_never_truncates_partial_requirement() {
+        use deps_core::lsp_helpers::PackageRendering;
+        let dep = test_dep("npm:lodash", "3");
+        let fix = ConcreteVersion::new("4.17.21");
+        assert_eq!(
+            DenoFormatter.format_version_replacing_floor_for(&dep, &fix, "3"),
+            "4.17.21"
+        );
+    }
+
+    #[test]
+    fn test_format_version_exact_pin_is_bare_version_1892() {
+        let new = ConcreteVersion::new("1.4.0");
+        assert_eq!(
+            DenoFormatter.format_version_exact_pin(&new).as_deref(),
+            Some("1.4.0")
         );
     }
 

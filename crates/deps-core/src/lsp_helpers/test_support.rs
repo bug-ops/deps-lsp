@@ -184,6 +184,33 @@ impl Dependency for MockDep {
     }
 }
 
+/// A [`MockDep`] reporting a caller-chosen [`crate::parser::DependencySource`].
+pub(crate) struct MockSourcedDep {
+    pub(crate) inner: MockDep,
+    pub(crate) source: crate::parser::DependencySource,
+}
+
+impl Dependency for MockSourcedDep {
+    fn name(&self) -> &PackageName {
+        self.inner.name()
+    }
+    fn name_range(&self) -> crate::position::Range {
+        self.inner.name_range()
+    }
+    fn version_requirement(&self) -> Option<&VersionReq> {
+        self.inner.version_requirement()
+    }
+    fn version_range(&self) -> Option<crate::position::Range> {
+        self.inner.version_range()
+    }
+    fn source(&self) -> crate::parser::DependencySource {
+        self.source.clone()
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// A dependency whose `name_range()` is a synthetic placeholder
 /// (`Dependency::name_range_is_synthetic() == true`) and `version_range()` is always `None` —
 /// mirrors a `deps-dart` container-anchor-alias-resolved dependency (issue #905) for testing
