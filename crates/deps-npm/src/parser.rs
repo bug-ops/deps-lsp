@@ -1545,7 +1545,7 @@ mod tests {
             express.source,
             deps_core::parser::DependencySource::AlternateRegistry {
                 index: "https://npm.mycorp.example".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
 
@@ -1558,7 +1558,7 @@ mod tests {
             scoped.source,
             deps_core::parser::DependencySource::AlternateRegistry {
                 index: "https://npm.pkg.github.com".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
 
@@ -1593,7 +1593,7 @@ mod tests {
             dep.source,
             deps_core::parser::DependencySource::AlternateRegistry {
                 index: "https://npm.pkg.github.com".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             },
             "routing must follow the real package's scope, not the unscoped alias key"
         );

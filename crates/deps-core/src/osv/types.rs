@@ -1616,6 +1616,9 @@ pub enum SkipReason {
     ResolvedTagNotFullVersion,
     /// `EcosystemFormatter::osv_package_name` returned `None`.
     UnmappableName,
+    /// The package name is an unexpanded template placeholder (`${pkg}`, `$(PkgName)`), which
+    /// names no real package (#1902).
+    TemplatedName,
     /// The OSV package name depends on registry data (a repository's canonical casing) that
     /// has not been fetched yet, or could not be; retried once the ecosystem's `TagIndex`
     /// is populated.
@@ -1653,6 +1656,7 @@ impl SkipReason {
             Self::NoConcreteVersion => "no-concrete-version",
             Self::ResolvedTagNotFullVersion => "resolved-tag-not-full-version",
             Self::UnmappableName => "unmappable-name",
+            Self::TemplatedName => "templated-name",
             Self::CanonicalNameUnconfirmed => "canonical-name-unconfirmed",
             Self::UnmappableEcosystem => "unmappable-ecosystem",
             Self::QueryFailed => "query-failed",
@@ -1712,6 +1716,9 @@ impl SkipReason {
             Self::UnmappableName => {
                 Some("the package name could not be mapped to an OSV.dev ecosystem")
             }
+            Self::TemplatedName => Some(
+                "the package name is an unexpanded template placeholder, so it was not queried",
+            ),
             Self::CanonicalNameUnconfirmed => {
                 Some("the repository's canonical name has not been confirmed by GitHub")
             }
@@ -1752,7 +1759,10 @@ impl SkipReason {
     pub const fn is_structural(self) -> bool {
         matches!(
             self,
-            Self::NonRegistrySource | Self::UnmappableName | Self::UnmappableEcosystem
+            Self::NonRegistrySource
+                | Self::UnmappableName
+                | Self::TemplatedName
+                | Self::UnmappableEcosystem
         )
     }
 }
@@ -1788,6 +1798,8 @@ pub enum StructuralSkipReason {
     NonRegistrySource,
     /// See [`SkipReason::UnmappableName`].
     UnmappableName,
+    /// See [`SkipReason::TemplatedName`].
+    TemplatedName,
     /// See [`SkipReason::UnmappableEcosystem`].
     UnmappableEcosystem,
 }
@@ -1800,6 +1812,7 @@ impl StructuralSkipReason {
         match self {
             Self::NonRegistrySource => SkipReason::NonRegistrySource,
             Self::UnmappableName => SkipReason::UnmappableName,
+            Self::TemplatedName => SkipReason::TemplatedName,
             Self::UnmappableEcosystem => SkipReason::UnmappableEcosystem,
         }
     }
@@ -1828,6 +1841,12 @@ mod skip_reason_unchecked_reason_tests {
             (
                 SkipReason::UnmappableName,
                 Some("the package name could not be mapped to an OSV.dev ecosystem"),
+            ),
+            (
+                SkipReason::TemplatedName,
+                Some(
+                    "the package name is an unexpanded template placeholder, so it was not queried",
+                ),
             ),
             (
                 SkipReason::UnmappableEcosystem,
@@ -1895,6 +1914,7 @@ mod skip_reason_unchecked_reason_tests {
             SkipReason::NoConcreteVersion,
             SkipReason::ResolvedTagNotFullVersion,
             SkipReason::UnmappableName,
+            SkipReason::TemplatedName,
             SkipReason::UnmappableEcosystem,
             SkipReason::CanonicalNameUnconfirmed,
             SkipReason::QueryFailed,

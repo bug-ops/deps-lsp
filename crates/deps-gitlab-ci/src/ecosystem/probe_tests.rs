@@ -80,7 +80,7 @@ fn on_mock(fx: &Fixture, mut parsed: GitlabCiParseResult) -> GitlabCiParseResult
         dep.name = fx.name.clone();
         dep.source = DependencySource::AlternateRegistry {
             index: ROUTE_KEY.to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
     }
     parsed
@@ -203,7 +203,7 @@ async fn component_includes_are_never_probed() {
         dep.name = fx.name.clone();
         dep.source = DependencySource::AlternateRegistry {
             index: ROUTE_KEY.to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
     }
 

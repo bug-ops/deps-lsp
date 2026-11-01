@@ -1229,7 +1229,9 @@ mod tests {
         .unwrap_err();
 
         match err {
-            DepsError::ParseError { file_type, source } => {
+            DepsError::ParseError {
+                file_type, source, ..
+            } => {
                 assert_eq!(file_type, format!("Cargo.lock at {}", lock_path.display()));
                 assert!(
                     source.to_string().contains("boom"),

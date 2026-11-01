@@ -68,7 +68,7 @@ async fn test_get_versions_from_routes_to_alternate_index() {
 
     let source = DependencySource::AlternateRegistry {
         index: index.as_str().to_string(),
-        mirrors_crates_io: false,
+        mirrors_public_registry: false,
     };
     let name = PackageName::new("internal-crate");
     let versions = registry
@@ -105,7 +105,7 @@ async fn test_get_latest_matching_from_routes_to_alternate_index() {
 
     let source = DependencySource::AlternateRegistry {
         index: index.as_str().to_string(),
-        mirrors_crates_io: false,
+        mirrors_public_registry: false,
     };
     let name = PackageName::new("internal-crate");
     let req = VersionReq::new("^1.0");
@@ -147,7 +147,7 @@ async fn test_get_latest_matching_from_on_empty_list_routes_to_alternate_index()
 
     let source = DependencySource::AlternateRegistry {
         index: index.as_str().to_string(),
-        mirrors_crates_io: false,
+        mirrors_public_registry: false,
     };
     let name = PackageName::new("internal-crate");
     let req = VersionReq::new("*");
@@ -212,7 +212,7 @@ async fn test_authenticated_alternate_registry_sends_authorization_header() {
 
     let source = DependencySource::AlternateRegistry {
         index: entry.index.as_str().to_string(),
-        mirrors_crates_io: false,
+        mirrors_public_registry: false,
     };
     let name = PackageName::new("internal-crate");
     let versions = registry
@@ -271,14 +271,14 @@ async fn test_end_to_end_parse_register_and_fetch() {
     let dep = &parse_result.dependencies[0];
     let DependencySource::AlternateRegistry {
         index,
-        mirrors_crates_io,
+        mirrors_public_registry,
     } = &dep.source
     else {
         panic!("expected AlternateRegistry, got {:?}", dep.source);
     };
     let source = DependencySource::AlternateRegistry {
         index: index.clone(),
-        mirrors_crates_io: *mirrors_crates_io,
+        mirrors_public_registry: *mirrors_public_registry,
     };
     let versions = registry
         .get_versions_from(&dep.name, &source, FreshnessSettings::default())
@@ -299,7 +299,7 @@ async fn test_unregistered_alternate_index_never_falls_back_to_crates_io() {
     let registry = CargoRegistry::new(cache);
     let source = DependencySource::AlternateRegistry {
         index: "https://index.never-registered.example".to_string(),
-        mirrors_crates_io: false,
+        mirrors_public_registry: false,
     };
     let name = PackageName::new("internal-crate");
 

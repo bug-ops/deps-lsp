@@ -409,7 +409,7 @@ async fn same_name_from_two_sources_is_tracked_independently() {
     let none = DependencyOutcomes::new();
     let alternate = DependencySource::AlternateRegistry {
         index: "https://203.0.113.7/".into(),
-        mirrors_crates_io: false,
+        mirrors_public_registry: false,
     };
     fixture
         .run_full(

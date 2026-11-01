@@ -70,10 +70,10 @@ pattern for exactly this class of problem, and the shared infrastructure in
 `deps-core` is generic enough that `deps-go` needs no `deps-core` change to
 reuse it:
 
-- `DependencySource::AlternateRegistry { index, mirrors_crates_io }`
+- `DependencySource::AlternateRegistry { index, mirrors_public_registry }`
   (`crates/deps-core/src/parser.rs`) — a source-agnostic "resolved to a
   concrete, fetchable index/proxy URL" variant. `deps-go` would construct
-  it directly (`mirrors_crates_io: false`, matching npm's and PyPI's choice
+  it directly (`mirrors_public_registry: false`, matching npm's and PyPI's choice
   — no analogous mirror-verification concept exists for a Go proxy).
 - `DependencySource::CustomRegistry { url }` — the existing "present, but
   not resolved to a concrete, fetchable proxy" fail-closed state.
@@ -401,7 +401,7 @@ Use EARS notation. Prefix with FR-NNN.
 
 | Entity | Description | Key Attributes |
 |--------|-------------|----------------|
-| `DependencySource::AlternateRegistry` | Existing `deps-core` variant, reused as-is — the FR-002/FR-007 resolved state | `index: String` — for Go, an opaque routing key identifying the resolved chain/hop (mirrors PyPI's `ResolvedChain::key` precedent for multi-hop sources, per 033's Data Model note on this field's widened contract), `mirrors_crates_io: bool` (always `false`) |
+| `DependencySource::AlternateRegistry` | Existing `deps-core` variant, reused as-is — the FR-002/FR-007 resolved state | `index: String` — for Go, an opaque routing key identifying the resolved chain/hop (mirrors PyPI's `ResolvedChain::key` precedent for multi-hop sources, per 033's Data Model note on this field's widened contract), `mirrors_public_registry: bool` (always `false`) |
 | `DependencySource::CustomRegistry` | Existing `deps-core` variant, reused as Go's FR-009 fail-closed state — no new variant introduced | `url: String` — the raw value as written; `is_version_resolvable()` already `false` |
 | `GoEnvConfig` | New `deps-go` type — parsed `$GOENV` file contents | `goproxy: Option<Result<GoProxyChain, InvalidEntry>>`, `goprivate: Option<Vec<GlobPattern>>` |
 | `GoProxyChain` | New `deps-go` type — an ordered, validated `GOPROXY` chain | `hops: Vec<GoProxyHop>` (declaration order preserved, FR-002/FR-005) |

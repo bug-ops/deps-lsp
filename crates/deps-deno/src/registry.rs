@@ -1740,7 +1740,7 @@ mod tests {
 
         let source = deps_core::DependencySource::AlternateRegistry {
             index: index.as_str().to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let versions = Registry::get_versions_from(
             &deno_registry,
@@ -1789,7 +1789,7 @@ mod tests {
 
         let source = deps_core::DependencySource::AlternateRegistry {
             index: index.as_str().to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let latest = Registry::get_latest_matching_from(
             &deno_registry,

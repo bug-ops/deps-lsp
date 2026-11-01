@@ -595,7 +595,7 @@ mod tests {
         assert!(formatter.can_resolve_source(
             &deps_core::parser::DependencySource::AlternateRegistry {
                 index: "https://npm.pkg.github.com".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         ));
         assert!(!formatter.can_resolve_source(

@@ -5559,7 +5559,7 @@ mod tests {
         let registry = RoutingMockRegistry;
         let alternate = crate::parser::DependencySource::AlternateRegistry {
             index: "gitlab-ci:deadbeef".into(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
 
         // `AlternateRegistry` is not resolvable under the default `SourcePolicy`, so this

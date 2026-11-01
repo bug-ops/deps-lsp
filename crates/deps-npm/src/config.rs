@@ -317,7 +317,7 @@ fn source_from_result(result: &Result<DeclaredNpmRegistry, InvalidEntry>) -> Dep
     match result {
         Ok(index) => DependencySource::AlternateRegistry {
             index: index.as_str().to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         },
         Err(invalid) => DependencySource::CustomRegistry {
             url: invalid.raw.to_string(),
@@ -1235,7 +1235,7 @@ mod tests {
             config.resolve_source_for(&pkg("express")),
             DependencySource::AlternateRegistry {
                 index: "https://npm.mycorp.example".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
     }
@@ -1261,7 +1261,7 @@ mod tests {
             config.resolve_source_for(&pkg("@myorg/internal-lib")),
             DependencySource::AlternateRegistry {
                 index: "https://npm.pkg.github.com".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
         // An unscoped name still falls through to the top-level override.
@@ -1269,7 +1269,7 @@ mod tests {
             config.resolve_source_for(&pkg("express")),
             DependencySource::AlternateRegistry {
                 index: "https://npm.mycorp.example".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
     }
@@ -1615,7 +1615,7 @@ mod tests {
             config.resolve_source_for(&pkg("express")),
             DependencySource::AlternateRegistry {
                 index: "https://npm.mycorp.example".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
     }
@@ -1692,7 +1692,7 @@ mod tests {
             config.resolve_source_for(&pkg("express")),
             DependencySource::AlternateRegistry {
                 index: "https://npm.project.example".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
     }
@@ -1758,7 +1758,7 @@ mod tests {
             config.resolve_source_for(&pkg("express")),
             DependencySource::AlternateRegistry {
                 index: format!("https://{name}.corp.example/npm"),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
     }
@@ -1849,7 +1849,7 @@ mod tests {
             config.resolve_source_for(&pkg("express")),
             DependencySource::AlternateRegistry {
                 index: "https://npm.user.example".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
     }
@@ -1881,7 +1881,7 @@ mod tests {
             config.resolve_source_for(&pkg("express")),
             DependencySource::AlternateRegistry {
                 index: "https://npm.user.example".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
     }

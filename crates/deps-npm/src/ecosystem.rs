@@ -1686,7 +1686,7 @@ mod tests {
                 "@myorg/pkg",
                 DependencySource::AlternateRegistry {
                     index: "https://npm.pkg.github.com".to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
                 1,
             );
@@ -1800,7 +1800,7 @@ mod tests {
                 "@myorg/pkg",
                 DependencySource::AlternateRegistry {
                     index: "https://never-registered.example".to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
                 0,
             );
@@ -1852,7 +1852,7 @@ mod tests {
                 "@myorg/pkg",
                 DependencySource::AlternateRegistry {
                     index: index.as_str().to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
                 0,
             );

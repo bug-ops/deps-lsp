@@ -538,7 +538,7 @@ mod tests {
             name: "apple.swift-nio".into(),
             source: deps_core::parser::DependencySource::AlternateRegistry {
                 index: "https://registry.example/api".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             },
             origin: SwiftOrigin::Swizzled {
                 scm: crate::scm::ScmLookupUrl::parse(scm).unwrap(),

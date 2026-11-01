@@ -3,7 +3,7 @@
 use crate::config::DepsConfig;
 use crate::document::config_epoch::ConfigEpoch;
 use crate::document::{
-    DocStamp, PrefetchVisibility, PublishTicket, ServerState, ensure_document_loaded,
+    DocStamp, ParseFailure, PrefetchVisibility, PublishTicket, ServerState, ensure_document_loaded,
 };
 use deps_core::policy_config::{
     FetchConcurrency, FetchTimeout, GossipChecks, OsvChecks, TyposquatChecks,
@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
-use tower_lsp_server::ls_types::{Diagnostic, MessageType, Uri};
+use tower_lsp_server::ls_types::{
+    Diagnostic, DiagnosticSeverity, MessageType, NumberOrString, Range, Uri,
+};
 
 /// Floor under the dependency/concurrency-scaled ceiling (issue #632 critic S1): keeps a
 /// small `fetch_timeout` or a small manifest from producing an unrealistically tight
@@ -396,6 +398,37 @@ pub async fn handle_diagnostics(
     generate_diagnostics_internal(state, uri, &snapshot, ceiling).await
 }
 
+/// The single file-level diagnostic shown when the manifest's parser rejected the document,
+/// which otherwise yields no dependency findings at all.
+fn parse_failure_diagnostic(failure: &ParseFailure) -> Diagnostic {
+    let (code, severity, message) = match failure.kind {
+        deps_core::ParseFailureKind::NestingTooDeep => (
+            "nesting-too-deep",
+            DiagnosticSeverity::ERROR,
+            format!(
+                "Manifest nesting is too deep to analyze; dependency checks are skipped ({})",
+                failure.message
+            ),
+        ),
+        deps_core::ParseFailureKind::Malformed => (
+            "parse-error",
+            DiagnosticSeverity::WARNING,
+            format!(
+                "Manifest could not be parsed; dependency checks are skipped ({})",
+                failure.message
+            ),
+        ),
+    };
+    Diagnostic {
+        range: Range::default(),
+        severity: Some(severity),
+        code: Some(NumberOrString::String(code.to_owned())),
+        source: Some("deps-lsp".into()),
+        message,
+        ..Default::default()
+    }
+}
+
 /// Internal diagnostic generation without cold start support.
 ///
 /// This is used when we know the document is already loaded (e.g., from background tasks).
@@ -446,6 +479,13 @@ pub(crate) async fn generate_diagnostics_internal(
             uri
         );
         state.force_document_failed_with_not_attempted(uri);
+    }
+
+    if let Some(diagnostic) = state
+        .with_document(uri, |doc| doc.parse_failure().map(parse_failure_diagnostic))
+        .flatten()
+    {
+        return vec![diagnostic];
     }
 
     // Release the DashMap shard `Ref` before awaiting (#333): `with_document` only hands
@@ -2734,6 +2774,90 @@ dependencies = ["requests>=2.0.0"]
                  {result:?}"
             );
             assert_eq!(result[0].severity, Some(DiagnosticSeverity::ERROR));
+        }
+    }
+
+    #[cfg(feature = "cargo")]
+    mod parse_failure {
+        use super::*;
+        use crate::document::DocumentState;
+        use deps_core::ParseFailureKind;
+
+        async fn diagnostics_for_rejected_cargo_manifest(
+            content: &str,
+        ) -> (ParseFailure, Vec<Diagnostic>) {
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let ecosystem = state
+                .ecosystem_registry
+                .get(EcosystemId::Cargo)
+                .expect("cargo ecosystem registered under the cargo feature");
+            let error = ecosystem
+                .parse_manifest(content, &url)
+                .await
+                .err()
+                .expect("the manifest must be rejected by the parser");
+            let failure = ParseFailure::from_error(&error);
+            state.update_document(
+                uri.clone(),
+                DocumentState::new_parse_failed(
+                    EcosystemId::Cargo,
+                    content.to_owned(),
+                    failure.clone(),
+                ),
+            );
+            let diagnostics = generate_diagnostics_internal(
+                Arc::clone(&state),
+                &uri,
+                &DiagnosticsSnapshot::for_test(
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::DiagnosticSeverities::default(),
+                    deps_core::NetworkMode::Online,
+                ),
+                MIN_LOADING_CEILING,
+            )
+            .await;
+            (failure, diagnostics)
+        }
+
+        #[tokio::test]
+        async fn too_deeply_nested_toml_publishes_nesting_diagnostic() {
+            let content = format!(
+                "[dependencies]\na = {}1{}\n",
+                "[".repeat(100),
+                "]".repeat(100)
+            );
+            let (failure, diagnostics) = diagnostics_for_rejected_cargo_manifest(&content).await;
+
+            assert_eq!(failure.kind, ParseFailureKind::NestingTooDeep);
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected exactly one diagnostic, got: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+            assert_eq!(
+                diagnostic.code,
+                Some(NumberOrString::String("nesting-too-deep".into()))
+            );
+            assert_eq!(diagnostic.range, Range::default());
+            assert!(diagnostic.message.contains("nesting is too deep"));
+        }
+
+        #[tokio::test]
+        async fn toml_syntax_error_publishes_parse_error_diagnostic() {
+            let (failure, diagnostics) =
+                diagnostics_for_rejected_cargo_manifest("[dependencies\nserde = ").await;
+
+            assert_eq!(failure.kind, ParseFailureKind::Malformed);
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected exactly one diagnostic, got: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+            assert_eq!(
+                diagnostic.code,
+                Some(NumberOrString::String("parse-error".into()))
+            );
+            assert!(diagnostic.message.contains("could not be parsed"));
         }
     }
 }

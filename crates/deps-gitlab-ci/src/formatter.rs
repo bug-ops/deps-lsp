@@ -766,7 +766,7 @@ mod tests {
             "gitlab.com/org/proj",
             DependencySource::AlternateRegistry {
                 index: "gitlab:abc".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             },
         );
         let version_range = gl_dep.version_range.expect("tag pin has a version range");
@@ -826,7 +826,7 @@ mod tests {
         assert!(
             !fmt.suppress_package_url(&DependencySource::AlternateRegistry {
                 index: "gitlab:abc".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             })
         );
     }
@@ -844,7 +844,7 @@ mod tests {
         assert!(
             fmt.suppress_package_url(&DependencySource::AlternateRegistry {
                 index: "gitlab:abc".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             })
         );
     }
@@ -855,7 +855,7 @@ mod tests {
         assert!(
             fmt.suppress_package_url(&DependencySource::AlternateRegistry {
                 index: "gitlab:missing".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             })
         );
     }
@@ -866,7 +866,7 @@ mod tests {
         assert!(
             fmt.can_resolve_source(&DependencySource::AlternateRegistry {
                 index: "x".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             })
         );
         assert!(!fmt.can_resolve_source(&DependencySource::CustomRegistry { url: "x".into() }));
@@ -1140,7 +1140,7 @@ mod tests {
             "gitlab.com/org/proj",
             DependencySource::AlternateRegistry {
                 index: "gitlab:abc".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             },
         );
         d.version_req = Some(sha.into());
@@ -1182,7 +1182,7 @@ mod tests {
                 "gitlab.com/org/proj",
                 DependencySource::AlternateRegistry {
                     index: "gitlab:abc".into(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
             );
             d.version_req = Some(sha.clone().into());
@@ -1222,7 +1222,7 @@ mod tests {
             "gitlab.com/org/proj",
             DependencySource::AlternateRegistry {
                 index: "gitlab:abc".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             },
         );
         d.version_req = Some(sha.into());
@@ -1248,7 +1248,7 @@ mod tests {
             "gitlab.com/org/proj",
             DependencySource::AlternateRegistry {
                 index: "gitlab:abc".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             },
         );
         d.version_req = Some(sha.into());
@@ -1267,7 +1267,7 @@ mod tests {
         let fmt = formatter();
         let source = || DependencySource::AlternateRegistry {
             index: "gitlab:abc".into(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let mut d = dep(
             Some(PinStyle::sha_without_comment(
@@ -1390,7 +1390,7 @@ mod tests {
             "gitlab.com/org/proj",
             DependencySource::AlternateRegistry {
                 index: "gitlab:abc".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             },
         );
         d.version_req = Some(sha.into());
@@ -2018,7 +2018,7 @@ mod tests {
             "gitlab.com/org/proj",
             DependencySource::AlternateRegistry {
                 index: "gitlab.com".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             },
         );
         d.version_req = Some("17.0.0".into());

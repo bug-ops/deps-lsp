@@ -1096,7 +1096,7 @@ pub struct DependencyOutcome {
 
 /// Why a successfully answered registry lookup yielded no usable "latest" version.
 ///
-/// Neither variant is a [`FetchFailure`]: the registry was reachable and replied.
+/// No variant is a [`FetchFailure`]: the registry was reachable and replied, or never asked.
 /// Exhaustive on purpose so every consumer must handle a new variant.
 ///
 /// # Examples
@@ -1113,6 +1113,10 @@ pub enum LookupMiss {
     /// The fetch succeeded but no published version is comparable with the requirement,
     /// e.g. a GitHub repository whose only tag `v1` is not full semver (#550).
     NoComparableVersions,
+    /// The miss was decided locally (policy, configuration, an unexpanded template), so no
+    /// registry was asked and nothing is known about the package's existence (#1901). Never
+    /// surfaced to the user; recorded so "no cache entry" is not misread as "unknown package".
+    NotLookedUp,
 }
 
 impl DependencyOutcome {
@@ -1883,7 +1887,7 @@ pub fn latest_verdict(
 /// goes through `formatter.public_content` — the same predicate phase B itself
 /// uses to classify `NonRegistrySource` in the first place (`deps-engine`'s `classify::osv`) —
 /// rather than a bare `DependencySource::Registry` match, so an ecosystem that widens what counts
-/// as registry content (e.g. `deps-cargo`'s `AlternateRegistry { mirrors_crates_io: true }` for a
+/// as registry content (e.g. `deps-cargo`'s `AlternateRegistry { mirrors_public_registry: true }` for a
 /// configured crates.io mirror) is not itself misread as still-non-registry and wrongly kept
 /// stale. A mismatch means the entry is stale, so it fails closed to
 /// [`LatestVerdict::Unverified`] instead.
@@ -5780,7 +5784,7 @@ mod tests {
 
     /// Mirrors `deps-cargo`'s `CargoFormatter::source_is_public_registry_content` override
     /// (impl-critic S1, #1531): a verified crates.io mirror (`AlternateRegistry {
-    /// mirrors_crates_io: true, .. }`, reached via a `[source.crates-io] replace-with` chain)
+    /// mirrors_public_registry: true, .. }`, reached via a `[source.crates-io] replace-with` chain)
     /// counts as public-registry content alongside plain `Registry`. A local double rather than
     /// depending on `deps-cargo` from `deps-core` (wrong dependency direction).
     struct MockMirrorFormatter;
@@ -5802,7 +5806,7 @@ mod tests {
                 source,
                 DependencySource::Registry
                     | DependencySource::AlternateRegistry {
-                        mirrors_crates_io: true,
+                        mirrors_public_registry: true,
                         ..
                     }
             )
@@ -5912,7 +5916,7 @@ mod tests {
     /// #1531 impl-critic S1: phase B classifies `NonRegistrySource` via
     /// `formatter.source_is_public_registry_content`, not a bare `DependencySource::Registry`
     /// match — an ecosystem like `deps-cargo` widens that predicate to also accept a verified
-    /// crates.io mirror (`AlternateRegistry { mirrors_crates_io: true, .. }`). A path dependency
+    /// crates.io mirror (`AlternateRegistry { mirrors_public_registry: true, .. }`). A path dependency
     /// edited to such a mirrored registry dependency must be recognized as a source change too,
     /// not stay wrongly `NotApplicable` just because it isn't the literal `Registry` variant.
     #[test]
@@ -5922,7 +5926,7 @@ mod tests {
             name_range: crate::position::Range::default(),
             source: DependencySource::AlternateRegistry {
                 index: "https://crates-mirror.example.com/index".to_string(),
-                mirrors_crates_io: true,
+                mirrors_public_registry: true,
             },
         };
         let formatter = MockMirrorFormatter;

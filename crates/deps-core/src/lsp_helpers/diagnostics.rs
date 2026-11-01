@@ -1463,6 +1463,7 @@ const fn should_notify_in_diagnostics(reason: SkipReason) -> bool {
         | SkipReason::UnevaluableAdvisoryRange => true,
         SkipReason::NonRegistrySource
         | SkipReason::UnmappableName
+        | SkipReason::TemplatedName
         | SkipReason::UnmappableEcosystem
         | SkipReason::UnmatchableVersion
         | SkipReason::SiblingTagsUnknown => false,
@@ -2394,6 +2395,8 @@ fn apply_in_use_yanked_rule(
 ///    `v1` isn't full semver) — reported by neither R5c ("couldn't be asked") nor R5d
 ///    ("no evidence it exists"). Checked before R5d so it takes priority over the
 ///    "absent cache entry" heuristic that would otherwise misclassify it.
+///    A locally decided miss ([`LookupMiss::NotLookedUp`], #1901) is silent for the same
+///    reason: no registry was asked, so there is no evidence either way.
 /// 7. `Ok(())` + `can_resolve_source` -> R5d `Unknown package '{name}'`.
 /// 8. `Ok(())` -> nothing (#248: unresolvable source, absent cache entry means "never
 ///    fetched").
@@ -2416,8 +2419,10 @@ fn apply_unknown_package_rule(
     let lookup_miss = ctx
         .versions
         .reportable_lookup_miss(dep, ctx.key, ctx.formatter);
-    let no_comparable_versions =
-        ctx.versions.lookup_miss_for(ctx.key) == Some(LookupMiss::NoComparableVersions);
+    let silent_miss = matches!(
+        ctx.versions.lookup_miss_for(ctx.key),
+        Some(LookupMiss::NoComparableVersions | LookupMiss::NotLookedUp)
+    );
     match ctx.formatter.validate_package_name(dep.name().as_str()) {
         Err(reason) if !in_lockfile => {
             diagnostics.push(
@@ -2466,6 +2471,9 @@ fn apply_unknown_package_rule(
                             "No registry version of '{name}' is comparable; lock-file version in use"
                         )
                     }
+                    LookupMiss::NotLookedUp => {
+                        format!("'{name}' was not looked up; lock-file version in use")
+                    }
                 };
                 diagnostics.push(
                     Diagnostic::new(DiagnosticKind::Notice, dep.name_range(), message)
@@ -2473,7 +2481,7 @@ fn apply_unknown_package_rule(
                 );
             }
         }
-        Ok(()) if can_resolve_source && no_comparable_versions => {}
+        Ok(()) if can_resolve_source && silent_miss => {}
         Ok(()) if can_resolve_source => {
             diagnostics.push(
                 Diagnostic::new(
@@ -4028,7 +4036,7 @@ mod tests {
     fn test_lockfile_lookup_miss_suppressed_for_alternate_registry_and_offline() {
         let alternate = crate::parser::DependencySource::AlternateRegistry {
             index: "https://index.example.internal".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         assert!(
             lookup_miss_diagnostics(
@@ -4097,6 +4105,23 @@ mod tests {
         );
         assert_eq!(not_found.len(), 1);
         assert_eq!(not_found[0].message(), "Unknown package 'locked-pkg'");
+    }
+
+    #[test]
+    fn test_not_looked_up_miss_never_reads_as_unknown_package_or_lockfile_notice() {
+        for in_lockfile in [false, true] {
+            let diagnostics = lookup_miss_diagnostics(
+                Some(LookupMiss::NotLookedUp),
+                in_lockfile,
+                registry_source(),
+                crate::NetworkMode::Online,
+                Severity::Warning,
+            );
+            assert!(
+                diagnostics.is_empty(),
+                "in_lockfile={in_lockfile}: {diagnostics:?}"
+            );
+        }
     }
 
     /// Shared fixture for the `declaration_key`-redaction test family below (#993 M3): builds a

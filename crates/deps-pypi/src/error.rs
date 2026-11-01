@@ -98,6 +98,8 @@ pub enum PypiError {
     TomlParseError {
         /// Description of the TOML parse failure.
         message: String,
+        /// Why the TOML was rejected.
+        kind: deps_core::ParseFailureKind,
     },
 
     /// Invalid PEP 508 dependency specification
@@ -142,6 +144,16 @@ impl PypiError {
         }
     }
 
+    /// The [`deps_core::ParseFailureKind`] behind this error.
+    pub(crate) const fn parse_failure_kind(&self) -> deps_core::ParseFailureKind {
+        match self {
+            Self::TomlParseError { kind, .. } => *kind,
+            Self::InvalidDependencySpec { .. }
+            | Self::UnsupportedFormat { .. }
+            | Self::RequirementTooLong { .. } => deps_core::ParseFailureKind::Malformed,
+        }
+    }
+
     /// A safe-to-log description of why parsing failed (#1228).
     ///
     /// [`Self::InvalidDependencySpec`] wraps a third-party `pep508_rs` error — [`Pep508ParseError`]'s
@@ -160,7 +172,7 @@ impl PypiError {
     pub(crate) fn reason_for_log(&self) -> String {
         match self {
             Self::InvalidDependencySpec { source } => source.kind_str().to_string(),
-            Self::UnsupportedFormat { message } | Self::TomlParseError { message } => {
+            Self::UnsupportedFormat { message } | Self::TomlParseError { message, .. } => {
                 message.clone()
             }
             // `len`/`max` are plain `usize`s, never attacker text — `Self::to_string()` (the
@@ -188,6 +200,7 @@ mod tests {
     fn test_toml_parse_error_display() {
         let err = PypiError::TomlParseError {
             message: "unexpected token".into(),
+            kind: deps_core::ParseFailureKind::Malformed,
         };
         assert_eq!(
             err.to_string(),

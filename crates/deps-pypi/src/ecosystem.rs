@@ -202,7 +202,13 @@ impl Ecosystem for PypiEcosystem {
                     )
                 }
             }
-            .map_err(|e| deps_core::DepsError::parse_error(kind.file_type(), &e))?;
+            .map_err(|e| {
+                deps_core::DepsError::parse_error_of_kind(
+                    kind.file_type(),
+                    e.parse_failure_kind(),
+                    &e,
+                )
+            })?;
             // Registers every chain this file's --index-url/--extra-index-url/Poetry-source/
             // uv-index declarations imply (spec FR-002/003/005/007/013) into the shared
             // root registry — the only point where a per-document resolution and the
@@ -2151,7 +2157,7 @@ dependencies = []
 
             let source = DependencySource::AlternateRegistry {
                 index: chain.key.clone(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             };
             let parse_result = parse_result_with_dependency("mypkg", source);
 
@@ -2205,7 +2211,7 @@ dependencies = []
 
             let source = DependencySource::AlternateRegistry {
                 index: "pypi-chain:never-registered".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             };
             let parse_result = parse_result_with_dependency("mypkg", source);
 
@@ -2246,7 +2252,7 @@ dependencies = []
                 "shared-name",
                 DependencySource::AlternateRegistry {
                     index: "pypi-chain:never-registered".to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
             )
             .dependencies

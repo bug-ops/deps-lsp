@@ -88,10 +88,10 @@ pattern for exactly this class of problem, and the shared infrastructure
 in `deps-core` is generic enough that `deps-pypi` needs no `deps-core`
 change to reuse it:
 
-- `DependencySource::AlternateRegistry { index, mirrors_crates_io }`
+- `DependencySource::AlternateRegistry { index, mirrors_public_registry }`
   (`crates/deps-core/src/parser.rs:894`) — a source-agnostic "resolved to
   a concrete, fetchable index URL" variant. `deps-pypi` would construct
-  it directly (with `mirrors_crates_io: false`, the same choice npm made
+  it directly (with `mirrors_public_registry: false`, the same choice npm made
   — no analogous mirror-verification concept exists for a PyPI-protocol
   index).
 - `DependencySource::CustomRegistry { url }`
@@ -380,7 +380,7 @@ Use EARS notation. Prefix with FR-NNN.
 
 | Entity | Description | Key Attributes |
 |--------|-------------|----------------|
-| `DependencySource::AlternateRegistry` | Existing `deps-core` variant, reused as-is — the FR-002/FR-003/FR-007 resolved state | `index: String`, `mirrors_crates_io: bool` (always `false` for PyPI, matching npm's choice). **Note (added 2026-09-02, second critic pass)**: `deps-core`'s doc comment describes `index` as "the resolved index URL" — accurate for Cargo/npm, which always store a literal URL there. PyPI's multi-hop chain sources (FR-005) instead store an **opaque, parser-owned routing key** (not a URL — see plan.md §3's `ResolvedChain::key`) for any dependency whose source is a chain rather than a single index; a single-hop named-source dependency (Poetry/uv `source`/`index =`) still stores that source's literal URL, matching Cargo/npm's convention. No `deps-core` consumer renders or parses this field as a URL today, so this is a documentation-level widening of the field's existing contract, not a type change — permitted by this spec's "Never widen the `deps-core` trait surface" boundary, which does not cover doc comments |
+| `DependencySource::AlternateRegistry` | Existing `deps-core` variant, reused as-is — the FR-002/FR-003/FR-007 resolved state | `index: String`, `mirrors_public_registry: bool` (always `false` for PyPI, matching npm's choice). **Note (added 2026-09-02, second critic pass)**: `deps-core`'s doc comment describes `index` as "the resolved index URL" — accurate for Cargo/npm, which always store a literal URL there. PyPI's multi-hop chain sources (FR-005) instead store an **opaque, parser-owned routing key** (not a URL — see plan.md §3's `ResolvedChain::key`) for any dependency whose source is a chain rather than a single index; a single-hop named-source dependency (Poetry/uv `source`/`index =`) still stores that source's literal URL, matching Cargo/npm's convention. No `deps-core` consumer renders or parses this field as a URL today, so this is a documentation-level widening of the field's existing contract, not a type change — permitted by this spec's "Never widen the `deps-core` trait surface" boundary, which does not cover doc comments |
 | `DependencySource::CustomRegistry` | Existing `deps-core` variant, reused as PyPI's FR-006 fail-closed state — no new variant introduced | `url: String` — the raw value as written; `is_version_resolvable()` already `false` |
 | `PypiIndexConfig` | New `deps-pypi` type — resolved index configuration for one manifest/requirements file | `primary: Option<Result<PypiIndexUrl, InvalidEntry>>` (from `--index-url` or a `priority = "primary"`/`"default"`-equivalent Poetry source), `extras: Vec<Result<PypiIndexUrl, InvalidEntry>>` (declaration order preserved, FR-005), `named_sources: HashMap<String, Result<PypiIndexUrl, InvalidEntry>>` (Poetry `[[tool.poetry.source]]` keyed by `name`, consulted when a dependency declares `source = "<name>"`) |
 | `InvalidEntry` | New `deps-pypi` type — a present-but-unusable entry, carrying what FR-006 needs to build `CustomRegistry` and to warn | `raw: String` (as written), `reason` (validation failure kind) |

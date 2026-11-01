@@ -191,7 +191,7 @@ impl SourcePolicy for CargoFormatter {
         true
     }
 
-    /// A verified crates.io mirror (`AlternateRegistry { mirrors_crates_io: true, .. }`,
+    /// A verified crates.io mirror (`AlternateRegistry { mirrors_public_registry: true, .. }`,
     /// spec plan-1b §1.3, F1/F1b) counts as public-registry content alongside plain
     /// [`DependencySource::Registry`] — Cargo verifies per-version checksum equality
     /// against crates.io for a `[source.crates-io] replace-with` mirror, so its content is
@@ -202,7 +202,7 @@ impl SourcePolicy for CargoFormatter {
             source,
             DependencySource::Registry
                 | DependencySource::AlternateRegistry {
-                    mirrors_crates_io: true,
+                    mirrors_public_registry: true,
                     ..
                 }
         )
@@ -282,7 +282,7 @@ mod tests {
         assert!(formatter.source_is_public_registry_content(
             &DependencySource::AlternateRegistry {
                 index: "https://mirror.example".into(),
-                mirrors_crates_io: true,
+                mirrors_public_registry: true,
             }
         ));
     }
@@ -293,7 +293,7 @@ mod tests {
         assert!(!formatter.source_is_public_registry_content(
             &DependencySource::AlternateRegistry {
                 index: "https://index.mycorp.dev".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         ));
     }
@@ -304,7 +304,7 @@ mod tests {
         assert!(
             !formatter.suppress_package_url(&DependencySource::AlternateRegistry {
                 index: "https://mirror.example".into(),
-                mirrors_crates_io: true,
+                mirrors_public_registry: true,
             })
         );
     }
@@ -315,7 +315,7 @@ mod tests {
         assert!(
             formatter.suppress_package_url(&DependencySource::AlternateRegistry {
                 index: "https://index.mycorp.dev".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             })
         );
     }

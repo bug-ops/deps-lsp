@@ -951,7 +951,7 @@ impl NuGetConfig {
         }
         DependencySource::AlternateRegistry {
             index: NuGetSourceChain::chain(hops, false).key,
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         }
     }
 
@@ -1036,7 +1036,7 @@ impl NuGetConfig {
         }
         DependencySource::AlternateRegistry {
             index: NuGetSourceChain::chain(valid_hops, self.implicit_public_fallback()).key,
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         }
     }
 

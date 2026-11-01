@@ -319,7 +319,7 @@ mod tests {
         assert!(
             formatter.can_resolve_source(&deps_core::DependencySource::AlternateRegistry {
                 index: "pypi-chain:deadbeef".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             })
         );
         assert!(
@@ -339,7 +339,7 @@ mod tests {
         assert!(
             formatter.suppress_package_url(&deps_core::DependencySource::AlternateRegistry {
                 index: "pypi-chain:deadbeef".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             })
         );
         assert!(

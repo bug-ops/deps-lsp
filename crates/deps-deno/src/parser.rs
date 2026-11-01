@@ -216,8 +216,9 @@ pub fn parse_deno_json_with_context(
     if let Some(value) = &ast.value
         && let Err(depth) = check_ast_nesting_depth(value, MAX_JSON_NESTING_DEPTH)
     {
-        return Err(DepsError::parse_error(
+        return Err(DepsError::parse_error_of_kind(
             "deno.json",
+            deps_core::ParseFailureKind::NestingTooDeep,
             &json_depth_error_message(depth),
         ));
     }
@@ -935,7 +936,7 @@ mod tests {
             result.dependencies[0].source,
             deps_core::parser::DependencySource::AlternateRegistry {
                 index: "https://npm.acme.internal".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             },
             "an injected All-access policy must resolve the .internal scope entry, proving \
              ctx's own policy — not a hardcoded default — drives classification"

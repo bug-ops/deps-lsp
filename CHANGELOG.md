@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cargo, deps-go**: `OperatorRegistries::declared_in_env` becomes `declared_by_env`, `OperatorEnvValue::read` takes `&OperatorEnvName`, `GoParseContext::new` takes `Arc<GoProcessEnv>`, and `GoEnvConfig::has_goprivate` becomes `registers_bypass_chain` (#1899)
 - **deps-core**: `CheckedTomlError::NestingTooDeep` carries `guard: TomlDepthGuard` instead of `depth`, `Syntax` no longer converts from `toml_span::Error`, and the `toml-span` floor is 0.7.2 (#1899)
 - **deps-core**: `DepsDevClient` lookup methods take `DepsDevTarget` and `DepsDevTargets` (#1899)
+- **deps-core**: `DependencySource::AlternateRegistry::mirrors_crates_io` is renamed `mirrors_public_registry` (#PR)
+- **deps-core, deps-pypi, deps-go, deps-engine**: `DepsError::ParseError` and `PypiError::TomlParseError` carry a `ParseFailureKind`, `LookupMiss` gains `NotLookedUp`, `GoProxyHop` gains `PrivateBypass`, and `SkipReason`, `StructuralSkipReason` gain `TemplatedName` (#PR)
 
 ### Added
 - **deps-npm, deps-cli**: `pnpm-workspace.yaml` catalog entries get hints, diagnostics, hover, completion and updates, and a duplicate default catalog is reported (#1880)
@@ -79,6 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle**: hover license precedence is registry, then deps.dev SPDX, then the POM fetch; Gradle coordinates, including internal-repository ones, go to deps.dev on hover unless `supply_chain.enabled`, `typosquat.enabled` and `gossip.enabled` are off (#1899)
 
 ### Fixed
+- **deps-lsp, deps-core**: a manifest rejected by the parser publishes a `parse-error` or `nesting-too-deep` diagnostic instead of failing silently (#PR)
+- **deps-go, deps-engine**: a GOPRIVATE, `GOPROXY=direct` or `GOPROXY=off` bypass is logged as skipped rather than as a Go proxy 404, and no longer reports "Unknown package" (#PR)
+- **deps-core, deps-maven, deps-gradle**: unexpanded template names such as `$grp:x` or `${grp}` get no registry link, no OSV claim and no registry request in every ecosystem (#PR)
 - **deps-core, deps-npm, deps-deno**: the update code action keeps the requirement operator and offers no prerelease unless the dependency is on one (#1896)
 - **deps-core, deps-cli**: a failed registry fetch for a dependency with a lockfile version publishes a diagnostic and a warning inlay instead of "up to date" (#1896)
 - **deps-core, deps-engine, deps-lsp, deps-cli**: a lock-file dependency whose registry answers 404 or has no comparable version gets a notice and a warning inlay instead of "up to date"; alternate registries, local lock entries and offline stay silent (#1898)

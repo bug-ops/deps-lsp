@@ -103,6 +103,7 @@ impl PypiParser {
         let doc = deps_core::parse_toml_checked(content).map_err(|e| {
             crate::error::PypiError::TomlParseError {
                 message: super::truncate_for_log(&e.to_string()).into_owned(),
+                kind: e.kind(),
             }
         })?;
 
@@ -892,7 +893,13 @@ mod tests {
         let content = format!("a = {}1{}", "[".repeat(300), "]".repeat(300));
         let parser = PypiParser::new();
         let result = parser.parse_content(&content, &test_uri());
-        assert_matches!(result, Err(PypiError::TomlParseError { .. }));
+        assert_matches!(
+            result,
+            Err(PypiError::TomlParseError {
+                kind: deps_core::ParseFailureKind::NestingTooDeep,
+                ..
+            })
+        );
     }
 
     /// Regression for #1228 M5: `toml_span::Error::Display` (unlike its own `ErrorKind::Display`,
@@ -909,7 +916,7 @@ b = 2
 "#;
         let parser = PypiParser::new();
         let result = parser.parse_content(content, &test_uri());
-        let Err(PypiError::TomlParseError { message }) = result else {
+        let Err(PypiError::TomlParseError { message, .. }) = result else {
             panic!("expected TomlParseError, got: {result:?}");
         };
         assert!(
@@ -2687,7 +2694,7 @@ requests = "^2.28.0"
             flask.source,
             PypiDependencySource::AlternateRegistry {
                 index: "https://pypi.mycorp.example/simple".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
 
@@ -2854,7 +2861,7 @@ dependencies = ["mypkg>=1.0.0", "requests>=2.28.0"]
             mypkg.source,
             PypiDependencySource::AlternateRegistry {
                 index: "https://pypi.mycorp.example/simple".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
 
@@ -2898,7 +2905,7 @@ dependencies = ["mypkg>=1.0.0"]
             mypkg.source,
             PypiDependencySource::AlternateRegistry {
                 index: "https://pypi.mycorp.example/simple".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
     }
@@ -2930,7 +2937,7 @@ dependencies = ["flask-sqlalchemy>=1.0.0"]
             dep.source,
             PypiDependencySource::AlternateRegistry {
                 index: "https://pypi.mycorp.example/simple".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
     }
@@ -2955,7 +2962,7 @@ dependencies = ["mypkg>=1.0.0"]
             result.dependencies[0].source,
             PypiDependencySource::AlternateRegistry {
                 index: "https://extra.example/simple".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
     }

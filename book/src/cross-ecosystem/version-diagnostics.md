@@ -182,6 +182,21 @@ manifest declares 12000 dependencies, exceeding deps-lsp's per-document limit of
 This limit is hardcoded, not configurable — the same "security limit, not a user
 preference" reasoning as the 10MB file-size cap.
 
+## Unparseable Manifest Diagnostics
+
+When the parser rejects a manifest, the server publishes a single file-level diagnostic at position 0:0 instead of silently showing nothing:
+
+| Code | Severity | Cause |
+|------|----------|-------|
+| `nesting-too-deep` | ERROR | TOML, YAML or Deno JSON nesting beyond the parser's depth guard |
+| `parse-error` | WARNING | Any other syntax error |
+
+The diagnostic is cleared as soon as the document parses again or is closed.
+
+## Unexpanded Template Placeholders
+
+A dependency name that is an unexpanded template placeholder (Maven/Gradle `$grp:x` or `${grp}`, NuGet `$(Pkg)`, npm `${pkg}`) is not a real package name in any ecosystem: it gets no registry link, no registry request and no OSV claim.
+
 ## CodeLens: "Update N Outdated Dependencies"
 
 An open manifest with at least one outdated, safely-editable dependency shows a code lens at

@@ -719,7 +719,7 @@ impl SwiftRegistriesConfig {
         match self.applicable(scope) {
             Some((_, Ok(resolved))) => DependencySource::AlternateRegistry {
                 index: resolved.url.as_str().to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             },
             Some((_, Err(invalid))) => DependencySource::CustomRegistry {
                 url: invalid.raw.to_string(),
@@ -1230,7 +1230,7 @@ mod tests {
     fn alternate(url: &str) -> DependencySource {
         DependencySource::AlternateRegistry {
             index: url.to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         }
     }
 

@@ -762,7 +762,7 @@ impl deps_core::Registry for PypiRegistry {
     /// Dispatches by `source` (spec FR-010): an `AlternateRegistry` whose index has a
     /// registered client routes through `Self::get_versions_chained` (FR-005's chain
     /// walk); one with **no** registered client is `PackageNotFound`, never a fall back to
-    /// `pypi.org` (PyPI always sets `mirrors_crates_io: false`, so Cargo's mirror-degradation
+    /// `pypi.org` (PyPI always sets `mirrors_public_registry: false`, so Cargo's mirror-degradation
     /// arm is dead here and must not be written — falling back would send a private package
     /// name to the public index, the exact #248-class leak this feature closes). Every other
     /// source keeps today's public-registry path unchanged.
@@ -2229,7 +2229,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: chain.key.clone(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let versions = deps_core::Registry::get_versions_from(
             root.as_ref(),
@@ -2323,7 +2323,7 @@ mod tests {
         let root = PypiRegistry::new(cache);
         let unregistered = DependencySource::AlternateRegistry {
             index: "missing".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let error = root
             .get_versions_from(
@@ -2555,7 +2555,7 @@ mod tests {
         let endpoint = |source: &DependencySource| root.endpoint_for(&name, source);
         let via = |key: &str| DependencySource::AlternateRegistry {
             index: key.to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
 
         assert_eq!(
@@ -2777,7 +2777,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: chain.key.clone(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let versions = deps_core::Registry::get_versions_from(
             root.as_ref(),
@@ -2833,7 +2833,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: chain.key.clone(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let versions = deps_core::Registry::get_versions_from(
             root.as_ref(),
@@ -2880,7 +2880,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: chain.key.clone(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let latest = deps_core::Registry::get_latest_matching_from(
             root.as_ref(),
@@ -2931,7 +2931,7 @@ mod tests {
 
         let source = DependencySource::AlternateRegistry {
             index: chain.key.clone(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let sentinel = SelectionContext::with_minimum_stability(StabilityFloor::Rc);
         SelectionContextCapture::reset();
@@ -3023,7 +3023,7 @@ mod tests {
         let registry = PypiRegistry::new(cache);
         let source = DependencySource::AlternateRegistry {
             index: "pypi-chain:never-registered".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let result = deps_core::Registry::get_versions_from(
             &registry,

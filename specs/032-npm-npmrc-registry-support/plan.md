@@ -52,7 +52,7 @@ lands in exactly one of three existing `deps-core` states — **no new
 | Config outcome for this dependency | Resolved `DependencySource` | Downstream effect |
 |---|---|---|
 | No `registry=`/`@scope:registry=` applies (FR-005) | `Registry` (today's behavior, unchanged) | Public registry, byte-identical to pre-feature |
-| A matching entry present, validated, policy-allowed (FR-003/FR-004) | `AlternateRegistry { index: <normalized url>, mirrors_crates_io: false }` | Routed to the alternate client |
+| A matching entry present, validated, policy-allowed (FR-003/FR-004) | `AlternateRegistry { index: <normalized url>, mirrors_public_registry: false }` | Routed to the alternate client |
 | A matching entry present but invalid, unexpandable, or policy-blocked (FR-006/FR-007/FR-008) | `CustomRegistry { url: <raw value as written> }` | `is_version_resolvable() == false` → fails closed everywhere |
 
 The third row is the C1 fix. `DependencySource::CustomRegistry { url }` is
@@ -448,10 +448,10 @@ wrong twice during design review":
 
 Two points that distinguish npm from Cargo here:
 
-- Cargo has a **fourth** arm — `None if *mirrors_crates_io` degrades to crates.io
+- Cargo has a **fourth** arm — `None if *mirrors_public_registry` degrades to crates.io
   (`registry.rs:503,529`) — justified because Cargo verifies per-version checksum
   equality against crates.io for a declared mirror. npm sets
-  `mirrors_crates_io: false` unconditionally and has no equivalent
+  `mirrors_public_registry: false` unconditionally and has no equivalent
   mirror-verification concept, so that arm is **dead for npm and must not be
   written**. The tempting simplification — "npm has no mirrors, so an
   unregistered index just falls back to the public client" — is precisely the
@@ -482,7 +482,7 @@ not completed). Both must degrade to `PackageNotFound`, not to a public fetch.
 | Entity | Description | Key Attributes |
 |--------|-------------|-----------------|
 | `DependencySource::Registry` | Existing variant, unchanged | Public registry — FR-005's fallback and today's universal behavior |
-| `DependencySource::AlternateRegistry` | Existing `deps-core` variant (#440), reused as-is | `index: String` (the **normalized** `NpmRegistryIndex::as_str()`), `mirrors_crates_io: false` always |
+| `DependencySource::AlternateRegistry` | Existing `deps-core` variant (#440), reused as-is | `index: String` (the **normalized** `NpmRegistryIndex::as_str()`), `mirrors_public_registry: false` always |
 | `DependencySource::CustomRegistry` | Existing `deps-core` variant, reused as npm's FR-006 fail-closed state (C1) | `url: String` — the raw `.npmrc` value as written; `is_version_resolvable() == false` |
 | `NpmConfig` | New `deps-npm` type — merged resolved `.npmrc` hierarchy | `registry: Option<Result<NpmRegistryIndex, InvalidEntry>>`, `scoped_registries: HashMap<String, Result<..>>` keyed by `@scope` byte-exact |
 | `InvalidEntry` | New — a present-but-unusable entry | `raw: String`, `reason: NpmRegistryIndexError` |
@@ -499,7 +499,7 @@ not completed). Both must degrade to `PackageNotFound`, not to a public fetch.
 `EcosystemFormatter::source_is_public_registry_content` is deliberately **not**
 overridden (M3): its default is `matches!(source, DependencySource::Registry)`,
 which is already correct for npm — an alternate registry's content is not
-npmjs.org's, and npm has no `mirrors_crates_io` equivalent to except. Documented
+npmjs.org's, and npm has no `mirrors_public_registry` equivalent to except. Documented
 side effect: a dependency resolved to an alternate registry drops out of OSV
 vulnerability scanning and out of public-registry hover links. That is the
 desired behavior (advisories keyed to a public package name do not apply to a
@@ -716,7 +716,7 @@ report alone.
 | ID | Disposition | Where |
 |----|-------------|-------|
 | **N-C1** r2 inverted S6; FR-006/NFR-002 mandate a release-build `http`-loopback exception `deps-core` rejects | **Accepted, and the critic is right on every point.** Verified directly: `deps-cargo/src/config.rs:185` carries `#[cfg(any(test, feature = "test-util"))]` above `fn is_loopback_url`; `deps-core/src/cache.rs:121` gates `is_loopback_host` identically and `ensure_https` (`:151-160`) consults it only under that cfg. Also verified the unreachability claim: `get_cached_workspace` (`cache.rs:1041-1048`) delegates to `get_cached_with_headers_via` (`:1074`), whose two send paths `conditional_request_with_headers` (`:1149`) and `fetch_and_store_with_headers` (`:1224`) each call `ensure_https` at `:1158` and `:1232` — so a release-build `http://localhost` index would indeed reach `CacheError("URL must use HTTPS")` rather than any usable outcome. r2's wording was net worse than both alternatives. Build-gated rule restored, with the reachability argument (not just the mirror-`deps-cargo` argument) written into the design so it cannot be "simplified" back out. The `deps-core` `ensure_https` change that would be needed to genuinely allow it stays out of scope, per §8 "Ask First" | §1 (`NpmRegistryIndex::new` doc, entity summary), §3, §6 NFR-002 bullet, §7 (mockito row reason + a new scheme-gate row), spec FR-006/NFR-002/§5/§6, and the S6 row above |
-| **N-S1** unregistered-`AlternateRegistry` fetch fallthrough unspecified | **Accepted; the recommended *behavior* is confirmed, but the task brief's suggested mechanism is not what Cargo does.** Verified `deps-cargo/src/registry.rs:489-547`: the arms are `Some(client)` → alternate, `None if *mirrors_crates_io` → crates.io, `None` → `Err(PackageNotFound{registry:"alternate registry (not registered)"})`, `_` → crates.io — and the comment at `:529-532` does record the enumeration being "wrong twice during design review". Cargo does **not** lazily create a client on the fetch path: the only `register_alternate` call site in the workspace is parse-time (`deps-cargo/src/ecosystem.rs:248`). Lazy creation is also not *constructible* on npm's fetch path, which holds only the validated `index: String` and not the `RegistryAccessPolicy` an `NpmRegistryIndex` requires. So npm keeps parse-time-only registration with an unconditional `PackageNotFound` on the `None` arm (npm's `mirrors_crates_io` is always `false`, so Cargo's mirror arm is dead and must not be written) | §3 new "dispatch (N-S1)" subsection, §5 alternate-registry row, §7 new integration row, spec FR-010 + a new §6 edge-case row |
+| **N-S1** unregistered-`AlternateRegistry` fetch fallthrough unspecified | **Accepted; the recommended *behavior* is confirmed, but the task brief's suggested mechanism is not what Cargo does.** Verified `deps-cargo/src/registry.rs:489-547`: the arms are `Some(client)` → alternate, `None if *mirrors_public_registry` → crates.io, `None` → `Err(PackageNotFound{registry:"alternate registry (not registered)"})`, `_` → crates.io — and the comment at `:529-532` does record the enumeration being "wrong twice during design review". Cargo does **not** lazily create a client on the fetch path: the only `register_alternate` call site in the workspace is parse-time (`deps-cargo/src/ecosystem.rs:248`). Lazy creation is also not *constructible* on npm's fetch path, which holds only the validated `index: String` and not the `RegistryAccessPolicy` an `NpmRegistryIndex` requires. So npm keeps parse-time-only registration with an unconditional `PackageNotFound` on the `None` arm (npm's `mirrors_public_registry` is always `false`, so Cargo's mirror arm is dead and must not be written) | §3 new "dispatch (N-S1)" subsection, §5 alternate-registry row, §7 new integration row, spec FR-010 + a new §6 edge-case row |
 | **N-S2** C2's rename blast radius understated in §2/§9/§11 | **Accepted; both sub-claims verified.** `#[serde(deny_unknown_fields)]` is on `DepsConfig` itself (`deps-lsp/src/config.rs:34`, and its own doc at `:25-32` says so explicitly), so a stale `cargo` key fails the whole payload. At `initialize` (`server.rs:385-395`) the `if let ... && let Some(config) = parse_config(...)` chain is simply skipped on failure, leaving `Backend::new`'s `DepsConfig::default()` (`:79`) — a full reset, not a "keep previous". Confirmed fail-closed for the security setting: `WorkspaceRegistriesSetting::default()` is `PublicOnly` and `HttpCache::new` constructs from `RegistryAccessPolicy::default()` (`cache.rs:708-714`), so the skipped `set_registry_policy` is harmless. `didChangeConfiguration` (`server.rs:516-518`) does early-return and keep the live config, so the old wording was right for that case only. Wording corrected to cover both; the C2 decision itself is **not** reversed — the alias remains rejected on the pre-1.0 no-shims rule | §2 (new N-S2 block), §9, §11 |
 | **N-M1** `get_cached_workspace_with_headers` needs a redirect/credential doc warning | **Accepted.** Verified the precedent at `cache.rs:948-962`, which documents exactly this hazard for `get_cached_trusted_origin_with_headers` and explains that origin-pinning is what closes it. The workspace transport pins by host *class*, not origin, so the new method has the hazard the trusted-origin one was built to avoid | §2 A1 doc requirement |
 | **N-M2** "delete `CargoConfig`" is ambiguous; two extra edit sites omitted | **Accepted.** Verified two distinct types: `deps_lsp::config::CargoConfig` (`config.rs:636`, one field, the one to delete) and `deps_cargo::config::CargoConfig` (`deps-cargo/src/config.rs:358`, re-exported at `deps-cargo/src/lib.rs:33`, unrelated and untouched). Edit sites in `deps-lsp/src/config.rs` enumerated exactly: `:51`, `:630-632`, `:636`, `:747`, `:769-770`, `:773` | §2 |

@@ -707,7 +707,7 @@ mod tests {
 
         let alternate = DependencySource::AlternateRegistry {
             index: "https://swift.acme.dev".into(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let custom = DependencySource::CustomRegistry { url: "acme".into() };
         assert!(SwiftFormatter.can_resolve_source(&alternate));
@@ -720,7 +720,7 @@ mod tests {
         assert!(!is_url_source(
             &deps_core::parser::DependencySource::AlternateRegistry {
                 index: "https://swift.acme.dev".into(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         ));
     }

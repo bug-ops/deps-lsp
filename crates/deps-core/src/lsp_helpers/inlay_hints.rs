@@ -182,6 +182,7 @@ pub fn generate_inlay_hints(
                     LookupMiss::NoComparableVersions => {
                         "No comparable registry version; latest version unknown"
                     }
+                    LookupMiss::NotLookedUp => "Package not looked up; latest version unknown",
                 };
                 hints.push(InlayHint {
                     position: version_range.end,
@@ -1722,7 +1723,7 @@ mod tests {
     fn test_inlay_hint_lockfile_lookup_miss_suppressed_for_alternate_registry_and_offline() {
         let alternate = crate::parser::DependencySource::AlternateRegistry {
             index: "https://index.example.internal".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         assert_eq!(
             lockfile_labels_with_miss(

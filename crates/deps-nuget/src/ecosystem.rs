@@ -1215,7 +1215,7 @@ mod tests {
                 "internal.auth",
                 DependencySource::AlternateRegistry {
                     index: "nuget-chain:never-registered".to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
                 0,
             );
@@ -1309,7 +1309,7 @@ mod tests {
                 "internal.auth",
                 DependencySource::AlternateRegistry {
                     index: "nuget-chain:test-alt".to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
                 0,
             );
@@ -1362,7 +1362,7 @@ mod tests {
                 "shared.pkg",
                 DependencySource::AlternateRegistry {
                     index: "nuget-chain:never-registered".to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
                 1,
             );

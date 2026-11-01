@@ -663,9 +663,11 @@ pub async fn fetch_latest_versions_parallel(
                 lookup_misses.insert(name, LookupMiss::NoComparableVersions);
             }
             PackageStatus::NotFound { message, origin } => {
-                if origin == ErrorOrigin::Endpoint {
-                    lookup_misses.insert(name, LookupMiss::NotFound);
-                }
+                let miss = match origin {
+                    ErrorOrigin::Endpoint => LookupMiss::NotFound,
+                    ErrorOrigin::Unattributed => LookupMiss::NotLookedUp,
+                };
+                lookup_misses.insert(name, miss);
                 failed_count += 1;
                 if fallback_message.is_none() {
                     fallback_message = Some(message);
@@ -1035,6 +1037,11 @@ async fn fetch_and_classify_package(
             // same file for being "unusable".
             if e.is_offline() {
                 tracing::debug!(package = %name.for_tracing(), "fetch skipped: offline");
+            } else if e.is_not_found() && e.origin() == deps_core::error::ErrorOrigin::Unattributed
+            {
+                // #1901: a locally decided miss (e.g. a Go GOPRIVATE/GOPROXY=off bypass) never
+                // asked the registry, so it is not a failed fetch.
+                tracing::debug!(package = %name.for_tracing(), error = %e, "fetch skipped: not looked up");
             } else {
                 tracing::warn!(package = %name.for_tracing(), error = %e, "fetch failed");
             }
@@ -1714,7 +1721,7 @@ mod tests {
                         name: PackageName::new("shared-name"),
                         source: DependencySource::AlternateRegistry {
                             index: "https://index.mycorp.dev".into(),
-                            mirrors_crates_io: false,
+                            mirrors_public_registry: false,
                         },
                         addr_tag: 1,
                     },
@@ -1801,7 +1808,7 @@ mod tests {
                         name: PackageName::new("shared-name"),
                         source: DependencySource::AlternateRegistry {
                             index: "https://index-a.mycorp.dev/api?api_key=SECRET_A".into(),
-                            mirrors_crates_io: false,
+                            mirrors_public_registry: false,
                         },
                         addr_tag: 0,
                     },
@@ -1809,7 +1816,7 @@ mod tests {
                         name: PackageName::new("shared-name"),
                         source: DependencySource::AlternateRegistry {
                             index: "https://index-b.mycorp.dev/api?api_key=SECRET_B".into(),
-                            mirrors_crates_io: false,
+                            mirrors_public_registry: false,
                         },
                         addr_tag: 1,
                     },
@@ -3112,19 +3119,51 @@ mod tests {
             let registry: Arc<dyn Registry> = Arc::new(NotFoundRegistry { at_endpoint });
             let packages = vec![PackageName::new("typo-pkg")];
 
-            let result = fetch_latest_versions_parallel(
-                deps_core::EcosystemId::Cargo,
-                registry,
-                with_registry_source(packages),
-                &HashMap::new(),
-                None,
-                deps_core::freshness::FreshnessSettings::default(),
-                secs(5),
-                conc(10),
-                &SelectionContext::none(),
-                None,
+            let mut result = None;
+            let log = deps_core::test_util::capture_tracing_output_async_at(
+                tracing::Level::DEBUG,
+                async {
+                    result = Some(
+                        fetch_latest_versions_parallel(
+                            deps_core::EcosystemId::Cargo,
+                            registry,
+                            with_registry_source(packages),
+                            &HashMap::new(),
+                            None,
+                            deps_core::freshness::FreshnessSettings::default(),
+                            secs(5),
+                            conc(10),
+                            &SelectionContext::none(),
+                            None,
+                        )
+                        .await,
+                    );
+                },
             )
             .await;
+            let result = result.expect("fetch ran");
+
+            let event = log
+                .lines()
+                .find(|line| {
+                    line.contains("typo-pkg")
+                        && (line.contains("fetch failed")
+                            || line.contains("fetch skipped: not looked up"))
+                })
+                .unwrap_or_else(|| panic!("no fetch event for typo-pkg: {log:?}"));
+            if at_endpoint {
+                assert!(
+                    event.contains("WARN") && event.contains("fetch failed"),
+                    "#1901: an endpoint-attributed not-found stays a WARN: {event:?}"
+                );
+            } else {
+                assert!(
+                    event.contains("DEBUG")
+                        && event.contains("fetch skipped: not looked up")
+                        && !event.contains("WARN"),
+                    "#1901: a locally decided miss is logged at debug: {event:?}"
+                );
+            }
 
             assert!(result.versions.is_empty());
             assert!(
@@ -3137,7 +3176,11 @@ mod tests {
                 result
                     .lookup_misses
                     .get(&NormalizedName::for_test("typo-pkg")),
-                at_endpoint.then_some(&LookupMiss::NotFound),
+                Some(&if at_endpoint {
+                    LookupMiss::NotFound
+                } else {
+                    LookupMiss::NotLookedUp
+                }),
                 "only a not-found attributed to the endpoint is a reportable lookup miss"
             );
             assert_eq!(result.failed_count(), 1);
@@ -5904,7 +5947,7 @@ mod tests {
                         name: PackageName::new("django"),
                         source: DependencySource::AlternateRegistry {
                             index: "https://index.mycorp.dev".into(),
-                            mirrors_crates_io: false,
+                            mirrors_public_registry: false,
                         },
                         addr_tag: 1,
                     },

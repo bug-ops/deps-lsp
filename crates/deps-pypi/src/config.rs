@@ -392,7 +392,7 @@ impl PypiIndexConfig {
             return match self.named_sources.get(name) {
                 Some(Ok(url)) => DependencySource::AlternateRegistry {
                     index: url.as_str().to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
                 Some(Err(invalid)) => DependencySource::CustomRegistry {
                     url: invalid.raw.to_string(),
@@ -409,7 +409,7 @@ impl PypiIndexConfig {
                 hops.extend(self.valid_extras());
                 DependencySource::AlternateRegistry {
                     index: ResolvedChain::chain(hops, false).key,
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 }
             }
             Some(Err(invalid)) => DependencySource::CustomRegistry {
@@ -418,7 +418,7 @@ impl PypiIndexConfig {
             None => match self.case_b_chain() {
                 Some(chain) if !chain.hops.is_empty() => DependencySource::AlternateRegistry {
                     index: ResolvedChain::chain(chain.hops, chain.implicit_public_fallback).key,
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
                 _ => DependencySource::Registry,
             },
@@ -687,12 +687,12 @@ mod tests {
         let source = config.resolve_source_for(None);
         let DependencySource::AlternateRegistry {
             index,
-            mirrors_crates_io,
+            mirrors_public_registry,
         } = source
         else {
             panic!("expected AlternateRegistry");
         };
-        assert!(!mirrors_crates_io);
+        assert!(!mirrors_public_registry);
         assert!(index.starts_with("pypi-chain:"));
 
         let chains = config.resolved_chains();
@@ -996,7 +996,7 @@ mod tests {
             source,
             DependencySource::AlternateRegistry {
                 index: "https://internal.example/simple".to_string(),
-                mirrors_crates_io: false,
+                mirrors_public_registry: false,
             }
         );
 

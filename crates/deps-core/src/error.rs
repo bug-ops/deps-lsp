@@ -260,6 +260,26 @@ impl std::error::Error for SanitizedRegistryError {
     }
 }
 
+/// Why a manifest or lockfile failed to parse, carried on [`DepsError::ParseError`].
+///
+/// Lets the language server tell the user the cause (for instance an over-nested TOML file)
+/// without matching on error text.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::ParseFailureKind;
+///
+/// assert_ne!(ParseFailureKind::Malformed, ParseFailureKind::NestingTooDeep);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseFailureKind {
+    /// The content is not valid for its format.
+    Malformed,
+    /// The content nests deeper than the parser guard allows.
+    NestingTooDeep,
+}
+
 /// Core error types for deps-lsp.
 ///
 /// Extended from Phase 1 to support multiple ecosystems (Cargo, npm, PyPI).
@@ -309,6 +329,8 @@ pub enum DepsError {
     ParseError {
         /// Ecosystem/file kind being parsed (e.g. `"Cargo.toml"`), for the error message.
         file_type: String,
+        /// Why the parse failed, so a client-facing diagnostic can branch without matching text.
+        kind: ParseFailureKind,
         /// The underlying parser error.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -632,9 +654,14 @@ impl std::fmt::Display for PaginationStop {
 impl std::fmt::Debug for DepsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ParseError { file_type, source } => f
+            Self::ParseError {
+                file_type,
+                kind,
+                source,
+            } => f
                 .debug_struct("ParseError")
                 .field("file_type", file_type)
+                .field("kind", kind)
                 .field("source", source)
                 .finish(),
             Self::RegistryError { package, source } => f
@@ -774,9 +801,42 @@ impl DepsError {
     /// ```
     #[must_use]
     pub fn parse_error(file_type: impl Into<String>, source: &dyn std::fmt::Display) -> Self {
+        Self::parse_error_of_kind(file_type, ParseFailureKind::Malformed, source)
+    }
+
+    /// Like [`Self::parse_error`], recording why parsing failed as a [`ParseFailureKind`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::{DepsError, ParseFailureKind};
+    ///
+    /// let err = DepsError::parse_error_of_kind(
+    ///     "Cargo.toml",
+    ///     ParseFailureKind::NestingTooDeep,
+    ///     &"nesting depth 65 exceeds maximum of 64",
+    /// );
+    /// assert_eq!(err.parse_failure_kind(), Some(ParseFailureKind::NestingTooDeep));
+    /// ```
+    #[must_use]
+    pub fn parse_error_of_kind(
+        file_type: impl Into<String>,
+        kind: ParseFailureKind,
+        source: &dyn std::fmt::Display,
+    ) -> Self {
         Self::ParseError {
             file_type: file_type.into(),
+            kind,
             source: crate::redact::parse_error_source(source),
+        }
+    }
+
+    /// The [`ParseFailureKind`] when this is a [`Self::ParseError`], `None` for any other error.
+    #[must_use]
+    pub const fn parse_failure_kind(&self) -> Option<ParseFailureKind> {
+        match self {
+            Self::ParseError { kind, .. } => Some(*kind),
+            _ => None,
         }
     }
 
@@ -1373,6 +1433,7 @@ mod tests {
         assert_eq!(
             DepsError::ParseError {
                 file_type: "Cargo.toml".into(),
+                kind: ParseFailureKind::Malformed,
                 source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad")),
             }
             .safe_tracing_summary(),
@@ -1609,6 +1670,7 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad data");
         let error = DepsError::ParseError {
             file_type: "Cargo.toml".into(),
+            kind: ParseFailureKind::Malformed,
             source: Box::new(io_err),
         };
         assert!(error.to_string().contains("failed to parse Cargo.toml"));
@@ -1900,6 +1962,7 @@ mod tests {
         let non_rate_limited = [
             DepsError::ParseError {
                 file_type: "Cargo.toml".into(),
+                kind: ParseFailureKind::Malformed,
                 source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad")),
             },
             DepsError::RegistryError {

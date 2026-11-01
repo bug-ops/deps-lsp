@@ -835,7 +835,7 @@ mod tests {
     fn via(index: &str) -> DependencySource {
         DependencySource::AlternateRegistry {
             index: index.to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         }
     }
 
@@ -935,7 +935,7 @@ mod tests {
         let name = PackageName::new("gitlab.com/org/other");
         let source = DependencySource::AlternateRegistry {
             index: "gitlab:unknown".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         match registry
             .get_versions_from(&name, &source, deps_core::FreshnessSettings::default())
@@ -1049,7 +1049,7 @@ mod tests {
         ));
         let source = DependencySource::AlternateRegistry {
             index: "gitlab:test".to_string(),
-            mirrors_crates_io: false,
+            mirrors_public_registry: false,
         };
         let req = deps_core::VersionReq::new("*");
         let sentinel = SelectionContext::with_minimum_stability(StabilityFloor::Rc);

@@ -1346,8 +1346,17 @@ impl LanguageServer for Backend {
         let uri = crate::lsp_types_interop::canonicalize_uri(&params.text_document.uri);
         tracing::info!("document closed: {:?}", uri);
 
+        let had_parse_failure = self
+            .state
+            .with_document(&uri, |doc| doc.parse_failure().is_some())
+            .unwrap_or(false);
         self.state.remove_document(&uri);
         self.state.cancel_background_task(&uri).await;
+        if had_parse_failure {
+            self.client
+                .publish_diagnostics(params.text_document.uri, Vec::new(), None)
+                .await;
+        }
     }
 
     /// Not routed through `canonicalize_uri` (#1086): `change.uri` here is a watched

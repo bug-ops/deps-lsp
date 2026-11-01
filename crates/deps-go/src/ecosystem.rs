@@ -1228,7 +1228,7 @@ go 1.21
                 "git.mycorp.example/pkg",
                 DependencySource::AlternateRegistry {
                     index: "go-private:never-registered".to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
                 1,
             );
@@ -1266,7 +1266,7 @@ go 1.21
                 "git.mycorp.example/internal/auth",
                 DependencySource::AlternateRegistry {
                     index: "never-registered".to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
                 0,
             );
@@ -1328,7 +1328,7 @@ go 1.21
                 "git.mycorp.example/internal/auth",
                 DependencySource::AlternateRegistry {
                     index: "go-proxy:test".to_string(),
-                    mirrors_crates_io: false,
+                    mirrors_public_registry: false,
                 },
                 0,
             );

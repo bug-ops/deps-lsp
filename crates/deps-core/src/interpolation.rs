@@ -16,6 +16,26 @@
 /// `MAX_DEPENDENCIES_PER_DOCUMENT * MAX_INTERPOLATED_VALUE_BYTES` per resolution pass.
 pub const MAX_INTERPOLATED_VALUE_BYTES: usize = 1024;
 
+/// Whether a package name still holds an unexpanded template placeholder (`$grp:x`,
+/// `${pkg}`, `$(PkgName)`, `@grp@`, ...) instead of a real name, in any ecosystem.
+///
+/// The single name gate: such a name must get no registry link, registry request, OSV
+/// query or deps.dev lookup, because the literal text names no real package (#1902).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::interpolation::package_name_is_unexpanded_template;
+///
+/// assert!(package_name_is_unexpanded_template("$grp:x"));
+/// assert!(package_name_is_unexpanded_template("${grp}"));
+/// assert!(!package_name_is_unexpanded_template("org.apache.commons:commons-lang3"));
+/// ```
+#[must_use]
+pub fn package_name_is_unexpanded_template(name: &str) -> bool {
+    crate::lsp_helpers::requirement_contains_template_placeholder(name)
+}
+
 /// A property/variable value that has been checked against
 /// [`MAX_INTERPOLATED_VALUE_BYTES`] and is guaranteed not to exceed it.
 ///
@@ -189,5 +209,26 @@ mod tests {
         let value = "x".repeat(MAX_INTERPOLATED_VALUE_BYTES + 1);
         let err = PropertyValue::new(value).unwrap_err();
         assert_eq!(err.len, MAX_INTERPOLATED_VALUE_BYTES + 1);
+    }
+
+    #[test]
+    fn detects_template_names_and_spares_real_ones() {
+        let cases = [
+            ("$grp:x", true),
+            ("${grp}", true),
+            ("$(PkgName)", true),
+            ("@grp@", true),
+            ("org.apache.commons:commons-lang3", false),
+            ("@scope/pkg", false),
+            ("Newtonsoft.Json", false),
+            ("", false),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                package_name_is_unexpanded_template(name),
+                expected,
+                "{name:?}"
+            );
+        }
     }
 }
