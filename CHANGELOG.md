@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `DepsDevClient` lookup methods take `DepsDevTarget` and `DepsDevTargets` (#1899)
 - **deps-core**: `DependencySource::AlternateRegistry::mirrors_crates_io` is renamed `mirrors_public_registry` (#1904)
 - **deps-core, deps-pypi, deps-go, deps-engine**: `DepsError::ParseError` and `PypiError::TomlParseError` carry a `ParseFailureKind`, `LookupMiss` gains `NotLookedUp`, `GoProxyHop` gains `PrivateBypass`, and `SkipReason`, `StructuralSkipReason` gain `TemplatedName` (#1904)
+- **deps-core**: `parse_json_checked` returns the typed `CheckedJsonError` instead of `serde_json::Error` (#1906)
 
 ### Added
 - **deps-npm, deps-cli**: `pnpm-workspace.yaml` catalog entries get hints, diagnostics, hover, completion and updates, and a duplicate default catalog is reported (#1880)
@@ -81,6 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle**: hover license precedence is registry, then deps.dev SPDX, then the POM fetch; Gradle coordinates, including internal-repository ones, go to deps.dev on hover unless `supply_chain.enabled`, `typosquat.enabled` and `gossip.enabled` are off (#1899)
 
 ### Fixed
+- **deps-core, deps-npm, deps-composer, deps-deno, deps-lsp**: an over-deep JSON manifest, including `deno.json` past the 512-level `jsonc-parser` cap, publishes `nesting-too-deep` like TOML and YAML instead of `parse-error` (#1906)
 - **deps-lsp, deps-core**: a manifest rejected by the parser publishes a `parse-error` or `nesting-too-deep` diagnostic instead of failing silently (#1904)
 - **deps-go, deps-engine**: a GOPRIVATE, `GOPROXY=direct` or `GOPROXY=off` bypass is logged as skipped rather than as a Go proxy 404, and no longer reports "Unknown package" (#1904)
 - **deps-core, deps-maven, deps-gradle**: unexpanded template names such as `$grp:x` or `${grp}` get no registry link, no OSV claim and no registry request in every ecosystem (#1904)

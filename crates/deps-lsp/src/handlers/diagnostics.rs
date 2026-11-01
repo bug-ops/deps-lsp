@@ -2783,16 +2783,18 @@ dependencies = ["requests>=2.0.0"]
         use crate::document::DocumentState;
         use deps_core::ParseFailureKind;
 
-        async fn diagnostics_for_rejected_cargo_manifest(
+        async fn diagnostics_for_rejected_manifest(
+            ecosystem_id: EcosystemId,
+            path: &str,
             content: &str,
         ) -> (ParseFailure, Vec<Diagnostic>) {
             let state = Arc::new(ServerState::new());
-            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let url = deps_core::test_util::test_uri(path);
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let ecosystem = state
                 .ecosystem_registry
-                .get(EcosystemId::Cargo)
-                .expect("cargo ecosystem registered under the cargo feature");
+                .get(ecosystem_id)
+                .expect("ecosystem registered under its feature");
             let error = ecosystem
                 .parse_manifest(content, &url)
                 .await
@@ -2801,11 +2803,7 @@ dependencies = ["requests>=2.0.0"]
             let failure = ParseFailure::from_error(&error);
             state.update_document(
                 uri.clone(),
-                DocumentState::new_parse_failed(
-                    EcosystemId::Cargo,
-                    content.to_owned(),
-                    failure.clone(),
-                ),
+                DocumentState::new_parse_failed(ecosystem_id, content.to_owned(), failure.clone()),
             );
             let diagnostics = generate_diagnostics_internal(
                 Arc::clone(&state),
@@ -2819,6 +2817,65 @@ dependencies = ["requests>=2.0.0"]
             )
             .await;
             (failure, diagnostics)
+        }
+
+        async fn diagnostics_for_rejected_cargo_manifest(
+            content: &str,
+        ) -> (ParseFailure, Vec<Diagnostic>) {
+            diagnostics_for_rejected_manifest(EcosystemId::Cargo, "/test/Cargo.toml", content).await
+        }
+
+        #[cfg(any(feature = "npm", feature = "composer", feature = "deno"))]
+        async fn assert_nesting_too_deep_diagnostic(
+            ecosystem_id: EcosystemId,
+            path: &str,
+            content: &str,
+        ) {
+            let (failure, diagnostics) =
+                diagnostics_for_rejected_manifest(ecosystem_id, path, content).await;
+
+            assert_eq!(failure.kind, ParseFailureKind::NestingTooDeep);
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected exactly one diagnostic, got: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+            assert_eq!(
+                diagnostic.code,
+                Some(NumberOrString::String("nesting-too-deep".into()))
+            );
+        }
+
+        #[cfg(any(feature = "npm", feature = "composer", feature = "deno"))]
+        fn over_nested_json(depth: usize) -> String {
+            format!("{}1{}", "[".repeat(depth), "]".repeat(depth))
+        }
+
+        #[cfg(feature = "npm")]
+        #[tokio::test]
+        async fn too_deeply_nested_json_publishes_nesting_diagnostic() {
+            let content = over_nested_json(deps_core::MAX_JSON_NESTING_DEPTH + 1);
+            assert_nesting_too_deep_diagnostic(EcosystemId::Npm, "/test/package.json", &content)
+                .await;
+        }
+
+        #[cfg(feature = "composer")]
+        #[tokio::test]
+        async fn too_deeply_nested_composer_json_publishes_nesting_diagnostic() {
+            let content = over_nested_json(deps_core::MAX_JSON_NESTING_DEPTH + 1);
+            assert_nesting_too_deep_diagnostic(
+                EcosystemId::Composer,
+                "/test/composer.json",
+                &content,
+            )
+            .await;
+        }
+
+        #[cfg(feature = "deno")]
+        #[tokio::test]
+        async fn deno_json_beyond_parser_native_cap_publishes_nesting_diagnostic() {
+            let content = over_nested_json(513);
+            assert_nesting_too_deep_diagnostic(EcosystemId::Deno, "/test/deno.json", &content)
+                .await;
         }
 
         #[tokio::test]

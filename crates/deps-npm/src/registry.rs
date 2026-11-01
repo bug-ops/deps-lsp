@@ -793,8 +793,9 @@ fn publish_times_stale(cached: &CachedTimes, now: Instant, current_top8: &[Strin
 ///
 /// # Errors
 ///
-/// Returns a [`DepsError::Json`]-wrapping error if `data` is not valid JSON matching
-/// [`PackageTimes`]'s shape, or nests deeper than [`deps_core::MAX_JSON_NESTING_DEPTH`].
+/// Returns [`DepsError::Json`] if `data` is not valid JSON matching [`PackageTimes`]'s shape,
+/// or a [`deps_core::ParseFailureKind::NestingTooDeep`] parse error if it nests deeper than
+/// [`deps_core::MAX_JSON_NESTING_DEPTH`].
 fn parse_package_times(
     data: &[u8],
     known_versions: &[String],
