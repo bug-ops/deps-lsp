@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- CI: docs/specs-only PRs no longer trigger the full test matrix (the `workflows` path filter's negated pattern matched every file)
+- CI: docs/specs-only PRs no longer trigger the full test matrix (the `workflows` path filter's negated pattern matched every file) (#1943)
 
 ## [4.0.0] - 2026-11-01
 
