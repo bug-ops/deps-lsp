@@ -20,6 +20,16 @@ status: moc
 | ID | Feature | Phase | Status |
 |----|---------|-------|--------|
 | 008 | [[008-codelens-update-all-outdated/spec\|CodeLens support for "update all outdated dependencies" action]] | specify | draft — research/parity, P2, 7 open `[NEEDS CLARIFICATION]` items |
+| 089 | [[089-npm-yarn-lockfile-provider/spec\|yarn.lock lock file provider (npm)]] | specify | draft — research/parity, P3, 5 open `[NEEDS CLARIFICATION]` items (issue #1921) |
+| 090 | [[090-npm-bun-lockfile-provider/spec\|bun.lock lock file provider (npm)]] | specify | draft — research/parity, P3, 5 open `[NEEDS CLARIFICATION]` items (issue #1922) |
+| 091 | [[091-deno-lockfile-provider/spec\|deno.lock lock file provider (Deno)]] | specify | draft — enhancement, P4, 7 open `[NEEDS CLARIFICATION]` items (issue #1924) |
+| 092 | [[092-gradle-lockfile-provider/spec\|Gradle dependency-locking lock file provider]] | specify | draft — enhancement, P4, 11 open `[NEEDS CLARIFICATION]` items (issue #1925) |
+| 093 | [[093-pypi-pipfile-pdm-lockfile-providers/spec\|Pipfile.lock and pdm.lock lock file providers (PyPI)]] | specify | draft — enhancement, P4, 6 open `[NEEDS CLARIFICATION]` items (issue #1926) |
+| 094 | [[094-lsp-per-package-diagnostic-suppression/spec\|Per-package diagnostic suppression (LSP)]] | specify | draft — research/parity, P3, 9 open `[NEEDS CLARIFICATION]` items (issue #1927) |
+| 095 | [[095-node-semver-dormant-dependency-evaluation/spec\|Evaluate the dormant node-semver range engine]] | specify | draft — research/dependency, P3, 7 open `[NEEDS CLARIFICATION]` items (issue #1928) |
+| 096 | [[096-pep440-rs-unmaintained-dependency-evaluation/spec\|Evaluate the unmaintained pep440_rs dependency]] | specify | draft — research/dependency, P3, 6 open `[NEEDS CLARIFICATION]` items (issue #1929) |
+| 097 | [[097-inlay-hints-fetch-failure-lookup-miss-marker/spec\|Inlay hints render the warning marker for a failed registry lookup or registry miss]] | specify | draft — bug, P2 (issue #1932) |
+| 098 | [[098-update-keeps-bundler-composer-constraint-operator/spec\|Update edits keep the Bundler and Composer constraint operator]] | specify | draft — bug, P2, cross-ecosystem (issue #1933) |
 | 015 | [[015-lsp-3-18-diagnostic-markup-tooltip-gap/spec\|LSP 3.18 diagnostic markup / command-tooltip support blocked by ls-types 0.0.6]] | specify | draft — research/dependency-gap, P4, 3 open `[NEEDS CLARIFICATION]` items, blocked on upstream — no `/sdd plan` (issue #308) |
 | 038 | [[038-workspace-diagnostics-pull-support/spec\|Workspace Diagnostics Pull Support]] | specify | parked — research/enhancement, P4, adoption-question resolved 2026-09-08 (wait for client support), 3 open plan-level `[NEEDS CLARIFICATION]` items remain moot until revisited (issue #547) |
 | 042 | [[042-docker-base-image-ecosystem/spec\|New ecosystem: Dockerfile FROM base-image tag/digest freshness]] | specify | draft — research/new ecosystem, P4, 5 open `[NEEDS CLARIFICATION]` items, no user demand signal (issue #557) |
