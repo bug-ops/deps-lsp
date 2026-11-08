@@ -48,8 +48,7 @@ jobs:
               - 'deny.toml'
               - '.github/Cross.toml'
             workflows:
-              - '.github/workflows/**'
-              - '!.github/workflows/mdbook.yml'
+              - '.github/workflows/!(mdbook).{yml,yaml}'
             github_action:
               - 'crates/github-action/**'
 
