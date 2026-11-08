@@ -293,7 +293,8 @@ fn disable_unsupported_keychain(registries: &mut RegistriesConfig, path: &Path) 
 /// [`crate::report::FailOnPolicy::matches`] checks a finding's `Category`, never its
 /// severity, so no severity value can suppress or weaken a `--fail-on` match. Everything else
 /// reverts to its default: `policy.diagnostics.{mutable_ref_pin,vulnerabilities}_enabled`
-/// (the two direct "disable the check" levers), `policy.cache.*` (a low `fetch_timeout_secs`
+/// (the two direct "disable the check" levers), `policy.diagnostics.suppress` (hides findings;
+/// #1927), `policy.cache.*` (a low `fetch_timeout_secs`
 /// can induce spurious fetch failures that mask a real finding as an unresolved lookup
 /// instead), `policy.freshness.*` and `policy.license_policy.{allow,deny}` (both change what
 /// counts as a violation), `policy.supply_chain.enabled` (moot for `deps-cli` today —
@@ -361,6 +362,7 @@ fn ignored_sections(policy: &PolicyConfig, required: bool) -> Vec<&'static str> 
         if policy.diagnostics.mutable_ref_pin_enabled != default.diagnostics.mutable_ref_pin_enabled
             || policy.diagnostics.vulnerabilities_enabled
                 != default.diagnostics.vulnerabilities_enabled
+            || !policy.diagnostics.suppress.is_empty()
         {
             sections.push("diagnostics");
         }
@@ -890,6 +892,34 @@ b = 2
             config.policy.diagnostics.unknown_ref_severity,
             deps_core::diagnostic::Severity::Error
         );
+    }
+
+    const SUPPRESS_TOML: &str = r#"
+            [[diagnostics.suppress]]
+            package = "request"
+            kinds = ["deprecated"]
+            "#;
+
+    /// #1927 / spec 062 F1: an auto-discovered `deps.toml` (a fork PR can add one) must not be
+    /// able to hide findings from `check`, and the dropped section is reported.
+    #[test]
+    fn test_load_auto_discovered_diagnostics_suppress_is_ignored_and_warned() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(dir.path().join(DEFAULT_CONFIG_FILENAME), SUPPRESS_TOML)
+            .expect("write deps.toml");
+        let config = load(None, dir.path()).expect("auto-discovered file must still load");
+        assert!(config.policy.diagnostics.suppress.is_empty());
+
+        let parsed = parse(SUPPRESS_TOML, Path::new("deps.toml")).expect("parses");
+        assert!(ignored_sections(&parsed.policy, false).contains(&"diagnostics"));
+        assert!(!ignored_sections(&parsed.policy, true).contains(&"diagnostics"));
+    }
+
+    #[test]
+    fn test_load_explicit_config_diagnostics_suppress_is_trusted() {
+        let file = write_temp_toml(SUPPRESS_TOML);
+        let config = load(Some(file.path()), Path::new(".")).expect("explicit config loads");
+        assert!(!config.policy.diagnostics.suppress.is_empty());
     }
 
     /// Companion to the test above: an explicitly-given `--config` *is* the operator's own

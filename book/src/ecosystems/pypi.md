@@ -61,6 +61,13 @@ uv's own lowest-priority, last-resort index — checked *after* every other decl
 uv index, replacing the implicit `pypi.org` slot, never checked first the way an
 explicit `--index-url` primary is.
 
+**Vulnerability scanning.** A dependency whose primary `--index-url` or uv `default = true`
+index replaces public PyPI and no hop of the chain is public is not sent to OSV, because the index
+cannot be verified as a mirror of PyPI. The skip is reported: `deps-cli check` prints the
+"vulnerability data not checked" stderr note and `--fail-on unchecked` fails the run. Extras-only
+chains, chains that still contain `pypi.org`, and uv indexes without `default = true` stay silent. A
+Poetry or uv named source whose URL is the public PyPI index is treated as plain PyPI and is scanned.
+
 **Poetry named sources**: a dependency declaring `source = "<name>"` (Poetry) or a
 `[tool.uv.sources] <dep> = { index = "<name>" }` binding (uv) resolves directly
 against that one named source, with no fallback to any other index — a deliberate,

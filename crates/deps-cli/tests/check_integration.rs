@@ -24,11 +24,11 @@
 #![allow(clippy::expect_used)]
 
 use deps_cli::exit::{EXIT_CLEAN, ExecutionOutcome, exit_code};
-use deps_cli::report::{CheckContext, CheckReport, FailOnPolicy, check_manifest};
+use deps_cli::report::{CheckContext, CheckReport, FailOnPolicy, OsvCoverage, check_manifest};
 use deps_cli::{format, walk};
 use deps_core::net_policy::{MapEnv, RegistryEnvironment};
 use deps_core::osv::OsvClient;
-use deps_core::policy_config::{LicensePolicyConfig, PolicyConfig};
+use deps_core::policy_config::{LicensePolicyConfig, OsvChecks, PolicyConfig};
 use deps_core::{EcosystemRegistry, HttpCache, NetworkMode};
 use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
 use std::sync::Arc;
@@ -148,6 +148,8 @@ async fn test_empty_directory_produces_no_findings_and_clean_exit() {
         exit_code(
             &report,
             &FailOnPolicy::default_categories(),
+            &OsvCoverage::default(),
+            OsvChecks::resolve(true, NetworkMode::Offline),
             ExecutionOutcome::from_had_execution_error(had_error)
         ),
         EXIT_CLEAN
@@ -537,6 +539,8 @@ async fn test_pnpm_workspace_yaml_is_checked_as_an_npm_manifest() {
         exit_code(
             &report,
             &FailOnPolicy::default_categories(),
+            &OsvCoverage::default(),
+            OsvChecks::resolve(true, NetworkMode::Offline),
             ExecutionOutcome::from_had_execution_error(had_error)
         ),
         EXIT_CLEAN,
@@ -870,6 +874,8 @@ mod probe_notes {
             exit_code(
                 &report,
                 &policy,
+                &OsvCoverage::default(),
+                OsvChecks::resolve(true, NetworkMode::Offline),
                 ExecutionOutcome::from_had_execution_error(false)
             ),
             EXIT_CLEAN
@@ -1811,7 +1817,6 @@ mod gossip_prefetch_wiring_regression {
 /// before the scan.
 mod unverified_registry_note {
     use super::*;
-    use deps_cli::report::OsvCoverage;
     use deps_core::policy_config::{RegistriesConfig, WorkspaceRegistriesSetting};
 
     async fn coverage_for(npmrc: &str, package_json: &str) -> OsvCoverage {
@@ -1878,7 +1883,7 @@ mod unverified_registry_note {
     #[tokio::test]
     async fn top_level_registry_override_reports_the_skipped_dependency() {
         let coverage = coverage_for("registry=http://HOST/\n", LODASH).await;
-        assert_eq!(coverage, OsvCoverage::new(1));
+        assert_eq!(coverage, OsvCoverage::new(1, 0));
         assert_eq!(
             coverage.note().as_deref(),
             Some(
@@ -1894,7 +1899,7 @@ mod unverified_registry_note {
             r#"{"dependencies":{"lodash":"4.17.15","@types/node":"20.0.0","@myorg/lib":"1.0.0"}}"#,
         )
         .await;
-        assert_eq!(coverage, OsvCoverage::new(2));
+        assert_eq!(coverage, OsvCoverage::new(2, 0));
     }
 
     #[tokio::test]
@@ -1915,7 +1920,9 @@ mod unverified_registry_note {
 mod go_env_subprocess {
     const GO_MOD: &str =
         "module example.com/app\n\ngo 1.22\n\nrequire github.com/gin-gonic/gin v1.9.0\n";
-    const GO_VARS: [&str; 7] = [
+    const GO_VARS: [&str; 9] = [
+        "GOROOT",
+        "PATH",
         "GOPROXY",
         "GOPRIVATE",
         "GONOPROXY",
@@ -1968,6 +1975,102 @@ mod go_env_subprocess {
         assert!(
             !stderr.contains("vulnerability data not checked"),
             "a GOPRIVATE module is private by declaration — stderr: {stderr}"
+        );
+    }
+}
+
+/// #1946 through the real binary: `--fail-on unchecked` is a strict, additive run-level gate.
+/// The Go environment reaches the child process only via `Command::env`; every scenario
+/// resolves before any network request.
+mod fail_on_unchecked_subprocess {
+    const GO_MOD: &str =
+        "module example.com/app\n\ngo 1.22\n\nrequire github.com/gin-gonic/gin v1.9.0\n";
+
+    fn run(args: &[&str], goenv: &[(&str, &str)]) -> std::process::Output {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let home = tempfile::tempdir().expect("create temp home");
+        std::fs::write(dir.path().join("go.mod"), GO_MOD).expect("write go.mod");
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_deps-cli"));
+        command
+            .arg("check")
+            .args(args)
+            .arg(dir.path())
+            .env("HOME", home.path());
+        for var in [
+            "GOROOT",
+            "PATH",
+            "GOPROXY",
+            "GOPRIVATE",
+            "GONOPROXY",
+            "GOSUMDB",
+            "GONOSUMDB",
+            "GOENV",
+            "GOFLAGS",
+        ] {
+            command.env_remove(var);
+        }
+        for (key, value) in goenv {
+            command.env(key, value);
+        }
+        command.output().expect("run the real deps-cli binary")
+    }
+
+    const UNVERIFIED: [(&str, &str); 1] = [("GOPROXY", "https://user:token@proxy.corp.example")];
+
+    #[test]
+    fn unchecked_gate_fails_a_run_with_an_unverified_registry() {
+        let output = run(&["--fail-on", "unchecked"], &UNVERIFIED);
+        assert_eq!(output.status.code(), Some(1));
+    }
+
+    #[test]
+    fn same_run_without_the_unchecked_token_stays_clean() {
+        let output = run(&["--fail-on", "vulnerable"], &UNVERIFIED);
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    #[test]
+    fn unchecked_gate_passes_when_the_only_dependency_is_private_by_declaration() {
+        let output = run(
+            &["--fail-on", "unchecked"],
+            &[("GOPROXY", "direct"), ("GOPRIVATE", "github.com/gin-gonic")],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn unchecked_gate_rejects_offline_as_a_usage_conflict() {
+        let output = run(&["--offline", "--fail-on", "unchecked"], &[]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("cannot be combined with offline mode")
+        );
+    }
+
+    #[test]
+    fn unchecked_gate_rejects_config_offline_like_the_flag() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let config = dir.path().join("deps.toml");
+        std::fs::write(&config, "[network]\noffline = true\n").expect("write config");
+        let output = run(
+            &[
+                "--fail-on",
+                "unchecked",
+                "--config",
+                config.to_str().expect("utf8"),
+            ],
+            &[],
+        );
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("cannot be combined with offline mode")
         );
     }
 }

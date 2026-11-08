@@ -749,6 +749,7 @@ impl PypiParser {
             markers_range,
             section: PypiDependencySection::Dependencies,
             source,
+            index_route: None,
         })
     }
 }

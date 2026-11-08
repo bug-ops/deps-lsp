@@ -22,6 +22,42 @@ pub struct NuGetDependency {
     /// parsing — every parser in `parser.rs` stays config-blind and always constructs this as
     /// `DependencySource::Registry`.
     pub source: deps_core::parser::DependencySource,
+    /// How the `NuGet.Config` feed configuration routed this dependency; `None` when it stayed
+    /// on plain public nuget.org.
+    pub(crate) feed_route: Option<NuGetFeedRoute>,
+}
+
+/// How a `NuGet.Config` routes a dependency away from the public nuget.org feed.
+///
+/// Only [`Self::ReplacesPublic`] makes the skipped OSV scan a reported coverage gap (#1947);
+/// a chain that still reaches nuget.org and a `<packageSourceMapping>` group stay silent.
+///
+/// # Examples
+///
+/// ```
+/// use deps_nuget::types::NuGetFeedRoute;
+///
+/// assert_ne!(NuGetFeedRoute::ReplacesPublic, NuGetFeedRoute::SupplementsPublic);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NuGetFeedRoute {
+    /// A plain source chain with no implicit nuget.org fallback and no nuget.org hop
+    /// (`<clear/>` or `<remove key="nuget.org"/>` merged root to leaf): plausibly an
+    /// unverified mirror of nuget.org.
+    ReplacesPublic,
+    /// A plain source chain that still contains nuget.org, implicitly or explicitly.
+    SupplementsPublic,
+    /// A `<packageSourceMapping>` group routed the package to its own sources.
+    Mapped,
+}
+
+impl NuGetDependency {
+    /// How the `NuGet.Config` feed configuration routed this dependency, or `None` when it
+    /// stayed on plain public nuget.org.
+    #[must_use]
+    pub const fn feed_route(&self) -> Option<NuGetFeedRoute> {
+        self.feed_route
+    }
 }
 
 deps_core::impl_dependency!(NuGetDependency {
@@ -164,6 +200,7 @@ mod tests {
             version_requirement: Some("13.0.3".into()),
             version_range: Some(Range::new(Position::new(2, 30), Position::new(2, 36))),
             source: deps_core::parser::DependencySource::Registry,
+            feed_route: None,
         }
     }
 
@@ -192,6 +229,7 @@ mod tests {
             version_requirement: None,
             version_range: None,
             source: deps_core::parser::DependencySource::Registry,
+            feed_route: None,
         };
         assert!(dep.version_requirement().is_none());
         assert!(dep.version_range().is_none());

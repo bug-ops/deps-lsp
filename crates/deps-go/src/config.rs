@@ -6,6 +6,8 @@
 //! resolves that file once per process (memoized, mtime-gated — see [`GoEnvCache`]) and layers
 //! the process environment ([`GoProcessEnv`]) over it with the go command's own precedence: per
 //! key, a non-empty process variable beats the `$GOENV` file, and an empty one falls through.
+//! The lowest layer is the Go distribution's own `$GOROOT/go.env` defaults file (Go 1.21+), see
+//! [`GorootEnvFile`].
 //! The result is a [`GoEnvConfig`] consulted by every `go.mod` parse.
 //!
 //! # Security model (read before touching this module)
@@ -31,7 +33,7 @@
 //! See `specs/034-go-goproxy-private-registry/spec.md` FR-001–FR-016 for the design this module
 //! implements.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use deps_core::EcosystemId;
@@ -154,14 +156,15 @@ fn parse_hop(
 
 /// Where a Go setting came from, so a rejected `GOPROXY` hop names the layer to fix.
 ///
-/// Exhaustive: these are the only layers read today; the `$GOROOT/go.env` defaults layer is
-/// tracked in #1948.
+/// Exhaustive: these are the only layers read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoSettingSource {
     /// The process environment (an exported variable).
     ProcessEnv,
     /// The user `$GOENV` file (`go env -w`).
     GoenvFile,
+    /// The Go distribution's `$GOROOT/go.env` defaults file.
+    GorootEnv,
 }
 
 impl GoSettingSource {
@@ -169,6 +172,7 @@ impl GoSettingSource {
         match self {
             Self::ProcessEnv => "GOPROXY hop from the process environment failed validation",
             Self::GoenvFile => "GOPROXY hop from $GOENV failed validation",
+            Self::GorootEnv => "GOPROXY hop from $GOROOT/go.env failed validation",
         }
     }
 }
@@ -236,6 +240,16 @@ pub struct GoProxyChain {
 }
 
 impl GoProxyChain {
+    /// Whether this is the go command's built-in default chain: the public proxy, then `direct`,
+    /// joined by `,`.
+    fn is_stock_default(&self) -> bool {
+        matches!(
+            (self.hops.as_slice(), self.separators.as_slice()),
+            ([GoProxyHop::Url(url), GoProxyHop::Direct], [ChainSeparator::NotFoundOnly])
+                if url.as_str() == GO_DEFAULT_PROXY_URL
+        )
+    }
+
     fn keyed(hops: Vec<GoProxyHop>, separators: Vec<ChainSeparator>) -> Self {
         let hop_parts = hops.iter().map(|hop| match hop {
             GoProxyHop::Url(url) => url.as_str(),
@@ -801,6 +815,7 @@ impl GoEnvConfig {
         Self::from_layers(
             &GoProcessEnv::default(),
             Some((&parse_goenv_raw(content), file)),
+            None,
             policy,
         )
     }
@@ -808,43 +823,74 @@ impl GoEnvConfig {
     fn from_layers(
         process: &GoProcessEnv,
         file: Option<(&RawGoEnv, &OperatorPath)>,
+        goroot: Option<(&RawGoEnv, &GorootEnvFile)>,
         policy: &RegistryAccessPolicy,
     ) -> Self {
         let file_raw = file.map(|(raw, _)| raw);
-        let goproxy = match (&process.goproxy, file) {
-            (Some(value), _) => Some(parse_goproxy(
-                value.as_str(),
-                &OperatorRegistries::declared_by_env(value, goproxy_urls),
-                policy,
-                GoSettingSource::ProcessEnv,
-            )),
-            (None, Some((raw, path))) => raw.goproxy.as_deref().map(|goproxy| {
+        let goroot_raw = goroot.map(|(raw, _)| raw);
+        let file_goproxy = file.and_then(|(raw, path)| {
+            raw.goproxy.as_deref().map(|goproxy| {
                 let operator = OperatorRegistries::declared_in(path, goproxy_urls(goproxy));
                 parse_goproxy(goproxy, &operator, policy, GoSettingSource::GoenvFile)
-            }),
-            (None, None) => None,
+            })
+        });
+        // ASSUMPTION: the distribution's stock `GOPROXY` equals the built-in default, so it is
+        // treated as "no override" (plain `Registry`); only a customised `go.env` changes routing.
+        // Compared on the parsed hops, so spelling variants of the stock chain match too.
+        let goroot_goproxy = goroot.and_then(|(raw, file)| {
+            let goproxy = raw.goproxy.as_deref()?;
+            let operator = file.operator_registries(goproxy);
+            Some(parse_goproxy(
+                goproxy,
+                &operator,
+                policy,
+                GoSettingSource::GorootEnv,
+            ))
+            .filter(|parsed| !parsed.as_ref().is_ok_and(GoProxyChain::is_stock_default))
+        });
+        let goproxy = process
+            .goproxy
+            .as_ref()
+            .map(|value| {
+                parse_goproxy(
+                    value.as_str(),
+                    &OperatorRegistries::declared_by_env(value, goproxy_urls),
+                    policy,
+                    GoSettingSource::ProcessEnv,
+                )
+            })
+            .or(file_goproxy)
+            .or(goroot_goproxy);
+        let layered = |key: fn(&RawGoEnv) -> Option<&PatternList>| {
+            [file_raw.and_then(key), goroot_raw.and_then(key)]
         };
-        let file_list = |key: fn(&RawGoEnv) -> Option<&PatternList>| file_raw.and_then(key);
+        let [file_private, goroot_private] = layered(|raw| raw.goprivate.as_ref());
+        let [file_noproxy, goroot_noproxy] = layered(|raw| raw.gonoproxy.as_ref());
+        let [file_nosumdb, goroot_nosumdb] = layered(|raw| raw.gonosumdb.as_ref());
         let process_private = process.goprivate.as_ref();
-        let file_private = file_list(|raw| raw.goprivate.as_ref());
         Self {
             goproxy,
             noproxy: first_patterns([
                 process.gonoproxy.as_ref(),
-                file_list(|raw| raw.gonoproxy.as_ref()),
+                file_noproxy,
+                goroot_noproxy,
                 process_private,
                 file_private,
+                goroot_private,
             ]),
-            private: first_patterns([process_private, file_private]),
+            private: first_patterns([process_private, file_private, goroot_private]),
             nosumdb: first_patterns([
                 process.gonosumdb.as_ref(),
-                file_list(|raw| raw.gonosumdb.as_ref()),
+                file_nosumdb,
+                goroot_nosumdb,
                 process_private,
                 file_private,
+                goroot_private,
             ]),
             sumdb: process
                 .gosumdb
                 .or_else(|| file_raw.and_then(|raw| raw.gosumdb))
+                .or_else(|| goroot_raw.and_then(|raw| raw.gosumdb))
                 .unwrap_or_default(),
         }
     }
@@ -1009,6 +1055,10 @@ fn goproxy_urls(raw: &str) -> Vec<&str> {
         .filter(|entry| !entry.is_empty() && !matches!(*entry, "direct" | "off"))
         .collect()
 }
+
+/// The normalized public proxy URL of the go command's built-in `GOPROXY` default
+/// (`https://proxy.golang.org,direct`).
+const GO_DEFAULT_PROXY_URL: &str = "https://proxy.golang.org";
 
 /// The Go settings this crate reads, from the process environment and from `$GOENV`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1241,6 +1291,10 @@ pub struct GoParseContext {
     /// The process-environment layer over `$GOENV`, captured once at startup. The [`Default`]
     /// value declares nothing (hermetic).
     pub process_env: Arc<GoProcessEnv>,
+    /// The `$GOROOT/go.env` defaults file, the lowest-precedence layer. `None` — the
+    /// [`Default`] value — reads no defaults file (hermetic); set it with
+    /// [`Self::with_goroot_env`].
+    pub goroot_env: Option<GorootEnvFile>,
 }
 
 impl GoParseContext {
@@ -1276,8 +1330,88 @@ impl GoParseContext {
             config_cache,
             goenv_path,
             process_env,
+            goroot_env: None,
         }
     }
+
+    /// Adds the `$GOROOT/go.env` defaults layer, normally from [`goroot_env_file`].
+    #[must_use]
+    pub fn with_goroot_env(mut self, goroot_env: Option<GorootEnvFile>) -> Self {
+        self.goroot_env = goroot_env;
+        self
+    }
+}
+
+/// The Go distribution's `go.env` defaults file (Go 1.21+), the lowest-precedence setting layer.
+///
+/// The variant records how the file was located, because that decides whether its `GOPROXY` hops
+/// are operator-declared: a `GOROOT` process variable is operator-owned, but a `go` binary found
+/// through `PATH` may sit inside a workspace (direnv, a vendored toolchain), so the hops of a
+/// PATH-derived file are validated under the workspace policy like any repository-controlled
+/// declaration. No `go` process is ever run (`go env` inside a hostile repository can trigger a
+/// toolchain download). When `PATH` has no usable `go` (a GUI-launched macOS editor often lacks
+/// the Go bin directory) and `GOROOT` is unset, the layer is absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GorootEnvFile {
+    /// `$GOROOT/go.env` with `GOROOT` an absolute process variable.
+    ProcessEnv(OperatorPath),
+    /// `go.env` next to the `bin/go` found on `PATH` (symlinks resolved).
+    PathLookup(PathBuf),
+}
+
+impl GorootEnvFile {
+    fn path(&self) -> &Path {
+        match self {
+            Self::ProcessEnv(path) => path.as_path(),
+            Self::PathLookup(path) => path,
+        }
+    }
+
+    fn operator_registries(&self, goproxy: &str) -> OperatorRegistries {
+        match self {
+            Self::ProcessEnv(path) => OperatorRegistries::declared_in(path, goproxy_urls(goproxy)),
+            Self::PathLookup(_) => OperatorRegistries::default(),
+        }
+    }
+}
+
+/// Locates `$GOROOT/go.env` from the real process environment; see [`GorootEnvFile`].
+#[must_use]
+pub fn goroot_env_file() -> Option<GorootEnvFile> {
+    goroot_env_file_with_env(&ProcessEnv)
+}
+
+/// [`goroot_env_file`], reading `GOROOT` and `PATH` from `env`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::MapEnv;
+/// use deps_go::config::goroot_env_file_with_env;
+///
+/// assert!(goroot_env_file_with_env(&MapEnv::new()).is_none());
+/// ```
+#[must_use]
+pub fn goroot_env_file_with_env(env: &impl EnvSource) -> Option<GorootEnvFile> {
+    match OperatorPath::from_env(env, OperatorEnvVar::Goroot) {
+        EnvPath::Path(goroot) => Some(GorootEnvFile::ProcessEnv(goroot.join("go.env"))),
+        EnvPath::Unset | EnvPath::Ignored => go_env_beside_path_binary(env),
+    }
+}
+
+fn go_env_beside_path_binary(env: &impl EnvSource) -> Option<GorootEnvFile> {
+    let binary = if cfg!(windows) { "go.exe" } else { "go" };
+    let path = env.var_os("PATH")?;
+    let go = std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(binary))
+        .find(|candidate| candidate.is_file())?;
+    let resolved = go.canonicalize().ok()?;
+    let bin = resolved.parent()?;
+    if bin.file_name()? != "bin" {
+        return None;
+    }
+    Some(GorootEnvFile::PathLookup(bin.parent()?.join("go.env")))
 }
 
 /// Resolves `$GOENV`'s path (FR-001).
@@ -1287,7 +1421,6 @@ impl GoParseContext {
 /// Windows). `GOENV=off` disables the file (`None`), as `go` itself does, and an empty or
 /// relative `GOENV` is ignored without falling back to the default: a relative path would
 /// resolve against a directory a repository can influence.
-// TODO(#1948): the `$GOROOT/go.env` defaults layer (Go 1.21+) is not read.
 #[must_use]
 pub fn goenv_path() -> Option<OperatorPath> {
     goenv_path_with_env(&ProcessEnv)
@@ -1355,6 +1488,7 @@ pub fn resolve(cache: &GoEnvCache, policy: &RegistryAccessPolicy) -> GoEnvConfig
         policy,
         goenv_path().as_ref(),
         &GoProcessEnv::from_process(),
+        goroot_env_file().as_ref(),
     )
 }
 
@@ -1371,6 +1505,7 @@ pub fn resolve_with_context(ctx: &GoParseContext) -> GoEnvConfig {
         &ctx.policy,
         ctx.goenv_path.as_ref(),
         &ctx.process_env,
+        ctx.goroot_env.as_ref(),
     )
 }
 
@@ -1381,11 +1516,14 @@ fn resolve_at(
     policy: &RegistryAccessPolicy,
     path: Option<&OperatorPath>,
     process: &GoProcessEnv,
+    goroot: Option<&GorootEnvFile>,
 ) -> GoEnvConfig {
     let file = path.and_then(|path| cache.get_or_parse(path.as_path()).map(|raw| (raw, path)));
+    let goroot = goroot.and_then(|file| cache.get_or_parse(file.path()).map(|raw| (raw, file)));
     GoEnvConfig::from_layers(
         process,
         file.as_ref().map(|(raw, path)| (raw.as_ref(), *path)),
+        goroot.as_ref().map(|(raw, file)| (raw.as_ref(), *file)),
         policy,
     )
 }
@@ -1769,6 +1907,7 @@ mod tests {
                     &all_policy(),
                     Some(&OperatorPath::for_test(path.clone())),
                     &GoProcessEnv::default(),
+                    None,
                 );
             }
 
@@ -1791,6 +1930,7 @@ mod tests {
                     &all_policy(),
                     Some(&OperatorPath::for_test(path.clone())),
                     &GoProcessEnv::default(),
+                    None,
                 );
             }
         });
@@ -2343,7 +2483,7 @@ mod tests {
     #[test]
     fn test_resolve_at_no_path_is_default() {
         let cache = GoEnvCache::new();
-        let config = resolve_at(&cache, &all_policy(), None, &GoProcessEnv::default());
+        let config = resolve_at(&cache, &all_policy(), None, &GoProcessEnv::default(), None);
         assert!(config.goproxy_chain().is_none());
     }
 
@@ -2355,6 +2495,7 @@ mod tests {
             &all_policy(),
             Some(&OperatorPath::for_test("/nonexistent/go/env")),
             &GoProcessEnv::default(),
+            None,
         );
         assert!(config.goproxy_chain().is_none());
     }
@@ -2371,6 +2512,7 @@ mod tests {
             &all_policy(),
             Some(&OperatorPath::for_test(path)),
             &GoProcessEnv::default(),
+            None,
         );
         assert!(config.goproxy_chain().is_some());
     }
@@ -2453,8 +2595,270 @@ mod tests {
         GoEnvConfig::from_layers(
             &process,
             raw.as_ref().map(|raw| (raw, &path)),
+            None,
             &all_policy(),
         )
+    }
+
+    fn with_goroot(
+        env: &MapEnv,
+        file: Option<&str>,
+        goroot: &str,
+        origin: &GorootEnvFile,
+        policy: &RegistryAccessPolicy,
+    ) -> GoEnvConfig {
+        let process = GoProcessEnv::from_env(env);
+        let raw = file.map(parse_goenv_raw);
+        let path = OperatorPath::for_test("/home/me/go/env");
+        let goroot_raw = parse_goenv_raw(goroot);
+        GoEnvConfig::from_layers(
+            &process,
+            raw.as_ref().map(|raw| (raw, &path)),
+            Some((&goroot_raw, origin)),
+            policy,
+        )
+    }
+
+    fn trusted_goroot() -> GorootEnvFile {
+        GorootEnvFile::ProcessEnv(OperatorPath::for_test("/usr/local/go/go.env"))
+    }
+
+    fn path_goroot() -> GorootEnvFile {
+        GorootEnvFile::PathLookup(PathBuf::from("/ws/.direnv/go/go.env"))
+    }
+
+    const DISTRO_GO_ENV: &str = "GOPROXY=direct\nGOSUMDB=sum.golang.org\n";
+
+    #[test]
+    fn test_goroot_layer_supplies_goproxy_when_nothing_above_declares_it() {
+        let config = with_goroot(
+            &MapEnv::new(),
+            None,
+            DISTRO_GO_ENV,
+            &trusted_goroot(),
+            &all_policy(),
+        );
+        assert_eq!(
+            config.goproxy_chain().expect("goroot GOPROXY").hops,
+            vec![GoProxyHop::Direct]
+        );
+    }
+
+    #[test]
+    fn test_precedence_process_env_over_goenv_over_goroot() {
+        let env = MapEnv::new().with_var("GOPROXY", "https://env.example");
+        let goenv = "GOPROXY=https://file.example\n";
+        let goroot = "GOPROXY=https://root.example\n";
+        let hop_of = |config: &GoEnvConfig| match &config.goproxy_chain().unwrap().hops[0] {
+            GoProxyHop::Url(url) => url.as_str().to_string(),
+            other => panic!("unexpected hop {other:?}"),
+        };
+        let all = with_goroot(&env, Some(goenv), goroot, &trusted_goroot(), &all_policy());
+        assert!(hop_of(&all).contains("env.example"));
+        let file_over_root = with_goroot(
+            &MapEnv::new(),
+            Some(goenv),
+            goroot,
+            &trusted_goroot(),
+            &all_policy(),
+        );
+        assert!(hop_of(&file_over_root).contains("file.example"));
+        let root_only = with_goroot(
+            &MapEnv::new(),
+            None,
+            goroot,
+            &trusted_goroot(),
+            &all_policy(),
+        );
+        assert!(hop_of(&root_only).contains("root.example"));
+    }
+
+    #[test]
+    fn test_goenv_file_without_goproxy_falls_through_to_goroot() {
+        let config = with_goroot(
+            &MapEnv::new(),
+            Some("GOPRIVATE=corp.example/*\n"),
+            DISTRO_GO_ENV,
+            &trusted_goroot(),
+            &all_policy(),
+        );
+        assert!(config.goproxy_chain().is_some());
+        assert!(any_match(&config.private, "corp.example/x"));
+    }
+
+    #[test]
+    fn test_stock_goroot_goproxy_is_no_override() {
+        let config = with_goroot(
+            &MapEnv::new(),
+            None,
+            "GOPROXY=https://proxy.golang.org,direct\nGOSUMDB=sum.golang.org\n",
+            &trusted_goroot(),
+            &all_policy(),
+        );
+        assert!(config.goproxy_chain().is_none());
+        assert_eq!(
+            config.resolve_source_for("github.com/x/y"),
+            DependencySource::Registry
+        );
+    }
+
+    #[test]
+    fn test_stock_goroot_goproxy_spelling_variants_are_no_override() {
+        for spelling in [
+            "https://proxy.golang.org/,direct",
+            "HTTPS://PROXY.GOLANG.ORG,direct",
+            "https://proxy.golang.org:443 , direct",
+        ] {
+            let config = with_goroot(
+                &MapEnv::new(),
+                None,
+                &format!("GOPROXY={spelling}\n"),
+                &trusted_goroot(),
+                &all_policy(),
+            );
+            assert!(config.goproxy_chain().is_none(), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn test_non_stock_goroot_goproxy_is_an_override() {
+        for goproxy in [
+            "https://proxy.golang.org|direct",
+            "https://proxy.golang.org",
+            "direct,https://proxy.golang.org",
+            "https://proxy.golang.org,off",
+            "https://proxy.golang.org/other,direct",
+        ] {
+            let config = with_goroot(
+                &MapEnv::new(),
+                None,
+                &format!("GOPROXY={goproxy}\n"),
+                &trusted_goroot(),
+                &all_policy(),
+            );
+            assert!(config.goproxy_chain().is_some(), "{goproxy}");
+        }
+    }
+
+    #[test]
+    fn test_goroot_gosumdb_and_patterns_are_lowest_precedence() {
+        let goroot = "GOSUMDB=off\nGOPRIVATE=root.example/*\n";
+        let config = with_goroot(
+            &MapEnv::new(),
+            Some("GOSUMDB=sum.golang.org\nGOPRIVATE=file.example/*\n"),
+            goroot,
+            &trusted_goroot(),
+            &all_policy(),
+        );
+        assert_eq!(config.sumdb, GoSumDb::Public);
+        assert!(any_match(&config.private, "file.example/x"));
+        assert!(!any_match(&config.private, "root.example/x"));
+        let only_root = with_goroot(
+            &MapEnv::new(),
+            None,
+            goroot,
+            &trusted_goroot(),
+            &all_policy(),
+        );
+        assert_eq!(only_root.sumdb, GoSumDb::Off);
+        assert!(any_match(&only_root.private, "root.example/x"));
+    }
+
+    fn goroot_hop_trust(
+        origin: &GorootEnvFile,
+        policy: &RegistryAccessPolicy,
+    ) -> Option<RegistryTrust> {
+        let config = with_goroot(
+            &MapEnv::new(),
+            None,
+            "GOPROXY=https://goproxy.mycorp.example\n",
+            origin,
+            policy,
+        );
+        config
+            .goproxy_chain()
+            .and_then(|chain| match &chain.hops[0] {
+                GoProxyHop::Url(url) => Some(url.trust()),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn test_goroot_from_process_env_is_trusted_and_skips_policy() {
+        assert_eq!(
+            goroot_hop_trust(&trusted_goroot(), &off_policy()),
+            Some(RegistryTrust::Trusted)
+        );
+    }
+
+    #[test]
+    fn test_path_derived_goroot_is_policy_checked() {
+        assert_eq!(goroot_hop_trust(&path_goroot(), &off_policy()), None);
+        assert_ne!(
+            goroot_hop_trust(&path_goroot(), &all_policy()),
+            Some(RegistryTrust::Trusted)
+        );
+    }
+
+    #[test]
+    fn test_goroot_file_failure_names_goroot_source() {
+        let config = with_goroot(
+            &MapEnv::new(),
+            None,
+            "GOPROXY=not-a-valid-url\n",
+            &trusted_goroot(),
+            &all_policy(),
+        );
+        assert_eq!(
+            config.failed_goproxy_source(),
+            Some(GoSettingSource::GorootEnv)
+        );
+    }
+
+    #[test]
+    fn test_goroot_env_var_locates_go_env_as_operator_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = MapEnv::new().with_var("GOROOT", dir.path().to_str().unwrap());
+        assert_eq!(
+            goroot_env_file_with_env(&env),
+            Some(GorootEnvFile::ProcessEnv(OperatorPath::for_test(
+                dir.path().join("go.env")
+            )))
+        );
+    }
+
+    #[test]
+    fn test_relative_goroot_env_var_is_ignored() {
+        let env = MapEnv::new().with_var("GOROOT", "relative/go");
+        assert_eq!(goroot_env_file_with_env(&env), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_path_lookup_resolves_symlinked_go_binary_to_goroot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("libexec");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin").join("go"), "").unwrap();
+        let shim = dir.path().join("shim");
+        std::fs::create_dir(&shim).unwrap();
+        std::os::unix::fs::symlink(root.join("bin").join("go"), shim.join("go")).unwrap();
+        let env = MapEnv::new().with_var("PATH", shim.to_str().unwrap());
+        let expected = root.canonicalize().unwrap().join("go.env");
+        assert_eq!(
+            goroot_env_file_with_env(&env),
+            Some(GorootEnvFile::PathLookup(expected))
+        );
+    }
+
+    #[test]
+    fn test_path_lookup_skips_relative_entries_and_non_bin_layouts() {
+        let env = MapEnv::new().with_var("PATH", "relative/bin");
+        assert_eq!(goroot_env_file_with_env(&env), None);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go"), "").unwrap();
+        let env = MapEnv::new().with_var("PATH", dir.path().to_str().unwrap());
+        assert_eq!(goroot_env_file_with_env(&env), None);
     }
 
     fn bypass() -> DependencySource {
@@ -2848,7 +3252,7 @@ mod tests {
 
     #[test]
     fn test_process_env_default_is_hermetic() {
-        let config = GoEnvConfig::from_layers(&GoProcessEnv::default(), None, &all_policy());
+        let config = GoEnvConfig::from_layers(&GoProcessEnv::default(), None, None, &all_policy());
         assert!(config.goproxy_chain().is_none());
         assert!(!config.registers_bypass_chain());
     }

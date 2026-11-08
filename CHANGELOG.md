@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
+- **deps-core**: `format_version_replacing_by_shape` takes a `RewriteTarget` argument
+- **deps-cli**: `exit_code`, `OsvCoverage::new` and `OsvCoverage::from_vulnerabilities` signatures changed and `CheckArgs::fail_on` is `Vec<FailOnToken>`
+- **deps-pypi, deps-nuget**: `PypiDependency` and `NuGetDependency` gain private route fields
 - **deps-core, deps-npm, deps-cli**: `SkipReason` and `StructuralSkipReason` gain `UnverifiedRegistrySource`, `NpmDependency` gains a crate-private `registry_entry`, and `ManifestCheckResult` gains `osv_coverage` (#1956)
 - **deps-core**: `AheadProof` and `CommitEvidence` fields are private with getters, `run_probe_pass` takes a `&RefreshSender` and announces changes itself, and `ProbeStores` exposes `question_for` (#1956)
 - **deps-go**: `GoSettingSource` is public, `GoProxyChain::has_url_hop` is removed, and `failed_goproxy_declaration` becomes `failed_goproxy_source` (#1956)
@@ -15,12 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-github-actions, deps-gitlab-ci**: invalid YAML returns `DepsError::ParseError` instead of an empty result, except a bare `action.yml` (#1956)
 
 ### Added
+- **deps-cli**: `--fail-on unchecked` is a strict, additive gate that exits 1 when vulnerability data was not checked for any dependency or scanning is disabled; with `--offline` it exits 2
+- **deps-npm**: read in-use versions from `yarn.lock` (Yarn v1 and Berry) for hover, inlay hints and OSV matching, after `package-lock.json` and `pnpm-lock.yaml`
+- **deps-core, deps-lsp, deps-cli**: `diagnostics.suppress` silences deprecated, outdated, yanked or license diagnostics for named packages or globs
 - **deps-core, deps-engine, deps-npm, deps-go, deps-cli**: hover and a `deps-cli check` stderr note report dependencies whose vulnerability data was not checked because the registry is not a verified public mirror (#1956)
 - **deps-core**: `OperatorGrammar`, `OsvNaming::non_public_route`, `NonPublicRoute` and `PackageRendering::format_version_exact_pin_replacing` (#1956)
 - **deps-engine**: `PreFetchDecision` with an offline `Skipped` outcome (#1956)
 - **deps-lsp**: a neutral `ℹ` inlay hint marks a dependency that was never looked up in a registry (#1956)
 
 ### Changed
+- **deps-go**: read the `$GOROOT/go.env` defaults layer below the process environment and `$GOENV`
+- **deps-npm**: an explicit `registry=https://registry.npmjs.org/` in `.npmrc` is OSV-scanned as public content
+- **deps-pypi, deps-nuget**: dependencies whose primary index or cleared feed chain replaces the public index report the unverified-mirror OSV signal
 - **deps-go, deps-engine**: `GOPROXY=direct` and `off` modules go to OSV and deps.dev unless `GOPRIVATE`, `GONOSUMDB` or `GOSUMDB=off` match, and the rejected-`GOPROXY` diagnostic names the variable and its source (#1956)
 - **deps-core, deps-github-actions, deps-gitlab-ci, deps-lsp**: probe orchestration is shared between GitHub Actions and GitLab CI, probe tasks run under `spawn_supervised` with spans, and `ProbeStores` uses the shared in-flight guard (#1956)
 - **deps-swift**: the swizzled form keeps typed identity and index values, SCM lookups use a case-folded key, and fetch limits share one lock (#1956)
@@ -28,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps**: refresh `Cargo.lock` (#1956)
 
 ### Fixed
+- **deps-core, deps-npm, deps-cargo**: partial tilde requirements such as npm `~16` and Cargo `~0.7` keep their declared precision on update
+- **deps-core, deps-composer**: Composer wildcard constraints (`2.*`, `2.0.*`) keep the wildcard on update
+- **deps-core, deps-lsp**: inlay hints show `ℹ` instead of the up-to-date mark for a custom-registry dependency that was never queried
+- **deps-lsp**: regression test that a registry fetch failure triggers `workspace/inlayHint/refresh` with the warning marker
 - CI: docs/specs-only PRs no longer trigger the full test matrix (the `workflows` path filter's negated pattern matched every file) (#1943)
 - **deps-lsp, deps-core**: inlay hints show a warning marker for a failed registry lookup or a 404, and hover drops the update footer and the all-clear line for a 404 without a verified fix (#1956)
 - **deps-core, deps-bundler, deps-composer, deps-cli**: update edits and `deps update` keep the Bundler `~>` and Composer `^`/`~` operator and the stability flag instead of an exact pin (#1956)

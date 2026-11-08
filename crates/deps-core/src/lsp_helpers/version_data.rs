@@ -13,6 +13,7 @@ use super::{
 };
 use super::{
     DependencyOutcomes, EcosystemFormatter, GossipFindings, InteractiveFetchGate, LookupMiss,
+    SuppressionSet,
 };
 use crate::ecosystem::Dependency;
 use crate::error::FetchFailure;
@@ -268,6 +269,10 @@ pub struct VersionData<'a> {
     /// `handlers/code_actions.rs` (deps-lsp) — which keeps the plain
     /// [`REGISTRY_FETCH_BUDGET`]-bounded await; see [`await_interactive_fetch`].
     pub interactive_fetch: Option<&'a InteractiveFetchGate>,
+    /// User-configured per-package diagnostic suppression (#1927, spec 094), applied by
+    /// [`generate_diagnostics_from_cache`] after each dependency's rules run. `None` means no
+    /// rule is configured.
+    pub suppression: Option<&'a SuppressionSet>,
 }
 
 impl<'a> VersionData<'a> {
@@ -306,6 +311,7 @@ impl<'a> VersionData<'a> {
             latest_status: None,
             candidate_status: None,
             interactive_fetch: None,
+            suppression: None,
         }
     }
 
@@ -674,6 +680,27 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub const fn with_license_policy(mut self, policy: &'a LicensePolicy) -> Self {
         self.license_policy = Some(policy);
+        self
+    }
+
+    /// Attaches the per-package suppression rules. See [`Self::suppression`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::SuppressionSet;
+    /// use deps_core::VersionData;
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let rules = SuppressionSet::default();
+    /// let versions = VersionData::new(&cached, &resolved).with_suppression(&rules);
+    /// assert!(versions.suppression.is_some());
+    /// ```
+    #[must_use]
+    pub const fn with_suppression(mut self, suppression: &'a SuppressionSet) -> Self {
+        self.suppression = Some(suppression);
         self
     }
 

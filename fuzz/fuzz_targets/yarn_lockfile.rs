@@ -1,0 +1,17 @@
+//! Fuzzes `deps_npm::lockfile::fuzz_parse_yarn_lock` (feature `fuzzing`), the CPU-bound
+//! `yarn.lock` parser (spec 089): the hand-written Yarn v1 line parser and the Yarn Berry YAML
+//! path (`patch:` unwrapping, percent-decoding, alias splitting).
+//!
+//! Property under test: never panics for any byte input, valid lock file or not.
+
+#![no_main]
+
+use deps_npm::lockfile::fuzz_parse_yarn_lock;
+use libfuzzer_sys::fuzz_target;
+
+fuzz_target!(|data: &[u8]| {
+    let Ok(content) = std::str::from_utf8(data) else {
+        return;
+    };
+    fuzz_parse_yarn_lock(content);
+});

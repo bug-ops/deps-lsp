@@ -124,6 +124,63 @@ fn npm_without_npmrc_is_scanned() {
 }
 
 #[test]
+fn npm_explicit_public_registry_is_scanned() {
+    for npmrc in [
+        "registry=https://registry.npmjs.org/\n",
+        "registry=https://registry.npmjs.org\n",
+    ] {
+        let verdicts = npm_verdicts(Some(npmrc), NPM_MANIFEST);
+        assert_eq!(verdicts["lodash"], Verdict::Scanned, "{npmrc:?} (#1953)");
+        assert_eq!(
+            verdicts["@types/node"],
+            Verdict::Scanned,
+            "{npmrc:?} (#1953)"
+        );
+    }
+}
+
+#[test]
+fn npm_public_registry_lookalikes_are_still_reported() {
+    for npmrc in [
+        "registry=https://registry.npmjs.org/?x=1\n",
+        "registry=http://registry.npmjs.org/\n",
+        "registry=https://user:pw@registry.npmjs.org/\n",
+    ] {
+        let verdicts = npm_verdicts(Some(npmrc), r#"{"dependencies": {"lodash": "4.17.15"}}"#);
+        assert_eq!(
+            verdicts["lodash"],
+            Verdict::Skipped(SkipReason::UnverifiedRegistrySource),
+            "{npmrc:?}"
+        );
+    }
+}
+
+#[test]
+fn npm_peer_dependencies_are_exempt_from_lock_coverage_gaps() {
+    use deps_core::lsp_helpers::OsvNaming;
+    use deps_core::osv::LockResolution;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = Url::from_file_path(dir.path().join("package.json")).unwrap();
+    let result = parse_package_json_with_context(
+        r#"{"peerDependencies": {"react": "^18.0.0"}, "dependencies": {"lodash": "4.17.15"}}"#,
+        &uri,
+        &deps_npm::NpmParseContext::default(),
+    )
+    .unwrap();
+    let resolution = |name: &str| {
+        let dep = result
+            .dependencies()
+            .into_iter()
+            .find(|dep| dep.name().as_str() == name)
+            .unwrap();
+        NpmFormatter.lock_resolution(dep)
+    };
+    assert_eq!(resolution("react"), LockResolution::NotLocked);
+    assert_eq!(resolution("lodash"), LockResolution::Expected);
+}
+
+#[test]
 fn npm_invalid_top_level_registry_is_reported() {
     let verdicts = npm_verdicts(
         Some("registry=${DEPS_LSP_TEST_UNDEFINED_REGISTRY}\n"),

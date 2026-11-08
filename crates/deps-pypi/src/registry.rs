@@ -32,6 +32,12 @@ const PYPI_BASE: &str = "https://pypi.org/pypi";
 /// Base URL for the PEP 691 Simple API, used by `get_versions`.
 const PYPI_SIMPLE_BASE: &str = "https://pypi.org/simple";
 
+/// Returns `true` when `url` is the public PyPI simple index itself (#1947), so a chain made
+/// only of it is public content rather than an unverified mirror.
+pub(crate) fn is_public_registry_url(url: &crate::config::PypiIndexUrl) -> bool {
+    url.as_str() == PYPI_SIMPLE_BASE
+}
+
 /// `Accept` header requesting the PEP 691 Simple API JSON representation.
 /// Roughly a third smaller than the full JSON API (verified against
 /// `django`: 619,755 bytes full vs 411,376 bytes Simple API).

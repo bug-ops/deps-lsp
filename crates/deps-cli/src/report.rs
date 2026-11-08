@@ -13,14 +13,15 @@
 use deps_core::diagnostic::{Diagnostic, DiagnosticKind, Severity};
 use deps_core::lsp_helpers::{redact_name_for_diagnostic, redact_requirement_for_diagnostic};
 use deps_core::osv::{
-    OsvClient, OsvId, ScanOutcome, SkipReason, VulnKeys, VulnSeverity, VulnerabilityMap,
+    CoverageGap, LockPresence, LockResolution, OsvClient, OsvId, ScanOutcome, SkipReason, VulnKey,
+    VulnKeys, VulnSeverity, VulnerabilityMap,
 };
-use deps_core::policy_config::PolicyConfig;
+use deps_core::policy_config::{OsvChecks, PolicyConfig};
 use deps_core::position::Range;
 use deps_core::{Dependency, Ecosystem, EcosystemId, HttpCache};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 /// A category a [`CheckFinding`] can be classified into.
 ///
@@ -363,18 +364,141 @@ impl CheckReport {
     }
 }
 
+/// One `--fail-on` token: a finding [`Category`], or the run-level `unchecked` gate (#1946).
+///
+/// `unchecked` is not a category: no [`CheckFinding`] carries it, so the clap value set is built
+/// by hand from [`Category`]'s own variants plus this extra token.
+///
+/// # Examples
+///
+/// ```
+/// use clap::ValueEnum;
+/// use deps_cli::report::{Category, FailOnToken};
+///
+/// assert!(FailOnToken::value_variants().contains(&FailOnToken::Unchecked));
+/// assert!(FailOnToken::value_variants().contains(&FailOnToken::Category(Category::Vulnerable)));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailOnToken {
+    /// Fail on findings of this category.
+    Category(Category),
+    /// Fail when vulnerability data was not checked for at least one dependency.
+    Unchecked,
+}
+
+static FAIL_ON_TOKENS: LazyLock<Vec<FailOnToken>> = LazyLock::new(|| {
+    <Category as clap::ValueEnum>::value_variants()
+        .iter()
+        .copied()
+        .map(FailOnToken::Category)
+        .chain(std::iter::once(FailOnToken::Unchecked))
+        .collect()
+});
+
+impl clap::ValueEnum for FailOnToken {
+    fn value_variants<'a>() -> &'a [Self] {
+        FAIL_ON_TOKENS.as_slice()
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        match self {
+            Self::Category(category) => clap::ValueEnum::to_possible_value(category),
+            Self::Unchecked => Some(
+                clap::builder::PossibleValue::new("unchecked")
+                    .help("also fail when vulnerability data was not checked for a dependency"),
+            ),
+        }
+    }
+}
+
+/// Whether unchecked vulnerability coverage turns into an exit-1 policy violation (#1946).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageGate {
+    /// Coverage gaps are reported on stderr only.
+    Ignore,
+    /// Any coverage gap, or a run with vulnerability scanning inactive, fails the run.
+    Fail,
+}
+
 /// The set of categories that turn at least one matching [`CheckFinding`] into a
-/// process-exit-1 policy violation (FR-009/FR-010).
+/// process-exit-1 policy violation (FR-009/FR-010), plus the strict [`CoverageGate`].
 #[derive(Debug, Clone)]
 pub struct FailOnPolicy {
     categories: Vec<Category>,
+    coverage: CoverageGate,
 }
 
 impl FailOnPolicy {
-    /// Builds a policy from an explicit category list.
+    /// Builds a policy from an explicit category list, with the coverage gate off.
     #[must_use]
     pub const fn new(categories: Vec<Category>) -> Self {
-        Self { categories }
+        Self {
+            categories,
+            coverage: CoverageGate::Ignore,
+        }
+    }
+
+    /// Builds a policy from parsed `--fail-on` tokens.
+    ///
+    /// `unchecked` is additive: the explicit category tokens are used when any are present,
+    /// otherwise [`Self::default_categories`] stays in force, and `unchecked` only switches the
+    /// coverage gate on. `--fail-on unchecked` therefore keeps `vulnerable,yanked,unsatisfiable`,
+    /// while `--fail-on outdated,unchecked` fails on `outdated` plus the gate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_cli::report::{Category, CoverageGate, FailOnPolicy, FailOnToken};
+    ///
+    /// let policy = FailOnPolicy::from_tokens(&[FailOnToken::Unchecked]);
+    /// assert!(policy.categories().contains(&Category::Vulnerable));
+    /// assert_eq!(policy.coverage_gate(), CoverageGate::Fail);
+    ///
+    /// let policy = FailOnPolicy::from_tokens(&[
+    ///     FailOnToken::Category(Category::Outdated),
+    ///     FailOnToken::Unchecked,
+    /// ]);
+    /// assert_eq!(policy.categories(), [Category::Outdated]);
+    /// assert_eq!(policy.coverage_gate(), CoverageGate::Fail);
+    /// ```
+    #[must_use]
+    pub fn from_tokens(tokens: &[FailOnToken]) -> Self {
+        let categories: Vec<Category> = tokens
+            .iter()
+            .filter_map(|token| match token {
+                FailOnToken::Category(category) => Some(*category),
+                FailOnToken::Unchecked => None,
+            })
+            .collect();
+        let coverage = if tokens.contains(&FailOnToken::Unchecked) {
+            CoverageGate::Fail
+        } else {
+            CoverageGate::Ignore
+        };
+        let mut policy = if categories.is_empty() {
+            Self::default_categories()
+        } else {
+            Self::new(categories)
+        };
+        policy.coverage = coverage;
+        policy
+    }
+
+    /// Whether unchecked coverage fails the run.
+    #[must_use]
+    pub const fn coverage_gate(&self) -> CoverageGate {
+        self.coverage
+    }
+
+    /// Whether the strict coverage gate fires for this run: some dependency's vulnerability data
+    /// was not checked, or vulnerability scanning never ran at all (offline, or disabled in
+    /// the config), which leaves every dependency unchecked.
+    #[must_use]
+    pub fn coverage_violated(&self, coverage: &OsvCoverage, osv: OsvChecks) -> bool {
+        match self.coverage {
+            CoverageGate::Ignore => false,
+            CoverageGate::Fail => coverage.unchecked() > 0 || !osv.is_active(),
+        }
     }
 
     /// The default policy (FR-010): `vulnerable,yanked,unsatisfiable` — the categories that
@@ -449,12 +573,12 @@ pub fn probe_notes(
         .collect()
 }
 
-/// How much of a run's vulnerability scan was skipped because a dependency's registry could not
-/// be verified as a public mirror (#1917).
+/// How much of a run's vulnerability scan was skipped for a reason that leaves the dependency
+/// unchecked (#1917, #1946): an unverified registry mirror, or a scan that could not complete.
 ///
 /// A skip is silent in the findings: without this, "no vulnerable findings" reads as "no known
-/// vulnerabilities" when nothing was checked. Summed per run and reported once on stderr; it
-/// never changes the exit code.
+/// vulnerabilities" when nothing was checked. Summed per run and reported once on stderr;
+/// `--fail-on unchecked` turns [`Self::unchecked`] into an exit condition.
 ///
 /// # Examples
 ///
@@ -463,66 +587,120 @@ pub fn probe_notes(
 ///
 /// let mut run = OsvCoverage::default();
 /// assert!(run.note().is_none());
-/// run.add(&OsvCoverage::new(1));
+/// run.add(&OsvCoverage::new(1, 0));
 /// assert_eq!(
 ///     run.note().as_deref(),
 ///     Some("vulnerability data not checked for 1 dependency (registry not verified as a public mirror)")
 /// );
-/// run.add(&OsvCoverage::new(2));
+/// run.add(&OsvCoverage::new(2, 0));
 /// assert_eq!(
 ///     run.note().as_deref(),
 ///     Some("vulnerability data not checked for 3 dependencies (registry not verified as a public mirror)")
 /// );
+/// assert_eq!(run.unchecked(), 3);
 /// ```
-// TODO(#1946): a strict `--fail-on unchecked` gate would turn this count into an exit condition.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct OsvCoverage {
     unverified_registry: usize,
+    scan_incomplete: usize,
 }
 
 impl OsvCoverage {
-    /// Coverage with `unverified_registry` dependencies skipped for an unverified registry.
+    /// Coverage with `unverified_registry` dependencies skipped for an unverified registry and
+    /// `scan_incomplete` dependencies whose scan could not complete.
     #[must_use]
-    pub const fn new(unverified_registry: usize) -> Self {
+    pub const fn new(unverified_registry: usize, scan_incomplete: usize) -> Self {
         Self {
             unverified_registry,
+            scan_incomplete,
         }
     }
 
-    /// Counts the dependencies in `vulnerabilities` skipped as
-    /// [`SkipReason::UnverifiedRegistrySource`]; zero when the scan did not run.
+    /// Counts the dependencies in `vulnerabilities` skipped for a [`CoverageGap`], given whether
+    /// `lock` backed the manifest's version resolution; zero when the scan did not run.
     #[must_use]
-    pub fn from_vulnerabilities(vulnerabilities: Option<&VulnerabilityMap>) -> Self {
-        Self::new(vulnerabilities.map_or(0, |map| {
-            map.values()
-                .filter(|outcome| {
-                    matches!(
-                        outcome,
-                        ScanOutcome::Skipped(SkipReason::UnverifiedRegistrySource)
-                    )
-                })
-                .count()
-        }))
+    pub fn from_vulnerabilities(
+        vulnerabilities: Option<&VulnerabilityMap>,
+        lock: LockPresence,
+        unlocked: &HashSet<VulnKey>,
+    ) -> Self {
+        let mut coverage = Self::default();
+        for (key, outcome) in vulnerabilities.into_iter().flat_map(|map| map.iter()) {
+            if let ScanOutcome::Skipped(reason) = outcome {
+                let reason_lock = if unlocked.contains(key) {
+                    LockPresence::Absent
+                } else {
+                    lock
+                };
+                match reason.coverage_gap(reason_lock) {
+                    Some(CoverageGap::UnverifiedRegistry) => coverage.unverified_registry += 1,
+                    Some(CoverageGap::ScanIncomplete) => coverage.scan_incomplete += 1,
+                    None => {}
+                }
+            }
+        }
+        coverage
+    }
+
+    /// Adds `count` dependencies that were never scanned because the manifest exceeded the
+    /// per-document dependency cap.
+    pub const fn add_truncated(&mut self, count: usize) {
+        self.scan_incomplete += count;
+    }
+
+    /// Whether `vulnerabilities` holds a [`SkipReason::NoConcreteVersion`] skip, the one reason
+    /// whose [`CoverageGap`] depends on [`LockPresence`].
+    #[must_use]
+    pub fn needs_lock_presence(vulnerabilities: Option<&VulnerabilityMap>) -> bool {
+        vulnerabilities.is_some_and(|map| {
+            map.values().any(|outcome| {
+                matches!(outcome, ScanOutcome::Skipped(SkipReason::NoConcreteVersion))
+            })
+        })
     }
 
     /// Adds another manifest's coverage into this run total.
     pub const fn add(&mut self, other: &Self) {
         self.unverified_registry += other.unverified_registry;
+        self.scan_incomplete += other.scan_incomplete;
+    }
+
+    /// Dependencies whose vulnerability data was not checked, across both gap classes.
+    #[must_use]
+    pub const fn unchecked(&self) -> usize {
+        self.unverified_registry + self.scan_incomplete
     }
 
     /// The stderr note for this run, or `None` when every dependency was either checked or
     /// skipped for a reason that needs no report.
     #[must_use]
     pub fn note(&self) -> Option<String> {
-        let noun = match self.unverified_registry {
-            0 => return None,
-            1 => "dependency",
-            _ => "dependencies",
-        };
-        Some(format!(
-            "vulnerability data not checked for {} {noun} (registry not verified as a public mirror)",
-            self.unverified_registry
-        ))
+        let unverified = (self.unverified_registry > 0).then(|| {
+            format!(
+                "vulnerability data not checked for {} (registry not verified as a public mirror)",
+                dependency_count(self.unverified_registry)
+            )
+        });
+        let incomplete = (self.scan_incomplete > 0).then(|| {
+            format!(
+                "vulnerability scan incomplete for {} (query failed or truncated, or a version or \
+                 tag lookup unresolved; set GITHUB_TOKEN/GITLAB_TOKEN to avoid rate-limited tag \
+                 lookups)",
+                dependency_count(self.scan_incomplete)
+            )
+        });
+        match (unverified, incomplete) {
+            (None, None) => None,
+            (Some(note), None) | (None, Some(note)) => Some(note),
+            (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        }
+    }
+}
+
+fn dependency_count(count: usize) -> String {
+    match count {
+        1 => "1 dependency".to_string(),
+        _ => format!("{count} dependencies"),
     }
 }
 
@@ -637,12 +815,19 @@ pub async fn check_manifest(
     )
     .await?;
     let formatter = ecosystem.formatter();
+    let lock = if OsvCoverage::needs_lock_presence(analysis.vulnerabilities.as_ref()) {
+        lock_presence(&analysis.uri, ecosystem).await
+    } else {
+        LockPresence::Absent
+    };
 
     let severities = ctx.policy.diagnostics.to_severities();
     let diagnostics = ecosystem
         .generate_diagnostics(
             analysis.parse_result.as_ref(),
-            analysis.version_data(),
+            analysis
+                .version_data()
+                .with_suppression(&ctx.policy.diagnostics.suppress),
             &analysis.uri,
             ctx.policy.freshness.to_freshness(),
             severities,
@@ -660,6 +845,14 @@ pub async fn check_manifest(
         formatter,
         analysis.ecosystem_id,
     );
+    let unlocked = unlocked_keys(analysis.parse_result.as_ref(), &vuln_keys, formatter);
+    let mut osv_coverage =
+        OsvCoverage::from_vulnerabilities(analysis.vulnerabilities.as_ref(), lock, &unlocked);
+    if analysis.vulnerabilities.is_some()
+        && let Some((kept, total)) = analysis.parse_result.dependency_truncation()
+    {
+        osv_coverage.add_truncated(total.saturating_sub(kept));
+    }
     let findings = diagnostics
         .into_iter()
         .map(|diagnostic| {
@@ -680,8 +873,44 @@ pub async fn check_manifest(
         registry_unreachable: analysis.registry_unreachable,
         license_fetch_incomplete: analysis.license_fetch_incomplete,
         probe_report: analysis.probe_report,
-        osv_coverage: OsvCoverage::from_vulnerabilities(analysis.vulnerabilities.as_ref()),
+        osv_coverage,
     })
+}
+
+/// Whether a lock file exists for the manifest at `uri`: a located lock file counts as found
+/// even if it would not parse, and a failed discovery task is treated conservatively as found.
+async fn lock_presence(uri: &url::Url, ecosystem: &Arc<dyn Ecosystem>) -> LockPresence {
+    let Some(provider) = ecosystem.lockfile_provider() else {
+        return LockPresence::Absent;
+    };
+    let uri = uri.clone();
+    match tokio::task::spawn_blocking(move || provider.locate_lockfile(&uri)).await {
+        Ok(Some(_)) | Err(_) => LockPresence::Found,
+        Ok(None) => LockPresence::Absent,
+    }
+}
+
+/// Scan keys whose every occurrence is declared where no lock file lists it (an npm peer
+/// dependency), so a missing concrete version there is not a coverage gap. A key shared with a
+/// lockable occurrence is not exempt.
+fn unlocked_keys(
+    parse_result: &dyn deps_core::ParseResult,
+    vuln_keys: &VulnKeys,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+) -> HashSet<VulnKey> {
+    let mut all_unlocked: HashMap<VulnKey, bool> = HashMap::new();
+    for dep in parse_result.dependencies() {
+        let key = deps_core::osv::vuln_key_for(dep, Some(vuln_keys), formatter);
+        let unlocked = formatter.lock_resolution(dep) == LockResolution::NotLocked;
+        all_unlocked
+            .entry(key)
+            .and_modify(|all| *all &= unlocked)
+            .or_insert(unlocked);
+    }
+    all_unlocked
+        .into_iter()
+        .filter_map(|(key, unlocked)| unlocked.then_some(key))
+        .collect()
 }
 
 /// Indexes every dependency occurrence by its name range and (separately) its version
@@ -1695,6 +1924,79 @@ mod tests {
             &HashMap::new(),
         );
         assert!(finding.advisory.is_none());
+    }
+
+    #[test]
+    fn test_osv_coverage_counts_each_gap_class_and_ignores_input_limited_skips() {
+        use deps_core::osv::LockPresence;
+
+        let mut map: VulnerabilityMap = HashMap::new();
+        for (name, reason) in [
+            ("a", SkipReason::UnverifiedRegistrySource),
+            ("b", SkipReason::QueryFailed),
+            ("c", SkipReason::Truncated),
+            ("d", SkipReason::NonRegistrySource),
+            ("e", SkipReason::UnmatchableVersion),
+            ("f", SkipReason::NoConcreteVersion),
+        ] {
+            map.insert(
+                deps_core::test_util::vuln_key(name),
+                ScanOutcome::Skipped(reason),
+            );
+        }
+        assert_eq!(
+            OsvCoverage::from_vulnerabilities(Some(&map), LockPresence::Absent, &HashSet::new()),
+            OsvCoverage::new(1, 2)
+        );
+        assert_eq!(
+            OsvCoverage::from_vulnerabilities(Some(&map), LockPresence::Found, &HashSet::new()),
+            OsvCoverage::new(1, 3),
+            "a dependency missing from an existing lock file is a coverage gap"
+        );
+        let unlocked = HashSet::from([deps_core::test_util::vuln_key("f")]);
+        assert_eq!(
+            OsvCoverage::from_vulnerabilities(Some(&map), LockPresence::Found, &unlocked),
+            OsvCoverage::new(1, 2),
+            "a peer dependency never appears in the lock file"
+        );
+        assert!(OsvCoverage::needs_lock_presence(Some(&map)));
+        assert!(!OsvCoverage::needs_lock_presence(None));
+        assert_eq!(
+            OsvCoverage::from_vulnerabilities(None, LockPresence::Found, &HashSet::new()),
+            OsvCoverage::default()
+        );
+    }
+
+    #[test]
+    fn test_osv_coverage_note_names_both_classes() {
+        let note = OsvCoverage::new(1, 2).note().expect("note");
+        assert!(note.contains("not checked for 1 dependency (registry not verified"));
+        assert!(note.contains("scan incomplete for 2 dependencies"));
+        assert!(note.contains("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn test_fail_on_tokens_are_additive() {
+        let lone = FailOnPolicy::from_tokens(&[FailOnToken::Unchecked]);
+        assert_eq!(
+            lone.categories(),
+            FailOnPolicy::default_categories().categories()
+        );
+        assert_eq!(lone.coverage_gate(), CoverageGate::Fail);
+
+        let explicit = FailOnPolicy::from_tokens(&[
+            FailOnToken::Category(Category::Outdated),
+            FailOnToken::Unchecked,
+        ]);
+        assert_eq!(explicit.categories(), [Category::Outdated]);
+        assert_eq!(explicit.coverage_gate(), CoverageGate::Fail);
+
+        let none = FailOnPolicy::from_tokens(&[]);
+        assert_eq!(none.coverage_gate(), CoverageGate::Ignore);
+        assert_eq!(
+            none.categories(),
+            FailOnPolicy::default_categories().categories()
+        );
     }
 
     #[test]

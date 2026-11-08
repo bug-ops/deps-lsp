@@ -37,6 +37,8 @@ use crate::net_policy::EnvSource;
 pub enum OperatorEnvVar {
     /// `GOENV`: the Go environment file.
     Goenv,
+    /// `GOROOT`: the Go installation root holding the `go.env` defaults file.
+    Goroot,
     /// `XDG_CONFIG_HOME`: the base directory of per-user config on Unix.
     XdgConfigHome,
     /// `APPDATA`: the roaming profile directory on Windows.
@@ -57,6 +59,7 @@ impl OperatorEnvVar {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Goenv => "GOENV",
+            Self::Goroot => "GOROOT",
             Self::XdgConfigHome => "XDG_CONFIG_HOME",
             Self::AppData => "APPDATA",
             Self::CargoHome => "CARGO_HOME",

@@ -59,6 +59,41 @@ pub struct PypiDependency {
     pub section: PypiDependencySection,
     /// Source of the dependency (PyPI, Git, Path, URL)
     pub source: PypiDependencySource,
+    /// How the declared index configuration routed this dependency; `None` when it stayed on
+    /// plain public PyPI or is not a registry dependency.
+    pub(crate) index_route: Option<PypiIndexRoute>,
+}
+
+/// How a PyPI index declaration routes a dependency away from the public index.
+///
+/// Only [`Self::ReplacesPublic`] makes the skipped OSV scan a reported coverage gap (#1947);
+/// extra indexes and named sources are private by convention and stay silent.
+///
+/// # Examples
+///
+/// ```
+/// use deps_pypi::types::PypiIndexRoute;
+///
+/// assert_ne!(PypiIndexRoute::ReplacesPublic, PypiIndexRoute::SupplementsPublic);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PypiIndexRoute {
+    /// A primary `index-url` or uv `default = true` index replaces public PyPI and no hop of
+    /// the chain is public: plausibly an unverified mirror of it.
+    ReplacesPublic,
+    /// An extras-only chain, or a chain that still contains the public index.
+    SupplementsPublic,
+    /// A Poetry `source =` / uv `index =` named source.
+    NamedSource,
+}
+
+impl PypiDependency {
+    /// How the declared index configuration routed this dependency, or `None` when it stayed
+    /// on plain public PyPI or is not a registry dependency.
+    #[must_use]
+    pub const fn index_route(&self) -> Option<PypiIndexRoute> {
+        self.index_route
+    }
 }
 
 /// Section in pyproject.toml where a dependency is declared.
@@ -427,6 +462,7 @@ mod tests {
             markers_range: None,
             section: PypiDependencySection::Dependencies,
             source: PypiDependencySource::Registry,
+            index_route: None,
         };
 
         assert_eq!(dep.name, "flask");
@@ -449,6 +485,7 @@ mod tests {
             markers_range: None,
             section: PypiDependencySection::Dependencies,
             source: PypiDependencySource::Registry,
+            index_route: None,
         };
 
         assert_eq!(

@@ -110,6 +110,7 @@ pub(crate) struct DiagnosticsSnapshot {
     typosquat: TyposquatChecks,
     gossip: GossipChecks,
     license_policy: Arc<deps_core::LicensePolicy>,
+    suppression: Arc<deps_core::lsp_helpers::SuppressionSet>,
     pub(crate) fetch_timeout: FetchTimeout,
     pub(crate) max_concurrent_fetches: FetchConcurrency,
     epoch: ConfigEpoch,
@@ -134,6 +135,7 @@ impl DiagnosticsSnapshot {
             typosquat: config.policy.typosquat_checks(),
             gossip: config.policy.gossip_checks(),
             license_policy: Arc::new(config.policy.license_policy.to_policy()),
+            suppression: Arc::new(config.policy.diagnostics.suppress.clone()),
             fetch_timeout: config.policy.cache.fetch_timeout,
             max_concurrent_fetches: config.policy.cache.max_concurrent_fetches,
             epoch,
@@ -203,6 +205,7 @@ impl DiagnosticsSnapshot {
             typosquat: inactive.typosquat_checks(),
             gossip: inactive.gossip_checks(),
             license_policy: Arc::new(deps_core::LicensePolicy::default()),
+            suppression: Arc::default(),
             fetch_timeout: FetchTimeout::MIN,
             max_concurrent_fetches: FetchConcurrency::MIN,
             epoch: ConfigEpoch::default(),
@@ -553,7 +556,8 @@ pub(crate) async fn generate_diagnostics_internal(
         .with_ecosystem(ecosystem_id)
         .with_network(network)
         .with_license_source(ecosystem.license_source())
-        .with_license_policy(&snapshot.license_policy);
+        .with_license_policy(&snapshot.license_policy)
+        .with_suppression(&snapshot.suppression);
 
     let domain_diagnostics = ecosystem
         .generate_diagnostics(
@@ -1141,6 +1145,18 @@ mod tests {
         let snapshot =
             DiagnosticsSnapshot::capture(&state, &epoch_test_uri(), &RwLock::new(config)).await;
         assert!(!snapshot.license_policy.is_empty());
+    }
+
+    #[tokio::test]
+    async fn capture_copies_the_suppression_rules_of_the_config_it_read() {
+        let state = ServerState::new();
+        let mut config = DepsConfig::default();
+        config.policy.diagnostics = config.policy.diagnostics.with_suppress(
+            serde_json::from_str(r#"[{"package":"request","kinds":["deprecated"]}]"#).unwrap(),
+        );
+        let snapshot =
+            DiagnosticsSnapshot::capture(&state, &epoch_test_uri(), &RwLock::new(config)).await;
+        assert!(!snapshot.suppression.is_empty());
     }
 
     fn epoch_test_uri() -> Uri {

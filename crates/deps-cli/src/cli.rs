@@ -1,6 +1,6 @@
 //! Command-line argument surface for the `deps-cli` binary.
 
-use crate::report::Category;
+use crate::report::FailOnToken;
 use crate::walk::{GitignorePolicy, SymlinkPolicy};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -83,8 +83,16 @@ pub struct CheckArgs {
     /// offline, skipped lookups for manifests without a lock file, unresolved GitLab hosts,
     /// dependency-ceiling and registry-fetch failures. It therefore fails any manifest
     /// without a lock file and every `--offline` run.
+    ///
+    /// `unchecked` is a strict, additive run-level gate: the run also exits 1 when
+    /// vulnerability data was not checked for at least one dependency (an unverified registry
+    /// mirror, an incomplete or failed scan, or a dependency missing from an existing lock
+    /// file), or when vulnerability scanning is disabled in the config. It adds to the
+    /// categories rather than replacing them: `--fail-on unchecked` keeps the default
+    /// `vulnerable,yanked,unsatisfiable`, and `--fail-on outdated,unchecked` fails on `outdated`
+    /// plus the gate. It cannot be combined with `--offline`, which checks nothing (exit 2).
     #[arg(long, value_delimiter = ',')]
-    pub fail_on: Vec<Category>,
+    pub fail_on: Vec<FailOnToken>,
 
     /// Serve only already-cached registry data; never make a new outbound request.
     #[arg(long)]
@@ -288,6 +296,7 @@ pub fn parse_cooldown(input: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::report::Category;
 
     #[test]
     fn test_walk_paths_defaults_to_current_directory() {
@@ -319,7 +328,13 @@ mod tests {
         let Command::Check(args) = cli.command else {
             unreachable!()
         };
-        assert_eq!(args.fail_on, vec![Category::Vulnerable, Category::License]);
+        assert_eq!(
+            args.fail_on,
+            vec![
+                FailOnToken::Category(Category::Vulnerable),
+                FailOnToken::Category(Category::License)
+            ]
+        );
     }
 
     #[test]
@@ -328,7 +343,10 @@ mod tests {
         let Command::Check(args) = cli.command else {
             unreachable!()
         };
-        assert_eq!(args.fail_on, vec![Category::MutableRefPin]);
+        assert_eq!(
+            args.fail_on,
+            vec![FailOnToken::Category(Category::MutableRefPin)]
+        );
     }
 
     #[test]
@@ -337,7 +355,34 @@ mod tests {
         let Command::Check(args) = cli.command else {
             unreachable!()
         };
-        assert_eq!(args.fail_on, vec![Category::Vulnerable, Category::Other]);
+        assert_eq!(
+            args.fail_on,
+            vec![
+                FailOnToken::Category(Category::Vulnerable),
+                FailOnToken::Category(Category::Other)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fail_on_unchecked_token_is_accepted_alone_and_in_a_list() {
+        let cli = Cli::parse_from(["deps-cli", "check", "--fail-on", "unchecked"]);
+        let Command::Check(args) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(args.fail_on, vec![FailOnToken::Unchecked]);
+
+        let cli = Cli::parse_from(["deps-cli", "check", "--fail-on", "outdated,unchecked"]);
+        let Command::Check(args) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(
+            args.fail_on,
+            vec![
+                FailOnToken::Category(Category::Outdated),
+                FailOnToken::Unchecked
+            ]
+        );
     }
 
     #[test]

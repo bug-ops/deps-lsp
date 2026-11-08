@@ -216,6 +216,7 @@ fn parse_package_element(
         version_requirement: version_requirement.map(Into::into),
         version_range,
         source: deps_core::parser::DependencySource::Registry,
+        feed_route: None,
     })
 }
 
@@ -333,6 +334,7 @@ fn finalize_dep(
         version_requirement: version_requirement.map(Into::into),
         version_range,
         source: deps_core::parser::DependencySource::Registry,
+        feed_route: None,
     })
 }
 

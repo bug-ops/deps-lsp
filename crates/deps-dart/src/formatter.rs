@@ -7,8 +7,8 @@ use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::{
     BoundedVersionReq, BuildMetadataPolicy, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
-    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
-    bare_meaning, format_version_replacing_by_shape,
+    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget,
+    SourcePolicy, bare_meaning, format_version_replacing_by_shape,
 };
 use deps_core::normalize_operator_spacing;
 
@@ -95,9 +95,13 @@ impl PackageRendering for DartFormatter {
     ///
     /// [`RequirementRewriteShape::ExplicitCaret`]: deps_core::lsp_helpers::RequirementRewriteShape::ExplicitCaret
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        format_version_replacing_by_shape(version, current, bare_meaning(EcosystemId::Dart), || {
-            version.as_str().to_string()
-        })
+        format_version_replacing_by_shape(
+            version,
+            current,
+            bare_meaning(EcosystemId::Dart),
+            RewriteTarget::Floor,
+            || version.as_str().to_string(),
+        )
     }
 
     fn package_url(&self, name: &PackageName) -> String {

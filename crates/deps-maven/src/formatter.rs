@@ -4,8 +4,8 @@ use std::ops::Bound;
 
 use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
-    compile_requirement_unless, format_version_replacing_by_shape,
+    PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget, SourcePolicy,
+    bare_meaning, compile_requirement_unless, format_version_replacing_by_shape,
     requirement_contains_template_placeholder,
 };
 use deps_core::{
@@ -194,6 +194,7 @@ impl PackageRendering for MavenFormatter {
             version,
             current,
             bare_meaning(EcosystemId::Maven),
+            RewriteTarget::Floor,
             || self.format_version_for_text_edit(version),
         )
     }

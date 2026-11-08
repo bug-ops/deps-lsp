@@ -2072,6 +2072,10 @@ pub async fn ensure_document_loaded(
 #[path = "lifecycle_rekey_signals_tests.rs"]
 mod rekey_signals_tests;
 
+#[cfg(all(test, feature = "npm"))]
+#[path = "lifecycle_refresh_tests.rs"]
+mod refresh_tests;
+
 #[cfg(test)]
 mod tests {
     use super::super::diff::drop_cache_for_forced_refetch;

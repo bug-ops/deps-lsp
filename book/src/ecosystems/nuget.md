@@ -56,6 +56,12 @@ deliberately: that is exactly where `<packageSourceCredentials>` most commonly
 lives, and a global `<clear/>` there would silently re-route every project on
 the machine.
 
+**Vulnerability scanning.** When `<clear/>` or `<remove key="nuget.org"/>` leaves a feed chain
+with no `nuget.org` hop and no implicit fallback, the feeds are plausibly an unverified mirror of
+`nuget.org`: the dependency is not sent to OSV, and the skip is reported through the
+"vulnerability data not checked" stderr note of `deps-cli check` and `--fail-on unchecked`. A chain
+that still reaches `nuget.org` and a dependency routed by a `<packageSourceMapping>` group stay silent.
+
 **Additive by default**: a `NuGet.Config` with no `<clear/>` adds its declared
 sources alongside the implicit `api.nuget.org` source, matching `nuget.exe`'s
 own default-source-preservation behavior — a package present only on the new

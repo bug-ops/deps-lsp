@@ -1,7 +1,8 @@
-//! package-lock.json file parsing.
+//! npm lock file parsing (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`).
 //!
 //! Parses package-lock.json files (versions 2 and 3) to extract resolved dependency
-//! versions. Supports npm workspaces and proper path resolution.
+//! versions. Supports npm workspaces and proper path resolution. `pnpm-lock.yaml` is parsed
+//! here; `yarn.lock` (v1 and Berry) lives in the private `yarn` submodule.
 //!
 //! # package-lock.json Format
 //!
@@ -37,6 +38,8 @@ use std::path::{Path, PathBuf};
 use url::Url;
 use yaml_rust2::{Yaml, YamlLoader};
 
+mod yarn;
+
 /// package-lock.json file parser.
 ///
 /// Implements lock file parsing for npm package manager.
@@ -70,8 +73,32 @@ pub struct NpmLockParser;
 
 impl NpmLockParser {
     /// Lock file names for npm ecosystem, in resolution-precedence order: `package-lock.json`
-    /// wins over `pnpm-lock.yaml` when both exist in the same directory (spec 052 FR-001/FR-002).
-    const LOCKFILE_NAMES: &'static [&'static str] = &["package-lock.json", "pnpm-lock.yaml"];
+    /// wins over `pnpm-lock.yaml`, which wins over `yarn.lock`, when several exist in the same
+    /// directory (spec 052 FR-001/FR-002, spec 089 FR-002).
+    pub(crate) const LOCKFILE_NAMES: &'static [&'static str] =
+        &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"];
+
+    /// Logs at debug level when lock files lower in precedence than `located` also sit next to
+    /// it, so a surprising lock file choice is diagnosable.
+    fn log_shadowed_lockfiles(located: &Path) {
+        let (Some(dir), Some(name)) = (located.parent(), located.file_name()) else {
+            return;
+        };
+        let shadowed: Vec<&str> = Self::LOCKFILE_NAMES
+            .iter()
+            .copied()
+            .skip_while(|candidate| std::ffi::OsStr::new(candidate) != name)
+            .skip(1)
+            .filter(|candidate| deps_core::fs_probe::is_file(&dir.join(candidate)))
+            .collect();
+        if !shadowed.is_empty() {
+            tracing::debug!(
+                used = ?name,
+                ?shadowed,
+                "multiple npm lock files in one directory; using the highest-precedence one"
+            );
+        }
+    }
 }
 
 /// package-lock.json structure (partial, only fields we need).
@@ -119,21 +146,25 @@ enum NpmLockfileKind {
     PackageLockJson,
     /// `pnpm-lock.yaml`.
     PnpmLock,
+    /// `yarn.lock` (Yarn classic v1 or Berry).
+    YarnLock,
 }
 
 impl NpmLockfileKind {
     fn from_path(path: &Path) -> Self {
-        if path.file_name().and_then(|n| n.to_str()) == Some("pnpm-lock.yaml") {
-            Self::PnpmLock
-        } else {
-            Self::PackageLockJson
+        match path.file_name().and_then(|n| n.to_str()) {
+            Some("pnpm-lock.yaml") => Self::PnpmLock,
+            Some("yarn.lock") => Self::YarnLock,
+            _ => Self::PackageLockJson,
         }
     }
 }
 
 impl LockFileProvider for NpmLockParser {
     fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
-        locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
+        let located = locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)?;
+        Self::log_shadowed_lockfiles(&located);
+        Some(located)
     }
 
     fn parse_lockfile<'a>(
@@ -144,10 +175,40 @@ impl LockFileProvider for NpmLockParser {
         Box::pin(async move {
             match NpmLockfileKind::from_path(lockfile_path) {
                 NpmLockfileKind::PnpmLock => parse_pnpm_lock(lockfile_path).await,
+                NpmLockfileKind::YarnLock => parse_yarn_lock_file(lockfile_path).await,
                 NpmLockfileKind::PackageLockJson => parse_package_lock_json(lockfile_path).await,
             }
         })
     }
+}
+
+/// Parses a `yarn.lock` at `lockfile_path` into resolved packages (spec 089).
+///
+/// Parsing runs on the blocking-thread pool inside
+/// [`deps_core::lockfile::read_and_parse_lockfile`], not the calling tokio worker.
+async fn parse_yarn_lock_file(lockfile_path: &Path) -> Result<ResolvedPackages> {
+    tracing::debug!("Parsing yarn.lock: {}", lockfile_path.display());
+
+    let packages = read_and_parse_lockfile(lockfile_path, "yarn.lock", |content| {
+        yarn::parse_yarn_lock(&content)
+    })
+    .await?;
+
+    tracing::info!(
+        "Parsed yarn.lock: {} packages from {}",
+        packages.len(),
+        lockfile_path.display()
+    );
+
+    Ok(packages)
+}
+
+/// Fuzz-only entry point for the `yarn.lock` parser (v1 and Berry). Gated on the `fuzzing`
+/// Cargo feature so it stays out of the crate's public API surface in a normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_parse_yarn_lock(content: &str) {
+    let _ = yarn::parse_yarn_lock(content);
 }
 
 /// Parses a `package-lock.json` at `lockfile_path` into resolved packages.
@@ -976,6 +1037,7 @@ importers:
         lockfiles: [
             "package-lock.json" => "{\"lockfileVersion\": 3}",
             "pnpm-lock.yaml" => "lockfileVersion: '9.0'\n",
+            "yarn.lock" => "# yarn lockfile v1\n",
         ];
         malformed: "not valid json {{{";
     }
@@ -1558,5 +1620,69 @@ importers:
         let parser = NpmLockParser;
 
         assert_eq!(parser.locate_lockfile(&manifest_uri).unwrap(), pnpm_lock);
+    }
+
+    // --- yarn.lock (spec 089) ---
+
+    #[test]
+    fn test_locate_lockfile_prefers_pnpm_over_yarn() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("package.json");
+        let pnpm_lock = temp_dir.path().join("pnpm-lock.yaml");
+
+        std::fs::write(&manifest_path, r#"{"name": "test"}"#).unwrap();
+        std::fs::write(&pnpm_lock, "lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(temp_dir.path().join("yarn.lock"), "# yarn lockfile v1\n").unwrap();
+
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
+        assert_eq!(
+            NpmLockParser.locate_lockfile(&manifest_uri).unwrap(),
+            pnpm_lock
+        );
+    }
+
+    #[test]
+    fn test_locate_lockfile_finds_yarn_lock_in_ancestor() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let member_dir = temp_dir.path().join("packages").join("member");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        let member_manifest = member_dir.join("package.json");
+        let yarn_lock = temp_dir.path().join("yarn.lock");
+        std::fs::write(&member_manifest, r#"{"name": "member"}"#).unwrap();
+        std::fs::write(&yarn_lock, "# yarn lockfile v1\n").unwrap();
+
+        let manifest_uri = Url::from_file_path(&member_manifest).unwrap();
+        assert_eq!(
+            NpmLockParser.locate_lockfile(&manifest_uri).unwrap(),
+            yarn_lock
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_yarn_lock_v1_and_berry_via_provider() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let v1_path = temp_dir.path().join("v1-yarn.lock");
+        std::fs::write(
+            &v1_path,
+            "# yarn lockfile v1\n\nrequest@^2.88.2:\n  version \"2.88.2\"\n",
+        )
+        .unwrap();
+        let resolved = parse_yarn_lock_file(&v1_path).await.unwrap();
+        assert_eq!(resolved.version("request"), Some("2.88.2"));
+
+        let berry_dir = temp_dir.path().join("berry");
+        std::fs::create_dir_all(&berry_dir).unwrap();
+        let berry_path = berry_dir.join("yarn.lock");
+        std::fs::write(
+            &berry_path,
+            "__metadata:\n  version: 8\n\n\"request@npm:^2.88.2\":\n  version: 2.88.2\n  resolution: \"request@npm:2.88.2\"\n",
+        )
+        .unwrap();
+        let resolved = NpmLockParser.parse_lockfile(&berry_path).await.unwrap();
+        assert_eq!(resolved.version("request"), Some("2.88.2"));
     }
 }

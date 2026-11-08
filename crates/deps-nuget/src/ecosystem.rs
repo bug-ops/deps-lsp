@@ -218,7 +218,7 @@ impl Ecosystem for NuGetEcosystem {
                 .unwrap_or_default();
 
             for dep in &mut result.dependencies {
-                dep.source = config.resolve_source_for(&dep.name);
+                (dep.source, dep.feed_route) = config.resolve_for(&dep.name);
                 // #965: a plain chain can carry more than one independently blocked source, so
                 // every classification `blocked_class_for` finds becomes its own diagnostic.
                 for classification in config.blocked_class_for(&dep.name) {
@@ -1006,6 +1006,7 @@ mod tests {
                     deps_core::Position::new(line, 10),
                 )),
                 source,
+                feed_route: None,
             }
         }
 
@@ -2456,6 +2457,7 @@ mod tests {
                 version_requirement: None,
                 version_range: None,
                 source: DependencySource::Registry,
+                feed_route: None,
             };
             let parse_result = NuGetParseResult {
                 dependencies: vec![dep],

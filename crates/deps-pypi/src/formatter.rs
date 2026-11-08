@@ -1,3 +1,4 @@
+use crate::types::{PypiDependency, PypiIndexRoute};
 use deps_core::ConcreteVersion;
 use deps_core::Dependency;
 use deps_core::InvalidPackageName;
@@ -7,7 +8,7 @@ use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
     PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
 };
-use deps_core::osv::OsvPackageName;
+use deps_core::osv::{NonPublicRoute, OsvPackageName};
 use pep440_rs::{Operator, Version, VersionSpecifiers};
 use std::str::FromStr;
 
@@ -265,6 +266,22 @@ impl SourcePolicy for PypiFormatter {
 }
 
 impl OsvNaming for PypiFormatter {
+    /// A dependency whose primary `index-url` or uv `default` index replaces public PyPI is an
+    /// unverified mirror; extras, public-containing chains and named sources stay silent
+    /// (#1947).
+    fn non_public_route(&self, dep: &dyn Dependency) -> NonPublicRoute {
+        let route = dep
+            .as_any()
+            .downcast_ref::<PypiDependency>()
+            .and_then(PypiDependency::index_route);
+        match route {
+            Some(PypiIndexRoute::ReplacesPublic) => NonPublicRoute::UnverifiedMirror,
+            Some(PypiIndexRoute::SupplementsPublic | PypiIndexRoute::NamedSource) | None => {
+                NonPublicRoute::Private
+            }
+        }
+    }
+
     /// OSV records PyPI package names in their PEP 503 normalized form
     /// (`affected[].package.name` is always lowercase with runs of `-`/`_`/`.`
     /// collapsed to `-`), and the advisory matcher compares it with `==` against
@@ -773,6 +790,7 @@ mod tests {
             markers_range: None,
             section: PypiDependencySection::Dependencies,
             source: PypiDependencySource::Registry,
+            index_route: None,
         };
 
         for (manifest, osv) in [
@@ -817,6 +835,42 @@ mod tests {
         }
         for stable in [">=2.0,<3.0rc1", "<=2.0rc1", "!=2.0rc1", ">=2.0", "invalid"] {
             assert!(!opts(stable), "{stable} should not opt in");
+        }
+    }
+
+    #[test]
+    fn test_non_public_route_flags_only_replaced_public_index() {
+        use crate::types::{PypiDependencySection, PypiDependencySource};
+        use deps_core::position::{Position, Range};
+
+        let dep = |index_route| PypiDependency {
+            name: "requests".into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            version_req: None,
+            version_range: None,
+            extras: Vec::new(),
+            extras_range: None,
+            markers: None,
+            markers_range: None,
+            section: PypiDependencySection::Dependencies,
+            source: PypiDependencySource::Registry,
+            index_route,
+        };
+
+        let formatter = PypiFormatter;
+        for (route, expected) in [
+            (
+                Some(PypiIndexRoute::ReplacesPublic),
+                NonPublicRoute::UnverifiedMirror,
+            ),
+            (
+                Some(PypiIndexRoute::SupplementsPublic),
+                NonPublicRoute::Private,
+            ),
+            (Some(PypiIndexRoute::NamedSource), NonPublicRoute::Private),
+            (None, NonPublicRoute::Private),
+        ] {
+            assert_eq!(formatter.non_public_route(&dep(route)), expected);
         }
     }
 }

@@ -926,6 +926,52 @@ mod tests {
         );
     }
 
+    /// #1953: a top-level `registry=` that is the public npm registry itself leaves an `npm:`
+    /// import on plain `Registry` (so it is OSV-scanned as public content) and registers no
+    /// alternate client; a non-public top-level `registry=` still does not.
+    #[test]
+    fn test_npm_import_under_top_level_public_registry_stays_public() {
+        use deps_core::lsp_helpers::SourcePolicy;
+
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let json = r#"{"imports": {"lodash": "npm:lodash@^4.17.0"}}"#;
+        let parse_with_npmrc = |npmrc: &str| {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join(".npmrc"), npmrc).unwrap();
+            let uri = Url::from_file_path(root.path().join("deno.json")).unwrap();
+            parse_deno_json(json, &uri).unwrap()
+        };
+
+        let formatter = crate::formatter::DenoFormatter;
+        for npmrc in [
+            "registry=https://registry.npmjs.org/\n",
+            "registry=HTTPS://registry.npmjs.org:443\n",
+        ] {
+            let result = parse_with_npmrc(npmrc);
+            let source = result.dependencies[0].source.clone();
+            assert_eq!(
+                source,
+                deps_core::parser::DependencySource::Registry,
+                "{npmrc:?}"
+            );
+            assert!(formatter.source_is_public_registry_content(&source));
+            assert!(result.resolved_registries.is_empty());
+        }
+
+        for npmrc in [
+            "registry=https://npm.acme.internal\n",
+            "registry=https://registry.npmjs.org/?x=1\n",
+        ] {
+            let source = parse_with_npmrc(npmrc).dependencies[0].source.clone();
+            assert_ne!(
+                source,
+                deps_core::parser::DependencySource::Registry,
+                "{npmrc:?}"
+            );
+            assert!(!formatter.source_is_public_registry_content(&source));
+        }
+    }
+
     /// #1212: `parse_deno_json_with_context` must resolve against `ctx`'s own policy, not a
     /// hardcoded [`deps_core::net_policy::RegistryAccessPolicy::default`] — a
     /// `WorkspaceRegistryAccess::All` policy (the real server-side config a workspace can set)

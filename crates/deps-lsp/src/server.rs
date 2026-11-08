@@ -3859,6 +3859,33 @@ let package = Package(
             assert_eq!(config.policy.freshness.cooldown_secs, 60);
         }
 
+        /// #1927: `diagnostics.suppress` goes through the same strict `parse_config`; an
+        /// unsuppressible kind, a bare `*`, an empty kind list or a stray key keeps the previous
+        /// configuration.
+        #[test]
+        fn test_parse_config_validates_diagnostics_suppress() {
+            let config = parse_config(serde_json::json!({
+                "diagnostics": { "suppress": [
+                    { "package": "request", "kinds": ["deprecated"] },
+                    { "package": "@types/*", "kinds": ["outdated", "yanked"] }
+                ] }
+            }))
+            .expect("valid suppression rules parse");
+            assert!(!config.policy.diagnostics.suppress.is_empty());
+
+            for bad in [
+                serde_json::json!({ "package": "request", "kinds": ["vulnerability"] }),
+                serde_json::json!({ "package": "*", "kinds": ["outdated"] }),
+                serde_json::json!({ "package": "request", "kinds": [] }),
+                serde_json::json!({ "package": "request", "kinds": ["outdated"], "x": 1 }),
+            ] {
+                let result = parse_config(serde_json::json!({
+                    "diagnostics": { "suppress": [bad] }
+                }));
+                assert!(result.is_none());
+            }
+        }
+
         /// C2 regression: a section-wrapped payload (a real shape some clients send)
         /// has none of `DepsConfig`'s own keys, so it would otherwise deserialize
         /// silently into an all-defaults config, discarding the user's settings.

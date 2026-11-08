@@ -144,6 +144,10 @@ it is likewise severity-agnostic and never part of the default policy. `other` c
 finding that matches none of the nine specific categories and is never part of the default
 policy.
 
+`unchecked` is not a finding category but a strict, additive run-level gate (see
+[Failing on unchecked vulnerability coverage](#failing-on-unchecked-vulnerability-coverage)); it
+adds to the other tokens instead of replacing the default list.
+
 **Warning:** `other` also matches informational notices, not only real problems: the offline
 notice, the skipped-lookup notice for any manifest without a lock file, an unresolved
 self-hosted GitLab host, the dependency-ceiling notice, and collapsed registry-fetch failures.
@@ -167,7 +171,9 @@ up to date (see [GitHub Actions](ecosystems/github-actions.md#commits-ahead-of-t
 
 **Vulnerability data not checked.** A dependency whose registry cannot be verified as a public
 mirror is never sent to OSV: an npm dependency routed by the top-level `registry=` entry in `.npmrc`
-(valid or not), or a Go module whose every `GOPROXY` hop was rejected (including one that also
+(valid or not; an explicit `registry=https://registry.npmjs.org/` is the public registry and is scanned),
+a PyPI dependency whose primary `--index-url` or uv `default = true` index replaces public PyPI, a NuGet
+dependency whose `<clear/>`-replaced feed chain has no public feed, or a Go module whose every `GOPROXY` hop was rejected (including one that also
 matches `GONOSUMDB`). Such a dependency produces no finding, so `--fail-on vulnerable` cannot see it.
 When the run skipped any, `deps-cli` prints exactly one line on stderr and the exit code is
 unaffected:
@@ -183,11 +189,47 @@ only for dependencies whose registry it can resolve (an npm dependency routed by
 `registry=`); an invalid npm entry and a Go module with every hop rejected get no footer, only the
 CLI note.
 
+### Failing on unchecked vulnerability coverage
+
+`--fail-on vulnerable` only sees dependencies that OSV actually scanned. `--fail-on unchecked`
+closes that blind spot: the run exits `1` when vulnerability data was not checked for at least one
+dependency, so a green CI result means every dependency was covered.
+
+```bash
+# Default categories (vulnerable,yanked,unsatisfiable) plus the coverage gate
+deps-cli check --fail-on unchecked
+
+# Fail on outdated dependencies and on any coverage gap
+deps-cli check --fail-on outdated,unchecked
+```
+
+The gate is additive: `--fail-on unchecked` alone keeps `vulnerable,yanked,unsatisfiable`, and
+`--fail-on outdated,unchecked` fails on `outdated` plus the gate. A dependency counts as unchecked
+when:
+
+- its registry cannot be verified as a public mirror (the case in the note above);
+- its scan did not complete: an OSV query failed or was truncated, or a version or tag lookup stayed
+  unresolved;
+- it is missing from a lock file that was found (a manifest edit that was never relocked) and so has
+  no concrete version to match;
+- it falls beyond the per-document dependency ceiling (5000), so it was never scanned.
+
+These are not gaps: `peerDependencies` entries (never written to a lock file), dependencies that
+are unlocked by design, VCS and path dependencies, and a project with no lock file at all. The
+gate also fails when vulnerability scanning is switched off with
+`diagnostics.vulnerabilities_enabled = false`, because then nothing was checked; `deps-cli` prints a
+stderr note naming the setting. When dependencies are unchecked, the stderr note lists each gap
+class, and for incomplete tag lookups it suggests setting `GITHUB_TOKEN`/`GITLAB_TOKEN`.
+
+`--fail-on unchecked` cannot be combined with `--offline` (or `network.offline = true`): an offline
+run checks no vulnerability data, so `deps-cli` exits `2` with an error instead of failing every
+dependency.
+
 | Exit code | Meaning |
 |---|---|
 | `0` | Clean — no finding matched the `--fail-on` policy |
-| `1` | Policy violation — at least one finding matched `--fail-on` |
-| `2` | Execution error — a registry was unreachable, a `deps.toml`/manifest failed to parse, or a walked path was unreadable |
+| `1` | Policy violation — at least one finding matched `--fail-on`, or `--fail-on unchecked` found a coverage gap |
+| `2` | Execution error — `--fail-on unchecked` combined with offline mode, a registry was unreachable, a `deps.toml`/manifest failed to parse, or a walked path was unreadable |
 
 An unreachable registry (DNS failure, connect timeout after 10 seconds, refused connection) is an
 execution error: `deps-cli check` exits `2` and reports "Registry lookup failed". A registry that the

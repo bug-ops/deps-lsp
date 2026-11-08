@@ -1181,10 +1181,14 @@ pub fn generate_diagnostics_from_cache(
     );
     blocked_and_rejected_registry_diagnostics(&mut diagnostics, parse_result, &deps);
 
+    let suppression = versions
+        .suppression
+        .map(|set| set.resolve(formatter))
+        .unwrap_or_default();
+
     for (dep, key) in &keyed_deps {
-        let dep = *dep;
         let ctx = RuleContext {
-            dep,
+            dep: *dep,
             key,
             versions,
             formatter,
@@ -1193,57 +1197,78 @@ pub fn generate_diagnostics_from_cache(
             now,
         };
 
-        // R2, R3, R4 run before both terminal guards below: an OSV / deprecation / in-use-yanked
-        // finding must never be hidden by an unrelated "latest" lookup failure (FR-007/US-004).
-        let vulnerable_in_use =
-            apply_vulnerability_rule(&mut diagnostics, &ctx, vuln_keys.as_ref());
-        apply_license_policy_rule(&mut diagnostics, &ctx);
-        apply_typosquat_rule(&mut diagnostics, &ctx);
-        let deprecation_found = apply_deprecation_rule(&mut diagnostics, &ctx);
-        let in_use_yanked_emitted =
-            apply_in_use_yanked_rule(&mut diagnostics, &ctx, deprecation_found);
-
-        let Some(package_versions) = ctx.cached_versions() else {
-            apply_unknown_package_rule(&mut diagnostics, &mut fetch_failed, &ctx);
-            continue;
-        };
-
-        // Every rule below anchors its diagnostic on the declared version range.
-        let Some(version_range) = dep.version_range() else {
-            continue;
-        };
-        let version_range: Range = version_range;
-        let resolved = ResolvedData {
-            package_versions,
-            version_range,
-        };
-
-        if apply_unsatisfiable_rule(&mut diagnostics, &ctx, &resolved) == RuleFlow::Stop {
-            continue;
-        }
-        if apply_yanked_only_rule(
+        let start = diagnostics.len();
+        let vulnerable_in_use = apply_dependency_rules(
             &mut diagnostics,
+            &mut fetch_failed,
             &ctx,
-            &resolved,
-            YankedOnlyPrior {
-                deprecation_found,
-                in_use_yanked_emitted,
-            },
-        ) == RuleFlow::Stop
-        {
-            continue;
-        }
-        apply_outdated_rule(
-            &mut diagnostics,
-            &ctx,
-            &resolved,
             vuln_keys.as_ref(),
-            vulnerable_in_use,
         );
+        let suppressed = suppression.kinds_for(key.normalized());
+        if !suppressed.is_empty() {
+            let kept: Vec<Diagnostic> = diagnostics
+                .drain(start..)
+                .filter(|d| !suppressed.hides(d.kind(), vulnerable_in_use))
+                .collect();
+            diagnostics.extend(kept);
+        }
     }
 
     push_collapsed_fetch_failures(&mut diagnostics, fetch_failed, uri);
     diagnostics
+}
+
+/// Runs the per-dependency rule pipeline (R2-R7) for one dependency.
+///
+/// Returns the dependency's resolved OSV finding (`None` when clean/skipped/unchecked) so the
+/// caller can classify advisory diagnostics when applying user suppression rules.
+fn apply_dependency_rules<'a>(
+    diagnostics: &mut Vec<Diagnostic>,
+    fetch_failed: &mut Vec<FetchFailureEntry>,
+    ctx: &RuleContext<'a>,
+    vuln_keys: Option<&crate::osv::VulnKeys>,
+) -> Option<&'a crate::osv::DependencyVulnerabilities> {
+    let dep = ctx.dep;
+    // R2, R3, R4 run before both terminal guards below: an OSV / deprecation / in-use-yanked
+    // finding must never be hidden by an unrelated "latest" lookup failure (FR-007/US-004).
+    let vulnerable_in_use = apply_vulnerability_rule(diagnostics, ctx, vuln_keys);
+    apply_license_policy_rule(diagnostics, ctx);
+    apply_typosquat_rule(diagnostics, ctx);
+    let deprecation_found = apply_deprecation_rule(diagnostics, ctx);
+    let in_use_yanked_emitted = apply_in_use_yanked_rule(diagnostics, ctx, deprecation_found);
+
+    let Some(package_versions) = ctx.cached_versions() else {
+        apply_unknown_package_rule(diagnostics, fetch_failed, ctx);
+        return vulnerable_in_use;
+    };
+
+    // Every rule below anchors its diagnostic on the declared version range.
+    let Some(version_range) = dep.version_range() else {
+        return vulnerable_in_use;
+    };
+    let version_range: Range = version_range;
+    let resolved = ResolvedData {
+        package_versions,
+        version_range,
+    };
+
+    if apply_unsatisfiable_rule(diagnostics, ctx, &resolved) == RuleFlow::Stop {
+        return vulnerable_in_use;
+    }
+    if apply_yanked_only_rule(
+        diagnostics,
+        ctx,
+        &resolved,
+        YankedOnlyPrior {
+            deprecation_found,
+            in_use_yanked_emitted,
+        },
+    ) == RuleFlow::Stop
+    {
+        return vulnerable_in_use;
+    }
+    apply_outdated_rule(diagnostics, ctx, &resolved, vuln_keys, vulnerable_in_use);
+    vulnerable_in_use
 }
 
 /// Per-dependency inputs every rule in the pipeline reads.
@@ -10032,6 +10057,139 @@ mod tests {
         assert_eq!(unknown_diag.severity, Some(Severity::Warning));
         assert!(informational_diag.message().contains("[INFORMATIONAL]"));
         assert!(!unknown_diag.message().contains("[INFORMATIONAL]"));
+    }
+
+    fn suppression_rules(json: &str) -> super::super::SuppressionSet {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// #1927: a `deprecated` rule hides the deprecation but leaves `outdated` untouched, and a
+    /// rule for another package changes nothing.
+    #[test]
+    fn test_suppression_hides_only_the_listed_kind_for_the_matching_package() {
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("left-pad")],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            NormalizedName::for_test("left-pad"),
+            PackageVersions::latest_only("2.0.0"),
+        );
+        let resolved_versions = HashMap::new();
+        let outcomes = DependencyOutcomes::new().with_deprecation(
+            NormalizedName::for_test("left-pad"),
+            Deprecation {
+                reason: None,
+                replacement: None,
+            },
+        );
+        let run = |rules: &super::super::SuppressionSet| {
+            generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_outcomes(&outcomes)
+                    .with_suppression(rules),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            )
+        };
+        let has = |diagnostics: &[Diagnostic], kind: &DiagnosticKind| {
+            diagnostics.iter().any(|d| d.kind() == kind)
+        };
+
+        let none = run(&suppression_rules("[]"));
+        assert!(has(&none, &DiagnosticKind::Deprecated));
+        assert!(has(&none, &DiagnosticKind::Outdated));
+
+        let deprecated = run(&suppression_rules(
+            r#"[{"package":"left-*","kinds":["deprecated"]}]"#,
+        ));
+        assert!(!has(&deprecated, &DiagnosticKind::Deprecated));
+        assert!(has(&deprecated, &DiagnosticKind::Outdated));
+
+        let outdated = run(&suppression_rules(
+            r#"[{"package":"left-pad","kinds":["outdated"]}]"#,
+        ));
+        assert!(has(&outdated, &DiagnosticKind::Deprecated));
+        assert!(!has(&outdated, &DiagnosticKind::Outdated));
+
+        let other = run(&suppression_rules(
+            r#"[{"package":"right-pad","kinds":["deprecated","outdated"]}]"#,
+        ));
+        assert_eq!(other, none);
+    }
+
+    /// #1927 S7: suppressing `deprecated` hides only the advisory typed `Informational`; a graded
+    /// advisory on the same package stays, and a rule never hides an advisory without `deprecated`.
+    #[test]
+    fn test_suppression_deprecated_hides_only_informational_advisory() {
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap,
+        };
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("fxhash")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            crate::test_util::vuln_key("fxhash"),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
+                advisories: Capped::new(
+                    vec![
+                        sample_advisory("RUSTSEC-2024-0320", VulnSeverity::Informational),
+                        sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Medium),
+                    ],
+                    2,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
+            }),
+        );
+        let codes = |rules: &super::super::SuppressionSet| -> Vec<String> {
+            generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_vulnerabilities(&vulns)
+                    .with_suppression(rules),
+                &formatter,
+                parse_result.uri(),
+                crate::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            )
+            .iter()
+            .filter_map(|d| d.code().map(str::to_owned))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+        };
+
+        assert_eq!(
+            codes(&suppression_rules("[]")),
+            ["RUSTSEC-2020-0071", "RUSTSEC-2024-0320"]
+        );
+        assert_eq!(
+            codes(&suppression_rules(
+                r#"[{"package":"fxhash","kinds":["deprecated"]}]"#
+            )),
+            ["RUSTSEC-2020-0071"]
+        );
+        assert_eq!(
+            codes(&suppression_rules(
+                r#"[{"package":"fxhash","kinds":["outdated","yanked","license"]}]"#
+            )),
+            ["RUSTSEC-2020-0071", "RUSTSEC-2024-0320"]
+        );
     }
 
     #[test]

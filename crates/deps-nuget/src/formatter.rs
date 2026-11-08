@@ -1,12 +1,14 @@
 //! Version formatting for the NuGet ecosystem.
 
+use crate::types::{NuGetDependency, NuGetFeedRoute};
 use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
-    compile_requirement_unless, format_version_replacing_by_shape,
+    PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget, SourcePolicy,
+    bare_meaning, compile_requirement_unless, format_version_replacing_by_shape,
     requirement_contains_template_placeholder,
 };
-use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName};
+use deps_core::osv::NonPublicRoute;
+use deps_core::{ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName};
 
 /// Maximum package ID length NuGet's client-side `PackageIdValidator` accepts.
 const MAX_PACKAGE_ID_LENGTH: usize = 100;
@@ -122,6 +124,7 @@ impl PackageRendering for NuGetFormatter {
             version,
             current,
             bare_meaning(EcosystemId::NuGet),
+            RewriteTarget::Floor,
             || self.format_version_for_text_edit(version),
         )
     }
@@ -334,7 +337,23 @@ impl SourcePolicy for NuGetFormatter {
     }
 }
 
-impl OsvNaming for NuGetFormatter {}
+impl OsvNaming for NuGetFormatter {
+    /// A dependency on a plain feed chain that dropped nuget.org (`<clear/>` or
+    /// `<remove key="nuget.org"/>`) is an unverified mirror; chains that still reach nuget.org
+    /// and `<packageSourceMapping>` groups stay silent (#1947).
+    fn non_public_route(&self, dep: &dyn Dependency) -> NonPublicRoute {
+        let route = dep
+            .as_any()
+            .downcast_ref::<NuGetDependency>()
+            .and_then(NuGetDependency::feed_route);
+        match route {
+            Some(NuGetFeedRoute::ReplacesPublic) => NonPublicRoute::UnverifiedMirror,
+            Some(NuGetFeedRoute::SupplementsPublic | NuGetFeedRoute::Mapped) | None => {
+                NonPublicRoute::Private
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -597,6 +616,7 @@ mod tests {
             version_requirement: Some("12.0.1".into()),
             version_range: None,
             source: DependencySource::Registry,
+            feed_route: None,
         };
         assert_eq!(dep.source(), DependencySource::Registry);
 
@@ -949,6 +969,7 @@ mod tests {
             version_requirement: Some(VersionReq::new("1.0.0")),
             version_range: Some(version_range),
             source: DependencySource::Registry,
+            feed_route: None,
         };
 
         let advisory = Arc::new(
@@ -1058,6 +1079,36 @@ mod tests {
             "1.0.0",
         ] {
             assert!(!opts(stable), "{stable} should not opt in");
+        }
+    }
+
+    #[test]
+    fn test_non_public_route_flags_only_replaced_public_feed() {
+        use deps_core::parser::DependencySource;
+        use deps_core::position::Range;
+
+        let dep = |feed_route| NuGetDependency {
+            name: PackageName::new("Newtonsoft.Json"),
+            name_range: Range::default(),
+            version_requirement: None,
+            version_range: None,
+            source: DependencySource::Registry,
+            feed_route,
+        };
+        let f = NuGetFormatter;
+        for (route, expected) in [
+            (
+                Some(NuGetFeedRoute::ReplacesPublic),
+                NonPublicRoute::UnverifiedMirror,
+            ),
+            (
+                Some(NuGetFeedRoute::SupplementsPublic),
+                NonPublicRoute::Private,
+            ),
+            (Some(NuGetFeedRoute::Mapped), NonPublicRoute::Private),
+            (None, NonPublicRoute::Private),
+        ] {
+            assert_eq!(f.non_public_route(&dep(route)), expected);
         }
     }
 }

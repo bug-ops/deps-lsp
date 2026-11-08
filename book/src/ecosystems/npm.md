@@ -8,7 +8,7 @@ Yarn — all three read the same `package.json` format.
 | | |
 |---|---|
 | Manifest file | `package.json`; `pnpm-workspace.yaml` for [catalog entries](#editing-pnpm-workspaceyaml-catalog-entries) |
-| Lock file (in-use version) | `package-lock.json` (versions 2 and 3) or `pnpm-lock.yaml` |
+| Lock file (in-use version) | `package-lock.json` (versions 2 and 3), `pnpm-lock.yaml` or `yarn.lock` (Yarn v1 and Berry) |
 | Registry | npm registry — packument API (`registry.npmjs.org/{package}`) for versions, search API (`registry.npmjs.org/-/v1/search`) for package-name search |
 | Version syntax | node-semver ranges: `^`, `~`, `=`, `<`, `>`, `*` |
 
@@ -73,7 +73,8 @@ the registry cannot be verified as a mirror of npmjs. The skip is reported, not 
 prints one stderr note with the count, and hover shows "Vulnerability data not checked". An invalid
 top-level `registry=` entry is counted in the note too, but hover shows no footer for it because its
 registry cannot be resolved. Dependencies routed by an `@scope:registry=` entry are treated as private
-and are skipped silently.
+and are skipped silently. An explicit `registry=https://registry.npmjs.org/` is the public
+registry itself: it is scanned like a dependency with no `.npmrc` at all and produces no note.
 
 **Proxies.** A registry your user `~/.npmrc` declares (and a project `.npmrc` URL equal to one)
 is an [operator-owned registry](../configuration.md#operator-owned-registries): it follows your
@@ -109,6 +110,24 @@ it lives.
 - `.yarnrc`/`.yarnrc.yml` (Yarn Berry's own config format) are not read; a
   standard `.npmrc` present in the workspace is still honored either way.
   pnpm's own `pnpm-workspace.yaml` catalog extension *is* read — see below.
+
+## Lock Files
+
+When several lock files sit next to a manifest, the first one in this order wins:
+`package-lock.json`, then `pnpm-lock.yaml`, then `yarn.lock`. A lock file that loses is logged at
+debug level.
+
+`yarn.lock` is read for both Yarn generations, so hover, inlay hints and OSV matching use the version
+Yarn actually installed:
+
+- **Yarn v1** (`# yarn lockfile v1`): one entry per header line. A header lists at most 256 package
+  names; anything beyond is ignored.
+- **Yarn Berry** (YAML with a top-level `__metadata`): supported for `__metadata.version` 4 to 8, a
+  newer or older lock file is rejected with a parse error rather than guessed at. A `patch:` entry
+  resolves to the version it patches, a `::__archiveUrl=` suffix is stripped from the version, and
+  `workspace:` and `link:` entries are skipped.
+
+`bun.lock` is not read.
 
 ## Non-Registry Dependency Sources
 
@@ -177,7 +196,7 @@ overwrite `"react": "catalog:"` with a literal version, destroying the catalog
 reference.
 
 **Update edits keep the operator**: an update to `^16.0.0` writes `^19.3.1`, and `~` and `=`
-are kept the same way, and a bare partial version (`16`, `16.1`) keeps its precision. Other range forms become the exact version. Prerelease versions are not
+are kept the same way, and a bare or tilde partial version (`16`, `16.1`, `~16`) keeps its precision (`~16` with a latest of 19.3.1 becomes `~19`). Other range forms become the exact version. Prerelease versions are not
 offered unless the registry's latest is a prerelease or the dependency is already on one.
 
 A catalog entry whose value exceeds a length cap (256 bytes) is rejected
@@ -201,9 +220,8 @@ never per-key-merges the two sections.
 - A catalog entry whose value isn't a scalar string (e.g. a nested mapping)
   gets its own distinct "not a version string" message rather than being
   validated against pnpm's own schema further.
-- `yarn.lock` and `bun.lock` are not read for in-use/resolved-version
-  detection — only `package-lock.json` and `pnpm-lock.yaml` are supported
-  lock file formats (tracked as follow-ups on issue #709).
+- `bun.lock` is not read for in-use/resolved-version detection — only `package-lock.json`,
+  `pnpm-lock.yaml` and `yarn.lock` are supported lock file formats (see [Lock Files](#lock-files)).
 - `pnpm-lock.yaml`'s `importers` map is aggregated flatly across every
   workspace member into one shared version pool per package name, without
   correlating an importer entry back to the specific `package.json` being

@@ -46,7 +46,7 @@ impl IndexContext<'_> {
             .uv_named_by_dep
             .get(dep.name.as_str())
             .map(String::as_str);
-        dep.source = self.config.resolve_source_for(named);
+        (dep.source, dep.index_route) = self.config.resolve_for(named);
         if let Some(classification) = self.config.blocked_class_for(named) {
             self.blocked_registries
                 .borrow_mut()
@@ -649,6 +649,7 @@ impl PypiParser {
                     .borrow_mut()
                     .push(classification.into_occurrence(name_range));
             }
+            let (source, index_route) = ctx.config.resolve_for(None);
             return Ok(PypiDependency {
                 name: name.into(),
                 name_range,
@@ -659,7 +660,8 @@ impl PypiParser {
                 markers,
                 markers_range,
                 section: PypiDependencySection::PoetryDependencies,
-                source: ctx.config.resolve_source_for(None),
+                source,
+                index_route,
             });
         }
 
@@ -686,31 +688,34 @@ impl PypiParser {
                 .filter(|_| markers.is_some())
                 .map(|v| span_to_range(content, line_table, v.span));
 
-            let source = if table.contains_key("git") {
-                PypiDependencySource::Git {
+            let (source, index_route) = if table.contains_key("git") {
+                let git = PypiDependencySource::Git {
                     url: table
                         .get("git")
                         .and_then(|g| g.as_str())
                         .unwrap_or("")
                         .to_string(),
                     rev: table.get("rev").and_then(|r| r.as_str()).map(String::from),
-                }
+                };
+                (git, None)
             } else if table.contains_key("path") {
-                PypiDependencySource::Path {
+                let path = PypiDependencySource::Path {
                     path: table
                         .get("path")
                         .and_then(|p| p.as_str())
                         .unwrap_or("")
                         .to_string(),
-                }
+                };
+                (path, None)
             } else if table.contains_key("url") {
-                PypiDependencySource::Url {
+                let url = PypiDependencySource::Url {
                     url: table
                         .get("url")
                         .and_then(|u| u.as_str())
                         .unwrap_or("")
                         .to_string(),
-                }
+                };
+                (url, None)
             } else {
                 // FR-007: a `source = "<name>"` key routes to that named Poetry source;
                 // absent, the dependency routes through the primary/extras chain like any
@@ -725,7 +730,7 @@ impl PypiParser {
                         .borrow_mut()
                         .push(classification.into_occurrence(name_range));
                 }
-                ctx.config.resolve_source_for(source_name)
+                ctx.config.resolve_for(source_name)
             };
 
             return Ok(PypiDependency {
@@ -739,6 +744,7 @@ impl PypiParser {
                 markers_range,
                 section: PypiDependencySection::PoetryDependencies,
                 source,
+                index_route,
             });
         }
 

@@ -1,0 +1,16 @@
+__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"lodash@npm:^4.17.21":
+  version: 4.17.21
+  resolution: "lodash@npm:4.17.21"
+  checksum: 10c0/abc
+
+"typescript@patch:typescript@npm%3A^5.3.0#optional!builtin<compat/typescript>":
+  version: 5.3.3
+  resolution: "typescript@patch:typescript@npm%3A5.3.3#optional!builtin<compat/typescript>::version=5.3.3&hash=e012d7"
+
+"app@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "app@workspace:."
