@@ -5,7 +5,9 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::osv::NonPublicRoute;
 use deps_core::parser::DependencySource;
-use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName};
+use deps_core::{
+    ConcreteVersion, Dependency, InvalidPackageName, NarrowDependency, OwnDependency, PackageName,
+};
 
 use crate::types::{GoDependency, GoDirective};
 
@@ -58,6 +60,10 @@ impl RequirementMatcher for ExactMatcher {
 /// - Pseudo-versions (v0.0.0-20191109021931-daa7c04131f5)
 /// - +incompatible suffix for v2+ modules without /v2 path
 pub struct GoFormatter;
+
+impl OwnDependency for GoFormatter {
+    type Dep = GoDependency;
+}
 
 impl PackageNaming for GoFormatter {
     /// Reuses `crate::registry::validate_module_path` — the same structural rule that
@@ -157,8 +163,7 @@ impl RequirementResolution for GoFormatter {
         // version, or the replaced-from version) — treating those as
         // resolved would fabricate a "current version" claim for a
         // dependency that isn't actually pinned there (#235 review).
-        dep.as_any()
-            .downcast_ref::<GoDependency>()
+        self.own_dependency(dep)
             .is_some_and(|go_dep| go_dep.directive == GoDirective::Require)
     }
 }

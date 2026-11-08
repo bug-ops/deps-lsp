@@ -11,7 +11,7 @@ use crate::package_registry::{
     PackageRegistryClient, PublishedAtLookup, REGISTRY as SE_0292_REGISTRY,
 };
 use crate::scm::{MemoKey, ScmLookupUrl};
-use crate::scm_memo::{LookupHandle, ScmIdentityMemo};
+use crate::scm_memo::ScmIdentityMemo;
 use crate::types::{SwiftPackage, SwiftVersion};
 use dashmap::DashMap;
 use deps_core::github::{
@@ -95,7 +95,7 @@ impl SwiftRegistry {
         key: &MemoKey,
         timeout: std::time::Duration,
         scm: &ScmLookupUrl,
-    ) -> Option<LookupHandle> {
+    ) -> Option<deps_core::FlightHandle> {
         let client = self.alternate(key.registry().as_str())?;
         let repository = scm.clone();
         Some(self.identity_memo.start(key, timeout, async move {

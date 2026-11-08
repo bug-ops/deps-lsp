@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
+- **deps-core, deps-github-actions, deps-gitlab-ci**: `unknown_ref_diagnostics` is generic over the dependency type and takes typed dependencies (#1974)
 - **deps-core**: `format_version_replacing_by_shape` takes a `RewriteTarget` argument (#1961)
 - **deps-cli**: `exit_code`, `OsvCoverage::new` and `OsvCoverage::from_vulnerabilities` signatures changed and `CheckArgs::fail_on` is `Vec<FailOnToken>` (#1961)
 - **deps-pypi, deps-nuget**: `PypiDependency` and `NuGetDependency` gain private route fields (#1961)
@@ -19,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-github-actions, deps-gitlab-ci**: invalid YAML returns `DepsError::ParseError` instead of an empty result, except a bare `action.yml` (#1956)
 
 ### Added
+- **deps-core**: `SwrStore`, `SingleFlight`/`FlightHandle` and the `OwnParseResult`/`OwnDependency` typed boundary; new methods on the unsealed `OwnDependency` need a default body (#1974)
 - **deps-cli**: `--fail-on unchecked` is a strict, additive gate that exits 1 when vulnerability data was not checked for any dependency or scanning is disabled; with `--offline` it exits 2 (#1961)
 - **deps-npm**: read in-use versions from `yarn.lock` (Yarn v1 and Berry) for hover, inlay hints and OSV matching, after `package-lock.json` and `pnpm-lock.yaml` (#1961)
 - **deps-core, deps-lsp, deps-cli**: `diagnostics.suppress` silences deprecated, outdated, yanked or license diagnostics for named packages or globs (#1961)
@@ -28,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: a neutral `ℹ` inlay hint marks a dependency that was never looked up in a registry (#1956)
 
 ### Changed
+- **deps-core, deps-swift**: `EvidenceStore` and `ScmIdentityMemo` share one SWR store with O(log n) eviction, and ecosystem hooks narrow parse results once at the boundary, cutting production `as_any()` calls from 51 to 4 (#1974)
+- **docs**: node-semver and pep440_rs evaluation records in specs 095 and 096; both provisional keep (#1974)
 - **deps-go**: read the `$GOROOT/go.env` defaults layer below the process environment and `$GOENV` (#1961)
 - **deps-npm**: an explicit `registry=https://registry.npmjs.org/` in `.npmrc` is OSV-scanned as public content (#1961)
 - **deps-pypi, deps-nuget**: dependencies whose primary index or cleared feed chain replaces the public index report the unverified-mirror OSV signal (#1961)

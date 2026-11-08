@@ -1,9 +1,10 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, Range, WorkspaceEdit};
 
 use crate::edit::{FixTargetContext, replacement_text, requirement_is_placeholder_for};
 use crate::osv::ScanOutcome;
-use crate::{ConcreteVersion, Dependency, PackageKey, ParseResult, Registry, VersionReq};
+use crate::{ConcreteVersion, Dependency, PackageKey, ParseResult, Registry, Version, VersionReq};
 
 use super::{
     BoundedVersionReq, DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, FetchContext,
@@ -561,10 +562,6 @@ fn build_replacement_action(
 /// impl plus `ParseResult`/`Dependency` mocks, which live as private test
 /// fixtures in the sibling `test_support` module rather than as public
 /// API — see the `generate_code_actions_*` tests here for realistic calls.
-#[expect(
-    clippy::too_many_lines,
-    reason = "shared generator past 300 lines, split tracked in #1952"
-)]
 pub async fn generate_code_actions<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,
@@ -574,41 +571,19 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     registry: &R,
     formatter: &dyn EcosystemFormatter,
 ) -> Vec<CodeAction> {
-    use crate::completion::prepare_version_display_items;
-
     let deps = parse_result.dependencies();
     let mut actions = Vec::with_capacity(deps.len().min(5) + 1);
 
-    let Some(dep) = deps
-        .into_iter()
-        .find(|d| formatter.is_position_on_dependency(*d, position.into()))
+    let Some(ActionTarget {
+        dep,
+        version_range,
+        version_req,
+        literal_target,
+        line_offsets,
+    }) = locate_action_target(deps, position, content, formatter)
     else {
         return actions;
     };
-
-    let Some(version_range) = dep.version_range() else {
-        return actions;
-    };
-    let version_range: Range = version_range.into();
-
-    let Some(version_req) = dep.version_requirement() else {
-        return actions;
-    };
-    if version_req.as_str().is_empty() {
-        // Defense-in-depth, mirroring `collect_update_all_edits`: an empty
-        // requirement would trivially satisfy the guard below.
-        return actions;
-    }
-
-    let line_offsets = LineOffsetTable::new(content);
-    let slice = slice_for_range(content, &line_offsets, version_range.into());
-    let literal_target = dep
-        .version_literal()
-        .unwrap_or_else(|| version_req.as_str());
-    if !literal_span_matches(slice, literal_target) {
-        // Literal-span guard — see this function's doc comment.
-        return actions;
-    }
 
     // Both fix actions are built before the registry fetch below so a registry outage
     // never suppresses an OSV-derived fix (FR-007) or a known-unsatisfiable one.
@@ -635,61 +610,20 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         formatter,
     );
 
-    // Gated on `can_resolve_source` (#248/FR-001): a Git/Path/unresolved-custom-registry
-    // dependency must never be looked up against this ecosystem's default registry client,
-    // which would offer bogus "update to X" actions for an unrelated package.
-    let dep_source = dep.source();
-    let key = PackageKey::new(dep.name(), formatter);
-    let (registry_versions, fetch_unverified) = if formatter.can_resolve_source(&dep_source) {
-        match await_interactive_versions(
-            registry,
-            InteractiveFetchRequest::for_dependency(
-                versions,
-                uri,
-                dep,
-                formatter,
-                FetchContext::CodeAction,
-            ),
-            crate::freshness::FreshnessSettings::Disabled,
-        )
-        .await
-        {
-            InteractiveFetch::Live(list) => (Some(list), false),
-            InteractiveFetch::Degraded(NoLiveList::Failed) => (None, false),
-            InteractiveFetch::Degraded(NoLiveList::Unverified) => (None, true),
-        }
-    } else {
-        (None, false)
-    };
+    let fetched = fetch_fix_versions(registry, dep, uri, versions, formatter).await;
 
     // A fix target the registry reports as yanked is dropped entirely rather than offered —
-    // the surviving diagnostics carry the finding either way. On a genuine registry outage
-    // (`NoLiveList::Failed`) both actions still pass through unfiltered, unchanged from before
-    // #1204. An *unverified* answer is treated differently (`fetch_unverified`, checked first
-    // below): a timeout, a failure only inferred from the background fetch, or the interactive
-    // concurrency cap means the registry never said no, so a live answer confirming or denying
-    // the yank may well have been moments away — failing open here would let a slow registry
-    // silently suppress the very yank check this block exists for. Both speculative actions
-    // are dropped outright instead.
-    let is_yanked_target = |version_native: &str| {
-        registry_versions.as_ref().is_some_and(|versions_list| {
-            versions_list
-                .iter()
-                .find(|v| v.version_string() == version_native)
-                .is_some_and(|v| v.removal_status().blocks_resolution())
-        })
-    };
-    let fix = fix.filter(|f| !fetch_unverified && !is_yanked_target(&f.version_native));
-    let unsat_fix = unsat_fix.filter(|f| !fetch_unverified && !is_yanked_target(&f.version_native));
-
-    // Yank-filtering both actions before this collision check matters: PyPI's
-    // `truncate_release_to_match` can map a yanked and a live version to identical rewritten
-    // text, so checking collision first could drop the unsat action against a vuln fix the
-    // yank filter above was about to drop anyway, leaving neither behind.
-    let unsat_fix = unsat_fix.filter(|u| {
-        fix.as_ref()
-            .is_none_or(|f| strip_whitespace(&f.new_text) != strip_whitespace(&u.new_text))
-    });
+    // see `FetchedVersions::rules_out`. Yank-filtering both actions before the collision check
+    // below matters: PyPI's `truncate_release_to_match` can map a yanked and a live version to
+    // identical rewritten text, so checking collision first could drop the unsat action against
+    // a vuln fix the yank filter was about to drop anyway, leaving neither behind.
+    let fix = fix.filter(|f| !fetched.rules_out(&f.version_native));
+    let unsat_fix = unsat_fix
+        .filter(|f| !fetched.rules_out(&f.version_native))
+        .filter(|u| {
+            fix.as_ref()
+                .is_none_or(|f| strip_whitespace(&f.new_text) != strip_whitespace(&u.new_text))
+        });
 
     // Captured before each action's `.action` moves into `actions` below, so the dedup
     // seeding and the `is_preferred` post-pass read back the exact text/index without
@@ -713,29 +647,12 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
 
     // De-dups every REFACTOR edit's formatted text against the declared literal and both fix
     // actions', so no two actions carry a byte-identical `WorkspaceEdit`. Seeded with
-    // `literal_target` (not `version_req`) for the same reason as the guard above — e.g.
+    // `literal_target` (not `version_req`) for the same reason as the literal-span guard — e.g.
     // `deps-swift`'s synthesized `"=2.61.0"` requirement never equals the formatted edit text.
     let mut emitted_texts: HashSet<String> = HashSet::new();
     emitted_texts.insert(strip_whitespace(literal_target));
-    if let Some(fix_text) = fix_new_text {
-        emitted_texts.insert(fix_text);
-    }
-    if let Some(unsat_text) = unsat_new_text {
-        emitted_texts.insert(unsat_text);
-    }
-
-    // Issue #1517/#1524: computed once, shared by both the `item.is_latest` gate (via
-    // `latest_verdict`) and every other display item's own gate (via `candidate_verdict`)
-    // below.
-    let latest_vuln_keys = versions.ecosystem.map(|ecosystem| {
-        crate::osv::vulnerability_keys(
-            parse_result,
-            versions.resolved_map(),
-            versions.candidates_map(),
-            formatter,
-            ecosystem,
-        )
-    });
+    emitted_texts.extend(fix_new_text);
+    emitted_texts.extend(unsat_new_text);
 
     let mut latest_refactor_idx = None;
     // A pin proved ahead of the latest release would be downgraded by "Update to X".
@@ -748,119 +665,24 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     // rather than relying on every generated edit happening to dedup away as a no-op.
     if !proven_ahead
         && !requirement_is_placeholder_for(formatter, dep, version_req.as_str())
-        && let Some(registry_versions) = &registry_versions
+        && let Some(registry_versions) = &fetched.live
     {
-        // Same registry-delegated pick hover's `live_latest_idx` uses (see
-        // `prepare_version_display_items`'s doc comment) — not a re-derived `is_stable()` scan.
-        // Threads `parse_result`'s own `SelectionContext` (e.g. Composer's
-        // `minimum-stability`, #1433) so this action never disagrees with hover/diagnostics
-        // about what "latest" means for the same dependency.
-        let latest_idx = registry.select_latest_matching(
-            registry_versions,
-            &crate::existence_wildcard_req(),
-            &parse_result.selection_context(),
-        );
-        let mut display_items =
-            prepare_version_display_items(registry_versions, dep.name(), latest_idx);
-        let in_use = versions.ecosystem.and_then(|ecosystem| {
-            super::resolve_in_use_version(
-                dep,
-                &key,
-                versions.resolved_map(),
-                versions.candidates_map(),
-                formatter,
-                ecosystem,
-            )
-        });
-        let prereleases: HashSet<&str> = registry_versions
-            .iter()
-            .filter(|v| v.is_prerelease())
-            .map(|v| v.version_string().as_str())
-            .collect();
-        let pick = latest_idx
-            .and_then(|i| registry_versions.get(i))
-            .map(|v| v.version_string());
-        // The registry pick (`is_latest`) is exempt: it already carries the ecosystem's
-        // stability policy, and hover must agree with this action about "latest" (#952).
-        if PrereleasePolicy::for_dependency(
-            &prereleases,
-            pick,
-            in_use.as_ref(),
+        let refactor = RefactorContext {
+            parse_result,
+            dep,
+            uri,
+            version_range,
             version_req,
+            versions: &versions,
             formatter,
-        ) == PrereleasePolicy::StableOnly
-        {
-            display_items
-                .retain(|item| item.is_latest || !prereleases.contains(item.version.as_str()));
-        }
-        for item in display_items {
-            if !is_safe_version_string(item.version.as_str()) {
-                warn_rejected_value(
-                    "is_safe_version_string",
-                    "update-to-version refactor code action",
-                    item.version.as_str(),
-                );
-                continue;
-            }
-            // Issue #1517/#1524: never offer an "update to X" quickfix unless OSV has
-            // actually verified this exact version (or does not apply at all) — a
-            // Flagged/Unverified candidate must never be one keystroke away from landing in
-            // the manifest. `latest_verdict` (phase B's single "latest" check) covers the
-            // `is_latest` item; every other display item is covered by `candidate_verdict`
-            // (phase B's separate multi-candidate check, #1524).
-            let verdict = if item.is_latest {
-                latest_verdict(
-                    versions.latest_status,
-                    dep,
-                    latest_vuln_keys.as_ref(),
-                    &key,
-                    item.version.as_str(),
-                    formatter,
-                )
-            } else {
-                candidate_verdict(
-                    versions.candidate_status,
-                    dep,
-                    latest_vuln_keys.as_ref(),
-                    &key,
-                    item.version.as_str(),
-                    formatter,
-                )
-            };
-            if !matches!(
-                verdict,
-                LatestVerdict::Verified | LatestVerdict::NotApplicable
-            ) {
-                continue;
-            }
-            // Unreachable after the gate above; fails closed rather than unwrapping.
-            let Some(new_text) =
-                replacement_text(formatter, dep, &item.version, version_req.as_str())
-            else {
-                continue;
-            };
-
-            if !emitted_texts.insert(strip_whitespace(&new_text)) {
-                continue;
-            }
-
-            let edits = single_file_edit(uri, version_range.into(), new_text);
-
-            if item.is_latest {
-                latest_refactor_idx = Some(actions.len());
-            }
-            actions.push(CodeAction {
-                title: item.label,
-                kind: Some(CodeActionKind::REFACTOR),
-                edit: Some(WorkspaceEdit {
-                    changes: Some(edits),
-                    ..Default::default()
-                }),
-                // Resolved once below, for every producer at once.
-                is_preferred: None,
-                ..Default::default()
-            });
-        }
+        };
+        latest_refactor_idx = push_refactor_actions(
+            &refactor,
+            registry,
+            registry_versions,
+            &mut emitted_texts,
+            &mut actions,
+        );
     }
 
     // Single post-pass resolving `isPreferred`, priority order vuln fix -> unsat fix -> latest
@@ -876,6 +698,266 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     }
 
     actions
+}
+
+/// The dependency a code action request lands on, with the version text it would rewrite.
+struct ActionTarget<'a> {
+    dep: &'a dyn Dependency,
+    version_range: Range,
+    version_req: &'a VersionReq,
+    literal_target: &'a str,
+    line_offsets: LineOffsetTable,
+}
+
+/// The dependency at `position` whose version literal still sits at its recorded range, or
+/// `None` when no code action can safely target it.
+fn locate_action_target<'a>(
+    deps: Vec<&'a dyn Dependency>,
+    position: Position,
+    content: &str,
+    formatter: &dyn EcosystemFormatter,
+) -> Option<ActionTarget<'a>> {
+    let dep = deps
+        .into_iter()
+        .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
+    let version_range: Range = dep.version_range()?.into();
+    let version_req = dep.version_requirement()?;
+    if version_req.as_str().is_empty() {
+        // Defense-in-depth, mirroring `collect_update_all_edits`: an empty
+        // requirement would trivially satisfy the guard below.
+        return None;
+    }
+    let line_offsets = LineOffsetTable::new(content);
+    let slice = slice_for_range(content, &line_offsets, version_range.into());
+    let literal_target = dep
+        .version_literal()
+        .unwrap_or_else(|| version_req.as_str());
+    // Literal-span guard — see `generate_code_actions`'s doc comment.
+    literal_span_matches(slice, literal_target).then_some(ActionTarget {
+        dep,
+        version_range,
+        version_req,
+        literal_target,
+        line_offsets,
+    })
+}
+
+/// The registry's answer for a code action's dependency.
+struct FetchedVersions {
+    live: Option<Arc<[Box<dyn Version>]>>,
+    unverified: bool,
+}
+
+impl FetchedVersions {
+    /// Whether a fix targeting `version_native` must be dropped.
+    ///
+    /// On a genuine registry outage (`NoLiveList::Failed`) both fix actions still pass through
+    /// unfiltered, unchanged from before #1204. An *unverified* answer is treated differently
+    /// (checked first): a timeout, a failure only inferred from the background fetch, or the
+    /// interactive concurrency cap means the registry never said no, so a live answer
+    /// confirming or denying the yank may well have been moments away — failing open here would
+    /// let a slow registry silently suppress the very yank check this exists for. Both
+    /// speculative actions are dropped outright instead.
+    fn rules_out(&self, version_native: &str) -> bool {
+        self.unverified
+            || self.live.as_ref().is_some_and(|versions_list| {
+                versions_list
+                    .iter()
+                    .find(|v| v.version_string() == version_native)
+                    .is_some_and(|v| v.removal_status().blocks_resolution())
+            })
+    }
+}
+
+/// Fetches the dependency's versions, gated on `can_resolve_source` (#248/FR-001): a
+/// Git/Path/unresolved-custom-registry dependency must never be looked up against this
+/// ecosystem's default registry client, which would offer bogus "update to X" actions for an
+/// unrelated package.
+async fn fetch_fix_versions<R: Registry + ?Sized>(
+    registry: &R,
+    dep: &dyn Dependency,
+    uri: &url::Url,
+    versions: VersionData<'_>,
+    formatter: &dyn EcosystemFormatter,
+) -> FetchedVersions {
+    if !formatter.can_resolve_source(&dep.source()) {
+        return FetchedVersions {
+            live: None,
+            unverified: false,
+        };
+    }
+    match await_interactive_versions(
+        registry,
+        InteractiveFetchRequest::for_dependency(
+            versions,
+            uri,
+            dep,
+            formatter,
+            FetchContext::CodeAction,
+        ),
+        crate::freshness::FreshnessSettings::Disabled,
+    )
+    .await
+    {
+        InteractiveFetch::Live(list) => FetchedVersions {
+            live: Some(list),
+            unverified: false,
+        },
+        InteractiveFetch::Degraded(NoLiveList::Failed) => FetchedVersions {
+            live: None,
+            unverified: false,
+        },
+        InteractiveFetch::Degraded(NoLiveList::Unverified) => FetchedVersions {
+            live: None,
+            unverified: true,
+        },
+    }
+}
+
+/// What [`push_refactor_actions`] needs to know about the targeted dependency.
+struct RefactorContext<'a, 'v> {
+    parse_result: &'a dyn ParseResult,
+    dep: &'a dyn Dependency,
+    uri: &'a url::Url,
+    version_range: Range,
+    version_req: &'a VersionReq,
+    versions: &'a VersionData<'v>,
+    formatter: &'a dyn EcosystemFormatter,
+}
+
+/// Pushes one REFACTOR "Update to X" action per distinct, OSV-verified display version, and
+/// returns the index of the one for the registry's latest pick, if any.
+fn push_refactor_actions<R: Registry + ?Sized>(
+    ctx: &RefactorContext<'_, '_>,
+    registry: &R,
+    registry_versions: &[Box<dyn Version>],
+    emitted_texts: &mut HashSet<String>,
+    actions: &mut Vec<CodeAction>,
+) -> Option<usize> {
+    use crate::completion::prepare_version_display_items;
+
+    let RefactorContext {
+        parse_result,
+        dep,
+        uri,
+        version_range,
+        version_req,
+        versions,
+        formatter,
+    } = *ctx;
+    let key = PackageKey::new(dep.name(), formatter);
+    // Issue #1517/#1524: computed once, shared by both the `item.is_latest` gate (via
+    // `latest_verdict`) and every other display item's own gate (via `candidate_verdict`)
+    // below.
+    let latest_vuln_keys = super::hover::vuln_keys_for(parse_result, versions, formatter);
+
+    // Same registry-delegated pick hover's `live_latest_idx` uses (see
+    // `prepare_version_display_items`'s doc comment) — not a re-derived `is_stable()` scan.
+    // Threads `parse_result`'s own `SelectionContext` (e.g. Composer's
+    // `minimum-stability`, #1433) so this action never disagrees with hover/diagnostics
+    // about what "latest" means for the same dependency.
+    let latest_idx = registry.select_latest_matching(
+        registry_versions,
+        &crate::existence_wildcard_req(),
+        &parse_result.selection_context(),
+    );
+    let mut display_items =
+        prepare_version_display_items(registry_versions, dep.name(), latest_idx);
+    let in_use = versions.ecosystem.and_then(|ecosystem| {
+        super::resolve_in_use_version(
+            dep,
+            &key,
+            versions.resolved_map(),
+            versions.candidates_map(),
+            formatter,
+            ecosystem,
+        )
+    });
+    let prereleases: HashSet<&str> = registry_versions
+        .iter()
+        .filter(|v| v.is_prerelease())
+        .map(|v| v.version_string().as_str())
+        .collect();
+    let pick = latest_idx
+        .and_then(|i| registry_versions.get(i))
+        .map(|v| v.version_string());
+    // The registry pick (`is_latest`) is exempt: it already carries the ecosystem's
+    // stability policy, and hover must agree with this action about "latest" (#952).
+    if PrereleasePolicy::for_dependency(&prereleases, pick, in_use.as_ref(), version_req, formatter)
+        == PrereleasePolicy::StableOnly
+    {
+        display_items.retain(|item| item.is_latest || !prereleases.contains(item.version.as_str()));
+    }
+
+    let mut latest_refactor_idx = None;
+    for item in display_items {
+        if !is_safe_version_string(item.version.as_str()) {
+            warn_rejected_value(
+                "is_safe_version_string",
+                "update-to-version refactor code action",
+                item.version.as_str(),
+            );
+            continue;
+        }
+        // Issue #1517/#1524: never offer an "update to X" quickfix unless OSV has
+        // actually verified this exact version (or does not apply at all) — a
+        // Flagged/Unverified candidate must never be one keystroke away from landing in
+        // the manifest. `latest_verdict` (phase B's single "latest" check) covers the
+        // `is_latest` item; every other display item is covered by `candidate_verdict`
+        // (phase B's separate multi-candidate check, #1524).
+        let verdict = if item.is_latest {
+            latest_verdict(
+                versions.latest_status,
+                dep,
+                latest_vuln_keys.as_ref(),
+                &key,
+                item.version.as_str(),
+                formatter,
+            )
+        } else {
+            candidate_verdict(
+                versions.candidate_status,
+                dep,
+                latest_vuln_keys.as_ref(),
+                &key,
+                item.version.as_str(),
+                formatter,
+            )
+        };
+        if !matches!(
+            verdict,
+            LatestVerdict::Verified | LatestVerdict::NotApplicable
+        ) {
+            continue;
+        }
+        // Unreachable after the gate above; fails closed rather than unwrapping.
+        let Some(new_text) = replacement_text(formatter, dep, &item.version, version_req.as_str())
+        else {
+            continue;
+        };
+
+        if !emitted_texts.insert(strip_whitespace(&new_text)) {
+            continue;
+        }
+
+        let edits = single_file_edit(uri, version_range.into(), new_text);
+
+        if item.is_latest {
+            latest_refactor_idx = Some(actions.len());
+        }
+        actions.push(CodeAction {
+            title: item.label,
+            kind: Some(CodeActionKind::REFACTOR),
+            edit: Some(WorkspaceEdit {
+                changes: Some(edits),
+                ..Default::default()
+            }),
+            // Resolved once by `generate_code_actions`, for every producer at once.
+            is_preferred: None,
+            ..Default::default()
+        });
+    }
+    latest_refactor_idx
 }
 
 #[cfg(test)]

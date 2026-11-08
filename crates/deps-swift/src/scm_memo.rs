@@ -11,14 +11,18 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use deps_core::{RefreshEvents, RefreshSender};
-use tokio::sync::watch;
+use deps_core::swr_store::{Recency, Refreshed, SwrPolicy, SwrStore, Upserted};
+use deps_core::{FlightHandle, RefreshEvents, RefreshSender, SingleFlight};
 
 use crate::package_location::RegistryIdentityBuf;
 use crate::scm::{CaseFoldedScmUrl, IdentityLookup, MemoKey, RegistryIndexUrl};
+
+pub(crate) use deps_core::swr_store::Freshness;
 
 /// How long an answer is served without scheduling a refresh.
 pub(crate) const IDENTITY_TTL: Duration = Duration::from_hours(1);
@@ -37,13 +41,6 @@ pub(crate) fn wait_budget(timeout: Duration) -> Duration {
     timeout + WAIT_GRACE
 }
 
-/// Whether a memoized answer is still within [`IDENTITY_TTL`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Freshness {
-    Fresh,
-    Stale,
-}
-
 /// A memoized answer and how old it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MemoRead {
@@ -51,84 +48,32 @@ pub(crate) struct MemoRead {
     pub freshness: Freshness,
 }
 
-#[derive(Debug)]
-struct Entry {
-    answer: IdentityLookup,
-    refreshed_at: Instant,
-    last_read: Instant,
-}
-
-#[derive(Debug, Default)]
-struct MemoState {
-    entries: HashMap<MemoKey, Entry>,
-    generation: u64,
-}
-
-/// A started or joined lookup that can be awaited.
-#[derive(Debug)]
-pub(crate) struct LookupHandle {
-    done: watch::Receiver<bool>,
-    issued: bool,
-}
-
-impl LookupHandle {
-    /// Whether this call sent a new request, as opposed to joining one in flight.
-    pub(crate) const fn issued(&self) -> bool {
-        self.issued
-    }
-
-    /// Waits up to `budget` for the lookup to finish; `false` when it did not. The lookup keeps
-    /// running either way.
-    pub(crate) async fn wait(mut self, budget: Duration) -> bool {
-        matches!(
-            tokio::time::timeout(budget, self.done.wait_for(|done| *done)).await,
-            Ok(Ok(_))
-        )
-    }
-}
-
-/// Removes the in-flight marker and wakes the waiters when the lookup task ends, however it ends.
-struct InflightGuard {
-    memo: Arc<ScmIdentityMemo>,
-    key: MemoKey,
-    done: watch::Sender<bool>,
-}
-
-impl Drop for InflightGuard {
-    fn drop(&mut self) {
-        self.memo.inflight().remove(&self.key);
-        self.done.send_replace(true);
-    }
-}
-
-// TODO(#1944): shared SWR store and single-flight
 /// Repository-URL identity answers shared by every Swift document of a registry.
 #[derive(Debug)]
 pub(crate) struct ScmIdentityMemo {
-    state: Mutex<MemoState>,
-    inflight: Mutex<HashMap<MemoKey, watch::Receiver<bool>>>,
+    entries: SwrStore<MemoKey, IdentityLookup>,
+    inflight: SingleFlight<MemoKey>,
+    generation: AtomicU64,
     events: RefreshSender,
 }
 
 impl Default for ScmIdentityMemo {
     fn default() -> Self {
         Self {
-            state: Mutex::default(),
-            inflight: Mutex::default(),
+            entries: SwrStore::new(SwrPolicy {
+                capacity: NonZeroUsize::new(MEMO_CAPACITY).unwrap_or(NonZeroUsize::MIN),
+                ttl: Some(IDENTITY_TTL),
+                idle: Some(IDLE_EVICTION),
+                recency: Recency::ReadsOnly,
+            }),
+            inflight: SingleFlight::default(),
+            generation: AtomicU64::new(0),
             events: RefreshSender::new(),
         }
     }
 }
 
 impl ScmIdentityMemo {
-    fn state(&self) -> MutexGuard<'_, MemoState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn inflight(&self) -> MutexGuard<'_, HashMap<MemoKey, watch::Receiver<bool>>> {
-        self.inflight.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// Receives `ReparseOpenDocuments` whenever a recorded answer changes.
     pub(crate) fn subscribe(&self) -> RefreshEvents {
         self.events.subscribe()
@@ -137,22 +82,15 @@ impl ScmIdentityMemo {
     /// The count of answer changes so far.
     #[cfg(test)]
     pub(crate) fn generation(&self) -> u64 {
-        self.state().generation
+        self.generation.load(Ordering::Acquire)
     }
 
     /// The memoized answer for `key`, marking it read at `now`.
     pub(crate) fn get(&self, key: &MemoKey, now: Instant) -> Option<MemoRead> {
-        let mut state = self.state();
-        let entry = state.entries.get_mut(key)?;
-        entry.last_read = now;
-        let freshness = if now.saturating_duration_since(entry.refreshed_at) < IDENTITY_TTL {
-            Freshness::Fresh
-        } else {
-            Freshness::Stale
-        };
+        let read = self.entries.get(key, now)?;
         Some(MemoRead {
-            answer: entry.answer.clone(),
-            freshness,
+            answer: read.value,
+            freshness: read.freshness,
         })
     }
 
@@ -165,12 +103,12 @@ impl ScmIdentityMemo {
         registry: &RegistryIndexUrl,
     ) -> HashMap<CaseFoldedScmUrl, RegistryIdentityBuf> {
         let mut found: HashMap<CaseFoldedScmUrl, Option<RegistryIdentityBuf>> = HashMap::new();
-        for (key, entry) in &self.state().entries {
-            let IdentityLookup::Unique(identity) = &entry.answer else {
-                continue;
+        self.entries.scan(|key, answer| {
+            let IdentityLookup::Unique(identity) = answer else {
+                return;
             };
             if key.registry() != registry {
-                continue;
+                return;
             }
             found
                 .entry(CaseFoldedScmUrl::from(key.repository()))
@@ -180,7 +118,7 @@ impl ScmIdentityMemo {
                     }
                 })
                 .or_insert_with(|| Some(identity.clone()));
-        }
+        });
         found
             .into_iter()
             .filter_map(|(url, identity)| Some((url, identity?)))
@@ -192,47 +130,27 @@ impl ScmIdentityMemo {
     ///
     /// [`IdentityLookup::Failed`] never replaces a known answer, and an unchanged answer only
     /// restarts its TTL. The generation advances, announcing
-    /// `RefreshEvent::ReparseOpenDocuments` after the lock is released, only when the unique
-    /// identity the key resolves to changes (appears, disappears or differs): every other
+    /// `RefreshEvent::ReparseOpenDocuments` after the store's lock is released, only when the
+    /// unique identity the key resolves to changes (appears, disappears or differs): every other
     /// answer leaves every dependency on the form it already has.
     pub(crate) fn record(&self, key: &MemoKey, answer: IdentityLookup, now: Instant) -> bool {
-        let generation = {
-            let mut state = self.state();
-            let changed = match state.entries.get_mut(key) {
-                Some(entry) if answer == IdentityLookup::Failed || answer == entry.answer => {
-                    entry.refreshed_at = now;
-                    false
-                }
-                Some(entry) => {
-                    let moved = unique_identity(&entry.answer) != unique_identity(&answer);
-                    entry.answer = answer;
-                    entry.refreshed_at = now;
-                    moved
-                }
-                None => {
-                    let moved = unique_identity(&answer).is_some();
-                    state.entries.insert(
-                        key.clone(),
-                        Entry {
-                            answer,
-                            refreshed_at: now,
-                            last_read: now,
-                        },
-                    );
-                    moved
-                }
-            };
-            evict(&mut state.entries, now);
-            changed.then(|| {
-                state.generation += 1;
-                state.generation
-            })
+        let moved = if answer == IdentityLookup::Failed {
+            match self.entries.refresh_or_insert(key.clone(), answer, now) {
+                Refreshed::Kept | Refreshed::Inserted => false,
+            }
+        } else {
+            let incoming = unique_identity(&answer).cloned();
+            match self.entries.upsert(key.clone(), answer, now) {
+                Upserted::Inserted => incoming.is_some(),
+                Upserted::Replaced { previous } => unique_identity(&previous) != incoming.as_ref(),
+            }
         };
-        generation.inspect(|generation| {
+        if moved {
+            let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
             self.events
-                .send_reparse_open_documents(*generation, key.repository().to_parse_input());
-        });
-        generation.is_some()
+                .send_reparse_open_documents(generation, key.repository().to_parse_input());
+        }
+        moved
     }
 
     /// Runs `lookup` for `key` in a detached task, or joins the one already in flight.
@@ -245,34 +163,15 @@ impl ScmIdentityMemo {
         key: &MemoKey,
         timeout: Duration,
         lookup: impl Future<Output = IdentityLookup> + Send + 'static,
-    ) -> LookupHandle {
-        let (done_tx, done_rx) = {
-            let mut inflight = self.inflight();
-            if let Some(running) = inflight.get(key) {
-                return LookupHandle {
-                    done: running.clone(),
-                    issued: false,
-                };
-            }
-            let (done_tx, done_rx) = watch::channel(false);
-            inflight.insert(key.clone(), done_rx.clone());
-            (done_tx, done_rx)
-        };
-        let guard = InflightGuard {
-            memo: Arc::clone(self),
-            key: key.clone(),
-            done: done_tx,
-        };
-        tokio::spawn(async move {
+    ) -> FlightHandle {
+        let memo = Arc::clone(self);
+        let recorded = key.clone();
+        self.inflight.start_or_join(key.clone(), async move {
             let answer = tokio::time::timeout(timeout, lookup)
                 .await
                 .unwrap_or(IdentityLookup::Failed);
-            guard.memo.record(&guard.key, answer, Instant::now());
-        });
-        LookupHandle {
-            done: done_rx,
-            issued: true,
-        }
+            memo.record(&recorded, answer, Instant::now());
+        })
     }
 }
 
@@ -283,22 +182,6 @@ fn unique_identity(answer: &IdentityLookup) -> Option<&RegistryIdentityBuf> {
         | IdentityLookup::NotRegistered
         | IdentityLookup::Rejected
         | IdentityLookup::Failed => None,
-    }
-}
-
-/// Drops entries unread for [`IDLE_EVICTION`], then the least recently read beyond
-/// [`MEMO_CAPACITY`].
-fn evict(entries: &mut HashMap<MemoKey, Entry>, now: Instant) {
-    entries.retain(|_, entry| now.saturating_duration_since(entry.last_read) <= IDLE_EVICTION);
-    while entries.len() > MEMO_CAPACITY {
-        let Some(oldest) = entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_read)
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        entries.remove(&oldest);
     }
 }
 

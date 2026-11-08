@@ -7,7 +7,8 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::osv::{LockResolution, NonPublicRoute};
 use deps_core::{
-    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName, VersionReq,
+    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, NarrowDependency, OwnDependency,
+    PackageName, VersionReq,
 };
 use std::borrow::Cow;
 
@@ -490,6 +491,10 @@ fn is_url_friendly_segment(segment: &str) -> bool {
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for npm.
 pub struct NpmFormatter;
 
+impl OwnDependency for NpmFormatter {
+    type Dep = NpmDependency;
+}
+
 impl PackageNaming for NpmFormatter {
     /// Lints `name` against npm's own `validate-npm-package-name` rules.
     ///
@@ -753,9 +758,8 @@ impl OsvNaming for NpmFormatter {
     /// (an Artifactory/Nexus/Verdaccio proxy); a scope entry, a failed downcast and every
     /// non-registry specifier stay private and silent (#1917).
     fn non_public_route(&self, dep: &dyn Dependency) -> NonPublicRoute {
-        let entry = dep
-            .as_any()
-            .downcast_ref::<NpmDependency>()
+        let entry = self
+            .own_dependency(dep)
             .and_then(NpmDependency::registry_entry);
         match entry {
             Some(NpmRegistryEntry::TopLevel) => NonPublicRoute::UnverifiedMirror,
@@ -766,18 +770,15 @@ impl OsvNaming for NpmFormatter {
     /// A `peerDependencies` entry is never written to a lock file, so its missing resolved
     /// version is not a coverage gap (#1946).
     fn lock_resolution(&self, dep: &dyn Dependency) -> LockResolution {
-        let is_peer = dep
-            .as_any()
-            .downcast_ref::<NpmDependency>()
-            .is_some_and(|dep| {
-                matches!(
-                    dep.origin,
-                    NpmDependencyOrigin::Manifest {
-                        section: NpmDependencySection::PeerDependencies,
-                        ..
-                    }
-                )
-            });
+        let is_peer = self.own_dependency(dep).is_some_and(|dep| {
+            matches!(
+                dep.origin,
+                NpmDependencyOrigin::Manifest {
+                    section: NpmDependencySection::PeerDependencies,
+                    ..
+                }
+            )
+        });
         if is_peer {
             LockResolution::NotLocked
         } else {

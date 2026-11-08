@@ -9,8 +9,8 @@ use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
 use deps_core::hover::Hover;
 use deps_core::{
-    ConfigReach, Ecosystem, ParseResult as ParseResultTrait, Registry, Result, WatchedConfig,
-    WatchedConfigEffect,
+    ConfigReach, Ecosystem, NarrowParseResult, OwnParseResult, ParseResult as ParseResultTrait,
+    Registry, Result, WatchedConfig, WatchedConfigEffect,
     diagnostic::{Diagnostic, DiagnosticKind, Severity},
     lsp_helpers::{DiagnosticSeverities, EcosystemFormatter},
 };
@@ -120,6 +120,10 @@ impl NpmEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for NpmEcosystem {}
 
+impl OwnParseResult for NpmEcosystem {
+    type Parsed = NpmParseResult;
+}
+
 const WATCHED_CONFIGS: [WatchedConfig; 2] = [
     WatchedConfig::new(
         "pnpm-workspace.yaml",
@@ -228,16 +232,15 @@ impl Ecosystem for NpmEcosystem {
             )
             .await?;
 
-            let hovered = parse_result
-                .dependencies()
-                .into_iter()
-                .find(|dep| {
-                    deps_core::position_in_range(position.into(), dep.name_range())
+            let parsed = self.own_parse_result(parse_result);
+            let hovered = parsed.and_then(|parsed| {
+                parsed.dependencies.iter().find(|dep| {
+                    deps_core::position_in_range(position.into(), dep.name_range)
                         || dep
-                            .version_range()
+                            .version_range
                             .is_some_and(|r| deps_core::position_in_range(position.into(), r))
                 })
-                .and_then(|dep| dep.as_any().downcast_ref::<NpmDependency>());
+            });
 
             if let Some(catalog_line) = hovered.and_then(catalog_hover_line) {
                 hover.push_markdown(&catalog_line);
@@ -252,10 +255,7 @@ impl Ecosystem for NpmEcosystem {
                         crate::types::NpmDependencyOrigin::CatalogEntry { .. }
                     )
                 }),
-                parse_result
-                    .as_any()
-                    .downcast_ref::<NpmParseResult>()
-                    .and_then(|result| result.workspace_members.as_ref()),
+                parsed.and_then(|result| result.workspace_members.as_ref()),
             ) {
                 let usage = self
                     .catalog_usage
@@ -302,9 +302,14 @@ impl Ecosystem for NpmEcosystem {
                 severities,
                 deps_core::PublishTime::now(),
             );
-            annotate_catalog_references(parse_result, &mut diagnostics);
-            diagnostics.extend(catalog_diagnostics(parse_result, severities.unknown));
-            diagnostics.extend(duplicate_default_catalog_diagnostic(parse_result));
+            if let Some(parsed) = self.own_parse_result(parse_result) {
+                annotate_catalog_references(&parsed.dependencies, &mut diagnostics);
+                diagnostics.extend(catalog_diagnostics(
+                    &parsed.dependencies,
+                    severities.unknown,
+                ));
+                diagnostics.extend(duplicate_default_catalog_diagnostic(parsed));
+            }
             diagnostics
         })
     }
@@ -396,12 +401,10 @@ fn extract_prefix(line: &str, character: u32) -> (&str, bool) {
 /// own `let Some(version_range) = dep.version_range() else { continue };` gate) — there is
 /// simply nowhere in the document to place a diagnostic squiggle without a span, catalog or
 /// otherwise.
-fn catalog_diagnostics(parse_result: &dyn ParseResultTrait, severity: Severity) -> Vec<Diagnostic> {
-    parse_result
-        .dependencies()
-        .into_iter()
-        .filter_map(|dep| {
-            let npm_dep = dep.as_any().downcast_ref::<NpmDependency>()?;
+fn catalog_diagnostics(dependencies: &[NpmDependency], severity: Severity) -> Vec<Diagnostic> {
+    dependencies
+        .iter()
+        .filter_map(|npm_dep| {
             let origin = npm_dep.catalog_ref()?;
             let range = npm_dep.version_range?;
             let message = origin.diagnostic_message(npm_dep.name.as_str())?;
@@ -414,14 +417,8 @@ fn catalog_diagnostics(parse_result: &dyn ParseResultTrait, severity: Severity) 
 /// `pnpm-workspace.yaml` with a `(set in pnpm-workspace.yaml, catalog <id>)` message suffix and
 /// a related location pointing at that entry (spec 078 FR-031). The finding itself stays on the
 /// reference; no rewrite is offered there.
-fn annotate_catalog_references(
-    parse_result: &dyn ParseResultTrait,
-    diagnostics: &mut [Diagnostic],
-) {
-    for dep in parse_result.dependencies() {
-        let Some(npm_dep) = dep.as_any().downcast_ref::<NpmDependency>() else {
-            continue;
-        };
+fn annotate_catalog_references(dependencies: &[NpmDependency], diagnostics: &mut [Diagnostic]) {
+    for npm_dep in dependencies {
         let (Some(origin), Some(range)) = (npm_dep.catalog_ref(), npm_dep.version_range) else {
             continue;
         };
@@ -453,11 +450,8 @@ fn annotate_catalog_references(
 
 /// The single Error finding for a `pnpm-workspace.yaml` defining the default catalog twice
 /// (spec 078 FR-030), anchored on the `catalogs.default` key.
-fn duplicate_default_catalog_diagnostic(parse_result: &dyn ParseResultTrait) -> Option<Diagnostic> {
-    let range = parse_result
-        .as_any()
-        .downcast_ref::<NpmParseResult>()?
-        .duplicate_default_catalog?;
+fn duplicate_default_catalog_diagnostic(parsed: &NpmParseResult) -> Option<Diagnostic> {
+    let range = parsed.duplicate_default_catalog?;
     Some(
         Diagnostic::new(
             DiagnosticKind::DuplicateDefaultCatalog,

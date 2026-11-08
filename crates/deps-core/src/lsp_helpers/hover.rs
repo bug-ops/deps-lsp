@@ -7,7 +7,7 @@ use crate::deps_dev::DepsDevScope;
 use crate::edit::requirement_is_placeholder_for;
 use crate::hover::Hover;
 use crate::licenses::resolve_license_entries_for_display;
-use crate::osv::ScanOutcome;
+use crate::osv::{ScanOutcome, UpgradeStatus};
 use crate::{
     ConcreteVersion, Dependency, Deprecation, GossipLowUsage, LicenseSource, PackageKey,
     ParseResult, ProvenanceStatus, PublishTime, Registry, SupplyChainTrustSignal, Version,
@@ -79,10 +79,6 @@ pub const CMD_DOT_FOOTER: &str = "\n---\n⌨️ **Press `Cmd+.` to update versio
 /// implementation: locates the dependency whose name or version range contains
 /// `position`, resolves its version data against `registry`, and renders the
 /// result through `formatter`. Returns `None` when no dependency covers the position.
-#[expect(
-    clippy::too_many_lines,
-    reason = "shared generator past 300 lines, split tracked in #1952"
-)]
 pub async fn generate_hover<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,
@@ -92,26 +88,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     freshness: crate::freshness::FreshnessSettings,
     now: PublishTime,
 ) -> Option<Hover> {
-    let dep = parse_result.dependencies().into_iter().find(|d| {
-        // #905: `position_in_range` is inclusive on both ends, so without this guard hovering
-        // the document's first character (a synthetic `name_range()`'s `Range::default()`
-        // sentinel) would match whichever synthetic-range dependency lists first.
-        let on_name =
-            !d.name_range_is_synthetic() && position_in_range(position.into(), d.name_range());
-        // `!version_range_is_synthetic_empty` gate (#1161 M1 code-review follow-up, second
-        // round): Maven's empty `<version></version>` gives `version_range()` a real,
-        // zero-width position purely so completion can locate the dependency there, with no
-        // requirement text to hover over — that degenerate case must not match here. A blanket
-        // `version_requirement().is_some()` gate over-corrected this: Gradle's version-catalog
-        // `version.ref` pointing at a dangling/rich-version alias legitimately has a REAL,
-        // non-empty `version_range()` (the alias-reference text) with `version_requirement()`
-        // still `None`, and hovering it worked before #1161 — the zero-width check keeps that
-        // working while still suppressing Maven's genuinely degenerate position.
-        let on_version = !super::version_range_is_synthetic_empty(*d)
-            && d.version_range()
-                .is_some_and(|r| position_in_range(position.into(), r));
-        on_name || on_version
-    })?;
+    let dep = find_hovered_dependency(parse_result, position)?;
 
     // A non-resolvable source (`CustomRegistry`, Git, Path) must skip the registry lookup —
     // fetching by name would silently check an unrelated public-registry package (#248).
@@ -164,131 +141,41 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     let mut markdown = HoverMarkdown::new();
     push_header_hover_section(&mut markdown, dep, url.as_deref());
 
-    let resolved: Option<&str> = if formatter.manifest_requirement_is_resolved_version(dep) {
-        dep.version_requirement().map(VersionReq::as_str)
-    } else {
-        in_use_version::resolve_occurrence_version(
-            dep,
-            &key,
-            versions.resolved_map(),
-            versions.candidates_map(),
-            formatter,
-        )
-        .map(ConcreteVersion::as_str)
-    };
+    let resolved = current_version_text(dep, &key, &versions, formatter);
     push_current_or_requirement_hover_section(&mut markdown, dep, resolved);
     push_provenance_hover_section(&mut markdown, formatter.hover_provenance(dep).as_ref());
 
     push_markers_hover_section(&mut markdown, dep);
 
-    // `**Latest**` prefers the just-fetched live list over the Ch1 cache whenever a live fetch
-    // happened — Ch1 alone could render a version older than "Recent versions"'s own
-    // `*(latest)*` entry (#227 F5). Falls back to Ch1 only when there's no live list at all,
-    // since an all-pre-release live list still means a fetch happened (#313).
-    //
-    // Exception (#373): when the list-based pick fails on a non-empty list, `latest_line` can
-    // render an unmarked version from `list_fallback_latest` instead (Go's pseudo-versions) —
-    // a correct-but-unmarked latest beats none.
-    //
-    // `live_latest_idx`, not raw index 0, since the list sorts purely by version number and a
-    // pre-release could sort first without being "latest stable". Delegated to
-    // `Registry::select_latest_matching`, threading `parse_result`'s own `SelectionContext`
-    // (e.g. Composer's `minimum-stability`, #1433) — the same call `lifecycle.rs`'s background
-    // fetch uses, so the two never disagree (e.g. npm's #338 non-deprecated preference,
-    // #347/#348 S1's label). Recorded as an index so the "Recent versions" marker matches by
-    // position.
-    let wildcard_req = crate::existence_wildcard_req();
-    let selection_context = parse_result.selection_context();
-    let live_latest_idx = available_versions
-        .as_ref()
-        .and_then(|v| registry.select_latest_matching(v, &wildcard_req, &selection_context));
-    // #373: a non-empty live list can still leave `live_latest_idx` `None` — e.g. Go's
-    // `/@v/list` never enumerates pseudo-versions, so an untagged module's all-pre-release
-    // history fails the list-based pick. Mirrors `lifecycle.rs`'s own fallback: a second call
-    // to `Registry::get_latest_matching`, which some registries (Go's `/@latest`) answer more
-    // completely than the list endpoint. Gated as `LatestFallback`; failure or refusal means
-    // no `**Latest**` line.
-    let list_fallback_latest = if available_versions.as_ref().is_some_and(|v| !v.is_empty())
-        && live_latest_idx.is_none()
-    {
-        let found = await_interactive_fetch(
-            registry,
-            registry.get_latest_matching_from(
-                dep.name(),
-                &dep_source,
-                &wildcard_req,
-                &selection_context,
-            ),
-            fetch_request,
-            AuxiliaryLookup::LatestFallback,
-        )
-        .await
-        .into_live()
-        .flatten();
-        tracing::debug!(package = %dep.name().for_tracing(), found = found.is_some(), "hover latest fallback (get_latest_matching) resolved");
-        found
-    } else {
-        None
-    };
+    let latest = pick_latest(
+        registry,
+        dep,
+        &dep_source,
+        available_versions.as_deref(),
+        &parse_result.selection_context(),
+        fetch_request,
+    )
+    .await;
     let cached_latest = resolvable.then(|| versions.cached_for(&key)).flatten();
-    // A non-empty live list with no stable entry tries `list_fallback_latest` (#373) first
-    // rather than Ch1, since the cache's version wouldn't be part of what the live list just
-    // showed. An empty live list has no such contradiction risk and falls back to Ch1 as usual.
-    // `.get(idx)` degrades to the fallback rather than trusting `select_latest_matching`'s
-    // in-bounds behavior, undocumented across its 14 per-ecosystem impls (#673 S2).
-    let latest_line: Option<(&str, Option<PublishTime>)> = match &available_versions {
-        Some(v) if !v.is_empty() => live_latest_idx
-            .and_then(|idx| v.get(idx))
-            .map(|live| (live.version_string().as_str(), live.published_at()))
-            .or_else(|| {
-                list_fallback_latest
-                    .as_deref()
-                    .map(|live| (live.version_string().as_str(), live.published_at()))
-            }),
-        _ => cached_latest.map(|v| (v.latest.as_str(), v.published_at)),
-    };
-    // Issue #1456, spec 072 FR-008: a hit is only trustworthy when its own recorded
-    // version exactly matches `latest_ver` — no live network wait, this is a synchronous
-    // read of the document-level prefetch populated ahead of time.
-    let precedence = match (freshness, latest_line) {
-        (
-            crate::freshness::FreshnessSettings::Enabled { cooldown },
-            Some((latest_ver, published_at)),
-        ) => cooldown_precedence(
-            versions.gossip_prefetch,
-            key.normalized(),
-            latest_ver,
-            published_at,
-            cooldown,
-            now,
-        ),
-        _ => CooldownPrecedence::Cleared,
-    };
+    let latest_line = latest.latest_line(available_versions.as_deref(), cached_latest);
+    let precedence = latest_cooldown_precedence(freshness, latest_line, &versions, &key, now);
     // #394 S2: version-qualified key so a hover on one occurrence of a duplicated name never
     // shows another occurrence's OSV result. Computed before `push_latest_hover_section` (issue
     // #1517) so that section's own OSV latest-verdict lookup can use it too.
-    let vuln_keys = versions.ecosystem.map(|ecosystem| {
-        crate::osv::vulnerability_keys(
-            parse_result,
-            versions.resolved_map(),
-            versions.candidates_map(),
-            formatter,
-            ecosystem,
-        )
-    });
+    let vuln_keys = vuln_keys_for(parse_result, &versions, formatter);
     // Issue #1517: computed once here (not inside `push_latest_hover_section`) since the
     // `Cmd+.` footer below also needs it to decide whether to advertise the update action.
-    let latest_verdict_result = match latest_line {
-        Some((latest_ver, _)) => latest_verdict(
-            versions.latest_status,
-            dep,
-            vuln_keys.as_ref(),
-            &key,
-            latest_ver,
-            formatter,
-        ),
-        None => LatestVerdict::NotApplicable,
-    };
+    let latest_verdict_result =
+        latest_line.map_or(LatestVerdict::NotApplicable, |(latest_ver, _)| {
+            latest_verdict(
+                versions.latest_status,
+                dep,
+                vuln_keys.as_ref(),
+                &key,
+                latest_ver,
+                formatter,
+            )
+        });
     push_latest_hover_section(
         &mut markdown,
         latest_line,
@@ -312,19 +199,12 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         .latest_status
         .and_then(|m| super::resolve_latest_status(m, dep, vuln_keys.as_ref(), &key));
     let registry_miss = versions.lookup_miss_for(&key);
-    let vulnerability_fix = if let Some(ScanOutcome::Vulnerable(dv)) = vuln_outcome
-        && crate::edit::resolve_verified_fix(
-            dv,
-            crate::edit::FixTargetContext::new(latest_status_for_dep)
-                .with_registry(versions.cached_for(&key)),
-            formatter,
-        )
-        .is_ok()
-    {
-        VulnerabilityFix::Available
-    } else {
-        VulnerabilityFix::Unavailable
-    };
+    let vulnerability_fix = vulnerability_fix_for(
+        vuln_outcome,
+        latest_status_for_dep,
+        versions.cached_for(&key),
+        formatter,
+    );
     push_vulnerability_hover_section(
         &mut markdown,
         formatter,
@@ -333,129 +213,28 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         registry_miss,
     );
 
-    // Awaited last so the wait overlaps as much of this function's own work as possible.
-    // Bounds only the wait: over budget, the spawned task keeps running and warms
-    // `DepsDevClient`'s memo regardless (`DEPS_DEV_WAIT_BUDGET`). A `JoinHandle` `Err` (panic)
-    // is swallowed like a timeout or fetch failure — FR-006 must hold here too.
-    let trust_signal = match trust_handle {
-        Some(handle) => match tokio::time::timeout(DEPS_DEV_WAIT_BUDGET, handle).await {
-            Ok(Ok(signal)) => signal,
-            Ok(Err(_)) | Err(_) => None,
-        },
-        None => None,
-    };
+    let (trust_signal, gossip_low_usage) =
+        await_trust_and_gossip(trust_handle, gossip_handle).await;
     push_trust_signal_hover_section(&mut markdown, trust_signal.as_ref());
-
-    // Issue #1456, spec 072 FR-005: awaited last alongside `trust_signal`, under its own
-    // independent `GOSSIP_WAIT_BUDGET` — over budget, the spawned task keeps running and
-    // still warms `DepsDevClient`'s version-scoped memo (spawn-and-warm, mirrors
-    // `trust_handle`'s identical pattern above).
-    let gossip_low_usage = match gossip_handle {
-        Some(handle) => match tokio::time::timeout(GOSSIP_WAIT_BUDGET, handle).await {
-            Ok(Ok(findings)) => findings.and_then(|f| f.low_usage),
-            Ok(Err(_)) | Err(_) => None,
-        },
-        None => None,
-    };
     push_gossip_low_usage_hover_section(&mut markdown, gossip_low_usage.as_ref());
 
-    // #204 (spec 010): resolved-version license first tries the already-fetched
-    // `available_versions` list, then falls back to `trust_signal`'s `licenses`
-    // (deps.dev-covered ecosystems). Latest-version license only ever comes from the native
-    // list — deps.dev only targets the resolved version, so a deps.dev-routed ecosystem's
-    // latest license degrades to "(unavailable)" (spec 010 §6) rather than a second call.
-    //
-    // Keys on `resolve_in_use_version`, not the weaker `resolved` the Current/Requirement line
-    // uses — it adds a `concrete_pin_version` fallback for an exact pin with no lock file.
-    let in_use_version: Option<ConcreteVersion> = versions.ecosystem.and_then(|ecosystem| {
-        resolve_in_use_version(
-            dep,
-            &key,
-            versions.resolved_map(),
-            versions.candidates_map(),
-            formatter,
-            ecosystem,
-        )
-    });
-    // Shared key for the resolved-license lookup below and the latest-license shortcut
-    // further down — both must agree, or the shortcut can miss a version the lookup found
-    // (round 3 M1 regression: comparing against the weaker `resolved` reintroduced S1's
-    // spurious "unavailable" note).
-    let resolved_key: Option<&str> = in_use_version
-        .as_ref()
-        .map(ConcreteVersion::as_str)
-        .or(resolved);
-    let license_source = versions.license_source.unwrap_or_default();
-    // `normalize_tag` on both sides, not `==` (#664 S1): a bare pin with no `v` (Composer's
-    // `"8.1.6"`) must still match a `v`-prefixed registry tag, and vice versa.
-    let resolved_license: Vec<String> = resolved_key
-        .and_then(|r| {
-            available_versions.as_ref().and_then(|versions| {
-                versions
-                    .iter()
-                    .find(|v| normalize_tag(v.version_string().as_str()) == normalize_tag(r))
-            })
-        })
-        .map(|v| v.license().to_vec())
-        .filter(|l| !l.is_empty())
-        .or_else(|| {
-            trust_signal
-                .as_ref()
-                .map(|s| s.licenses.clone())
-                .filter(|l| !l.is_empty())
-        })
-        // Tier 3 (#660): Dart/Swift/Deno have no deps.dev coverage or version-list license
-        // field, so the only source left is `DocumentState`'s pre-fetch cache. Gradle is
-        // deps.dev-covered (spec 080), so its POM pre-fetch is only the fallback behind the
-        // deps.dev SPDX license above, as for Maven.
-        // Resolved via `resolve_license_entries_for_display` (#687 S1/S2), not the
-        // policy-evaluation `resolve_license_entries`: an unrecognized Gradle POM name falls
-        // back to raw text instead of vanishing.
-        .or_else(|| {
-            versions
-                .license_prefetch
-                .and_then(|m| m.get(key.normalized()))
-                .filter(|raw| !raw.is_empty())
-                .map(|raw| resolve_license_entries_for_display(license_source, raw))
-        })
-        .unwrap_or_default();
-    // `None` (no latest version) is distinct from `Some(&[])` (latest exists, license
-    // unknown): the former renders no note, the latter "(latest version license
-    // unavailable)" (impl-critic S1). Reuses `resolved_license` when the latest version is
-    // the resolved one (up to date), avoiding a spurious "unavailable" note on the common
-    // case. Skipped once `resolved_license` is already empty.
-    //
-    // Deliberately has no `license_prefetch` fallback of its own (round 3 finding #6):
-    // `license_prefetch` is a single per-package or per-resolved-version entry, never
-    // per-latest-version, so reusing `resolved_license` for a tier-3 dependency whose latest
-    // differs from resolved would misrepresent the resolved version's license as the
-    // latest's, suppressing a real "License changed" note or fabricating a false "no change".
-    let latest_license: Option<Vec<String>> = (!resolved_license.is_empty())
-        .then(|| {
-            latest_line.map(|(latest_ver, _)| {
-                if resolved_key == Some(latest_ver) {
-                    resolved_license.clone()
-                } else {
-                    live_latest_idx
-                        .and_then(|idx| available_versions.as_ref().and_then(|v| v.get(idx)))
-                        .map(|v| v.license().to_vec())
-                        .filter(|l| !l.is_empty())
-                        .unwrap_or_default()
-                }
-            })
-        })
-        .flatten();
-    // Dart's license comes from pub.dev's `/score` detector tag (pana's heuristic) and
-    // Swift's from GitHub's `license.spdx_id` (the `licensee` gem) — both detector output,
-    // not author-declared registry metadata (spec 010 §1, NFR-005 exception; critic S2).
-    // Every other ecosystem's license is a genuine registry-declared field, so only a
-    // `DetectedSpdx` source (Dart, Swift — #688) gets the "(detected)" qualifier.
-    let license_is_detected = license_source == LicenseSource::DetectedSpdx;
+    let licenses = LicenseContext {
+        dep,
+        key: &key,
+        versions: &versions,
+        formatter,
+        available: available_versions.as_deref(),
+        trust_signal: trust_signal.as_ref(),
+        manifest_resolved: resolved,
+        latest_line,
+        live_latest_idx: latest.live_idx,
+    }
+    .resolve();
     push_license_hover_section(
         &mut markdown,
-        &resolved_license,
-        latest_license.as_deref(),
-        license_is_detected,
+        &licenses.resolved,
+        licenses.latest.as_deref(),
+        licenses.is_detected,
     );
 
     // `!v.is_empty()`, not just `Some(_)` (#550): a resolvable source's live fetch can
@@ -467,7 +246,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         push_recent_versions_hover_section(
             &mut markdown,
             available_versions,
-            live_latest_idx,
+            latest.live_idx,
             freshness,
             now,
             formatter,
@@ -481,6 +260,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     let requirement_is_placeholder = dep
         .version_requirement()
         .is_some_and(|req| requirement_is_placeholder_for(formatter, dep, req.as_str()));
+    let offline = versions.network.is_offline();
     push_cmd_dot_footer_hover_section(
         &mut markdown,
         CmdDotFooterState {
@@ -489,7 +269,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             cached_latest,
             vuln_outcome,
             deprecation,
-            offline: versions.network.is_offline(),
+            offline,
             requirement_is_placeholder,
             latest_verdict: latest_verdict_result.clone(),
             registry_miss,
@@ -497,11 +277,363 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         },
     );
 
-    let offline = versions.network.is_offline();
     push_offline_footer_hover_section(&mut markdown, resolvable, offline);
     push_skip_reason_footer_hover_section(&mut markdown, resolvable, offline, vuln_outcome);
 
     Some(markdown.finish(Some(dep.name_range())))
+}
+
+fn find_hovered_dependency(
+    parse_result: &dyn ParseResult,
+    position: Position,
+) -> Option<&dyn Dependency> {
+    parse_result.dependencies().into_iter().find(|d| {
+        // #905: `position_in_range` is inclusive on both ends, so without this guard hovering
+        // the document's first character (a synthetic `name_range()`'s `Range::default()`
+        // sentinel) would match whichever synthetic-range dependency lists first.
+        let on_name =
+            !d.name_range_is_synthetic() && position_in_range(position.into(), d.name_range());
+        // `!version_range_is_synthetic_empty` gate (#1161 M1 code-review follow-up, second
+        // round): Maven's empty `<version></version>` gives `version_range()` a real,
+        // zero-width position purely so completion can locate the dependency there, with no
+        // requirement text to hover over — that degenerate case must not match here. A blanket
+        // `version_requirement().is_some()` gate over-corrected this: Gradle's version-catalog
+        // `version.ref` pointing at a dangling/rich-version alias legitimately has a REAL,
+        // non-empty `version_range()` (the alias-reference text) with `version_requirement()`
+        // still `None`, and hovering it worked before #1161 — the zero-width check keeps that
+        // working while still suppressing Maven's genuinely degenerate position.
+        let on_version = !super::version_range_is_synthetic_empty(*d)
+            && d.version_range()
+                .is_some_and(|r| position_in_range(position.into(), r));
+        on_name || on_version
+    })
+}
+
+/// The version the "Current"/"Requirement" line shows: the manifest requirement when the
+/// ecosystem treats it as the resolved version, else the lock-file-resolved occurrence.
+fn current_version_text<'a>(
+    dep: &'a dyn Dependency,
+    key: &PackageKey,
+    versions: &VersionData<'a>,
+    formatter: &dyn EcosystemFormatter,
+) -> Option<&'a str> {
+    if formatter.manifest_requirement_is_resolved_version(dep) {
+        dep.version_requirement().map(VersionReq::as_str)
+    } else {
+        in_use_version::resolve_occurrence_version(
+            dep,
+            key,
+            versions.resolved_map(),
+            versions.candidates_map(),
+            formatter,
+        )
+        .map(ConcreteVersion::as_str)
+    }
+}
+
+/// Issue #1456, spec 072 FR-008: a gossip prefetch hit is only trustworthy when its own recorded
+/// version exactly matches the latest version — no live network wait, this is a synchronous
+/// read of the document-level prefetch populated ahead of time.
+fn latest_cooldown_precedence(
+    freshness: crate::freshness::FreshnessSettings,
+    latest_line: Option<(&str, Option<PublishTime>)>,
+    versions: &VersionData<'_>,
+    key: &PackageKey,
+    now: PublishTime,
+) -> CooldownPrecedence {
+    match (freshness, latest_line) {
+        (
+            crate::freshness::FreshnessSettings::Enabled { cooldown },
+            Some((latest_ver, published_at)),
+        ) => cooldown_precedence(
+            versions.gossip_prefetch,
+            key.normalized(),
+            latest_ver,
+            published_at,
+            cooldown,
+            now,
+        ),
+        _ => CooldownPrecedence::Cleared,
+    }
+}
+
+/// The version-qualified OSV keys for the document, when an ecosystem is known.
+pub(super) fn vuln_keys_for(
+    parse_result: &dyn ParseResult,
+    versions: &VersionData<'_>,
+    formatter: &dyn EcosystemFormatter,
+) -> Option<crate::osv::VulnKeys> {
+    versions.ecosystem.map(|ecosystem| {
+        crate::osv::vulnerability_keys(
+            parse_result,
+            versions.resolved_map(),
+            versions.candidates_map(),
+            formatter,
+            ecosystem,
+        )
+    })
+}
+
+/// What the live version list says is latest.
+struct LatestPick {
+    live_idx: Option<usize>,
+    list_fallback: Option<Box<dyn Version>>,
+}
+
+impl LatestPick {
+    /// The `**Latest**` version and its publish time. A non-empty live list with no stable entry
+    /// tries `list_fallback` (#373) first rather than Ch1, since the cache's version wouldn't be
+    /// part of what the live list just showed. An empty live list has no such contradiction risk
+    /// and falls back to Ch1 as usual. `.get(idx)` degrades to the fallback rather than trusting
+    /// `select_latest_matching`'s in-bounds behavior, undocumented across its 14 per-ecosystem
+    /// impls (#673 S2).
+    fn latest_line<'a>(
+        &'a self,
+        available: Option<&'a [Box<dyn Version>]>,
+        cached: Option<&'a super::PackageVersions>,
+    ) -> Option<(&'a str, Option<PublishTime>)> {
+        match available {
+            Some(v) if !v.is_empty() => self
+                .live_idx
+                .and_then(|idx| v.get(idx))
+                .map(|live| (live.version_string().as_str(), live.published_at()))
+                .or_else(|| {
+                    self.list_fallback
+                        .as_deref()
+                        .map(|live| (live.version_string().as_str(), live.published_at()))
+                }),
+            _ => cached.map(|v| (v.latest.as_str(), v.published_at)),
+        }
+    }
+}
+
+/// Picks the latest entry of the just-fetched live list, falling back to a second registry call.
+///
+/// `**Latest**` prefers the just-fetched live list over the Ch1 cache whenever a live fetch
+/// happened — Ch1 alone could render a version older than "Recent versions"'s own
+/// `*(latest)*` entry (#227 F5). Falls back to Ch1 only when there's no live list at all,
+/// since an all-pre-release live list still means a fetch happened (#313).
+///
+/// `live_idx`, not raw index 0, since the list sorts purely by version number and a
+/// pre-release could sort first without being "latest stable". Delegated to
+/// `Registry::select_latest_matching`, threading `parse_result`'s own `SelectionContext`
+/// (e.g. Composer's `minimum-stability`, #1433) — the same call `lifecycle.rs`'s background
+/// fetch uses, so the two never disagree (e.g. npm's #338 non-deprecated preference,
+/// #347/#348 S1's label). Recorded as an index so the "Recent versions" marker matches by
+/// position.
+///
+/// #373: a non-empty live list can still leave `live_idx` `None` — e.g. Go's `/@v/list` never
+/// enumerates pseudo-versions, so an untagged module's all-pre-release history fails the
+/// list-based pick. Mirrors `lifecycle.rs`'s own fallback: a second call to
+/// `Registry::get_latest_matching`, which some registries (Go's `/@latest`) answer more
+/// completely than the list endpoint. Gated as `LatestFallback`; failure or refusal means no
+/// `**Latest**` line.
+async fn pick_latest<R: Registry + ?Sized>(
+    registry: &R,
+    dep: &dyn Dependency,
+    dep_source: &crate::DependencySource,
+    available: Option<&[Box<dyn Version>]>,
+    selection_context: &crate::SelectionContext,
+    fetch_request: InteractiveFetchRequest<'_>,
+) -> LatestPick {
+    let wildcard_req = crate::existence_wildcard_req();
+    let live_idx = available
+        .and_then(|v| registry.select_latest_matching(v, &wildcard_req, selection_context));
+    let list_fallback = if available.is_some_and(|v| !v.is_empty()) && live_idx.is_none() {
+        let found = await_interactive_fetch(
+            registry,
+            registry.get_latest_matching_from(
+                dep.name(),
+                dep_source,
+                &wildcard_req,
+                selection_context,
+            ),
+            fetch_request,
+            AuxiliaryLookup::LatestFallback,
+        )
+        .await
+        .into_live()
+        .flatten();
+        tracing::debug!(package = %dep.name().for_tracing(), found = found.is_some(), "hover latest fallback (get_latest_matching) resolved");
+        found
+    } else {
+        None
+    };
+    LatestPick {
+        live_idx,
+        list_fallback,
+    }
+}
+
+/// Whether `Cmd+.` would offer an OSV fix for a vulnerable `vuln_outcome`.
+fn vulnerability_fix_for(
+    vuln_outcome: Option<&ScanOutcome>,
+    latest_status: Option<&UpgradeStatus>,
+    registry: Option<&super::PackageVersions>,
+    formatter: &dyn EcosystemFormatter,
+) -> VulnerabilityFix {
+    if let Some(ScanOutcome::Vulnerable(dv)) = vuln_outcome
+        && crate::edit::resolve_verified_fix(
+            dv,
+            crate::edit::FixTargetContext::new(latest_status).with_registry(registry),
+            formatter,
+        )
+        .is_ok()
+    {
+        VulnerabilityFix::Available
+    } else {
+        VulnerabilityFix::Unavailable
+    }
+}
+
+/// Awaits the spawned deps.dev trust-signal and GOSSIP low-usage fetches, trust first.
+///
+/// Awaited last so the wait overlaps as much of [`generate_hover`]'s own work as possible.
+/// Each bounds only its wait, under its own independent budget: over budget, the spawned task
+/// keeps running and warms `DepsDevClient`'s memo regardless (`DEPS_DEV_WAIT_BUDGET`,
+/// `GOSSIP_WAIT_BUDGET`). A `JoinHandle` `Err` (panic) is swallowed like a timeout or fetch
+/// failure — FR-006 must hold here too.
+async fn await_trust_and_gossip(
+    trust_handle: Option<tokio::task::JoinHandle<Option<SupplyChainTrustSignal>>>,
+    gossip_handle: Option<tokio::task::JoinHandle<Option<crate::GossipFindings>>>,
+) -> (Option<SupplyChainTrustSignal>, Option<GossipLowUsage>) {
+    let trust_signal = match trust_handle {
+        Some(handle) => match tokio::time::timeout(DEPS_DEV_WAIT_BUDGET, handle).await {
+            Ok(Ok(signal)) => signal,
+            Ok(Err(_)) | Err(_) => None,
+        },
+        None => None,
+    };
+    let gossip_low_usage = match gossip_handle {
+        Some(handle) => match tokio::time::timeout(GOSSIP_WAIT_BUDGET, handle).await {
+            Ok(Ok(findings)) => findings.and_then(|f| f.low_usage),
+            Ok(Err(_)) | Err(_) => None,
+        },
+        None => None,
+    };
+    (trust_signal, gossip_low_usage)
+}
+
+/// The inputs [`LicenseContext::resolve`] derives the hover's license section from.
+struct LicenseContext<'a, 'v> {
+    dep: &'a dyn Dependency,
+    key: &'a PackageKey,
+    versions: &'a VersionData<'v>,
+    formatter: &'a dyn EcosystemFormatter,
+    available: Option<&'a [Box<dyn Version>]>,
+    trust_signal: Option<&'a SupplyChainTrustSignal>,
+    manifest_resolved: Option<&'a str>,
+    latest_line: Option<(&'a str, Option<PublishTime>)>,
+    live_latest_idx: Option<usize>,
+}
+
+/// The licenses the hover shows for the in-use and the latest version.
+struct HoverLicenses {
+    resolved: Vec<String>,
+    latest: Option<Vec<String>>,
+    is_detected: bool,
+}
+
+impl LicenseContext<'_, '_> {
+    fn resolve(&self) -> HoverLicenses {
+        // #204 (spec 010): resolved-version license first tries the already-fetched
+        // `available` list, then falls back to `trust_signal`'s `licenses`
+        // (deps.dev-covered ecosystems). Latest-version license only ever comes from the native
+        // list — deps.dev only targets the resolved version, so a deps.dev-routed ecosystem's
+        // latest license degrades to "(unavailable)" (spec 010 §6) rather than a second call.
+        //
+        // Keys on `resolve_in_use_version`, not the weaker `manifest_resolved` the
+        // Current/Requirement line uses — it adds a `concrete_pin_version` fallback for an exact
+        // pin with no lock file.
+        let in_use_version: Option<ConcreteVersion> =
+            self.versions.ecosystem.and_then(|ecosystem| {
+                resolve_in_use_version(
+                    self.dep,
+                    self.key,
+                    self.versions.resolved_map(),
+                    self.versions.candidates_map(),
+                    self.formatter,
+                    ecosystem,
+                )
+            });
+        // Shared key for the resolved-license lookup below and the latest-license shortcut
+        // further down — both must agree, or the shortcut can miss a version the lookup found
+        // (round 3 M1 regression: comparing against the weaker `manifest_resolved` reintroduced
+        // S1's spurious "unavailable" note).
+        let resolved_key: Option<&str> = in_use_version
+            .as_ref()
+            .map(ConcreteVersion::as_str)
+            .or(self.manifest_resolved);
+        let license_source = self.versions.license_source.unwrap_or_default();
+        // `normalize_tag` on both sides, not `==` (#664 S1): a bare pin with no `v` (Composer's
+        // `"8.1.6"`) must still match a `v`-prefixed registry tag, and vice versa.
+        let resolved: Vec<String> = resolved_key
+            .and_then(|r| {
+                self.available.and_then(|available| {
+                    available
+                        .iter()
+                        .find(|v| normalize_tag(v.version_string().as_str()) == normalize_tag(r))
+                })
+            })
+            .map(|v| v.license().to_vec())
+            .filter(|l| !l.is_empty())
+            .or_else(|| {
+                self.trust_signal
+                    .map(|s| s.licenses.clone())
+                    .filter(|l| !l.is_empty())
+            })
+            // Tier 3 (#660): Dart/Swift/Deno have no deps.dev coverage or version-list license
+            // field, so the only source left is `DocumentState`'s pre-fetch cache. Gradle is
+            // deps.dev-covered (spec 080), so its POM pre-fetch is only the fallback behind the
+            // deps.dev SPDX license above, as for Maven.
+            // Resolved via `resolve_license_entries_for_display` (#687 S1/S2), not the
+            // policy-evaluation `resolve_license_entries`: an unrecognized Gradle POM name falls
+            // back to raw text instead of vanishing.
+            .or_else(|| {
+                self.versions
+                    .license_prefetch
+                    .and_then(|m| m.get(self.key.normalized()))
+                    .filter(|raw| !raw.is_empty())
+                    .map(|raw| resolve_license_entries_for_display(license_source, raw))
+            })
+            .unwrap_or_default();
+        // `None` (no latest version) is distinct from `Some(&[])` (latest exists, license
+        // unknown): the former renders no note, the latter "(latest version license
+        // unavailable)" (impl-critic S1). Reuses `resolved` when the latest version is the
+        // resolved one (up to date), avoiding a spurious "unavailable" note on the common case.
+        // Skipped once `resolved` is already empty.
+        //
+        // Deliberately has no `license_prefetch` fallback of its own (round 3 finding #6):
+        // `license_prefetch` is a single per-package or per-resolved-version entry, never
+        // per-latest-version, so reusing `resolved` for a tier-3 dependency whose latest
+        // differs from resolved would misrepresent the resolved version's license as the
+        // latest's, suppressing a real "License changed" note or fabricating a false "no change".
+        let latest: Option<Vec<String>> = (!resolved.is_empty())
+            .then(|| {
+                self.latest_line.map(|(latest_ver, _)| {
+                    if resolved_key == Some(latest_ver) {
+                        resolved.clone()
+                    } else {
+                        self.live_latest_idx
+                            .and_then(|idx| self.available.and_then(|v| v.get(idx)))
+                            .map(|v| v.license().to_vec())
+                            .filter(|l| !l.is_empty())
+                            .unwrap_or_default()
+                    }
+                })
+            })
+            .flatten();
+        // Dart's license comes from pub.dev's `/score` detector tag (pana's heuristic) and
+        // Swift's from GitHub's `license.spdx_id` (the `licensee` gem) — both detector output,
+        // not author-declared registry metadata (spec 010 §1, NFR-005 exception; critic S2).
+        // Every other ecosystem's license is a genuine registry-declared field, so only a
+        // `DetectedSpdx` source (Dart, Swift — #688) gets the "(detected)" qualifier.
+        HoverLicenses {
+            resolved,
+            latest,
+            is_detected: license_source == LicenseSource::DetectedSpdx,
+        }
+    }
 }
 
 /// Spawns the deps.dev supply-chain trust-signal fetch (spec 037) as a detached

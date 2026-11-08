@@ -127,6 +127,7 @@ pub mod conformance;
 /// [`ecosystem::parse_manifest_blocking`] for all 14 ecosystems (#796).
 pub mod dependency_cap;
 pub mod deps_dev;
+pub mod detached_flight;
 /// Protocol-agnostic [`diagnostic::Diagnostic`]/[`diagnostic::Severity`] types (issue #1083).
 ///
 /// The domain-level replacement for `tower_lsp_server::ls_types::{Diagnostic,
@@ -224,9 +225,11 @@ pub use redact::secret;
 /// selection state (#1444).
 pub mod selection;
 mod single_flight;
+pub mod swr_store;
 pub mod tag_index_refresh;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
+pub mod typed_boundary;
 pub mod version_matcher;
 pub mod xml_bounds;
 pub mod yaml_anchor;
@@ -251,6 +254,7 @@ pub use deps_dev::{
     DepsDevClient, FetchCompleteness, GossipCooldown, GossipFindings, GossipLowUsage,
     GossipRiskLevel, ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal, TyposquatSignal,
 };
+pub use detached_flight::{FlightHandle, SingleFlight};
 pub use ecosystem::{
     BlockedRegistryOccurrence, BlockedSourceClass, ConfigOwner, ConfigReach, Dependency, Ecosystem,
     EcosystemConfig, EcosystemId, LicenseSource, OwnerReach, ParseResult, RegistryOccurrence,
@@ -326,7 +330,9 @@ pub use registry_endpoint::{CachedEndpoint, EgressTier, EndpointFingerprint, Reg
 pub use selection::{
     InvalidStabilityOccurrence, SelectionContext, StabilityFloor, UnknownStability,
 };
+pub use swr_store::{Recency, Refreshed, SwrPolicy, SwrRead, SwrStore, Upserted};
 pub use tag_index_refresh::{ParseInputKey, RefreshEvent, RefreshEvents, RefreshSender};
+pub use typed_boundary::{NarrowDependency, NarrowParseResult, OwnDependency, OwnParseResult};
 pub use version_matcher::{
     Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,
     normalize_and_parse_version, normalize_operator_spacing,

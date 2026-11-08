@@ -77,10 +77,6 @@ fn lookup_miss_marker(
 /// is the `ℹ {resolved}` for a `CustomRegistry` dependency the registry never queried
 /// (#1949): it replaces the up-to-date check mark, so it renders only when
 /// `show_up_to_date_hints` is on.
-#[expect(
-    clippy::too_many_lines,
-    reason = "shared generator past 300 lines, split tracked in #1952"
-)]
 pub fn generate_inlay_hints(
     parse_result: &dyn ParseResult,
     versions: VersionData<'_>,
@@ -89,326 +85,352 @@ pub fn generate_inlay_hints(
     formatter: &dyn EcosystemFormatter,
 ) -> Vec<InlayHint> {
     let deps = parse_result.dependencies();
-    let mut hints = Vec::with_capacity(deps.len());
-
     // Issue #1517: shared per-occurrence OSV lookup keys, mirroring every other renderer's
-    // identical `versions.ecosystem.map(..)` pattern — needed so `latest_verdict` below can
-    // tell one duplicated-name occurrence's latest-check result apart from another's.
-    let vuln_keys = versions.ecosystem.map(|ecosystem| {
-        crate::osv::vulnerability_keys(
-            parse_result,
-            versions.resolved_map(),
-            versions.candidates_map(),
-            formatter,
-            ecosystem,
-        )
-    });
+    // identical pattern — needed so `latest_verdict` can tell one duplicated-name occurrence's
+    // latest-check result apart from another's.
+    let ctx = HintContext {
+        versions,
+        loading_state,
+        config,
+        formatter,
+        vuln_keys: super::hover::vuln_keys_for(parse_result, &versions, formatter),
+    };
+    let mut hints = Vec::with_capacity(deps.len());
+    hints.extend(deps.into_iter().filter_map(|dep| inlay_hint_for(dep, &ctx)));
+    hints
+}
 
-    for dep in deps {
-        let Some(version_range) = dep.version_range() else {
-            continue;
-        };
-        let version_range: tower_lsp_server::ls_types::Range = version_range.into();
+/// What every dependency's hint is rendered against.
+struct HintContext<'a> {
+    versions: VersionData<'a>,
+    loading_state: crate::LoadingState,
+    config: &'a EcosystemConfig,
+    formatter: &'a dyn EcosystemFormatter,
+    vuln_keys: Option<crate::osv::VulnKeys>,
+}
 
-        let key = PackageKey::new(dep.name(), formatter);
-        let latest_version = versions.cached_for(&key).map(|v| &v.latest);
-        let resolved_version: Option<ConcreteVersion> =
-            if formatter.manifest_requirement_is_resolved_version(dep) {
-                dep.version_requirement()
-                    .map(|r| ConcreteVersion::new(r.as_str()))
-            } else {
-                in_use_version::resolve_occurrence_version(
-                    dep,
-                    &key,
-                    versions.resolved_map(),
-                    versions.candidates_map(),
-                    formatter,
-                )
-                .cloned()
-            };
+/// A hint at `position` carrying `label` and an optional plain-text `tooltip`.
+fn type_hint(
+    position: tower_lsp_server::ls_types::Position,
+    label: String,
+    tooltip: Option<String>,
+) -> InlayHint {
+    InlayHint {
+        position,
+        label: InlayHintLabel::String(label),
+        kind: Some(InlayHintKind::TYPE),
+        tooltip: tooltip.map(InlayHintTooltip::String),
+        padding_left: Some(true),
+        padding_right: None,
+        text_edits: None,
+        data: None,
+    }
+}
 
-        if super::version_range_is_synthetic_empty(dep) && resolved_version.is_none() {
-            // Maven's `<version></version>` (#1161 M1 follow-up): `version_range()` is `Some`
-            // purely so completion can locate the dependency at that position, but there is no
-            // declared requirement to show a version hint against — skip, the same way a
-            // manifest with no `<version>` tag at all (`version_range() == None`, caught by the
-            // gate above) is already skipped. Without this, a dependency here would flash a
-            // "Loading…" hint at the empty tag's position while `versions` is being fetched,
-            // then vanish once `RequirementStatus::Unresolved` is reached.
-            //
-            // `version_range_is_synthetic_empty`, not a bare `version_requirement().is_none()`
-            // (code-review follow-up, second round): Gradle's version-catalog `version.ref`
-            // pointing at a dangling/rich-version alias legitimately has a REAL, non-empty
-            // `version_range()` with `version_requirement()` still `None` — inlay hints
-            // rendered for it before #1161, and a blanket check would have silently broken
-            // that. Checked AFTER `resolved_version` is computed, not before (critic follow-up,
-            // second round): a lockfile-derived `resolved_version` can be present even when
-            // `version_requirement()` is `None` for a currently-unreached ecosystem/shape, and
-            // the #483 I5/SEC-2 guarantee below never discards a purely-local, offline
-            // `resolved_version` — skipping earlier would silently drop that hint instead.
-            continue;
-        }
+/// The hint for one dependency, or `None` when it shows nothing.
+fn inlay_hint_for(
+    dep: &dyn crate::ecosystem::Dependency,
+    ctx: &HintContext<'_>,
+) -> Option<InlayHint> {
+    let HintContext {
+        versions,
+        loading_state,
+        config,
+        formatter,
+        ..
+    } = ctx;
+    let version_range: tower_lsp_server::ls_types::Range = dep.version_range()?.into();
 
-        if loading_state == crate::LoadingState::Loading
-            && config.show_loading_hints
-            && latest_version.is_none()
-        {
-            hints.push(InlayHint {
-                position: version_range.end,
-                label: InlayHintLabel::String(config.loading_text.clone()),
-                kind: Some(InlayHintKind::TYPE),
-                tooltip: Some(InlayHintTooltip::String(
-                    "Fetching latest version...".to_string(),
-                )),
-                padding_left: Some(true),
-                padding_right: None,
-                text_edits: None,
-                data: None,
-            });
-            continue;
-        }
-
-        let Some(latest) = latest_version else {
-            // Issue #483 I5/SEC-2: never discard a purely-local, lockfile-derived
-            // `resolved_version` just because the registry side is unknown while
-            // offline — show it alongside the marker rather than replacing it.
-            if config.network.is_offline() {
-                let label = resolved_version.as_ref().map_or_else(
-                    || "📴".to_string(),
-                    |resolved| format!("📴 {}", sanitize_hint_version(resolved.as_str())),
-                );
-                hints.push(InlayHint {
-                    position: version_range.end,
-                    label: InlayHintLabel::String(label),
-                    kind: Some(InlayHintKind::TYPE),
-                    tooltip: Some(InlayHintTooltip::String(
-                        "Offline: registry not checked".to_string(),
-                    )),
-                    padding_left: Some(true),
-                    padding_right: None,
-                    text_edits: None,
-                    data: None,
-                });
-                continue;
-            }
-
-            // #1884: an attempted-but-failed registry lookup must not read as "up to date".
-            // Hardcoded status marker (like the offline `📴`), shown regardless of
-            // `show_up_to_date_hints`; `NotAttempted` placeholders stay silent.
-            if let Some(resolved) = &resolved_version
-                && formatter.can_resolve_source(&dep.source())
-                && versions
-                    .fetch_failure_for(&key)
-                    .is_some_and(FetchFailure::was_attempted)
-            {
-                hints.push(InlayHint {
-                    position: version_range.end,
-                    label: InlayHintLabel::String(format!(
-                        "⚠ {}",
-                        sanitize_hint_version(resolved.as_str())
-                    )),
-                    kind: Some(InlayHintKind::TYPE),
-                    tooltip: Some(InlayHintTooltip::String(
-                        "Registry lookup failed; latest version unknown".to_string(),
-                    )),
-                    padding_left: Some(true),
-                    padding_right: None,
-                    text_edits: None,
-                    data: None,
-                });
-                continue;
-            }
-
-            if let Some(resolved) = &resolved_version
-                && let Some(marker) = lookup_miss_marker(dep, &key, versions, formatter)
-            {
-                hints.push(InlayHint {
-                    position: version_range.end,
-                    label: InlayHintLabel::String(format!(
-                        "{} {}",
-                        marker.glyph,
-                        sanitize_hint_version(resolved.as_str())
-                    )),
-                    kind: Some(InlayHintKind::TYPE),
-                    tooltip: Some(InlayHintTooltip::String(marker.tooltip.to_string())),
-                    padding_left: Some(true),
-                    padding_right: None,
-                    text_edits: None,
-                    data: None,
-                });
-                continue;
-            }
-
-            if let Some(resolved) = &resolved_version
-                && config.show_up_to_date_hints
-            {
-                // #1949: a source the registry never queried must not read as "up to date".
-                let unqueried = matches!(
-                    dep.source(),
-                    crate::parser::DependencySource::CustomRegistry { .. }
-                ) && !formatter.can_resolve_source(&dep.source());
-                let (label, tooltip) = if unqueried {
-                    (
-                        format!(
-                            "{} {}",
-                            NOT_LOOKED_UP_MARKER.glyph,
-                            sanitize_hint_version(resolved.as_str())
-                        ),
-                        Some(InlayHintTooltip::String(
-                            NOT_LOOKED_UP_MARKER.tooltip.to_string(),
-                        )),
-                    )
-                } else {
-                    (
-                        format!(
-                            "{} {}",
-                            config.up_to_date_text,
-                            sanitize_hint_version(resolved.as_str())
-                        ),
-                        None,
-                    )
-                };
-                hints.push(InlayHint {
-                    position: version_range.end,
-                    label: InlayHintLabel::String(label),
-                    kind: Some(InlayHintKind::TYPE),
-                    padding_left: Some(true),
-                    padding_right: None,
-                    text_edits: None,
-                    tooltip,
-                    data: None,
-                });
-            }
-            continue;
-        };
-
-        let status = if let Some(resolved) = &resolved_version {
-            if formatter
-                .build_metadata_policy()
-                .versions_equal(resolved.as_str(), latest.as_str())
-            {
-                RequirementStatus::UpToDate
-            } else {
-                RequirementStatus::Outdated
-            }
+    let key = PackageKey::new(dep.name(), *formatter);
+    let latest_version = versions.cached_for(&key).map(|v| &v.latest);
+    let resolved_version: Option<ConcreteVersion> =
+        if formatter.manifest_requirement_is_resolved_version(dep) {
+            dep.version_requirement()
+                .map(|r| ConcreteVersion::new(r.as_str()))
         } else {
-            match dep.version_requirement() {
-                // `requirement_status_for`, matching `diagnostics.rs`'s `apply_outdated_rule`
-                // (#907): lets e.g. `GithubActionsFormatter` prefer a SHA pin's
-                // registry-confirmed tag over trusting its own comment text.
-                Some(version_req) => formatter.requirement_status_for(dep, version_req, latest),
-                // No declared requirement at all (e.g. a dangling alias/reference the
-                // parser couldn't resolve to any string) — nothing was verified.
-                None => RequirementStatus::Unresolved,
-            }
+            in_use_version::resolve_occurrence_version(
+                dep,
+                &key,
+                versions.resolved_map(),
+                versions.candidates_map(),
+                *formatter,
+            )
+            .cloned()
         };
 
-        let mut flagged_tooltip: Option<String> = None;
-        let label_text = match status {
-            RequirementStatus::UpToDate => {
-                if !config.show_up_to_date_hints {
-                    continue;
-                }
-                // #1526: a requirement can already admit `latest` (so `UpToDate`, not
-                // `Outdated`) while `latest` itself is flagged — mirrors the `Outdated` arm's
-                // identical `latest_verdict` check below, so this always-visible surface never
-                // shows a plain checkmark for a range that already admits an OSV-flagged
-                // version. Deliberately gated on `Flagged` only (not `Unverified`) — see
-                // `diagnostics.rs`'s `push_flagged_latest_admitted_by_requirement` for why.
-                let verdict = latest_verdict(
-                    versions.latest_status,
-                    dep,
-                    vuln_keys.as_ref(),
-                    &key,
-                    latest.as_str(),
-                    formatter,
+    if super::version_range_is_synthetic_empty(dep) && resolved_version.is_none() {
+        // Maven's `<version></version>` (#1161 M1 follow-up): `version_range()` is `Some`
+        // purely so completion can locate the dependency at that position, but there is no
+        // declared requirement to show a version hint against — skip, the same way a
+        // manifest with no `<version>` tag at all (`version_range() == None`, caught by the
+        // gate above) is already skipped. Without this, a dependency here would flash a
+        // "Loading…" hint at the empty tag's position while `versions` is being fetched,
+        // then vanish once `RequirementStatus::Unresolved` is reached.
+        //
+        // `version_range_is_synthetic_empty`, not a bare `version_requirement().is_none()`
+        // (code-review follow-up, second round): Gradle's version-catalog `version.ref`
+        // pointing at a dangling/rich-version alias legitimately has a REAL, non-empty
+        // `version_range()` with `version_requirement()` still `None` — inlay hints
+        // rendered for it before #1161, and a blanket check would have silently broken
+        // that. Checked AFTER `resolved_version` is computed, not before (critic follow-up,
+        // second round): a lockfile-derived `resolved_version` can be present even when
+        // `version_requirement()` is `None` for a currently-unreached ecosystem/shape, and
+        // the #483 I5/SEC-2 guarantee below never discards a purely-local, offline
+        // `resolved_version` — skipping earlier would silently drop that hint instead.
+        return None;
+    }
+
+    let position = version_range.end;
+    if *loading_state == crate::LoadingState::Loading
+        && config.show_loading_hints
+        && latest_version.is_none()
+    {
+        return Some(type_hint(
+            position,
+            config.loading_text.clone(),
+            Some("Fetching latest version...".to_string()),
+        ));
+    }
+
+    let Some(latest) = latest_version else {
+        return hint_without_latest(dep, &key, resolved_version.as_ref(), position, ctx);
+    };
+
+    let status = if let Some(resolved) = &resolved_version {
+        if formatter
+            .build_metadata_policy()
+            .versions_equal(resolved.as_str(), latest.as_str())
+        {
+            RequirementStatus::UpToDate
+        } else {
+            RequirementStatus::Outdated
+        }
+    } else {
+        match dep.version_requirement() {
+            // `requirement_status_for`, matching `diagnostics.rs`'s `apply_outdated_rule`
+            // (#907): lets e.g. `GithubActionsFormatter` prefer a SHA pin's
+            // registry-confirmed tag over trusting its own comment text.
+            Some(version_req) => formatter.requirement_status_for(dep, version_req, latest),
+            // No declared requirement at all (e.g. a dangling alias/reference the
+            // parser couldn't resolve to any string) — nothing was verified.
+            None => RequirementStatus::Unresolved,
+        }
+    };
+
+    let (label_text, flagged_tooltip) =
+        hint_label(status, dep, &key, latest, resolved_version.as_ref(), ctx)?;
+
+    // Issue #483 I5/SEC-2: `latest` here may be a warm-cache value fetched before an
+    // online -> offline flip — without this, the badge is indistinguishable from live
+    // data on this always-visible inline surface.
+    let label_text = if config.network.is_offline() {
+        format!("{label_text} 📴")
+    } else {
+        label_text
+    };
+
+    Some(type_hint(position, label_text, flagged_tooltip))
+}
+
+/// The hint for a dependency with no cached latest version: an offline or failed-lookup marker
+/// over its locally known version, the up-to-date text, or nothing.
+fn hint_without_latest(
+    dep: &dyn crate::ecosystem::Dependency,
+    key: &PackageKey,
+    resolved_version: Option<&ConcreteVersion>,
+    position: tower_lsp_server::ls_types::Position,
+    ctx: &HintContext<'_>,
+) -> Option<InlayHint> {
+    let HintContext {
+        versions,
+        config,
+        formatter,
+        ..
+    } = ctx;
+    // Issue #483 I5/SEC-2: never discard a purely-local, lockfile-derived
+    // `resolved_version` just because the registry side is unknown while
+    // offline — show it alongside the marker rather than replacing it.
+    if config.network.is_offline() {
+        let label = resolved_version.map_or_else(
+            || "📴".to_string(),
+            |resolved| format!("📴 {}", sanitize_hint_version(resolved.as_str())),
+        );
+        return Some(type_hint(
+            position,
+            label,
+            Some("Offline: registry not checked".to_string()),
+        ));
+    }
+
+    let resolved = resolved_version?;
+    // #1884: an attempted-but-failed registry lookup must not read as "up to date".
+    // Hardcoded status marker (like the offline `📴`), shown regardless of
+    // `show_up_to_date_hints`; `NotAttempted` placeholders stay silent.
+    if formatter.can_resolve_source(&dep.source())
+        && versions
+            .fetch_failure_for(key)
+            .is_some_and(FetchFailure::was_attempted)
+    {
+        return Some(type_hint(
+            position,
+            format!("⚠ {}", sanitize_hint_version(resolved.as_str())),
+            Some("Registry lookup failed; latest version unknown".to_string()),
+        ));
+    }
+
+    if let Some(marker) = lookup_miss_marker(dep, key, *versions, *formatter) {
+        return Some(type_hint(
+            position,
+            format!(
+                "{} {}",
+                marker.glyph,
+                sanitize_hint_version(resolved.as_str())
+            ),
+            Some(marker.tooltip.to_string()),
+        ));
+    }
+
+    config.show_up_to_date_hints.then(|| {
+        // #1949: a source the registry never queried must not read as "up to date".
+        let unqueried = matches!(
+            dep.source(),
+            crate::parser::DependencySource::CustomRegistry { .. }
+        ) && !formatter.can_resolve_source(&dep.source());
+        if unqueried {
+            type_hint(
+                position,
+                format!(
+                    "{} {}",
+                    NOT_LOOKED_UP_MARKER.glyph,
+                    sanitize_hint_version(resolved.as_str())
+                ),
+                Some(NOT_LOOKED_UP_MARKER.tooltip.to_string()),
+            )
+        } else {
+            type_hint(
+                position,
+                format!(
+                    "{} {}",
+                    config.up_to_date_text,
+                    sanitize_hint_version(resolved.as_str())
+                ),
+                None,
+            )
+        }
+    })
+}
+
+/// The label of a hint whose latest version is known, with the tooltip of a flagged one, or
+/// `None` when the status shows nothing.
+fn hint_label(
+    status: RequirementStatus,
+    dep: &dyn crate::ecosystem::Dependency,
+    key: &PackageKey,
+    latest: &ConcreteVersion,
+    resolved_version: Option<&ConcreteVersion>,
+    ctx: &HintContext<'_>,
+) -> Option<(String, Option<String>)> {
+    let HintContext {
+        versions,
+        config,
+        formatter,
+        vuln_keys,
+        ..
+    } = ctx;
+    match status {
+        RequirementStatus::UpToDate => {
+            if !config.show_up_to_date_hints {
+                return None;
+            }
+            // #1526: a requirement can already admit `latest` (so `UpToDate`, not
+            // `Outdated`) while `latest` itself is flagged — mirrors the `Outdated` arm's
+            // identical `latest_verdict` check below, so this always-visible surface never
+            // shows a plain checkmark for a range that already admits an OSV-flagged
+            // version. Deliberately gated on `Flagged` only (not `Unverified`) — see
+            // `diagnostics.rs`'s `push_flagged_latest_admitted_by_requirement` for why.
+            let verdict = latest_verdict(
+                versions.latest_status,
+                dep,
+                vuln_keys.as_ref(),
+                key,
+                latest.as_str(),
+                *formatter,
+            );
+            if let LatestVerdict::Flagged {
+                advisory_ids,
+                malicious,
+                via_sibling_tags,
+            } = verdict
+            {
+                let icon = if malicious { "🚫" } else { "⚠️" };
+                let note = via_sibling_tags
+                    .as_ref()
+                    .map(|tags| SiblingMatchNote::new(*formatter, tags));
+                let tooltip = format!(
+                    "This requirement already admits a version OSV.dev flags{} — do not \
+                     rely on it being safe",
+                    flagged_detail(&advisory_ids, note.as_ref())
                 );
-                if let LatestVerdict::Flagged {
-                    advisory_ids,
-                    malicious,
-                    via_sibling_tags,
-                } = verdict
-                {
-                    let icon = if malicious { "🚫" } else { "⚠️" };
-                    let note = via_sibling_tags
-                        .as_ref()
-                        .map(|tags| SiblingMatchNote::new(formatter, tags));
-                    flagged_tooltip = Some(format!(
-                        "This requirement already admits a version OSV.dev flags{} — do not \
-                         rely on it being safe",
-                        flagged_detail(&advisory_ids, note.as_ref())
-                    ));
-                    format!("{icon} {}", sanitize_hint_version(latest.as_str()))
-                } else if let Some(resolved) = &resolved_version {
+                Some((
+                    format!("{icon} {}", sanitize_hint_version(latest.as_str())),
+                    Some(tooltip),
+                ))
+            } else if let Some(resolved) = resolved_version {
+                Some((
                     format!(
                         "{} {}",
                         config.up_to_date_text,
                         sanitize_hint_version(resolved.as_str())
-                    )
-                } else {
-                    config.up_to_date_text.clone()
-                }
+                    ),
+                    None,
+                ))
+            } else {
+                Some((config.up_to_date_text.clone(), None))
             }
-            RequirementStatus::Outdated => {
-                // Issue #1517: an OSV-flagged/malicious latest must never render with the same
-                // plain "needs update" icon as an ordinary outdated version — that icon alone
-                // reads as a routine, safe-to-click upgrade nudge on this always-visible surface.
-                let verdict = latest_verdict(
-                    versions.latest_status,
-                    dep,
-                    vuln_keys.as_ref(),
-                    &key,
-                    latest.as_str(),
-                    formatter,
+        }
+        RequirementStatus::Outdated => {
+            // Issue #1517: an OSV-flagged/malicious latest must never render with the same
+            // plain "needs update" icon as an ordinary outdated version — that icon alone
+            // reads as a routine, safe-to-click upgrade nudge on this always-visible surface.
+            let verdict = latest_verdict(
+                versions.latest_status,
+                dep,
+                vuln_keys.as_ref(),
+                key,
+                latest.as_str(),
+                *formatter,
+            );
+            if let LatestVerdict::Flagged {
+                advisory_ids,
+                malicious,
+                via_sibling_tags,
+            } = verdict
+            {
+                let icon = if malicious { "🚫" } else { "⚠️" };
+                let note = via_sibling_tags
+                    .as_ref()
+                    .map(|tags| SiblingMatchNote::new(*formatter, tags));
+                let tooltip = format!(
+                    "Flagged by OSV.dev{} — do not upgrade to this version",
+                    flagged_detail(&advisory_ids, note.as_ref())
                 );
-                if let LatestVerdict::Flagged {
-                    advisory_ids,
-                    malicious,
-                    via_sibling_tags,
-                } = verdict
-                {
-                    let icon = if malicious { "🚫" } else { "⚠️" };
-                    let note = via_sibling_tags
-                        .as_ref()
-                        .map(|tags| SiblingMatchNote::new(formatter, tags));
-                    flagged_tooltip = Some(format!(
-                        "Flagged by OSV.dev{} — do not upgrade to this version",
-                        flagged_detail(&advisory_ids, note.as_ref())
-                    ));
-                    format!("{icon} {} flagged", sanitize_hint_version(latest.as_str()))
-                } else {
+                Some((
+                    format!("{icon} {} flagged", sanitize_hint_version(latest.as_str())),
+                    Some(tooltip),
+                ))
+            } else {
+                Some((
                     config
                         .needs_update_text
-                        .replace("{}", &sanitize_hint_version(latest.as_str()))
-                }
+                        .replace("{}", &sanitize_hint_version(latest.as_str())),
+                    None,
+                ))
             }
-            // Resolution failed (e.g. dangling alias/unexpanded variable) — neither
-            // "up to date" nor "outdated" was actually verified, so show nothing.
-            RequirementStatus::Unresolved => continue,
-        };
-
-        // Issue #483 I5/SEC-2: `latest` here may be a warm-cache value fetched before an
-        // online -> offline flip — without this, the badge is indistinguishable from live
-        // data on this always-visible inline surface.
-        let label_text = if config.network.is_offline() {
-            format!("{label_text} 📴")
-        } else {
-            label_text
-        };
-
-        hints.push(InlayHint {
-            position: version_range.end,
-            label: InlayHintLabel::String(label_text),
-            kind: Some(InlayHintKind::TYPE),
-            padding_left: Some(true),
-            padding_right: None,
-            text_edits: None,
-            tooltip: flagged_tooltip.map(InlayHintTooltip::String),
-            data: None,
-        });
+        }
+        // Resolution failed (e.g. dangling alias/unexpanded variable) — neither
+        // "up to date" nor "outdated" was actually verified, so show nothing.
+        RequirementStatus::Unresolved => None,
     }
-
-    hints
 }
 
 #[cfg(test)]

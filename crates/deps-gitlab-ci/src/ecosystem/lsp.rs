@@ -15,11 +15,12 @@ use deps_core::lsp_helpers::{
     AuxiliaryLookup, CommentCheck, FetchContext, InteractiveFetch, InteractiveFetchRequest,
     ShaPinTail, await_interactive_fetch, sha_pin_rewrite, truncate_for_diagnostic,
 };
-use deps_core::{PackageKey, PackageName};
+use deps_core::{NarrowDependency, PackageKey, PackageName};
 
 use super::{
-    GitlabCiDependency, GitlabCiFormatter, GitlabCiRegistry, MAX_DIAGNOSTIC_VALUE_CHARS,
-    PackageRendering, ParseResultTrait, ShaPinQuickfixKind, Url, sha_pin_quickfix_kind,
+    GitlabCiDependency, GitlabCiFormatter, GitlabCiParseResult, GitlabCiRegistry,
+    MAX_DIAGNOSTIC_VALUE_CHARS, PackageRendering, ParseResultTrait, ShaPinQuickfixKind, Url,
+    sha_pin_quickfix_kind,
 };
 use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 
@@ -39,9 +40,9 @@ impl deps_core::lsp_helpers::ShaPinning for GitlabCiFormatter {
         &self,
         dep: &dyn deps_core::Dependency,
     ) -> Option<deps_core::lsp_helpers::ResolvedShaPin> {
-        let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
+        let gl_dep = self.own_dependency(dep)?;
         if !matches!(
-            sha_pin_quickfix_kind(dep, gl_dep, self),
+            sha_pin_quickfix_kind(gl_dep, self),
             Some(ShaPinQuickfixKind::StaticTagIndex)
         ) {
             return None;
@@ -107,16 +108,15 @@ pub(super) fn build_sha_pin_action(
 /// [`deps_core::lsp_helpers::build_sha_comment_fix_action`], which offers a fix only for a
 /// comment naming another tag of the pinned commit.
 pub(super) fn build_sha_comment_fix_action(
-    parse_result: &dyn ParseResultTrait,
+    parsed: &GitlabCiParseResult,
     position: Position,
     uri: &Url,
     formatter: &GitlabCiFormatter,
 ) -> Option<CodeAction> {
-    let dep = parse_result
-        .dependencies()
-        .into_iter()
+    let gl_dep = parsed
+        .dependencies
+        .iter()
         .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
-    let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
     let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gl_dep)? else {
         return None;
     };
@@ -142,7 +142,7 @@ pub(super) fn build_unknown_ref_fix_action(
 ) -> Option<CodeAction> {
     let dep =
         deps_core::lsp_helpers::dependency_at_position(parse_result, position.into(), formatter)?;
-    let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
+    let gl_dep = formatter.own_dependency(dep)?;
     super::unknown_ref_target(formatter, gl_dep)?.fix_action(uri)
 }
 
@@ -166,7 +166,7 @@ pub(super) fn build_unknown_ref_fix_action(
 /// #643) — the single source of truth this and `mutable_ref_pin_diagnostics`'s message
 /// both consult, so they cannot independently drift about whether a quickfix exists.
 pub(super) async fn build_dynamic_component_pin_action(
-    parse_result: &dyn ParseResultTrait,
+    parsed: &GitlabCiParseResult,
     position: Position,
     uri: &Url,
     formatter: &GitlabCiFormatter,
@@ -176,13 +176,12 @@ pub(super) async fn build_dynamic_component_pin_action(
     // M2 (#640): the same `formatter.is_position_on_dependency` lookup
     // `build_sha_pin_action` uses, rather than a bare `version_range` check — a
     // consistency unification, not a behavior change for this pin shape.
-    let dep = parse_result
-        .dependencies()
-        .into_iter()
+    let gl_dep = parsed
+        .dependencies
+        .iter()
         .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
-    let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
     if !matches!(
-        sha_pin_quickfix_kind(dep, gl_dep, formatter),
+        sha_pin_quickfix_kind(gl_dep, formatter),
         Some(ShaPinQuickfixKind::DynamicComponentPin)
     ) {
         return None;
@@ -193,16 +192,15 @@ pub(super) async fn build_dynamic_component_pin_action(
         .version_req
         .as_ref()
         .map(deps_core::VersionReq::as_str)?;
-    let dep_source = dep.source();
-    let route = registry.route(&dep_source)?;
+    let route = registry.route(&gl_dep.source)?;
 
     let resolved = match await_interactive_fetch(
         registry,
-        registry.resolve_component_pin(dep.name(), &route, pin, raw),
+        registry.resolve_component_pin(&gl_dep.name, &route, pin, raw),
         InteractiveFetchRequest::for_dependency(
             versions,
             uri,
-            dep,
+            gl_dep,
             formatter,
             FetchContext::CodeAction,
         ),
@@ -266,14 +264,13 @@ fn dynamic_pin_replacement(
 /// [`reconstitute_component_releases`] for why an unresolved-SHA entry is kept as a
 /// placeholder rather than dropped.
 pub(super) fn collect_pin_all_to_sha_edits(
-    parse_result: &dyn ParseResultTrait,
+    dependencies: &[GitlabCiDependency],
     formatter: &GitlabCiFormatter,
     versions: deps_core::VersionData<'_>,
 ) -> Vec<TextEdit> {
-    let edits: Vec<TextEdit> = parse_result
-        .dependencies()
-        .into_iter()
-        .filter_map(|dep| bulk_sha_pin_text_edit_for(dep, formatter, versions))
+    let edits: Vec<TextEdit> = dependencies
+        .iter()
+        .filter_map(|gl_dep| bulk_sha_pin_text_edit_for(gl_dep, formatter, versions))
         .collect();
     deps_core::lsp_helpers::dedup_overlapping_edits(edits, "collect_pin_all_to_sha_edits")
 }
@@ -284,16 +281,15 @@ pub(super) fn collect_pin_all_to_sha_edits(
 /// `version_range`, or (`DynamicComponentPin` only) the ladder can't resolve it from the
 /// caller's already-fetched `versions`.
 pub(super) fn bulk_sha_pin_text_edit_for(
-    dep: &dyn deps_core::Dependency,
+    gl_dep: &GitlabCiDependency,
     formatter: &GitlabCiFormatter,
     versions: deps_core::VersionData<'_>,
 ) -> Option<TextEdit> {
-    let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
     let version_range = gl_dep.version_range?;
 
-    match sha_pin_quickfix_kind(dep, gl_dep, formatter)? {
+    match sha_pin_quickfix_kind(gl_dep, formatter)? {
         ShaPinQuickfixKind::StaticTagIndex => {
-            deps_core::lsp_helpers::sha_pin_text_edit(formatter, dep)
+            deps_core::lsp_helpers::sha_pin_text_edit(formatter, gl_dep)
         }
         ShaPinQuickfixKind::DynamicComponentPin => {
             let pin = gl_dep.pin.as_ref()?;
@@ -302,7 +298,7 @@ pub(super) fn bulk_sha_pin_text_edit_for(
                 .as_ref()
                 .map(deps_core::VersionReq::as_str)?;
             let releases =
-                reconstitute_component_releases(dep.name(), gl_dep, formatter, versions)?;
+                reconstitute_component_releases(&gl_dep.name, gl_dep, formatter, versions)?;
             let resolved = crate::component::resolve_component_pin(pin, raw, &releases)?;
             // The reconstituted list may carry `sha: None` placeholders (see
             // `reconstitute_component_releases`); only a winner with a known SHA is safe

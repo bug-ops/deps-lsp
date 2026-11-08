@@ -1,0 +1,219 @@
+//! Single-flight for work that outlives its caller.
+//!
+//! [`SingleFlight::start_or_join`] runs a future in its own spawned task, or joins the task
+//! already running for the same key. The returned [`FlightHandle`] only waits: aborting the
+//! waiter drops the handle and leaves the task running, so its result still lands wherever the
+//! work stores it. The task owns the claim, so it is released when the work finishes, panics, or
+//! the runtime shuts down and drops the task; only then are waiters woken. Nothing outside the
+//! task can abort it, because its `JoinHandle` is dropped.
+//!
+//! The in-flight map is an implementation detail: no map type appears in this module's public
+//! signatures.
+
+use std::fmt;
+use std::future::Future;
+use std::hash::Hash;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::single_flight::{FlightMap, Follower, OwnedClaim, claim_or_follow_owned};
+
+/// Deduplicates detached background work per key.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use deps_core::SingleFlight;
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() {
+/// let flights = SingleFlight::<&str>::default();
+/// let (release, gate) = tokio::sync::oneshot::channel::<()>();
+///
+/// let first = flights.start_or_join("key", async move { gate.await.unwrap() });
+/// let second = flights.start_or_join("key", async {});
+/// assert!(first.issued());
+/// assert!(!second.issued());
+///
+/// release.send(()).unwrap();
+/// assert!(first.wait(Duration::from_secs(5)).await);
+/// assert!(second.wait(Duration::from_secs(5)).await);
+/// # }
+/// ```
+pub struct SingleFlight<K>(Arc<FlightMap<K, ()>>);
+
+impl<K: Hash + Eq> fmt::Debug for SingleFlight<K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SingleFlight")
+            .field("in_flight", &self.0.len())
+            .finish()
+    }
+}
+
+impl<K: Hash + Eq> Default for SingleFlight<K> {
+    fn default() -> Self {
+        Self(Arc::default())
+    }
+}
+
+impl<K: Hash + Eq + Clone + Send + Sync + 'static> SingleFlight<K> {
+    /// Spawns `work` as the leader for `key`, or joins the leader already running.
+    ///
+    /// A joining call drops `work` unrun. The task owns the claim, so a panic or a runtime
+    /// shutdown releases it and wakes every waiter.
+    ///
+    /// Must be called within a tokio runtime.
+    pub fn start_or_join(
+        &self,
+        key: K,
+        work: impl Future<Output = ()> + Send + 'static,
+    ) -> FlightHandle {
+        match claim_or_follow_owned(&self.0, key) {
+            OwnedClaim::Follower(follower) => FlightHandle {
+                follower,
+                issued: false,
+            },
+            OwnedClaim::Leader(leader) => {
+                let follower = leader.follower();
+                tokio::spawn(async move {
+                    let _claim = leader;
+                    work.await;
+                });
+                FlightHandle {
+                    follower,
+                    issued: true,
+                }
+            }
+        }
+    }
+}
+
+/// A started or joined flight that can be awaited.
+#[derive(Debug)]
+pub struct FlightHandle {
+    follower: Follower<()>,
+    issued: bool,
+}
+
+impl FlightHandle {
+    /// Whether this call started the work, as opposed to joining a flight already running.
+    #[must_use]
+    pub const fn issued(&self) -> bool {
+        self.issued
+    }
+
+    /// Waits up to `budget` for the flight to end; `false` only when the budget ran out.
+    ///
+    /// A leader that panicked or was dropped by a runtime shutdown counts as ended. The work
+    /// keeps running when the budget runs out.
+    pub async fn wait(self, budget: Duration) -> bool {
+        tokio::time::timeout(budget, self.follower.wait())
+            .await
+            .is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const BUDGET: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn a_second_call_for_the_same_key_joins_and_never_runs_its_work() {
+        let flights = SingleFlight::default();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let counter = Arc::clone(&runs);
+        let first = flights.start_or_join("k", async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            gate.await.unwrap();
+        });
+        let counter = Arc::clone(&runs);
+        let second = flights.start_or_join("k", async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(first.issued());
+        assert!(!second.issued());
+
+        release.send(()).unwrap();
+        assert!(first.wait(BUDGET).await);
+        assert!(second.wait(BUDGET).await);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_finished_flight_frees_the_key() {
+        let flights = SingleFlight::default();
+        assert!(flights.start_or_join("k", async {}).wait(BUDGET).await);
+        assert!(flights.start_or_join("k", async {}).issued());
+    }
+
+    #[tokio::test]
+    async fn a_panicking_leader_still_wakes_waiters_and_frees_the_key() {
+        let flights = SingleFlight::default();
+        let handle = flights.start_or_join("k", async { panic!("leader failed") });
+        assert!(handle.wait(BUDGET).await);
+        assert!(flights.start_or_join("k", async {}).issued());
+    }
+
+    #[tokio::test]
+    async fn a_waiter_that_gives_up_leaves_the_work_running() {
+        let flights = SingleFlight::default();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = flights.start_or_join("k", async move {
+            gate.await.unwrap();
+            done_tx.send(()).unwrap();
+        });
+        let waiter = tokio::spawn(handle.wait(BUDGET));
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+
+        release.send(()).unwrap();
+        done_rx.await.unwrap();
+    }
+
+    #[test]
+    fn dropping_the_runtime_releases_the_claim_and_wakes_waiters() {
+        let build = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+        };
+        let flights = SingleFlight::default();
+        let runtime = build();
+        let handle = runtime.block_on(async { flights.start_or_join("k", std::future::pending()) });
+        assert!(handle.issued());
+
+        drop(runtime);
+
+        assert!(
+            flights.0.is_empty(),
+            "the dropped leader released the claim"
+        );
+        assert!(
+            build().block_on(handle.wait(BUDGET)),
+            "waiters see the flight end"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_past_the_budget_reports_false() {
+        let flights = SingleFlight::default();
+        let handle = flights.start_or_join("k", std::future::pending());
+        assert!(!handle.wait(Duration::from_millis(20)).await);
+    }
+
+    #[tokio::test]
+    async fn waiters_wake_only_after_the_key_is_free() {
+        let flights = SingleFlight::default();
+        let handle = flights.start_or_join("k", async {});
+        assert!(handle.wait(BUDGET).await);
+        assert!(flights.0.is_empty());
+    }
+}

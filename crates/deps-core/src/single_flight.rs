@@ -8,6 +8,7 @@
 //! what a follower does with it.
 
 use std::hash::Hash;
+use std::sync::Arc;
 
 use dashmap::mapref::entry::Entry;
 use dashmap::{DashMap, DashSet};
@@ -83,6 +84,7 @@ impl<K: Hash + Eq, T> Leader<'_, K, T> {
 }
 
 /// A caller waiting on a leader's result.
+#[derive(Debug)]
 pub(crate) struct Follower<T>(watch::Receiver<Slot<T>>);
 
 impl<T> From<watch::Receiver<Slot<T>>> for Follower<T> {
@@ -112,25 +114,89 @@ pub(crate) enum Claim<'a, K: Hash + Eq, T> {
     Follower(Follower<T>),
 }
 
-/// Either claims `key` as the leader (installing a fresh, `Pending` channel) or joins as a
-/// follower of whichever channel the current leader already installed. A plain, synchronous
-/// function so the map's [`Entry`] guard is dropped before the caller ever reaches an `.await`
-/// (this workspace's `clippy.toml` denies holding one across an await point on principle,
-/// regardless of whether a given case is provably safe).
-pub(crate) fn claim_or_follow<K, T>(in_flight: &FlightMap<K, T>, key: K) -> Claim<'_, K, T>
+/// What entering a key's flight found: nobody leading it, or a leader to follow.
+enum Entered<T> {
+    Led(watch::Sender<Slot<T>>),
+    Following(watch::Receiver<Slot<T>>),
+}
+
+/// Either installs a fresh, `Pending` channel for `key` or reads the one the current leader
+/// installed. A plain, synchronous function so the map's [`Entry`] guard is dropped before the
+/// caller ever reaches an `.await` (this workspace's `clippy.toml` denies holding one across an
+/// await point on principle, regardless of whether a given case is provably safe).
+fn enter<K, T>(in_flight: &FlightMap<K, T>, key: &K) -> Entered<T>
 where
     K: Hash + Eq + Clone,
 {
     match in_flight.entry(key.clone()) {
-        Entry::Occupied(occupied) => Claim::Follower(Follower(occupied.get().clone())),
+        Entry::Occupied(occupied) => Entered::Following(occupied.get().clone()),
         Entry::Vacant(vacant) => {
             let (sender, receiver) = watch::channel(Slot::Pending);
             vacant.insert(receiver);
-            Claim::Leader(Leader {
-                _claim: InFlightGuard::new(in_flight, key),
-                sender,
-            })
+            Entered::Led(sender)
         }
+    }
+}
+
+/// Either claims `key` as the leader (installing a fresh, `Pending` channel) or joins as a
+/// follower of whichever channel the current leader already installed.
+pub(crate) fn claim_or_follow<K, T>(in_flight: &FlightMap<K, T>, key: K) -> Claim<'_, K, T>
+where
+    K: Hash + Eq + Clone,
+{
+    match enter(in_flight, &key) {
+        Entered::Following(receiver) => Claim::Follower(Follower(receiver)),
+        Entered::Led(sender) => Claim::Leader(Leader {
+            _claim: InFlightGuard::new(in_flight, key),
+            sender,
+        }),
+    }
+}
+
+/// A [`Leader`] that owns its map, so it can move into a spawned task.
+///
+/// Its [`Drop`] releases the claim, and only afterwards does the `sender` field drop and wake
+/// the followers: a woken follower always finds the key free.
+pub(crate) struct OwnedLeader<K: Hash + Eq, T> {
+    flights: Arc<FlightMap<K, T>>,
+    key: K,
+    sender: watch::Sender<Slot<T>>,
+}
+
+impl<K: Hash + Eq, T> OwnedLeader<K, T> {
+    /// A follower of this leader's own flight.
+    pub(crate) fn follower(&self) -> Follower<T> {
+        Follower(self.sender.subscribe())
+    }
+}
+
+impl<K: Hash + Eq, T> Drop for OwnedLeader<K, T> {
+    fn drop(&mut self) {
+        self.flights.remove(&self.key);
+    }
+}
+
+/// Whether the caller leads `key` with an owned handle or follows whoever already does.
+pub(crate) enum OwnedClaim<K: Hash + Eq, T> {
+    Leader(OwnedLeader<K, T>),
+    Follower(Follower<T>),
+}
+
+/// [`claim_or_follow`] for a map held in an [`Arc`], leading with an [`OwnedLeader`].
+pub(crate) fn claim_or_follow_owned<K, T>(
+    in_flight: &Arc<FlightMap<K, T>>,
+    key: K,
+) -> OwnedClaim<K, T>
+where
+    K: Hash + Eq + Clone,
+{
+    match enter(in_flight, &key) {
+        Entered::Following(receiver) => OwnedClaim::Follower(Follower(receiver)),
+        Entered::Led(sender) => OwnedClaim::Leader(OwnedLeader {
+            flights: Arc::clone(in_flight),
+            key,
+            sender,
+        }),
     }
 }
 
@@ -252,6 +318,26 @@ mod tests {
 
         assert!(outcome.is_err());
         assert!(flights.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_owned_leader_frees_the_key_before_waking_its_followers() {
+        let flights = Arc::new(Flights::new());
+        let OwnedClaim::Leader(leader) = claim_or_follow_owned(&flights, "key") else {
+            panic!("expected to lead");
+        };
+        let own = leader.follower();
+        let OwnedClaim::Follower(joined) = claim_or_follow_owned(&flights, "key") else {
+            panic!("expected to follow");
+        };
+        drop(leader);
+
+        assert_eq!(own.wait().await, None);
+        assert_eq!(joined.wait().await, None);
+        assert!(flights.is_empty());
+        let OwnedClaim::Leader(_) = claim_or_follow_owned(&flights, "key") else {
+            panic!("the released key is claimable again");
+        };
     }
 
     #[test]
