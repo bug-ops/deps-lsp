@@ -14,7 +14,8 @@ use url::Url;
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
+    Ecosystem, NarrowParseResult, OwnParseResult, ParseResult as ParseResultTrait, Registry,
+    Result, lsp_helpers::EcosystemFormatter,
 };
 
 use crate::formatter::PypiFormatter;
@@ -149,6 +150,10 @@ impl PypiEcosystem {
 }
 
 impl deps_core::ecosystem::private::Sealed for PypiEcosystem {}
+
+impl OwnParseResult for PypiEcosystem {
+    type Parsed = crate::parser::ParseResult;
+}
 
 impl Ecosystem for PypiEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
@@ -287,10 +292,7 @@ impl Ecosystem for PypiEcosystem {
         parse_result: &dyn ParseResultTrait,
         uri: &Url,
     ) -> Vec<DocumentLink> {
-        let Some(result) = parse_result
-            .as_any()
-            .downcast_ref::<crate::parser::ParseResult>()
-        else {
+        let Some(result) = self.own_parse_result(parse_result) else {
             return Vec::new();
         };
         if result.document_links.is_empty() {

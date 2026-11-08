@@ -9,15 +9,15 @@
 //! stored, so the pin it concerns stays silent.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
-use std::sync::{Mutex, PoisonError};
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use super::{CommitSha, RequirementStatus, TagName, is_dot_segment, is_tag_shaped};
 use crate::NormalizedName;
 use crate::cache::BodyLimit;
+use crate::swr_store::{Recency, SwrPolicy, SwrStore, Upserted};
 
 /// Entries each evidence store keeps before evicting the least recently used one.
 pub const EVIDENCE_STORE_CAPACITY: usize = 4096;
@@ -200,7 +200,6 @@ impl ProbeReport {
     }
 }
 
-// TODO(#1944): shared SWR store and single-flight
 /// A bounded map that evicts its least recently used entry and marks entries stale after a TTL.
 ///
 /// Stale-while-revalidate: [`Self::get`] keeps serving the last authoritative answer after its
@@ -212,11 +211,7 @@ impl ProbeReport {
 /// The store behind [`BranchEvidenceStore`] and [`CommitEvidenceStore`]. Reads and writes take
 /// one short lock and never block on I/O.
 #[derive(Debug)]
-pub struct EvidenceStore<K, V> {
-    capacity: usize,
-    ttl: Option<Duration>,
-    inner: Mutex<StoreInner<K, V>>,
-}
+pub struct EvidenceStore<K, V>(SwrStore<K, V>);
 
 #[derive(Debug, Clone, Copy)]
 enum Freshness {
@@ -224,31 +219,17 @@ enum Freshness {
     Fresh,
 }
 
-#[derive(Debug)]
-struct StoreInner<K, V> {
-    entries: HashMap<K, Slot<V>>,
-    tick: u64,
-}
-
-#[derive(Debug)]
-struct Slot<V> {
-    value: V,
-    stored: Instant,
-    used: u64,
-}
-
 impl<K: Eq + Hash + Clone, V: Clone> EvidenceStore<K, V> {
-    /// A store of at most `capacity` entries whose entries expire after `ttl` when given.
+    /// A store of at most `capacity` entries (at least one) whose entries expire after `ttl`
+    /// when given.
     #[must_use]
     pub fn new(capacity: usize, ttl: Option<Duration>) -> Self {
-        Self {
-            capacity: capacity.max(1),
+        Self(SwrStore::new(SwrPolicy {
+            capacity: NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN),
             ttl,
-            inner: Mutex::new(StoreInner {
-                entries: HashMap::new(),
-                tick: 0,
-            }),
-        }
+            idle: None,
+            recency: Recency::ReadsAndWrites,
+        }))
     }
 
     /// The stored value for `key`, refreshing its recency, whether or not its TTL has passed.
@@ -265,19 +246,9 @@ impl<K: Eq + Hash + Clone, V: Clone> EvidenceStore<K, V> {
     }
 
     fn read_at(&self, key: &K, now: Instant, freshness: Freshness) -> Option<V> {
-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        inner.tick += 1;
-        let tick = inner.tick;
-        let slot = inner.entries.get_mut(key)?;
-        let stale = self
-            .ttl
-            .is_some_and(|ttl| now.saturating_duration_since(slot.stored) >= ttl);
         match freshness {
-            Freshness::Fresh if stale => None,
-            Freshness::Fresh | Freshness::Any => {
-                slot.used = tick;
-                Some(slot.value.clone())
-            }
+            Freshness::Any => self.0.get(key, now).map(|read| read.value),
+            Freshness::Fresh => self.0.get_fresh(key, now),
         }
     }
 
@@ -295,48 +266,22 @@ impl<K: Eq + Hash + Clone, V: Clone> EvidenceStore<K, V> {
     where
         V: PartialEq,
     {
-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        inner.tick += 1;
-        let tick = inner.tick;
-        let changed = inner
-            .entries
-            .get(&key)
-            .is_none_or(|previous| previous.value != value);
-        if !inner.entries.contains_key(&key) && inner.entries.len() >= self.capacity {
-            let oldest = inner
-                .entries
-                .iter()
-                .min_by_key(|(_, slot)| slot.used)
-                .map(|(k, _)| k.clone());
-            if let Some(oldest) = oldest {
-                inner.entries.remove(&oldest);
-            }
+        match self.0.upsert(key, value.clone(), now) {
+            Upserted::Inserted => true,
+            Upserted::Replaced { previous } => previous != value,
         }
-        inner.entries.insert(
-            key,
-            Slot {
-                value,
-                stored: now,
-                used: tick,
-            },
-        );
-        changed
     }
 
     /// Number of stored entries, expired ones included until read.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entries
-            .len()
+        self.0.len()
     }
 
     /// Whether no entry is stored.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.0.is_empty()
     }
 }
 

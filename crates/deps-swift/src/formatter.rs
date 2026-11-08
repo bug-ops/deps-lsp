@@ -13,6 +13,7 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::osv::OsvPackageName;
 use deps_core::redact::RedactedUrl;
+use deps_core::{NarrowDependency, OwnDependency};
 use std::borrow::Cow;
 
 use crate::scm::SwiftOrigin;
@@ -60,6 +61,10 @@ fn is_non_github_registry_url(name: &str) -> bool {
 
 /// Formatter for Swift/SPM ecosystem LSP responses.
 pub struct SwiftFormatter;
+
+impl OwnDependency for SwiftFormatter {
+    type Dep = SwiftDependency;
+}
 
 impl PackageNaming for SwiftFormatter {
     fn normalized_spelling(&self, name: &PackageName) -> String {
@@ -129,7 +134,7 @@ impl PackageRendering for SwiftFormatter {
     /// A swizzled dependency (spec 088) says which registry identity it was swapped to and from
     /// which repository.
     fn hover_provenance(&self, dep: &dyn Dependency) -> Option<HoverProvenance> {
-        let swift_dep = dep.as_any().downcast_ref::<SwiftDependency>()?;
+        let swift_dep = self.own_dependency(dep)?;
         match &swift_dep.origin {
             SwiftOrigin::Swizzled { scm, .. } => {
                 Some(HoverProvenance::ResolvedViaRegistryIdentity {
@@ -247,7 +252,7 @@ impl OsvNaming for SwiftFormatter {
     /// A swizzled dependency (spec 088) is described by its source repository instead:
     /// `dep.name()` is then the registry identity, which OSV has never heard of.
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<OsvPackageName> {
-        let swift_dep = dep.as_any().downcast_ref::<SwiftDependency>()?;
+        let swift_dep = self.own_dependency(dep)?;
         match &swift_dep.origin {
             SwiftOrigin::Swizzled { .. } => self
                 .public_content(dep)
@@ -268,11 +273,7 @@ impl OsvNaming for SwiftFormatter {
     /// public content OSV or license data could describe. Every other dependency follows the
     /// source gate.
     fn public_content<'d>(&self, dep: &'d dyn Dependency) -> Option<PublicContent<'d>> {
-        match dep
-            .as_any()
-            .downcast_ref::<SwiftDependency>()
-            .map(|swift_dep| &swift_dep.origin)
-        {
+        match self.own_dependency(dep).map(|swift_dep| &swift_dep.origin) {
             Some(SwiftOrigin::Swizzled { scm, .. }) => crate::parser::url_to_identity(scm.wire())
                 .filter(|repository| is_valid_owner_repo(repository))
                 .map(|repository| PublicContent {

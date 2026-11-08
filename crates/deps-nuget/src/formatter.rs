@@ -8,7 +8,10 @@ use deps_core::lsp_helpers::{
     requirement_contains_template_placeholder,
 };
 use deps_core::osv::NonPublicRoute;
-use deps_core::{ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName};
+use deps_core::{
+    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, NarrowDependency, OwnDependency,
+    PackageName,
+};
 
 /// Maximum package ID length NuGet's client-side `PackageIdValidator` accepts.
 const MAX_PACKAGE_ID_LENGTH: usize = 100;
@@ -57,6 +60,10 @@ impl RequirementMatcher for NuGetMatcher {
 
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for NuGet.
 pub struct NuGetFormatter;
+
+impl OwnDependency for NuGetFormatter {
+    type Dep = NuGetDependency;
+}
 
 impl PackageNaming for NuGetFormatter {
     /// Lints `name` against NuGet's own `PackageIdValidator` rule (see
@@ -342,9 +349,8 @@ impl OsvNaming for NuGetFormatter {
     /// `<remove key="nuget.org"/>`) is an unverified mirror; chains that still reach nuget.org
     /// and `<packageSourceMapping>` groups stay silent (#1947).
     fn non_public_route(&self, dep: &dyn Dependency) -> NonPublicRoute {
-        let route = dep
-            .as_any()
-            .downcast_ref::<NuGetDependency>()
+        let route = self
+            .own_dependency(dep)
             .and_then(NuGetDependency::feed_route);
         match route {
             Some(NuGetFeedRoute::ReplacesPublic) => NonPublicRoute::UnverifiedMirror,

@@ -4,8 +4,8 @@
 use deps_core::completion::Completions;
 use deps_core::diagnostic::{Diagnostic, DiagnosticKind, Severity};
 use deps_core::{
-    ConfigReach, Ecosystem, ParseResult as ParseResultTrait, Registry, Result, WatchedConfig,
-    WatchedConfigEffect, is_safe_registry_url,
+    ConfigReach, Ecosystem, NarrowParseResult, OwnParseResult, ParseResult as ParseResultTrait,
+    Registry, Result, WatchedConfig, WatchedConfigEffect, is_safe_registry_url,
     lsp_helpers::{
         DiagnosticSeverities, EcosystemFormatter, ProbeEffect, ProbePhase, ProbeReport,
         warn_rejected_value,
@@ -179,7 +179,7 @@ impl SwiftEcosystem {
     /// end on the same forms. Stale entries refresh in the background and are never awaited.
     /// Does nothing unless `Replace` is on and the document has an eligible dependency.
     async fn warm_identities(&self, parse_result: &dyn ParseResultTrait) -> ProbeReport {
-        let Some(parsed) = parse_result.as_any().downcast_ref::<SwiftParseResult>() else {
+        let Some(parsed) = self.own_parse_result(parse_result) else {
             return ProbeReport::default();
         };
         let mode = self.context.scm_mode();
@@ -316,7 +316,7 @@ impl SwiftEcosystem {
         key: &MemoKey,
         timeout: std::time::Duration,
         scm: &ScmLookupUrl,
-    ) -> Option<crate::scm_memo::LookupHandle> {
+    ) -> Option<deps_core::FlightHandle> {
         self.registry.lookup_identity(key, timeout, scm)
     }
 
@@ -326,7 +326,7 @@ impl SwiftEcosystem {
         &self,
         parse_result: &dyn ParseResultTrait,
     ) -> Vec<Diagnostic> {
-        let Some(parsed) = parse_result.as_any().downcast_ref::<SwiftParseResult>() else {
+        let Some(parsed) = self.own_parse_result(parse_result) else {
             return Vec::new();
         };
         match self.context.scm_mode() {
@@ -397,6 +397,10 @@ impl SwiftEcosystem {
 }
 
 impl deps_core::ecosystem::private::Sealed for SwiftEcosystem {}
+
+impl OwnParseResult for SwiftEcosystem {
+    type Parsed = SwiftParseResult;
+}
 
 const WATCHED_CONFIGS: [WatchedConfig; 1] = [WatchedConfig::new(
     crate::config::PROJECT_REGISTRIES_SUFFIX,
@@ -475,7 +479,7 @@ impl Ecosystem for SwiftEcosystem {
         parse_result: &dyn ParseResultTrait,
         input: &deps_core::ParseInputKey,
     ) -> bool {
-        let Some(parsed) = parse_result.as_any().downcast_ref::<SwiftParseResult>() else {
+        let Some(parsed) = self.own_parse_result(parse_result) else {
             return true;
         };
         eligible_dependencies(parsed)

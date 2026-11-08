@@ -11,7 +11,10 @@ use deps_core::lsp_helpers::{
     tag_pin_is_up_to_date, warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
-use deps_core::{ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName};
+use deps_core::{
+    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, NarrowDependency, OwnDependency,
+    PackageName,
+};
 use std::sync::Arc;
 
 use crate::host::is_valid_gitlab_coordinate;
@@ -339,6 +342,10 @@ impl PackageNaming for GitlabCiFormatter {
     }
 }
 
+impl OwnDependency for GitlabCiFormatter {
+    type Dep = GitlabCiDependency;
+}
+
 impl PackageRendering for GitlabCiFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.as_str().to_string()
@@ -350,7 +357,7 @@ impl PackageRendering for GitlabCiFormatter {
         &self,
         dep: &dyn Dependency,
     ) -> Option<deps_core::lsp_helpers::HoverProvenance> {
-        let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
+        let gl_dep = self.own_dependency(dep)?;
         self.commit_proof(gl_dep)
             .map(|proof| proof.hover_provenance())
     }
@@ -373,7 +380,7 @@ impl PackageRendering for GitlabCiFormatter {
         version: &ConcreteVersion,
         current: &str,
     ) -> String {
-        let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
+        let Some(gl_dep) = self.own_dependency(dep) else {
             return self.format_version_for_text_edit(version);
         };
         match &gl_dep.pin {
@@ -502,7 +509,7 @@ impl RequirementResolution for GitlabCiFormatter {
         requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> RequirementStatus {
-        let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
+        let Some(gl_dep) = self.own_dependency(dep) else {
             return self.classify_requirement_status(requirement, latest);
         };
         let Some(pin) = gl_dep.pin.as_ref() else {
@@ -530,7 +537,7 @@ impl RequirementResolution for GitlabCiFormatter {
     }
 
     fn commit_rewrite_for(&self, dep: &dyn Dependency, version: &ConcreteVersion) -> CommitRewrite {
-        let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
+        let Some(gl_dep) = self.own_dependency(dep) else {
             return CommitRewrite::NotACommitPin;
         };
         let index = self.endpoint_index(gl_dep);
@@ -545,7 +552,7 @@ impl RequirementResolution for GitlabCiFormatter {
     /// disambiguation `Self::resolved_tag_for_sha` applies, since a `project:` and
     /// `component:` include can textually collide on name across endpoints.
     fn resolved_pin_version(&self, dep: &dyn Dependency) -> PinResolution {
-        let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
+        let Some(gl_dep) = self.own_dependency(dep) else {
             return PinResolution::Unresolved;
         };
         let index = self.endpoint_index(gl_dep);
@@ -568,7 +575,7 @@ impl RequirementResolution for GitlabCiFormatter {
     /// is not consulted yet; stating it keeps the default `NotTagBased` from silently failing
     /// open once GitLab CI gains OSV coverage.
     fn candidate_tag_source(&self, dep: &dyn Dependency) -> CandidateTagSource {
-        let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
+        let Some(gl_dep) = self.own_dependency(dep) else {
             return CandidateTagSource::NotTagBased;
         };
         git_candidate_tag_source(Self::pin_view(gl_dep), self.endpoint_index(gl_dep))

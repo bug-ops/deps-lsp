@@ -8,7 +8,8 @@ use deps_core::hover::Hover;
 #[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::ShaPinning;
 use deps_core::{
-    Dependency, Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
+    Ecosystem, NarrowParseResult, OwnParseResult, ParseResult as ParseResultTrait, Registry,
+    Result,
     diagnostic::{Diagnostic, DiagnosticKind, GitTagsPlatform, Severity},
     lsp_helpers::{EcosystemFormatter, unknown_ref_diagnostics},
 };
@@ -20,7 +21,7 @@ use url::Url;
 
 use crate::formatter::GithubActionsFormatter;
 use crate::registry::GithubActionsRegistry;
-use crate::types::{GithubActionsDependency, PinStyle};
+use crate::types::{GithubActionsDependency, GithubActionsParseResult, PinStyle};
 use deps_core::lsp_helpers::{CommentCheck, ProbePhase, ProbePlan, ProbeReport, UnknownRefTarget};
 
 #[cfg(feature = "lsp-responses")]
@@ -92,6 +93,10 @@ impl GithubActionsEcosystem {
 }
 
 impl deps_core::ecosystem::private::Sealed for GithubActionsEcosystem {}
+
+impl OwnParseResult for GithubActionsEcosystem {
+    type Parsed = GithubActionsParseResult;
+}
 
 impl Ecosystem for GithubActionsEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
@@ -168,7 +173,12 @@ impl Ecosystem for GithubActionsEcosystem {
         phase: ProbePhase,
     ) -> deps_core::ecosystem::BoxFuture<'a, ProbeReport> {
         let plan = (phase == ProbePhase::PostFetch)
-            .then(|| probe_plan(&self.formatter, parse_result))
+            .then(|| {
+                self.own_parse_result(parse_result)
+                    .map_or_else(ProbePlan::default, |parsed| {
+                        probe_plan(&self.formatter, &parsed.dependencies)
+                    })
+            })
             .filter(|plan| !plan.is_empty());
         Box::pin(async move {
             match plan {
@@ -210,7 +220,10 @@ impl Ecosystem for GithubActionsEcosystem {
         prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
-            if position_past_sha_pin_own_ref(request.parse_result, request.position) {
+            if self
+                .own_parse_result(request.parse_result)
+                .is_some_and(|parsed| position_past_sha_pin_own_ref(parsed, request.position))
+            {
                 return Completions::default();
             }
             deps_core::completion::complete_versions_at_position(
@@ -258,22 +271,25 @@ impl Ecosystem for GithubActionsEcosystem {
                 severities,
                 deps_core::PublishTime::now(),
             );
+            let Some(parsed) = self.own_parse_result(parse_result) else {
+                return diagnostics;
+            };
             if severities.mutable_ref_pin_enabled {
                 diagnostics.extend(mutable_ref_pin_diagnostics(
-                    parse_result,
+                    &parsed.dependencies,
                     severities.mutable_ref_pin,
                     &self.formatter.tag_index,
                 ));
             }
             diagnostics.extend(sha_comment_mismatch_diagnostics(
-                parse_result,
+                &parsed.dependencies,
                 severities.sha_comment_mismatch,
                 &self.formatter,
             ));
             diagnostics.extend(unknown_ref_diagnostics(
-                parse_result,
+                &parsed.dependencies,
                 severities.unknown_ref,
-                |dep| tag_pin_target(&self.formatter, dep),
+                |dep| unknown_ref_target(&self.formatter, dep),
             ));
             diagnostics
         })
@@ -365,27 +381,26 @@ impl Ecosystem for GithubActionsEcosystem {
             .await;
             let mut hover = base_hover?;
 
-            let dep = parse_result.dependencies().into_iter().find(|d| {
-                deps_core::position_in_range(position.into(), d.name_range())
-                    || d.version_range()
-                        .is_some_and(|r| deps_core::position_in_range(position.into(), r))
-            });
-            let Some(dep) = dep else {
+            let Some(parsed) = self.own_parse_result(parse_result) else {
                 return Some(hover);
             };
-            if dep.version_range().is_none() {
+            let Some(gha_dep) = parsed.dependencies.iter().find(|d| {
+                deps_core::position_in_range(position.into(), d.name_range)
+                    || d.version_range
+                        .is_some_and(|r| deps_core::position_in_range(position.into(), r))
+            }) else {
+                return Some(hover);
+            };
+            if gha_dep.version_range.is_none() {
                 return Some(hover);
             }
-            let Some(gha_dep) = dep.as_any().downcast_ref::<GithubActionsDependency>() else {
-                return Some(hover);
-            };
 
             // #501/#550: the shared footer gate only sees `VersionData`, not `tag_index` —
             // so a `PinStyle::Tag` step with a warm `TagIndex` entry can have a real "Pin to
             // commit SHA" quickfix even when the shared gate suppressed the footer for lack
             // of `VersionData`. Restored post-hoc via `CMD_DOT_FOOTER`, idempotently, using
             // the same centralized eligibility check the quickfix/code-lens build on (#1177).
-            if self.formatter.resolve_static_sha_pin(dep).is_some()
+            if self.formatter.resolve_static_sha_pin(gha_dep).is_some()
                 && !hover
                     .markdown()
                     .contains(deps_core::lsp_helpers::CMD_DOT_FOOTER)
@@ -398,7 +413,7 @@ impl Ecosystem for GithubActionsEcosystem {
             };
 
             use deps_core::lsp_helpers::{PinResolution, RequirementResolution};
-            let resolved_tag = match self.formatter.resolved_pin_version(dep) {
+            let resolved_tag = match self.formatter.resolved_pin_version(gha_dep) {
                 PinResolution::Resolved { pin, .. } => Some(pin.version().as_str().to_string()),
                 PinResolution::Unresolved
                 | PinResolution::NotYetIndexed
@@ -549,15 +564,13 @@ pub(crate) fn is_sha_pinnable_tag(gha_dep: &GithubActionsDependency) -> bool {
 /// `PinStyle::Sha` and a `PinStyle::Branch` `tag_index` cannot (yet) confirm produce no
 /// diagnostic (FR-003).
 fn mutable_ref_pin_diagnostics(
-    parse_result: &dyn ParseResultTrait,
+    dependencies: &[GithubActionsDependency],
     severity: Severity,
     tag_index: &RepositoryIndexes,
 ) -> Vec<Diagnostic> {
-    parse_result
-        .dependencies()
-        .into_iter()
-        .filter_map(|dep| {
-            let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+    dependencies
+        .iter()
+        .filter_map(|gha_dep| {
             if !is_registry_confirmed_tag(gha_dep, tag_index) {
                 return None;
             }
@@ -606,15 +619,13 @@ fn mutable_ref_pin_diagnostics(
 /// Emits nothing for a confirmed comment, a commentless pin, or an unverifiable one (cold
 /// cache, or a SHA absent from a truncated tag list).
 fn sha_comment_mismatch_diagnostics(
-    parse_result: &dyn ParseResultTrait,
+    dependencies: &[GithubActionsDependency],
     severity: Severity,
     formatter: &GithubActionsFormatter,
 ) -> Vec<Diagnostic> {
-    parse_result
-        .dependencies()
-        .into_iter()
-        .filter_map(|dep| {
-            let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+    dependencies
+        .iter()
+        .filter_map(|gha_dep| {
             let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gha_dep)? else {
                 return None;
             };
@@ -661,13 +672,10 @@ pub(crate) fn unknown_ref_target<'a>(
 /// validation) is not asked at all.
 fn probe_plan(
     formatter: &GithubActionsFormatter,
-    parse_result: &dyn ParseResultTrait,
+    dependencies: &[GithubActionsDependency],
 ) -> ProbePlan {
     let mut plan = ProbePlan::default();
-    for dep in parse_result.dependencies() {
-        let Some(gha_dep) = dep.as_any().downcast_ref::<GithubActionsDependency>() else {
-            continue;
-        };
+    for gha_dep in dependencies {
         if deps_core::github::validate_owner_repo(gha_dep.name.as_str()).is_err() {
             continue;
         }
@@ -678,9 +686,7 @@ fn probe_plan(
         else {
             continue;
         };
-        let Some(pin) = GithubActionsFormatter::pin_view(dep) else {
-            continue;
-        };
+        let pin = GithubActionsFormatter::pin_view(gha_dep);
         if let Some(question) = formatter
             .probe_stores
             .question_for(&gha_dep.name, &index, pin)
@@ -689,17 +695,6 @@ fn probe_plan(
         }
     }
     plan
-}
-
-/// [`unknown_ref_target`] for a type-erased dependency of this ecosystem.
-fn tag_pin_target<'a>(
-    formatter: &GithubActionsFormatter,
-    dep: &'a dyn Dependency,
-) -> Option<UnknownRefTarget<'a>> {
-    unknown_ref_target(
-        formatter,
-        dep.as_any().downcast_ref::<GithubActionsDependency>()?,
-    )
 }
 
 #[cfg(test)]
@@ -3641,15 +3636,35 @@ mod tests {
                     .unwrap()
                     .start
                     .character;
+                let parsed = eco.own_parse_result(parse_result.as_ref()).unwrap();
                 let past = |character: u32| {
-                    position_past_sha_pin_own_ref(
-                        parse_result.as_ref(),
-                        Position::new(1, character),
-                    )
+                    position_past_sha_pin_own_ref(parsed, Position::new(1, character))
                 };
                 assert!(!past(start + 40), "{line}");
                 assert!(past(start + 41), "{line}");
             }
+        }
+
+        /// A parse result of another ecosystem reaching a real hook trips the typed boundary's
+        /// `debug_assert`; release builds fall back to an empty probe report.
+        #[cfg(debug_assertions)]
+        #[test]
+        #[should_panic(expected = "parse result is not a ")]
+        fn test_background_probes_asserts_on_a_foreign_parse_result_in_debug_builds() {
+            let eco = GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+            let foreign = deps_core::test_util::stub_parse_result_with_dependencies(1);
+            drop(eco.background_probes(foreign.as_ref(), ProbePhase::PostFetch));
+        }
+
+        #[cfg(not(debug_assertions))]
+        #[tokio::test]
+        async fn test_background_probes_ignore_a_foreign_parse_result_in_release_builds() {
+            let eco = GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+            let foreign = deps_core::test_util::stub_parse_result_with_dependencies(1);
+            let report = eco
+                .background_probes(foreign.as_ref(), ProbePhase::PostFetch)
+                .await;
+            assert_eq!(report, ProbeReport::default());
         }
 
         /// A commentless SHA pin's `version_range` already ends exactly at the SHA's own end

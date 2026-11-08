@@ -8,10 +8,11 @@
 //! module (which globs `use super::*;`) keeps referencing them unqualified, unchanged from
 //! before the move.
 
+use deps_core::NarrowDependency;
 use deps_core::lsp_helpers::{CommentCheck, PackageRendering};
 use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
 
-use super::{GithubActionsDependency, GithubActionsFormatter, ParseResultTrait, Url};
+use super::{GithubActionsFormatter, GithubActionsParseResult, ParseResultTrait, Url};
 use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 
 /// Leading version-constraint operators stripped from a completion prefix before matching
@@ -27,15 +28,12 @@ pub(super) const VERSION_OPERATOR_CHARS: &[char] = &[];
 /// only there is `position` compared against the SHA's own end column (range start plus SHA
 /// length). A position exactly at that column (still typing the SHA) is not past it.
 pub(super) fn position_past_sha_pin_own_ref(
-    parse_result: &dyn ParseResultTrait,
+    parsed: &GithubActionsParseResult,
     position: Position,
 ) -> bool {
     let position: deps_core::position::Position = position.into();
-    parse_result.dependencies().into_iter().any(|dep| {
-        let Some(range) = dep.version_range() else {
-            return false;
-        };
-        let Some(gha_dep) = dep.as_any().downcast_ref::<GithubActionsDependency>() else {
+    parsed.dependencies.iter().any(|gha_dep| {
+        let Some(range) = gha_dep.version_range else {
             return false;
         };
         gha_dep.sha_comment().is_some()
@@ -95,7 +93,7 @@ pub(super) fn build_sha_comment_fix_action(
         .dependencies()
         .into_iter()
         .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
-    let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+    let gha_dep = formatter.own_dependency(dep)?;
     let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gha_dep)? else {
         return None;
     };
@@ -120,7 +118,7 @@ pub(super) fn build_unknown_ref_fix_action(
 ) -> Option<CodeAction> {
     let dep =
         deps_core::lsp_helpers::dependency_at_position(parse_result, position.into(), formatter)?;
-    let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+    let gha_dep = formatter.own_dependency(dep)?;
     super::unknown_ref_target(formatter, gha_dep)?.fix_action(uri)
 }
 

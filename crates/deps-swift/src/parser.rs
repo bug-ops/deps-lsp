@@ -473,395 +473,313 @@ pub fn parse_package_swift_with_context(
     parse_with_resolver(content, uri, IdResolver::configured(context, uri))
 }
 
-// Every capture-group slice below (`url.start()..url.end()`, etc.) uses regex match offsets,
-// always char boundaries; offsets taken on `stripped` are valid in `content` too because
-// `strip_comments` overwrites byte-for-byte (length- and boundary-preserving). Group 0
-// always exists on a successful match; the `ver`/`lower`/`upper` and numbered groups are
-// mandatory (never `?`-optional), so their `unwrap()` is always `Some`. The alternative `url`/`id`
-// head is optional per group and goes through `locate` instead.
+/// A mandatory capture group: its byte span and its text.
+struct RequiredGroup<'a> {
+    span: std::ops::Range<usize>,
+    text: &'a str,
+}
+
+// Capture-group slices use regex match offsets, always char boundaries; offsets taken on
+// `stripped` are valid in `content` too because `strip_comments` overwrites byte-for-byte
+// (length- and boundary-preserving). Group 0 always exists on a successful match; the
+// `ver`/`lower`/`upper` and numbered groups are mandatory (never `?`-optional), so their
+// `unwrap()` is always `Some`. The alternative `url`/`id` head is optional per group and goes
+// through `locate` instead.
 #[allow(clippy::string_slice, clippy::unwrap_used)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "scanner past 300 lines, split tracked in #1952"
-)]
+fn required<'a>(group: Option<regex::Match<'_>>, content: &'a str) -> RequiredGroup<'a> {
+    let range = group.unwrap().range();
+    RequiredGroup {
+        text: &content[range.clone()],
+        span: range,
+    }
+}
+
+/// The requirement a registry-form match declares, and the literal an edit would rewrite.
+struct VersionedPin {
+    version_req: String,
+    span: std::ops::Range<usize>,
+    literal: Option<String>,
+}
+
+impl VersionedPin {
+    /// A single-literal form: the literal is the whole requirement text.
+    fn single(version: &RequiredGroup<'_>, version_req: String) -> Self {
+        Self {
+            version_req,
+            span: version.span.clone(),
+            literal: Some(version.text.to_string()),
+        }
+    }
+
+    /// A two-literal range form, whose `span` covers only the lower bound.
+    ///
+    /// The literal is deliberately `None`, unlike every other registry form: reporting the
+    /// lower bound as the literal would let the guard pass and the edit rewrite it alone,
+    /// inverting the range (e.g. `"1.0.0"..<"2.0.0"` -> `"3.5.0"..<"2.0.0"`) — SwiftPM traps on
+    /// `lowerBound > upperBound`, corrupting the whole manifest (#367 C1). `None` keeps this form
+    /// fail-closed.
+    fn range(lower: &RequiredGroup<'_>, version_req: String) -> Self {
+        Self {
+            version_req,
+            span: lower.span.clone(),
+            literal: None,
+        }
+    }
+}
+
+type PinForm = fn(&regex::Captures<'_>, &str) -> VersionedPin;
+
+fn up_to_next_major_pin(cap: &regex::Captures<'_>, content: &str) -> VersionedPin {
+    let ver = required(cap.name("ver"), content);
+    let major = ver.text.split('.').next().unwrap_or("0");
+    let version_req = format!(">={}, <{}.0.0", ver.text, next_major(major));
+    VersionedPin::single(&ver, version_req)
+}
+
+fn up_to_next_minor_pin(cap: &regex::Captures<'_>, content: &str) -> VersionedPin {
+    let ver = required(cap.name("ver"), content);
+    let mut parts = ver.text.split('.');
+    let major = parts.next().unwrap_or("0");
+    let minor = parts.next().unwrap_or("0");
+    let version_req = format!(">={}, <{}", ver.text, next_minor(major, minor));
+    VersionedPin::single(&ver, version_req)
+}
+
+fn exact_pin(cap: &regex::Captures<'_>, content: &str) -> VersionedPin {
+    let ver = required(cap.name("ver"), content);
+    let version_req = format!("={}", ver.text);
+    VersionedPin::single(&ver, version_req)
+}
+
+fn half_open_range_pin(cap: &regex::Captures<'_>, content: &str) -> VersionedPin {
+    let lower = required(cap.name("lower"), content);
+    let upper = required(cap.name("upper"), content);
+    let version_req = format!(">={}, <{}", lower.text, upper.text);
+    VersionedPin::range(&lower, version_req)
+}
+
+fn closed_range_pin(cap: &regex::Captures<'_>, content: &str) -> VersionedPin {
+    let lower = required(cap.name("lower"), content);
+    let upper = required(cap.name("upper"), content);
+    let version_req = format!(">={}, <={}", lower.text, upper.text);
+    VersionedPin::range(&lower, version_req)
+}
+
+fn from_pin(cap: &regex::Captures<'_>, content: &str) -> VersionedPin {
+    let ver = required(cap.name("ver"), content);
+    let version_req = format!(">={}, <{}.0.0", ver.text, next_major(ver.text));
+    VersionedPin::single(&ver, version_req)
+}
+
+/// What the scan passes share: the manifest text, spans already claimed by an earlier pass, the
+/// per-document dependency budget (#796, shared across all 9 passes, not per form) and the
+/// dependencies found so far.
+struct ScanState<'a> {
+    content: &'a str,
+    line_table: LineOffsetTable,
+    matched: deps_core::MatchedSpans,
+    budget: deps_core::DependencyBudget,
+    resolver: IdResolver<'a>,
+    dependencies: Vec<SwiftDependency>,
+}
+
+impl ScanState<'_> {
+    /// Captures `content`/`line_table` so passes only hand over byte spans.
+    fn range(&self, span: &std::ops::Range<usize>) -> Range {
+        byte_span_to_range(self.content, &self.line_table, span.start, span.end)
+    }
+
+    /// Takes one dependency from the budget; a denied match is still claimed so no later pass
+    /// re-reads it.
+    fn admit(&mut self, full: &std::ops::Range<usize>) -> bool {
+        let allowed = self.budget.allow();
+        if !allowed {
+            self.matched.insert(full.clone());
+        }
+        allowed
+    }
+
+    fn push(&mut self, full: std::ops::Range<usize>, dependency: SwiftDependency) {
+        self.dependencies.push(dependency);
+        self.matched.insert(full);
+    }
+
+    /// Scans a registry form (`url:` or `id:` head) whose requirement `pin` extracts.
+    fn scan_versioned<'h>(
+        &mut self,
+        captures: impl Iterator<Item = regex::Captures<'h>>,
+        pin: PinForm,
+    ) {
+        let content = self.content;
+        for cap in captures {
+            let full = required(cap.get(0), content).span;
+            if self.matched.contains(&full) {
+                continue;
+            }
+            let Some((url_span, location)) = locate(&cap, content) else {
+                self.matched.insert(full);
+                continue;
+            };
+            let pin = pin(&cap, content);
+            if !self.admit(&full) {
+                continue;
+            }
+            let name_range = self.range(&url_span);
+            let (name, source, origin) =
+                resolve_registry_source(location, name_range, &mut self.resolver);
+            let dependency = SwiftDependency {
+                name: name.into(),
+                name_range,
+                version_req: Some(pin.version_req.into()),
+                version_range: Some(self.range(&pin.span)),
+                version_literal: pin.literal,
+                url: location.url().to_string(),
+                source,
+                requirement_form: SwiftRequirementForm::Version,
+                origin,
+            };
+            self.push(full, dependency);
+        }
+    }
+
+    /// Scans a `url:` form pinned to a branch or revision (group 1 is the URL, group 2 the ref).
+    fn scan_url_ref<'h>(
+        &mut self,
+        captures: impl Iterator<Item = regex::Captures<'h>>,
+        form: SwiftRequirementForm,
+    ) {
+        let content = self.content;
+        for cap in captures {
+            let full = required(cap.get(0), content).span;
+            if self.matched.contains(&full) {
+                continue;
+            }
+            let url = required(cap.get(1), content);
+            let git_ref = required(cap.get(2), content);
+            let identity = url_to_identity(url.text).unwrap_or_else(|| url.text.to_string());
+            if !self.admit(&full) {
+                continue;
+            }
+            let dependency = SwiftDependency {
+                name: identity.into(),
+                name_range: self.range(&url.span),
+                version_req: None,
+                version_range: None,
+                version_literal: None,
+                url: url.text.to_string(),
+                source: DependencySource::Git {
+                    url: url.text.to_string(),
+                    rev: Some(git_ref.text.to_string()),
+                },
+                requirement_form: form,
+                origin: SwiftOrigin::Declared,
+            };
+            self.push(full, dependency);
+        }
+    }
+
+    /// Scans `.package(path: "...")`.
+    fn scan_path<'h>(&mut self, captures: impl Iterator<Item = regex::Captures<'h>>) {
+        let content = self.content;
+        for cap in captures {
+            let full = required(cap.get(0), content).span;
+            if self.matched.contains(&full) {
+                continue;
+            }
+            let path = required(cap.get(1), content);
+            let name = std::path::Path::new(path.text)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path.text)
+                .to_string();
+            if !self.admit(&full) {
+                continue;
+            }
+            let dependency = SwiftDependency {
+                name: name.into(),
+                name_range: self.range(&path.span),
+                version_req: None,
+                version_range: None,
+                version_literal: None,
+                url: String::new(),
+                source: DependencySource::Path {
+                    path: path.text.to_string(),
+                },
+                requirement_form: SwiftRequirementForm::Path,
+                origin: SwiftOrigin::Declared,
+            };
+            self.push(full, dependency);
+        }
+    }
+}
+
 fn parse_with_resolver(
     content: &str,
     uri: &Url,
-    mut resolver: IdResolver<'_>,
+    resolver: IdResolver<'_>,
 ) -> Result<SwiftParseResult> {
+    // Offsets taken on `stripped` map straight back to `content`: stripping only replaces with
+    // spaces (same byte length).
     let stripped = strip_comments(content);
-    let line_table = LineOffsetTable::new(content);
-    let mut dependencies = Vec::new();
-
-    // Captures `content`/`line_table` so call sites only pass byte start/end offsets.
-    let make_range = |start: usize, end: usize| -> Range {
-        byte_span_to_range(content, &line_table, start, end)
+    let mut state = ScanState {
+        content,
+        line_table: LineOffsetTable::new(content),
+        matched: deps_core::MatchedSpans::default(),
+        budget: deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT),
+        resolver,
+        dependencies: Vec::new(),
     };
 
-    // Find the byte offset of a capture within the stripped content
-    // and map back to original content for position calculation.
-    // Since stripping only replaces with spaces (same byte length), offsets match.
-
-    let mut matched = deps_core::MatchedSpans::default();
-    // Shared across all 9 pin-form passes below (#796) — the ceiling is per-document, not
-    // per-form.
-    let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
-
     // 1. .package(url:|id: "...", .upToNextMajor(from: "..."))
-    for cap in RE_UP_TO_NEXT_MAJOR.captures_iter(&stripped) {
-        let full = cap.get(0).unwrap();
-        if matched.contains(&(full.start()..full.end())) {
-            continue;
-        }
-        let Some((url_span, location)) = locate(&cap, content) else {
-            matched.insert(full.start()..full.end());
-            continue;
-        };
-        let ver = cap.name("ver").unwrap();
-
-        let ver_str = &content[ver.start()..ver.end()];
-
-        let parts: Vec<&str> = ver_str.splitn(3, '.').collect();
-        let major = parts.first().copied().unwrap_or("0");
-        let version_req = format!(">={ver_str}, <{}.0.0", next_major(major));
-
-        if !budget.allow() {
-            matched.insert(full.start()..full.end());
-            continue;
-        }
-        let name_range = make_range(url_span.start, url_span.end);
-        let (name, source, origin) = resolve_registry_source(location, name_range, &mut resolver);
-        dependencies.push(SwiftDependency {
-            name: name.into(),
-            name_range,
-            version_req: Some(version_req.into()),
-            version_range: Some(make_range(ver.start(), ver.end())),
-            version_literal: Some(ver_str.to_string()),
-            url: location.url().to_string(),
-            source,
-            requirement_form: SwiftRequirementForm::Version,
-            origin,
-        });
-        matched.insert(full.start()..full.end());
-    }
-
+    state.scan_versioned(
+        RE_UP_TO_NEXT_MAJOR.captures_iter(&stripped),
+        up_to_next_major_pin,
+    );
     // 2. .package(url:|id: "...", .upToNextMinor(from: "..."))
-    for cap in RE_UP_TO_NEXT_MINOR.captures_iter(&stripped) {
-        let full = cap.get(0).unwrap();
-        if matched.contains(&(full.start()..full.end())) {
-            continue;
-        }
-        let Some((url_span, location)) = locate(&cap, content) else {
-            matched.insert(full.start()..full.end());
-            continue;
-        };
-        let ver = cap.name("ver").unwrap();
-
-        let ver_str = &content[ver.start()..ver.end()];
-
-        let parts: Vec<&str> = ver_str.splitn(3, '.').collect();
-        let major = parts.first().copied().unwrap_or("0");
-        let minor = parts.get(1).copied().unwrap_or("0");
-        let version_req = format!(">={ver_str}, <{}", next_minor(major, minor));
-
-        if !budget.allow() {
-            matched.insert(full.start()..full.end());
-            continue;
-        }
-        let name_range = make_range(url_span.start, url_span.end);
-        let (name, source, origin) = resolve_registry_source(location, name_range, &mut resolver);
-        dependencies.push(SwiftDependency {
-            name: name.into(),
-            name_range,
-            version_req: Some(version_req.into()),
-            version_range: Some(make_range(ver.start(), ver.end())),
-            version_literal: Some(ver_str.to_string()),
-            url: location.url().to_string(),
-            source,
-            requirement_form: SwiftRequirementForm::Version,
-            origin,
-        });
-        matched.insert(full.start()..full.end());
-    }
-
+    state.scan_versioned(
+        RE_UP_TO_NEXT_MINOR.captures_iter(&stripped),
+        up_to_next_minor_pin,
+    );
     // 3. .package(url: "...", .exact("...")) / exact: "..."
-    for cap in RE_EXACT
-        .captures_iter(&stripped)
-        .chain(RE_EXACT_LABELLED.captures_iter(&stripped))
-    {
-        let full = cap.get(0).unwrap();
-        if matched.contains(&(full.start()..full.end())) {
-            continue;
-        }
-        let Some((url_span, location)) = locate(&cap, content) else {
-            matched.insert(full.start()..full.end());
-            continue;
-        };
-        let ver = cap.name("ver").unwrap();
-
-        let ver_str = &content[ver.start()..ver.end()];
-
-        let version_req = format!("={ver_str}");
-
-        if !budget.allow() {
-            matched.insert(full.start()..full.end());
-            continue;
-        }
-        let name_range = make_range(url_span.start, url_span.end);
-        let (name, source, origin) = resolve_registry_source(location, name_range, &mut resolver);
-        dependencies.push(SwiftDependency {
-            name: name.into(),
-            name_range,
-            version_req: Some(version_req.into()),
-            version_range: Some(make_range(ver.start(), ver.end())),
-            version_literal: Some(ver_str.to_string()),
-            url: location.url().to_string(),
-            source,
-            requirement_form: SwiftRequirementForm::Version,
-            origin,
-        });
-        matched.insert(full.start()..full.end());
-    }
-
+    state.scan_versioned(
+        RE_EXACT
+            .captures_iter(&stripped)
+            .chain(RE_EXACT_LABELLED.captures_iter(&stripped)),
+        exact_pin,
+    );
     // 4. .package(url: "...", "lower"..<"upper")
-    for cap in RE_RANGE_HALF_OPEN.captures_iter(&stripped) {
-        let full = cap.get(0).unwrap();
-        if matched.contains(&(full.start()..full.end())) {
-            continue;
-        }
-        let Some((url_span, location)) = locate(&cap, content) else {
-            matched.insert(full.start()..full.end());
-            continue;
-        };
-        let lower = cap.name("lower").unwrap();
-        let upper = cap.name("upper").unwrap();
-
-        let lower_str = &content[lower.start()..lower.end()];
-        let upper_str = &content[upper.start()..upper.end()];
-
-        let version_req = format!(">={lower_str}, <{upper_str}");
-
-        if !budget.allow() {
-            matched.insert(full.start()..full.end());
-            continue;
-        }
-        let name_range = make_range(url_span.start, url_span.end);
-        let (name, source, origin) = resolve_registry_source(location, name_range, &mut resolver);
-        dependencies.push(SwiftDependency {
-            name: name.into(),
-            name_range,
-            version_req: Some(version_req.into()),
-            version_range: Some(make_range(lower.start(), lower.end())),
-            // Deliberately `None`, unlike every other registry form: `version_range` spans
-            // only the lower bound of a two-literal range, so reporting it as the literal
-            // would let the guard pass and the edit rewrite the lower bound alone,
-            // inverting the range (e.g. `"1.0.0"..<"2.0.0"` -> `"3.5.0"..<"2.0.0"`) — SwiftPM
-            // traps on `lowerBound > upperBound`, corrupting the whole manifest (#367 C1).
-            // `None` keeps this form fail-closed, matching pre-fix behavior.
-            version_literal: None,
-            url: location.url().to_string(),
-            source,
-            requirement_form: SwiftRequirementForm::Version,
-            origin,
-        });
-        matched.insert(full.start()..full.end());
-    }
-
+    state.scan_versioned(
+        RE_RANGE_HALF_OPEN.captures_iter(&stripped),
+        half_open_range_pin,
+    );
     // 5. .package(url: "...", "lower"..."upper")
-    for cap in RE_RANGE_CLOSED.captures_iter(&stripped) {
-        let full = cap.get(0).unwrap();
-        if matched.contains(&(full.start()..full.end())) {
-            continue;
-        }
-        let Some((url_span, location)) = locate(&cap, content) else {
-            matched.insert(full.start()..full.end());
-            continue;
-        };
-        let lower = cap.name("lower").unwrap();
-        let upper = cap.name("upper").unwrap();
-
-        let lower_str = &content[lower.start()..lower.end()];
-        let upper_str = &content[upper.start()..upper.end()];
-
-        let version_req = format!(">={lower_str}, <={upper_str}");
-
-        if !budget.allow() {
-            matched.insert(full.start()..full.end());
-            continue;
-        }
-        let name_range = make_range(url_span.start, url_span.end);
-        let (name, source, origin) = resolve_registry_source(location, name_range, &mut resolver);
-        dependencies.push(SwiftDependency {
-            name: name.into(),
-            name_range,
-            version_req: Some(version_req.into()),
-            version_range: Some(make_range(lower.start(), lower.end())),
-            // See the half-open range form above (#367 C1): `version_range` spans only
-            // the lower bound, so reporting it as the literal would let the guard rewrite
-            // the lower bound alone and invert the range.
-            version_literal: None,
-            url: location.url().to_string(),
-            source,
-            requirement_form: SwiftRequirementForm::Version,
-            origin,
-        });
-        matched.insert(full.start()..full.end());
-    }
-
+    state.scan_versioned(RE_RANGE_CLOSED.captures_iter(&stripped), closed_range_pin);
     // 6. .package(url: "...", from: "...")
-    for cap in RE_FROM.captures_iter(&stripped) {
-        let full = cap.get(0).unwrap();
-        if matched.contains(&(full.start()..full.end())) {
-            continue;
-        }
-        let Some((url_span, location)) = locate(&cap, content) else {
-            matched.insert(full.start()..full.end());
-            continue;
-        };
-        let ver = cap.name("ver").unwrap();
-
-        let ver_str = &content[ver.start()..ver.end()];
-
-        let version_req = format!(">={ver_str}, <{}.0.0", next_major(ver_str));
-
-        if !budget.allow() {
-            matched.insert(full.start()..full.end());
-            continue;
-        }
-        let name_range = make_range(url_span.start, url_span.end);
-        let (name, source, origin) = resolve_registry_source(location, name_range, &mut resolver);
-        dependencies.push(SwiftDependency {
-            name: name.into(),
-            name_range,
-            version_req: Some(version_req.into()),
-            version_range: Some(make_range(ver.start(), ver.end())),
-            version_literal: Some(ver_str.to_string()),
-            url: location.url().to_string(),
-            source,
-            requirement_form: SwiftRequirementForm::Version,
-            origin,
-        });
-        matched.insert(full.start()..full.end());
-    }
-
+    state.scan_versioned(RE_FROM.captures_iter(&stripped), from_pin);
     // 7. .package(url: "...", .branch("...")) / branch: "..."
-    for cap in RE_URL_BRANCH
-        .captures_iter(&stripped)
-        .chain(RE_URL_BRANCH_LABELLED.captures_iter(&stripped))
-    {
-        let full = cap.get(0).unwrap();
-        if matched.contains(&(full.start()..full.end())) {
-            continue;
-        }
-        let url = cap.get(1).unwrap();
-        let branch = cap.get(2).unwrap();
-
-        let url_str = &content[url.start()..url.end()];
-        let branch_str = &content[branch.start()..branch.end()];
-
-        let identity = url_to_identity(url_str).unwrap_or_else(|| url_str.to_string());
-
-        if !budget.allow() {
-            matched.insert(full.start()..full.end());
-            continue;
-        }
-        dependencies.push(SwiftDependency {
-            name: identity.into(),
-            name_range: make_range(url.start(), url.end()),
-            version_req: None,
-            version_range: None,
-            version_literal: None,
-            url: url_str.to_string(),
-            source: DependencySource::Git {
-                url: url_str.to_string(),
-                rev: Some(branch_str.to_string()),
-            },
-            requirement_form: SwiftRequirementForm::Branch,
-            origin: SwiftOrigin::Declared,
-        });
-        matched.insert(full.start()..full.end());
-    }
-
+    state.scan_url_ref(
+        RE_URL_BRANCH
+            .captures_iter(&stripped)
+            .chain(RE_URL_BRANCH_LABELLED.captures_iter(&stripped)),
+        SwiftRequirementForm::Branch,
+    );
     // 8. .package(url: "...", .revision("...")) / revision: "..."
-    for cap in RE_URL_REVISION
-        .captures_iter(&stripped)
-        .chain(RE_URL_REVISION_LABELLED.captures_iter(&stripped))
-    {
-        let full = cap.get(0).unwrap();
-        if matched.contains(&(full.start()..full.end())) {
-            continue;
-        }
-        let url = cap.get(1).unwrap();
-        let rev = cap.get(2).unwrap();
-
-        let url_str = &content[url.start()..url.end()];
-        let rev_str = &content[rev.start()..rev.end()];
-
-        let identity = url_to_identity(url_str).unwrap_or_else(|| url_str.to_string());
-
-        if !budget.allow() {
-            matched.insert(full.start()..full.end());
-            continue;
-        }
-        dependencies.push(SwiftDependency {
-            name: identity.into(),
-            name_range: make_range(url.start(), url.end()),
-            version_req: None,
-            version_range: None,
-            version_literal: None,
-            url: url_str.to_string(),
-            source: DependencySource::Git {
-                url: url_str.to_string(),
-                rev: Some(rev_str.to_string()),
-            },
-            requirement_form: SwiftRequirementForm::Revision,
-            origin: SwiftOrigin::Declared,
-        });
-        matched.insert(full.start()..full.end());
-    }
-
+    state.scan_url_ref(
+        RE_URL_REVISION
+            .captures_iter(&stripped)
+            .chain(RE_URL_REVISION_LABELLED.captures_iter(&stripped)),
+        SwiftRequirementForm::Revision,
+    );
     // 9. .package(path: "...")
-    for cap in RE_PATH.captures_iter(&stripped) {
-        let full = cap.get(0).unwrap();
-        if matched.contains(&(full.start()..full.end())) {
-            continue;
-        }
-        let path = cap.get(1).unwrap();
-        let path_str = &content[path.start()..path.end()];
-
-        let name = std::path::Path::new(path_str)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(path_str)
-            .to_string();
-
-        if !budget.allow() {
-            matched.insert(full.start()..full.end());
-            continue;
-        }
-        dependencies.push(SwiftDependency {
-            name: name.into(),
-            name_range: make_range(path.start(), path.end()),
-            version_req: None,
-            version_range: None,
-            version_literal: None,
-            url: String::new(),
-            source: DependencySource::Path {
-                path: path_str.to_string(),
-            },
-            requirement_form: SwiftRequirementForm::Path,
-            origin: SwiftOrigin::Declared,
-        });
-        matched.insert(full.start()..full.end());
-    }
+    state.scan_path(RE_PATH.captures_iter(&stripped));
 
     Ok(SwiftParseResult {
-        dependencies,
+        dependencies: state.dependencies,
         uri: uri.clone(),
-        dependency_truncation: budget.truncation(),
-        resolved_registries: resolver.used,
-        blocked_registries: resolver.blocked,
-        rejected_registries: resolver.rejected,
+        dependency_truncation: state.budget.truncation(),
+        resolved_registries: state.resolver.used,
+        blocked_registries: state.resolver.blocked,
+        rejected_registries: state.resolver.rejected,
     })
 }
 

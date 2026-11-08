@@ -9,6 +9,7 @@ use deps_core::lsp_helpers::{
     PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
 };
 use deps_core::osv::{NonPublicRoute, OsvPackageName};
+use deps_core::{NarrowDependency, OwnDependency};
 use pep440_rs::{Operator, Version, VersionSpecifiers};
 use std::str::FromStr;
 
@@ -44,6 +45,10 @@ impl RequirementMatcher for Pep440Matcher {
 
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for PyPI.
 pub struct PypiFormatter;
+
+impl OwnDependency for PypiFormatter {
+    type Dep = PypiDependency;
+}
 
 impl PackageNaming for PypiFormatter {
     fn normalized_spelling(&self, name: &PackageName) -> String {
@@ -270,9 +275,8 @@ impl OsvNaming for PypiFormatter {
     /// unverified mirror; extras, public-containing chains and named sources stay silent
     /// (#1947).
     fn non_public_route(&self, dep: &dyn Dependency) -> NonPublicRoute {
-        let route = dep
-            .as_any()
-            .downcast_ref::<PypiDependency>()
+        let route = self
+            .own_dependency(dep)
             .and_then(PypiDependency::index_route);
         match route {
             Some(PypiIndexRoute::ReplacesPublic) => NonPublicRoute::UnverifiedMirror,

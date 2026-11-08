@@ -17,7 +17,8 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
-    Dependency, Ecosystem, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
+    Ecosystem, HttpCache, NarrowDependency, NarrowParseResult, OwnParseResult,
+    ParseResult as ParseResultTrait, Registry, Result,
     diagnostic::{Diagnostic, DiagnosticKind, GitTagsPlatform, Severity},
     lsp_helpers::{
         CommentCheck, EcosystemFormatter, MAX_DIAGNOSTIC_VALUE_CHARS, UnknownRefTarget,
@@ -38,7 +39,9 @@ use crate::host::GitlabInstanceHost;
 use crate::host::is_valid_gitlab_coordinate;
 use crate::registry::GitlabCiRegistry;
 use crate::registry::{HostProbePlan, project_path_from_name};
-use crate::types::{EndpointKind, GitlabCiDependency, HostRef, IncludeKind, PinStyle};
+use crate::types::{
+    EndpointKind, GitlabCiDependency, GitlabCiParseResult, HostRef, IncludeKind, PinStyle,
+};
 use deps_core::lsp_helpers::{ProbePhase, ProbePlan, ProbeReport};
 use std::collections::HashMap;
 
@@ -103,11 +106,10 @@ enum ShaPinQuickfixKind {
     DynamicComponentPin,
 }
 
-/// Classifies `dep`/`gl_dep`'s pin against the two quickfix builders' own guards, so
+/// Classifies `gl_dep`'s pin against the two quickfix builders' own guards, so
 /// message construction and quickfix dispatch read from one place instead of maintaining
 /// two independent guards that can drift (issue #643).
 fn sha_pin_quickfix_kind(
-    dep: &dyn deps_core::Dependency,
     gl_dep: &GitlabCiDependency,
     formatter: &GitlabCiFormatter,
 ) -> Option<ShaPinQuickfixKind> {
@@ -120,13 +122,14 @@ fn sha_pin_quickfix_kind(
     match &gl_dep.pin {
         Some(PinStyle::Tag) => Some(ShaPinQuickfixKind::StaticTagIndex),
         Some(PinStyle::Latest | PinStyle::Partial) if gl_dep.kind == IncludeKind::Component => {
-            let deps_core::parser::DependencySource::AlternateRegistry { index, .. } = dep.source()
+            let deps_core::parser::DependencySource::AlternateRegistry { index, .. } =
+                &gl_dep.source
             else {
                 return None;
             };
             formatter
                 .routes
-                .contains_key(&index)
+                .contains_key(index)
                 .then_some(ShaPinQuickfixKind::DynamicComponentPin)
         }
         _ => None,
@@ -186,6 +189,10 @@ impl GitlabCiEcosystem {
 }
 
 impl deps_core::ecosystem::private::Sealed for GitlabCiEcosystem {}
+
+impl OwnParseResult for GitlabCiEcosystem {
+    type Parsed = GitlabCiParseResult;
+}
 
 impl Ecosystem for GitlabCiEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
@@ -270,7 +277,12 @@ impl Ecosystem for GitlabCiEcosystem {
         phase: ProbePhase,
     ) -> deps_core::ecosystem::BoxFuture<'a, ProbeReport> {
         let plans = (phase == ProbePhase::PostFetch)
-            .then(|| probe_plans(&self.registry, &self.formatter, parse_result))
+            .then(|| {
+                self.own_parse_result(parse_result)
+                    .map_or_else(Vec::new, |parsed| {
+                        probe_plans(&self.registry, &self.formatter, &parsed.dependencies)
+                    })
+            })
             .filter(|plans| !plans.is_empty());
         Box::pin(async move {
             match plans {
@@ -325,18 +337,12 @@ impl Ecosystem for GitlabCiEcosystem {
             // — is never reached in the first place. This local check is kept as explicit
             // defense-in-depth (and as FR-011's literal specification), not as the
             // load-bearing gate.
-            if dep
-                .as_any()
-                .downcast_ref::<GitlabCiDependency>()
-                .is_some_and(|gl_dep| gl_dep.is_alias_occurrence)
-            {
+            let gl_dep = self.formatter.own_dependency(dep);
+            if gl_dep.is_some_and(|gl_dep| gl_dep.is_alias_occurrence) {
                 return Completions::default();
             }
 
-            if dep
-                .as_any()
-                .downcast_ref::<GitlabCiDependency>()
-                .is_some_and(|gl_dep| position_in_sha_comment(gl_dep, request.position.into()))
+            if gl_dep.is_some_and(|gl_dep| position_in_sha_comment(gl_dep, request.position.into()))
             {
                 return Completions::default();
             }
@@ -382,20 +388,23 @@ impl Ecosystem for GitlabCiEcosystem {
                 severities,
                 deps_core::PublishTime::now(),
             );
-            diagnostics.extend(unresolved_host_diagnostics(parse_result));
+            let Some(parsed) = self.own_parse_result(parse_result) else {
+                return diagnostics;
+            };
+            diagnostics.extend(unresolved_host_diagnostics(&parsed.dependencies));
             diagnostics.extend(sha_comment_mismatch_diagnostics(
-                parse_result,
+                &parsed.dependencies,
                 severities.sha_comment_mismatch,
                 &self.formatter,
             ));
             diagnostics.extend(unknown_ref_diagnostics(
-                parse_result,
+                &parsed.dependencies,
                 severities.unknown_ref,
-                |dep| tag_pin_target(&self.formatter, dep),
+                |gl_dep| unknown_ref_target(&self.formatter, gl_dep),
             ));
             if severities.mutable_ref_pin_enabled {
                 diagnostics.extend(mutable_ref_pin_diagnostics(
-                    parse_result,
+                    &parsed.dependencies,
                     severities.mutable_ref_pin,
                     &self.formatter,
                 ));
@@ -441,27 +450,26 @@ impl Ecosystem for GitlabCiEcosystem {
                 uri,
                 &self.formatter,
             ));
-            actions.extend(build_sha_comment_fix_action(
-                parse_result,
-                position,
-                uri,
-                &self.formatter,
-            ));
+            let parsed = self.own_parse_result(parse_result);
+            actions.extend(parsed.and_then(|parsed| {
+                build_sha_comment_fix_action(parsed, position, uri, &self.formatter)
+            }));
             actions.extend(build_unknown_ref_fix_action(
                 parse_result,
                 position,
                 uri,
                 &self.formatter,
             ));
-            if let Some(action) = build_dynamic_component_pin_action(
-                parse_result,
-                position,
-                uri,
-                &self.formatter,
-                self.registry.as_ref(),
-                versions,
-            )
-            .await
+            if let Some(parsed) = parsed
+                && let Some(action) = build_dynamic_component_pin_action(
+                    parsed,
+                    position,
+                    uri,
+                    &self.formatter,
+                    self.registry.as_ref(),
+                    versions,
+                )
+                .await
             {
                 actions.push(action);
             }
@@ -494,15 +502,14 @@ impl Ecosystem for GitlabCiEcosystem {
             .await;
             let mut hover = base_hover?;
 
-            let dep = parse_result.dependencies().into_iter().find(|d| {
-                deps_core::position_in_range(position.into(), d.name_range())
-                    || d.version_range()
-                        .is_some_and(|r| deps_core::position_in_range(position.into(), r))
-            });
-            let Some(dep) = dep else {
+            let Some(parsed) = self.own_parse_result(parse_result) else {
                 return Some(hover);
             };
-            let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
+            let Some(gl_dep) = parsed.dependencies.iter().find(|d| {
+                deps_core::position_in_range(position.into(), d.name_range)
+                    || d.version_range
+                        .is_some_and(|r| deps_core::position_in_range(position.into(), r))
+            }) else {
                 return Some(hover);
             };
 
@@ -517,7 +524,7 @@ impl Ecosystem for GitlabCiEcosystem {
             if let Some(sha) = gl_dep.pinned_sha()
                 && let Some(resolved_tag) =
                     self.formatter
-                        .resolved_tag_for_sha(gl_dep.kind.endpoint(), dep.name(), sha)
+                        .resolved_tag_for_sha(gl_dep.kind.endpoint(), &gl_dep.name, sha)
             {
                 hover.rewrite_markdown(|md| {
                     deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, sha)
@@ -537,7 +544,7 @@ impl Ecosystem for GitlabCiEcosystem {
             // no extra fetch needed) or `Tag`/`Branch` (whose text either is or isn't the
             // version). Resolving it needs the priority ladder run against the project's
             // published releases.
-            let dep_source = dep.source();
+            let dep_source = gl_dep.source.clone();
             if gl_dep.kind == IncludeKind::Component
                 && let Some(pin @ (PinStyle::Latest | PinStyle::Partial)) = &gl_dep.pin
                 && let Some(route) = registry.route(&dep_source)
@@ -548,11 +555,11 @@ impl Ecosystem for GitlabCiEcosystem {
             {
                 let outcome = await_interactive_fetch(
                     registry.as_ref(),
-                    registry.resolve_component_pin(dep.name(), &route, pin, raw),
+                    registry.resolve_component_pin(&gl_dep.name, &route, pin, raw),
                     InteractiveFetchRequest::for_dependency(
                         versions,
                         parse_result.uri(),
-                        dep,
+                        gl_dep,
                         &self.formatter,
                         FetchContext::Hover,
                     ),
@@ -609,7 +616,10 @@ impl Ecosystem for GitlabCiEcosystem {
         parse_result: &dyn ParseResultTrait,
         versions: deps_core::VersionData<'_>,
     ) -> Vec<TextEdit> {
-        collect_pin_all_to_sha_edits(parse_result, &self.formatter, versions)
+        self.own_parse_result(parse_result)
+            .map_or_else(Vec::new, |parsed| {
+                collect_pin_all_to_sha_edits(&parsed.dependencies, &self.formatter, versions)
+            })
     }
 
     // `pin_all_to_sha_noun` is deliberately left at the trait default (`{"ref", "refs"}`,
@@ -618,7 +628,7 @@ impl Ecosystem for GitlabCiEcosystem {
     // the default.
 }
 
-fn unresolved_host_diagnostics(parse_result: &dyn ParseResultTrait) -> Vec<Diagnostic> {
+fn unresolved_host_diagnostics(dependencies: &[GitlabCiDependency]) -> Vec<Diagnostic> {
     // #1254: redact before sanitizing/truncating so a credential can't survive a cut.
     let redact_and_sanitize = |s: &str| {
         sanitize_and_truncate_for_diagnostic(
@@ -626,11 +636,9 @@ fn unresolved_host_diagnostics(parse_result: &dyn ParseResultTrait) -> Vec<Diagn
             MAX_UNRESOLVED_HOST_MESSAGE_VALUE_CHARS,
         )
     };
-    parse_result
-        .dependencies()
-        .into_iter()
-        .filter_map(|dep| {
-            let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
+    dependencies
+        .iter()
+        .filter_map(|gl_dep| {
             // M-a (#466 review): a capacity refusal gets its own message — the host itself
             // was perfectly determinable, so telling the user to set
             // `registries.gitlab_instance_host` (a fix for `Unresolved`, not this) would be
@@ -689,15 +697,13 @@ fn unresolved_host_diagnostics(parse_result: &dyn ParseResultTrait) -> Vec<Diagn
 /// this message and that dispatch cannot independently drift apart again (issue #643).
 /// `PinStyle::Sha` and an *unconfirmed* `PinStyle::Branch` produce no diagnostic at all.
 fn mutable_ref_pin_diagnostics(
-    parse_result: &dyn ParseResultTrait,
+    dependencies: &[GitlabCiDependency],
     severity: Severity,
     formatter: &GitlabCiFormatter,
 ) -> Vec<Diagnostic> {
-    parse_result
-        .dependencies()
-        .into_iter()
-        .filter_map(|dep| {
-            let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
+    dependencies
+        .iter()
+        .filter_map(|gl_dep| {
             let name = deps_core::lsp_helpers::redact_name_for_diagnostic(&gl_dep.name);
             let noun = match gl_dep.kind {
                 IncludeKind::Project => "project",
@@ -749,7 +755,7 @@ fn mutable_ref_pin_diagnostics(
             // by design); a registry-confirmed `PinStyle::Branch` always classifies `None`
             // (`build_sha_pin_action` stays restricted to `Tag` only, C2/#551 branch/tag
             // name-collision risk), so its message always carries the suffix.
-            let has_quickfix = sha_pin_quickfix_kind(dep, gl_dep, formatter).is_some();
+            let has_quickfix = sha_pin_quickfix_kind(gl_dep, formatter).is_some();
             let manual_edit_suffix = if has_quickfix {
                 ""
             } else {
@@ -803,15 +809,13 @@ fn position_in_sha_comment(
 /// names a different commit than the pinned SHA; silent for a confirmed, absent or
 /// unverifiable (cold or truncated index) comment.
 fn sha_comment_mismatch_diagnostics(
-    parse_result: &dyn ParseResultTrait,
+    dependencies: &[GitlabCiDependency],
     severity: Severity,
     formatter: &GitlabCiFormatter,
 ) -> Vec<Diagnostic> {
-    parse_result
-        .dependencies()
-        .into_iter()
-        .filter_map(|dep| {
-            let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
+    dependencies
+        .iter()
+        .filter_map(|gl_dep| {
             let CommentCheck::Mismatch(mismatch) = formatter.sha_comment_check(gl_dep)? else {
                 return None;
             };
@@ -857,13 +861,10 @@ pub(crate) fn unknown_ref_target<'a>(
 fn probe_plans(
     registry: &GitlabCiRegistry,
     formatter: &GitlabCiFormatter,
-    parse_result: &dyn deps_core::ParseResult,
+    dependencies: &[GitlabCiDependency],
 ) -> Vec<HostProbePlan> {
     let mut plans: Vec<HostProbePlan> = Vec::new();
-    for dep in parse_result.dependencies() {
-        let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
-            continue;
-        };
+    for gl_dep in dependencies {
         if gl_dep.kind.endpoint() != EndpointKind::Tags {
             continue;
         }
@@ -905,17 +906,6 @@ fn probe_plans(
         host_plan.plan.push(question);
     }
     plans
-}
-
-/// [`unknown_ref_target`] for a type-erased dependency of this ecosystem.
-fn tag_pin_target<'a>(
-    formatter: &GitlabCiFormatter,
-    dep: &'a dyn Dependency,
-) -> Option<UnknownRefTarget<'a>> {
-    unknown_ref_target(
-        formatter,
-        dep.as_any().downcast_ref::<GitlabCiDependency>()?,
-    )
 }
 
 #[cfg(test)]
@@ -1113,7 +1103,7 @@ mod tests {
             blocked_registries: Vec::new(),
         };
 
-        let diagnostics = unresolved_host_diagnostics(&parse_result);
+        let diagnostics = unresolved_host_diagnostics(&parse_result.dependencies);
 
         assert_eq!(diagnostics.len(), 2);
         assert!(
@@ -1167,7 +1157,7 @@ mod tests {
             blocked_registries: Vec::new(),
         };
 
-        let diagnostics = unresolved_host_diagnostics(&parse_result);
+        let diagnostics = unresolved_host_diagnostics(&parse_result.dependencies);
 
         assert_eq!(diagnostics.len(), 2);
         // Asserts the full sanitized message, not just absence of the bad characters —
@@ -1225,7 +1215,7 @@ mod tests {
             blocked_registries: Vec::new(),
         };
 
-        let diagnostics = unresolved_host_diagnostics(&parse_result);
+        let diagnostics = unresolved_host_diagnostics(&parse_result.dependencies);
 
         assert_eq!(diagnostics.len(), 2);
         for diagnostic in &diagnostics {
@@ -1508,7 +1498,8 @@ mod tests {
             Arc::new(crate::registry::ProjectIndexes::default()),
         );
 
-        let diagnostics = mutable_ref_pin_diagnostics(&parse_result, Severity::Hint, &formatter);
+        let diagnostics =
+            mutable_ref_pin_diagnostics(&parse_result.dependencies, Severity::Hint, &formatter);
 
         let found = diagnostics
             .iter()
@@ -1838,7 +1829,7 @@ mod tests {
         ];
 
         for (label, gl_dep, expect_static, expect_dynamic) in cases {
-            let kind = sha_pin_quickfix_kind(&gl_dep, &gl_dep, &formatter);
+            let kind = sha_pin_quickfix_kind(&gl_dep, &formatter);
             assert_eq!(
                 matches!(kind, Some(ShaPinQuickfixKind::StaticTagIndex)),
                 expect_static,
@@ -1932,7 +1923,7 @@ mod tests {
         );
         let range = deps_core::position::Range::default();
         let gl_dep = alias_dispatch_test_dep(range, range, Some(PinStyle::Tag));
-        assert!(sha_pin_quickfix_kind(&gl_dep, &gl_dep, &formatter).is_none());
+        assert!(sha_pin_quickfix_kind(&gl_dep, &formatter).is_none());
     }
 
     /// FR-010/#643: an alias-occurrence dependency's mutable-ref-pin diagnostic must carry
@@ -2140,7 +2131,7 @@ mod tests {
             let formatter = GitlabCiFormatter::new(Arc::new(DashMap::new()), tag_index);
 
             let diagnostics =
-                mutable_ref_pin_diagnostics(&parse_result, Severity::Hint, &formatter);
+                mutable_ref_pin_diagnostics(&parse_result.dependencies, Severity::Hint, &formatter);
 
             let found = diagnostics
                 .iter()
@@ -2497,7 +2488,7 @@ mod tests {
                 component_pin_test_setup(&server, PinStyle::Latest, "~latest");
 
             let diagnostics =
-                mutable_ref_pin_diagnostics(&parse_result, Severity::Hint, &formatter);
+                mutable_ref_pin_diagnostics(&parse_result.dependencies, Severity::Hint, &formatter);
             let found = diagnostics
                 .iter()
                 .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
@@ -3741,10 +3732,16 @@ mod tests {
         }
 
         impl CommentFixture {
+            fn own(&self) -> &GitlabCiParseResult {
+                self.eco
+                    .own_parse_result(self.parse_result.as_ref())
+                    .unwrap()
+            }
+
             fn pin_all(&self) -> Vec<TextEdit> {
                 let resolved = std::collections::HashMap::new();
                 collect_pin_all_to_sha_edits(
-                    self.parse_result.as_ref(),
+                    &self.own().dependencies,
                     &self.eco.formatter,
                     deps_core::VersionData::new(&self.cached, &resolved),
                 )
@@ -3761,7 +3758,7 @@ mod tests {
 
             fn fix_action(&self, line: u32, column: u32) -> Option<CodeAction> {
                 build_sha_comment_fix_action(
-                    self.parse_result.as_ref(),
+                    self.own(),
                     Position::new(line, column),
                     &self.uri,
                     &self.eco.formatter,

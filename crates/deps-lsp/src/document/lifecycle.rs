@@ -19,17 +19,20 @@ use super::state::{DocumentState, ParseFailure, ServerState, spawn_supervised};
 use super::typosquat::{current_declared_names, run_typosquat_prefetch};
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
-use crate::progress::RegistryProgress;
+use crate::progress::{ProgressSender, RegistryProgress};
 use deps_core::DependencyOutcomes;
 use deps_core::Ecosystem;
 use deps_core::FetchFailure;
 use deps_core::NormalizeName;
 use deps_core::NormalizedName;
+use deps_core::ResolvedCandidatesMap;
 use deps_core::ResolvedVersionsMap;
 use deps_core::Result;
 use deps_core::VersionReq;
 use deps_core::policy_config::{FetchTimeout, OsvChecks};
-use deps_engine::classify::fetch::{fetch_latest_versions_parallel, prepare_fetch};
+use deps_engine::classify::fetch::{
+    FailureSummary, FetchPreparation, FetchResult, fetch_latest_versions_parallel, prepare_fetch,
+};
 use deps_engine::classify::resolved::{
     cached_versions_from_lockfile, dependency_version_map, forget_local_locked_misses,
     load_resolved_versions,
@@ -183,10 +186,6 @@ pub async fn handle_document_open(
               reduce, the parameter list"
 )]
 #[tracing::instrument(skip_all, fields(uri = ?uri, ecosystem = ecosystem.id()))]
-#[expect(
-    clippy::too_many_lines,
-    reason = "open-task phases past 300 lines, split tracked in #1952"
-)]
 async fn run_document_open_background_task(
     uri: Uri,
     state: Arc<ServerState>,
@@ -219,42 +218,13 @@ async fn run_document_open_background_task(
             .await
             .into_maps();
 
-    if !resolved_versions.is_empty()
-        && let Some(mut doc) = state.documents.get_mut(&uri)
-    {
-        doc.update_resolved_versions(
-            resolved_versions.clone(),
-            resolved_version_candidates.clone(),
-            state.next_resolved_versions_generation(),
-        );
-
-        // Use resolved versions as cached versions for instant display,
-        // except for a dependency whose manifest requirement is itself
-        // already the resolved version (Go's `require` lines) — for
-        // those, go.sum can hold a stale, no-longer-selected version
-        // (#235), so seeding it as the "latest" comparison operand would
-        // desync hover/inlay-hint status against the go.mod-accurate
-        // `resolved` value during the cold-open window before the
-        // registry fetch completes (critique S1).
-        let formatter = ecosystem.formatter();
-        let instant_resolved: ResolvedVersionsMap = match doc.parse_result() {
-            Some(parse_result) => {
-                let pinned_by_manifest: HashSet<NormalizedName> = parse_result
-                    .dependencies()
-                    .into_iter()
-                    .filter(|d| formatter.manifest_requirement_is_resolved_version(*d))
-                    .map(|d| formatter.normalize_package_name(d.name()))
-                    .collect();
-                resolved_versions
-                    .iter()
-                    .filter(|(name, _)| !pinned_by_manifest.contains(*name))
-                    .map(|(name, version)| (name.clone(), version.clone()))
-                    .collect()
-            }
-            None => resolved_versions.clone(),
-        };
-        doc.update_cached_versions(cached_versions_from_lockfile(&instant_resolved));
-    }
+    seed_cached_versions_from_lockfile(
+        &uri,
+        &state,
+        ecosystem.as_ref(),
+        &resolved_versions,
+        &resolved_version_candidates,
+    );
 
     // Phase A OSV scan and tier-3 license pre-fetch (issue #660), both spawned so they run
     // concurrently with the registry fetch below rather than gating the inlay-hint refresh
@@ -328,34 +298,21 @@ async fn run_document_open_background_task(
     // `RegistryProgress`'s total. A non-resolvable source is dropped entirely, and two
     // occurrences of the same name resolving to *different* sources are dropped and recorded
     // as collided instead (spec FR-011) — see `prepare_fetch`/`dedup_dependencies_by_source`.
-    let deps_engine::classify::fetch::FetchPreparation {
+    let Some(FetchPreparation {
         dep_sources,
         in_use,
         selection_context,
         collided_names,
         ..
-    } = {
-        let doc = match state.get_document(&uri) {
-            Some(d) => d,
-            None => {
-                tracing::warn!("document not found, aborting fetch");
-                return;
-            }
-        };
-        let parse_result = match doc.parse_result() {
-            Some(p) => p,
-            None => {
-                tracing::warn!("no parse result, aborting fetch");
-                return;
-            }
-        };
-        prepare_fetch(
-            parse_result,
-            ecosystem.formatter(),
-            ecosystem.ecosystem_id(),
-            &resolved_versions,
-            &resolved_version_candidates,
-        )
+    }) = prepare_open_fetch(
+        &uri,
+        &state,
+        ecosystem.as_ref(),
+        &resolved_versions,
+        &resolved_version_candidates,
+    )
+    else {
+        return;
     };
 
     let dep_count = dep_sources.len();
@@ -383,19 +340,8 @@ async fn run_document_open_background_task(
         doc.set_loading();
     }
 
-    let (progress, progress_sender) = if state.supports_progress() {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            RegistryProgress::start(client.clone(), uri.as_str(), dep_sources.len()),
-        )
-        .await
-        {
-            Ok(Ok((p, s))) => (Some(p), Some(s)),
-            _ => (None, None),
-        }
-    } else {
-        (None, None)
-    };
+    let (progress, progress_sender) =
+        start_registry_progress(&state, &client, &uri, dep_sources.len()).await;
 
     tracing::debug!("progress started, fetching versions");
 
@@ -431,7 +377,144 @@ async fn run_document_open_background_task(
         "registry fetch complete"
     );
 
-    if let Some(mut doc) = state.documents.get_mut(&uri) {
+    let failure_summary =
+        commit_open_fetch_result(&state, &uri, fetch_result, collided_names, success);
+
+    finish_after_fetch(
+        progress,
+        success,
+        failure_summary.as_ref(),
+        FetchTail {
+            uri: &uri,
+            state: &state,
+            client: &client,
+            ecosystem: &ecosystem,
+            config: &config,
+            fetch_timeout: diagnostics_snapshot.fetch_timeout,
+            osv_task,
+            license_task,
+            dep_count,
+        },
+    )
+    .await;
+}
+
+/// Opens the registry progress report when the client supports it, bounded by a short timeout
+/// so a slow client cannot stall the fetch.
+async fn start_registry_progress(
+    state: &ServerState,
+    client: &Client,
+    uri: &Uri,
+    dep_count: usize,
+) -> (Option<RegistryProgress>, Option<ProgressSender>) {
+    if !state.supports_progress() {
+        return (None, None);
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        RegistryProgress::start(client.clone(), uri.as_str(), dep_count),
+    )
+    .await
+    {
+        Ok(Ok((progress, sender))) => (Some(progress), Some(sender)),
+        _ => (None, None),
+    }
+}
+
+/// Seeds the lockfile-resolved versions as the document's resolved and cached versions, so
+/// hints render before the registry fetch completes.
+fn seed_cached_versions_from_lockfile(
+    uri: &Uri,
+    state: &ServerState,
+    ecosystem: &dyn Ecosystem,
+    resolved_versions: &ResolvedVersionsMap,
+    resolved_version_candidates: &ResolvedCandidatesMap,
+) {
+    if resolved_versions.is_empty() {
+        return;
+    }
+    let Some(mut doc) = state.documents.get_mut(uri) else {
+        return;
+    };
+    doc.update_resolved_versions(
+        resolved_versions.clone(),
+        resolved_version_candidates.clone(),
+        state.next_resolved_versions_generation(),
+    );
+
+    // Use resolved versions as cached versions for instant display,
+    // except for a dependency whose manifest requirement is itself
+    // already the resolved version (Go's `require` lines) — for
+    // those, go.sum can hold a stale, no-longer-selected version
+    // (#235), so seeding it as the "latest" comparison operand would
+    // desync hover/inlay-hint status against the go.mod-accurate
+    // `resolved` value during the cold-open window before the
+    // registry fetch completes (critique S1).
+    let formatter = ecosystem.formatter();
+    let instant_resolved: ResolvedVersionsMap = match doc.parse_result() {
+        Some(parse_result) => {
+            let pinned_by_manifest: HashSet<NormalizedName> = parse_result
+                .dependencies()
+                .into_iter()
+                .filter(|d| formatter.manifest_requirement_is_resolved_version(*d))
+                .map(|d| formatter.normalize_package_name(d.name()))
+                .collect();
+            resolved_versions
+                .iter()
+                .filter(|(name, _)| !pinned_by_manifest.contains(*name))
+                .map(|(name, version)| (name.clone(), version.clone()))
+                .collect()
+        }
+        None => resolved_versions.clone(),
+    };
+    doc.update_cached_versions(cached_versions_from_lockfile(&instant_resolved));
+}
+
+/// Collects dependency names+sources, the in-use-version map (§4.6), and the manifest's own
+/// `SelectionContext` (#1433) in one pass while holding the reference (can't hold across
+/// await). Deduped by name (critique M3): a duplicated name shares one registry fetch
+/// across all its occurrences — the result is name-keyed anyway (`FetchResult::versions`),
+/// so fetching it more than once would only issue wasted extra registry calls and inflate
+/// `RegistryProgress`'s total. A non-resolvable source is dropped entirely, and two
+/// occurrences of the same name resolving to *different* sources are dropped and recorded
+/// as collided instead (spec FR-011) — see `prepare_fetch`/`dedup_dependencies_by_source`.
+///
+/// `None` when the document or its parse result is gone, which aborts the fetch.
+fn prepare_open_fetch(
+    uri: &Uri,
+    state: &ServerState,
+    ecosystem: &dyn Ecosystem,
+    resolved_versions: &ResolvedVersionsMap,
+    resolved_version_candidates: &ResolvedCandidatesMap,
+) -> Option<FetchPreparation> {
+    let Some(doc) = state.get_document(uri) else {
+        tracing::warn!("document not found, aborting fetch");
+        return None;
+    };
+    let Some(parse_result) = doc.parse_result() else {
+        tracing::warn!("no parse result, aborting fetch");
+        return None;
+    };
+    Some(prepare_fetch(
+        parse_result,
+        ecosystem.formatter(),
+        ecosystem.ecosystem_id(),
+        resolved_versions,
+        resolved_version_candidates,
+    ))
+}
+
+/// Commits a completed open-path registry fetch into the document (cached versions, outcomes,
+/// loading state), then returns `fetch_result.failure_summary`, the one field it does not
+/// consume, so the caller can still raise the fetch-failure toast.
+fn commit_open_fetch_result(
+    state: &ServerState,
+    uri: &Uri,
+    fetch_result: FetchResult,
+    collided_names: HashSet<NormalizedName>,
+    success: bool,
+) -> Option<FailureSummary> {
+    if let Some(mut doc) = state.documents.get_mut(uri) {
         doc.update_cached_versions(fetch_result.versions);
         let mut outcomes = DependencyOutcomes::new();
         for (name, d) in fetch_result.deprecations {
@@ -464,25 +547,57 @@ async fn run_document_open_background_task(
             doc.set_failed();
         }
     }
+    fetch_result.failure_summary
+}
 
+/// What the tail shared by the open and change tasks needs once the registry data is committed.
+struct FetchTail<'a> {
+    uri: &'a Uri,
+    state: &'a Arc<ServerState>,
+    client: &'a Client,
+    ecosystem: &'a Arc<dyn Ecosystem>,
+    config: &'a Arc<RwLock<DepsConfig>>,
+    fetch_timeout: FetchTimeout,
+    osv_task: Option<JoinHandle<Option<OsvScanResult>>>,
+    license_task: Option<JoinHandle<()>>,
+    dep_count: usize,
+}
+
+/// The tail of a task whose registry fetch just committed: refreshes the GOSSIP mismatch
+/// check, closes the progress report, toasts failures, then runs
+/// [`publish_after_prefetches`].
+async fn finish_after_fetch(
+    progress: Option<RegistryProgress>,
+    success: bool,
+    failure_summary: Option<&FailureSummary>,
+    tail: FetchTail<'_>,
+) {
     // Issue #1456, spec 072 FR-011/M21b: detect a GOSSIP version-equality mismatch now that
-    // `cached_versions` reflects this registry fetch's fresh latest — after the `get_mut`
-    // guard above has been dropped, since this call takes its own `with_document`/`get_mut`
-    // guards on potentially the same and other documents.
-    spawn_gossip_mismatch_refetch_if_needed(&uri, &state, &client, &ecosystem, &config);
+    // `cached_versions` reflects this registry fetch's fresh latest — after any `get_mut`
+    // guard on the document has been dropped, since this call takes its own
+    // `with_document`/`get_mut` guards on potentially the same and other documents. `config`
+    // is the live config handle, so the eventual republish re-reads current settings.
+    spawn_gossip_mismatch_refetch_if_needed(
+        tail.uri,
+        tail.state,
+        tail.client,
+        tail.ecosystem,
+        tail.config,
+    );
 
     if let Some(progress) = progress {
         progress.end(success).await;
     }
 
     // Notify user about failed packages — suppressed when offline, see
-    // `fetch_failure_toast`'s docs. `fetch_result.failure_summary` is a single typed value
-    // (issue #1470), so there's no longer a separate count/message pair that can drift out
-    // of sync (#480, #490).
-    let failure_summary = fetch_result.failure_summary.as_ref();
-    match fetch_failure_toast(failure_summary, state.cache.is_offline()) {
+    // `fetch_failure_toast`'s docs. `failure_summary` is a single typed value (issue #1470),
+    // so there's no longer a separate count/message pair that can drift out of sync (#480,
+    // #490).
+    match fetch_failure_toast(failure_summary, tail.state.cache.is_offline()) {
         Some(message) => {
-            client.show_message(MessageType::WARNING, message).await;
+            tail.client
+                .show_message(MessageType::WARNING, message)
+                .await;
         }
         None => {
             if let Some(summary) = failure_summary {
@@ -494,6 +609,23 @@ async fn run_document_open_background_task(
         }
     }
 
+    publish_after_prefetches(tail).await;
+}
+
+/// Refreshes hints, joins the OSV and license pre-fetches, and publishes diagnostics.
+async fn publish_after_prefetches(tail: FetchTail<'_>) {
+    let FetchTail {
+        uri,
+        state,
+        client,
+        ecosystem,
+        config,
+        fetch_timeout,
+        osv_task,
+        license_task,
+        dep_count,
+    } = tail;
+
     // Kick off inlay hint / code lens refresh as soon as loading completes, so
     // clients see updated hints as early as possible — typically before
     // diagnostics, which may take longer due to additional network calls, though
@@ -502,46 +634,38 @@ async fn run_document_open_background_task(
     // client that never declared refresh support, or stops replying, must not
     // hang this task's critical path — including the OSV commit and diagnostics
     // publish below — forever).
-    state.spawn_refresh_requests(&client);
+    state.spawn_refresh_requests(client);
 
-    // Join phase A (already running concurrently since it was spawned
-    // above) and, only now that `cached_versions` holds the registry's
-    // actual latest (not the lockfile-seeded placeholder — critique S1),
-    // run phase B and commit before generating diagnostics.
+    // Join phase A (already running concurrently since it was spawned earlier) and, only now
+    // that `cached_versions` holds the registry's actual latest (not the lockfile-seeded
+    // placeholder — critique S1), run phase B and commit before generating diagnostics.
     await_and_commit_osv_phase_b(
         osv_task,
-        &uri,
-        &state,
-        &client,
+        uri,
+        state,
+        client,
         ecosystem.as_ref(),
-        diagnostics_snapshot.fetch_timeout,
+        fetch_timeout,
     )
     .await;
 
-    // #1556 critic S2: phase A above ran concurrently with (not after) the registry fetch,
-    // so a GitHub Actions/GitLab CI `TagIndex`-dependent resolution can have missed this
-    // fetch's own tags — re-check now that they're warm. No-op unless this ecosystem opts in
-    // and phase A actually left something unresolved.
-    rescan_osv_if_tag_index_now_warm(
-        &uri,
-        &state,
-        &client,
-        &ecosystem,
-        diagnostics_snapshot.fetch_timeout,
-    )
-    .await;
+    // #1556 critic S2: phase A ran concurrently with (not after) any registry fetch, so a
+    // GitHub Actions/GitLab CI `TagIndex`-dependent resolution can have missed that fetch's own
+    // tags — re-check now that they're warm. No-op unless this ecosystem opts in and phase A
+    // actually left something unresolved.
+    rescan_osv_if_tag_index_now_warm(uri, state, client, ecosystem, fetch_timeout).await;
 
     // Join the tier-3 license pre-fetch too (round 3 finding #3), for the same reason:
-    // its commit must land before this publish, not after. The typosquat pre-fetch,
-    // spawned above via `spawn_typosquat_prefetch_and_republish`, is deliberately *not*
-    // joined here (impl-critic N2) — it republishes on its own once it resolves.
+    // its commit must land before this publish, not after. The typosquat pre-fetch is
+    // deliberately *not* joined here (impl-critic N2) — it republishes on its own once it
+    // resolves.
     await_license_prefetch(license_task).await;
 
     // Publish diagnostics (may be slower, runs after hints are already visible)
-    diagnostics::publish_document_diagnostics(&state, &client, &uri, &config, dep_count).await;
+    diagnostics::publish_document_diagnostics(state, client, uri, config, dep_count).await;
 
-    // The fetch populated the tag index the probes need.
-    spawn_background_probes(&state, &uri, &ecosystem);
+    // Any fetch that ran populated the tag index the probes need.
+    spawn_background_probes(state, uri, ecosystem);
 }
 
 /// What caused a parse, which decides whether the pre-fetch probes run before it is committed.
@@ -1254,10 +1378,6 @@ async fn spawn_and_track_gossip(
               this task; bundling it in would just relocate, not reduce, the parameter list"
 )]
 #[tracing::instrument(skip_all, fields(uri = ?uri, ecosystem = ecosystem.id()))]
-#[expect(
-    clippy::too_many_lines,
-    reason = "change-task phases past 300 lines, split tracked in #1952"
-)]
 async fn run_document_change_task(
     uri: Uri,
     state: Arc<ServerState>,
@@ -1295,53 +1415,12 @@ async fn run_document_change_task(
         return;
     };
 
-    // Lock file read is instant and network-free, so it runs before the registry fetch below.
-    // `lockfile_reload_ok` (issue #1407 E1) distinguishes a lock file that genuinely
-    // resolved to nothing (or doesn't apply to this ecosystem) from one that was found
-    // but failed to parse — e.g. caught mid-rewrite by the package manager while this
-    // edit's own change event was in flight. See its use below.
-    let load = load_resolved_versions(&domain_uri, &state.lockfile_cache, ecosystem.as_ref()).await;
-    let lockfile_reload_ok = load.reload_ok();
-    let (resolved_versions, resolved_version_candidates) = load.into_maps();
-
-    // Must not touch cached_versions here — it holds the latest registry versions.
-    //
-    // Issue #1399/#1407 S1: a lock-file rewrite observed here (e.g. a `cargo build`
-    // racing this debounced edit) must trigger an OSV rescan/license refresh even when
-    // the edit itself touches no dependency (`diff_needs_rescan == false`) — mirrors
-    // `server::handle_lockfile_change`'s own drift check for the lock-file-watcher path.
-    // `reload_resolved_versions` (issue #1398/#1399 code review) shares the diff-and-write
-    // sequence with that other call site.
-    //
-    // Gated on `lockfile_reload_ok` alone (issue #1407 R1/E1), not
-    // `!resolved_versions.is_empty()`: `load_resolved_versions` only ever returns `false`
-    // alongside empty maps (a parse failure — e.g. a lock file caught mid-rewrite by the
-    // package manager racing this same debounced edit), so `lockfile_reload_ok` is `true`
-    // whenever the reload was a genuine success — including to zero packages, which
-    // covers Gradle/Deno's permanent no-`LockFileProvider` state and Dart/Swift before
-    // their first resolve (R1: a manifest edit on those ecosystems must still reach
-    // `change_task_triggers` below via `diff_needs_rescan`, not be skipped because there
-    // was never any lock data to diff) — or `resolved_versions` is non-empty (which
-    // itself implies success). Gating on `lockfile_reload_ok` alone therefore both fires
-    // the diff/write on a genuine populated-to-empty transition (a lock file deleted,
-    // `cargo clean`, a VCS checkout mid-edit — `reload_resolved_versions`'s internal
-    // comparison already falls back to each dependency's manifest-declared pin and
-    // detects this correctly) and skips it entirely on an actual parse failure, so a
-    // transient error never wipes known-good `doc.signals.resolved_versions` or bumps the
-    // generation off untrustworthy data (E1 — the exact #1395 M1 failure mode the
-    // watcher path's own `lockfile_reload_ok` already guards against).
+    let ReloadedLockfile {
+        versions: resolved_versions,
+        candidates: resolved_version_candidates,
+        moved: resolved_changed,
+    } = reload_lockfile_for_change(&uri, &state, ecosystem.as_ref(), &domain_uri).await;
     let diff_needs_rescan = needs_osv_rescan;
-    let resolved_changed = if lockfile_reload_ok {
-        reload_resolved_versions(
-            &uri,
-            &state,
-            ecosystem.as_ref(),
-            &resolved_versions,
-            &resolved_version_candidates,
-        )
-    } else {
-        false
-    };
 
     let (needs_osv_rescan, needs_license_refresh) = change_task_triggers(
         ResolvedVersionMove {
@@ -1446,36 +1525,18 @@ async fn run_document_change_task(
             doc.set_loaded();
         }
 
-        // Detached, capability-gated, timeout-bounded (issue #493): see
-        // `ServerState::spawn_refresh_requests` for rationale.
-        state.spawn_refresh_requests(&client);
-
-        await_and_commit_osv_phase_b(
+        publish_after_prefetches(FetchTail {
+            uri: &uri,
+            state: &state,
+            client: &client,
+            ecosystem: &ecosystem,
+            config: &live_config,
+            fetch_timeout: config.diagnostics.fetch_timeout,
             osv_task,
-            &uri,
-            &state,
-            &client,
-            ecosystem.as_ref(),
-            config.diagnostics.fetch_timeout,
-        )
+            license_task,
+            dep_count: 0,
+        })
         .await;
-
-        // #1556 critic S2: no fetch ran on this branch, but a `TagIndex`-dependent
-        // resolution left unresolved by a still-in-flight fetch from elsewhere (e.g. the
-        // document's own initial open) may have warmed since. No-op otherwise.
-        rescan_osv_if_tag_index_now_warm(
-            &uri,
-            &state,
-            &client,
-            &ecosystem,
-            config.diagnostics.fetch_timeout,
-        )
-        .await;
-
-        await_license_prefetch(license_task).await;
-
-        diagnostics::publish_document_diagnostics(&state, &client, &uri, &live_config, 0).await;
-        spawn_background_probes(&state, &uri, &ecosystem);
         return;
     }
 
@@ -1522,63 +1583,87 @@ async fn run_document_change_task(
     );
     drop(fetch_permit);
 
-    // Issue #1456, spec 072 FR-011/M21b: same rationale as the open-path's identical call —
-    // `cached_versions` now reflects this fetch's fresh latest. `live_config`, not
-    // `config: ChangeTaskConfig` (mirrors `spawn_typosquat_prefetch_and_republish`'s own
-    // use of `live_config` for the identical "eventual republish re-reads current
-    // settings" reason).
-    spawn_gossip_mismatch_refetch_if_needed(&uri, &state, &client, &ecosystem, &live_config);
-
-    if let Some(progress) = progress {
-        progress.end(success).await;
-    }
-
-    // Notify user about failed packages — suppressed when offline, see
-    // `fetch_failure_toast`'s docs. `failure_summary` is a single typed value (issue
-    // #1470), so there's no longer a separate count/message pair that can drift out of
-    // sync (#480, #490).
-    match fetch_failure_toast(failure_summary.as_ref(), state.cache.is_offline()) {
-        Some(message) => {
-            client.show_message(MessageType::WARNING, message).await;
-        }
-        None => {
-            if let Some(summary) = &failure_summary {
-                let failed_count = summary.count();
-                tracing::debug!(failed_count, "suppressing fetch-failure toast: offline");
-            }
-        }
-    }
-
-    // Detached, capability-gated, timeout-bounded (issue #493): see
-    // `ServerState::spawn_refresh_requests` for rationale.
-    state.spawn_refresh_requests(&client);
-
-    await_and_commit_osv_phase_b(
-        osv_task,
-        &uri,
-        &state,
-        &client,
-        ecosystem.as_ref(),
-        config.diagnostics.fetch_timeout,
+    finish_after_fetch(
+        progress,
+        success,
+        failure_summary.as_ref(),
+        FetchTail {
+            uri: &uri,
+            state: &state,
+            client: &client,
+            ecosystem: &ecosystem,
+            config: &live_config,
+            fetch_timeout: config.diagnostics.fetch_timeout,
+            osv_task,
+            license_task,
+            dep_count,
+        },
     )
     .await;
+}
 
-    // #1556 critic S2: same re-check as the open path — this branch's own registry fetch
-    // (just above) may have just warmed a `TagIndex`-dependent resolution phase A missed.
-    rescan_osv_if_tag_index_now_warm(
-        &uri,
-        &state,
-        &client,
-        &ecosystem,
-        config.diagnostics.fetch_timeout,
-    )
-    .await;
+/// The lock file's resolved versions as seen by a debounced edit, and whether they moved.
+struct ReloadedLockfile {
+    versions: ResolvedVersionsMap,
+    candidates: ResolvedCandidatesMap,
+    moved: bool,
+}
 
-    await_license_prefetch(license_task).await;
+/// Reloads the lock file for a debounced edit and writes any drift into the document.
+async fn reload_lockfile_for_change(
+    uri: &Uri,
+    state: &ServerState,
+    ecosystem: &dyn Ecosystem,
+    domain_uri: &url::Url,
+) -> ReloadedLockfile {
+    // Lock file read is instant and network-free, so it runs before the registry fetch.
+    // `lockfile_reload_ok` (issue #1407 E1) distinguishes a lock file that genuinely
+    // resolved to nothing (or doesn't apply to this ecosystem) from one that was found
+    // but failed to parse — e.g. caught mid-rewrite by the package manager while this
+    // edit's own change event was in flight. See its use below.
+    let load = load_resolved_versions(domain_uri, &state.lockfile_cache, ecosystem).await;
+    let lockfile_reload_ok = load.reload_ok();
+    let (resolved_versions, resolved_version_candidates) = load.into_maps();
 
-    diagnostics::publish_document_diagnostics(&state, &client, &uri, &live_config, dep_count).await;
-
-    spawn_background_probes(&state, &uri, &ecosystem);
+    // Must not touch cached_versions here — it holds the latest registry versions.
+    //
+    // Issue #1399/#1407 S1: a lock-file rewrite observed here (e.g. a `cargo build`
+    // racing this debounced edit) must trigger an OSV rescan/license refresh even when
+    // the edit itself touches no dependency (`diff_needs_rescan == false`) — mirrors
+    // `server::handle_lockfile_change`'s own drift check for the lock-file-watcher path.
+    // `reload_resolved_versions` (issue #1398/#1399 code review) shares the diff-and-write
+    // sequence with that other call site.
+    //
+    // Gated on `lockfile_reload_ok` alone (issue #1407 R1/E1), not
+    // `!resolved_versions.is_empty()`: `load_resolved_versions` only ever returns `false`
+    // alongside empty maps (a parse failure — e.g. a lock file caught mid-rewrite by the
+    // package manager racing this same debounced edit), so `lockfile_reload_ok` is `true`
+    // whenever the reload was a genuine success — including to zero packages, which
+    // covers Gradle/Deno's permanent no-`LockFileProvider` state and Dart/Swift before
+    // their first resolve (R1: a manifest edit on those ecosystems must still reach
+    // `change_task_triggers` via `diff_needs_rescan`, not be skipped because there
+    // was never any lock data to diff) — or `resolved_versions` is non-empty (which
+    // itself implies success). Gating on `lockfile_reload_ok` alone therefore both fires
+    // the diff/write on a genuine populated-to-empty transition (a lock file deleted,
+    // `cargo clean`, a VCS checkout mid-edit — `reload_resolved_versions`'s internal
+    // comparison already falls back to each dependency's manifest-declared pin and
+    // detects this correctly) and skips it entirely on an actual parse failure, so a
+    // transient error never wipes known-good `doc.signals.resolved_versions` or bumps the
+    // generation off untrustworthy data (E1 — the exact #1395 M1 failure mode the
+    // watcher path's own `lockfile_reload_ok` already guards against).
+    let resolved_changed = lockfile_reload_ok
+        && reload_resolved_versions(
+            uri,
+            state,
+            ecosystem,
+            &resolved_versions,
+            &resolved_version_candidates,
+        );
+    ReloadedLockfile {
+        versions: resolved_versions,
+        candidates: resolved_version_candidates,
+        moved: resolved_changed,
+    }
 }
 
 /// Awaits the concurrently-spawned OSV phase-A scan, if one was started, and — when it

@@ -14,8 +14,8 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
-    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName,
-    lsp_helpers::warn_rejected_value,
+    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, NarrowDependency, OwnDependency,
+    PackageName, lsp_helpers::warn_rejected_value,
 };
 use std::sync::Arc;
 
@@ -93,8 +93,7 @@ impl GithubActionsFormatter {
 
     /// The proof that a commentless SHA pin is ahead of the latest release and on the default
     /// branch, when probes stored both facts.
-    fn commit_proof(&self, dep: &dyn Dependency) -> Option<AheadProof> {
-        let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+    fn commit_proof(&self, gha_dep: &GithubActionsDependency) -> Option<AheadProof> {
         let Some(PinStyle::Sha { sha, comment: None }) = &gha_dep.pin else {
             return None;
         };
@@ -180,7 +179,7 @@ impl deps_core::lsp_helpers::ShaPinning for GithubActionsFormatter {
         &self,
         dep: &dyn Dependency,
     ) -> Option<deps_core::lsp_helpers::ResolvedShaPin> {
-        let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+        let gha_dep = self.own_dependency(dep)?;
         // Shared with `mutable_ref_pin_diagnostics`'s message-branch selection (#1188
         // critic S1/S2): the structural shape gate (`PinStyle::Tag`, `is_plain_scalar`/
         // FR-010, `is_last_on_line`/#633) lives in one ungated place so a diagnostic and
@@ -253,6 +252,10 @@ impl PackageNaming for GithubActionsFormatter {
     }
 }
 
+impl OwnDependency for GithubActionsFormatter {
+    type Dep = GithubActionsDependency;
+}
+
 impl PackageRendering for GithubActionsFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.as_str().to_string()
@@ -264,7 +267,8 @@ impl PackageRendering for GithubActionsFormatter {
         &self,
         dep: &dyn Dependency,
     ) -> Option<deps_core::lsp_helpers::HoverProvenance> {
-        self.commit_proof(dep).map(|proof| proof.hover_provenance())
+        self.commit_proof(self.own_dependency(dep)?)
+            .map(|proof| proof.hover_provenance())
     }
 
     /// Tag → the latest tag, preserving `current`'s `v`-prefix style. SHA → looks up the
@@ -283,7 +287,7 @@ impl PackageRendering for GithubActionsFormatter {
         version: &ConcreteVersion,
         current: &str,
     ) -> String {
-        let Some(gha_dep) = dep.as_any().downcast_ref::<GithubActionsDependency>() else {
+        let Some(gha_dep) = self.own_dependency(dep) else {
             return self.format_version_for_text_edit(version);
         };
         match &gha_dep.pin {
@@ -402,16 +406,19 @@ impl RequirementResolution for GithubActionsFormatter {
         requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> RequirementStatus {
+        let Some(gha_dep) = self.own_dependency(dep) else {
+            return self.classify_requirement_status(requirement, latest);
+        };
         let text = || {
             let status = self.classify_requirement_status(requirement, latest);
-            let status = self.distrust_unpublished_tag(dep, requirement, latest, status);
-            self.cap_unlisted_tag_pin(dep, requirement, status)
+            let status = self.distrust_unpublished_tag(gha_dep, requirement, latest, status);
+            self.cap_unlisted_tag_pin(gha_dep, requirement, status)
         };
-        match self.sha_pin_lookup(dep, latest) {
+        match self.sha_pin_lookup(gha_dep, latest) {
             Some(lookup) => {
                 let untagged = lookup == ShaPinLookup::NotIndexed;
                 let status = lookup.status_or_text(text);
-                match self.commit_proof(dep).filter(|_| untagged) {
+                match self.commit_proof(gha_dep).filter(|_| untagged) {
                     Some(proof) => proof.override_status(status),
                     None => status,
                 }
@@ -421,11 +428,11 @@ impl RequirementResolution for GithubActionsFormatter {
     }
 
     fn commit_rewrite_for(&self, dep: &dyn Dependency, version: &ConcreteVersion) -> CommitRewrite {
-        let Some(pin) = Self::pin_view(dep) else {
+        let Some(gha_dep) = self.own_dependency(dep) else {
             return CommitRewrite::NotACommitPin;
         };
-        let index = self.tag_index.get(dep.name());
-        git_commit_rewrite(pin, index.as_deref(), version)
+        let index = self.tag_index.get(&gha_dep.name);
+        git_commit_rewrite(Self::pin_view(gha_dep), index.as_deref(), version)
     }
 
     /// #1556: a SHA pin's registry-confirmed tag (`TagIndex.sha_to_tag`) is a real,
@@ -452,11 +459,15 @@ impl RequirementResolution for GithubActionsFormatter {
     /// An exact full-semver tag pin (`@v4.8.0`) keeps itself as the primary and gains the other
     /// releases of its major line on the same commit as siblings (#1709).
     fn resolved_pin_version(&self, dep: &dyn Dependency) -> PinResolution {
-        let Some(pin) = Self::pin_view(dep) else {
+        let Some(gha_dep) = self.own_dependency(dep) else {
             return PinResolution::Unresolved;
         };
-        let index = self.tag_index.get(dep.name());
-        resolve_git_pin(pin, index.as_deref(), EcosystemId::GithubActions)
+        let index = self.tag_index.get(&gha_dep.name);
+        resolve_git_pin(
+            Self::pin_view(gha_dep),
+            index.as_deref(),
+            EcosystemId::GithubActions,
+        )
     }
 
     /// `tag_index` is populated as a side effect of [`GithubActionsRegistry`]'s own tags
@@ -470,24 +481,22 @@ impl RequirementResolution for GithubActionsFormatter {
     /// A SHA pin names its whole commit, so a candidate's siblings span every major; any other
     /// pin keeps the exact-tag same-major rule. Absent index entry: not yet fetched.
     fn candidate_tag_source(&self, dep: &dyn Dependency) -> CandidateTagSource {
-        let Some(pin) = Self::pin_view(dep) else {
+        let Some(gha_dep) = self.own_dependency(dep) else {
             return CandidateTagSource::NotTagBased;
         };
         let index = self
             .tag_index
-            .get(dep.name())
+            .get(&gha_dep.name)
             .map(|index| Arc::clone(&index));
-        git_candidate_tag_source(pin, index)
+        git_candidate_tag_source(Self::pin_view(gha_dep), index)
     }
 }
 
 impl GithubActionsFormatter {
-    /// Projects `dep`'s pin into the shared [`GitPinView`]; `None` when `dep` is not a GitHub
-    /// Actions dependency. A tag pin without declared ref text, a branch and an unpinned ref
-    /// are [`GitPinView::Other`].
-    pub(crate) fn pin_view(dep: &dyn Dependency) -> Option<GitPinView<'_>> {
-        let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-        Some(match &gha_dep.pin {
+    /// Projects `gha_dep`'s pin into the shared [`GitPinView`]. A tag pin without declared ref
+    /// text, a branch and an unpinned ref are [`GitPinView::Other`].
+    pub(crate) fn pin_view(gha_dep: &GithubActionsDependency) -> GitPinView<'_> {
+        match &gha_dep.pin {
             Some(PinStyle::Sha { sha, comment }) => GitPinView::Sha {
                 sha,
                 comment: comment.as_ref().map(ShaComment::comment_tag),
@@ -499,7 +508,7 @@ impl GithubActionsFormatter {
                     written: req.as_str(),
                 }),
             Some(PinStyle::Branch) | None => GitPinView::Other,
-        })
+        }
     }
 
     /// The commit `gha_dep` is pinned to: the raw SHA of a full-SHA pin, or the commit a
@@ -531,21 +540,18 @@ impl GithubActionsFormatter {
     /// text cannot prove it current (#1769).
     fn cap_unlisted_tag_pin(
         &self,
-        dep: &dyn Dependency,
+        gha_dep: &GithubActionsDependency,
         requirement: BoundedVersionReq<'_>,
         status: RequirementStatus,
     ) -> RequirementStatus {
         let written = requirement.as_str();
-        let is_tag_pin = dep
-            .as_any()
-            .downcast_ref::<GithubActionsDependency>()
-            .is_some_and(|gha_dep| gha_dep.pin == Some(PinStyle::Tag));
+        let is_tag_pin = gha_dep.pin == Some(PinStyle::Tag);
         let is_version_shaped = concrete_pin_version(written, EcosystemId::GithubActions).is_some()
             || is_partial_semver_shaped(written);
         if !is_tag_pin || !is_version_shaped {
             return status;
         }
-        self.tag_index.get(dep.name()).map_or(status, |index| {
+        self.tag_index.get(&gha_dep.name).map_or(status, |index| {
             index.cap_status_if_tag_unlisted(written, status)
         })
     }
@@ -560,25 +566,21 @@ impl GithubActionsFormatter {
     /// (it may be a branch), is deliberately left without a finding.
     fn distrust_unpublished_tag(
         &self,
-        dep: &dyn Dependency,
+        gha_dep: &GithubActionsDependency,
         requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
         status: RequirementStatus,
     ) -> RequirementStatus {
-        let is_tag_pin = dep
-            .as_any()
-            .downcast_ref::<GithubActionsDependency>()
-            .is_some_and(|gha_dep| gha_dep.pin == Some(PinStyle::Tag));
-        if !is_tag_pin {
+        if gha_dep.pin != Some(PinStyle::Tag) {
             return status;
         }
-        self.tag_index.get(dep.name()).map_or(status, |index| {
+        self.tag_index.get(&gha_dep.name).map_or(status, |index| {
             index.cap_status_if_unpublished(
                 requirement.as_str(),
                 latest.as_str(),
                 PartialTagPolicy::MovingLine,
                 status,
-                self.branch_evidence(dep.name(), requirement.as_str()),
+                self.branch_evidence(&gha_dep.name, requirement.as_str()),
             )
         })
     }
@@ -602,14 +604,13 @@ impl GithubActionsFormatter {
     /// itself up to date; a non-version tag (`cargo-deny`) never counts as up to date by text.
     fn sha_pin_lookup(
         &self,
-        dep: &dyn Dependency,
+        gha_dep: &GithubActionsDependency,
         latest: &ConcreteVersion,
     ) -> Option<ShaPinLookup> {
-        let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
         let Some(PinStyle::Sha { sha, comment }) = &gha_dep.pin else {
             return None;
         };
-        let index = self.tag_index.get(dep.name());
+        let index = self.tag_index.get(&gha_dep.name);
         Some(ShaPinLookup::resolve(
             index.as_deref(),
             sha,
