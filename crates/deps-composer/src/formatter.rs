@@ -6,9 +6,10 @@ use deps_core::PackageName;
 use deps_core::StabilityFloor;
 use deps_core::interval::{VersionRange, range_from_edges, tighter_lower, tighter_upper};
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
-    compile_requirement_unless, match_v_prefix_style, requirement_contains_template_placeholder,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OperatorGrammar, OsvNaming,
+    PackageNaming, PackageRendering, RequirementGate, RequirementMatcher, RequirementResolution,
+    RewriteTarget, SourcePolicy, compile_requirement_unless, match_v_prefix_style,
+    requirement_contains_template_placeholder,
 };
 use deps_core::normalize_operator_spacing;
 use deps_core::osv::OsvPackageName;
@@ -872,6 +873,17 @@ impl PackageNaming for ComposerFormatter {
     }
 }
 
+fn render_composer_requirement(
+    formatter: &ComposerFormatter,
+    version: &ConcreteVersion,
+    current: &str,
+    target: RewriteTarget,
+) -> String {
+    OperatorGrammar::COMPOSER.replacing(version, current, target, |bound| {
+        formatter.version_satisfies_requirement(version, &deps_core::VersionReq::new(bound))
+    })
+}
+
 impl PackageRendering for ComposerFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         let version = version.as_str();
@@ -888,7 +900,27 @@ impl PackageRendering for ComposerFormatter {
     /// Composer itself already strips `v`/`V` before comparing
     /// (`walk_requirement`'s own leading strip).
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        match_v_prefix_style(current, version.as_str())
+        render_composer_requirement(self, version, current, RewriteTarget::Update)
+    }
+
+    /// Security-fix and fallback targets keep the operator but write the full version
+    /// (`^2.0` -> `^2.9.1`), so the rewritten range never admits releases below the target.
+    fn format_version_replacing_floor_for(
+        &self,
+        _dep: &dyn Dependency,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        render_composer_requirement(self, version, current, RewriteTarget::Floor)
+    }
+
+    /// Exact pin that keeps `current`'s `v` style and `@stability` flag (#1892).
+    fn format_version_exact_pin_replacing(
+        &self,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> Option<String> {
+        Some(OperatorGrammar::COMPOSER.exact_pin(version, current))
     }
 
     /// Same fix as [`format_version_replacing`](Self::format_version_replacing), for
@@ -3546,7 +3578,7 @@ mod tests {
         let f = ComposerFormatter;
         assert_eq!(
             f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "^1.0"),
-            "1.2.0"
+            "^1.2"
         );
     }
 
@@ -4153,6 +4185,88 @@ mod tests {
             ">=1.0,<2.0-beta",
         ] {
             assert!(!opts(stable), "{stable} should not opt in");
+        }
+    }
+
+    fn composer_update(current: &str, picked: &str) -> String {
+        ComposerFormatter.format_version_replacing(&ConcreteVersion::new(picked), current)
+    }
+
+    fn composer_floor(current: &str, picked: &str) -> String {
+        ComposerFormatter.format_version_replacing_floor_for(
+            &placeholder_probe_dependency(),
+            &ConcreteVersion::new(picked),
+            current,
+        )
+    }
+
+    /// Spec 098 SC-009..SC-019 and the section 6 edge cases (#1933).
+    #[test]
+    fn test_update_keeps_operator_precision_and_stability_flag_1933() {
+        for (current, picked, expected) in [
+            ("^2.0", "3.12.1", "^3.12"),
+            ("~6.0", "8.3.1", "~8.3"),
+            ("~6.0.1", "8.3.1", "~8.3.1"),
+            ("~1.2.3.4", "1.3.0.1", "~1.3.0.1"),
+            ("^5.0@beta", "8.1.11", "^8.1@beta"),
+            ("^5.0 @beta", "8.1.11", "^8.1 @beta"),
+            ("^8.0@dev", "13.40.0", "^13.40@dev"),
+            ("^2.0", "3.0.0-beta1", "^3.0.0-beta1"),
+            ("^0.3", "0.5.2", "^0.5"),
+            ("~1.2.3", "2.0", "~2.0.0"),
+            ("^2.0.1", "3.2", "^3.2.0"),
+            ("^0.0.3", "0.0.9", "^0.0.9"),
+            ("^0.0", "0.0.9", "^0.0.9"),
+            ("^v2.0", "v3.12.1", "^v3.12"),
+            ("^2.0", "v3.12.1", "^3.12"),
+            ("^2.0 || ^3.0", "4.1.0", "4.1.0"),
+            ("3.28.0", "4.0.0", "4.0.0"),
+            ("v3.28.0", "4.0.0", "v4.0.0"),
+            ("1.0@beta", "4.0.0", "4.0.0@beta"),
+            (">=2.0", "3.1.0", ">=3.1.0"),
+            (">= 2.0", "3.1.0", ">= 3.1.0"),
+            (">2.0", "3.1.0", ">=3.1.0"),
+            ("<3.0", "2.9.0", "2.9.0"),
+            ("^2.0, >=2.1", "2.9.0", "^2.9"),
+            ("^2.0 >=2.1", "2.9.0", "2.9.0"),
+            (">=1.0 <2.0", "2.1.0", "2.1.0"),
+            ("2.*", "3.2.1", "3.2.1"),
+            ("*", "3.2.1", "3.2.1"),
+            ("^", "3.2.1", "3.2.1"),
+            ("^é", "3.2.1", "3.2.1"),
+        ] {
+            assert_eq!(
+                composer_update(current, picked),
+                expected,
+                "{current} -> {picked}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_floor_target_writes_full_version_and_keeps_flag_1933() {
+        assert_eq!(composer_floor("^2.0", "2.9.1"), "^2.9.1");
+        assert_eq!(composer_floor("~6.0@beta", "6.9.1"), "~6.9.1@beta");
+    }
+
+    #[test]
+    fn test_exact_pin_keeps_stability_flag_and_v_style_1933() {
+        let pin = |current: &str, picked: &str| {
+            ComposerFormatter
+                .format_version_exact_pin_replacing(&ConcreteVersion::new(picked), current)
+        };
+        assert_eq!(pin("^2.0@beta", "2.9.1").as_deref(), Some("2.9.1@beta"));
+        assert_eq!(pin("^v2.0", "2.9.1").as_deref(), Some("v2.9.1"));
+        assert_eq!(pin("^2.0", "2.9.1").as_deref(), Some("2.9.1"));
+    }
+
+    /// Spec 098 Q9: branch and alias constraints never reach an update edit, so
+    /// the renderer is never asked about them; the requirement gate still rejects them as
+    /// non-version text.
+    #[test]
+    fn test_branch_constraints_are_not_range_rewritten_1933() {
+        for current in ["dev-main", "1.0.x-dev", "dev-main as 1.0.x-dev"] {
+            assert_eq!(composer_update(current, "2.0.0"), "2.0.0", "{current}");
         }
     }
 }

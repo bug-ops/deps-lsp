@@ -10,6 +10,9 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-indexing-slicing-in-tests = true
 
+# 100 would need about 40 files of `#[expect]`; see #1920
+too-many-lines-threshold = 150
+
 await-holding-invalid-types = [
     { path = "dashmap::mapref::one::Ref", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
     { path = "dashmap::mapref::one::RefMut", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },

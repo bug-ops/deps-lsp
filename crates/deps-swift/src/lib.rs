@@ -50,9 +50,7 @@ pub use lockfile::SwiftLockParser;
 pub use lockfile::fuzz_parse_package_resolved;
 pub use parser::{SwiftParseResult, parse_package_swift, parse_package_swift_with_context};
 pub use registry::SwiftRegistry;
-pub use scm::{
-    ScmLookupUrl, ScmSwizzleMode, ScmToRegistryHandle, SwiftOrigin, SwiftRequirementForm,
-};
+pub use scm::{ScmLookupUrl, ScmSwizzleMode, ScmToRegistryHandle, SwiftRequirementForm};
 pub use types::{SwiftDependency, SwiftPackage, SwiftVersion};
 
 /// Whether `name` matches the `owner/repo` GitHub identifier shape this crate accepts.

@@ -30,10 +30,10 @@ use types::worst_severity;
 pub use types::{
     Advisory, CandidateStatusMap, CandidateStatuses, Capped, DependencyVulnerabilities,
     EmptyOsvPackageName, FixRecommendation, InvalidOsvId, LatestStatusMap, MatchedTags,
-    OsvEcosystem, OsvId, OsvPackageName, OsvQueryName, OsvVersion, ScanOutcome, ScanTarget,
-    ScanVersion, SiblingCoverage, SiblingMatches, SkipReason, StructuralSkipReason, UpgradeStatus,
-    VersionMatching, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap, vuln_key_for,
-    vulnerability_keys,
+    NonPublicRoute, OsvEcosystem, OsvId, OsvPackageName, OsvQueryName, OsvVersion, ScanOutcome,
+    ScanTarget, ScanVersion, SiblingCoverage, SiblingMatches, SkipReason, StructuralSkipReason,
+    UpgradeStatus, VersionMatching, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap,
+    vuln_key_for, vulnerability_keys,
 };
 use types::{
     BatchStubs, OsvBatchRequest, OsvBatchResponse, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord,
@@ -42,6 +42,43 @@ use types::{
 
 use crate::ConcreteVersion;
 use crate::cache::HttpCache;
+
+/// Classifies why `dep`, whose source is not public registry content, produced no OSV query.
+///
+/// Returns [`StructuralSkipReason::UnverifiedRegistrySource`] only when the ecosystem marks the
+/// route a [`NonPublicRoute::UnverifiedMirror`] *and* the package name maps to an OSV name, i.e.
+/// a scan would have been possible on a public registry; otherwise the silent
+/// [`StructuralSkipReason::NonRegistrySource`] (VCS and path forks, private and unmappable
+/// routes).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::{StructuralSkipReason, non_public_skip_reason};
+/// use deps_core::test_util::{StubFormatter, stub_parse_result_with_dependencies};
+///
+/// let parse_result = stub_parse_result_with_dependencies(1);
+/// let dep = parse_result.dependencies()[0];
+/// // A formatter that does not opt in keeps the skip silent.
+/// assert_eq!(
+///     non_public_skip_reason(dep, &StubFormatter::DEFAULT),
+///     StructuralSkipReason::NonRegistrySource
+/// );
+/// ```
+#[must_use]
+pub fn non_public_skip_reason(
+    dep: &dyn crate::Dependency,
+    formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
+) -> StructuralSkipReason {
+    match formatter.non_public_route(dep) {
+        NonPublicRoute::UnverifiedMirror if formatter.osv_package_name(dep).is_some() => {
+            StructuralSkipReason::UnverifiedRegistrySource
+        }
+        NonPublicRoute::UnverifiedMirror | NonPublicRoute::Private => {
+            StructuralSkipReason::NonRegistrySource
+        }
+    }
+}
 
 /// Advisories rendered (§7) per dependency in hover/diagnostics/`deps-cli` output.
 ///

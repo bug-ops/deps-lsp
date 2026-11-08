@@ -85,14 +85,19 @@ database: `GOSUMDB` unset or `sum.golang.org`/`sum.golang.google.cn` (with an op
 `+key` and sumdb-proxy URL), and the module matches neither `GONOSUMDB` nor `GOPRIVATE`.
 `GOSUMDB=off` or a custom checksum database, combined with a `GOPROXY`, turns these
 signals off for the chain's modules, because a private checksum database proves nothing
-about public content. A chain made only of `off`/`direct` downloads nothing and is never
-treated as public content.
+about public content. A chain made only of `off`/`direct` is treated the same way: the go
+command still verifies origin fetches against the checksum database, so those modules are
+scanned unless `GOSUMDB=off`, `GONOSUMDB` or `GOPRIVATE` excludes them. A module matching
+only `GONOSUMDB`, while every `GOPROXY` hop was rejected, is treated as an unverified mirror:
+nothing is scanned and the CLI counts it as not checked (hover shows no footer, because the
+module has no resolvable registry).
 
-**Disclosure**: with `GOPROXY` set to a chain that has a URL hop (from the process
+**Disclosure**: with `GOPROXY` set to a chain with a URL, `direct` or `off` hop (from the process
 environment or from `go env -w`), the names of modules not matched by `GOPRIVATE` or
 `GONOSUMDB` are sent to OSV.dev (on by default) and, on hover, to deps.dev, exactly as for a
-user without `GOPROXY`. Set `GOPRIVATE` or `GONOSUMDB` for private module paths, or turn
-the OSV and `supply_chain` features off. Users who only had `go env -w GOPROXY=...` and no
+user without `GOPROXY`. With `GOPROXY=off`, a private module not listed in `GOPRIVATE` or
+`GONOSUMDB` goes to OSV.dev as well, the same as with no `GOPROXY`. Set `GOPRIVATE` or `GONOSUMDB`
+for private module paths, or turn the OSV and `supply_chain` features off. Users who only had `go env -w GOPROXY=...` and no
 `GOPRIVATE` previously sent nothing for such modules; that changed with process-environment
 support, intentionally, for parity with users without `GOPROXY`.
 

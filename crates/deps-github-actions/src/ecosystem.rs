@@ -21,10 +21,7 @@ use url::Url;
 use crate::formatter::GithubActionsFormatter;
 use crate::registry::GithubActionsRegistry;
 use crate::types::{GithubActionsDependency, PinStyle};
-use deps_core::lsp_helpers::{
-    BranchProbe, CommentCheck, CommitProbe, NormalizeName, PinResolution, ProbePhase, ProbePlan,
-    ProbeRef, ProbeReport, UnknownRefTarget, UnpublishedRef,
-};
+use deps_core::lsp_helpers::{CommentCheck, ProbePhase, ProbePlan, ProbeReport, UnknownRefTarget};
 
 #[cfg(feature = "lsp-responses")]
 mod lsp;
@@ -681,48 +678,14 @@ fn probe_plan(
         else {
             continue;
         };
-        let repository = formatter.normalize_package_name(&gha_dep.name);
-        match &gha_dep.pin {
-            Some(PinStyle::Tag) => {
-                let Some(written) = gha_dep
-                    .version_req
-                    .as_ref()
-                    .map(deps_core::VersionReq::as_str)
-                else {
-                    continue;
-                };
-                if index.unpublished_tag_ref(written) != Some(UnpublishedRef::Partial) {
-                    continue;
-                }
-                if let Some(git_ref) = ProbeRef::parse(written) {
-                    plan.branches.push(BranchProbe {
-                        repository,
-                        package: gha_dep.name.clone(),
-                        git_ref,
-                    });
-                }
-            }
-            Some(PinStyle::Sha { sha, comment: None }) => {
-                if index.pin_resolution(sha, None) != PinResolution::Untagged {
-                    continue;
-                }
-                let Some(latest) = formatter.probe_stores.latest(&repository) else {
-                    continue;
-                };
-                plan.commits.push(CommitProbe {
-                    repository,
-                    package: gha_dep.name.clone(),
-                    latest: latest.commit,
-                    pin: sha.clone(),
-                });
-            }
-            Some(
-                PinStyle::Sha {
-                    comment: Some(_), ..
-                }
-                | PinStyle::Branch,
-            )
-            | None => {}
+        let Some(pin) = GithubActionsFormatter::pin_view(dep) else {
+            continue;
+        };
+        if let Some(question) = formatter
+            .probe_stores
+            .question_for(&gha_dep.name, &index, pin)
+        {
+            plan.push(question);
         }
     }
     plan

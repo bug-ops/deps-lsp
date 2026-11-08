@@ -24,7 +24,7 @@ use super::hover_markdown::{FieldKind, HoverMarkdown};
 use super::{
     AuxiliaryLookup, CooldownBlocker, CooldownPrecedence, DiagnosticMessages, EcosystemFormatter,
     FetchContext, HOVER_RECENT_VERSIONS, HoverProvenance, InteractiveFetchRequest, LatestVerdict,
-    SiblingMatchNote, VersionData, await_interactive_fetch, await_interactive_versions,
+    LookupMiss, SiblingMatchNote, VersionData, await_interactive_fetch, await_interactive_versions,
     cooldown_precedence, escape_markdown, in_use_version, latest_verdict, markdown_code_span,
     position_in_range, resolve_in_use_version, resolve_scan_outcome,
 };
@@ -79,6 +79,10 @@ pub const CMD_DOT_FOOTER: &str = "\n---\n⌨️ **Press `Cmd+.` to update versio
 /// implementation: locates the dependency whose name or version range contains
 /// `position`, resolves its version data against `registry`, and renders the
 /// result through `formatter`. Returns `None` when no dependency covers the position.
+#[expect(
+    clippy::too_many_lines,
+    reason = "shared generator past 300 lines, split tracked in #1952"
+)]
 pub async fn generate_hover<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,
@@ -307,11 +311,26 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     let latest_status_for_dep = versions
         .latest_status
         .and_then(|m| super::resolve_latest_status(m, dep, vuln_keys.as_ref(), &key));
+    let registry_miss = versions.lookup_miss_for(&key);
+    let vulnerability_fix = if let Some(ScanOutcome::Vulnerable(dv)) = vuln_outcome
+        && crate::edit::resolve_verified_fix(
+            dv,
+            crate::edit::FixTargetContext::new(latest_status_for_dep)
+                .with_registry(versions.cached_for(&key)),
+            formatter,
+        )
+        .is_ok()
+    {
+        VulnerabilityFix::Available
+    } else {
+        VulnerabilityFix::Unavailable
+    };
     push_vulnerability_hover_section(
         &mut markdown,
         formatter,
         vuln_outcome,
         latest_status_for_dep,
+        registry_miss,
     );
 
     // Awaited last so the wait overlaps as much of this function's own work as possible.
@@ -473,6 +492,8 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             offline: versions.network.is_offline(),
             requirement_is_placeholder,
             latest_verdict: latest_verdict_result.clone(),
+            registry_miss,
+            vulnerability_fix,
         },
     );
 
@@ -933,6 +954,12 @@ fn push_recent_versions_hover_section(
 /// ([`crate::edit::requirement_is_placeholder_for`], default-on across ecosystems since
 /// #1393), so `Cmd+.` would return zero actions regardless of how much version,
 /// vulnerability, or deprecation data was rendered above.
+///
+/// `registry_miss == Some(LookupMiss::NotFound)` (#1936) suppresses the footer: a 404 leaves
+/// no version list or deprecation data to act on. A `Vulnerable` outcome keeps it only when a
+/// verified OSV fix exists (`VulnerabilityFix::Available`); that action does not depend on the
+/// registry's version list, but an advisory with no fixed version leaves `Cmd+.` empty.
+///
 /// Issue #1517: whether `latest` is safe enough to justify advertising an "update to latest"
 /// action at all — `Verified` (checked, clean) or `NotApplicable` (OSV disabled/offline, or a
 /// structural skip); `Flagged`/`Unverified` must never be implied safe by this footer.
@@ -949,7 +976,13 @@ fn push_cmd_dot_footer_hover_section(markdown: &mut HoverMarkdown, state: CmdDot
     let live_fetch_definitively_empty = state.available_versions.is_some_and(<[_]>::is_empty);
     let footer_actionable = has_offline_actionable_data
         || (!live_fetch_definitively_empty && !state.offline && latest_is_safe);
-    if state.resolvable && footer_actionable && !state.requirement_is_placeholder {
+    let registry_knows_package = state.registry_miss != Some(LookupMiss::NotFound)
+        || state.vulnerability_fix == VulnerabilityFix::Available;
+    if state.resolvable
+        && registry_knows_package
+        && footer_actionable
+        && !state.requirement_is_placeholder
+    {
         markdown.push_static(CMD_DOT_FOOTER);
     }
 }
@@ -966,6 +999,19 @@ struct CmdDotFooterState<'a> {
     requirement_is_placeholder: bool,
     /// See [`push_cmd_dot_footer_hover_section`]'s doc.
     latest_verdict: LatestVerdict,
+    /// A registry 404 leaves no version list to update to, so it suppresses the footer
+    /// unless a vulnerability fix action exists (#1936).
+    registry_miss: Option<LookupMiss>,
+    /// Whether `Cmd+.` would offer an OSV fix: a recommended fix with a verified target, as
+    /// decided by [`crate::edit::resolve_verified_fix`], the planner `codeAction` uses.
+    vulnerability_fix: VulnerabilityFix,
+}
+
+/// Whether `Cmd+.` would offer an OSV fix for the hovered dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VulnerabilityFix {
+    Available,
+    Unavailable,
 }
 
 /// Appends the "Offline: version and vulnerability data not checked" footer (issue
@@ -1165,6 +1211,7 @@ fn push_vulnerability_hover_section(
     formatter: &dyn EcosystemFormatter,
     outcome: Option<&ScanOutcome>,
     latest_status: Option<&crate::osv::UpgradeStatus>,
+    registry_miss: Option<LookupMiss>,
 ) {
     match outcome {
         Some(ScanOutcome::Vulnerable(dv)) => {
@@ -1252,7 +1299,10 @@ fn push_vulnerability_hover_section(
             markdown.push_static("\n");
         }
         Some(ScanOutcome::Clean) => {
-            markdown.push_static("**No known vulnerabilities** (OSV.dev)\n\n");
+            // OSV having no record of a package the registry does not know is not an all-clear.
+            if registry_miss != Some(LookupMiss::NotFound) {
+                markdown.push_static("**No known vulnerabilities** (OSV.dev)\n\n");
+            }
         }
         Some(ScanOutcome::Skipped(_)) | None => {}
     }
@@ -5723,6 +5773,7 @@ mod tests {
             &MOCK_FORMATTER,
             Some(&outcome),
             Some(&latest),
+            None,
         );
 
         // `S`/`F`/`V` are not ASCII punctuation, so `escape_markdown`/`markdown_code_span`
@@ -5797,7 +5848,13 @@ mod tests {
         let dv = DependencyVulnerabilities::new(Capped::new(vec![Arc::new(advisory)], 1));
         let outcome = ScanOutcome::Vulnerable(dv);
         let mut markdown = HoverMarkdown::new();
-        push_vulnerability_hover_section(&mut markdown, &GO_STYLE_FORMATTER, Some(&outcome), None);
+        push_vulnerability_hover_section(
+            &mut markdown,
+            &GO_STYLE_FORMATTER,
+            Some(&outcome),
+            None,
+            None,
+        );
 
         assert!(
             markdown.as_str().contains("v0.55.0"),
@@ -5842,6 +5899,7 @@ mod tests {
             &crate::test_util::StubFormatter::DEFAULT,
             Some(&ScanOutcome::Vulnerable(dv)),
             None,
+            None,
         );
 
         let rendered = markdown.as_str();
@@ -5878,6 +5936,7 @@ mod tests {
             &mut markdown,
             &crate::test_util::StubFormatter::DEFAULT,
             Some(&ScanOutcome::Vulnerable(dv)),
+            None,
             None,
         );
 
@@ -5917,6 +5976,7 @@ mod tests {
             &crate::test_util::StubFormatter::DEFAULT,
             Some(&ScanOutcome::Vulnerable(dv)),
             Some(&sibling_only_latest()),
+            None,
         );
 
         assert!(
@@ -7622,5 +7682,164 @@ mod tests {
              immediately; got: {}",
             content
         );
+    }
+
+    /// #1936: a registry 404 leaves nothing to update to and nothing to certify as clean.
+    mod registry_not_found {
+        use super::*;
+        use crate::lsp_helpers::{DependencyOutcomes, LookupMiss};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, ScanOutcome, UpgradeStatus,
+            VulnSeverity, VulnerabilityMap,
+        };
+
+        const FOOTER: &str = "Press `Cmd+.` to update version";
+
+        fn outcomes(miss: LookupMiss) -> DependencyOutcomes {
+            DependencyOutcomes::new().with_lookup_miss(crate::NormalizedName::for_test("pkg"), miss)
+        }
+
+        fn vulnerable() -> ScanOutcome {
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                sibling_matches: None,
+                advisories: Capped::new(
+                    vec![Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec![OsvVersion::new("1.1.0")]),
+                    )],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::CandidateClean {
+                    version: ConcreteVersion::new("1.1.0"),
+                },
+            })
+        }
+
+        /// A removed package's advisory (for example `MAL-`) usually names no fixed version.
+        fn unfixable_vulnerable() -> ScanOutcome {
+            ScanOutcome::Vulnerable(DependencyVulnerabilities::new(Capped::new(
+                vec![Arc::new(
+                    Advisory::new(
+                        "MAL-2023-1".to_string(),
+                        "2023-01-01T00:00:00Z".to_string(),
+                        VulnSeverity::Critical,
+                    )
+                    .expect("valid osv id"),
+                )],
+                1,
+            )))
+        }
+
+        async fn hover_markdown(
+            outcomes: &DependencyOutcomes,
+            vulnerabilities: &VulnerabilityMap,
+        ) -> String {
+            let (dep, _, _) = vulnerable_dep("1.0.0");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            generate_hover(
+                &parse_result,
+                Position::new(0, 1).into(),
+                VersionData::new(&cached, &resolved)
+                    .with_outcomes(outcomes)
+                    .with_vulnerabilities(vulnerabilities),
+                &MockRegistryWithVersions {
+                    versions: vec![MockVersionWithAge {
+                        version: "1.2.3".into(),
+                        yanked: false,
+                        published_at: None,
+                    }],
+                },
+                &MOCK_FORMATTER,
+                crate::FreshnessSettings::default(),
+                PublishTime::now(),
+            )
+            .await
+            .expect("hover should be generated")
+            .markdown()
+            .to_string()
+        }
+
+        fn scan(outcome: ScanOutcome) -> VulnerabilityMap {
+            let mut map = VulnerabilityMap::new();
+            map.insert(crate::test_util::vuln_key("pkg"), outcome);
+            map
+        }
+
+        #[tokio::test]
+        async fn not_found_drops_footer_and_all_clear_line() {
+            let content =
+                hover_markdown(&outcomes(LookupMiss::NotFound), &scan(ScanOutcome::Clean)).await;
+            assert!(!content.contains(FOOTER), "{content}");
+            assert!(!content.contains("No known vulnerabilities"), "{content}");
+        }
+
+        #[tokio::test]
+        async fn other_misses_keep_footer_and_all_clear_line() {
+            for miss in [LookupMiss::NoComparableVersions, LookupMiss::NotLookedUp] {
+                let content = hover_markdown(&outcomes(miss), &scan(ScanOutcome::Clean)).await;
+                assert!(content.contains(FOOTER), "{miss:?}: {content}");
+                assert!(
+                    content.contains("No known vulnerabilities"),
+                    "{miss:?}: {content}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn not_found_with_vulnerability_keeps_advisories_and_footer() {
+            let content =
+                hover_markdown(&outcomes(LookupMiss::NotFound), &scan(vulnerable())).await;
+            assert!(content.contains("Security advisories"), "{content}");
+            assert!(content.contains(FOOTER), "{content}");
+        }
+
+        #[tokio::test]
+        async fn not_found_with_unfixable_vulnerability_drops_footer() {
+            let content = hover_markdown(
+                &outcomes(LookupMiss::NotFound),
+                &scan(unfixable_vulnerable()),
+            )
+            .await;
+            assert!(content.contains("Security advisories"), "{content}");
+            assert!(!content.contains(FOOTER), "{content}");
+            assert!(!content.contains("No known vulnerabilities"), "{content}");
+        }
+
+        /// The footer kept for 404 + `Vulnerable` is honest: the fix action really exists.
+        #[tokio::test]
+        async fn not_found_with_fixable_vulnerability_still_offers_fix_action() {
+            let (dep, version_range, content) = vulnerable_dep("1.0.0");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            let outcomes = outcomes(LookupMiss::NotFound);
+            let vulnerabilities = scan(vulnerable());
+            let actions = crate::lsp_helpers::generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                VersionData::new(&cached, &resolved)
+                    .with_outcomes(&outcomes)
+                    .with_vulnerabilities(&vulnerabilities),
+                &content,
+                &MockRegistry,
+                &MOCK_FORMATTER,
+            )
+            .await;
+            assert_eq!(quickfix_titles(&actions), ["Update to 1.1.0 (fixes A1)"]);
+        }
     }
 }

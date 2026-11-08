@@ -60,6 +60,7 @@ pub async fn handle_inlay_hints(
             .snapshot()
             .with_resolved_version_candidates()
             .with_latest_status(osv_checks)
+            .with_outcomes()
             .finish();
         Some((
             ecosystem,
@@ -92,7 +93,10 @@ pub async fn handle_inlay_hints(
     ecosystem
         .generate_inlay_hints(
             parse_result.as_ref(),
-            snapshot.version_data().with_ecosystem(ecosystem_id),
+            snapshot
+                .version_data()
+                .with_ecosystem(ecosystem_id)
+                .with_network(network),
             loading_state,
             &ecosystem_config,
         )
@@ -308,6 +312,79 @@ serde = "1.0.0"
 
             let (client, full_config) = create_test_client_and_config();
             let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
+        }
+
+        fn hint_label(hint: &InlayHint) -> &str {
+            match &hint.label {
+                tower_lsp_server::ls_types::InlayHintLabel::String(label) => label,
+                tower_lsp_server::ls_types::InlayHintLabel::LabelParts(_) => "",
+            }
+        }
+
+        /// FR-010: the handler must hand the recorded outcomes to the renderer, so a lookup
+        /// failure, a 404 and a local bypass never read as "up to date" (#1932, #1935).
+        #[tokio::test]
+        async fn test_handle_inlay_hints_renders_recorded_outcomes() {
+            use deps_core::{ConcreteVersion, FetchFailure, LookupMiss, NormalizedName};
+
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let config = InlayHintsConfig {
+                enabled: true,
+                up_to_date_text: "UPTODATE".to_string(),
+                needs_update_text: "UPDATE: {}".to_string(),
+            };
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
+            let content =
+                "[dependencies]\nbypassed = \"1.0.0\"\nfailing = \"1.0.0\"\nmissing = \"1.0.0\"\n"
+                    .to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &url)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            for name in ["failing", "missing", "bypassed"] {
+                doc_state.signals.resolved_versions.insert(
+                    NormalizedName::for_test(name),
+                    ConcreteVersion::from("1.0.0"),
+                );
+            }
+            doc_state
+                .signals
+                .outcomes
+                .set_fetch_failure(NormalizedName::for_test("failing"), FetchFailure::Transient);
+            doc_state
+                .signals
+                .outcomes
+                .set_lookup_miss(NormalizedName::for_test("missing"), LookupMiss::NotFound);
+            doc_state.signals.outcomes.set_lookup_miss(
+                NormalizedName::for_test("bypassed"),
+                LookupMiss::NotLookedUp,
+            );
+            state.update_document(uri.clone(), doc_state);
+
+            let params = InlayHintParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: Default::default(),
+                range: tower_lsp_server::ls_types::Range::new(
+                    tower_lsp_server::ls_types::Position::new(0, 0),
+                    tower_lsp_server::ls_types::Position::new(100, 0),
+                ),
+            };
+
+            let (client, full_config) = create_test_client_and_config();
+            let hints = handle_inlay_hints(state, params, &config, client, full_config).await;
+
+            let labels: Vec<&str> = hints.iter().map(hint_label).collect();
+            assert_eq!(labels, ["ℹ 1.0.0", "⚠ 1.0.0", "⚠ 1.0.0"], "{labels:?}");
         }
 
         #[tokio::test]

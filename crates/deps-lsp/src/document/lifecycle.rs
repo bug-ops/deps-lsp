@@ -28,13 +28,13 @@ use deps_core::NormalizedName;
 use deps_core::ResolvedVersionsMap;
 use deps_core::Result;
 use deps_core::VersionReq;
-use deps_core::lsp_helpers::{ProbeEffect, ProbePhase};
 use deps_core::policy_config::{FetchTimeout, OsvChecks};
 use deps_engine::classify::fetch::{fetch_latest_versions_parallel, prepare_fetch};
 use deps_engine::classify::resolved::{
     cached_versions_from_lockfile, dependency_version_map, forget_local_locked_misses,
     load_resolved_versions,
 };
+use deps_engine::probe::{PreFetchDecision, pre_fetch_decision};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -183,6 +183,10 @@ pub async fn handle_document_open(
               reduce, the parameter list"
 )]
 #[tracing::instrument(skip_all, fields(uri = ?uri, ecosystem = ecosystem.id()))]
+#[expect(
+    clippy::too_many_lines,
+    reason = "open-task phases past 300 lines, split tracked in #1952"
+)]
 async fn run_document_open_background_task(
     uri: Uri,
     state: Arc<ServerState>,
@@ -578,19 +582,28 @@ async fn apply_pre_fetch_reparse(
     state: &ServerState,
     ecosystem: &Arc<dyn Ecosystem>,
 ) -> Option<PreFetchReparse> {
-    if state.cache.is_offline() {
-        return None;
-    }
     let (parsed, version) = state
         .get_document(uri)
         .and_then(|doc| Some((doc.parse_result_arc()?, doc.version)))?;
-    let report = ecosystem
-        .background_probes(parsed.as_ref(), ProbePhase::PreFetch)
-        .await;
+    let decision =
+        pre_fetch_decision(ecosystem.as_ref(), parsed.as_ref(), state.network_mode()).await;
+    let report = match decision {
+        PreFetchDecision::Skipped => return None,
+        PreFetchDecision::Keep(report) | PreFetchDecision::Reparse(report) => report,
+    };
+    tracing::debug!(
+        issued = report.issued,
+        skipped_over_budget = report.skipped_over_budget,
+        inconclusive = report.inconclusive,
+        incomplete_identity_lookups = report.incomplete_identity_lookups,
+        effect = ?report.effect,
+        "pre-fetch probes finished"
+    );
     // Taken once the probe has decided: every input announced before now is reflected in what
-    // this document parses to from here on, so the re-parse listener need not redo it.
+    // this document parses to from here on, so the re-parse listener need not redo it. Not
+    // taken when skipped: nothing was probed, so an offline run must not look like one.
     state.pre_fetch_stamps.insert(uri.clone(), Instant::now());
-    if report.effect != ProbeEffect::Reparse {
+    if matches!(decision, PreFetchDecision::Keep(_)) {
         return None;
     }
     let content = state.get_document(uri)?.content.clone();
@@ -1241,6 +1254,10 @@ async fn spawn_and_track_gossip(
               this task; bundling it in would just relocate, not reduce, the parameter list"
 )]
 #[tracing::instrument(skip_all, fields(uri = ?uri, ecosystem = ecosystem.id()))]
+#[expect(
+    clippy::too_many_lines,
+    reason = "change-task phases past 300 lines, split tracked in #1952"
+)]
 async fn run_document_change_task(
     uri: Uri,
     state: Arc<ServerState>,
@@ -5077,7 +5094,7 @@ github.com/gorilla/mux v1.8.1 h1:hash2=
 mod pre_fetch_tests {
     use super::*;
     use crate::test_utils::test_helpers::create_test_client_and_config;
-    use deps_core::lsp_helpers::ProbePhase;
+    use deps_core::lsp_helpers::{ProbeEffect, ProbePhase};
     use deps_engine::test_util::{ProbeScript, TestTier3Ecosystem};
 
     const REPARSE: ProbeScript = ProbeScript {

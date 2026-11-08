@@ -1452,7 +1452,8 @@ fn offline_notice(
 /// [`SkipReason::SiblingTagsUnknown`] (phase A's truncated tag list or cold/failed tag fetch, and phase B's unknown
 /// candidate siblings alike) is hover-only by design: for a repository over the tag fetch cap it
 /// is as permanent as the structural reasons, so a standing Problems-panel entry could never be
-/// resolved.
+/// resolved. [`SkipReason::UnverifiedRegistrySource`] is hover-only for the same reason: it holds
+/// for as long as the registry override is configured.
 const fn should_notify_in_diagnostics(reason: SkipReason) -> bool {
     match reason {
         SkipReason::NoConcreteVersion
@@ -1462,6 +1463,7 @@ const fn should_notify_in_diagnostics(reason: SkipReason) -> bool {
         | SkipReason::Truncated
         | SkipReason::UnevaluableAdvisoryRange => true,
         SkipReason::NonRegistrySource
+        | SkipReason::UnverifiedRegistrySource
         | SkipReason::UnmappableName
         | SkipReason::TemplatedName
         | SkipReason::UnmappableEcosystem

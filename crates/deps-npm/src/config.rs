@@ -54,6 +54,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::types::NpmRegistryEntry;
 use deps_core::config_trust::{self, ConfigTier, EnvVarSyntax, OperatorPath};
 use deps_core::net_policy::{
     BlockedHost, BlockedHostReason, DeclaredRegistry, IndexUrlError, OperatorRegistries,
@@ -211,14 +212,24 @@ impl NpmConfig {
     ///   [`DependencySource::Registry`] (the #248 regression class this closes for npm).
     #[must_use]
     pub fn resolve_source_for(&self, package_name: &PackageName) -> DependencySource {
+        self.resolve_for(package_name).0
+    }
+
+    /// [`Self::resolve_source_for`] plus the `.npmrc` entry that produced the source: the one
+    /// copy of the scope-over-top-level branching. `None` means no entry applied.
+    #[must_use]
+    pub fn resolve_for(
+        &self,
+        package_name: &PackageName,
+    ) -> (DependencySource, Option<NpmRegistryEntry>) {
         if let Some(scope) = scope_of(package_name.as_str())
             && let Some(result) = self.scoped_registries.get(scope)
         {
-            return source_from_result(result);
+            return (source_from_result(result), Some(NpmRegistryEntry::Scope));
         }
         match &self.registry {
-            Some(result) => source_from_result(result),
-            None => DependencySource::Registry,
+            Some(result) => (source_from_result(result), Some(NpmRegistryEntry::TopLevel)),
+            None => (DependencySource::Registry, None),
         }
     }
 
@@ -1272,6 +1283,40 @@ mod tests {
                 mirrors_public_registry: false,
             }
         );
+    }
+
+    /// #1917: `resolve_for` names the entry that produced the source — a scope entry beats
+    /// the top-level one, a scoped name without its own entry follows the top level, and no
+    /// entry yields `None`.
+    #[test]
+    fn test_resolve_for_reports_producing_entry() {
+        let policy = all_policy();
+        let mut scoped = HashMap::new();
+        scoped.insert(
+            "@myorg".to_string(),
+            resolve_workspace_entry("https://npm.example.org", ConfigTier::User, &policy),
+        );
+        let config = NpmConfig {
+            registry: Some(resolve_workspace_entry(
+                "https://npm.mycorp.example",
+                ConfigTier::User,
+                &policy,
+            )),
+            scoped_registries: scoped,
+        };
+        assert_eq!(
+            config.resolve_for(&pkg("@myorg/lib")).1,
+            Some(NpmRegistryEntry::Scope)
+        );
+        assert_eq!(
+            config.resolve_for(&pkg("@types/node")).1,
+            Some(NpmRegistryEntry::TopLevel)
+        );
+        assert_eq!(
+            config.resolve_for(&pkg("lodash")).1,
+            Some(NpmRegistryEntry::TopLevel)
+        );
+        assert_eq!(NpmConfig::default().resolve_for(&pkg("lodash")).1, None);
     }
 
     /// FR-005: a scope with no matching entry is the normal case, not FR-006's fail-closed

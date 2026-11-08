@@ -37,12 +37,9 @@ use crate::host::GitlabInstanceHost;
 #[cfg(feature = "lsp-responses")]
 use crate::host::is_valid_gitlab_coordinate;
 use crate::registry::GitlabCiRegistry;
-use crate::registry::HostProbePlan;
+use crate::registry::{HostProbePlan, project_path_from_name};
 use crate::types::{EndpointKind, GitlabCiDependency, HostRef, IncludeKind, PinStyle};
-use deps_core::lsp_helpers::{
-    BranchProbe, CommitProbe, NormalizeName, PinResolution, ProbePhase, ProbePlan, ProbeRef,
-    ProbeReport, TagIndex, UnpublishedRef,
-};
+use deps_core::lsp_helpers::{ProbePhase, ProbePlan, ProbeReport};
 use std::collections::HashMap;
 
 #[cfg(feature = "lsp-responses")]
@@ -851,49 +848,6 @@ pub(crate) fn unknown_ref_target<'a>(
     )
 }
 
-/// One question a `project:` include asks its GitLab host.
-enum ProbeWork {
-    Branch(BranchProbe),
-    Commit(CommitProbe),
-}
-
-/// The question `gl_dep` asks, if any: a partial tag ref that the complete tag list does not
-/// list asks for the branch; a commentless SHA pin that no tag names asks to be proven ahead of
-/// the latest release. Anything the shared safety checks refuse (`ProbeRef::parse`) asks nothing.
-fn probe_work(
-    formatter: &GitlabCiFormatter,
-    gl_dep: &GitlabCiDependency,
-    index: &TagIndex,
-) -> Option<ProbeWork> {
-    let repository = formatter.normalize_package_name(&gl_dep.name);
-    match gl_dep.pin.as_ref()? {
-        PinStyle::Tag => {
-            let written = gl_dep.version_req.as_ref()?.as_str();
-            if index.unpublished_tag_ref(written) != Some(UnpublishedRef::Partial) {
-                return None;
-            }
-            Some(ProbeWork::Branch(BranchProbe {
-                repository,
-                package: gl_dep.name.clone(),
-                git_ref: ProbeRef::parse(written)?,
-            }))
-        }
-        PinStyle::Sha { sha, tail } if tail.comment().is_none() => {
-            if index.pin_resolution(sha, None) != PinResolution::Untagged {
-                return None;
-            }
-            let latest = formatter.probe_stores.latest(&repository)?;
-            Some(ProbeWork::Commit(CommitProbe {
-                repository,
-                package: gl_dep.name.clone(),
-                latest: latest.commit,
-                pin: sha.clone(),
-            }))
-        }
-        PinStyle::Sha { .. } | PinStyle::Branch | PinStyle::Latest | PinStyle::Partial => None,
-    }
-}
-
 /// What a document's `project:` includes ask their GitLab hosts, grouped per host because each
 /// host has its own probe budget.
 ///
@@ -919,15 +873,18 @@ fn probe_plans(
         let Some(index) = formatter.tag_list_index(gl_dep) else {
             continue;
         };
-        let Some(work) = probe_work(formatter, gl_dep, &index) else {
+        let Some(question) = formatter.probe_stores.question_for(
+            &gl_dep.name,
+            &index,
+            GitlabCiFormatter::pin_view(gl_dep),
+        ) else {
             continue;
         };
-        let Some(project_path) = gl_dep
-            .name
-            .as_str()
-            .strip_prefix(route.host().host())
-            .and_then(|rest| rest.strip_prefix('/'))
-        else {
+        let Some(project_path) = project_path_from_name(
+            gl_dep.name.as_str(),
+            route.host().host(),
+            EndpointKind::Tags,
+        ) else {
             continue;
         };
         let position = plans
@@ -944,13 +901,8 @@ fn probe_plans(
         let Some(host_plan) = plans.get_mut(position) else {
             continue;
         };
-        host_plan
-            .projects
-            .insert(gl_dep.name.clone(), project_path.to_string());
-        match work {
-            ProbeWork::Branch(probe) => host_plan.plan.branches.push(probe),
-            ProbeWork::Commit(probe) => host_plan.plan.commits.push(probe),
-        }
+        host_plan.projects.insert(gl_dep.name.clone(), project_path);
+        host_plan.plan.push(question);
     }
     plans
 }

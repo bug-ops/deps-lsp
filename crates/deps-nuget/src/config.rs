@@ -1194,6 +1194,10 @@ enum ConfigSection {
 /// No element-count/scan-position bound is applied here (#698): the input is a local
 /// `NuGet.Config` already capped by `get_or_parse`'s `MAX_CACHED_FILE_BYTES` (8 MiB) read
 /// path, unlike a remote registry response.
+#[expect(
+    clippy::too_many_lines,
+    reason = "11 mutable section-state flags threaded through one XML event loop"
+)]
 fn parse_nuget_config_raw(content: &str) -> RawNuGetConfigFile {
     let mut out = RawNuGetConfigFile::default();
     let mut reader = Reader::from_str(content);

@@ -5,12 +5,11 @@
 //! as an `id:` dependency. The parser and the PreFetch probe both decide through
 //! [`swizzle_decision`], so a parse can never disagree with the probe that warms its inputs.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use deps_core::lockfile::{ResolvedPackage, ResolvedPackages, ResolvedSource};
-use deps_core::parser::DependencySource;
 use deps_core::policy_config::{FetchConcurrency, FetchTimeout, ScmToRegistry};
 
 use crate::config::{SwiftRegistryUrl, TrustedLookupRegistry};
@@ -38,7 +37,7 @@ pub enum SwiftRequirementForm {
 
 /// Where a dependency's identity comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SwiftOrigin {
+pub(crate) enum SwiftOrigin {
     /// The dependency is what the manifest declares.
     Declared,
     /// A `url:` dependency swapped to a registry identity; `scm` is the repository it was
@@ -46,6 +45,10 @@ pub enum SwiftOrigin {
     Swizzled {
         /// The repository URL the dependency was written with, credential-stripped.
         scm: ScmLookupUrl,
+        /// The registry identity the dependency was swapped to.
+        identity: RegistryIdentityBuf,
+        /// The registry that serves `identity`.
+        index: RegistryIndexUrl,
     },
 }
 
@@ -63,6 +66,23 @@ impl CanonicalScmUrl {
     /// [`deps_core::ParseInputKey`].
     pub(crate) fn to_parse_input(&self) -> deps_core::ParseInputKey {
         deps_core::ParseInputKey::new(self.0.as_str())
+    }
+}
+
+/// A [`CanonicalScmUrl`] with its ASCII letters lowercased, for matching a repository whose case a
+/// lock file spells independently of the manifest. Never sent to a registry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CaseFoldedScmUrl(String);
+
+impl From<&CanonicalScmUrl> for CaseFoldedScmUrl {
+    fn from(canonical: &CanonicalScmUrl) -> Self {
+        Self(canonical.as_str().to_ascii_lowercase())
+    }
+}
+
+impl From<&ScmLookupUrl> for CaseFoldedScmUrl {
+    fn from(url: &ScmLookupUrl) -> Self {
+        Self::from(url.canonical())
     }
 }
 
@@ -143,14 +163,6 @@ pub(crate) struct RegistryIndexUrl(String);
 impl RegistryIndexUrl {
     pub(crate) fn of(url: &SwiftRegistryUrl) -> Self {
         Self(url.as_str().to_string())
-    }
-
-    fn from_index(index: &str) -> Self {
-        Self(index.to_string())
-    }
-
-    pub(crate) fn into_string(self) -> String {
-        self.0
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -284,19 +296,16 @@ pub(crate) fn decide_from_memo(
     })
 }
 
-/// The form `dependency` was parsed with, reconstructed from what the parser stored.
+/// The form `dependency` was parsed with, read from its origin.
 pub(crate) fn parsed_form(dependency: &SwiftDependency) -> SwiftForm {
-    match (&dependency.origin, &dependency.source) {
-        (SwiftOrigin::Swizzled { .. }, DependencySource::AlternateRegistry { index, .. }) => {
-            RegistryIdentityBuf::parse(dependency.name.as_str()).map_or(
-                SwiftForm::Scm,
-                |identity| SwiftForm::RegistryIdentity {
-                    identity,
-                    index: RegistryIndexUrl::from_index(index),
-                },
-            )
-        }
-        (SwiftOrigin::Swizzled { .. } | SwiftOrigin::Declared, _) => SwiftForm::Scm,
+    match &dependency.origin {
+        SwiftOrigin::Swizzled {
+            identity, index, ..
+        } => SwiftForm::RegistryIdentity {
+            identity: identity.clone(),
+            index: index.clone(),
+        },
+        SwiftOrigin::Declared => SwiftForm::Scm,
     }
 }
 
@@ -326,7 +335,7 @@ pub(crate) fn identity_pins(
                 return None;
             };
             let repository = ScmLookupUrl::parse(url)?;
-            let identity = identities.get(&repository.canonical().as_str().to_ascii_lowercase())?;
+            let identity = identities.get(&CaseFoldedScmUrl::from(&repository))?;
             Some(ResolvedPackage::new(
                 identity.to_string(),
                 package.version.clone(),
@@ -398,8 +407,7 @@ pub struct ScmToRegistryHandle {
     setting: Mutex<ScmToRegistry>,
     xcode: Arc<XcodeDefaultsCell>,
     warned_missing_default: AtomicBool,
-    fetch_timeout_secs: AtomicU64,
-    fetch_concurrency: AtomicUsize,
+    fetch_limits: Mutex<(FetchTimeout, FetchConcurrency)>,
 }
 
 impl Default for ScmToRegistryHandle {
@@ -415,8 +423,7 @@ impl ScmToRegistryHandle {
             setting: Mutex::new(ScmToRegistry::Disabled),
             xcode,
             warned_missing_default: AtomicBool::new(false),
-            fetch_timeout_secs: AtomicU64::new(FetchTimeout::DEFAULT.as_secs()),
-            fetch_concurrency: AtomicUsize::new(FetchConcurrency::DEFAULT.get()),
+            fetch_limits: Mutex::new((FetchTimeout::DEFAULT, FetchConcurrency::DEFAULT)),
         }
     }
 
@@ -495,24 +502,27 @@ impl ScmToRegistryHandle {
     /// Bounds the identity lookups by the user's fetch settings: each lookup is cut off after
     /// `timeout` and at most `concurrency` run at once.
     pub fn set_fetch_limits(&self, timeout: FetchTimeout, concurrency: FetchConcurrency) {
-        self.fetch_timeout_secs
-            .store(timeout.as_secs(), Ordering::Relaxed);
-        self.fetch_concurrency
-            .store(concurrency.get(), Ordering::Relaxed);
+        *self.fetch_limits() = (timeout, concurrency);
     }
 
     /// The per-lookup timeout.
     #[must_use]
     pub fn fetch_timeout(&self) -> FetchTimeout {
-        FetchTimeout::try_from_secs(self.fetch_timeout_secs.load(Ordering::Relaxed))
-            .unwrap_or_default()
+        self.fetch_limits().0
     }
 
     /// The most lookups that run at once.
     #[must_use]
     pub fn fetch_concurrency(&self) -> FetchConcurrency {
-        FetchConcurrency::try_new(self.fetch_concurrency.load(Ordering::Relaxed))
-            .unwrap_or_default()
+        self.fetch_limits().1
+    }
+
+    /// A pair of `Copy` values is replaced in one assignment, so a poisoned lock still holds a
+    /// consistent pair.
+    fn fetch_limits(&self) -> MutexGuard<'_, (FetchTimeout, FetchConcurrency)> {
+        self.fetch_limits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Warns once per setting change that `Replace` has no trusted user-tier default registry.
@@ -586,6 +596,36 @@ mod tests {
         ] {
             assert!(ScmLookupUrl::parse(written).is_none(), "{written}");
         }
+    }
+
+    #[test]
+    fn test_case_folded_url_is_shared_by_case_spellings_of_one_repository() {
+        let folded = |written| CaseFoldedScmUrl::from(&ScmLookupUrl::parse(written).unwrap());
+        assert_eq!(
+            folded("https://github.com/Apple/Swift-NIO.git"),
+            folded("https://GITHUB.com/apple/swift-nio/")
+        );
+        assert_ne!(
+            folded("https://github.com/apple/swift-nio"),
+            folded("https://github.com/apple/swift-log")
+        );
+    }
+
+    #[test]
+    fn test_handle_fetch_limits_survive_a_poisoned_lock() {
+        let handle = Arc::new(ScmToRegistryHandle::default());
+        let poisoner = Arc::clone(&handle);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.fetch_limits();
+            panic!("poison the fetch limits lock");
+        })
+        .join();
+
+        let timeout = FetchTimeout::try_from_secs(30).unwrap();
+        let concurrency = FetchConcurrency::try_new(3).unwrap();
+        handle.set_fetch_limits(timeout, concurrency);
+        assert_eq!(handle.fetch_timeout(), timeout);
+        assert_eq!(handle.fetch_concurrency(), concurrency);
     }
 
     #[test]

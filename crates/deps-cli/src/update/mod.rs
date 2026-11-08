@@ -1118,8 +1118,9 @@ fn writable_fallback_edit(
     if reason != FallbackEditRejection::EditedAdmitsNewer {
         return None;
     }
+    let current = dep.version_requirement()?;
     let exact_text = formatter
-        .format_version_exact_pin(target)
+        .format_version_exact_pin_replacing(target, current.as_str())
         .filter(|text| *text != candidate.new_text)?;
     let exact = ManifestEdit {
         range: candidate.range,
@@ -1140,6 +1141,10 @@ fn writable_fallback_edit(
     reason = "every parameter is either the two views' shared lookup data or a planning \
               knob already threaded through plan_updates; grouping into a struct would only \
               move, not reduce, churn (mirrors deps-engine::classify::fetch's identical call)"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one decision tree over three lookup maps and the fallback candidate"
 )]
 fn resolve_occurrence(
     latest_candidate: UpdateCandidate,

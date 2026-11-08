@@ -27,6 +27,9 @@ version hidden behind an alias is still tracked correctly. Like GitHub Actions, 
 package registry involved — only the mutable-ref-vs-SHA distinction described in [CI/CD
 Pinning](../cross-ecosystem/ci-pinning.md).
 
+A file that is not valid YAML publishes a `parse-error` diagnostic at the document start, and
+`deps-cli check` prints a `failed to parse` warning for it.
+
 ## YAML Anchor/Alias Resolution
 
 `.gitlab-ci.yml` supports YAML anchors (`&name`) and aliases (`*name`) for reuse — GitLab's

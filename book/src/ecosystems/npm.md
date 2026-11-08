@@ -67,6 +67,14 @@ reachability policy below shows no version data for the affected dependency —
 never a silent fallback to `registry.npmjs.org`, matching Cargo's equivalent
 guarantee for a misconfigured registry alias.
 
+**Vulnerability scanning.** A dependency routed by a top-level `registry=` entry (an Artifactory,
+Nexus or Verdaccio proxy, or a mirror such as `registry.npmmirror.com`) is not sent to OSV, because
+the registry cannot be verified as a mirror of npmjs. The skip is reported, not silent: `deps-cli check`
+prints one stderr note with the count, and hover shows "Vulnerability data not checked". An invalid
+top-level `registry=` entry is counted in the note too, but hover shows no footer for it because its
+registry cannot be resolved. Dependencies routed by an `@scope:registry=` entry are treated as private
+and are skipped silently.
+
 **Proxies.** A registry your user `~/.npmrc` declares (and a project `.npmrc` URL equal to one)
 is an [operator-owned registry](../configuration.md#operator-owned-registries): it follows your
 system proxy like the public registries. Registries only a project `.npmrc` declares stay

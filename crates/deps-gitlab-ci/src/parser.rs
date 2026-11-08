@@ -34,7 +34,6 @@ use crate::types::{
     EndpointKind, GitlabCiDependency, GitlabCiParseResult, GitlabRoute, HostRef, IncludeKind,
     PinStyle,
 };
-use deps_core::Result;
 use deps_core::lsp_helpers::{
     CommentSlot, CommitSha, LineOffsetTable, MarkedScalar, ShaPinTail, byte_span_to_range,
     comment_slot_after, is_plain_null, is_tag_shaped, marker_byte_offset, read_sha_pin_tail,
@@ -44,6 +43,7 @@ use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::parser::DependencySource;
 use deps_core::yaml_anchor::{AnchorLimits, ScalarAnchorTable};
 use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
+use deps_core::{DepsError, Result};
 use std::collections::{HashMap, HashSet};
 use url::Url;
 use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser, Tag};
@@ -1471,13 +1471,13 @@ fn build_dependency(
 /// with LSP position tracking, host resolution, and routing.
 ///
 /// Gated first by [`deps_core::check_yaml_bounds`], which returns a real
-/// [`deps_core::DepsError::ParseError`]. A downstream YAML syntax error degrades to an
-/// **empty** [`GitlabCiParseResult`] (logged at `debug`) rather than propagating.
+/// [`deps_core::DepsError::ParseError`]. A downstream YAML syntax error returns the same
+/// error so the user sees a `parse-error` diagnostic.
 ///
 /// # Errors
 ///
-/// Returns [`deps_core::DepsError::ParseError`] only when `content` exceeds the shared YAML
-/// nesting-depth or expansion-size gate.
+/// Returns [`deps_core::DepsError::ParseError`] when `content` exceeds the shared YAML
+/// nesting-depth or expansion-size gate, or is not valid YAML.
 ///
 /// # Examples
 ///
@@ -1511,14 +1511,7 @@ pub fn parse_gitlab_ci_yaml(
     // **component** file's `spec:` header form is genuinely multi-document
     // (`spec: … \n--- \n job:`); `Parser::load(_, false)` stops after the first document.
     if let Err(e) = parser.load(&mut receiver, true) {
-        tracing::debug!(error = %e, "failed to parse GitLab CI YAML, treating as empty");
-        return Ok(GitlabCiParseResult {
-            dependencies: Vec::new(),
-            routes: Vec::new(),
-            uri: uri.clone(),
-            dependency_truncation: None,
-            blocked_registries: Vec::new(),
-        });
+        return Err(DepsError::parse_error("gitlab-ci.yml", &e));
     }
 
     let line_table = LineOffsetTable::new(content);
@@ -1587,7 +1580,6 @@ pub fn parse_gitlab_ci_yaml(
 mod tests {
     use super::*;
     use deps_core::Dependency;
-    use deps_core::DepsError;
     use deps_core::lsp_helpers::CommentSlot;
     use deps_core::net_policy::WorkspaceRegistryAccess;
     use deps_core::position::Range;
@@ -2106,11 +2098,11 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_yaml_returns_empty_result_not_error() {
+    fn test_invalid_yaml_returns_parse_error() {
         let (policy, instance_host) = ctx();
         let content = "include:\n  - [unterminated\n";
-        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
-        assert!(result.dependencies.is_empty());
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host);
+        assert_matches!(result, Err(DepsError::ParseError { .. }));
     }
 
     #[test]
@@ -2663,14 +2655,14 @@ mod tests {
     }
 
     /// EC-009/NFR-007: a dangling alias (`*nope` with no matching `&nope` anywhere) is a
-    /// whole-document load error in `yaml-rust2`, degrading to an empty result — not a
+    /// whole-document load error in `yaml-rust2`, surfaced as a parse error — not a
     /// panic, and not reached by this fix's own code.
     #[test]
-    fn test_dangling_alias_is_a_parse_error_degrading_to_empty_result() {
+    fn test_dangling_alias_is_a_parse_error() {
         let (policy, instance_host) = ctx();
         let content = "include:\n  - project: org/proj\n    ref: *nope\n";
-        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
-        assert!(result.dependencies.is_empty());
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host);
+        assert_matches!(result, Err(DepsError::ParseError { .. }));
     }
 
     // --- spec 058 / #933/#916: mapping-shaped container anchor support ---
@@ -2958,13 +2950,13 @@ mod tests {
     /// empirically (not assumed): `yaml-rust2` 0.12 clears its anchor *name*->id lookup
     /// table at every document boundary, so document 2's bare alias to a document-1 anchor
     /// is a hard parse error for the **whole stream** — document 1's otherwise-valid entry
-    /// is lost too, which is exactly what "zero dependencies overall" pins.
+    /// is lost too, which is exactly what the whole-stream parse error pins.
     #[test]
-    fn test_bare_alias_at_document_root_yields_zero_dependencies_overall() {
+    fn test_bare_alias_at_document_root_is_a_parse_error_for_the_whole_stream() {
         let (policy, instance_host) = ctx();
         let content = ".tpl: &tpl {project: org/proj, ref: v1.0.0}\ninclude:\n  - project: org/valid\n    ref: v2.0.0\n---\n*tpl\n";
-        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host).unwrap();
-        assert!(result.dependencies.is_empty(), "{:?}", result.dependencies);
+        let result = parse_gitlab_ci_yaml(content, &test_uri(), &policy, &instance_host);
+        assert_matches!(result, Err(DepsError::ParseError { .. }));
     }
 
     /// Critic M1 (ruled): a merge chain deep enough to trip [`MAX_REPLAY_DEPTH`] (linear,

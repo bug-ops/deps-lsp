@@ -1023,6 +1023,7 @@ mod tests {
                     catalog_ref: None,
                 },
                 source,
+                registry_entry: None,
                 package: None,
             }
         }

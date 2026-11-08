@@ -681,6 +681,7 @@ mod tests {
                 catalog_ref: None,
             },
             source: deps_core::parser::DependencySource::Registry,
+            registry_entry: None,
             package: None,
         }
     }

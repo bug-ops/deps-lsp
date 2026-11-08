@@ -1804,3 +1804,170 @@ mod gossip_prefetch_wiring_regression {
         mock.assert_async().await;
     }
 }
+
+/// #1917: dependencies whose OSV scan was skipped because their registry is unverified are
+/// counted into the run's single stderr note. The npm registry is a `mockito` server reached
+/// through the fixture's `.npmrc`; no OSV request is made because every dependency is skipped
+/// before the scan.
+mod unverified_registry_note {
+    use super::*;
+    use deps_cli::report::OsvCoverage;
+    use deps_core::policy_config::{RegistriesConfig, WorkspaceRegistriesSetting};
+
+    async fn coverage_for(npmrc: &str, package_json: &str) -> OsvCoverage {
+        let mut server = mockito::Server::new_async().await;
+        let _packuments = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .expect_at_least(0)
+            .create_async()
+            .await;
+        let host = server.host_with_port();
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(dir.path().join(".npmrc"), npmrc.replace("HOST", &host))
+            .expect("write npmrc");
+        std::fs::write(dir.path().join("package.json"), package_json).expect("write package.json");
+
+        let policy = PolicyConfig {
+            registries: RegistriesConfig::new()
+                .with_workspace_registries(WorkspaceRegistriesSetting::All),
+            ..PolicyConfig::default()
+        };
+        let env = MapEnv::new().with_var(
+            "DEPS_LSP_PRIVATE_REGISTRY_HOSTS",
+            host.split(':').next().expect("host"),
+        );
+        let runtime = EcosystemRuntime::from_policy(&policy, &RegistryEnvironment::read(&env));
+        let cache = Arc::new(HttpCache::with_policy(Arc::clone(&runtime.policy)));
+        let registry = EcosystemRegistry::new();
+        let _ = register_ecosystems(&registry, Arc::clone(&cache), &runtime);
+        let ctx = CheckContext {
+            cache: Arc::clone(&cache),
+            osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
+            deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
+            lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            policy,
+        };
+
+        let outcome = walk::walk(
+            &[dir.path().to_path_buf()],
+            &registry,
+            walk::GitignorePolicy::Ignore,
+            walk::SymlinkPolicy::Skip,
+        );
+        let mut coverage = OsvCoverage::default();
+        for manifest in outcome.manifests() {
+            let content = std::fs::read_to_string(&manifest.path).expect("read manifest");
+            let result = check_manifest(
+                &manifest.ecosystem,
+                &manifest.uri_path,
+                &manifest.display_path,
+                &content,
+                &ctx,
+            )
+            .await
+            .expect("check_manifest");
+            coverage.add(&result.osv_coverage);
+        }
+        coverage
+    }
+
+    const LODASH: &str = r#"{"dependencies":{"lodash":"4.17.15"}}"#;
+
+    #[tokio::test]
+    async fn top_level_registry_override_reports_the_skipped_dependency() {
+        let coverage = coverage_for("registry=http://HOST/\n", LODASH).await;
+        assert_eq!(coverage, OsvCoverage::new(1));
+        assert_eq!(
+            coverage.note().as_deref(),
+            Some(
+                "vulnerability data not checked for 1 dependency (registry not verified as a public mirror)"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn unmatched_scoped_names_count_too_but_a_scope_entry_stays_silent() {
+        let coverage = coverage_for(
+            "registry=http://HOST/\n@myorg:registry=http://HOST/\n",
+            r#"{"dependencies":{"lodash":"4.17.15","@types/node":"20.0.0","@myorg/lib":"1.0.0"}}"#,
+        )
+        .await;
+        assert_eq!(coverage, OsvCoverage::new(2));
+    }
+
+    #[tokio::test]
+    async fn scope_only_registry_reports_nothing() {
+        let coverage = coverage_for(
+            "@myorg:registry=http://HOST/\n",
+            r#"{"dependencies":{"@myorg/lib":"1.0.0"}}"#,
+        )
+        .await;
+        assert_eq!(coverage, OsvCoverage::default());
+        assert!(coverage.note().is_none());
+    }
+}
+
+/// #1914/#1917/#1937 through the real binary: the Go environment reaches the child process only
+/// via `Command::env`, so the tests stay hermetic and need no ecosystem-crate dependency. Every
+/// scenario resolves before any network request (no OSV target, no registry URL).
+mod go_env_subprocess {
+    const GO_MOD: &str =
+        "module example.com/app\n\ngo 1.22\n\nrequire github.com/gin-gonic/gin v1.9.0\n";
+    const GO_VARS: [&str; 7] = [
+        "GOPROXY",
+        "GOPRIVATE",
+        "GONOPROXY",
+        "GOSUMDB",
+        "GONOSUMDB",
+        "GOENV",
+        "GOFLAGS",
+    ];
+
+    fn run_check(goenv: &[(&str, &str)]) -> std::process::Output {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let home = tempfile::tempdir().expect("create temp home");
+        std::fs::write(dir.path().join("go.mod"), GO_MOD).expect("write go.mod");
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_deps-cli"));
+        command
+            .args(["check", "--fail-on", "vulnerable"])
+            .arg(dir.path())
+            .env("HOME", home.path());
+        for var in GO_VARS {
+            command.env_remove(var);
+        }
+        for (key, value) in goenv {
+            command.env(key, value);
+        }
+        command.output().expect("run the real deps-cli binary")
+    }
+
+    #[test]
+    fn rejected_hop_is_noted_and_never_leaks_the_credential() {
+        let output = run_check(&[("GOPROXY", "https://user:topsecret@proxy.corp.example")]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(
+                "vulnerability data not checked for 1 dependency (registry not verified as a public mirror)"
+            ),
+            "stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("GOPROXY (process environment)"),
+            "the diagnostic must name the variable (#1937) — stdout: {stdout}"
+        );
+        assert!(!stdout.contains("topsecret") && !stderr.contains("topsecret"));
+    }
+
+    #[test]
+    fn private_module_prints_no_unchecked_note() {
+        let output = run_check(&[("GOPROXY", "direct"), ("GOPRIVATE", "github.com/gin-gonic")]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("vulnerability data not checked"),
+            "a GOPRIVATE module is private by declaration — stderr: {stderr}"
+        );
+    }
+}

@@ -350,7 +350,8 @@ pub fn build_scan_targets(
         let key = deps_core::osv::vuln_key_for(dep, Some(&keys), formatter);
 
         if formatter.public_content(dep).is_none() {
-            skipped.insert(key, ScanOutcome::Skipped(SkipReason::NonRegistrySource));
+            let reason = deps_core::osv::non_public_skip_reason(dep, formatter);
+            skipped.insert(key, ScanOutcome::Skipped(reason.as_skip_reason()));
             continue;
         }
 
@@ -434,8 +435,9 @@ pub fn build_scan_targets(
 /// (code-review finding: the two functions used to duplicate this exact branch sequence, which
 /// this PR's `StructuralSkipReason` retyping had to edit in lockstep in both copies).
 enum DepCheckClassification<'a> {
-    /// `formatter.source_is_public_registry_content` returned `false`.
-    NonRegistrySource,
+    /// `formatter.public_content` returned `None`; carries whether the skip stays silent
+    /// (`NonRegistrySource`) or is reported (`UnverifiedRegistrySource`, #1917).
+    NonPublicSource(deps_core::osv::StructuralSkipReason),
     /// No registry-cached version list yet for this dependency — absence, not a structural
     /// skip: a later commit populating `cached_versions` can still turn this into a real
     /// target (see both callers' own doc for why this must not be read as "not applicable").
@@ -476,7 +478,9 @@ fn classify_dep_for_check_targets<'a>(
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> DepCheckClassification<'a> {
     if formatter.public_content(dep).is_none() {
-        return DepCheckClassification::NonRegistrySource;
+        return DepCheckClassification::NonPublicSource(deps_core::osv::non_public_skip_reason(
+            dep, formatter,
+        ));
     }
 
     let Some(cached) =
@@ -600,7 +604,7 @@ pub fn build_latest_check_targets(
     Vec<deps_core::osv::ScanTarget>,
     deps_core::osv::LatestStatusMap,
 ) {
-    use deps_core::osv::{SkipReason, StructuralSkipReason, UpgradeStatus, vuln_key_for};
+    use deps_core::osv::{SkipReason, UpgradeStatus, vuln_key_for};
 
     let mut targets = Vec::new();
     let mut structural = deps_core::osv::LatestStatusMap::new();
@@ -610,11 +614,8 @@ pub fn build_latest_check_targets(
         let key = vuln_key_for(dep, Some(vuln_keys), formatter);
 
         match classify_dep_for_check_targets(dep, cached_versions, formatter) {
-            DepCheckClassification::NonRegistrySource => {
-                structural.insert(
-                    key,
-                    UpgradeStatus::StructurallyUnchecked(StructuralSkipReason::NonRegistrySource),
-                );
+            DepCheckClassification::NonPublicSource(reason) => {
+                structural.insert(key, UpgradeStatus::StructurallyUnchecked(reason));
             }
             // No registry-cached latest yet — absence, not a structural skip (see doc above).
             DepCheckClassification::NoCachedVersions => {}
@@ -737,11 +738,8 @@ pub fn build_candidate_check_targets(
 
         let (osv_name, package_versions) =
             match classify_dep_for_check_targets(dep, cached_versions, formatter) {
-                DepCheckClassification::NonRegistrySource => {
-                    structural.insert(
-                        key,
-                        CandidateStatuses::Structural(StructuralSkipReason::NonRegistrySource),
-                    );
+                DepCheckClassification::NonPublicSource(reason) => {
+                    structural.insert(key, CandidateStatuses::Structural(reason));
                     continue;
                 }
                 // No registry-cached version list yet — absence, not a structural skip (see

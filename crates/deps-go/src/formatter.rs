@@ -3,6 +3,7 @@ use deps_core::lsp_helpers::{
     PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
     compile_requirement_unless,
 };
+use deps_core::osv::NonPublicRoute;
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName};
 
@@ -180,8 +181,10 @@ impl SourcePolicy for GoFormatter {
     /// (`AlternateRegistry { mirrors_public_registry: true, .. }`, set by
     /// `GoEnvConfig::resolve_source_for` from `GOSUMDB`/`GONOSUMDB`/`GOPRIVATE`) counts as
     /// public-registry content alongside plain [`DependencySource::Registry`], so OSV and
-    /// deps.dev keep covering users who set `GOPROXY`. The `GOPRIVATE` bypass and a fail-closed
-    /// `CustomRegistry` never do.
+    /// deps.dev keep covering users who set `GOPROXY`, whatever its hop kinds: a `direct` or
+    /// `off` chain still has `go` verify the module against the checksum database (#1914). The
+    /// `GOPRIVATE` bypass, a `GOSUMDB=off`/`GONOSUMDB` match and a fail-closed `CustomRegistry`
+    /// never count.
     fn source_is_public_registry_content(&self, source: &DependencySource) -> bool {
         matches!(
             source,
@@ -195,6 +198,19 @@ impl SourcePolicy for GoFormatter {
 }
 
 impl OsvNaming for GoFormatter {
+    /// A fail-closed `CustomRegistry` (every `GOPROXY` hop rejected) is an unverified route
+    /// to public modules and is reported; the `GOPRIVATE` bypass and `GOSUMDB=off`/`GONOSUMDB`
+    /// chains are user-declared "do not verify" routes and stay silent (#1917). A
+    /// `GONOSUMDB`-only module with every hop rejected is still `CustomRegistry`, because
+    /// routing fails closed before the checksum-database check, so it is reported too.
+    fn non_public_route(&self, dep: &dyn Dependency) -> NonPublicRoute {
+        if matches!(dep.source(), DependencySource::CustomRegistry { .. }) {
+            NonPublicRoute::UnverifiedMirror
+        } else {
+            NonPublicRoute::Private
+        }
+    }
+
     fn osv_version_to_native(&self, version: &deps_core::osv::OsvVersion) -> ConcreteVersion {
         // OSV's `fixed` events for Go are plain semver (`0.3.7`), never
         // carrying the `v` prefix Go module versions require in go.mod.
@@ -231,6 +247,44 @@ mod tests {
             directive,
             indirect: false,
             source: deps_core::parser::DependencySource::Registry,
+        }
+    }
+
+    fn dep_with_source(source: DependencySource) -> GoDependency {
+        GoDependency {
+            source,
+            ..go_dep(GoDirective::Require, "v1.0.0")
+        }
+    }
+
+    /// #1917: only a fail-closed `CustomRegistry` is reported; `GOPRIVATE`/`GONOSUMDB`-style
+    /// `AlternateRegistry { mirrors_public_registry: false }` routes stay silent.
+    #[test]
+    fn non_public_route_flags_only_custom_registry() {
+        let formatter = GoFormatter;
+        let custom = dep_with_source(DependencySource::CustomRegistry {
+            url: "https://proxy.corp.example".into(),
+        });
+        assert_eq!(
+            formatter.non_public_route(&custom),
+            NonPublicRoute::UnverifiedMirror
+        );
+        for source in [
+            DependencySource::Registry,
+            DependencySource::AlternateRegistry {
+                index: crate::config::GOPRIVATE_CHAIN_KEY.into(),
+                mirrors_public_registry: false,
+            },
+            DependencySource::AlternateRegistry {
+                index: "https://proxy.golang.org".into(),
+                mirrors_public_registry: false,
+            },
+        ] {
+            assert_eq!(
+                formatter.non_public_route(&dep_with_source(source.clone())),
+                NonPublicRoute::Private,
+                "{source:?} must stay silent"
+            );
         }
     }
 

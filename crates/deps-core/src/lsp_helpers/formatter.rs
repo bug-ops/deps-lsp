@@ -153,6 +153,21 @@ pub trait PackageRendering: Send + Sync {
         None
     }
 
+    /// [`format_version_exact_pin`](Self::format_version_exact_pin) for the existing requirement
+    /// text `current`, for ecosystems whose exact pin must keep a piece of `current` (Composer's
+    /// `@stability` flag and `v` prefix style).
+    ///
+    /// Default: ignores `current`, delegating to
+    /// [`format_version_exact_pin`](Self::format_version_exact_pin).
+    fn format_version_exact_pin_replacing(
+        &self,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> Option<String> {
+        let _ = current;
+        self.format_version_exact_pin(version)
+    }
+
     /// Like [`format_version_replacing`](Self::format_version_replacing), but also
     /// carries the dependency identity `version`/`current` apply to.
     ///
@@ -764,6 +779,335 @@ pub fn format_version_replacing_by_shape(
             };
             format!("{prefix}{}", version.as_str())
         }
+    }
+}
+
+/// Whether a rewrite target is a plain "update to latest" or a security-fix / cooldown-fallback
+/// floor that must never be rendered below the picked version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteTarget {
+    /// Plain update: the operand keeps its declared precision (`~> 2.0` -> `~> 3.2`).
+    Update,
+    /// Floor target: the full picked version is written (`~> 2.0` -> `~> 2.9.1`).
+    Floor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeOperator {
+    PessimisticTilde,
+    Tilde,
+    Caret,
+}
+
+impl RangeOperator {
+    const fn spelling(self) -> &'static str {
+        match self {
+            Self::PessimisticTilde => "~>",
+            Self::Tilde => "~",
+            Self::Caret => "^",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StabilitySuffix {
+    Unsupported,
+    AtFlag,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VPrefix {
+    Absent,
+    MatchOperand,
+}
+
+/// Operator grammar of an ecosystem whose bare version is an exact pin but whose manifests
+/// commonly declare `~`/`~>`/`^` ranges.
+///
+/// Only [`BUNDLER`](Self::BUNDLER) and [`COMPOSER`](Self::COMPOSER) exist; an ecosystem opts in
+/// by naming its constant, so there is no runtime lookup that could fail.
+#[derive(Debug, Clone, Copy)]
+pub struct OperatorGrammar {
+    operators: &'static [RangeOperator],
+    stability: StabilitySuffix,
+    v_prefix: VPrefix,
+}
+
+const COMPOSER_STABILITY_FLAGS: [&str; 5] = ["dev", "alpha", "beta", "rc", "stable"];
+
+/// One declared comparator, classified for the operator-keeping rewrite.
+#[derive(Debug, Clone, Copy)]
+enum DeclaredComparator<'a> {
+    Range {
+        operator: RangeOperator,
+        gap: &'a str,
+        operand: &'a str,
+    },
+    LowerBound {
+        gap: &'a str,
+        operand: &'a str,
+    },
+    Other,
+}
+
+impl OperatorGrammar {
+    /// Bundler: `~>` pessimistic ranges, no stability flag, no `v` prefix.
+    pub const BUNDLER: Self = Self {
+        operators: &[RangeOperator::PessimisticTilde],
+        stability: StabilitySuffix::Unsupported,
+        v_prefix: VPrefix::Absent,
+    };
+
+    /// Composer: `~` and `^` ranges, trailing `@stability` flag, `v` prefix style.
+    pub const COMPOSER: Self = Self {
+        operators: &[RangeOperator::Tilde, RangeOperator::Caret],
+        stability: StabilitySuffix::AtFlag,
+        v_prefix: VPrefix::MatchOperand,
+    };
+
+    /// Renders `version` as a replacement for the declared requirement `current`, keeping the
+    /// operator, its spacing, the operand precision and, for Composer, the trailing
+    /// `@stability` flag and `v` prefix style (spec 098).
+    ///
+    /// - A single `~>`/`~`/`^` comparator keeps its operator. A plain update fits the picked
+    ///   version to the operand's segment count (`~> 2.0` -> `~> 3.2`, padding with `0` when the
+    ///   picked version is shorter); a floor target, a `0.0.x` caret pick or a prerelease pick
+    ///   writes the full version.
+    /// - One operator comparator plus lower bounds the picked version satisfies (per
+    ///   `satisfies`) renders the operator comparator alone.
+    /// - A single `>=`/`>` renders `>=` plus the picked version.
+    /// - Every other shape (bare version, upper bounds, `||`, wildcards, unparsable operands)
+    ///   renders the bare picked version, keeping a Composer stability flag.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::ConcreteVersion;
+    /// use deps_core::lsp_helpers::{OperatorGrammar, RewriteTarget};
+    ///
+    /// let render = |grammar: OperatorGrammar, current, picked, target| {
+    ///     grammar.replacing(&ConcreteVersion::new(picked), current, target, |_| true)
+    /// };
+    /// assert_eq!(
+    ///     render(OperatorGrammar::BUNDLER, "~> 2.0", "3.2.8", RewriteTarget::Update),
+    ///     "~> 3.2"
+    /// );
+    /// assert_eq!(
+    ///     render(OperatorGrammar::BUNDLER, "~> 2.0", "2.9.1", RewriteTarget::Floor),
+    ///     "~> 2.9.1"
+    /// );
+    /// assert_eq!(
+    ///     render(OperatorGrammar::COMPOSER, "^5.0@beta", "8.1.11", RewriteTarget::Update),
+    ///     "^8.1@beta"
+    /// );
+    /// ```
+    #[must_use]
+    pub fn replacing(
+        self,
+        version: &ConcreteVersion,
+        current: &str,
+        target: RewriteTarget,
+        satisfies: impl Fn(&str) -> bool,
+    ) -> String {
+        let (body, suffix) = self.split_stability_suffix(current);
+        let core = self.strip_v(version.as_str());
+        let rendered = render_operator_constraint(self, body, core, target, satisfies)
+            .unwrap_or_else(|| self.bare(body, version));
+        format!("{rendered}{suffix}")
+    }
+
+    /// Renders `version` as an exact pin for the declared requirement `current`: the bare
+    /// version, keeping Composer's `v` prefix style and trailing `@stability` flag.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::ConcreteVersion;
+    /// use deps_core::lsp_helpers::OperatorGrammar;
+    ///
+    /// let version = ConcreteVersion::new("2.9.1");
+    /// assert_eq!(
+    ///     OperatorGrammar::COMPOSER.exact_pin(&version, "^2.0@beta"),
+    ///     "2.9.1@beta"
+    /// );
+    /// assert_eq!(OperatorGrammar::BUNDLER.exact_pin(&version, "~> 2.0"), "2.9.1");
+    /// ```
+    #[must_use]
+    pub fn exact_pin(self, version: &ConcreteVersion, current: &str) -> String {
+        let (body, suffix) = self.split_stability_suffix(current);
+        format!("{}{suffix}", self.bare(body, version))
+    }
+
+    /// Splits a trailing `@stability` flag (kept verbatim, with its leading whitespace) off
+    /// `requirement`, returning `(body, suffix)`.
+    fn split_stability_suffix(self, requirement: &str) -> (&str, &str) {
+        let trimmed = requirement.trim();
+        if self.stability == StabilitySuffix::Unsupported {
+            return (trimmed, "");
+        }
+        let Some(at) = trimmed.rfind('@') else {
+            return (trimmed, "");
+        };
+        let (head, flag) = trimmed.split_at(at);
+        let is_flag = flag.strip_prefix('@').is_some_and(|word| {
+            COMPOSER_STABILITY_FLAGS
+                .iter()
+                .any(|known| word.eq_ignore_ascii_case(known))
+        });
+        if !is_flag {
+            return (trimmed, "");
+        }
+        let body = head.trim_end();
+        (body, trimmed.split_at(body.len()).1)
+    }
+
+    fn strip_v(self, operand: &str) -> &str {
+        match self.v_prefix {
+            VPrefix::Absent => operand,
+            VPrefix::MatchOperand => operand
+                .strip_prefix(['v', 'V'])
+                .filter(|rest| !rest.is_empty())
+                .unwrap_or(operand),
+        }
+    }
+
+    fn is_numeric_operand(self, operand: &str) -> bool {
+        self.strip_v(operand)
+            .split('.')
+            .all(|segment| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()))
+    }
+
+    fn style_operand(self, operand_style_source: &str, rendered: &str) -> String {
+        match self.v_prefix {
+            VPrefix::Absent => rendered.to_string(),
+            VPrefix::MatchOperand => super::match_v_prefix_style(operand_style_source, rendered),
+        }
+    }
+
+    fn classify_comparator(self, part: &str) -> DeclaredComparator<'_> {
+        let part = part.trim();
+        for operator in self.operators {
+            if let Some(rest) = part.strip_prefix(operator.spelling()) {
+                let (gap, operand) = split_leading_space(rest);
+                return if self.is_numeric_operand(operand) {
+                    DeclaredComparator::Range {
+                        operator: *operator,
+                        gap,
+                        operand,
+                    }
+                } else {
+                    DeclaredComparator::Other
+                };
+            }
+        }
+        let lower = part.strip_prefix(">=").or_else(|| part.strip_prefix('>'));
+        if let Some(rest) = lower {
+            let (gap, operand) = split_leading_space(rest);
+            if self.is_numeric_operand(operand) {
+                return DeclaredComparator::LowerBound { gap, operand };
+            }
+        }
+        DeclaredComparator::Other
+    }
+
+    fn bare(self, body: &str, version: &ConcreteVersion) -> String {
+        match self.v_prefix {
+            VPrefix::Absent => version.as_str().to_string(),
+            VPrefix::MatchOperand => {
+                super::match_v_prefix_style(strip_requirement_operator(body), version.as_str())
+            }
+        }
+    }
+}
+
+fn split_leading_space(rest: &str) -> (&str, &str) {
+    rest.split_at(rest.len() - rest.trim_start().len())
+}
+
+fn is_prerelease_core(core: &str) -> bool {
+    core.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+fn caret_is_exact(core: &str) -> bool {
+    let mut segments = core.split('.');
+    segments.next() == Some("0") && segments.next() == Some("0")
+}
+
+/// Truncates `core` to `count` segments, padding with `0` when it has fewer so the rewritten
+/// operand never has a lower precision (a wider range) than the declared one.
+fn fit_segments(core: &str, count: usize) -> String {
+    let mut segments: Vec<&str> = core.split('.').take(count).collect();
+    while segments.len() < count {
+        segments.push("0");
+    }
+    segments.join(".")
+}
+
+fn render_range(
+    grammar: OperatorGrammar,
+    operator: RangeOperator,
+    gap: &str,
+    operand: &str,
+    core: &str,
+    target: RewriteTarget,
+) -> String {
+    let operand_segments = grammar.strip_v(operand).split('.').count();
+    let keep_full = target == RewriteTarget::Floor
+        || (operator == RangeOperator::Caret && caret_is_exact(core));
+    let rendered = if is_prerelease_core(core) {
+        core.to_string()
+    } else if keep_full {
+        fit_segments(core, core.split('.').count().max(operand_segments))
+    } else {
+        fit_segments(core, operand_segments)
+    };
+    format!(
+        "{}{gap}{}",
+        operator.spelling(),
+        grammar.style_operand(operand, &rendered)
+    )
+}
+
+fn render_operator_constraint(
+    grammar: OperatorGrammar,
+    body: &str,
+    core: &str,
+    target: RewriteTarget,
+    satisfies: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if body.contains('|') {
+        return None;
+    }
+    let parts: Vec<&str> = body.split(',').map(str::trim).collect();
+    let mut range = None;
+    let mut lower_bounds = Vec::new();
+    for part in &parts {
+        match grammar.classify_comparator(part) {
+            DeclaredComparator::Range {
+                operator,
+                gap,
+                operand,
+            } => {
+                if range.replace((operator, gap, operand)).is_some() {
+                    return None;
+                }
+            }
+            DeclaredComparator::LowerBound { gap, operand } => {
+                lower_bounds.push((*part, gap, operand));
+            }
+            DeclaredComparator::Other => return None,
+        }
+    }
+    match (range, lower_bounds.as_slice()) {
+        (Some((operator, gap, operand)), bounds)
+            if bounds.iter().all(|(part, _, _)| satisfies(part)) =>
+        {
+            Some(render_range(grammar, operator, gap, operand, core, target))
+        }
+        (None, &[(_, gap, operand)]) if parts.len() == 1 => {
+            Some(format!(">={gap}{}", grammar.style_operand(operand, core)))
+        }
+        _ => None,
     }
 }
 
@@ -2497,6 +2841,46 @@ pub trait OsvNaming: SourcePolicy + Send + Sync {
             .then(|| PublicContent {
                 name: std::borrow::Cow::Borrowed(dep.name()),
             })
+    }
+
+    /// How a dependency that is not public registry content (see [`Self::public_content`])
+    /// is classified for the "vulnerability data not checked" signal (#1917).
+    ///
+    /// [`crate::osv::NonPublicRoute::UnverifiedMirror`] means the route plausibly proxies public
+    /// content but cannot be verified as doing so (an npm `registry=` override), so the skipped
+    /// OSV scan is reported to the user. Default: [`crate::osv::NonPublicRoute::Private`], which
+    /// stays silent. An ecosystem that overrides this must also map to an OSV ecosystem; the
+    /// `deps-engine` guard test lists every opting-in ecosystem.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{OsvNaming, SourcePolicy};
+    /// use deps_core::osv::NonPublicRoute;
+    /// use deps_core::parser::DependencySource;
+    /// use deps_core::position::Range;
+    /// use deps_core::{Dependency, PackageName, VersionReq};
+    ///
+    /// struct DefaultFormatter;
+    /// impl SourcePolicy for DefaultFormatter {}
+    /// impl OsvNaming for DefaultFormatter {}
+    ///
+    /// struct Dep(PackageName);
+    /// impl Dependency for Dep {
+    ///     fn name(&self) -> &PackageName { &self.0 }
+    ///     fn name_range(&self) -> Range { Range::default() }
+    ///     fn version_requirement(&self) -> Option<&VersionReq> { None }
+    ///     fn version_range(&self) -> Option<Range> { None }
+    ///     fn source(&self) -> DependencySource { DependencySource::Registry }
+    ///     fn as_any(&self) -> &dyn std::any::Any { self }
+    /// }
+    ///
+    /// let dep = Dep(PackageName::new("serde"));
+    /// assert_eq!(DefaultFormatter.non_public_route(&dep), NonPublicRoute::Private);
+    /// ```
+    fn non_public_route(&self, dep: &dyn Dependency) -> crate::osv::NonPublicRoute {
+        let _ = dep;
+        crate::osv::NonPublicRoute::Private
     }
 
     /// OSV.dev's canonical spelling for `dep`'s package name, or `None` if

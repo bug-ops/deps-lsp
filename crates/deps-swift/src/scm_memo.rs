@@ -18,7 +18,7 @@ use deps_core::{RefreshEvents, RefreshSender};
 use tokio::sync::watch;
 
 use crate::package_location::RegistryIdentityBuf;
-use crate::scm::{IdentityLookup, MemoKey, RegistryIndexUrl};
+use crate::scm::{CaseFoldedScmUrl, IdentityLookup, MemoKey, RegistryIndexUrl};
 
 /// How long an answer is served without scheduling a refresh.
 pub(crate) const IDENTITY_TTL: Duration = Duration::from_hours(1);
@@ -101,6 +101,7 @@ impl Drop for InflightGuard {
     }
 }
 
+// TODO(#1944): shared SWR store and single-flight
 /// Repository-URL identity answers shared by every Swift document of a registry.
 #[derive(Debug)]
 pub(crate) struct ScmIdentityMemo {
@@ -162,8 +163,8 @@ impl ScmIdentityMemo {
     pub(crate) fn unique_by_lowercase_repository(
         &self,
         registry: &RegistryIndexUrl,
-    ) -> HashMap<String, RegistryIdentityBuf> {
-        let mut found: HashMap<String, Option<RegistryIdentityBuf>> = HashMap::new();
+    ) -> HashMap<CaseFoldedScmUrl, RegistryIdentityBuf> {
+        let mut found: HashMap<CaseFoldedScmUrl, Option<RegistryIdentityBuf>> = HashMap::new();
         for (key, entry) in &self.state().entries {
             let IdentityLookup::Unique(identity) = &entry.answer else {
                 continue;
@@ -172,7 +173,7 @@ impl ScmIdentityMemo {
                 continue;
             }
             found
-                .entry(key.repository().as_str().to_ascii_lowercase())
+                .entry(CaseFoldedScmUrl::from(key.repository()))
                 .and_modify(|seen| {
                     if seen.as_ref() != Some(identity) {
                         *seen = None;

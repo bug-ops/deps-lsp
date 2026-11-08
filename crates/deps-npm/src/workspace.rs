@@ -904,6 +904,7 @@ fn push_dependency(
         version_range: range,
         origin,
         source: deps_core::parser::DependencySource::Registry,
+        registry_entry: None,
         package,
     });
 }

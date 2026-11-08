@@ -10,7 +10,7 @@ tags:
   - cross-ecosystem
   - bug
 created: 2026-11-08
-status: draft
+status: ready
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
@@ -161,24 +161,24 @@ THEN the returned hints contain the warning marker for both dependencies
 | ID | Requirement | Priority |
 |----|-------------|----------|
 | FR-001 | WHEN an inlay-hint request is served for a document whose recorded outcomes include an attempted fetch failure for a dependency that has a lock-file-resolved version, THE SYSTEM SHALL return `⚠ <resolved>` with tooltip "Registry lookup failed; latest version unknown" for that dependency, regardless of `show_up_to_date_hints`. | must |
-| FR-002 | WHEN an inlay-hint request is served for a dependency with a reportable `LookupMiss::NotFound` or `LookupMiss::NoComparableVersions` and a resolved version, THE SYSTEM SHALL return `⚠ <resolved>` with tooltip "Package not found in the registry; latest version unknown" or "No comparable registry version; latest version unknown" respectively. | must |
+| FR-002 | WHEN an inlay-hint request is served for a dependency with a reportable `LookupMiss::NotFound` or `LookupMiss::NoComparableVersions` and a resolved version, THE SYSTEM SHALL return `⚠ <resolved>` with tooltip "Package not found in the registry; latest version unknown" or "No comparable registry version; latest version unknown" respectively. (Verification: the 404 case live for cargo, npm2 and pypi; `NoComparableVersions` and the `NotLookedUp` `ℹ` marker by generator unit tests and the `handle_inlay_hints` handler test only, not live.) | must |
 | FR-003 | THE SYSTEM SHALL supply the same per-dependency outcome data to the inlay-hint renderer in the LSP handler as it supplies to the diagnostics renderer for the same document state, so that the two surfaces cannot disagree about failure or miss status. | must |
 | FR-004 | WHEN a fetch-failure record has not been attempted (a `NotAttempted` placeholder), THE SYSTEM SHALL NOT render the failure marker for that dependency. | must |
 | FR-005 | WHILE the session is offline, THE SYSTEM SHALL render the offline marker (`📴`, with the resolved version when one exists) and SHALL NOT render the failure or miss marker, even if outcomes recorded before going offline exist. | must |
 | FR-006 | WHEN a dependency's source is one for which `reportable_lookup_miss` suppresses reporting (an alternate registry, or a source the formatter cannot resolve), THE SYSTEM SHALL NOT render a lookup-miss marker for it, matching diagnostics. | must |
 | FR-007 | WHEN the dependency has no lock-file-resolved version, THE SYSTEM SHALL keep existing behavior (no failure or miss marker, since there is no resolved version to display). | must |
-| FR-008 | WHEN the recorded miss is `LookupMiss::NotLookedUp` (decided locally, no registry request made), THE SYSTEM SHALL NOT render the up-to-date checkmark for that dependency; the replacement rendering is [NEEDS CLARIFICATION: see Q1]. | must |
+| FR-008 | WHEN the recorded miss is `LookupMiss::NotLookedUp` (decided locally, no registry request made), THE SYSTEM SHALL NOT render the up-to-date checkmark for that dependency; the replacement rendering is the neutral marker `ℹ <resolved>` with tooltip "Package not looked up; latest version unknown" (Q1 resolution), rendered regardless of `show_up_to_date_hints`. | must |
 | FR-009 | THE SYSTEM SHALL apply FR-001 through FR-008 identically for all supported ecosystems, through the shared `deps-core` generator and the shared handler path, with no per-ecosystem inlay logic. | must |
 | FR-010 | THE SYSTEM SHALL include a regression test that invokes `handle_inlay_hints` against a `ServerState` whose document signals hold a recorded fetch failure and a recorded `NotFound` miss, and asserts the warning hints, so that omitting the outcomes dimension from the handler snapshot fails the test. | must |
 | FR-011 | THE SYSTEM SHALL include a per-ecosystem or table-driven check that, for each of the eight ecosystems under both the 404 and the transport-failure scenarios, the set of dependencies with failure or miss diagnostics equals the set with a warning hint. | should |
-| FR-012 | WHEN a registry fetch completes with a failure or miss after hints were already rendered as loading or up to date, THE SYSTEM SHALL cause the editor to re-request inlay hints so the marker appears without a manual edit. | should: [NEEDS CLARIFICATION: see Q3, current refresh triggers unverified for the outcome-change case] |
+| FR-012 | WHEN a registry fetch completes with a failure or miss after hints were already rendered as loading or up to date, THE SYSTEM SHALL cause the editor to re-request inlay hints so the marker appears without a manual edit. | should (Q3: NOT verified live; no refresh trigger was added or tested in this PR, remains open, tracked in #1955) |
 
 ## 4. Non-Functional Requirements
 
 | ID | Category | Requirement |
 |----|----------|-------------|
 | NFR-001 | Performance | Attaching outcomes to the inlay snapshot SHALL NOT add a registry request or any blocking work to the handler; it clones already-held in-memory state, consistent with hover and diagnostics. Hint latency from cached state SHALL stay within the existing handler budget. |
-| NFR-002 | Type safety | The fix SHOULD make the omission unrepresentable or a compile-time error where practicable (for example a renderer declaring the snapshot dimensions it requires) rather than relying only on a runtime test. [NEEDS CLARIFICATION: mechanism is a plan-phase decision, see Q2] |
+| NFR-002 | Type safety | The fix SHOULD make the omission unrepresentable or a compile-time error where practicable (for example a renderer declaring the snapshot dimensions it requires) rather than relying only on a runtime test. (mechanism: test-only enforcement, Q2) |
 | NFR-003 | Security | Hint labels and tooltips SHALL continue to pass the resolved version through `sanitize_hint_version`; no registry-supplied text (error bodies, URLs) enters the label or tooltip. Tooltips remain the fixed strings listed in FR-001/FR-002. |
 | NFR-004 | Consistency | Behavior SHALL be implemented once in `deps-core` and the `deps-lsp` handler; a per-ecosystem divergence is a defect (project cross-ecosystem consistency rule). |
 
@@ -205,7 +205,7 @@ No new data. Existing entities involved:
 | Dependency from an alternate registry that 404s | No miss marker (FR-006), matching diagnostics. |
 | Dependency without lock-file resolution and a failed lookup | No marker from this feature (FR-007); no resolved version to show. |
 | `show_up_to_date_hints = false` | Failure and miss markers still render (fixed status markers). |
-| Diagnostics disabled by user configuration | Hints still render the marker. [NEEDS CLARIFICATION: Q4, whether US-003 "agree" must hold when diagnostics are turned off] |
+| Diagnostics disabled by user configuration | Hints still render the marker. (Q4: yes, the marker still renders) |
 
 ## 7. Success Criteria
 
@@ -235,14 +235,16 @@ No new data. Existing entities involved:
 - Put registry-supplied text into hint labels or tooltips.
 - Use `.local/specs/`; spec artifacts live in tracked `specs/`.
 
-## 9. Open Questions
+## 9. Resolved Questions
 
-> [!question] Open items
-> - [ ] **Q1** [NEEDS CLARIFICATION: Required inlay rendering for `LookupMiss::NotLookedUp` (dependency bypassed by `GOPROXY=direct|off`, `GOPRIVATE`, policy, or an unexpanded template). Options: (a) `⚠ <resolved>` with the existing tooltip "Package not looked up; latest version unknown"; (b) a distinct neutral marker (for example `ℹ`/`—`) because nothing failed and the miss is intentional or local; (c) render nothing (no checkmark, no marker). Diagnostics currently do not surface `NotLookedUp` at all ("never surfaced to the user", #1901), so (a) would make hints louder than diagnostics, contradicting US-003. Recommendation: (c) or (b) until the separate Go bypass issue decides the diagnostic, then align both surfaces.]
-> - [ ] **Q2** [NEEDS CLARIFICATION: Mechanism preventing recurrence (NFR-002): a typed "required dimensions" declaration per renderer, a single shared snapshot constructor used by all renderers, or test-only enforcement (FR-010). Plan-phase decision.]
-> - [ ] **Q3** [NEEDS CLARIFICATION: Does recording a fetch failure or miss trigger `workspace/inlayHint/refresh` today? If not, FR-012 needs a trigger; if the existing refresh after fetch completion already covers it, FR-012 reduces to a test.]
-> - [ ] **Q4** [NEEDS CLARIFICATION: With diagnostics disabled in configuration, should the hint marker still render? Current gating of the hint is independent of diagnostics config; recommendation: yes (marker is a status, not a diagnostic).]
-> - [ ] **Q5** [NEEDS CLARIFICATION: Audit scope. `code_lens` also builds its snapshot without `.with_outcomes()`; does its renderer consume outcome data, and do any other consumers of `snapshot().version_data()` (including non-LSP consumers that build `VersionData` for hints) omit it? Confirm by live test before widening scope.]
+> [!success] Resolutions (architect plan 2026-11-08, spec phase closed)
+> - [x] **Q1** `LookupMiss::NotLookedUp` renders the neutral fixed marker `ℹ <resolved>` with the existing tooltip "Package not looked up; latest version unknown". It is not `⚠` because nothing failed and diagnostics stay silent (#1901). Like `📴` and `⚠` it ignores `show_up_to_date_hints`. It is not routed through `reportable_lookup_miss`, whose `AlternateRegistry` suppression is exactly the Go bypass source. Offline still wins.
+> - [x] **Q2** Test-only enforcement: FR-010 regression test plus a mutation check (removing `.with_outcomes()` must fail it).
+> - [ ] **Q3** Open: whether recording an outcome triggers `workspace/inlayHint/refresh` was not verified live; deferred to #1955.
+> - [x] **Q4** Yes: the marker is a status, not a diagnostic, and renders with diagnostics disabled.
+> - [x] **Q5** Resolved: `code_lenses.rs` reads no outcomes (grep verified); no change there.
+>
+> `NoComparableVersions` is untouched by the related hover issue #1936: only `NotFound` suppresses the `Cmd+.` footer and the all-clear OSV line.
 
 ## 10. See Also
 

@@ -6,9 +6,10 @@ use deps_core::Dependency;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
-    compile_requirement_unless, requirement_contains_template_placeholder, requirement_is_compound,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OperatorGrammar, OsvNaming,
+    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget,
+    SourcePolicy, compile_requirement_unless, requirement_contains_template_placeholder,
+    requirement_is_compound,
 };
 
 /// Whether every character of `name` is in RubyGems' gem-name charset
@@ -294,8 +295,39 @@ impl PackageRendering for BundlerFormatter {
         if literal_span_has_mixed_quote_styles(literal_target) {
             return literal_target.to_string();
         }
-        self.format_version_for_text_edit(version)
+        render_bundler_requirement(version, current, RewriteTarget::Update)
     }
+
+    /// Security-fix and fallback targets keep the operator but write the full version
+    /// (`~> 2.0` -> `~> 2.9.1`), so the rewritten range never admits releases below the target.
+    fn format_version_replacing_floor_for(
+        &self,
+        dep: &dyn Dependency,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        let literal_target = dep.version_literal().unwrap_or(current);
+        if literal_span_has_mixed_quote_styles(literal_target) {
+            return literal_target.to_string();
+        }
+        render_bundler_requirement(version, current, RewriteTarget::Floor)
+    }
+
+    /// A bare version is an exact pin in RubyGems, the narrowest rendering for the fallback
+    /// retry (#1892).
+    fn format_version_exact_pin(&self, version: &ConcreteVersion) -> Option<String> {
+        Some(self.format_version_for_text_edit(version))
+    }
+}
+
+fn render_bundler_requirement(
+    version: &ConcreteVersion,
+    current: &str,
+    target: RewriteTarget,
+) -> String {
+    OperatorGrammar::BUNDLER.replacing(version, current, target, |bound| {
+        version_matches_requirement(version.as_str(), bound)
+    })
 }
 
 impl RequirementResolution for BundlerFormatter {
@@ -886,7 +918,7 @@ mod tests {
         );
         assert_eq!(
             replacement_text(&formatter, &dep, &ConcreteVersion::new("9.9.9"), "~> 7.0"),
-            Some("9.9.9".to_string())
+            Some("~> 9.9".to_string())
         );
     }
 
@@ -1158,6 +1190,85 @@ mod tests {
             Err(VulnFixSkip::UnresolvedPlaceholder),
             "the real BundlerFormatter must suppress the fix for #1390's unexpanded ERB \
              template placeholder, got {planned:?}"
+        );
+    }
+
+    fn bundler_update(current: &str, picked: &str) -> String {
+        BundlerFormatter.format_version_replacing_for(
+            &placeholder_probe_dependency(),
+            &ConcreteVersion::new(picked),
+            current,
+        )
+    }
+
+    fn bundler_floor(current: &str, picked: &str) -> String {
+        BundlerFormatter.format_version_replacing_floor_for(
+            &placeholder_probe_dependency(),
+            &ConcreteVersion::new(picked),
+            current,
+        )
+    }
+
+    /// Spec 098 SC-001..SC-008 (#1933).
+    #[test]
+    fn test_update_keeps_pessimistic_operator_and_precision_1933() {
+        for (current, picked, expected) in [
+            ("~> 2.0", "3.2.8", "~> 3.2"),
+            ("~> 2.0.1", "3.2.8", "~> 3.2.8"),
+            ("~> 2", "3.2.8", "~> 3"),
+            ("~>2.0", "3.2.8", "~>3.2"),
+            ("~> 2.0", "3.0.0.rc1", "~> 3.0.0.rc1"),
+            ("~> 2.0", "3", "~> 3.0"),
+            ("~> 2.0.1", "3.2", "~> 3.2.0"),
+            ("2.3.0", "3.1.0", "3.1.0"),
+            ("= 2.3.0", "3.1.0", "3.1.0"),
+            (">= 12.0", "13.3.0", ">= 13.3.0"),
+            ("> 12.0", "13.3.0", ">= 13.3.0"),
+            ("~> 1.0, >= 1.0.1", "1.9.0", "~> 1.9"),
+            ("~> 1.0, >= 3.0", "1.9.0", "1.9.0"),
+            (">= 5.0, < 6.0", "6.1.0", "6.1.0"),
+            ("< 6.0", "5.9.0", "5.9.0"),
+            ("~> 1.0, != 1.5", "1.9.0", "1.9.0"),
+            ("*", "1.9.0", "1.9.0"),
+        ] {
+            assert_eq!(
+                bundler_update(current, picked),
+                expected,
+                "{current} -> {picked}"
+            );
+        }
+    }
+
+    /// Spec 098 SC-004: a floor target never truncates.
+    #[test]
+    fn test_floor_target_writes_full_version_1933() {
+        assert_eq!(bundler_floor("~> 2.0", "2.9.1"), "~> 2.9.1");
+        assert_eq!(bundler_floor(">= 2.0", "2.9.1"), ">= 2.9.1");
+        assert_eq!(bundler_floor("2.0.0", "2.9.1"), "2.9.1");
+        assert_eq!(bundler_floor("~> 2.0.1", "3.2"), "~> 3.2.0");
+    }
+
+    #[test]
+    fn test_exact_pin_is_bare_version_1933() {
+        assert_eq!(
+            BundlerFormatter
+                .format_version_exact_pin_replacing(&ConcreteVersion::new("2.9.1"), "~> 2.0")
+                .as_deref(),
+            Some("2.9.1")
+        );
+    }
+
+    #[test]
+    fn test_mixed_quote_guard_precedes_operator_rewrite_1933() {
+        let mut dep = placeholder_probe_dependency();
+        dep.version_literal = Some("'>= 5.0', \"< 6.0\"".to_string());
+        assert_eq!(
+            BundlerFormatter.format_version_replacing_for(
+                &dep,
+                &ConcreteVersion::new("6.1.0"),
+                ">= 5.0, < 6.0"
+            ),
+            "'>= 5.0', \"< 6.0\""
         );
     }
 }

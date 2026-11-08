@@ -52,6 +52,16 @@ Composer's update code actions and completion also preserve the requirement's ow
 style instead of forcing the raw Packagist tag's prefix onto an unprefixed requirement (or vice
 versa).
 
+Update edits also keep the constraint operator, its precision and the trailing `@stability` flag
+instead of collapsing the range to an exact pin (#1933): `^2.0` becomes `^3.12`, `~6.0` becomes
+`~8.3`, `^5.0@beta` becomes `^8.1@beta`. A security-fix or cooldown-fallback target keeps the
+operator but writes the full version (`^2.0` becomes `^2.9.1`); a prerelease target or a `^0.0.x`
+caret also writes the full version. A single `>=`/`>` becomes `>= <version>`, and one operator
+comparator plus satisfied lower bounds (`^2.0, >=2.1`) renders the operator comparator alone.
+A bare version, an `||` alternative, an upper bound or a wildcard (`2.*`, tracked in #1950) is
+still replaced by the bare version, keeping the stability flag. The LSP code actions and
+`deps-cli update` write identical text.
+
 See [Dart](dart.md#version-comparison) for the equivalent fix in that ecosystem, which shares
 the same underlying `compare_versions` bug class and was corrected in the same change.
 

@@ -1535,6 +1535,13 @@ impl ServerState {
         self.set_gossip_checks(policy.gossip_checks());
     }
 
+    /// Whether outbound requests are currently allowed, as the typed mode the shared probe
+    /// sequence in [`deps_engine::probe`] takes.
+    #[must_use]
+    pub fn network_mode(&self) -> deps_core::NetworkMode {
+        deps_core::NetworkMode::from_offline_flag(self.cache.is_offline())
+    }
+
     /// Returns the OSV gate as of the last applied config (issue #1517 critique S5). See
     /// [`Self::osv_checks`]'s field doc.
     pub fn osv_checks(&self) -> OsvChecks {

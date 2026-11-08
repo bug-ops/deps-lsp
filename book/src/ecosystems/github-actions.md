@@ -28,6 +28,10 @@ Pinning](../cross-ecosystem/ci-pinning.md) for why this matters and how the SHA-
 action/code lens works. A full 40-character commit SHA is the only pin GitHub itself cannot
 silently repoint.
 
+A workflow file that is not valid YAML publishes a `parse-error` diagnostic at the document start,
+and `deps-cli check` prints a `failed to parse` warning for it. A file matched only by the bare
+`action.yml`/`action.yaml` name stays silent, because that name matches anywhere in a workspace.
+
 ## Non-Semver Tag Handling (issue #550)
 
 When a GitHub Action repository has only tags that don't parse as full semantic versions — such as

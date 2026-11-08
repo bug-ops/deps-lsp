@@ -379,6 +379,10 @@ pub(crate) fn cooldown_fallback_view(
 /// Returns [`CheckError::InvalidPath`] if `manifest_path` cannot be represented as a file
 /// URI, or [`CheckError::Parse`] if `content` fails to parse as this ecosystem's manifest
 /// format.
+#[expect(
+    clippy::too_many_lines,
+    reason = "parse, fetch, OSV and report stages share one CheckContext borrow"
+)]
 pub async fn analyze_manifest(
     ecosystem: &Arc<dyn Ecosystem>,
     manifest_path: &Path,

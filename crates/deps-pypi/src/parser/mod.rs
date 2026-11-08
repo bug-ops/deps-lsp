@@ -495,6 +495,10 @@ impl PypiParser {
     // (from `.find(';')`, an ASCII byte) or `requirement_str.len()`, so all bounds are always
     // char boundaries.
     #[allow(clippy::string_slice)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one marker, extras, url and version decision chain sharing spans"
+    )]
     fn parse_pep508_requirement(
         &self,
         requirement_str: &str,

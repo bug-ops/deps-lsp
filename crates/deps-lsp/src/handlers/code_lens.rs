@@ -818,7 +818,7 @@ mod tests {
                 &uri,
                 content,
                 cached,
-                "\"symfony/console\": \"7.0.0\"",
+                "\"symfony/console\": \"^7.0\"",
             )
             .await;
         }
@@ -844,7 +844,7 @@ mod tests {
                 &uri,
                 content,
                 cached,
-                "gem 'rails', '8.0.0'",
+                "gem 'rails', '~> 8.0'",
             )
             .await;
         }

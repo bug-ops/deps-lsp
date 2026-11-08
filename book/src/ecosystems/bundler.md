@@ -22,6 +22,16 @@ rubygems.org page; an outdated requirement gets an inlay hint and a diagnostic w
 `:key => value` option syntax (`group:`, `require:`, `platforms:`, `source:`, `git:`,
 `path:`) are recognized identically.
 
+## Update Edits Keep the Constraint Operator (#1933)
+
+An update edit keeps a `~>` constraint and its precision instead of collapsing it to an exact pin:
+`~> 2.0` becomes `~> 3.2`, `~> 2.0.1` becomes `~> 3.2.8`. A security-fix or cooldown-fallback target
+keeps the operator but writes the full version (`~> 2.0` becomes `~> 2.9.1`), so the range never
+admits releases below the fix. A single `>=`/`>` becomes `>= <version>`; `~> 1.0, >= 1.0.1` becomes
+`~> 1.9` when the picked version satisfies the lower bound. A bare version, an `=` pin, an upper
+bound or any other multi-comparator requirement is still replaced by the bare version. The LSP
+code actions and `deps-cli update` write identical text.
+
 ## Custom/Private Registries (issue #980)
 
 Unlike [Cargo](cargo.md)/[npm](npm.md)/[PyPI](pypi.md)/[Go](go.md)/[NuGet](nuget.md), `deps-bundler`
