@@ -501,10 +501,10 @@ request@^2.88.2:
             "\"loc@file:../loc\":\n  version \"1.0.0\"\n\n\
              \"g@git+https://github.com/u/g.git#abc\":\n  version \"2.0.0\"\n  resolved \"git+https://github.com/u/g.git#abc\"\n",
         );
-        assert!(matches!(
-            packages.get("loc").unwrap().source,
+        assert_matches!(
+            &packages.get("loc").unwrap().source,
             ResolvedSource::Path { .. }
-        ));
+        );
         assert_matches!(
             &packages.get("g").unwrap().source,
             ResolvedSource::Git { .. }
