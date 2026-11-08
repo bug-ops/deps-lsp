@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `format_version_replacing_by_shape` takes a `RewriteTarget` argument (#1961)
 - **deps-cli**: `exit_code`, `OsvCoverage::new` and `OsvCoverage::from_vulnerabilities` signatures changed and `CheckArgs::fail_on` is `Vec<FailOnToken>` (#1961)
 - **deps-pypi, deps-nuget**: `PypiDependency` and `NuGetDependency` gain private route fields (#1961)
+- **deps-core, deps-go**: `OperatorEnvVar` gains `Goroot` (neighbouring discriminants shift) and `GoSettingSource` gains `GorootEnv` (#1961)
 - **deps-core, deps-npm, deps-cli**: `SkipReason` and `StructuralSkipReason` gain `UnverifiedRegistrySource`, `NpmDependency` gains a crate-private `registry_entry`, and `ManifestCheckResult` gains `osv_coverage` (#1956)
 - **deps-core**: `AheadProof` and `CommitEvidence` fields are private with getters, `run_probe_pass` takes a `&RefreshSender` and announces changes itself, and `ProbeStores` exposes `question_for` (#1956)
 - **deps-go**: `GoSettingSource` is public, `GoProxyChain::has_url_hop` is removed, and `failed_goproxy_declaration` becomes `failed_goproxy_source` (#1956)
