@@ -11,7 +11,7 @@ tags:
   - cross-ecosystem
   - research/parity
 created: 2026-11-08
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[011-deprecation-replacement-diagnostics/spec|Deprecation and Replacement Diagnostics]]"

@@ -20,12 +20,12 @@ status: moc
 | ID | Feature | Phase | Status |
 |----|---------|-------|--------|
 | 008 | [[008-codelens-update-all-outdated/spec\|CodeLens support for "update all outdated dependencies" action]] | specify | draft — research/parity, P2, 7 open `[NEEDS CLARIFICATION]` items |
-| 089 | [[089-npm-yarn-lockfile-provider/spec\|yarn.lock lock file provider (npm)]] | specify | draft — research/parity, P3, 5 open `[NEEDS CLARIFICATION]` items (issue #1921) |
+| 089 | [[089-npm-yarn-lockfile-provider/spec\|yarn.lock lock file provider (npm)]] | specify | shipped — npm yarn.lock v1 and Berry provide in-use versions (PR #1961, issue #1921) |
 | 090 | [[090-npm-bun-lockfile-provider/spec\|bun.lock lock file provider (npm)]] | specify | draft — research/parity, P3, 5 open `[NEEDS CLARIFICATION]` items (issue #1922) |
 | 091 | [[091-deno-lockfile-provider/spec\|deno.lock lock file provider (Deno)]] | specify | draft — enhancement, P4, 7 open `[NEEDS CLARIFICATION]` items (issue #1924) |
 | 092 | [[092-gradle-lockfile-provider/spec\|Gradle dependency-locking lock file provider]] | specify | draft — enhancement, P4, 11 open `[NEEDS CLARIFICATION]` items (issue #1925) |
 | 093 | [[093-pypi-pipfile-pdm-lockfile-providers/spec\|Pipfile.lock and pdm.lock lock file providers (PyPI)]] | specify | draft — enhancement, P4, 6 open `[NEEDS CLARIFICATION]` items (issue #1926) |
-| 094 | [[094-lsp-per-package-diagnostic-suppression/spec\|Per-package diagnostic suppression (LSP)]] | specify | draft — research/parity, P3, 9 open `[NEEDS CLARIFICATION]` items (issue #1927) |
+| 094 | [[094-lsp-per-package-diagnostic-suppression/spec\|Per-package diagnostic suppression (LSP)]] | specify | shipped — diagnostics.suppress for deprecated, outdated, yanked and license kinds, vulnerability kind deferred (PR #1961, issue #1927) |
 | 095 | [[095-node-semver-dormant-dependency-evaluation/spec\|Evaluate the dormant node-semver range engine]] | specify | draft — research/dependency, P3, 7 open `[NEEDS CLARIFICATION]` items (issue #1928) |
 | 096 | [[096-pep440-rs-unmaintained-dependency-evaluation/spec\|Evaluate the unmaintained pep440_rs dependency]] | specify | draft — research/dependency, P3, 6 open `[NEEDS CLARIFICATION]` items (issue #1929) |
 | 097 | [[097-inlay-hints-fetch-failure-lookup-miss-marker/spec\|Inlay hints render the warning marker for a failed registry lookup or registry miss]] | specify | shipped — inlay hints show the warning marker for failed lookups and 404s, neutral marker for never-looked-up dependencies (PR #1956, issue #1932) |
