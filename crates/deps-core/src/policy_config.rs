@@ -1,4 +1,5 @@
 use crate::diagnostic::Severity;
+use crate::lsp_helpers::SuppressionSet;
 use serde::Deserialize;
 
 /// The policy-relevant subset of `deps-lsp`'s configuration.
@@ -596,6 +597,7 @@ impl PolicyConfig {
             sha_comment_mismatch_severity: _,
             unknown_ref_severity: _,
             vulnerabilities_enabled: _,
+            suppress: _,
         } = new_diagnostics;
         let CacheConfig {
             enabled: _,
@@ -748,6 +750,13 @@ pub struct DiagnosticsConfig {
     /// feature (approved Q5).
     #[serde(default = "default_true")]
     pub vulnerabilities_enabled: bool,
+    /// Per-package diagnostic suppression rules (#1927, spec 094): each names a package or
+    /// single-wildcard glob and the diagnostic kinds to silence for it. Vulnerability advisories
+    /// are never suppressible (workspace settings can be repository-controlled); an advisory
+    /// classified as unmaintained is hidden together with `deprecated`. Not parse-affecting: it
+    /// is read on every diagnostics generation.
+    #[serde(default)]
+    pub suppress: SuppressionSet,
 }
 
 impl Default for DiagnosticsConfig {
@@ -781,6 +790,7 @@ impl DiagnosticsConfig {
             sha_comment_mismatch_severity: default_sha_comment_mismatch_severity(),
             unknown_ref_severity: default_unknown_ref_severity(),
             vulnerabilities_enabled: true,
+            suppress: SuppressionSet::new(Vec::new()),
         }
     }
 
@@ -857,6 +867,13 @@ impl DiagnosticsConfig {
     #[must_use]
     pub const fn with_vulnerabilities_enabled(mut self, vulnerabilities_enabled: bool) -> Self {
         self.vulnerabilities_enabled = vulnerabilities_enabled;
+        self
+    }
+
+    /// Overrides [`Self::suppress`]. See [`Self::new`].
+    #[must_use]
+    pub fn with_suppress(mut self, suppress: SuppressionSet) -> Self {
+        self.suppress = suppress;
         self
     }
 
@@ -2503,6 +2520,33 @@ mod tests {
         let json = r#"{ "mutable_ref_pin_enabled": false }"#;
         let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
         assert!(!config.mutable_ref_pin_enabled);
+    }
+
+    #[test]
+    fn test_diagnostics_config_suppress_parses_and_defaults_empty() {
+        let default: DiagnosticsConfig = serde_json::from_str("{}").unwrap();
+        assert!(default.suppress.is_empty());
+        let config: DiagnosticsConfig = serde_json::from_str(
+            r#"{"suppress":[{"package":"request","kinds":["deprecated","outdated"]}]}"#,
+        )
+        .unwrap();
+        assert!(!config.suppress.is_empty());
+        assert!(
+            serde_json::from_str::<DiagnosticsConfig>(
+                r#"{"suppress":[{"package":"request","kinds":["vulnerability"]}]}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_diff_ignores_suppress_changes() {
+        let old = PolicyConfig::default();
+        let mut new = PolicyConfig::default();
+        new.diagnostics = new.diagnostics.with_suppress(
+            serde_json::from_str(r#"[{"package":"x","kinds":["yanked"]}]"#).unwrap(),
+        );
+        assert_eq!(PolicyConfig::diff(&old, &new), PolicyConfigDiff::default());
     }
 
     #[test]

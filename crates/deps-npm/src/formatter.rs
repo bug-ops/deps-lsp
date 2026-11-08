@@ -1,11 +1,11 @@
-use crate::types::{NpmDependency, NpmRegistryEntry};
+use crate::types::{NpmDependency, NpmDependencyOrigin, NpmDependencySection, NpmRegistryEntry};
 use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, MAX_REQUIREMENT_LEN, OsvNaming,
-    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
-    bare_meaning, format_version_replacing_by_shape, requirement_len_exceeds_cap,
+    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget,
+    SourcePolicy, bare_meaning, format_version_replacing_by_shape, requirement_len_exceeds_cap,
     up_to_date_via_compiled_matcher,
 };
-use deps_core::osv::NonPublicRoute;
+use deps_core::osv::{LockResolution, NonPublicRoute};
 use deps_core::{
     ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName, VersionReq,
 };
@@ -606,9 +606,13 @@ impl PartialPrecision {
 /// `5` -> `6` would admit older, possibly affected `6.x` releases below the target.
 #[must_use]
 pub fn format_node_semver_replacing_floor(version: &ConcreteVersion, current: &str) -> String {
-    format_version_replacing_by_shape(version, current, bare_meaning(EcosystemId::Npm), || {
-        version.as_str().to_string()
-    })
+    format_version_replacing_by_shape(
+        version,
+        current,
+        bare_meaning(EcosystemId::Npm),
+        RewriteTarget::Floor,
+        || version.as_str().to_string(),
+    )
 }
 
 /// Renders `version` as a replacement for the node-semver requirement `current` (npm and Deno).
@@ -627,7 +631,13 @@ pub fn format_node_semver_replacing(version: &ConcreteVersion, current: &str) ->
     {
         return precision.render(&parsed);
     }
-    format_version_replacing_by_shape(version, current, bare_meaning(EcosystemId::Npm), exact)
+    format_version_replacing_by_shape(
+        version,
+        current,
+        bare_meaning(EcosystemId::Npm),
+        RewriteTarget::Update,
+        exact,
+    )
 }
 
 impl PackageRendering for NpmFormatter {
@@ -750,6 +760,28 @@ impl OsvNaming for NpmFormatter {
         match entry {
             Some(NpmRegistryEntry::TopLevel) => NonPublicRoute::UnverifiedMirror,
             Some(NpmRegistryEntry::Scope) | None => NonPublicRoute::Private,
+        }
+    }
+
+    /// A `peerDependencies` entry is never written to a lock file, so its missing resolved
+    /// version is not a coverage gap (#1946).
+    fn lock_resolution(&self, dep: &dyn Dependency) -> LockResolution {
+        let is_peer = dep
+            .as_any()
+            .downcast_ref::<NpmDependency>()
+            .is_some_and(|dep| {
+                matches!(
+                    dep.origin,
+                    NpmDependencyOrigin::Manifest {
+                        section: NpmDependencySection::PeerDependencies,
+                        ..
+                    }
+                )
+            });
+        if is_peer {
+            LockResolution::NotLocked
+        } else {
+            LockResolution::Expected
         }
     }
 }
@@ -996,6 +1028,19 @@ mod tests {
             format_node_semver_replacing_floor(&fix, "~3.1.0"),
             "~4.17.21"
         );
+    }
+
+    #[test]
+    fn test_tilde_update_keeps_declared_precision_1951() {
+        let new = ConcreteVersion::new("19.3.1");
+        assert_eq!(format_node_semver_replacing(&new, "~16"), "~19");
+        assert_eq!(format_node_semver_replacing(&new, "~16.2"), "~19.3");
+        assert_eq!(format_node_semver_replacing(&new, "~16.2.0"), "~19.3.1");
+        assert_eq!(
+            format_node_semver_replacing(&ConcreteVersion::new("19.3.1-rc.1"), "~16"),
+            "~19.3.1-rc.1"
+        );
+        assert_eq!(format_node_semver_replacing_floor(&new, "~16"), "~19.3.1");
     }
 
     #[test]
@@ -1583,5 +1628,38 @@ mod tests {
         let _ = npm_up_to_date("", "4.18.1");
         let _ = npm_up_to_date("^4", "");
         let _ = npm_up_to_date("", "");
+    }
+
+    #[test]
+    fn test_lock_resolution_exempts_only_peer_dependencies() {
+        use crate::types::NpmDependencySection;
+        use deps_core::position::Range;
+
+        let dep = |section| NpmDependency {
+            name: deps_core::PackageName::new("react"),
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            origin: NpmDependencyOrigin::Manifest {
+                section,
+                catalog_ref: None,
+            },
+            source: deps_core::parser::DependencySource::Registry,
+            registry_entry: None,
+            package: None,
+        };
+        let f = NpmFormatter;
+        assert_eq!(
+            f.lock_resolution(&dep(NpmDependencySection::PeerDependencies)),
+            LockResolution::NotLocked
+        );
+        assert_eq!(
+            f.lock_resolution(&dep(NpmDependencySection::Dependencies)),
+            LockResolution::Expected
+        );
+        assert_eq!(
+            f.lock_resolution(&dep(NpmDependencySection::DevDependencies)),
+            LockResolution::Expected
+        );
     }
 }

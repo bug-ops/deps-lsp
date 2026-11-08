@@ -1653,7 +1653,90 @@ pub enum SkipReason {
     SiblingTagsUnknown,
 }
 
+/// Whether a lock file backed a manifest's version resolution; decides whether
+/// [`SkipReason::NoConcreteVersion`] is a coverage gap (#1946).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockPresence {
+    /// A lock file was found for the manifest (parsed or not).
+    Found,
+    /// No lock file exists, so a missing concrete version is expected rather than a gap.
+    Absent,
+}
+
+/// Whether a lock file is expected to list a dependency (#1946).
+///
+/// A dependency that is [`Self::NotLocked`] by construction (an npm `peerDependencies` entry,
+/// which package managers never write to the lock file) is not a coverage gap when it has no
+/// concrete version.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::LockResolution;
+///
+/// assert_ne!(LockResolution::Expected, LockResolution::NotLocked);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockResolution {
+    /// The lock file normally lists this dependency.
+    Expected,
+    /// The dependency is declared in a section package managers never lock.
+    NotLocked,
+}
+
+/// Why a skipped dependency counts against a strict `--fail-on unchecked` gate (#1946).
+///
+/// Input-limited skips (a dependency with nothing to query) are deliberately not gaps, or every
+/// project without a lock file would fail the gate.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::{CoverageGap, LockPresence, SkipReason};
+///
+/// assert_eq!(
+///     SkipReason::UnverifiedRegistrySource.coverage_gap(LockPresence::Absent),
+///     Some(CoverageGap::UnverifiedRegistry)
+/// );
+/// assert_eq!(SkipReason::NonRegistrySource.coverage_gap(LockPresence::Found), None);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageGap {
+    /// The route was skipped as an unverified registry mirror.
+    UnverifiedRegistry,
+    /// The scan could not complete for a dependency it should have covered.
+    ScanIncomplete,
+}
+
 impl SkipReason {
+    /// The coverage gap this skip represents, or `None` when it is input-limited or not
+    /// applicable.
+    ///
+    /// [`Self::NoConcreteVersion`] is a gap only when `lock` is [`LockPresence::Found`]: a
+    /// dependency absent from an existing lock file (a manifest edit that was never relocked)
+    /// is unscanned, while a project with no lock file at all has nothing to resolve.
+    #[must_use]
+    pub const fn coverage_gap(self, lock: LockPresence) -> Option<CoverageGap> {
+        match self {
+            Self::UnverifiedRegistrySource => Some(CoverageGap::UnverifiedRegistry),
+            Self::QueryFailed
+            | Self::Truncated
+            | Self::CanonicalNameUnconfirmed
+            | Self::SiblingTagsUnknown
+            | Self::UnevaluableAdvisoryRange => Some(CoverageGap::ScanIncomplete),
+            Self::NoConcreteVersion => match lock {
+                LockPresence::Found => Some(CoverageGap::ScanIncomplete),
+                LockPresence::Absent => None,
+            },
+            Self::NonRegistrySource
+            | Self::ResolvedTagNotFullVersion
+            | Self::UnmappableName
+            | Self::TemplatedName
+            | Self::UnmappableEcosystem
+            | Self::UnmatchableVersion => None,
+        }
+    }
+
     /// Short tag used in the `info`-level scan summary log line.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {

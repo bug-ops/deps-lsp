@@ -2107,6 +2107,7 @@ dependencies = []
                     markers_range: None,
                     section: crate::types::PypiDependencySection::Requirements,
                     source,
+                    index_route: None,
                 }],
                 workspace_root: None,
                 uri: deps_core::test_util::test_uri("/test/requirements.txt"),

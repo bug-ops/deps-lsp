@@ -1,0 +1,157 @@
+//! End-to-end check of spec 097 FR-012 (#1955): once a registry fetch ends in a failure, the
+//! outcome is already committed when the server asks the client for `workspace/inlayHint/refresh`,
+//! so the `textDocument/inlayHint` request served at refresh time carries the `⚠` marker.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test code; clippy's allow-*-in-tests does not see this `cfg(all(test, ..))` module"
+)]
+
+use crate::server::Backend;
+use futures::{SinkExt as _, StreamExt as _};
+use std::time::Duration;
+use tower_lsp_server::jsonrpc::{Request, Response};
+use tower_lsp_server::ls_types::{
+    ClientCapabilities, DidChangeConfigurationParams, DidOpenTextDocumentParams, InitializeParams,
+    InlayHintLabel, InlayHintParams, InlayHintWorkspaceClientCapabilities, Position, Range,
+    TextDocumentIdentifier, TextDocumentItem, Uri, WorkspaceClientCapabilities,
+};
+
+const MANIFEST: &str = r#"{"dependencies": {"@acme-corp/secretpkg": "^1.0.0"}}"#;
+const LOCKFILE: &str = r#"{
+  "lockfileVersion": 3,
+  "packages": {
+    "": {"dependencies": {"@acme-corp/secretpkg": "^1.0.0"}},
+    "node_modules/@acme-corp/secretpkg": {"version": "1.0.0"}
+  }
+}"#;
+const REFRESH_METHOD: &str = "workspace/inlayHint/refresh";
+const DEADLINE: Duration = Duration::from_secs(30);
+
+async fn labels(backend: &Backend, uri: &Uri) -> Vec<String> {
+    use tower_lsp_server::LanguageServer as _;
+    let hints = backend
+        .inlay_hint(InlayHintParams {
+            work_done_progress_params: Default::default(),
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range: Range::new(Position::new(0, 0), Position::new(10, 0)),
+        })
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    hints
+        .into_iter()
+        .map(|hint| match hint.label {
+            InlayHintLabel::String(text) => text,
+            InlayHintLabel::LabelParts(_) => panic!("expected string label"),
+        })
+        .collect()
+}
+
+/// Opens a locked npm manifest whose scoped registry answers `status`, then answers the
+/// server's client requests and returns the labels served at the first
+/// `workspace/inlayHint/refresh` that shows a `⚠` marker, or the last labels seen on timeout.
+async fn labels_served_at_refresh(registry_url: &str) -> Vec<String> {
+    use tower::Service as _;
+    use tower_lsp_server::LanguageServer as _;
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".npmrc"),
+        format!("@acme-corp:registry={registry_url}\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("package-lock.json"), LOCKFILE).unwrap();
+    let manifest = dir.path().join("package.json");
+    std::fs::write(&manifest, MANIFEST).unwrap();
+    let uri = Uri::from_file_path(&manifest).unwrap();
+
+    let (mut service, mut socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+    let capabilities = ClientCapabilities {
+        workspace: Some(WorkspaceClientCapabilities {
+            inlay_hint: Some(InlayHintWorkspaceClientCapabilities {
+                refresh_support: Some(true),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let init = Request::build("initialize")
+        .id(1_i64)
+        .params(
+            serde_json::to_value(InitializeParams {
+                capabilities,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .finish();
+    assert!(
+        service
+            .call(init)
+            .await
+            .unwrap()
+            .is_some_and(|response| response.is_ok())
+    );
+    let backend = service.inner();
+    assert!(backend.state().inlay_hint_refresh_supported());
+    backend
+        .did_change_configuration(DidChangeConfigurationParams {
+            settings: serde_json::json!({ "registries": { "workspace_registries": "all" } }),
+        })
+        .await;
+    backend
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "json".to_string(),
+                version: 1,
+                text: MANIFEST.to_string(),
+            },
+        })
+        .await;
+
+    let mut last = labels(backend, &uri).await;
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while let Ok(Some(request)) = tokio::time::timeout_at(deadline, socket.next()).await {
+        let Some(id) = request.id().cloned() else {
+            continue;
+        };
+        socket
+            .send(Response::from_ok(id, serde_json::Value::Null))
+            .await
+            .unwrap();
+        if request.method() != REFRESH_METHOD {
+            continue;
+        }
+        last = labels(backend, &uri).await;
+        if last.iter().any(|label| label.starts_with('⚠')) {
+            break;
+        }
+    }
+    last
+}
+
+#[tokio::test]
+async fn test_registry_http_failure_is_visible_at_inlay_refresh() {
+    let mut registry = mockito::Server::new_async().await;
+    let _mock = registry
+        .mock("GET", "/@acme-corp/secretpkg")
+        .with_status(500)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    assert_eq!(
+        labels_served_at_refresh(&registry.url()).await,
+        vec!["⚠ 1.0.0"]
+    );
+}
+
+#[tokio::test]
+async fn test_registry_transport_failure_is_visible_at_inlay_refresh() {
+    assert_eq!(
+        labels_served_at_refresh("http://127.0.0.1:9").await,
+        vec!["⚠ 1.0.0"]
+    );
+}

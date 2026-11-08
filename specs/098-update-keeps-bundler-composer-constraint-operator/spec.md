@@ -153,7 +153,7 @@ THEN the literal becomes "~> 2.9.1"
 |----|----------|-------------|
 | NFR-001 | Architecture | The operator, precision and stability rules live once in `deps-core::lsp_helpers` (next to `format_version_replacing_by_shape`); `deps-bundler` and `deps-composer` only supply their grammar-specific inputs. No rule is reimplemented per crate (cross-ecosystem consistency rule). |
 | NFR-002 | Type safety | The rewrite is keyed by exhaustive `EcosystemId` matches with no catch-all `_` arm; operator, precision and stability flag are modeled as typed values (enums/newtypes), not re-parsed from strings at each call site. |
-| NFR-003 | Behavior compatibility | Cargo, npm, Deno, PyPI, Dart, NuGet, Maven and Gradle output is byte-identical before and after (existing snapshot and unit tests pass unchanged). |
+| NFR-003 | Behavior compatibility | PyPI, Dart, NuGet, Maven and Gradle output is byte-identical before and after. Cargo and npm/Deno change only for a partial tilde requirement (`~16`, `~0.7`), which now keeps its declared precision on a plain update (#1951); security-fix and cooldown-fallback targets keep the full version. |
 | NFR-004 | Latency | Rendering is pure string work with no I/O and adds no registry call; handlers stay non-blocking. |
 | NFR-005 | Robustness | A malformed or unrecognized constraint never panics and falls back to today's rendering; fuzz-style inputs (empty operand, lone operator, unicode, 4-segment Composer versions) are covered. |
 
@@ -227,7 +227,7 @@ Aggregate targets: 100% of rows above pass; 0 byte differences in the existing t
 ### Ask First
 - Changing the shared `format_version_replacing_by_shape` result for any ecosystem other than Bundler and Composer (it is used by npm, Deno and others).
 - Adding a dependency (a Composer or RubyGems constraint parser crate); the existing hand-rolled classification is expected to suffice.
-- Rewriting wildcard (`2.*`) or upper-bound constraints (resolved: wildcards out of scope, #1950; upper bounds stay bare, Q2).
+- Rewriting upper-bound constraints (upper bounds stay bare, Q2).
 
 ### Never
 - Edit `crates/deps-zed` (separate repository).
@@ -240,11 +240,11 @@ Aggregate targets: 100% of rows above pass; 0 byte differences in the existing t
 - **Q1 (resolved).** A compound made of one `~>`/`~`/`^` comparator plus lower bounds the picked version satisfies renders only the operator comparator, per FR-001..006 (`~> 1.0, >= 1.0.1` with 1.9.0 picked gives `~> 1.9`). If any lower bound is NOT satisfied, render the bare picked version.
 - **Q2 (resolved).** Every other compound (`>=1.0 <2.0`, `^2.0 || ^3.0`, upper bounds, `!=`) renders the bare picked version, as today.
 - **Q3 (resolved).** A single `>=` or `>` renders `>=` plus the picked version, keeping the operator-operand spacing as written. A single `<` or `<=` renders bare, as today.
-- **Q4 (resolved).** Composer wildcards are out of scope; tracked as follow-up #1950.
+- **Q4 (resolved).** Composer trailing wildcards (`2.*`, `2.0.x`, `2.0.X`) keep their spelling and segment count on a plain update (`2.*` -> `3.*`, `2.0.*` -> `3.2.*`); a floor target or prerelease pick writes a bare pin; a suffixed form such as `2.x-dev` is not a wildcard (#1950).
 - **Q5 (resolved).** The stability flag is kept verbatim and always. No flag is ever added: a prerelease pick with no flag gets none.
 - **Q6 (resolved).** For a plain update, truncate to the operand's segment count for `^`, `~` and `~>`. A floor target, a prerelease pick, or a caret whose picked version is `0.0.x` gets the full version.
 - **Q6a (resolved, impl-critic M2/M8).** A rendered operand never has fewer segments than the declared one: a shorter picked version is padded with `0`. A floor rewrite (`~> 2.0` -> `~> 2.9.1`) deliberately narrows the range to the floor's precision (SC-004), so later plain updates keep that precision; this is accepted, no worse than the former bare pin, and keeps the fix floor exact. A follow-up may render a floor as `~> 2.9, >= 2.9.1` if the narrowing proves unwelcome.
-- **Q7 (resolved, out of scope).** Verified live during implementation; any confirmed Cargo/npm/Dart `~1`/`~1.2` divergence is filed as a separate cross-ecosystem issue.
+- **Q7 (resolved).** Verified live: Cargo `~0.7` and npm `~16` were rewritten at full precision and are fixed in the shared helper (#1951). Dart has no `~` syntax in pub, so the issue's `~0.9` row does not apply and Dart is unchanged.
 - **Q8 (resolved).** Audit result: Swift uses DSL forms, and Go, GitHub Actions and GitLab CI use tags with no operators, so none of them change.
 - **Q9 (resolved).** Composer `dev-*`, `as` aliases and `x-dev` produce no update edit; a regression test asserts no edit.
 

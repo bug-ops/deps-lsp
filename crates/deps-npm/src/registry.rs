@@ -27,6 +27,16 @@ use std::time::{Duration, Instant};
 
 const REGISTRY_BASE: &str = "https://registry.npmjs.org";
 
+/// Returns `true` when `url` is the public npm registry itself (#1953): an explicit
+/// `registry=https://registry.npmjs.org/` is public content, not an unverified mirror.
+///
+/// Compares the already-validated, normalized form, so case, default port and trailing
+/// slashes cannot defeat or spoof the match; userinfo, `http` and query strings never validate
+/// to this value.
+pub(crate) fn is_public_registry_url(url: &crate::config::NpmRegistryIndex) -> bool {
+    url.as_str() == REGISTRY_BASE
+}
+
 /// `Accept` header requesting the abbreviated packument format, which omits
 /// README, changelog, and per-version `dist.signatures` data that
 /// `get_versions` never uses. Cuts response size by roughly 60% (verified

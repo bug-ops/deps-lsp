@@ -34,6 +34,7 @@
 
 use std::collections::HashMap;
 
+use crate::types::PypiIndexRoute;
 use deps_core::EcosystemId;
 #[cfg(test)]
 use deps_core::net_policy::HostClass;
@@ -257,6 +258,35 @@ pub struct PypiIndexConfig {
     named_sources: HashMap<String, Result<PypiIndexUrl, InvalidEntry>>,
 }
 
+fn all_public(hops: &[PypiIndexUrl]) -> bool {
+    hops.iter().all(crate::registry::is_public_registry_url)
+}
+
+/// Routes a non-empty chain: public-only chains stay [`DependencySource::Registry`] (and so
+/// are not registered, see [`PypiIndexConfig::resolved_chains`]).
+fn chain_route(
+    hops: Vec<PypiIndexUrl>,
+    implicit_public_fallback: bool,
+    has_replace_position: bool,
+) -> (DependencySource, Option<PypiIndexRoute>) {
+    if all_public(&hops) {
+        return (DependencySource::Registry, None);
+    }
+    let replaces = has_replace_position
+        && !implicit_public_fallback
+        && !hops.iter().any(crate::registry::is_public_registry_url);
+    let route = if replaces {
+        PypiIndexRoute::ReplacesPublic
+    } else {
+        PypiIndexRoute::SupplementsPublic
+    };
+    let source = DependencySource::AlternateRegistry {
+        index: ResolvedChain::chain(hops, implicit_public_fallback).key,
+        mirrors_public_registry: false,
+    };
+    (source, Some(route))
+}
+
 impl PypiIndexConfig {
     /// An empty config — every dependency resolves to plain [`DependencySource::Registry`],
     /// byte-identical to today (US-004).
@@ -388,8 +418,27 @@ impl PypiIndexConfig {
     ///   [`ResolvedChain::key`] this same config's [`Self::resolved_chains`] registers.
     #[must_use]
     pub fn resolve_source_for(&self, named_source: Option<&str>) -> DependencySource {
+        self.resolve_for(named_source).0
+    }
+
+    /// [`Self::resolve_source_for`] plus the [`PypiIndexRoute`] that produced the source: the
+    /// one copy of the routing logic (#1947).
+    ///
+    /// A chain whose every hop is the public index is plain [`DependencySource::Registry`] with
+    /// no route, so an explicit `--index-url https://pypi.org/simple` stays scannable. Otherwise
+    /// a primary or uv `default = true` hop is a replace position:
+    /// [`PypiIndexRoute::ReplacesPublic`] when no hop of the chain is public (an invalid primary
+    /// counts too), else [`PypiIndexRoute::SupplementsPublic`].
+    #[must_use]
+    pub fn resolve_for(
+        &self,
+        named_source: Option<&str>,
+    ) -> (DependencySource, Option<PypiIndexRoute>) {
         if let Some(name) = named_source {
-            return match self.named_sources.get(name) {
+            let source = match self.named_sources.get(name) {
+                Some(Ok(url)) if crate::registry::is_public_registry_url(url) => {
+                    return (DependencySource::Registry, None);
+                }
                 Some(Ok(url)) => DependencySource::AlternateRegistry {
                     index: url.as_str().to_string(),
                     mirrors_public_registry: false,
@@ -401,26 +450,28 @@ impl PypiIndexConfig {
                     url: name.to_string(),
                 },
             };
+            return (source, Some(PypiIndexRoute::NamedSource));
         }
 
         match &self.primary {
             Some(Ok(primary)) => {
                 let mut hops = vec![primary.clone()];
                 hops.extend(self.valid_extras());
-                DependencySource::AlternateRegistry {
-                    index: ResolvedChain::chain(hops, false).key,
-                    mirrors_public_registry: false,
-                }
+                chain_route(hops, false, true)
             }
-            Some(Err(invalid)) => DependencySource::CustomRegistry {
-                url: invalid.raw.to_string(),
-            },
-            None => match self.case_b_chain() {
-                Some(chain) if !chain.hops.is_empty() => DependencySource::AlternateRegistry {
-                    index: ResolvedChain::chain(chain.hops, chain.implicit_public_fallback).key,
-                    mirrors_public_registry: false,
+            Some(Err(invalid)) => (
+                DependencySource::CustomRegistry {
+                    url: invalid.raw.to_string(),
                 },
-                _ => DependencySource::Registry,
+                Some(PypiIndexRoute::ReplacesPublic),
+            ),
+            None => match self.case_b_chain() {
+                Some(chain) if !chain.hops.is_empty() => chain_route(
+                    chain.hops,
+                    chain.implicit_public_fallback,
+                    matches!(self.tail_hop, Some(Ok(_))),
+                ),
+                _ => (DependencySource::Registry, None),
             },
         }
     }
@@ -550,12 +601,15 @@ impl PypiIndexConfig {
             Some(Ok(primary)) => {
                 let mut hops = vec![primary.clone()];
                 hops.extend(self.valid_extras());
-                chains.push(ResolvedChain::chain(hops, false));
+                if !all_public(&hops) {
+                    chains.push(ResolvedChain::chain(hops, false));
+                }
             }
             Some(Err(_)) => {}
             None => {
                 if let Some(chain) = self.case_b_chain()
                     && !chain.hops.is_empty()
+                    && !all_public(&chain.hops)
                 {
                     chains.push(ResolvedChain::chain(
                         chain.hops,
@@ -565,7 +619,12 @@ impl PypiIndexConfig {
             }
         }
 
-        for url in self.named_sources.values().flatten() {
+        for url in self
+            .named_sources
+            .values()
+            .flatten()
+            .filter(|url| !crate::registry::is_public_registry_url(url))
+        {
             chains.push(ResolvedChain::named_source(url.clone()));
         }
 
@@ -1293,6 +1352,147 @@ mod tests {
         assert!(
             !log.contains("hunter2"),
             "tracing output leaked the credential: {log:?}"
+        );
+    }
+
+    // --- #1947: only a replaced public index is a reported OSV coverage gap ---
+
+    const PUBLIC: &str = "https://pypi.org/simple";
+    const PRIVATE: &str = "https://pypi.mycorp.example/simple";
+
+    fn route_of(config: &PypiIndexConfig, named: Option<&str>) -> Option<PypiIndexRoute> {
+        config.resolve_for(named).1
+    }
+
+    fn uv_default(config: &mut PypiIndexConfig, raw: &str) {
+        config.set_tail_hop_resolved(resolve_entry(raw, &all_policy()));
+    }
+
+    #[test]
+    fn test_primary_public_index_is_plain_registry_and_unregistered() {
+        let mut config = PypiIndexConfig::new();
+        config.set_primary(PUBLIC, &all_policy());
+        assert_eq!(config.resolve_for(None), (DependencySource::Registry, None));
+        assert!(config.resolved_chains().is_empty());
+    }
+
+    #[test]
+    fn test_uv_default_public_index_is_plain_registry_and_unregistered() {
+        let mut config = PypiIndexConfig::new();
+        uv_default(&mut config, PUBLIC);
+        assert_eq!(config.resolve_for(None), (DependencySource::Registry, None));
+        assert!(config.resolved_chains().is_empty());
+    }
+
+    #[test]
+    fn test_public_primary_with_extras_supplements_public() {
+        let mut config = PypiIndexConfig::new();
+        config.set_primary(PUBLIC, &all_policy());
+        config.add_extra(PRIVATE, &all_policy());
+        let (source, route) = config.resolve_for(None);
+        assert_matches!(source, DependencySource::AlternateRegistry { .. });
+        assert_eq!(route, Some(PypiIndexRoute::SupplementsPublic));
+    }
+
+    #[test]
+    fn test_private_primary_replaces_public() {
+        let mut config = PypiIndexConfig::new();
+        config.set_primary(PRIVATE, &all_policy());
+        assert_eq!(
+            route_of(&config, None),
+            Some(PypiIndexRoute::ReplacesPublic)
+        );
+        config.add_extra("https://pypi.other.example/simple", &all_policy());
+        assert_eq!(
+            route_of(&config, None),
+            Some(PypiIndexRoute::ReplacesPublic)
+        );
+    }
+
+    #[test]
+    fn test_private_primary_with_public_extra_supplements_public() {
+        let mut config = PypiIndexConfig::new();
+        config.set_primary(PRIVATE, &all_policy());
+        config.add_extra(PUBLIC, &all_policy());
+        assert_eq!(
+            route_of(&config, None),
+            Some(PypiIndexRoute::SupplementsPublic)
+        );
+    }
+
+    #[test]
+    fn test_private_uv_default_replaces_public() {
+        let mut config = PypiIndexConfig::new();
+        uv_default(&mut config, PRIVATE);
+        assert_eq!(
+            route_of(&config, None),
+            Some(PypiIndexRoute::ReplacesPublic)
+        );
+    }
+
+    #[test]
+    fn test_extras_only_never_replaces_public() {
+        let mut config = PypiIndexConfig::new();
+        config.add_extra(PRIVATE, &all_policy());
+        assert_eq!(
+            route_of(&config, None),
+            Some(PypiIndexRoute::SupplementsPublic)
+        );
+    }
+
+    #[test]
+    fn test_invalid_primary_counts_as_replacing_public() {
+        let mut config = PypiIndexConfig::new();
+        config.set_primary("http://pypi.mycorp.example/simple", &all_policy());
+        let (source, route) = config.resolve_for(None);
+        assert_matches!(source, DependencySource::CustomRegistry { .. });
+        assert_eq!(route, Some(PypiIndexRoute::ReplacesPublic));
+    }
+
+    #[test]
+    fn test_blocked_primary_under_off_policy_still_blocks() {
+        let mut config = PypiIndexConfig::new();
+        config.set_primary(PUBLIC, &off_policy());
+        let (source, _) = config.resolve_for(None);
+        assert_matches!(source, DependencySource::CustomRegistry { .. });
+        assert!(config.blocked_class_for(None).is_some());
+    }
+
+    #[test]
+    fn test_userinfo_primary_is_rejected_not_public() {
+        let mut config = PypiIndexConfig::new();
+        config.set_primary("https://user:pw@pypi.org/simple", &all_policy());
+        assert_matches!(
+            config.resolve_for(None).0,
+            DependencySource::CustomRegistry { .. }
+        );
+    }
+
+    #[test]
+    fn test_named_source_pointing_at_public_index_is_plain_registry_and_unregistered() {
+        let mut config = PypiIndexConfig::new();
+        config.add_named_source_resolved("pypi".to_string(), resolve_entry(PUBLIC, &all_policy()));
+        assert_eq!(
+            config.resolve_for(Some("pypi")),
+            (DependencySource::Registry, None)
+        );
+        assert!(config.resolved_chains().is_empty());
+    }
+
+    #[test]
+    fn test_named_source_route_is_named_source() {
+        let mut config = PypiIndexConfig::new();
+        config.add_named_source_resolved(
+            "internal".to_string(),
+            resolve_entry(PRIVATE, &all_policy()),
+        );
+        assert_eq!(
+            route_of(&config, Some("internal")),
+            Some(PypiIndexRoute::NamedSource)
+        );
+        assert_eq!(
+            route_of(&config, Some("missing")),
+            Some(PypiIndexRoute::NamedSource)
         );
     }
 }

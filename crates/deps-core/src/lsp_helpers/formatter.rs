@@ -694,6 +694,10 @@ pub fn classify_requirement_rewrite_shape(requirement: &str) -> RequirementRewri
 /// Default requirement-rewrite policy driven by [`classify_requirement_rewrite_shape`] and
 /// `bare_meaning`.
 ///
+/// A tilde requirement keeps its declared precision on a plain update (`~16` -> `~19`,
+/// `~0.7` -> `~0.10`) and gets the full version for [`RewriteTarget::Floor`] or a prerelease
+/// pick.
+///
 /// Always preserves an [`ExactPin`](RequirementRewriteShape::ExactPin),
 /// [`BracketExactPin`](RequirementRewriteShape::BracketExactPin), or
 /// [`Tilde`](RequirementRewriteShape::Tilde) operator, and always calls `bare` for
@@ -714,11 +718,11 @@ pub fn classify_requirement_rewrite_shape(requirement: &str) -> RequirementRewri
 ///
 /// ```
 /// use deps_core::ConcreteVersion;
-/// use deps_core::lsp_helpers::{BareMeaning, format_version_replacing_by_shape};
+/// use deps_core::lsp_helpers::{BareMeaning, RewriteTarget, format_version_replacing_by_shape};
 ///
 /// let new_version = ConcreteVersion::new("2.0.0");
 /// assert_eq!(
-///     format_version_replacing_by_shape(&new_version, "=1.5.0", BareMeaning::Caret, || {
+///     format_version_replacing_by_shape(&new_version, "=1.5.0", BareMeaning::Caret, RewriteTarget::Update, || {
 ///         new_version.to_string()
 ///     }),
 ///     "=2.0.0"
@@ -728,6 +732,7 @@ pub fn classify_requirement_rewrite_shape(requirement: &str) -> RequirementRewri
 ///         &new_version,
 ///         ">=1.2, <1.5",
 ///         BareMeaning::Caret,
+///         RewriteTarget::Update,
 ///         || new_version.to_string()
 ///     ),
 ///     ">=1.2, <1.5"
@@ -737,6 +742,7 @@ pub fn classify_requirement_rewrite_shape(requirement: &str) -> RequirementRewri
 ///         &new_version,
 ///         ">=1.2.0 <1.5.0",
 ///         BareMeaning::ExactPin,
+///         RewriteTarget::Update,
 ///         || new_version.to_string()
 ///     ),
 ///     "2.0.0"
@@ -747,6 +753,7 @@ pub fn format_version_replacing_by_shape(
     version: &ConcreteVersion,
     current: &str,
     bare_meaning: BareMeaning,
+    target: RewriteTarget,
     bare: impl FnOnce() -> String,
 ) -> String {
     match classify_requirement_rewrite_shape(current) {
@@ -772,14 +779,30 @@ pub fn format_version_replacing_by_shape(
             // Reconstructs whichever tilde spelling `current` actually used, rather than
             // hardcoding `~` — `~>` is RubyGems' spelling (Bundler doesn't call this function
             // today, but nothing here should silently mangle it if that ever changes).
-            let prefix = if current.trim_start().starts_with("~>") {
-                "~>"
+            let trimmed = current.trim_start();
+            let (prefix, operand) = trimmed.strip_prefix("~>").map_or_else(
+                || ("~", trimmed.strip_prefix('~').unwrap_or(trimmed)),
+                |rest| ("~>", rest),
+            );
+            let operand = operand.trim();
+            let core = version.as_str();
+            let keep_full = target == RewriteTarget::Floor
+                || is_prerelease_core(core)
+                || !is_plain_numeric_operand(operand);
+            if keep_full {
+                format!("{prefix}{core}")
             } else {
-                "~"
-            };
-            format!("{prefix}{}", version.as_str())
+                format!("{prefix}{}", fit_segments(core, operand.split('.').count()))
+            }
         }
     }
+}
+
+/// Whether `operand` is a dot-separated list of plain decimal segments (`16`, `0.7`, `1.2.3`).
+fn is_plain_numeric_operand(operand: &str) -> bool {
+    operand
+        .split('.')
+        .all(|segment| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Whether a rewrite target is a plain "update to latest" or a security-fix / cooldown-fallback
@@ -821,6 +844,13 @@ enum VPrefix {
     MatchOperand,
 }
 
+/// Whether an ecosystem's requirement grammar has a trailing wildcard segment (`2.*`, `2.0.x`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WildcardSupport {
+    Unsupported,
+    TrailingWildcard,
+}
+
 /// Operator grammar of an ecosystem whose bare version is an exact pin but whose manifests
 /// commonly declare `~`/`~>`/`^` ranges.
 ///
@@ -831,6 +861,7 @@ pub struct OperatorGrammar {
     operators: &'static [RangeOperator],
     stability: StabilitySuffix,
     v_prefix: VPrefix,
+    wildcard: WildcardSupport,
 }
 
 const COMPOSER_STABILITY_FLAGS: [&str; 5] = ["dev", "alpha", "beta", "rc", "stable"];
@@ -856,6 +887,7 @@ impl OperatorGrammar {
         operators: &[RangeOperator::PessimisticTilde],
         stability: StabilitySuffix::Unsupported,
         v_prefix: VPrefix::Absent,
+        wildcard: WildcardSupport::Unsupported,
     };
 
     /// Composer: `~` and `^` ranges, trailing `@stability` flag, `v` prefix style.
@@ -863,6 +895,7 @@ impl OperatorGrammar {
         operators: &[RangeOperator::Tilde, RangeOperator::Caret],
         stability: StabilitySuffix::AtFlag,
         v_prefix: VPrefix::MatchOperand,
+        wildcard: WildcardSupport::TrailingWildcard,
     };
 
     /// Renders `version` as a replacement for the declared requirement `current`, keeping the
@@ -876,7 +909,10 @@ impl OperatorGrammar {
     /// - One operator comparator plus lower bounds the picked version satisfies (per
     ///   `satisfies`) renders the operator comparator alone.
     /// - A single `>=`/`>` renders `>=` plus the picked version.
-    /// - Every other shape (bare version, upper bounds, `||`, wildcards, unparsable operands)
+    /// - Where the grammar has one (Composer), a single trailing-wildcard comparator (`2.*`,
+    ///   `2.0.x`) keeps its wildcard spelling and the number of leading segments (`2.*` -> `3.*`,
+    ///   `2.0.*` -> `3.2.*`); a floor target or prerelease pick renders the bare picked version.
+    /// - Every other shape (bare version, upper bounds, `||`, unparsable operands)
     ///   renders the bare picked version, keeping a Composer stability flag.
     ///
     /// # Examples
@@ -899,6 +935,10 @@ impl OperatorGrammar {
     /// assert_eq!(
     ///     render(OperatorGrammar::COMPOSER, "^5.0@beta", "8.1.11", RewriteTarget::Update),
     ///     "^8.1@beta"
+    /// );
+    /// assert_eq!(
+    ///     render(OperatorGrammar::COMPOSER, "2.0.*", "3.2.8", RewriteTarget::Update),
+    ///     "3.2.*"
     /// );
     /// ```
     #[must_use]
@@ -1010,6 +1050,24 @@ impl OperatorGrammar {
         DeclaredComparator::Other
     }
 
+    /// Parses `body` as a lone trailing-wildcard comparator (`2.*`, `2.0.X`): one or more
+    /// numeric leading segments followed by a final `*`, `x` or `X` segment, with nothing after
+    /// it (so a branch alias such as `2.x-dev` is not a wildcard).
+    fn parse_trailing_wildcard(self, body: &str) -> Option<TrailingWildcard<'_>> {
+        if self.wildcard == WildcardSupport::Unsupported {
+            return None;
+        }
+        let (leading, token) = body.rsplit_once('.')?;
+        if !matches!(token, "*" | "x" | "X") || !self.is_numeric_operand(leading) {
+            return None;
+        }
+        Some(TrailingWildcard {
+            leading,
+            segments: leading.split('.').count(),
+            token,
+        })
+    }
+
     fn bare(self, body: &str, version: &ConcreteVersion) -> String {
         match self.v_prefix {
             VPrefix::Absent => version.as_str().to_string(),
@@ -1068,6 +1126,31 @@ fn render_range(
     )
 }
 
+/// A lone trailing-wildcard comparator, split into its numeric prefix and wildcard spelling.
+#[derive(Debug, Clone, Copy)]
+struct TrailingWildcard<'a> {
+    leading: &'a str,
+    segments: usize,
+    token: &'a str,
+}
+
+fn render_trailing_wildcard(
+    grammar: OperatorGrammar,
+    wildcard: TrailingWildcard<'_>,
+    core: &str,
+    target: RewriteTarget,
+) -> Option<String> {
+    if target == RewriteTarget::Floor || is_prerelease_core(core) {
+        return None;
+    }
+    let rendered = fit_segments(core, wildcard.segments);
+    Some(format!(
+        "{}.{}",
+        grammar.style_operand(wildcard.leading, &rendered),
+        wildcard.token
+    ))
+}
+
 fn render_operator_constraint(
     grammar: OperatorGrammar,
     body: &str,
@@ -1077,6 +1160,9 @@ fn render_operator_constraint(
 ) -> Option<String> {
     if body.contains('|') {
         return None;
+    }
+    if let Some(wildcard) = grammar.parse_trailing_wildcard(body) {
+        return render_trailing_wildcard(grammar, wildcard, core, target);
     }
     let parts: Vec<&str> = body.split(',').map(str::trim).collect();
     let mut range = None;
@@ -2883,6 +2969,16 @@ pub trait OsvNaming: SourcePolicy + Send + Sync {
         crate::osv::NonPublicRoute::Private
     }
 
+    /// Whether a lock file is expected to list `dep` (#1946). A dependency reported as
+    /// [`crate::osv::LockResolution::NotLocked`] (an npm `peerDependencies` entry) never counts
+    /// as a `--fail-on unchecked` coverage gap for lacking a concrete version.
+    ///
+    /// Default: [`crate::osv::LockResolution::Expected`].
+    fn lock_resolution(&self, dep: &dyn Dependency) -> crate::osv::LockResolution {
+        let _ = dep;
+        crate::osv::LockResolution::Expected
+    }
+
     /// OSV.dev's canonical spelling for `dep`'s package name, or `None` if
     /// this dependency cannot be mapped (e.g. a non-GitHub Swift package).
     ///
@@ -3995,9 +4091,13 @@ mod tests {
             BareMeaning::Floor,
         ] {
             assert_eq!(
-                format_version_replacing_by_shape(&new_version, "", bare_meaning, || {
-                    new_version.to_string()
-                }),
+                format_version_replacing_by_shape(
+                    &new_version,
+                    "",
+                    bare_meaning,
+                    RewriteTarget::Update,
+                    || { new_version.to_string() }
+                ),
                 "2.0.0"
             );
         }
@@ -4063,9 +4163,13 @@ mod tests {
     fn test_format_version_replacing_by_shape_preserves_exact_pin_and_tilde() {
         let new_version = ConcreteVersion::new("2.0.0");
         assert_eq!(
-            format_version_replacing_by_shape(&new_version, "=1.5.0", BareMeaning::Caret, || {
-                new_version.to_string()
-            }),
+            format_version_replacing_by_shape(
+                &new_version,
+                "=1.5.0",
+                BareMeaning::Caret,
+                RewriteTarget::Update,
+                || { new_version.to_string() }
+            ),
             "=2.0.0"
         );
         assert_eq!(
@@ -4073,6 +4177,7 @@ mod tests {
                 &new_version,
                 "~1.5.0",
                 BareMeaning::ExactPin,
+                RewriteTarget::Update,
                 || { new_version.to_string() }
             ),
             "~2.0.0"
@@ -4090,6 +4195,7 @@ mod tests {
                 &new_version,
                 "~>1.5.0",
                 BareMeaning::ExactPin,
+                RewriteTarget::Update,
                 || { new_version.to_string() }
             ),
             "~>2.0.0"
@@ -4107,6 +4213,7 @@ mod tests {
                     &new_version,
                     requirement,
                     BareMeaning::Caret,
+                    RewriteTarget::Update,
                     || new_version.to_string()
                 ),
                 requirement,
@@ -4126,6 +4233,7 @@ mod tests {
                     &new_version,
                     requirement,
                     BareMeaning::ExactPin,
+                    RewriteTarget::Update,
                     || new_version.to_string()
                 ),
                 "2.0.0",
@@ -4145,9 +4253,13 @@ mod tests {
             BareMeaning::Floor,
         ] {
             assert_eq!(
-                format_version_replacing_by_shape(&new_version, "*", bare_meaning, || {
-                    new_version.to_string()
-                }),
+                format_version_replacing_by_shape(
+                    &new_version,
+                    "*",
+                    bare_meaning,
+                    RewriteTarget::Update,
+                    || { new_version.to_string() }
+                ),
                 "2.0.0"
             );
         }
@@ -4157,9 +4269,13 @@ mod tests {
     fn test_format_version_replacing_by_shape_bare_calls_bare_closure() {
         let new_version = ConcreteVersion::new("2.0.0");
         assert_eq!(
-            format_version_replacing_by_shape(&new_version, "1.5.0", BareMeaning::ExactPin, || {
-                new_version.as_str().to_string()
-            }),
+            format_version_replacing_by_shape(
+                &new_version,
+                "1.5.0",
+                BareMeaning::ExactPin,
+                RewriteTarget::Update,
+                || { new_version.as_str().to_string() }
+            ),
             "2.0.0"
         );
     }
@@ -4170,9 +4286,13 @@ mod tests {
     fn test_format_version_replacing_by_shape_explicit_caret_collapses_under_caret_meaning() {
         let new_version = ConcreteVersion::new("2.0.0");
         assert_eq!(
-            format_version_replacing_by_shape(&new_version, "^1.5.0", BareMeaning::Caret, || {
-                new_version.to_string()
-            }),
+            format_version_replacing_by_shape(
+                &new_version,
+                "^1.5.0",
+                BareMeaning::Caret,
+                RewriteTarget::Update,
+                || { new_version.to_string() }
+            ),
             "2.0.0"
         );
     }
@@ -4188,6 +4308,7 @@ mod tests {
                 &new_version,
                 "^1.5.0",
                 BareMeaning::ExactPin,
+                RewriteTarget::Update,
                 || { new_version.to_string() }
             ),
             "^2.0.0"
@@ -4243,6 +4364,7 @@ mod tests {
                     &new_version,
                     requirement,
                     BareMeaning::Floor,
+                    RewriteTarget::Update,
                     || new_version.to_string()
                 ),
                 requirement,
@@ -4257,9 +4379,13 @@ mod tests {
     fn test_format_version_replacing_by_shape_floor_meaning_preserves_bracket_exact_pin() {
         let new_version = ConcreteVersion::new("13.0.4");
         assert_eq!(
-            format_version_replacing_by_shape(&new_version, "[12.0.1]", BareMeaning::Floor, || {
-                new_version.to_string()
-            }),
+            format_version_replacing_by_shape(
+                &new_version,
+                "[12.0.1]",
+                BareMeaning::Floor,
+                RewriteTarget::Update,
+                || { new_version.to_string() }
+            ),
             "[13.0.4]"
         );
     }
@@ -4270,9 +4396,13 @@ mod tests {
     fn test_format_version_replacing_by_shape_floor_meaning_bare_still_collapses() {
         let new_version = ConcreteVersion::new("13.0.4");
         assert_eq!(
-            format_version_replacing_by_shape(&new_version, "12.0.1", BareMeaning::Floor, || {
-                new_version.to_string()
-            }),
+            format_version_replacing_by_shape(
+                &new_version,
+                "12.0.1",
+                BareMeaning::Floor,
+                RewriteTarget::Update,
+                || { new_version.to_string() }
+            ),
             "13.0.4"
         );
     }
@@ -4285,9 +4415,13 @@ mod tests {
     fn test_format_version_replacing_by_shape_floor_meaning_refuses_explicit_caret() {
         let new_version = ConcreteVersion::new("13.0.4");
         assert_eq!(
-            format_version_replacing_by_shape(&new_version, "^1.2.3", BareMeaning::Floor, || {
-                new_version.to_string()
-            }),
+            format_version_replacing_by_shape(
+                &new_version,
+                "^1.2.3",
+                BareMeaning::Floor,
+                RewriteTarget::Update,
+                || { new_version.to_string() }
+            ),
             "^1.2.3"
         );
     }

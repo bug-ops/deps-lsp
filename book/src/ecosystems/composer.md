@@ -58,8 +58,10 @@ instead of collapsing the range to an exact pin (#1933): `^2.0` becomes `^3.12`,
 operator but writes the full version (`^2.0` becomes `^2.9.1`); a prerelease target or a `^0.0.x`
 caret also writes the full version. A single `>=`/`>` becomes `>= <version>`, and one operator
 comparator plus satisfied lower bounds (`^2.0, >=2.1`) renders the operator comparator alone.
-A bare version, an `||` alternative, an upper bound or a wildcard (`2.*`, tracked in #1950) is
-still replaced by the bare version, keeping the stability flag. The LSP code actions and
+A trailing wildcard keeps its spelling and segment count (#1950): `2.*` becomes `3.*` and `2.0.*`
+becomes `3.2.*` for a latest of 3.2.1; a security-fix or cooldown-fallback target or a prerelease
+writes a bare pin. A bare version, an `||` alternative or an upper bound is still replaced by the
+bare version, keeping the stability flag. The LSP code actions and
 `deps-cli update` write identical text.
 
 See [Dart](dart.md#version-comparison) for the equivalent fix in that ecosystem, which shares

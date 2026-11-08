@@ -35,10 +35,11 @@ use deps_core::{Dependency, EcosystemId, EcosystemRegistry, HttpCache, PackageNa
 use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
 
 /// Ecosystems known to override [`deps_core::lsp_helpers::OsvNaming::non_public_route`] by
-/// inspecting their own dependency type (npm), which a synthetic probe cannot trigger. Probe-visible
-/// overrides are derived from the registered formatters instead (see
+/// inspecting their own dependency type (npm, PyPI, NuGet), which a synthetic probe cannot
+/// trigger. Probe-visible overrides are derived from the registered formatters instead (see
 /// `every_probe_visible_unverified_route_has_an_osv_mapping`); this list only covers the rest.
-const DOWNCAST_OPT_INS: [EcosystemId; 1] = [EcosystemId::Npm];
+const DOWNCAST_OPT_INS: [EcosystemId; 3] =
+    [EcosystemId::Npm, EcosystemId::Pypi, EcosystemId::NuGet];
 
 struct RouteDep {
     name: PackageName,

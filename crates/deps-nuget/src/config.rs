@@ -51,6 +51,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::types::NuGetFeedRoute;
 use deps_core::config_trust::{self, EnvPath, EnvVarSyntax, OperatorEnvVar, OperatorPath};
 use deps_core::net_policy::{
     BlockedHost, BlockedHostReason, DeclaredRegistry, EnvSource, IndexUrlError, OperatorRegistries,
@@ -713,8 +714,19 @@ impl NuGetConfig {
     /// FR-002–FR-009: resolves one dependency's [`DependencySource`].
     #[must_use]
     pub fn resolve_source_for(&self, package: &PackageName) -> DependencySource {
+        self.resolve_for(package).0
+    }
+
+    /// [`Self::resolve_source_for`] plus the [`NuGetFeedRoute`] that produced the source: the
+    /// one copy of the routing logic (#1947). A route is `None` whenever the result is plain
+    /// public [`DependencySource::Registry`] or has no usable source.
+    #[must_use]
+    pub fn resolve_for(&self, package: &PackageName) -> (DependencySource, Option<NuGetFeedRoute>) {
         if !self.mapping.is_empty() {
-            return self.resolve_via_mapping(package);
+            let source = self.resolve_via_mapping(package);
+            let route = matches!(source, DependencySource::AlternateRegistry { .. })
+                .then_some(NuGetFeedRoute::Mapped);
+            return (source, route);
         }
         self.resolve_plain()
     }
@@ -1011,18 +1023,21 @@ impl NuGetConfig {
     /// somewhere in the chain, the implicit tail is gone too, so zero usable hops is an
     /// explicit fail-closed state (R4) — never a silent fall-through to `Registry`, whether
     /// there is a nameable invalid entry or genuinely nothing left to name.
-    fn resolve_plain(&self) -> DependencySource {
+    fn resolve_plain(&self) -> (DependencySource, Option<NuGetFeedRoute>) {
         let valid_hops = self.valid_hops();
         if valid_hops.is_empty() {
             if self.implicit_public_fallback() {
-                return DependencySource::Registry;
+                return (DependencySource::Registry, None);
             }
             let raw = self
                 .sources
                 .iter()
                 .find_map(|s| s.value.as_ref().err().map(|e| e.raw.to_string()))
                 .unwrap_or_else(|| NO_SOURCES_CONFIGURED_SENTINEL.to_string());
-            return DependencySource::CustomRegistry { url: raw };
+            return (
+                DependencySource::CustomRegistry { url: raw },
+                Some(NuGetFeedRoute::ReplacesPublic),
+            );
         }
         // M2 (impl-critic): mirrors `resolve_via_mapping`'s identical check — an explicit
         // `<clear/>` + `<add key="nuget.org" value="https://api.nuget.org/v3/index.json"/>`
@@ -1032,12 +1047,22 @@ impl NuGetConfig {
         if let [hop] = valid_hops.as_slice()
             && crate::registry::is_public_registry_url(hop.url.as_str())
         {
-            return DependencySource::Registry;
+            return (DependencySource::Registry, None);
         }
-        DependencySource::AlternateRegistry {
+        let keeps_public = self.implicit_public_fallback()
+            || valid_hops
+                .iter()
+                .any(|hop| crate::registry::is_public_registry_url(hop.url.as_str()));
+        let route = if keeps_public {
+            NuGetFeedRoute::SupplementsPublic
+        } else {
+            NuGetFeedRoute::ReplacesPublic
+        };
+        let source = DependencySource::AlternateRegistry {
             index: NuGetSourceChain::chain(valid_hops, self.implicit_public_fallback()).key,
             mirrors_public_registry: false,
-        }
+        };
+        (source, Some(route))
     }
 
     /// Whether the implicit `nuget.org` tail hop is still in effect — `false` once either an
@@ -5857,5 +5882,86 @@ mod tests {
             !log.contains('\r'),
             "carriage return must not survive into the log: {log:?}"
         );
+    }
+
+    // --- #1947: only a feed chain that drops nuget.org is a reported OSV coverage gap ---
+
+    fn route_for_xml(sources: &str) -> (DependencySource, Option<NuGetFeedRoute>) {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            &format!("<configuration>{sources}</configuration>"),
+        );
+        let config = resolve(dir.path(), &NuGetConfigCache::new(), &all_policy());
+        config.resolve_for(&pkg("Newtonsoft.Json"))
+    }
+
+    const PRIVATE_ADD: &str =
+        r#"<add key="corp" value="https://nuget.mycorp.example/v3/index.json" />"#;
+    const PUBLIC_ADD: &str =
+        r#"<add key="nuget.org" value="https://api.nuget.org/v3/index.json" />"#;
+
+    #[test]
+    fn test_route_clear_with_private_feed_replaces_public() {
+        let (source, route) = route_for_xml(&format!(
+            "<packageSources><clear />{PRIVATE_ADD}</packageSources>"
+        ));
+        assert_matches!(source, DependencySource::AlternateRegistry { .. });
+        assert_eq!(route, Some(NuGetFeedRoute::ReplacesPublic));
+    }
+
+    #[test]
+    fn test_route_remove_nuget_org_with_private_feed_replaces_public() {
+        let (_, route) = route_for_xml(&format!(
+            r#"<packageSources>{PRIVATE_ADD}<remove key="nuget.org" /></packageSources>"#
+        ));
+        assert_eq!(route, Some(NuGetFeedRoute::ReplacesPublic));
+    }
+
+    #[test]
+    fn test_route_private_feed_without_clear_stays_silent() {
+        let (source, route) =
+            route_for_xml(&format!("<packageSources>{PRIVATE_ADD}</packageSources>"));
+        assert_matches!(source, DependencySource::AlternateRegistry { .. });
+        assert_eq!(route, Some(NuGetFeedRoute::SupplementsPublic));
+    }
+
+    #[test]
+    fn test_route_clear_with_public_and_private_feed_stays_silent() {
+        let (_, route) = route_for_xml(&format!(
+            "<packageSources><clear />{PUBLIC_ADD}{PRIVATE_ADD}</packageSources>"
+        ));
+        assert_eq!(route, Some(NuGetFeedRoute::SupplementsPublic));
+    }
+
+    #[test]
+    fn test_route_clear_with_only_public_feed_is_plain_registry() {
+        let (source, route) = route_for_xml(&format!(
+            "<packageSources><clear />{PUBLIC_ADD}</packageSources>"
+        ));
+        assert_eq!((source, route), (DependencySource::Registry, None));
+    }
+
+    #[test]
+    fn test_route_without_sources_is_plain_registry() {
+        assert_eq!(route_for_xml(""), (DependencySource::Registry, None));
+    }
+
+    #[test]
+    fn test_route_clear_with_every_feed_unusable_replaces_public() {
+        let (source, route) = route_for_xml("<packageSources><clear /></packageSources>");
+        assert_matches!(source, DependencySource::CustomRegistry { .. });
+        assert_eq!(route, Some(NuGetFeedRoute::ReplacesPublic));
+    }
+
+    #[test]
+    fn test_route_source_mapping_group_is_mapped_and_silent() {
+        let (source, route) = route_for_xml(&format!(
+            r#"<packageSources><clear />{PRIVATE_ADD}</packageSources>
+            <packageSourceMapping><packageSource key="corp"><package pattern="*" /></packageSource></packageSourceMapping>"#
+        ));
+        assert_matches!(source, DependencySource::AlternateRegistry { .. });
+        assert_eq!(route, Some(NuGetFeedRoute::Mapped));
     }
 }

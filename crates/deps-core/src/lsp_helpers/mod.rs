@@ -40,6 +40,7 @@ mod inlay_hints;
 mod interactive_fetch;
 mod probe_pass;
 mod sha_comment;
+mod suppression;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]
@@ -144,6 +145,10 @@ pub use sha_comment::{
     SHA_COMMENT_MISMATCH_DIAGNOSTIC_CODE, ShaPinComment, ShaPinTail, ShaPinTailRead,
     comment_slot_after, position_past_sha, read_sha_pin_tail, ref_is_last_on_line,
     sha_comment_mismatch_diagnostic, sha_comment_mismatch_hover_line, sha_pin_rewrite,
+};
+pub use suppression::{
+    PackagePattern, PatternError, ResolvedSuppression, RuleError, SuppressedKinds, SuppressionKind,
+    SuppressionRule, SuppressionSet,
 };
 #[cfg(feature = "lsp-responses")]
 pub use unknown_ref::build_unknown_ref_fix_action;

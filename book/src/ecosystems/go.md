@@ -53,6 +53,16 @@ startup, so a variable exported later needs a restart of the server. `GONOPROXY`
 `GOPRIVATE` (the first non-empty of env `GONOPROXY`, file `GONOPROXY`, env `GOPRIVATE`,
 file `GOPRIVATE`), so a `GONOPROXY` in the file beats a `GOPRIVATE` in the environment.
 
+**`go.env` defaults**: below `$GOENV`, `deps-go` reads the toolchain's own `$GOROOT/go.env` as the
+lowest-precedence layer, so the order per setting is process environment, then `$GOENV`, then
+`go.env`. `GOROOT` comes from the process environment, otherwise from the `go` binary found on
+`PATH` (an absolute `PATH` entry, symlinks resolved, with a `bin/go` layout); `go` is never run. A
+customised `go.env` such as `GOPROXY=direct` therefore changes routing, while the stock
+`GOPROXY=https://proxy.golang.org,direct` is ignored as equal to the default. `GOPROXY` hops from a
+`go.env` found through `PATH` are validated under the workspace registry policy; one from the `GOROOT`
+environment variable is operator-trusted. GUI-launched editors on macOS often lack the Go `bin`
+directory on `PATH`, in which case this layer is silently absent.
+
 **Resolution**: `$GOENV` is read once per process — the `GOENV` environment
 variable if it is an absolute path, else the platform default
 `os.UserConfigDir()/go/env` (`~/.config/go/env` on Linux/macOS,

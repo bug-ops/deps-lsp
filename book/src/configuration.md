@@ -34,6 +34,7 @@ control, see [Conventions](cross-ecosystem/conventions.md).
 | `diagnostics` | `unknown_ref_severity` | `"warning"` | Severity for the [unknown-ref diagnostic](ecosystems/github-actions.md#unpublished-refs-and-the-unknown-ref-diagnostic-issue-1766) (GitHub Actions or GitLab CI/CD tag pin whose ref is a full release no published tag matches); no on/off toggle |
 | `diagnostics` | `mutable_ref_pin_enabled` | `true` | Turns the mutable-ref-pin diagnostic and its bulk code lens off entirely — unlike the other diagnostics, severity alone cannot silence it |
 | `diagnostics` | `vulnerabilities_enabled` | `true` | Whether OSV.dev-backed vulnerability diagnostics run at all |
+| `diagnostics` | `suppress` | `[]` | List of `{ package, kinds }` rules that silence diagnostics per package; see [Suppressing diagnostics per package](#suppressing-diagnostics-per-package) |
 | `freshness` | `enabled` | `true` | Flag a "latest" version still inside its cooldown window |
 | `freshness` | `cooldown_secs` | `259200` | Cooldown window in seconds (3 days), clamped to 0-30 days |
 | `registries` | `workspace_registries` | `"public_only"` | Which workspace-declared registry index hosts are ever fetched, across every ecosystem (Cargo's `.cargo/config.toml`/`[source]`, npm's `.npmrc`, PyPI's `--index-url`/Poetry/uv sources, NuGet's `NuGet.Config`, Swift's `registries.json`) — `"public_only"`, `"off"`, or `"all"`. A registry you declared yourself is exempt: Go's `$GOENV` `GOPROXY`, your user `~/.npmrc`, your user-profile `NuGet.Config` and your user-level `registries.json`, and any repository URL equal to one of them, ignore this setting (see [Operator-owned registries](#operator-owned-registries)). See [Cargo Custom/Private Registries](ecosystems/cargo.md#customprivate-registries), [npm Custom/Private Registries](ecosystems/npm.md#customprivate-registries), [PyPI Custom/Private Indexes](ecosystems/pypi.md#customprivate-indexes), [Go GOPROXY/GOPRIVATE Support](ecosystems/go.md#goproxygoprivate-support), [NuGet Private/Custom Feeds](ecosystems/nuget.md#privatecustom-feeds), and [Swift Package Registries](ecosystems/swift.md#package-registries-se-0292). |
@@ -47,6 +48,45 @@ control, see [Conventions](cross-ecosystem/conventions.md).
 | `license_policy` | `deny` | `[]` | SPDX identifiers a dependency's license must not include any of; produces an ERROR diagnostic when matched (wins over `allow`). Invalid entries are dropped with a logged warning, not rejected. See [License Policy Diagnostic](cross-ecosystem/licensing.md#license-policy-diagnostic-issue-661) |
 | `typosquat` | `enabled` | `false` | Whether the [typosquat-similarity diagnostic](cross-ecosystem/typosquat-detection.md) runs at all — opt-in, backed by deps.dev's v3alpha `GetSimilarlyNamedPackages`/`GetDependents` endpoints |
 | `gossip` | `enabled` | `false` | Whether [deps.dev GOSSIP signals](cross-ecosystem/gossip-signals.md) (Dynamic Cooldown, low-usage) are fetched at all — opt-in, backed by deps.dev's v3alpha `GetFindingsBatch`/`GetFindings` endpoints |
+
+### Suppressing diagnostics per package
+
+`diagnostics.suppress` is a list of rules. Each rule names a package and the diagnostic kinds to hide
+for it:
+
+```json
+{
+  "diagnostics": {
+    "suppress": [
+      { "package": "request", "kinds": ["deprecated"] },
+      { "package": "@types/*", "kinds": ["outdated"] }
+    ]
+  }
+}
+```
+
+The same rules in TOML:
+
+```toml
+[[diagnostics.suppress]]
+package = "request"
+kinds = ["deprecated"]
+```
+
+- `package` is an exact name or a pattern with a single leading or trailing `*` (`@types/*`,
+  `*-sys`). A bare `*` is rejected. Names are compared after the ecosystem's own normalization (PEP 503
+  for PyPI).
+- `kinds` is a non-empty subset of `deprecated`, `outdated`, `yanked` and `license`. There is no
+  `vulnerability` kind: advisories cannot be suppressed, because editor workspace settings can be
+  written by the repository. The one exception is that `deprecated` also hides that package's RustSec
+  "unmaintained" advisory.
+- A suppressed package is still fetched and checked for every kind you did not list.
+- An invalid rule (unknown kind, empty `kinds`, bare `*`, `*` in the middle of a pattern, unknown key)
+  rejects the whole configuration and keeps the previous one.
+- `deps-cli check` honors the rules from an explicit `--config` only; the `suppress` list of an
+  auto-discovered `deps.toml` is dropped with a warning.
+- The "Update N outdated" code lens and update-all still count suppressed packages, and the
+  "+N more advisories" line can still count a hidden unmaintained advisory.
 
 ### Editor workspace settings and trust
 
@@ -205,7 +245,8 @@ An invalid `GITLAB_TOKEN_HOST` disables the token entirely. See
     "sha_comment_mismatch_severity": "warning",
     "unknown_ref_severity": "warning",
     "mutable_ref_pin_enabled": true,
-    "vulnerabilities_enabled": true
+    "vulnerabilities_enabled": true,
+    "suppress": []
   },
   "freshness": {
     "enabled": true,

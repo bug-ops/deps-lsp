@@ -302,7 +302,7 @@ impl PypiParser {
                     // Git/Path/Url-sourced one is untouched — those have no PyPI index
                     // routing concept.
                     if dep.source == PypiDependencySource::Registry {
-                        dep.source = config.resolve_source_for(None);
+                        (dep.source, dep.index_route) = config.resolve_for(None);
                         if let Some(classification) = config.blocked_class_for(None) {
                             blocked_registries.push(classification.into_occurrence(dep.name_range));
                         } else if let Some(classification) = config.rejected_reason_for(None) {

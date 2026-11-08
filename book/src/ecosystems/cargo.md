@@ -32,6 +32,9 @@ dependencies, and a `package = "..."` rename (aliasing the TOML key to a differe
 lookup name) are all recognized and routed correctly — a renamed dependency's diagnostics and
 completions key off the real crate name, not the local alias.
 
+Update edits keep a partial tilde requirement's precision: `~0.7` with a latest of 0.10.3 becomes
+`~0.10`, not `~0.10.3`. A security-fix or cooldown-fallback target writes the full version.
+
 ## Custom/Private Registries
 
 A Cargo dependency declared as `registry = "<alias>"` or `registry-index = "<url>"`

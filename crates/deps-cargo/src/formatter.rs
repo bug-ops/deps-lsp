@@ -1,11 +1,11 @@
 use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
-    compile_semver_requirement, format_version_replacing_by_shape,
+    PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget, SourcePolicy,
+    bare_meaning, compile_semver_requirement, format_version_replacing_by_shape,
     up_to_date_for_comparators_via_compiled_matcher,
 };
 use deps_core::parser::DependencySource;
-use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName};
+use deps_core::{ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName};
 
 /// Maximum crate name length this diagnostic accepts.
 ///
@@ -19,6 +19,23 @@ const MAX_NAME_LENGTH: usize = 64;
 
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for Cargo.
 pub struct CargoFormatter;
+
+impl CargoFormatter {
+    fn render_replacing(
+        &self,
+        version: &ConcreteVersion,
+        current: &str,
+        target: RewriteTarget,
+    ) -> String {
+        format_version_replacing_by_shape(
+            version,
+            current,
+            bare_meaning(EcosystemId::Cargo),
+            target,
+            || self.format_version_for_text_edit(version),
+        )
+    }
+}
 
 impl PackageNaming for CargoFormatter {
     /// Validates a crate name against crates.io's naming rules.
@@ -121,12 +138,18 @@ impl PackageRendering for CargoFormatter {
     /// then classifies the dependency as [`deps_core::edit::UnplannableReason::NoOpRewrite`]
     /// instead of silently writing a rewrite that changes what the requirement admits.
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        format_version_replacing_by_shape(
-            version,
-            current,
-            bare_meaning(EcosystemId::Cargo),
-            || self.format_version_for_text_edit(version),
-        )
+        self.render_replacing(version, current, RewriteTarget::Update)
+    }
+
+    /// Security-fix and cooldown-fallback targets keep the full picked version in a tilde
+    /// requirement (`~0.7` -> `~0.7.3`), so the floor never drops below `version`.
+    fn format_version_replacing_floor_for(
+        &self,
+        _dep: &dyn Dependency,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        self.render_replacing(version, current, RewriteTarget::Floor)
     }
 
     fn package_url(&self, name: &PackageName) -> String {
@@ -230,6 +253,41 @@ mod tests {
             &deps_core::VersionReq::new("1.2.3+a"),
             &deps_core::ConcreteVersion::new("1.2.3+b"),
         ));
+    }
+
+    #[test]
+    fn test_tilde_update_keeps_declared_precision_and_floor_keeps_full_version() {
+        let dep = crate::types::CargoDependency {
+            name: PackageName::new("serde"),
+            name_range: deps_core::position::Range::default(),
+            version_req: None,
+            version_range: None,
+            features: Vec::new(),
+            features_range: None,
+            source: DependencySource::Registry,
+            section: crate::types::CargoDependencySection::Dependencies,
+            package: None,
+            custom_registry_origin: None,
+        };
+        let picked = ConcreteVersion::new("0.10.3");
+        assert_eq!(
+            CargoFormatter.format_version_replacing(&picked, "~0.7"),
+            "~0.10"
+        );
+        assert_eq!(CargoFormatter.format_version_replacing(&picked, "~0"), "~0");
+        assert_eq!(
+            CargoFormatter.format_version_replacing(&picked, "~0.7.1"),
+            "~0.10.3"
+        );
+        assert_eq!(
+            CargoFormatter.format_version_replacing_floor_for(&dep, &picked, "~0.7"),
+            "~0.10.3"
+        );
+        let pre = ConcreteVersion::new("0.10.3-rc.1");
+        assert_eq!(
+            CargoFormatter.format_version_replacing(&pre, "~0.7"),
+            "~0.10.3-rc.1"
+        );
     }
 
     // #758: exact-value `EcosystemFormatter` conformance, replacing several hand-written

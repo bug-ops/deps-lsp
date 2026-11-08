@@ -1,7 +1,8 @@
 //! Exit-code mapping (FR-011, FR-012): 0 clean, 1 policy violation, 2 execution error.
 
-use crate::report::{CheckReport, FailOnPolicy};
+use crate::report::{CheckReport, FailOnPolicy, OsvCoverage};
 use crate::update::{Outcome, SkipReason, UpdatePlan};
+use deps_core::policy_config::OsvChecks;
 
 /// The process exited cleanly: no finding matched the `--fail-on` policy.
 pub const EXIT_CLEAN: i32 = 0;
@@ -56,20 +57,33 @@ impl ExecutionOutcome {
 ///
 /// ```
 /// use deps_cli::exit::{EXIT_CLEAN, EXIT_EXECUTION_ERROR, EXIT_POLICY_VIOLATION, ExecutionOutcome, exit_code};
-/// use deps_cli::report::{CheckReport, FailOnPolicy};
+/// use deps_cli::report::{CheckReport, FailOnPolicy, FailOnToken, OsvCoverage};
+/// use deps_core::NetworkMode;
+/// use deps_core::policy_config::OsvChecks;
 ///
 /// let clean = CheckReport::default();
 /// let policy = FailOnPolicy::default_categories();
-/// assert_eq!(exit_code(&clean, &policy, ExecutionOutcome::Clean), EXIT_CLEAN);
-/// assert_eq!(exit_code(&clean, &policy, ExecutionOutcome::Failed), EXIT_EXECUTION_ERROR);
+/// let coverage = OsvCoverage::default();
+/// let osv = OsvChecks::resolve(true, NetworkMode::Online);
+/// assert_eq!(exit_code(&clean, &policy, &coverage, osv, ExecutionOutcome::Clean), EXIT_CLEAN);
+/// assert_eq!(exit_code(&clean, &policy, &coverage, osv, ExecutionOutcome::Failed), EXIT_EXECUTION_ERROR);
+///
+/// let strict = FailOnPolicy::from_tokens(&[FailOnToken::Unchecked]);
+/// let unchecked = OsvCoverage::new(1, 0);
+/// assert_eq!(
+///     exit_code(&clean, &strict, &unchecked, osv, ExecutionOutcome::Clean),
+///     EXIT_POLICY_VIOLATION
+/// );
 /// ```
 #[must_use]
 pub fn exit_code(
     report: &CheckReport,
     policy: &FailOnPolicy,
+    coverage: &OsvCoverage,
+    osv: OsvChecks,
     had_execution_error: ExecutionOutcome,
 ) -> i32 {
-    if policy.matches(&report.findings) {
+    if policy.matches(&report.findings) || policy.coverage_violated(coverage, osv) {
         return EXIT_POLICY_VIOLATION;
     }
     if had_execution_error == ExecutionOutcome::Failed {
@@ -145,8 +159,9 @@ pub fn update_exit_code(plan: &UpdatePlan) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::{Category, CheckFinding};
+    use crate::report::{Category, CheckFinding, FailOnToken};
     use deps_core::EcosystemId;
+    use deps_core::NetworkMode;
     use deps_core::diagnostic::Severity;
     use deps_core::position::Range;
     use std::path::PathBuf;
@@ -166,12 +181,108 @@ mod tests {
         }
     }
 
+    fn online() -> OsvChecks {
+        OsvChecks::resolve(true, NetworkMode::Online)
+    }
+
+    fn strict() -> FailOnPolicy {
+        FailOnPolicy::from_tokens(&[FailOnToken::Unchecked])
+    }
+
+    #[test]
+    fn test_unchecked_gate_fails_on_any_coverage_gap() {
+        let report = CheckReport::default();
+        for coverage in [OsvCoverage::new(1, 0), OsvCoverage::new(0, 1)] {
+            assert_eq!(
+                exit_code(
+                    &report,
+                    &strict(),
+                    &coverage,
+                    online(),
+                    ExecutionOutcome::Clean
+                ),
+                EXIT_POLICY_VIOLATION
+            );
+        }
+    }
+
+    #[test]
+    fn test_unchecked_gate_passes_with_full_coverage() {
+        assert_eq!(
+            exit_code(
+                &CheckReport::default(),
+                &strict(),
+                &OsvCoverage::default(),
+                online(),
+                ExecutionOutcome::Clean
+            ),
+            EXIT_CLEAN
+        );
+    }
+
+    #[test]
+    fn test_coverage_gap_is_ignored_without_the_unchecked_token() {
+        assert_eq!(
+            exit_code(
+                &CheckReport::default(),
+                &FailOnPolicy::default_categories(),
+                &OsvCoverage::new(3, 2),
+                online(),
+                ExecutionOutcome::Clean
+            ),
+            EXIT_CLEAN
+        );
+    }
+
+    #[test]
+    fn test_unchecked_gate_fails_when_osv_scanning_is_inactive() {
+        for osv in [
+            OsvChecks::resolve(false, NetworkMode::Online),
+            OsvChecks::resolve(true, NetworkMode::Offline),
+        ] {
+            assert_eq!(
+                exit_code(
+                    &CheckReport::default(),
+                    &strict(),
+                    &OsvCoverage::default(),
+                    osv,
+                    ExecutionOutcome::Clean
+                ),
+                EXIT_POLICY_VIOLATION
+            );
+        }
+    }
+
+    /// `--fail-on unchecked` is additive: the default categories still fail the run.
+    #[test]
+    fn test_unchecked_gate_keeps_default_categories() {
+        let report = CheckReport {
+            findings: vec![finding(Category::Vulnerable)],
+        };
+        assert_eq!(
+            exit_code(
+                &report,
+                &strict(),
+                &OsvCoverage::default(),
+                online(),
+                ExecutionOutcome::Clean
+            ),
+            EXIT_POLICY_VIOLATION
+        );
+    }
+
     #[test]
     fn test_exit_code_clean_report_is_zero() {
         let report = CheckReport::default();
         let policy = FailOnPolicy::default_categories();
         assert_eq!(
-            exit_code(&report, &policy, ExecutionOutcome::Clean),
+            exit_code(
+                &report,
+                &policy,
+                &OsvCoverage::default(),
+                online(),
+                ExecutionOutcome::Clean
+            ),
             EXIT_CLEAN
         );
     }
@@ -183,7 +294,13 @@ mod tests {
         };
         let policy = FailOnPolicy::default_categories();
         assert_eq!(
-            exit_code(&report, &policy, ExecutionOutcome::Clean),
+            exit_code(
+                &report,
+                &policy,
+                &OsvCoverage::default(),
+                online(),
+                ExecutionOutcome::Clean
+            ),
             EXIT_POLICY_VIOLATION
         );
     }
@@ -200,6 +317,8 @@ mod tests {
             exit_code(
                 &report,
                 &FailOnPolicy::new(vec![Category::UnknownRef]),
+                &OsvCoverage::default(),
+                online(),
                 ExecutionOutcome::Clean
             ),
             EXIT_POLICY_VIOLATION
@@ -208,6 +327,8 @@ mod tests {
             exit_code(
                 &report,
                 &FailOnPolicy::default_categories(),
+                &OsvCoverage::default(),
+                online(),
                 ExecutionOutcome::Clean
             ),
             EXIT_CLEAN
@@ -221,7 +342,13 @@ mod tests {
         };
         let policy = FailOnPolicy::default_categories();
         assert_eq!(
-            exit_code(&report, &policy, ExecutionOutcome::Clean),
+            exit_code(
+                &report,
+                &policy,
+                &OsvCoverage::default(),
+                online(),
+                ExecutionOutcome::Clean
+            ),
             EXIT_CLEAN
         );
     }
@@ -231,7 +358,13 @@ mod tests {
         let report = CheckReport::default();
         let policy = FailOnPolicy::default_categories();
         assert_eq!(
-            exit_code(&report, &policy, ExecutionOutcome::Failed),
+            exit_code(
+                &report,
+                &policy,
+                &OsvCoverage::default(),
+                online(),
+                ExecutionOutcome::Failed
+            ),
             EXIT_EXECUTION_ERROR
         );
     }
@@ -243,7 +376,13 @@ mod tests {
         };
         let policy = FailOnPolicy::default_categories();
         assert_eq!(
-            exit_code(&report, &policy, ExecutionOutcome::Failed),
+            exit_code(
+                &report,
+                &policy,
+                &OsvCoverage::default(),
+                online(),
+                ExecutionOutcome::Failed
+            ),
             EXIT_EXECUTION_ERROR
         );
     }
@@ -257,7 +396,13 @@ mod tests {
         };
         let policy = FailOnPolicy::default_categories();
         assert_eq!(
-            exit_code(&report, &policy, ExecutionOutcome::Failed),
+            exit_code(
+                &report,
+                &policy,
+                &OsvCoverage::default(),
+                online(),
+                ExecutionOutcome::Failed
+            ),
             EXIT_POLICY_VIOLATION
         );
     }

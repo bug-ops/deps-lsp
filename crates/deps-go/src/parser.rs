@@ -287,6 +287,7 @@ fn goproxy_failure_occurrences(
     let declaration = match source {
         GoSettingSource::ProcessEnv => "GOPROXY (process environment)",
         GoSettingSource::GoenvFile => "GOPROXY ($GOENV file)",
+        GoSettingSource::GorootEnv => "GOPROXY ($GOROOT/go.env file)",
     };
     if affected_ranges.is_empty() {
         return (Vec::new(), Vec::new());

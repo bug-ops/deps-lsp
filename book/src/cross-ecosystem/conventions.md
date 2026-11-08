@@ -3,7 +3,7 @@
 ## Inlay Hint Icons at a Glance
 
 Every ecosystem's "inlay hints" (the inline text shown right next to a dependency's
-version in the manifest) come from the same four icons, all defined in `deps-core`'s
+version in the manifest) come from the same small set of icons, all defined in `deps-core`'s
 `Ecosystem` trait defaults and `deps-lsp`'s config:
 
 | Icon | Meaning | Shown when |
@@ -11,11 +11,17 @@ version in the manifest) come from the same four icons, all defined in `deps-cor
 | ✅ | Up to date | The declared version already matches the latest available version. |
 | ❌ `<version>` | Update available | A newer version exists; `<version>` is the latest one, substituted into the hint text. |
 | ⏳ | Loading | Version/vulnerability data is still being fetched from the registry. Only appears for editors that don't support LSP work-done progress reporting — most editors show a native progress indicator instead. |
+| ⚠ `<version>` | Lookup failed | The registry lookup failed or returned 404, so the latest version is unknown; `<version>` is the in-use version. |
+| ℹ `<version>` | Not looked up | The dependency's registry was not queried (a bypassed or unroutable source, or a custom registry the server cannot resolve). Shown for custom-registry dependencies only when up-to-date hints are enabled. |
 | 📴 | Offline | Network access is disabled, so version and vulnerability data were not checked. Also appears as an "Offline: version and vulnerability data not checked" note in hover text. |
 
-All four are user-configurable — an editor/client can override the up-to-date and
+The up-to-date, needs-update and loading icons are user-configurable — an editor/client can override the up-to-date and
 needs-update text via the `inlay_hints` LSP config block, and the loading text via
 `loading_indicator`. The examples above are the defaults.
+
+**Refresh after a failure.** When a registry fetch fails, the server sends
+`workspace/inlayHint/refresh` so the `⚠` marker appears without an edit. Clients that do not declare
+`workspace.inlayHint.refreshSupport` show failure markers only after the next edit or a manual refresh.
 
 **✅/❌ compares against the lock file, not the manifest range, when a lock file
 exists.** When a lock file (`Cargo.lock`, `package-lock.json`, etc.) is present, the

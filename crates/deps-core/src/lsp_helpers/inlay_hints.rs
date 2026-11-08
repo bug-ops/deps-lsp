@@ -73,7 +73,10 @@ fn lookup_miss_marker(
 /// Status markers (the offline `📴`, the `⚠ {resolved}` shown when the registry lookup
 /// failed for a lock-file dependency, #1884, and the neutral `ℹ {resolved}` for a dependency
 /// that was never looked up, #1935) are fixed text, not configurable through
-/// [`EcosystemConfig`], and appear regardless of `show_up_to_date_hints`.
+/// [`EcosystemConfig`], and appear regardless of `show_up_to_date_hints`. The one exception
+/// is the `ℹ {resolved}` for a `CustomRegistry` dependency the registry never queried
+/// (#1949): it replaces the up-to-date check mark, so it renders only when
+/// `show_up_to_date_hints` is on.
 #[expect(
     clippy::too_many_lines,
     reason = "shared generator past 300 lines, split tracked in #1952"
@@ -239,18 +242,40 @@ pub fn generate_inlay_hints(
             if let Some(resolved) = &resolved_version
                 && config.show_up_to_date_hints
             {
+                // #1949: a source the registry never queried must not read as "up to date".
+                let unqueried = matches!(
+                    dep.source(),
+                    crate::parser::DependencySource::CustomRegistry { .. }
+                ) && !formatter.can_resolve_source(&dep.source());
+                let (label, tooltip) = if unqueried {
+                    (
+                        format!(
+                            "{} {}",
+                            NOT_LOOKED_UP_MARKER.glyph,
+                            sanitize_hint_version(resolved.as_str())
+                        ),
+                        Some(InlayHintTooltip::String(
+                            NOT_LOOKED_UP_MARKER.tooltip.to_string(),
+                        )),
+                    )
+                } else {
+                    (
+                        format!(
+                            "{} {}",
+                            config.up_to_date_text,
+                            sanitize_hint_version(resolved.as_str())
+                        ),
+                        None,
+                    )
+                };
                 hints.push(InlayHint {
                     position: version_range.end,
-                    label: InlayHintLabel::String(format!(
-                        "{} {}",
-                        config.up_to_date_text,
-                        sanitize_hint_version(resolved.as_str())
-                    )),
+                    label: InlayHintLabel::String(label),
                     kind: Some(InlayHintKind::TYPE),
                     padding_left: Some(true),
                     padding_right: None,
                     text_edits: None,
-                    tooltip: None,
+                    tooltip,
                     data: None,
                 });
             }
@@ -1694,11 +1719,20 @@ mod tests {
         network: crate::NetworkMode,
         source: crate::parser::DependencySource,
     ) -> Vec<String> {
+        lockfile_labels_with_miss_and_flag(miss, network, source, true)
+    }
+
+    fn lockfile_labels_with_miss_and_flag(
+        miss: Option<LookupMiss>,
+        network: crate::NetworkMode,
+        source: crate::parser::DependencySource,
+        show_up_to_date_hints: bool,
+    ) -> Vec<String> {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
         let config = EcosystemConfig {
-            show_up_to_date_hints: true,
+            show_up_to_date_hints,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
@@ -1753,6 +1787,21 @@ mod tests {
                 vec!["⚠ 1.0.0".to_string()]
             );
         }
+    }
+
+    #[test]
+    fn test_inlay_hint_lockfile_custom_registry_shows_neutral_marker_not_checkmark() {
+        let custom = || crate::parser::DependencySource::CustomRegistry {
+            url: "https://registry.example.internal".to_string(),
+        };
+        assert_eq!(
+            lockfile_labels_with_miss(None, crate::NetworkMode::Online, custom()),
+            vec!["ℹ 1.0.0".to_string()]
+        );
+        assert!(
+            lockfile_labels_with_miss_and_flag(None, crate::NetworkMode::Online, custom(), false)
+                .is_empty()
+        );
     }
 
     #[test]

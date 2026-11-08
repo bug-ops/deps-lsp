@@ -225,10 +225,10 @@ impl NpmConfig {
         if let Some(scope) = scope_of(package_name.as_str())
             && let Some(result) = self.scoped_registries.get(scope)
         {
-            return (source_from_result(result), Some(NpmRegistryEntry::Scope));
+            return route_from_result(result, NpmRegistryEntry::Scope);
         }
         match &self.registry {
-            Some(result) => (source_from_result(result), Some(NpmRegistryEntry::TopLevel)),
+            Some(result) => route_from_result(result, NpmRegistryEntry::TopLevel),
             None => (DependencySource::Registry, None),
         }
     }
@@ -318,21 +318,40 @@ impl NpmConfig {
             .iter()
             .chain(self.scoped_registries.values())
             .filter_map(|result| result.as_ref().ok())
+            .filter(|index| !crate::registry::is_public_registry_url(index.url()))
             .filter(|index| seen.insert(index.as_str().to_string()))
             .cloned()
             .collect()
     }
 }
 
-fn source_from_result(result: &Result<DeclaredNpmRegistry, InvalidEntry>) -> DependencySource {
+/// Maps one resolved `.npmrc` entry to its source and the entry that produced it.
+///
+/// A validated entry that is the public registry itself (#1953) is plain
+/// [`DependencySource::Registry`] with no entry, keeping "entry is `Some`" equivalent to "a
+/// non-public route". A rejected entry never reaches that arm, so a blocked or invalid
+/// `registry=` still fails closed.
+fn route_from_result(
+    result: &Result<DeclaredNpmRegistry, InvalidEntry>,
+    entry: NpmRegistryEntry,
+) -> (DependencySource, Option<NpmRegistryEntry>) {
     match result {
-        Ok(index) => DependencySource::AlternateRegistry {
-            index: index.as_str().to_string(),
-            mirrors_public_registry: false,
-        },
-        Err(invalid) => DependencySource::CustomRegistry {
-            url: invalid.raw.to_string(),
-        },
+        Ok(index) if crate::registry::is_public_registry_url(index.url()) => {
+            (DependencySource::Registry, None)
+        }
+        Ok(index) => (
+            DependencySource::AlternateRegistry {
+                index: index.as_str().to_string(),
+                mirrors_public_registry: false,
+            },
+            Some(entry),
+        ),
+        Err(invalid) => (
+            DependencySource::CustomRegistry {
+                url: invalid.raw.to_string(),
+            },
+            Some(entry),
+        ),
     }
 }
 
@@ -2017,5 +2036,89 @@ mod tests {
         let second = cache.get_or_parse(&path).unwrap();
         assert_eq!(second.registry.as_deref(), Some("https://npm.two.example"));
         assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    // --- #1953: explicit public registry= is public content ---
+
+    fn top_level(raw: &str, tier: ConfigTier, policy: &RegistryAccessPolicy) -> NpmConfig {
+        NpmConfig {
+            registry: Some(resolve_workspace_entry(raw, tier, policy)),
+            scoped_registries: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_explicit_public_registry_resolves_to_registry_without_entry() {
+        for tier in [ConfigTier::User, ConfigTier::Project] {
+            for raw in [
+                "https://registry.npmjs.org/",
+                "https://registry.npmjs.org",
+                "HTTPS://REGISTRY.NPMJS.ORG:443//",
+            ] {
+                let config = top_level(raw, tier, &public_only_policy());
+                assert_eq!(
+                    config.resolve_for(&pkg("lodash")),
+                    (DependencySource::Registry, None),
+                    "{raw} ({tier:?})"
+                );
+                assert!(config.resolved_registries().is_empty(), "{raw} ({tier:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn test_scope_entry_pointing_at_public_registry_resolves_to_registry() {
+        let policy = public_only_policy();
+        let mut scoped = HashMap::new();
+        scoped.insert(
+            "@myorg".to_string(),
+            resolve_workspace_entry("https://registry.npmjs.org/", ConfigTier::Project, &policy),
+        );
+        let config = NpmConfig {
+            registry: Some(resolve_workspace_entry(
+                "https://npm.mycorp.example",
+                ConfigTier::User,
+                &policy,
+            )),
+            scoped_registries: scoped,
+        };
+        assert_eq!(
+            config.resolve_for(&pkg("@myorg/lib")),
+            (DependencySource::Registry, None)
+        );
+        assert_eq!(
+            config.resolve_for(&pkg("other")).1,
+            Some(NpmRegistryEntry::TopLevel)
+        );
+        assert_eq!(config.resolved_registries().len(), 1);
+    }
+
+    #[test]
+    fn test_public_registry_stays_blocked_when_policy_is_off() {
+        let config = top_level(
+            "https://registry.npmjs.org/",
+            ConfigTier::Project,
+            &off_policy(),
+        );
+        let (source, entry) = config.resolve_for(&pkg("lodash"));
+        assert_matches!(source, DependencySource::CustomRegistry { .. });
+        assert_eq!(entry, Some(NpmRegistryEntry::TopLevel));
+        assert!(config.blocked_class_for(&pkg("lodash")).is_some());
+    }
+
+    #[test]
+    fn test_public_lookalikes_stay_non_public() {
+        for raw in [
+            "https://registry.npmjs.org/?x=1",
+            "https://user:pw@registry.npmjs.org/",
+            "http://registry.npmjs.org/",
+            "https://registry.npmjs.org/private",
+            "https://registry.npmjs.org.evil.example/",
+        ] {
+            let config = top_level(raw, ConfigTier::User, &public_only_policy());
+            let (source, entry) = config.resolve_for(&pkg("lodash"));
+            assert_ne!(source, DependencySource::Registry, "{raw}");
+            assert_eq!(entry, Some(NpmRegistryEntry::TopLevel), "{raw}");
+        }
     }
 }

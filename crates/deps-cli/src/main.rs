@@ -13,7 +13,7 @@ use deps_cli::analyze::analyze_manifest;
 use deps_cli::cli::{Cli, Command, OutputFormat, UpdateArgs, UpdateOutputFormat};
 use deps_cli::config::{self, CliConfig};
 use deps_cli::exit::{ExecutionOutcome, exit_code};
-use deps_cli::report::{CheckContext, CheckReport, FailOnPolicy, check_manifest};
+use deps_cli::report::{CheckContext, CheckReport, CoverageGate, FailOnPolicy, check_manifest};
 use deps_cli::update::ignore::IgnoreRules;
 use deps_cli::update::{self, UpdatePlan};
 use deps_cli::{format, walk};
@@ -176,11 +176,21 @@ fn run_check_command(
         }
     };
 
-    let fail_on = if args.fail_on.is_empty() {
-        FailOnPolicy::default_categories()
-    } else {
-        FailOnPolicy::new(args.fail_on.clone())
-    };
+    let fail_on = FailOnPolicy::from_tokens(&args.fail_on);
+    let osv_checks = cli_config.policy.osv_checks();
+    if fail_on.coverage_gate() == CoverageGate::Fail {
+        if !cli_config.policy.network.mode().is_online() {
+            eprintln!(
+                "deps-cli: error: --fail-on unchecked cannot be combined with offline mode (--offline or network.offline = true): an offline run checks no vulnerability data"
+            );
+            return ExitCode::from(2);
+        }
+        if !osv_checks.is_active() {
+            eprintln!(
+                "deps-cli: note: --fail-on unchecked: vulnerability scanning is disabled (diagnostics.vulnerabilities_enabled = false), so no dependency was checked"
+            );
+        }
+    }
 
     let (report, had_execution_error, probe_summary, osv_coverage) = runtime.block_on(run_check(
         walk_paths,
@@ -218,6 +228,8 @@ fn run_check_command(
         u8::try_from(exit_code(
             &report,
             &fail_on,
+            &osv_coverage,
+            osv_checks,
             ExecutionOutcome::from_had_execution_error(had_execution_error),
         ))
         .unwrap_or(2),

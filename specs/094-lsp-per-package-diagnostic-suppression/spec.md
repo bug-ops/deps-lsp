@@ -11,7 +11,7 @@ tags:
   - cross-ecosystem
   - research/parity
 created: 2026-11-08
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[011-deprecation-replacement-diagnostics/spec|Deprecation and Replacement Diagnostics]]"
@@ -151,15 +151,15 @@ THEN the deprecation and the unmaintained advisory are both suppressed
 | ID | Requirement | Priority |
 |----|------------|----------|
 | FR-001 | THE SYSTEM SHALL accept a typed, per-package suppression rule set in the LSP configuration (initialization options and `workspace/didChangeConfiguration`), parsed through the same `parse_config` path as all other settings, with no separate validation path. | must |
-| FR-002 | Each rule SHALL identify packages by a pattern and SHALL list one or more diagnostic kinds to suppress, drawn from a closed typed set: deprecated, outdated, yanked, vulnerability, license. | must |
+| FR-002 | Each rule SHALL identify packages by a pattern and SHALL list one or more diagnostic kinds to suppress, drawn from a closed typed set: deprecated, outdated, yanked, license. The set deliberately has no `vulnerability` kind: LSP workspace settings (`.vscode/settings.json`, `.zed/settings.json`) can be controlled by the repository being opened, so a repo-supplied rule must never be able to hide a security advisory (see [[#9. Open Questions]] Q2, resolved). | must |
 | FR-003 | WHEN a package matches a rule for kind K THE SYSTEM SHALL NOT publish diagnostics of kind K for that package, and SHALL publish all other kinds unchanged. | must |
 | FR-004 | THE SYSTEM SHALL match patterns against package names normalized through the owning ecosystem's `EcosystemFormatter::normalize_package_name`, applied to both the rule pattern literal parts and the dependency name, reusing the normalization already used by deps-cli `[update].ignore`. | must |
 | FR-005 | THE SYSTEM SHALL support exact names and glob patterns with at least a trailing and leading `*` wildcard (for example `@types/*`). The matcher SHALL be a single implementation in `deps-core`, shared by every ecosystem. | must |
 | FR-006 | WHEN a package is suppressed for some kinds only THE SYSTEM SHALL still fetch registry metadata and run OSV and license checks needed by the remaining kinds. | must |
 | FR-007 | THE SYSTEM SHALL apply suppression inside the shared diagnostic generation path in `deps-core::lsp_helpers`, not in per-ecosystem crates, so a rule behaves identically for all 14 ecosystems. | must |
 | FR-008 | WHEN the deprecated kind is suppressed for a package THE SYSTEM SHALL also suppress that package's advisories classified as unmaintained, and SHALL NOT suppress other advisory classes. | must |
-| FR-009 | WHEN a suppressed package also carries a deprecation hint, hover, or inlay-hint annotation THE SYSTEM SHALL apply the same suppression rule to those surfaces. | should |
-| FR-010 | THE SYSTEM SHALL provide a distinct whole-package ignore (no diagnostics of any kind, no hints) separate from per-kind suppression, so "skip checks entirely" and "allow this one condition" are different, typed choices. | should |
+| FR-009 | WHEN a suppressed package also carries a deprecation hint, hover, or inlay-hint annotation THE SYSTEM SHALL apply the same suppression rule to those surfaces. | should (deferred) |
+| FR-010 | THE SYSTEM SHALL provide a distinct whole-package ignore (no diagnostics of any kind, no hints) separate from per-kind suppression, so "skip checks entirely" and "allow this one condition" are different, typed choices. | should (deferred) |
 | FR-011 | WHEN a rule pattern is syntactically invalid, or lists an unknown kind, THE SYSTEM SHALL reject the configuration with a typed error and keep the previous configuration, consistent with existing config behavior. | must |
 | FR-012 | WHEN a rule matches no dependency in an open manifest THE SYSTEM SHALL do nothing and SHALL NOT log above debug level. | should |
 | FR-013 | THE SYSTEM SHALL document the new settings in `book/src/configuration.md` and each affected ecosystem reference page. | must |
@@ -180,7 +180,7 @@ THEN the deprecation and the unmaintained advisory are both suppressed
 |--------|-------------|----------------|
 | SuppressionRule | One user-declared exemption | package pattern, set of suppressed kinds |
 | PackagePattern | Validated name or glob | literal or wildcard form, normalized per ecosystem at match time |
-| SuppressibleKind | Closed enum of user-suppressible diagnostic kinds | deprecated, outdated, yanked, vulnerability, license |
+| SuppressibleKind | Closed enum of user-suppressible diagnostic kinds | deprecated, outdated, yanked, license |
 | SuppressionSet | Compiled rule collection held in the policy config | rules in declaration order |
 
 > [!note]
@@ -196,7 +196,10 @@ THEN the deprecation and the unmaintained advisory are both suppressed
 | Rule names a package absent from the manifest | No effect, no warning above debug. |
 | Two rules match one package | Suppressed kinds are the union. |
 | Pattern is `*` | Rejected or accepted only as an explicit whole-ecosystem choice, see Q3. |
-| Rule suppresses vulnerability | Advisory diagnostics for the package are hidden; OSV may still be queried if other kinds need it. See Q2 on security risk. |
+| Rule lists `vulnerability` | Rejected by the typed kind set; previous config kept (FR-011). Only advisories typed informational (unmaintained) are hidden, and only with `deprecated` (FR-008). |
+| `yanked` suppressed where R6b (yanked-only match) fires | R6b stops the dependency's pipeline before the outdated rule, so outdated is absent too; FR-003 still holds (no kind other than the listed one is lost that was not already absent). |
+| "Update N outdated" code lens and update-all | Still include outdated-suppressed packages; deferred together with FR-009/FR-010. |
+| Auto-discovered `deps.toml` with `diagnostics.suppress` (`deps-cli check`) | Dropped with a warning, like every other gate-relevant section (spec 062 F1); only an explicit `--config` is honored. |
 | Scoped npm name `@scope/name` with glob `@scope/*` | Matches; slash is an ordinary character. |
 | PyPI `Foo_Bar` vs rule `foo-bar` | Match via formatter normalization. |
 | Unknown config key under the new section | Rejected by `deny_unknown_fields`, previous config kept. |
@@ -232,16 +235,21 @@ THEN the deprecation and the unmaintained advisory are both suppressed
 
 ## 9. Open Questions
 
-> [!question] Unresolved
-> - [NEEDS CLARIFICATION: Q1. Is in-manifest comment suppression (`exhortignore`-style) in scope for a later phase, and if so which manifest formats can carry comments (JSON cannot)?]
-> - [NEEDS CLARIFICATION: Q2. Should vulnerability suppression be allowed at all, or restricted to the unmaintained class (FR-008) plus an explicit whole-package ignore (FR-010)? Allowing silent per-package vulnerability suppression is a security trade-off.]
-> - [NEEDS CLARIFICATION: Q3. Should a bare `*` pattern be permitted?]
-> - [NEEDS CLARIFICATION: Q4. Is suppression by advisory ID (finer than per-package) wanted now or later?]
-> - [NEEDS CLARIFICATION: Q5. Config location: LSP init options only, or also a shared `deps.toml` read by both deps-lsp and deps-cli? deps-cli `update` deliberately never auto-discovers `deps.toml` (spec 068 FR-007); `check` behavior is undecided.]
-> - [NEEDS CLARIFICATION: Q6. Should `deps-cli check` honor the same suppressions so editor and CI agree, and should a flag exist to bypass them in CI?]
-> - [NEEDS CLARIFICATION: Q7. Config shape: a flat list of rules (pattern plus kinds), a per-kind `allow` list as in zed-depsy, or both? Preference is a single typed shape.]
-> - [NEEDS CLARIFICATION: Q8. How is "unmaintained" identified in OSV data across ecosystems (RustSec only, or also GHSA malware or deprecated classes)?]
-> - [NEEDS CLARIFICATION: Q9. Should suppressed diagnostics be surfaced anywhere (for example a counter or a hint-level note) so suppressions stay auditable?]
+All questions are resolved or deferred; none block implementation.
+
+| Q | Question | Outcome |
+|---|----------|---------|
+| Q1 | In-manifest comment suppression (`exhortignore`-style)? | Deferred; out of scope for this feature. |
+| Q2 | Allow vulnerability suppression at all? | No `vulnerability` kind in the MVP (user decision). Workspace settings can be repository-controlled, so advisories are never suppressible; only unmaintained advisories follow `deprecated` (FR-008). |
+| Q3 | Allow a bare `*` pattern? | Rejected; a single leading or trailing `*` is the only wildcard. |
+| Q5 | Config location? | `PolicyConfig.diagnostics.suppress`, shared by deps-lsp and deps-cli; no separate file. |
+| Q6 | Should `deps-cli check` honor suppressions? | Explicit `--config` only; an auto-discovered `deps.toml`'s `suppress` is dropped with a warning (spec 062 F1). No bypass flag. |
+| Q7 | Config shape? | A flat list of `{ package, kinds }` rules. |
+| Q8 | How is "unmaintained" identified? | RustSec informational-unmaintained only, via the typed `VulnSeverity::Informational`, which only the unmaintained allowlist produces. |
+| Q9 | Surface suppressed diagnostics for auditability? | No user-visible surface and no log in the MVP. |
+
+> [!question] Deferred
+> - Q4: suppression by advisory ID (finer than per-package) is a separate, later spec.
 
 ## 10. See Also
 
