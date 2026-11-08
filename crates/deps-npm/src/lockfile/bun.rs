@@ -198,6 +198,8 @@ pub(super) fn parse_bun_lock(content: &str) -> Result<ResolvedPackages> {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     // Fixtures are trimmed from real Bun output, taken from the MIT-licensed
@@ -346,10 +348,10 @@ mod tests {
     #[test]
     fn registry_entries_carry_no_copied_url_or_checksum() {
         let packages = parse(V2);
-        assert!(matches!(
+        assert_matches!(
             &packages.get("etag").unwrap().source,
             ResolvedSource::Registry { url, checksum } if url.is_empty() && checksum.is_empty()
-        ));
+        );
     }
 
     #[test]
@@ -379,7 +381,7 @@ mod tests {
             (r#"{"lockfileVersion": null, "packages": {}}"#, "missing"),
         ] {
             let err = parse_bun_lock(content).unwrap_err();
-            assert!(matches!(err, DepsError::ParseError { .. }), "{content}");
+            assert_matches!(err, DepsError::ParseError { .. }, "{content}");
             assert!(err.to_string().contains(needle), "{err}");
         }
     }
@@ -395,8 +397,9 @@ mod tests {
     #[test]
     fn absent_lockfile_version_and_non_object_documents_are_errors() {
         for content in [r#"{"packages": {}}"#, "{}", "[]", "42", "{ not json"] {
-            assert!(
-                matches!(parse_bun_lock(content), Err(DepsError::ParseError { .. })),
+            assert_matches!(
+                parse_bun_lock(content),
+                Err(DepsError::ParseError { .. }),
                 "{content}"
             );
         }
