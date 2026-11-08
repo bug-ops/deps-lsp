@@ -7,9 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+### Breaking
+- **deps-core, deps-npm, deps-cli**: `SkipReason` and `StructuralSkipReason` gain `UnverifiedRegistrySource`, `NpmDependency` gains a crate-private `registry_entry`, and `ManifestCheckResult` gains `osv_coverage` (#1956)
+- **deps-core**: `AheadProof` and `CommitEvidence` fields are private with getters, `run_probe_pass` takes a `&RefreshSender` and announces changes itself, and `ProbeStores` exposes `question_for` (#1956)
+- **deps-go**: `GoSettingSource` is public, `GoProxyChain::has_url_hop` is removed, and `failed_goproxy_declaration` becomes `failed_goproxy_source` (#1956)
+- **deps-swift**: `SwiftOrigin` is no longer public and `SwiftDependency::origin` is crate-private (#1956)
+- **deps-github-actions, deps-gitlab-ci**: invalid YAML returns `DepsError::ParseError` instead of an empty result, except a bare `action.yml` (#1956)
 
+### Added
+- **deps-core, deps-engine, deps-npm, deps-go, deps-cli**: hover and a `deps-cli check` stderr note report dependencies whose vulnerability data was not checked because the registry is not a verified public mirror (#1956)
+- **deps-core**: `OperatorGrammar`, `OsvNaming::non_public_route`, `NonPublicRoute` and `PackageRendering::format_version_exact_pin_replacing` (#1956)
+- **deps-engine**: `PreFetchDecision` with an offline `Skipped` outcome (#1956)
+- **deps-lsp**: a neutral `ℹ` inlay hint marks a dependency that was never looked up in a registry (#1956)
+
+### Changed
+- **deps-go, deps-engine**: `GOPROXY=direct` and `off` modules go to OSV and deps.dev unless `GOPRIVATE`, `GONOSUMDB` or `GOSUMDB=off` match, and the rejected-`GOPROXY` diagnostic names the variable and its source (#1956)
+- **deps-core, deps-github-actions, deps-gitlab-ci, deps-lsp**: probe orchestration is shared between GitHub Actions and GitLab CI, probe tasks run under `spawn_supervised` with spans, and `ProbeStores` uses the shared in-flight guard (#1956)
+- **deps-swift**: the swizzled form keeps typed identity and index values, SCM lookups use a case-folded key, and fetch limits share one lock (#1956)
+- **build**: `clippy::too_many_lines` is a warning at threshold 150 with scoped `#[expect]` markers (#1956)
+- **deps**: refresh `Cargo.lock` (#1956)
+
+### Fixed
 - CI: docs/specs-only PRs no longer trigger the full test matrix (the `workflows` path filter's negated pattern matched every file) (#1943)
+- **deps-lsp, deps-core**: inlay hints show a warning marker for a failed registry lookup or a 404, and hover drops the update footer and the all-clear line for a 404 without a verified fix (#1956)
+- **deps-core, deps-bundler, deps-composer, deps-cli**: update edits and `deps update` keep the Bundler `~>` and Composer `^`/`~` operator and the stability flag instead of an exact pin (#1956)
+- **deps-github-actions, deps-gitlab-ci**: invalid YAML publishes a parse-error diagnostic and a CLI finding (#1956)
+- **ci**: the semver job derives `release_type` from the workspace major version, and SECURITY.md lists only the latest release as supported (#1956)
 
 ## [4.0.0] - 2026-11-01
 
