@@ -335,10 +335,9 @@ mod tests {
         assert_eq!(own.wait().await, None);
         assert_eq!(joined.wait().await, None);
         assert!(flights.is_empty());
-        assert!(matches!(
-            claim_or_follow_owned(&flights, "key"),
-            OwnedClaim::Leader(_)
-        ));
+        let OwnedClaim::Leader(_) = claim_or_follow_owned(&flights, "key") else {
+            panic!("the released key is claimable again");
+        };
     }
 
     #[test]

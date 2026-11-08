@@ -12,10 +12,12 @@ use tower_lsp_server::ls_types::{CompletionItem, DocumentLink, Range, Uri};
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
+use deps_core::NarrowParseResult;
+#[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 use deps_core::{
-    Ecosystem, NarrowParseResult, OwnParseResult, ParseResult as ParseResultTrait, Registry,
-    Result, lsp_helpers::EcosystemFormatter,
+    Ecosystem, OwnParseResult, ParseResult as ParseResultTrait, Registry, Result,
+    lsp_helpers::EcosystemFormatter,
 };
 
 use crate::formatter::PypiFormatter;

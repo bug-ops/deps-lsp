@@ -1,6 +1,8 @@
 //! GitLab CI ecosystem implementation for deps-lsp.
 
 #[cfg(feature = "lsp-responses")]
+use deps_core::NarrowDependency;
+#[cfg(feature = "lsp-responses")]
 #[cfg(test)]
 #[cfg(feature = "lsp-responses")]
 use deps_core::PackageName;
@@ -17,8 +19,8 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
-    Ecosystem, HttpCache, NarrowDependency, NarrowParseResult, OwnParseResult,
-    ParseResult as ParseResultTrait, Registry, Result,
+    Ecosystem, HttpCache, NarrowParseResult, OwnParseResult, ParseResult as ParseResultTrait,
+    Registry, Result,
     diagnostic::{Diagnostic, DiagnosticKind, GitTagsPlatform, Severity},
     lsp_helpers::{
         CommentCheck, EcosystemFormatter, MAX_DIAGNOSTIC_VALUE_CHARS, UnknownRefTarget,
