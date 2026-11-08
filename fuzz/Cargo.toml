@@ -211,6 +211,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "bun_lockfile"
+path = "fuzz_targets/bun_lockfile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "pnpm_catalog"
 path = "fuzz_targets/pnpm_catalog.rs"
 test = false

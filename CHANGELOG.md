@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Breaking
+- **deps-cli, deps-core**: `deps-cli check` exits 1 when the OSV query fails or times out and `vulnerable` is in `--fail-on` (including the default), and `CoverageGap` gains `QueryFailed` (#1976)
 - **deps-core, deps-github-actions, deps-gitlab-ci**: `unknown_ref_diagnostics` is generic over the dependency type and takes typed dependencies (#1974)
 - **deps-core**: `format_version_replacing_by_shape` takes a `RewriteTarget` argument (#1961)
 - **deps-cli**: `exit_code`, `OsvCoverage::new` and `OsvCoverage::from_vulnerabilities` signatures changed and `CheckArgs::fail_on` is `Vec<FailOnToken>` (#1961)
@@ -20,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-github-actions, deps-gitlab-ci**: invalid YAML returns `DepsError::ParseError` instead of an empty result, except a bare `action.yml` (#1956)
 
 ### Added
+- **deps-npm, deps-core**: read in-use versions from `bun.lock` (lockfileVersion 0-3) through the new `parse_jsonc_typed` helper (#1976)
 - **deps-core**: `SwrStore`, `SingleFlight`/`FlightHandle` and the `OwnParseResult`/`OwnDependency` typed boundary; new methods on the unsealed `OwnDependency` need a default body (#1974)
 - **deps-cli**: `--fail-on unchecked` is a strict, additive gate that exits 1 when vulnerability data was not checked for any dependency or scanning is disabled; with `--offline` it exits 2 (#1961)
 - **deps-npm**: read in-use versions from `yarn.lock` (Yarn v1 and Berry) for hover, inlay hints and OSV matching, after `package-lock.json` and `pnpm-lock.yaml` (#1961)
@@ -30,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: a neutral `ℹ` inlay hint marks a dependency that was never looked up in a registry (#1956)
 
 ### Changed
+- **deps-pypi**: an invalid or blocked uv `default = true` index fails closed as an unverified registry even when valid extra indexes exist (#1976)
+- **deps-go**: a `go.env` found through `PATH` no longer feeds the trusted `GOPRIVATE`, `GONOPROXY`, `GONOSUMDB` and `GOSUMDB` lists and only marks matching modules unverified (#1976)
 - **deps-core, deps-swift**: `EvidenceStore` and `ScmIdentityMemo` share one SWR store with O(log n) eviction, and ecosystem hooks narrow parse results once at the boundary, cutting production `as_any()` calls from 51 to 4 (#1974)
 - **docs**: node-semver and pep440_rs evaluation records in specs 095 and 096; both provisional keep (#1974)
 - **deps-go**: read the `$GOROOT/go.env` defaults layer below the process environment and `$GOENV` (#1961)
@@ -42,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps**: refresh `Cargo.lock` (#1956)
 
 ### Fixed
+- **deps-npm**: partial `<=` ranges such as `<=1` and `<=1.x` admit every matching version instead of flagging it outdated (#1976)
+- **deps-deno, deps-npm**: Deno `npm:` specifiers under a non-public `registry=` report the unverified-mirror OSV signal (#1976)
+- **deps-core, deps-composer**: `^0` and `^0.0` requirements are kept unchanged on update when the picked version is in range (#1976)
+- **deps-core**: an alternate-registry dependency with a suppressed lookup miss shows a neutral inlay marker instead of the up-to-date mark (#1976)
+- **deps-swift**: fs_probe tests take `snapshot_guard`, fixing a flake under single-process `cargo test` (#1976)
 - **deps-core, deps-npm, deps-cargo**: partial tilde requirements such as npm `~16` and Cargo `~0.7` keep their declared precision on update (#1961)
 - **deps-core, deps-composer**: Composer wildcard constraints (`2.*`, `2.0.*`) keep the wildcard on update (#1961)
 - **deps-core, deps-lsp**: inlay hints show `ℹ` instead of the up-to-date mark for a custom-registry dependency that was never queried (#1961)

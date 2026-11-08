@@ -13,7 +13,7 @@ use deps_core::lsp_helpers::{
     PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
     up_to_date_via_compiled_matcher, warn_rejected_value,
 };
-use deps_core::osv::OsvPackageName;
+use deps_core::osv::{NonPublicRoute, OsvPackageName};
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 
 /// Conservative cap on a `jsr:` scope/package-name segment's length (S-L1). JSR's own
@@ -228,6 +228,19 @@ impl OsvNaming for DenoFormatter {
             Some((Scheme::Npm, rest)) => OsvPackageName::new_or_skip(rest),
             _ => None,
         }
+    }
+
+    /// An `npm:` import routed by the top-level `.npmrc` `registry=` is an unverified mirror
+    /// of npmjs, exactly as for `package.json`; a scope entry and every other source stay
+    /// private and silent (#1965).
+    fn non_public_route(&self, dep: &dyn Dependency) -> NonPublicRoute {
+        dep.as_any()
+            .downcast_ref::<crate::types::DenoDependency>()
+            .and_then(|dep| dep.registry_entry)
+            .map_or(
+                NonPublicRoute::Private,
+                deps_npm::types::NpmRegistryEntry::non_public_route,
+            )
     }
 }
 
@@ -492,6 +505,7 @@ mod tests {
             version_range: None,
             section: crate::types::DenoDependencySection::Imports,
             source: deps_core::parser::DependencySource::Registry,
+            registry_entry: None,
         }
     }
 
@@ -671,7 +685,7 @@ mod tests {
 
     #[test]
     fn test_is_requirement_up_to_date_npm_and_jsr_shapes() {
-        for requirement in ["=4.18.1", "<5", "^3 || ^4", "~*", ">=4.0.0 <4.20.0"] {
+        for requirement in ["=4.18.1", "<5", "^3 || ^4", "~*", ">=4.0.0 <4.20.0", "<=4"] {
             assert!(
                 DenoFormatter.is_requirement_up_to_date(
                     &VersionReq::new(requirement),
@@ -689,6 +703,28 @@ mod tests {
                 "{requirement:?} must be outdated"
             );
         }
+    }
+
+    /// #1965: the route follows the `.npmrc` entry recorded at parse time, and defaults to
+    /// private for anything unrouted.
+    #[test]
+    fn test_non_public_route_follows_registry_entry() {
+        use deps_npm::types::NpmRegistryEntry;
+
+        let route = |entry| {
+            let mut dep = test_dep("npm:lodash", "^4");
+            dep.registry_entry = entry;
+            DenoFormatter.non_public_route(&dep)
+        };
+        assert_eq!(
+            route(Some(NpmRegistryEntry::TopLevel)),
+            NonPublicRoute::UnverifiedMirror
+        );
+        assert_eq!(
+            route(Some(NpmRegistryEntry::Scope)),
+            NonPublicRoute::Private
+        );
+        assert_eq!(route(None), NonPublicRoute::Private);
     }
 
     #[test]

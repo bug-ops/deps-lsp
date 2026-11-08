@@ -172,9 +172,12 @@ up to date (see [GitHub Actions](ecosystems/github-actions.md#commits-ahead-of-t
 **Vulnerability data not checked.** A dependency whose registry cannot be verified as a public
 mirror is never sent to OSV: an npm dependency routed by the top-level `registry=` entry in `.npmrc`
 (valid or not; an explicit `registry=https://registry.npmjs.org/` is the public registry and is scanned),
-a PyPI dependency whose primary `--index-url` or uv `default = true` index replaces public PyPI, a NuGet
-dependency whose `<clear/>`-replaced feed chain has no public feed, or a Go module whose every `GOPROXY` hop was rejected (including one that also
-matches `GONOSUMDB`). Such a dependency produces no finding, so `--fail-on vulnerable` cannot see it.
+a Deno `deno.json` `npm:` import routed by that same top-level `registry=` to a non-public registry (an `@scope:registry=` entry stays private and silent),
+a PyPI dependency whose primary `--index-url` or uv `default = true` index replaces public PyPI (an invalid or
+blocked `default = true` index counts, with or without extra indexes; it fails closed to an unverifiable custom registry), a NuGet
+dependency whose `<clear/>`-replaced feed chain has no public feed, a Go module whose every `GOPROXY` hop was rejected (including one that also
+matches `GONOSUMDB`), or a Go module matched only by a `GOPRIVATE`, `GONOPROXY` or `GONOSUMDB` pattern of a `go.env` found through `PATH`
+(not `GOROOT`): that file is not operator-trusted, so the module counts as reaching a registry not verified as a public mirror. Such a dependency produces no finding, so `--fail-on vulnerable` cannot see it.
 When the run skipped any, `deps-cli` prints exactly one line on stderr and the exit code is
 unaffected:
 
@@ -208,7 +211,8 @@ The gate is additive: `--fail-on unchecked` alone keeps `vulnerable,yanked,unsat
 when:
 
 - its registry cannot be verified as a public mirror (the case in the note above);
-- its scan did not complete: an OSV query failed or was truncated, or a version or tag lookup stayed
+- its OSV query failed or timed out (see below), which also fails `--fail-on vulnerable`;
+- its scan did not complete: the OSV result was truncated, or a version or tag lookup stayed
   unresolved;
 - it is missing from a lock file that was found (a manifest edit that was never relocked) and so has
   no concrete version to match;
@@ -221,6 +225,16 @@ gate also fails when vulnerability scanning is switched off with
 stderr note naming the setting. When dependencies are unchecked, the stderr note lists each gap
 class, and for incomplete tag lookups it suggests setting `GITHUB_TOKEN`/`GITLAB_TOKEN`.
 
+**OSV outage.** When `vulnerable` is among the gated categories (it is in the default set) and an
+OSV query fails (network error, timeout, server error, or the scan deadline expiring before the query ran), the run exits `1`, the same code as
+`--fail-on unchecked`, and prints `vulnerability data unavailable for N dependencies (OSV query
+failed)` on stderr. A broken OSV connection therefore never looks like a clean scan. This applies to
+`--fail-on vulnerable` and the default set alike; a run that does not gate `vulnerable` (for example
+`--fail-on outdated`) is unaffected. If scanning is inactive instead (`--offline`, or
+`diagnostics.vulnerabilities_enabled = false`), no query is made: the exit code does not change,
+but `deps-cli` prints a stderr note that `--fail-on vulnerable` checked nothing. Use
+`--fail-on unchecked` to make that case fail too.
+
 `--fail-on unchecked` cannot be combined with `--offline` (or `network.offline = true`): an offline
 run checks no vulnerability data, so `deps-cli` exits `2` with an error instead of failing every
 dependency.
@@ -228,7 +242,7 @@ dependency.
 | Exit code | Meaning |
 |---|---|
 | `0` | Clean — no finding matched the `--fail-on` policy |
-| `1` | Policy violation — at least one finding matched `--fail-on`, or `--fail-on unchecked` found a coverage gap |
+| `1` | Policy violation — at least one finding matched `--fail-on`, `--fail-on unchecked` found a coverage gap, or an OSV query failed while `vulnerable` is gated |
 | `2` | Execution error — `--fail-on unchecked` combined with offline mode, a registry was unreachable, a `deps.toml`/manifest failed to parse, or a walked path was unreadable |
 
 An unreachable registry (DNS failure, connect timeout after 10 seconds, refused connection) is an

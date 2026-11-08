@@ -426,6 +426,22 @@ mod tests {
         );
     }
 
+    /// #1966: an in-range pick on `0`/`^0` must not narrow the range to `0.3.2`.
+    #[test]
+    fn test_format_version_replacing_zero_caret_in_range_pick_unchanged() {
+        let formatter = CargoFormatter;
+        for current in ["0", "^0"] {
+            assert_eq!(
+                formatter.format_version_replacing(&ConcreteVersion::new("0.3.2"), current),
+                current
+            );
+        }
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("1.4.0"), "0"),
+            "1.4.0"
+        );
+    }
+
     /// Issue #1566: a tilde requirement (`~1.2.3`, patch-level-only compatible) must keep its
     /// `~` operator on rewrite — collapsing to bare would widen it to Cargo's default caret
     /// (minor-level compatible), silently admitting versions the original requirement excluded.

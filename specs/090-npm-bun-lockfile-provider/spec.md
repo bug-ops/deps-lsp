@@ -9,7 +9,7 @@ tags:
   - bun
   - cross-ecosystem
 created: 2026-11-08
-status: draft
+status: shipped
 related:
   - "[[constitution]]"
   - "[[052-pnpm-lockfile-provider/spec|pnpm-lock.yaml Lock File Provider]]"
@@ -20,7 +20,7 @@ related:
 > [!info] Metadata
 > **Author**: research/parity scan, follow-up to issue #709
 > **Category**: enhancement/parity, P3
-> **Branch**: (none yet — spec stage)
+> **Branch**: feat/1972-p3-batch (issue #1922)
 
 ## 1. Overview
 
@@ -49,11 +49,11 @@ v0.400.0 added "Support Bun 1.4 and lockfile versions 2 and 3"
 that must be handled explicitly. The older binary `bun.lockb` is not parseable as
 text.
 
-> [!warning] Assumption
-> The exact `bun.lock` layout (a `workspaces` map keyed by workspace path and a
-> `packages` map whose values are tuples led by a `name@version` identifier) is
-> taken from Bun's documentation and public examples, not yet verified against
-> real Bun 1.2-1.4 output. See [[#9. Open Questions]].
+> [!success] Verified
+> The `bun.lock` layout (a `packages` map whose values are tuples led by a
+> `name@resolution` label) was verified against real Bun output for every
+> `lockfileVersion` from 0 to 3, taken from the MIT-licensed
+> `dependabot/dependabot-core` fixtures. See [[#9. Decisions]].
 
 ### Goal
 
@@ -153,16 +153,16 @@ THEN results and code path are identical to before this feature
 | ID | Requirement | Priority |
 |----|------------|----------|
 | FR-001 | WHEN `NpmLockParser::locate_lockfile` searches a manifest's directory and ancestors THE SYSTEM SHALL also consider `bun.lock`, using the existing first-match-wins `locate_lockfile_for_manifest` helper | must |
-| FR-002 | WHEN more than one npm-ecosystem lock file exists in the same directory THE SYSTEM SHALL resolve from exactly one, chosen by a single fixed precedence defined once in the shared lock file location code, not per file type in `deps-npm` call sites | must |
+| FR-002 | WHEN more than one npm-ecosystem lock file exists in the same directory THE SYSTEM SHALL resolve from exactly one, chosen by the single fixed precedence `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lock` held in `NpmLockParser::LOCKFILE_NAMES` | must |
 | FR-003 | WHEN parsing a `bun.lock` THE SYSTEM SHALL accept JSONC, including trailing commas and comments, and SHALL NOT fail on input that Bun itself writes | must |
 | FR-004 | WHEN parsing a `bun.lock` THE SYSTEM SHALL read the file through `deps_core::fs_probe::read_to_string_capped` (via the shared lock file read path) with the existing lock file size cap, and run the CPU-bound parse inside `spawn_blocking` | must |
 | FR-005 | WHEN parsing a `bun.lock` THE SYSTEM SHALL bound nesting depth with the same limit used for JSON lock files, returning the same nesting-too-deep error shape | must |
-| FR-006 | WHEN the lock file's `lockfileVersion` is a version this feature supports THE SYSTEM SHALL parse it; WHEN it is absent, unknown, or newer than the highest supported version THE SYSTEM SHALL return `DepsError::ParseError` naming the version rather than guess at the layout | must |
+| FR-006 | WHEN the lock file's `lockfileVersion` is an integer from 0 to 3 THE SYSTEM SHALL parse it; WHEN it is absent, not a non-negative integer, or above 3 THE SYSTEM SHALL return `DepsError::ParseError` naming the value rather than guess at the layout; empty, whitespace-only and comment-only content is an empty result, decided before the version check | must |
 | FR-007 | WHEN reading the `packages` map THE SYSTEM SHALL emit one resolved package per registry entry, taking name and version from the entry's resolved identifier (`name@version`), correctly handling scoped names (`@scope/name@version`) and `npm:` aliases (the real registry name, not the alias key) | must |
-| FR-008 | WHEN a `packages` entry resolves to a non-registry source (workspace member, `file:`, `link:`, git, tarball) THE SYSTEM SHALL record it with the matching `ResolvedSource` kind or skip it, consistently with `package-lock.json` handling, and SHALL NOT report it as a registry version | must |
+| FR-008 | WHEN a `packages` entry resolves to a non-registry source (workspace member, `file:`, `link:`, git, tarball) THE SYSTEM SHALL skip it, because Bun records no version for it and a resolution string stored as a version would reach hover and OSV queries (same rule as `pnpm-lock.yaml` and `yarn.lock`) | must |
 | FR-009 | WHEN the same package name resolves to several versions (nested or per-workspace) THE SYSTEM SHALL record every distinct version as a candidate in `ResolvedPackages`, relying on existing semver-based per-occurrence selection | must |
 | FR-010 | WHEN `Ecosystem::lockfile_filenames()` is consulted by the LSP file watcher THE SYSTEM SHALL include `bun.lock` so edits to it re-parse and refresh dependent manifests | must |
-| FR-011 | WHEN a `bun.lockb` exists with no usable text lock file THE SYSTEM SHALL behave as if no lock file exists and SHOULD log a single debug-level note that the binary format is unsupported | should |
+| FR-011 | WHEN a `bun.lockb` exists next to the manifest with no usable text lock file THE SYSTEM SHALL behave as if no lock file exists and log a single debug-level note that the binary format is unsupported; no user-visible diagnostic | should |
 | FR-012 | WHEN a `bun.lock` is looked up through the lock file cache THE SYSTEM SHALL rely on the existing mtime-keyed `LockFileCache` behavior, with no provider override | should |
 | FR-013 | THE SYSTEM SHALL provide a fuzz target for the `bun.lock` content parser, following the existing `fuzz_parse_*` entry-point and `fuzz/fuzz_targets/` pattern | should |
 | FR-014 | WHEN the lock file output is keyed by package name THE SYSTEM SHALL use the same `NormalizedName`-keyed convention as the other npm lock parsers, with no stringly-typed key introduced | must |
@@ -176,7 +176,7 @@ THEN results and code path are identical to before this feature
 | NFR-003 | Consistency | No new `DepsError` variant; reuse `ParseError { file_type, source }` with file type `bun.lock` |
 | NFR-004 | Type safety | Lock file kind dispatch uses the existing typed `NpmLockfileKind` enum (new variant, exhaustive match), not filename string comparison |
 | NFR-005 | Backward compatibility | Zero behavioral change for projects without a `bun.lock` |
-| NFR-006 | Dependencies | Prefer the JSONC parser already in the workspace (`jsonc-parser`, used by `deps-core::json_ast`); any new third-party dependency requires prior approval |
+| NFR-006 | Dependencies | Use the JSONC parser already in the workspace (`jsonc-parser`) through the shared `deps_core::json_ast::parse_jsonc_typed`; `deps-npm` names no `jsonc_parser` type and adds no dependency |
 
 ## 5. Data Model
 
@@ -196,15 +196,17 @@ No new public lock types. Reuses `deps_core::lockfile::{ResolvedPackage, Resolve
 | Several lock files in one directory | Single fixed precedence from FR-002; the others are never read |
 | `bun.lock` in an ancestor directory (workspace root) | Found by ancestor search, same depth bound as other lock files |
 | Trailing commas / comments | Accepted (FR-003) |
-| Empty file or no `packages` key | Empty `ResolvedPackages`, not a parse error |
+| Empty, whitespace-only or comment-only file; or a document with a valid `lockfileVersion` and no `packages` key | Empty `ResolvedPackages`, not a parse error |
+| Document without `lockfileVersion`, or not an object | `ParseError` |
+| `packages` value that is not a tuple, or whose head is not a string | Entry skipped, rest of the file still parses |
 | Malformed JSONC | `DepsError::ParseError` with the underlying error as source |
 | Unknown or newer `lockfileVersion` | `ParseError` naming the version (FR-006) |
 | Scoped or aliased package | Real registry name used (FR-007) |
-| Workspace-member or `link:`/`file:` entry | Not a registry version (FR-008) |
+| Workspace-member, `link:`, `file:`, git or tarball entry | Skipped (FR-008) |
 | Same name, several versions | All candidates recorded (FR-009) |
 | Over the size cap, symlink, or non-regular file | Rejected by the existing capped-read contract, as for other lock files |
 | Over-deep nesting | Nesting-too-deep error shape shared with JSON lock files |
-| Only `bun.lockb` present | Treated as no lock file (FR-011) |
+| Only `bun.lockb` present | Treated as no lock file, one debug line (FR-011) |
 | Lock file edited while the editor is open | Watcher triggers re-parse (FR-010) |
 
 ## 7. Success Criteria
@@ -237,14 +239,15 @@ No new public lock types. Reuses `deps_core::lockfile::{ResolvedPackage, Resolve
 - Add a catch-all `_ =>` arm to the lock kind match
 - Start work on `bun.lockb` or other lock formats under this spec
 
-## 9. Open Questions
+## 9. Decisions
 
-> [!question] Open items
-> - [NEEDS CLARIFICATION: Is `jsonc-parser` (already used by `deps-core::json_ast`) tolerant of trailing commas under its default `ParseOptions`, and can its value tree feed a typed lock structure without an intermediate `serde_json::Value`? Today `parse_json_checked` is strict `serde_json` and rejects trailing commas, so it cannot be reused as is. Decide whether to add a shared JSONC-to-typed helper in `deps-core`, since other ecosystems may need it.]
-> - [NEEDS CLARIFICATION: Which `lockfileVersion` values must be supported at launch (0, 1, 2, 3)? Confirm the `packages` tuple layout is stable across them using real files from Bun 1.2 through 1.4.]
-> - [NEEDS CLARIFICATION: Cross-format precedence when `bun.lock` coexists with `package-lock.json` and/or `pnpm-lock.yaml` in one directory. Candidates: fixed order with `package-lock.json` first (consistent with spec 052); or prefer the lock file matching the `packageManager` field in `package.json` when present. Decide once in `deps-core`.]
-> - [NEEDS CLARIFICATION: How does Bun encode workspace-member and `catalog:` dependencies in `packages`, and should they map to `ResolvedSource` local kinds or be skipped?]
-> - [NEEDS CLARIFICATION: Should `bun.lockb`-only projects get a user-visible hint (diagnostic or log) suggesting `bun install --save-text-lockfile`, or stay silent per FR-011?]
+Resolved while implementing issue #1922; each replaces a former `[NEEDS CLARIFICATION]` item.
+
+1. **JSONC to typed data**: `jsonc-parser`'s default `ParseOptions` accept trailing commas and comments. A shared `deps_core::json_ast::parse_jsonc_typed` runs the depth-bounded parse, converts the AST to a `serde_json::Value` and deserializes it, so no ecosystem crate names `jsonc_parser` types. `deps-deno` shares the same depth gate through `parse_jsonc_ast_checked`.
+2. **`lockfileVersion` support**: 0, 1, 2 and 3. Real files for each were checked: the `packages` tuple head `name@resolution` is identical across them. Version 4 and negative values appear only in dependabot's "unsupported" fixtures, so they fail closed.
+3. **Precedence**: fixed order `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lock`, defined once in `NpmLockParser::LOCKFILE_NAMES`. No `packageManager`-field preference.
+4. **Workspace-member and `catalog:` entries**: workspace members appear as `name@workspace:<path>` labels (verified against real files); labels with a `link:`, `file:`, git or tarball resolution are skipped the same way, since none is a semver version. `catalog:` references live only in `workspaces` and `catalogs`, which are ignored; the resolved package is an ordinary registry entry.
+5. **`bun.lockb`**: silent for the user, one debug line.
 
 ## 10. See Also
 
@@ -252,7 +255,7 @@ No new public lock types. Reuses `deps_core::lockfile::{ResolvedPackage, Resolve
 - [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
 - Issue #709 — origin issue that listed `bun.lock` among missing providers
-- `crates/deps-npm/src/lockfile.rs` — `NpmLockParser`, `NpmLockfileKind`
+- `crates/deps-npm/src/lockfile/` — `NpmLockParser`, `NpmLockfileKind`, `bun.rs`
 - `crates/deps-npm/src/ecosystem.rs` — `lockfile_filenames()`
 - `crates/deps-core/src/lockfile.rs` — `LockFileProvider`, `locate_lockfile_for_manifest`, `read_and_parse_lockfile`
 - `crates/deps-core/src/json_ast.rs` — shared `jsonc-parser` usage

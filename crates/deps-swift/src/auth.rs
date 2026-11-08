@@ -586,6 +586,7 @@ mod tests {
 
     #[test]
     fn test_source_precedence_is_env_then_netrc_data_then_netrc_file() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let home = Path::new("home");
         let pick = |vars: &[(&str, &str)], home: Option<&Path>| {
             SwiftCredentialSource::from_lookup(lookup(vars), home, UserConfigPlatform::Other)
@@ -612,6 +613,7 @@ mod tests {
 
     #[test]
     fn test_unusable_netrc_data_warns_without_its_content_and_falls_through() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let logs = deps_core::test_util::capture_tracing_output(|| {
             let vars = [(NETRC_DATA_VAR, "machine a.dev login secret-user")];
             let source = SwiftCredentialSource::from_lookup(
@@ -627,6 +629,7 @@ mod tests {
 
     #[test]
     fn test_macos_ignores_the_netrc_file_default_entry() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let default_entry = |platform| match SwiftCredentialSource::from_lookup(
             lookup(&[]),
             Some(Path::new("home")),

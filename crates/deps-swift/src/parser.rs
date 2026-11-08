@@ -1058,6 +1058,7 @@ let package = Package(
 
         #[test]
         fn test_id_dependency_resolves_to_the_configured_registry() {
+            let _guard = deps_core::fs_probe::snapshot_guard();
             let ws = Workspace::with_project_registries(&registries("https://swift.acme.dev/api"));
             let ctx = ws.context(WorkspaceRegistryAccess::PublicOnly);
             let result = parse_package_swift_with_context(MANIFEST, &ws.uri(), &ctx).unwrap();
@@ -1078,6 +1079,7 @@ let package = Package(
 
         #[test]
         fn test_id_dependency_without_a_matching_entry_keeps_the_canonical_scope() {
+            let _guard = deps_core::fs_probe::snapshot_guard();
             let ws = Workspace::with_project_registries(
                 r#"{"registries": {"other": {"url": "https://other.dev"}}, "version": 1}"#,
             );
@@ -1092,6 +1094,7 @@ let package = Package(
 
         #[test]
         fn test_blocked_registry_is_reported_at_the_id_literal() {
+            let _guard = deps_core::fs_probe::snapshot_guard();
             let ws = Workspace::with_project_registries(&registries("https://10.0.0.5"));
             let ctx = ws.context(WorkspaceRegistryAccess::PublicOnly);
             let result = parse_package_swift_with_context(MANIFEST, &ws.uri(), &ctx).unwrap();
@@ -1115,6 +1118,7 @@ let package = Package(
 
         #[test]
         fn test_rejected_registry_is_reported_and_its_userinfo_redacted() {
+            let _guard = deps_core::fs_probe::snapshot_guard();
             let ws = Workspace::with_project_registries(&registries(
                 "https://user:hunter2@swift.acme.dev",
             ));
@@ -1132,6 +1136,7 @@ let package = Package(
 
         #[test]
         fn test_unusable_tier_leaves_every_id_unresolved() {
+            let _guard = deps_core::fs_probe::snapshot_guard();
             let ws = Workspace::with_project_registries("not json");
             let ctx = ws.context(WorkspaceRegistryAccess::PublicOnly);
             let result = parse_package_swift_with_context(MANIFEST, &ws.uri(), &ctx).unwrap();

@@ -1376,6 +1376,7 @@ jobs:
           - dart_lockfile
           - pnpm_lockfile
           - yarn_lockfile
+          - bun_lockfile
           - pnpm_catalog
           - fallback_completion
           - redact_userinfo

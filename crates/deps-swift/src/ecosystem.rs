@@ -692,6 +692,7 @@ mod tests {
 
     #[test]
     fn test_project_registries_json_is_watched_and_routing_affecting() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let ecosystem = SwiftEcosystem::new(Arc::new(deps_core::HttpCache::new()));
         let [config] = ecosystem.watched_configs() else {
             panic!("swift watches exactly the project registries.json");
@@ -731,6 +732,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_registry_refused_at_the_client_cap_leaves_the_dependency_unresolved() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
 
         let dir = tempfile::tempdir().unwrap();
@@ -776,6 +778,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_manifest_registers_the_registry_and_resolves_the_id_dependency() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
 
         let mut server = mockito::Server::new_async().await;
@@ -859,6 +862,7 @@ mod tests {
 
     #[test]
     fn test_lockfile_provider_some() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = SwiftEcosystem::new(cache);
         assert!(eco.lockfile_provider().is_some());
@@ -866,6 +870,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_manifest_valid() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = SwiftEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/Package.swift");
@@ -877,6 +882,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_depends_on_matches_canonical_repository_of_swappable_dependencies() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let eco = SwiftEcosystem::new(Arc::new(deps_core::HttpCache::new()));
         let uri = deps_core::test_util::test_uri("/test/Package.swift");
         let content = r#"
@@ -901,6 +907,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_manifest_empty() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = SwiftEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/Package.swift");
@@ -914,6 +921,7 @@ mod tests {
     /// boundary, so no override.
     #[test]
     fn test_fallback_completion_prefix_default_none() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = SwiftEcosystem::new(cache);
         assert!(
@@ -953,6 +961,7 @@ mod tests {
 
     #[test]
     fn test_completion_insert_text_with_repository() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = SwiftEcosystem::new(cache);
         let meta = MockMetadata {
@@ -971,6 +980,7 @@ mod tests {
 
     #[test]
     fn test_completion_insert_text_empty_latest_omits_from_clause() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = SwiftEcosystem::new(cache);
         let meta = MockMetadata {
@@ -986,6 +996,7 @@ mod tests {
 
     #[test]
     fn test_completion_insert_text_no_repository_falls_back_to_name() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = SwiftEcosystem::new(cache);
         let meta = MockMetadata {
@@ -1004,6 +1015,7 @@ mod tests {
 
     #[test]
     fn test_completion_insert_text_rejects_string_literal_breakout_repository() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = SwiftEcosystem::new(cache);
         let meta = MockMetadata {
@@ -1182,6 +1194,7 @@ mod tests {
         /// fast and offline.
         #[tokio::test]
         async fn test_complete_package_urls_rejects_credential_bearing_query() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let cache = Arc::new(deps_core::HttpCache::new());
             let eco = SwiftEcosystem::new(cache);
             let query = "deploy:AUDITSENTINEL0000@git.internal.corp/team/x.git";
@@ -1246,6 +1259,7 @@ mod tests {
         #[tokio::test]
         async fn test_generate_completions_package_name_context_strips_github_prefix_before_dispatch()
          {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             // `let x = "https://github.com/a"` — name_range spans the quoted content
             // (excluding quotes), byte-for-byte (ASCII, so UTF-16 offsets equal byte offsets).
             let content = "let x = \"https://github.com/a\"";
@@ -1372,6 +1386,7 @@ mod tests {
         /// still fall through to an untouched empty result.
         #[tokio::test]
         async fn test_generate_completions_none_context_returns_empty() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let uri = deps_core::test_util::test_uri("/test/Package.swift");
             let parse_result = crate::parser::SwiftParseResult {
                 dependencies: vec![],
@@ -1406,6 +1421,7 @@ mod tests {
         #[tokio::test]
         #[ignore = "requires network access"]
         async fn test_generate_completions_version_context_dispatches_to_registry() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let name_range = deps_core::position::Range::new(
                 deps_core::position::Position::new(0, 9),
                 deps_core::position::Position::new(0, 40),
@@ -1496,6 +1512,7 @@ mod tests {
         /// range is unambiguously safe to complete into.
         #[tokio::test]
         async fn test_generate_completions_version_context_withheld_for_range_form() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let content = r#".package(url: "https://github.com/foo/bar", "1.0.0"..<"2.0.0")"#;
             let uri = deps_core::test_util::test_uri("/test/Package.swift");
             let parse_result = crate::parser::parse_package_swift(content, &uri).unwrap();

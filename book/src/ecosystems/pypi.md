@@ -68,6 +68,11 @@ cannot be verified as a mirror of PyPI. The skip is reported: `deps-cli check` p
 chains, chains that still contain `pypi.org`, and uv indexes without `default = true` stay silent. A
 Poetry or uv named source whose URL is the public PyPI index is treated as plain PyPI and is scanned.
 
+**uv `first-index` limit.** uv's default `first-index` strategy consults a non-default index
+*before* PyPI, but a PyPI proxy declared without `default = true` is only an extra hop in the
+chain, so it stays silent: no vulnerability-skip note and no `--fail-on unchecked` failure. Declare
+the proxy with `default = true` to get the signal.
+
 **Poetry named sources**: a dependency declaring `source = "<name>"` (Poetry) or a
 `[tool.uv.sources] <dep> = { index = "<name>" }` binding (uv) resolves directly
 against that one named source, with no fallback to any other index — a deliberate,
@@ -94,6 +99,12 @@ dropped from the fallback chain (with a logged warning) rather than failing the
 whole dependency closed, since an extra is additive/optional by definition — the
 remaining valid hops (including the implicit `pypi.org` fallback, if applicable)
 still serve the dependency.
+
+An invalid or blocked uv `default = true` index is not an extra: it fails closed even when
+valid extras are declared. Every dependency routed through the default chain is reported as
+coming from an unverifiable custom registry, so version lookups stop for it (hover and inlay
+hints show "not looked up"), the vulnerability scan is skipped, and `--fail-on unchecked` fails
+the run. Dependencies bound to a named source are unaffected.
 
 **Availability trade-off of the security fix above**: a genuine transport error
 (timeout, 5xx, connection refused) on any hop — including a declared extra that

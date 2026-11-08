@@ -756,7 +756,14 @@ pub fn format_version_replacing_by_shape(
     target: RewriteTarget,
     bare: impl FnOnce() -> String,
 ) -> String {
-    match classify_requirement_rewrite_shape(current) {
+    let shape = classify_requirement_rewrite_shape(current);
+    if target == RewriteTarget::Update
+        && zero_caret_operand(shape, bare_meaning, current)
+            .is_some_and(|operand| zero_caret_admits(operand, version.as_str()))
+    {
+        return current.to_string();
+    }
+    match shape {
         RequirementRewriteShape::Compound
         | RequirementRewriteShape::PartialWildcard
         | RequirementRewriteShape::SingleBound => match bare_meaning {
@@ -796,6 +803,48 @@ pub fn format_version_replacing_by_shape(
             }
         }
     }
+}
+
+/// The operand of a caret requirement (explicit `^`, or a bare version under
+/// [`BareMeaning::Caret`]), or `None` for every other shape.
+fn zero_caret_operand(
+    shape: RequirementRewriteShape,
+    bare_meaning: BareMeaning,
+    current: &str,
+) -> Option<&str> {
+    let trimmed = current.trim();
+    match (shape, bare_meaning) {
+        (RequirementRewriteShape::ExplicitCaret, _) => {
+            trimmed.strip_prefix('^').map(str::trim_start)
+        }
+        (RequirementRewriteShape::Bare, BareMeaning::Caret) => Some(trimmed),
+        _ => None,
+    }
+}
+
+/// Whether `operand` is an all-zero plain numeric caret operand of one or two segments (`0`,
+/// `0.0`) and `version` is a non-prerelease version inside its caret range (`^0` is
+/// `<1.0.0`, `^0.0` is `<0.1.0`). Rewriting such a requirement to the picked version at full
+/// precision would narrow the range, so an update leaves it unchanged (#1966).
+fn zero_caret_admits(operand: &str, version: &str) -> bool {
+    let parts: Vec<&str> = operand.split('.').collect();
+    if parts.len() > 2
+        || !is_plain_numeric_operand(operand)
+        || parts.iter().any(|p| p.parse::<u64>() != Ok(0))
+    {
+        return false;
+    }
+    if is_prerelease_core(version) || version.contains('-') {
+        return false;
+    }
+    let version_parts: Vec<&str> = strip_version_suffix(version).split('.').collect();
+    let (Some(picked), Some(upper)) = (
+        parse_caret_components(&version_parts),
+        caret_upper_bound([0, 0, 0], &parts),
+    ) else {
+        return false;
+    };
+    picked < upper
 }
 
 /// Whether `operand` is a dot-separated list of plain decimal segments (`16`, `0.7`, `1.2.3`).
@@ -904,8 +953,9 @@ impl OperatorGrammar {
     ///
     /// - A single `~>`/`~`/`^` comparator keeps its operator. A plain update fits the picked
     ///   version to the operand's segment count (`~> 2.0` -> `~> 3.2`, padding with `0` when the
-    ///   picked version is shorter); a floor target, a `0.0.x` caret pick or a prerelease pick
-    ///   writes the full version.
+    ///   picked version is shorter); a floor target or a prerelease pick writes the full version.
+    ///   An in-range pick on an all-zero `^0`/`^0.0` operand leaves the requirement unchanged
+    ///   (#1966).
     /// - One operator comparator plus lower bounds the picked version satisfies (per
     ///   `satisfies`) renders the operator comparator alone.
     /// - A single `>=`/`>` renders `>=` plus the picked version.
@@ -1110,6 +1160,12 @@ fn render_range(
     target: RewriteTarget,
 ) -> String {
     let operand_segments = grammar.strip_v(operand).split('.').count();
+    if operator == RangeOperator::Caret
+        && target == RewriteTarget::Update
+        && zero_caret_admits(grammar.strip_v(operand), core)
+    {
+        return format!("{}{gap}{operand}", operator.spelling());
+    }
     let keep_full = target == RewriteTarget::Floor
         || (operator == RangeOperator::Caret && caret_is_exact(core));
     let rendered = if is_prerelease_core(core) {
@@ -4627,5 +4683,86 @@ mod tests {
         assert_matches!(content.name, Cow::Owned(_));
         assert_eq!(content.name.as_str(), "Owner/Repo");
         assert!(Swapped.public_content(&own).is_none());
+    }
+
+    fn zero_caret_update(bare_meaning: BareMeaning, current: &str, picked: &str) -> String {
+        let version = ConcreteVersion::new(picked);
+        format_version_replacing_by_shape(
+            &version,
+            current,
+            bare_meaning,
+            RewriteTarget::Update,
+            || picked.to_string(),
+        )
+    }
+
+    /// #1966: an in-range pick on an all-zero caret operand must not narrow the range.
+    #[test]
+    fn test_zero_caret_in_range_pick_leaves_requirement_unchanged() {
+        for (current, picked) in [
+            ("^0", "0.3.2"),
+            ("^0", "0.0.9"),
+            ("^0.0", "0.0.9"),
+            ("^ 0", "0.3.2"),
+        ] {
+            assert_eq!(
+                zero_caret_update(BareMeaning::ExactPin, current, picked),
+                current
+            );
+        }
+        for (current, picked) in [("0", "0.3.2"), ("0.0", "0.0.9"), ("^0", "0.3.2")] {
+            assert_eq!(
+                zero_caret_update(BareMeaning::Caret, current, picked),
+                current
+            );
+        }
+    }
+
+    #[test]
+    fn test_zero_caret_out_of_range_or_other_operands_keep_existing_output() {
+        let exact = |current, picked| zero_caret_update(BareMeaning::ExactPin, current, picked);
+        assert_eq!(exact("^0", "1.4.0"), "^1.4.0");
+        assert_eq!(exact("^0.0", "0.3.2"), "^0.3.2");
+        assert_eq!(exact("^0", "0.3.0-rc.1"), "^0.3.0-rc.1");
+        assert_eq!(exact("^0.2", "0.2.9"), "^0.2.9");
+        assert_eq!(exact("^1.2", "1.4.0"), "^1.4.0");
+        assert_eq!(exact("^0.0.0", "0.0.0"), "^0.0.0");
+        assert_eq!(exact("^0.0.3", "0.0.3"), "^0.0.3");
+        assert_eq!(exact("0", "0.3.2"), "0.3.2");
+        assert_eq!(zero_caret_update(BareMeaning::Caret, "0", "1.4.0"), "1.4.0");
+        assert_eq!(zero_caret_update(BareMeaning::Floor, "0", "0.3.2"), "0.3.2");
+    }
+
+    #[test]
+    fn test_zero_caret_floor_target_writes_full_version() {
+        let version = ConcreteVersion::new("0.3.2");
+        assert_eq!(
+            format_version_replacing_by_shape(
+                &version,
+                "^0",
+                BareMeaning::ExactPin,
+                RewriteTarget::Floor,
+                || "0.3.2".to_string()
+            ),
+            "^0.3.2"
+        );
+    }
+
+    #[test]
+    fn test_composer_zero_caret_in_range_pick_leaves_requirement_unchanged() {
+        let render = |current, picked, target| {
+            OperatorGrammar::COMPOSER.replacing(
+                &ConcreteVersion::new(picked),
+                current,
+                target,
+                |_| true,
+            )
+        };
+        assert_eq!(render("^0", "0.0.9", RewriteTarget::Update), "^0");
+        assert_eq!(render("^0.0", "0.0.9", RewriteTarget::Update), "^0.0");
+        assert_eq!(render("^0@beta", "0.3.2", RewriteTarget::Update), "^0@beta");
+        assert_eq!(render("^0.0", "0.3.2", RewriteTarget::Update), "^0.3");
+        assert_eq!(render("^0", "1.4.0", RewriteTarget::Update), "^1");
+        assert_eq!(render("^0.0", "0.0.9", RewriteTarget::Floor), "^0.0.9");
     }
 }

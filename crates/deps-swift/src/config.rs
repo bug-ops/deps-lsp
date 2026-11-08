@@ -1252,6 +1252,7 @@ mod tests {
 
     #[test]
     fn test_user_config_path_table() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         use UserConfigPlatform::{MacOs, Other};
         let home = OperatorPath::for_test(std::env::temp_dir().join("u"));
         let tail = |base: OperatorPath| base.join("configuration").join("registries.json");
@@ -1299,6 +1300,7 @@ mod tests {
 
     #[test]
     fn test_invalid_xdg_makes_the_user_tier_unusable_even_with_a_project_registry() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.project(&registries(&[("[default]", PRIVATE)]));
         let ctx = SwiftParseContext::new(
@@ -1315,6 +1317,7 @@ mod tests {
 
     #[test]
     fn test_missing_files_are_absent_and_resolve_to_custom_registry() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         assert_eq!(
             fx.config().resolve_source_for(&scope("acme")),
@@ -1328,6 +1331,7 @@ mod tests {
 
     #[test]
     fn test_non_regular_oversized_and_unreadable_files_are_unusable() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         let cache = SwiftRegistriesCache::new();
 
@@ -1351,6 +1355,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_swiftpm_dir_that_is_a_regular_file_makes_the_tier_unusable() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         let swiftpm = fx.dir.path().join("proj/.swiftpm");
         Fixture::write(&swiftpm, "not a directory");
@@ -1363,6 +1368,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_fifo_is_unusable_without_being_opened() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         let path = fx.project_file();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1380,6 +1386,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_unreadable_file_is_unusable() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         use std::os::unix::fs::PermissionsExt;
 
         let fx = Fixture::new();
@@ -1398,6 +1405,7 @@ mod tests {
 
     #[test]
     fn test_unusable_project_tier_never_falls_back_to_the_user_default() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.user(&registries(&[("[default]", PRIVATE)]));
         fx.project(r#"{"registries": {}, "version": 2}"#);
@@ -1408,6 +1416,7 @@ mod tests {
 
     #[test]
     fn test_unusable_user_tier_never_falls_back_to_the_project_default() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.project(&registries(&[("[default]", PRIVATE)]));
         fx.user("not json");
@@ -1419,6 +1428,7 @@ mod tests {
 
     #[test]
     fn test_unusable_tier_warning_is_debounced_per_path_and_mtime() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.project("not json");
         let ctx = fx.context(WorkspaceRegistryAccess::PublicOnly, None);
@@ -1513,6 +1523,7 @@ mod tests {
 
     #[test]
     fn test_user_scoped_entry_beats_project_default() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.user(&registries(&[("acme", PRIVATE)]));
         fx.project(&registries(&[("[default]", PUBLIC)]));
@@ -1529,6 +1540,7 @@ mod tests {
 
     #[test]
     fn test_project_overrides_user_per_scope_and_default() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.user(&registries(&[("acme", PRIVATE), ("[default]", PRIVATE)]));
         fx.project(&registries(&[("acme", PUBLIC), ("[default]", PUBLIC)]));
@@ -1539,6 +1551,7 @@ mod tests {
 
     #[test]
     fn test_scopes_match_case_insensitively() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.user(&registries(&[("Acme", PRIVATE)]));
         let config = fx.config();
@@ -1552,6 +1565,7 @@ mod tests {
 
     #[test]
     fn test_trust_table() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.user(&registries_with_auth(
             &[("acme", PRIVATE)],
@@ -1588,6 +1602,7 @@ mod tests {
 
     #[test]
     fn test_trust_is_url_equality_after_normalization() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.user(&registries(&[("acme", PRIVATE)]));
         fx.project(&registries(&[("same", "https://SWIFT.acme.dev:443/api/")]));
@@ -1602,6 +1617,7 @@ mod tests {
 
     #[test]
     fn test_one_credential_reaches_every_user_tier_registry() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.user(&registries(&[("[default]", PUBLIC), ("acme", PRIVATE)]));
         let config = fx.config_with(WorkspaceRegistryAccess::PublicOnly, Some(token("t0k")));
@@ -1613,6 +1629,7 @@ mod tests {
 
     #[test]
     fn test_project_tier_authentication_has_no_effect_on_the_header_or_digest() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.user(&registries(&[("acme", PRIVATE)]));
         let baseline = find(
@@ -1637,6 +1654,7 @@ mod tests {
 
     #[test]
     fn test_user_tier_authentication_selects_the_header_format() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.user(&registries_with_auth(
             &[("acme", PRIVATE)],
@@ -1651,6 +1669,7 @@ mod tests {
 
     #[test]
     fn test_authentication_is_keyed_by_host_and_non_default_port() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let with_port = "https://swift.acme.dev:8443/api";
         let fx = Fixture::new();
         fx.user(&registries_with_auth(
@@ -1678,6 +1697,7 @@ mod tests {
 
     #[test]
     fn test_digest_tracks_credential_and_trust() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.user(&registries(&[("acme", PRIVATE)]));
         let digest = |credential| {
@@ -1707,6 +1727,7 @@ mod tests {
 
     #[test]
     fn test_netrc_file_is_reread_when_it_changes_and_absent_or_invalid_means_no_credential() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         use deps_core::netrc::DefaultEntry;
 
         let fx = Fixture::new();
@@ -1760,6 +1781,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_unreadable_netrc_file_warns_once() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         use deps_core::netrc::DefaultEntry;
         use std::os::unix::fs::PermissionsExt;
 
@@ -1786,6 +1808,7 @@ mod tests {
 
     #[test]
     fn test_netrc_credential_never_reaches_a_workspace_declared_registry() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         use deps_core::netrc::DefaultEntry;
 
         let fx = Fixture::new();
@@ -1809,6 +1832,7 @@ mod tests {
 
     #[test]
     fn test_trusted_never_a_registry_hosts_are_rejected_at_the_floor() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         for host in [
             "https://127.0.0.1",
             "https://[::1]",
@@ -1837,6 +1861,7 @@ mod tests {
 
     #[test]
     fn test_never_a_registry_rejection_logs_the_class_and_not_the_credential() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.user(&registries(&[("acme", "https://169.254.169.254")]));
         let logs = deps_core::test_util::capture_tracing_output(|| {
@@ -1848,6 +1873,7 @@ mod tests {
 
     #[test]
     fn test_user_tier_rfc1918_literal_is_accepted_under_public_only() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.user(&registries(&[("acme", "https://10.0.0.5")]));
         let config = fx.config();
@@ -1863,6 +1889,7 @@ mod tests {
 
     #[test]
     fn test_project_tier_rfc1918_literal_is_blocked_by_the_policy() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.project(&registries(&[("acme", "https://10.0.0.5")]));
         let config = fx.config();
@@ -1885,6 +1912,7 @@ mod tests {
 
     #[test]
     fn test_invalid_project_entries_are_rejected_with_a_redacted_raw_value() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         for (url, reason) in [
             ("http://swift.acme.dev", RegistryRejectionReason::NotHttps),
             ("not a url", RegistryRejectionReason::InvalidUrl),
@@ -1923,6 +1951,7 @@ mod tests {
 
     #[test]
     fn test_invalid_entry_warning_is_emitted_once_across_reparses() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.project(&registries(&[("acme", "http://swift.acme.dev")]));
         let ctx = fx.context(WorkspaceRegistryAccess::PublicOnly, None);
@@ -1940,6 +1969,7 @@ mod tests {
 
     #[test]
     fn test_default_declaration_key() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.project(&registries(&[("[default]", "https://10.0.0.5")]));
         let blocked = fx.config().blocked_class_for(&scope("any")).unwrap();
@@ -1948,6 +1978,7 @@ mod tests {
 
     #[test]
     fn test_resolved_registries_are_deduplicated_by_url() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.user(&registries(&[
             ("a", PRIVATE),
@@ -1970,6 +2001,7 @@ mod tests {
 
     #[test]
     fn test_config_debug_never_renders_the_credential() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.user(&registries(&[("acme", PRIVATE)]));
         let config = fx.config_with(WorkspaceRegistryAccess::PublicOnly, Some(token("hunter2")));
@@ -1985,6 +2017,7 @@ mod tests {
 
     #[test]
     fn test_manifest_uri_without_a_filesystem_path_has_no_project_tier() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
         let fx = Fixture::new();
         fx.user(&registries(&[("acme", PRIVATE)]));
         let ctx = fx.context(WorkspaceRegistryAccess::PublicOnly, None);
@@ -2047,6 +2080,7 @@ mod tests {
 
         #[test]
         fn test_enabled_on_macos_binds_a_deferred_keychain_credential_without_any_lookup() {
+            let _guard = deps_core::fs_probe::snapshot_guard();
             let fx = user_declared_fixture();
             let wired = wired(
                 &fx,
@@ -2063,6 +2097,7 @@ mod tests {
 
         #[test]
         fn test_disabled_or_non_macos_never_selects_the_keychain() {
+            let _guard = deps_core::fs_probe::snapshot_guard();
             let fx = user_declared_fixture();
             for (platform, setting) in [
                 (UserConfigPlatform::MacOs, KeychainCredentials::Disabled),
@@ -2078,6 +2113,7 @@ mod tests {
 
         #[test]
         fn test_environment_and_netrc_data_take_precedence_over_the_keychain() {
+            let _guard = deps_core::fs_probe::snapshot_guard();
             let fx = user_declared_fixture();
             let wired = wired(
                 &fx,
@@ -2105,6 +2141,7 @@ mod tests {
 
         #[test]
         fn test_keychain_replaces_the_netrc_file() {
+            let _guard = deps_core::fs_probe::snapshot_guard();
             let fx = user_declared_fixture();
             let netrc_path = fx.dir.path().join("home/.netrc");
             Fixture::write(&netrc_path, "default login d password d");
@@ -2129,6 +2166,7 @@ mod tests {
 
         #[test]
         fn test_keychain_credential_never_reaches_a_workspace_declared_registry() {
+            let _guard = deps_core::fs_probe::snapshot_guard();
             let fx = user_declared_fixture();
             fx.project(&registries(&[(
                 "other",
@@ -2146,6 +2184,7 @@ mod tests {
 
         #[test]
         fn test_digest_tells_keychain_from_no_credential_and_from_another_host() {
+            let _guard = deps_core::fs_probe::snapshot_guard();
             let fx = Fixture::new();
             fx.user(&registries(&[
                 ("a", PRIVATE),
@@ -2171,6 +2210,7 @@ mod tests {
 
         #[test]
         fn test_debug_of_a_keychain_bound_registry_shows_no_secret() {
+            let _guard = deps_core::fs_probe::snapshot_guard();
             let fx = user_declared_fixture();
             let wired = wired(
                 &fx,
@@ -2185,6 +2225,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_disabling_purges_found_secrets_immediately_with_no_swift_document() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let fx = user_declared_fixture();
             let wired = wired(
                 &fx,
@@ -2204,6 +2245,7 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn test_toggling_the_setting_purges_the_memo_on_the_next_resolve() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let fx = user_declared_fixture();
             let wired = wired(
                 &fx,

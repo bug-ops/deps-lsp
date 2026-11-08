@@ -16,12 +16,8 @@ use crate::types::{DenoDependency, DenoDependencySection};
 use deps_core::json_ast::find_last_prop;
 use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use deps_core::net_policy::RegistryAccessPolicy;
-use deps_core::{
-    DepsError, MAX_JSON_NESTING_DEPTH, PackageName, Result, VersionReq, json_depth_error_message,
-};
+use deps_core::{PackageName, Result, VersionReq};
 use jsonc_parser::ast::{Object, StringLit, Value};
-use jsonc_parser::errors::ParseErrorKind;
-use jsonc_parser::{CollectOptions, ParseOptions, parse_to_ast};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -207,35 +203,13 @@ pub fn parse_deno_json_with_context(
     uri: &Url,
     ctx: &DenoParseContext,
 ) -> Result<DenoParseResult> {
-    let ast = parse_to_ast(
-        content,
-        &CollectOptions::default(),
-        &ParseOptions::default(),
-    )
-    .map_err(|e| {
-        let kind = if matches!(e.kind(), ParseErrorKind::NestingDepthExceeded) {
-            deps_core::ParseFailureKind::NestingTooDeep
-        } else {
-            deps_core::ParseFailureKind::Malformed
-        };
-        DepsError::parse_error_of_kind("deno.json", kind, &e)
-    })?;
-
-    if let Some(value) = &ast.value
-        && let Err(depth) = check_ast_nesting_depth(value, MAX_JSON_NESTING_DEPTH)
-    {
-        return Err(DepsError::parse_error_of_kind(
-            "deno.json",
-            deps_core::ParseFailureKind::NestingTooDeep,
-            &json_depth_error_message(depth),
-        ));
-    }
+    let root = deps_core::json_ast::parse_jsonc_ast_checked(content, "deno.json")?;
 
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
-    if let Some(Value::Object(root)) = ast.value
+    if let Some(Value::Object(root)) = root
         && let Some(imports_prop) = find_last_prop(&root, "imports")
         && let Value::Object(imports) = &imports_prop.value
     {
@@ -256,52 +230,6 @@ pub fn parse_deno_json_with_context(
         dependency_truncation: budget.truncation(),
         resolved_registries,
     })
-}
-
-/// Computes `value`'s real nesting depth (`value` itself counts as depth 1, each further
-/// `Object`/`Array` descent adds one), rejecting once it exceeds `max_depth`.
-///
-/// Unlike a raw byte scan over the source text (`deps_core::check_json_nesting_depth`, the
-/// pattern `deps-npm`/`deps-composer` use ahead of their own strict-JSON `serde_json` parse),
-/// walking the already-parsed AST is immune to JSONC comment characters (`//`, `/* */`)
-/// miscounting as structural nesting — a comment's bracket characters never become AST nodes
-/// at all, so they cannot be mistaken for real nesting the way a text scanner would (impl-critic
-/// #618 S1). `jsonc-parser`'s own hardcoded 512-deep recursion cap already bounded
-/// `parse_to_ast` itself before this ever runs, so this walk exists to align `deno.json`
-/// parsing with `deps_core::MAX_JSON_NESTING_DEPTH` — the same, tighter bound every other
-/// workspace JSON call site enforces — not because `parse_to_ast`'s result is unsafe to walk.
-/// An explicit stack (rather than recursive descent) keeps the walk itself non-recursive
-/// regardless.
-///
-/// # Errors
-///
-/// Returns `Err(depth)` with the depth reached the instant nesting exceeds `max_depth`.
-fn check_ast_nesting_depth(root: &Value<'_>, max_depth: usize) -> std::result::Result<(), usize> {
-    let mut stack = vec![(root, 1_usize)];
-    while let Some((value, depth)) = stack.pop() {
-        // Only `Object`/`Array` nodes open a nesting level; a leaf (string/number/bool/null)
-        // is never itself checked or descended into, so it can never inflate the depth of the
-        // container that holds it.
-        match value {
-            Value::Object(obj) => {
-                if depth > max_depth {
-                    return Err(depth);
-                }
-                stack.extend(obj.properties.iter().map(|prop| (&prop.value, depth + 1)));
-            }
-            Value::Array(arr) => {
-                if depth > max_depth {
-                    return Err(depth);
-                }
-                stack.extend(arr.elements.iter().map(|elem| (elem, depth + 1)));
-            }
-            Value::StringLit(_)
-            | Value::NumberLit(_)
-            | Value::BooleanLit(_)
-            | Value::NullKeyword(_) => {}
-        }
-    }
-    Ok(())
 }
 
 /// Reclassifies every `npm:`-scheme dependency whose scope resolves, through the same
@@ -354,9 +282,10 @@ fn classify_npm_imports(
         else {
             continue;
         };
-        let source = npm_config.resolve_source_for(&PackageName::new(bare_name));
+        let (source, entry) = npm_config.resolve_for(&PackageName::new(bare_name));
         if !matches!(source, deps_core::parser::DependencySource::Registry) {
             dep.source = source;
+            dep.registry_entry = entry;
         }
     }
 
@@ -436,6 +365,7 @@ fn build_dependency(
             version_range: None,
             section: DenoDependencySection::Imports,
             source: deps_core::parser::DependencySource::Registry,
+            registry_entry: None,
         });
     }
 
@@ -465,6 +395,7 @@ fn build_dependency(
             version_range,
             section: DenoDependencySection::Imports,
             source: deps_core::parser::DependencySource::Registry,
+            registry_entry: None,
         });
     }
 
@@ -491,6 +422,7 @@ fn build_dependency(
         version_range: None,
         section: DenoDependencySection::Imports,
         source: deps_core::parser::DependencySource::Registry,
+        registry_entry: None,
     })
 }
 
@@ -498,6 +430,7 @@ fn build_dependency(
 mod tests {
     use super::*;
 
+    use deps_core::DepsError;
     use std::assert_matches;
 
     fn test_uri() -> Url {
@@ -869,6 +802,40 @@ mod tests {
 }"#;
         let result = parse_deno_json(jsonc, &test_uri());
         assert!(result.is_err());
+    }
+
+    fn registry_entry_of(npmrc: &str, import: &str) -> Option<deps_npm::types::NpmRegistryEntry> {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".npmrc"), npmrc).unwrap();
+        let uri = Url::from_file_path(root.path().join("deno.json")).unwrap();
+        let json = format!(r#"{{"imports": {{"dep": "{import}"}}}}"#);
+        parse_deno_json(&json, &uri).unwrap().dependencies[0].registry_entry
+    }
+
+    /// #1965: the `.npmrc` entry that routed an `npm:` import is kept on the dependency.
+    #[test]
+    fn test_npm_import_records_registry_entry() {
+        use deps_npm::types::NpmRegistryEntry;
+
+        assert_eq!(
+            registry_entry_of("registry=https://npm.acme.internal\n", "npm:lodash@4.17.15"),
+            Some(NpmRegistryEntry::TopLevel)
+        );
+        assert_eq!(
+            registry_entry_of(
+                "@acme-corp:registry=https://npm.acme.internal\n",
+                "npm:@acme-corp/pkg@^1.0.0"
+            ),
+            Some(NpmRegistryEntry::Scope)
+        );
+        assert_eq!(
+            registry_entry_of(
+                "registry=https://registry.npmjs.org/\n",
+                "npm:lodash@4.17.15"
+            ),
+            None
+        );
     }
 
     /// #1202: an `npm:` scoped import whose scope resolves, via `.npmrc`, to a non-default

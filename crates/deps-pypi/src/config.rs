@@ -378,9 +378,9 @@ impl PypiIndexConfig {
     /// state, distinct from "declared but every hop turned out invalid" (the zero-hop case,
     /// which returns `Some` with an empty `hops`).
     ///
-    /// An invalid uv `default` entry (`tail_hop` is `Some(Err(_))`) degrades to the implicit
-    /// public fallback rather than being dropped with no replacement — the same
-    /// fail-toward-availability rule FR-006 applies to every other extra.
+    /// An invalid uv `default` entry (`tail_hop` is `Some(Err(_))`) yields no chain at all:
+    /// [`Self::resolve_for`] fails closed to [`DependencySource::CustomRegistry`] for every
+    /// default-routed dependency, so there is no chain to register (#1958).
     fn case_b_chain(&self) -> Option<CaseBChain> {
         if self.extras.is_empty() && self.tail_hop.is_none() {
             return None;
@@ -391,7 +391,8 @@ impl PypiIndexConfig {
                 hops.push(tail.clone());
                 false
             }
-            Some(Err(_)) | None => true,
+            Some(Err(_)) => return None,
+            None => true,
         };
         Some(CaseBChain {
             hops,
@@ -414,6 +415,9 @@ impl PypiIndexConfig {
     /// - An explicit primary present but invalid -> [`DependencySource::CustomRegistry`]
     ///   (fail-closed — never falls through to the extras chain, matching an explicit
     ///   `--index-url`'s *replace*, not *add*, semantics).
+    /// - No primary but an invalid or blocked uv `default = true` index -> the same
+    ///   fail-closed [`DependencySource::CustomRegistry`], even when valid extras exist
+    ///   (#1958); version lookups for default-routed dependencies stop.
     /// - Otherwise -> [`DependencySource::AlternateRegistry`] pointing at the chain
     ///   [`ResolvedChain::key`] this same config's [`Self::resolved_chains`] registers.
     #[must_use]
@@ -466,6 +470,12 @@ impl PypiIndexConfig {
                 Some(PypiIndexRoute::ReplacesPublic),
             ),
             None => match self.case_b_chain() {
+                None if let Some(Err(invalid)) = &self.tail_hop => (
+                    DependencySource::CustomRegistry {
+                        url: invalid.raw.to_string(),
+                    },
+                    Some(PypiIndexRoute::ReplacesPublic),
+                ),
                 Some(chain) if !chain.hops.is_empty() => chain_route(
                     chain.hops,
                     chain.implicit_public_fallback,
@@ -499,7 +509,8 @@ impl PypiIndexConfig {
     /// inspected `tail_hop` at all, so a blocked uv default index degraded
     /// `Self::case_b_chain` all the way to the implicit public fallback — the exact
     /// dependency-silently-resolves-against-the-wrong-registry failure mode #925 exists to
-    /// close — with zero diagnostic, the same silent-degradation shape as NuGet's own S1 fix).
+    /// close — with zero diagnostic, the same silent-degradation shape as NuGet's own S1 fix;
+    /// resolution now fails closed instead, #1958).
     ///
     /// Deliberately does not cover a rejected `--extra-index-url`/supplemental-priority
     /// entry: FR-006 already drops those from the fallback chain with only a warning (never
@@ -590,9 +601,9 @@ impl PypiIndexConfig {
 
     /// Every chain this config implies, ready for registration — FR-005(a)/(b) resolved to
     /// concrete hop lists, plus one single-hop chain per valid named source. Empty when the
-    /// file declares nothing (US-004) or when every case-(b) hop turned out invalid with no
-    /// explicit primary (N5's zero-hop case — [`Self::resolve_source_for`] returns plain
-    /// `Registry` in that case, and there is nothing to register).
+    /// file declares nothing (US-004), when every case-(b) hop turned out invalid with no
+    /// explicit primary (N5's zero-hop case), or when the uv default index is invalid (the
+    /// dependencies fail closed to `CustomRegistry`, so no chain is referenced).
     #[must_use]
     pub fn resolved_chains(&self) -> Vec<ResolvedChain> {
         let mut chains = Vec::new();
@@ -1147,37 +1158,79 @@ mod tests {
         assert!(!chains[0].implicit_public_fallback);
     }
 
-    /// An invalid uv `default` entry degrades to the implicit public fallback rather than
-    /// leaving the chain with no final hop at all.
+    /// An invalid uv `default` entry fails closed even with valid extras (#1958), and no chain
+    /// is registered for the unreferenced case-(b) hops.
     #[test]
-    fn test_uv_invalid_default_degrades_to_implicit_public() {
+    fn test_uv_invalid_default_with_valid_extra_fails_closed() {
         let policy = all_policy();
         let mut config = PypiIndexConfig::new();
         config.add_extra("https://non-default.example/simple", &policy);
         config.set_tail_hop_resolved(resolve_entry("not-a-valid-url", &policy));
 
-        let chains = config.resolved_chains();
-        assert_eq!(chains.len(), 1);
-        assert_eq!(chains[0].hops.len(), 1);
-        assert!(chains[0].implicit_public_fallback);
+        assert_eq!(
+            config.resolve_for(None),
+            (
+                DependencySource::CustomRegistry {
+                    url: "not-a-valid-url".to_string(),
+                },
+                Some(PypiIndexRoute::ReplacesPublic),
+            )
+        );
+        assert!(config.resolved_chains().is_empty());
+    }
+
+    /// An invalid uv `default` entry with every extra invalid too still fails closed.
+    #[test]
+    fn test_uv_invalid_default_with_all_extras_invalid_fails_closed() {
+        let policy = all_policy();
+        let mut config = PypiIndexConfig::new();
+        config.add_extra("also-not-a-url", &policy);
+        config.set_tail_hop_resolved(resolve_entry("not-a-valid-url", &policy));
+
+        assert_matches!(
+            config.resolve_for(None),
+            (
+                DependencySource::CustomRegistry { .. },
+                Some(PypiIndexRoute::ReplacesPublic)
+            )
+        );
+        assert!(config.resolved_chains().is_empty());
+    }
+
+    /// A named-source dependency is unaffected by an invalid uv default.
+    #[test]
+    fn test_uv_invalid_default_does_not_affect_named_source() {
+        let policy = all_policy();
+        let mut config = PypiIndexConfig::new();
+        config.add_named_source_resolved(
+            "internal".to_string(),
+            resolve_entry("https://internal.example/simple", &policy),
+        );
+        config.set_tail_hop_resolved(resolve_entry("not-a-valid-url", &policy));
+
+        assert_matches!(
+            config.resolve_for(Some("internal")),
+            (
+                DependencySource::AlternateRegistry { .. },
+                Some(PypiIndexRoute::NamedSource)
+            )
+        );
+        assert_eq!(config.resolved_chains().len(), 1);
     }
 
     /// Code-review correctness finding (#925): a uv `default = true` index blocked by policy,
-    /// with no explicit primary and no extras, must populate `blocked_class_for` even though
-    /// `resolve_source_for` degrades all the way to plain `Registry` (zero-hop case-(b) chain)
-    /// — the same silent-degradation failure mode #925 exists to close, previously missed
-    /// entirely because `blocked_class_for` never inspected `tail_hop`.
+    /// with no explicit primary and no extras, must populate `blocked_class_for` and resolve
+    /// fail-closed — the silent-degradation failure mode #925 exists to close.
     #[test]
-    fn test_blocked_class_for_uv_default_blocked_with_no_extras_degrades_to_registry() {
+    fn test_blocked_class_for_uv_default_blocked_with_no_extras_fails_closed() {
         let policy = off_policy();
         let mut config = PypiIndexConfig::new();
         config.set_tail_hop_resolved(resolve_entry("https://127.0.0.1:9999/simple", &policy));
 
-        assert_eq!(
+        assert_matches!(
             config.resolve_source_for(None),
-            DependencySource::Registry,
-            "test premise: a blocked tail_hop with no extras degrades to the implicit public \
-             fallback, not CustomRegistry"
+            DependencySource::CustomRegistry { .. },
+            "a blocked tail_hop fails closed, never degrades to the public registry"
         );
         let occurrence = config
             .blocked_class_for(None)
@@ -1187,9 +1240,8 @@ mod tests {
         assert_eq!(occurrence.declaration_key, "uv-tail");
     }
 
-    /// The same blocked `tail_hop`, but with a valid extra present too: resolution still
-    /// succeeds (as an `AlternateRegistry` chain over the extra alone), yet the blocked
-    /// default index must still be reported — it silently vanished from its last-resort slot.
+    /// The same blocked `tail_hop`, but with a valid extra present too: resolution fails
+    /// closed to `CustomRegistry` (#1958) and the blocked default index is still reported.
     #[test]
     fn test_blocked_class_for_uv_default_blocked_with_valid_extra_present() {
         let policy = off_policy();
@@ -1199,7 +1251,7 @@ mod tests {
 
         assert_matches!(
             config.resolve_source_for(None),
-            DependencySource::AlternateRegistry { .. }
+            DependencySource::CustomRegistry { .. }
         );
         let occurrence = config
             .blocked_class_for(None)

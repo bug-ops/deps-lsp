@@ -192,6 +192,15 @@ fn run_check_command(
         }
     }
 
+    if fail_on.coverage_gate() == CoverageGate::Ignore
+        && fail_on.gates_vulnerable()
+        && !osv_checks.is_active()
+    {
+        eprintln!(
+            "deps-cli: note: vulnerability scanning is inactive (offline or disabled in the config), so --fail-on vulnerable checked nothing"
+        );
+    }
+
     let (report, had_execution_error, probe_summary, osv_coverage) = runtime.block_on(run_check(
         walk_paths,
         cli_config,

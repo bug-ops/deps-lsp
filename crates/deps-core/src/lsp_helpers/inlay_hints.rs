@@ -30,10 +30,72 @@ struct StatusMarker {
     tooltip: &'static str,
 }
 
+const INFO_GLYPH: &str = "ℹ";
+const WARNING_GLYPH: &str = "⚠";
+
 const NOT_LOOKED_UP_MARKER: StatusMarker = StatusMarker {
-    glyph: "ℹ",
+    glyph: INFO_GLYPH,
     tooltip: "Package not looked up; latest version unknown",
 };
+
+/// Which registry a [`LookupMiss`] came from; it picks the tooltip wording.
+#[derive(Clone, Copy)]
+enum MissRoute {
+    Default,
+    Alternate,
+}
+
+/// The marker for `miss` on `route`, shown with `glyph`.
+///
+/// [`LookupMiss::NotLookedUp`] is route-independent and always the neutral
+/// [`NOT_LOOKED_UP_MARKER`].
+const fn miss_marker(glyph: &'static str, route: MissRoute, miss: LookupMiss) -> StatusMarker {
+    let tooltip = match (route, miss) {
+        (_, LookupMiss::NotLookedUp) => return NOT_LOOKED_UP_MARKER,
+        (MissRoute::Default, LookupMiss::NotFound) => {
+            "Package not found in the registry; latest version unknown"
+        }
+        (MissRoute::Default, LookupMiss::NoComparableVersions) => {
+            "No comparable registry version; latest version unknown"
+        }
+        (MissRoute::Alternate, LookupMiss::NotFound) => {
+            "Package not found on the alternate registry; latest version unknown"
+        }
+        (MissRoute::Alternate, LookupMiss::NoComparableVersions) => {
+            "No comparable version on the alternate registry; latest version unknown"
+        }
+    };
+    StatusMarker { glyph, tooltip }
+}
+
+/// The neutral marker that replaces the up-to-date check mark when no latest version was verified.
+///
+/// Covers a `CustomRegistry` source the registry never queried (#1949) and an
+/// `AlternateRegistry` source whose lookup miss diagnostics suppress (#1957): the miss is
+/// expected there, but "up to date" was never confirmed, so it must not read as verified.
+fn unverified_latest_marker(
+    dep: &dyn crate::ecosystem::Dependency,
+    key: &PackageKey,
+    versions: VersionData<'_>,
+    formatter: &dyn EcosystemFormatter,
+) -> Option<StatusMarker> {
+    use crate::parser::DependencySource;
+    let source = dep.source();
+    match source {
+        DependencySource::CustomRegistry { .. } => {
+            (!formatter.can_resolve_source(&source)).then_some(NOT_LOOKED_UP_MARKER)
+        }
+        DependencySource::AlternateRegistry { .. } => versions
+            .lookup_miss_for(key)
+            .map(|miss| miss_marker(INFO_GLYPH, MissRoute::Alternate, miss)),
+        DependencySource::Registry
+        | DependencySource::Git { .. }
+        | DependencySource::Path { .. }
+        | DependencySource::Url { .. }
+        | DependencySource::Sdk { .. }
+        | DependencySource::Workspace => None,
+    }
+}
 
 /// The marker for a dependency whose registry lookup produced no latest version, or `None`.
 ///
@@ -50,17 +112,8 @@ fn lookup_miss_marker(
     if versions.lookup_miss_for(key) == Some(LookupMiss::NotLookedUp) {
         return Some(NOT_LOOKED_UP_MARKER);
     }
-    let tooltip = match versions.reportable_lookup_miss(dep, key, formatter)? {
-        LookupMiss::NotFound => "Package not found in the registry; latest version unknown",
-        LookupMiss::NoComparableVersions => {
-            "No comparable registry version; latest version unknown"
-        }
-        LookupMiss::NotLookedUp => return Some(NOT_LOOKED_UP_MARKER),
-    };
-    Some(StatusMarker {
-        glyph: "⚠",
-        tooltip,
-    })
+    let miss = versions.reportable_lookup_miss(dep, key, formatter)?;
+    Some(miss_marker(WARNING_GLYPH, MissRoute::Default, miss))
 }
 
 /// Builds inlay hints showing the latest/in-use version next to each dependency's declaration.
@@ -75,8 +128,8 @@ fn lookup_miss_marker(
 /// that was never looked up, #1935) are fixed text, not configurable through
 /// [`EcosystemConfig`], and appear regardless of `show_up_to_date_hints`. The one exception
 /// is the `ℹ {resolved}` for a `CustomRegistry` dependency the registry never queried
-/// (#1949): it replaces the up-to-date check mark, so it renders only when
-/// `show_up_to_date_hints` is on.
+/// (#1949) or an `AlternateRegistry` dependency with a suppressed lookup miss (#1957): it
+/// replaces the up-to-date check mark, so it renders only when `show_up_to_date_hints` is on.
 pub fn generate_inlay_hints(
     parse_result: &dyn ParseResult,
     versions: VersionData<'_>,
@@ -291,23 +344,17 @@ fn hint_without_latest(
     }
 
     config.show_up_to_date_hints.then(|| {
-        // #1949: a source the registry never queried must not read as "up to date".
-        let unqueried = matches!(
-            dep.source(),
-            crate::parser::DependencySource::CustomRegistry { .. }
-        ) && !formatter.can_resolve_source(&dep.source());
-        if unqueried {
-            type_hint(
+        match unverified_latest_marker(dep, key, *versions, *formatter) {
+            Some(marker) => type_hint(
                 position,
                 format!(
                     "{} {}",
-                    NOT_LOOKED_UP_MARKER.glyph,
+                    marker.glyph,
                     sanitize_hint_version(resolved.as_str())
                 ),
-                Some(NOT_LOOKED_UP_MARKER.tooltip.to_string()),
-            )
-        } else {
-            type_hint(
+                Some(marker.tooltip.to_string()),
+            ),
+            None => type_hint(
                 position,
                 format!(
                     "{} {}",
@@ -315,7 +362,7 @@ fn hint_without_latest(
                     sanitize_hint_version(resolved.as_str())
                 ),
                 None,
-            )
+            ),
         }
     })
 }
@@ -1744,12 +1791,12 @@ mod tests {
         lockfile_labels_with_miss_and_flag(miss, network, source, true)
     }
 
-    fn lockfile_labels_with_miss_and_flag(
+    fn lockfile_hints_with_miss_and_flag(
         miss: Option<LookupMiss>,
         network: crate::NetworkMode,
         source: crate::parser::DependencySource,
         show_up_to_date_hints: bool,
-    ) -> Vec<String> {
+    ) -> Vec<InlayHint> {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
@@ -1789,12 +1836,56 @@ mod tests {
             &config,
             &MOCK_FORMATTER,
         )
+    }
+
+    fn lockfile_labels_with_miss_and_flag(
+        miss: Option<LookupMiss>,
+        network: crate::NetworkMode,
+        source: crate::parser::DependencySource,
+        show_up_to_date_hints: bool,
+    ) -> Vec<String> {
+        lockfile_hints_with_miss_and_flag(miss, network, source, show_up_to_date_hints)
+            .into_iter()
+            .map(|hint| match hint.label {
+                InlayHintLabel::String(text) => text,
+                InlayHintLabel::LabelParts(_) => panic!("expected string label"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_inlay_hint_alternate_registry_miss_tooltip_matches_miss_kind() {
+        let tooltips: Vec<String> = [
+            LookupMiss::NotFound,
+            LookupMiss::NoComparableVersions,
+            LookupMiss::NotLookedUp,
+        ]
         .into_iter()
-        .map(|hint| match hint.label {
-            InlayHintLabel::String(text) => text,
-            InlayHintLabel::LabelParts(_) => panic!("expected string label"),
+        .map(|miss| {
+            let hints = lockfile_hints_with_miss_and_flag(
+                Some(miss),
+                crate::NetworkMode::Online,
+                crate::parser::DependencySource::AlternateRegistry {
+                    index: "https://index.example.internal".to_string(),
+                    mirrors_public_registry: false,
+                },
+                true,
+            );
+            match hints.into_iter().next().and_then(|hint| hint.tooltip) {
+                Some(InlayHintTooltip::String(text)) => text,
+                other => panic!("expected string tooltip, got {other:?}"),
+            }
         })
-        .collect()
+        .collect();
+        assert_eq!(
+            tooltips,
+            vec![
+                "Package not found on the alternate registry; latest version unknown".to_string(),
+                "No comparable version on the alternate registry; latest version unknown"
+                    .to_string(),
+                NOT_LOOKED_UP_MARKER.tooltip.to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -1828,7 +1919,7 @@ mod tests {
 
     #[test]
     fn test_inlay_hint_lockfile_lookup_miss_suppressed_for_alternate_registry_and_offline() {
-        let alternate = crate::parser::DependencySource::AlternateRegistry {
+        let alternate = || crate::parser::DependencySource::AlternateRegistry {
             index: "https://index.example.internal".to_string(),
             mirrors_public_registry: false,
         };
@@ -1836,9 +1927,18 @@ mod tests {
             lockfile_labels_with_miss(
                 Some(LookupMiss::NotFound),
                 crate::NetworkMode::Online,
-                alternate
+                alternate()
             ),
-            vec!["✅ 1.0.0".to_string()]
+            vec!["ℹ 1.0.0".to_string()]
+        );
+        assert!(
+            lockfile_labels_with_miss_and_flag(
+                Some(LookupMiss::NotFound),
+                crate::NetworkMode::Online,
+                alternate(),
+                false
+            )
+            .is_empty()
         );
         assert_eq!(
             lockfile_labels_with_miss(
