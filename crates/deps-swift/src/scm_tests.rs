@@ -149,6 +149,7 @@ fn dependency(parsed: &SwiftParseResult) -> &SwiftDependency {
 
 #[tokio::test]
 async fn test_prefetch_warms_the_memo_then_the_reparse_swaps_the_dependency() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let mut server = mockito::Server::new_async().await;
     let lookup = identifiers(&mut server, NIO_URL, UNIQUE, 200).expect(1);
     let fixture = Fixture::with_default(&server.url(), ScmToRegistry::Replace);
@@ -187,6 +188,7 @@ async fn test_prefetch_warms_the_memo_then_the_reparse_swaps_the_dependency() {
 
 #[tokio::test]
 async fn test_a_disabled_mode_changes_nothing_and_sends_nothing() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let mut server = mockito::Server::new_async().await;
     let lookup = identifiers(&mut server, NIO_URL, UNIQUE, 200).expect(0);
     let fixture = Fixture::with_default(&server.url(), ScmToRegistry::Disabled);
@@ -199,6 +201,7 @@ async fn test_a_disabled_mode_changes_nothing_and_sends_nothing() {
 
 #[tokio::test]
 async fn test_each_registry_answer_maps_to_its_form() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let cases: [(&str, usize, bool); 5] = [
         (UNIQUE, 200, true),
         (
@@ -233,6 +236,7 @@ async fn test_each_registry_answer_maps_to_its_form() {
 
 #[tokio::test]
 async fn test_a_failed_lookup_keeps_source_control_and_adds_a_notice() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let mut server = mockito::Server::new_async().await;
     let _lookup = identifiers(&mut server, NIO_URL, "boom", 500);
     let fixture = Fixture::with_default(&server.url(), ScmToRegistry::Replace);
@@ -260,6 +264,7 @@ async fn test_a_failed_lookup_keeps_source_control_and_adds_a_notice() {
 
 #[tokio::test]
 async fn test_a_not_registered_url_gets_no_notice() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let mut server = mockito::Server::new_async().await;
     let _lookup = identifiers(&mut server, NIO_URL, "", 404);
     let fixture = Fixture::with_default(&server.url(), ScmToRegistry::Replace);
@@ -271,6 +276,7 @@ async fn test_a_not_registered_url_gets_no_notice() {
 
 #[tokio::test]
 async fn test_written_url_is_sent_first_and_the_canonical_form_once_on_not_registered() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let mut server = mockito::Server::new_async().await;
     let written = identifiers(
         &mut server,
@@ -291,6 +297,7 @@ async fn test_written_url_is_sent_first_and_the_canonical_form_once_on_not_regis
 
 #[tokio::test]
 async fn test_credentials_in_the_written_url_never_reach_the_registry() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let mut server = mockito::Server::new_async().await;
     let leak = server
         .mock("GET", "/identifiers")
@@ -315,6 +322,7 @@ async fn test_credentials_in_the_written_url_never_reach_the_registry() {
 
 #[tokio::test]
 async fn test_only_version_requirements_on_http_urls_are_eligible() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let mut server = mockito::Server::new_async().await;
     let lookup = server
         .mock("GET", "/identifiers")
@@ -346,6 +354,7 @@ async fn test_only_version_requirements_on_http_urls_are_eligible() {
 
 #[tokio::test]
 async fn test_a_project_tier_default_is_never_asked() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let mut server = mockito::Server::new_async().await;
     let lookup = identifiers(&mut server, NIO_URL, UNIQUE, 200).expect(0);
     let fixture = Fixture::new(
@@ -365,6 +374,7 @@ async fn test_a_project_tier_default_is_never_asked() {
 
 #[tokio::test]
 async fn test_a_project_tier_default_cannot_redirect_a_user_tier_lookup() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let mut operator = mockito::Server::new_async().await;
     let mut attacker = mockito::Server::new_async().await;
     let asked = identifiers(&mut operator, NIO_URL, UNIQUE, 200).expect(1);
@@ -390,6 +400,7 @@ async fn test_a_project_tier_default_cannot_redirect_a_user_tier_lookup() {
 
 #[tokio::test]
 async fn test_the_identity_scope_routes_through_the_user_tier_table() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let mut default = mockito::Server::new_async().await;
     let scoped = mockito::Server::new_async().await;
     let _lookup = identifiers(&mut default, NIO_URL, UNIQUE, 200);
@@ -415,6 +426,7 @@ async fn test_the_identity_scope_routes_through_the_user_tier_table() {
 
 #[tokio::test]
 async fn test_removing_the_trusted_default_converges_without_reparse_or_events() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let mut server = mockito::Server::new_async().await;
     let _lookup = identifiers(&mut server, NIO_URL, UNIQUE, 200);
     let warm = Fixture::with_default(&server.url(), ScmToRegistry::Replace);
@@ -445,6 +457,7 @@ async fn test_removing_the_trusted_default_converges_without_reparse_or_events()
 
 #[tokio::test]
 async fn test_a_stale_entry_is_served_and_refreshed_in_the_background() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let mut server = mockito::Server::new_async().await;
     let lookup = identifiers(&mut server, NIO_URL, r#"{"identifiers": []}"#, 200).expect(1);
     let fixture = Fixture::with_default(&server.url(), ScmToRegistry::Replace);
@@ -475,6 +488,7 @@ async fn test_a_stale_entry_is_served_and_refreshed_in_the_background() {
 
 #[test]
 fn test_swizzle_decision_truth_table() {
+    let _guard = deps_core::fs_probe::snapshot_guard();
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("user.json");
     std::fs::write(&file, registries(Some("https://swift.acme.dev/api"), &[])).unwrap();
@@ -586,6 +600,7 @@ fn test_swizzle_decision_truth_table() {
 /// are, instead of giving up after a fixed wait and swapping them later.
 #[tokio::test]
 async fn test_many_misses_are_all_answered_within_the_live_concurrency_limit() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     const COUNT: usize = 30;
     let mut server = mockito::Server::new_async().await;
     let lookups = server
@@ -648,6 +663,7 @@ const SCM_PIN: &str = r#"{"version": 2, "pins": [{"identity": "swift-nio", "kind
 /// canonical repository URL however the pin spells it.
 #[tokio::test]
 async fn test_a_source_control_pin_is_named_by_the_identity_the_memo_maps_it_to() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let mut server = mockito::Server::new_async().await;
     let _lookup = identifiers(&mut server, NIO_URL, UNIQUE, 200);
     let fixture = Fixture::with_default(&server.url(), ScmToRegistry::Replace);
@@ -675,6 +691,7 @@ async fn test_a_source_control_pin_is_named_by_the_identity_the_memo_maps_it_to(
 
 #[tokio::test]
 async fn test_no_pin_is_named_when_the_mode_is_disabled() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let mut server = mockito::Server::new_async().await;
     let _lookup = identifiers(&mut server, NIO_URL, UNIQUE, 200);
     let fixture = Fixture::with_default(&server.url(), ScmToRegistry::Replace);

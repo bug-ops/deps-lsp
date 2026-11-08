@@ -41,6 +41,12 @@ diagnostics, completion, and inlay hints query the resolved alternate registry �
 `deps-npm` registry client and fail-closed routing `package.json` uses for the identical
 `.npmrc` entry — instead of silently behaving as an unresolved dependency (resolves #1227).
 
+**Vulnerability scanning.** An `npm:` specifier routed by a top-level `registry=` entry is not sent to
+OSV, because the registry cannot be verified as a mirror of npmjs, and it is reported as "Vulnerability
+data not checked" exactly like the same dependency in `package.json` (see
+[npm](npm.md#customprivate-registries)). A specifier routed by an `@scope:registry=` entry is treated as
+private and skipped silently.
+
 ## Release-Freshness Coverage
 
 `jsr:` specifiers get full freshness coverage at **zero extra request cost** — better than

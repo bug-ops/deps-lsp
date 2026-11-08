@@ -94,7 +94,7 @@ fn partial_version_components(version: &str) -> Option<Vec<VersionComponentKind>
         .collect()
 }
 
-/// Re-merges a bare `~`/`~>`/`=` operator token with the token immediately following it.
+/// Re-merges a bare `~`/`~>`/`=`/`<=` operator token with the token immediately following it.
 /// `node_semver`-compatible tooling binds internal whitespace right after these operators to
 /// the same comparator (`"~ *"` behaves as `"~*"` — verified live against npm's own `semver`
 /// package for #1646), but naive whitespace-splitting tokenization otherwise treats them as
@@ -111,7 +111,7 @@ fn merge_bare_operator_tokens<'a>(tokens: impl Iterator<Item = &'a str>) -> Vec<
     for token in tokens {
         if let Some(operator) = pending_operator.take() {
             merged.push(Cow::Owned(format!("{operator}{token}")));
-        } else if matches!(token, "~" | "~>" | "=") {
+        } else if matches!(token, "~" | "~>" | "=" | "<=") {
             pending_operator = Some(token);
         } else {
             merged.push(Cow::Borrowed(token));
@@ -119,6 +119,24 @@ fn merge_bare_operator_tokens<'a>(tokens: impl Iterator<Item = &'a str>) -> Vec<
     }
     merged.extend(pending_operator.map(Cow::Borrowed));
     merged
+}
+
+/// Exclusive upper bound that replaces a partial `<=` operand (#1972): `node_semver` 2.2.0
+/// reads `<=1` as `<=1.0.0-0`, but npm admits every `1.x.y`. Holds the already-incremented
+/// component(s), so `<=1` is `Major(2)` and `<=1.2` is `MajorMinor { major: 1, minor: 3 }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartialUpper {
+    Major(u64),
+    MajorMinor { major: u64, minor: u64 },
+}
+
+impl PartialUpper {
+    fn render(self) -> String {
+        match self {
+            Self::Major(major) => format!("<{major}.0.0-0"),
+            Self::MajorMinor { major, minor } => format!("<{major}.{minor}.0-0"),
+        }
+    }
 }
 
 /// Outcome of [`classify_token_shape`] for a single whitespace-delimited comparator token
@@ -138,6 +156,47 @@ enum TokenShape {
     /// Rewritten to `~{major}.x` before re-parsing, dropping the `~>`/`~` distinction since
     /// npm doesn't make one for this shape either.
     TildeWildcardPatch { major: String },
+    /// Partial `<=` operand (`<=1`, `<=1.2`, `<=1.x`, #1972): `node_semver` evaluates these
+    /// as `<=N.0.0-0`, which excludes `1.2.3`. Rewritten to the equivalent exclusive upper
+    /// bound. Unlike the panic shapes above, `node_semver` parses these without error, they
+    /// are just evaluated wrongly.
+    PartialLessOrEqual(PartialUpper),
+}
+
+/// Classifies the operand of a `<=` token (after the operator). `<=*` / `<=x.x.x` is
+/// [`TokenShape::Unresolvable`]; full versions, prereleases, builds, malformed input and
+/// `u64` overflow are `None` and keep their `node_semver` behaviour.
+fn classify_less_or_equal_operand(operand: &str) -> Option<TokenShape> {
+    let parts: Vec<&str> = operand
+        .strip_prefix('v')
+        .unwrap_or(operand)
+        .split('.')
+        .collect();
+    if parts.len() > 3 {
+        return None;
+    }
+    let mut numbers = Vec::with_capacity(parts.len());
+    let mut seen_wildcard = false;
+    for part in parts {
+        if matches!(part, "x" | "X" | "*") {
+            seen_wildcard = true;
+        } else if seen_wildcard || !is_clean_numeral(part) {
+            return None;
+        } else {
+            numbers.push(part.parse::<u64>().ok()?);
+        }
+    }
+    match numbers.as_slice() {
+        [] => Some(TokenShape::Unresolvable),
+        [major] => Some(TokenShape::PartialLessOrEqual(PartialUpper::Major(
+            major.checked_add(1)?,
+        ))),
+        [major, minor] => Some(TokenShape::PartialLessOrEqual(PartialUpper::MajorMinor {
+            major: *major,
+            minor: minor.checked_add(1)?,
+        })),
+        _ => None,
+    }
 }
 
 /// Classifies a single, already-merged (see [`merge_bare_operator_tokens`]) comparator token
@@ -156,7 +215,9 @@ enum TokenShape {
 /// cheap pre-check that keeps the common cases off the panic-unwind-log path, not a full
 /// grammar re-implementation — caret (`^`) ranges are not checked here since `node_semver`'s
 /// caret match arms have no equivalent gap. Must never return `Some` for a token `node_semver`
-/// can actually parse as-is (a false positive would silently rewrite valid input), and for
+/// can parse and evaluate correctly as-is (a false positive would silently rewrite valid
+/// input); the one deliberate exception is a partial `<=` operand, which `node_semver` parses
+/// but evaluates wrongly (#1972, see [`TokenShape::PartialLessOrEqual`]). For
 /// `Unresolvable` specifically — rewritten to `*` and re-parsed rather than rejecting the whole
 /// requirement outright, see [`parse_range_safe`] — must never return `Some(Unresolvable)` for
 /// a shape that actually has a narrower real bound (that would silently produce a wrong,
@@ -183,6 +244,9 @@ fn classify_token_shape(token: &str) -> Option<TokenShape> {
             });
         }
         return None;
+    }
+    if let Some(operand) = token.strip_prefix("<=") {
+        return classify_less_or_equal_operand(operand);
     }
     if let Some(rest) = token.strip_prefix('=') {
         let unprefixed = rest.strip_prefix('v').unwrap_or(rest);
@@ -287,6 +351,7 @@ pub fn parse_range_safe(requirement: &str) -> Result<node_semver::Range, RangePa
             .map(|(token, shape)| match shape {
                 Some(TokenShape::Unresolvable) => "*".to_string(),
                 Some(TokenShape::TildeWildcardPatch { major }) => format!("~{major}.x"),
+                Some(TokenShape::PartialLessOrEqual(upper)) => upper.render(),
                 None => token.as_ref().to_string(),
             })
             .collect::<Vec<_>>()
@@ -758,13 +823,9 @@ impl OsvNaming for NpmFormatter {
     /// (an Artifactory/Nexus/Verdaccio proxy); a scope entry, a failed downcast and every
     /// non-registry specifier stay private and silent (#1917).
     fn non_public_route(&self, dep: &dyn Dependency) -> NonPublicRoute {
-        let entry = self
-            .own_dependency(dep)
-            .and_then(NpmDependency::registry_entry);
-        match entry {
-            Some(NpmRegistryEntry::TopLevel) => NonPublicRoute::UnverifiedMirror,
-            Some(NpmRegistryEntry::Scope) | None => NonPublicRoute::Private,
-        }
+        self.own_dependency(dep)
+            .and_then(NpmDependency::registry_entry)
+            .map_or(NonPublicRoute::Private, NpmRegistryEntry::non_public_route)
     }
 
     /// A `peerDependencies` entry is never written to a lock file, so its missing resolved
@@ -1367,6 +1428,66 @@ mod tests {
         }
     }
 
+    /// #1972: expectations are npm `semver` 7.8.5 `satisfies` results.
+    #[test]
+    fn test_compile_requirement_partial_less_or_equal_matches_npm() {
+        let rows = [
+            ("<=1", "1.2.3", true),
+            ("<=1", "1.0.0-0", false),
+            ("<=1", "2.0.0", false),
+            ("<=0", "0.5.0", true),
+            ("<=1.x", "1.5.0", true),
+            ("<=1.2", "1.2.3", true),
+            ("<=1.2", "1.3.0", false),
+            ("<=1.2.x", "1.2.9", true),
+            ("<=1.2.x", "1.3.0", false),
+            ("<=v1", "1.9.0", true),
+            ("<= 1", "1.2.3", true),
+            ("<=1 || ^3", "3.1.0", true),
+            ("<=1 || ^3", "2.0.0", false),
+            ("^1.0.0 <=1", "1.5.0", true),
+            ("<=*", "5.0.0", true),
+            ("<=x.x.x", "5.0.0", true),
+            ("<=1.2.3", "1.2.3", true),
+            ("<=1.2.3", "1.2.4", false),
+            (">1", "1.5.0", false),
+            (">1", "2.0.0", true),
+            (">1.2", "1.2.9", false),
+            (">1.2", "1.3.0", true),
+            ("<1.2", "1.1.9", true),
+            ("<1.2", "1.2.0", false),
+            (">=1.x", "1.0.0", true),
+        ];
+        for (requirement, version, expected) in rows {
+            let matcher = NpmFormatter
+                .compile_requirement(&VersionReq::new(requirement))
+                .unwrap_or_else(|| panic!("{requirement:?} must compile"));
+            assert_eq!(
+                matcher.matches(&ConcreteVersion::new(version)),
+                Some(expected),
+                "{requirement:?} vs {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_partial_less_or_equal_overflow_is_not_rewritten() {
+        let max = u64::MAX;
+        assert!(classify_less_or_equal_operand(&max.to_string()).is_none());
+        assert!(classify_less_or_equal_operand(&format!("1.{max}")).is_none());
+        assert!(classify_less_or_equal_operand("1.2.3").is_none());
+        assert!(classify_less_or_equal_operand("1.2.3-beta").is_none());
+        assert!(classify_less_or_equal_operand("1.x.3").is_none());
+        assert!(classify_less_or_equal_operand("").is_none());
+    }
+
+    #[test]
+    fn test_is_requirement_up_to_date_partial_less_or_equal_1972() {
+        assert!(npm_up_to_date("<=4", "4.18.1"));
+        assert!(npm_up_to_date("<=4.18", "4.18.1"));
+        assert!(!npm_up_to_date("<=3", "4.18.1"));
+    }
+
     #[test]
     fn test_compile_requirement_unparseable_candidate_is_skipped() {
         let formatter = NpmFormatter;
@@ -1521,6 +1642,7 @@ mod tests {
             "~4.18",
             "~X",
             "=X",
+            "<=4",
         ] {
             assert!(
                 npm_up_to_date(requirement, "4.18.1"),
@@ -1531,15 +1653,7 @@ mod tests {
 
     #[test]
     fn test_is_requirement_up_to_date_excluding_shapes() {
-        for requirement in [
-            ">=5",
-            "<4",
-            "^5 || ^6",
-            "^4.5 <4.7",
-            "=4.18.0",
-            "1 - 3",
-            "<=4",
-        ] {
+        for requirement in [">=5", "<4", "^5 || ^6", "^4.5 <4.7", "=4.18.0", "1 - 3"] {
             assert!(
                 !npm_up_to_date(requirement, "4.18.1"),
                 "{requirement:?} must be outdated against 4.18.1"

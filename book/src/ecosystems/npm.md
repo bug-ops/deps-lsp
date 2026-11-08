@@ -8,9 +8,9 @@ Yarn — all three read the same `package.json` format.
 | | |
 |---|---|
 | Manifest file | `package.json`; `pnpm-workspace.yaml` for [catalog entries](#editing-pnpm-workspaceyaml-catalog-entries) |
-| Lock file (in-use version) | `package-lock.json` (versions 2 and 3), `pnpm-lock.yaml` or `yarn.lock` (Yarn v1 and Berry) |
+| Lock file (in-use version) | `package-lock.json` (versions 2 and 3), `pnpm-lock.yaml`, `yarn.lock` (Yarn v1 and Berry) or `bun.lock` (Bun 1.2+) |
 | Registry | npm registry — packument API (`registry.npmjs.org/{package}`) for versions, search API (`registry.npmjs.org/-/v1/search`) for package-name search |
-| Version syntax | node-semver ranges: `^`, `~`, `=`, `<`, `>`, `*` |
+| Version syntax | node-semver ranges: `^`, `~`, `=`, `<`, `<=`, `>`, `>=`, `*` |
 
 `deps-npm` parses `dependencies`, `devDependencies`, `peerDependencies`, and
 `optionalDependencies`, tracking each entry's exact key/value byte span for accurate
@@ -114,8 +114,8 @@ it lives.
 ## Lock Files
 
 When several lock files sit next to a manifest, the first one in this order wins:
-`package-lock.json`, then `pnpm-lock.yaml`, then `yarn.lock`. A lock file that loses is logged at
-debug level.
+`package-lock.json`, then `pnpm-lock.yaml`, then `yarn.lock`, then `bun.lock`. A lock file that loses
+is logged at debug level.
 
 `yarn.lock` is read for both Yarn generations, so hover, inlay hints and OSV matching use the version
 Yarn actually installed:
@@ -127,7 +127,13 @@ Yarn actually installed:
   resolves to the version it patches, a `::__archiveUrl=` suffix is stripped from the version, and
   `workspace:` and `link:` entries are skipped.
 
-`bun.lock` is not read.
+`bun.lock` (the text lock file written by Bun 1.2 and later, JSONC with trailing commas) is read for
+`lockfileVersion` 0 to 3; an absent, non-integer or newer version is rejected with a parse error naming
+the value rather than guessed at. An empty or whitespace-only file yields no resolved versions. The
+version comes from each entry's `name@version` label, so an `npm:` alias resolves under the real
+registry name and a nested install (`is-odd/is-number`) records its own version next to the hoisted one.
+`workspace:`, `link:`, `file:`, git and tarball entries are skipped, because Bun records no version for
+them. The binary `bun.lockb` is not read; run `bun install --save-text-lockfile` to get a `bun.lock`.
 
 ## Non-Registry Dependency Sources
 
@@ -220,8 +226,8 @@ never per-key-merges the two sections.
 - A catalog entry whose value isn't a scalar string (e.g. a nested mapping)
   gets its own distinct "not a version string" message rather than being
   validated against pnpm's own schema further.
-- `bun.lock` is not read for in-use/resolved-version detection — only `package-lock.json`,
-  `pnpm-lock.yaml` and `yarn.lock` are supported lock file formats (see [Lock Files](#lock-files)).
+- The binary `bun.lockb` is not read for in-use/resolved-version detection; only the text
+  `bun.lock` is (see [Lock Files](#lock-files)).
 - `pnpm-lock.yaml`'s `importers` map is aggregated flatly across every
   workspace member into one shared version pool per package name, without
   correlating an importer entry back to the specific `package.json` being

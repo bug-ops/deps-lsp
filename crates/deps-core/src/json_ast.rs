@@ -17,14 +17,174 @@
 //!
 //! [`JsonSection`] keeps `jsonc-parser`'s own AST types out of every downstream crate's public
 //! (and Cargo.toml direct-dependency) surface — only `deps-core` names `jsonc_parser::ast`
-//! types directly.
+//! types directly. The one exception is [`parse_jsonc_ast_checked`], whose only caller
+//! (`deps-deno`, which already depends on `jsonc-parser` directly) walks the AST for positions;
+//! every other caller goes through [`parse_jsonc_typed`].
 
 use jsonc_parser::ast::{Object, ObjectProp, ObjectPropName, Value};
+use jsonc_parser::errors::ParseErrorKind;
 use jsonc_parser::{CollectOptions, ParseOptions, parse_to_ast};
 use std::collections::HashMap;
 
+use crate::error::{DepsError, ParseFailureKind, Result};
 use crate::lsp_helpers::{LineOffsetTable, byte_span_to_range};
+use crate::parser::{MAX_JSON_NESTING_DEPTH, json_depth_error_message};
 use crate::position::Range;
+
+/// Computes `value`'s real nesting depth (`value` itself counts as depth 1, each further
+/// `Object`/`Array` descent adds one), rejecting once it exceeds `max_depth`.
+///
+/// Walking the already-parsed AST is immune to JSONC comment characters (`//`, `/* */`)
+/// miscounting as structural nesting, unlike a raw byte scan
+/// ([`crate::check_json_nesting_depth`]): a comment's bracket characters never become AST
+/// nodes. `jsonc-parser`'s own hardcoded 512-deep recursion cap already bounds `parse_to_ast`;
+/// this walk aligns JSONC parsing with the tighter [`MAX_JSON_NESTING_DEPTH`] every other JSON
+/// call site enforces. An explicit stack keeps the walk non-recursive.
+///
+/// Returns `Err(depth)` with the depth reached the instant nesting exceeds `max_depth`.
+fn check_ast_nesting_depth(root: &Value<'_>, max_depth: usize) -> std::result::Result<(), usize> {
+    let mut stack = vec![(root, 1_usize)];
+    while let Some((value, depth)) = stack.pop() {
+        match value {
+            Value::Object(obj) => {
+                if depth > max_depth {
+                    return Err(depth);
+                }
+                stack.extend(obj.properties.iter().map(|prop| (&prop.value, depth + 1)));
+            }
+            Value::Array(arr) => {
+                if depth > max_depth {
+                    return Err(depth);
+                }
+                stack.extend(arr.elements.iter().map(|elem| (elem, depth + 1)));
+            }
+            Value::StringLit(_)
+            | Value::NumberLit(_)
+            | Value::BooleanLit(_)
+            | Value::NullKeyword(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Parses JSONC `content` (comments and trailing commas allowed) into an AST bounded by
+/// [`MAX_JSON_NESTING_DEPTH`]. `Ok(None)` means the document holds no value (empty,
+/// whitespace-only or comment-only).
+///
+/// `file_type` names the file in the resulting [`DepsError::ParseError`].
+///
+/// # Errors
+///
+/// [`ParseFailureKind::Malformed`] for a syntax error, [`ParseFailureKind::NestingTooDeep`]
+/// when the document nests deeper than [`MAX_JSON_NESTING_DEPTH`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::json_ast::parse_jsonc_ast_checked;
+///
+/// assert!(parse_jsonc_ast_checked(r#"{"a": [1,],}"#, "deno.json").unwrap().is_some());
+/// assert!(parse_jsonc_ast_checked("  // nothing\n", "deno.json").unwrap().is_none());
+/// assert!(parse_jsonc_ast_checked("{", "deno.json").is_err());
+/// ```
+pub fn parse_jsonc_ast_checked<'a>(
+    content: &'a str,
+    file_type: &'static str,
+) -> Result<Option<Value<'a>>> {
+    let ast = parse_to_ast(
+        content,
+        &CollectOptions::default(),
+        &ParseOptions::default(),
+    )
+    .map_err(|e| {
+        let kind = if matches!(e.kind(), ParseErrorKind::NestingDepthExceeded) {
+            ParseFailureKind::NestingTooDeep
+        } else {
+            ParseFailureKind::Malformed
+        };
+        DepsError::parse_error_of_kind(file_type, kind, &e)
+    })?;
+
+    if let Some(value) = &ast.value
+        && let Err(depth) = check_ast_nesting_depth(value, MAX_JSON_NESTING_DEPTH)
+    {
+        return Err(DepsError::parse_error_of_kind(
+            file_type,
+            ParseFailureKind::NestingTooDeep,
+            &json_depth_error_message(depth),
+        ));
+    }
+    Ok(ast.value)
+}
+
+/// Converts a depth-bounded AST into a `serde_json::Value`. Recursion is bounded by
+/// [`MAX_JSON_NESTING_DEPTH`], enforced by [`parse_jsonc_ast_checked`] before this runs.
+/// Duplicate object keys resolve to the last occurrence, like [`find_last_prop`].
+fn ast_to_json(value: &Value<'_>, file_type: &'static str) -> Result<serde_json::Value> {
+    Ok(match value {
+        Value::Object(obj) => {
+            let mut map = serde_json::Map::with_capacity(obj.properties.len());
+            for prop in &obj.properties {
+                map.insert(
+                    prop.name.as_str().to_string(),
+                    ast_to_json(&prop.value, file_type)?,
+                );
+            }
+            serde_json::Value::Object(map)
+        }
+        Value::Array(arr) => serde_json::Value::Array(
+            arr.elements
+                .iter()
+                .map(|element| ast_to_json(element, file_type))
+                .collect::<Result<_>>()?,
+        ),
+        Value::StringLit(lit) => serde_json::Value::String(lit.value.to_string()),
+        Value::NumberLit(lit) => {
+            serde_json::Value::Number(lit.value.parse::<serde_json::Number>().map_err(|_| {
+                DepsError::parse_error(file_type, &format!("invalid JSON number `{}`", lit.value))
+            })?)
+        }
+        Value::BooleanLit(lit) => serde_json::Value::Bool(lit.value),
+        Value::NullKeyword(_) => serde_json::Value::Null,
+    })
+}
+
+/// Deserializes JSONC `content` (comments and trailing commas allowed) into `T`, after the
+/// same [`MAX_JSON_NESTING_DEPTH`] gate as [`parse_jsonc_ast_checked`].
+///
+/// `Ok(None)` means the document holds no value (empty, whitespace-only or comment-only), so a
+/// caller can treat it as an empty file.
+///
+/// # Errors
+///
+/// [`DepsError::ParseError`] for a syntax error, excessive nesting, a number that is not valid
+/// JSON (e.g. hex), or a value that does not fit `T`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::json_ast::parse_jsonc_typed;
+/// use std::collections::HashMap;
+///
+/// let map: Option<HashMap<String, u32>> =
+///     parse_jsonc_typed("{ \"a\": 1, // note\n \"b\": 2, }", "bun.lock").unwrap();
+/// assert_eq!(map.unwrap().len(), 2);
+///
+/// let empty: Option<HashMap<String, u32>> = parse_jsonc_typed("  ", "bun.lock").unwrap();
+/// assert!(empty.is_none());
+/// ```
+pub fn parse_jsonc_typed<T: serde::de::DeserializeOwned>(
+    content: &str,
+    file_type: &'static str,
+) -> Result<Option<T>> {
+    let Some(root) = parse_jsonc_ast_checked(content, file_type)? else {
+        return Ok(None);
+    };
+    let json = ast_to_json(&root, file_type)?;
+    serde_json::from_value(json)
+        .map(Some)
+        .map_err(|e| DepsError::parse_error(file_type, &e))
+}
 
 /// Finds the property named `key` among `object`'s own direct children, taking the *last* one
 /// if `key` occurs more than once.
@@ -275,6 +435,40 @@ fn quoted_lsp_range(
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_jsonc_typed_last_duplicate_key_wins() {
+        let parsed: Option<HashMap<String, u32>> =
+            parse_jsonc_typed(r#"{"a": 1, "a": 2}"#, "t").unwrap();
+        assert_eq!(parsed.unwrap()["a"], 2);
+    }
+
+    #[test]
+    fn test_parse_jsonc_typed_rejects_non_json_number_and_wrong_shape() {
+        assert!(parse_jsonc_typed::<serde_json::Value>("[0x10]", "t").is_err());
+        assert!(parse_jsonc_typed::<HashMap<String, u32>>(r#"{"a": "x"}"#, "t").is_err());
+    }
+
+    #[test]
+    fn test_parse_jsonc_typed_nesting_depth_boundary() {
+        let nest = |depth: usize| format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(parse_jsonc_typed::<serde_json::Value>(&nest(MAX_JSON_NESTING_DEPTH), "t").is_ok());
+        let err = parse_jsonc_typed::<serde_json::Value>(&nest(MAX_JSON_NESTING_DEPTH + 1), "t")
+            .unwrap_err();
+        assert_eq!(
+            err.parse_failure_kind(),
+            Some(ParseFailureKind::NestingTooDeep)
+        );
+    }
+
+    #[test]
+    fn test_parse_jsonc_typed_comment_only_is_none() {
+        assert!(
+            parse_jsonc_typed::<serde_json::Value>("// c\n/* d */", "t")
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn test_section_indexes_direct_properties_only() {

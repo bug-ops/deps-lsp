@@ -545,6 +545,45 @@ fn test_update_keeps_bundler_and_composer_constraint_operator_1933() {
     }
 }
 
+/// #1966 (M4): a requirement the latest release already satisfies is never planned, so an
+/// echoed requirement cannot surface as a `NoOpRewrite` skip that exits 1.
+#[test]
+fn test_update_bare_cargo_requirement_satisfied_by_latest_never_becomes_a_no_op_rewrite() {
+    use deps_core::EcosystemId;
+
+    for (constraint, latest) in [("^0", "0.3.2"), ("^0.0", "0.0.9"), ("0", "0.3.2")] {
+        let content = format!(
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"{constraint}\"\n"
+        );
+        let plan = plan_manifest(&ManifestFixture {
+            ecosystem_id: EcosystemId::Cargo,
+            uri_path: "/project/Cargo.toml",
+            content: &content,
+            declared_name: "serde",
+            cache_key: "serde",
+            latest,
+            ignore_name: None,
+        });
+        assert!(
+            plan.items.iter().all(|item| !matches!(
+                item.outcome,
+                Outcome::Skipped {
+                    reason: deps_cli::update::SkipReason::NotSafelyEditable(
+                        deps_core::edit::UnplannableReason::NoOpRewrite
+                    ),
+                    ..
+                }
+            )),
+            "{constraint} vs {latest}: {plan:?}"
+        );
+        assert_eq!(
+            deps_cli::exit::update_exit_code(&plan),
+            deps_cli::exit::EXIT_CLEAN,
+            "{constraint} vs {latest}: {plan:?}"
+        );
+    }
+}
+
 /// N3: `--package monolog/monolog` selects `Monolog/Monolog`, and the JSON names it with the
 /// bytes the manifest declares, not the normalized spelling the cache and the filter use.
 #[test]

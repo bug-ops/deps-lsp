@@ -284,6 +284,20 @@ mod tests {
         );
     }
 
+    /// #1966: Dart rewrites through the `Floor` target, so the zero-major caret rule (which
+    /// applies to `Update` only) never fires; pub_semver also rejects a one- or two-segment
+    /// `^0`/`^0.0`, so the full-version output cannot narrow a valid constraint.
+    #[test]
+    fn test_format_version_replacing_zero_major_caret_writes_full_version() {
+        let f = DartFormatter;
+        for current in ["^0", "^0.0"] {
+            assert_eq!(
+                f.format_version_replacing(&ConcreteVersion::new("0.3.2"), current),
+                "^0.3.2"
+            );
+        }
+    }
+
     /// N1: locks in the exact collapsed output (not just that it isn't refused) for a single
     /// asymmetric bound and pub's `any` keyword — both narrow safely on this ecosystem, same
     /// as the compound-range case above.

@@ -63,6 +63,17 @@ customised `go.env` such as `GOPROXY=direct` therefore changes routing, while th
 environment variable is operator-trusted. GUI-launched editors on macOS often lack the Go `bin`
 directory on `PATH`, in which case this layer is silently absent.
 
+A `go.env` found through `PATH` is not trusted for its other keys either, because a directory
+on `PATH` can be repository-controlled. Its `GOSUMDB` is ignored, and the effective `GOPRIVATE`,
+`GONOPROXY` and `GONOSUMDB` lists are built from the process environment, `$GOENV` and a
+`GOROOT`-variable `go.env` only. The patterns of a `PATH`-derived file can only mark a matching
+module as unverified: its registry is not verified as a public mirror, no request is made for it,
+and its vulnerability data is not checked. Such
+patterns never hide a module that a trusted list already matches. Its `GOPROXY` keywords `direct`
+and `off` are still honoured, because distribution `go.env` files ship `GOPROXY=direct`. With
+those keywords version lookups stop, so the `yanked` and `unsatisfiable` checks go quiet; OSV
+vulnerability scanning keeps working.
+
 **Resolution**: `$GOENV` is read once per process — the `GOENV` environment
 variable if it is an absolute path, else the platform default
 `os.UserConfigDir()/go/env` (`~/.config/go/env` on Linux/macOS,
@@ -200,7 +211,7 @@ per-dependency one.
 - Editing `$GOENV` does not take effect until the affected `go.mod` is next
   reparsed (edited, or the document reopened) — there is no dedicated file
   watcher for it yet.
-- `GOFLAGS` and `$GOROOT/go.env` defaults (Go 1.21+) are not read.
+- `GOFLAGS` is not read.
 - A `GOPROXY` with embedded userinfo fails closed for every module, whether it comes from
   the process environment or from `$GOENV`.
 - Checksum-database verification itself is out of scope — no ecosystem crate in this

@@ -501,6 +501,30 @@ impl FailOnPolicy {
         }
     }
 
+    /// Whether the run fails because the OSV query itself failed for some dependency while
+    /// [`Category::Vulnerable`] is gated (#1963): without it a broken OSV connection would look
+    /// identical to a clean scan. Independent of the `unchecked` token.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_cli::report::{FailOnPolicy, OsvCoverage};
+    ///
+    /// let failed = OsvCoverage::default().with_query_failed(1);
+    /// assert!(FailOnPolicy::default_categories().scan_failure_violated(&failed));
+    /// assert!(!FailOnPolicy::default_categories().scan_failure_violated(&OsvCoverage::default()));
+    /// ```
+    #[must_use]
+    pub fn scan_failure_violated(&self, coverage: &OsvCoverage) -> bool {
+        self.gates_vulnerable() && coverage.query_failed() > 0
+    }
+
+    /// Whether [`Category::Vulnerable`] findings fail the run.
+    #[must_use]
+    pub fn gates_vulnerable(&self) -> bool {
+        self.categories.contains(&Category::Vulnerable)
+    }
+
     /// The default policy (FR-010): `vulnerable,yanked,unsatisfiable` — the categories that
     /// represent a broken or unsafe build, as opposed to advisory-only categories.
     ///
@@ -603,6 +627,7 @@ pub fn probe_notes(
 pub struct OsvCoverage {
     unverified_registry: usize,
     scan_incomplete: usize,
+    query_failed: usize,
 }
 
 impl OsvCoverage {
@@ -613,7 +638,21 @@ impl OsvCoverage {
         Self {
             unverified_registry,
             scan_incomplete,
+            query_failed: 0,
         }
+    }
+
+    /// This coverage with `query_failed` dependencies whose OSV query failed.
+    #[must_use]
+    pub const fn with_query_failed(mut self, query_failed: usize) -> Self {
+        self.query_failed = query_failed;
+        self
+    }
+
+    /// Dependencies whose OSV query failed.
+    #[must_use]
+    pub const fn query_failed(&self) -> usize {
+        self.query_failed
     }
 
     /// Counts the dependencies in `vulnerabilities` skipped for a [`CoverageGap`], given whether
@@ -635,6 +674,7 @@ impl OsvCoverage {
                 match reason.coverage_gap(reason_lock) {
                     Some(CoverageGap::UnverifiedRegistry) => coverage.unverified_registry += 1,
                     Some(CoverageGap::ScanIncomplete) => coverage.scan_incomplete += 1,
+                    Some(CoverageGap::QueryFailed) => coverage.query_failed += 1,
                     None => {}
                 }
             }
@@ -663,12 +703,13 @@ impl OsvCoverage {
     pub const fn add(&mut self, other: &Self) {
         self.unverified_registry += other.unverified_registry;
         self.scan_incomplete += other.scan_incomplete;
+        self.query_failed += other.query_failed;
     }
 
-    /// Dependencies whose vulnerability data was not checked, across both gap classes.
+    /// Dependencies whose vulnerability data was not checked, across all gap classes.
     #[must_use]
     pub const fn unchecked(&self) -> usize {
-        self.unverified_registry + self.scan_incomplete
+        self.unverified_registry + self.scan_incomplete + self.query_failed
     }
 
     /// The stderr note for this run, or `None` when every dependency was either checked or
@@ -683,17 +724,23 @@ impl OsvCoverage {
         });
         let incomplete = (self.scan_incomplete > 0).then(|| {
             format!(
-                "vulnerability scan incomplete for {} (query failed or truncated, or a version or \
+                "vulnerability scan incomplete for {} (result truncated, or a version or \
                  tag lookup unresolved; set GITHUB_TOKEN/GITLAB_TOKEN to avoid rate-limited tag \
                  lookups)",
                 dependency_count(self.scan_incomplete)
             )
         });
-        match (unverified, incomplete) {
-            (None, None) => None,
-            (Some(note), None) | (None, Some(note)) => Some(note),
-            (Some(first), Some(second)) => Some(format!("{first}; {second}")),
-        }
+        let failed = (self.query_failed > 0).then(|| {
+            format!(
+                "vulnerability data unavailable for {} (OSV query failed)",
+                dependency_count(self.query_failed)
+            )
+        });
+        let notes: Vec<String> = [unverified, incomplete, failed]
+            .into_iter()
+            .flatten()
+            .collect();
+        (!notes.is_empty()).then(|| notes.join("; "))
     }
 }
 
@@ -1946,17 +1993,18 @@ mod tests {
         }
         assert_eq!(
             OsvCoverage::from_vulnerabilities(Some(&map), LockPresence::Absent, &HashSet::new()),
-            OsvCoverage::new(1, 2)
+            OsvCoverage::new(1, 1).with_query_failed(1),
+            "a failed query is counted apart from other incomplete scans"
         );
         assert_eq!(
             OsvCoverage::from_vulnerabilities(Some(&map), LockPresence::Found, &HashSet::new()),
-            OsvCoverage::new(1, 3),
+            OsvCoverage::new(1, 2).with_query_failed(1),
             "a dependency missing from an existing lock file is a coverage gap"
         );
         let unlocked = HashSet::from([deps_core::test_util::vuln_key("f")]);
         assert_eq!(
             OsvCoverage::from_vulnerabilities(Some(&map), LockPresence::Found, &unlocked),
-            OsvCoverage::new(1, 2),
+            OsvCoverage::new(1, 1).with_query_failed(1),
             "a peer dependency never appears in the lock file"
         );
         assert!(OsvCoverage::needs_lock_presence(Some(&map)));
@@ -1973,6 +2021,26 @@ mod tests {
         assert!(note.contains("not checked for 1 dependency (registry not verified"));
         assert!(note.contains("scan incomplete for 2 dependencies"));
         assert!(note.contains("GITHUB_TOKEN"));
+        assert!(!note.contains("query failed"));
+    }
+
+    #[test]
+    fn test_osv_coverage_note_names_query_failure_separately() {
+        let coverage = OsvCoverage::new(0, 1).with_query_failed(2);
+        let note = coverage.note().expect("note");
+        assert!(
+            note.contains("vulnerability data unavailable for 2 dependencies (OSV query failed)")
+        );
+        assert!(note.contains("scan incomplete for 1 dependency"));
+        assert_eq!(coverage.unchecked(), 3);
+        let only = OsvCoverage::default()
+            .with_query_failed(1)
+            .note()
+            .expect("note");
+        assert_eq!(
+            only,
+            "vulnerability data unavailable for 1 dependency (OSV query failed)"
+        );
     }
 
     #[test]

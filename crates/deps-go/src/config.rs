@@ -781,7 +781,15 @@ pub struct GoEnvConfig {
     /// Effective `GONOSUMDB`, defaulting to `GOPRIVATE` like `GONOPROXY`.
     nosumdb: Vec<GlobPattern>,
     sumdb: GoSumDb,
+    /// `GOPRIVATE`/`GONOPROXY`/`GONOSUMDB` patterns of a `go.env` found through `PATH`
+    /// ([`GorootEnvFile::PathLookup`]). Never merged into the trusted lists above: they can only
+    /// mark a module unverified, never hide a trusted match.
+    untrusted: Vec<GlobPattern>,
 }
+
+/// Non-URL label of the `CustomRegistry` source given to a module matched only by an untrusted
+/// `PATH`-derived `go.env`; no request is ever made for it.
+const PATH_GOENV_LABEL: &str = "go.env found through PATH (untrusted)";
 
 /// The first non-empty pattern list of `layers` (most specific first), compiled.
 fn first_patterns<'a>(
@@ -792,6 +800,14 @@ fn first_patterns<'a>(
         .flatten()
         .next()
         .map_or_else(Vec::new, |list| list.compiled().to_vec())
+}
+
+fn untrusted_patterns(raw: &RawGoEnv) -> Vec<GlobPattern> {
+    [&raw.goprivate, &raw.gonoproxy, &raw.gonosumdb]
+        .into_iter()
+        .flatten()
+        .flat_map(|list| list.compiled().iter().cloned())
+        .collect()
 }
 
 fn any_match(patterns: &[GlobPattern], module_path: &str) -> bool {
@@ -827,7 +843,12 @@ impl GoEnvConfig {
         policy: &RegistryAccessPolicy,
     ) -> Self {
         let file_raw = file.map(|(raw, _)| raw);
-        let goroot_raw = goroot.map(|(raw, _)| raw);
+        let trusted_goroot_raw = goroot
+            .filter(|(_, origin)| origin.is_operator_owned())
+            .map(|(raw, _)| raw);
+        let untrusted_goroot_raw = goroot
+            .filter(|(_, origin)| !origin.is_operator_owned())
+            .map(|(raw, _)| raw);
         let file_goproxy = file.and_then(|(raw, path)| {
             raw.goproxy.as_deref().map(|goproxy| {
                 let operator = OperatorRegistries::declared_in(path, goproxy_urls(goproxy));
@@ -862,7 +883,7 @@ impl GoEnvConfig {
             .or(file_goproxy)
             .or(goroot_goproxy);
         let layered = |key: fn(&RawGoEnv) -> Option<&PatternList>| {
-            [file_raw.and_then(key), goroot_raw.and_then(key)]
+            [file_raw.and_then(key), trusted_goroot_raw.and_then(key)]
         };
         let [file_private, goroot_private] = layered(|raw| raw.goprivate.as_ref());
         let [file_noproxy, goroot_noproxy] = layered(|raw| raw.gonoproxy.as_ref());
@@ -890,8 +911,9 @@ impl GoEnvConfig {
             sumdb: process
                 .gosumdb
                 .or_else(|| file_raw.and_then(|raw| raw.gosumdb))
-                .or_else(|| goroot_raw.and_then(|raw| raw.gosumdb))
+                .or_else(|| trusted_goroot_raw.and_then(|raw| raw.gosumdb))
                 .unwrap_or_default(),
+            untrusted: untrusted_goroot_raw.map_or_else(Vec::new, untrusted_patterns),
         }
     }
 
@@ -910,6 +932,9 @@ impl GoEnvConfig {
     /// - A module matching the effective `GONOPROXY` (defaulting to `GOPRIVATE`) bypasses
     ///   `GOPROXY` entirely, routing to the fixed [`GOPRIVATE_CHAIN_KEY`] chain (FR-008) —
     ///   checked first, regardless of `GOPROXY`.
+    /// - A module matched only by the patterns of a `go.env` found through `PATH` (untrusted) ->
+    ///   [`DependencySource::CustomRegistry`] labelled `PATH_GOENV_LABEL`: unverified, never
+    ///   fetched, and never able to override a trusted match above.
     /// - A `GOPROXY` override where every hop is invalid -> [`DependencySource::CustomRegistry`]
     ///   (FR-009, fail-closed, never a `proxy.golang.org` fallback).
     /// - Otherwise a `GOPROXY` override -> [`DependencySource::AlternateRegistry`] pointing at the
@@ -928,6 +953,14 @@ impl GoEnvConfig {
         };
         if any_match(&self.noproxy, module_path) {
             return bypass();
+        }
+        if any_match(&self.untrusted, module_path)
+            && !any_match(&self.private, module_path)
+            && !any_match(&self.nosumdb, module_path)
+        {
+            return DependencySource::CustomRegistry {
+                url: PATH_GOENV_LABEL.to_string(),
+            };
         }
 
         match &self.goproxy {
@@ -1348,7 +1381,11 @@ impl GoParseContext {
 /// are operator-declared: a `GOROOT` process variable is operator-owned, but a `go` binary found
 /// through `PATH` may sit inside a workspace (direnv, a vendored toolchain), so the hops of a
 /// PATH-derived file are validated under the workspace policy like any repository-controlled
-/// declaration. No `go` process is ever run (`go env` inside a hostile repository can trigger a
+/// declaration. The other keys of a PATH-derived file are not trusted either: its `GOSUMDB` is
+/// ignored and its `GOPRIVATE`/`GONOPROXY`/`GONOSUMDB` patterns only mark matching modules
+/// unverified (`PATH_GOENV_LABEL`); they never replace or hide a trusted list. Its `GOPROXY`
+/// keywords (`direct`, `off`) are kept, because distribution `go.env` files ship
+/// `GOPROXY=direct`. No `go` process is ever run (`go env` inside a hostile repository can trigger a
 /// toolchain download). When `PATH` has no usable `go` (a GUI-launched macOS editor often lacks
 /// the Go bin directory) and `GOROOT` is unset, the layer is absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1364,6 +1401,13 @@ impl GorootEnvFile {
         match self {
             Self::ProcessEnv(path) => path.as_path(),
             Self::PathLookup(path) => path,
+        }
+    }
+
+    const fn is_operator_owned(&self) -> bool {
+        match self {
+            Self::ProcessEnv(_) => true,
+            Self::PathLookup(_) => false,
         }
     }
 
@@ -2762,6 +2806,130 @@ mod tests {
         );
         assert_eq!(only_root.sumdb, GoSumDb::Off);
         assert!(any_match(&only_root.private, "root.example/x"));
+    }
+
+    fn assert_path_goenv_label(source: &DependencySource) {
+        let DependencySource::CustomRegistry { url } = source else {
+            panic!("expected CustomRegistry, got {source:?}");
+        };
+        assert_eq!(url, PATH_GOENV_LABEL);
+    }
+
+    #[test]
+    fn test_path_goenv_goprivate_marks_modules_unverified() {
+        let config = with_goroot(
+            &MapEnv::new(),
+            None,
+            "GOPRIVATE=*\n",
+            &path_goroot(),
+            &all_policy(),
+        );
+        assert_path_goenv_label(&config.resolve_source_for("github.com/a/b"));
+        assert!(config.resolved_chains().is_empty());
+    }
+
+    #[test]
+    fn test_path_goenv_gonoproxy_and_gonosumdb_mark_modules_unverified() {
+        let config = with_goroot(
+            &MapEnv::new(),
+            None,
+            "GONOPROXY=a.example/*\nGONOSUMDB=b.example/*\n",
+            &path_goroot(),
+            &all_policy(),
+        );
+        assert_path_goenv_label(&config.resolve_source_for("a.example/x"));
+        assert_path_goenv_label(&config.resolve_source_for("b.example/x"));
+        assert_eq!(
+            config.resolve_source_for("c.example/x"),
+            DependencySource::Registry
+        );
+    }
+
+    #[test]
+    fn test_path_goenv_cannot_hide_trusted_goprivate() {
+        let env = MapEnv::new().with_var("GOPRIVATE", "corp.example/*");
+        let goroot = "GOPROXY=https://proxy.golang.org\nGONOPROXY=none.invalid\n";
+        let config = with_goroot(&env, None, goroot, &path_goroot(), &all_policy());
+        assert_eq!(
+            config.resolve_source_for("corp.example/x"),
+            DependencySource::AlternateRegistry {
+                index: GOPRIVATE_CHAIN_KEY.to_string(),
+                mirrors_public_registry: false,
+            }
+        );
+        let trusted = with_goroot(&env, None, goroot, &trusted_goroot(), &all_policy());
+        assert_matches!(
+            trusted.resolve_source_for("corp.example/x"),
+            DependencySource::AlternateRegistry { index, mirrors_public_registry: false }
+                if index != GOPRIVATE_CHAIN_KEY
+        );
+    }
+
+    #[test]
+    fn test_path_goenv_untrusted_match_keeps_trusted_private_route() {
+        let env = MapEnv::new().with_var("GOPRIVATE", "corp.example/*");
+        let config = with_goroot(
+            &env,
+            None,
+            "GOPRIVATE=corp.example/*\n",
+            &path_goroot(),
+            &all_policy(),
+        );
+        assert_matches!(
+            config.resolve_source_for("corp.example/x"),
+            DependencySource::AlternateRegistry { .. }
+        );
+    }
+
+    #[test]
+    fn test_path_goenv_gosumdb_is_ignored() {
+        let config = with_goroot(
+            &MapEnv::new(),
+            None,
+            "GOPROXY=https://proxy.golang.org\nGOSUMDB=off\n",
+            &path_goroot(),
+            &all_policy(),
+        );
+        assert_eq!(config.sumdb, GoSumDb::Public);
+    }
+
+    #[test]
+    fn test_path_goenv_goproxy_keywords_keep_the_chain_osv_scannable() {
+        for goproxy in ["direct", "off"] {
+            let config = with_goroot(
+                &MapEnv::new(),
+                None,
+                &format!("GOPROXY={goproxy}\nGOSUMDB=sum.golang.org\n"),
+                &path_goroot(),
+                &all_policy(),
+            );
+            assert_matches!(
+                config.resolve_source_for("github.com/a/b"),
+                DependencySource::AlternateRegistry {
+                    mirrors_public_registry: true,
+                    ..
+                },
+                "{goproxy}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_process_env_goroot_patterns_stay_trusted() {
+        let config = with_goroot(
+            &MapEnv::new(),
+            None,
+            "GOPRIVATE=*\n",
+            &trusted_goroot(),
+            &all_policy(),
+        );
+        assert_matches!(
+            config.resolve_source_for("github.com/a/b"),
+            DependencySource::AlternateRegistry {
+                mirrors_public_registry: false,
+                ..
+            }
+        );
     }
 
     fn goroot_hop_trust(

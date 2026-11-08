@@ -68,6 +68,7 @@ fn answers() -> Vec<Answer> {
 
 #[tokio::test]
 async fn test_each_answer_is_memoized_as_its_own_outcome() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     for Answer {
         label,
         status,
@@ -98,6 +99,7 @@ async fn test_each_answer_is_memoized_as_its_own_outcome() {
 
 #[tokio::test]
 async fn test_a_swizzled_dependency_adopts_the_identity_the_registry_returned() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     let mut server = mockito::Server::new_async().await;
     let _lookup = server
         .mock("GET", "/identifiers")
@@ -118,6 +120,7 @@ async fn test_a_swizzled_dependency_adopts_the_identity_the_registry_returned() 
 
 #[tokio::test]
 async fn test_only_a_failed_answer_is_incomplete_and_only_a_unique_one_swaps() {
+    let _guard = deps_core::fs_probe::snapshot_guard_async().await;
     for Answer {
         label,
         status,

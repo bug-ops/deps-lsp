@@ -17,12 +17,12 @@
 //! feature is what those crates enable in their `dev-dependencies` instead.
 //!
 //! Any test in `deps-core`, `deps-gradle`, `deps-cargo`, `deps-npm`, `deps-nuget`,
-//! `deps-maven`, or `deps-lsp` that touches `fs_probe` (directly, through
+//! `deps-maven`, `deps-swift`, or `deps-lsp` that touches `fs_probe` (directly, through
 //! [`crate::mtime_cache::MtimeFileCache`], through an ecosystem's own config-file cache, or
 //! through `Ecosystem::parse_manifest`) must hold [`snapshot_guard`]/[`snapshot_guard_async`]
 //! for the duration of that touch — see [`snapshot_guard`]'s doc for why. Nothing enforces
 //! this at compile time; run `scripts/check-fs-probe-race.sh` after adding a new
-//! fs_probe-touching test in one of those seven crates to catch a missing guard before it
+//! fs_probe-touching test in one of those eight crates to catch a missing guard before it
 //! reaches CI's i686 cross-test leg (issue #806).
 
 use std::io::{Read, Write};

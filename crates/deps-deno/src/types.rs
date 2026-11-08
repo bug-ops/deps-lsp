@@ -40,6 +40,9 @@ pub struct DenoDependency {
     /// `parser::classify_npm_imports`). `jsr:` imports always stay `Registry` — JSR has no
     /// alternate-registry concept.
     pub source: deps_core::parser::DependencySource,
+    /// The `.npmrc` entry that produced [`Self::source`] for an `npm:` import (#1965);
+    /// `None` when no entry applied.
+    pub(crate) registry_entry: Option<deps_npm::types::NpmRegistryEntry>,
 }
 
 deps_core::impl_dependency!(DenoDependency {
@@ -312,6 +315,7 @@ mod tests {
             version_range: Some(Range::new(Position::new(0, 13), Position::new(0, 17))),
             section: DenoDependencySection::Imports,
             source: deps_core::parser::DependencySource::Registry,
+            registry_entry: None,
         };
 
         assert_eq!(dep.name, "jsr:@std/fs");

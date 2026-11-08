@@ -2074,3 +2074,97 @@ mod fail_on_unchecked_subprocess {
         );
     }
 }
+
+/// #1963: a failing OSV query must reach the exit code through the real `check_manifest`
+/// coverage accounting, not only through hand-built [`OsvCoverage`] values.
+mod osv_query_failure_gate {
+    use super::*;
+    use deps_cli::exit::EXIT_POLICY_VIOLATION;
+    use deps_cli::report::Category;
+
+    async fn coverage_with_failing_osv() -> (CheckReport, OsvCoverage, PolicyConfig) {
+        let mut server = mockito::Server::new_async().await;
+        let _osv = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(500)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = \"=1.0.100\"\n",
+        )
+        .expect("write Cargo.toml");
+        std::fs::write(
+            dir.path().join("Cargo.lock"),
+            "version = 3\n\n[[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\ndependencies = [\"serde\"]\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.100\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+        )
+        .expect("write Cargo.lock");
+
+        let policy = PolicyConfig::default();
+        let runtime =
+            EcosystemRuntime::from_policy(&policy, &RegistryEnvironment::read(&MapEnv::new()));
+        let cache = Arc::new(HttpCache::with_policy(Arc::clone(&runtime.policy)));
+        let registry = EcosystemRegistry::new();
+        let _ = register_ecosystems(&registry, Arc::clone(&cache), &runtime);
+        let ctx = CheckContext {
+            cache: Arc::clone(&cache),
+            osv: Arc::new(OsvClient::for_test(Arc::clone(&cache), server.url())),
+            deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
+            lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            policy: policy.clone(),
+        };
+
+        let outcome = walk::walk(
+            &[dir.path().to_path_buf()],
+            &registry,
+            walk::GitignorePolicy::Ignore,
+            walk::SymlinkPolicy::Skip,
+        );
+        let mut report = CheckReport::default();
+        let mut coverage = OsvCoverage::default();
+        for manifest in outcome.manifests() {
+            let content = std::fs::read_to_string(&manifest.path).expect("read manifest");
+            let result = check_manifest(
+                &manifest.ecosystem,
+                &manifest.uri_path,
+                &manifest.display_path,
+                &content,
+                &ctx,
+            )
+            .await
+            .expect("check_manifest");
+            coverage.add(&result.osv_coverage);
+            report.findings.extend(result.findings);
+        }
+        (report, coverage, policy)
+    }
+
+    #[tokio::test]
+    async fn failing_osv_query_exits_one_under_vulnerable_and_default_policies() {
+        let (report, coverage, policy) = coverage_with_failing_osv().await;
+        assert!(coverage.query_failed() > 0, "{coverage:?}");
+        let osv = policy.osv_checks();
+        for gate in [
+            FailOnPolicy::default_categories(),
+            FailOnPolicy::new(vec![Category::Vulnerable]),
+        ] {
+            assert_eq!(
+                exit_code(&report, &gate, &coverage, osv, ExecutionOutcome::Clean),
+                EXIT_POLICY_VIOLATION
+            );
+        }
+        assert_eq!(
+            exit_code(
+                &CheckReport::default(),
+                &FailOnPolicy::new(vec![Category::Outdated]),
+                &coverage,
+                osv,
+                ExecutionOutcome::Clean
+            ),
+            EXIT_CLEAN
+        );
+    }
+}

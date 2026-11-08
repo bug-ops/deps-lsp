@@ -21,7 +21,7 @@ status: moc
 |----|---------|-------|--------|
 | 008 | [[008-codelens-update-all-outdated/spec\|CodeLens support for "update all outdated dependencies" action]] | specify | draft — research/parity, P2, 7 open `[NEEDS CLARIFICATION]` items |
 | 089 | [[089-npm-yarn-lockfile-provider/spec\|yarn.lock lock file provider (npm)]] | specify | shipped — npm yarn.lock v1 and Berry provide in-use versions (PR #1961, issue #1921) |
-| 090 | [[090-npm-bun-lockfile-provider/spec\|bun.lock lock file provider (npm)]] | specify | draft — research/parity, P3, 5 open `[NEEDS CLARIFICATION]` items (issue #1922) |
+| 090 | [[090-npm-bun-lockfile-provider/spec\|bun.lock lock file provider (npm)]] | specify | shipped — npm bun.lock lockfileVersion 0 to 3 provides in-use versions (issue #1922) |
 | 091 | [[091-deno-lockfile-provider/spec\|deno.lock lock file provider (Deno)]] | specify | draft — enhancement, P4, 7 open `[NEEDS CLARIFICATION]` items (issue #1924) |
 | 092 | [[092-gradle-lockfile-provider/spec\|Gradle dependency-locking lock file provider]] | specify | draft — enhancement, P4, 11 open `[NEEDS CLARIFICATION]` items (issue #1925) |
 | 093 | [[093-pypi-pipfile-pdm-lockfile-providers/spec\|Pipfile.lock and pdm.lock lock file providers (PyPI)]] | specify | draft — enhancement, P4, 6 open `[NEEDS CLARIFICATION]` items (issue #1926) |

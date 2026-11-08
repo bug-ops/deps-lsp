@@ -12,6 +12,8 @@ use deps_core::lockfile::{ResolvedPackage, ResolvedPackages, ResolvedSource};
 use deps_core::yaml_scalar_string;
 use yaml_rust2::{Yaml, YamlLoader};
 
+use super::split_specifier;
+
 const FILE_TYPE: &str = "yarn.lock";
 
 /// Most distinct package names recorded from one v1 entry header. A header normally lists a
@@ -71,17 +73,6 @@ fn skip_non_semver(name: &str, version: &str) -> bool {
         "skipping yarn.lock entry with non-semver version"
     );
     true
-}
-
-/// Splits `name@range` (scoped names start with `@`) at the first `@` after the first
-/// character. Returns `None` when there is no range part.
-fn split_specifier(specifier: &str) -> Option<(&str, &str)> {
-    let at = specifier
-        .char_indices()
-        .skip(1)
-        .find_map(|(i, c)| (c == '@').then_some(i))?;
-    let (name, range) = specifier.split_at(at);
-    Some((name, range.strip_prefix('@').unwrap_or(range)))
 }
 
 /// Real package name behind a specifier, unwrapping `alias@npm:real@range` (FR-008).

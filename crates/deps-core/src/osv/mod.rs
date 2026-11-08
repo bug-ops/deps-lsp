@@ -378,8 +378,9 @@ impl OsvClient {
     /// already caps each individual request at 30s. The deadline is checked
     /// between chunks/recovery items, not mid-request, so already-completed
     /// work is never discarded on timeout: only whatever had not yet started
-    /// degrades to [`SkipReason::QueryFailed`]/[`SkipReason::Truncated`]
-    /// (critique S5).
+    /// degrades to [`SkipReason::QueryFailed`] (critique S5); an exhausted
+    /// deadline is never [`SkipReason::Truncated`], which is reserved for
+    /// genuine pagination truncation.
     ///
     /// Never returns an error: every failure degrades to a
     /// [`ScanOutcome::Skipped`] entry, never an absent one. Logs a
@@ -629,14 +630,9 @@ impl OsvClient {
         if Instant::now() >= deadline {
             tracing::warn!(
                 count = truncated.len(),
-                "OSV scan deadline exceeded before truncation recovery"
+                "OSV scan deadline exceeded before truncation recovery, marking as query-failed"
             );
-            for target in &truncated {
-                outcomes.insert(
-                    target.key.clone(),
-                    ScanOutcome::Skipped(SkipReason::Truncated),
-                );
-            }
+            mark_chunk_failed(&truncated, &mut outcomes);
             return outcomes;
         }
 
@@ -2693,13 +2689,39 @@ mod tests {
         );
     }
 
+    /// #1963: a deadline that expires after the batch chunk, before truncation recovery, is
+    /// `QueryFailed`, never `Truncated`, so the `vulnerable` gate cannot read it as tolerable.
+    #[tokio::test]
+    async fn deadline_expiring_before_truncation_recovery_is_query_failed() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_chunked_body(|writer| {
+                std::thread::sleep(Duration::from_millis(600));
+                writer.write_all(br#"{"results":[{"next_page_token":"abc"}]}"#)
+            })
+            .create_async()
+            .await;
+
+        let targets = vec![target("linux", "5.10.1")];
+        let outcomes = client
+            .scan(EcosystemId::Go, &targets, Duration::from_millis(300))
+            .await;
+
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("linux")),
+            Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
+        );
+    }
+
     /// Issue #1539: `recover_truncated`'s permit wait must also fail closed at the scan
     /// deadline — the same bound as `fetch_record_single_flight`, exercised end-to-end through
     /// `scan` with the client-wide semaphore held externally so the requery can never acquire a
     /// permit before the deadline elapses. Budget widened to 1s (critique M3) to comfortably
-    /// cover the mock-server round trip on a slow CI runner without risking the pre-recovery
-    /// deadline check (mod.rs `resolve`) firing first and yielding `Truncated` instead of the
-    /// `QueryFailed` this test targets; the whole call is wrapped in an outer test timeout
+    /// cover the mock-server round trip on a slow CI runner; the pre-recovery deadline check
+    /// (mod.rs `resolve`) also yields `QueryFailed`, so only this test proves the permit-wait
+    /// bound itself. The whole call is wrapped in an outer test timeout
     /// (critique M2) so a regression fails this test rather than hanging CI.
     #[tokio::test]
     async fn recover_truncated_permit_wait_bounded_by_deadline_fails_query_failed() {

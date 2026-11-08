@@ -43,6 +43,10 @@ missing binary). Whether a policy violation should fail your build is your own w
 decision, made explicit by the last step above. Drop that step if you only want the SARIF
 findings uploaded to GitHub's code scanning UI, without failing the build.
 
+An OSV.dev outage counts as a policy violation: when `vulnerable` is in `fail-on` (it is in the
+default), a failed OSV query makes `deps-cli` exit `1`, so the step above fails the job instead of
+passing a run that checked nothing.
+
 This action requires a Linux runner (`runs-on: ubuntu-latest` or similar) — it is a Docker
 action, which GitHub Actions only runs on Linux.
 
@@ -69,7 +73,7 @@ action, which GitHub Actions only runs on Linux.
 | Output | Description |
 |--------|-------------|
 | `sarif-file` | Path to the produced SARIF file (`deps-lsp-results.sarif`). Set only when a non-empty, regular SARIF file was produced — may be unset even for exit code `0`/`1` (e.g. an unwritable output path), and is always unset for an execution error |
-| `exit-code` | `deps-cli check`'s own exit code (`0` clean, `1` a `--fail-on` category matched, `2` execution error), or the raw exit code from an abnormal termination. Set whenever `deps-cli` ran; unset only if the action refused to start before running it at all |
+| `exit-code` | `deps-cli check`'s own exit code (`0` clean, `1` a `--fail-on` category matched or an OSV query failed while `vulnerable` is gated, `2` execution error), or the raw exit code from an abnormal termination. Set whenever `deps-cli` ran; unset only if the action refused to start before running it at all |
 
 ## How it maps to `deps-cli`
 

@@ -1699,6 +1699,10 @@ pub enum LockResolution {
 ///     Some(CoverageGap::UnverifiedRegistry)
 /// );
 /// assert_eq!(SkipReason::NonRegistrySource.coverage_gap(LockPresence::Found), None);
+/// assert_eq!(
+///     SkipReason::QueryFailed.coverage_gap(LockPresence::Found),
+///     Some(CoverageGap::QueryFailed)
+/// );
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoverageGap {
@@ -1706,6 +1710,8 @@ pub enum CoverageGap {
     UnverifiedRegistry,
     /// The scan could not complete for a dependency it should have covered.
     ScanIncomplete,
+    /// The OSV.dev query for the dependency failed (network error, timeout, server error).
+    QueryFailed,
 }
 
 impl SkipReason {
@@ -1719,8 +1725,8 @@ impl SkipReason {
     pub const fn coverage_gap(self, lock: LockPresence) -> Option<CoverageGap> {
         match self {
             Self::UnverifiedRegistrySource => Some(CoverageGap::UnverifiedRegistry),
-            Self::QueryFailed
-            | Self::Truncated
+            Self::QueryFailed => Some(CoverageGap::QueryFailed),
+            Self::Truncated
             | Self::CanonicalNameUnconfirmed
             | Self::SiblingTagsUnknown
             | Self::UnevaluableAdvisoryRange => Some(CoverageGap::ScanIncomplete),

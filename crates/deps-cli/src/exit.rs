@@ -74,6 +74,12 @@ impl ExecutionOutcome {
 ///     exit_code(&clean, &strict, &unchecked, osv, ExecutionOutcome::Clean),
 ///     EXIT_POLICY_VIOLATION
 /// );
+///
+/// let outage = OsvCoverage::default().with_query_failed(1);
+/// assert_eq!(
+///     exit_code(&clean, &policy, &outage, osv, ExecutionOutcome::Clean),
+///     EXIT_POLICY_VIOLATION
+/// );
 /// ```
 #[must_use]
 pub fn exit_code(
@@ -83,7 +89,10 @@ pub fn exit_code(
     osv: OsvChecks,
     had_execution_error: ExecutionOutcome,
 ) -> i32 {
-    if policy.matches(&report.findings) || policy.coverage_violated(coverage, osv) {
+    if policy.matches(&report.findings)
+        || policy.coverage_violated(coverage, osv)
+        || policy.scan_failure_violated(coverage)
+    {
         return EXIT_POLICY_VIOLATION;
     }
     if had_execution_error == ExecutionOutcome::Failed {
@@ -251,6 +260,56 @@ mod tests {
                 EXIT_POLICY_VIOLATION
             );
         }
+    }
+
+    #[test]
+    fn test_query_failure_fails_vulnerable_gate_with_exit_one() {
+        let failed = OsvCoverage::default().with_query_failed(1);
+        for policy in [
+            FailOnPolicy::default_categories(),
+            FailOnPolicy::new(vec![Category::Vulnerable]),
+            strict(),
+        ] {
+            assert_eq!(
+                exit_code(
+                    &CheckReport::default(),
+                    &policy,
+                    &failed,
+                    online(),
+                    ExecutionOutcome::Clean
+                ),
+                EXIT_POLICY_VIOLATION
+            );
+        }
+    }
+
+    #[test]
+    fn test_query_failure_is_ignored_when_vulnerable_is_not_gated() {
+        let failed = OsvCoverage::default().with_query_failed(1);
+        assert_eq!(
+            exit_code(
+                &CheckReport::default(),
+                &FailOnPolicy::new(vec![Category::Outdated]),
+                &failed,
+                online(),
+                ExecutionOutcome::Clean
+            ),
+            EXIT_CLEAN
+        );
+    }
+
+    #[test]
+    fn test_execution_error_with_clean_policy_stays_two() {
+        assert_eq!(
+            exit_code(
+                &CheckReport::default(),
+                &FailOnPolicy::new(vec![Category::Outdated]),
+                &OsvCoverage::default(),
+                online(),
+                ExecutionOutcome::Failed
+            ),
+            EXIT_EXECUTION_ERROR
+        );
     }
 
     /// `--fail-on unchecked` is additive: the default categories still fail the run.

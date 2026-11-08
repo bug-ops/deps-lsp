@@ -387,6 +387,31 @@ pub enum NpmRegistryEntry {
     Scope,
 }
 
+impl NpmRegistryEntry {
+    /// The OSV non-public route this entry implies: a top-level `registry=` is an unverified
+    /// mirror of npmjs, a scope entry a private registry (#1917, #1965).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::NonPublicRoute;
+    /// use deps_npm::types::NpmRegistryEntry;
+    ///
+    /// assert_eq!(
+    ///     NpmRegistryEntry::TopLevel.non_public_route(),
+    ///     NonPublicRoute::UnverifiedMirror
+    /// );
+    /// assert_eq!(NpmRegistryEntry::Scope.non_public_route(), NonPublicRoute::Private);
+    /// ```
+    #[must_use]
+    pub const fn non_public_route(self) -> deps_core::osv::NonPublicRoute {
+        match self {
+            Self::TopLevel => deps_core::osv::NonPublicRoute::UnverifiedMirror,
+            Self::Scope => deps_core::osv::NonPublicRoute::Private,
+        }
+    }
+}
+
 impl NpmDependency {
     /// The `.npmrc` entry that routed this dependency, or `None` when none applied (the public
     /// default registry, or a non-registry specifier).

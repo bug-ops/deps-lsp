@@ -571,7 +571,7 @@ mod tests {
         id: "npm";
         display_name: "npm (JavaScript)";
         manifest_filenames: &["package.json", "pnpm-workspace.yaml"];
-        lockfile_filenames: &["package-lock.json", "pnpm-lock.yaml", "yarn.lock"];
+        lockfile_filenames: &["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock"];
         non_registry_fixture: "package.json" => r#"{"dependencies": {"acme-internal-secret": "git+ssh://git@github.com/acme/internal-secret.git"}}"#;
     }
 
