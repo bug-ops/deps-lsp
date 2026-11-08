@@ -219,10 +219,14 @@ fn resolve_registry_source(
                 return (
                     identity.to_string(),
                     DependencySource::AlternateRegistry {
-                        index: index.into_string(),
+                        index: index.as_str().to_string(),
                         mirrors_public_registry: false,
                     },
-                    SwiftOrigin::Swizzled { scm },
+                    SwiftOrigin::Swizzled {
+                        scm,
+                        identity,
+                        index,
+                    },
                 );
             }
             match url_to_identity(url_str) {
@@ -476,6 +480,10 @@ pub fn parse_package_swift_with_context(
 // mandatory (never `?`-optional), so their `unwrap()` is always `Some`. The alternative `url`/`id`
 // head is optional per group and goes through `locate` instead.
 #[allow(clippy::string_slice, clippy::unwrap_used)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "scanner past 300 lines, split tracked in #1952"
+)]
 fn parse_with_resolver(
     content: &str,
     uri: &Url,

@@ -494,6 +494,10 @@ const LICENSE_PREFETCH_CONCURRENCY: FetchConcurrency = FetchConcurrency::constan
 /// own contract), which every renderer's [`deps_core::lsp_helpers::latest_verdict`] already
 /// treats as [`deps_core::lsp_helpers::LatestVerdict::Unverified`] (fail-closed) — never
 /// silently "verified safe".
+#[expect(
+    clippy::too_many_lines,
+    reason = "phase B results feed the commit under one shared formatter and state"
+)]
 pub(crate) async fn run_osv_phase_b_and_commit(
     uri: &Uri,
     state: &Arc<ServerState>,
@@ -3392,6 +3396,64 @@ mod tests {
                 )),
                 "the pre-existing skip must survive untouched: {:?}",
                 doc.signals.vulnerabilities
+            );
+        }
+    }
+
+    /// #1917: the LSP scan path records the unverified-registry skip, so hover can render the
+    /// "Vulnerability data not checked" footer for it.
+    #[cfg(feature = "npm")]
+    mod unverified_registry_tests {
+        use super::super::super::state::DocumentState;
+        use super::*;
+        use deps_core::policy_config::FetchTimeout;
+        use std::assert_matches;
+
+        async fn skip_outcome_for(npmrc: &str, name: &str) -> Option<deps_core::osv::ScanOutcome> {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(".npmrc"), npmrc).unwrap();
+            let content = format!(r#"{{"dependencies": {{"{name}": "1.0.0"}}}}"#);
+            let url = url::Url::from_file_path(dir.path().join("package.json")).unwrap();
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let state = Arc::new(ServerState::new());
+            let ecosystem = state.ecosystem_registry.for_uri(&url).unwrap();
+            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            state.update_document(
+                uri.clone(),
+                DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse_result),
+            );
+            let result = run_osv_scan_phase_a(
+                uri,
+                Arc::clone(&state),
+                Arc::clone(&ecosystem),
+                FetchTimeout::constant::<5>(),
+            )
+            .await
+            .expect("phase A must produce a skip result");
+            result
+                .vulnerabilities
+                .get(&deps_core::test_util::vuln_key(name))
+                .cloned()
+        }
+
+        #[tokio::test]
+        async fn top_level_registry_override_commits_an_unverified_registry_skip() {
+            assert_matches!(
+                skip_outcome_for("registry=https://registry.npmmirror.com/\n", "lodash").await,
+                Some(deps_core::osv::ScanOutcome::Skipped(
+                    deps_core::osv::SkipReason::UnverifiedRegistrySource
+                ))
+            );
+        }
+
+        #[tokio::test]
+        async fn scope_registry_commits_a_silent_non_registry_skip() {
+            assert_matches!(
+                skip_outcome_for("@myorg:registry=https://npm.corp.example/\n", "@myorg/lib").await,
+                Some(deps_core::osv::ScanOutcome::Skipped(
+                    deps_core::osv::SkipReason::NonRegistrySource
+                ))
             );
         }
     }

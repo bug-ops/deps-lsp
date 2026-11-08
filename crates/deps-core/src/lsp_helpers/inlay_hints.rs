@@ -24,6 +24,45 @@ fn sanitize_hint_version(version: &str) -> String {
     sanitize_and_truncate_for_diagnostic(version, MAX_VERSION_DIAGNOSTIC_CHARS)
 }
 
+/// Fixed glyph and tooltip of a no-latest-version status marker.
+struct StatusMarker {
+    glyph: &'static str,
+    tooltip: &'static str,
+}
+
+const NOT_LOOKED_UP_MARKER: StatusMarker = StatusMarker {
+    glyph: "ℹ",
+    tooltip: "Package not looked up; latest version unknown",
+};
+
+/// The marker for a dependency whose registry lookup produced no latest version, or `None`.
+///
+/// A [`LookupMiss::NotLookedUp`] is a local decision (a bypassed or unroutable source), so it
+/// reads the raw miss and renders the neutral `ℹ`: [`VersionData::reportable_lookup_miss`]
+/// drops it, and its `AlternateRegistry` filter would drop the Go bypass too. The other
+/// misses stay behind that gate and render `⚠`, matching diagnostics.
+fn lookup_miss_marker(
+    dep: &dyn crate::ecosystem::Dependency,
+    key: &PackageKey,
+    versions: VersionData<'_>,
+    formatter: &dyn EcosystemFormatter,
+) -> Option<StatusMarker> {
+    if versions.lookup_miss_for(key) == Some(LookupMiss::NotLookedUp) {
+        return Some(NOT_LOOKED_UP_MARKER);
+    }
+    let tooltip = match versions.reportable_lookup_miss(dep, key, formatter)? {
+        LookupMiss::NotFound => "Package not found in the registry; latest version unknown",
+        LookupMiss::NoComparableVersions => {
+            "No comparable registry version; latest version unknown"
+        }
+        LookupMiss::NotLookedUp => return Some(NOT_LOOKED_UP_MARKER),
+    };
+    Some(StatusMarker {
+        glyph: "⚠",
+        tooltip,
+    })
+}
+
 /// Builds inlay hints showing the latest/in-use version next to each dependency's declaration.
 ///
 /// Shared by every ecosystem's default
@@ -31,9 +70,14 @@ fn sanitize_hint_version(version: &str) -> String {
 /// emitted per dependency that has a version range, using `versions` and
 /// `loading_state` to decide whether cached data is ready to render yet.
 ///
-/// Status markers (the offline `📴` and the `⚠ {resolved}` shown when the registry lookup
-/// failed for a lock-file dependency, #1884) are fixed text, not configurable through
+/// Status markers (the offline `📴`, the `⚠ {resolved}` shown when the registry lookup
+/// failed for a lock-file dependency, #1884, and the neutral `ℹ {resolved}` for a dependency
+/// that was never looked up, #1935) are fixed text, not configurable through
 /// [`EcosystemConfig`], and appear regardless of `show_up_to_date_hints`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "shared generator past 300 lines, split tracked in #1952"
+)]
 pub fn generate_inlay_hints(
     parse_result: &dyn ParseResult,
     versions: VersionData<'_>,
@@ -173,25 +217,17 @@ pub fn generate_inlay_hints(
             }
 
             if let Some(resolved) = &resolved_version
-                && let Some(miss) = versions.reportable_lookup_miss(dep, &key, formatter)
+                && let Some(marker) = lookup_miss_marker(dep, &key, versions, formatter)
             {
-                let tooltip = match miss {
-                    LookupMiss::NotFound => {
-                        "Package not found in the registry; latest version unknown"
-                    }
-                    LookupMiss::NoComparableVersions => {
-                        "No comparable registry version; latest version unknown"
-                    }
-                    LookupMiss::NotLookedUp => "Package not looked up; latest version unknown",
-                };
                 hints.push(InlayHint {
                     position: version_range.end,
                     label: InlayHintLabel::String(format!(
-                        "⚠ {}",
+                        "{} {}",
+                        marker.glyph,
                         sanitize_hint_version(resolved.as_str())
                     )),
                     kind: Some(InlayHintKind::TYPE),
-                    tooltip: Some(InlayHintTooltip::String(tooltip.to_string())),
+                    tooltip: Some(InlayHintTooltip::String(marker.tooltip.to_string())),
                     padding_left: Some(true),
                     padding_right: None,
                     text_edits: None,

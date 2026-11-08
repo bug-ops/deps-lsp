@@ -138,6 +138,10 @@ struct AccumulatedDep {
 /// # Errors
 ///
 /// Returns an error if the content is not well-formed XML.
+#[expect(
+    clippy::too_many_lines,
+    reason = "13 mutable parse-state vars threaded through one XML event loop"
+)]
 pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
     let line_table = LineOffsetTable::new(content);
     let mut dependencies: Vec<AccumulatedDep> = Vec::new();

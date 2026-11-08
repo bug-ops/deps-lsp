@@ -14,11 +14,12 @@ use url::Url;
 
 use crate::config::{SwiftParseContext, TrustedLookupRegistry, UserConfigPath};
 use crate::ecosystem::SwiftEcosystem;
+use crate::package_location::RegistryIdentityBuf;
 use crate::parser::SwiftParseResult;
 use crate::registry::SwiftRegistry;
 use crate::scm::{
-    IdentityLookup, MemoKey, ScmLookupUrl, ScmSwizzleMode, ScmToRegistryHandle, SwiftForm,
-    SwiftOrigin, SwiftRequirementForm, SwizzleInput, swizzle_decision,
+    IdentityLookup, MemoKey, RegistryIndexUrl, ScmLookupUrl, ScmSwizzleMode, ScmToRegistryHandle,
+    SwiftForm, SwiftOrigin, SwiftRequirementForm, SwizzleInput, swizzle_decision,
 };
 use crate::types::SwiftDependency;
 
@@ -170,7 +171,7 @@ async fn test_prefetch_warms_the_memo_then_the_reparse_swaps_the_dependency() {
             mirrors_public_registry: false,
         }
     );
-    assert_matches!(&swapped.origin, SwiftOrigin::Swizzled { scm } if scm.wire() == NIO_URL);
+    assert_matches!(&swapped.origin, SwiftOrigin::Swizzled { scm, .. } if scm.wire() == NIO_URL);
     assert_eq!(swapped.url, NIO_URL);
     assert_eq!(swapped.name_range, dependency(&first).name_range);
     assert_eq!(swapped.version_range, dependency(&first).version_range);
@@ -628,6 +629,11 @@ fn test_a_reverted_swizzled_dependency_is_exactly_the_declared_one() {
     };
     swizzled.origin = SwiftOrigin::Swizzled {
         scm: ScmLookupUrl::parse(&declared.url).unwrap(),
+        identity: RegistryIdentityBuf::parse("apple.swift-nio").unwrap(),
+        index: RegistryIndexUrl::of(&crate::config::SwiftRegistryUrl::for_test(
+            "https://registry.example",
+            deps_core::net_policy::RegistryTrust::Trusted,
+        )),
     };
 
     swizzled.revert_to_scm();

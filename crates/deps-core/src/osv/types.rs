@@ -1609,6 +1609,11 @@ impl DependencyVulnerabilities {
 pub enum SkipReason {
     /// `dep.source()` was not [`crate::parser::DependencySource::Registry`] (§3 step 0).
     NonRegistrySource,
+    /// `dep.source()` was not public registry content, but its route is one the ecosystem
+    /// marks as an unverified mirror that may proxy public content (an npm `registry=`
+    /// override, a Go `GOPROXY` chain with every hop rejected), so it was never queried and the
+    /// user is told so (#1917). Unlike [`Self::NonRegistrySource`] this is surfaced, not silent.
+    UnverifiedRegistrySource,
     /// No lockfile-resolved or concrete version was available (§3 steps 1-3).
     NoConcreteVersion,
     /// A tag was resolved (e.g. a SHA pin's hover `**Resolved**` line) but it is a moving
@@ -1653,6 +1658,7 @@ impl SkipReason {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::NonRegistrySource => "non-registry-source",
+            Self::UnverifiedRegistrySource => "unverified-registry-source",
             Self::NoConcreteVersion => "no-concrete-version",
             Self::ResolvedTagNotFullVersion => "resolved-tag-not-full-version",
             Self::UnmappableName => "unmappable-name",
@@ -1704,11 +1710,18 @@ impl SkipReason {
     ///     Some("the resolved tag is not a full version, so it was not queried")
     /// );
     /// assert_eq!(SkipReason::NonRegistrySource.unchecked_reason(), None);
+    /// assert_eq!(
+    ///     SkipReason::UnverifiedRegistrySource.unchecked_reason(),
+    ///     Some("the registry is not verified as a public mirror, so it was not queried")
+    /// );
     /// ```
     #[must_use]
     pub const fn unchecked_reason(self) -> Option<&'static str> {
         match self {
             Self::NonRegistrySource => None,
+            Self::UnverifiedRegistrySource => {
+                Some("the registry is not verified as a public mirror, so it was not queried")
+            }
             Self::NoConcreteVersion => Some("no resolved or exact version was available to query"),
             Self::ResolvedTagNotFullVersion => {
                 Some("the resolved tag is not a full version, so it was not queried")
@@ -1760,6 +1773,7 @@ impl SkipReason {
         matches!(
             self,
             Self::NonRegistrySource
+                | Self::UnverifiedRegistrySource
                 | Self::UnmappableName
                 | Self::TemplatedName
                 | Self::UnmappableEcosystem
@@ -1796,6 +1810,8 @@ impl SkipReason {
 pub enum StructuralSkipReason {
     /// See [`SkipReason::NonRegistrySource`].
     NonRegistrySource,
+    /// See [`SkipReason::UnverifiedRegistrySource`].
+    UnverifiedRegistrySource,
     /// See [`SkipReason::UnmappableName`].
     UnmappableName,
     /// See [`SkipReason::TemplatedName`].
@@ -1811,11 +1827,43 @@ impl StructuralSkipReason {
     pub const fn as_skip_reason(self) -> SkipReason {
         match self {
             Self::NonRegistrySource => SkipReason::NonRegistrySource,
+            Self::UnverifiedRegistrySource => SkipReason::UnverifiedRegistrySource,
             Self::UnmappableName => SkipReason::UnmappableName,
             Self::TemplatedName => SkipReason::TemplatedName,
             Self::UnmappableEcosystem => SkipReason::UnmappableEcosystem,
         }
     }
+
+    /// Whether this skip was decided from the dependency's *source*, so a cached entry goes
+    /// stale when that source later becomes public registry content (issue #1531).
+    #[must_use]
+    pub const fn depends_on_source(self) -> bool {
+        match self {
+            Self::NonRegistrySource | Self::UnverifiedRegistrySource => true,
+            Self::UnmappableName | Self::TemplatedName | Self::UnmappableEcosystem => false,
+        }
+    }
+}
+
+/// How an ecosystem classifies a dependency whose source is not public registry content
+/// (see [`crate::lsp_helpers::OsvNaming::non_public_route`]).
+///
+/// Exhaustive on purpose: adding a variant forces every `match` to decide how it surfaces.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::NonPublicRoute;
+///
+/// assert_ne!(NonPublicRoute::Private, NonPublicRoute::UnverifiedMirror);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonPublicRoute {
+    /// A private, local or user-declared "do not verify" route: skipped silently.
+    Private,
+    /// A route that plausibly proxies public content but cannot be verified as doing so:
+    /// skipped, and reported as [`StructuralSkipReason::UnverifiedRegistrySource`].
+    UnverifiedMirror,
 }
 
 impl From<StructuralSkipReason> for SkipReason {
@@ -1834,6 +1882,10 @@ mod skip_reason_unchecked_reason_tests {
     fn unchecked_reason_covers_every_variant() {
         let cases: &[(SkipReason, Option<&str>)] = &[
             (SkipReason::NonRegistrySource, None),
+            (
+                SkipReason::UnverifiedRegistrySource,
+                Some("the registry is not verified as a public mirror, so it was not queried"),
+            ),
             (
                 SkipReason::NoConcreteVersion,
                 Some("no resolved or exact version was available to query"),

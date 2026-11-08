@@ -135,6 +135,10 @@ impl PypiParser {
     /// # Errors
     ///
     /// Same as [`Self::parse_requirements`] — never actually errs.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "8 mutable accumulators shared across the directive and line loops"
+    )]
     pub fn parse_requirements_with_policy(
         &self,
         content: &str,

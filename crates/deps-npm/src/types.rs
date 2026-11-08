@@ -349,6 +349,8 @@ pub struct NpmDependency {
     /// Resolved by `.npmrc` lookup (spec `032-npm-npmrc-registry-support`) — `Registry`
     /// (the public default) unless a `registry=`/`@scope:registry=` entry applies.
     pub source: deps_core::parser::DependencySource,
+    /// The `.npmrc` entry that produced [`Self::source`]; `None` when no entry applied.
+    pub(crate) registry_entry: Option<NpmRegistryEntry>,
     /// The real registry package name from an
     /// [`npm:` alias value](https://docs.npmjs.com/cli/v10/configuring-npm/package-json#dependencies)
     /// (`"my-react": "npm:react@^18.0.0"`), when present. `None` for an ordinary, non-aliased
@@ -364,7 +366,35 @@ pub struct NpmDependency {
     pub package: Option<deps_core::PackageName>,
 }
 
+/// Which `.npmrc` entry routed a dependency to a non-default registry.
+///
+/// The top-level `registry=` is the user's replacement for npmjs and so plausibly a mirror of
+/// it; an `@scope:registry=` entry names a registry for that scope's packages, which are
+/// private by convention (#1917).
+///
+/// # Examples
+///
+/// ```
+/// use deps_npm::types::NpmRegistryEntry;
+///
+/// assert_ne!(NpmRegistryEntry::TopLevel, NpmRegistryEntry::Scope);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NpmRegistryEntry {
+    /// The top-level `registry=` entry.
+    TopLevel,
+    /// A matching `@scope:registry=` entry, which wins over the top-level entry.
+    Scope,
+}
+
 impl NpmDependency {
+    /// The `.npmrc` entry that routed this dependency, or `None` when none applied (the public
+    /// default registry, or a non-registry specifier).
+    #[must_use]
+    pub const fn registry_entry(&self) -> Option<NpmRegistryEntry> {
+        self.registry_entry
+    }
+
     /// The `catalog:` reference this dependency was declared with (spec 046), or `None` for a
     /// literal-range dependency and for a catalog entry itself.
     #[must_use]
@@ -732,6 +762,7 @@ mod tests {
                 catalog_ref: None,
             },
             source: deps_core::parser::DependencySource::Registry,
+            registry_entry: None,
             package: None,
         };
 

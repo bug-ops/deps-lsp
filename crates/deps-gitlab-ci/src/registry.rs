@@ -8,9 +8,9 @@ use dashmap::DashMap;
 use deps_core::error::{DepsError, RateLimitEvidence, Result};
 use deps_core::github::{normalize_tag, semver_tags_newest_first};
 use deps_core::lsp_helpers::{
-    BranchEvidence, CommitLineage, CommitSha, DefaultBranchMembership, LatestRelease,
-    LowercaseNaming, NormalizeName, ProbeAnswer, ProbeBackend, ProbeEffect, ProbePlan, ProbeRef,
-    ProbeReport, ProbeStores, TagIndex, TagName, run_probe_pass,
+    BranchEvidence, CommitLineage, CommitSha, DefaultBranchMembership, GitTagVersion,
+    LowercaseNaming, NormalizeName, ProbeAnswer, ProbeBackend, ProbeKind, ProbePlan, ProbeRef,
+    ProbeReport, ProbeStores, TagIndex, branch_answer, parsed_answer, run_probe_pass,
 };
 use deps_core::pagination::ListCoverage;
 use deps_core::rate_limit::{DEFAULT_COOLDOWN_SECS, ProbeAllowance, RateLimitGate};
@@ -209,16 +209,31 @@ fn releases_to_versions(releases: Vec<GitlabRelease>) -> Vec<GitlabCiVersion> {
     versions
 }
 
-/// Derives `project_path` (and, for a [`EndpointKind::Releases`] route, strips the trailing
+/// The path of a project on its GitLab host (`group/subgroup/project`), the part of a
+/// host-qualified dependency name that the API addresses it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectPath(String);
+
+impl ProjectPath {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Derives the [`ProjectPath`] (and, for a [`EndpointKind::Releases`] route, strips the trailing
 /// component-name segment) from a host-qualified `name` (spec §3.1) and the route's bare
 /// host.
-fn project_path_from_name(name: &str, host_bare: &str, endpoint: EndpointKind) -> Option<String> {
+pub(crate) fn project_path_from_name(
+    name: &str,
+    host_bare: &str,
+    endpoint: EndpointKind,
+) -> Option<ProjectPath> {
     let remainder = name.strip_prefix(host_bare)?.strip_prefix('/')?;
     match endpoint {
-        EndpointKind::Tags => Some(remainder.to_string()),
+        EndpointKind::Tags => Some(ProjectPath(remainder.to_string())),
         EndpointKind::Releases => remainder
             .rsplit_once('/')
-            .map(|(path, _component)| path.to_string()),
+            .map(|(path, _component)| ProjectPath(path.to_string())),
     }
 }
 
@@ -238,7 +253,7 @@ pub struct GitlabCiRegistry {
     probe_stores: Arc<ProbeStores>,
     /// One probe budget per host (spec 086 FR-021), created on first use from that host's
     /// quota meter, token binding and rate-limit gate.
-    probe_allowances: Arc<DashMap<String, Arc<ProbeAllowance>>>,
+    probe_allowances: Arc<DashMap<GitlabHost, Arc<ProbeAllowance>>>,
 }
 
 /// What one document asks one GitLab host: the plan, and the project path of each project the
@@ -246,7 +261,7 @@ pub struct GitlabCiRegistry {
 pub(crate) struct HostProbePlan {
     pub(crate) host: GitlabHost,
     pub(crate) plan: ProbePlan,
-    pub(crate) projects: HashMap<PackageName, String>,
+    pub(crate) projects: HashMap<PackageName, ProjectPath>,
 }
 
 /// Asks one GitLab host the probe questions.
@@ -256,23 +271,30 @@ pub(crate) struct HostProbePlan {
 struct GitlabProbeBackend<'a> {
     client: &'a GitlabApiClient,
     host: &'a GitlabHost,
-    projects: &'a HashMap<PackageName, String>,
+    projects: &'a HashMap<PackageName, ProjectPath>,
 }
 
 impl GitlabProbeBackend<'_> {
-    async fn merge_base(
+    /// One merge-base request, read through `parse`; a project the plan does not name is
+    /// inconclusive without a request.
+    async fn merge_base_answer<T>(
         &self,
+        kind: ProbeKind,
         package: &PackageName,
         first: MergeBaseRef<'_>,
         pin: &CommitSha,
-    ) -> Option<CommitSha> {
-        let path = self.projects.get(package)?;
-        let body = self
+        parse: impl FnOnce(&CommitSha) -> T,
+    ) -> ProbeAnswer<T> {
+        let Some(path) = self.projects.get(package) else {
+            return ProbeAnswer::Inconclusive;
+        };
+        let result = self
             .client
-            .fetch_merge_base(self.host, path, first, pin)
-            .await
-            .ok()?;
-        parse_merge_base(&body)
+            .fetch_merge_base(self.host, path.as_str(), first, pin)
+            .await;
+        parsed_answer(kind, result, |body| {
+            parse_merge_base(&body).map(|base| parse(&base))
+        })
     }
 }
 
@@ -286,13 +308,11 @@ impl ProbeBackend for GitlabProbeBackend<'_> {
             let Some(path) = self.projects.get(package) else {
                 return ProbeAnswer::Inconclusive;
             };
-            match self.client.fetch_branch(self.host, path, git_ref).await {
-                Ok(_) => ProbeAnswer::Answer(BranchEvidence::Exists),
-                Err(DepsError::HttpStatus { status: 404, .. }) => {
-                    ProbeAnswer::Answer(BranchEvidence::Absent)
-                }
-                Err(_) => ProbeAnswer::Inconclusive,
-            }
+            branch_answer(
+                self.client
+                    .fetch_branch(self.host, path.as_str(), git_ref)
+                    .await,
+            )
         })
     }
 
@@ -303,11 +323,14 @@ impl ProbeBackend for GitlabProbeBackend<'_> {
         pin: &'a CommitSha,
     ) -> deps_core::ecosystem::BoxFuture<'a, ProbeAnswer<CommitLineage>> {
         Box::pin(async move {
-            self.merge_base(package, MergeBaseRef::Commit(latest), pin)
-                .await
-                .map_or(ProbeAnswer::Inconclusive, |base| {
-                    ProbeAnswer::Answer(CommitLineage::from_merge_base(&base, latest, pin))
-                })
+            self.merge_base_answer(
+                ProbeKind::Lineage,
+                package,
+                MergeBaseRef::Commit(latest),
+                pin,
+                |base| CommitLineage::from_merge_base(base, latest, pin),
+            )
+            .await
         })
     }
 
@@ -317,12 +340,29 @@ impl ProbeBackend for GitlabProbeBackend<'_> {
         pin: &'a CommitSha,
     ) -> deps_core::ecosystem::BoxFuture<'a, ProbeAnswer<DefaultBranchMembership>> {
         Box::pin(async move {
-            self.merge_base(package, MergeBaseRef::DefaultBranchHead, pin)
-                .await
-                .map_or(ProbeAnswer::Inconclusive, |base| {
-                    ProbeAnswer::Answer(DefaultBranchMembership::from_merge_base(&base, pin))
-                })
+            self.merge_base_answer(
+                ProbeKind::Membership,
+                package,
+                MergeBaseRef::DefaultBranchHead,
+                pin,
+                |base| DefaultBranchMembership::from_merge_base(base, pin),
+            )
+            .await
         })
+    }
+}
+
+impl GitTagVersion for GitlabCiVersion {
+    fn tag(&self) -> &str {
+        self.version.as_str()
+    }
+
+    fn is_prerelease(&self) -> bool {
+        self.prerelease
+    }
+
+    fn commit(&self) -> Option<&CommitSha> {
+        self.sha.as_ref()
     }
 }
 
@@ -352,7 +392,7 @@ impl GitlabCiRegistry {
     fn probe_allowance(&self, host: &GitlabHost) -> Arc<ProbeAllowance> {
         Arc::clone(
             self.probe_allowances
-                .entry(host.origin().to_string())
+                .entry(host.clone())
                 .or_insert_with(|| {
                     Arc::new(ProbeAllowance::new(
                         self.client.probe_credential(host),
@@ -368,7 +408,6 @@ impl GitlabCiRegistry {
     /// evidence changed as a [`deps_core::RefreshEvent::ProbeEvidence`].
     pub(crate) async fn run_probes(&self, plans: &[HostProbePlan]) -> ProbeReport {
         let mut report = ProbeReport::default();
-        let mut announced = HashSet::new();
         for host_plan in plans {
             let backend = GitlabProbeBackend {
                 client: &self.client,
@@ -380,33 +419,12 @@ impl GitlabCiRegistry {
                 &backend,
                 &self.probe_allowance(&host_plan.host),
                 &self.probe_stores,
+                &self.tag_refreshes,
             )
             .await;
             report = report.merge(outcome.report);
-            for repository in outcome.changed {
-                if announced.insert(repository.clone()) {
-                    self.tag_refreshes.send_probe_evidence(repository);
-                }
-            }
-        }
-        if announced.is_empty() {
-            report.effect = ProbeEffect::Unchanged;
         }
         report
-    }
-
-    /// Remembers the newest stable release of `name`, the commit a SHA pin is proven ahead of.
-    fn record_latest_release(&self, name: &PackageName, versions: &[GitlabCiVersion]) {
-        let latest = versions.iter().find(|version| !version.prerelease);
-        if let Some((version, commit)) = latest.and_then(|v| Some((v, v.sha.clone()?))) {
-            self.probe_stores.record_latest(
-                LowercaseNaming.normalize_package_name(name),
-                LatestRelease {
-                    tag: TagName::from_published(version.version.as_str().to_string()),
-                    commit,
-                },
-            );
-        }
     }
 
     /// Subscribes to tag-index refresh events: the project's [`PackageName`] is sent when a
@@ -598,7 +616,7 @@ impl GitlabCiRegistry {
                     tags.coverage,
                 );
                 let versions = tags_to_versions(tags.items);
-                self.record_latest_release(name, &versions);
+                self.probe_stores.record_latest_from(name, &versions);
                 versions
             }
             EndpointKind::Releases => {

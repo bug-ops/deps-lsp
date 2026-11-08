@@ -200,6 +200,7 @@ impl ProbeReport {
     }
 }
 
+// TODO(#1944): shared SWR store and single-flight
 /// A bounded map that evicts its least recently used entry and marks entries stale after a TTL.
 ///
 /// Stale-while-revalidate: [`Self::get`] keeps serving the last authoritative answer after its
@@ -568,28 +569,52 @@ impl DefaultBranchMembership {
 ///
 /// # Examples
 ///
+/// Only a [`CommitEvidenceStore`] builds one, from probe answers it was given, so evidence
+/// (and the [`AheadProof`] it yields) cannot be written out by hand.
+///
 /// ```
-/// use deps_core::lsp_helpers::{CommitEvidence, CommitLineage, DefaultBranchMembership, TagName};
-///
-/// let latest = TagName::from_published("v4.2.2".to_string());
-/// let proven = CommitEvidence {
-///     lineage: Some(CommitLineage::AheadOfLatest { ahead_by: Some(3) }),
-///     membership: Some(DefaultBranchMembership::Reachable),
+/// use std::time::Duration;
+/// use deps_core::PackageName;
+/// use deps_core::lsp_helpers::{
+///     CommitEvidenceStore, CommitLineage, CommitSha, DefaultBranchMembership, LowercaseNaming,
+///     NormalizeName, TagName,
 /// };
-/// assert_eq!(proven.proven_ahead(&latest).unwrap().ahead_by, Some(3));
 ///
-/// let imposter = CommitEvidence { membership: Some(DefaultBranchMembership::NotProven), ..proven };
-/// assert!(imposter.proven_ahead(&latest).is_none());
+/// let store = CommitEvidenceStore::new(Duration::from_secs(3600));
+/// let repo = LowercaseNaming.normalize_package_name(&PackageName::new("o/r"));
+/// let release = CommitSha::parse(&"a".repeat(40)).unwrap();
+/// let pin = CommitSha::parse(&"b".repeat(40)).unwrap();
+/// let fork = CommitSha::parse(&"c".repeat(40)).unwrap();
+/// let latest = TagName::from_published("v4.2.2".to_string());
+/// let ahead = CommitLineage::AheadOfLatest { ahead_by: Some(3) };
+/// store.record_lineage(repo.clone(), release.clone(), pin.clone(), ahead);
+/// store.record_membership(repo.clone(), pin.clone(), DefaultBranchMembership::Reachable);
+/// store.record_lineage(repo.clone(), release.clone(), fork.clone(), ahead);
+/// store.record_membership(repo.clone(), fork.clone(), DefaultBranchMembership::NotProven);
+///
+/// let proven = store.evidence(&repo, &release, &pin);
+/// assert_eq!(proven.proven_ahead(&latest).unwrap().ahead_by(), Some(3));
+/// assert!(store.evidence(&repo, &release, &fork).proven_ahead(&latest).is_none());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CommitEvidence {
-    /// Lineage against the latest release commit, if probed.
-    pub lineage: Option<CommitLineage>,
-    /// Reachability from the default branch, if probed.
-    pub membership: Option<DefaultBranchMembership>,
+    lineage: Option<CommitLineage>,
+    membership: Option<DefaultBranchMembership>,
 }
 
 impl CommitEvidence {
+    /// Lineage against the latest release commit, if probed.
+    #[must_use]
+    pub const fn lineage(&self) -> Option<CommitLineage> {
+        self.lineage
+    }
+
+    /// Reachability from the default branch, if probed.
+    #[must_use]
+    pub const fn membership(&self) -> Option<DefaultBranchMembership> {
+        self.membership
+    }
+
     /// The proof that the pin is ahead of release `latest_tag` and on the default branch, or
     /// `None` unless both [`CommitLineage::AheadOfLatest`] and
     /// [`DefaultBranchMembership::Reachable`] hold.
@@ -617,23 +642,52 @@ impl CommitEvidence {
 /// `Outdated` pin) and the hover line, see [`HoverProvenance::CommitAheadOfLatestRelease`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AheadProof {
-    /// Commits the pin is ahead of the release, when the forge reports it.
-    pub ahead_by: Option<u32>,
-    /// The latest release tag the pin is ahead of.
-    pub latest_tag: TagName,
+    ahead_by: Option<u32>,
+    latest_tag: TagName,
 }
 
 impl AheadProof {
+    /// Commits the pin is ahead of the release, when the forge reports it.
+    #[must_use]
+    pub const fn ahead_by(&self) -> Option<u32> {
+        self.ahead_by
+    }
+
+    /// The latest release tag the pin is ahead of.
+    #[must_use]
+    pub const fn latest_tag(&self) -> &TagName {
+        &self.latest_tag
+    }
+
     /// `status` with a pin the proof covers lifted from `Outdated` to `UpToDate`; any other
     /// status is left alone.
     ///
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::{AheadProof, RequirementStatus, TagName};
+    /// use std::time::Duration;
+    /// use deps_core::PackageName;
+    /// use deps_core::lsp_helpers::{
+    ///     CommitEvidenceStore, CommitLineage, CommitSha, DefaultBranchMembership,
+    ///     LowercaseNaming, NormalizeName, RequirementStatus, TagName,
+    /// };
     ///
+    /// let store = CommitEvidenceStore::new(Duration::from_secs(3600));
+    /// let repo = LowercaseNaming.normalize_package_name(&PackageName::new("o/r"));
+    /// let release = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let pin = CommitSha::parse(&"b".repeat(40)).unwrap();
+    /// store.record_lineage(
+    ///     repo.clone(),
+    ///     release.clone(),
+    ///     pin.clone(),
+    ///     CommitLineage::AheadOfLatest { ahead_by: None },
+    /// );
+    /// store.record_membership(repo.clone(), pin.clone(), DefaultBranchMembership::Reachable);
     /// let latest_tag = TagName::from_published("v4.2.2".to_string());
-    /// let proof = AheadProof { ahead_by: None, latest_tag };
+    /// let proof = store
+    ///     .evidence(&repo, &release, &pin)
+    ///     .proven_ahead(&latest_tag)
+    ///     .unwrap();
     /// assert_eq!(proof.override_status(RequirementStatus::Outdated), RequirementStatus::UpToDate);
     /// assert_eq!(proof.override_status(RequirementStatus::Unresolved), RequirementStatus::Unresolved);
     /// ```
@@ -716,9 +770,9 @@ struct MembershipKey {
 /// let release = CommitSha::parse(&"a".repeat(40)).unwrap();
 /// let pin = CommitSha::parse(&"b".repeat(40)).unwrap();
 /// store.record_lineage(repo.clone(), release.clone(), pin.clone(), CommitLineage::NotAhead);
-/// assert_eq!(store.evidence(&repo, &release, &pin).lineage, Some(CommitLineage::NotAhead));
+/// assert_eq!(store.evidence(&repo, &release, &pin).lineage(), Some(CommitLineage::NotAhead));
 /// let newer = CommitSha::parse(&"c".repeat(40)).unwrap();
-/// assert_eq!(store.evidence(&repo, &newer, &pin).lineage, None);
+/// assert_eq!(store.evidence(&repo, &newer, &pin).lineage(), None);
 /// ```
 #[derive(Debug)]
 pub struct CommitEvidenceStore {
@@ -1018,10 +1072,12 @@ mod tests {
 
     #[test]
     fn ahead_proof_only_lifts_an_outdated_status() {
-        let proof = AheadProof {
-            ahead_by: Some(1),
-            latest_tag: "v1".into(),
-        };
+        let proof = CommitEvidence {
+            lineage: Some(CommitLineage::AheadOfLatest { ahead_by: Some(1) }),
+            membership: Some(DefaultBranchMembership::Reachable),
+        }
+        .proven_ahead(&"v1".into())
+        .unwrap();
         assert_eq!(
             proof.override_status(RequirementStatus::Outdated),
             RequirementStatus::UpToDate

@@ -153,9 +153,14 @@ fn parse_hop(
 }
 
 /// Where a Go setting came from, so a rejected `GOPROXY` hop names the layer to fix.
+///
+/// Exhaustive: these are the only layers read today; the `$GOROOT/go.env` defaults layer is
+/// tracked in #1948.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GoSettingSource {
+pub enum GoSettingSource {
+    /// The process environment (an exported variable).
     ProcessEnv,
+    /// The user `$GOENV` file (`go env -w`).
     GoenvFile,
 }
 
@@ -231,14 +236,6 @@ pub struct GoProxyChain {
 }
 
 impl GoProxyChain {
-    /// Whether the chain can download anything: `off`/`direct`-only chains fetch nothing, so no
-    /// checksum database ever verifies their content.
-    fn has_url_hop(&self) -> bool {
-        self.hops
-            .iter()
-            .any(|hop| matches!(hop, GoProxyHop::Url(_)))
-    }
-
     fn keyed(hops: Vec<GoProxyHop>, separators: Vec<ChainSeparator>) -> Self {
         let hop_parts = hops.iter().map(|hop| match hop {
             GoProxyHop::Url(url) => url.as_str(),
@@ -281,6 +278,7 @@ pub const GOPRIVATE_CHAIN_KEY: &str = "go-private:direct";
 struct GoProxyChainFailure {
     for_resolution: InvalidEntry,
     first_blocked: Option<(BlockedHost, RedactedUrl)>,
+    source: GoSettingSource,
 }
 
 /// Parses a raw `GOPROXY` value (FR-002) into either a non-empty [`GoProxyChain`], or — when
@@ -381,6 +379,7 @@ fn parse_goproxy(
         Err(GoProxyChainFailure {
             for_resolution,
             first_blocked,
+            source,
         })
     } else {
         Ok(GoProxyChain::keyed(hops, separators))
@@ -868,8 +867,10 @@ impl GoEnvConfig {
     /// - A `GOPROXY` override where every hop is invalid -> [`DependencySource::CustomRegistry`]
     ///   (FR-009, fail-closed, never a `proxy.golang.org` fallback).
     /// - Otherwise a `GOPROXY` override -> [`DependencySource::AlternateRegistry`] pointing at the
-    ///   chain [`Self::goproxy_chain`] registers; it counts as public registry content only when
-    ///   the checksum database verifies it (`mirrors_public_registry`, which never affects routing).
+    ///   chain [`Self::goproxy_chain`] registers; it counts as public registry content whenever the
+    ///   module's identity is verified against the public checksum database, whatever the hop kind
+    ///   (`direct` and `off` chains included, since `go` still verifies origin fetches) —
+    ///   `mirrors_public_registry` never affects routing.
     /// - No `GOPROXY` override: a module matching `GOPRIVATE` or `GONOSUMDB` is bypassed too, so
     ///   it never reaches `proxy.golang.org` or a public service, even when `GONOPROXY` excludes
     ///   it; any other module is plain [`DependencySource::Registry`] (US-005).
@@ -886,8 +887,7 @@ impl GoEnvConfig {
         match &self.goproxy {
             Some(Ok(chain)) => DependencySource::AlternateRegistry {
                 index: chain.key.clone(),
-                mirrors_public_registry: chain.has_url_hop()
-                    && self.mirrors_public_content(module_path),
+                mirrors_public_registry: self.mirrors_public_content(module_path),
             },
             Some(Err(failure)) => DependencySource::CustomRegistry {
                 url: failure.for_resolution.raw.to_string(),
@@ -947,6 +947,17 @@ impl GoEnvConfig {
     pub fn rejected_reason_for(&self) -> Option<(RegistryRejectionReason, String)> {
         match &self.goproxy {
             Some(Err(failure)) => failure.for_resolution.rejection_reason(),
+            _ => None,
+        }
+    }
+
+    /// The setting layer whose `GOPROXY` failed closed, so a diagnostic can point at the
+    /// variable to fix rather than at a `go.mod` line (#1937). `None` when `GOPROXY` is absent
+    /// or yielded a usable chain.
+    #[must_use]
+    pub const fn failed_goproxy_source(&self) -> Option<GoSettingSource> {
+        match &self.goproxy {
+            Some(Err(failure)) => Some(failure.source),
             _ => None,
         }
     }
@@ -1276,7 +1287,7 @@ impl GoParseContext {
 /// Windows). `GOENV=off` disables the file (`None`), as `go` itself does, and an empty or
 /// relative `GOENV` is ignored without falling back to the default: a relative path would
 /// resolve against a directory a repository can influence.
-// TODO(critic): the `$GOROOT/go.env` defaults layer (Go 1.21+) is not read.
+// TODO(#1948): the `$GOROOT/go.env` defaults layer (Go 1.21+) is not read.
 #[must_use]
 pub fn goenv_path() -> Option<OperatorPath> {
     goenv_path_with_env(&ProcessEnv)
@@ -2769,23 +2780,51 @@ mod tests {
         assert!(!unreachable.registers_bypass_chain());
     }
 
-    /// Security M1: a chain with no URL hop downloads nothing, so it is never public content.
+    /// #1914: `go` verifies origin fetches against the checksum database too, so a chain without
+    /// a URL hop (or one whose only URL hop was rejected) is still public content.
     #[test]
-    fn test_off_or_direct_only_chains_are_not_public_content() {
-        for goproxy in ["off", "direct", "off,direct", "direct,off"] {
+    fn test_off_or_direct_only_chains_are_public_content() {
+        for goproxy in [
+            "off",
+            "direct",
+            "off,direct",
+            "direct,off",
+            "https://user:pw@proxy.example,direct",
+        ] {
             let env = MapEnv::new().with_var("GOPROXY", goproxy);
             let config = layered(&env, None);
-            assert_eq!(
-                config.resolve_source_for("github.com/a/b"),
-                chain_source(&config, false),
-                "{goproxy}"
-            );
+            assert!(mirrors(&config, "github.com/a/b"), "{goproxy}");
         }
         let url_chain = layered(
             &MapEnv::new().with_var("GOPROXY", "https://corp-proxy.example,direct"),
             None,
         );
         assert!(mirrors(&url_chain, "github.com/a/b"));
+    }
+
+    #[test]
+    fn test_direct_chain_excludes_unverified_modules_from_public_content() {
+        let direct = |extra: (&str, &str)| {
+            layered(
+                &MapEnv::new()
+                    .with_var("GOPROXY", "direct")
+                    .with_var(extra.0, extra.1),
+                None,
+            )
+        };
+        assert!(!mirrors(&direct(("GOSUMDB", "off")), "github.com/a/b"));
+        assert!(!mirrors(
+            &direct(("GONOSUMDB", "corp.example/*")),
+            "corp.example/x"
+        ));
+        assert!(mirrors(
+            &direct(("GONOSUMDB", "corp.example/*")),
+            "github.com/a/b"
+        ));
+        assert!(!mirrors(
+            &direct(("GOPRIVATE", "corp.example/*")),
+            "corp.example/x"
+        ));
     }
 
     #[test]

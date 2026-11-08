@@ -10,8 +10,9 @@ use deps_core::github::{
 };
 use deps_core::lsp_helpers::{
     BranchEvidence, CommitLineage, CommitSha, CompareSummary, DefaultBranchMembership,
-    LatestRelease, LowercaseNaming, NormalizeName, ProbeAnswer, ProbeBackend, ProbeOutcome,
-    ProbePlan, ProbeRef, ProbeStores, TagIndex, TagName, run_probe_pass,
+    GitTagVersion, LowercaseNaming, NormalizeName, ProbeAnswer, ProbeBackend, ProbeKind,
+    ProbeOutcome, ProbePlan, ProbeRef, ProbeStores, TagIndex, branch_answer, parsed_answer,
+    run_probe_pass,
 };
 use deps_core::pagination::ListCoverage;
 use deps_core::rate_limit::{DEFAULT_COOLDOWN_SECS, ProbeAllowance, RateLimitGate};
@@ -230,20 +231,14 @@ impl GithubActionsRegistry {
     /// A probe neither trips nor consults anything but the budget: the tag-index gate only
     /// denies probes, never the reverse.
     pub(crate) async fn run_probes(&self, plan: &ProbePlan) -> ProbeOutcome {
-        let outcome = run_probe_pass(
+        run_probe_pass(
             plan,
             &GithubProbeBackend(&self.github),
             &self.probe_allowance,
             &self.probe_stores,
+            &self.tag_refreshes,
         )
-        .await;
-        let mut announced = std::collections::HashSet::new();
-        for repository in &outcome.changed {
-            if announced.insert(repository) {
-                self.tag_refreshes.send_probe_evidence(repository.clone());
-            }
-        }
-        outcome
+        .await
     }
 
     /// Shares this registry's [`TagIndex`] map with a [`crate::formatter::GithubActionsFormatter`],
@@ -376,19 +371,6 @@ impl GithubActionsRegistry {
         );
     }
 
-    /// Remembers the newest stable release of `name`, the commit a SHA pin is proven ahead of.
-    fn record_latest_release(&self, name: &PackageName, versions: &[GithubActionsVersion]) {
-        if let Some(latest) = versions.iter().find(|version| !version.prerelease) {
-            self.probe_stores.record_latest(
-                LowercaseNaming.normalize_package_name(name),
-                LatestRelease {
-                    tag: TagName::from_published(latest.version.as_str().to_string()),
-                    commit: latest.sha.clone(),
-                },
-            );
-        }
-    }
-
     /// Fetches all semver-tagged versions for `name` (`owner/repo`).
     ///
     /// Returns versions sorted newest-first. Non-semver tags are skipped. Follows GitHub
@@ -429,7 +411,8 @@ impl GithubActionsRegistry {
 
         self.populate_tag_index(&package_name, &tags.items, tags.coverage);
         let versions = tags_to_versions(tags.items);
-        self.record_latest_release(&package_name, &versions);
+        self.probe_stores
+            .record_latest_from(&package_name, &versions);
         Ok(versions)
     }
 
@@ -514,19 +497,17 @@ impl GithubActionsRegistry {
 /// inconclusive and stores nothing.
 struct GithubProbeBackend<'a>(&'a GithubTagsClient);
 
-impl GithubProbeBackend<'_> {
-    async fn compare(
-        &self,
-        package: &PackageName,
-        base: CompareBase<'_>,
-        pin: &CommitSha,
-    ) -> Option<CompareSummary> {
-        let body = self
-            .0
-            .fetch_compare(package.as_str(), base, pin)
-            .await
-            .ok()?;
-        CompareSummary::parse(&body)
+impl GitTagVersion for GithubActionsVersion {
+    fn tag(&self) -> &str {
+        self.version.as_str()
+    }
+
+    fn is_prerelease(&self) -> bool {
+        self.prerelease
+    }
+
+    fn commit(&self) -> Option<&CommitSha> {
+        Some(&self.sha)
     }
 }
 
@@ -536,15 +517,9 @@ impl ProbeBackend for GithubProbeBackend<'_> {
         package: &'a PackageName,
         git_ref: &'a ProbeRef,
     ) -> deps_core::ecosystem::BoxFuture<'a, ProbeAnswer<BranchEvidence>> {
-        Box::pin(async move {
-            match self.0.fetch_branch_ref(package.as_str(), git_ref).await {
-                Ok(_) => ProbeAnswer::Answer(BranchEvidence::Exists),
-                Err(DepsError::HttpStatus { status: 404, .. }) => {
-                    ProbeAnswer::Answer(BranchEvidence::Absent)
-                }
-                Err(_) => ProbeAnswer::Inconclusive,
-            }
-        })
+        Box::pin(
+            async move { branch_answer(self.0.fetch_branch_ref(package.as_str(), git_ref).await) },
+        )
     }
 
     fn lineage<'a>(
@@ -554,11 +529,13 @@ impl ProbeBackend for GithubProbeBackend<'_> {
         pin: &'a CommitSha,
     ) -> deps_core::ecosystem::BoxFuture<'a, ProbeAnswer<CommitLineage>> {
         Box::pin(async move {
-            self.compare(package, CompareBase::Commit(latest), pin)
-                .await
-                .map_or(ProbeAnswer::Inconclusive, |summary| {
-                    ProbeAnswer::Answer(CommitLineage::from_compare(summary))
-                })
+            let result = self
+                .0
+                .fetch_compare(package.as_str(), CompareBase::Commit(latest), pin)
+                .await;
+            parsed_answer(ProbeKind::Lineage, result, |body| {
+                CompareSummary::parse(&body).map(CommitLineage::from_compare)
+            })
         })
     }
 
@@ -568,11 +545,13 @@ impl ProbeBackend for GithubProbeBackend<'_> {
         pin: &'a CommitSha,
     ) -> deps_core::ecosystem::BoxFuture<'a, ProbeAnswer<DefaultBranchMembership>> {
         Box::pin(async move {
-            self.compare(package, CompareBase::DefaultBranchHead, pin)
-                .await
-                .map_or(ProbeAnswer::Inconclusive, |summary| {
-                    ProbeAnswer::Answer(DefaultBranchMembership::from_compare(summary))
-                })
+            let result = self
+                .0
+                .fetch_compare(package.as_str(), CompareBase::DefaultBranchHead, pin)
+                .await;
+            parsed_answer(ProbeKind::Membership, result, |body| {
+                CompareSummary::parse(&body).map(DefaultBranchMembership::from_compare)
+            })
         })
     }
 }

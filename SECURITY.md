@@ -2,10 +2,12 @@
 
 ## Supported Versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 2.0.x   | :white_check_mark: |
-| < 2.0   | :x:                |
+| Version              | Supported          |
+| -------------------- | ------------------ |
+| Latest release       | :white_check_mark: |
+| Any older release    | :x:                |
+
+Security fixes ship in the next release; they are not backported.
 
 ## Reporting a Vulnerability
 

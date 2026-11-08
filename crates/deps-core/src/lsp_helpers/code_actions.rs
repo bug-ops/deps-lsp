@@ -561,6 +561,10 @@ fn build_replacement_action(
 /// impl plus `ParseResult`/`Dependency` mocks, which live as private test
 /// fixtures in the sibling `test_support` module rather than as public
 /// API — see the `generate_code_actions_*` tests here for realistic calls.
+#[expect(
+    clippy::too_many_lines,
+    reason = "shared generator past 300 lines, split tracked in #1952"
+)]
 pub async fn generate_code_actions<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,

@@ -26,7 +26,7 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::parser::DependencySource;
 use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
-use deps_core::{Range, Result};
+use deps_core::{DepsError, Range, Result};
 use url::Url;
 use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
 use yaml_rust2::scanner::Marker;
@@ -415,14 +415,15 @@ fn build_dependency(
 ///
 /// Gated first (as `deps-dart`'s pubspec.yaml parser) by [`deps_core::check_yaml_bounds`],
 /// which returns a real [`deps_core::DepsError::ParseError`]. A downstream YAML syntax
-/// error, by contrast, degrades to an **empty** [`GithubActionsParseResult`] (logged at
-/// `debug`) rather than propagating — workflows are numerous per repository, and one
-/// malformed file should not disable hover/completion for every other open workflow.
+/// error also returns that error so the user sees a `parse-error` diagnostic, except for
+/// files routed only by the bare `action.yml`/`action.yaml` basename (#706), which match
+/// anywhere in a workspace and degrade to an **empty** [`GithubActionsParseResult`].
 ///
 /// # Errors
 ///
-/// Returns [`deps_core::DepsError::ParseError`] only when `content` exceeds the shared YAML
-/// nesting-depth or expansion-size gate.
+/// Returns [`deps_core::DepsError::ParseError`] when `content` exceeds the shared YAML
+/// nesting-depth or expansion-size gate, or is not valid YAML (except for a bare
+/// `action.yml`/`action.yaml` basename).
 ///
 /// # Examples
 ///
@@ -443,12 +444,15 @@ pub fn parse_workflow_yaml(content: &str, uri: &Url) -> Result<GithubActionsPars
     let mut receiver = WorkflowReceiver::new();
     let mut parser = Parser::new_from_str(content);
     if let Err(e) = parser.load(&mut receiver, false) {
-        tracing::debug!(error = %e, "failed to parse workflow YAML, treating as empty");
-        return Ok(GithubActionsParseResult {
-            dependencies: Vec::new(),
-            uri: uri.clone(),
-            dependency_truncation: None,
-        });
+        if is_action_manifest_filename(uri) {
+            tracing::debug!(error = %e, "failed to parse action manifest YAML, treating as empty");
+            return Ok(GithubActionsParseResult {
+                dependencies: Vec::new(),
+                uri: uri.clone(),
+                dependency_truncation: None,
+            });
+        }
+        return Err(DepsError::parse_error("workflow.yml", &e));
     }
 
     // #706 (security, LOW): `action.yml`/`action.yaml` routes by bare basename, matching
@@ -506,7 +510,7 @@ fn is_action_manifest_filename(uri: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::{Dependency, DepsError};
+    use deps_core::Dependency;
     use std::assert_matches;
     use yaml_rust2::scanner::TScalarStyle;
 
@@ -1150,9 +1154,17 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_yaml_returns_empty_result_not_error() {
+    fn test_invalid_yaml_returns_parse_error() {
         let content = "steps:\n  - uses: [unterminated\n";
-        let result = parse_workflow_yaml(content, &test_uri()).unwrap();
+        let result = parse_workflow_yaml(content, &test_uri());
+        assert_matches!(result, Err(DepsError::ParseError { .. }));
+    }
+
+    #[test]
+    fn test_invalid_yaml_in_bare_action_manifest_stays_silent() {
+        let content = "steps:\n  - uses: [unterminated\n";
+        let uri = deps_core::test_util::test_uri("/repo/some/action.yml");
+        let result = parse_workflow_yaml(content, &uri).unwrap();
         assert!(result.dependencies.is_empty());
     }
 

@@ -240,6 +240,10 @@ pub async fn plan_security_updates(
               `deps-lsp::document::osv_scan::run_osv_fix_target_verification`'s identical \
               precedent for the same OSV-plumbing reason"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one verdict decision tree over advisory and upgrade status"
+)]
 fn classify_vulnerable_dependency(
     dep: &dyn deps_core::Dependency,
     dv: &deps_core::osv::DependencyVulnerabilities,

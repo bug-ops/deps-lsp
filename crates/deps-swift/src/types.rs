@@ -44,7 +44,7 @@ pub struct SwiftDependency {
     /// Whether the manifest declares this identity or it was swapped in from a repository URL
     /// (`url` then still holds the URL as written)
     #[raw]
-    pub origin: SwiftOrigin,
+    pub(crate) origin: SwiftOrigin,
 }
 
 deps_core::impl_dependency!(SwiftDependency {

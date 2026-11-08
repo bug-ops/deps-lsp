@@ -373,13 +373,37 @@ fn test_apply_plan_dry_run_leaves_the_manifest_byte_for_byte_intact() {
 /// the cache empty. Composer rather than PyPI because the PyPI parser already normalizes the
 /// name it hands out, so its declared and normalized spellings never differ.
 fn plan_monolog(ignore_name: Option<&str>) -> String {
+    let plan = plan_manifest(&ManifestFixture {
+        ecosystem_id: deps_core::EcosystemId::Composer,
+        uri_path: "/project/composer.json",
+        content: "{\n  \"require\": {\n    \"Monolog/Monolog\": \"^2.0\"\n  }\n}\n",
+        declared_name: "Monolog/Monolog",
+        cache_key: "monolog/monolog",
+        latest: "3.5.0",
+        ignore_name,
+    });
+    deps_cli::format::json::render_update(&plan, DryRun::Yes).expect("render the plan as JSON")
+}
+
+/// One manifest, its registry's latest version and an optional ignore rule, planned in process.
+struct ManifestFixture<'a> {
+    ecosystem_id: deps_core::EcosystemId,
+    uri_path: &'a str,
+    content: &'a str,
+    declared_name: &'a str,
+    cache_key: &'a str,
+    latest: &'a str,
+    ignore_name: Option<&'a str>,
+}
+
+fn plan_manifest(fixture: &ManifestFixture<'_>) -> deps_cli::update::UpdatePlan {
     use deps_cli::analyze::ManifestAnalysis;
     use deps_cli::update::ignore::IgnoreRules;
     use deps_cli::update::plan_updates;
     use deps_core::lsp_helpers::{DependencyOutcomes, PackageVersions};
     use deps_core::net_policy::{MapEnv, RegistryEnvironment};
     use deps_core::policy_config::PolicyConfig;
-    use deps_core::{EcosystemId, EcosystemRegistry, HttpCache, NormalizedName, PackageName};
+    use deps_core::{EcosystemRegistry, HttpCache, NormalizedName, PackageName};
     use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -397,15 +421,15 @@ fn plan_monolog(ignore_name: Option<&str>) -> String {
     let registry = EcosystemRegistry::new();
     let _ = register_ecosystems(&registry, cache, &runtime);
     let ecosystem = registry
-        .get(EcosystemId::Composer)
-        .expect("the Composer ecosystem is registered");
+        .get(fixture.ecosystem_id)
+        .expect("the ecosystem is registered");
     let formatter = ecosystem.formatter();
 
-    let content = "{\n  \"require\": {\n    \"Monolog/Monolog\": \"^2.0\"\n  }\n}\n";
-    let uri = deps_core::test_util::test_uri("/project/composer.json");
+    let content = fixture.content;
+    let uri = deps_core::test_util::test_uri(fixture.uri_path);
     let parse_result = deps_core::ecosystem::parse_manifest_now(ecosystem.as_ref(), content, &uri)
         .expect("the fixture parses");
-    let declared = PackageName::new("Monolog/Monolog");
+    let declared = PackageName::new(fixture.declared_name);
     assert!(
         parse_result
             .dependencies()
@@ -416,14 +440,14 @@ fn plan_monolog(ignore_name: Option<&str>) -> String {
 
     let mut cached = HashMap::new();
     cached.insert(
-        NormalizedName::for_test("monolog/monolog"),
-        PackageVersions::latest_only("3.5.0"),
+        NormalizedName::for_test(fixture.cache_key),
+        PackageVersions::latest_only(fixture.latest),
     );
     let analysis = ManifestAnalysis {
         parse_result,
         uri,
         now: deps_core::PublishTime::now(),
-        ecosystem_id: EcosystemId::Composer,
+        ecosystem_id: fixture.ecosystem_id,
         cached_versions: cached,
         resolved_versions: HashMap::new(),
         resolved_version_candidates: HashMap::new(),
@@ -443,7 +467,7 @@ fn plan_monolog(ignore_name: Option<&str>) -> String {
         probe_report: deps_core::lsp_helpers::ProbeReport::default(),
     };
 
-    let ignore_rules = match ignore_name {
+    let ignore_rules = match fixture.ignore_name {
         None => IgnoreRules::empty(),
         Some(name) => {
             let dir = tempfile::tempdir().expect("create temp dir");
@@ -455,17 +479,70 @@ fn plan_monolog(ignore_name: Option<&str>) -> String {
         }
     };
     let reparse = |_: &str| -> Option<Box<dyn deps_core::ParseResult>> { None };
-    let plan = plan_updates(
+    plan_updates(
         &analysis,
         content,
         formatter,
         &reparse,
-        &["monolog/monolog".to_string()],
+        &[fixture.cache_key.to_string()],
         &ignore_rules,
         deps_core::FreshnessSettings::Disabled,
         analysis.now,
-    );
-    deps_cli::format::json::render_update(&plan, DryRun::Yes).expect("render the plan as JSON")
+    )
+}
+
+/// SC-024 (#1933): `deps-cli update` writes the operator-keeping text for Bundler and Composer
+/// constraints. It plans through the same `replacement_text` the LSP code actions use, so the
+/// expected strings are also the code actions' `newText`.
+#[test]
+fn test_update_keeps_bundler_and_composer_constraint_operator_1933() {
+    use deps_core::EcosystemId;
+
+    let composer = |constraint: &str| {
+        (
+            EcosystemId::Composer,
+            "/project/composer.json",
+            "vendor/pkg",
+            format!("{{\n  \"require\": {{\n    \"vendor/pkg\": \"{constraint}\"\n  }}\n}}\n"),
+        )
+    };
+    let bundler = |constraint: &str| {
+        (
+            EcosystemId::Bundler,
+            "/project/Gemfile",
+            "vendor-pkg",
+            format!("source \"https://rubygems.org\"\ngem \"vendor-pkg\", \"{constraint}\"\n"),
+        )
+    };
+    let rows = [
+        (bundler("~> 2.0"), "3.2.8", "~> 3.2"),
+        (bundler("2.3.0"), "3.2.8", "3.2.8"),
+        (composer("^2.0"), "3.12.1", "^3.12"),
+        (composer("~6.0"), "8.3.1", "~8.3"),
+        (composer("^5.0@beta"), "8.1.11", "^8.1@beta"),
+        (composer("^2.0 || ^3.0"), "4.1.0", "4.1.0"),
+    ];
+    for ((ecosystem_id, uri_path, name, content), latest, expected) in rows {
+        let plan = plan_manifest(&ManifestFixture {
+            ecosystem_id,
+            uri_path,
+            content: &content,
+            declared_name: name,
+            cache_key: name,
+            latest,
+            ignore_name: None,
+        });
+        let [item] = plan.items.as_slice() else {
+            panic!("{expected}: expected one planned item, got {plan:?}");
+        };
+        let Outcome::Applied { edit, .. } = &item.outcome else {
+            panic!(
+                "{expected}: expected an applied edit, got {:?}",
+                item.outcome
+            );
+        };
+        assert_eq!(edit.new_text, expected, "{content}");
+    }
 }
 
 /// N3: `--package monolog/monolog` selects `Monolog/Monolog`, and the JSON names it with the

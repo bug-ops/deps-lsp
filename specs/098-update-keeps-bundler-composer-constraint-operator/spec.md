@@ -12,7 +12,7 @@ tags:
   - deps-core
   - priority/p2
 created: 2026-11-08
-status: draft
+status: implemented
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
@@ -27,7 +27,7 @@ related:
 > **Issue**: to be filed (labels `bug`, `P2`, `cross-ecosystem`)
 > **Branch**: suggested `fix/<issue>-keep-bundler-composer-operator`
 > **Related shipped work**: #1885 (npm/Deno keep `^`, `~`, `=`; PR #1896), #1892/#1895 (fallback exact pin, partial precision; PR #1898)
-> **Phase**: specify. Open `[NEEDS CLARIFICATION]`: 9.
+> **Phase**: specify, implemented (issue #1933). Open `[NEEDS CLARIFICATION]`: 0.
 
 > [!abstract]
 > The "update to X" code action, the vulnerability and unsatisfiable-requirement quickfixes, the "Update N outdated" code lens and `deps-cli update` rewrite a Bundler `~> 2.0` and a Composer `^2.0`, `~6.0` or `^5.0@beta` constraint to a bare version. In both package managers a bare version is an exact pin, so the edit silently turns a range into a pin (and Composer also loses its `@beta`/`@dev` stability flag). npm and Deno were fixed in #1885; Cargo, Dart and PyPI already keep their operator. This spec makes the operator-keeping rule a single `deps-core` behavior that Bundler and Composer adopt, with a per-ecosystem table of expected rewrites.
@@ -66,7 +66,7 @@ An update edit for a Bundler or Composer dependency preserves the constraint's o
 ### Out of Scope
 
 - The `deps-cli update` table's empty "current" column for these dependencies (`[applied] rack  -> 3.2.8`). It is cosmetic and tracked separately; this spec does not change table rendering.
-- NuGet, Maven and Gradle. A bare version there is a minimum bound (`BareMeaning::Floor`); the shared helper already refuses to collapse a bounded requirement and keeps `[1.0.0]` brackets. No divergence was found by code reading; not verified live (see Open Questions).
+- NuGet, Maven and Gradle. A bare version there is a minimum bound (`BareMeaning::Floor`); the shared helper already refuses to collapse a bounded requirement and keeps `[1.0.0]` brackets. No divergence was found by code reading; not verified live (see Resolved Questions, Q7).
 - Completion (`format_version_for_completion`): it inserts a version the user is typing and has no existing operator to preserve.
 - Composer branch constraints (`dev-main`, `dev-main as 1.0.x-dev`, `1.0.x-dev`) and VCS/path repositories: they are not version updates.
 - Changing which version is picked (latest, cooldown, minimum-stability, vulnerability fix target). Only the rendering of the chosen version changes.
@@ -176,8 +176,8 @@ THEN the literal becomes "~> 2.9.1"
 | `^2.0`, picked 3.0.0-beta1 | `^3.0.0-beta1` (full) |
 | Composer `^v2.0`, picked `v3.12.1` (Packagist raw tag) | `^v3.12` |
 | Composer 4-segment operand `~1.2.3.4`, picked 1.3.0.1 | `~1.3.0.1` |
-| `~> 2.0` and picked version has fewer segments than the operand (picked `3.2`) | `~> 3.2` (pad nothing; never invent segments) |
-| `"^5.0@beta"` with picked stable 8.1.11 | `^8.1@beta` (flag kept verbatim, see Open Questions) |
+| `~> 2.0.1` and picked version has fewer segments than the operand (picked `3.2`) | `~> 3.2.0` (pad with `0` up to the operand's segment count so the range never widens; prerelease picks are written as is) |
+| `"^5.0@beta"` with picked stable 8.1.11 | `^8.1@beta` (flag kept verbatim, see Resolved Questions, Q5) |
 | `"^5.0 @beta"` (space before flag) | spacing kept as written |
 | Compound with `<` bound (`>=1.0 <2.0`) | bare picked version, as today |
 | `*` or empty Composer constraint | bare picked version, as today (any-version collapse is a narrowing but unchanged here) |
@@ -227,7 +227,7 @@ Aggregate targets: 100% of rows above pass; 0 byte differences in the existing t
 ### Ask First
 - Changing the shared `format_version_replacing_by_shape` result for any ecosystem other than Bundler and Composer (it is used by npm, Deno and others).
 - Adding a dependency (a Composer or RubyGems constraint parser crate); the existing hand-rolled classification is expected to suffice.
-- Rewriting wildcard (`2.*`) or upper-bound constraints (open questions below).
+- Rewriting wildcard (`2.*`) or upper-bound constraints (resolved: wildcards out of scope, #1950; upper bounds stay bare, Q2).
 
 ### Never
 - Edit `crates/deps-zed` (separate repository).
@@ -235,17 +235,18 @@ Aggregate targets: 100% of rows above pass; 0 byte differences in the existing t
 - Use a catch-all `_` arm on `EcosystemId` or an untyped string flag for the stability suffix.
 - Change the CLI table's "current" column in this work.
 
-## 9. Open Questions
+## 9. Resolved Questions
 
-- [NEEDS CLARIFICATION: Q1. Compound with one pessimistic operator plus lower bounds (`~> 1.0, >= 1.0.1`, the Gemfile `thor` line in the fixture). Default in FR-010: render only the operator comparator (`~> 1.9`), dropping the lower bounds because the picked version satisfies them. Alternative: keep the lower bounds verbatim, or leave today's bare pin.]
-- [NEEDS CLARIFICATION: Q2. Other compound shapes (`>=1.0 <2.0`, `^2.0 || ^3.0` beyond latest, upper bounds). Default in FR-011: keep today's bare exact pin, the same choice npm made in #1576. Alternative: refuse the edit (echo unchanged, as Cargo does under `BareMeaning::Caret`), or rewrite the last comparator.]
-- [NEEDS CLARIFICATION: Q3. Single lower bound (`>= 12.0`, Composer `>=2.0`). Default in FR-009: `>= <picked version>`. Today it collapses to an exact pin, which is a large narrowing for an open-ended bound. Alternative: leave as FR-011. Upper-bound singles (`< 3.0`) are assumed to stay on today's bare pin.]
-- [NEEDS CLARIFICATION: Q4. Composer wildcards (`2.*`, `2.0.*`) share the defect (collapse to a bare pin). Default: out of scope here, tracked as a follow-up; alternative: in scope as `3.*` and `3.2.*` using the same precision rule.]
-- [NEEDS CLARIFICATION: Q5. Stability flag when the picked version is a stable release (`^5.0@beta` -> `^8.1@beta`). Default: always keep the flag verbatim (it is user intent and costs nothing). The finding suggested keeping it only "when the picked version is a prerelease or the flag is meaningful". Also: does Composer need `@beta` on a constraint that names a prerelease version (`^3.0.0-beta1` with no flag, under `minimum-stability: stable`)? `composer` is not installed in the test environment; verify against Composer itself before fixing FR-004's no-flag behavior.]
-- [NEEDS CLARIFICATION: Q6. Truncation versus full version for plain (non-floor) updates. Default: truncate to the operand's precision (FR-002, FR-003), matching the finding's `^2.0` -> `^3.12`. Alternative: always write the full version for caret and truncate only for `~`/`~>`, where precision changes meaning. The first choice leaves the floor slightly below the picked version (`^3.12` admits 3.12.0).]
-- [NEEDS CLARIFICATION: Q7. Likely same defect class in other ecosystems: Cargo, npm and Dart tilde with fewer segments than the full picked version (`~1` or `~1.2` rewritten to `~1.13.1`) narrows a major or minor range to a patch range. Not verified live. Default: out of scope for this fix; verify with the harness and file a separate `cross-ecosystem` issue if confirmed, reusing the FR-002 helper.]
-- [NEEDS CLARIFICATION: Q8. Other `BareMeaning::ExactPin` ecosystems with operator grammar not covered by this table: Swift (`.upToNextMajor(from:)`, ranges) and Go, GitHub Actions and GitLab CI (tags, no operators). Default: audit by code reading in the plan phase and record the result; no change expected.]
-- [NEEDS CLARIFICATION: Q9. Composer inline aliases (`dev-main as 1.0.x-dev`) and `-dev` suffixes on version-like constraints (`1.0.x-dev`). Default: treated as non-version constraints and left unchanged; confirm the parser already excludes them from update edits.]
+- **Q1 (resolved).** A compound made of one `~>`/`~`/`^` comparator plus lower bounds the picked version satisfies renders only the operator comparator, per FR-001..006 (`~> 1.0, >= 1.0.1` with 1.9.0 picked gives `~> 1.9`). If any lower bound is NOT satisfied, render the bare picked version.
+- **Q2 (resolved).** Every other compound (`>=1.0 <2.0`, `^2.0 || ^3.0`, upper bounds, `!=`) renders the bare picked version, as today.
+- **Q3 (resolved).** A single `>=` or `>` renders `>=` plus the picked version, keeping the operator-operand spacing as written. A single `<` or `<=` renders bare, as today.
+- **Q4 (resolved).** Composer wildcards are out of scope; tracked as follow-up #1950.
+- **Q5 (resolved).** The stability flag is kept verbatim and always. No flag is ever added: a prerelease pick with no flag gets none.
+- **Q6 (resolved).** For a plain update, truncate to the operand's segment count for `^`, `~` and `~>`. A floor target, a prerelease pick, or a caret whose picked version is `0.0.x` gets the full version.
+- **Q6a (resolved, impl-critic M2/M8).** A rendered operand never has fewer segments than the declared one: a shorter picked version is padded with `0`. A floor rewrite (`~> 2.0` -> `~> 2.9.1`) deliberately narrows the range to the floor's precision (SC-004), so later plain updates keep that precision; this is accepted, no worse than the former bare pin, and keeps the fix floor exact. A follow-up may render a floor as `~> 2.9, >= 2.9.1` if the narrowing proves unwelcome.
+- **Q7 (resolved, out of scope).** Verified live during implementation; any confirmed Cargo/npm/Dart `~1`/`~1.2` divergence is filed as a separate cross-ecosystem issue.
+- **Q8 (resolved).** Audit result: Swift uses DSL forms, and Go, GitHub Actions and GitLab CI use tags with no operators, so none of them change.
+- **Q9 (resolved).** Composer `dev-*`, `as` aliases and `x-dev` produce no update edit; a regression test asserts no edit.
 
 ## 10. See Also
 

@@ -131,10 +131,12 @@ impl PackageRendering for SwiftFormatter {
     fn hover_provenance(&self, dep: &dyn Dependency) -> Option<HoverProvenance> {
         let swift_dep = dep.as_any().downcast_ref::<SwiftDependency>()?;
         match &swift_dep.origin {
-            SwiftOrigin::Swizzled { scm } => Some(HoverProvenance::ResolvedViaRegistryIdentity {
-                identity: swift_dep.name.clone(),
-                scm: RedactedUrl::new(scm.wire()),
-            }),
+            SwiftOrigin::Swizzled { scm, .. } => {
+                Some(HoverProvenance::ResolvedViaRegistryIdentity {
+                    identity: swift_dep.name.clone(),
+                    scm: RedactedUrl::new(scm.wire()),
+                })
+            }
             SwiftOrigin::Declared => None,
         }
     }
@@ -271,7 +273,7 @@ impl OsvNaming for SwiftFormatter {
             .downcast_ref::<SwiftDependency>()
             .map(|swift_dep| &swift_dep.origin)
         {
-            Some(SwiftOrigin::Swizzled { scm }) => crate::parser::url_to_identity(scm.wire())
+            Some(SwiftOrigin::Swizzled { scm, .. }) => crate::parser::url_to_identity(scm.wire())
                 .filter(|repository| is_valid_owner_repo(repository))
                 .map(|repository| PublicContent {
                     name: Cow::Owned(PackageName::new(repository)),
@@ -542,6 +544,14 @@ mod tests {
             },
             origin: SwiftOrigin::Swizzled {
                 scm: crate::scm::ScmLookupUrl::parse(scm).unwrap(),
+                identity: crate::package_location::RegistryIdentityBuf::parse("apple.swift-nio")
+                    .unwrap(),
+                index: crate::scm::RegistryIndexUrl::of(
+                    &crate::config::SwiftRegistryUrl::for_test(
+                        "https://registry.example/api",
+                        deps_core::net_policy::RegistryTrust::Trusted,
+                    ),
+                ),
             },
             ..dep_with_url("apple.swift-nio", scm)
         }

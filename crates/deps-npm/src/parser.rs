@@ -247,7 +247,7 @@ pub(crate) fn resolve_dependency_sources(
         // Route by the real registry name, not the manifest alias (#654 S2): a `.npmrc`
         // scope entry matches the package actually installed, not the local alias.
         let name = deps_core::Dependency::name(dep).clone();
-        dep.source = npm_config.resolve_source_for(&name);
+        (dep.source, dep.registry_entry) = npm_config.resolve_for(&name);
         if let Some(classification) = npm_config.blocked_class_for(&name) {
             blocked_registries.push(classification.into_occurrence(dep.name_range));
         } else if let Some(classification) = npm_config.rejected_reason_for(&name) {
@@ -307,6 +307,7 @@ fn parse_dependency_section(
             // Overwritten once `.npmrc` resolution runs; `Registry` is correct for a
             // manifest with none (NFR-005) and for this function's own unit tests.
             source: deps_core::parser::DependencySource::Registry,
+            registry_entry: None,
             package,
         });
     }
@@ -1631,6 +1632,48 @@ mod tests {
         );
         assert!(!result.dependencies[0].source.is_version_resolvable());
         assert!(result.resolved_registries.is_empty());
+    }
+
+    /// #1917: each dependency records the `.npmrc` entry that routed it: scoped names without
+    /// their own scope entry follow the top-level entry, a matching scope entry wins, and
+    /// no `.npmrc` records nothing.
+    #[test]
+    fn test_parse_with_context_records_producing_registry_entry() {
+        use crate::types::NpmRegistryEntry;
+
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".npmrc"),
+            "registry=https://registry.npmmirror.com/\n@myorg:registry=https://npm.corp.example/\n",
+        )
+        .unwrap();
+        let uri = Url::from_file_path(root.path().join("package.json")).unwrap();
+
+        let json = r#"{"dependencies": {"@types/node": "^20.0.0", "@babel/core": "^7.0.0", "@myorg/lib": "^1.0.0", "lodash": "4.17.15"}}"#;
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+        let entry_of = |name: &str| {
+            result
+                .dependencies
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap()
+                .registry_entry()
+        };
+        assert_eq!(entry_of("@types/node"), Some(NpmRegistryEntry::TopLevel));
+        assert_eq!(entry_of("@babel/core"), Some(NpmRegistryEntry::TopLevel));
+        assert_eq!(entry_of("@myorg/lib"), Some(NpmRegistryEntry::Scope));
+        assert_eq!(entry_of("lodash"), Some(NpmRegistryEntry::TopLevel));
+
+        let no_npmrc = tempfile::tempdir().unwrap();
+        let uri = Url::from_file_path(no_npmrc.path().join("package.json")).unwrap();
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+        assert!(
+            result
+                .dependencies
+                .iter()
+                .all(|d| d.registry_entry().is_none())
+        );
     }
 
     /// NFR-005: no `.npmrc` at any tier is byte-identical to pre-feature behavior — every

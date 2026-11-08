@@ -1,9 +1,11 @@
+use crate::types::{NpmDependency, NpmRegistryEntry};
 use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, MAX_REQUIREMENT_LEN, OsvNaming,
     PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
     bare_meaning, format_version_replacing_by_shape, requirement_len_exceeds_cap,
     up_to_date_via_compiled_matcher,
 };
+use deps_core::osv::NonPublicRoute;
 use deps_core::{
     ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName, VersionReq,
 };
@@ -736,7 +738,21 @@ impl SourcePolicy for NpmFormatter {
     }
 }
 
-impl OsvNaming for NpmFormatter {}
+impl OsvNaming for NpmFormatter {
+    /// A dependency routed by the top-level `registry=` entry is an unverified mirror of npmjs
+    /// (an Artifactory/Nexus/Verdaccio proxy); a scope entry, a failed downcast and every
+    /// non-registry specifier stay private and silent (#1917).
+    fn non_public_route(&self, dep: &dyn Dependency) -> NonPublicRoute {
+        let entry = dep
+            .as_any()
+            .downcast_ref::<NpmDependency>()
+            .and_then(NpmDependency::registry_entry);
+        match entry {
+            Some(NpmRegistryEntry::TopLevel) => NonPublicRoute::UnverifiedMirror,
+            Some(NpmRegistryEntry::Scope) | None => NonPublicRoute::Private,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1363,6 +1379,7 @@ mod tests {
                     catalog_ref: None,
                 },
                 source: deps_core::parser::DependencySource::Registry,
+                registry_entry: None,
                 package: None,
             };
             assert!(

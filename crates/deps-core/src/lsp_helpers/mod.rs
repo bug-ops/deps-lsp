@@ -8,8 +8,8 @@ use std::time::Duration;
 use crate::EcosystemId;
 use crate::error::DepsError;
 use crate::osv::{
-    CandidateStatusMap, CandidateStatuses, LatestStatusMap, ScanOutcome, StructuralSkipReason,
-    UpgradeStatus, VulnKey, VulnSeverity, VulnerabilityMap,
+    CandidateStatusMap, CandidateStatuses, LatestStatusMap, ScanOutcome, UpgradeStatus, VulnKey,
+    VulnSeverity, VulnerabilityMap,
 };
 use crate::package::NormalizedName;
 use crate::position::{Position, Range};
@@ -90,10 +90,10 @@ pub use diagnostics::requirement_is_oversized;
 pub(crate) use diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
 pub use formatter::{
     BareMeaning, BuildMetadataPolicy, DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter,
-    LowercaseNaming, NormalizeName, OsvNameAvailability, OsvNaming, PackageNaming,
+    LowercaseNaming, NormalizeName, OperatorGrammar, OsvNameAvailability, OsvNaming, PackageNaming,
     PackageRendering, PublicContent, RequirementGate, RequirementResolution,
-    RequirementRewriteShape, SourcePolicy, bare_meaning, classify_requirement_rewrite_shape,
-    format_version_replacing_by_shape, requirement_is_compound,
+    RequirementRewriteShape, RewriteTarget, SourcePolicy, bare_meaning,
+    classify_requirement_rewrite_shape, format_version_replacing_by_shape, requirement_is_compound,
     up_to_date_for_comparators_via_compiled_matcher, up_to_date_via_compiled_matcher,
 };
 pub use git_pin::{
@@ -133,8 +133,9 @@ pub use interactive_fetch::{
     await_interactive_versions,
 };
 pub use probe_pass::{
-    BranchProbe, CommitProbe, EVIDENCE_TTL, LatestRelease, PROBE_CONCURRENCY, ProbeAnswer,
-    ProbeBackend, ProbeOutcome, ProbePlan, ProbeStores, run_probe_pass,
+    BranchProbe, CommitProbe, EVIDENCE_TTL, GitTagVersion, LatestRelease, PROBE_CONCURRENCY,
+    ProbeAnswer, ProbeBackend, ProbeKind, ProbeOutcome, ProbePlan, ProbeQuestion, ProbeStores,
+    branch_answer, parsed_answer, run_probe_pass,
 };
 #[cfg(feature = "lsp-responses")]
 pub use sha_comment::build_sha_comment_fix_action;
@@ -1878,19 +1879,19 @@ pub fn latest_verdict(
 /// [`candidate_verdict`] (#1524) — factored out so the two never drift on what "clean" vs.
 /// "vulnerable" vs. "unverified"/"not applicable" means for a checked candidate.
 ///
-/// A `SkipReason::NonRegistrySource` structural entry is cached under `dep`'s plain
-/// [`crate::osv::VulnKey`] (name, not source), so it survives untouched if `dep`'s source later
-/// changes from e.g. path/git to registry — until the next phase B run overwrites it. Since that
-/// window would otherwise read as the fail-open [`LatestVerdict::NotApplicable`] for a dependency
-/// that is now registry-resolvable and simply hasn't been checked yet, this re-checks `dep`'s
-/// *current* source before trusting a cached `NonRegistrySource` skip (issue #1531). The check
-/// goes through `formatter.public_content` — the same predicate phase B itself
-/// uses to classify `NonRegistrySource` in the first place (`deps-engine`'s `classify::osv`) —
-/// rather than a bare `DependencySource::Registry` match, so an ecosystem that widens what counts
-/// as registry content (e.g. `deps-cargo`'s `AlternateRegistry { mirrors_public_registry: true }` for a
-/// configured crates.io mirror) is not itself misread as still-non-registry and wrongly kept
-/// stale. A mismatch means the entry is stale, so it fails closed to
-/// [`LatestVerdict::Unverified`] instead.
+/// A source-dependent structural entry (`NonRegistrySource`, `UnverifiedRegistrySource`) is
+/// cached under `dep`'s plain [`crate::osv::VulnKey`] (name, not source), so it survives
+/// untouched if `dep`'s source later changes from e.g. path/git to registry — until the next
+/// phase B run overwrites it. Since that window would otherwise read as the fail-open
+/// [`LatestVerdict::NotApplicable`] for a dependency that is now registry-resolvable and simply
+/// hasn't been checked yet, this re-checks `dep`'s *current* source before trusting a cached
+/// source-dependent skip (issue #1531). The check goes through `formatter.public_content` — the
+/// same predicate phase B itself uses to classify the skip in the first place (`deps-engine`'s
+/// `classify::osv`) — rather than a bare `DependencySource::Registry` match, so an ecosystem
+/// that widens what counts as registry content (e.g. `deps-cargo`'s
+/// `AlternateRegistry { mirrors_public_registry: true }` for a configured crates.io mirror) is
+/// not itself misread as still-non-registry and wrongly kept stale. A mismatch means the entry
+/// is stale, so it fails closed to [`LatestVerdict::Unverified`] instead.
 fn upgrade_status_to_verdict(
     status: Option<&UpgradeStatus>,
     expected_version: &str,
@@ -1900,8 +1901,8 @@ fn upgrade_status_to_verdict(
     match status {
         None | Some(UpgradeStatus::NotChecked) => LatestVerdict::Unverified,
         Some(UpgradeStatus::StructurallyUnchecked(reason)) => {
-            let stale_non_registry_skip = *reason == StructuralSkipReason::NonRegistrySource
-                && formatter.public_content(dep).is_some();
+            let stale_non_registry_skip =
+                reason.depends_on_source() && formatter.public_content(dep).is_some();
             if stale_non_registry_skip {
                 LatestVerdict::Unverified
             } else {
@@ -3805,7 +3806,7 @@ pub fn dependency_version_range_is_literal(
 mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;
-    use crate::osv::SkipReason;
+    use crate::osv::{SkipReason, StructuralSkipReason};
     use crate::{DependencySource, PackageName, VersionReq};
     use std::assert_matches;
 

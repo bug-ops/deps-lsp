@@ -165,6 +165,24 @@ In CI, set the token so a mistyped ref cannot slip through unchecked. `--offline
 check, and the same checks also decide whether a commit-pinned action ahead of its latest release is
 up to date (see [GitHub Actions](ecosystems/github-actions.md#commits-ahead-of-the-latest-release-issue-1725)).
 
+**Vulnerability data not checked.** A dependency whose registry cannot be verified as a public
+mirror is never sent to OSV: an npm dependency routed by the top-level `registry=` entry in `.npmrc`
+(valid or not), or a Go module whose every `GOPROXY` hop was rejected (including one that also
+matches `GONOSUMDB`). Such a dependency produces no finding, so `--fail-on vulnerable` cannot see it.
+When the run skipped any, `deps-cli` prints exactly one line on stderr and the exit code is
+unaffected:
+
+```text
+deps-cli: note: vulnerability data not checked for N dependencies (registry not verified as a public mirror)
+```
+
+Scoped npm registries (`@scope:registry=`), modules excluded by `GOPRIVATE`, `GONOSUMDB` or
+`GOSUMDB=off` while a usable `GOPROXY` route exists, and VCS or path dependencies are private by
+declaration and stay silent. In the editor, hover shows a "Vulnerability data not checked" footer
+only for dependencies whose registry it can resolve (an npm dependency routed by a valid top-level
+`registry=`); an invalid npm entry and a Go module with every hop rejected get no footer, only the
+CLI note.
+
 | Exit code | Meaning |
 |---|---|
 | `0` | Clean — no finding matched the `--fail-on` policy |

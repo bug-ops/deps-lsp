@@ -358,6 +358,8 @@ impl Backend {
     /// re-parses open Swift documents once it settles (#1879). Never blocks the caller.
     #[cfg(feature = "swift")]
     fn spawn_reparse_when_xcode_settles(&self) {
+        use tracing::Instrument as _;
+
         let handle = Arc::clone(&self.state.scm_to_registry);
         if !handle.xcode_pending() {
             return;
@@ -367,22 +369,27 @@ impl Backend {
             self.client.clone(),
             Arc::clone(&self.config),
         );
-        tokio::spawn(async move {
-            if !handle.xcode_settled().await {
-                return;
+        let span = tracing::Span::current();
+        spawn_supervised(
+            async move {
+                if !handle.xcode_settled().await {
+                    return;
+                }
+                crate::document::reparse::reparse_open_documents(
+                    crate::config::ReparseScope::Ecosystems(
+                        crate::config::SWIFT_SCM_TO_REGISTRY_ECOSYSTEMS.to_vec(),
+                    ),
+                    crate::document::RefetchPolicy::AllDependencies,
+                    "xcode scm-to-registry default read",
+                    state,
+                    client,
+                    config,
+                )
+                .await;
             }
-            crate::document::reparse::reparse_open_documents(
-                crate::config::ReparseScope::Ecosystems(
-                    crate::config::SWIFT_SCM_TO_REGISTRY_ECOSYSTEMS.to_vec(),
-                ),
-                crate::document::RefetchPolicy::AllDependencies,
-                "xcode scm-to-registry default read",
-                state,
-                client,
-                config,
-            )
-            .await;
-        });
+            .instrument(span),
+            |error| tracing::error!(%error, "xcode scm-to-registry reparse task panicked"),
+        );
     }
 
     /// Delivers the notices [`Self::apply_resolved_config`] deferred.
@@ -515,6 +522,10 @@ impl Backend {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "per-document reload loop borrows self and lockfile state inline"
+    )]
     async fn handle_lockfile_change(
         &self,
         lockfile_path: &std::path::Path,

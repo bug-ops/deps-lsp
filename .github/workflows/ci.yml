@@ -709,12 +709,26 @@ jobs:
           echo "Baseline revision: ${rev}"
           echo "rev=${rev}" >> "$GITHUB_OUTPUT"
 
+          # A major bump between baseline and head makes every documented break fail a minor-level check.
+          workspace_major() {
+            awk '/^\[workspace\.package\]/ {in_pkg=1; next} /^\[/ {in_pkg=0} in_pkg && /^version[[:space:]]*=/ {gsub(/"/, "", $3); split($3, v, "."); print v[1]; exit}'
+          }
+          base_major=$(git show "${rev}:Cargo.toml" | workspace_major)
+          head_major=$(workspace_major < Cargo.toml)
+          if [ -n "$base_major" ] && [ "$base_major" != "$head_major" ]; then
+            release_type=major
+          else
+            release_type=minor
+          fi
+          echo "Release type: ${release_type} (baseline major ${base_major:-unknown}, head major ${head_major:-unknown})"
+          echo "release_type=${release_type}" >> "$GITHUB_OUTPUT"
+
       - name: Check semver against the baseline revision
         uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239  # v2.9
         with:
           feature-group: all-features
           baseline-rev: ${{ steps.baseline.outputs.rev }}
-          release-type: minor
+          release-type: ${{ steps.baseline.outputs.release_type }}
 
       # Build health only: `release-type: major` allows every break, so this fails solely when
       # the workspace no longer builds its rustdoc against the published 2.x line.
@@ -732,7 +746,7 @@ jobs:
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           body="Scheduled semver-check run ${run_url} failed.
 
-          This job is part of the weekly regression sweep (\`.github/workflows/ci.yml\`, job \`semver\`), advisory-only on PR/push again since #1048. It compares the workspace against \`main\` as it was seven days earlier at release type minor, so every reported break landed this week: match each one against the \`### Breaking\` section of CHANGELOG.md and add the missing entry, or fix the unintended break. A build failure in the log is a separate, infrastructure-level problem."
+          This job is part of the weekly regression sweep (\`.github/workflows/ci.yml\`, job \`semver\`), advisory-only on PR/push again since #1048. It compares the workspace against \`main\` as it was seven days earlier at release type minor (major when the workspace major version changed in that window, which only checks that the baseline builds), so every reported break landed this week: match each one against the \`### Breaking\` section of CHANGELOG.md and add the missing entry, or fix the unintended break. A build failure in the log is a separate, infrastructure-level problem."
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --search "in:title \"${title}\"" --state open --json number --jq '.[0].number // empty')
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"

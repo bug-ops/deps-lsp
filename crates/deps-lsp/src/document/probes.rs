@@ -14,11 +14,13 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use deps_core::lsp_helpers::ProbePhase;
 use deps_core::{Ecosystem, EcosystemId, RefreshEvent, RefreshEvents};
+use deps_engine::probe::run_background_probes;
 use tokio::sync::{RwLock, broadcast::error::RecvError};
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::Uri;
+use tracing::Instrument;
 
-use super::state::ServerState;
+use super::state::{ServerState, spawn_supervised};
 use super::tag_refresh::{COALESCE_WINDOW, RefreshedRepos, affected_documents};
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
@@ -118,7 +120,7 @@ pub(crate) fn spawn_background_probes(
     uri: &Uri,
     ecosystem: &Arc<dyn Ecosystem>,
 ) {
-    if state.cache.is_offline() || state.probe_slots.claim(uri) == Claim::Coalesced {
+    if state.network_mode().is_offline() || state.probe_slots.claim(uri) == Claim::Coalesced {
         return;
     }
     let mut guard = SlotGuard {
@@ -127,15 +129,23 @@ pub(crate) fn spawn_background_probes(
         finished: false,
     };
     let ecosystem = Arc::clone(ecosystem);
-    tokio::spawn(async move {
-        loop {
-            run_pass(&guard.state, &guard.uri, ecosystem.as_ref()).await;
-            if guard.state.probe_slots.finish(&guard.uri) == Finish::Done {
-                guard.disarm();
-                break;
+    let span = tracing::Span::current();
+    let panic_uri = uri.clone();
+    spawn_supervised(
+        async move {
+            loop {
+                run_pass(&guard.state, &guard.uri, ecosystem.as_ref()).await;
+                if guard.state.probe_slots.finish(&guard.uri) == Finish::Done {
+                    guard.disarm();
+                    break;
+                }
             }
         }
-    });
+        .instrument(span),
+        move |error| {
+            tracing::error!(%error, uri = ?panic_uri, "background probe task panicked");
+        },
+    );
 }
 
 /// One probe pass over the document's current parse result, if it is still open.
@@ -146,9 +156,13 @@ async fn run_pass(state: &ServerState, uri: &Uri, ecosystem: &dyn Ecosystem) {
     else {
         return;
     };
-    let report = ecosystem
-        .background_probes(parse_result.as_ref(), ProbePhase::PostFetch)
-        .await;
+    let report = run_background_probes(
+        ecosystem,
+        parse_result.as_ref(),
+        ProbePhase::PostFetch,
+        state.network_mode(),
+    )
+    .await;
     tracing::debug!(
         issued = report.issued,
         skipped_over_budget = report.skipped_over_budget,

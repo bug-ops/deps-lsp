@@ -485,7 +485,7 @@ impl GithubActionsFormatter {
     /// Projects `dep`'s pin into the shared [`GitPinView`]; `None` when `dep` is not a GitHub
     /// Actions dependency. A tag pin without declared ref text, a branch and an unpinned ref
     /// are [`GitPinView::Other`].
-    fn pin_view(dep: &dyn Dependency) -> Option<GitPinView<'_>> {
+    pub(crate) fn pin_view(dep: &dyn Dependency) -> Option<GitPinView<'_>> {
         let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
         Some(match &gha_dep.pin {
             Some(PinStyle::Sha { sha, comment }) => GitPinView::Sha {

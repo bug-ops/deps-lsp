@@ -5,8 +5,8 @@
 //! findings equal the server's for the same registry answers:
 //!
 //! 1. parse the manifest;
-//! 2. [`ProbePhase::PreFetch`] probes ([`parse_with_pre_fetch_probes`]), which may ask for one
-//!    re-parse;
+//! 2. [`ProbePhase::PreFetch`] probes ([`pre_fetch_decision`], or [`parse_with_pre_fetch_probes`]
+//!    for callers that only want the parse), which may ask for one re-parse;
 //! 3. the registry fetch;
 //! 4. [`ProbePhase::PostFetch`] probes ([`run_background_probes`]);
 //! 5. classify.
@@ -53,11 +53,62 @@ pub async fn run_background_probes(
     ecosystem.background_probes(parse_result, phase).await
 }
 
+/// What the [`ProbePhase::PreFetch`] probes decided about a parse result.
+///
+/// Callers that must commit or diff around the re-parse (the language server) match on this;
+/// [`parse_with_pre_fetch_probes`] is the parse-and-return form built on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreFetchDecision {
+    /// Offline: no probe ran, so there is no report and nothing was learned about the document.
+    Skipped,
+    /// The probes ran and the parse result stands.
+    Keep(ProbeReport),
+    /// The probes ran and changed an input the parse depends on: parse once more. That parse
+    /// must run no probe, so the sequence cannot loop.
+    Reparse(ProbeReport),
+}
+
+/// Runs `ecosystem`'s [`ProbePhase::PreFetch`] probes over `parse_result` and reports whether the
+/// caller must parse again.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn run(
+/// #     ecosystem: &dyn deps_core::Ecosystem,
+/// #     parsed: &dyn deps_core::ParseResult,
+/// # ) {
+/// use deps_core::NetworkMode;
+/// use deps_engine::probe::{PreFetchDecision, pre_fetch_decision};
+///
+/// match pre_fetch_decision(ecosystem, parsed, NetworkMode::Online).await {
+///     PreFetchDecision::Reparse(_) => println!("parse again, without probing"),
+///     PreFetchDecision::Keep(_) | PreFetchDecision::Skipped => {}
+/// }
+/// # }
+/// ```
+pub async fn pre_fetch_decision(
+    ecosystem: &dyn Ecosystem,
+    parse_result: &dyn ParseResult,
+    network: NetworkMode,
+) -> PreFetchDecision {
+    if network.is_offline() {
+        return PreFetchDecision::Skipped;
+    }
+    let report = ecosystem
+        .background_probes(parse_result, ProbePhase::PreFetch)
+        .await;
+    match report.effect {
+        ProbeEffect::Reparse => PreFetchDecision::Reparse(report),
+        ProbeEffect::Unchanged | ProbeEffect::Republish => PreFetchDecision::Keep(report),
+    }
+}
+
 /// Parses `content`, runs the [`ProbePhase::PreFetch`] probes, and re-parses once when a probe
 /// returned [`ProbeEffect::Reparse`].
 ///
 /// The re-parse runs no probe: a probe that changed the parse is applied exactly once, so the
-/// sequence cannot loop. The returned report is the pre-fetch pass's.
+/// sequence cannot loop. The returned report is the pre-fetch pass's (empty when offline).
 ///
 /// # Errors
 ///
@@ -69,19 +120,13 @@ pub async fn parse_with_pre_fetch_probes(
     network: NetworkMode,
 ) -> deps_core::error::Result<(Box<dyn ParseResult>, ProbeReport)> {
     let parsed = deps_core::parse_manifest_blocking(ecosystem, content, uri).await?;
-    let report = run_background_probes(
-        ecosystem.as_ref(),
-        parsed.as_ref(),
-        ProbePhase::PreFetch,
-        network,
-    )
-    .await;
-    match report.effect {
-        ProbeEffect::Reparse => {
+    match pre_fetch_decision(ecosystem.as_ref(), parsed.as_ref(), network).await {
+        PreFetchDecision::Skipped => Ok((parsed, ProbeReport::default())),
+        PreFetchDecision::Keep(report) => Ok((parsed, report)),
+        PreFetchDecision::Reparse(report) => {
             let reparsed = deps_core::parse_manifest_blocking(ecosystem, content, uri).await?;
             Ok((reparsed, report))
         }
-        ProbeEffect::Unchanged | ProbeEffect::Republish => Ok((parsed, report)),
     }
 }
 
@@ -262,6 +307,45 @@ mod tests {
 
         assert_eq!(eco.parse_count(), 1);
         assert!(eco.probe_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn decision_is_skipped_offline_and_never_probes() {
+        let eco = scripted(ProbeEffect::Reparse);
+        let dynamic: Arc<dyn Ecosystem> = eco.clone();
+        let parsed = deps_core::parse_manifest_blocking(&dynamic, "", &uri())
+            .await
+            .unwrap();
+
+        let decision =
+            pre_fetch_decision(eco.as_ref(), parsed.as_ref(), NetworkMode::Offline).await;
+
+        assert_eq!(decision, PreFetchDecision::Skipped);
+        assert!(eco.probe_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn decision_maps_each_effect() {
+        for (effect, expect_reparse) in [
+            (ProbeEffect::Reparse, true),
+            (ProbeEffect::Republish, false),
+            (ProbeEffect::Unchanged, false),
+        ] {
+            let eco = scripted(effect);
+            let dynamic: Arc<dyn Ecosystem> = eco.clone();
+            let parsed = deps_core::parse_manifest_blocking(&dynamic, "", &uri())
+                .await
+                .unwrap();
+
+            let decision =
+                pre_fetch_decision(eco.as_ref(), parsed.as_ref(), NetworkMode::Online).await;
+
+            assert_eq!(
+                matches!(decision, PreFetchDecision::Reparse(_)),
+                expect_reparse
+            );
+            assert_eq!(eco.probe_calls(), [ProbePhase::PreFetch]);
+        }
     }
 
     #[tokio::test]

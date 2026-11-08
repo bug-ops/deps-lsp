@@ -233,7 +233,7 @@ impl GitlabCiFormatter {
     /// A `component:` tag pin is [`GitPinView::Other`]: its Releases list never proves a tag
     /// absent (see [`Self::tag_list_index`]), so no tag-pin conclusion may be drawn from it. A
     /// ref-less include and every non-tag, non-SHA pin are also `Other`.
-    fn pin_view(gl_dep: &GitlabCiDependency) -> GitPinView<'_> {
+    pub(crate) fn pin_view(gl_dep: &GitlabCiDependency) -> GitPinView<'_> {
         match (&gl_dep.pin, gl_dep.kind.endpoint()) {
             (Some(PinStyle::Sha { sha, tail }), _) => GitPinView::Sha {
                 sha,

@@ -886,6 +886,10 @@ fn finalize_pending_gem(
 // The `caps.get(0).unwrap().end()` offset is a regex match end, always a char boundary.
 // Group 1 is mandatory in `GEM_PATTERN` and group 0 always exists on a successful match.
 #[allow(clippy::string_slice, clippy::unwrap_used)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "gem, group, source and git branches share one line-loop state"
+)]
 pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult> {
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();

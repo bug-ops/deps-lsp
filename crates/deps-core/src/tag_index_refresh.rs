@@ -75,6 +75,7 @@ pub enum RefreshEvent {
 pub struct ParseInputKey(String);
 
 impl ParseInputKey {
+    // TODO(#1945): enforce the mint rule by type
     /// Wraps the canonical form of a parse input; call it only from the ecosystem that owns the
     /// input and sends the event.
     #[must_use]

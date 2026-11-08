@@ -807,6 +807,10 @@ impl Pick {
               fetch_latest_versions_parallel or a counter/sender shared across the \
               whole stream; grouping into a struct would only move, not reduce, churn"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "fetch and classify share registry, source and in-use version context"
+)]
 async fn fetch_and_classify_package(
     registry: &dyn Registry,
     key: PackageKey,

@@ -12,7 +12,9 @@
 
 use deps_core::diagnostic::{Diagnostic, DiagnosticKind, Severity};
 use deps_core::lsp_helpers::{redact_name_for_diagnostic, redact_requirement_for_diagnostic};
-use deps_core::osv::{OsvClient, OsvId, ScanOutcome, VulnKeys, VulnSeverity, VulnerabilityMap};
+use deps_core::osv::{
+    OsvClient, OsvId, ScanOutcome, SkipReason, VulnKeys, VulnSeverity, VulnerabilityMap,
+};
 use deps_core::policy_config::PolicyConfig;
 use deps_core::position::Range;
 use deps_core::{Dependency, Ecosystem, EcosystemId, HttpCache};
@@ -447,6 +449,83 @@ pub fn probe_notes(
         .collect()
 }
 
+/// How much of a run's vulnerability scan was skipped because a dependency's registry could not
+/// be verified as a public mirror (#1917).
+///
+/// A skip is silent in the findings: without this, "no vulnerable findings" reads as "no known
+/// vulnerabilities" when nothing was checked. Summed per run and reported once on stderr; it
+/// never changes the exit code.
+///
+/// # Examples
+///
+/// ```
+/// use deps_cli::report::OsvCoverage;
+///
+/// let mut run = OsvCoverage::default();
+/// assert!(run.note().is_none());
+/// run.add(&OsvCoverage::new(1));
+/// assert_eq!(
+///     run.note().as_deref(),
+///     Some("vulnerability data not checked for 1 dependency (registry not verified as a public mirror)")
+/// );
+/// run.add(&OsvCoverage::new(2));
+/// assert_eq!(
+///     run.note().as_deref(),
+///     Some("vulnerability data not checked for 3 dependencies (registry not verified as a public mirror)")
+/// );
+/// ```
+// TODO(#1946): a strict `--fail-on unchecked` gate would turn this count into an exit condition.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OsvCoverage {
+    unverified_registry: usize,
+}
+
+impl OsvCoverage {
+    /// Coverage with `unverified_registry` dependencies skipped for an unverified registry.
+    #[must_use]
+    pub const fn new(unverified_registry: usize) -> Self {
+        Self {
+            unverified_registry,
+        }
+    }
+
+    /// Counts the dependencies in `vulnerabilities` skipped as
+    /// [`SkipReason::UnverifiedRegistrySource`]; zero when the scan did not run.
+    #[must_use]
+    pub fn from_vulnerabilities(vulnerabilities: Option<&VulnerabilityMap>) -> Self {
+        Self::new(vulnerabilities.map_or(0, |map| {
+            map.values()
+                .filter(|outcome| {
+                    matches!(
+                        outcome,
+                        ScanOutcome::Skipped(SkipReason::UnverifiedRegistrySource)
+                    )
+                })
+                .count()
+        }))
+    }
+
+    /// Adds another manifest's coverage into this run total.
+    pub const fn add(&mut self, other: &Self) {
+        self.unverified_registry += other.unverified_registry;
+    }
+
+    /// The stderr note for this run, or `None` when every dependency was either checked or
+    /// skipped for a reason that needs no report.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        let noun = match self.unverified_registry {
+            0 => return None,
+            1 => "dependency",
+            _ => "dependencies",
+        };
+        Some(format!(
+            "vulnerability data not checked for {} {noun} (registry not verified as a public mirror)",
+            self.unverified_registry
+        ))
+    }
+}
+
 impl Default for FailOnPolicy {
     fn default() -> Self {
         Self::default_categories()
@@ -522,6 +601,8 @@ pub struct ManifestCheckResult {
     /// The manifest's ref-probe passes (specs 086/087), summed by the caller into one
     /// [`deps_engine::probe::ProbeSummary`] for the run's single stderr note.
     pub probe_report: deps_core::lsp_helpers::ProbeReport,
+    /// Dependencies whose OSV scan was skipped because their registry is unverified (#1917).
+    pub osv_coverage: OsvCoverage,
 }
 
 /// Classifies one already-routed manifest.
@@ -599,6 +680,7 @@ pub async fn check_manifest(
         registry_unreachable: analysis.registry_unreachable,
         license_fetch_incomplete: analysis.license_fetch_incomplete,
         probe_report: analysis.probe_report,
+        osv_coverage: OsvCoverage::from_vulnerabilities(analysis.vulnerabilities.as_ref()),
     })
 }
 
