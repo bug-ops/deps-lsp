@@ -2212,6 +2212,7 @@ mod initial_fetch_tests;
 #[cfg(test)]
 mod tests {
     use super::super::diff::drop_cache_for_forced_refetch;
+    #[cfg(feature = "cargo")]
     use super::super::fetch::ChangeFetch;
     use super::*;
     use deps_core::ConcreteVersion;

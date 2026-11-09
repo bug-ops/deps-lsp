@@ -10,6 +10,7 @@
 
 use super::{handle_document_change, handle_document_open};
 use crate::config::DepsConfig;
+#[cfg(feature = "npm")]
 use crate::document::osv_scan::osv_scan_plan_is_stale;
 use crate::document::state::ServerState;
 use crate::handlers::diagnostics::handle_diagnostics;
