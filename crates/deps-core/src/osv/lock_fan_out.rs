@@ -207,6 +207,7 @@ fn union_advisories(
 mod tests {
     use super::*;
     use crate::osv::{OsvPackageName, OsvQueryName, VulnSeverity};
+    use std::assert_matches;
 
     fn vulnerable(ids: &[&str]) -> ScanOutcome {
         let advisories: Vec<Arc<Advisory>> = ids
@@ -274,7 +275,7 @@ mod tests {
             vec![("1.2.5", ScanOutcome::Clean)],
             false,
         );
-        assert!(matches!(outcome, ScanOutcome::Clean));
+        assert_matches!(outcome, ScanOutcome::Clean);
     }
 
     #[test]

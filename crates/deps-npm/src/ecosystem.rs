@@ -416,6 +416,7 @@ mod tests {
     use super::*;
     use deps_core::VersionData;
     use std::collections::HashMap;
+    #[cfg(feature = "lsp-responses")]
     use tower_lsp_server::ls_types::Position;
 
     fn pkg(s: &str) -> deps_core::PackageName {
