@@ -33,7 +33,7 @@ use deps_core::parser::DependencySource;
 use deps_core::{Dependency, ParsedView};
 use deps_core::{EcosystemBase, Registry, Result, TypedEcosystem};
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(all(test, feature = "lsp-responses"))]
 use tower_lsp_server::ls_types::Position;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, Range};
