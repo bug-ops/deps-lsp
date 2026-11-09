@@ -91,6 +91,9 @@ pub trait FormattedDependency<'a>: Send + Sync {
 
     /// Like [`Self::resolve_in_use_versions`], reusing `memo` across the dependencies of one
     /// pass so repeated `(name, requirement)` lock selections are computed once.
+    ///
+    /// The default ignores `memo` and gives the same answer unmemoized, so an implementor that
+    /// predates this method stays correct.
     fn resolve_in_use_versions_memoized(
         &self,
         key: &PackageKey,
@@ -98,7 +101,15 @@ pub trait FormattedDependency<'a>: Send + Sync {
         resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
         ecosystem: EcosystemId,
         memo: &mut LockSelectionMemo,
-    ) -> Option<InUseVersions>;
+    ) -> Option<InUseVersions> {
+        let _ = memo;
+        self.resolve_in_use_versions(
+            key,
+            resolved_versions,
+            resolved_version_candidates,
+            ecosystem,
+        )
+    }
 
     /// See [`crate::lsp_helpers::has_unqueryable_resolved_pin`].
     fn has_unqueryable_resolved_pin(&self, ecosystem: EcosystemId) -> bool;
