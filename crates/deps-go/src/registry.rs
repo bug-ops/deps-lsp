@@ -15,7 +15,7 @@
 //! use deps_core::HttpCache;
 //! use std::sync::Arc;
 //!
-//! #[tokio::main]
+//! #[tokio::main(flavor = "current_thread")]
 //! async fn main() {
 //!     let cache = Arc::new(HttpCache::new());
 //!     let registry = GoRegistry::new(cache);
@@ -642,7 +642,7 @@ impl GoRegistry {
     /// # use deps_go::GoRegistry;
     /// # use deps_core::HttpCache;
     /// # use std::sync::Arc;
-    /// # #[tokio::main]
+    /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() {
     /// let cache = Arc::new(HttpCache::new());
     /// let registry = GoRegistry::new(cache);
@@ -685,7 +685,7 @@ impl GoRegistry {
     /// # use deps_go::GoRegistry;
     /// # use deps_core::HttpCache;
     /// # use std::sync::Arc;
-    /// # #[tokio::main]
+    /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() {
     /// let cache = Arc::new(HttpCache::new());
     /// let registry = GoRegistry::new(cache);
@@ -737,7 +737,7 @@ impl GoRegistry {
     /// # use deps_go::GoRegistry;
     /// # use deps_core::HttpCache;
     /// # use std::sync::Arc;
-    /// # #[tokio::main]
+    /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() {
     /// let cache = Arc::new(HttpCache::new());
     /// let registry = GoRegistry::new(cache);
@@ -807,7 +807,7 @@ impl GoRegistry {
     /// # use deps_go::GoRegistry;
     /// # use deps_core::HttpCache;
     /// # use std::sync::Arc;
-    /// # #[tokio::main]
+    /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() {
     /// let cache = Arc::new(HttpCache::new());
     /// let registry = GoRegistry::new(cache);

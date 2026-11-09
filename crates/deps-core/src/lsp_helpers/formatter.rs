@@ -12,7 +12,7 @@ use crate::package::strip_build_metadata;
 use crate::position::Position;
 
 use super::{
-    BoundedVersionReq, RequirementMatcher, RequirementStatus, is_same_major_minor,
+    BoundedVersionReq, CandidateSet, RequirementMatcher, RequirementStatus, is_same_major_minor,
     position_in_range,
 };
 use crate::package::NormalizedName;
@@ -633,7 +633,9 @@ pub fn classify_requirement_rewrite_shape(requirement: &str) -> RequirementRewri
 ///
 /// A tilde requirement keeps its declared precision on a plain update (`~16` -> `~19`,
 /// `~0.7` -> `~0.10`) and gets the full version for [`RewriteTarget::Floor`] or a prerelease
-/// pick.
+/// pick. A partial caret requirement does the same under [`BareMeaning::Caret`] (bare `0.7` ->
+/// `0.10`, `^0.4` -> `1.0`), so Cargo matches npm and Composer (#1990); see
+/// `partial_caret_operand` for the cases that keep the full version.
 ///
 /// Always preserves an [`ExactPin`](RequirementRewriteShape::ExactPin),
 /// [`BracketExactPin`](RequirementRewriteShape::BracketExactPin), or
@@ -712,10 +714,15 @@ pub fn format_version_replacing_by_shape(
         // `Caret`'s own refusal on every other unsafe shape above, since there is no known-safe
         // rewrite to fall back on.
         RequirementRewriteShape::ExplicitCaret => match bare_meaning {
-            BareMeaning::Caret => bare(),
+            BareMeaning::Caret => {
+                partial_caret_operand(current, version, target).unwrap_or_else(bare)
+            }
             BareMeaning::Floor => current.to_string(),
             BareMeaning::ExactPin => format!("^{}", version.as_str()),
         },
+        RequirementRewriteShape::Bare if bare_meaning == BareMeaning::Caret => {
+            partial_caret_operand(current, version, target).unwrap_or_else(bare)
+        }
         RequirementRewriteShape::AnyVersion | RequirementRewriteShape::Bare => bare(),
         RequirementRewriteShape::ExactPin => format!("={}", version.as_str()),
         RequirementRewriteShape::BracketExactPin => format!("[{}]", version.as_str()),
@@ -740,6 +747,32 @@ pub fn format_version_replacing_by_shape(
             }
         }
     }
+}
+
+/// The picked version cut to the declared precision of a caret operand (`0.7` + `0.10.3` -> `0.10`).
+///
+/// Returns `None` when the full version must be written: a [`RewriteTarget::Floor`] target, a
+/// prerelease or `0.0.x` pick or an all-zero operand (precision would change what the range
+/// admits), or a non-plain operand.
+///
+/// `current` may carry a leading `^`, which is not part of the result.
+fn partial_caret_operand(
+    current: &str,
+    version: &ConcreteVersion,
+    target: RewriteTarget,
+) -> Option<String> {
+    let trimmed = current.trim();
+    let operand = trimmed.strip_prefix('^').unwrap_or(trimmed).trim_start();
+    let core = version.as_str();
+    (target == RewriteTarget::Update
+        && !is_prerelease_core(core)
+        && !core.contains('-')
+        && !caret_is_exact(core)
+        && is_plain_numeric_operand(operand)
+        && operand
+            .split('.')
+            .any(|segment| segment.parse::<u64>() != Ok(0)))
+    .then(|| fit_segments(core, operand.split('.').count()))
 }
 
 /// The operand of a caret requirement (explicit `^`, or a bare version under
@@ -1080,7 +1113,17 @@ fn caret_is_exact(core: &str) -> bool {
 
 /// Truncates `core` to `count` segments, padding with `0` when it has fewer so the rewritten
 /// operand never has a lower precision (a wider range) than the declared one.
-fn fit_segments(core: &str, count: usize) -> String {
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::fit_segments;
+///
+/// assert_eq!(fit_segments("0.10.3", 2), "0.10");
+/// assert_eq!(fit_segments("5", 3), "5.0.0");
+/// ```
+#[must_use]
+pub fn fit_segments(core: &str, count: usize) -> String {
     let mut segments: Vec<&str> = core.split('.').take(count).collect();
     while segments.len() < count {
         segments.push("0");
@@ -1954,11 +1997,8 @@ pub trait RequirementResolution: Send + Sync {
     /// only a yanked release, a malformed Maven/Gradle/NuGet range. Scanning either case would
     /// always decide `Some(false)` for every candidate, producing a false "no published
     /// version satisfies" verdict instead of correctly suppressing the check. Implementors of
-    /// the second (predicate-guard) shape should use
-    /// [`crate::lsp_helpers::compile_requirement_unless`], which
-    /// centralizes this contract instead of re-deriving it per ecosystem. `deps-dart` is the
-    /// only ecosystem with neither cause: every requirement string is a valid Dart constraint
-    /// by construction, so its override is always `Some`.
+    /// the second (predicate-guard) shape return `None` from
+    /// [`VersionGrammar::compile`](super::VersionGrammar::compile).
     ///
     /// Default: `None` — an ecosystem that has not opted in emits no unsatisfiable-requirement
     /// diagnostics.
@@ -1980,6 +2020,31 @@ pub trait RequirementResolution: Send + Sync {
         &self,
         _requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
+        None
+    }
+
+    /// Parses `candidates` once so many requirements can be matched against them without
+    /// reparsing, see [`CandidateSet`].
+    ///
+    /// An override must answer every requirement exactly as
+    /// [`Self::compile_bounded_requirement`] followed by [`RequirementMatcher::matches`] would:
+    /// the set's `satisfying` is `None` where the compile is `None`, and `false` for a candidate
+    /// whose `matches` is not `Some(true)`. Ecosystems built on a
+    /// [`VersionGrammar`](super::VersionGrammar) get both from the same grammar.
+    ///
+    /// Default: `None` — the caller compiles and matches per requirement.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::RequirementResolution;
+    ///
+    /// struct DefaultFormatter;
+    /// impl RequirementResolution for DefaultFormatter {}
+    ///
+    /// assert!(DefaultFormatter.candidate_set(&[]).is_none());
+    /// ```
+    fn candidate_set(&self, _candidates: &[ConcreteVersion]) -> Option<Box<dyn CandidateSet>> {
         None
     }
 
@@ -2391,6 +2456,16 @@ pub trait DiagnosticMessages: Send + Sync {
     /// Label for a deprecated package in hover.
     fn deprecated_label(&self) -> &'static str {
         "*(deprecated)*"
+    }
+
+    /// Lead-in of the "newer version" diagnostic for a dependency declared with `requirement`
+    /// (`None` when it declares none), followed by `: <version>`.
+    ///
+    /// Default: `Newer version available`. Override only where the update edit cannot rewrite
+    /// `requirement`, so the wording does not promise a fix that no code action offers (NuGet
+    /// intervals, #1939). Must be a cheap classification of `requirement`, not a lookup.
+    fn newer_version_notice(&self, _requirement: Option<&VersionReq>) -> &'static str {
+        "Newer version available"
     }
 }
 

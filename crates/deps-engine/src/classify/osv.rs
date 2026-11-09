@@ -126,7 +126,7 @@ impl CandidateTagSources {
     ///
     /// let parsed = stub_document(stub_parse_result(1));
     /// let keys = parsed.vulnerability_keys(&HashMap::new(), None);
-    /// let sources = candidate_tag_sources(parsed.as_ref(), &keys, EcosystemId::Cargo);
+    /// let sources = candidate_tag_sources(parsed.as_ref(), &keys);
     /// let siblings = sources
     ///     .siblings_for(&vuln_key("dep-0"), &ConcreteVersion::new("2.0.0"))
     ///     .unwrap();
@@ -154,8 +154,8 @@ impl CandidateTagSources {
 pub fn candidate_tag_sources(
     document: &dyn deps_core::ParsedManifest,
     vuln_keys: &deps_core::osv::VulnKeys,
-    ecosystem: EcosystemId,
 ) -> CandidateTagSources {
+    let ecosystem = document.ecosystem_id();
     let mut by_key: HashMap<deps_core::osv::VulnKey, CandidateTagSource> = HashMap::new();
     document.for_each_formatted_dependency(&mut |bound| {
         let key =
@@ -232,7 +232,6 @@ pub fn candidate_tag_sources(
 ///     parsed.as_ref(),
 ///     &resolved_versions,
 ///     &HashMap::new(),
-///     EcosystemId::Cargo,
 /// );
 ///
 /// assert_eq!(targets.len(), 1);
@@ -242,12 +241,13 @@ pub fn build_scan_targets(
     document: &dyn deps_core::ParsedManifest,
     resolved_versions: &deps_core::ResolvedVersionsMap,
     resolved_version_candidates: &deps_core::ResolvedCandidatesMap,
-    ecosystem: EcosystemId,
 ) -> (
     Vec<deps_core::osv::ScanTarget>,
     deps_core::osv::VulnerabilityMap,
 ) {
     use deps_core::osv::{OsvQueryName, ScanOutcome, SkipReason};
+
+    let ecosystem = document.ecosystem_id();
     use std::collections::hash_map::Entry;
 
     let mut targets: Vec<deps_core::osv::ScanTarget> = Vec::new();
@@ -459,7 +459,7 @@ fn classify_dep_for_check_targets<'a>(
 /// );
 /// let vuln_keys = parsed.vulnerability_keys(&HashMap::new(), None);
 ///
-/// let candidate_tags = candidate_tag_sources(parsed.as_ref(), &vuln_keys, EcosystemId::Cargo);
+/// let candidate_tags = candidate_tag_sources(parsed.as_ref(), &vuln_keys);
 ///
 /// let (targets, structural) =
 ///     build_latest_check_targets(parsed.as_ref(), &cached_versions, &vuln_keys, &candidate_tags);
@@ -889,7 +889,7 @@ fn resolve_fix_target(
 /// // live network check.
 /// let parsed = stub_document(stub_parse_result(1));
 /// let vuln_keys = parsed.vulnerability_keys(&HashMap::new(), None);
-/// let candidate_tags = candidate_tag_sources(parsed.as_ref(), &vuln_keys, EcosystemId::Cargo);
+/// let candidate_tags = candidate_tag_sources(parsed.as_ref(), &vuln_keys);
 /// let (resolved, live_check_candidates) = collect_fix_target_resolutions(
 ///     &vulnerabilities,
 ///     &[vuln_key("pkg")],
@@ -1213,7 +1213,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Cargo,
             );
             assert!(targets.is_empty());
             assert_matches!(
@@ -1243,7 +1242,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Cargo,
             );
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].version, "1.0.195");
@@ -1263,8 +1261,10 @@ mod tests {
             };
             let name = NormalizedName::for_test("serde");
             let resolved = HashMap::from([(name.clone(), "1.0.195".into())]);
-            let candidates =
-                HashMap::from([(name, vec!["1.0.195".into(), "1.0.5".into(), "2.0.0".into()])]);
+            let candidates = HashMap::from([(
+                name,
+                vec!["1.0.195".into(), "1.0.5".into(), "2.0.0".into()].into(),
+            )]);
 
             let (targets, skipped) = build_scan_targets(
                 stub_document_with(
@@ -1275,7 +1275,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &candidates,
-                EcosystemId::Cargo,
             );
             assert!(skipped.is_empty());
             assert_eq!(targets.len(), 1);
@@ -1299,7 +1298,7 @@ mod tests {
             };
             let name = NormalizedName::for_test("serde");
             let resolved = HashMap::from([(name.clone(), "1.0.195".into())]);
-            let candidates = HashMap::from([(name, vec!["1.0.5".into(), "1.0.195".into()])]);
+            let candidates = HashMap::from([(name, vec!["1.0.5".into(), "1.0.195".into()].into())]);
 
             for requirements in [["1.0.195", "1.0"], ["1.0", "1.0.195"]] {
                 let (targets, _skipped) = build_scan_targets(
@@ -1313,7 +1312,6 @@ mod tests {
                     .as_ref(),
                     &resolved,
                     &candidates,
-                    EcosystemId::Cargo,
                 );
                 assert_eq!(targets.len(), 2, "{requirements:?}");
                 let mut alternatives: Vec<Vec<&str>> = targets
@@ -1411,7 +1409,6 @@ mod tests {
                 stub_document_with(parse_result, MockVPrefixFormatter, EcosystemId::Go).as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Go,
             );
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].version, "1.9.0");
@@ -1445,7 +1442,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Cargo,
             );
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].version, "1.0.195");
@@ -1485,7 +1481,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Go,
             );
             assert_eq!(targets.len(), 1);
             // `.version` (the wire-format value) goes through `formatter.osv_version`,
@@ -1520,7 +1515,6 @@ mod tests {
                     .as_ref(),
                     &HashMap::new(),
                     &HashMap::new(),
-                    EcosystemId::Go,
                 );
 
                 assert!(targets.is_empty(), "{name}");
@@ -1549,12 +1543,8 @@ mod tests {
                 r#"{"imports": {"@std/fs": "jsr:@std/fs@1.0.0"}}"#,
             );
 
-            let (targets, skipped) = build_scan_targets(
-                document.as_ref(),
-                &HashMap::new(),
-                &HashMap::new(),
-                EcosystemId::Deno,
-            );
+            let (targets, skipped) =
+                build_scan_targets(document.as_ref(), &HashMap::new(), &HashMap::new());
 
             assert!(targets.is_empty(), "jsr: dep must never reach an OSV query");
             assert_eq!(skipped.len(), 1);
@@ -1586,12 +1576,8 @@ mod tests {
                 r#"{"require": {"Symfony/Http-Kernel": "4.4.0"}}"#,
             );
 
-            let (targets, skipped) = build_scan_targets(
-                document.as_ref(),
-                &HashMap::new(),
-                &HashMap::new(),
-                EcosystemId::Composer,
-            );
+            let (targets, skipped) =
+                build_scan_targets(document.as_ref(), &HashMap::new(), &HashMap::new());
 
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].osv_name.name(), "symfony/http-kernel");
@@ -1610,12 +1596,8 @@ mod tests {
                 "[tool.poetry.dependencies]\nWerkzeug = \"==1.0.0\"\n\"---\" = \"==1.0.0\"\n",
             );
 
-            let (targets, skipped) = build_scan_targets(
-                document.as_ref(),
-                &HashMap::new(),
-                &HashMap::new(),
-                EcosystemId::Pypi,
-            );
+            let (targets, skipped) =
+                build_scan_targets(document.as_ref(), &HashMap::new(), &HashMap::new());
 
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].osv_name.name(), "werkzeug");
@@ -1637,12 +1619,8 @@ mod tests {
                 "dependencies:\n  image_picker_android: 0.8.13+1\n  caret_pkg: ^0.8.13+1\n",
             );
 
-            let (targets, skipped) = build_scan_targets(
-                document.as_ref(),
-                &HashMap::new(),
-                &HashMap::new(),
-                EcosystemId::Dart,
-            );
+            let (targets, skipped) =
+                build_scan_targets(document.as_ref(), &HashMap::new(), &HashMap::new());
 
             assert_eq!(targets.len(), 1, "{skipped:?}");
             assert_eq!(targets[0].display_version, "0.8.13+1");
@@ -1688,7 +1666,6 @@ mod tests {
                 stub_document_with(parse_result(), formatter, EcosystemId::GithubActions).as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                EcosystemId::GithubActions,
             );
 
             assert!(
@@ -1746,7 +1723,6 @@ mod tests {
                         .as_ref(),
                     &HashMap::new(),
                     &HashMap::new(),
-                    EcosystemId::GithubActions,
                 );
 
                 match expected {
@@ -1809,7 +1785,6 @@ mod tests {
                 stub_document_with(parse_result(), formatter, EcosystemId::GithubActions).as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                EcosystemId::GithubActions,
             );
 
             assert_eq!(
@@ -1866,7 +1841,6 @@ mod tests {
                 stub_document_with(parse_result(), formatter, EcosystemId::GithubActions).as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                EcosystemId::GithubActions,
             );
 
             assert!(skipped.is_empty(), "{skipped:?}");
@@ -1936,7 +1910,6 @@ mod tests {
                 stub_document_with(parse_result(), formatter, EcosystemId::GithubActions).as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                EcosystemId::GithubActions,
             );
 
             assert!(skipped.is_empty(), "{skipped:?}");
@@ -1967,7 +1940,6 @@ mod tests {
                 .as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                EcosystemId::Maven,
             );
             assert!(targets.iter().all(|t| t.siblings().is_empty()));
         }
@@ -1992,7 +1964,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Maven,
             );
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].version, "2.14.1");
@@ -2019,7 +1990,6 @@ mod tests {
                 .as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                EcosystemId::Cargo,
             );
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].version, "1.2.3");
@@ -2041,7 +2011,6 @@ mod tests {
                 .as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                EcosystemId::NuGet,
             );
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].version, "1.0.0");
@@ -2068,7 +2037,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Cargo,
             );
             assert!(targets.is_empty());
             assert_matches!(
@@ -2097,7 +2065,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Cargo,
             );
             assert!(targets.is_empty());
             assert_matches!(
@@ -2144,7 +2111,6 @@ mod tests {
                     .as_ref(),
                     &resolved,
                     &HashMap::new(),
-                    EcosystemId::Cargo,
                 );
                 assert!(targets.is_empty(), "{source:?} must be skipped (step 0)");
                 assert_matches!(
@@ -2191,7 +2157,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Maven,
             );
 
             assert_eq!(targets.len(), 1);
@@ -2232,7 +2197,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Cargo,
             );
             assert_eq!(
                 in_use.get(&NormalizedName::for_test("serde")),
@@ -2262,7 +2226,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Maven,
             );
             assert_eq!(
                 in_use.get(&NormalizedName::for_test("log4j-core")),
@@ -2294,7 +2257,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Pypi,
             );
             assert_eq!(
                 in_use.get(&NormalizedName::for_test("typing_extensions")),
@@ -2323,7 +2285,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Cargo,
             );
             assert!(in_use.is_empty());
         }
@@ -2354,7 +2315,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Cargo,
             );
             assert!(in_use.is_empty());
         }
@@ -2389,7 +2349,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Cargo,
             );
             assert_eq!(
                 in_use.get(&NormalizedName::for_test("time")),
@@ -2633,7 +2592,6 @@ mod tests {
                         .as_ref(),
                     &HashMap::new(),
                     &HashMap::new(),
-                    EcosystemId::GithubActions,
                 );
 
                 assert!(skipped.is_empty(), "{skipped:?}");
@@ -2659,7 +2617,6 @@ mod tests {
                 stub_document_with(parse_result(), formatter, EcosystemId::GithubActions).as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                EcosystemId::GithubActions,
             );
             assert_eq!(targets[0].osv_name, OsvQueryName::Confirmed(canonical));
         }
@@ -2706,7 +2663,6 @@ mod tests {
                     .as_ref(),
                     &HashMap::new(),
                     &HashMap::new(),
-                    EcosystemId::GithubActions,
                 )
             };
 
@@ -2771,7 +2727,6 @@ mod tests {
                 .as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                EcosystemId::GithubActions,
             );
             assert!(targets.is_empty(), "{targets:?}");
             assert_matches!(
@@ -2804,7 +2759,6 @@ mod tests {
                 .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                EcosystemId::Cargo,
             );
 
             assert!(targets.is_empty());
@@ -2890,7 +2844,6 @@ mod tests {
                     stub_document_with(parse_result, formatter, EcosystemId::Cargo).as_ref(),
                     &resolved,
                     &HashMap::new(),
-                    EcosystemId::Cargo,
                 );
                 assert_eq!(targets.len(), 1, "ready={ready:?}");
                 assert_eq!(targets[0].osv_name, expected, "ready={ready:?}");

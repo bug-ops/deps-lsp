@@ -657,7 +657,7 @@ mod tests {
     /// Impl-critic fix-cycle S1: NO listed `available` entry strictly newer than the excluded
     /// `fallback` matches R0 here (2.0.0 fails the `<2.0` ceiling too), so a purely structural
     /// "does something newer also match" scan is vacuous — this only rejects because
-    /// `Pep440Matcher::explicitly_excludes` asks the `!=` specifier directly.
+    /// `Pep440Grammar::explicitly_excludes` asks the `!=` specifier directly.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback_vacuous_case() {
         let ecosystem = Arc::new(PypiEcosystem::new(Arc::new(deps_core::HttpCache::new())))

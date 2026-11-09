@@ -4,10 +4,10 @@ use std::ops::Bound;
 
 use crate::types::MavenDependency;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
-    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget,
-    SourcePolicy, bare_meaning, compile_requirement_unless, format_version_replacing_by_shape,
-    requirement_contains_template_placeholder,
+    BoundedVersionReq, CandidateSet, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+    OsvNaming, PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution,
+    RewriteTarget, SourcePolicy, VersionGrammar, bare_meaning, format_version_replacing_by_shape,
+    grammar_candidates, grammar_matcher, requirement_contains_template_placeholder,
 };
 use deps_core::{
     ConcreteVersion, EcosystemId, InvalidPackageName, PackageName, is_safe_maven_coordinate_segment,
@@ -30,7 +30,7 @@ fn is_unresolved(requirement: &str) -> bool {
 
 /// Maven's `LATEST`/`RELEASE` metadata keywords (case-sensitive per Maven's own grammar):
 /// "resolve to whatever `<latest>`/`<release>` in maven-metadata.xml currently designates".
-/// That designation is a side channel [`MavenMatcher`] has no access to (the same
+/// That designation is a side channel [`MavenRequirement`] has no access to (the same
 /// `<release>`-side-channel limitation `MavenCentralRegistry::select_latest_matching`
 /// documents), so — like an unresolved `${property}` — the requirement can't be checked
 /// literally against `available` and must be treated as always satisfied.
@@ -85,7 +85,7 @@ fn is_timestamped_snapshot(requirement: &str) -> bool {
 /// `compare_versions_for_range` instead of raw string equality, so `1.0` correctly matches a
 /// published `1.0.0` (equal under Maven's own `ComparableVersion`) rather than reporting a
 /// false WARNING.
-enum MavenMatcher {
+enum MavenRequirement {
     /// Unresolved `${property}`/`@property@`, `LATEST`/`RELEASE`, or a `-SNAPSHOT` pin — see
     /// [`is_unresolved`], [`is_latest_keyword`], [`is_snapshot`].
     AlwaysSatisfied,
@@ -95,32 +95,71 @@ enum MavenMatcher {
     Exact(String),
 }
 
-impl RequirementMatcher for MavenMatcher {
-    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-        let version = version.as_str();
-        Some(match self {
-            Self::AlwaysSatisfied => true,
-            Self::Ranges(ranges) => crate::range::satisfies_ranges(version, ranges),
-            Self::Exact(target) => {
-                crate::version::compare_versions_for_range(version, target)
-                    == std::cmp::Ordering::Equal
-            }
+/// Maven's version grammar: bracket-interval ranges and qualifier-aware soft versions. Every
+/// candidate is decidable: matching has no "candidate failed to parse" signal, only "range
+/// failed to parse", which [`Self::compile`] rules out.
+#[derive(Clone, Copy)]
+struct MavenGrammar;
+
+impl VersionGrammar for MavenGrammar {
+    type Version = ConcreteVersion;
+    type Compiled = MavenRequirement;
+
+    fn parse_version(&self, version: &ConcreteVersion) -> Option<ConcreteVersion> {
+        Some(version.clone())
+    }
+
+    /// `None` for a malformed range (`is_range` true but `parse_range` fails), checked first,
+    /// before any other branch: without it a range that also ends in `-SNAPSHOT` or contains
+    /// `${` would be misclassified as always-satisfied instead of rejected, and a typo would
+    /// produce a false "unsatisfiable" verdict instead of correctly suppressing the check.
+    fn compile(&self, requirement: BoundedVersionReq<'_>) -> Option<MavenRequirement> {
+        let requirement = requirement.as_str();
+        let ranges = if crate::range::is_range(requirement) {
+            Some(crate::range::parse_range(requirement)?)
+        } else {
+            None
+        };
+        if is_unresolved(requirement)
+            || is_latest_keyword(requirement)
+            || is_snapshot(requirement)
+            || is_timestamped_snapshot(requirement)
+        {
+            return Some(MavenRequirement::AlwaysSatisfied);
+        }
+        Some(match ranges {
+            Some(ranges) => MavenRequirement::Ranges(ranges),
+            None => MavenRequirement::Exact(requirement.to_owned()),
         })
     }
 
+    fn satisfies(&self, compiled: &MavenRequirement, version: &ConcreteVersion) -> bool {
+        let version = version.as_str();
+        match compiled {
+            MavenRequirement::AlwaysSatisfied => true,
+            MavenRequirement::Ranges(ranges) => crate::range::satisfies_ranges(version, ranges),
+            MavenRequirement::Exact(target) => {
+                crate::version::compare_versions_for_range(version, target)
+                    == std::cmp::Ordering::Equal
+            }
+        }
+    }
+
     /// Maven's bracket-interval range model is not strict SemVer 2.0.0 (#299) — must not opt in.
-    fn strict_prerelease_exclusion(&self) -> bool {
+    fn strict_prerelease_exclusion(&self, _: &MavenRequirement) -> bool {
         false
     }
 
-    /// #1590: Maven has no literal `!=` operator, but `Self::Ranges` can express the same kind
-    /// of exclusion through a disjoint union (e.g. `[1.0,1.5),(1.5,2.0)` bans exactly `1.5.0`)
-    /// — see [`crate::range::explicitly_excludes`] for the gap-detection logic.
+    /// #1590: Maven has no literal `!=` operator, but `Ranges` can express the same kind of
+    /// exclusion through a disjoint union (e.g. `[1.0,1.5),(1.5,2.0)` bans exactly `1.5.0`) —
+    /// see [`crate::range::explicitly_excludes`] for the gap-detection logic.
     /// `AlwaysSatisfied`/`Exact` have no such shape to punch a hole in.
-    fn explicitly_excludes(&self, version: &ConcreteVersion) -> bool {
-        match self {
-            Self::Ranges(ranges) => crate::range::explicitly_excludes(version.as_str(), ranges),
-            Self::AlwaysSatisfied | Self::Exact(_) => false,
+    fn explicitly_excludes(&self, compiled: &MavenRequirement, version: &ConcreteVersion) -> bool {
+        match compiled {
+            MavenRequirement::Ranges(ranges) => {
+                crate::range::explicitly_excludes(version.as_str(), ranges)
+            }
+            MavenRequirement::AlwaysSatisfied | MavenRequirement::Exact(_) => false,
         }
     }
 }
@@ -224,7 +263,7 @@ impl RequirementResolution for MavenFormatter {
     }
 
     // #249 review (M4): this branch order (unresolved → range → exact) is a separate copy
-    // from `compile_bounded_requirement`'s below — kept apart deliberately (see `MavenMatcher`'s
+    // from `compile_bounded_requirement`'s below — kept apart deliberately (see `MavenRequirement`'s
     // docs for the two precision differences), but any reordering here must be checked
     // against `compile_bounded_requirement`'s malformed-range guard placement too, since S1/S2
     // happened in `deps-gradle` from exactly this kind of drift between two copies.
@@ -253,10 +292,10 @@ impl RequirementResolution for MavenFormatter {
     // produces) plus the other four cross-ecosystem shapes (`%VAR%`, `{{ }}`, `{% %}`,
     // `<%= %>`) defensively, with no override needed here.
 
-    /// Uses [`compile_requirement_unless`] (see that function and
+    /// Matches through `MavenGrammar` (see
     /// [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`] for the shared "undecidable" contract).
     ///
-    /// The undecidable predicate rejects a malformed range (`is_range` true but
+    /// The grammar rejects a malformed range (`is_range` true but
     /// `crate::range::parse_range` fails) — checked unconditionally, first, before any other
     /// branch: without this guard ahead of the `AlwaysSatisfied` short-circuits below, a
     /// range that happens to also end in `-SNAPSHOT` or contain `${` would be misclassified
@@ -270,26 +309,11 @@ impl RequirementResolution for MavenFormatter {
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        compile_requirement_unless(
-            requirement.as_str(),
-            |r| crate::range::is_range(r) && crate::range::parse_range(r).is_none(),
-            |r| {
-                if is_unresolved(&r)
-                    || is_latest_keyword(&r)
-                    || is_snapshot(&r)
-                    || is_timestamped_snapshot(&r)
-                {
-                    return MavenMatcher::AlwaysSatisfied;
-                }
-                // The undecidable guard above already ensures `parse_range` succeeds here.
-                if crate::range::is_range(&r)
-                    && let Some(ranges) = crate::range::parse_range(&r)
-                {
-                    return MavenMatcher::Ranges(ranges);
-                }
-                MavenMatcher::Exact(r)
-            },
-        )
+        grammar_matcher(MavenGrammar, requirement)
+    }
+
+    fn candidate_set(&self, candidates: &[ConcreteVersion]) -> Option<Box<dyn CandidateSet>> {
+        Some(grammar_candidates(MavenGrammar, candidates))
     }
 }
 
@@ -311,6 +335,69 @@ mod tests {
     use deps_core::NormalizeName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::{RequirementGate, RequirementStatus};
+
+    const REQUIREMENTS: &[&str] = &[
+        "1.0",
+        "1.0.0",
+        "1.0-beta",
+        "[1.0]",
+        "[1.0,)",
+        "(1.0,)",
+        "(,2.0]",
+        "(,2.0)",
+        "[1.0,2.0)",
+        "(1.0,2.0]",
+        "[1.0,1.5),(1.5,2.0)",
+        "[1.0,1.5],[1.7,2.0]",
+        "[1.0,2.0",
+        "[2.0,1.0]",
+        "[,]",
+        "LATEST",
+        "RELEASE",
+        "1.0-SNAPSHOT",
+        "[1.0,2.0)-SNAPSHOT",
+        "1.0-20240101.120000-1",
+        "${project.version}",
+        "@project.version@",
+        "[${min},${max})",
+        "{{ version }}",
+        "",
+        "garbage",
+        "1.0.0.RELEASE",
+        "1.0-SP1",
+        "[1.0.0-RC1,)",
+    ];
+    const VERSIONS: &[&str] = &[
+        "0.9",
+        "1.0",
+        "1.0.0",
+        "1.0-beta",
+        "1.0.0-beta-1",
+        "1.0-SNAPSHOT",
+        "1.0.0.RELEASE",
+        "1.0-SP1",
+        "1.1",
+        "1.5",
+        "1.5.0",
+        "1.7",
+        "1.9",
+        "2.0",
+        "2.0-rc1",
+        "2.0.1",
+        "3.0",
+        "garbage",
+        "",
+        "1.0-20240101.120000-1",
+    ];
+
+    #[test]
+    fn candidate_set_agrees_with_the_matcher() {
+        deps_core::test_util::assert_candidate_set_consistent(
+            &MavenFormatter,
+            REQUIREMENTS,
+            VERSIONS,
+        );
+    }
 
     #[test]
     fn test_format_version() {
@@ -513,7 +600,7 @@ mod tests {
     }
 
     /// #1347 S1 deferral rationale: an unresolved `${property}` compiles to
-    /// `MavenMatcher::AlwaysSatisfied`, which reports `Some(true)` against *any* candidate —
+    /// `MavenRequirement::AlwaysSatisfied`, which reports `Some(true)` against *any* candidate —
     /// including a vulnerability's fix target. Since #1391, the actual guard against a
     /// destructive rewrite is [`deps_core::edit::replacement_text`]'s central placeholder gate
     /// (backed by `RequirementResolution::bounded_requirement_is_placeholder`, which composes the
@@ -699,7 +786,7 @@ mod tests {
     /// `bounded_requirement_already_resolves_to`/`compile_bounded_requirement` pairing misses for a
     /// requirement that is *both* unresolved and an undecidable malformed range (see the
     /// malformed-range test below) — `compile_bounded_requirement` returns `None` for that shape,
-    /// not `MavenMatcher::AlwaysSatisfied`, making the pairing inert.
+    /// not `MavenRequirement::AlwaysSatisfied`, making the pairing inert.
     #[test]
     fn test_replacement_text_unresolved_property_is_none() {
         use deps_core::edit::replacement_text;
@@ -737,7 +824,7 @@ mod tests {
     /// `requirement_contains_template_placeholder`, which detects the embedded `${hi}`), but
     /// it is *also* a malformed range — `is_range` is true and `crate::range::parse_range`
     /// fails on it, so `compile_bounded_requirement`'s malformed-range guard returns `None` (not
-    /// `MavenMatcher::AlwaysSatisfied`), making the default `bounded_requirement_already_resolves_to`
+    /// `MavenRequirement::AlwaysSatisfied`), making the default `bounded_requirement_already_resolves_to`
     /// inert. `RequirementResolution::bounded_requirement_is_placeholder`'s direct `is_unresolved`
     /// check — consulted by `deps_core::edit::replacement_text` before ever calling into the
     /// formatter's rewrite logic — is what actually closes this gap.

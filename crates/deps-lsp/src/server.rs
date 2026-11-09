@@ -566,33 +566,40 @@ impl Backend {
         let state = Arc::clone(&self.state);
         let lock_provider_for_scan = Arc::clone(&lock_provider);
         let lockfile_path_owned = lockfile_path.to_path_buf();
-        let affected_uris: Vec<Uri> = tokio::task::spawn_blocking(move || {
-            state
-                .documents
-                .iter()
-                .filter_map(|entry| {
-                    let uri = entry.key();
-                    let doc = entry.value();
-                    if doc.ecosystem != ecosystem {
-                        return None;
-                    }
-                    let domain_uri = crate::lsp_types_interop::from_lsp_uri(uri)?;
-                    let doc_lockfile = lock_provider_for_scan.locate_lockfile(&domain_uri)?;
-                    if doc_lockfile == lockfile_path_owned {
-                        Some(uri.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("lock file affected-document scan panicked: {}", e);
-            Vec::new()
-        });
+        let affected: Vec<(Uri, Option<deps_core::ImporterPath>)> =
+            tokio::task::spawn_blocking(move || {
+                state
+                    .documents
+                    .iter()
+                    .filter_map(|entry| {
+                        let uri = entry.key();
+                        let doc = entry.value();
+                        if doc.ecosystem != ecosystem {
+                            return None;
+                        }
+                        let domain_uri = crate::lsp_types_interop::from_lsp_uri(uri)?;
+                        let doc_lockfile = lock_provider_for_scan.locate_lockfile(&domain_uri)?;
+                        (doc_lockfile == lockfile_path_owned).then(|| {
+                            let scope =
+                                deps_core::lockfile::resolve_manifest_file_path(&domain_uri)
+                                    .and_then(|manifest| {
+                                        deps_core::ImporterPath::of_manifest(
+                                            &doc_lockfile,
+                                            &manifest,
+                                        )
+                                    });
+                            (uri.clone(), scope)
+                        })
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("lock file affected-document scan panicked: {}", e);
+                Vec::new()
+            });
 
-        if affected_uris.is_empty() {
+        if affected.is_empty() {
             return Vec::new();
         }
 
@@ -609,22 +616,54 @@ impl Backend {
         // impl-critic M1), that empty pair is never actually written into the document on
         // error, so `doc.signals.resolved_versions` itself survives a transient reload failure
         // untouched.
-        let load = deps_engine::classify::resolved::parse_known_lockfile(
+        // The lock is parsed once; each distinct importer scope is split once, off the async
+        // task, and shared by the manifests that resolve to it (#1993).
+        let Some(packages) = deps_engine::classify::resolved::load_lockfile_packages(
             &self.state.lockfile_cache,
             lock_provider.as_ref(),
-            ecosystem_impl.formatter(),
             lockfile_path,
         )
-        .await;
-        if !load.reload_ok() {
+        .await
+        else {
             let message = format!("Failed to reload lock file: {}", lockfile_path.display());
             tracing::error!("{}", message);
             self.client.log_message(MessageType::ERROR, message).await;
+            return affected
+                .into_iter()
+                .map(|(uri, _)| (uri, LockfileLoad::Failed))
+                .collect();
+        };
+        let mut loads: std::collections::HashMap<Option<deps_core::ImporterPath>, LockfileLoad> =
+            std::collections::HashMap::new();
+        let mut refreshes = Vec::with_capacity(affected.len());
+        for (uri, scope) in affected {
+            if !loads.contains_key(&scope) {
+                let packages = Arc::clone(&packages);
+                let ecosystem = Arc::clone(ecosystem_impl);
+                let split_scope = scope.clone();
+                let load = tokio::task::spawn_blocking(move || {
+                    let (versions, candidates) =
+                        deps_engine::classify::resolved::split_resolved_packages(
+                            &packages,
+                            ecosystem.formatter(),
+                            split_scope.as_ref(),
+                        );
+                    LockfileLoad::Loaded {
+                        versions,
+                        candidates,
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("lock file split task panicked: {}", e);
+                    LockfileLoad::Failed
+                });
+                loads.insert(scope.clone(), load);
+            }
+            let load = loads.get(&scope).cloned().unwrap_or(LockfileLoad::Failed);
+            refreshes.push((uri, load));
         }
-        affected_uris
-            .into_iter()
-            .map(|uri| (uri, load.clone()))
-            .collect()
+        refreshes
     }
 
     /// Open manifests under the deleted lock file's directory, each re-resolved from scratch
@@ -1473,17 +1512,12 @@ impl LanguageServer for Backend {
         let uri = crate::lsp_types_interop::canonicalize_uri(&params.text_document.uri);
         tracing::info!("document closed: {:?}", uri);
 
-        let had_parse_failure = self
-            .state
-            .with_document(&uri, |doc| doc.parse_failure().is_some())
-            .unwrap_or(false);
-        self.state.remove_document(&uri);
+        let client_uri = params.text_document.uri;
+        diagnostics::clear_diagnostics_on_close(&self.state, &uri, |cleared| {
+            self.client.publish_diagnostics(client_uri, cleared, None)
+        })
+        .await;
         self.state.cancel_background_task(&uri).await;
-        if had_parse_failure {
-            self.client
-                .publish_diagnostics(params.text_document.uri, Vec::new(), None)
-                .await;
-        }
     }
 
     /// Not routed through `canonicalize_uri` (#1086): `change.uri` here is a watched

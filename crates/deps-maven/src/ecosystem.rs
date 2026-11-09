@@ -565,7 +565,7 @@ mod tests {
     /// than the excluded `1.5.0` fallback matches R0 either (`2.0.0` also fails the exclusive
     /// `2.0` ceiling), mirroring PR #1589's vacuous-case shape: a purely structural "does
     /// something newer also match" scan is vacuous here, so this only rejects because
-    /// `MavenMatcher::explicitly_excludes` asks the range union's shape directly.
+    /// `MavenGrammar::explicitly_excludes` asks the range union's shape directly.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_rejects_disjoint_range_excluded_fallback_vacuous_case()
      {

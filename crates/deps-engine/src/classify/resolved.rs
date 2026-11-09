@@ -3,7 +3,7 @@
 use deps_core::CachedVersionsMap;
 use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
-use deps_core::EcosystemId;
+use deps_core::ImporterPath;
 use deps_core::NormalizedName;
 use deps_core::PackageKey;
 use deps_core::PackageVersions;
@@ -33,7 +33,7 @@ use std::sync::Arc;
 ///
 /// ```
 /// use deps_core::test_util::{stub_document, stub_parse_result};
-/// use deps_core::{ConcreteVersion, EcosystemId, NormalizedName};
+/// use deps_core::{ConcreteVersion, NormalizedName};
 /// use deps_engine::classify::resolved::collect_in_use_versions;
 /// use std::collections::HashMap;
 ///
@@ -46,7 +46,6 @@ use std::sync::Arc;
 ///     document.as_ref(),
 ///     &resolved_versions,
 ///     &HashMap::new(),
-///     EcosystemId::Cargo,
 /// );
 /// assert_eq!(
 ///     in_use.get(&NormalizedName::for_test("dep-0")),
@@ -57,8 +56,8 @@ pub fn collect_in_use_versions(
     document: &dyn deps_core::ParsedManifest,
     resolved_versions: &ResolvedVersionsMap,
     resolved_version_candidates: &ResolvedCandidatesMap,
-    ecosystem: EcosystemId,
 ) -> HashMap<NormalizedName, Vec<ConcreteVersion>> {
+    let ecosystem = document.ecosystem_id();
     let mut map: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
     let mut memo = deps_core::lsp_helpers::LockSelectionMemo::default();
     document.for_each_formatted_dependency(&mut |bound| {
@@ -173,7 +172,9 @@ pub fn cached_versions_from_lockfile(resolved: &ResolvedVersionsMap) -> CachedVe
 /// lock-file version for names with more than one — and deliberately omitting a name with a
 /// single distinct version entirely (NFR-003: the common case never pays for a
 /// candidates-map lookup). Lock-file spellings that normalize alike are unioned; see
-/// [`deps_core::ResolvedPackages::split_normalized`] for the collision rule.
+/// [`deps_core::ResolvedPackages::split_normalized`] for the collision rule. A `scope` selects
+/// the entries the manifest at that workspace path owns
+/// ([`deps_core::ResolvedPackages::split_normalized_for`]); `None` is the owner-blind split.
 ///
 /// Shared by both [`LockfileLoad::Loaded`] constructors: [`parse_known_lockfile`] (and thus
 /// [`load_resolved_versions`]) and `deps-lsp`'s watched-lock-file-change handler, which calls
@@ -197,7 +198,7 @@ pub fn cached_versions_from_lockfile(resolved: &ResolvedVersionsMap) -> CachedVe
 ///     },
 /// ));
 ///
-/// let (versions, candidates) = split_resolved_packages(&resolved, &StubFormatter::new());
+/// let (versions, candidates) = split_resolved_packages(&resolved, &StubFormatter::new(), None);
 /// assert_eq!(versions.len(), 1);
 /// assert!(
 ///     candidates.is_empty(),
@@ -207,8 +208,12 @@ pub fn cached_versions_from_lockfile(resolved: &ResolvedVersionsMap) -> CachedVe
 pub fn split_resolved_packages(
     resolved: &deps_core::lockfile::ResolvedPackages,
     naming: &(impl PackageNaming + ?Sized),
+    scope: Option<&ImporterPath>,
 ) -> (ResolvedVersionsMap, ResolvedCandidatesMap) {
-    resolved.split_normalized(naming)
+    match scope {
+        Some(scope) => resolved.split_normalized_for(naming, scope),
+        None => resolved.split_normalized(naming),
+    }
 }
 
 /// Outcome of loading (or reloading) a lock file's resolved-version data.
@@ -302,7 +307,8 @@ impl LockfileLoad {
 /// conclude that; a known path means discovery already succeeded.
 ///
 /// `naming` is the document's formatter: the maps are keyed by the names it normalizes the
-/// lock file's spellings to.
+/// lock file's spellings to. `scope` is the requesting manifest's directory relative to the
+/// lock file ([`ImporterPath::of_manifest`]); `None` skips owner-aware selection.
 ///
 /// Shared by [`load_resolved_versions`] and `deps-lsp`'s watched-lock-file-change handler
 /// (issue #1424) — both need the identical get-or-parse-then-split sequence, previously
@@ -330,6 +336,7 @@ impl LockfileLoad {
 ///         lock_provider.as_ref(),
 ///         ecosystem.formatter(),
 ///         Path::new("/nonexistent-for-doctest/Cargo.lock"),
+///         None,
 ///     )
 ///     .await;
 ///     assert_eq!(load, LockfileLoad::Failed);
@@ -340,7 +347,31 @@ pub async fn parse_known_lockfile(
     lock_provider: &dyn LockFileProvider,
     naming: &(impl PackageNaming + ?Sized),
     lockfile_path: &Path,
+    scope: Option<&ImporterPath>,
 ) -> LockfileLoad {
+    match load_lockfile_packages(lockfile_cache, lock_provider, lockfile_path).await {
+        Some(packages) => {
+            let (versions, candidates) = split_resolved_packages(&packages, naming, scope);
+            LockfileLoad::Loaded {
+                versions,
+                candidates,
+            }
+        }
+        None => LockfileLoad::Failed,
+    }
+}
+
+/// Parses the lock file through `lockfile_cache` and merges the provider's derived packages,
+/// returning the shared set every per-manifest split reads, or `None` when it fails to parse.
+///
+/// The merge deep-clones the cached set only when the provider derives packages, so a caller
+/// splitting for several scopes (`deps-lsp`'s lock reload) calls this once and splits the
+/// returned `Arc` per scope with [`split_resolved_packages`].
+pub async fn load_lockfile_packages(
+    lockfile_cache: &LockFileCache,
+    lock_provider: &dyn LockFileProvider,
+    lockfile_path: &Path,
+) -> Option<Arc<deps_core::lockfile::ResolvedPackages>> {
     match lockfile_cache
         .get_or_parse(lock_provider, lockfile_path)
         .await
@@ -352,19 +383,14 @@ pub async fn parse_known_lockfile(
                 lockfile_path.display()
             );
             let derived = lock_provider.derived_packages(&resolved);
-            let (versions, candidates) = if derived.is_empty() {
-                split_resolved_packages(&resolved, naming)
-            } else {
-                let mut merged = resolved;
-                for package in derived {
-                    merged.insert(package);
-                }
-                split_resolved_packages(&merged, naming)
-            };
-            LockfileLoad::Loaded {
-                versions,
-                candidates,
+            if derived.is_empty() {
+                return Some(resolved);
             }
+            let mut merged = Arc::unwrap_or_clone(resolved);
+            for package in derived {
+                merged.insert(package);
+            }
+            Some(Arc::new(merged))
         }
         Err(e) => {
             tracing::warn!(
@@ -372,7 +398,7 @@ pub async fn parse_known_lockfile(
                 lockfile_path.display(),
                 e
             );
-            LockfileLoad::Failed
+            None
         }
     }
 }
@@ -438,11 +464,14 @@ pub async fn load_resolved_versions(
         }
     };
 
+    let scope = deps_core::lockfile::resolve_manifest_file_path(uri)
+        .and_then(|manifest| ImporterPath::of_manifest(&lockfile_path, &manifest));
     parse_known_lockfile(
         lockfile_cache,
         lock_provider.as_ref(),
         ecosystem.formatter(),
         &lockfile_path,
+        scope.as_ref(),
     )
     .await
 }
@@ -484,6 +513,7 @@ pub async fn forget_local_locked_misses(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::EcosystemId;
 
     /// N5 regression guard: the lock-file-population path must build every
     /// `PackageVersions` with an **empty** `available` list, never a populated one — an
@@ -659,13 +689,48 @@ mod tests {
                 document.as_ref(),
                 &resolved,
                 &ResolvedCandidatesMap::new(),
-                EcosystemId::Pypi,
             );
 
             assert_eq!(
                 in_use.get(&NormalizedName::for_test("django")),
                 Some(&vec![ConcreteVersion::from("4.1.0")])
             );
+        }
+
+        /// #1993: without a scope the split ignores entry owners and equals
+        /// `split_normalized`; with one, the manifest's own importer entry is the collapsed one.
+        #[test]
+        fn split_resolved_packages_scope_selects_the_owned_entry_and_none_ignores_owners() {
+            use deps_core::lockfile::{
+                EntryOwner, EntryPlacement, ImporterPath, ResolvedPackage, ResolvedPackages,
+                ResolvedSource,
+            };
+
+            let mut packages = ResolvedPackages::new();
+            for (version, importer) in [("1.0.0", "packages/a"), ("2.0.0", "packages/b")] {
+                packages.insert(
+                    ResolvedPackage::new(
+                        "dep".into(),
+                        version.into(),
+                        ResolvedSource::Registry {
+                            url: String::new(),
+                            checksum: String::new(),
+                        },
+                    )
+                    .with_placement(EntryPlacement::Hoisted {
+                        owner: EntryOwner::Importer(ImporterPath::parse(importer).unwrap()),
+                    }),
+                );
+            }
+            let key = NormalizedName::for_test("dep");
+
+            let blind = split_resolved_packages(&packages, &LOWERCASE, None);
+            assert_eq!(blind, packages.split_normalized(&LOWERCASE));
+            assert_eq!(blind.0.get(&key), Some(&ConcreteVersion::from("2.0.0")));
+
+            let scope = ImporterPath::parse("packages/a").unwrap();
+            let (versions, _) = split_resolved_packages(&packages, &LOWERCASE, Some(&scope));
+            assert_eq!(versions.get(&key), Some(&ConcreteVersion::from("1.0.0")));
         }
 
         #[test]
@@ -684,7 +749,7 @@ mod tests {
                 ));
             }
 
-            let (versions, candidates) = split_resolved_packages(&packages, &LOWERCASE);
+            let (versions, candidates) = split_resolved_packages(&packages, &LOWERCASE, None);
 
             let key = NormalizedName::for_test("newtonsoft.json");
             assert_eq!(versions.len(), 1);
@@ -721,6 +786,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             &provider,
             &deps_core::test_util::StubFormatter::new(),
             &lockfile_path,
+            None,
         )
         .await
         {
@@ -732,6 +798,62 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             }
             other => panic!("expected Loaded, got {other:?}"),
         }
+    }
+
+    /// #1993: a manifest outside the lock file's directory has no importer scope
+    /// (`ImporterPath::of_manifest` is `None`); that loads the owner-blind split, not a skip.
+    #[cfg(feature = "npm")]
+    #[tokio::test]
+    async fn test_parse_known_lockfile_without_scope_is_the_owner_blind_split() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let lockfile_path = dir.path().join("package-lock.json");
+        std::fs::write(
+            &lockfile_path,
+            r#"{"lockfileVersion": 3, "packages": {
+  "": {"name": "root"},
+  "packages/a/node_modules/left-pad": {"version": "1.0.5"},
+  "packages/b/node_modules/left-pad": {"version": "1.2.0"}
+}}"#,
+        )
+        .expect("write package-lock.json");
+
+        let provider = deps_npm::NpmLockParser;
+        let scope = ImporterPath::of_manifest(&lockfile_path, Path::new("/elsewhere/package.json"));
+        assert!(
+            scope.is_none(),
+            "premise: the manifest is outside the lock directory"
+        );
+
+        let load = parse_known_lockfile(
+            &LockFileCache::new(),
+            &provider,
+            &deps_npm::NpmFormatter,
+            &lockfile_path,
+            scope.as_ref(),
+        )
+        .await;
+
+        let LockfileLoad::Loaded {
+            versions,
+            candidates,
+        } = load
+        else {
+            panic!("expected Loaded");
+        };
+        let key = NormalizedName::for_test("left-pad");
+        assert_eq!(versions.get(&key), Some(&ConcreteVersion::from("1.2.0")));
+        let mut listed: Vec<&str> = candidates[&key]
+            .versions()
+            .iter()
+            .map(ConcreteVersion::as_str)
+            .collect();
+        listed.sort_unstable();
+        assert_eq!(listed, ["1.0.5", "1.2.0"]);
+        assert_eq!(
+            candidates[&key],
+            deps_core::LockCandidates::from(candidates[&key].versions().to_vec()),
+            "no ownership data is attached"
+        );
     }
 
     /// #1891 S1: a lookup miss for a package whose lock entry is a local path (a workspace

@@ -1,13 +1,14 @@
 use tower_lsp_server::ls_types::{InlayHint, InlayHintKind, InlayHintLabel, InlayHintTooltip};
 
 use crate::error::FetchFailure;
+use crate::osv::{MatchOrigin, ScanOutcome};
 use crate::{ConcreteVersion, Dependency, EcosystemConfig, PackageKey, TypedParseResult};
 
 use super::diagnostics::{MAX_VERSION_DIAGNOSTIC_CHARS, flagged_detail};
 use super::{
     DependencyFormatter, DependencyGate, EcosystemFormatter, LatestVerdict, LookupMiss,
     RequirementStatus, SiblingMatchNote, VersionData, in_use_version, latest_verdict,
-    sanitize_and_truncate_for_diagnostic,
+    resolve_scan_outcome, sanitize_and_truncate_for_diagnostic,
 };
 
 /// Sanitizes and caps a version-shaped string (`latest` or `resolved_version`) for
@@ -184,8 +185,90 @@ fn type_hint(
     }
 }
 
+/// How the dependency's own OSV scan relates to the version its hint shows (#2003).
+enum InUseAdvisoryState {
+    /// No advisory, or the scan did not complete; the hint is unchanged.
+    Clean,
+    /// An advisory matches the shown version itself, or the list is a lower bound so an
+    /// alternative-only claim cannot be made. Carries the advisory ids shown by the diagnostic.
+    Primary(Vec<crate::osv::OsvId>),
+    /// Every advisory matches only other lock-file entries, named by the tags.
+    LockAlternativeOnly(crate::osv::MatchedTags),
+}
+
+fn in_use_advisory_state<F: DependencyFormatter>(
+    dep: &F::Dep,
+    key: &PackageKey,
+    ctx: &HintContext<'_, F>,
+) -> InUseAdvisoryState {
+    let Some(vulnerabilities) = ctx.versions.vulnerabilities else {
+        return InUseAdvisoryState::Clean;
+    };
+    let Some(ScanOutcome::Vulnerable(dv)) =
+        resolve_scan_outcome(vulnerabilities, dep, ctx.vuln_keys.as_ref(), key)
+    else {
+        return InUseAdvisoryState::Clean;
+    };
+    match dv.sibling_only_tags() {
+        Some(tags) if tags.origin() == MatchOrigin::LockEntry => {
+            InUseAdvisoryState::LockAlternativeOnly(tags)
+        }
+        Some(_) | None => InUseAdvisoryState::Primary(
+            dv.advisories_for_display()
+                .items()
+                .iter()
+                .map(|advisory| advisory.id().clone())
+                .collect(),
+        ),
+    }
+}
+
 /// The hint for one dependency, or `None` when it shows nothing.
+///
+/// A dependency with an OSV advisory gets a warning glyph and a tooltip: naming the other lock
+/// entries when it is vulnerable only through them, naming the advisories otherwise. The hint
+/// never shows a clean check mark the diagnostic contradicts.
 fn inlay_hint_for<F: DependencyFormatter>(
+    dep: &F::Dep,
+    ctx: &HintContext<'_, F>,
+) -> Option<InlayHint> {
+    let mut hint = base_hint_for(dep, ctx)?;
+    let key = PackageKey::new(dep.name(), ctx.formatter);
+    match in_use_advisory_state(dep, &key, ctx) {
+        InUseAdvisoryState::Clean => {}
+        InUseAdvisoryState::Primary(ids) => flag_advisory(
+            &mut hint,
+            format!("Flagged by OSV.dev{}", flagged_detail(&ids, None)),
+        ),
+        InUseAdvisoryState::LockAlternativeOnly(tags) => flag_advisory(
+            &mut hint,
+            format!(
+                "OSV.dev flags an advisory on another lock entry ({})",
+                SiblingMatchNote::new(ctx.formatter, &tags)
+            ),
+        ),
+    }
+    Some(hint)
+}
+
+fn flag_advisory(hint: &mut InlayHint, detail: String) {
+    let InlayHintLabel::String(label) = &mut hint.label else {
+        return;
+    };
+    if !label.starts_with(['⚠', '🚫']) {
+        *label = format!("⚠ {label}");
+    }
+    hint.tooltip = Some(InlayHintTooltip::String(match hint.tooltip.take() {
+        Some(InlayHintTooltip::String(existing)) => format!("{existing}. {detail}"),
+        Some(other) => {
+            hint.tooltip = Some(other);
+            return;
+        }
+        None => detail,
+    }));
+}
+
+fn base_hint_for<F: DependencyFormatter>(
     dep: &F::Dep,
     ctx: &HintContext<'_, F>,
 ) -> Option<InlayHint> {
@@ -490,6 +573,7 @@ mod tests {
     use crate::lsp_helpers::test_support::*;
     use crate::lsp_helpers::test_support_lsp::*;
     use crate::lsp_helpers::*;
+    use std::assert_matches;
 
     /// #1161 M1 (critic follow-up): a dependency whose `version_range()` is `Some` but which
     /// has no `version_requirement()` — Maven's `<version></version>`, whose zero-width
@@ -997,6 +1081,119 @@ mod tests {
         }
     }
 
+    /// #2003: an advisory on another lock entry only must not leave a clean check mark.
+    #[test]
+    fn test_inlay_hint_lock_alternative_only_advisory_shows_warning_and_tooltip() {
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, MatchedTags, OsvVersion, ScanOutcome, VulnSeverity,
+            VulnerabilityMap,
+        };
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MOCK_FORMATTER;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            network: crate::NetworkMode::Online,
+        };
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "pkg".into(),
+                version_req: "^1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            NormalizedName::for_test("pkg"),
+            PackageVersions::latest_only("1.0.8"),
+        );
+        let resolved_versions = HashMap::new();
+
+        let advisory = sample_advisory("GHSA-aaaa-bbbb-cccc", VulnSeverity::High);
+        let id = advisory.id().clone();
+        let hints_for = |dv: DependencyVulnerabilities| {
+            let mut vulns = VulnerabilityMap::new();
+            vulns.insert(
+                crate::test_util::vuln_key("pkg"),
+                ScanOutcome::Vulnerable(dv),
+            );
+            generate_inlay_hints(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+                crate::LoadingState::Loaded,
+                &config,
+                &formatter,
+            )
+        };
+
+        let primary = hints_for(DependencyVulnerabilities::new(Capped::new(
+            vec![advisory.clone()],
+            1,
+        )));
+        assert_eq!(primary.len(), 1);
+        assert_matches!(
+            &primary[0].label,
+            InlayHintLabel::String(t) if t.starts_with("⚠ "),
+            "got: {:?}",
+            primary[0].label
+        );
+        assert_matches!(
+            &primary[0].tooltip,
+            Some(InlayHintTooltip::String(t)) if t.contains("GHSA-aaaa-bbbb-cccc")
+        );
+
+        let lower_bound = hints_for(DependencyVulnerabilities::new(
+            Capped::new(vec![advisory.clone()], 1).with_total_as_lower_bound(),
+        ));
+        assert_matches!(
+            &lower_bound[0].label,
+            InlayHintLabel::String(t) if t.starts_with("⚠ "),
+            "an incomplete union must not keep the check mark: {:?}",
+            lower_bound[0].label
+        );
+
+        let clean = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            crate::LoadingState::Loaded,
+            &config,
+            &formatter,
+        );
+        assert_matches!(&clean[0].label, InlayHintLabel::String(t) if t.starts_with('✅'));
+        assert!(clean[0].tooltip.is_none());
+
+        let alternative_only = hints_for(
+            DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+                .with_sibling_matches_for_test(
+                    OsvVersion::new("1.0.8"),
+                    [(
+                        id,
+                        MatchedTags::lock_entries_for_test(ConcreteVersion::new("1.0.2"), vec![]),
+                    )],
+                ),
+        );
+        assert_eq!(alternative_only.len(), 1);
+        assert_matches!(
+            &alternative_only[0].label,
+            InlayHintLabel::String(t) if t.starts_with("⚠ "),
+            "got: {:?}",
+            alternative_only[0].label
+        );
+        match &alternative_only[0].tooltip {
+            Some(InlayHintTooltip::String(tooltip)) => {
+                assert!(tooltip.contains("also locked at 1.0.2"), "got: {tooltip}");
+            }
+            other => panic!("expected a tooltip naming the lock entry, got: {other:?}"),
+        }
+    }
+
     #[test]
     fn test_inlay_hint_caret_version_up_to_date() {
         use std::collections::HashMap;
@@ -1208,7 +1405,7 @@ mod tests {
         );
 
         assert_eq!(hints.len(), 1);
-        std::assert_matches!(&hints[0].label, InlayHintLabel::String(text) if text.starts_with("✅"));
+        assert_matches!(&hints[0].label, InlayHintLabel::String(text) if text.starts_with("✅"));
     }
 
     #[test]

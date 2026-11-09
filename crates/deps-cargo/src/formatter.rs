@@ -1,8 +1,9 @@
 use crate::types::CargoDependency;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
-    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget,
-    SourcePolicy, bare_meaning, compile_semver_requirement, format_version_replacing_by_shape,
+    BoundedVersionReq, CandidateSet, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+    OsvNaming, PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution,
+    RewriteTarget, SemverGrammar, SourcePolicy, VersionGrammar, bare_meaning,
+    format_version_replacing_by_shape, grammar_candidates, grammar_matcher,
     up_to_date_for_comparators_via_compiled_matcher,
 };
 use deps_core::parser::DependencySource;
@@ -20,6 +21,34 @@ const MAX_NAME_LENGTH: usize = 64;
 
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for Cargo.
 pub struct CargoFormatter;
+
+/// Cargo's version grammar: [`SemverGrammar`] minus requirements with an unresolved placeholder.
+#[derive(Clone, Copy)]
+struct CargoGrammar;
+
+impl VersionGrammar for CargoGrammar {
+    type Version = semver::Version;
+    type Compiled = semver::VersionReq;
+
+    fn parse_version(&self, version: &ConcreteVersion) -> Option<semver::Version> {
+        SemverGrammar.parse_version(version)
+    }
+
+    fn compile(&self, requirement: BoundedVersionReq<'_>) -> Option<semver::VersionReq> {
+        if CargoFormatter.bounded_requirement_is_unresolved(requirement) {
+            return None;
+        }
+        SemverGrammar.compile(requirement)
+    }
+
+    fn satisfies(&self, compiled: &semver::VersionReq, version: &semver::Version) -> bool {
+        SemverGrammar.satisfies(compiled, version)
+    }
+
+    fn strict_prerelease_exclusion(&self, compiled: &semver::VersionReq) -> bool {
+        SemverGrammar.strict_prerelease_exclusion(compiled)
+    }
+}
 
 impl CargoFormatter {
     fn render_replacing(
@@ -174,18 +203,19 @@ impl DependencyFormatter for CargoFormatter {
 }
 
 impl RequirementResolution for CargoFormatter {
-    /// Delegates to [`compile_semver_requirement`] — precise `semver::VersionReq` range
-    /// semantics (`^`, `~`, comparator lists), the same crate `deps-cargo`'s registry uses for
-    /// matching, unlike the default `version_satisfies_requirement` heuristic this method
-    /// deliberately does not reuse (see that method's docs). Shared with `deps-swift` (#1495).
+    /// Precise `semver::VersionReq` range semantics (`^`, `~`, comparator lists) through
+    /// `CargoGrammar`, the same crate `deps-cargo`'s registry uses for matching, unlike the
+    /// default `version_satisfies_requirement` heuristic this method deliberately does not reuse
+    /// (see that method's docs). Shared with `deps-swift` (#1495).
     fn compile_bounded_requirement(
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        if self.bounded_requirement_is_unresolved(requirement) {
-            return None;
-        }
-        compile_semver_requirement(requirement.get())
+        grammar_matcher(CargoGrammar, requirement)
+    }
+
+    fn candidate_set(&self, candidates: &[ConcreteVersion]) -> Option<Box<dyn CandidateSet>> {
+        Some(grammar_candidates(CargoGrammar, candidates))
     }
 
     /// Comparator-style requirements (`=1.2.3`, `<2`, `>=1.2, <2`) are judged by the compiled
@@ -246,6 +276,61 @@ mod tests {
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
 
+    const REQUIREMENTS: &[&str] = &[
+        "1",
+        "1.2",
+        "1.2.3",
+        "^1.2.3",
+        "~1.2",
+        "~1.2.3",
+        "=1.2.3",
+        "<2",
+        ">=1.2, <2",
+        ">1.0.0-alpha",
+        "1.*",
+        "1.2.*",
+        "*",
+        "^0.0.3",
+        "^0.3",
+        "=1.0.0-beta.1",
+        ">=1.0.0-alpha, <1.0.0",
+        "1.2.3+build",
+        "",
+        "not semver",
+        "\\(v)",
+        "$(Version)",
+        "^1.2.3 || ^2.0",
+        "1.2.3-",
+    ];
+    const VERSIONS: &[&str] = &[
+        "0.0.3",
+        "0.3.1",
+        "1.0.0-alpha",
+        "1.0.0-beta.1",
+        "1.0.0",
+        "1.2.0",
+        "1.2.3",
+        "1.2.4",
+        "1.2.3+build",
+        "1.9.9",
+        "2.0.0",
+        "2.0.0-rc.1",
+        "10.0.0",
+        "v1.2.3",
+        "garbage",
+        "",
+        "1.2",
+    ];
+
+    #[test]
+    fn candidate_set_agrees_with_the_matcher() {
+        deps_core::test_util::assert_candidate_set_consistent(
+            &CargoFormatter,
+            REQUIREMENTS,
+            VERSIONS,
+        );
+    }
+
     /// #1687: only pub treats `+build` as significant; SemVer ecosystems keep ignoring it.
     #[test]
     fn test_build_metadata_stays_ignored_for_pins() {
@@ -292,6 +377,33 @@ mod tests {
         assert_eq!(
             CargoFormatter.format_version_replacing(&pre, "~0.7"),
             "~0.10.3-rc.1"
+        );
+    }
+
+    /// #1990: a partial bare or caret requirement keeps its declared precision on update; the
+    /// floor target and a prerelease pick keep the full version.
+    #[test]
+    fn test_partial_caret_update_keeps_declared_precision_1990() {
+        let picked = ConcreteVersion::new("0.10.3");
+        for (current, expected) in [
+            ("0.7", "0.10"),
+            ("1", "0"),
+            ("^0.4", "0.10"),
+            ("0.7.1", "0.10.3"),
+        ] {
+            assert_eq!(
+                CargoFormatter.format_version_replacing(&picked, current),
+                expected,
+                "{current}"
+            );
+        }
+        assert_eq!(
+            CargoFormatter.format_version_replacing(&ConcreteVersion::new("1.0.19"), "^0.4"),
+            "1.0"
+        );
+        assert_eq!(
+            CargoFormatter.format_version_replacing(&ConcreteVersion::new("0.10.3-rc.1"), "0.7"),
+            "0.10.3-rc.1"
         );
     }
 

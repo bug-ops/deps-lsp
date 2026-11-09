@@ -702,7 +702,7 @@ mod tests {
         }
     }
 
-    crate::test_utils::impl_parsing_stub_ecosystem!(MockEcosystem, {
+    deps_core::impl_stub_typed_ecosystem!(MockEcosystem, {
         fn completions<'a>(
             &'a self,
             _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
@@ -825,7 +825,7 @@ mod tests {
             }
         }
 
-        crate::test_utils::impl_parsing_stub_ecosystem!(IncompleteEcosystem, {
+        deps_core::impl_stub_typed_ecosystem!(IncompleteEcosystem, {
             fn completions<'a>(
                 &'a self,
                 _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
@@ -2161,7 +2161,7 @@ mod tests {
             }
         }
 
-        crate::test_utils::impl_parsing_stub_ecosystem!(FreshnessEchoEcosystem, {
+        deps_core::impl_stub_typed_ecosystem!(FreshnessEchoEcosystem, {
             fn completions<'a>(
                 &'a self,
                 _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
@@ -2869,7 +2869,7 @@ ser"
             }
         }
 
-        crate::test_utils::impl_parsing_stub_ecosystem!(SlowEcosystem, {
+        deps_core::impl_stub_typed_ecosystem!(SlowEcosystem, {
             fn completions<'a>(
                 &'a self,
                 _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
@@ -2948,7 +2948,7 @@ ser"
             }
         }
 
-        crate::test_utils::impl_parsing_stub_ecosystem!(StalledCompletionEcosystem, {
+        deps_core::impl_stub_typed_ecosystem!(StalledCompletionEcosystem, {
             fn completions<'a>(
                 &'a self,
                 _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
@@ -3059,7 +3059,7 @@ ser"
             }
         }
 
-        crate::test_utils::impl_parsing_stub_ecosystem!(IncompleteEcosystem, {
+        deps_core::impl_stub_typed_ecosystem!(IncompleteEcosystem, {
             fn completions<'a>(
                 &'a self,
                 _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
@@ -3170,7 +3170,7 @@ ser"
             }
         }
 
-        crate::test_utils::impl_parsing_stub_ecosystem!(SuppressFallbackEcosystem, {
+        deps_core::impl_stub_typed_ecosystem!(SuppressFallbackEcosystem, {
             fn completions<'a>(
                 &'a self,
                 _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
@@ -3261,7 +3261,7 @@ ser"
             }
         }
 
-        crate::test_utils::impl_parsing_stub_ecosystem!(NotSuppressingEcosystem, {
+        deps_core::impl_stub_typed_ecosystem!(NotSuppressingEcosystem, {
             fn completions<'a>(
                 &'a self,
                 _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
@@ -3358,7 +3358,7 @@ ser"
             }
         }
 
-        crate::test_utils::impl_parsing_stub_ecosystem!(OriginProbeEcosystem, {
+        deps_core::impl_stub_typed_ecosystem!(OriginProbeEcosystem, {
             fn completions<'a>(
                 &'a self,
                 _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,

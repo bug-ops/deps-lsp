@@ -53,10 +53,22 @@ use crate::{ConcreteVersion, NormalizedName};
 /// });
 /// assert_eq!(names, ["dep-0", "dep-1"]);
 /// ```
-pub trait ParsedManifest: ParseResult {
+pub trait ParsedManifest: ParseResult + crate::sealed::ParsedManifest {
     /// Whether the document consulted the parse input `input` names, see
     /// [`TypedEcosystem::depends_on`].
     fn parse_depends_on(&self, input: &crate::ParseInputKey) -> bool;
+
+    /// The identity of the ecosystem that parsed the document.
+    ///
+    /// Callers read it here instead of taking it as a separate parameter, so a manifest can never
+    /// be paired with the identity of another ecosystem.
+    fn ecosystem_id(&self) -> crate::EcosystemId;
+
+    /// The formatter of the ecosystem instance that parsed the document.
+    ///
+    /// The same instance [`Self::for_each_formatted_dependency`] binds each dependency to, so
+    /// keys normalized with it agree with every verdict computed from the document.
+    fn formatter(&self) -> &dyn crate::lsp_helpers::EcosystemFormatter;
 
     /// Gathers background evidence for the document, see [`TypedEcosystem::probes`].
     fn background_probes(
@@ -146,7 +158,7 @@ pub trait ParsedManifest: ParseResult {
     fn vulnerability_keys(
         &self,
         resolved: &HashMap<NormalizedName, ConcreteVersion>,
-        resolved_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
+        resolved_candidates: Option<&crate::lsp_helpers::ResolvedCandidatesMap>,
     ) -> VulnKeys;
 
     /// Calls `visit` once per dependency, in [`ParseResult::dependencies`] order, with the
@@ -190,9 +202,11 @@ impl<E: TypedEcosystem> EcosystemManifest<E> {
 #[deny(clippy::missing_trait_methods)]
 impl<E: TypedEcosystem> ParseResult for EcosystemManifest<E> {
     fn dependencies(&self) -> Vec<&dyn Dependency> {
-        let mut deps = self.parsed.dependencies();
-        deps.truncate(MAX_DEPENDENCIES_PER_DOCUMENT);
-        deps
+        self.view()
+            .dependencies_slice()
+            .iter()
+            .map(|dep| dep as &dyn Dependency)
+            .collect()
     }
 
     fn workspace_root(&self) -> Option<&std::path::Path> {
@@ -231,9 +245,19 @@ impl<E: TypedEcosystem> ParseResult for EcosystemManifest<E> {
     }
 }
 
+impl<E: TypedEcosystem> crate::sealed::ParsedManifest for EcosystemManifest<E> {}
+
 impl<E: TypedEcosystem> ParsedManifest for EcosystemManifest<E> {
     fn parse_depends_on(&self, input: &crate::ParseInputKey) -> bool {
         self.ecosystem.depends_on(self.view(), input)
+    }
+
+    fn ecosystem_id(&self) -> crate::EcosystemId {
+        self.ecosystem.ecosystem_id()
+    }
+
+    fn formatter(&self) -> &dyn crate::lsp_helpers::EcosystemFormatter {
+        self.ecosystem.own_formatter()
     }
 
     fn background_probes(
@@ -364,7 +388,7 @@ impl<E: TypedEcosystem> ParsedManifest for EcosystemManifest<E> {
     fn vulnerability_keys(
         &self,
         resolved: &HashMap<NormalizedName, ConcreteVersion>,
-        resolved_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
+        resolved_candidates: Option<&crate::lsp_helpers::ResolvedCandidatesMap>,
     ) -> VulnKeys {
         crate::osv::vulnerability_keys(
             &self.view(),
@@ -798,6 +822,68 @@ mod tests {
             .swap(0, std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// A parse result whose erased `dependencies()` disagrees with its typed slice.
+    struct Disagreeing(crate::test_util::StubParseResult);
+
+    impl ParseResult for Disagreeing {
+        fn dependencies(&self) -> Vec<&dyn Dependency> {
+            let mut deps = self.0.dependencies();
+            deps.reverse();
+            deps
+        }
+
+        fn workspace_root(&self) -> Option<&Path> {
+            None
+        }
+
+        fn uri(&self) -> &url::Url {
+            self.0.uri()
+        }
+    }
+
+    impl TypedParseResult for Disagreeing {
+        type Dep = StubDependency;
+
+        fn own_dependencies(&self) -> &[StubDependency] {
+            self.0.own_dependencies()
+        }
+    }
+
+    #[test]
+    fn erased_dependencies_follow_the_typed_slice_the_visitor_uses() {
+        let parsed = crate::test_util::StubParseResult::new(test_uri("/project/manifest.json"), 3);
+        let manifest = crate::test_util::stub_document(Disagreeing(parsed));
+        let erased: Vec<String> = manifest
+            .dependencies()
+            .iter()
+            .map(|dep| dep.name().as_str().to_owned())
+            .collect();
+        let mut visited = Vec::new();
+        manifest.for_each_formatted_dependency(&mut |bound| {
+            visited.push(bound.dependency().name().as_str().to_owned());
+        });
+        assert_eq!(erased, ["dep-0", "dep-1", "dep-2"]);
+        assert_eq!(erased, visited);
+    }
+
+    #[test]
+    fn the_manifest_reports_the_identity_and_formatter_of_its_parsing_ecosystem() {
+        let document = crate::test_util::stub_document_with(
+            crate::test_util::stub_parse_result(1),
+            crate::test_util::StubFormatter::DEFAULT.for_dependency::<StubDependency>(),
+            crate::EcosystemId::Pypi,
+        );
+        assert_eq!(document.ecosystem_id(), crate::EcosystemId::Pypi);
+        let mut seen = Vec::new();
+        document.for_each_formatted_dependency(&mut |bound| {
+            seen.push(std::ptr::addr_eq(
+                std::ptr::from_ref(bound.formatter()),
+                std::ptr::from_ref(document.formatter()),
+            ));
+        });
+        assert_eq!(seen, [true]);
+    }
+
     #[tokio::test]
     async fn every_hook_sees_exactly_the_capped_dependencies() {
         let (manifest, observed, ecosystem) = recording_manifest(MAX_DEPENDENCIES_PER_DOCUMENT + 1);
@@ -807,7 +893,10 @@ mod tests {
             || VersionData::new(&cached, &resolved).with_ecosystem(crate::EcosystemId::Cargo);
         let uri = test_uri("/project/manifest.json");
 
-        manifest.parse_depends_on(&crate::ParseInputKey::new("input"));
+        manifest.parse_depends_on(&crate::ParseInputKey::minted_by(
+            crate::EcosystemId::Cargo,
+            "input",
+        ));
         manifest
             .background_probes(crate::lsp_helpers::ProbePhase::PreFetch)
             .await;

@@ -121,6 +121,7 @@ THEN results are identical to behavior before this feature
 | FR-012 | WHEN the content is malformed or exceeds parser bounds THE SYSTEM SHALL return `DepsError::ParseError` (no new error variant) with credential-bearing URLs redacted as the existing pnpm/package-lock paths do, and SHALL NOT panic | must |
 | FR-013 | THE SYSTEM SHALL key all yarn-derived output by `NormalizedName` (via the same name-normalization path the npm ecosystem already uses) so lookups match manifest dependency names regardless of spelling variants | must |
 | FR-014 | WHEN a lock file's yarn format version is unrecognized (e.g. a future Berry `__metadata.version` beyond those supported) THE SYSTEM SHALL return a `ParseError` naming the version rather than silently returning wrong data | should |
+| FR-015 | WHEN an entry's header (v1) or key (Berry) lists several declared requirements for one package name THE SYSTEM SHALL record every one of them, as written (a Berry default `npm:` protocol prefix removed, an alias reduced to its real range), as that entry's descriptors; WHEN a manifest's own declared requirement text equals a descriptor of a satisfying entry THE SYSTEM SHALL select that entry as the dependency's version before falling back to the highest satisfying entry; non-registry entries carry no descriptors (#1993) | must |
 
 ## 4. Non-Functional Requirements
 
@@ -148,7 +149,7 @@ No new public types beyond a private lock-format classification enum. Reuses `de
 |----------|-------------------|
 | `yarn.lock` and `package-lock.json` in same directory | Higher-precedence file per FR-002 wins; `yarn.lock` is not read |
 | `yarn.lock` only in an ancestor directory (workspace root) | Located via ancestor search; resolves member manifests |
-| Header with multiple specifiers (`"a@^1.0.0", a@~1.2.0:`) | One resolved version recorded for name `a`; duplicate specifiers do not create duplicate candidates |
+| Header with multiple specifiers (`"a@^1.0.0", a@~1.2.0:`) | One resolved version recorded for name `a`; duplicate specifiers do not create duplicate candidates, and both specifiers are kept as that entry's descriptors (FR-015) |
 | Scoped package `"@scope/pkg@^1.0.0":` | Name extracted as `@scope/pkg` |
 | Alias `"my-react@npm:react@^18.0.0"` | Recorded under `react` (FR-008) |
 | Berry `workspace:` / `link:` entry | Skipped (FR-007) |

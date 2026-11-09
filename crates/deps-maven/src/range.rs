@@ -89,7 +89,7 @@ fn lower_edge(range: &VersionRange) -> Bound<&str> {
 ///
 /// `[1.0,1.5),(1.5,2.0)` is Maven's only way to express a `!=`-style exclusion (no literal
 /// `!=` operator exists in its grammar), so this is the Maven counterpart of
-/// `ComposerMatcher`/`Pep440Matcher`/`RubygemsMatcher`'s `explicitly_excludes` override: a
+/// `ComposerGrammar`/`Pep440Grammar`/`RubygemsGrammar`'s `explicitly_excludes` override: a
 /// fallback-candidate scan of `available` cannot tell "excluded by a gap" apart from
 /// "legitimately above the requirement's ceiling" without asking the matcher directly (#1571).
 ///

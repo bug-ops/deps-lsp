@@ -120,6 +120,8 @@ impl SuppressedKinds {
                             .any(|a| a.id() == id && a.severity == VulnSeverity::Informational)
                     })
             }
+            // The overflow line is never hidden itself; its count already excludes hidden
+            // advisories (#1960, `push_vulnerability_diagnostics`).
             DiagnosticKind::FlaggedLatest
             | DiagnosticKind::UnverifiedLatest
             | DiagnosticKind::AdvisoryOverflow

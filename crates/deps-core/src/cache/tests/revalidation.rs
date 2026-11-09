@@ -435,6 +435,7 @@ async fn test_get_cached_non_2xx_on_refresh_preserves_stale_cache() {
 
 /// A connect-time policy block during revalidation makes no connection, so a warm entry is
 /// still served (stale-while-revalidate) instead of surfacing `HostBlockedByPolicy`.
+#[cfg(feature = "test-util")]
 #[tokio::test]
 async fn test_get_cached_policy_block_on_refresh_serves_warm_entry() {
     let mut server = mockito::Server::new_async().await;

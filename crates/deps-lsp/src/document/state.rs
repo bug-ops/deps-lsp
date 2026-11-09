@@ -185,6 +185,15 @@ pub(crate) struct DocStamp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PublishTicket(u64);
 
+/// Identifies one escalation to a full registry refetch (#1994), so a debounced task clears
+/// only the escalation it served and never one raised by a newer change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefetchEscalation(u64);
+
+/// Held while one diagnostics publish (or a close's clearing publish) runs for a document; see
+/// [`ServerState::lock_publish`].
+pub(crate) type PublishGate = tokio::sync::OwnedMutexGuard<()>;
+
 /// Why a manifest's parser rejected it, kept on the [`DocumentState`] so diagnostics can
 /// surface the cause instead of silently publishing nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1279,6 +1288,17 @@ pub struct ServerState {
     /// Newest ticket that published per document, so a generation that started earlier but
     /// finishes later (and so may have read older signals) never overwrites a newer publish.
     published: DashMap<Uri, PublishTicket>,
+    /// Per-document gate serializing a diagnostics publish's claim-to-send window against
+    /// `did_close`'s removal and clearing publish (#1938); see [`Self::lock_publish`].
+    publish_gates: DashMap<Uri, Arc<tokio::sync::Mutex<()>>>,
+    /// Flags tasks aborted through [`Self::tasks`] so their progress indicator ends quietly (#2001).
+    abort_registry: Arc<crate::progress::AbortRegistry>,
+    /// Source of [`RefetchEscalation`]s.
+    refetch_escalation_ids: AtomicU64,
+    /// Full refetches requested for a document that no committed fetch has served yet, so an
+    /// aborted debounced task cannot lose one (#1994). Not part of `DocumentState`, which every
+    /// reparse commit replaces.
+    refetch_escalations: DashMap<Uri, RefetchEscalation>,
     /// Server-global source for [`PackageSignals::resolved_versions_generation`] (issue
     /// #1395 critic M10), drawn via [`Self::next_resolved_versions_generation`]. A
     /// per-document-instance counter that restarts at 0 on every `DocumentState` rebuild
@@ -1405,6 +1425,10 @@ impl ServerState {
             republish: tokio::sync::Notify::new(),
             publish_tickets: AtomicU64::new(0),
             published: DashMap::new(),
+            publish_gates: DashMap::new(),
+            abort_registry: Arc::default(),
+            refetch_escalation_ids: AtomicU64::new(0),
+            refetch_escalations: DashMap::new(),
             resolved_versions_generation_source: AtomicU64::new(0),
         }
     }
@@ -1837,7 +1861,36 @@ impl ServerState {
         // inserting, so a generation racing this close cannot leave an entry behind.
         let removed = self.documents.remove(uri);
         self.published.remove(uri);
+        self.refetch_escalations.remove(uri);
         removed
+    }
+
+    /// Records a request for a full registry refetch of `uri`, replacing any earlier one.
+    pub(crate) fn escalate_refetch(&self, uri: &Uri) -> RefetchEscalation {
+        let escalation =
+            RefetchEscalation(self.refetch_escalation_ids.fetch_add(1, Ordering::SeqCst) + 1);
+        self.refetch_escalations.insert(uri.clone(), escalation);
+        escalation
+    }
+
+    /// The full refetch still owed to `uri`, if no committed fetch has served it yet.
+    pub(crate) fn pending_refetch_escalation(&self, uri: &Uri) -> Option<RefetchEscalation> {
+        self.refetch_escalations.get(uri).map(|entry| *entry)
+    }
+
+    /// Drops `uri`'s pending escalation when its document is no longer tracked, so an
+    /// escalation that raced `did_close` (which clears it with the document) leaves no entry
+    /// behind. Call after the escalation was recorded.
+    pub(crate) fn drop_refetch_escalation_if_untracked(&self, uri: &Uri) {
+        if !self.documents.contains_key(uri) {
+            self.refetch_escalations.remove(uri);
+        }
+    }
+
+    /// Marks `escalation` served; a no-op when a newer escalation replaced it meanwhile.
+    pub(crate) fn clear_refetch_escalation(&self, uri: &Uri, escalation: RefetchEscalation) {
+        self.refetch_escalations
+            .remove_if(uri, |_, pending| *pending == escalation);
     }
 
     /// Draws the ticket for a new diagnostics generation attempt; later tickets started later.
@@ -1851,9 +1904,35 @@ impl ServerState {
         self.published.contains_key(uri)
     }
 
+    /// The registry [`crate::progress::start_registry_progress`] enrolls progress-holding tasks in.
+    pub(crate) fn abort_registry(&self) -> &Arc<crate::progress::AbortRegistry> {
+        &self.abort_registry
+    }
+
+    /// Takes `uri`'s publish gate. A diagnostics publish holds it from its [`Self::claim_publish`]
+    /// to the end of its send, and `did_close` holds it across the removal and the clearing
+    /// publish, so no stale publish can be sent after the close's empty one (#1938).
+    ///
+    /// Release it by dropping the guard, then call [`Self::prune_publish_gate`].
+    pub(crate) async fn lock_publish(&self, uri: &Uri) -> PublishGate {
+        let gate = Arc::clone(&*self.publish_gates.entry(uri.clone()).or_default());
+        gate.lock_owned().await
+    }
+
+    /// Drops `uri`'s gate entry once nobody holds or awaits it, so the map does not grow with
+    /// every document ever opened. Call after dropping the [`PublishGate`].
+    pub(crate) fn prune_publish_gate(&self, uri: &Uri) {
+        self.publish_gates
+            .remove_if(uri, |_, gate| Arc::strong_count(gate) == 1);
+    }
+
     /// Claims the right to publish `uri`'s diagnostics for `ticket`; `false` when a generation
-    /// that started later already published, so this older one must stay silent.
+    /// that started later already published, or when `uri` is no longer tracked, so this one
+    /// must stay silent.
     pub(crate) fn claim_publish(&self, uri: &Uri, ticket: PublishTicket) -> bool {
+        if !self.documents.contains_key(uri) {
+            return false;
+        }
         let mut claimed = false;
         self.published
             .entry(uri.clone())
@@ -1868,8 +1947,10 @@ impl ServerState {
                 ticket
             });
         if claimed && !self.documents.contains_key(uri) {
-            // A closed document keeps no claim, or the map would grow with every closed URI.
+            // A document closed since the check keeps no claim, or the map would grow with
+            // every closed URI.
             self.published.remove_if(uri, |_, newest| *newest == ticket);
+            return false;
         }
         claimed
     }
@@ -1902,7 +1983,8 @@ impl ServerState {
 
         {
             let mut tasks = self.tasks.write().await;
-            if let Some((_, old_task)) = tasks.insert(uri.clone(), (task_id, abort_handle)) {
+            if let Some((old_id, old_task)) = tasks.insert(uri.clone(), (task_id, abort_handle)) {
+                self.abort_registry.mark_aborted(old_id);
                 old_task.abort();
             }
         }
@@ -2017,7 +2099,8 @@ impl ServerState {
     #[tracing::instrument(skip_all, fields(uri = ?uri))]
     pub async fn cancel_background_task(&self, uri: &Uri) {
         let mut tasks = self.tasks.write().await;
-        if let Some((_, task)) = tasks.remove(uri) {
+        if let Some((id, task)) = tasks.remove(uri) {
+            self.abort_registry.mark_aborted(id);
             task.abort();
         }
         drop(tasks);
@@ -2149,7 +2232,7 @@ mod tests {
                 None
             }
         }
-        crate::test_utils::impl_parsing_stub_ecosystem!(TaggedEcosystem, {
+        deps_core::impl_stub_typed_ecosystem!(TaggedEcosystem, {
             fn decorate_code_actions<'a>(
                 &'a self,
                 _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,

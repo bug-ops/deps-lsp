@@ -146,7 +146,7 @@ pub fn is_prerelease(version: &str) -> bool {
 }
 
 /// A parsed interval-notation version range (spec §2), produced once per dependency by
-/// [`parse_range`] and reused by `crate::formatter::NuGetMatcher` against every candidate
+/// [`parse_range`] and reused by `crate::formatter::NuGetGrammar` against every candidate
 /// version, instead of being re-parsed per candidate.
 ///
 /// The bracket-interval *grammar* (delimiter parsing, malformed-input rejection) is shared
@@ -214,8 +214,13 @@ pub(crate) fn compare_minimum_floor(range: &str, other: &str) -> Option<Ordering
 
 /// Whether `version` falls inside an already-parsed NuGet interval `range`.
 pub(crate) fn range_contains(version: &str, range: &VersionRange) -> bool {
-    let v = ParsedVersion::parse(version);
-    deps_core::interval::contains(&v, range, compare_parsed)
+    range_contains_parsed(&ParsedVersion::parse(version), range)
+}
+
+/// [`range_contains`] for a candidate that is already parsed, so many ranges can be tested
+/// against one parse.
+pub(crate) fn range_contains_parsed(version: &ParsedVersion, range: &VersionRange) -> bool {
+    deps_core::interval::contains(version, range, compare_parsed)
 }
 
 /// Checks whether `version` satisfies a NuGet interval-notation `range` (spec §2).
@@ -233,7 +238,7 @@ pub fn satisfies(version: &str, range: &str) -> bool {
 }
 
 /// A parsed floating-version pattern (spec §2), produced once per dependency by
-/// [`parse_float`] and reused by `crate::formatter::NuGetMatcher` against every candidate
+/// [`parse_float`] and reused by `crate::formatter::NuGetGrammar` against every candidate
 /// version, instead of being re-parsed per candidate.
 pub(crate) enum FloatPattern {
     /// `*` (stable only) or `*-*` (including prerelease).

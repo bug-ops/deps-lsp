@@ -40,8 +40,108 @@ pub type CachedVersionsMap = HashMap<NormalizedName, PackageVersions>;
 /// Lock-file-resolved version per package, keyed by the ecosystem-normalized name.
 pub type ResolvedVersionsMap = HashMap<NormalizedName, ConcreteVersion>;
 
+/// The lock-file versions retained for one package, in the lock file's own order, with the
+/// ownership data that decides which of them a requesting manifest is using (#1993).
+///
+/// A named type rather than a bare `Vec` so lock-entry selection metadata travels with the
+/// versions. Built by [`crate::lockfile::ResolvedPackages::split_normalized_for`]
+/// (owner-aware) or `From<Vec<ConcreteVersion>>` (no ownership data).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::ConcreteVersion;
+/// use deps_core::lsp_helpers::LockCandidates;
+///
+/// let candidates = LockCandidates::from(vec![ConcreteVersion::new("1.0.0")]);
+/// assert_eq!(candidates.len(), 1);
+/// assert_eq!(candidates.versions(), [ConcreteVersion::new("1.0.0")]);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockCandidates {
+    versions: Vec<ConcreteVersion>,
+    preference: OwnerPreference,
+}
+
+/// Which retained versions the requesting manifest owns, parallel to
+/// [`LockCandidates::versions`].
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum OwnerPreference {
+    /// No ownership data: every satisfying version is equally likely.
+    Unscoped,
+    /// One flag per version: the lock entry sits under the requesting manifest's importer.
+    Owned(Box<[bool]>),
+    /// Per version, the declaration texts the lock file recorded as resolving to it (yarn).
+    Descriptors(Box<[Box<[crate::VersionReq]>]>),
+}
+
+impl std::fmt::Debug for OwnerPreference {
+    /// Manual: descriptor texts are raw lock-file declarations, redacted like every other
+    /// declaration key.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unscoped => f.write_str("Unscoped"),
+            Self::Owned(flags) => f.debug_tuple("Owned").field(flags).finish(),
+            Self::Descriptors(per_version) => {
+                let redacted: Vec<Vec<String>> = per_version
+                    .iter()
+                    .map(|descriptors| {
+                        descriptors
+                            .iter()
+                            .map(|d| crate::redact::redact_declaration_key(d.as_str()).into_owned())
+                            .collect()
+                    })
+                    .collect();
+                f.debug_tuple("Descriptors").field(&redacted).finish()
+            }
+        }
+    }
+}
+
+impl LockCandidates {
+    /// Pairs `versions` with the ownership data for them; any per-version slice in
+    /// `preference` must be as long as `versions`.
+    pub(crate) const fn with_preference(
+        versions: Vec<ConcreteVersion>,
+        preference: OwnerPreference,
+    ) -> Self {
+        Self {
+            versions,
+            preference,
+        }
+    }
+
+    pub(crate) const fn preference(&self) -> &OwnerPreference {
+        &self.preference
+    }
+
+    /// The retained versions.
+    #[must_use]
+    pub fn versions(&self) -> &[ConcreteVersion] {
+        &self.versions
+    }
+
+    /// Number of retained versions.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.versions.len()
+    }
+
+    /// Whether no version is retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.versions.is_empty()
+    }
+}
+
+impl From<Vec<ConcreteVersion>> for LockCandidates {
+    fn from(versions: Vec<ConcreteVersion>) -> Self {
+        Self::with_preference(versions, OwnerPreference::Unscoped)
+    }
+}
+
 /// Every retained lock-file version per package, keyed by the ecosystem-normalized name.
-pub type ResolvedCandidatesMap = HashMap<NormalizedName, Vec<ConcreteVersion>>;
+pub type ResolvedCandidatesMap = HashMap<NormalizedName, LockCandidates>;
 
 /// Bundles the per-package version maps (`cached`, `resolved`, the optional lock-file
 /// candidates) that LSP handlers pass together everywhere.
@@ -402,7 +502,7 @@ impl<'a> VersionData<'a> {
     pub fn resolved_candidates_for(&self, key: &PackageKey) -> Option<&'a [ConcreteVersion]> {
         self.resolved_version_candidates
             .and_then(|candidates| candidates.get(key.normalized()))
-            .map(Vec::as_slice)
+            .map(LockCandidates::versions)
     }
 
     /// The whole lock-file map, for deps-core helpers that take the raw map.
@@ -455,7 +555,7 @@ impl<'a> VersionData<'a> {
     /// let resolved = HashMap::new();
     /// let key = PackageKey::new(&PackageName::new("serde"), &Identity);
     /// let mut candidates = HashMap::new();
-    /// candidates.insert(key.normalized().clone(), vec![ConcreteVersion::new("1.0.200")]);
+    /// candidates.insert(key.normalized().clone(), vec![ConcreteVersion::new("1.0.200")].into());
     /// let versions =
     ///     VersionData::new(&cached, &resolved).with_resolved_version_candidates(&candidates);
     /// assert_eq!(versions.resolved_candidates_for(&key).map(<[_]>::len), Some(1));

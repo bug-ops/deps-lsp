@@ -5,39 +5,60 @@ use deps_core::InvalidPackageName;
 use deps_core::NormalizeName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
-    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
+    BoundedVersionReq, CandidateSet, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+    OsvNaming, PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution,
+    SourcePolicy, VersionGrammar, grammar_candidates, grammar_matcher,
 };
 use deps_core::osv::{NonPublicRoute, OsvPackageName};
 use pep440_rs::{Operator, Version, VersionSpecifiers};
 use std::str::FromStr;
 
-/// Precise PEP 440 specifier-set matcher, compiled once per dependency by
-/// [`PypiFormatter::compile_bounded_requirement`].
-struct Pep440Matcher(VersionSpecifiers);
+/// PyPI's version grammar: PEP 440 versions against PEP 440 specifier sets.
+#[derive(Clone, Copy)]
+struct Pep440Grammar;
 
-impl RequirementMatcher for Pep440Matcher {
-    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-        let version = version.as_str();
-        Version::from_str(version).ok().map(|v| self.0.contains(&v))
+impl VersionGrammar for Pep440Grammar {
+    type Version = Version;
+    type Compiled = VersionSpecifiers;
+
+    fn parse_version(&self, version: &ConcreteVersion) -> Option<Version> {
+        Version::from_str(version.as_str()).ok()
+    }
+
+    /// `None` for an unresolved requirement, one that is not a PEP 440 specifier set, or one that
+    /// names a [local version identifier]: such a requirement is only satisfiable by custom or
+    /// alternate indexes (e.g. the PyTorch wheel index), not the default registry the candidates
+    /// come from, so an empty match set would not mean it is unsatisfiable everywhere.
+    ///
+    /// [local version identifier]: https://peps.python.org/pep-0440/#local-version-identifiers
+    fn compile(&self, requirement: BoundedVersionReq<'_>) -> Option<VersionSpecifiers> {
+        if PypiFormatter.bounded_requirement_is_unresolved(requirement) {
+            return None;
+        }
+        let specs = VersionSpecifiers::from_str(requirement.as_str()).ok()?;
+        if specs.iter().any(|spec| spec.version().is_local()) {
+            return None;
+        }
+        Some(specs)
+    }
+
+    fn satisfies(&self, compiled: &VersionSpecifiers, version: &Version) -> bool {
+        compiled.contains(version)
     }
 
     /// PEP 440's own pre-release handling is not SemVer 2.0.0's (#299) — must not opt in.
-    fn strict_prerelease_exclusion(&self) -> bool {
+    fn strict_prerelease_exclusion(&self, _: &VersionSpecifiers) -> bool {
         false
     }
 
     /// Fix-cycle (#1571): a `!=`/`!=X.*` specifier's own [`pep440_rs::VersionSpecifier::contains`]
     /// already returns `false` exactly for the version(s) it bans — reusing it here (rather than
-    /// re-deriving the ban from `self.0.contains`, which folds every specifier together) is the
-    /// same precise comparator `matches` uses, scoped to only the exclusion-shaped specifiers.
-    fn explicitly_excludes(&self, version: &ConcreteVersion) -> bool {
-        let Ok(version) = Version::from_str(version.as_str()) else {
-            return false;
-        };
-        self.0.iter().any(|spec| {
+    /// re-deriving the ban from `compiled.contains`, which folds every specifier together) is the
+    /// same precise comparator `satisfies` uses, scoped to only the exclusion-shaped specifiers.
+    fn explicitly_excludes(&self, compiled: &VersionSpecifiers, version: &Version) -> bool {
+        compiled.iter().any(|spec| {
             matches!(spec.operator(), Operator::NotEqual | Operator::NotEqualStar)
-                && !spec.contains(&version)
+                && !spec.contains(version)
         })
     }
 }
@@ -202,14 +223,11 @@ impl RequirementResolution for PypiFormatter {
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        if self.bounded_requirement_is_unresolved(requirement) {
-            return None;
-        }
-        let specs = VersionSpecifiers::from_str(requirement.as_str()).ok()?;
-        if specs.iter().any(|spec| spec.version().is_local()) {
-            return None;
-        }
-        Some(Box::new(Pep440Matcher(specs)))
+        grammar_matcher(Pep440Grammar, requirement)
+    }
+
+    fn candidate_set(&self, candidates: &[ConcreteVersion]) -> Option<Box<dyn CandidateSet>> {
+        Some(grammar_candidates(Pep440Grammar, candidates))
     }
 
     // #1370/#1374/#1379/#1391: PyPI's requirement grammar has no placeholder syntax of its
@@ -326,6 +344,59 @@ mod tests {
     use super::*;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
+
+    const REQUIREMENTS: &[&str] = &[
+        ">=1.0",
+        ">=1.0,<2.0",
+        "==1.2.3",
+        "==1.2.*",
+        "~=1.2",
+        "~=1.2.3",
+        "!=1.5.0",
+        ">=1.0,!=1.5.0,<2.0",
+        "!=1.*",
+        ">1.0.0a1",
+        ">=1.0.0rc1",
+        "<2.0.0.dev1",
+        "===1.2.3",
+        "==1.2.3+local",
+        ">=1.0+cpu",
+        "",
+        "not a spec",
+        "{{ version }}",
+        "$(Version)",
+        "==1.0.0.post1",
+        ">=1!1.0",
+        "<=0.9",
+    ];
+    const VERSIONS: &[&str] = &[
+        "0.9",
+        "1.0",
+        "1.0.0a1",
+        "1.0.0rc1",
+        "1.0.0.post1",
+        "1.2.3",
+        "1.2.3+local",
+        "1.2.4",
+        "1.5.0",
+        "1.9.9",
+        "2.0.0",
+        "2.0.0.dev1",
+        "1!1.0",
+        "1.0.0-beta",
+        "garbage",
+        "",
+        "1.0.legacy",
+    ];
+
+    #[test]
+    fn candidate_set_agrees_with_the_matcher() {
+        deps_core::test_util::assert_candidate_set_consistent(
+            &PypiFormatter,
+            REQUIREMENTS,
+            VERSIONS,
+        );
+    }
 
     /// FR-009: `Registry` and `AlternateRegistry` both resolve; `CustomRegistry` and every
     /// non-registry source stay fail-closed via the default `is_version_resolvable()`.

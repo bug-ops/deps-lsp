@@ -39,10 +39,17 @@ enum Announced {
 }
 
 impl Announced {
-    fn add(self, event: &RefreshEvent) -> Self {
+    /// Folds `event` into the window of the listener of `listener`; a key minted by another
+    /// ecosystem is not this listener's concern.
+    fn add(self, event: &RefreshEvent, listener: EcosystemId) -> Self {
         match (self, event) {
             (Self::Lagged, _) => Self::Lagged,
             (current, RefreshEvent::TagIndex(_) | RefreshEvent::ProbeEvidence(_)) => current,
+            (current, RefreshEvent::ReparseOpenDocuments { input, .. })
+                if input.owner() != listener =>
+            {
+                current
+            }
             (Self::Nothing, RefreshEvent::ReparseOpenDocuments { generation, input }) => {
                 Self::Inputs {
                     generation: *generation,
@@ -213,7 +220,7 @@ pub(crate) async fn run_reparse_listener(
         let mut announced = Announced::Nothing;
         let mut last_event = Instant::now();
         match events.recv().await {
-            Ok(event) => announced = announced.add(&event),
+            Ok(event) => announced = announced.add(&event, ecosystem),
             Err(RecvError::Lagged(_)) => announced = Announced::Lagged,
             Err(RecvError::Closed) => return,
         }
@@ -226,7 +233,7 @@ pub(crate) async fn run_reparse_listener(
             match tokio::time::timeout_at(deadline, events.recv()).await {
                 Err(_elapsed) => break,
                 Ok(Ok(event)) => {
-                    announced = announced.add(&event);
+                    announced = announced.add(&event, ecosystem);
                     last_event = Instant::now();
                 }
                 Ok(Err(RecvError::Lagged(_))) => {
@@ -259,6 +266,8 @@ pub(crate) async fn run_reparse_listener(
 mod tests {
     use super::*;
 
+    const SWIFT: EcosystemId = EcosystemId::Swift;
+
     fn uri(name: &str) -> Uri {
         crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(name))
     }
@@ -266,7 +275,7 @@ mod tests {
     fn reparse_input(generation: u64, input: &str) -> RefreshEvent {
         RefreshEvent::ReparseOpenDocuments {
             generation,
-            input: ParseInputKey::new(input),
+            input: ParseInputKey::minted_by(SWIFT, input),
         }
     }
 
@@ -277,30 +286,50 @@ mod tests {
     fn inputs(generation: u64, names: &[&str]) -> Announced {
         Announced::Inputs {
             generation,
-            inputs: names.iter().map(|name| ParseInputKey::new(*name)).collect(),
+            inputs: names
+                .iter()
+                .map(|name| ParseInputKey::minted_by(SWIFT, *name))
+                .collect(),
         }
     }
 
     #[test]
     fn announcements_keep_the_newest_generation_and_union_the_inputs() {
         let announced = Announced::Nothing
-            .add(&reparse_input(3, "a"))
-            .add(&RefreshEvent::TagIndex(
-                deps_core::NormalizedName::for_test("o/r"),
-            ))
-            .add(&reparse_input(2, "b"));
+            .add(&reparse_input(3, "a"), SWIFT)
+            .add(
+                &RefreshEvent::TagIndex(deps_core::NormalizedName::for_test("o/r")),
+                SWIFT,
+            )
+            .add(&reparse_input(2, "b"), SWIFT);
         assert_eq!(announced, inputs(3, &["a", "b"]));
         assert_eq!(
-            Announced::Nothing.add(&RefreshEvent::ProbeEvidence(
-                deps_core::NormalizedName::for_test("o/r")
-            )),
+            Announced::Nothing.add(
+                &RefreshEvent::ProbeEvidence(deps_core::NormalizedName::for_test("o/r")),
+                SWIFT
+            ),
             Announced::Nothing
         );
     }
 
     #[test]
+    fn keys_minted_by_another_ecosystem_are_not_announced() {
+        let foreign = RefreshEvent::ReparseOpenDocuments {
+            generation: 1,
+            input: ParseInputKey::minted_by(EcosystemId::Cargo, "a"),
+        };
+        assert_eq!(Announced::Nothing.add(&foreign, SWIFT), Announced::Nothing);
+        assert_eq!(
+            Announced::Nothing
+                .add(&reparse_input(2, "a"), SWIFT)
+                .add(&foreign, SWIFT),
+            inputs(2, &["a"])
+        );
+    }
+
+    #[test]
     fn lag_dominates_later_announcements() {
-        assert_eq!(Announced::Lagged.add(&reparse(9)), Announced::Lagged);
+        assert_eq!(Announced::Lagged.add(&reparse(9), SWIFT), Announced::Lagged);
     }
 
     #[test]

@@ -11,8 +11,10 @@ use deps_core::hover::Hover;
 use deps_core::lsp_helpers::ShaPinning;
 use deps_core::{
     EcosystemBase, ParsedView, Registry, Result, TypedEcosystem, TypedParseResult,
-    diagnostic::{Diagnostic, DiagnosticKind, GitTagsPlatform, Severity},
-    lsp_helpers::{GitTagsPinning, git_tags_diagnostics},
+    diagnostic::{Diagnostic, Severity},
+    lsp_helpers::{
+        FixAvailability, GitTagsPinning, MutableRefPin, PinSubject, git_tags_diagnostics,
+    },
 };
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
@@ -157,24 +159,26 @@ impl GithubActionsEcosystem {
             .version_req
             .as_ref()
             .map(deps_core::VersionReq::as_str);
-        if let Some(resolved_tag) = resolved_tag.filter(|resolved| {
+        let resolved_tag = resolved_tag.filter(|resolved| {
             !(gha_dep.pin == Some(PinStyle::Tag) && written_tag == Some(resolved.as_str()))
-        }) {
-            hover.rewrite_markdown(|md| {
-                deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, &sha)
-            });
-        }
-
-        if let Some(CommentCheck::Mismatch(mismatch)) = self.formatter.sha_comment_check(gha_dep)
-            && let Some(comment) = gha_dep.sha_comment()
-        {
-            let line = deps_core::lsp_helpers::sha_comment_mismatch_hover_line(
-                &sha,
-                &comment.pin_comment().tag,
-                &mismatch,
-            );
-            hover.rewrite_markdown(|md| deps_core::lsp_helpers::splice_hover_line(md, &line));
-        }
+        });
+        let mismatch = match (
+            self.formatter.sha_comment_check(gha_dep),
+            gha_dep.sha_comment(),
+        ) {
+            (Some(CommentCheck::Mismatch(mismatch)), Some(comment)) => {
+                Some((comment.pin_comment(), mismatch))
+            }
+            _ => None,
+        };
+        deps_core::lsp_helpers::splice_sha_pin_hover_lines(
+            hover,
+            &sha,
+            resolved_tag.as_deref(),
+            mismatch
+                .as_ref()
+                .map(|(comment, mismatch)| (*comment, mismatch)),
+        );
     }
 }
 
@@ -526,40 +530,24 @@ fn mutable_ref_pin_diagnostics(
             if !is_registry_confirmed_tag(gha_dep, tag_index) {
                 return None;
             }
-            let range = gha_dep.version_range?;
-            let tag = gha_dep
+            let ref_text = gha_dep
                 .version_req
                 .as_ref()
                 .map(deps_core::VersionReq::as_str)?;
-            let name = deps_core::lsp_helpers::redact_name_for_diagnostic(&gha_dep.name);
-            let tag = deps_core::lsp_helpers::sanitize_and_truncate_for_diagnostic(
-                tag,
-                deps_core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS,
-            );
-            // Critic C2 (#551): a registry-confirmed `PinStyle::Branch` has no automated fix
-            // (`build_sha_pin_action` stays restricted to `PinStyle::Tag`, FR-005) — the
-            // message must say so, not imply one exists. Gated on `is_sha_pinnable_tag`
-            // (#1188), not raw `PinStyle::Tag` alone, so a quoted-scalar/flow-style tag pin
-            // (quickfix withheld) doesn't claim one.
-            let message = if is_sha_pinnable_tag(gha_dep) {
-                format!(
-                    "{name} is pinned to the mutable tag ref `{tag}`; pin to a full commit \
-                     SHA to guard against tag mutation"
-                )
+            let fix = if is_sha_pinnable_tag(gha_dep) {
+                FixAvailability::Automated
             } else {
-                format!(
-                    "{name} is pinned to the mutable tag ref `{tag}`; pin to a full commit \
-                     SHA to guard against tag mutation (manual edit — no automated fix \
-                     available for this ref)"
-                )
+                FixAvailability::ManualOnly
             };
             Some(
-                Diagnostic::new(
-                    DiagnosticKind::MutableRefPin(GitTagsPlatform::GithubActions),
-                    range,
-                    message,
-                )
-                .with_severity(severity),
+                MutableRefPin::Ref {
+                    subject: PinSubject::GithubAction,
+                    name: &gha_dep.name,
+                    anchor: gha_dep.version_range?,
+                    ref_text,
+                    fix,
+                }
+                .into_diagnostic(severity),
             )
         })
         .collect()

@@ -33,7 +33,7 @@
 
 use std::sync::Arc;
 
-use deps_core::net_policy::{ProcessEnv, RegistryEnvironment};
+use deps_core::net_policy::{MapEnv, RegistryEnvironment};
 use deps_core::osv::NonPublicRoute;
 use deps_core::parser::DependencySource;
 use deps_core::policy_config::PolicyConfig;
@@ -54,7 +54,7 @@ fn registered_ecosystems() -> EcosystemRegistry {
     let registry = EcosystemRegistry::new();
     let runtime = EcosystemRuntime::from_policy(
         &PolicyConfig::default(),
-        &RegistryEnvironment::read(&ProcessEnv),
+        &RegistryEnvironment::read(&MapEnv::new()),
     );
     register_ecosystems(&registry, Arc::new(HttpCache::new()), &runtime);
     registry

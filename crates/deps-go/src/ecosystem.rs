@@ -235,7 +235,7 @@ mod tests {
 
     /// Spec 076 FR-022/SC-020 (T005): `fallback_edit_excludes_newer` against Go's REAL
     /// formatter and a real `EcosystemReparse` — Go's `require` directive is always an exact
-    /// version, so `ExactMatcher` alone (no `manifest_requirement_is_resolved_version` bypass,
+    /// version, so `GoGrammar` alone (no `manifest_requirement_is_resolved_version` bypass,
     /// removed by FR-022) is sufficient: this inverts spec 075's Go-bypass-specific test, and
     /// pins the unconditional `Writable` outcome the bypass used to short-circuit to.
     #[tokio::test]

@@ -18,7 +18,7 @@ use super::diagnostics::{MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_VALUE_CHARS};
 // Only referenced from this module's own tests now that the corresponding
 // `push_*_hover_section` functions go through a `FieldKind` instead of the raw
 // constant (#1310).
-use super::code_actions::{FetchedVersions, code_actions_offered};
+use super::code_actions::{FetchedVersions, PrereleasePolicy, code_actions_offered};
 #[cfg(test)]
 use super::diagnostics::{MAX_DIAGNOSTIC_PROSE_CHARS, MAX_VERSION_DIAGNOSTIC_CHARS};
 use super::hover_markdown::{FieldKind, HoverMarkdown};
@@ -250,14 +250,17 @@ where
     // a "**Recent versions**:" header with no entries under it is never useful,
     // regardless of ecosystem.
     if let Some(available_versions) = available_versions.as_ref().filter(|v| !v.is_empty()) {
-        push_recent_versions_hover_section(
-            &mut markdown,
+        RecentVersionsContext {
+            dep,
+            key: &key,
+            versions: &versions,
             available_versions,
-            latest.live_idx,
+            live_latest_idx: latest.live_idx,
             freshness,
             now,
             formatter,
-        );
+        }
+        .push(&mut markdown);
     }
 
     // #1402: an unexpanded template placeholder (`{{ VAR }}`, `${VAR}`, ...) is refused by
@@ -949,6 +952,75 @@ fn push_gossip_low_usage_hover_section(
     markdown.push_static("\n\n");
 }
 
+/// The hover-local inputs of the "Recent versions" list for one dependency.
+struct RecentVersionsContext<'a, 'v, F: DependencyFormatter> {
+    dep: &'a F::Dep,
+    key: &'a PackageKey,
+    versions: &'a VersionData<'v>,
+    available_versions: &'a [Box<dyn Version>],
+    live_latest_idx: Option<usize>,
+    freshness: crate::freshness::FreshnessSettings,
+    now: PublishTime,
+    formatter: &'a F,
+}
+
+impl<F: DependencyFormatter> RecentVersionsContext<'_, '_, F> {
+    /// Renders the list, applying the dependency's prerelease policy.
+    fn push(&self, markdown: &mut HoverMarkdown) {
+        let policy = recent_versions_prerelease_policy(
+            self.dep,
+            self.key,
+            self.versions,
+            self.available_versions,
+            self.live_latest_idx,
+            self.formatter,
+        );
+        push_recent_versions_hover_section(
+            markdown,
+            self.available_versions,
+            self.live_latest_idx,
+            policy,
+            self.freshness,
+            self.now,
+            self.formatter,
+        );
+    }
+}
+
+/// Whether the "Recent versions" list may show prereleases: the same policy the update code
+/// actions apply, so a stable requirement is not buried under canary builds (#1940).
+fn recent_versions_prerelease_policy<F: DependencyFormatter>(
+    dep: &F::Dep,
+    key: &PackageKey,
+    versions: &VersionData<'_>,
+    available_versions: &[Box<dyn Version>],
+    live_latest_idx: Option<usize>,
+    formatter: &F,
+) -> PrereleasePolicy {
+    let (Some(requirement), Some(_)) = (dep.version_requirement(), live_latest_idx) else {
+        return PrereleasePolicy::IncludePrereleases;
+    };
+    let prereleases: std::collections::HashSet<&str> = available_versions
+        .iter()
+        .filter(|v| v.is_prerelease())
+        .map(|v| v.version_string().as_str())
+        .collect();
+    let pick = live_latest_idx
+        .and_then(|i| available_versions.get(i))
+        .map(|v| v.version_string());
+    let in_use = versions.ecosystem.and_then(|ecosystem| {
+        resolve_in_use_version(
+            dep,
+            key,
+            versions.resolved_map(),
+            versions.candidates_map(),
+            formatter,
+            ecosystem,
+        )
+    });
+    PrereleasePolicy::for_dependency(&prereleases, pick, in_use.as_ref(), requirement, formatter)
+}
+
 /// Appends the "Recent versions" list: up to [`HOVER_RECENT_VERSIONS`] entries drawn from
 /// `available_versions`, each optionally aged (freshness-gated) and marked
 /// `*(latest)*` at `live_latest_idx` — matched by position against the header's
@@ -973,6 +1045,7 @@ fn push_recent_versions_hover_section(
     markdown: &mut HoverMarkdown,
     available_versions: &[Box<dyn Version>],
     live_latest_idx: Option<usize>,
+    prerelease_policy: PrereleasePolicy,
     freshness: crate::freshness::FreshnessSettings,
     now: PublishTime,
     formatter: &dyn EcosystemFormatter,
@@ -984,11 +1057,16 @@ fn push_recent_versions_hover_section(
     let mut entries: Vec<(usize, &Box<dyn Version>)> = available_versions
         .iter()
         .enumerate()
+        .filter(|(i, version)| {
+            prerelease_policy == PrereleasePolicy::IncludePrereleases
+                || Some(*i) == live_latest_idx
+                || !version.is_prerelease()
+        })
         .take(HOVER_RECENT_VERSIONS)
         .collect();
 
     if let Some(idx) = live_latest_idx
-        && idx >= HOVER_RECENT_VERSIONS
+        && !entries.iter().any(|(i, _)| *i == idx)
         && let Some(pick) = available_versions.get(idx)
     {
         entries.truncate(HOVER_RECENT_VERSIONS - 1);
@@ -1311,11 +1389,10 @@ fn push_vulnerability_hover_section(
                 }
             }
 
-            let remaining = display_advisories.remaining();
-            if remaining > 0 {
-                markdown.push_static("- *(+");
-                markdown.push_number(remaining);
-                markdown.push_static(" more advisories)*\n");
+            if let Some(overflow) = display_advisories.overflow() {
+                markdown.push_static("- *(");
+                markdown.push_trusted(overflow.to_string());
+                markdown.push_static(")*\n");
             }
 
             if let Some(crate::osv::UpgradeStatus::CandidateVulnerable {
@@ -2080,6 +2157,42 @@ mod tests {
         assert!(markdown.as_str().contains("popular-pkg"), "got: {markdown}");
     }
 
+    /// #1940: a stable requirement's "Recent versions" list drops canary builds, while a
+    /// prerelease requirement keeps them.
+    #[test]
+    fn push_recent_versions_hover_section_stable_only_drops_prereleases() {
+        let versions: Vec<Box<dyn crate::Version>> =
+            ["19.3.1", "19.3.0-canary-ff8f88fc", "19.3.0", "18.0.0"]
+                .into_iter()
+                .map(|version| {
+                    Box::new(TestVersion {
+                        version: version.into(),
+                        yanked: false,
+                    }) as Box<dyn crate::Version>
+                })
+                .collect();
+        let render = |policy| {
+            let mut markdown = HoverMarkdown::new();
+            push_recent_versions_hover_section(
+                &mut markdown,
+                &versions,
+                Some(0),
+                policy,
+                crate::freshness::FreshnessSettings::default(),
+                PublishTime::now(),
+                &MOCK_FORMATTER,
+            );
+            markdown.as_str().to_owned()
+        };
+        let stable = render(PrereleasePolicy::StableOnly);
+        assert!(!stable.contains("canary"), "got: {stable}");
+        assert!(
+            stable.contains("19.3.0") && stable.contains("18.0.0"),
+            "got: {stable}"
+        );
+        assert!(render(PrereleasePolicy::IncludePrereleases).contains("canary"));
+    }
+
     #[test]
     fn push_recent_versions_hover_section_truncates_overlong_version_string() {
         let long = "9".repeat(5000);
@@ -2092,6 +2205,7 @@ mod tests {
             &mut markdown,
             &versions,
             None,
+            PrereleasePolicy::IncludePrereleases,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
             &MOCK_FORMATTER,
@@ -2115,6 +2229,7 @@ mod tests {
             &mut markdown,
             &versions,
             None,
+            PrereleasePolicy::IncludePrereleases,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
             &MOCK_FORMATTER,
@@ -2134,6 +2249,7 @@ mod tests {
             &mut markdown,
             &versions,
             None,
+            PrereleasePolicy::IncludePrereleases,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
             &MOCK_FORMATTER,
@@ -2159,6 +2275,7 @@ mod tests {
             &mut markdown,
             &versions,
             None,
+            PrereleasePolicy::IncludePrereleases,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
             &MOCK_FORMATTER,
@@ -3261,8 +3378,10 @@ mod tests {
         );
     }
 
+    /// #1940: under a stable requirement the prerelease run is dropped, so the stable pick
+    /// is the only entry and needs no bump-in.
     #[tokio::test]
-    async fn test_generate_hover_latest_marker_bumped_in_when_stable_outside_top_n() {
+    async fn test_generate_hover_stable_requirement_hides_prerelease_run_1940() {
         use std::collections::HashMap;
 
         // Nine pre-releases followed by one stable version: the stable pick sits past
@@ -3310,119 +3429,62 @@ mod tests {
         );
         assert_eq!(
             content.lines().filter(|l| l.starts_with("- `")).count(),
-            HOVER_RECENT_VERSIONS,
-            "the list must stay capped at HOVER_RECENT_VERSIONS entries even after the bump-in; got: {}",
-            content
-        );
-        assert!(
-            !content.contains("2.0.0-alpha7"),
-            "the displaced 8th natural entry must not remain in the capped list; got: {}",
-            content
-        );
-    }
-
-    #[tokio::test]
-    async fn test_generate_hover_latest_marker_at_last_window_slot_not_bumped() {
-        use std::collections::HashMap;
-
-        // The stable pick sits exactly at `HOVER_RECENT_VERSIONS - 1` — already the last
-        // entry the raw-order window naturally displays — so it must render once, in
-        // place, without triggering the bump-in path (boundary just inside the window).
-        let mut versions: Vec<MockVersionWithAge> = (0..HOVER_RECENT_VERSIONS - 1)
-            .map(|i| MockVersionWithAge {
-                version: format!("2.0.0-alpha{i}").into(),
-                yanked: false,
-                published_at: None,
-            })
-            .collect();
-        versions.push(MockVersionWithAge {
-            version: "1.9.0".into(),
-            yanked: false,
-            published_at: None,
-        });
-        assert_eq!(versions.len(), HOVER_RECENT_VERSIONS);
-        let registry = MockRegistryWithVersions { versions };
-        let parse_result = freshness_test_parse_result("example");
-
-        let hover = generate_hover(
-            &parse_result,
-            Position::new(0, 2).into(),
-            VersionData::new(&HashMap::new(), &HashMap::new()),
-            &registry,
-            &MOCK_FORMATTER,
-            crate::freshness::FreshnessSettings::default(),
-            PublishTime::now(),
-        )
-        .await
-        .expect("hover should be generated for a dependency at the cursor");
-
-        let content = hover.markdown();
-        assert_eq!(
-            content.matches("- `1.9.0` *(latest)*").count(),
             1,
-            "the in-window pick must render exactly once, not duplicated by a bump-in; got: {}",
-            content
+            "only the stable pick remains; got: {content}"
         );
-        assert_eq!(
-            content.lines().filter(|l| l.starts_with("- `")).count(),
-            HOVER_RECENT_VERSIONS,
-            "got: {}",
-            content
-        );
+        assert!(!content.contains("2.0.0-alpha"), "got: {content}");
     }
 
-    #[tokio::test]
-    async fn test_generate_hover_latest_marker_one_past_window_triggers_bump() {
-        use std::collections::HashMap;
-
-        // The stable pick sits at exactly `HOVER_RECENT_VERSIONS` — the first index the
-        // bump-in path must catch (minimal boundary, one past
-        // `test_generate_hover_latest_marker_at_last_window_slot_not_bumped` above).
-        let mut versions: Vec<MockVersionWithAge> = (0..HOVER_RECENT_VERSIONS)
-            .map(|i| MockVersionWithAge {
-                version: format!("2.0.0-alpha{i}").into(),
+    /// #961: with prereleases allowed, a stable pick at the last window slot renders once in
+    /// place, and one past the window it is bumped into the final slot instead of dropped.
+    #[test]
+    fn push_recent_versions_hover_section_pick_window_boundary() {
+        let render = |prerelease_run: usize| {
+            let mut versions: Vec<Box<dyn crate::Version>> = (0..prerelease_run)
+                .map(|i| {
+                    Box::new(TestVersion {
+                        version: format!("2.0.0-alpha{i}").into(),
+                        yanked: false,
+                    }) as Box<dyn crate::Version>
+                })
+                .collect();
+            versions.push(Box::new(TestVersion {
+                version: "1.9.0".into(),
                 yanked: false,
-                published_at: None,
-            })
-            .collect();
-        versions.push(MockVersionWithAge {
-            version: "1.9.0".into(),
-            yanked: false,
-            published_at: None,
-        });
-        assert_eq!(versions.len(), HOVER_RECENT_VERSIONS + 1);
-        let registry = MockRegistryWithVersions { versions };
-        let parse_result = freshness_test_parse_result("example");
+            }));
+            let mut markdown = HoverMarkdown::new();
+            push_recent_versions_hover_section(
+                &mut markdown,
+                &versions,
+                Some(prerelease_run),
+                PrereleasePolicy::IncludePrereleases,
+                crate::freshness::FreshnessSettings::default(),
+                PublishTime::now(),
+                &MOCK_FORMATTER,
+            );
+            markdown.as_str().to_owned()
+        };
+        let entries = |content: &str| content.lines().filter(|l| l.starts_with("- `")).count();
 
-        let hover = generate_hover(
-            &parse_result,
-            Position::new(0, 2).into(),
-            VersionData::new(&HashMap::new(), &HashMap::new()),
-            &registry,
-            &MOCK_FORMATTER,
-            crate::freshness::FreshnessSettings::default(),
-            PublishTime::now(),
-        )
-        .await
-        .expect("hover should be generated for a dependency at the cursor");
-
-        let content = hover.markdown();
-        assert!(
-            content.contains("- `1.9.0` *(latest)*"),
-            "the pick at index HOVER_RECENT_VERSIONS must be bumped in; got: {}",
-            content
-        );
-        assert!(
-            !content.contains(&format!("2.0.0-alpha{}", HOVER_RECENT_VERSIONS - 1)),
-            "the displaced last natural entry must not remain in the capped list; got: {}",
-            content
+        let in_window = render(HOVER_RECENT_VERSIONS - 1);
+        assert_eq!(
+            in_window.matches("- `1.9.0` *(latest)*").count(),
+            1,
+            "got: {in_window}"
         );
         assert_eq!(
-            content.lines().filter(|l| l.starts_with("- `")).count(),
+            entries(&in_window),
             HOVER_RECENT_VERSIONS,
-            "got: {}",
-            content
+            "got: {in_window}"
         );
+
+        let one_past = render(HOVER_RECENT_VERSIONS);
+        assert!(one_past.contains("- `1.9.0` *(latest)*"), "got: {one_past}");
+        assert!(
+            !one_past.contains(&format!("2.0.0-alpha{}", HOVER_RECENT_VERSIONS - 1)),
+            "got: {one_past}"
+        );
+        assert_eq!(entries(&one_past), HOVER_RECENT_VERSIONS, "got: {one_past}");
     }
 
     #[tokio::test]
@@ -3886,6 +3948,7 @@ mod tests {
     /// arrived in #1210, after the original #1209 security audit, which is why it was missed.
     /// Now redacted via `dep.name().for_tracing()` at the call site. Asserts against the fully
     /// rendered captured line, mirroring the `deps-engine::classify::fetch` precedent.
+    #[cfg(feature = "test-util")]
     #[tokio::test(start_paused = true)]
     async fn test_generate_hover_registry_fetch_timeout_log_redacts_credential_shaped_package_name()
     {
@@ -3929,6 +3992,7 @@ mod tests {
     /// #1209 C1: the hover latest fallback's failure log used to interpolate `dep.name()` raw.
     /// The fallback now runs through the interactive gate, whose log redacts the name via
     /// `dep.name().for_tracing()` and carries only a coarse cause, never the error text.
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     async fn test_generate_hover_fallback_failure_log_redacts_credential_shaped_package_name() {
         use std::collections::HashMap;
@@ -6427,10 +6491,10 @@ mod tests {
         let mut resolved_version_candidates = HashMap::new();
         resolved_version_candidates.insert(
             NormalizedName::for_test("serde"),
-            vec![
+            LockCandidates::from(vec![
                 ConcreteVersion::from("0.9.15"),
                 ConcreteVersion::from("1.0.219"),
-            ],
+            ]),
         );
 
         let keys = crate::osv::vulnerability_keys(

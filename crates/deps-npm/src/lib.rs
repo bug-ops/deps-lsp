@@ -31,8 +31,8 @@ pub use config::{
 };
 pub use ecosystem::NpmEcosystem;
 pub use formatter::{
-    NpmFormatter, RangeParseError, compile_node_semver_range, format_node_semver_replacing_floor,
-    parse_range_safe,
+    NodeSemverGrammar, NodeSemverRange, NpmFormatter, RangeParseError,
+    format_node_semver_replacing_floor, parse_range_safe,
 };
 pub use lockfile::NpmLockParser;
 // Wrappers exposed only under non-default `fuzzing` feature (#727) so `fuzz/`'s pnpm targets

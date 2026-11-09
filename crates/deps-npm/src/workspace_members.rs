@@ -123,8 +123,9 @@ impl PackageGlob {
     /// ```
     /// use deps_npm::workspace_members::PackageGlob;
     ///
-    /// assert!(matches!(PackageGlob::parse("apps/*"), Some(PackageGlob::Include(_))));
-    /// assert!(matches!(PackageGlob::parse("!**/test/**"), Some(PackageGlob::Exclude(_))));
+    /// # use std::assert_matches;
+    /// assert_matches!(PackageGlob::parse("apps/*"), Some(PackageGlob::Include(_)));
+    /// assert_matches!(PackageGlob::parse("!**/test/**"), Some(PackageGlob::Exclude(_)));
     /// assert!(PackageGlob::parse("!../x").is_none());
     /// ```
     #[must_use]

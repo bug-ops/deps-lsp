@@ -12,8 +12,6 @@ use deps_core::ecosystem::HoverDecorator;
 #[cfg(feature = "lsp-responses")]
 use deps_core::hover::Hover;
 #[cfg(feature = "lsp-responses")]
-use deps_core::lsp_helpers::sha_comment_mismatch_hover_line;
-#[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::{
     AuxiliaryLookup, FetchContext, InteractiveFetch, InteractiveFetchRequest,
     await_interactive_fetch,
@@ -21,10 +19,11 @@ use deps_core::lsp_helpers::{
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
     EcosystemBase, HttpCache, ParsedView, Registry, Result, TypedEcosystem,
-    diagnostic::{Diagnostic, DiagnosticKind, GitTagsPlatform, Severity},
+    diagnostic::{Diagnostic, DiagnosticKind, Severity},
     lsp_helpers::{
-        CommentCheck, CommitSha, GitTagsPinning, MAX_DIAGNOSTIC_VALUE_CHARS, ShaPinComment,
-        UnknownRefTarget, git_tags_diagnostics, sanitize_and_truncate_for_diagnostic,
+        CommentCheck, CommitSha, FixAvailability, GitTagsPinning, GitlabInclude, MutableRefPin,
+        PinSubject, ShaPinComment, UnknownRefTarget, git_tags_diagnostics,
+        sanitize_and_truncate_for_diagnostic,
     },
 };
 use std::sync::{Arc, RwLock};
@@ -205,22 +204,27 @@ impl GitlabCiEcosystem {
             hover.rewrite_markdown(|md| splice_project_line(md, &url));
         }
 
-        if let Some(sha) = gl_dep.pinned_sha()
-            && let Some(resolved_tag) =
+        if let Some(sha) = gl_dep.pinned_sha() {
+            let resolved_tag =
                 self.formatter
-                    .resolved_tag_for_sha(gl_dep.kind.endpoint(), &gl_dep.name, sha)
-        {
-            hover.rewrite_markdown(|md| {
-                deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, sha)
-            });
-        }
-
-        if let Some(CommentCheck::Mismatch(mismatch)) = self.formatter.sha_comment_check(gl_dep)
-            && let Some(comment) = gl_dep.sha_comment()
-            && let Some(sha) = gl_dep.pinned_sha()
-        {
-            let line = sha_comment_mismatch_hover_line(sha, &comment.tag, &mismatch);
-            hover.rewrite_markdown(|md| deps_core::lsp_helpers::splice_hover_line(md, &line));
+                    .resolved_tag_for_sha(gl_dep.kind.endpoint(), &gl_dep.name, sha);
+            let mismatch = match (
+                self.formatter.sha_comment_check(gl_dep),
+                gl_dep.sha_comment(),
+            ) {
+                (Some(CommentCheck::Mismatch(mismatch)), Some(comment)) => {
+                    Some((comment, mismatch))
+                }
+                _ => None,
+            };
+            deps_core::lsp_helpers::splice_sha_pin_hover_lines(
+                hover,
+                sha,
+                resolved_tag.as_deref(),
+                mismatch
+                    .as_ref()
+                    .map(|(comment, mismatch)| (*comment, mismatch)),
+            );
         }
 
         if let Some((version, sha)) = component_resolved {
@@ -670,89 +674,63 @@ fn mutable_ref_pin_diagnostics(
     dependencies
         .iter()
         .filter_map(|gl_dep| {
-            let name = deps_core::lsp_helpers::redact_name_for_diagnostic(&gl_dep.name);
-            let noun = match gl_dep.kind {
-                IncludeKind::Project => "project",
-                IncludeKind::Component => "component",
-            };
-
             let Some(pin) = &gl_dep.pin else {
-                // Ref-less `project:` include: no `ref:` key at all, so there is no
-                // version span to anchor on or edit — anchor on the `project:` value
-                // itself, mirroring the FR-012 unresolved-host diagnostic's convention.
+                // No `ref:` key, so there is no version span to anchor on: anchor on the
+                // `project:` value, like the FR-012 unresolved-host diagnostic.
                 return Some(
-                    Diagnostic::new(
-                        DiagnosticKind::MutableRefPin(GitTagsPlatform::GitlabCi),
-                        gl_dep.name_range,
-                        format!(
-                            "{name} project has no `ref:`; GitLab CI defaults to the project's \
-                             default branch, which is mutable — add an explicit `ref:` pinned \
-                             to a tag or commit SHA (manual edit — no automated fix available)"
-                        ),
-                    )
-                    .with_severity(severity),
+                    MutableRefPin::MissingRef {
+                        name: &gl_dep.name,
+                        anchor: gl_dep.name_range,
+                    }
+                    .into_diagnostic(severity),
                 );
             };
 
-            let diagnosable = match pin {
-                PinStyle::Tag | PinStyle::Latest | PinStyle::Partial => true,
-                PinStyle::Branch => is_registry_confirmed_tag(gl_dep, formatter),
-                PinStyle::Sha { .. } => false,
+            let floating = match pin {
+                PinStyle::Latest | PinStyle::Partial => true,
+                PinStyle::Tag => false,
+                PinStyle::Branch if is_registry_confirmed_tag(gl_dep, formatter) => false,
+                PinStyle::Branch | PinStyle::Sha { .. } => return None,
             };
-            if !diagnosable {
-                return None;
-            }
 
-            let range = gl_dep.version_range?;
-            let tag = gl_dep
+            let ref_text = gl_dep
                 .version_req
                 .as_ref()
                 .map(deps_core::VersionReq::as_str)?;
-            let tag = sanitize_and_truncate_for_diagnostic(tag, MAX_DIAGNOSTIC_VALUE_CHARS);
-
-            // Issue #643/S1,S2: `sha_pin_quickfix_kind` is the single source of truth for
-            // whether a quickfix is actually available for this dependency — the same
-            // predicate `build_sha_pin_action`/`build_dynamic_component_pin_action` consult
-            // for their own guards — so the suffix decision below can never independently
-            // drift from what `generate_code_actions` actually offers. `PinStyle::Tag`
-            // always classifies `Some(StaticTagIndex)` (even on a cold `TagIndex` miss —
-            // the *diagnostic* doesn't need a live cache hit the way the quickfix build
-            // does, so `Tag`'s message never carries the suffix regardless of cache state,
-            // by design); a registry-confirmed `PinStyle::Branch` always classifies `None`
-            // (`build_sha_pin_action` stays restricted to `Tag` only, C2/#551 branch/tag
-            // name-collision risk), so its message always carries the suffix.
-            let has_quickfix = sha_pin_quickfix_kind(gl_dep, formatter).is_some();
-            let manual_edit_suffix = if has_quickfix {
-                ""
+            // `sha_pin_quickfix_kind` is the single source of truth for whether
+            // `generate_code_actions` offers a quickfix, so message and dispatch cannot drift
+            // (#643); a cold `TagIndex` miss on a `Tag` pin still counts as available.
+            let fix = if sha_pin_quickfix_kind(gl_dep, formatter).is_some() {
+                FixAvailability::Automated
             } else {
-                " (manual edit — no automated fix available for this ref)"
+                FixAvailability::ManualOnly
             };
-
-            let message = if matches!(pin, PinStyle::Tag) {
-                format!(
-                    "{name} {noun} is pinned to the mutable ref `{tag}`; pin to a full commit \
-                     SHA to guard against ref mutation{manual_edit_suffix}"
-                )
-            } else if matches!(pin, PinStyle::Latest | PinStyle::Partial) {
-                format!(
-                    "{name} {noun} is pinned to `{tag}`, which always resolves to whichever \
-                     release currently matches rather than a fixed version; pin to an exact \
-                     release and commit SHA to guard against ref mutation{manual_edit_suffix}"
-                )
+            let anchor = gl_dep.version_range?;
+            let name = &gl_dep.name;
+            let finding = if floating {
+                MutableRefPin::Floating {
+                    include: match gl_dep.kind {
+                        IncludeKind::Project => GitlabInclude::Project,
+                        IncludeKind::Component => GitlabInclude::Component,
+                    },
+                    name,
+                    anchor,
+                    ref_text,
+                    fix,
+                }
             } else {
-                format!(
-                    "{name} {noun} is pinned to the mutable ref `{tag}`; pin to a full commit \
-                     SHA to guard against ref mutation{manual_edit_suffix}"
-                )
+                MutableRefPin::Ref {
+                    subject: match gl_dep.kind {
+                        IncludeKind::Project => PinSubject::GitlabProject,
+                        IncludeKind::Component => PinSubject::GitlabComponent,
+                    },
+                    name,
+                    anchor,
+                    ref_text,
+                    fix,
+                }
             };
-            Some(
-                Diagnostic::new(
-                    DiagnosticKind::MutableRefPin(GitTagsPlatform::GitlabCi),
-                    range,
-                    message,
-                )
-                .with_severity(severity),
-            )
+            Some(finding.into_diagnostic(severity))
         })
         .collect()
 }
@@ -1905,7 +1883,7 @@ mod tests {
 
         use deps_core::lsp_helpers::splice_resolved_line;
 
-        use deps_core::lsp_helpers::{CommitSha, TagIndex};
+        use deps_core::lsp_helpers::{CommitSha, MAX_DIAGNOSTIC_VALUE_CHARS, TagIndex};
 
         // #1137: regression guard, not independent parser verification (see
         // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s

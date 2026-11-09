@@ -6,10 +6,10 @@ use deps_core::ConcreteVersion;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OperatorGrammar,
-    OsvNaming, PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution,
-    RewriteTarget, SourcePolicy, compile_requirement_unless,
-    requirement_contains_template_placeholder, requirement_is_compound,
+    BoundedVersionReq, CandidateSet, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+    OperatorGrammar, OsvNaming, PackageNaming, PackageRendering, RequirementMatcher,
+    RequirementResolution, RewriteTarget, SourcePolicy, VersionGrammar, grammar_candidates,
+    grammar_matcher, requirement_contains_template_placeholder, requirement_is_compound,
 };
 
 /// Whether every character of `name` is in RubyGems' gem-name charset
@@ -63,24 +63,42 @@ fn any_constraint_fails_closed_and_invalid(requirement: &str) -> bool {
     })
 }
 
-/// Rubygems requirement matcher, compiled once per dependency by
-/// [`BundlerFormatter::compile_bounded_requirement`]. `version_matches_requirement` is a hand-rolled
-/// comparator with no external parser to fail on, so this always decides (`Some`).
-struct RubygemsMatcher(String);
+/// Bundler's version grammar: RubyGems requirements. `version_matches_requirement` is a
+/// hand-rolled comparator with no external parser to fail on, so every candidate is decidable.
+#[derive(Clone, Copy)]
+struct RubygemsGrammar;
 
-impl RequirementMatcher for RubygemsMatcher {
-    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-        let version = version.as_str();
-        Some(version_matches_requirement(version, &self.0))
+impl VersionGrammar for RubygemsGrammar {
+    type Version = ConcreteVersion;
+    type Compiled = String;
+
+    fn parse_version(&self, version: &ConcreteVersion) -> Option<ConcreteVersion> {
+        Some(version.clone())
+    }
+
+    /// `None` for an unresolved interpolation, or a requirement with a fail-closed operand that is
+    /// not a valid RubyGems version, see [`BundlerFormatter::compile_bounded_requirement`].
+    fn compile(&self, requirement: BoundedVersionReq<'_>) -> Option<String> {
+        let text = requirement.as_str();
+        if BundlerFormatter.bounded_requirement_is_unresolved(requirement)
+            || any_constraint_fails_closed_and_invalid(text)
+        {
+            return None;
+        }
+        Some(text.to_owned())
+    }
+
+    fn satisfies(&self, compiled: &String, version: &ConcreteVersion) -> bool {
+        version_matches_requirement(version.as_str(), compiled)
     }
 
     /// RubyGems' requirement grammar is not strict SemVer 2.0.0 (#299) — must not opt in.
-    fn strict_prerelease_exclusion(&self) -> bool {
+    fn strict_prerelease_exclusion(&self, _: &String) -> bool {
         false
     }
 
-    fn explicitly_excludes(&self, version: &ConcreteVersion) -> bool {
-        crate::version::version_explicitly_excluded_by_requirement(version.as_str(), &self.0)
+    fn explicitly_excludes(&self, compiled: &String, version: &ConcreteVersion) -> bool {
+        crate::version::version_explicitly_excluded_by_requirement(version.as_str(), compiled)
     }
 }
 
@@ -183,7 +201,7 @@ fn exact_pin_version(requirement: &str) -> Option<&str> {
 /// is a rare edge case rather than the common one exact pins hit.
 ///
 /// Note on the boundary case (pin equal to the maximum): this gate compares via
-/// [`compare_versions`], and since #345 the actual scan in [`RubygemsMatcher`]
+/// [`compare_versions`], and since #345 the actual scan in `RubygemsGrammar`
 /// (`version_matches_requirement`) does too for both the explicit `=` and bare-pin forms —
 /// both now agree that a pin of `"1.6"` canonically equals a published `"1.6.0"`. (Before
 /// #345, the string/prefix matcher used there disagreed with this gate at that boundary; the
@@ -350,7 +368,7 @@ impl RequirementResolution for BundlerFormatter {
         version_matches_requirement(version.as_str(), requirement.as_str())
     }
 
-    /// Compiles `requirement` into a `RubygemsMatcher` using the same
+    /// Compiles `requirement` into a `RubygemsGrammar` requirement using the same
     /// `version_matches_requirement` comparator as `version_satisfies_requirement` — Bundler
     /// requirements have no separate "loose" vs. "precise" form to distinguish, and
     /// `version_matches_requirement` never fails to parse, so this always decides (`Some`),
@@ -370,14 +388,11 @@ impl RequirementResolution for BundlerFormatter {
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        if self.bounded_requirement_is_unresolved(requirement) {
-            return None;
-        }
-        compile_requirement_unless(
-            requirement.as_str(),
-            any_constraint_fails_closed_and_invalid,
-            RubygemsMatcher,
-        )
+        grammar_matcher(RubygemsGrammar, requirement)
+    }
+
+    fn candidate_set(&self, candidates: &[ConcreteVersion]) -> Option<Box<dyn CandidateSet>> {
+        Some(grammar_candidates(RubygemsGrammar, candidates))
     }
 
     /// See `exact_pin_could_be_yanked` for the RubyGems-specific rationale and heuristic.
@@ -428,6 +443,64 @@ mod tests {
     use deps_core::NormalizeName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
+
+    const REQUIREMENTS: &[&str] = &[
+        "~> 1.2",
+        "~> 1.2.3",
+        ">= 1.0",
+        "> 1.0",
+        "< 2.0",
+        "<= 1.5",
+        "= 1.2.3",
+        "1.2.3",
+        "!= 1.5.0",
+        ">= 1.0, < 2.0",
+        ">= 1.0, != 1.5.0, < 2.0",
+        "~> 1.0, >= 1.2",
+        "*",
+        "",
+        "~> garbage",
+        "< 1.0.0!!!",
+        ">= 1.0.0!!!",
+        "!= 1.0.0!!!",
+        ">= 1.0.0.pre",
+        "~> 1.0.0.rc1",
+        "~> #{V}",
+        ">= #{V}",
+        "~> #@v",
+        "~> #$V",
+        "{{ version }}",
+        "$(Version)",
+        "1.2.3.4",
+    ];
+    const VERSIONS: &[&str] = &[
+        "0.9.0",
+        "1.0.0",
+        "1.0.0.pre",
+        "1.0.0.rc1",
+        "1.2.0",
+        "1.2.3",
+        "1.2.3.4",
+        "1.2.4",
+        "1.5.0",
+        "1.9.9",
+        "2.0.0",
+        "2.0.0.beta1",
+        "3.0.0",
+        "garbage",
+        "",
+        "1.2",
+        "1.0.0!!!",
+    ];
+
+    #[test]
+    fn candidate_set_agrees_with_the_matcher() {
+        deps_core::test_util::assert_candidate_set_consistent(
+            &BundlerFormatter,
+            REQUIREMENTS,
+            VERSIONS,
+        );
+    }
 
     #[test]
     fn test_format_version() {
@@ -770,7 +843,7 @@ mod tests {
     /// Boundary case the doc comment above [`exact_pin_could_be_yanked`] guarantees: a
     /// shorter pin like `1.6` zero-pads to `1.6.0` under the gate's numeric comparator and
     /// sorts below the observed maximum `1.6.14`, so it is suppressed here even though the
-    /// actual string-based `RubygemsMatcher` would never treat `1.6` and `1.6.0` as equal.
+    /// actual string-based `RubygemsGrammar` would never treat `1.6` and `1.6.0` as equal.
     #[test]
     fn test_exact_pin_could_be_yanked_short_pin_numeric_boundary_suppressed() {
         let available = ["1.6.14".into(), "1.6.9".into()];

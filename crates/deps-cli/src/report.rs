@@ -757,20 +757,29 @@ impl OsvCoverage {
                 dependency_count(self.query_failed)
             )
         });
-        let lock_alternatives = (self.lock_alternatives_unchecked > 0).then(|| {
-            format!(
-                "not every lock-file entry satisfying the requirement was checked for {} (more \
-                 than {MAX_LOCK_ALTERNATIVES} satisfying entries, so only the lowest \
-                 {MAX_LOCK_ALTERNATIVES} alternatives were scanned, or an entry's version could \
-                 not be matched)",
-                dependency_count(self.lock_alternatives_unchecked)
-            )
-        });
-        let notes: Vec<String> = [unverified, incomplete, lock_alternatives, failed]
+        let notes: Vec<String> = [unverified, incomplete, failed]
             .into_iter()
             .flatten()
             .collect();
         (!notes.is_empty()).then(|| notes.join("; "))
+    }
+
+    /// The separate stderr warning for dependencies whose other satisfying lock-file entries
+    /// were not all scanned, or `None` when none were affected.
+    ///
+    /// Kept apart from [`Self::note`] so a possibly missed advisory on a newer or older lock
+    /// entry is not folded into the registry-coverage line. Human stderr only: the structured
+    /// reports do not carry it, and it does not change the exit code.
+    #[must_use]
+    pub fn lock_alternatives_warning(&self) -> Option<String> {
+        (self.lock_alternatives_unchecked > 0).then(|| {
+            format!(
+                "not every lock-file entry satisfying the requirement was checked for {} (only \
+                 the {MAX_LOCK_ALTERNATIVES} entries nearest the in-use version were scanned \
+                 when more satisfy it, or an entry's version could not be matched)",
+                dependency_count(self.lock_alternatives_unchecked)
+            )
+        })
     }
 }
 
@@ -2030,19 +2039,20 @@ mod tests {
         assert!(!note.contains("query failed"));
     }
 
-    /// #1981: an unchecked lock alternative never suggests a token, which would not help.
+    /// #1981, #1997: unchecked lock alternatives get their own warning that names the nearest
+    /// entries and never suggests a token, and the registry note stays free of them.
     #[test]
-    fn test_osv_coverage_note_explains_unchecked_lock_alternatives() {
-        let note = OsvCoverage::default()
-            .with_lock_alternatives_unchecked(2)
-            .note()
-            .expect("note");
-        assert!(note.contains(
+    fn test_osv_coverage_warns_separately_about_unchecked_lock_alternatives() {
+        let coverage = OsvCoverage::default().with_lock_alternatives_unchecked(2);
+        let warning = coverage.lock_alternatives_warning().expect("warning");
+        assert!(warning.contains(
             "not every lock-file entry satisfying the requirement was checked for 2 dependencies"
         ));
-        assert!(note.contains("more than 16 satisfying entries"));
-        assert!(!note.contains("GITHUB_TOKEN"));
-        assert!(!note.contains("scan incomplete"));
+        assert!(warning.contains("16 entries nearest the in-use version"));
+        assert!(!warning.contains("GITHUB_TOKEN"));
+        assert_eq!(coverage.note(), None);
+        assert_eq!(coverage.unchecked(), 2);
+        assert_eq!(OsvCoverage::default().lock_alternatives_warning(), None);
     }
 
     #[test]

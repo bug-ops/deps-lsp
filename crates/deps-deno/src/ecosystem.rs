@@ -320,7 +320,7 @@ mod tests {
 
     /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against Deno's REAL
     /// formatter and a real `EcosystemReparse`. Like npm, Deno's `compile_bounded_requirement` shares
-    /// `deps_npm::compile_node_semver_range`, whose default bare-version rendering is exact
+    /// `deps_npm::NodeSemverGrammar`, whose default bare-version rendering is exact
     /// (not auto-following), so FR-025's rule is unconditional — one assertion suffices.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_pins_writable_bare_exact_rendering() {

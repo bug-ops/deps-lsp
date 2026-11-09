@@ -1342,6 +1342,7 @@ mod tests {
 
     /// #1501: a POM's registry-controlled license `<name>` that fails to normalize is logged
     /// at `debug!` verbatim — a `\n`/`\r` in it must not forge a fake log line (CWE-117).
+    #[cfg(feature = "test-util")]
     #[test]
     fn normalize_names_checked_sanitizes_control_chars_in_log() {
         let raw = vec!["Evil\nWARN forged log line\r".to_string()];

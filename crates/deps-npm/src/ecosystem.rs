@@ -464,7 +464,7 @@ mod tests {
     /// #1601: `fallback` sits in the gap between two `||`-branches (`>=1.0.0 <1.5.0` and
     /// `>1.5.0 <2.0.0`) — neither branch covers it, and `2.0.0` also fails both branches'
     /// ceilings, so the extensional "something newer also matches" scan is vacuous. Only
-    /// `NodeSemverMatcher::explicitly_excludes`'s OR-gap probe catches this.
+    /// `NodeSemverGrammar::explicitly_excludes`'s OR-gap probe catches this.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_rejects_or_alternation_gap_vacuous_case() {
         let ecosystem: Arc<dyn deps_core::Ecosystem> =

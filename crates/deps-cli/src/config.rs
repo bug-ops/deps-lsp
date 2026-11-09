@@ -239,23 +239,37 @@ pub fn load(explicit_path: Option<&Path>, default_dir: &Path) -> Result<CliConfi
     // to the auto-discovered (`!required`) branch; `ignored_sections` itself already
     // distinguishes which sections are worth warning about for which path (see its own doc).
     for section in ignored_sections(&config.policy, required) {
-        if required {
-            eprintln!(
-                "deps-cli: warning: {path}'s [{section}] section has no effect in deps-cli today — see `deps_cli::config::ignored_sections`'s doc for why",
-                path = crate::sanitize::sanitize_path_for_display(&path).display(),
-            );
-        } else {
-            eprintln!(
-                "deps-cli: warning: {path}'s [{section}] section was auto-discovered, not given via --config, and is ignored — see `deps_cli::config::safe_auto_discovered_config`'s doc for why",
-                path = crate::sanitize::sanitize_path_for_display(&path).display(),
-            );
-        }
+        eprintln!(
+            "{}",
+            ignored_section_warning(
+                &crate::sanitize::sanitize_path_for_display(&path)
+                    .display()
+                    .to_string(),
+                section,
+                required,
+            )
+        );
     }
     if !required {
         return Ok(safe_auto_discovered_config(config));
     }
     disable_unsupported_keychain(&mut config.policy.registries, &path);
     Ok(config)
+}
+
+/// Warning text for one section [`ignored_sections`] reported. Only a section reset by
+/// [`safe_auto_discovered_config`] is fixed by passing the file via `--config`; `typosquat` is
+/// a no-op for an explicit config too, so it never gets that hint.
+fn ignored_section_warning(path: &str, section: &str, required: bool) -> String {
+    if required || section == "typosquat" {
+        format!(
+            "deps-cli: warning: {path}'s [{section}] section has no effect in deps-cli today (see the Configuration chapter of the deps-lsp book)"
+        )
+    } else {
+        format!(
+            "deps-cli: warning: {path}'s [{section}] section was auto-discovered, not given via --config, and is ignored; pass the file with --config to apply it (see the Configuration chapter of the deps-lsp book)"
+        )
+    }
 }
 
 /// Forces `registries.swift_keychain_credentials` back to `Disabled` with a warning: `deps-cli`
@@ -525,6 +539,18 @@ mod tests {
         policy.typosquat.enabled = true;
         assert!(ignored_sections(&policy, false).contains(&"typosquat"));
         assert!(ignored_sections(&policy, true).contains(&"typosquat"));
+    }
+
+    #[test]
+    fn test_ignored_section_warning_never_suggests_config_for_typosquat() {
+        for required in [false, true] {
+            let text = ignored_section_warning("deps.toml", "typosquat", required);
+            assert!(text.contains("has no effect in deps-cli today"), "{text}");
+            assert!(!text.contains("--config"), "{text}");
+        }
+        let auto = ignored_section_warning("deps.toml", "diagnostics", false);
+        assert!(auto.contains("pass the file with --config"), "{auto}");
+        assert!(!auto.contains("deps_cli::"), "{auto}");
     }
 
     #[test]

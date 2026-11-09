@@ -13,13 +13,14 @@ use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit,
 
 use deps_core::lsp_helpers::{
     AuxiliaryLookup, DependencyFormatter, FetchContext, InteractiveFetch, InteractiveFetchRequest,
-    ShaPinTail, await_interactive_fetch, sha_pin_rewrite, truncate_for_diagnostic,
+    MAX_DIAGNOSTIC_VALUE_CHARS, ShaPinTail, await_interactive_fetch, sha_pin_rewrite,
+    truncate_for_diagnostic,
 };
 use deps_core::{PackageKey, PackageName, ParsedView};
 
 use super::{
     GitlabCiDependency, GitlabCiFormatter, GitlabCiParseResult, GitlabCiRegistry,
-    MAX_DIAGNOSTIC_VALUE_CHARS, ShaPinQuickfixKind, Url, sha_pin_quickfix_kind,
+    ShaPinQuickfixKind, Url, sha_pin_quickfix_kind,
 };
 use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 

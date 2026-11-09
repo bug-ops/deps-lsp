@@ -2168,7 +2168,7 @@ mod tests {
         );
         assert!(ecosystem.depends_on(
             crate::typed_boundary::ParsedView::new(&parsed),
-            &crate::ParseInputKey::new("any")
+            &crate::ParseInputKey::minted_by(crate::EcosystemId::Cargo, "any")
         ));
     }
 

@@ -1907,10 +1907,10 @@ mod tests {
             let mut candidates = HashMap::new();
             candidates.insert(
                 NormalizedName::for_test("serde"),
-                vec![
+                crate::lsp_helpers::LockCandidates::from(vec![
                     ConcreteVersion::from("0.9.15"),
                     ConcreteVersion::from("1.0.219"),
-                ],
+                ]),
             );
             let versions = VersionData::new(&cached, &resolved_versions)
                 .with_resolved_version_candidates(&candidates)

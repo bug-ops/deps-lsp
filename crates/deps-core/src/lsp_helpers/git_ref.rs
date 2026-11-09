@@ -1791,8 +1791,54 @@ pub fn is_plain_null(style: TScalarStyle, tag: Option<&Tag>, value: &str) -> boo
 /// ```
 #[must_use]
 pub fn is_null_tag(tag: &Tag) -> bool {
-    (tag.handle == "tag:yaml.org,2002:" && tag.suffix == "null")
-        || (tag.handle.is_empty() && tag.suffix == "tag:yaml.org,2002:null")
+    is_core_schema_tag(tag, CoreSchemaType::Null)
+}
+
+/// YAML core-schema scalar types whose explicit tags the manifest parsers recognize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreSchemaType {
+    /// `!!null`
+    Null,
+    /// `!!str`
+    Str,
+}
+
+impl CoreSchemaType {
+    const fn suffix(self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Str => "str",
+        }
+    }
+}
+
+/// Whether `tag` is the YAML core-schema tag for `ty`, in either scanner form.
+///
+/// Covers the `!!str` shorthand and the verbatim `!<tag:yaml.org,2002:str>`, whose whole URI
+/// lands in `suffix` with an empty `handle`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{CoreSchemaType, is_core_schema_tag};
+/// use yaml_rust2::parser::Tag;
+///
+/// let verbatim = Tag {
+///     handle: String::new(),
+///     suffix: "tag:yaml.org,2002:str".to_string(),
+/// };
+/// assert!(is_core_schema_tag(&verbatim, CoreSchemaType::Str));
+/// assert!(!is_core_schema_tag(&verbatim, CoreSchemaType::Null));
+/// ```
+#[must_use]
+pub fn is_core_schema_tag(tag: &Tag, ty: CoreSchemaType) -> bool {
+    let suffix = ty.suffix();
+    (tag.handle == "tag:yaml.org,2002:" && tag.suffix == suffix)
+        || (tag.handle.is_empty()
+            && tag
+                .suffix
+                .strip_prefix("tag:yaml.org,2002:")
+                .is_some_and(|rest| rest == suffix))
 }
 
 /// Resolves a `yaml-rust2` scanner marker's `(line, col)` position into a byte offset in
@@ -2496,6 +2542,27 @@ pub fn splice_hover_line(markdown: &str, line: &str) -> String {
         }
     }
     format!("{markdown}{line}\n\n")
+}
+
+/// Splices the SHA-pin hover lines every tag-pinning ecosystem shows: a `**Resolved**` line for
+/// `resolved_tag` (when given), then the SHA-comment mismatch warning (when `mismatch` is given).
+///
+/// The order is load-bearing: [`splice_hover_line`] anchors on `**Resolved**` first, so the
+/// warning lands below the resolved line.
+#[cfg(feature = "lsp-responses")]
+pub fn splice_sha_pin_hover_lines(
+    hover: &mut crate::hover::Hover,
+    sha: &CommitSha,
+    resolved_tag: Option<&str>,
+    mismatch: Option<(&super::ShaPinComment, &super::CommentMismatch)>,
+) {
+    if let Some(resolved_tag) = resolved_tag {
+        hover.rewrite_markdown(|md| splice_resolved_line(md, resolved_tag, sha));
+    }
+    if let Some((comment, mismatch)) = mismatch {
+        let line = super::sha_comment_mismatch_hover_line(sha, &comment.tag, mismatch);
+        hover.rewrite_markdown(|md| splice_hover_line(md, &line));
+    }
 }
 
 #[cfg(test)]

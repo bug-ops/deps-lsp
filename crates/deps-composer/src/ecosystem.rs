@@ -325,7 +325,7 @@ mod tests {
     /// Impl-critic fix-cycle S1: NO listed `available` entry strictly newer than the excluded
     /// `fallback` matches R0 here (2.0.0 fails the `<2.0` ceiling too), so a purely structural
     /// "does something newer also match" scan is vacuous — this only rejects because
-    /// `ComposerMatcher::explicitly_excludes` asks the `!=` clause directly.
+    /// `ComposerGrammar::explicitly_excludes` asks the `!=` clause directly.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback_vacuous_case() {
         let ecosystem: Arc<dyn deps_core::Ecosystem> = Arc::new(ComposerEcosystem::new(Arc::new(
@@ -355,7 +355,7 @@ mod tests {
     /// the two `||`-branches (`>=1.0 <1.5` and `>1.5 <2.0`) — neither branch covers it, and
     /// `2.0.0` also fails both branches' ceilings, so the extensional "something newer also
     /// matches" scan is vacuous too. Only `composer_or_gap_excludes` (routed through
-    /// `ComposerMatcher::explicitly_excludes`) catches this.
+    /// `ComposerGrammar::explicitly_excludes`) catches this.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_rejects_or_alternation_gap_vacuous_case() {
         let ecosystem: Arc<dyn deps_core::Ecosystem> = Arc::new(ComposerEcosystem::new(Arc::new(

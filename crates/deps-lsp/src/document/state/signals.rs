@@ -597,7 +597,7 @@ mod tests {
                 .insert(name(pkg), ConcreteVersion::new(latest));
             signals
                 .resolved_version_candidates
-                .insert(name(pkg), vec![ConcreteVersion::new(latest)]);
+                .insert(name(pkg), vec![ConcreteVersion::new(latest)].into());
         }
         signals
             .licenses

@@ -57,10 +57,13 @@ impl SourcePolicy for MockUnresolvedFormatter {}
 impl OsvNaming for MockUnresolvedFormatter {}
 
 /// A formatter whose [`BuildMetadataPolicy`] is `Significant`, standing in for Dart/pub.
+#[cfg(feature = "lsp-responses")]
 pub(crate) struct MockBuildAwareFormatter;
 
+#[cfg(feature = "lsp-responses")]
 impl PackageNaming for MockBuildAwareFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl PackageRendering for MockBuildAwareFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
@@ -71,18 +74,23 @@ impl PackageRendering for MockBuildAwareFormatter {
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 impl RequirementResolution for MockBuildAwareFormatter {
     fn build_metadata_policy(&self) -> BuildMetadataPolicy {
         BuildMetadataPolicy::Significant
     }
 }
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticMessages for MockBuildAwareFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl DiagnosticPolicy for MockBuildAwareFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl SourcePolicy for MockBuildAwareFormatter {}
 
+#[cfg(feature = "lsp-responses")]
 impl OsvNaming for MockBuildAwareFormatter {}
 
 /// A formatter whose `validate_package_name` always rejects, for exercising
@@ -541,11 +549,13 @@ macro_rules! mock_dependency_formatter {
 
 mock_dependency_formatter!(
     MockUnresolvedFormatter,
-    MockBuildAwareFormatter,
     RejectingFormatter,
     ExactMatchFormatter,
     StrictSemverFormatter,
 );
+
+#[cfg(feature = "lsp-responses")]
+mock_dependency_formatter!(MockBuildAwareFormatter);
 
 /// [`ExactMatchFormatter`] paired with [`NonRegistryDep`].
 pub(crate) struct NonRegistryExactFormatter;

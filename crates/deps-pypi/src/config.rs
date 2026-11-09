@@ -493,7 +493,7 @@ impl PypiIndexConfig {
     /// `registries.workspace_registries` policy — and if so, the blocked
     /// [`deps_core::net_policy::HostClass`], the raw declared value, and a declaration key
     /// identifying *which* index declaration
-    /// produced it (`"primary"`, `"uv-tail"`, or `"named:<name>"`) (#925: so the block
+    /// produced it (`"primary"`, `"uv default index"`, or `"named:<name>"`) (#925: so the block
     /// surfaces as a diagnostic instead of only a `tracing::warn!`). `None` for every other
     /// outcome (no override, a valid entry, or an entry invalid for a different reason).
     ///
@@ -550,7 +550,7 @@ impl PypiIndexConfig {
         Some(BlockedSourceClass {
             block,
             raw_value,
-            declaration_key: "uv-tail".to_string(),
+            declaration_key: "uv default index".to_string(),
         })
     }
 
@@ -595,7 +595,7 @@ impl PypiIndexConfig {
         Some(RejectedSourceClass {
             reason,
             raw_value,
-            declaration_key: "uv-tail".to_string(),
+            declaration_key: "uv default index".to_string(),
         })
     }
 
@@ -1237,7 +1237,7 @@ mod tests {
             .expect("blocked uv default index must still be reported");
         assert_eq!(occurrence.block.class(), HostClass::Loopback);
         assert_eq!(occurrence.raw_value, "https://127.0.0.1:9999/simple");
-        assert_eq!(occurrence.declaration_key, "uv-tail");
+        assert_eq!(occurrence.declaration_key, "uv default index");
     }
 
     /// The same blocked `tail_hop`, but with a valid extra present too: resolution fails
@@ -1258,7 +1258,7 @@ mod tests {
             .expect("blocked uv default index must still be reported");
         assert_eq!(occurrence.block.class(), HostClass::Loopback);
         assert_eq!(occurrence.raw_value, "https://127.0.0.1:9999/simple");
-        assert_eq!(occurrence.declaration_key, "uv-tail");
+        assert_eq!(occurrence.declaration_key, "uv default index");
     }
 
     /// An explicit primary takes priority over `tail_hop` entirely (FR-005(a) beats (b)) — a

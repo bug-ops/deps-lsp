@@ -213,6 +213,9 @@ fn run_check_command(
     if let Some(note) = osv_coverage.note() {
         eprintln!("deps-cli: note: {note}");
     }
+    if let Some(warning) = osv_coverage.lock_alternatives_warning() {
+        eprintln!("deps-cli: warning: {warning}");
+    }
 
     let rendered = match args.format {
         OutputFormat::Table => format::table::render(&report),
@@ -658,9 +661,7 @@ async fn run_update(
     // (`--package`/`[update].ignore`) — `--security-only` never reads the default-mode plan
     // this check exists to protect, and an unrelated, unrequested dependency's transient OSV
     // timeout must not block it from applying fixes it already independently verified.
-    if !args.security_only
-        && analysis.has_unverified_latest_check(formatter, &args.package, &ignore_rules)
-    {
+    if !args.security_only && analysis.has_unverified_latest_check(&args.package, &ignore_rules) {
         return Err(format!(
             "the OSV.dev latest-version check for one or more dependencies in {} could not be \
              completed (timeout or query failure); the plan would be based on unverified data",
@@ -688,7 +689,6 @@ async fn run_update(
         update::plan_updates(
             &analysis,
             &content,
-            formatter,
             &reparse,
             &args.package,
             &ignore_rules,

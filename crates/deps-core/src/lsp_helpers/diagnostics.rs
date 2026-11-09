@@ -23,8 +23,8 @@ use crate::{
 use super::{
     CooldownBlocker, CooldownDisposition, DependencyFormatter, DependencyGate, DiagnosticMessages,
     EcosystemFormatter, LatestVerdict, LookupMiss, PackageVersions, RequirementMatcher,
-    RequirementStatus, VersionData, cooldown_disposition, resolve_scan_outcome,
-    version_range_is_synthetic_empty,
+    RequirementStatus, SuppressedKinds, SuppressionKind, VersionData, cooldown_disposition,
+    resolve_scan_outcome, version_range_is_synthetic_empty,
 };
 
 /// Stable [`Diagnostic::code`] set on the unsatisfiable-requirement diagnostic.
@@ -610,71 +610,6 @@ impl DiagnosticSeverities {
     }
 }
 
-/// Shared shape for a [`crate::lsp_helpers::RequirementResolution::compile_bounded_requirement`] guarded by one predicate.
-///
-/// This is the pattern several ecosystems' guards independently re-implemented
-/// (`deps-go`'s pseudo-version check, `deps-composer`'s dev-branch/`@dev` check,
-/// `deps-bundler`'s exact-pin check, `deps-maven`/`deps-gradle`'s malformed-range check,
-/// `deps-nuget`'s malformed-requirement check). See
-/// [`crate::lsp_helpers::RequirementResolution::compile_bounded_requirement`]'s docs for why `None` is correct in exactly
-/// this case: `is_undecidable(requirement)` true means the fetched `available` list
-/// structurally cannot contain a version that would decide the match either way, so scanning
-/// it would always report `Some(false)` and produce a false "no published version satisfies
-/// this requirement" diagnostic.
-///
-/// Returns `None` when `is_undecidable(requirement)` is `true`. Otherwise builds `matcher`
-/// from `requirement`'s owned `String` and boxes it as the trait object
-/// [`crate::lsp_helpers::RequirementResolution::compile_bounded_requirement`] returns.
-///
-/// Ecosystems whose guard is a fallible parse rather than a named predicate over the
-/// requirement string (`deps-cargo`, `deps-npm`, `deps-pypi`, `deps-swift`) don't fit this
-/// shape and implement `compile_bounded_requirement` directly via `.ok().map(...)` instead.
-/// `deps-dart` implements `compile_bounded_requirement` but has no guard at all — every requirement
-/// string is a valid Dart constraint by construction, so it is always `Some`.
-///
-/// # Examples
-///
-/// ```
-/// use deps_core::lsp_helpers::{compile_requirement_unless, RequirementMatcher};
-/// use deps_core::ConcreteVersion;
-///
-/// struct ExactMatcher(String);
-/// impl RequirementMatcher for ExactMatcher {
-///     fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-///         Some(version.as_str() == self.0)
-///     }
-///
-///     fn strict_prerelease_exclusion(&self) -> bool {
-///         false
-///     }
-/// }
-///
-/// let is_pseudo_version = |r: &str| r.starts_with("v0.0.0-");
-///
-/// assert!(
-///     compile_requirement_unless(
-///         "v0.0.0-20191109021931-daa7c04131f5",
-///         is_pseudo_version,
-///         ExactMatcher,
-///     )
-///     .is_none()
-/// );
-/// assert!(compile_requirement_unless("v1.2.3", is_pseudo_version, ExactMatcher).is_some());
-/// ```
-pub fn compile_requirement_unless<M>(
-    requirement: &str,
-    is_undecidable: impl FnOnce(&str) -> bool,
-    matcher: impl FnOnce(String) -> M,
-) -> Option<Box<dyn RequirementMatcher>>
-where
-    M: RequirementMatcher + 'static,
-{
-    if is_undecidable(requirement) {
-        return None;
-    }
-    Some(Box::new(matcher(requirement.to_string())))
-}
-
 /// Requirement strings longer than this are rejected before compilation, rather than
 /// compiled and scanned.
 ///
@@ -1203,6 +1138,7 @@ where
         .unwrap_or_default();
 
     for (dep, key) in &keyed_deps {
+        let suppressed = suppression.kinds_for(key.normalized());
         let ctx = RuleContext {
             dep: *dep,
             key,
@@ -1211,6 +1147,7 @@ where
             severities,
             freshness,
             now,
+            suppressed,
         };
 
         let start = diagnostics.len();
@@ -1220,7 +1157,6 @@ where
             &ctx,
             vuln_keys.as_ref(),
         );
-        let suppressed = suppression.kinds_for(key.normalized());
         if !suppressed.is_empty() {
             let kept: Vec<Diagnostic> = diagnostics
                 .drain(start..)
@@ -1308,6 +1244,9 @@ struct RuleContext<'a, F: DependencyFormatter> {
     /// The instant every publish age in this call is aged against. Read only by
     /// [`apply_outdated_rule`].
     now: PublishTime,
+    /// The user-suppressed kinds for this dependency. Read only by [`apply_vulnerability_rule`],
+    /// whose "+N more" count must exclude advisories the suppression hides (#1960).
+    suppressed: SuppressedKinds,
 }
 
 impl<'a, F: DependencyFormatter> RuleContext<'a, F> {
@@ -1934,7 +1873,7 @@ fn apply_vulnerability_rule<'a, F: DependencyFormatter>(
     else {
         return None;
     };
-    push_vulnerability_diagnostics(diagnostics, ctx.dep, dv, ctx.formatter);
+    push_vulnerability_diagnostics(diagnostics, ctx.dep, dv, ctx.formatter, ctx.suppressed);
     Some(dv)
 }
 
@@ -2973,6 +2912,9 @@ fn apply_outdated_rule<F: DependencyFormatter>(
 
     let latest =
         sanitize_and_truncate_for_diagnostic(latest.as_str(), MAX_VERSION_DIAGNOSTIC_CHARS);
+    let notice = ctx
+        .formatter
+        .newer_version_notice(dep.version_requirement());
     let (kind, message, severity) = match &verdict {
         LatestVerdict::Flagged {
             advisory_ids,
@@ -2996,7 +2938,7 @@ fn apply_outdated_rule<F: DependencyFormatter>(
         }
         LatestVerdict::Unverified => (
             DiagnosticKind::Outdated,
-            format!("Newer version available: {latest} (not yet verified against OSV)"),
+            format!("{notice}: {latest} (not yet verified against OSV)"),
             ctx.severities.outdated,
         ),
         // Issue #1517 AC7: a confirmed-unsafe version never also reads as a benign "recently
@@ -3016,18 +2958,18 @@ fn apply_outdated_rule<F: DependencyFormatter>(
                     by: CooldownBlocker::Gossip,
                     ..
                 } => format!(
-                    "Newer version available: {latest} (deps.dev/GOSSIP reports this release is \
+                    "{notice}: {latest} (deps.dev/GOSSIP reports this release is \
                      still within its cooldown window)"
                 ),
                 CooldownDisposition::Blocked {
                     by: CooldownBlocker::Local { published_at },
                     ..
                 } => format!(
-                    "Newer version available: {latest} (published {} — still within the release cooldown window)",
+                    "{notice}: {latest} (published {} — still within the release cooldown window)",
                     format_relative_age(published_at.age_secs_from(ctx.now))
                 ),
                 CooldownDisposition::Cleared | CooldownDisposition::NotEvaluated => {
-                    format!("Newer version available: {latest}")
+                    format!("{notice}: {latest}")
                 }
             };
             (DiagnosticKind::Outdated, message, ctx.severities.outdated)
@@ -3249,9 +3191,17 @@ fn push_vulnerability_diagnostics(
     dep: &dyn Dependency,
     dv: &crate::osv::DependencyVulnerabilities,
     formatter: &dyn EcosystemFormatter,
+    suppressed: SuppressedKinds,
 ) {
     let range: Range = version_anchor_range(dep);
 
+    let visible;
+    let dv = if suppressed.contains(SuppressionKind::Deprecated) {
+        visible = dv.without_informational();
+        &visible
+    } else {
+        dv
+    };
     let display_advisories = dv.advisories_for_display();
     for advisory in display_advisories.items() {
         let code_description = advisory
@@ -3278,13 +3228,12 @@ fn push_vulnerability_diagnostics(
         diagnostics.push(diagnostic);
     }
 
-    let remaining = display_advisories.remaining();
-    if remaining > 0 {
+    if let Some(overflow) = display_advisories.overflow() {
         diagnostics.push(
             Diagnostic::new(
                 DiagnosticKind::AdvisoryOverflow,
                 range,
-                format!("+{remaining} more advisories"),
+                overflow.to_string(),
             )
             .with_severity(Severity::Information),
         );
@@ -10214,6 +10163,92 @@ mod tests {
         assert_eq!(other, none);
     }
 
+    fn overflow_messages(
+        vulnerabilities: crate::osv::DependencyVulnerabilities,
+        rules: &super::super::SuppressionSet,
+    ) -> Vec<String> {
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("noisy-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut vulns = crate::osv::VulnerabilityMap::new();
+        vulns.insert(
+            crate::test_util::vuln_key("noisy-pkg"),
+            crate::osv::ScanOutcome::Vulnerable(vulnerabilities),
+        );
+        generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_vulnerabilities(&vulns)
+                .with_suppression(rules),
+            &formatter,
+            parse_result.uri(),
+            crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        )
+        .iter()
+        .filter(|d| *d.kind() == DiagnosticKind::AdvisoryOverflow)
+        .map(|d| d.message().to_owned())
+        .collect()
+    }
+
+    /// #1960: the "+N more" count excludes unmaintained advisories a `deprecated` suppression
+    /// hides, and only for a package that suppression names.
+    #[test]
+    fn test_suppression_deprecated_excludes_informational_from_overflow_count() {
+        use crate::osv::{ADVISORY_DISPLAY_CAP, Capped, DependencyVulnerabilities, VulnSeverity};
+
+        let build = || {
+            let mut advisories: Vec<_> = (0..ADVISORY_DISPLAY_CAP)
+                .map(|i| sample_advisory(&format!("ADV-{i}"), VulnSeverity::Low))
+                .collect();
+            advisories.push(sample_advisory(
+                "RUSTSEC-2024-0320",
+                VulnSeverity::Informational,
+            ));
+            DependencyVulnerabilities::new(Capped::new(advisories, ADVISORY_DISPLAY_CAP + 3))
+        };
+
+        assert_eq!(
+            overflow_messages(build(), &suppression_rules("[]")),
+            ["+3 more advisories"]
+        );
+        assert_eq!(
+            overflow_messages(
+                build(),
+                &suppression_rules(r#"[{"package":"noisy-pkg","kinds":["deprecated"]}]"#)
+            ),
+            ["+2 more advisories"]
+        );
+        assert_eq!(
+            overflow_messages(
+                build(),
+                &suppression_rules(r#"[{"package":"other","kinds":["deprecated"]}]"#)
+            ),
+            ["+3 more advisories"]
+        );
+    }
+
+    /// #1996: an unchecked lock entry makes the count a lower bound, worded as such even when no
+    /// advisory is hidden.
+    #[test]
+    fn test_lower_bound_advisory_count_is_worded_as_at_least() {
+        use crate::osv::{Capped, DependencyVulnerabilities, VulnSeverity};
+
+        let lower_bound = DependencyVulnerabilities::new(
+            Capped::new(vec![sample_advisory("ADV-1", VulnSeverity::Low)], 1)
+                .with_total_as_lower_bound(),
+        );
+        assert_eq!(
+            overflow_messages(lower_bound, &suppression_rules("[]")),
+            ["+0 or more advisories; some lock entries were not checked"]
+        );
+    }
+
     /// #1927 S7: suppressing `deprecated` hides only the advisory typed `Informational`; a graded
     /// advisory on the same package stays, and a rule never hides an advisory without `deprecated`.
     #[test]
@@ -10533,10 +10568,10 @@ mod tests {
         let mut resolved_version_candidates = HashMap::new();
         resolved_version_candidates.insert(
             NormalizedName::for_test("serde"),
-            vec![
+            LockCandidates::from(vec![
                 ConcreteVersion::from("0.9.15"),
                 ConcreteVersion::from("1.0.219"),
-            ],
+            ]),
         );
 
         let keys = vulnerability_keys(

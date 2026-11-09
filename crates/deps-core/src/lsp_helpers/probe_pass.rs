@@ -34,7 +34,7 @@ pub const PROBE_CONCURRENCY: usize = 4;
 ///
 /// ASSUMPTION: the tag index itself has no TTL (it is revalidated on every fetch), so one hour
 /// stands in for "the tag-index TTL" of specs 086/087.
-pub const EVIDENCE_TTL: Duration = Duration::from_secs(3600);
+pub const EVIDENCE_TTL: Duration = Duration::from_hours(1);
 
 /// Latest-release records kept per ecosystem.
 const MAX_LATEST_RELEASES: usize = 256;
@@ -218,7 +218,8 @@ impl ProbeStores {
     /// let package = PackageName::new("actions/checkout");
     ///
     /// let partial = stores.question_for(&package, &index, GitPinView::Tag { written: "v40" });
-    /// assert!(matches!(partial, Some(ProbeQuestion::Branch(_))));
+    /// # use std::assert_matches;
+    /// assert_matches!(partial, Some(ProbeQuestion::Branch(_)));
     ///
     /// let published = stores.question_for(&package, &index, GitPinView::Tag { written: "v4.3.1" });
     /// assert!(published.is_none());

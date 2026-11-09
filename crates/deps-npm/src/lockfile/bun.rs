@@ -4,14 +4,17 @@
 //! graphs are out of scope. The input is untrusted repository content, so the parse goes
 //! through the shared depth-bounded JSONC path ([`deps_core::json_ast::parse_jsonc_typed`]).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use deps_core::error::Result;
 use deps_core::json_ast::parse_jsonc_typed;
-use deps_core::lockfile::{ResolvedPackage, ResolvedPackages, ResolvedSource};
-use serde::Deserialize;
-use serde::de::{IgnoredAny, SeqAccess, Visitor};
+use deps_core::lockfile::{
+    EntryOwner, EntryPlacement, ImporterPath, ResolvedPackage, ResolvedPackages, ResolvedSource,
+};
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 use super::{lockfile_parse_error, split_specifier};
 
@@ -22,48 +25,313 @@ const MIN_LOCKFILE_VERSION: u32 = 0;
 /// Highest supported `lockfileVersion`; newer lock files fail closed (spec 090 FR-006).
 const MAX_LOCKFILE_VERSION: u32 = 3;
 
-/// A `lockfileVersion` value as written: an unsigned integer, or anything else (kept only to
-/// name it in the error).
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawLockfileVersion {
-    Integer(u32),
-    Other(serde_json::Value),
+/// Generates the `visit_*` methods that accept a value of an unwanted shape and yield
+/// `$unrecognized`, so a value of any other shape never fails the whole file. Each shape is
+/// consumed without building it (sequences and maps are drained as `IgnoredAny`).
+macro_rules! ignore_shapes {
+    (@bool $u:expr) => {
+        fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+            Ok($u)
+        }
+    };
+    (@i64 $u:expr) => {
+        fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+            Ok($u)
+        }
+    };
+    (@u64 $u:expr) => {
+        fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+            Ok($u)
+        }
+    };
+    (@f64 $u:expr) => {
+        fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+            Ok($u)
+        }
+    };
+    (@str $u:expr) => {
+        fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+            Ok($u)
+        }
+    };
+    (@unit $u:expr) => {
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok($u)
+        }
+    };
+    (@seq $u:expr) => {
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok($u)
+        }
+    };
+    (@map $u:expr) => {
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok($u)
+        }
+    };
+    ($unrecognized:expr; $($shape:ident),+ $(,)?) => { $(ignore_shapes!(@$shape $unrecognized);)+ };
 }
 
-/// The parts of `bun.lock` this parser reads; `workspaces`, `overrides`, `catalogs`,
-/// `configVersion` and every other key are ignored.
+/// A `lockfileVersion` value as written: an unsigned integer, or anything else (kept only to
+/// name it in the error).
+enum RawLockfileVersion {
+    Integer(u32),
+    Other(OtherValue),
+}
+
+/// The shape of a non-integer `lockfileVersion`; composite values are drained, never kept.
+enum OtherValue {
+    Null,
+    Bool(bool),
+    Number(String),
+    Text(String),
+    Array,
+    Object,
+}
+
+impl<'de> Deserialize<'de> for RawLockfileVersion {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct VersionVisitor;
+
+        impl VersionVisitor {
+            fn other(value: OtherValue) -> RawLockfileVersion {
+                RawLockfileVersion::Other(value)
+            }
+        }
+
+        impl<'de> Visitor<'de> for VersionVisitor {
+            type Value = RawLockfileVersion;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bun.lock lockfileVersion")
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<Self::Value, E> {
+                Ok(u32::try_from(value).map_or_else(
+                    |_| Self::other(OtherValue::Number(value.to_string())),
+                    RawLockfileVersion::Integer,
+                ))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<Self::Value, E> {
+                Ok(u32::try_from(value).map_or_else(
+                    |_| Self::other(OtherValue::Number(value.to_string())),
+                    RawLockfileVersion::Integer,
+                ))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> std::result::Result<Self::Value, E> {
+                let text = serde_json::Number::from_f64(value)
+                    .map_or_else(|| value.to_string(), |number| number.to_string());
+                Ok(Self::other(OtherValue::Number(text)))
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> std::result::Result<Self::Value, E> {
+                Ok(Self::other(OtherValue::Bool(value)))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+                Ok(Self::other(OtherValue::Text(value.to_owned())))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(Self::other(OtherValue::Null))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(Self::other(OtherValue::Array))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Self::other(OtherValue::Object))
+            }
+        }
+
+        deserializer.deserialize_any(VersionVisitor)
+    }
+}
+
+/// The parts of `bun.lock` this parser reads; `overrides`, `catalogs`, `configVersion` and every
+/// other key are ignored. `workspaces` is read only for each member's `name` (spec 090 decision
+/// 4, amended by #1993): a `packages` key prefixed with a member's name is installed under it.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BunLock {
     lockfile_version: Option<RawLockfileVersion>,
     #[serde(default)]
-    packages: BTreeMap<String, BunPackageEntry>,
+    workspaces: BunWorkspaces,
+    #[serde(default)]
+    packages: BTreeMap<String, BunPackageLabel>,
 }
 
-/// One `packages` value: normally a tuple led by a `name@resolution` label, but a value of any
-/// other shape must not fail the whole file.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum BunPackageEntry {
-    Tuple(BunPackageLabel),
-    Unrecognized(IgnoredAny),
+/// A string value, or `None` for a value of any other shape.
+#[derive(Default)]
+struct LenientString(Option<String>);
+
+impl<'de> Deserialize<'de> for LenientString {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct StringVisitor;
+
+        impl<'de> Visitor<'de> for StringVisitor {
+            type Value = LenientString;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("any value")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+                Ok(LenientString(Some(value.to_owned())))
+            }
+
+            ignore_shapes!(LenientString(None); bool, i64, u64, f64, unit, seq, map);
+        }
+
+        deserializer.deserialize_any(StringVisitor)
+    }
 }
 
-/// The `name@resolution` head of a `packages` tuple; `None` when the head is not a string.
+/// The `workspaces` value: path -> member's name. A value of any other shape yields no members
+/// rather than failing the whole file.
+#[derive(Default)]
+struct BunWorkspaces(BTreeMap<String, LenientString>);
+
+impl<'de> Deserialize<'de> for BunWorkspaces {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct WorkspacesVisitor;
+
+        impl<'de> Visitor<'de> for WorkspacesVisitor {
+            type Value = BunWorkspaces;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("any value")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut members = BTreeMap::new();
+                while let Some((path, member)) = map.next_entry::<String, WorkspaceMember>()? {
+                    members.insert(path, member.name);
+                }
+                Ok(BunWorkspaces(members))
+            }
+
+            ignore_shapes!(BunWorkspaces::default(); bool, i64, u64, f64, str, unit, seq);
+        }
+
+        deserializer.deserialize_any(WorkspacesVisitor)
+    }
+}
+
+/// One workspace member: only its `name` is read; a non-object member has no name.
+struct WorkspaceMember {
+    name: LenientString,
+}
+
+impl<'de> Deserialize<'de> for WorkspaceMember {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            #[serde(default)]
+            name: LenientString,
+        }
+
+        struct MemberVisitor;
+
+        impl<'de> Visitor<'de> for MemberVisitor {
+            type Value = WorkspaceMember;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("any value")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let fields = Fields::deserialize(MapAccessDeserializer::new(map))?;
+                Ok(WorkspaceMember { name: fields.name })
+            }
+
+            ignore_shapes!(
+                WorkspaceMember { name: LenientString(None) };
+                bool, i64, u64, f64, str, unit, seq
+            );
+        }
+
+        deserializer.deserialize_any(MemberVisitor)
+    }
+}
+
+/// Workspace member name -> its directory, for the members that declare a name and a valid
+/// path.
+fn workspace_directories(workspaces: BunWorkspaces) -> HashMap<String, ImporterPath> {
+    let mut directories = HashMap::new();
+    for (path, member) in workspaces.0 {
+        let LenientString(Some(name)) = member else {
+            continue;
+        };
+        if let Ok(path) = ImporterPath::parse(&path) {
+            directories.entry(name).or_insert(path);
+        }
+    }
+    directories
+}
+
+/// Splits a `packages` key into its package-name components: `app/@types/node` is `app` then
+/// `@types/node`, and `@org/app/x` is `@org/app` then `x`.
+fn key_components(key: &str) -> Vec<&str> {
+    let mut components = Vec::new();
+    let mut rest = key;
+    while !rest.is_empty() {
+        let mut slashes = rest.match_indices('/').map(|(index, _)| index);
+        let end = if rest.starts_with('@') {
+            slashes.nth(1)
+        } else {
+            slashes.next()
+        }
+        .unwrap_or(rest.len());
+        let (component, tail) = rest.split_at_checked(end).unwrap_or((rest, ""));
+        components.push(component);
+        rest = tail.strip_prefix('/').unwrap_or_default();
+    }
+    components
+}
+
+/// The importer a `packages` key is installed under: a bare key is hoisted to the root, a key
+/// under a workspace member's name belongs to that member, and any other prefix is a copy
+/// nested under another package, which only serves that package.
+fn key_importer(key: &str, directories: &HashMap<String, ImporterPath>) -> Option<ImporterPath> {
+    match key_components(key).as_slice() {
+        [_] => Some(ImporterPath::root()),
+        [member, _] => directories.get(*member).cloned(),
+        _ => None,
+    }
+}
+
+/// The `name@resolution` head of a `packages` tuple; `None` when the value is not a tuple or
+/// its head is not a string. The tuple's remaining elements are drained without being built.
 struct BunPackageLabel(Option<String>);
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum TupleHead {
-    Label(String),
-    Other(IgnoredAny),
-}
-
 impl<'de> Deserialize<'de> for BunPackageLabel {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         struct LabelVisitor;
 
         impl<'de> Visitor<'de> for LabelVisitor {
@@ -77,16 +345,15 @@ impl<'de> Deserialize<'de> for BunPackageLabel {
                 self,
                 mut seq: A,
             ) -> std::result::Result<Self::Value, A::Error> {
-                let head = seq.next_element::<TupleHead>()?;
+                let head = seq.next_element::<LenientString>()?;
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(BunPackageLabel(match head {
-                    Some(TupleHead::Label(label)) => Some(label),
-                    Some(TupleHead::Other(_)) | None => None,
-                }))
+                Ok(BunPackageLabel(head.and_then(|head| head.0)))
             }
+
+            ignore_shapes!(BunPackageLabel(None); bool, i64, u64, f64, str, unit, map);
         }
 
-        deserializer.deserialize_seq(LabelVisitor)
+        deserializer.deserialize_any(LabelVisitor)
     }
 }
 
@@ -120,20 +387,20 @@ const MAX_PREVIEW_CHARS: usize = 64;
 
 /// Names a JSON value's type, with a bounded preview for scalars: the value comes from an
 /// untrusted file and may be megabytes long, so it is never echoed whole.
-fn describe_json_value(value: &serde_json::Value) -> String {
+fn describe_json_value(value: &OtherValue) -> String {
     match value {
-        serde_json::Value::Null => "null".to_string(),
-        serde_json::Value::Bool(flag) => format!("boolean {flag}"),
-        serde_json::Value::Number(number) => format!("number {number}"),
-        serde_json::Value::String(text) => {
+        OtherValue::Null => "null".to_string(),
+        OtherValue::Bool(flag) => format!("boolean {flag}"),
+        OtherValue::Number(number) => format!("number {number}"),
+        OtherValue::Text(text) => {
             let preview = deps_core::lsp_helpers::truncate_for_diagnostic(text, MAX_PREVIEW_CHARS);
             format!(
                 "string '{}'",
                 deps_core::redact::redact_declaration_key(&preview)
             )
         }
-        serde_json::Value::Array(_) => "array".to_string(),
-        serde_json::Value::Object(_) => "object".to_string(),
+        OtherValue::Array => "array".to_string(),
+        OtherValue::Object => "object".to_string(),
     }
 }
 
@@ -158,10 +425,10 @@ pub(super) fn parse_bun_lock(content: &str) -> Result<ResolvedPackages> {
     };
     check_lockfile_version(lock.lockfile_version)?;
 
-    let mut packages = ResolvedPackages::new();
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let directories = workspace_directories(lock.workspaces);
+    let mut installs: BTreeMap<(String, String), BTreeSet<Option<ImporterPath>>> = BTreeMap::new();
     for (key, entry) in lock.packages {
-        let BunPackageEntry::Tuple(BunPackageLabel(Some(label))) = entry else {
+        let BunPackageLabel(Some(label)) = entry else {
             tracing::debug!(
                 key = %deps_core::redact::redact_declaration_key(&key),
                 "skipping bun.lock entry without a name@resolution label"
@@ -179,15 +446,38 @@ pub(super) fn parse_bun_lock(content: &str) -> Result<ResolvedPackages> {
             );
             continue;
         }
-        if seen.insert((name.to_string(), resolution.to_string())) {
-            packages.insert(ResolvedPackage::new(
-                name.to_string(),
-                resolution.to_string(),
-                ResolvedSource::Registry {
-                    url: String::new(),
-                    checksum: String::new(),
-                },
-            ));
+        let importer = key_importer(&key, &directories);
+        let importers = installs
+            .entry((name.to_string(), resolution.to_string()))
+            .or_default();
+        importers.insert(importer);
+    }
+
+    let mut packages = ResolvedPackages::new();
+    for ((name, version), importers) in installs {
+        let owners: Vec<ImporterPath> = importers.into_iter().flatten().collect();
+        let placements: Vec<EntryPlacement> = if owners.is_empty() {
+            vec![EntryPlacement::Nested]
+        } else {
+            owners
+                .into_iter()
+                .map(|path| EntryPlacement::Hoisted {
+                    owner: EntryOwner::Importer(path),
+                })
+                .collect()
+        };
+        for placement in placements {
+            packages.insert(
+                ResolvedPackage::new(
+                    name.clone(),
+                    version.clone(),
+                    ResolvedSource::Registry {
+                        url: String::new(),
+                        checksum: String::new(),
+                    },
+                )
+                .with_placement(placement),
+            );
         }
     }
     Ok(packages)
@@ -334,6 +624,106 @@ mod tests {
     }
 
     #[test]
+    fn key_components_keep_scoped_names_whole() {
+        for (key, expected) in [
+            ("left-pad", &["left-pad"][..]),
+            ("@types/node", &["@types/node"]),
+            ("app/@types/node", &["app", "@types/node"]),
+            ("@org/app/x", &["@org/app", "x"]),
+            ("@org/app/@types/node", &["@org/app", "@types/node"]),
+            ("a/b/c", &["a", "b", "c"]),
+        ] {
+            assert_eq!(key_components(key), expected, "{key}");
+        }
+    }
+
+    const WORKSPACE_OWNERS: &str = r#"{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": { "name": "root", "dependencies": { "lodash": "^4.0.0" } },
+    "packages/a": { "name": "a", "dependencies": { "lodash": "^3.0.0" } },
+    "packages/b": { "name": "b", "dependencies": { "lodash": "^2.0.0" } },
+  },
+  "packages": {
+    "lodash": ["lodash@4.0.0", "", {}, "sha512-x"],
+    "a/lodash": ["lodash@3.0.0", "", {}, "sha512-y"],
+    "b/lodash": ["lodash@2.0.0", "", {}, "sha512-z"],
+    "lodash/inner": ["inner@1.0.0", "", {}, "sha512-w"],
+  }
+}"#;
+
+    fn collapsed_for(packages: &ResolvedPackages, scope: &str) -> Option<String> {
+        let naming = deps_core::test_util::StubFormatter::new();
+        let scope = ImporterPath::parse(scope).unwrap();
+        let (versions, _) = packages.split_normalized_for(&naming, &scope);
+        versions
+            .iter()
+            .find(|(name, _)| name.as_str() == "lodash")
+            .map(|(_, version)| version.as_str().to_string())
+    }
+
+    #[test]
+    fn workspace_prefixed_keys_are_owned_by_that_member() {
+        let packages = parse(WORKSPACE_OWNERS);
+        assert_eq!(
+            collapsed_for(&packages, "packages/a").as_deref(),
+            Some("3.0.0")
+        );
+        assert_eq!(
+            collapsed_for(&packages, "packages/b").as_deref(),
+            Some("2.0.0")
+        );
+        assert_eq!(collapsed_for(&packages, "").as_deref(), Some("4.0.0"));
+        assert_eq!(
+            collapsed_for(&packages, "packages/c").as_deref(),
+            Some("4.0.0"),
+            "a member without its own entry resolves through the root"
+        );
+        assert_eq!(versions(&packages, "inner"), ["1.0.0"]);
+    }
+
+    /// Intended (#1993, extends #1981 to bun): a copy nested under another package stops being
+    /// a lock alternative once a hoisted entry of the same name exists.
+    #[test]
+    fn nested_copies_are_demoted_when_a_hoisted_entry_exists() {
+        let naming = deps_core::test_util::StubFormatter::new();
+        let (versions, candidates) = parse(V3_NESTED).split_normalized(&naming);
+        assert_eq!(
+            versions
+                .iter()
+                .find(|(name, _)| name.as_str() == "is-number")
+                .map(|(_, version)| version.as_str()),
+            Some("7.0.0")
+        );
+        assert!(
+            candidates.keys().all(|name| name.as_str() != "is-number"),
+            "{candidates:?}"
+        );
+    }
+
+    /// Owners are a set per `(name, version)`: a repeated importer is one entry, and N members
+    /// give exactly N entries (no per-insert linear scan).
+    #[test]
+    fn owners_are_deduplicated_per_name_and_version() {
+        const MEMBERS: usize = 500;
+        let mut workspaces = vec![r#""": {"name": "root"}"#.to_string()];
+        let mut entries = vec![
+            r#""x": ["x@1.0.0", "", {}, "sha512-a"]"#.to_string(),
+            r#""alias": ["x@1.0.0", "", {}, "sha512-a"]"#.to_string(),
+        ];
+        for n in 0..MEMBERS {
+            workspaces.push(format!(r#""p{n}": {{"name": "w{n}"}}"#));
+            entries.push(format!(r#""w{n}/x": ["x@1.0.0", "", {{}}, "sha512-a"]"#));
+        }
+        let content = format!(
+            r#"{{"lockfileVersion": 1, "workspaces": {{{}}}, "packages": {{{}}}}}"#,
+            workspaces.join(","),
+            entries.join(",")
+        );
+        assert_eq!(parse(&content).all("x").unwrap().len(), MEMBERS + 1);
+    }
+
+    #[test]
     fn non_registry_resolutions_are_not_recorded_as_versions() {
         let packages = parse(WORKSPACE_V0);
         for name in ["bar", "sib", "loc"] {
@@ -412,6 +802,23 @@ mod tests {
         );
         assert_eq!(packages.version("ok"), Some("1.2.3"));
         assert_eq!(packages.len(), 1);
+    }
+
+    #[test]
+    fn unrecognized_workspace_shapes_are_ignored_without_failing_the_file() {
+        for workspaces in [
+            "[]",
+            "7",
+            r#""x""#,
+            "null",
+            r#"{"": 1, "a": [], "b": {"name": 7}, "c": {"name": {"n": []}}}"#,
+        ] {
+            let packages = parse(&format!(
+                r#"{{"lockfileVersion": 3, "workspaces": {workspaces},
+                    "packages": {{"ok": ["ok@1.2.3"]}}}}"#
+            ));
+            assert_eq!(packages.version("ok"), Some("1.2.3"), "{workspaces}");
+        }
     }
 
     #[test]

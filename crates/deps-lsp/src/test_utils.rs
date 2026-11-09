@@ -144,38 +144,6 @@ pub(crate) mod test_helpers {
     }
 }
 
-/// Implements [`deps_core::TypedEcosystem`] for a test double over [`StubParseResult`] and a
-/// [`StubFormatter`]; the optional braced items (hook overrides) go into the same impl block.
-/// Implement [`deps_core::EcosystemBase`] for the type separately.
-#[cfg(test)]
-macro_rules! impl_parsing_stub_ecosystem {
-    ($ty:ty $(, { $($item:item)* })?) => {
-        impl deps_core::TypedEcosystem for $ty {
-            type Parsed = deps_core::test_util::StubParseResult;
-            type Formatter = deps_core::test_util::StubFormatter;
-
-            fn own_formatter(&self) -> &deps_core::test_util::StubFormatter {
-                &deps_core::test_util::StubFormatter::DEFAULT
-            }
-
-            fn parse<'a>(
-                &'a self,
-                _content: &'a str,
-                uri: &'a url::Url,
-            ) -> deps_core::ecosystem::BoxFuture<
-                'a,
-                deps_core::Result<deps_core::test_util::StubParseResult>,
-            > {
-                Box::pin(async move { Ok(deps_core::test_util::StubParseResult::new(uri.clone(), 0)) })
-            }
-
-            $($($item)*)?
-        }
-    };
-}
-#[cfg(test)]
-pub(crate) use impl_parsing_stub_ecosystem;
-
 /// A [`deps_core::ParsedManifest`] of `uri` paired with `ecosystem`, so the ecosystem's own
 /// hooks serve it.
 #[cfg(test)]
@@ -281,7 +249,7 @@ pub(crate) mod blocking_ecosystem {
         }
     }
 
-    crate::test_utils::impl_parsing_stub_ecosystem!(BlockingEcosystem, {
+    deps_core::impl_stub_typed_ecosystem!(BlockingEcosystem, {
         fn inlay_hints<'a>(
             &'a self,
             _parsed: ParsedView<'a, StubParseResult>,

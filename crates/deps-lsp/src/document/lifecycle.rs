@@ -15,11 +15,11 @@ use super::osv_scan::{
 };
 use super::probes::spawn_background_probes;
 use super::resolved::RefetchPolicy;
-use super::state::{DocumentState, ParseFailure, ServerState, spawn_supervised};
+use super::state::{DocumentState, ParseFailure, RefetchEscalation, ServerState, spawn_supervised};
 use super::typosquat::{current_declared_names, run_typosquat_prefetch};
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
-use crate::progress::{ProgressSender, RegistryProgress};
+use crate::progress::{RegistryProgress, start_registry_progress};
 use deps_core::DependencyOutcomes;
 use deps_core::Ecosystem;
 use deps_core::FetchFailure;
@@ -408,28 +408,6 @@ async fn run_document_open_background_task(
     .await;
 }
 
-/// Opens the registry progress report when the client supports it, bounded by a short timeout
-/// so a slow client cannot stall the fetch.
-async fn start_registry_progress(
-    state: &ServerState,
-    client: &Client,
-    uri: &Uri,
-    dep_count: usize,
-) -> (Option<RegistryProgress>, Option<ProgressSender>) {
-    if !state.supports_progress() {
-        return (None, None);
-    }
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        RegistryProgress::start(client.clone(), uri.as_str(), dep_count),
-    )
-    .await
-    {
-        Ok(Ok((progress, sender))) => (Some(progress), Some(sender)),
-        _ => (None, None),
-    }
-}
-
 /// Seeds the lockfile-resolved versions as the document's resolved and cached versions, so
 /// hints render before the registry fetch completes.
 fn seed_cached_versions_from_lockfile(
@@ -509,13 +487,7 @@ fn prepare_open_fetch(
         return None;
     };
     Some((
-        prepare_fetch(
-            manifest,
-            ecosystem.formatter(),
-            ecosystem.ecosystem_id(),
-            resolved_versions,
-            resolved_version_candidates,
-        ),
+        prepare_fetch(manifest, resolved_versions, resolved_version_candidates),
         dependency_version_map(manifest, ecosystem.formatter()),
     ))
 }
@@ -1059,7 +1031,7 @@ pub(crate) async fn handle_document_change_guarded(
     version: Option<i32>,
     guard: CommitGuard,
     trigger: ParseTrigger,
-    mut refetch: RefetchPolicy,
+    refetch: RefetchPolicy,
     state: Arc<ServerState>,
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
@@ -1093,11 +1065,21 @@ pub(crate) async fn handle_document_change_guarded(
     // refetched under the new context, matching what hover/completion/code-actions already
     // compute live against the freshly committed parse result (see `parse_and_diff_manifest`'s
     // doc).
-    if selection_context_changed {
-        refetch = RefetchPolicy::AllDependencies;
-    }
+    // #1994: an escalation is sticky until a committed fetch serves it, so a newer edit that
+    // aborts the debounced task before its fetch cannot drop the full refetch. Recorded before
+    // the commit guard so a skipped (superseded) reparse does not lose it either.
+    let escalation = if selection_context_changed || refetch == RefetchPolicy::AllDependencies {
+        Some(state.escalate_refetch(&uri))
+    } else {
+        state.pending_refetch_escalation(&uri)
+    };
+    let refetch = if escalation.is_some() {
+        RefetchPolicy::AllDependencies
+    } else {
+        refetch
+    };
 
-    if !commit_parsed_document(
+    let committed = commit_parsed_document(
         &uri,
         ecosystem.as_ref(),
         content,
@@ -1105,7 +1087,11 @@ pub(crate) async fn handle_document_change_guarded(
         version,
         &state,
         CommitOptions { diff: &diff, guard },
-    ) {
+    );
+    // A close that raced the recording above already removed the document and cleared the
+    // entry before it existed; without this the entry would outlive the document.
+    state.drop_refetch_escalation_if_untracked(&uri);
+    if !committed {
         return Ok(None);
     }
 
@@ -1142,6 +1128,7 @@ pub(crate) async fn handle_document_change_guarded(
             ChangeTaskConfig {
                 diagnostics: diagnostics_snapshot,
                 refetch,
+                escalation,
                 trigger,
             },
             Arc::clone(&config),
@@ -1185,6 +1172,8 @@ fn pending_fetch_names(
 struct ChangeTaskConfig {
     diagnostics: diagnostics::DiagnosticsSnapshot,
     refetch: RefetchPolicy,
+    /// The sticky full-refetch request `refetch` serves, cleared once its fetch commits (#1994).
+    escalation: Option<RefetchEscalation>,
     /// Whether the pre-fetch probes may run (only for the document's own content events).
     trigger: ParseTrigger,
 }
@@ -1273,15 +1262,10 @@ pub(crate) const fn osv_phase_a_should_run(
 
 /// Whether `uri`'s committed OSV scan plan is stale while OSV checks are active (FR-005,
 /// issue #1987); see [`osv_scan_plan_is_stale`].
-fn osv_plan_is_stale(
-    state: &ServerState,
-    uri: &Uri,
-    ecosystem: &dyn Ecosystem,
-    osv_checks: OsvChecks,
-) -> bool {
+fn osv_plan_is_stale(state: &ServerState, uri: &Uri, osv_checks: OsvChecks) -> bool {
     osv_checks.is_active()
         && state
-            .with_document(uri, |doc| osv_scan_plan_is_stale(doc, ecosystem))
+            .with_document(uri, osv_scan_plan_is_stale)
             .unwrap_or(false)
 }
 
@@ -1505,12 +1489,7 @@ async fn run_document_change_task(
     // always runs both.
     // A stale plan also covers an OSV outcome an aborted predecessor never committed (FR-005,
     // issue #1987); it is false for an unchanged, fully scanned document.
-    let plan_stale = osv_plan_is_stale(
-        &state,
-        &uri,
-        ecosystem.as_ref(),
-        config.diagnostics.osv_checks(),
-    );
+    let plan_stale = osv_plan_is_stale(&state, &uri, config.diagnostics.osv_checks());
     let should_run_osv_phase_a = osv_phase_a_should_run(
         needs_osv_rescan || plan_stale,
         config.diagnostics.osv_checks(),
@@ -1576,6 +1555,9 @@ async fn run_document_change_task(
         if let Some(mut doc) = state.documents.get_mut(&uri) {
             doc.set_loaded();
         }
+        if let Some(escalation) = config.escalation {
+            state.clear_refetch_escalation(&uri, escalation);
+        }
 
         publish_after_prefetches(FetchTail {
             uri: &uri,
@@ -1626,6 +1608,9 @@ async fn run_document_change_task(
 
     let failure_summary = merge_registry_fetch_result(&state, &uri, fetched, success);
     drop(fetch_permit);
+    if let Some(escalation) = config.escalation {
+        state.clear_refetch_escalation(&uri, escalation);
+    }
 
     finish_after_fetch(
         progress,
@@ -2991,6 +2976,116 @@ mod tests {
                 "S1 regression: a dropped-cache entry surviving preserve_cache into an \
                  empty-diff commit must never render as 'Unknown package', got: {diags:?}"
             );
+        }
+    }
+
+    /// #1994: a forced `AllDependencies` refetch must outlive a debounced task that a newer
+    /// edit aborts, and be served (and cleared) by the first task that commits its fetch.
+    #[cfg(feature = "cargo")]
+    mod sticky_escalation_tests {
+        use super::*;
+
+        async fn change(
+            state: &Arc<ServerState>,
+            uri: &Uri,
+            version: i32,
+            refetch: RefetchPolicy,
+        ) -> JoinHandle<()> {
+            let (client, config) = crate::test_utils::test_helpers::create_test_client_and_config();
+            handle_document_change_guarded(
+                uri.clone(),
+                "[package]\nname = \"t\"\nversion = \"0.1.0\"\n".to_string(),
+                Some(version),
+                CommitGuard::Unconditional,
+                ParseTrigger::Config,
+                refetch,
+                Arc::clone(state),
+                client,
+                config,
+            )
+            .await
+            .unwrap()
+            .expect("CommitGuard::Unconditional never skips the commit")
+        }
+
+        #[tokio::test]
+        async fn aborted_escalation_is_served_by_the_next_change() {
+            let state = Arc::new(ServerState::new());
+            let uri: Uri = "file:///tmp/sticky-escalation/Cargo.toml".parse().unwrap();
+
+            let first = change(&state, &uri, 1, RefetchPolicy::AllDependencies).await;
+            first.abort();
+            let raised = state
+                .pending_refetch_escalation(&uri)
+                .expect("an escalating change records its request");
+
+            let second = change(&state, &uri, 2, RefetchPolicy::Diff).await;
+            assert_eq!(
+                state.pending_refetch_escalation(&uri),
+                Some(raised),
+                "a non-escalating change must inherit, not replace or drop, the request"
+            );
+
+            second.await.unwrap();
+            assert_eq!(
+                state.pending_refetch_escalation(&uri),
+                None,
+                "the task that served the escalation clears it"
+            );
+        }
+
+        #[tokio::test]
+        async fn newer_escalation_survives_an_older_tasks_clear() {
+            let state = ServerState::new();
+            let uri: Uri = "file:///tmp/sticky-escalation/Cargo.toml".parse().unwrap();
+
+            let older = state.escalate_refetch(&uri);
+            let newer = state.escalate_refetch(&uri);
+            state.clear_refetch_escalation(&uri, older);
+
+            assert_eq!(state.pending_refetch_escalation(&uri), Some(newer));
+            state.clear_refetch_escalation(&uri, newer);
+            assert_eq!(state.pending_refetch_escalation(&uri), None);
+        }
+
+        /// M5: an escalation recorded for a document that closed meanwhile (here: never
+        /// tracked, so the guarded commit is skipped) must not leave an entry behind.
+        #[tokio::test]
+        async fn escalation_racing_a_close_leaves_no_entry() {
+            let state = Arc::new(ServerState::new());
+            let uri: Uri = "file:///tmp/sticky-escalation/Cargo.toml".parse().unwrap();
+            let (client, config) = crate::test_utils::test_helpers::create_test_client_and_config();
+
+            let skipped = handle_document_change_guarded(
+                uri.clone(),
+                "[package]\nname = \"t\"\nversion = \"0.1.0\"\n".to_string(),
+                Some(2),
+                CommitGuard::ExpectVersion(Some(1)),
+                ParseTrigger::Config,
+                RefetchPolicy::AllDependencies,
+                Arc::clone(&state),
+                client,
+                config,
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                skipped.is_none(),
+                "the commit guard skips an untracked document"
+            );
+            assert_eq!(state.pending_refetch_escalation(&uri), None);
+        }
+
+        #[tokio::test]
+        async fn closing_a_document_drops_its_pending_escalation() {
+            let state = ServerState::new();
+            let uri: Uri = "file:///tmp/sticky-escalation/Cargo.toml".parse().unwrap();
+
+            state.escalate_refetch(&uri);
+            state.remove_document(&uri);
+
+            assert_eq!(state.pending_refetch_escalation(&uri), None);
         }
     }
 
@@ -5388,6 +5483,7 @@ mod pre_fetch_tests {
                 ChangeTaskConfig {
                     diagnostics: snapshot,
                     refetch: RefetchPolicy::Diff,
+                    escalation: None,
                     trigger,
                 },
                 config,

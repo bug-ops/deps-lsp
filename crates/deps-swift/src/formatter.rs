@@ -5,10 +5,10 @@ use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::is_dot_segment;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, HoverProvenance,
-    OsvNaming, PackageNaming, PackageRendering, PublicContent, RequirementMatcher,
-    RequirementResolution, SourcePolicy, compile_semver_requirement,
-    requirement_contains_template_placeholder, warn_rejected_value,
+    BoundedVersionReq, CandidateSet, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+    HoverProvenance, OsvNaming, PackageNaming, PackageRendering, PublicContent, RequirementMatcher,
+    RequirementResolution, SemverGrammar, SourcePolicy, VersionGrammar, grammar_candidates,
+    grammar_matcher, requirement_contains_template_placeholder, warn_rejected_value,
 };
 use deps_core::osv::OsvPackageName;
 use deps_core::redact::RedactedUrl;
@@ -59,6 +59,35 @@ fn is_non_github_registry_url(name: &str) -> bool {
 
 /// Formatter for Swift/SPM ecosystem LSP responses.
 pub struct SwiftFormatter;
+
+/// Swift's version grammar: [`SemverGrammar`] minus requirements with an unresolved string
+/// interpolation.
+#[derive(Clone, Copy)]
+struct SwiftGrammar;
+
+impl VersionGrammar for SwiftGrammar {
+    type Version = semver::Version;
+    type Compiled = semver::VersionReq;
+
+    fn parse_version(&self, version: &ConcreteVersion) -> Option<semver::Version> {
+        SemverGrammar.parse_version(version)
+    }
+
+    fn compile(&self, requirement: BoundedVersionReq<'_>) -> Option<semver::VersionReq> {
+        if SwiftFormatter.bounded_requirement_is_unresolved(requirement) {
+            return None;
+        }
+        SemverGrammar.compile(requirement)
+    }
+
+    fn satisfies(&self, compiled: &semver::VersionReq, version: &semver::Version) -> bool {
+        SemverGrammar.satisfies(compiled, version)
+    }
+
+    fn strict_prerelease_exclusion(&self, compiled: &semver::VersionReq) -> bool {
+        SemverGrammar.strict_prerelease_exclusion(compiled)
+    }
+}
 
 impl PackageNaming for SwiftFormatter {
     fn normalized_spelling(&self, name: &PackageName) -> String {
@@ -158,7 +187,7 @@ impl RequirementResolution for SwiftFormatter {
         req.matches(&ver)
     }
 
-    /// Delegates to [`compile_semver_requirement`] — the same `semver::VersionReq` crate
+    /// Matches through `SwiftGrammar` — the same `semver::VersionReq` crate
     /// `version_satisfies_requirement` uses, shared with `deps-cargo` (#1495). `None` on parse
     /// failure is the fallible-parse shape of `compile_bounded_requirement`'s "undecidable" contract
     /// (see [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`]) — Swift's
@@ -174,10 +203,11 @@ impl RequirementResolution for SwiftFormatter {
         &self,
         requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
-        if self.bounded_requirement_is_unresolved(requirement) {
-            return None;
-        }
-        compile_semver_requirement(requirement.get())
+        grammar_matcher(SwiftGrammar, requirement)
+    }
+
+    fn candidate_set(&self, candidates: &[ConcreteVersion]) -> Option<Box<dyn CandidateSet>> {
+        Some(grammar_candidates(SwiftGrammar, candidates))
     }
 
     /// #1354: an unexpanded Swift string-interpolation placeholder (`\(...)`) inside a
@@ -288,6 +318,55 @@ impl DependencyFormatter for SwiftFormatter {
 mod tests {
     use super::*;
     use crate::scm::SwiftRequirementForm;
+
+    const REQUIREMENTS: &[&str] = &[
+        "1",
+        "1.2",
+        "1.2.3",
+        "^1.2.3",
+        "~1.2",
+        "=1.2.3",
+        "<2",
+        ">=1.2, <2",
+        ">=1.0.0-alpha",
+        "1.*",
+        "*",
+        "^0.0.3",
+        "=1.0.0-beta.1",
+        "1.2.3+build",
+        "",
+        "not semver",
+        "\\(v)",
+        "1.2.\\(patch)",
+        "$(Version)",
+    ];
+    const VERSIONS: &[&str] = &[
+        "0.0.3",
+        "1.0.0-alpha",
+        "1.0.0-beta.1",
+        "1.0.0",
+        "1.2.0",
+        "1.2.3",
+        "1.2.4",
+        "1.2.3+build",
+        "1.9.9",
+        "2.0.0",
+        "2.0.0-rc.1",
+        "v1.2.3",
+        "garbage",
+        "",
+        "1.2",
+    ];
+
+    #[test]
+    fn candidate_set_agrees_with_the_matcher() {
+        deps_core::test_util::assert_candidate_set_consistent(
+            &SwiftFormatter,
+            REQUIREMENTS,
+            VERSIONS,
+        );
+    }
+
     use deps_core::Dependency;
     use deps_core::NormalizeName;
     use deps_core::VersionReq;

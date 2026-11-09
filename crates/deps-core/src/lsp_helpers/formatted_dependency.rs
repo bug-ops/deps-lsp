@@ -33,7 +33,7 @@ use crate::{
 /// `&dyn FormattedDependency` only for the duration of a callback
 /// ([`ParsedManifest::for_each_formatted_dependency`](crate::ecosystem::ParsedManifest::for_each_formatted_dependency));
 /// only [`Self::dependency`], which borrows from the document, may outlive it.
-pub trait FormattedDependency<'a>: Send + Sync {
+pub trait FormattedDependency<'a>: Send + Sync + crate::sealed::FormattedDependency {
     /// The dependency itself, borrowed from the document.
     fn dependency(&self) -> &'a dyn Dependency;
 
@@ -76,7 +76,7 @@ pub trait FormattedDependency<'a>: Send + Sync {
         &self,
         key: &PackageKey,
         resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
-        resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
+        resolved_version_candidates: Option<&crate::lsp_helpers::ResolvedCandidatesMap>,
         ecosystem: EcosystemId,
     ) -> Option<ConcreteVersion>;
 
@@ -85,7 +85,7 @@ pub trait FormattedDependency<'a>: Send + Sync {
         &self,
         key: &PackageKey,
         resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
-        resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
+        resolved_version_candidates: Option<&crate::lsp_helpers::ResolvedCandidatesMap>,
         ecosystem: EcosystemId,
     ) -> Option<InUseVersions>;
 
@@ -98,7 +98,7 @@ pub trait FormattedDependency<'a>: Send + Sync {
         &self,
         key: &PackageKey,
         resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
-        resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
+        resolved_version_candidates: Option<&crate::lsp_helpers::ResolvedCandidatesMap>,
         ecosystem: EcosystemId,
         memo: &mut LockSelectionMemo,
     ) -> Option<InUseVersions> {
@@ -194,6 +194,8 @@ impl<F: DependencyFormatter> Clone for BoundDependency<'_, F> {
 
 impl<F: DependencyFormatter> Copy for BoundDependency<'_, F> {}
 
+impl<F: DependencyFormatter> crate::sealed::FormattedDependency for BoundDependency<'_, F> {}
+
 impl<'a, F: DependencyFormatter> FormattedDependency<'a> for BoundDependency<'a, F> {
     fn dependency(&self) -> &'a dyn Dependency {
         self.dep
@@ -249,7 +251,7 @@ impl<'a, F: DependencyFormatter> FormattedDependency<'a> for BoundDependency<'a,
         &self,
         key: &PackageKey,
         resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
-        resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
+        resolved_version_candidates: Option<&crate::lsp_helpers::ResolvedCandidatesMap>,
         ecosystem: EcosystemId,
     ) -> Option<ConcreteVersion> {
         crate::lsp_helpers::resolve_in_use_version(
@@ -266,7 +268,7 @@ impl<'a, F: DependencyFormatter> FormattedDependency<'a> for BoundDependency<'a,
         &self,
         key: &PackageKey,
         resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
-        resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
+        resolved_version_candidates: Option<&crate::lsp_helpers::ResolvedCandidatesMap>,
         ecosystem: EcosystemId,
     ) -> Option<InUseVersions> {
         crate::lsp_helpers::resolve_in_use_versions(
@@ -283,7 +285,7 @@ impl<'a, F: DependencyFormatter> FormattedDependency<'a> for BoundDependency<'a,
         &self,
         key: &PackageKey,
         resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
-        resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
+        resolved_version_candidates: Option<&crate::lsp_helpers::ResolvedCandidatesMap>,
         ecosystem: EcosystemId,
         memo: &mut LockSelectionMemo,
     ) -> Option<InUseVersions> {

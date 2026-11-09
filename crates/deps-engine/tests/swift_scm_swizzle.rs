@@ -103,8 +103,7 @@ async fn swapped_dependency_keeps_osv_target_and_license_policy_findings() {
     let resolved = HashMap::from([(key.clone(), ConcreteVersion::from("2.65.0"))]);
     let candidates = HashMap::new();
 
-    let (targets, skipped) =
-        build_scan_targets(parsed.as_ref(), &resolved, &candidates, EcosystemId::Swift);
+    let (targets, skipped) = build_scan_targets(parsed.as_ref(), &resolved, &candidates);
     assert!(
         skipped.is_empty(),
         "swapped dependency must stay scannable: {skipped:?}"
@@ -223,8 +222,7 @@ async fn the_same_advisory_matches_before_and_after_the_swap() {
         } else {
             resolved.clone()
         };
-        let (targets, _) =
-            build_scan_targets(parsed.as_ref(), &resolved, &candidates, EcosystemId::Swift);
+        let (targets, _) = build_scan_targets(parsed.as_ref(), &resolved, &candidates);
         assert_eq!(targets.len(), 1, "{mode:?}");
         assert_eq!(
             targets[0].osv_name.name().as_str(),

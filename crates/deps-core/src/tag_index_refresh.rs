@@ -13,8 +13,8 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tokio::sync::broadcast;
 
-use crate::NormalizedName;
 use crate::lsp_helpers::TagIndex;
+use crate::{EcosystemId, NormalizedName};
 
 /// Capacity of the refresh channel; a receiver that falls further behind gets
 /// `RecvError::Lagged` and must treat every repository as refreshed.
@@ -28,9 +28,9 @@ const CHANNEL_CAPACITY: usize = 256;
 /// # Examples
 ///
 /// ```
-/// use deps_core::{ParseInputKey, RefreshEvent};
+/// use deps_core::{EcosystemId, ParseInputKey, RefreshEvent};
 ///
-/// let input = ParseInputKey::new("https://github.com/apple/swift-nio");
+/// let input = ParseInputKey::minted_by(EcosystemId::Swift, "https://github.com/apple/swift-nio");
 /// let event = RefreshEvent::ReparseOpenDocuments { generation: 3, input: input.clone() };
 /// assert_eq!(event, RefreshEvent::ReparseOpenDocuments { generation: 3, input });
 /// ```
@@ -58,35 +58,49 @@ pub enum RefreshEvent {
 /// Identifies one input of an ecosystem's parser whose decision changed, so an announcement
 /// reaches only the open documents that consult it.
 ///
-/// Opaque to everything but the ecosystem: only the ecosystem that sends
-/// [`RefreshEvent::ReparseOpenDocuments`] mints a key, from its own canonical form of the input
-/// (Swift: a canonicalized repository URL), and only its own
+/// The key is tagged with the [`EcosystemId`] that minted it, so a listener skips keys of other
+/// ecosystems structurally instead of relying on the convention that only the sending ecosystem
+/// mints. The canonical form stays opaque to everything but that ecosystem (Swift: a
+/// canonicalized repository URL), and only its own
 /// [`TypedEcosystem::depends_on`](crate::TypedEcosystem::depends_on) interprets it.
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_core::ParseInputKey;
+/// use deps_core::{EcosystemId, ParseInputKey};
 ///
-/// let key = ParseInputKey::new("https://github.com/apple/swift-nio");
+/// let key = ParseInputKey::minted_by(EcosystemId::Swift, "https://github.com/apple/swift-nio");
+/// assert_eq!(key.owner(), EcosystemId::Swift);
 /// assert_eq!(key.as_str(), "https://github.com/apple/swift-nio");
+/// assert_ne!(key, ParseInputKey::minted_by(EcosystemId::Cargo, key.as_str()));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ParseInputKey(String);
+pub struct ParseInputKey {
+    owner: EcosystemId,
+    canonical: String,
+}
 
 impl ParseInputKey {
-    // TODO(#1945): enforce the mint rule by type
-    /// Wraps the canonical form of a parse input; call it only from the ecosystem that owns the
-    /// input and sends the event.
+    /// Wraps the canonical form of a parse input of `owner`, the ecosystem that owns the input
+    /// and sends the event.
     #[must_use]
-    pub fn new(canonical: impl Into<String>) -> Self {
-        Self(canonical.into())
+    pub fn minted_by(owner: EcosystemId, canonical: impl Into<String>) -> Self {
+        Self {
+            owner,
+            canonical: canonical.into(),
+        }
+    }
+
+    /// The ecosystem that minted the key.
+    #[must_use]
+    pub const fn owner(&self) -> EcosystemId {
+        self.owner
     }
 
     /// The canonical form the ecosystem minted the key from.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.canonical
     }
 }
 
@@ -328,7 +342,7 @@ mod tests {
         let mut f = Fixture::new();
         f.sender.send_probe_evidence(f.repository.clone());
         f.sender
-            .send_reparse_open_documents(7, ParseInputKey::new("input"));
+            .send_reparse_open_documents(7, ParseInputKey::minted_by(EcosystemId::Swift, "input"));
         assert_eq!(
             f.rx.try_recv().unwrap(),
             RefreshEvent::ProbeEvidence(f.repository.clone())
@@ -337,7 +351,7 @@ mod tests {
             f.rx.try_recv().unwrap(),
             RefreshEvent::ReparseOpenDocuments {
                 generation: 7,
-                input: ParseInputKey::new("input"),
+                input: ParseInputKey::minted_by(EcosystemId::Swift, "input"),
             }
         );
         assert!(f.rx.try_recv().is_err());

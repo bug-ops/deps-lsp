@@ -221,6 +221,7 @@ pub mod registry;
 pub mod registry_endpoint;
 /// Re-export of [`redact::secret`] at its pre-#1247 path.
 pub use redact::secret;
+mod sealed;
 /// [`selection::SelectionContext`]/[`selection::StabilityFloor`]: manifest-scoped
 /// selection state (#1444).
 pub mod selection;
@@ -286,15 +287,15 @@ pub use licenses::{
     evaluate as evaluate_license_policy, resolve_license_entries,
 };
 pub use lockfile::{
-    EntryPlacement, LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
-    read_and_parse_lockfile, read_lockfile_content,
+    EntryOwner, EntryPlacement, ImporterPath, ImporterPathError, LockFileProvider, ResolvedPackage,
+    ResolvedPackages, ResolvedSource, read_and_parse_lockfile, read_lockfile_content,
 };
 pub use lsp_helpers::{
     BoundDependency, CachedVersionsMap, DependencyFormatter, DependencyGate, DependencyOutcome,
     DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy, DiagnosticSeverities,
     EcosystemFormatter, FormattedDependency, HOVER_RECENT_VERSIONS,
-    LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE, LineOffsetTable, LookupMiss, NormalizeName,
-    OsvNaming, PackageNaming, PackageRendering, PackageVersions, RequirementMatcher,
+    LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE, LineOffsetTable, LockCandidates, LookupMiss,
+    NormalizeName, OsvNaming, PackageNaming, PackageRendering, PackageVersions, RequirementMatcher,
     RequirementResolution, RequirementStatus, ResolvedCandidatesMap, ResolvedVersionsMap,
     SourcePolicy, UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, is_dot_segment, is_safe_feature_name,
     is_safe_maven_coordinate_segment, is_safe_package_name, is_safe_registry_url,

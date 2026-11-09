@@ -530,7 +530,7 @@ mod tests {
                     evidence("o/shared"),
                     RefreshEvent::ReparseOpenDocuments {
                         generation: 1,
-                        input: deps_core::ParseInputKey::new("o/shared"),
+                        input: deps_core::ParseInputKey::minted_by(EcosystemId::Swift, "o/shared"),
                     },
                 ],
             )
