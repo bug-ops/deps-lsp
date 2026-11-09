@@ -116,8 +116,11 @@ impl TypedEcosystem for {Ecosystem}Ecosystem {
         Box::pin(async move { parse_{manifest}(content, uri) })
     }
 
-    // inlay_hints, hover, code_actions, diagnostics and completions all have default
-    // implementations in TypedEcosystem that delegate to lsp_helpers / dispatch to the
+    // inlay_hints and completions have default implementations in TypedEcosystem; hover,
+    // diagnostics and code actions are composed by the public free functions
+    // `deps_core::ecosystem::{hover, diagnostics, code_actions}` from lsp_helpers plus the
+    // optional `decorate_hover` / `decorate_diagnostics` / `decorate_code_actions` hooks
+    // (override a hook only to add ecosystem-specific output). Completions delegate to the
     // complete_* hooks below. Override only if custom behavior is needed (issue #793:
     // completions's default is the exhaustive match over CompletionContext — do NOT
     // hand-write that match again in a new ecosystem crate; implement the three hooks it
@@ -178,5 +181,10 @@ impl TypedEcosystem for {Ecosystem}Ecosystem {
 ```
 
 `as_any` is gone from `Ecosystem`, `ParseResult` and `Dependency`: no ecosystem implements it, and
-production code must not downcast. Only `Registry`, `Version` and `Metadata` keep `as_any`, and
-clippy's `disallowed-methods` (see `clippy.toml`) rejects calling it outside test code.
+production code must not downcast. On `Registry`, `Version` and `Metadata` it is provided by
+blanket-implemented supertraits (`RegistryAny`, `VersionAny`, `MetadataAny`) that only carry the
+method under `cfg(test)` or the `test-util` feature, so implementors write nothing and a
+production call does not compile.
+
+The string id is not implemented either: implement `ecosystem_id()` only. `id()` on a
+`dyn Ecosystem` is derived from it (`ecosystem_id().id()`).

@@ -36,7 +36,7 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let ecosystem = {Ecosystem}Ecosystem::new(cache);
 
-        assert_eq!(ecosystem.id(), "{ecosystem_id}");
+        assert_eq!(ecosystem.ecosystem_id().id(), "{ecosystem_id}");
         assert!(ecosystem.manifest_filenames().contains(&"{manifest_file}"));
     }
 }
