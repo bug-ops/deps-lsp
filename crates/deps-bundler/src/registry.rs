@@ -6,7 +6,6 @@ use crate::types::{BundlerVersion, GemInfo};
 use crate::version::{compare_versions, version_matches_requirement};
 use deps_core::{HttpCache, Result};
 use serde::Deserialize;
-use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -280,10 +279,6 @@ impl deps_core::Version for BundlerVersion {
     fn published_at(&self) -> Option<deps_core::PublishTime> {
         self.published_at
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 impl deps_core::Metadata for GemInfo {
@@ -305,10 +300,6 @@ impl deps_core::Metadata for GemInfo {
 
     fn latest_version(&self) -> &deps_core::ConcreteVersion {
         &self.version
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -379,10 +370,6 @@ impl deps_core::Registry for RubyGemsRegistry {
     // (#298).
     fn reports_yanked(&self) -> bool {
         false
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -920,18 +907,6 @@ mod tests {
         let registry = RubyGemsRegistry::new(cache);
 
         assert!(!registry.reports_yanked());
-    }
-
-    #[test]
-    fn test_registry_as_any() {
-        use deps_core::Registry;
-
-        let cache = Arc::new(HttpCache::new());
-        let registry = RubyGemsRegistry::new(cache);
-
-        let any = registry.as_any();
-        assert!(any.is::<RubyGemsRegistry>());
-        assert!(any.downcast_ref::<RubyGemsRegistry>().is_some());
     }
 
     #[test]

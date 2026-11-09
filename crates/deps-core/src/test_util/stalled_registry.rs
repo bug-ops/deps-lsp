@@ -258,8 +258,4 @@ impl Registry for StalledCoalescingRegistry {
     fn endpoint_for(&self, _name: &PackageName, _source: &DependencySource) -> RegistryEndpoint {
         self.endpoint
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }

@@ -274,10 +274,6 @@ impl crate::Metadata for MockMetadata {
     fn latest_version(&self) -> &crate::ConcreteVersion {
         &self.latest_version
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 /// [`MockVersion`]'s `is_prerelease` behavior — see [`MockVersion::with_prerelease`].
@@ -401,10 +397,6 @@ impl crate::Version for MockVersion {
 
     fn license(&self) -> &[String] {
         &self.license
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -558,10 +550,6 @@ impl crate::Registry for MockRegistry {
         _source: &crate::DependencySource,
     ) -> crate::RegistryEndpoint {
         self.endpoint.unwrap_or(crate::RegistryEndpoint::Unresolved)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 

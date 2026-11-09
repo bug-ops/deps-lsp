@@ -345,31 +345,6 @@ jobs:
             exit 1
           fi
 
-      - name: Guard the as_any test-exemption list (#1970)
-        # clippy.toml's `disallowed-methods` bans `Registry`/`Version`/`Metadata::as_any` in
-        # production code; the clippy job counts real violations. This step only pins where the
-        # test-only opt-out may live: exactly these lib.rs files, once each, in the
-        # `cfg_attr(test, ..)` form, and never as an `expect`.
-        run: |
-          expected=$(printf '%s\n' \
-            crates/deps-bundler/src/lib.rs crates/deps-core/src/lib.rs crates/deps-dart/src/lib.rs \
-            crates/deps-engine/src/lib.rs crates/deps-go/src/lib.rs crates/deps-lsp/src/lib.rs \
-            crates/deps-maven/src/lib.rs crates/deps-nuget/src/lib.rs | sort)
-          actual=$(grep -rl --include='*.rs' --exclude-dir=deps-zed 'clippy::disallowed_methods' crates | sort)
-          if [ "$expected" != "$actual" ]; then
-            echo "::error::clippy::disallowed_methods opt-outs must live only in the allow-listed lib.rs files:"
-            diff <(echo "$expected") <(echo "$actual") || true
-            exit 1
-          fi
-          for f in $expected; do
-            n=$(grep -c 'clippy::disallowed_methods' "$f")
-            m=$(grep -c '^#!\[cfg_attr(test, allow(clippy::disallowed_methods))\]$' "$f")
-            if [ "$n" != 1 ] || [ "$m" != 1 ]; then
-              echo "::error file=$f::expected exactly one #![cfg_attr(test, allow(clippy::disallowed_methods))]"
-              exit 1
-            fi
-          done
-
       - name: Check documentation
         run: cargo doc --workspace --no-deps --all-features
         env:

@@ -139,7 +139,6 @@ impl TypedEcosystem for BundlerEcosystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::any::Any;
 
     /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against Bundler's REAL
     /// formatter and a real `EcosystemReparse`. `format_version_for_text_edit` writes a bare
@@ -315,9 +314,6 @@ gem 'rails', '~> 7.0'";
             }
             fn latest_version(&self) -> &deps_core::ConcreteVersion {
                 &self.latest_version
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
         let meta = MockMetadata {

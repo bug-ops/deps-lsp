@@ -4,7 +4,6 @@ use crate::types::{DartVersion, PackageInfo};
 use crate::version::compare_versions;
 use deps_core::{HttpCache, Result, SafePathSegment};
 use serde::Deserialize;
-use std::any::Any;
 use std::sync::Arc;
 
 const PUB_DEV_API_BASE: &str = "https://pub.dev/api";
@@ -367,10 +366,6 @@ impl deps_core::Version for DartVersion {
     fn published_at(&self) -> Option<deps_core::PublishTime> {
         self.published_at
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 impl deps_core::Metadata for PackageInfo {
@@ -392,10 +387,6 @@ impl deps_core::Metadata for PackageInfo {
 
     fn latest_version(&self) -> &deps_core::ConcreteVersion {
         &self.version
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -454,10 +445,6 @@ impl deps_core::Registry for PubDevRegistry {
             crate::version::version_matches_constraint(v.version_string().as_str(), req.as_str())
                 && !v.removal_status().blocks_resolution()
         })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -830,14 +817,6 @@ mod tests {
         assert_eq!(info.description(), Some("A test package"));
         assert_eq!(info.repository(), Some("https://github.com/test/test"));
         assert!(info.documentation().is_none());
-    }
-
-    #[test]
-    fn test_registry_as_any() {
-        use deps_core::Registry;
-        let cache = Arc::new(HttpCache::new());
-        let registry = PubDevRegistry::new(cache);
-        assert!(registry.as_any().is::<PubDevRegistry>());
     }
 
     deps_core::registry_conformance! {

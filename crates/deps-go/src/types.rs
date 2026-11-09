@@ -2,7 +2,6 @@
 
 use deps_core::parser::DependencySource;
 use deps_core::position::Range;
-use std::any::Any;
 
 /// A dependency from a go.mod file.
 #[non_exhaustive]
@@ -163,10 +162,6 @@ impl deps_core::registry::Version for GoVersion {
 
     fn features(&self) -> Vec<String> {
         vec![]
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

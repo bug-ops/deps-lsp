@@ -232,7 +232,6 @@ fn extract_prefix(line: &str, character: u32) -> (&str, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::any::Any;
 
     /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against Composer's REAL
     /// formatter and a real `EcosystemReparse` for the ORDINARY (no bare vcs/path/artifact
@@ -617,9 +616,6 @@ mod tests {
         }
         fn latest_version(&self) -> &deps_core::ConcreteVersion {
             &self.latest_version
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
         }
     }
 

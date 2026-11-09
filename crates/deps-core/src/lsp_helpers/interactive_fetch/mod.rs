@@ -483,7 +483,6 @@ struct Admitted<'a> {
 /// #     fn search_raw<'a>(&'a self, _: &'a str, _: usize)
 /// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>>
 /// #     { Box::pin(async { Ok(Vec::new()) }) }
-/// #     fn as_any(&self) -> &dyn std::any::Any { self }
 /// # }
 /// let cached = HashMap::new();
 /// let resolved = HashMap::new();

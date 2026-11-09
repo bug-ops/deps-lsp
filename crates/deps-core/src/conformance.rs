@@ -47,8 +47,6 @@
 //! [`crate::test_util::ADVERSARIAL_URL_SEGMENTS`], which guards the unrelated *fetch* sink
 //! (dot-segment/traversal class). See that const's doc for the sink split.
 
-#[cfg(feature = "lsp-responses")]
-use std::any::Any;
 use std::assert_matches;
 use std::sync::Arc;
 
@@ -504,10 +502,6 @@ impl crate::Registry for AlwaysHasResultsRegistry {
             let metadata = crate::test_util::MockMetadata::new("conformance-probe", "1.0.0");
             Ok(vec![Box::new(metadata) as Box<dyn crate::Metadata>])
         })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -1437,7 +1431,6 @@ impl<T: ?Sized> NotInherent for T {}
 ///
 /// ```
 /// mod example {
-/// # use std::any::Any;
 /// # use std::sync::Arc;
 /// # struct FakeRegistry;
 /// # impl deps_core::Registry for FakeRegistry {
@@ -1453,7 +1446,6 @@ impl<T: ?Sized> NotInherent for T {}
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>> + Send + 'a>> {
 /// #         Box::pin(async move { Ok(vec![]) })
 /// #     }
-/// #     fn as_any(&self) -> &dyn Any { self }
 /// # }
 /// # struct Fake { registry: Arc<FakeRegistry> }
 /// # impl deps_core::ecosystem::private::Sealed for Fake {}
@@ -2154,7 +2146,6 @@ macro_rules! json_depth_conformance {
 ///
 /// ```
 /// mod example {
-/// # use std::any::Any;
 /// # struct FakeVersion { version: deps_core::ConcreteVersion }
 /// # deps_core::impl_version!(FakeVersion {
 /// #     version: version,
@@ -2178,7 +2169,6 @@ macro_rules! json_depth_conformance {
 /// #         let req = req.as_str();
 /// #         versions.iter().position(|v| v.version_string().as_str() == req)
 /// #     }
-/// #     fn as_any(&self) -> &dyn Any { self }
 /// # }
 /// deps_core::registry_conformance! {
 ///     mod fake_registry_conformance;
@@ -2381,7 +2371,6 @@ macro_rules! registry_conformance {
 ///
 /// ```
 /// mod example {
-/// # use std::any::Any;
 /// # use std::sync::Arc;
 /// # use deps_core::parser::DependencySource;
 /// # use deps_core::position::{Position, Range};
@@ -2399,7 +2388,6 @@ macro_rules! registry_conformance {
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>> + Send + 'a>> {
 /// #         Box::pin(async move { Ok(vec![]) })
 /// #     }
-/// #     fn as_any(&self) -> &dyn Any { self }
 /// # }
 /// # struct FakeDep { name: deps_core::PackageName }
 /// # deps_core::impl_unprobed_dependency!(FakeDep);
@@ -2643,7 +2631,6 @@ macro_rules! operator_chars_conformance {
 ///
 /// ```
 /// mod example {
-/// # use std::any::Any;
 /// # use std::sync::Arc;
 /// # struct FakeRegistry;
 /// # impl deps_core::Registry for FakeRegistry {
@@ -2659,7 +2646,6 @@ macro_rules! operator_chars_conformance {
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>> + Send + 'a>> {
 /// #         Box::pin(async move { Ok(vec![]) })
 /// #     }
-/// #     fn as_any(&self) -> &dyn Any { self }
 /// # }
 /// # struct Fake { registry: Arc<FakeRegistry> }
 /// # impl deps_core::ecosystem::private::Sealed for Fake {}

@@ -43,7 +43,6 @@ use deps_core::{
     registry::{KeyShape, register_capped},
 };
 use serde::Deserialize;
-use std::any::Any;
 use std::sync::Arc;
 
 const PROXY_BASE: &str = "https://proxy.golang.org";
@@ -1073,10 +1072,6 @@ impl deps_core::Registry for GoRegistry {
     // yanked-check probe here would always come back empty (#233).
     fn reports_yanked(&self) -> bool {
         false
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

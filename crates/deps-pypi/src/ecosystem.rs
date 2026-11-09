@@ -5,8 +5,6 @@
 //! `requirements.txt`/`constraints.txt` files (pip's requirements file
 //! format).
 
-#[cfg(test)]
-use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, DocumentLink, Range, Uri};
@@ -1172,9 +1170,6 @@ dependencies = []
         fn latest_version(&self) -> &deps_core::ConcreteVersion {
             &self.latest_version
         }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
 
     #[test]
@@ -1280,10 +1275,6 @@ dependencies = []
                     deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>>,
                 > {
                     Box::pin(async move { Ok(Vec::new()) })
-                }
-
-                fn as_any(&self) -> &dyn std::any::Any {
-                    self
                 }
             }
 

@@ -4116,10 +4116,6 @@ mod tests {
         {
             Box::pin(async move { Ok(vec![]) })
         }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
     }
 
     /// #1656: a compound caret no longer gets hijacked by the single-caret shortcut.

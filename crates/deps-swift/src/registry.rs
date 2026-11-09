@@ -24,7 +24,6 @@ use deps_core::{
     DepsError, EcosystemId, HttpCache, PublishTime, RegistryEndpoint, Result, Version,
 };
 use serde::Deserialize;
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -632,10 +631,6 @@ impl deps_core::Registry for SwiftRegistry {
     // (tags carry no yank signal, #233).
     fn reports_yanked(&self) -> bool {
         true
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

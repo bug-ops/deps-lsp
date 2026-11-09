@@ -38,7 +38,6 @@ use deps_core::{
 };
 use semver::{Version, VersionReq};
 use serde::Deserialize;
-use std::any::Any;
 use std::sync::Arc;
 
 const SPARSE_INDEX_BASE: &str = "https://index.crates.io";
@@ -330,10 +329,6 @@ impl deps_core::Registry for CratesIoRegistry {
                 .collect())
         })
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 /// A [`deps_core::Registry`] implementation over one [`SparseIndexClient`] directly — used
@@ -384,10 +379,6 @@ impl deps_core::Registry for SparseIndexClient {
         _limit: usize,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Metadata>>>> {
         Box::pin(async move { Ok(Vec::new()) })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -697,10 +688,6 @@ impl deps_core::Registry for CargoRegistry {
         limit: usize,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Metadata>>>> {
         deps_core::Registry::search_raw(&self.crates_io, query, limit)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

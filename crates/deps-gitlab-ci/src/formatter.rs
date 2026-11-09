@@ -1961,10 +1961,6 @@ mod tests {
         > {
             Box::pin(async move { Ok(vec![]) })
         }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
     }
 
     /// #1820: the "update version" code action for `ref: 17.0.0`, where the project only

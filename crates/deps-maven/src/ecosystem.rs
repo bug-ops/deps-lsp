@@ -529,7 +529,6 @@ fn extract_prefix(line: &str, character: u32) -> (&str, Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::any::Any;
 
     /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against Maven's REAL
     /// formatter and a real `EcosystemReparse`. `format_version_for_text_edit` writes a bare
@@ -741,9 +740,6 @@ mod tests {
         }
         fn latest_version(&self) -> &deps_core::ConcreteVersion {
             &self.latest_version
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
         }
     }
 

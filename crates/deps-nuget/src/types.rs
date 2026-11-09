@@ -1,7 +1,6 @@
 //! Domain types for NuGet/.NET project dependencies.
 
 use deps_core::position::Range;
-use std::any::Any;
 
 /// A single `PackageReference` / `PackageVersion` / `package` entry from a manifest.
 #[non_exhaustive]
@@ -102,10 +101,6 @@ impl deps_core::Version for NuGetVersion {
 
     fn published_at(&self) -> Option<deps_core::PublishTime> {
         self.published_at
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -260,7 +255,6 @@ mod tests {
         assert_eq!(ver.version_string(), "13.0.3");
         assert!(!ver.removal_status().blocks_resolution());
         assert!(!ver.is_prerelease());
-        assert!(ver.as_any().is::<NuGetVersion>());
     }
 
     #[test]
@@ -305,6 +299,5 @@ mod tests {
         );
         assert_eq!(info.latest_version(), "13.0.3");
         assert!(info.repository().is_none());
-        assert!(info.as_any().is::<PackageInfo>());
     }
 }

@@ -331,7 +331,6 @@ impl TypedEcosystem for GradleEcosystem {
 #[allow(clippy::string_slice)]
 mod tests {
     use super::*;
-    use std::any::Any;
 
     fn make_cache() -> Arc<deps_core::HttpCache> {
         Arc::new(deps_core::HttpCache::new())
@@ -477,9 +476,6 @@ dependencies {
             }
             fn latest_version(&self) -> &deps_core::ConcreteVersion {
                 &self.latest_version
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
         let meta = MockMetadata {

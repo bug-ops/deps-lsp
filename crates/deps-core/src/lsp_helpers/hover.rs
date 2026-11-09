@@ -3993,7 +3993,6 @@ mod tests {
     /// `dep.name().for_tracing()` and carries only a coarse cause, never the error text.
     #[tokio::test]
     async fn test_generate_hover_fallback_failure_log_redacts_credential_shaped_package_name() {
-        use std::any::Any;
         use std::collections::HashMap;
 
         struct FallbackFailsRegistry;
@@ -4035,10 +4034,6 @@ mod tests {
             ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -4083,7 +4078,6 @@ mod tests {
     /// is memoized and the next hover skips the fallback request instead of repaying it.
     #[tokio::test]
     async fn test_generate_hover_fallback_failure_is_memoized_by_the_gate() {
-        use std::any::Any;
         use std::collections::HashMap;
         use std::num::NonZeroUsize;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4131,10 +4125,6 @@ mod tests {
             {
                 Box::pin(async move { Ok(vec![]) })
             }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         let parse_result = freshness_test_parse_result("serde");
@@ -4170,7 +4160,6 @@ mod tests {
     /// breaker stays closed: an answering endpoint is not dead.)
     #[tokio::test(start_paused = true)]
     async fn test_generate_hover_stalled_fallback_is_capped_and_memoized() {
-        use std::any::Any;
         use std::collections::HashMap;
         use std::num::NonZeroUsize;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4219,10 +4208,6 @@ mod tests {
             ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 

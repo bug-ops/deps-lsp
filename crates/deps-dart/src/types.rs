@@ -311,7 +311,6 @@ mod tests {
         assert_eq!(ver.version_string(), "1.0.0");
         assert!(!ver.removal_status().blocks_resolution());
         assert!(ver.features().is_empty());
-        assert!(ver.as_any().is::<DartVersion>());
     }
 
     #[test]
@@ -361,7 +360,6 @@ mod tests {
         assert_eq!(info.name(), "provider");
         assert!(info.description().is_some());
         assert_eq!(info.latest_version(), "6.1.2");
-        assert!(info.as_any().is::<PackageInfo>());
     }
 
     #[test]

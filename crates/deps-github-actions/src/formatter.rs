@@ -833,10 +833,6 @@ mod tests {
         > {
             Box::pin(async move { Ok(Vec::new()) })
         }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
     }
 
     /// Runs `generate_hover` end-to-end against a real parsed workflow line and the real
@@ -1029,10 +1025,6 @@ mod tests {
                 >,
             > {
                 Box::pin(async move { Ok(Vec::new()) })
-            }
-
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
             }
         }
 
@@ -2957,10 +2949,6 @@ mod tests {
             deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>>,
         > {
             Box::pin(async move { Ok(vec![]) })
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
         }
     }
 

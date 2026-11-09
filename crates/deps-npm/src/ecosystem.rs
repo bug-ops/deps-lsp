@@ -893,9 +893,6 @@ mod tests {
         fn latest_version(&self) -> &deps_core::ConcreteVersion {
             &self.latest_version
         }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
     }
 
     #[test]

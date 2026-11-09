@@ -13,8 +13,6 @@ use deps_core::{
     },
 };
 use futures::StreamExt;
-#[cfg(test)]
-use std::any::Any;
 use std::sync::Arc;
 use std::time::Instant;
 #[cfg(feature = "lsp-responses")]
@@ -939,9 +937,6 @@ mod tests {
         }
         fn latest_version(&self) -> &deps_core::ConcreteVersion {
             &self.latest_version
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
         }
     }
 

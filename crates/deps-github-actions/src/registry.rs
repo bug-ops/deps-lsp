@@ -20,7 +20,6 @@ use deps_core::{
     DepsError, EcosystemId, HttpCache, NormalizedName, PackageName, PublishTime, RateLimitEvidence,
     RefreshEvents, RefreshSender, Result,
 };
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -680,10 +679,6 @@ impl deps_core::Registry for GithubActionsRegistry {
     /// GitHub's tags API exposes no yank/deprecation signal for actions.
     fn reports_yanked(&self) -> bool {
         false
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

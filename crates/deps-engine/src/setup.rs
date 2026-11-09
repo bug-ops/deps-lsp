@@ -1397,7 +1397,6 @@ mod tests {
     #[test]
     fn test_select_latest_matching_resolves_advisory_deprecated_for_every_ecosystem() {
         use deps_core::{RemovalStatus, Version, VersionReq};
-        use std::any::Any;
 
         struct StatusVersion {
             version: deps_core::ConcreteVersion,
@@ -1411,10 +1410,6 @@ mod tests {
 
             fn removal_status(&self) -> RemovalStatus {
                 self.status
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -1446,10 +1441,6 @@ mod tests {
 
             fn is_prerelease(&self) -> bool {
                 true
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 

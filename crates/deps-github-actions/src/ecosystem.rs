@@ -655,7 +655,6 @@ mod tests {
     use super::*;
     use deps_core::Dependency;
     use deps_core::lsp_helpers::{LowercaseNaming, NormalizeName};
-    use std::any::Any;
 
     fn tag_index_event(name: &PackageName) -> deps_core::RefreshEvent {
         deps_core::RefreshEvent::TagIndex(LowercaseNaming.normalize_package_name(name))
@@ -1408,9 +1407,6 @@ mod tests {
         }
         fn latest_version(&self) -> &deps_core::ConcreteVersion {
             &self.latest_version
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
         }
     }
 

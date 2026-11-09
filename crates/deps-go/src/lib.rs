@@ -3,7 +3,6 @@
 // `-D warnings` error on the fuzz CI job (rust-lang/rust#159228). Same fix as deps-cargo
 // (#745), deps-nuget (#696), deps-swift (#673), deps-composer.
 #![recursion_limit = "256"]
-#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 //! Go module ecosystem support for deps-lsp.
 //!

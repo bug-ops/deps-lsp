@@ -32,8 +32,6 @@ use deps_core::parser::DependencySource;
 #[cfg(feature = "lsp-responses")]
 use deps_core::{Dependency, ParsedView};
 use deps_core::{EcosystemBase, Registry, Result, TypedEcosystem};
-#[cfg(test)]
-use std::any::Any;
 use std::sync::Arc;
 #[cfg(test)]
 use tower_lsp_server::ls_types::Position;
@@ -735,9 +733,6 @@ mod tests {
             fn latest_version(&self) -> &deps_core::ConcreteVersion {
                 &self.latest_version
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
         let meta = MockMetadata {
             name: deps_core::PackageName::new("Newtonsoft.Json"),
@@ -883,9 +878,6 @@ mod tests {
             }
             fn latest_version(&self) -> &deps_core::ConcreteVersion {
                 &self.latest_version
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
         let meta = MockMetadata {

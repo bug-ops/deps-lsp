@@ -990,7 +990,6 @@ mod tests {
     use crate::lsp_helpers::*;
     use crate::position::{Position, Range};
     use crate::{ConcreteVersion, Dependency, PackageName, ParseResult, VersionReq};
-    use std::any::Any;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -3798,10 +3797,6 @@ mod tests {
             ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
             {
                 Box::pin(async move { Ok(Vec::new()) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 

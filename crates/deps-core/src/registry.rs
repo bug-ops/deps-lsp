@@ -3,11 +3,68 @@ use crate::parser::DependencySource;
 use crate::{ConcreteVersion, EcosystemId, PackageName, RegistryEndpoint, VersionReq};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use std::any::Any;
 use std::hash::Hash;
 use std::pin::Pin;
 
 type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Declares one `*Any` supertrait: `as_any` under `test`/`test-util`, an empty blanket
+/// marker otherwise, so a production downcast is a compile error rather than a lint.
+macro_rules! test_only_downcast {
+    ($(#[$doc:meta])* $name:ident, $target:literal) => {
+        $(#[$doc])*
+        ///
+        /// With `test` or the `test-util` feature enabled, this trait carries
+        /// `fn as_any(&self) -> &dyn Any` and is implemented for every `'static` type.
+        #[cfg(any(test, feature = "test-util"))]
+        #[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
+        pub trait $name: ::std::any::Any {
+            #[doc = concat!("Downcasts to the concrete ", $target, " type; test-only.")]
+            fn as_any(&self) -> &dyn ::std::any::Any;
+        }
+
+        #[cfg(any(test, feature = "test-util"))]
+        impl<T: ::std::any::Any> $name for T {
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+        }
+
+        $(#[$doc])*
+        ///
+        /// Without `test` or the `test-util` feature, this trait is an empty marker
+        /// implemented for every type, so no downcast method exists in release builds.
+        #[cfg(not(any(test, feature = "test-util")))]
+        pub trait $name {}
+
+        #[cfg(not(any(test, feature = "test-util")))]
+        impl<T: ?Sized> $name for T {}
+    };
+}
+
+test_only_downcast!(
+    /// Test-only downcast supertrait of [`Registry`].
+    ///
+    /// Blanket-implemented, so registry implementors write nothing for it.
+    RegistryAny,
+    "registry"
+);
+
+test_only_downcast!(
+    /// Test-only downcast supertrait of [`Version`].
+    ///
+    /// Blanket-implemented, so version implementors write nothing for it.
+    VersionAny,
+    "version"
+);
+
+test_only_downcast!(
+    /// Test-only downcast supertrait of [`Metadata`].
+    ///
+    /// Blanket-implemented, so metadata implementors write nothing for it.
+    MetadataAny,
+    "metadata"
+);
 
 /// Generic package registry interface.
 ///
@@ -88,7 +145,6 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 ///
 /// ```no_run
 /// use deps_core::{Registry, Version, Metadata, PackageName, ConcreteVersion};
-/// use std::any::Any;
 /// use std::pin::Pin;
 ///
 /// struct MyRegistry;
@@ -98,7 +154,6 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 ///
 /// impl Version for MyVersion {
 ///     fn version_string(&self) -> &ConcreteVersion { &self.version }
-///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
 /// #[derive(Clone)]
@@ -110,7 +165,6 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 ///     fn repository(&self) -> Option<&str> { None }
 ///     fn documentation(&self) -> Option<&str> { None }
 ///     fn latest_version(&self) -> &ConcreteVersion { &self.latest }
-///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
 /// impl Registry for MyRegistry {
@@ -132,10 +186,9 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 ///         Box::pin(async move { Ok(vec![]) })
 ///     }
 ///
-///     fn as_any(&self) -> &dyn Any { self }
 /// }
 /// ```
-pub trait Registry: Send + Sync {
+pub trait Registry: Send + Sync + RegistryAny {
     /// Fetches all available versions for a package.
     ///
     /// Returns versions sorted newest-first. May include yanked/deprecated versions.
@@ -392,9 +445,6 @@ pub trait Registry: Send + Sync {
     fn reports_yanked(&self) -> bool {
         true
     }
-
-    /// Downcast to concrete registry type for ecosystem-specific operations
-    fn as_any(&self) -> &dyn Any;
 }
 
 impl dyn Registry + '_ {
@@ -427,7 +477,6 @@ impl dyn Registry + '_ {
     ///
     /// struct MyRegistry;
     /// # use deps_core::{Metadata, PackageName, Version};
-    /// # use std::any::Any;
     /// # use std::pin::Pin;
     /// impl Registry for MyRegistry {
     /// #   fn get_versions<'a>(&'a self, _name: &'a PackageName)
@@ -441,7 +490,6 @@ impl dyn Registry + '_ {
     ///     {
     ///         panic!("must never be reached for a credential-bearing query");
     ///     }
-    /// #   fn as_any(&self) -> &dyn Any { self }
     /// }
     ///
     /// # #[tokio::main]
@@ -865,7 +913,7 @@ pub struct Deprecation {
 /// Version information trait.
 ///
 /// All version types must implement this to work with generic handlers.
-pub trait Version: Send + Sync {
+pub trait Version: Send + Sync + VersionAny {
     /// Version string (e.g., "1.0.214", "14.21.3").
     fn version_string(&self) -> &ConcreteVersion;
 
@@ -898,9 +946,6 @@ pub trait Version: Send + Sync {
     fn features(&self) -> Vec<String> {
         vec![]
     }
-
-    /// Downcast to concrete version type
-    fn as_any(&self) -> &dyn Any;
 
     /// Whether this version is stable: not hard-yanked and not a pre-release.
     ///
@@ -951,14 +996,12 @@ pub trait Version: Send + Sync {
 /// ```
 /// use deps_core::registry::{RemovalStatus, Version, find_latest_stable};
 /// use deps_core::ConcreteVersion;
-/// use std::any::Any;
 ///
 /// struct MyVersion { version: ConcreteVersion, yanked: bool }
 ///
 /// impl Version for MyVersion {
 ///     fn version_string(&self) -> &ConcreteVersion { &self.version }
 ///     fn removal_status(&self) -> RemovalStatus { RemovalStatus::from_yanked(self.yanked) }
-///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
 /// let versions: Vec<Box<dyn Version>> = vec![
@@ -1070,7 +1113,6 @@ pub fn existence_wildcard_req() -> crate::VersionReq {
 /// ```
 /// use deps_core::registry::{RemovalStatus, Version, select_latest_for_existence};
 /// use deps_core::ConcreteVersion;
-/// use std::any::Any;
 ///
 /// struct MyVersion { version: ConcreteVersion, status: RemovalStatus, prerelease: bool }
 ///
@@ -1078,7 +1120,6 @@ pub fn existence_wildcard_req() -> crate::VersionReq {
 ///     fn version_string(&self) -> &ConcreteVersion { &self.version }
 ///     fn removal_status(&self) -> RemovalStatus { self.status }
 ///     fn is_prerelease(&self) -> bool { self.prerelease }
-///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
 /// // Newest version is yanked; rung 3 still returns it rather than `None`.
@@ -1119,7 +1160,7 @@ pub fn select_latest_for_existence<T>(
 /// Package metadata trait.
 ///
 /// Used for completion items and hover documentation.
-pub trait Metadata: Send + Sync {
+pub trait Metadata: Send + Sync + MetadataAny {
     /// The package name as the *registry* reports it.
     ///
     /// This is the identifier the registry displays and that completion
@@ -1143,9 +1184,6 @@ pub trait Metadata: Send + Sync {
 
     /// Latest stable version.
     fn latest_version(&self) -> &ConcreteVersion;
-
-    /// Downcast to concrete metadata type
-    fn as_any(&self) -> &dyn Any;
 }
 
 /// The error for a dependency whose `AlternateRegistry` index has no registered client.
@@ -1483,10 +1521,6 @@ mod tests {
                 Ok(vec![Box::new(metadata) as Box<dyn Metadata>])
             })
         }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
 
     #[tokio::test]
@@ -1546,7 +1580,7 @@ mod tests {
         let version = MockVersion::new("1.0.0").yanked(true);
 
         let boxed: Box<dyn Version> = Box::new(version);
-        let any = boxed.as_any();
+        let any = VersionAny::as_any(&*boxed);
 
         assert!(any.is::<MockVersion>());
     }
@@ -1575,10 +1609,6 @@ mod tests {
 
         fn latest_version(&self) -> &ConcreteVersion {
             &self.latest
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
     }
 
@@ -1622,9 +1652,6 @@ mod tests {
             }
             fn latest_version(&self) -> &ConcreteVersion {
                 &self.latest
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -1768,10 +1795,6 @@ mod tests {
 
         fn removal_status(&self) -> RemovalStatus {
             self.status
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
     }
 

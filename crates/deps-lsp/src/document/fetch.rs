@@ -393,7 +393,6 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_failure_toast_wording_for_mixed_not_found_and_genuine_failure_batch() {
         use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
 
         struct FallbackErrorRegistry;
 
@@ -435,10 +434,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -543,7 +538,6 @@ dependencies = ["requests>=2.0.0"]
         use super::*;
         use deps_core::{DiagnosticSeverities, Metadata, Version, VersionData};
         use deps_engine::classify::resolved::collect_in_use_versions;
-        use std::any::Any;
 
         #[derive(Debug, Clone)]
         struct MockYankVersion {
@@ -557,9 +551,6 @@ dependencies = ["requests>=2.0.0"]
             }
             fn removal_status(&self) -> deps_core::RemovalStatus {
                 deps_core::RemovalStatus::from_yanked(self.yanked)
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -610,10 +601,6 @@ dependencies = ["requests>=2.0.0"]
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 

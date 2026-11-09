@@ -3010,7 +3010,6 @@ mod tests {
             Dependency, EcosystemConfig, FreshnessSettings, Metadata, Version, VersionData,
             completion::Completions,
         };
-        use std::any::Any;
         use std::path::Path;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use tokio::sync::Barrier;
@@ -3110,9 +3109,6 @@ mod tests {
                 _limit: usize,
             ) -> BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>> {
                 Box::pin(async move { Ok(vec![]) })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 

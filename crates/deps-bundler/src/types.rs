@@ -460,7 +460,6 @@ mod tests {
         assert_eq!(version.version_string(), "1.2.3");
         assert!(!version.removal_status().blocks_resolution());
         assert!(version.features().is_empty());
-        assert!(version.as_any().is::<BundlerVersion>());
     }
 
     #[test]
@@ -502,7 +501,6 @@ mod tests {
         assert_eq!(gem.repository(), Some("https://github.com/rails/rails"));
         assert_eq!(gem.documentation(), Some("https://api.rubyonrails.org"));
         assert_eq!(gem.latest_version(), "7.0.8");
-        assert!(gem.as_any().is::<GemInfo>());
     }
 
     #[test]

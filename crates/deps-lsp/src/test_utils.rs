@@ -204,7 +204,6 @@ pub(crate) mod blocking_ecosystem {
         DiagnosticSeverities, EcosystemBase, EcosystemConfig, FreshnessSettings, Metadata,
         ParsedManifest, ParsedView, Registry, Version, VersionData, completion::Completions,
     };
-    use std::any::Any;
     use std::sync::Arc;
     use tokio::sync::Barrier;
     use tower_lsp_server::ls_types::{CodeLens, InlayHint, Position};
@@ -231,9 +230,6 @@ pub(crate) mod blocking_ecosystem {
             _limit: usize,
         ) -> BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>> {
             Box::pin(async move { Ok(vec![]) })
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
         }
     }
 

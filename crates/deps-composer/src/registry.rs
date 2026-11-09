@@ -13,7 +13,6 @@ use deps_core::{
     Deprecation, DepsError, HttpCache, Result, SafePathSegment, SegmentedPathName, StabilityFloor,
 };
 use serde::Deserialize;
-use std::any::Any;
 use std::sync::Arc;
 
 const PACKAGIST_BASE: &str = "https://repo.packagist.org";
@@ -626,10 +625,6 @@ impl deps_core::Registry for PackagistRegistry {
     // (#233 R2, #205).
     fn reports_yanked(&self) -> bool {
         false
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

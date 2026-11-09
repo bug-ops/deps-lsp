@@ -18,7 +18,6 @@ use deps_core::{
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use serde::Deserialize;
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -1151,10 +1150,6 @@ impl deps_core::Registry for MavenCentralRegistry {
     fn reports_yanked(&self) -> bool {
         false
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 #[cfg(test)]
@@ -2093,14 +2088,6 @@ mod tests {
     fn test_registry_creation() {
         let cache = Arc::new(HttpCache::new());
         let _registry = MavenCentralRegistry::new(cache);
-    }
-
-    #[test]
-    fn test_registry_as_any() {
-        use deps_core::Registry;
-        let cache = Arc::new(HttpCache::new());
-        let registry = MavenCentralRegistry::new(cache);
-        assert!(registry.as_any().is::<MavenCentralRegistry>());
     }
 
     // `select_latest_matching`'s contract is "index 0 of a `get_versions`-shaped list

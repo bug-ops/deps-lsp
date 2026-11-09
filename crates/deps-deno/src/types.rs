@@ -1,7 +1,6 @@
 //! Deno-specific dependency, version, and metadata types.
 
 use deps_core::position::Range;
-use std::any::Any;
 
 /// A parsed Deno import, scheme-qualified (D2).
 ///
@@ -294,10 +293,6 @@ impl deps_core::Metadata for DenoMetadata {
     fn latest_version(&self) -> &deps_core::ConcreteVersion {
         self.inner.latest_version()
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 /// Builds a neutral dependency for the cross-ecosystem `non_public_route` guard; see
@@ -408,9 +403,6 @@ mod tests {
                 static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
                     std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("18.3.1"));
                 &VERSION
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 

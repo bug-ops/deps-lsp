@@ -1375,7 +1375,6 @@ impl VersionDisplayItem {
 /// ```
 /// use deps_core::completion::prepare_version_display_items;
 /// use deps_core::{PackageName, Version};
-/// use std::any::Any;
 /// use std::sync::Arc;
 ///
 /// struct SimpleVersion(deps_core::ConcreteVersion);
@@ -1383,9 +1382,6 @@ impl VersionDisplayItem {
 /// impl Version for SimpleVersion {
 ///     fn version_string(&self) -> &deps_core::ConcreteVersion {
 ///         &self.0
-///     }
-///     fn as_any(&self) -> &dyn Any {
-///         self
 ///     }
 /// }
 ///
@@ -1594,7 +1590,6 @@ pub fn reject_credential_bearing_value(value: &str, context: &str) -> Option<Vec
 /// ```
 /// use deps_core::completion::apply_raw_prefix_filter_text;
 /// use deps_core::{Metadata, PackageName, Registry, Version};
-/// use std::any::Any;
 /// use std::pin::Pin;
 /// use tower_lsp_server::ls_types::CompletionItem;
 ///
@@ -1610,7 +1605,6 @@ pub fn reject_credential_bearing_value(value: &str, context: &str) -> Option<Vec
 /// #       -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Vec<Box<dyn Metadata>>>> + Send + 'a>>
 /// #   { Box::pin(async move { Ok(vec![]) }) }
 ///     fn search_normalizes_query(&self) -> bool { true }
-/// #   fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
 /// let registry = NormalizingRegistry;
@@ -2102,7 +2096,6 @@ mod wiring_tests;
 mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::MOCK_FORMATTER;
-    use std::any::Any;
     use std::assert_matches;
 
     fn pkg(s: &str) -> PackageName {
@@ -2207,10 +2200,6 @@ mod tests {
         fn latest_version(&self) -> &ConcreteVersion {
             &self.latest_version
         }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
 
     struct MockRegistry {
@@ -2264,10 +2253,6 @@ mod tests {
         ) -> Option<usize> {
             crate::select_latest_for_existence(versions, |v| v.as_ref())
         }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
 
     /// Registry stub whose `search` returns preconfigured metadata, used to verify
@@ -2309,10 +2294,6 @@ mod tests {
                 .map(|m| Box::new(m) as Box<dyn crate::Metadata>)
                 .collect();
             Box::pin(async move { Ok(results) })
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
     }
 
@@ -2452,10 +2433,6 @@ mod tests {
 
             fn search_normalizes_query(&self) -> bool {
                 true
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
 
@@ -5444,10 +5421,6 @@ mod tests {
             {
                 panic!("registry must not be queried for a non-resolvable source");
             }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         let git_source = crate::parser::DependencySource::Git {
@@ -5546,10 +5519,6 @@ mod tests {
             _selection_context: &crate::SelectionContext,
         ) -> Option<usize> {
             crate::select_latest_for_existence(versions, |v| v.as_ref())
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
     }
 

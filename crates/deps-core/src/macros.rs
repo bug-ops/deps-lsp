@@ -232,10 +232,6 @@ macro_rules! impl_version {
             fn removal_status(&self) -> $crate::registry::RemovalStatus {
                 ($status)(self)
             }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
-            }
         }
     };
     ($type:ty {
@@ -255,10 +251,6 @@ macro_rules! impl_version {
             fn published_at(&self) -> Option<$crate::freshness::PublishTime> {
                 self.$published_at
             }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
-            }
         }
     };
     ($type:ty {
@@ -277,10 +269,6 @@ macro_rules! impl_version {
 
             fn is_prerelease(&self) -> bool {
                 ($prerelease)(self)
-            }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
             }
         }
     };
@@ -305,10 +293,6 @@ macro_rules! impl_version {
 
             fn is_prerelease(&self) -> bool {
                 ($prerelease)(self)
-            }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
             }
         }
     };
@@ -345,10 +329,6 @@ macro_rules! impl_version {
                 let f: fn(&$type) -> Option<&$crate::registry::Deprecation> = $deprecation;
                 f(self)
             }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
-            }
         }
     };
     ($type:ty {
@@ -383,10 +363,6 @@ macro_rules! impl_version {
 
             fn license(&self) -> &[String] {
                 &self.$license
-            }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
             }
         }
     };
@@ -452,10 +428,6 @@ macro_rules! impl_metadata {
 
             fn latest_version(&self) -> &$crate::ConcreteVersion {
                 &self.$latest_version
-            }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
             }
         }
     };
@@ -641,7 +613,7 @@ macro_rules! impl_parse_result {
 /// impl deps_core::Registry for MyRegistry {
 ///     impl_registry_versions_method!(get_versions);
 ///     impl_registry_versions_method!(get_versions_with);
-///     // ... get_latest_matching, search, as_any still hand-written ...
+///     // ... get_latest_matching and search still hand-written ...
 /// }
 /// ```
 #[macro_export]
@@ -1072,7 +1044,6 @@ mod tests {
         };
         assert!(deprecated.deprecation().is_none());
         assert!(!deprecated.is_prerelease());
-        assert!(deprecated.as_any().is::<TestVersionWithDeprecation>());
 
         let licensed = TestVersionWithLicense {
             version: "1.0.0".into(),
@@ -1082,7 +1053,6 @@ mod tests {
             license: vec!["MIT".to_string()],
         };
         assert_eq!(licensed.license(), ["MIT".to_string()]);
-        assert!(licensed.as_any().is::<TestVersionWithLicense>());
     }
 
     #[test]
@@ -1096,7 +1066,6 @@ mod tests {
 
         assert_eq!(version.version_string().as_str(), "2.0.0");
         assert!(version.removal_status().blocks_resolution());
-        assert!(version.as_any().is::<TestVersion>());
         assert!(version.published_at().is_none());
     }
 
@@ -1117,7 +1086,6 @@ mod tests {
             version.published_at(),
             Some(PublishTime::from_unix_secs(1_000))
         );
-        assert!(version.as_any().is::<TestVersionWithPublishedAt>());
     }
 
     #[test]
@@ -1172,7 +1140,6 @@ mod tests {
         assert_eq!(pkg.name(), "my-pkg");
         assert_eq!(pkg.description(), Some("A test package"));
         assert_eq!(pkg.documentation(), Some("https://example.com"));
-        assert!(pkg.as_any().is::<TestPackage>());
     }
 
     #[test]

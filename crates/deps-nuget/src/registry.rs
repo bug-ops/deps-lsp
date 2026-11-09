@@ -21,7 +21,6 @@ use deps_core::{
     SafePathSegment,
 };
 use serde::Deserialize;
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -1533,10 +1532,6 @@ impl deps_core::Registry for NuGetRegistry {
     fn reports_yanked(&self) -> bool {
         false
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 #[cfg(test)]
@@ -2132,14 +2127,6 @@ mod tests {
     fn test_pick_latest_matching_exact_pin_not_rescued() {
         let versions = vec![v("2.0.0-beta2"), v("2.0.0-beta1")];
         assert!(pick_latest_matching(versions, "[9.9.9]").is_none());
-    }
-
-    #[test]
-    fn test_registry_creation_and_trait_impls() {
-        use deps_core::Registry;
-        let cache = Arc::new(HttpCache::new());
-        let registry = NuGetRegistry::new(cache);
-        assert!(registry.as_any().is::<NuGetRegistry>());
     }
 
     /// #365 end-to-end coverage (critic S2): exercises the real production

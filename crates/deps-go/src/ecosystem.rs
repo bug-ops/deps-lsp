@@ -6,8 +6,6 @@
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 use deps_core::{EcosystemBase, Registry, Result, TypedEcosystem};
-#[cfg(test)]
-use std::any::Any;
 #[cfg(feature = "lsp-responses")]
 use std::future::Future;
 use std::sync::Arc;
@@ -480,9 +478,6 @@ require github.com/gin-gonic/gin v1.9.1
             }
             fn latest_version(&self) -> &deps_core::ConcreteVersion {
                 &self.latest_version
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
             }
         }
         let meta = MockMetadata {
