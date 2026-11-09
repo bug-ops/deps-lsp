@@ -320,7 +320,8 @@ pub fn build_scan_targets(
             versions.primary().clone(),
             formatter,
         )
-        .with_siblings(&versions, formatter);
+        .with_siblings(&versions, formatter)
+        .with_lock_alternatives(&versions, formatter);
         match target_index.entry(target.key.clone()) {
             Entry::Vacant(slot) => {
                 slot.insert(targets.len());

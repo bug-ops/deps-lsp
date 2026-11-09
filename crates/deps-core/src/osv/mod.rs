@@ -15,6 +15,7 @@
 //! rather than propagating an error into the LSP response (FR-007).
 
 mod local_match;
+mod lock_fan_out;
 mod severity;
 mod types;
 
@@ -30,9 +31,9 @@ use types::worst_severity;
 pub use types::{
     Advisory, CandidateStatusMap, CandidateStatuses, Capped, CoverageGap,
     DependencyVulnerabilities, EmptyOsvPackageName, FixRecommendation, InvalidOsvId,
-    LatestStatusMap, LockPresence, LockResolution, MatchedTags, NonPublicRoute, OsvEcosystem,
-    OsvId, OsvPackageName, OsvQueryName, OsvVersion, ScanOutcome, ScanTarget, ScanVersion,
-    SiblingCoverage, SiblingMatches, SkipReason, StructuralSkipReason, UpgradeStatus,
+    LatestStatusMap, LockPresence, LockResolution, MatchOrigin, MatchedTags, NonPublicRoute,
+    OsvEcosystem, OsvId, OsvPackageName, OsvQueryName, OsvVersion, ScanOutcome, ScanTarget,
+    ScanVersion, SiblingCoverage, SiblingMatches, SkipReason, StructuralSkipReason, UpgradeStatus,
     VersionMatching, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap, vuln_key_for,
     vulnerability_keys,
 };
@@ -104,6 +105,13 @@ pub const ADVISORY_DISPLAY_CAP: usize = 5;
 /// ([`DependencyVulnerabilities::recommended_fix`]'s "Limitations" section), traded off against
 /// bounding this client's per-scan fan-out cost.
 pub const MAX_ADVISORY_RECORDS: usize = 50;
+
+/// Bound on lock-file alternatives scanned per dependency occurrence (#1981).
+///
+/// Each alternative is an extra OSV query. More satisfying lock entries than this is vanishingly
+/// rare; beyond the cap the lowest are scanned and a clean answer degrades to
+/// [`SkipReason::LockAlternativesUnchecked`] rather than being reported as authoritative.
+pub const MAX_LOCK_ALTERNATIVES: usize = 16;
 
 /// Query cache TTL (approved Q6).
 const QUERY_CACHE_TTL: Duration = Duration::from_hours(6);
@@ -512,7 +520,8 @@ impl OsvClient {
         targets: &[ScanTarget],
         timeout: Duration,
     ) -> VulnerabilityMap {
-        let mut outcomes = self.resolve_by_name(ecosystem, targets, timeout).await;
+        let (expanded, fans) = lock_fan_out::expand(targets);
+        let mut outcomes = self.resolve_by_name(ecosystem, &expanded, timeout).await;
         let mut seen: HashSet<&VulnKey> = HashSet::with_capacity(targets.len());
         for t in targets {
             if !seen.insert(&t.key) {
@@ -535,6 +544,7 @@ impl OsvClient {
                 }
             }
         }
+        lock_fan_out::merge(&mut outcomes, fans);
         outcomes
     }
 
@@ -3065,6 +3075,243 @@ mod tests {
                     && advisory_ids.items() == [crate::test_util::osv_id("ADV-1")]
                     && advisory_ids.total() == 1
         );
+    }
+
+    // ---- #1981: lock-file alternatives ----
+
+    fn lock_target(name: &str, version: &str, alternatives: &[&str]) -> ScanTarget {
+        let in_use = crate::lsp_helpers::InUseVersions::for_test_with_lock_alternatives(
+            ConcreteVersion::new(version),
+            alternatives
+                .iter()
+                .map(|v| ConcreteVersion::new(*v))
+                .collect(),
+        );
+        target(name, version)
+            .with_lock_alternatives(&in_use, &crate::test_util::StubFormatter::DEFAULT)
+    }
+
+    fn batch_results(results: &[&str]) -> String {
+        format!(r#"{{"results":[{}]}}"#, results.join(","))
+    }
+
+    const NO_VULNS: &str = "{}";
+    const TRUNCATED: &str = r#"{"next_page_token":"more"}"#;
+
+    fn vulns(id: &str) -> String {
+        format!(r#"{{"vulns":[{{"id":"{id}","modified":"2023-01-01T00:00:00Z"}}]}}"#)
+    }
+
+    async fn mock_lock_scan(
+        server: &mut mockito::ServerGuard,
+        results: &[&str],
+        records: &[&str],
+    ) -> Vec<mockito::Mock> {
+        let mut mocks = vec![
+            server
+                .mock("POST", "/v1/querybatch")
+                .with_status(200)
+                .with_body(batch_results(results))
+                .create_async()
+                .await,
+        ];
+        for id in records {
+            mocks.push(
+                server
+                    .mock("GET", format!("/v1/vulns/{id}").as_str())
+                    .with_status(200)
+                    .with_body(format!(
+                        r#"{{"id":"{id}","modified":"2023-01-01T00:00:00Z"}}"#
+                    ))
+                    .create_async()
+                    .await,
+            );
+        }
+        mocks
+    }
+
+    async fn scan_one(
+        client: &OsvClient,
+        ecosystem: EcosystemId,
+        target: ScanTarget,
+    ) -> ScanOutcome {
+        let key = target.key.clone();
+        let mut outcomes = client.scan(ecosystem, &[target], TEST_TIMEOUT).await;
+        assert_eq!(outcomes.len(), 1, "no synthetic key may escape the scan");
+        outcomes.remove(&key).expect("one outcome per target")
+    }
+
+    fn advisory_ids(outcome: &ScanOutcome) -> Vec<&str> {
+        match outcome {
+            ScanOutcome::Vulnerable(dv) => dv
+                .advisories
+                .items()
+                .iter()
+                .map(|a| a.id().as_str())
+                .collect(),
+            other => panic!("expected Vulnerable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_alternative_scan_finds_an_advisory_only_the_primary_has() {
+        let (mut server, client) = mock_client().await;
+        let _mocks =
+            mock_lock_scan(&mut server, &[&vulns("ADV-NEW"), NO_VULNS], &["ADV-NEW"]).await;
+
+        let outcome = scan_one(
+            &client,
+            EcosystemId::Npm,
+            lock_target("ua-parser-js", "0.7.29", &["0.7.28"]),
+        )
+        .await;
+
+        assert_eq!(advisory_ids(&outcome), ["ADV-NEW"]);
+        let ScanOutcome::Vulnerable(dv) = &outcome else {
+            unreachable!("asserted Vulnerable above")
+        };
+        assert!(
+            dv.sibling_match(&crate::test_util::osv_id("ADV-NEW"))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn lock_alternative_scan_finds_an_advisory_only_an_alternative_has() {
+        let (mut server, client) = mock_client().await;
+        let _mocks =
+            mock_lock_scan(&mut server, &[NO_VULNS, &vulns("ADV-OLD")], &["ADV-OLD"]).await;
+
+        let outcome = scan_one(
+            &client,
+            EcosystemId::Npm,
+            lock_target("minimist", "1.2.8", &["1.2.5"]),
+        )
+        .await;
+
+        assert_eq!(advisory_ids(&outcome), ["ADV-OLD"]);
+        let ScanOutcome::Vulnerable(dv) = &outcome else {
+            unreachable!("asserted Vulnerable above")
+        };
+        let tags = dv
+            .sibling_match(&crate::test_util::osv_id("ADV-OLD"))
+            .expect("alternative-only match");
+        assert_eq!(tags.origin(), MatchOrigin::LockEntry);
+        assert_eq!(
+            tags.iter().map(ConcreteVersion::as_str).collect::<Vec<_>>(),
+            ["1.2.5"]
+        );
+    }
+
+    async fn mock_failing_single_query(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/v1/query")
+            .with_status(500)
+            .create_async()
+            .await
+    }
+
+    #[tokio::test]
+    async fn clean_primary_with_a_failed_lock_alternative_is_query_failed() {
+        let (mut server, client) = mock_client().await;
+        let _mocks = mock_lock_scan(&mut server, &[NO_VULNS, TRUNCATED], &[]).await;
+        let _single = mock_failing_single_query(&mut server).await;
+
+        let outcome = scan_one(
+            &client,
+            EcosystemId::Npm,
+            lock_target("minimist", "1.2.8", &["1.2.5"]),
+        )
+        .await;
+
+        assert_matches!(outcome, ScanOutcome::Skipped(SkipReason::QueryFailed));
+    }
+
+    #[tokio::test]
+    async fn vulnerable_primary_with_a_failed_lock_alternative_stays_vulnerable_but_incomplete() {
+        let (mut server, client) = mock_client().await;
+        let _mocks =
+            mock_lock_scan(&mut server, &[&vulns("ADV-NEW"), TRUNCATED], &["ADV-NEW"]).await;
+        let _single = mock_failing_single_query(&mut server).await;
+
+        let outcome = scan_one(
+            &client,
+            EcosystemId::Npm,
+            lock_target("minimist", "1.2.8", &["1.2.5"]),
+        )
+        .await;
+
+        assert_eq!(advisory_ids(&outcome), ["ADV-NEW"]);
+        let ScanOutcome::Vulnerable(dv) = &outcome else {
+            unreachable!("asserted Vulnerable above")
+        };
+        assert!(!dv.advisories.is_complete());
+    }
+
+    #[tokio::test]
+    async fn clean_primary_with_a_structurally_skipped_lock_alternative_is_unchecked() {
+        let (mut server, client) = mock_client().await;
+        // The unparseable alternative is skipped before querying, so only the primary is sent.
+        let _mocks = mock_lock_scan(&mut server, &[NO_VULNS], &[]).await;
+
+        let outcome = scan_one(
+            &client,
+            EcosystemId::GithubActions,
+            lock_target("actions/checkout", "1.2.8", &["not-a-version"]),
+        )
+        .await;
+
+        assert_matches!(
+            outcome,
+            ScanOutcome::Skipped(SkipReason::LockAlternativesUnchecked)
+        );
+    }
+
+    fn overflowing_alternatives() -> Vec<String> {
+        (0..=MAX_LOCK_ALTERNATIVES)
+            .map(|n| format!("1.0.{n}"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn lock_alternative_overflow_with_clean_results_is_unchecked() {
+        let (mut server, client) = mock_client().await;
+        let all_clean = vec![NO_VULNS; 1 + MAX_LOCK_ALTERNATIVES];
+        let _mocks = mock_lock_scan(&mut server, &all_clean, &[]).await;
+        let alternatives = overflowing_alternatives();
+        let alternatives: Vec<&str> = alternatives.iter().map(String::as_str).collect();
+
+        let outcome = scan_one(
+            &client,
+            EcosystemId::Npm,
+            lock_target("minimist", "2.0.0", &alternatives),
+        )
+        .await;
+
+        assert_matches!(
+            outcome,
+            ScanOutcome::Skipped(SkipReason::LockAlternativesUnchecked)
+        );
+    }
+
+    #[tokio::test]
+    async fn lock_alternative_overflow_never_masks_a_vulnerable_result() {
+        let (mut server, client) = mock_client().await;
+        let mut results = vec![NO_VULNS.to_string(); 1 + MAX_LOCK_ALTERNATIVES];
+        results[0] = vulns("ADV-NEW");
+        let results: Vec<&str> = results.iter().map(String::as_str).collect();
+        let _mocks = mock_lock_scan(&mut server, &results, &["ADV-NEW"]).await;
+        let alternatives = overflowing_alternatives();
+        let alternatives: Vec<&str> = alternatives.iter().map(String::as_str).collect();
+
+        let outcome = scan_one(
+            &client,
+            EcosystemId::Npm,
+            lock_target("minimist", "2.0.0", &alternatives),
+        )
+        .await;
+
+        assert_eq!(advisory_ids(&outcome), ["ADV-NEW"]);
     }
 
     /// Issue #1655: candidates sharing a `VulnKey` (one dependency declared in several

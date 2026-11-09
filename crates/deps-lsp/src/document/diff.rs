@@ -281,6 +281,11 @@ impl DependencyDiff {
 /// [`super::state::PackageSignals::resolved_versions`]/[`super::state::PackageSignals::resolved_version_candidates`]
 /// before and after [`super::state::DocumentState::update_resolved_versions`].
 ///
+/// The comparison covers the whole [`deps_core::lsp_helpers::InUseVersions`], not just the
+/// primary: a lock-file change that adds or removes a satisfying lock alternative with the
+/// primary unchanged still changes what the OSV scan must query (#1981). The cost is a harmless
+/// license re-fetch when only an alternative moved.
+///
 /// The returned names are also what [`reload_resolved_versions`] evicts from
 /// [`super::state::PackageSignals::licenses`] (issue #1424): a dependency whose in-use version
 /// just moved can no longer vouch for its previously cached license.
@@ -296,9 +301,9 @@ pub(crate) fn resolved_versions_changed(
     manifest.for_each_formatted_dependency(&mut |bound| {
         let key = deps_core::PackageKey::new(bound.dependency().name(), bound.formatter());
         let old =
-            bound.resolve_in_use_version(&key, old_resolved, Some(old_candidates), ecosystem_id);
+            bound.resolve_in_use_versions(&key, old_resolved, Some(old_candidates), ecosystem_id);
         let new =
-            bound.resolve_in_use_version(&key, new_resolved, Some(new_candidates), ecosystem_id);
+            bound.resolve_in_use_versions(&key, new_resolved, Some(new_candidates), ecosystem_id);
         if old != new {
             changed.push(key.normalized().clone());
         }
@@ -2625,6 +2630,50 @@ time = "0.1"
                  (0.1.43 -> 0.1.45) must be detected even though the collapsed \
                  resolved_versions value (the highest entry, 0.3.36) stays unchanged"
             );
+        }
+
+        /// #1981 (critic S1): a lock reload that adds or removes a satisfying lock alternative
+        /// while the primary stays put still changes what the OSV scan queries, so it must be
+        /// reported as a change.
+        #[test]
+        fn test_resolved_versions_changed_detects_a_lock_alternative_added_or_removed() {
+            let minimist = StubDependency {
+                name: PackageName::new("minimist"),
+                version_req: Some(VersionReq::new("1.2")),
+            };
+            let manifest = document(vec![minimist], IDENTITY_FORMATTER, EcosystemId::Cargo);
+            let resolved: HashMap<NormalizedName, ConcreteVersion> = std::iter::once((
+                NormalizedName::for_test("minimist"),
+                ConcreteVersion::from("2.0.0"),
+            ))
+            .collect();
+            let candidates = |versions: &[&str]| -> HashMap<NormalizedName, Vec<ConcreteVersion>> {
+                std::iter::once((
+                    NormalizedName::for_test("minimist"),
+                    versions.iter().map(|v| ConcreteVersion::from(*v)).collect(),
+                ))
+                .collect()
+            };
+            let without = candidates(&["1.2.8", "2.0.0"]);
+            let with = candidates(&["1.2.5", "1.2.8", "2.0.0"]);
+            let changed = |old: &ResolvedCandidatesMap, new: &ResolvedCandidatesMap| {
+                !resolved_versions_changed(
+                    &*manifest,
+                    &resolved,
+                    old,
+                    &resolved,
+                    new,
+                    EcosystemId::Cargo,
+                )
+                .is_empty()
+            };
+
+            assert!(changed(&without, &with), "an added alternative is a change");
+            assert!(
+                changed(&with, &without),
+                "a removed alternative is a change"
+            );
+            assert!(!changed(&with, &with), "identical candidates are no change");
         }
     }
 }

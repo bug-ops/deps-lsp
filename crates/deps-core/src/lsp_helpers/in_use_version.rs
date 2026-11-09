@@ -377,14 +377,14 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// version requirement (FR-001/FR-002), among a name's multiple retained lock-file entries.
 ///
 /// Filters `candidates` down to those [`crate::lsp_helpers::RequirementResolution::version_satisfies_bounded_requirement`]
-/// accepts, then returns the **lowest**-semver entry among that satisfying subset — falling back
+/// accepts, then returns the **highest**-semver entry among that satisfying subset — falling back
 /// to [`crate::lockfile`]'s lexicographic tiebreak for non-parseable versions
 /// ([`crate::lockfile::compare_lockfile_versions`]), the same ordering a single-candidate
-/// collapse already uses, so this never diverges from it. Lowest, not highest (#1981): the
-/// candidates map cannot say which entry the package manager installed for this dependency,
-/// so the choice fails toward reporting an advisory instead of hiding one. Returns `None` when nothing
-/// satisfies the requirement (FR-003) — the caller must not then substitute an arbitrary
-/// non-matching entry.
+/// collapse already uses, so this never diverges from it. The candidates map cannot say which
+/// entry the package manager installed for this dependency, so every other satisfying entry is
+/// reported as a lock alternative ([`InUseVersions::lock_alternatives`]) and scanned too (#1981).
+/// Returns `None` when nothing satisfies the requirement (FR-003) — the caller must not then
+/// substitute an arbitrary non-matching entry.
 /// Prefers [`crate::lsp_helpers::RequirementResolution::compile_bounded_requirement`]'s precise, ecosystem-native
 /// comparator (e.g. `deps-cargo`'s real `semver::VersionReq` range semantics) over
 /// [`crate::lsp_helpers::RequirementResolution::version_satisfies_bounded_requirement`]'s looser heuristic — critical
@@ -406,17 +406,60 @@ fn version_matches_requirement(
     }
 }
 
+/// Every candidate that satisfies `requirement`; empty for an oversized requirement (#1472: its
+/// parse cost would multiply by `candidates.len()`).
+fn satisfying_candidates<'a>(
+    candidates: &'a [ConcreteVersion],
+    requirement: &crate::VersionReq,
+    formatter: &dyn EcosystemFormatter,
+) -> Vec<&'a ConcreteVersion> {
+    let Some(requirement) = BoundedVersionReq::new(requirement) else {
+        return Vec::new();
+    };
+    candidates
+        .iter()
+        .filter(|v| version_matches_requirement(formatter, v, requirement))
+        .collect()
+}
+
 fn best_candidate_for_requirement<'a>(
     candidates: &'a [ConcreteVersion],
     requirement: &crate::VersionReq,
     formatter: &dyn EcosystemFormatter,
 ) -> Option<&'a ConcreteVersion> {
-    // #1472: an oversized requirement's parse cost would multiply by `candidates.len()`.
-    let requirement = BoundedVersionReq::new(requirement)?;
-    candidates
-        .iter()
-        .filter(|v| version_matches_requirement(formatter, v, requirement))
-        .min_by(|a, b| crate::lockfile::compare_lockfile_versions(a.as_str(), b.as_str()))
+    satisfying_candidates(candidates, requirement, formatter)
+        .into_iter()
+        .max_by(|a, b| crate::lockfile::compare_lockfile_versions(a.as_str(), b.as_str()))
+}
+
+/// The satisfying lock entries other than `primary`, distinct and lowest first.
+///
+/// Empty on every path where [`resolve_occurrence_version`] did not disambiguate among
+/// several candidates, so a single-entry name never carries alternatives.
+fn lock_alternatives(
+    dep: &dyn Dependency,
+    key: &PackageKey,
+    resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
+    formatter: &dyn EcosystemFormatter,
+    primary: &ConcreteVersion,
+) -> Vec<ConcreteVersion> {
+    let (Some(candidates), Some(req)) = (
+        resolved_version_candidates.and_then(|c| c.get(key.normalized())),
+        dep.version_requirement(),
+    ) else {
+        return Vec::new();
+    };
+    if candidates.len() <= 1 {
+        return Vec::new();
+    }
+    let mut alternatives: Vec<ConcreteVersion> = satisfying_candidates(candidates, req, formatter)
+        .into_iter()
+        .filter(|v| *v != primary)
+        .cloned()
+        .collect();
+    alternatives.sort_by(|a, b| crate::lockfile::compare_lockfile_versions(a.as_str(), b.as_str()));
+    alternatives.dedup();
+    alternatives
 }
 
 /// Resolves one dependency occurrence's lock-file version, disambiguating by its own
@@ -572,17 +615,20 @@ pub fn resolve_in_use_version<F: DependencyFormatter>(
     .map(InUseVersions::into_primary)
 }
 
-/// Every version of one dependency occurrence that is in use: the primary plus any sibling
-/// release tags naming the same commit.
+/// Every version of one dependency occurrence that is in use: the primary, any sibling
+/// release tags naming the same commit, and any other lock entries satisfying the requirement.
 ///
 /// Siblings come only from a formatter-resolved tag pin (GitHub Actions SHA and exact-tag
 /// pins), each admitted through the same queryability gate as the primary. Every value states
 /// whether its sibling list is complete ([`Self::sibling_coverage`]): a primary read from
 /// manifest text for a pin that a truncated tag list does not reach has unknown siblings.
+/// Lock alternatives come only from the lock-file candidate branch, so the two lists are
+/// disjoint by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InUseVersions {
     primary: ConcreteVersion,
     siblings: Vec<ConcreteVersion>,
+    lock_alternatives: Vec<ConcreteVersion>,
     sibling_coverage: SiblingCoverage,
 }
 
@@ -593,6 +639,7 @@ impl InUseVersions {
         Self {
             primary,
             siblings: Vec::new(),
+            lock_alternatives: Vec::new(),
             sibling_coverage: SiblingCoverage::Complete,
         }
     }
@@ -603,6 +650,7 @@ impl InUseVersions {
         Self {
             primary,
             siblings: Vec::new(),
+            lock_alternatives: Vec::new(),
             sibling_coverage: SiblingCoverage::Truncated,
         }
     }
@@ -613,6 +661,7 @@ impl InUseVersions {
         Self {
             primary,
             siblings: Vec::new(),
+            lock_alternatives: Vec::new(),
             sibling_coverage: SiblingCoverage::NotYetIndexed,
         }
     }
@@ -637,7 +686,21 @@ impl InUseVersions {
         Self {
             primary,
             siblings,
+            lock_alternatives: Vec::new(),
             sibling_coverage,
+        }
+    }
+
+    /// Like [`Self::for_test`], with lock alternatives.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn for_test_with_lock_alternatives(
+        primary: ConcreteVersion,
+        lock_alternatives: Vec<ConcreteVersion>,
+    ) -> Self {
+        Self {
+            lock_alternatives,
+            ..Self::untagged(primary)
         }
     }
 
@@ -663,7 +726,16 @@ impl InUseVersions {
         &self.siblings
     }
 
-    /// Discards the siblings, keeping the primary.
+    /// Other lock-file entries that also satisfy the requirement, distinct and lowest first.
+    ///
+    /// The lock file cannot say which of them the package manager installed for this
+    /// dependency, so each is scanned for advisories alongside the primary (#1981).
+    #[must_use]
+    pub fn lock_alternatives(&self) -> &[ConcreteVersion] {
+        &self.lock_alternatives
+    }
+
+    /// Discards the siblings and lock alternatives, keeping the primary.
     #[must_use]
     pub fn into_primary(self) -> ConcreteVersion {
         self.primary
@@ -674,7 +746,8 @@ impl InUseVersions {
 /// primary's commit (see [`InUseVersions`]).
 ///
 /// Siblings only come from an ecosystem's tag-pin resolution (GitHub Actions); every other
-/// source yields an empty list.
+/// source yields an empty list. Lock alternatives only come from a name with several
+/// satisfying lock-file candidates.
 ///
 /// # Examples
 ///
@@ -769,7 +842,16 @@ pub fn resolve_in_use_versions<F: DependencyFormatter>(
         resolved_version_candidates,
         formatter,
     ) {
-        return Some(InUseVersions::untagged(version.clone()));
+        return Some(InUseVersions {
+            lock_alternatives: lock_alternatives(
+                dep,
+                key,
+                resolved_version_candidates,
+                formatter,
+                version,
+            ),
+            ..InUseVersions::untagged(version.clone())
+        });
     }
 
     // #1556: an ecosystem's own out-of-band resolution (e.g. GitHub Actions' `TagIndex`)
@@ -787,6 +869,7 @@ pub fn resolve_in_use_versions<F: DependencyFormatter>(
             Some(InUseVersions {
                 primary,
                 siblings,
+                lock_alternatives: Vec::new(),
                 sibling_coverage: sibling_coverage.into(),
             })
         }
@@ -1845,7 +1928,7 @@ mod tests {
     #[test]
     fn best_candidate_for_requirement_non_semver_uses_lexicographic_tiebreak() {
         // Testing gap 2 fix: both candidates must satisfy the requirement and both must fail
-        // semver parsing, so `min_by` falls all the way to `compare_lockfile_versions`'s
+        // semver parsing, so `max_by` falls all the way to `compare_lockfile_versions`'s
         // `(Err, Err) => a.cmp(b)` branch — a single-match case never calls the comparator.
         // Requirement `"1"` is a partial-version bare requirement; both `"1-rc1"`/`"1-rc2"`
         // satisfy it via the `starts_with` fallback branch.
@@ -1860,7 +1943,7 @@ mod tests {
             &crate::lsp_helpers::test_support::MOCK_FORMATTER,
         );
 
-        assert_eq!(result, Some(&ConcreteVersion::from("1-rc1")));
+        assert_eq!(result, Some(&ConcreteVersion::from("1-rc2")));
     }
 
     /// C1 fix regression guard: `best_candidate_for_requirement` must prefer
@@ -1888,12 +1971,11 @@ mod tests {
         assert_eq!(result, Some(&ConcreteVersion::from("2.9.4")));
     }
 
-    /// FR-002 / #1981: when more than one lock-file entry satisfies an occurrence's
-    /// requirement, the tiebreak picks the lowest-semver *among the satisfying subset* —
-    /// `2.0.0` does not satisfy `^1.0` and must never be picked, and `1.0.5` must lose to
-    /// `1.0.1` so the fallback fails toward reporting an advisory.
+    /// FR-002: when more than one lock-file entry satisfies an occurrence's requirement,
+    /// the tiebreak picks the highest-semver *among the satisfying subset* — `2.0.0` is the
+    /// highest candidate but does not satisfy `^1.0`, so it must never be picked.
     #[test]
-    fn best_candidate_for_requirement_picks_lowest_of_satisfying_subset() {
+    fn best_candidate_for_requirement_picks_highest_of_satisfying_subset() {
         use crate::VersionReq;
 
         let candidates = vec![
@@ -1905,7 +1987,7 @@ mod tests {
         let result =
             best_candidate_for_requirement(&candidates, &VersionReq::new("^1.0"), &CaretFormatter);
 
-        assert_eq!(result, Some(&ConcreteVersion::from("1.0.1")));
+        assert_eq!(result, Some(&ConcreteVersion::from("1.0.5")));
     }
 
     /// #1472 defense-in-depth: an oversized requirement must short-circuit to `None` before
@@ -1928,41 +2010,80 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    /// FR-002 end-to-end through `in_use_version`/`resolve_occurrence_version`, not just the
-    /// isolated `best_candidate_for_requirement` helper.
+    /// FR-002 end-to-end: the highest satisfying entry is the primary, and the other
+    /// satisfying entry is the lock alternative (#1981); `2.0.0` is neither.
     #[test]
-    fn in_use_version_tiebreaks_among_multiple_satisfying_candidates() {
+    fn in_use_version_picks_highest_satisfying_and_reports_the_rest_as_alternatives() {
+        let versions = resolve_caret_pkg("^1.0", &["1.0.5", "2.0.0", "1.0.1"]).unwrap();
+
+        assert_eq!(versions.primary(), &ConcreteVersion::from("1.0.5"));
+        assert_eq!(
+            versions.lock_alternatives(),
+            &[ConcreteVersion::from("1.0.1")]
+        );
+        assert!(versions.siblings().is_empty());
+    }
+
+    #[test]
+    fn lock_alternatives_are_distinct_and_lowest_first() {
+        let versions =
+            resolve_caret_pkg("^1.0", &["1.0.9", "1.0.3", "1.0.3", "1.0.5", "1.0.9"]).unwrap();
+
+        assert_eq!(versions.primary(), &ConcreteVersion::from("1.0.9"));
+        assert_eq!(
+            versions.lock_alternatives(),
+            &[
+                ConcreteVersion::from("1.0.3"),
+                ConcreteVersion::from("1.0.5")
+            ]
+        );
+    }
+
+    #[test]
+    fn lock_alternatives_empty_for_a_single_satisfying_candidate() {
+        let versions = resolve_caret_pkg("^1.0", &["1.0.5", "2.0.0"]).unwrap();
+
+        assert_eq!(versions.primary(), &ConcreteVersion::from("1.0.5"));
+        assert!(versions.lock_alternatives().is_empty());
+    }
+
+    #[test]
+    fn lock_alternatives_empty_for_a_single_candidate() {
+        let versions = resolve_caret_pkg("^1.0", &["1.0.5"]).unwrap();
+
+        assert!(versions.lock_alternatives().is_empty());
+    }
+
+    fn resolve_caret_pkg(requirement: &str, locked: &[&str]) -> Option<InUseVersions> {
         use crate::VersionReq;
         use crate::lsp_helpers::test_support::MockDep;
 
         let dep = MockDep {
             name: PackageName::new("pkg"),
-            version_req: VersionReq::new("^1.0"),
+            version_req: VersionReq::new(requirement),
             version_range: Range::default(),
             name_range: Range::default(),
         };
-
-        let resolved_versions = HashMap::new();
         let mut candidates = HashMap::new();
         candidates.insert(
             NormalizedName::for_test("pkg"),
-            vec![
-                ConcreteVersion::from("1.0.1"),
-                ConcreteVersion::from("1.0.5"),
-                ConcreteVersion::from("2.0.0"),
-            ],
+            locked.iter().map(|v| ConcreteVersion::from(*v)).collect(),
         );
 
-        let result = resolve_in_use_version(
+        let collapsed: HashMap<NormalizedName, ConcreteVersion> = locked
+            .last()
+            .map(|v| (NormalizedName::for_test("pkg"), ConcreteVersion::from(*v)))
+            .into_iter()
+            .collect();
+
+        resolve_in_use_versions(
             &dep,
             &crate::test_util::package_key("pkg"),
-            &resolved_versions,
+            &collapsed,
             Some(&candidates),
             &CaretFormatter,
             EcosystemId::Cargo,
-        );
-
-        assert_eq!(result, Some(ConcreteVersion::from("1.0.1")));
+        )
     }
 
     // --- in_use_version end-to-end: #664's exact repro (no lock file, bare full version) ---
@@ -2144,6 +2265,7 @@ mod tests {
         assert_eq!(versions.primary().as_str(), "v4.8.0");
         let siblings: Vec<&str> = versions.siblings().iter().map(|s| s.as_str()).collect();
         assert_eq!(siblings, ["v4.9.0", "v4.10.0"]);
+        assert!(versions.lock_alternatives().is_empty());
     }
 
     /// #1709 (G7): a most-specific two-component primary keeps its two-component siblings.

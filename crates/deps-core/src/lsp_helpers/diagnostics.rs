@@ -319,6 +319,10 @@ pub fn sanitize_advisory_text_for_diagnostic(value: &str, max_chars: usize) -> S
 /// Cap on how many sibling tags [`format_matched_tags`] names before collapsing the rest.
 const MAX_SIBLING_TAGS_RENDERED: usize = 3;
 
+/// Label for an advisory that matched another lock-file entry rather than the scanned version
+/// (#1981). Ecosystem-independent: every lock-file ecosystem words the fact the same way.
+const LOCK_ALTERNATIVE_MATCH_LABEL: &str = "also locked at";
+
 /// Renders the sibling tags an advisory matched as one bounded, sanitized, comma-separated
 /// string: each tag is stripped of invisible characters and truncated before the count-capped
 /// join, so a registry-controlled tag name never reaches a message unbounded.
@@ -352,6 +356,8 @@ pub(crate) fn format_matched_tags(tags: &crate::osv::MatchedTags) -> String {
 /// let note = SiblingMatchNote::new(&Messages, &tags);
 /// assert_eq!(note.to_string(), "matched tag v4.9.0");
 /// ```
+///
+/// A match on another lock-file entry reads `also locked at 1.2.5` for every ecosystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SiblingMatchNote {
     label: &'static str,
@@ -359,11 +365,16 @@ pub struct SiblingMatchNote {
 }
 
 impl SiblingMatchNote {
-    /// Pairs `tags` (shared, not copied) with the ecosystem's label for a sibling match.
+    /// Pairs `tags` (shared, not copied) with the label for their origin: the ecosystem's own
+    /// for a release-tag match, `also locked at` for another lock-file entry.
     #[must_use]
     pub fn new(messages: &dyn DiagnosticMessages, tags: &crate::osv::MatchedTags) -> Self {
+        let label = match tags.origin() {
+            crate::osv::MatchOrigin::ReleaseTag => messages.sibling_match_label(),
+            crate::osv::MatchOrigin::LockEntry => LOCK_ALTERNATIVE_MATCH_LABEL,
+        };
         Self {
-            label: messages.sibling_match_label(),
+            label,
             tags: tags.clone(),
         }
     }
@@ -1484,7 +1495,9 @@ fn offline_notice<D: Dependency>(
 /// candidate siblings alike) is hover-only by design: for a repository over the tag fetch cap it
 /// is as permanent as the structural reasons, so a standing Problems-panel entry could never be
 /// resolved. [`SkipReason::UnverifiedRegistrySource`] is hover-only for the same reason: it holds
-/// for as long as the registry override is configured.
+/// for as long as the registry override is configured. [`SkipReason::LockAlternativesUnchecked`]
+/// is hover-only too: it follows from the lock file's shape, which a user cannot change per
+/// dependency.
 const fn should_notify_in_diagnostics(reason: SkipReason) -> bool {
     match reason {
         SkipReason::NoConcreteVersion
@@ -1499,7 +1512,8 @@ const fn should_notify_in_diagnostics(reason: SkipReason) -> bool {
         | SkipReason::TemplatedName
         | SkipReason::UnmappableEcosystem
         | SkipReason::UnmatchableVersion
-        | SkipReason::SiblingTagsUnknown => false,
+        | SkipReason::SiblingTagsUnknown
+        | SkipReason::LockAlternativesUnchecked => false,
     }
 }
 
@@ -6034,6 +6048,24 @@ mod tests {
         assert!(skip_notice_present(SkipReason::UnevaluableAdvisoryRange));
         assert!(!skip_notice_present(SkipReason::UnmatchableVersion));
         assert!(!skip_notice_present(SkipReason::SiblingTagsUnknown));
+        assert!(!skip_notice_present(SkipReason::LockAlternativesUnchecked));
+    }
+
+    /// #1981: a lock-entry match is worded by the shared const, never by the ecosystem's
+    /// release-tag label.
+    #[test]
+    fn sibling_match_note_words_a_lock_entry_match_with_the_shared_label() {
+        struct Messages;
+        impl DiagnosticMessages for Messages {}
+
+        let tags = crate::osv::MatchedTags::lock_entries_for_test(
+            crate::ConcreteVersion::new("1.2.5"),
+            vec![crate::ConcreteVersion::new("1.2.6")],
+        );
+        assert_eq!(
+            SiblingMatchNote::new(&Messages, &tags).to_string(),
+            "also locked at 1.2.5, 1.2.6"
+        );
     }
 
     /// Issue #1392 (critic S2, M4): two dependencies skipped for the *same* reason must
