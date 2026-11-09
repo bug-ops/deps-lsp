@@ -51,6 +51,7 @@ impl Gate {
     }
 
     /// Requests that reached the gated mock after the one [`Self::wait_started`] consumed.
+    #[cfg(feature = "npm")]
     fn further_requests(&self) -> usize {
         let started = self.started.lock().unwrap();
         std::iter::from_fn(|| started.try_recv().ok()).count()
@@ -201,6 +202,7 @@ impl Fixture {
         .expect("the document load settles");
     }
 
+    #[cfg(feature = "npm")]
     async fn wait_for_cached_count(&self, expected: usize) {
         tokio::time::timeout(SETTLE_DEADLINE, async {
             while self.cached_count() != expected {
@@ -589,7 +591,7 @@ mod footer_parity {
     };
 
     const FOOTER: &str = "Cmd+.";
-    const PACKUMENT_ALL_DEPRECATED: &str = r#"{"versions": {"1.0.0": {"deprecated": "old"}, "1.1.0": {"deprecated": "use another package"}}, "dist-tags": {"latest": "1.1.0"}}"#;
+    const PACKUMENT_ALL_DEPRECATED: &str = r#"{"versions": {"1.1.0": {"deprecated": "use another package"}}, "dist-tags": {"latest": "1.1.0"}}"#;
     const PACKUMENT_CURRENT: &str =
         r#"{"versions": {"1.0.0": {}, "1.1.0": {}}, "dist-tags": {"latest": "1.1.0"}}"#;
     const MANIFEST: &str = r#"{"dependencies": {"@acme-corp/widget": "^1.1.0"}}"#;
@@ -658,23 +660,63 @@ mod footer_parity {
         let fixture = npm_fixture_for(MANIFEST.to_owned(), &registry.url(), Some(osv.url()));
         fixture.open().await.await.unwrap();
 
-        let (footer, actions) = fixture.footer_and_actions().await;
-
-        assert_eq!(footer, actions > 0, "footer={footer} actions={actions}");
+        assert_eq!(fixture.footer_and_actions().await, (false, 0));
     }
 
+    impl Fixture {
+        /// Leaves phase B's candidate checks unproduced: an entry for the dependency with no
+        /// per-version verdict, which `codeAction` reads as every candidate unverified. Seeded
+        /// directly because the mock registry's non-public route never produces an entry.
+        fn leave_candidates_unverified(&self) {
+            self.state
+                .documents
+                .get_mut(&self.uri)
+                .unwrap()
+                .signals
+                .candidate_status = deps_core::osv::CandidateStatusMap::from([(
+                deps_core::test_util::vuln_key("@acme-corp/widget"),
+                deps_core::osv::CandidateStatuses::PerVersion(std::collections::HashMap::new()),
+            )]);
+        }
+    }
+
+    /// The hover handler must hand the footer the same candidate OSV verdicts `codeAction`
+    /// reads: with every candidate unverified, the older versions are not offered, so no
+    /// footer may promise them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn footer_matches_code_actions_when_candidates_are_not_osv_verified() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let registry = registry_serving(PACKUMENT_CURRENT).await;
+        let osv = mockito::Server::new_async().await;
+        let fixture = npm_fixture_for(MANIFEST.to_owned(), &registry.url(), Some(osv.url()));
+        fixture.open().await.await.unwrap();
+        fixture.leave_candidates_unverified();
+
+        assert_eq!(fixture.footer_and_actions().await, (false, 0));
+    }
+
+    /// The same state inside the loading window of a freshly opened document (live-tester
+    /// F3): the phase is `Loading` when the request lands, and neither surface offers the
+    /// versions that are not yet verified.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn footer_matches_code_actions_while_the_document_is_still_loading() {
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let registry = registry_serving(PACKUMENT_CURRENT).await;
         let osv = mockito::Server::new_async().await;
         let fixture = npm_fixture_for(MANIFEST.to_owned(), &registry.url(), Some(osv.url()));
-        let _open = fixture.open().await;
+        fixture.open().await.await.unwrap();
+        fixture.leave_candidates_unverified();
+        let phase = fixture
+            .state
+            .documents
+            .get_mut(&fixture.uri)
+            .map(|mut doc| {
+                doc.set_loading();
+                doc.loading_state()
+            })
+            .unwrap();
+        assert_eq!(phase, LoadingState::Loading);
 
-        let (footer, actions) = fixture.footer_and_actions().await;
-
-        // The OSV phase keeps running between the two requests, so an action may appear
-        // after the hover; a footer without an action must never be shown.
-        assert!(!footer || actions > 0, "footer={footer} actions={actions}");
+        assert_eq!(fixture.footer_and_actions().await, (false, 0));
     }
 }

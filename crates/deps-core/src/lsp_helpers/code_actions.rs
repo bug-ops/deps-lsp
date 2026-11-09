@@ -860,6 +860,11 @@ impl FetchedVersions {
     /// A genuine failure fails open only for the request that received it, and records a memo
     /// that refuses every later lookup as unverified. The `codeAction` the footer points at is
     /// such a later request, so a failure here promises no fix action.
+    ///
+    /// Call it only for a lookup the gate memoized (online, gate and ecosystem attached,
+    /// `InteractiveFetchRequest::is_memoized`). Offline or ungated there is no memo, so the
+    /// `codeAction` fails open too and the unchanged answer is the honest one. The memo lasts
+    /// 30 s: a later `codeAction` may offer the fix without a footer, the safe direction.
     pub(super) const fn seen_by_the_next_request(mut self) -> Self {
         if self.live.is_none() {
             self.unverified = true;

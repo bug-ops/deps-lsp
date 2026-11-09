@@ -129,12 +129,15 @@ where
         FetchContext::Hover,
     );
     let fetched = if resolvable {
-        Some(
-            FetchedVersions::from_interactive(
-                await_interactive_versions(registry, fetch_request.clone(), freshness).await,
-            )
-            .seen_by_the_next_request(),
-        )
+        let memoized = fetch_request.is_memoized(registry);
+        let answer = FetchedVersions::from_interactive(
+            await_interactive_versions(registry, fetch_request.clone(), freshness).await,
+        );
+        Some(if memoized {
+            answer.seen_by_the_next_request()
+        } else {
+            answer
+        })
     } else {
         None
     };
@@ -7840,7 +7843,8 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn not_found_with_vulnerability_keeps_advisories_and_footer() {
+        async fn not_found_outcome_with_an_answering_registry_and_fixable_vulnerability_keeps_footer()
+         {
             let content = hover_markdown(
                 &outcomes(LookupMiss::NotFound),
                 &scan(vulnerable()),
@@ -7908,6 +7912,7 @@ mod tests {
             vulnerabilities: VulnerabilityMap,
             outcomes: DependencyOutcomes,
             formatter: &'static StubFormatter<MockDep>,
+            network: crate::NetworkMode,
             offers_actions: bool,
         }
 
@@ -7944,6 +7949,7 @@ mod tests {
                     vulnerabilities: VulnerabilityMap::new(),
                     outcomes: DependencyOutcomes::new(),
                     formatter: &MOCK_FORMATTER,
+                    network: crate::NetworkMode::Online,
                     offers_actions: true,
                 },
                 Scenario {
@@ -7952,6 +7958,7 @@ mod tests {
                     vulnerabilities: VulnerabilityMap::new(),
                     outcomes: DependencyOutcomes::new(),
                     formatter: &MOCK_FORMATTER,
+                    network: crate::NetworkMode::Online,
                     offers_actions: false,
                 },
                 Scenario {
@@ -7960,6 +7967,7 @@ mod tests {
                     vulnerabilities: VulnerabilityMap::new(),
                     outcomes: DependencyOutcomes::new(),
                     formatter: &MOCK_FORMATTER,
+                    network: crate::NetworkMode::Online,
                     offers_actions: false,
                 },
                 Scenario {
@@ -7968,6 +7976,7 @@ mod tests {
                     vulnerabilities: VulnerabilityMap::new(),
                     outcomes: DependencyOutcomes::new(),
                     formatter: &MOCK_FORMATTER,
+                    network: crate::NetworkMode::Online,
                     offers_actions: false,
                 },
                 Scenario {
@@ -7978,6 +7987,7 @@ mod tests {
                     vulnerabilities: scan(vulnerable()),
                     outcomes: DependencyOutcomes::new(),
                     formatter: &MOCK_FORMATTER,
+                    network: crate::NetworkMode::Online,
                     offers_actions: false,
                 },
                 Scenario {
@@ -7986,6 +7996,29 @@ mod tests {
                     vulnerabilities: scan(unfixable_vulnerable()),
                     outcomes: DependencyOutcomes::new(),
                     formatter: &MOCK_FORMATTER,
+                    network: crate::NetworkMode::Online,
+                    offers_actions: false,
+                },
+                Scenario {
+                    // Offline there is no failure memo, so `codeAction` fails open as the
+                    // hover did and both surfaces still offer the cached advisory's fix.
+                    name: "offline, nothing cached, fixable advisory",
+                    registry: Box::new(ErrorRegistry),
+                    vulnerabilities: scan(vulnerable()),
+                    outcomes: DependencyOutcomes::new(),
+                    formatter: &MOCK_FORMATTER,
+                    network: crate::NetworkMode::Offline,
+                    offers_actions: true,
+                },
+                Scenario {
+                    // #1936: a 404 is a failed lookup like any other; the hover's failure is
+                    // memoized, so the `codeAction` after it offers no fix either.
+                    name: "registry 404, fixable advisory",
+                    registry: Box::new(NotFoundRegistry),
+                    vulnerabilities: scan(vulnerable()),
+                    outcomes: DependencyOutcomes::new(),
+                    formatter: &MOCK_FORMATTER,
+                    network: crate::NetworkMode::Online,
                     offers_actions: false,
                 },
                 Scenario {
@@ -7994,6 +8027,7 @@ mod tests {
                     vulnerabilities: VulnerabilityMap::new(),
                     outcomes: DependencyOutcomes::new(),
                     formatter: &PLAIN_FORMATTER,
+                    network: crate::NetworkMode::Online,
                     offers_actions: false,
                 },
                 Scenario {
@@ -8008,6 +8042,7 @@ mod tests {
                         },
                     ),
                     formatter: &PLAIN_FORMATTER,
+                    network: crate::NetworkMode::Online,
                     offers_actions: false,
                 },
             ];
@@ -8027,6 +8062,7 @@ mod tests {
                 );
                 let versions = VersionData::new(&cached, &resolved)
                     .with_ecosystem(crate::EcosystemId::Cargo)
+                    .with_network(scenario.network)
                     .with_interactive_fetch_gate(&gate)
                     .with_outcomes(&scenario.outcomes)
                     .with_vulnerabilities(&scenario.vulnerabilities);
