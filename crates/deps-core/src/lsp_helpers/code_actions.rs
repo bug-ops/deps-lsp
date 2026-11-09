@@ -4,15 +4,18 @@ use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, Range, Wo
 
 use crate::edit::{FixTargetContext, replacement_text, requirement_is_placeholder_for};
 use crate::osv::ScanOutcome;
-use crate::{ConcreteVersion, Dependency, PackageKey, ParseResult, Registry, Version, VersionReq};
+use crate::{
+    ConcreteVersion, Dependency, PackageKey, Registry, TypedParseResult, Version, VersionReq,
+};
 
 use super::{
-    BoundedVersionReq, DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, FetchContext,
-    InteractiveFetch, InteractiveFetchRequest, LatestVerdict, LineOffsetTable, NoLiveList,
-    RequirementGate, UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, await_interactive_versions,
-    candidate_verdict, is_safe_version_string, latest_verdict, literal_span_matches,
-    requirement_is_unsatisfiable, requirement_len_exceeds_cap, resolve_latest_status,
-    resolve_scan_outcome, single_file_edit, slice_for_range, strip_whitespace, warn_rejected_value,
+    BoundedVersionReq, DEPRECATED_DIAGNOSTIC_CODE, DependencyFormatter, EcosystemFormatter,
+    FetchContext, InteractiveFetch, InteractiveFetchRequest, LatestVerdict, LineOffsetTable,
+    NoLiveList, RequirementGate, UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData,
+    await_interactive_versions, candidate_verdict, is_safe_version_string, latest_verdict,
+    literal_span_matches, requirement_is_unsatisfiable, requirement_len_exceeds_cap,
+    resolve_latest_status, resolve_scan_outcome, single_file_edit, slice_for_range,
+    strip_whitespace, warn_rejected_value,
 };
 
 /// Whether REFACTOR "Update to X" items may offer pre-release versions (#1885).
@@ -150,15 +153,19 @@ struct VulnerabilityFixAction {
 /// ahead of phase B completing) leaves that unresolved and suppresses this action — the
 /// intended fail-safe degradation, not a bug. Callers must still reconcile the result against a successful registry fetch when one
 /// is available — see the yank check in [`generate_code_actions`].
-fn build_vulnerability_fix_action(
-    parse_result: &dyn ParseResult,
-    dep: &dyn Dependency,
+fn build_vulnerability_fix_action<P, F>(
+    parse_result: &P,
+    dep: &P::Dep,
     uri: &url::Url,
     version_range: Range,
     versions: VersionData<'_>,
     version_req: &str,
-    formatter: &dyn EcosystemFormatter,
-) -> Option<VulnerabilityFixAction> {
+    formatter: &F,
+) -> Option<VulnerabilityFixAction>
+where
+    P: TypedParseResult,
+    F: DependencyFormatter<Dep = P::Dep>,
+{
     let key = PackageKey::new(dep.name(), formatter);
     // #394 S2: prefer the version-qualified key so a fix action for one
     // occurrence of a duplicated name is never built from another
@@ -322,13 +329,13 @@ struct UnsatisfiableFixAction {
 /// so an unverifiable rewrite passes through unrejected. That is the safe direction — a
 /// rewrite this scan cannot judge is not evidence it is bad — but it means the guard holds
 /// only "for every rewrite the ecosystem can evaluate", not unconditionally.
-fn build_unsatisfiable_fix_action(
-    dep: &dyn Dependency,
+fn build_unsatisfiable_fix_action<F: DependencyFormatter>(
+    dep: &F::Dep,
     uri: &url::Url,
     version_range: Range,
     versions: VersionData<'_>,
     version_req: &VersionReq,
-    formatter: &dyn EcosystemFormatter,
+    formatter: &F,
 ) -> Option<UnsatisfiableFixAction> {
     // #1370: central placeholder gate — an unexpanded placeholder has no concrete version
     // text a fix action could ever replace, independent of whether `compile_bounded_requirement`
@@ -562,16 +569,21 @@ fn build_replacement_action(
 /// impl plus `ParseResult`/`Dependency` mocks, which live as private test
 /// fixtures in the sibling `test_support` module rather than as public
 /// API — see the `generate_code_actions_*` tests here for realistic calls.
-pub async fn generate_code_actions<R: Registry + ?Sized>(
-    parse_result: &dyn ParseResult,
+pub async fn generate_code_actions<P, F, R>(
+    parse_result: &P,
     position: Position,
     uri: &url::Url,
     versions: VersionData<'_>,
     content: &str,
     registry: &R,
-    formatter: &dyn EcosystemFormatter,
-) -> Vec<CodeAction> {
-    let deps = parse_result.dependencies();
+    formatter: &F,
+) -> Vec<CodeAction>
+where
+    P: TypedParseResult,
+    F: DependencyFormatter<Dep = P::Dep>,
+    R: Registry + ?Sized,
+{
+    let deps = parse_result.own_dependencies();
     let mut actions = Vec::with_capacity(deps.len().min(5) + 1);
 
     let Some(ActionTarget {
@@ -701,8 +713,8 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
 }
 
 /// The dependency a code action request lands on, with the version text it would rewrite.
-struct ActionTarget<'a> {
-    dep: &'a dyn Dependency,
+struct ActionTarget<'a, D> {
+    dep: &'a D,
     version_range: Range,
     version_req: &'a VersionReq,
     literal_target: &'a str,
@@ -711,15 +723,15 @@ struct ActionTarget<'a> {
 
 /// The dependency at `position` whose version literal still sits at its recorded range, or
 /// `None` when no code action can safely target it.
-fn locate_action_target<'a>(
-    deps: Vec<&'a dyn Dependency>,
+fn locate_action_target<'a, F: DependencyFormatter>(
+    deps: &'a [F::Dep],
     position: Position,
     content: &str,
-    formatter: &dyn EcosystemFormatter,
-) -> Option<ActionTarget<'a>> {
+    formatter: &F,
+) -> Option<ActionTarget<'a, F::Dep>> {
     let dep = deps
-        .into_iter()
-        .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
+        .iter()
+        .find(|d| formatter.is_position_on_dependency(d, position.into()))?;
     let version_range: Range = dep.version_range()?.into();
     let version_req = dep.version_requirement()?;
     if version_req.as_str().is_empty() {
@@ -815,25 +827,30 @@ async fn fetch_fix_versions<R: Registry + ?Sized>(
 }
 
 /// What [`push_refactor_actions`] needs to know about the targeted dependency.
-struct RefactorContext<'a, 'v> {
-    parse_result: &'a dyn ParseResult,
-    dep: &'a dyn Dependency,
+struct RefactorContext<'a, 'v, P: TypedParseResult, F> {
+    parse_result: &'a P,
+    dep: &'a P::Dep,
     uri: &'a url::Url,
     version_range: Range,
     version_req: &'a VersionReq,
     versions: &'a VersionData<'v>,
-    formatter: &'a dyn EcosystemFormatter,
+    formatter: &'a F,
 }
 
 /// Pushes one REFACTOR "Update to X" action per distinct, OSV-verified display version, and
 /// returns the index of the one for the registry's latest pick, if any.
-fn push_refactor_actions<R: Registry + ?Sized>(
-    ctx: &RefactorContext<'_, '_>,
+fn push_refactor_actions<P, F, R>(
+    ctx: &RefactorContext<'_, '_, P, F>,
     registry: &R,
     registry_versions: &[Box<dyn Version>],
     emitted_texts: &mut HashSet<String>,
     actions: &mut Vec<CodeAction>,
-) -> Option<usize> {
+) -> Option<usize>
+where
+    P: TypedParseResult,
+    F: DependencyFormatter<Dep = P::Dep>,
+    R: Registry + ?Sized,
+{
     use crate::completion::prepare_version_display_items;
 
     let RefactorContext {
@@ -972,7 +989,7 @@ mod tests {
     use crate::lsp_helpers::test_support_lsp::*;
     use crate::lsp_helpers::*;
     use crate::position::{Position, Range};
-    use crate::{ConcreteVersion, Dependency, PackageName, VersionReq};
+    use crate::{ConcreteVersion, Dependency, PackageName, ParseResult, VersionReq};
     use std::any::Any;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1903,14 +1920,6 @@ mod tests {
         fn package_url(&self, name: &PackageName) -> String {
             format!("https://example.com/{}", name.as_str())
         }
-
-        fn hover_provenance(&self, _dep: &dyn Dependency) -> Option<HoverProvenance> {
-            self.proven
-                .then(|| HoverProvenance::CommitAheadOfLatestRelease {
-                    ahead_by: Some(2),
-                    latest_tag: "1.2.0".into(),
-                })
-        }
     }
 
     impl RequirementResolution for ProvenAheadFormatter {}
@@ -1918,6 +1927,18 @@ mod tests {
     impl DiagnosticPolicy for ProvenAheadFormatter {}
     impl SourcePolicy for ProvenAheadFormatter {}
     impl OsvNaming for ProvenAheadFormatter {}
+
+    impl DependencyFormatter for ProvenAheadFormatter {
+        type Dep = MockDep;
+
+        fn hover_provenance(&self, _dep: &MockDep) -> Option<HoverProvenance> {
+            self.proven
+                .then(|| HoverProvenance::CommitAheadOfLatestRelease {
+                    ahead_by: Some(2),
+                    latest_tag: "1.2.0".into(),
+                })
+        }
+    }
 
     /// Spec 087 SC-004 at code-action level: the plain update is offered for an ordinary pin and
     /// withheld for one proven ahead of the latest release.
@@ -2156,7 +2177,7 @@ mod tests {
     async fn vulnerability_fix_titles(
         dep_name: &str,
         verified_target: &str,
-        formatter: &dyn EcosystemFormatter,
+        formatter: &impl DependencyFormatter<Dep = MockDep>,
     ) -> Vec<String> {
         let (parse_result, version_range, content, vulnerabilities) =
             steer_fixture(dep_name, verified_target);
@@ -2203,7 +2224,9 @@ mod tests {
     /// spelling; the shared lookup still finds the normalized entry, so the action steers.
     #[tokio::test]
     async fn test_vulnerability_fix_steers_for_a_mixed_case_declared_name() {
-        let formatter = crate::test_util::StubFormatter::DEFAULT.with_lowercase_names();
+        let formatter = crate::test_util::StubFormatter::DEFAULT
+            .with_lowercase_names()
+            .for_dependency();
         assert_eq!(
             vulnerability_fix_titles("Pkg", "4.18.1", &formatter).await,
             vec!["Update to 4.18.1 (fixes A1)"]
@@ -3115,7 +3138,7 @@ mod tests {
         requirement: &str,
         registry_versions: Vec<(&'static str, bool)>,
         lockfile_version: Option<&str>,
-        formatter: &dyn EcosystemFormatter,
+        formatter: &impl DependencyFormatter<Dep = MockDep>,
     ) -> Vec<String> {
         let (dep, version_range, content) = vulnerable_dep(requirement);
         let parse_result = MockParseResult {
@@ -3306,6 +3329,10 @@ mod tests {
     impl crate::lsp_helpers::DiagnosticPolicy for MajorOnlyFormatter {}
     impl crate::lsp_helpers::SourcePolicy for MajorOnlyFormatter {}
     impl crate::lsp_helpers::OsvNaming for MajorOnlyFormatter {}
+
+    impl crate::lsp_helpers::DependencyFormatter for MajorOnlyFormatter {
+        type Dep = MockDep;
+    }
 
     #[tokio::test]
     async fn test_refactor_partial_bucket_keeps_newest_version_title() {
@@ -3641,9 +3668,6 @@ mod tests {
             fn source(&self) -> crate::parser::DependencySource {
                 crate::parser::DependencySource::Registry
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         struct CaParseResult {
@@ -3661,8 +3685,12 @@ mod tests {
             fn uri(&self) -> &url::Url {
                 &self.uri
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+
+        impl crate::TypedParseResult for CaParseResult {
+            type Dep = CaDep;
+            fn own_dependencies(&self) -> &[CaDep] {
+                &self.deps
             }
         }
 
@@ -3697,9 +3725,6 @@ mod tests {
             fn version_literal(&self) -> Option<&str> {
                 self.version_literal.as_deref()
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         struct CaLiteralParseResult {
@@ -3717,8 +3742,12 @@ mod tests {
             fn uri(&self) -> &url::Url {
                 &self.uri
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+
+        impl crate::TypedParseResult for CaLiteralParseResult {
+            type Dep = CaLiteralDep;
+            fn own_dependencies(&self) -> &[CaLiteralDep] {
+                &self.deps
             }
         }
 
@@ -3809,7 +3838,7 @@ mod tests {
                 versions,
                 content,
                 &CaRegistry,
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             )
             .await;
 
@@ -3872,7 +3901,7 @@ mod tests {
                 versions,
                 content,
                 &CaRegistry,
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             )
             .await;
 
@@ -3904,7 +3933,7 @@ mod tests {
                 versions,
                 content,
                 &CaRegistry,
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             )
             .await;
 
@@ -3935,7 +3964,7 @@ mod tests {
                 versions,
                 content,
                 &CaRegistry,
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             )
             .await;
 
@@ -3972,7 +4001,7 @@ mod tests {
                 versions,
                 content,
                 &CaRegistry,
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             )
             .await;
 
@@ -4009,7 +4038,7 @@ mod tests {
                 versions,
                 content,
                 &CaRegistry,
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
             )
             .await;
 
@@ -4068,6 +4097,10 @@ mod tests {
 
         impl OsvNaming for NonFixingFormatter {}
 
+        impl DependencyFormatter for NonFixingFormatter {
+            type Dep = MockDep;
+        }
+
         /// Same exact-match `compile_bounded_requirement` as [`ExactMatchFormatter`], but
         /// `format_version_replacing` always returns the same fixed text regardless of
         /// its input — mirroring PyPI's `truncate_release_to_match`, which can map
@@ -4114,6 +4147,10 @@ mod tests {
 
         impl OsvNaming for CollidingTextFormatter {}
 
+        impl DependencyFormatter for CollidingTextFormatter {
+            type Dep = MockDep;
+        }
+
         /// Same exact-match `compile_bounded_requirement` as [`ExactMatchFormatter`], but with a
         /// non-identity `normalize_package_name`, for the M1 lookup-fallback test.
         struct NormalizingExactFormatter;
@@ -4151,53 +4188,8 @@ mod tests {
 
         impl OsvNaming for NormalizingExactFormatter {}
 
-        struct UnsatDep {
-            name: PackageName,
-            version_req: VersionReq,
-            version_range: Range,
-            source: crate::parser::DependencySource,
-        }
-
-        impl Dependency for UnsatDep {
-            fn name(&self) -> &PackageName {
-                &self.name
-            }
-            fn name_range(&self) -> crate::position::Range {
-                Range::default()
-            }
-            fn version_requirement(&self) -> Option<&VersionReq> {
-                Some(&self.version_req)
-            }
-            fn version_range(&self) -> Option<crate::position::Range> {
-                Some(self.version_range)
-            }
-            fn source(&self) -> crate::parser::DependencySource {
-                self.source.clone()
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        /// `MockParseResult` only stores `MockDep`s; wraps a single `UnsatDep` instead.
-        struct UnsatParseResult {
-            dep: UnsatDep,
-            uri: url::Url,
-        }
-
-        impl ParseResult for UnsatParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                vec![&self.dep]
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &url::Url {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
+        impl DependencyFormatter for NormalizingExactFormatter {
+            type Dep = MockDep;
         }
 
         fn cached_versions_keyed(
@@ -4329,15 +4321,18 @@ mod tests {
             // (#248): a path/git/SDK/workspace dependency's cache entry may be
             // coincidental, so no fix action should be offered for it either.
             let content = "1.0.0";
-            let dep = UnsatDep {
-                name: pkg("pkg"),
-                version_req: VersionReq::new("1.0.0"),
-                version_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-                source: crate::parser::DependencySource::Path {
+            let dep = NonRegistryDep(
+                MockDep {
+                    name: pkg("pkg"),
+                    version_req: VersionReq::new("1.0.0"),
+                    version_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                    name_range: Range::default(),
+                },
+                crate::parser::DependencySource::Path {
                     path: "../local".into(),
                 },
-            };
-            let pr = UnsatParseResult {
+            );
+            let pr = SingleDepParseResult {
                 dep,
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
@@ -4353,7 +4348,7 @@ mod tests {
                 versions,
                 content,
                 &MockRegistry,
-                &ExactMatchFormatter,
+                &NonRegistryExactFormatter,
             )
             .await;
 
@@ -4820,6 +4815,10 @@ mod tests {
         impl SourcePolicy for PlaceholderGatedFormatter {}
 
         impl OsvNaming for PlaceholderGatedFormatter {}
+
+        impl DependencyFormatter for PlaceholderGatedFormatter {
+            type Dep = MockDep;
+        }
 
         /// #1370: same setup as `test_unsat_fix_emitted_for_unsatisfiable_requirement` (which
         /// asserts the action IS offered without the gate), swapping in

@@ -12,10 +12,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::lsp_helpers::DependencyFormatter;
 use deps_core::net_policy::{MapEnv, RegistryAccessPolicy};
 use deps_core::osv::{ScanOutcome, SkipReason, vuln_key_for};
-use deps_core::{EcosystemId, ParseResult};
+use deps_core::test_util::stub_document_with;
+use deps_core::{EcosystemId, TypedParseResult};
 use deps_engine::classify::osv::build_scan_targets;
 use deps_go::config::{GoEnvCache, GoParseContext, GoProcessEnv};
 use deps_go::{GoFormatter, parse_go_mod_with_context};
@@ -29,38 +30,37 @@ enum Verdict {
     Skipped(SkipReason),
 }
 
-fn verdicts(
-    parse_result: &dyn ParseResult,
-    formatter: &dyn EcosystemFormatter,
-    ecosystem: EcosystemId,
-) -> HashMap<String, Verdict> {
+fn verdicts<P, F>(parse_result: P, formatter: F, ecosystem: EcosystemId) -> HashMap<String, Verdict>
+where
+    P: TypedParseResult + 'static,
+    F: DependencyFormatter<Dep = P::Dep> + 'static,
+{
+    let document = stub_document_with(parse_result, formatter, ecosystem);
     let (targets, skipped) = build_scan_targets(
-        parse_result,
+        document.as_ref(),
         &HashMap::new(),
         &HashMap::new(),
-        formatter,
         ecosystem,
     );
-    parse_result
-        .dependencies()
-        .into_iter()
-        .map(|dep| {
-            let key = vuln_key_for(dep, None, formatter);
-            let verdict = match skipped.get(&key) {
-                Some(ScanOutcome::Skipped(reason)) => Verdict::Skipped(*reason),
-                Some(other) => panic!("unexpected pre-scan outcome {other:?}"),
-                None => {
-                    assert!(
-                        !targets.is_empty(),
-                        "{} neither skipped nor targeted",
-                        dep.name().as_str()
-                    );
-                    Verdict::Scanned
-                }
-            };
-            (dep.name().as_str().to_owned(), verdict)
-        })
-        .collect()
+    let mut verdicts = HashMap::new();
+    document.for_each_formatted_dependency(&mut |bound| {
+        let dep = bound.dependency();
+        let key = vuln_key_for(dep, None, bound.formatter());
+        let verdict = match skipped.get(&key) {
+            Some(ScanOutcome::Skipped(reason)) => Verdict::Skipped(*reason),
+            Some(other) => panic!("unexpected pre-scan outcome {other:?}"),
+            None => {
+                assert!(
+                    !targets.is_empty(),
+                    "{} neither skipped nor targeted",
+                    dep.name().as_str()
+                );
+                Verdict::Scanned
+            }
+        };
+        verdicts.insert(dep.name().as_str().to_owned(), verdict);
+    });
+    verdicts
 }
 
 fn npm_verdicts(npmrc: Option<&str>, package_json: &str) -> HashMap<String, Verdict> {
@@ -72,7 +72,7 @@ fn npm_verdicts(npmrc: Option<&str>, package_json: &str) -> HashMap<String, Verd
     let result =
         parse_package_json_with_context(package_json, &uri, &deps_npm::NpmParseContext::default())
             .unwrap();
-    verdicts(&result, &NpmFormatter, EcosystemId::Npm)
+    verdicts(result, NpmFormatter, EcosystemId::Npm)
 }
 
 const NPM_MANIFEST: &str = r#"{"dependencies": {
@@ -91,7 +91,7 @@ fn go_verdicts(env: &MapEnv, go_mod: &str) -> HashMap<String, Verdict> {
     let dir = tempfile::tempdir().unwrap();
     let uri = Url::from_file_path(dir.path().join("go.mod")).unwrap();
     let result = parse_go_mod_with_context(go_mod, &uri, &ctx).unwrap();
-    verdicts(&result, &GoFormatter, EcosystemId::Go)
+    verdicts(result, GoFormatter, EcosystemId::Go)
 }
 
 const GO_MOD: &str =
@@ -157,7 +157,6 @@ fn npm_public_registry_lookalikes_are_still_reported() {
 
 #[test]
 fn npm_peer_dependencies_are_exempt_from_lock_coverage_gaps() {
-    use deps_core::lsp_helpers::OsvNaming;
     use deps_core::osv::LockResolution;
 
     let dir = tempfile::tempdir().unwrap();
@@ -168,13 +167,15 @@ fn npm_peer_dependencies_are_exempt_from_lock_coverage_gaps() {
         &deps_npm::NpmParseContext::default(),
     )
     .unwrap();
+    let document = stub_document_with(result, NpmFormatter, EcosystemId::Npm);
     let resolution = |name: &str| {
-        let dep = result
-            .dependencies()
-            .into_iter()
-            .find(|dep| dep.name().as_str() == name)
-            .unwrap();
-        NpmFormatter.lock_resolution(dep)
+        let mut resolution = None;
+        document.for_each_formatted_dependency(&mut |bound| {
+            if bound.dependency().name().as_str() == name {
+                resolution = Some(bound.lock_resolution());
+            }
+        });
+        resolution.unwrap()
     };
     assert_eq!(resolution("react"), LockResolution::NotLocked);
     assert_eq!(resolution("lodash"), LockResolution::Expected);

@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use deps_core::{Ecosystem, EcosystemId, ParseInputKey, ParseResult, RefreshEvent, RefreshEvents};
+use deps_core::{EcosystemId, ParseInputKey, ParsedManifest, RefreshEvent, RefreshEvents};
 use tokio::sync::{RwLock, broadcast::error::RecvError};
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::Uri;
@@ -65,16 +65,13 @@ impl Announced {
         }
     }
 
-    /// Whether a document parsed as `parse_result` must be considered for re-parsing.
-    fn concerns(&self, ecosystem: &dyn Ecosystem, parse_result: Option<&dyn ParseResult>) -> bool {
+    /// Whether a document parsed as `manifest` must be considered for re-parsing.
+    fn concerns(&self, manifest: Option<&dyn ParsedManifest>) -> bool {
         match self {
             Self::Nothing => false,
             Self::Lagged => true,
-            Self::Inputs { inputs, .. } => parse_result.is_some_and(|parsed| {
-                inputs
-                    .iter()
-                    .any(|input| ecosystem.parse_depends_on(parsed, input))
-            }),
+            Self::Inputs { inputs, .. } => manifest
+                .is_some_and(|parsed| inputs.iter().any(|input| parsed.parse_depends_on(input))),
         }
     }
 }
@@ -115,7 +112,7 @@ struct OpenDocument {
     uri: Uri,
     content: String,
     version: Option<i32>,
-    parse_result: Option<Arc<dyn ParseResult>>,
+    manifest: Option<Arc<dyn ParsedManifest>>,
 }
 
 /// Open documents of `ecosystem`.
@@ -128,7 +125,7 @@ fn open_documents(state: &ServerState, ecosystem: EcosystemId) -> Vec<OpenDocume
             uri: entry.key().clone(),
             content: entry.value().content.clone(),
             version: entry.value().version,
-            parse_result: entry.value().parse_result_arc(),
+            manifest: entry.value().manifest_arc(),
         })
         .collect()
 }
@@ -143,9 +140,6 @@ async fn reparse_due(
     announced: &Announced,
     last_event: Instant,
 ) {
-    let Some(ecosystem_impl) = state.ecosystem_registry.get(ecosystem) else {
-        return;
-    };
     ledger.retain_open(state);
     state
         .pre_fetch_stamps
@@ -155,12 +149,10 @@ async fn reparse_due(
         uri,
         content,
         version,
-        parse_result,
+        manifest,
     } in open_documents(state, ecosystem)
     {
-        if !announced.concerns(&*ecosystem_impl, parse_result.as_deref())
-            || !ledger.take(&uri, version, announced)
-        {
+        if !announced.concerns(manifest.as_deref()) || !ledger.take(&uri, version, announced) {
             continue;
         }
         if state
@@ -356,14 +348,20 @@ mod tests {
     }
 
     #[cfg(feature = "swift")]
-    async fn swift_document(ecosystem: &dyn Ecosystem, repository: &str) -> Box<dyn ParseResult> {
+    async fn swift_document(
+        ecosystem: &Arc<dyn deps_core::Ecosystem>,
+        repository: &str,
+    ) -> Box<dyn ParsedManifest> {
         let manifest = format!(r#".package(url: "{repository}", from: "1.0.0")"#);
         let uri = deps_core::test_util::test_uri("/test/Package.swift");
-        ecosystem.parse_manifest(&manifest, &uri).await.unwrap()
+        Arc::clone(ecosystem)
+            .parse_manifest(&manifest, &uri)
+            .await
+            .unwrap()
     }
 
     #[cfg(feature = "swift")]
-    fn swift_ecosystem() -> Arc<dyn Ecosystem> {
+    fn swift_ecosystem() -> Arc<dyn deps_core::Ecosystem> {
         ServerState::new()
             .ecosystem_registry
             .get(EcosystemId::Swift)
@@ -376,23 +374,23 @@ mod tests {
     #[tokio::test]
     async fn an_announcement_concerns_only_documents_referencing_its_inputs() {
         let ecosystem = swift_ecosystem();
-        let a = swift_document(&*ecosystem, "https://github.com/apple/swift-nio.git").await;
-        let b = swift_document(&*ecosystem, "https://github.com/apple/swift-log").await;
+        let a = swift_document(&ecosystem, "https://github.com/apple/swift-nio.git").await;
+        let b = swift_document(&ecosystem, "https://github.com/apple/swift-log").await;
         let nio = "https://github.com/apple/swift-nio";
         let log = "https://github.com/apple/swift-log";
 
         let for_nio = inputs(1, &[nio]);
-        assert!(for_nio.concerns(&*ecosystem, Some(&*a)));
-        assert!(!for_nio.concerns(&*ecosystem, Some(&*b)));
+        assert!(for_nio.concerns(Some(&*a)));
+        assert!(!for_nio.concerns(Some(&*b)));
 
         let for_both = inputs(1, &[nio, log]);
-        assert!(for_both.concerns(&*ecosystem, Some(&*a)));
-        assert!(for_both.concerns(&*ecosystem, Some(&*b)));
+        assert!(for_both.concerns(Some(&*a)));
+        assert!(for_both.concerns(Some(&*b)));
 
-        assert!(!for_nio.concerns(&*ecosystem, None), "no parse result");
-        assert!(Announced::Lagged.concerns(&*ecosystem, Some(&*b)));
-        assert!(Announced::Lagged.concerns(&*ecosystem, None));
-        assert!(!Announced::Nothing.concerns(&*ecosystem, Some(&*a)));
+        assert!(!for_nio.concerns(None), "no parse result");
+        assert!(Announced::Lagged.concerns(Some(&*b)));
+        assert!(Announced::Lagged.concerns(None));
+        assert!(!Announced::Nothing.concerns(Some(&*a)));
     }
 
     /// An ecosystem without a `parse_depends_on` override re-parses every document.
@@ -404,10 +402,10 @@ mod tests {
             .get(EcosystemId::Cargo)
             .unwrap();
         let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
-        let parsed = ecosystem
+        let parsed = Arc::clone(&ecosystem)
             .parse_manifest("[dependencies]\nserde = \"1\"\n", &uri)
             .await
             .unwrap();
-        assert!(inputs(1, &["unrelated"]).concerns(&*ecosystem, Some(&*parsed)));
+        assert!(inputs(1, &["unrelated"]).concerns(Some(&*parsed)));
     }
 }

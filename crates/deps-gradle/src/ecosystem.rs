@@ -2,17 +2,17 @@
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
-use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
-};
+use deps_core::{EcosystemBase, Registry, Result, TypedEcosystem};
+#[cfg(feature = "lsp-responses")]
+use deps_core::{ParseResult as ParseResultTrait, ParsedView};
 use deps_maven::MavenCentralRegistry;
-use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
 use url::Url;
 
 use crate::formatter::GradleFormatter;
+use crate::parser::GradleParseResult;
 
 #[cfg(feature = "lsp-responses")]
 mod lsp;
@@ -24,7 +24,7 @@ use lsp::{
 #[cfg(feature = "lsp-responses")]
 use lsp::{current_field_start, dsl_declaration_scope, skip_vararg_siblings};
 
-/// [`Ecosystem`] implementation for Gradle (`build.gradle`/`build.gradle.kts`), reusing
+/// [`deps_core::Ecosystem`] implementation for Gradle (`build.gradle`/`build.gradle.kts`), reusing
 /// Maven Central resolution via [`MavenCentralRegistry`].
 pub struct GradleEcosystem {
     registry: Arc<MavenCentralRegistry>,
@@ -97,7 +97,7 @@ impl GradleEcosystem {
     /// [`GradleCompletionContext::Package`], or the whole version literal for
     /// [`GradleCompletionContext::Version`] (the latter is also consumed by
     /// [`deps_core::lsp_helpers::dependency_version_range_is_literal`] at the
-    /// `Version`-arm call site in [`Ecosystem::generate_completions`]) — and is meaningless
+    /// `Version`-arm call site in [`TypedEcosystem::completions`]) — and is meaningless
     /// only when `context_type` is [`GradleCompletionContext::None`].
     ///
     /// `position.character` is a UTF-16 code unit offset (LSP spec) and is converted to a
@@ -170,7 +170,7 @@ impl GradleEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for GradleEcosystem {}
 
-impl Ecosystem for GradleEcosystem {
+impl EcosystemBase for GradleEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::Gradle
     }
@@ -193,43 +193,75 @@ impl Ecosystem for GradleEcosystem {
         &[]
     }
 
-    fn parse_manifest<'a>(
-        &'a self,
-        content: &'a str,
-        uri: &'a Url,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
-        Box::pin(async move {
-            let result =
-                crate::parser::parse_gradle_with_cache(content, uri, &self.properties_cache)?;
-            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
-        })
-    }
-
     fn registry(&self) -> Arc<dyn Registry> {
         self.registry.clone() as Arc<dyn Registry>
     }
 
-    fn formatter(&self) -> &dyn EcosystemFormatter {
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        Some(format!("implementation(\"{}:{latest}\")", name.as_str()))
+    }
+
+    /// Fetches `name`'s (`"group:artifact"`) license at `version` from Maven Central or
+    /// Google Maven (routed per-`groupId`, issue #1479), following one or more `<parent>`
+    /// POM hops when the leaf POM declares no `<licenses>` block of its own (issue
+    /// #660/#688/#692). See `crate::license::fetch_license`.
+    fn fetch_license<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        version: &'a deps_core::ConcreteVersion,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<String>> {
+        Box::pin(crate::license::fetch_license(
+            &self.http_cache,
+            name.as_str(),
+            version.as_str(),
+        ))
+    }
+
+    /// Gradle's Maven Central POM `<licenses><license><name>` is free text, not an SPDX
+    /// identifier — see [`deps_core::LicenseSource::PomFreeText`].
+    fn license_source(&self) -> deps_core::LicenseSource {
+        deps_core::LicenseSource::PomFreeText
+    }
+}
+
+impl TypedEcosystem for GradleEcosystem {
+    type Parsed = GradleParseResult;
+    type Formatter = GradleFormatter;
+
+    fn own_formatter(&self) -> &GradleFormatter {
         &self.formatter
     }
 
-    /// This is a full override, not the shared [`Ecosystem::generate_completions`] default
+    fn parse<'a>(
+        &'a self,
+        content: &'a str,
+        uri: &'a Url,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<GradleParseResult>> {
+        Box::pin(async move {
+            crate::parser::parse_gradle_with_cache(content, uri, &self.properties_cache)
+        })
+    }
+
+    /// This is a full override, not the shared [`TypedEcosystem::completions`] default
     /// dispatch: Gradle routes on its own `GradleCompletionContext` DSL/catalog context
     /// (`Self::detect_completion_context`), detected from raw manifest text rather than
     /// [`deps_core::completion::detect_completion_context`]'s parsed-AST dependency ranges
     /// (see `GradleCompletionContext`'s doc for why that source difference — not a missing
     /// concept — is the actual reason this crate can't reuse the shared dispatch). Opting
     /// out of it means this ecosystem takes on #793's wildcard-match obligation itself; see
-    /// `deps_core::Ecosystem::generate_completions`'s doc.
+    /// `deps_core::TypedEcosystem::completions`'s doc.
     #[cfg(feature = "lsp-responses")]
-    fn generate_completions<'a>(
+    fn completions<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
+        parsed: ParsedView<'a, GradleParseResult>,
         position: Position,
         content: &'a str,
         freshness: deps_core::FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
+            let parse_result: &dyn ParseResultTrait = &parsed;
             let uri = parse_result.uri();
             let (ctx_type, value, range, scope) =
                 Self::detect_completion_context(content, position, uri);
@@ -275,14 +307,14 @@ impl Ecosystem for GradleEcosystem {
         })
     }
 
-    /// Required by [`Ecosystem`]; called only from this crate's own
-    /// [`Self::generate_completions`] override (Gradle does not use the shared default
+    /// Required by [`TypedEcosystem`]; called only from this crate's own
+    /// [`Self::completions`] override (Gradle does not use the shared default
     /// dispatch — see that method's doc), for the `GradleCompletionContext::Version`
     /// DSL/catalog context.
     #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
-        request: deps_core::completion::CompletionRequest<'a>,
+        request: deps_core::completion::CompletionRequest<'a, GradleParseResult>,
         package_name: deps_core::PackageName,
         prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
@@ -292,38 +324,6 @@ impl Ecosystem for GradleEcosystem {
                 .into()
         })
     }
-
-    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
-        let name = metadata.name();
-        let latest = metadata.latest_version().as_str();
-        Some(format!("implementation(\"{}:{latest}\")", name.as_str()))
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    /// Fetches `name`'s (`"group:artifact"`) license at `version` from Maven Central or
-    /// Google Maven (routed per-`groupId`, issue #1479), following one or more `<parent>`
-    /// POM hops when the leaf POM declares no `<licenses>` block of its own (issue
-    /// #660/#688/#692). See `crate::license::fetch_license`.
-    fn fetch_license<'a>(
-        &'a self,
-        name: &'a deps_core::PackageName,
-        version: &'a deps_core::ConcreteVersion,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<String>> {
-        Box::pin(crate::license::fetch_license(
-            &self.http_cache,
-            name.as_str(),
-            version.as_str(),
-        ))
-    }
-
-    /// Gradle's Maven Central POM `<licenses><license><name>` is free text, not an SPDX
-    /// identifier — see [`deps_core::LicenseSource::PomFreeText`].
-    fn license_source(&self) -> deps_core::LicenseSource {
-        deps_core::LicenseSource::PomFreeText
-    }
 }
 
 #[cfg(test)]
@@ -331,6 +331,7 @@ impl Ecosystem for GradleEcosystem {
 #[allow(clippy::string_slice)]
 mod tests {
     use super::*;
+    use std::any::Any;
 
     fn make_cache() -> Arc<deps_core::HttpCache> {
         Arc::new(deps_core::HttpCache::new())
@@ -342,7 +343,7 @@ mod tests {
     /// FR-025's rule is unconditional, one assertion suffices.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_pins_writable_bare_exact_rendering() {
-        let ecosystem = GradleEcosystem::new(make_cache());
+        let ecosystem: Arc<dyn deps_core::Ecosystem> = Arc::new(GradleEcosystem::new(make_cache()));
         let content = "dependencies { implementation \"com.acme:pkg:1.0.0\" }\n".to_string();
         let uri = deps_core::test_util::test_uri("/test/build.gradle");
         let verdict = deps_core::test_util::fallback_edit_outcome(
@@ -439,8 +440,8 @@ dependencies {
         let eco = GradleEcosystem::new(make_cache());
         let content = "dependencies {\n    implementation(\"junit:junit:4.13.2\")\n}\n";
         let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
-        let result = eco.parse_manifest(content, &uri).await.unwrap();
-        assert_eq!(result.dependencies().len(), 1);
+        let result = eco.parse(content, &uri).await.unwrap();
+        assert_eq!(result.dependencies.len(), 1);
     }
 
     #[tokio::test]
@@ -450,8 +451,8 @@ dependencies {
         let eco = GradleEcosystem::new(make_cache());
         let content = "dependencies {\n    implementation 'junit:junit:4.13.2'\n}\n";
         let uri = deps_core::test_util::test_uri("/project/build.gradle");
-        let result = eco.parse_manifest(content, &uri).await.unwrap();
-        assert_eq!(result.dependencies().len(), 1);
+        let result = eco.parse(content, &uri).await.unwrap();
+        assert_eq!(result.dependencies.len(), 1);
     }
 
     #[test]
@@ -1225,7 +1226,7 @@ dependencies {
             let eco = GradleEcosystem::new(make_cache());
             let content = "dependencies { implementation \"io.ktor:ktor-client-core:2.3.0\", \"io.ktor:ktor-client-cio:2.3.0\" }\n";
             let uri = deps_core::test_util::test_uri("/project/build.gradle");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             assert_eq!(
                 parse_result.dependencies().len(),
                 1,
@@ -1244,7 +1245,7 @@ dependencies {
 
             let position = Position::new(0, u32::try_from(col).unwrap());
             let resolved = deps_core::completion::literal_version_dependency_in_scope(
-                parse_result.as_ref(),
+                &parse_result,
                 position,
                 content,
                 range,
@@ -1901,7 +1902,7 @@ dependencies {
             );
         }
 
-        // --- #793 characterization: `GradleEcosystem::generate_completions` keeps its own
+        // --- #793 characterization: `GradleEcosystem::completions` keeps its own
         // full override (crate-local `GradleCompletionContext`-typed DSL/catalog context, out of
         // #793's scope — see the plan), but the "version" arm's body moves into the new required
         // `complete_version` hook. This pins the arm's observable output before that move.
@@ -1922,12 +1923,12 @@ dependencies {
             let eco = GradleEcosystem::new(make_cache());
             let content = "implementation(\"junit:junit:4.13.2\")\n";
             let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             assert!(parse_result.dependencies().is_empty());
 
             let result = eco
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     Position::new(0, 31),
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -1956,15 +1957,15 @@ dependencies {
             let eco = GradleEcosystem::new(make_cache());
             let content = "// no dependency coordinate on this line\n";
             let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
 
             let (ctx, _, _, _) =
                 GradleEcosystem::detect_completion_context(content, Position::new(0, 5), &uri);
             assert_eq!(ctx, GradleCompletionContext::None);
 
             let result = eco
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     Position::new(0, 5),
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -1988,7 +1989,7 @@ dependencies {
             let eco = GradleEcosystem::new(make_cache());
             let content = r#"implementation("junit:junit:4.13.2")"#;
             let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
 
             // Only "j" typed: too short for `complete_package_names_generic` to search the
             // registry, so this stays network-free while still exercising the `Package` arm.
@@ -1998,8 +1999,8 @@ dependencies {
             assert_eq!(value, "j");
 
             let result = eco
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     Position::new(0, 17),
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -2027,7 +2028,7 @@ dependencies {
             let content =
                 "dependencies {\n    implementation(\"com.example:lib:$libVersion\")\n}\n";
             let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let dep = &parse_result.dependencies()[0];
             assert_eq!(
                 dep.version_requirement().map(deps_core::VersionReq::as_str),
@@ -2052,7 +2053,7 @@ dependencies {
             );
 
             let result = eco
-                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             assert_eq!(
                 result,
@@ -2074,7 +2075,7 @@ dependencies {
             let content =
                 "dependencies {\n    implementation 'com.google.guava:guava:32.0.1-jre'\n}\n";
             let uri = deps_core::test_util::test_uri("/project/build.gradle");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let dep = &parse_result.dependencies()[0];
             let position: Position = dep.version_range().unwrap().start.into();
 
@@ -2098,7 +2099,7 @@ dependencies {
             let eco = GradleEcosystem::new(make_cache());
             let content = "[libraries]\ncommons-lang = { module = \"org.apache.commons:commons-lang3\", version = \"3.12.0\" }\n";
             let uri = deps_core::test_util::test_uri("/project/libs.versions.toml");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let dep = &parse_result.dependencies()[0];
             let position: Position = dep.version_range().unwrap().start.into();
 
@@ -2125,7 +2126,7 @@ dependencies {
             let eco = GradleEcosystem::new(make_cache());
             let content = "[versions]\nguavaVersion = \"guavaVersion\"\n\n[libraries]\nguava = { module = \"com.google.guava:guava\", version.ref = \"guavaVersion\" }\n";
             let uri = deps_core::test_util::test_uri("/project/gradle/libs.versions.toml");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let dep = &parse_result.dependencies()[0];
             assert_eq!(
                 dep.version_requirement().map(deps_core::VersionReq::as_str),
@@ -2135,8 +2136,8 @@ dependencies {
             let position: Position = dep.version_range().unwrap().start.into();
 
             let result = eco
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     position,
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -2165,7 +2166,7 @@ dependencies {
                     "[versions]\nguavaVersion = \"32.0.1\"\n\n[libraries]\nguava = {{ module = \"com.google.guava:guava\", version.ref = \"{partial}\" }}\n"
                 );
                 let uri = deps_core::test_util::test_uri("/project/gradle/libs.versions.toml");
-                let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+                let parse_result = eco.parse(&content, &uri).await.unwrap();
                 let dep = &parse_result.dependencies()[0];
                 assert!(
                     dep.version_requirement().is_none(),
@@ -2174,8 +2175,8 @@ dependencies {
                 let position: Position = dep.version_range().unwrap().start.into();
 
                 let result = eco
-                    .generate_completions(
-                        parse_result.as_ref(),
+                    .completions(
+                        ParsedView::new(&parse_result),
                         position,
                         &content,
                         deps_core::FreshnessSettings::default(),
@@ -2201,14 +2202,14 @@ dependencies {
             let eco = GradleEcosystem::new(make_cache());
             let content = "dependencies {\n    implementation(\"junit:junit:4.13.2\")\n}\n";
             let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let dep = &parse_result.dependencies()[0];
             let position: Position = dep.version_range().unwrap().start.into();
             let freshness = deps_core::FreshnessSettings::default();
 
             let direct = eco.complete_versions(dep.name(), "", freshness).await;
             let via_dispatch = eco
-                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             assert_eq!(via_dispatch.items, direct);
         }
@@ -2304,7 +2305,7 @@ dependencies {
             let eco = GradleEcosystem::new(make_cache());
             let content = "dependencies {\n    implementation(\"com.example:foo:1.0.0\"); implementation(\"com.example:bar:2.0.0\")\n}\n";
             let uri = deps_core::test_util::test_uri("/project/build.gradle");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let deps = parse_result.dependencies();
             assert_eq!(
                 deps.len(),
@@ -2336,7 +2337,7 @@ dependencies {
             let eco = GradleEcosystem::new(make_cache());
             let content = "dependencies {\n    implementation(\"com.example:foo:1.0.0\"); implementation(\"com.example:bar:2.0.0\")\n}\n";
             let uri = deps_core::test_util::test_uri("/project/build.gradle");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let deps = parse_result.dependencies();
             assert_eq!(
                 deps.len(),
@@ -2352,7 +2353,7 @@ dependencies {
             };
 
             let resolved = deps_core::completion::literal_version_dependency(
-                parse_result.as_ref(),
+                &parse_result,
                 position,
                 content,
                 dep_two_version_range,
@@ -2377,7 +2378,7 @@ dependencies {
             let content =
                 "[libraries]\nfoo-bar = { version = \"1.0.0\", module = \"com.example:foo\" }\n";
             let uri = deps_core::test_util::test_uri("/project/gradle/libs.versions.toml");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let deps = parse_result.dependencies();
             assert_eq!(
                 deps.len(),
@@ -2396,7 +2397,7 @@ dependencies {
             };
 
             let resolved = deps_core::completion::literal_version_dependency(
-                parse_result.as_ref(),
+                &parse_result,
                 position,
                 content,
                 version_range,
@@ -2418,7 +2419,7 @@ dependencies {
             let eco = GradleEcosystem::new(make_cache());
             let content = "dependencies { implementation(\"com.example:foo:1.0.0\"); println(\"a:b:1.0.0\") }\n";
             let uri = deps_core::test_util::test_uri("/project/build.gradle");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             assert_eq!(
                 parse_result.dependencies().len(),
                 1,
@@ -2437,7 +2438,7 @@ dependencies {
 
             assert!(
                 deps_core::completion::literal_version_dependency_in_scope(
-                    parse_result.as_ref(),
+                    &parse_result,
                     position,
                     content,
                     range,
@@ -2448,7 +2449,7 @@ dependencies {
             );
             assert_eq!(
                 deps_core::completion::literal_version_dependency_in_scope(
-                    parse_result.as_ref(),
+                    &parse_result,
                     position,
                     content,
                     range,
@@ -2472,7 +2473,7 @@ dependencies {
             let eco = GradleEcosystem::new(make_cache());
             let content = "dependencies { implementation(\"com.example:foo:1.0.0\"); implementation(\"org.other:bar:1.0.0";
             let uri = deps_core::test_util::test_uri("/project/build.gradle");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             assert_eq!(
                 parse_result.dependencies().len(),
                 1,
@@ -2489,7 +2490,7 @@ dependencies {
 
             assert_eq!(
                 deps_core::completion::literal_version_dependency_in_scope(
-                    parse_result.as_ref(),
+                    &parse_result,
                     position,
                     content,
                     range,
@@ -2501,7 +2502,7 @@ dependencies {
             );
             assert!(
                 deps_core::completion::literal_version_dependency_in_scope(
-                    parse_result.as_ref(),
+                    &parse_result,
                     position,
                     content,
                     range,
@@ -2523,7 +2524,7 @@ dependencies {
             let eco = GradleEcosystem::new(make_cache());
             let content = "dependencies { implementation(\"com.example:foo: 1.0.0\") }\n";
             let uri = deps_core::test_util::test_uri("/project/build.gradle");
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let deps = parse_result.dependencies();
             assert_eq!(
                 deps.len(),
@@ -2547,7 +2548,7 @@ dependencies {
             );
 
             let resolved = deps_core::completion::literal_version_dependency_in_scope(
-                parse_result.as_ref(),
+                &parse_result,
                 position,
                 content,
                 range,

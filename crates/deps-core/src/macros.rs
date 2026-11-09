@@ -74,10 +74,6 @@ macro_rules! impl_dependency {
             fn source(&self) -> $crate::parser::DependencySource {
                 $crate::parser::DependencySource::Registry
             }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
-            }
         }
     };
     ($type:ty {
@@ -106,10 +102,6 @@ macro_rules! impl_dependency {
 
             fn source(&self) -> $crate::parser::DependencySource {
                 self.$source.clone()
-            }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
             }
         }
     };
@@ -144,10 +136,6 @@ macro_rules! impl_dependency {
 
             fn version_literal(&self) -> Option<&str> {
                 self.$version_literal.as_deref()
-            }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
             }
         }
     };
@@ -619,9 +607,13 @@ macro_rules! impl_parse_result {
             $crate::__impl_parse_result_blocked_registries!($($blocked_registries)?);
 
             $crate::__impl_parse_result_rejected_registries!($($rejected_registries)?);
+        }
 
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
+        impl $crate::typed_boundary::TypedParseResult for $type {
+            type Dep = $dep_type;
+
+            fn own_dependencies(&self) -> &[$dep_type] {
+                &self.$dependencies
             }
         }
     };
@@ -765,9 +757,35 @@ mod tests {
     }
 
     #[derive(Debug, Clone)]
+    struct TestDependencyWithSourceOnly {
+        name: crate::PackageName,
+        name_range: Range,
+        version_req: Option<crate::VersionReq>,
+        version_range: Option<Range>,
+        source: crate::parser::DependencySource,
+    }
+
+    #[derive(Debug, Clone)]
     struct TestVersion {
         version: ConcreteVersion,
         yanked: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestVersionWithDeprecation {
+        version: ConcreteVersion,
+        yanked: bool,
+        published_at: Option<crate::freshness::PublishTime>,
+        deprecation: Option<crate::registry::Deprecation>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestVersionWithLicense {
+        version: ConcreteVersion,
+        yanked: bool,
+        published_at: Option<crate::freshness::PublishTime>,
+        deprecation: Option<crate::registry::Deprecation>,
+        license: Vec<String>,
     }
 
     #[derive(Debug, Clone)]
@@ -812,6 +830,7 @@ mod tests {
         workspace_root: Option<std::path::PathBuf>,
         dependency_truncation: Option<(usize, usize)>,
         blocked_registries: Vec<crate::ecosystem::BlockedRegistryOccurrence>,
+        rejected_registries: Vec<crate::ecosystem::RejectedRegistryOccurrence>,
     }
 
     #[derive(Debug)]
@@ -836,6 +855,33 @@ mod tests {
         version_range: version_range,
         source: source,
         version_literal: version_literal,
+    });
+
+    impl_dependency!(TestDependencyWithSourceOnly {
+        name: name,
+        name_range: name_range,
+        version: version_req,
+        version_range: version_range,
+        source: source,
+    });
+
+    impl_version!(TestVersionWithDeprecation {
+        version: version,
+        status: |v: &TestVersionWithDeprecation| crate::registry::RemovalStatus::from_yanked(
+            v.yanked
+        ),
+        published_at: published_at,
+        prerelease: |_: &TestVersionWithDeprecation| false,
+        deprecation: |v: &TestVersionWithDeprecation| v.deprecation.as_ref(),
+    });
+
+    impl_version!(TestVersionWithLicense {
+        version: version,
+        status: |v: &TestVersionWithLicense| crate::registry::RemovalStatus::from_yanked(v.yanked),
+        published_at: published_at,
+        prerelease: |_: &TestVersionWithLicense| false,
+        deprecation: |v: &TestVersionWithLicense| v.deprecation.as_ref(),
+        license: license,
     });
 
     impl_version!(TestVersion {
@@ -895,6 +941,7 @@ mod tests {
             workspace_root: workspace_root,
             dependency_truncation: dependency_truncation,
             blocked_registries: blocked_registries,
+            rejected_registries: rejected_registries,
         }
     );
 
@@ -924,7 +971,6 @@ mod tests {
             dep.version_requirement().map(crate::VersionReq::as_str),
             Some("1.0.0")
         );
-        assert!(dep.as_any().is::<TestDependency>());
         assert_matches!(dep.source(), crate::parser::DependencySource::Registry);
     }
 
@@ -946,6 +992,49 @@ mod tests {
 
         assert_matches!(dep.source(), crate::parser::DependencySource::Git { .. });
         assert_eq!(dep.version_literal(), Some("v1.0.0"));
+    }
+
+    #[test]
+    fn test_impl_dependency_macro_with_source_only() {
+        use crate::ecosystem::Dependency;
+
+        let dep = TestDependencyWithSourceOnly {
+            name: "test-pkg".into(),
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            source: crate::parser::DependencySource::Path {
+                path: "../local".into(),
+            },
+        };
+
+        assert_matches!(dep.source(), crate::parser::DependencySource::Path { .. });
+        assert_eq!(dep.version_literal(), None);
+    }
+
+    #[test]
+    fn test_impl_version_macro_with_deprecation_and_license() {
+        use crate::registry::Version;
+
+        let deprecated = TestVersionWithDeprecation {
+            version: "1.0.0".into(),
+            yanked: false,
+            published_at: None,
+            deprecation: None,
+        };
+        assert!(deprecated.deprecation().is_none());
+        assert!(!deprecated.is_prerelease());
+        assert!(deprecated.as_any().is::<TestVersionWithDeprecation>());
+
+        let licensed = TestVersionWithLicense {
+            version: "1.0.0".into(),
+            yanked: false,
+            published_at: None,
+            deprecation: None,
+            license: vec!["MIT".to_string()],
+        };
+        assert_eq!(licensed.license(), ["MIT".to_string()]);
+        assert!(licensed.as_any().is::<TestVersionWithLicense>());
     }
 
     #[test]
@@ -1041,6 +1130,7 @@ mod tests {
     #[test]
     fn test_impl_parse_result_macro() {
         use crate::ecosystem::ParseResult;
+        use crate::typed_boundary::TypedParseResult;
 
         let result = TestParseResult {
             dependencies: vec![TestDependency {
@@ -1054,13 +1144,14 @@ mod tests {
 
         assert_eq!(result.dependencies().len(), 1);
         assert!(result.workspace_root().is_none());
-        assert!(result.as_any().is::<TestParseResult>());
+        assert_eq!(result.own_dependencies().len(), 1);
     }
 
     #[test]
     fn test_impl_parse_result_macro_all_optionals() {
         use crate::ecosystem::{BlockedRegistryOccurrence, ParseResult};
         use crate::net_policy::HostClass;
+        use crate::typed_boundary::TypedParseResult;
 
         let result = TestParseResultAllOptionals {
             dependencies: vec![TestDependency {
@@ -1078,8 +1169,15 @@ mod tests {
                 raw_value: "registry".into(),
                 declaration_key: "key".into(),
             }],
+            rejected_registries: vec![crate::ecosystem::RejectedRegistryOccurrence {
+                range: Range::default(),
+                reason: crate::net_policy::RegistryRejectionReason::InvalidUrl,
+                raw_value: "not-a-url".into(),
+                declaration_key: "rejected".into(),
+            }],
         };
 
+        assert_eq!(result.rejected_registries().len(), 1);
         assert_eq!(result.dependencies().len(), 1);
         assert_eq!(
             result.workspace_root(),
@@ -1087,13 +1185,14 @@ mod tests {
         );
         assert_eq!(result.dependency_truncation(), Some((5, 10)));
         assert_eq!(result.blocked_registries().len(), 1);
-        assert!(result.as_any().is::<TestParseResultAllOptionals>());
+        assert_eq!(result.own_dependencies().len(), 1);
     }
 
     #[test]
     fn test_impl_parse_result_macro_truncation_and_blocked_registries() {
         use crate::ecosystem::{BlockedRegistryOccurrence, ParseResult};
         use crate::net_policy::HostClass;
+        use crate::typed_boundary::TypedParseResult;
 
         let result = TestParseResultTruncationAndBlockedRegistries {
             dependencies: vec![],
@@ -1110,10 +1209,6 @@ mod tests {
         assert!(result.workspace_root().is_none());
         assert_eq!(result.dependency_truncation(), Some((3, 7)));
         assert_eq!(result.blocked_registries().len(), 1);
-        assert!(
-            result
-                .as_any()
-                .is::<TestParseResultTruncationAndBlockedRegistries>()
-        );
+        assert!(result.own_dependencies().is_empty());
     }
 }

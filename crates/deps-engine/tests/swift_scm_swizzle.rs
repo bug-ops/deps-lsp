@@ -15,9 +15,7 @@ use std::time::Duration;
 
 use deps_core::config_trust::OperatorPath;
 use deps_core::diagnostic::DiagnosticKind;
-use deps_core::lsp_helpers::{
-    DiagnosticSeverities, LatestVerdict, PackageVersions, VersionData, latest_verdict,
-};
+use deps_core::lsp_helpers::{DiagnosticSeverities, LatestVerdict, PackageVersions, VersionData};
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::osv::{
     LatestStatusMap, OsvClient, ScanOutcome, StructuralSkipReason, UpgradeStatus, vuln_key_for,
@@ -25,7 +23,7 @@ use deps_core::osv::{
 use deps_core::policy_config::{FetchConcurrency, FetchTimeout, ScmToRegistry};
 use deps_core::{
     ConcreteVersion, Ecosystem, EcosystemId, FreshnessSettings, HttpCache, LicensePolicy,
-    NetworkMode, NormalizedName, PackageKey, PublishTime,
+    NetworkMode, NormalizedName, PackageKey,
 };
 use deps_engine::classify::license::prefetch_tier3_licenses;
 use deps_engine::classify::osv::build_scan_targets;
@@ -105,13 +103,8 @@ async fn swapped_dependency_keeps_osv_target_and_license_policy_findings() {
     let resolved = HashMap::from([(key.clone(), ConcreteVersion::from("2.65.0"))]);
     let candidates = HashMap::new();
 
-    let (targets, skipped) = build_scan_targets(
-        parsed.as_ref(),
-        &resolved,
-        &candidates,
-        setup.ecosystem.formatter(),
-        EcosystemId::Swift,
-    );
+    let (targets, skipped) =
+        build_scan_targets(parsed.as_ref(), &resolved, &candidates, EcosystemId::Swift);
     assert!(
         skipped.is_empty(),
         "swapped dependency must stay scannable: {skipped:?}"
@@ -141,17 +134,16 @@ async fn swapped_dependency_keeps_osv_target_and_license_policy_findings() {
     );
 
     let cached = HashMap::from([(key, PackageVersions::latest_only("2.65.0"))]);
-    let diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
-        parsed.as_ref(),
-        VersionData::new(&cached, &resolved)
-            .with_license_prefetch(&fetched.licenses)
-            .with_license_policy(&policy),
-        setup.ecosystem.formatter(),
-        &setup.uri,
-        FreshnessSettings::default(),
-        DiagnosticSeverities::default(),
-        PublishTime::now(),
-    );
+    let diagnostics = parsed
+        .generate_diagnostics(
+            VersionData::new(&cached, &resolved)
+                .with_license_prefetch(&fetched.licenses)
+                .with_license_policy(&policy),
+            &setup.uri,
+            FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        )
+        .await;
     assert!(
         diagnostics
             .iter()
@@ -231,13 +223,8 @@ async fn the_same_advisory_matches_before_and_after_the_swap() {
         } else {
             resolved.clone()
         };
-        let (targets, _) = build_scan_targets(
-            parsed.as_ref(),
-            &resolved,
-            &candidates,
-            setup.ecosystem.formatter(),
-            EcosystemId::Swift,
-        );
+        let (targets, _) =
+            build_scan_targets(parsed.as_ref(), &resolved, &candidates, EcosystemId::Swift);
         assert_eq!(targets.len(), 1, "{mode:?}");
         assert_eq!(
             targets[0].osv_name.name().as_str(),
@@ -286,7 +273,11 @@ async fn a_swapped_dependency_is_unverified_until_phase_b_answers() {
     let package_key = PackageKey::new(dep.name(), formatter);
     let vuln_key = vuln_key_for(dep, None, formatter);
     let verdict = |map: &LatestStatusMap| {
-        latest_verdict(Some(map), dep, None, &package_key, "2.65.0", formatter)
+        let mut verdict = None;
+        parsed.for_each_formatted_dependency(&mut |bound| {
+            verdict = Some(bound.latest_verdict(Some(map), None, &package_key, "2.65.0"));
+        });
+        verdict.unwrap()
     };
 
     assert_eq!(verdict(&LatestStatusMap::new()), LatestVerdict::Unverified);

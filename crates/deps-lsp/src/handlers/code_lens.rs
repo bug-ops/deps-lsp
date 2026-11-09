@@ -60,7 +60,7 @@ pub async fn handle_code_lens(
 
     // Release the DashMap shard `Ref` before awaiting (#333): `with_document` only hands
     // `extract` a borrowed `&DocumentState` synchronously, so it can't leak across the await below.
-    let Some((ecosystem, ecosystem_id, parse_result, content, snapshot)) = state
+    let Some((ecosystem, ecosystem_id, manifest, content, snapshot)) = state
         .with_document(uri, |doc| {
             let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
 
@@ -71,7 +71,7 @@ pub async fn handle_code_lens(
                 return None;
             }
 
-            let parse_result = doc.parse_result_arc()?;
+            let manifest = doc.manifest_arc()?;
             let snapshot = doc
                 .signals
                 .snapshot()
@@ -81,7 +81,7 @@ pub async fn handle_code_lens(
             Some((
                 ecosystem,
                 doc.ecosystem,
-                parse_result,
+                manifest,
                 doc.content.clone(),
                 snapshot,
             ))
@@ -105,23 +105,15 @@ pub async fn handle_code_lens(
         .version_data()
         .with_network(network)
         .with_ecosystem(ecosystem_id);
-    let mut lenses = ecosystem
-        .generate_code_lenses(
-            parse_result.as_ref(),
-            &content,
-            versions,
-            &domain_uri,
-            COMMAND_ID,
-        )
+    let mut lenses = manifest
+        .generate_code_lenses(&content, versions, &domain_uri, COMMAND_ID)
         .await;
 
     // M4 (#640): the bulk pin-to-SHA lens lives here, not in an ecosystem override, so no
     // override can silently drop it. Same on/off toggle as the pin diagnostic (#633): a
     // lens is permanently rendered, so disabling the flag must suppress it too.
     if severities.mutable_ref_pin_enabled {
-        let count = ecosystem
-            .collect_pin_all_to_sha_edits(parse_result.as_ref(), versions)
-            .len();
+        let count = manifest.collect_pin_all_to_sha_edits(versions).len();
         lenses.extend(deps_core::lsp_helpers::build_pin_all_to_sha_lens(
             count,
             ecosystem.pin_all_to_sha_noun(),
@@ -204,27 +196,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_document_write_not_blocked_by_in_flight_code_lens() {
         use crate::document::DocumentState;
-        use crate::test_utils::blocking_ecosystem::{
-            BlockingEcosystem, BlockingHook, MockParseResult,
-        };
-        use deps_core::ParseResult;
+        use crate::test_utils::blocking_ecosystem::{BlockingEcosystem, BlockingHook};
+
         use tokio::sync::Barrier;
 
         let state = Arc::new(ServerState::new());
         let started = Arc::new(Barrier::new(2));
-        state
-            .ecosystem_registry
-            .register(Arc::new(BlockingEcosystem {
-                started: Arc::clone(&started),
-                hook: BlockingHook::CodeLenses,
-            }));
+        let blocking = Arc::new(BlockingEcosystem {
+            started: Arc::clone(&started),
+            hook: BlockingHook::CodeLenses,
+        });
+        state.ecosystem_registry.register(blocking.clone());
 
         let url = deps_core::test_util::test_uri("/test/Cargo.toml");
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
         let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url.clone() });
-        let mut doc =
-            DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+        let manifest = blocking.manifest(&url);
+        let mut doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, manifest);
         doc.set_version(Some(1));
         state.update_document(uri.clone(), doc);
 
@@ -285,7 +273,7 @@ mod tests {
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(
                     content,
                     &crate::lsp_types_interop::from_lsp_uri(uri).unwrap(),
@@ -571,7 +559,7 @@ mod tests {
             feature = "github-actions"
         ))]
         async fn assert_single_edit_produces_valid_declaration(
-            ecosystem: &dyn deps_core::Ecosystem,
+            ecosystem: &Arc<dyn deps_core::Ecosystem>,
             uri: &url::Url,
             content: &str,
             cached: HashMap<deps_core::NormalizedName, deps_core::PackageVersions>,
@@ -580,17 +568,13 @@ mod tests {
             // Held per fs_probe::snapshot_guard's doc: several ecosystems under test here
             // touch fs_probe, and this helper shares a binary with document/loader.rs's diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(ecosystem)
                 .parse_manifest(content, uri)
                 .await
                 .expect("fixture must parse");
             let resolved = HashMap::new();
-            let edits = deps_core::collect_update_all_edits(
-                parse_result.as_ref(),
-                content,
-                deps_core::VersionData::new(&cached, &resolved),
-                ecosystem.formatter(),
-            );
+            let edits = parse_result
+                .collect_update_all_edits(content, deps_core::VersionData::new(&cached, &resolved));
             assert_eq!(edits.len(), 1, "expected exactly one edit for this fixture");
 
             let new_content = apply_single_edit(content, &edits[0]);
@@ -598,7 +582,7 @@ mod tests {
                 new_content.contains(expected_fragment),
                 "resulting text should contain {expected_fragment:?}, got: {new_content}"
             );
-            ecosystem
+            Arc::clone(ecosystem)
                 .parse_manifest(&new_content, uri)
                 .await
                 .unwrap_or_else(|e| panic!("resulting text failed to re-parse: {e}"));
@@ -612,7 +596,7 @@ mod tests {
             feature = "github-actions"
         ))]
         async fn assert_guard_skips(
-            ecosystem: &dyn deps_core::Ecosystem,
+            ecosystem: &Arc<dyn deps_core::Ecosystem>,
             uri: &url::Url,
             content: &str,
             cached: HashMap<deps_core::NormalizedName, deps_core::PackageVersions>,
@@ -620,17 +604,13 @@ mod tests {
             // See the comment in `assert_single_edit_produces_valid_declaration` on why
             // this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(ecosystem)
                 .parse_manifest(content, uri)
                 .await
                 .expect("fixture must parse");
             let resolved = HashMap::new();
-            let edits = deps_core::collect_update_all_edits(
-                parse_result.as_ref(),
-                content,
-                deps_core::VersionData::new(&cached, &resolved),
-                ecosystem.formatter(),
-            );
+            let edits = parse_result
+                .collect_update_all_edits(content, deps_core::VersionData::new(&cached, &resolved));
             assert!(
                 edits.is_empty(),
                 "expected the literal-span guard to skip this dependency"
@@ -654,7 +634,7 @@ mod tests {
             );
 
             assert_single_edit_produces_valid_declaration(
-                ecosystem.as_ref(),
+                &ecosystem,
                 &uri,
                 content,
                 cached,
@@ -680,7 +660,7 @@ mod tests {
             );
 
             assert_single_edit_produces_valid_declaration(
-                ecosystem.as_ref(),
+                &ecosystem,
                 &uri,
                 content,
                 cached,
@@ -708,7 +688,7 @@ mod tests {
             );
 
             assert_single_edit_produces_valid_declaration(
-                ecosystem.as_ref(),
+                &ecosystem,
                 &uri,
                 content,
                 cached,
@@ -735,7 +715,7 @@ mod tests {
             );
 
             assert_single_edit_produces_valid_declaration(
-                ecosystem.as_ref(),
+                &ecosystem,
                 &uri,
                 content,
                 cached,
@@ -762,7 +742,7 @@ mod tests {
             );
 
             assert_single_edit_produces_valid_declaration(
-                ecosystem.as_ref(),
+                &ecosystem,
                 &uri,
                 content,
                 cached,
@@ -788,7 +768,7 @@ mod tests {
             );
 
             assert_single_edit_produces_valid_declaration(
-                ecosystem.as_ref(),
+                &ecosystem,
                 &uri,
                 content,
                 cached,
@@ -814,7 +794,7 @@ mod tests {
             );
 
             assert_single_edit_produces_valid_declaration(
-                ecosystem.as_ref(),
+                &ecosystem,
                 &uri,
                 content,
                 cached,
@@ -840,7 +820,7 @@ mod tests {
             );
 
             assert_single_edit_produces_valid_declaration(
-                ecosystem.as_ref(),
+                &ecosystem,
                 &uri,
                 content,
                 cached,
@@ -875,7 +855,7 @@ mod tests {
             );
 
             assert_single_edit_produces_valid_declaration(
-                ecosystem.as_ref(),
+                &ecosystem,
                 &uri,
                 content,
                 cached,
@@ -912,7 +892,7 @@ mod tests {
                 PackageVersions::latest_only("2.1.0"),
             );
 
-            assert_guard_skips(ecosystem.as_ref(), &uri, content, cached).await;
+            assert_guard_skips(&ecosystem, &uri, content, cached).await;
         }
 
         #[cfg(feature = "gradle")]
@@ -943,7 +923,7 @@ mod tests {
                 PackageVersions::latest_only("2.2.0"),
             );
 
-            assert_guard_skips(ecosystem.as_ref(), &uri, content, cached).await;
+            assert_guard_skips(&ecosystem, &uri, content, cached).await;
         }
 
         #[cfg(feature = "gradle")]
@@ -962,7 +942,7 @@ mod tests {
                 PackageVersions::latest_only("3.3.0"),
             );
 
-            assert_guard_skips(ecosystem.as_ref(), &uri, content, cached).await;
+            assert_guard_skips(&ecosystem, &uri, content, cached).await;
         }
 
         #[cfg(feature = "swift")]
@@ -991,11 +971,7 @@ let package = Package(
             );
 
             assert_single_edit_produces_valid_declaration(
-                ecosystem.as_ref(),
-                &uri,
-                content,
-                cached,
-                "3.0.0",
+                &ecosystem, &uri, content, cached, "3.0.0",
             )
             .await;
         }
@@ -1029,7 +1005,7 @@ let package = Package(
                     PackageVersions::latest_only("3.5.0"),
                 );
 
-                assert_guard_skips(ecosystem.as_ref(), &uri, content, cached).await;
+                assert_guard_skips(&ecosystem, &uri, content, cached).await;
             }
         }
 
@@ -1050,11 +1026,7 @@ let package = Package(
             );
 
             assert_single_edit_produces_valid_declaration(
-                ecosystem.as_ref(),
-                &uri,
-                content,
-                cached,
-                "v4.3.0",
+                &ecosystem, &uri, content, cached, "v4.3.0",
             )
             .await;
         }
@@ -1080,7 +1052,7 @@ let package = Package(
             );
 
             assert_single_edit_produces_valid_declaration(
-                ecosystem.as_ref(),
+                &ecosystem,
                 &uri,
                 &content,
                 cached,
@@ -1119,7 +1091,7 @@ let package = Package(
             );
 
             assert_single_edit_produces_valid_declaration(
-                ecosystem.as_ref(),
+                &ecosystem,
                 &uri,
                 &content,
                 cached,
@@ -1150,7 +1122,7 @@ let package = Package(
                 PackageVersions::latest_only("v4.3.0"),
             );
 
-            assert_guard_skips(ecosystem.as_ref(), &uri, &content, cached).await;
+            assert_guard_skips(&ecosystem, &uri, &content, cached).await;
         }
 
         /// (C′) test split, issue #640: migrated from
@@ -1177,7 +1149,10 @@ let package = Package(
                 "v4",
                 &"a".repeat(40),
             );
-            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(&content, &url)
+                .await
+                .unwrap();
             let mut doc_state = crate::document::DocumentState::new_from_parse_result(
                 deps_core::EcosystemId::GithubActions,
                 content.clone(),
@@ -1224,7 +1199,10 @@ let package = Package(
                 "v3",
                 &"a".repeat(40),
             );
-            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(&content, &url)
+                .await
+                .unwrap();
             let mut doc_state = crate::document::DocumentState::new_from_parse_result(
                 deps_core::EcosystemId::GithubActions,
                 content.clone(),

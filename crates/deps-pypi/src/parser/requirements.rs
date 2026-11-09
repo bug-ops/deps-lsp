@@ -87,7 +87,7 @@ impl PypiParser {
     /// `require_strong_signal` drops that ratio-based arm entirely, requiring
     /// the strong-signal check alone. Set this when the caller routed to this
     /// parser via a weaker signal than a basename match — PyPI's
-    /// `requirements/*.txt` [`Ecosystem::manifest_directory_patterns`](deps_core::Ecosystem::manifest_directory_patterns)
+    /// `requirements/*.txt` [`EcosystemBase::manifest_directory_patterns`](deps_core::EcosystemBase::manifest_directory_patterns)
     /// fallback matches *every* `.txt` file under a directory literally named
     /// `requirements/`, including requirements-engineering docs folders with
     /// no relation to Python; without this, prose lines that happen to parse

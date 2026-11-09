@@ -2699,7 +2699,6 @@ gem 'rails', '~> 7.0'";
 
         assert_eq!(result.dependencies().len(), 1);
         assert!(result.workspace_root().is_none());
-        assert!(result.as_any().is::<BundlerParseResult>());
     }
 
     #[test]

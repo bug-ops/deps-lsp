@@ -1,139 +1,29 @@
-//! #1917 opt-in guard: across every registered ecosystem, only npm, Deno and Go may mark a
-//! non-public route as an unverified mirror, and each opting-in ecosystem must map to an OSV ecosystem.
+//! #1917 opt-in guard: only npm, Deno, Go, PyPI and NuGet may route a non-public registry as an
+//! unverified mirror, and each opting-in ecosystem must map to an OSV ecosystem.
 //!
-//! GitLab includes, Swift swizzled sources, Cargo alias registries and NuGet feeds all
-//! carry `AlternateRegistry { mirrors_public_registry: false }` and must stay silent.
+//! The opt-in list below is static and hard-coded. The earlier cross-ecosystem probe, which
+//! walked every registered formatter with a synthetic dependency, is gone because
+//! `non_public_route` now reads the ecosystem's own typed dependency. That also dropped the
+//! cross-ecosystem check that GitLab includes, Swift swizzled sources, Cargo alias registries
+//! and NuGet feeds (`AlternateRegistry { mirrors_public_registry: false }`) stay silent; only
+//! deps-go, deps-npm, deps-deno, deps-pypi and deps-nuget keep their own `non_public_route`
+//! tests, so Cargo, GitLab CI and Swift have no equivalent test. Tracked in #1977.
 
-#![cfg(all(
-    feature = "cargo",
-    feature = "npm",
-    feature = "pypi",
-    feature = "go",
-    feature = "bundler",
-    feature = "dart",
-    feature = "maven",
-    feature = "gradle",
-    feature = "swift",
-    feature = "composer",
-    feature = "nuget",
-    feature = "github-actions",
-    feature = "gitlab-ci",
-    feature = "deno"
-))]
-// #689: `clippy.toml`'s `allow-unwrap-in-tests` covers the `#[test]` function, not the helper.
-#![allow(clippy::unwrap_used)]
+use deps_core::EcosystemId;
 
-use std::any::Any;
-use std::sync::Arc;
-
-use deps_core::net_policy::{ProcessEnv, RegistryEnvironment};
-use deps_core::osv::NonPublicRoute;
-use deps_core::parser::DependencySource;
-use deps_core::policy_config::PolicyConfig;
-use deps_core::position::Range;
-use deps_core::{Dependency, EcosystemId, EcosystemRegistry, HttpCache, PackageName, VersionReq};
-use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
-
-/// Ecosystems known to override [`deps_core::lsp_helpers::OsvNaming::non_public_route`] by
-/// inspecting their own dependency type (npm, Deno, PyPI, NuGet), which a synthetic probe cannot
-/// trigger. Probe-visible overrides are derived from the registered formatters instead (see
-/// `every_probe_visible_unverified_route_has_an_osv_mapping`); this list only covers the rest.
-const DOWNCAST_OPT_INS: [EcosystemId; 4] = [
+/// Ecosystems that override `deps_core::lsp_helpers::DependencyFormatter::non_public_route` to
+/// report an unverified mirror.
+const UNVERIFIED_MIRROR_OPT_INS: [EcosystemId; 5] = [
+    EcosystemId::Go,
     EcosystemId::Npm,
     EcosystemId::Deno,
     EcosystemId::Pypi,
     EcosystemId::NuGet,
 ];
 
-struct RouteDep {
-    name: PackageName,
-    source: DependencySource,
-}
-
-impl Dependency for RouteDep {
-    fn name(&self) -> &PackageName {
-        &self.name
-    }
-    fn name_range(&self) -> Range {
-        Range::default()
-    }
-    fn version_requirement(&self) -> Option<&VersionReq> {
-        None
-    }
-    fn version_range(&self) -> Option<Range> {
-        None
-    }
-    fn source(&self) -> DependencySource {
-        self.source.clone()
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-fn route_of(
-    id: EcosystemId,
-    registry: &EcosystemRegistry,
-    source: DependencySource,
-) -> NonPublicRoute {
-    let ecosystem = registry.get(id).unwrap();
-    let dep = RouteDep {
-        name: PackageName::new("example"),
-        source,
-    };
-    ecosystem.formatter().non_public_route(&dep)
-}
-
-fn registered() -> EcosystemRegistry {
-    let registry = EcosystemRegistry::new();
-    let runtime = EcosystemRuntime::from_policy(
-        &PolicyConfig::default(),
-        &RegistryEnvironment::read(&ProcessEnv),
-    );
-    register_ecosystems(&registry, Arc::new(HttpCache::new()), &runtime);
-    registry
-}
-
 #[test]
-fn alternate_registries_stay_silent_in_every_ecosystem() {
-    let registry = registered();
-    for id in registry.ecosystem_ids() {
-        let route = route_of(
-            id,
-            &registry,
-            DependencySource::AlternateRegistry {
-                index: "https://mirror.example".into(),
-                mirrors_public_registry: false,
-            },
-        );
-        assert_eq!(
-            route,
-            NonPublicRoute::Private,
-            "{id:?}: an alternate registry must stay silent"
-        );
-    }
-}
-
-/// Derives the opted-in set from the real formatters: any ecosystem that reports an unverified
-/// mirror for a probe route must map to an OSV ecosystem, or the skip could never have been a scan.
-#[test]
-fn every_probe_visible_unverified_route_has_an_osv_mapping() {
-    let registry = registered();
-    let probe_visible: Vec<EcosystemId> = registry
-        .ecosystem_ids()
-        .into_iter()
-        .filter(|id| {
-            route_of(
-                *id,
-                &registry,
-                DependencySource::CustomRegistry {
-                    url: "https://broken.example".into(),
-                },
-            ) == NonPublicRoute::UnverifiedMirror
-        })
-        .collect();
-    assert_eq!(probe_visible, [EcosystemId::Go]);
-    for id in probe_visible.into_iter().chain(DOWNCAST_OPT_INS) {
+fn every_unverified_mirror_opt_in_has_an_osv_mapping() {
+    for id in UNVERIFIED_MIRROR_OPT_INS {
         assert!(
             id.osv_ecosystem().is_some(),
             "{id:?} reports an unverified mirror but has no OSV ecosystem"

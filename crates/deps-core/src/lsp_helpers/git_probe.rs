@@ -2,7 +2,7 @@
 //! probes gather, and the bounded stores diagnostics read it from.
 //!
 //! Diagnostics generation stays synchronous and network-free. A probe runs in a spawned task
-//! (see [`Ecosystem::background_probes`](crate::Ecosystem::background_probes)), stores only
+//! (see [`TypedEcosystem::probes`](crate::TypedEcosystem::probes)), stores only
 //! authoritative answers here, and reports whether anything changed through a [`ProbeReport`].
 //! Specs 086 (branch evidence) and 087 (commit lineage and default-branch membership) share
 //! this infrastructure; an inconclusive answer (rate limit, 5xx, timeout, overflow) is never
@@ -144,7 +144,7 @@ pub enum ProbePhase {
     PostFetch,
 }
 
-/// The outcome of one [`Ecosystem::background_probes`](crate::Ecosystem::background_probes)
+/// The outcome of one [`TypedEcosystem::probes`](crate::TypedEcosystem::probes)
 /// pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ProbeReport {
@@ -657,7 +657,7 @@ impl AheadProof {
 /// An extra, provenance-explaining line of a dependency's hover.
 ///
 /// Returned by
-/// [`PackageRendering::hover_provenance`](super::PackageRendering::hover_provenance). The
+/// [`DependencyFormatter::hover_provenance`](super::DependencyFormatter::hover_provenance). The
 /// variants are exhaustive and carry typed fields, which the hover renderer sanitizes; an
 /// ecosystem never supplies markdown.
 #[derive(Debug, Clone, PartialEq, Eq)]

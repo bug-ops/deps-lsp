@@ -136,7 +136,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
         DepSources,
         HashSet<NormalizedName>,
     ) = match state.get_document(uri) {
-        Some(doc) => match doc.parse_result() {
+        Some(doc) => match doc.manifest() {
             Some(pr) => {
                 let mut prep = prepare_fetch(
                     pr,
@@ -476,7 +476,7 @@ dependencies = ["requests>=2.0.0"]
                 .for_uri(&url)
                 .expect("pypi ecosystem not found");
 
-            let parse_result = ecosystem.parse_manifest(content, &url).await;
+            let parse_result = Arc::clone(&ecosystem).parse_manifest(content, &url).await;
             assert!(parse_result.is_ok());
 
             let doc_state = DocumentState::new_from_parse_result(
@@ -615,7 +615,7 @@ dependencies = ["requests>=2.0.0"]
                 .expect("pypi ecosystem not found");
             let formatter = ecosystem.formatter();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("a single Poetry table-key dependency must parse");
@@ -639,7 +639,6 @@ dependencies = ["requests>=2.0.0"]
                 parse_result.as_ref(),
                 &resolved_versions,
                 &HashMap::new(),
-                formatter,
                 EcosystemId::Pypi,
             );
             // Sanity check on the fix this guard exists for: the pep440
@@ -682,17 +681,23 @@ dependencies = ["requests>=2.0.0"]
             doc_state.replace_outcomes(outcomes);
             state.update_document(uri.clone(), doc_state);
 
-            let doc = state.get_document(&uri).unwrap();
-            let diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
-                doc.parse_result().unwrap(),
-                VersionData::new(&doc.signals.cached_versions, &doc.signals.resolved_versions)
-                    .with_outcomes(&doc.signals.outcomes),
-                formatter,
-                &url,
-                deps_core::freshness::FreshnessSettings::default(),
-                DiagnosticSeverities::default(),
-                deps_core::PublishTime::now(),
-            );
+            let (manifest, cached_versions, resolved_versions, outcomes) = {
+                let doc = state.get_document(&uri).unwrap();
+                (
+                    doc.manifest_arc().unwrap(),
+                    doc.signals.cached_versions.clone(),
+                    doc.signals.resolved_versions.clone(),
+                    doc.signals.outcomes.clone(),
+                )
+            };
+            let diagnostics = manifest
+                .generate_diagnostics(
+                    VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
+                    &url,
+                    deps_core::freshness::FreshnessSettings::default(),
+                    DiagnosticSeverities::default(),
+                )
+                .await;
 
             (diagnostics, yanked_versions)
         }

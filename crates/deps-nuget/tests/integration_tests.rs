@@ -166,5 +166,4 @@ fn test_parse_result_trait() {
 
     assert_eq!(result.dependencies().len(), 2);
     assert!(result.workspace_root().is_none());
-    assert!(result.as_any().is::<deps_nuget::NuGetParseResult>());
 }

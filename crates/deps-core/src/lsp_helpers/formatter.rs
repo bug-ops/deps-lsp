@@ -113,11 +113,11 @@ impl<T: PackageNaming + ?Sized> NormalizeName for T {
 /// already passed the workspace's shared safety gates
 /// ([`crate::is_safe_version_string`], [`crate::is_safe_package_name`]). Callers may assume the
 /// replacement-preserving methods ([`format_version_replacing`](Self::format_version_replacing),
-/// [`format_version_replacing_for`](Self::format_version_replacing_for)) never change a
+/// [`format_version_replacing_for`](DependencyFormatter::format_version_replacing_for)) never change a
 /// requirement's semantics unless the ecosystem has explicitly opted in to that transformation.
 ///
 /// Since #1391, implementors of [`format_version_replacing`](Self::format_version_replacing)/
-/// [`format_version_replacing_for`](Self::format_version_replacing_for) need not guard against
+/// [`format_version_replacing_for`](DependencyFormatter::format_version_replacing_for) need not guard against
 /// an unexpanded placeholder themselves: [`crate::edit::replacement_text`] is the only
 /// production path that calls into either method, and it never does so once
 /// [`RequirementResolution::bounded_requirement_is_placeholder`]
@@ -166,50 +166,6 @@ pub trait PackageRendering: Send + Sync {
     ) -> Option<String> {
         let _ = current;
         self.format_version_exact_pin(version)
-    }
-
-    /// Like [`format_version_replacing`](Self::format_version_replacing), but also
-    /// carries the dependency identity `version`/`current` apply to.
-    ///
-    /// Default: ignores `dep`, delegating to
-    /// [`format_version_replacing`](Self::format_version_replacing). Override when the
-    /// replacement text cannot be derived from `version`/`current` alone — e.g.
-    /// `deps-github-actions`'s SHA-pinned `uses: owner/repo@<sha> # vX.Y.Z` form, where
-    /// the new SHA for a given tag is looked up per `dep.name()` (a tag's commit SHA is
-    /// per-repository, unknowable from the tag string alone) in a registry-populated
-    /// index the formatter holds a shared handle to.
-    ///
-    /// Every shared call site that builds a version-update edit (the vulnerability and
-    /// unsatisfiable-requirement quickfixes, the REFACTOR-loop "update to X" actions, and
-    /// the "Update N outdated dependencies" code lens) already has `dep` in scope and
-    /// calls this method instead of [`format_version_replacing`](Self::format_version_replacing)
-    /// directly, so an override here is picked up on every edit path at once.
-    fn format_version_replacing_for(
-        &self,
-        _dep: &dyn Dependency,
-        version: &ConcreteVersion,
-        current: &str,
-    ) -> String {
-        self.format_version_replacing(version, current)
-    }
-
-    /// Like [`format_version_replacing_for`](Self::format_version_replacing_for), but for a
-    /// version that is a security or cooldown-fallback *target*: the rendering must never lower
-    /// the requirement's floor below `version`, because the target was chosen to exclude older
-    /// affected releases.
-    ///
-    /// Default: delegates to [`format_version_replacing_for`](Self::format_version_replacing_for)
-    /// -- correct wherever the plain rewrite already keeps the floor at `version` (every
-    /// operator-preserving or exact rendering). Override only where the plain rewrite may
-    /// widen downward, as npm and Deno do for a bare partial requirement (`3` -> `4` would
-    /// admit `4.0.0`).
-    fn format_version_replacing_floor_for(
-        &self,
-        dep: &dyn Dependency,
-        version: &ConcreteVersion,
-        current: &str,
-    ) -> String {
-        self.format_version_replacing_for(dep, version, current)
     }
 
     /// Adjusts a candidate version's presentation before a completion item's
@@ -287,25 +243,6 @@ pub trait PackageRendering: Send + Sync {
     /// ```
     fn suppress_package_url(&self, source: &crate::parser::DependencySource) -> bool {
         !matches!(source, crate::parser::DependencySource::Registry)
-    }
-
-    /// An extra line explaining where `dep`'s data comes from, shown in its hover (a SHA pin
-    /// proven newer than the latest release, a source dependency served by a registry
-    /// identity).
-    ///
-    /// Default: `None`, no extra line.
-    fn hover_provenance(
-        &self,
-        dep: &dyn Dependency,
-    ) -> Option<crate::lsp_helpers::HoverProvenance> {
-        let _ = dep;
-        None
-    }
-
-    /// Detect if cursor position is on a dependency for code actions.
-    fn is_position_on_dependency(&self, dep: &dyn Dependency, position: Position) -> bool {
-        dep.version_range()
-            .is_some_and(|r| position_in_range(position, r))
     }
 }
 
@@ -1922,7 +1859,7 @@ pub trait RequirementResolution: Send + Sync {
     /// [`compile_bounded_requirement`](Self::compile_bounded_requirement), and
     /// [`version_satisfies_bounded_requirement`](Self::version_satisfies_bounded_requirement) — and, since
     /// #1391, need not guard [`format_version_replacing`](PackageRendering::format_version_replacing)/
-    /// [`format_version_replacing_for`](PackageRendering::format_version_replacing_for) at all:
+    /// [`format_version_replacing_for`](DependencyFormatter::format_version_replacing_for) at all:
     /// [`crate::edit::replacement_text`] is the only production path that ever calls into
     /// those methods, and it never does so once this predicate says `true`.
     ///
@@ -1994,31 +1931,6 @@ pub trait RequirementResolution: Send + Sync {
         } else {
             RequirementStatus::Outdated
         }
-    }
-
-    /// Like [`classify_requirement_status`](Self::classify_requirement_status), but also hands
-    /// the ecosystem the dependency itself — for an ecosystem whose requirement *text* alone is
-    /// ambiguous between two shapes with different resolution rules, and which already computed
-    /// the disambiguating classification once, at parse time, onto the dependency
-    /// (`deps-gitlab-ci`'s `PinStyle`, #466 review M-c: a bare `"1.2"` is `Partial` under its
-    /// `component:` pin grammar but `Branch` under its simpler `project:` ref grammar —
-    /// indistinguishable from the text alone).
-    ///
-    /// Default: forwards to [`classify_requirement_status`](Self::classify_requirement_status),
-    /// ignoring `dep` — every other ecosystem's requirement text alone is unambiguous, so this
-    /// is a no-op for them. Callers that already have `dep` in hand (the diagnostic pipeline's
-    /// outdated rule) call [`RequirementGate::requirement_status_for`] instead of
-    /// [`RequirementGate::requirement_status`] directly, mirroring
-    /// `Registry::select_latest_matching`'s identical additive-default pattern for its own
-    /// `selection_context` parameter.
-    fn classify_requirement_status_for(
-        &self,
-        dep: &dyn Dependency,
-        requirement: BoundedVersionReq<'_>,
-        latest: &ConcreteVersion,
-    ) -> RequirementStatus {
-        let _ = dep;
-        self.classify_requirement_status(requirement, latest)
     }
 
     /// Compiles `requirement` into a matcher for precise membership testing against a list
@@ -2159,99 +2071,7 @@ pub trait RequirementResolution: Send + Sync {
         false
     }
 
-    /// Whether `dep`'s manifest version-requirement line is itself the exact
-    /// version already selected — never a range.
-    ///
-    /// True only for a Go `require`-directive dependency: `go.mod`'s
-    /// `require` line already holds the module version selected by Go's
-    /// MVS, unlike Cargo/npm where the manifest holds a range and the lock
-    /// file holds the pin. When true, hover and inlay hints prefer
-    /// [`Dependency::version_requirement`] over the lock-file-derived entry
-    /// in [`crate::lsp_helpers::VersionData::resolved_for`], because `go.sum` is a checksum ledger
-    /// that `go get`/`go build` only ever append to (only `go mod tidy`
-    /// prunes it) — a stale, no-longer-selected higher version can remain
-    /// recorded there after a downgrade and, since go.sum is written sorted
-    /// ascending by semver, always sorts last and wins naive
-    /// last-occurrence-wins parsing (overridden in `deps-go`; see `#235`).
-    ///
-    /// Takes `dep` (precedent: [`OsvNaming::osv_package_name`]) because Go's
-    /// `exclude`/`replace` directives are also surfaced as dependencies
-    /// whose `version_requirement()` is *not* an in-use version (the
-    /// excluded version, or the replaced-from version) — the `deps-go`
-    /// override inspects the directive kind and returns `true` only for
-    /// `require`.
-    fn manifest_requirement_is_resolved_version(&self, dep: &dyn Dependency) -> bool {
-        let _ = dep;
-        false
-    }
-
-    /// An ecosystem-resolved concrete version for `dep`, sourced from out-of-band
-    /// resolution data this ecosystem already holds elsewhere — rather than reconstructed
-    /// from the manifest requirement text alone the way
-    /// [`crate::lsp_helpers::concrete_pin_version`] must.
-    ///
-    /// GitHub Actions is the motivating case (#1556): a SHA-pinned `uses:` step's exact
-    /// version is knowable from [`crate::lsp_helpers::TagIndex::resolved_pin`] — resolved via
-    /// the same live tags fetch that already backs hover's `**Resolved**` line and the "Pin
-    /// to commit SHA" quickfix — even when the pin's trailing `# comment` fails
-    /// `concrete_pin_version`'s text-shape check (a moving-major-tag comment, a literal
-    /// tool-name comment, or no comment at all). Overriding this lets such a dependency
-    /// still reach a real OSV vulnerability scan, hover, and inlay hints instead of being
-    /// skipped as unresolvable.
-    ///
-    /// Consulted by [`crate::lsp_helpers::resolve_in_use_version`] between its lock-file
-    /// step and its final `concrete_pin_version` text fallback: a lock-file-resolved
-    /// version, when one exists, still wins over this hook (impl-critic M2 — an
-    /// ecosystem's own out-of-band resolution must only fill a gap the lock file leaves
-    /// open, never silently supersede a stronger existing resolution source), but a `Some`
-    /// here wins over the blind manifest-text guess below it, since it is still strictly
-    /// more trustworthy than text alone. Its own output is not trusted verbatim either: the
-    /// caller re-applies a shape gate (`concrete_pin_version`, plus a two-component allowance
-    /// for a [`crate::lsp_helpers::ResolvedPin::MostSpecific`] tag), since this hook can itself
-    /// resolve to a moving/partial name (#1556 impl-critic S1, #1668).
-    ///
-    /// The result has six values ([`crate::lsp_helpers::PinResolution`]): a
-    /// [`Resolved`](crate::lsp_helpers::PinResolution::Resolved) pin is authoritative (an
-    /// unqueryable one yields no version, never the manifest text), an
-    /// [`Untagged`](crate::lsp_helpers::PinResolution::Untagged) pin is proven to name no
-    /// release (its trailing comment must not stand in), an
-    /// [`Unpublished`](crate::lsp_helpers::PinResolution::Unpublished) tag pin names no
-    /// published tag (its text must not stand in either), a
-    /// [`CommentContradicted`](crate::lsp_helpers::PinResolution::CommentContradicted) pin has
-    /// a comment that is provably wrong and must not stand in either (an implementor must not
-    /// map it to `Unresolved`), and only
-    /// [`Unresolved`](crate::lsp_helpers::PinResolution::Unresolved),
-    /// [`Unlisted`](crate::lsp_helpers::PinResolution::Unlisted) and
-    /// [`NotYetIndexed`](crate::lsp_helpers::PinResolution::NotYetIndexed) let the manifest
-    /// text stand in. An unlisted or not-yet-indexed pin's text is not authoritative: its
-    /// sibling tags are unknown (a truncated list, or a cold or failed tag fetch), so a clean
-    /// vulnerability answer is not trusted (an implementor must not map either to
-    /// `Unresolved`).
-    ///
-    /// Default: [`Unresolved`](crate::lsp_helpers::PinResolution::Unresolved) — every
-    /// ecosystem's manifest requirement text is authoritative until it opts in.
-    fn resolved_pin_version(&self, dep: &dyn Dependency) -> crate::lsp_helpers::PinResolution {
-        let _ = dep;
-        crate::lsp_helpers::PinResolution::Unresolved
-    }
-
-    /// Whether `dep`, when it is a commit pin, can be rewritten to the release `version`
-    /// (#1779), so a vulnerability fix can tell "no release tag for this fix version" apart
-    /// from "the tag list is not available".
-    ///
-    /// Default: [`CommitRewrite::NotACommitPin`](crate::lsp_helpers::CommitRewrite::NotACommitPin) — every ecosystem whose rewrite does not go
-    /// through a tag index. An ecosystem whose `format_version_replacing_for` echoes the
-    /// declared literal back when no release commit is found MUST override this.
-    fn commit_rewrite_for(
-        &self,
-        dep: &dyn Dependency,
-        version: &ConcreteVersion,
-    ) -> crate::lsp_helpers::CommitRewrite {
-        let _ = (dep, version);
-        crate::lsp_helpers::CommitRewrite::NotACommitPin
-    }
-
-    /// Whether [`Self::resolved_pin_version`] may only start returning a non-`Unresolved` value
+    /// Whether [`DependencyFormatter::resolved_pin_version`] may only start returning a non-`Unresolved` value
     /// for a given dependency once this ecosystem's own registry fetch completes (e.g. GitHub Actions'/
     /// GitLab CI's `TagIndex`, populated as a side effect of `Registry::get_versions` — not
     /// present yet at document-open/edit time).
@@ -2266,19 +2086,6 @@ pub trait RequirementResolution: Send + Sync {
     /// re-run the OSV scan pipeline after that fetch completes.
     fn resolved_pin_version_depends_on_registry_fetch(&self) -> bool {
         false
-    }
-
-    /// Where the sibling release tags of `dep`'s *candidate* versions (registry latest, upgrade
-    /// candidates, a recommended fix target) come from, so phase B's OSV checks can evaluate
-    /// them like phase A evaluates the in-use version's siblings (#1727).
-    ///
-    /// Default: [`NotTagBased`](crate::lsp_helpers::CandidateTagSource::NotTagBased) — a
-    /// candidate version has no sibling names. A git-tag-based ecosystem returns
-    /// [`NotYetIndexed`](crate::lsp_helpers::CandidateTagSource::NotYetIndexed) until its tag
-    /// index is populated, which keeps the candidate unverified instead of reporting it clean.
-    fn candidate_tag_source(&self, dep: &dyn Dependency) -> crate::lsp_helpers::CandidateTagSource {
-        let _ = dep;
-        crate::lsp_helpers::CandidateTagSource::NotTagBased
     }
 }
 
@@ -2480,58 +2287,6 @@ pub trait RequirementGate: RequirementResolution {
         requirement: &VersionReq,
         latest: &ConcreteVersion,
     ) -> RequirementStatus;
-
-    /// Dependency-aware variant of [`Self::requirement_status`] — see
-    /// [`RequirementResolution::classify_requirement_status_for`] for why some ecosystems need
-    /// `dep` in hand.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_core::lsp_helpers::{RequirementResolution, RequirementStatus, RequirementGate};
-    /// use deps_core::{ConcreteVersion, Dependency, PackageName, VersionReq};
-    ///
-    /// struct DefaultFormatter;
-    /// impl RequirementResolution for DefaultFormatter {}
-    ///
-    /// # struct FakeDep(PackageName);
-    /// # impl Dependency for FakeDep {
-    /// #     fn name(&self) -> &PackageName {
-    /// #         &self.0
-    /// #     }
-    /// #     fn name_range(&self) -> deps_core::position::Range {
-    /// #         deps_core::position::Range::default()
-    /// #     }
-    /// #     fn version_requirement(&self) -> Option<&VersionReq> {
-    /// #         None
-    /// #     }
-    /// #     fn version_range(&self) -> Option<deps_core::position::Range> {
-    /// #         None
-    /// #     }
-    /// #     fn source(&self) -> deps_core::parser::DependencySource {
-    /// #         deps_core::parser::DependencySource::Registry
-    /// #     }
-    /// #     fn as_any(&self) -> &dyn std::any::Any {
-    /// #         self
-    /// #     }
-    /// # }
-    /// #
-    /// let dep = FakeDep(PackageName::new("example"));
-    /// assert_eq!(
-    ///     DefaultFormatter.requirement_status_for(
-    ///         &dep,
-    ///         &VersionReq::new("^1.2"),
-    ///         &ConcreteVersion::new("1.5.0")
-    ///     ),
-    ///     RequirementStatus::UpToDate
-    /// );
-    /// ```
-    fn requirement_status_for(
-        &self,
-        dep: &dyn Dependency,
-        requirement: &VersionReq,
-        latest: &ConcreteVersion,
-    ) -> RequirementStatus;
 }
 
 impl<T: RequirementResolution + ?Sized> RequirementGate for T {
@@ -2598,17 +2353,6 @@ impl<T: RequirementResolution + ?Sized> RequirementGate for T {
             self.classify_requirement_status(requirement, latest)
         })
     }
-
-    fn requirement_status_for(
-        &self,
-        dep: &dyn Dependency,
-        requirement: &VersionReq,
-        latest: &ConcreteVersion,
-    ) -> RequirementStatus {
-        BoundedVersionReq::new(requirement).map_or(RequirementStatus::Unresolved, |requirement| {
-            self.classify_requirement_status_for(dep, requirement, latest)
-        })
-    }
 }
 
 /// Static wording for diagnostics and hover about yanked/deprecated package state.
@@ -2655,7 +2399,7 @@ pub trait DiagnosticMessages: Send + Sync {
 /// Implementors guarantee these hooks only ever narrow or disable a diagnostic a shared,
 /// ecosystem-agnostic pass would otherwise emit unconditionally — never widen or fabricate one.
 /// An override does not always mean "this ecosystem is broken": `NpmFormatter` returns `false`
-/// from [`yanked_diagnostic_applies_to`](Self::yanked_diagnostic_applies_to) unconditionally not
+/// from [`yanked_diagnostic_applies_to`](DependencyFormatter::yanked_diagnostic_applies_to) unconditionally not
 /// because the underlying signal is wrong, but to avoid duplicating the separate #205
 /// package-level deprecation diagnostic that would otherwise fire alongside it.
 pub trait DiagnosticPolicy: Send + Sync {
@@ -2670,86 +2414,6 @@ pub trait DiagnosticPolicy: Send + Sync {
     /// name field, not extracted text.
     fn supports_package_rename(&self) -> bool {
         false
-    }
-
-    /// Whether the "requirement satisfiable only by a yanked version" diagnostic
-    /// (`crate::lsp_helpers::requirement_matches_only_yanked`) should evaluate `requirement`
-    /// at all for this ecosystem.
-    ///
-    /// Default `true` — no restriction, every requirement shape is checked. Override to
-    /// `false` for a requirement shape (or, returning `false` unconditionally, for every
-    /// requirement) where this diagnostic would duplicate a more specific one, or where this
-    /// ecosystem's `Version::removal_status()` is not a reliable enough per-version signal.
-    /// This is independent of
-    /// [`Registry::reports_yanked`](crate::Registry::reports_yanked): that flag gates whether
-    /// `removal_status()` data is trusted at all (and thus whether the separate #263
-    /// in-use-version yanked check runs), while this hook only narrows *this* diagnostic.
-    ///
-    /// `dep` is passed alongside `requirement` (rather than `requirement` alone) so an
-    /// implementor can key its decision off the dependency's package name — needed by
-    /// `DenoFormatter` (#448) to tell its `jsr:`- and `npm:`-scheme specifiers apart, since
-    /// the scheme lives in the name, not in the requirement text. At the sole call site
-    /// (`crate::lsp_helpers::diagnostics::generate_diagnostics_from_cache`), `requirement`
-    /// is always `dep.version_requirement().unwrap()` for the same `dep` — the two are
-    /// never independent, though an implementor is free to key off either or both.
-    ///
-    /// `DenoFormatter` returns `false` unconditionally for `npm:` specifiers, mirroring
-    /// `NpmFormatter` (#448), and applies unconditionally (`true`, the same as leaving this
-    /// hook at its default) for `jsr:` specifiers, for any requirement shape (#454): unlike
-    /// npm's `deprecated`, JSR's `yanked` flag is a genuine per-version signal with no
-    /// package-level deprecation diagnostic to conflate with, so `jsr:` needs no restriction
-    /// here at all — see that formatter's docs. `NpmFormatter` returns `false`
-    /// unconditionally (#436): npm's `AdvisoryDeprecated` is genuinely per-version but
-    /// commonly applied package-wide, so even an exact pin would often just duplicate the
-    /// dedicated package-level deprecation diagnostic ([`DiagnosticMessages::deprecated_message`],
-    /// issue #205); npm keeps `reports_yanked() == true`; so the #263 in-use-version check
-    /// stays live. `ComposerFormatter` does not override this hook at all — it opts out at
-    /// the registry level instead
-    /// ([`Registry::reports_yanked`](crate::Registry::reports_yanked) `== false`, pre-dating
-    /// #436, independently justified by #233 R2): Packagist's `abandoned` is package-level via
-    /// p2 minified inheritance, so its yanked map is never populated and this hook has nothing
-    /// to restrict.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_core::lsp_helpers::DiagnosticPolicy;
-    /// use deps_core::{Dependency, PackageName, VersionReq};
-    ///
-    /// struct DefaultFormatter;
-    /// impl DiagnosticPolicy for DefaultFormatter {}
-    ///
-    /// # struct FakeDep(PackageName);
-    /// # impl Dependency for FakeDep {
-    /// #     fn name(&self) -> &PackageName {
-    /// #         &self.0
-    /// #     }
-    /// #     fn name_range(&self) -> deps_core::position::Range {
-    /// #         deps_core::position::Range::default()
-    /// #     }
-    /// #     fn version_requirement(&self) -> Option<&VersionReq> {
-    /// #         None
-    /// #     }
-    /// #     fn version_range(&self) -> Option<deps_core::position::Range> {
-    /// #         None
-    /// #     }
-    /// #     fn source(&self) -> deps_core::parser::DependencySource {
-    /// #         deps_core::parser::DependencySource::Registry
-    /// #     }
-    /// #     fn as_any(&self) -> &dyn std::any::Any {
-    /// #         self
-    /// #     }
-    /// # }
-    /// #
-    /// let dep = FakeDep(PackageName::new("example"));
-    /// assert!(DefaultFormatter.yanked_diagnostic_applies_to(&dep, &VersionReq::new("^1.2")));
-    /// ```
-    fn yanked_diagnostic_applies_to(
-        &self,
-        _dep: &dyn Dependency,
-        _requirement: &VersionReq,
-    ) -> bool {
-        true
     }
 }
 
@@ -2890,14 +2554,14 @@ pub trait SourcePolicy: Send + Sync {
 }
 
 /// Whether a dependency's OSV package name can be produced yet, as reported by
-/// [`OsvNaming::osv_name_availability`].
+/// [`DependencyFormatter::osv_name_availability`].
 ///
 /// Separates a transient gap (registry data the name depends on has not landed) from a
 /// structural one (`osv_package_name` returning `None` for good), so the former is never
 /// recorded as permanently unmappable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OsvNameAvailability {
-    /// [`OsvNaming::osv_package_name`]'s answer is final for the data currently held.
+    /// [`DependencyFormatter::osv_package_name`]'s answer is final for the data currently held.
     Ready,
     /// The name depends on registry data that has not been fetched yet; retry after it lands.
     AwaitingRegistryData {
@@ -2909,7 +2573,7 @@ pub enum OsvNameAvailability {
 }
 
 /// The public package whose content a dependency is, as returned by
-/// [`OsvNaming::public_content`].
+/// [`DependencyFormatter::public_content`].
 ///
 /// Its `name` is what OSV and license lookups are keyed by; it is the dependency's own name
 /// except where an ecosystem serves a dependency from one place and describes it by another
@@ -2938,135 +2602,6 @@ pub struct PublicContent<'d> {
 /// (the OSV scan-target builder and advisory matcher) rely on the defaults being safe no-ops
 /// for the common case of an ecosystem with no such divergence.
 pub trait OsvNaming: SourcePolicy + Send + Sync {
-    /// The public package content `dep` is, when OSV and license data about that content apply
-    /// to it, or `None` when they do not (a path, git or private-registry dependency).
-    ///
-    /// Replaces a bare [`SourcePolicy::source_is_public_registry_content`] check at every OSV
-    /// and tier-3 license gate, so an ecosystem can answer for a dependency whose registry
-    /// source and public content differ. The lifetime is tied to `dep`, so the default can
-    /// borrow its name.
-    ///
-    /// Default: [`SourcePolicy::source_is_public_registry_content`] of `dep`'s source, with
-    /// `dep`'s own name. Every ecosystem that does not override this is bit-identical to the
-    /// source gate. Gates that concern deps.dev or registry semantics (typosquat, GOSSIP,
-    /// trust, in-use fetch) keep using the source gate and are not routed through here.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_core::lsp_helpers::{OsvNaming, SourcePolicy};
-    /// use deps_core::parser::DependencySource;
-    /// use deps_core::{Dependency, PackageName, VersionReq};
-    /// use deps_core::position::Range;
-    ///
-    /// struct DefaultFormatter;
-    /// impl SourcePolicy for DefaultFormatter {}
-    /// impl OsvNaming for DefaultFormatter {}
-    ///
-    /// struct Dep(PackageName, DependencySource);
-    /// impl Dependency for Dep {
-    ///     fn name(&self) -> &PackageName { &self.0 }
-    ///     fn name_range(&self) -> Range { Range::default() }
-    ///     fn version_requirement(&self) -> Option<&VersionReq> { None }
-    ///     fn version_range(&self) -> Option<Range> { None }
-    ///     fn source(&self) -> DependencySource { self.1.clone() }
-    ///     fn as_any(&self) -> &dyn std::any::Any { self }
-    /// }
-    ///
-    /// let public = Dep(PackageName::new("serde"), DependencySource::Registry);
-    /// assert_eq!(DefaultFormatter.public_content(&public).unwrap().name.as_str(), "serde");
-    /// let local = Dep(PackageName::new("local"), DependencySource::Path { path: "../x".into() });
-    /// assert!(DefaultFormatter.public_content(&local).is_none());
-    /// ```
-    fn public_content<'d>(&self, dep: &'d dyn Dependency) -> Option<PublicContent<'d>> {
-        self.source_is_public_registry_content(&dep.source())
-            .then(|| PublicContent {
-                name: std::borrow::Cow::Borrowed(dep.name()),
-            })
-    }
-
-    /// How a dependency that is not public registry content (see [`Self::public_content`])
-    /// is classified for the "vulnerability data not checked" signal (#1917).
-    ///
-    /// [`crate::osv::NonPublicRoute::UnverifiedMirror`] means the route plausibly proxies public
-    /// content but cannot be verified as doing so (an npm `registry=` override), so the skipped
-    /// OSV scan is reported to the user. Default: [`crate::osv::NonPublicRoute::Private`], which
-    /// stays silent. An ecosystem that overrides this must also map to an OSV ecosystem; the
-    /// `deps-engine` guard test lists every opting-in ecosystem.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_core::lsp_helpers::{OsvNaming, SourcePolicy};
-    /// use deps_core::osv::NonPublicRoute;
-    /// use deps_core::parser::DependencySource;
-    /// use deps_core::position::Range;
-    /// use deps_core::{Dependency, PackageName, VersionReq};
-    ///
-    /// struct DefaultFormatter;
-    /// impl SourcePolicy for DefaultFormatter {}
-    /// impl OsvNaming for DefaultFormatter {}
-    ///
-    /// struct Dep(PackageName);
-    /// impl Dependency for Dep {
-    ///     fn name(&self) -> &PackageName { &self.0 }
-    ///     fn name_range(&self) -> Range { Range::default() }
-    ///     fn version_requirement(&self) -> Option<&VersionReq> { None }
-    ///     fn version_range(&self) -> Option<Range> { None }
-    ///     fn source(&self) -> DependencySource { DependencySource::Registry }
-    ///     fn as_any(&self) -> &dyn std::any::Any { self }
-    /// }
-    ///
-    /// let dep = Dep(PackageName::new("serde"));
-    /// assert_eq!(DefaultFormatter.non_public_route(&dep), NonPublicRoute::Private);
-    /// ```
-    fn non_public_route(&self, dep: &dyn Dependency) -> crate::osv::NonPublicRoute {
-        let _ = dep;
-        crate::osv::NonPublicRoute::Private
-    }
-
-    /// Whether a lock file is expected to list `dep` (#1946). A dependency reported as
-    /// [`crate::osv::LockResolution::NotLocked`] (an npm `peerDependencies` entry) never counts
-    /// as a `--fail-on unchecked` coverage gap for lacking a concrete version.
-    ///
-    /// Default: [`crate::osv::LockResolution::Expected`].
-    fn lock_resolution(&self, dep: &dyn Dependency) -> crate::osv::LockResolution {
-        let _ = dep;
-        crate::osv::LockResolution::Expected
-    }
-
-    /// OSV.dev's canonical spelling for `dep`'s package name, or `None` if
-    /// this dependency cannot be mapped (e.g. a non-GitHub Swift package).
-    ///
-    /// Deliberately **not** routed through [`NormalizeName::normalize_package_name`]:
-    /// that method produces this project's internal lookup key, while this
-    /// one produces the name sent on the wire to OSV. They coincide for most
-    /// ecosystems and diverge for NuGet (case-preserving; normalizing would
-    /// lowercase it and zero out results), Composer (OSV wants lowercase,
-    /// overridden in `deps-composer`), and Swift (prefixed to
-    /// `github.com/{owner}/{repo}`, overridden in `deps-swift`). Takes
-    /// `&dyn Dependency` rather than `&str` because the Swift override needs
-    /// to downcast to inspect the dependency's source URL host — see
-    /// `architecture.md` §2.
-    ///
-    /// The default implementation is the identity: for Cargo, npm, Go, Maven,
-    /// Gradle, Dart, Bundler, and NuGet the manifest's raw name already matches
-    /// OSV's canonical spelling. PyPI (PEP 503 normalization) and Composer
-    /// (lowercase) override it.
-    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<crate::osv::OsvPackageName> {
-        crate::osv::OsvPackageName::new_or_skip(dep.name().as_str())
-    }
-
-    /// Whether [`Self::osv_package_name`] can already answer for `dep`.
-    ///
-    /// Callers check this first: [`OsvNameAvailability::AwaitingRegistryData`] is a transient
-    /// skip, not an unmappable name. Default: always [`OsvNameAvailability::Ready`]; override
-    /// only when the OSV name is derived from registry data (GitHub Actions' canonical casing).
-    fn osv_name_availability(&self, dep: &dyn Dependency) -> OsvNameAvailability {
-        let _ = dep;
-        OsvNameAvailability::Ready
-    }
-
     /// Converts a version string as it appears in an OSV advisory record
     /// (e.g. [`crate::osv::Advisory::fixed_versions`]) into this ecosystem's
     /// own version namespace, as used in manifests and by the registry.
@@ -3099,7 +2634,7 @@ pub trait OsvNaming: SourcePolicy + Send + Sync {
     /// Rewrites a native-ecosystem version string into the spelling OSV.dev's
     /// SEMVER range matching expects.
     ///
-    /// Deliberately the inverse of [`Self::osv_package_name`] rather than a
+    /// Deliberately the inverse of [`DependencyFormatter::osv_package_name`] rather than a
     /// field on [`crate::osv::ScanTarget`] itself: the caller (`deps-lsp`'s
     /// scan-target builder) has only the native version string at hand, so
     /// each ecosystem's formatter is the natural place to own the transform.
@@ -3139,6 +2674,393 @@ pub trait OsvNaming: SourcePolicy + Send + Sync {
     /// ```
     fn osv_version(&self, version: &ConcreteVersion) -> crate::osv::OsvVersion {
         crate::osv::OsvVersion::new(crate::github::normalize_tag(version.as_str()))
+    }
+}
+
+/// The dependency-taking half of an ecosystem's formatter, typed to the one dependency kind
+/// the ecosystem parses.
+///
+/// Every method here answers a question about one dependency and receives it as
+/// [`Self::Dep`], never as `&dyn Dependency`: handing a formatter a dependency its ecosystem did
+/// not produce does not compile. [`EcosystemFormatter`] stays the dependency-free,
+/// dyn-compatible umbrella; this trait is never used as a trait object.
+///
+/// The defaults below are the dependency-free behavior of the concern traits
+/// ([`PackageRendering`], [`RequirementResolution`], [`DiagnosticPolicy`], [`OsvNaming`]): an
+/// override changes only what it documents.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::DependencyFormatter;
+/// use deps_core::test_util::{StubDependency, StubFormatter};
+///
+/// let formatter = StubFormatter::DEFAULT;
+/// let dep = StubDependency::new("serde");
+/// let content = formatter.public_content(&dep).unwrap();
+/// assert_eq!(content.name.as_str(), "serde");
+/// ```
+pub trait DependencyFormatter: EcosystemFormatter + 'static {
+    /// The dependency type this formatter reads.
+    type Dep: Dependency + 'static;
+
+    /// Like [`format_version_replacing`](PackageRendering::format_version_replacing), but also
+    /// carries the dependency identity `version`/`current` apply to.
+    ///
+    /// Default: ignores `dep`, delegating to
+    /// [`format_version_replacing`](PackageRendering::format_version_replacing). Override when the
+    /// replacement text cannot be derived from `version`/`current` alone — e.g.
+    /// `deps-github-actions`'s SHA-pinned `uses: owner/repo@<sha> # vX.Y.Z` form, where
+    /// the new SHA for a given tag is looked up per `dep.name()` (a tag's commit SHA is
+    /// per-repository, unknowable from the tag string alone) in a registry-populated
+    /// index the formatter holds a shared handle to.
+    ///
+    /// Every shared call site that builds a version-update edit (the vulnerability and
+    /// unsatisfiable-requirement quickfixes, the REFACTOR-loop "update to X" actions, and
+    /// the "Update N outdated dependencies" code lens) already has `dep` in scope and
+    /// calls this method instead of [`format_version_replacing`](PackageRendering::format_version_replacing)
+    /// directly, so an override here is picked up on every edit path at once.
+    fn format_version_replacing_for(
+        &self,
+        dep: &Self::Dep,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        let _ = dep;
+        PackageRendering::format_version_replacing(self, version, current)
+    }
+
+    /// Like [`format_version_replacing_for`](Self::format_version_replacing_for), but for a
+    /// version that is a security or cooldown-fallback *target*: the rendering must never lower
+    /// the requirement's floor below `version`, because the target was chosen to exclude older
+    /// affected releases.
+    ///
+    /// Default: delegates to [`format_version_replacing_for`](Self::format_version_replacing_for)
+    /// -- correct wherever the plain rewrite already keeps the floor at `version` (every
+    /// operator-preserving or exact rendering). Override only where the plain rewrite may
+    /// widen downward, as npm and Deno do for a bare partial requirement (`3` -> `4` would
+    /// admit `4.0.0`).
+    fn format_version_replacing_floor_for(
+        &self,
+        dep: &Self::Dep,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        self.format_version_replacing_for(dep, version, current)
+    }
+
+    /// An extra line explaining where `dep`'s data comes from, shown in its hover (a SHA pin
+    /// proven newer than the latest release, a source dependency served by a registry
+    /// identity).
+    ///
+    /// Default: `None`, no extra line.
+    fn hover_provenance(&self, dep: &Self::Dep) -> Option<crate::lsp_helpers::HoverProvenance> {
+        let _ = dep;
+        None
+    }
+
+    /// Detect if cursor position is on a dependency for code actions.
+    fn is_position_on_dependency(&self, dep: &Self::Dep, position: Position) -> bool {
+        dep.version_range()
+            .is_some_and(|r| position_in_range(position, r))
+    }
+
+    /// Like [`classify_requirement_status`](RequirementResolution::classify_requirement_status), but also hands
+    /// the ecosystem the dependency itself — for an ecosystem whose requirement *text* alone is
+    /// ambiguous between two shapes with different resolution rules, and which already computed
+    /// the disambiguating classification once, at parse time, onto the dependency
+    /// (`deps-gitlab-ci`'s `PinStyle`, #466 review M-c: a bare `"1.2"` is `Partial` under its
+    /// `component:` pin grammar but `Branch` under its simpler `project:` ref grammar —
+    /// indistinguishable from the text alone).
+    ///
+    /// Default: forwards to [`classify_requirement_status`](RequirementResolution::classify_requirement_status),
+    /// ignoring `dep` — every other ecosystem's requirement text alone is unambiguous, so this
+    /// is a no-op for them. Callers that already have `dep` in hand (the diagnostic pipeline's
+    /// outdated rule) call [`DependencyGate::requirement_status_for`] instead of
+    /// [`RequirementGate::requirement_status`] directly, mirroring
+    /// `Registry::select_latest_matching`'s identical additive-default pattern for its own
+    /// `selection_context` parameter.
+    fn classify_requirement_status_for(
+        &self,
+        dep: &Self::Dep,
+        requirement: BoundedVersionReq<'_>,
+        latest: &ConcreteVersion,
+    ) -> RequirementStatus {
+        let _ = dep;
+        RequirementResolution::classify_requirement_status(self, requirement, latest)
+    }
+
+    /// Whether `dep`'s manifest version-requirement line is itself the exact
+    /// version already selected — never a range.
+    ///
+    /// True only for a Go `require`-directive dependency: `go.mod`'s
+    /// `require` line already holds the module version selected by Go's
+    /// MVS, unlike Cargo/npm where the manifest holds a range and the lock
+    /// file holds the pin. When true, hover and inlay hints prefer
+    /// [`Dependency::version_requirement`] over the lock-file-derived entry
+    /// in [`crate::lsp_helpers::VersionData::resolved_for`], because `go.sum` is a checksum ledger
+    /// that `go get`/`go build` only ever append to (only `go mod tidy`
+    /// prunes it) — a stale, no-longer-selected higher version can remain
+    /// recorded there after a downgrade and, since go.sum is written sorted
+    /// ascending by semver, always sorts last and wins naive
+    /// last-occurrence-wins parsing (overridden in `deps-go`; see `#235`).
+    ///
+    /// Takes `dep` (precedent: [`DependencyFormatter::osv_package_name`]) because Go's
+    /// `exclude`/`replace` directives are also surfaced as dependencies
+    /// whose `version_requirement()` is *not* an in-use version (the
+    /// excluded version, or the replaced-from version) — the `deps-go`
+    /// override inspects the directive kind and returns `true` only for
+    /// `require`.
+    fn manifest_requirement_is_resolved_version(&self, dep: &Self::Dep) -> bool {
+        let _ = dep;
+        false
+    }
+
+    /// An ecosystem-resolved concrete version for `dep`, sourced from out-of-band
+    /// resolution data this ecosystem already holds elsewhere — rather than reconstructed
+    /// from the manifest requirement text alone the way
+    /// [`crate::lsp_helpers::concrete_pin_version`] must.
+    ///
+    /// GitHub Actions is the motivating case (#1556): a SHA-pinned `uses:` step's exact
+    /// version is knowable from [`crate::lsp_helpers::TagIndex::resolved_pin`] — resolved via
+    /// the same live tags fetch that already backs hover's `**Resolved**` line and the "Pin
+    /// to commit SHA" quickfix — even when the pin's trailing `# comment` fails
+    /// `concrete_pin_version`'s text-shape check (a moving-major-tag comment, a literal
+    /// tool-name comment, or no comment at all). Overriding this lets such a dependency
+    /// still reach a real OSV vulnerability scan, hover, and inlay hints instead of being
+    /// skipped as unresolvable.
+    ///
+    /// Consulted by [`crate::lsp_helpers::resolve_in_use_version`] between its lock-file
+    /// step and its final `concrete_pin_version` text fallback: a lock-file-resolved
+    /// version, when one exists, still wins over this hook (impl-critic M2 — an
+    /// ecosystem's own out-of-band resolution must only fill a gap the lock file leaves
+    /// open, never silently supersede a stronger existing resolution source), but a `Some`
+    /// here wins over the blind manifest-text guess below it, since it is still strictly
+    /// more trustworthy than text alone. Its own output is not trusted verbatim either: the
+    /// caller re-applies a shape gate (`concrete_pin_version`, plus a two-component allowance
+    /// for a [`crate::lsp_helpers::ResolvedPin::MostSpecific`] tag), since this hook can itself
+    /// resolve to a moving/partial name (#1556 impl-critic S1, #1668).
+    ///
+    /// The result has six values ([`crate::lsp_helpers::PinResolution`]): a
+    /// [`Resolved`](crate::lsp_helpers::PinResolution::Resolved) pin is authoritative (an
+    /// unqueryable one yields no version, never the manifest text), an
+    /// [`Untagged`](crate::lsp_helpers::PinResolution::Untagged) pin is proven to name no
+    /// release (its trailing comment must not stand in), an
+    /// [`Unpublished`](crate::lsp_helpers::PinResolution::Unpublished) tag pin names no
+    /// published tag (its text must not stand in either), a
+    /// [`CommentContradicted`](crate::lsp_helpers::PinResolution::CommentContradicted) pin has
+    /// a comment that is provably wrong and must not stand in either (an implementor must not
+    /// map it to `Unresolved`), and only
+    /// [`Unresolved`](crate::lsp_helpers::PinResolution::Unresolved),
+    /// [`Unlisted`](crate::lsp_helpers::PinResolution::Unlisted) and
+    /// [`NotYetIndexed`](crate::lsp_helpers::PinResolution::NotYetIndexed) let the manifest
+    /// text stand in. An unlisted or not-yet-indexed pin's text is not authoritative: its
+    /// sibling tags are unknown (a truncated list, or a cold or failed tag fetch), so a clean
+    /// vulnerability answer is not trusted (an implementor must not map either to
+    /// `Unresolved`).
+    ///
+    /// Default: [`Unresolved`](crate::lsp_helpers::PinResolution::Unresolved) — every
+    /// ecosystem's manifest requirement text is authoritative until it opts in.
+    fn resolved_pin_version(&self, dep: &Self::Dep) -> crate::lsp_helpers::PinResolution {
+        let _ = dep;
+        crate::lsp_helpers::PinResolution::Unresolved
+    }
+
+    /// Whether `dep`, when it is a commit pin, can be rewritten to the release `version`
+    /// (#1779), so a vulnerability fix can tell "no release tag for this fix version" apart
+    /// from "the tag list is not available".
+    ///
+    /// Default: [`CommitRewrite::NotACommitPin`](crate::lsp_helpers::CommitRewrite::NotACommitPin) — every ecosystem whose rewrite does not go
+    /// through a tag index. An ecosystem whose `format_version_replacing_for` echoes the
+    /// declared literal back when no release commit is found MUST override this.
+    fn commit_rewrite_for(
+        &self,
+        dep: &Self::Dep,
+        version: &ConcreteVersion,
+    ) -> crate::lsp_helpers::CommitRewrite {
+        let _ = (dep, version);
+        crate::lsp_helpers::CommitRewrite::NotACommitPin
+    }
+
+    /// Where the sibling release tags of `dep`'s *candidate* versions (registry latest, upgrade
+    /// candidates, a recommended fix target) come from, so phase B's OSV checks can evaluate
+    /// them like phase A evaluates the in-use version's siblings (#1727).
+    ///
+    /// Default: [`NotTagBased`](crate::lsp_helpers::CandidateTagSource::NotTagBased) — a
+    /// candidate version has no sibling names. A git-tag-based ecosystem returns
+    /// [`NotYetIndexed`](crate::lsp_helpers::CandidateTagSource::NotYetIndexed) until its tag
+    /// index is populated, which keeps the candidate unverified instead of reporting it clean.
+    fn candidate_tag_source(&self, dep: &Self::Dep) -> crate::lsp_helpers::CandidateTagSource {
+        let _ = dep;
+        crate::lsp_helpers::CandidateTagSource::NotTagBased
+    }
+
+    /// Whether the "requirement satisfiable only by a yanked version" diagnostic
+    /// (`crate::lsp_helpers::requirement_matches_only_yanked`) should evaluate `requirement`
+    /// at all for this ecosystem.
+    ///
+    /// Default `true` — no restriction, every requirement shape is checked. Override to
+    /// `false` for a requirement shape (or, returning `false` unconditionally, for every
+    /// requirement) where this diagnostic would duplicate a more specific one, or where this
+    /// ecosystem's `Version::removal_status()` is not a reliable enough per-version signal.
+    /// This is independent of
+    /// [`Registry::reports_yanked`](crate::Registry::reports_yanked): that flag gates whether
+    /// `removal_status()` data is trusted at all (and thus whether the separate #263
+    /// in-use-version yanked check runs), while this hook only narrows *this* diagnostic.
+    ///
+    /// `dep` is passed alongside `requirement` (rather than `requirement` alone) so an
+    /// implementor can key its decision off the dependency's package name — needed by
+    /// `DenoFormatter` (#448) to tell its `jsr:`- and `npm:`-scheme specifiers apart, since
+    /// the scheme lives in the name, not in the requirement text. At the sole call site
+    /// (`crate::lsp_helpers::diagnostics::generate_diagnostics_from_cache`), `requirement`
+    /// is always `dep.version_requirement().unwrap()` for the same `dep` — the two are
+    /// never independent, though an implementor is free to key off either or both.
+    ///
+    /// `DenoFormatter` returns `false` unconditionally for `npm:` specifiers, mirroring
+    /// `NpmFormatter` (#448), and applies unconditionally (`true`, the same as leaving this
+    /// hook at its default) for `jsr:` specifiers, for any requirement shape (#454): unlike
+    /// npm's `deprecated`, JSR's `yanked` flag is a genuine per-version signal with no
+    /// package-level deprecation diagnostic to conflate with, so `jsr:` needs no restriction
+    /// here at all — see that formatter's docs. `NpmFormatter` returns `false`
+    /// unconditionally (#436): npm's `AdvisoryDeprecated` is genuinely per-version but
+    /// commonly applied package-wide, so even an exact pin would often just duplicate the
+    /// dedicated package-level deprecation diagnostic ([`DiagnosticMessages::deprecated_message`],
+    /// issue #205); npm keeps `reports_yanked() == true`; so the #263 in-use-version check
+    /// stays live. `ComposerFormatter` does not override this hook at all — it opts out at
+    /// the registry level instead
+    /// ([`Registry::reports_yanked`](crate::Registry::reports_yanked) `== false`, pre-dating
+    /// #436, independently justified by #233 R2): Packagist's `abandoned` is package-level via
+    /// p2 minified inheritance, so its yanked map is never populated and this hook has nothing
+    /// to restrict.
+    fn yanked_diagnostic_applies_to(&self, dep: &Self::Dep, requirement: &VersionReq) -> bool {
+        let _ = (dep, requirement);
+        true
+    }
+
+    /// The public package content `dep` is, when OSV and license data about that content apply
+    /// to it, or `None` when they do not (a path, git or private-registry dependency).
+    ///
+    /// Replaces a bare [`SourcePolicy::source_is_public_registry_content`] check at every OSV
+    /// and tier-3 license gate, so an ecosystem can answer for a dependency whose registry
+    /// source and public content differ. The lifetime is tied to `dep`, so the default can
+    /// borrow its name.
+    ///
+    /// Default: [`SourcePolicy::source_is_public_registry_content`] of `dep`'s source, with
+    /// `dep`'s own name. Every ecosystem that does not override this is bit-identical to the
+    /// source gate. Gates that concern deps.dev or registry semantics (typosquat, GOSSIP,
+    /// trust, in-use fetch) keep using the source gate and are not routed through here.
+    fn public_content<'d>(&self, dep: &'d Self::Dep) -> Option<PublicContent<'d>> {
+        SourcePolicy::source_is_public_registry_content(self, &dep.source()).then(|| {
+            PublicContent {
+                name: std::borrow::Cow::Borrowed(dep.name()),
+            }
+        })
+    }
+
+    /// How a dependency that is not public registry content (see [`Self::public_content`])
+    /// is classified for the "vulnerability data not checked" signal (#1917).
+    ///
+    /// [`crate::osv::NonPublicRoute::UnverifiedMirror`] means the route plausibly proxies public
+    /// content but cannot be verified as doing so (an npm `registry=` override), so the skipped
+    /// OSV scan is reported to the user. Default: [`crate::osv::NonPublicRoute::Private`], which
+    /// stays silent. An ecosystem that overrides this must also map to an OSV ecosystem. The
+    /// opting-in ecosystems are a hard-coded static list in
+    /// `deps-engine/tests/osv_non_public_routes.rs`, not derived from this trait, so a new
+    /// override has to be added there by hand (a follow-up issue to derive it is pending).
+    fn non_public_route(&self, dep: &Self::Dep) -> crate::osv::NonPublicRoute {
+        let _ = dep;
+        crate::osv::NonPublicRoute::Private
+    }
+
+    /// Whether a lock file is expected to list `dep` (#1946). A dependency reported as
+    /// [`crate::osv::LockResolution::NotLocked`] (an npm `peerDependencies` entry) never counts
+    /// as a `--fail-on unchecked` coverage gap for lacking a concrete version.
+    ///
+    /// Default: [`crate::osv::LockResolution::Expected`].
+    fn lock_resolution(&self, dep: &Self::Dep) -> crate::osv::LockResolution {
+        let _ = dep;
+        crate::osv::LockResolution::Expected
+    }
+
+    /// OSV.dev's canonical spelling for `dep`'s package name, or `None` if
+    /// this dependency cannot be mapped (e.g. a non-GitHub Swift package).
+    ///
+    /// Deliberately **not** routed through [`NormalizeName::normalize_package_name`]:
+    /// that method produces this project's internal lookup key, while this
+    /// one produces the name sent on the wire to OSV. They coincide for most
+    /// ecosystems and diverge for NuGet (case-preserving; normalizing would
+    /// lowercase it and zero out results), Composer (OSV wants lowercase,
+    /// overridden in `deps-composer`), and Swift (prefixed to
+    /// `github.com/{owner}/{repo}`, overridden in `deps-swift`). Takes
+    /// the dependency rather than a `&str` because the Swift override inspects the
+    /// dependency's source URL host — see `architecture.md` §2.
+    ///
+    /// The default implementation is the identity: for Cargo, npm, Go, Maven,
+    /// Gradle, Dart, Bundler, and NuGet the manifest's raw name already matches
+    /// OSV's canonical spelling. PyPI (PEP 503 normalization) and Composer
+    /// (lowercase) override it.
+    fn osv_package_name(&self, dep: &Self::Dep) -> Option<crate::osv::OsvPackageName> {
+        crate::osv::OsvPackageName::new_or_skip(dep.name().as_str())
+    }
+
+    /// Whether [`Self::osv_package_name`] can already answer for `dep`.
+    ///
+    /// Callers check this first: [`OsvNameAvailability::AwaitingRegistryData`] is a transient
+    /// skip, not an unmappable name. Default: always [`OsvNameAvailability::Ready`]; override
+    /// only when the OSV name is derived from registry data (GitHub Actions' canonical casing).
+    fn osv_name_availability(&self, dep: &Self::Dep) -> OsvNameAvailability {
+        let _ = dep;
+        OsvNameAvailability::Ready
+    }
+}
+
+mod dependency_gate_sealed {
+    pub trait Sealed {}
+    impl<T: super::DependencyFormatter> Sealed for T {}
+}
+
+/// The un-overridable dependency-aware requirement-status entry point: the typed counterpart of
+/// [`DependencyGate::requirement_status_for`].
+///
+/// Sealed with a blanket implementation over every [`DependencyFormatter`], so the oversized
+/// requirement check it performs cannot be bypassed by an override.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{DependencyGate, RequirementStatus};
+/// use deps_core::test_util::{StubDependency, StubFormatter};
+/// use deps_core::{ConcreteVersion, VersionReq};
+///
+/// let status = DependencyGate::requirement_status_for(
+///     &StubFormatter::DEFAULT,
+///     &StubDependency::new("serde"),
+///     &VersionReq::new("^1.2"),
+///     &ConcreteVersion::new("1.5.0"),
+/// );
+/// assert_eq!(status, RequirementStatus::UpToDate);
+/// ```
+pub trait DependencyGate: DependencyFormatter + dependency_gate_sealed::Sealed {
+    /// Classifies `requirement` against `latest` for `dep`, treating an oversized requirement as
+    /// [`RequirementStatus::Unresolved`] before any override sees it.
+    fn requirement_status_for(
+        &self,
+        dep: &Self::Dep,
+        requirement: &VersionReq,
+        latest: &ConcreteVersion,
+    ) -> RequirementStatus;
+}
+
+impl<T: DependencyFormatter> DependencyGate for T {
+    fn requirement_status_for(
+        &self,
+        dep: &Self::Dep,
+        requirement: &VersionReq,
+        latest: &ConcreteVersion,
+    ) -> RequirementStatus {
+        BoundedVersionReq::new(requirement).map_or(RequirementStatus::Unresolved, |requirement| {
+            self.classify_requirement_status_for(dep, requirement, latest)
+        })
     }
 }
 
@@ -3208,7 +3130,7 @@ mod tests {
 
     /// #1648: proves an override cannot bypass the oversized gate even if it tries to —
     /// `AlwaysOutdatedFormatter`'s `classify_requirement_status_for` unconditionally reports
-    /// `Outdated`, yet [`RequirementGate::requirement_status_for`] still reports
+    /// `Outdated`, yet [`DependencyGate::requirement_status_for`] still reports
     /// `Unresolved` for an oversized requirement, because it never reaches the override at
     /// all: the [`BoundedVersionReq::new`] construction fails first. The within-cap positive
     /// control below is load-bearing, not decorative (impl-critic M2): without it, this test
@@ -3228,10 +3150,13 @@ mod tests {
                 name.as_str().to_string()
             }
         }
-        impl RequirementResolution for AlwaysOutdatedFormatter {
+        impl RequirementResolution for AlwaysOutdatedFormatter {}
+        impl DependencyFormatter for AlwaysOutdatedFormatter {
+            type Dep = crate::lsp_helpers::test_support::MockDep;
+
             fn classify_requirement_status_for(
                 &self,
-                _dep: &dyn Dependency,
+                _dep: &Self::Dep,
                 _requirement: BoundedVersionReq<'_>,
                 _latest: &ConcreteVersion,
             ) -> RequirementStatus {
@@ -4658,9 +4583,24 @@ mod tests {
         use std::borrow::Cow;
 
         struct Swapped;
+        impl PackageNaming for Swapped {}
+        impl PackageRendering for Swapped {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl RequirementResolution for Swapped {}
+        impl DiagnosticMessages for Swapped {}
+        impl DiagnosticPolicy for Swapped {}
         impl SourcePolicy for Swapped {}
-        impl OsvNaming for Swapped {
-            fn public_content<'d>(&self, dep: &'d dyn Dependency) -> Option<PublicContent<'d>> {
+        impl OsvNaming for Swapped {}
+        impl DependencyFormatter for Swapped {
+            type Dep = MockDep;
+
+            fn public_content<'d>(&self, dep: &'d MockDep) -> Option<PublicContent<'d>> {
                 (dep.name().as_str() == "scope.name").then(|| PublicContent {
                     name: Cow::Owned(PackageName::new("Owner/Repo")),
                 })
@@ -4764,5 +4704,16 @@ mod tests {
         assert_eq!(render("^0.0", "0.3.2", RewriteTarget::Update), "^0.3");
         assert_eq!(render("^0", "1.4.0", RewriteTarget::Update), "^1");
         assert_eq!(render("^0.0", "0.0.9", RewriteTarget::Floor), "^0.0.9");
+    }
+
+    #[test]
+    fn test_non_public_route_defaults_to_private() {
+        use crate::lsp_helpers::test_support::dep_at;
+        use crate::osv::NonPublicRoute;
+
+        assert_eq!(
+            MOCK_FORMATTER.non_public_route(&dep_at("serde")),
+            NonPublicRoute::Private
+        );
     }
 }

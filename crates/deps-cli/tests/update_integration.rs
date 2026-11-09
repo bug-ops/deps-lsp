@@ -427,7 +427,7 @@ fn plan_manifest(fixture: &ManifestFixture<'_>) -> deps_cli::update::UpdatePlan 
 
     let content = fixture.content;
     let uri = deps_core::test_util::test_uri(fixture.uri_path);
-    let parse_result = deps_core::ecosystem::parse_manifest_now(ecosystem.as_ref(), content, &uri)
+    let parse_result = deps_core::ecosystem::parse_manifest_now(&ecosystem, content, &uri)
         .expect("the fixture parses");
     let declared = PackageName::new(fixture.declared_name);
     assert!(

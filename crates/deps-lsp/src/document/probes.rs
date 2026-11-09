@@ -2,7 +2,7 @@
 //! triggers coalesce, and how their evidence reaches the client.
 //!
 //! A probe asks the forge something synchronous diagnostics must not (see
-//! [`Ecosystem::background_probes`]). It runs in a spawned task, never in a handler, after a
+//! [`deps_core::ParsedManifest::background_probes`]). It runs in a spawned task, never in a handler, after a
 //! document's registry fetch has populated the tag index it needs. The ecosystem stores only
 //! authoritative answers and announces a [`RefreshEvent::ProbeEvidence`] per changed
 //! repository; the listener here answers that event by republishing diagnostics, and nothing
@@ -115,11 +115,7 @@ impl Drop for SlotGuard {
 /// Called after a document's open or change fetch merged, and for every open document that
 /// references a repository whose tag index just refreshed. Returns immediately; offline,
 /// nothing is spawned.
-pub(crate) fn spawn_background_probes(
-    state: &Arc<ServerState>,
-    uri: &Uri,
-    ecosystem: &Arc<dyn Ecosystem>,
-) {
+pub(crate) fn spawn_background_probes(state: &Arc<ServerState>, uri: &Uri) {
     if state.network_mode().is_offline() || state.probe_slots.claim(uri) == Claim::Coalesced {
         return;
     }
@@ -128,13 +124,12 @@ pub(crate) fn spawn_background_probes(
         uri: uri.clone(),
         finished: false,
     };
-    let ecosystem = Arc::clone(ecosystem);
     let span = tracing::Span::current();
     let panic_uri = uri.clone();
     spawn_supervised(
         async move {
             loop {
-                run_pass(&guard.state, &guard.uri, ecosystem.as_ref()).await;
+                run_pass(&guard.state, &guard.uri).await;
                 if guard.state.probe_slots.finish(&guard.uri) == Finish::Done {
                     guard.disarm();
                     break;
@@ -149,16 +144,15 @@ pub(crate) fn spawn_background_probes(
 }
 
 /// One probe pass over the document's current parse result, if it is still open.
-async fn run_pass(state: &ServerState, uri: &Uri, ecosystem: &dyn Ecosystem) {
-    let Some(parse_result) = state
-        .with_document(uri, super::state::DocumentState::parse_result_arc)
+async fn run_pass(state: &ServerState, uri: &Uri) {
+    let Some(manifest) = state
+        .with_document(uri, super::state::DocumentState::manifest_arc)
         .flatten()
     else {
         return;
     };
     let report = run_background_probes(
-        ecosystem,
-        parse_result.as_ref(),
+        manifest.as_ref(),
         ProbePhase::PostFetch,
         state.network_mode(),
     )
@@ -271,7 +265,7 @@ pub(crate) async fn run_probe_listener(
         &state,
         ecosystem.ecosystem_id(),
         events,
-        |uri| spawn_background_probes(&state, uri, &ecosystem),
+        |uri| spawn_background_probes(&state, uri),
         |uri| {
             let state = Arc::clone(&state);
             let client = client.clone();
@@ -382,10 +376,9 @@ mod tests {
     async fn overlapping_triggers_run_one_pass_and_one_rerun() {
         let state = Arc::new(ServerState::new());
         let (uri, ecosystem) = open_stub_document(&state, "/a/pubspec.yaml").await;
-        let dynamic: Arc<dyn Ecosystem> = ecosystem.clone();
 
         for _ in 0..5 {
-            spawn_background_probes(&state, &uri, &dynamic);
+            spawn_background_probes(&state, &uri);
         }
         settle().await;
 
@@ -393,7 +386,7 @@ mod tests {
             ecosystem.probe_calls(),
             [ProbePhase::PostFetch, ProbePhase::PostFetch]
         );
-        spawn_background_probes(&state, &uri, &dynamic);
+        spawn_background_probes(&state, &uri);
         settle().await;
         assert_eq!(ecosystem.probe_calls().len(), 3, "the slot was released");
     }
@@ -402,10 +395,9 @@ mod tests {
     async fn a_closed_document_is_not_probed() {
         let state = Arc::new(ServerState::new());
         let (uri, ecosystem) = open_stub_document(&state, "/a/pubspec.yaml").await;
-        let dynamic: Arc<dyn Ecosystem> = ecosystem.clone();
         state.documents.remove(&uri);
 
-        spawn_background_probes(&state, &uri, &dynamic);
+        spawn_background_probes(&state, &uri);
         settle().await;
 
         assert!(ecosystem.probe_calls().is_empty());
@@ -416,9 +408,8 @@ mod tests {
         let state = Arc::new(ServerState::new());
         state.cache.set_offline(deps_core::NetworkMode::Offline);
         let a = uri("/a.yml");
-        let ecosystem: Arc<dyn Ecosystem> = Arc::new(TestTier3Ecosystem::returning(vec![]));
 
-        spawn_background_probes(&state, &a, &ecosystem);
+        spawn_background_probes(&state, &a);
 
         assert_eq!(
             state.probe_slots.claim(&a),
@@ -442,7 +433,10 @@ mod tests {
                 deps_core::HttpCache::new(),
             ));
             let content = format!("steps:\n  - uses: {repo}@v4\n");
-            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let parse_result = Arc::new(ecosystem)
+                .parse_manifest(&content, &url)
+                .await
+                .unwrap();
             state.update_document(
                 uri.clone(),
                 DocumentState::new_from_parse_result(

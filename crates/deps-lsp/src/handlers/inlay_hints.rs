@@ -54,7 +54,7 @@ pub async fn handle_inlay_hints(
             tracing::warn!("Ecosystem not found: {}", doc.ecosystem);
             return None;
         };
-        let parse_result = doc.parse_result_arc()?;
+        let manifest = doc.manifest_arc()?;
         let snapshot = doc
             .signals
             .snapshot()
@@ -65,7 +65,7 @@ pub async fn handle_inlay_hints(
         Some((
             ecosystem,
             doc.ecosystem,
-            parse_result,
+            manifest,
             snapshot,
             doc.loading_state(),
         ))
@@ -74,7 +74,7 @@ pub async fn handle_inlay_hints(
         return vec![];
     };
 
-    let Some((ecosystem, ecosystem_id, parse_result, snapshot, loading_state)) = extracted else {
+    let Some((ecosystem, ecosystem_id, manifest, snapshot, loading_state)) = extracted else {
         return vec![];
     };
 
@@ -90,9 +90,8 @@ pub async fn handle_inlay_hints(
     // Issue #1517: `with_ecosystem` is needed for `generate_inlay_hints`'s own OSV
     // latest-verdict lookup to disambiguate duplicate dependency names, mirroring every
     // other renderer's identical `vuln_keys` derivation.
-    ecosystem
+    manifest
         .generate_inlay_hints(
-            parse_result.as_ref(),
             snapshot
                 .version_data()
                 .with_ecosystem(ecosystem_id)
@@ -187,29 +186,26 @@ mod tests {
     /// immediately, proving the `Ref` was already dropped before the call was awaited.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_document_write_not_blocked_by_in_flight_inlay_hints() {
-        use crate::test_utils::blocking_ecosystem::{
-            BlockingEcosystem, BlockingHook, MockParseResult,
-        };
-        use deps_core::ParseResult;
+        use crate::test_utils::blocking_ecosystem::{BlockingEcosystem, BlockingHook};
+
         use tokio::sync::Barrier;
 
         let state = Arc::new(ServerState::new());
         let started = Arc::new(Barrier::new(2));
-        state
-            .ecosystem_registry
-            .register(Arc::new(BlockingEcosystem {
-                started: Arc::clone(&started),
-                hook: BlockingHook::InlayHints,
-            }));
+        let blocking = Arc::new(BlockingEcosystem {
+            started: Arc::clone(&started),
+            hook: BlockingHook::InlayHints,
+        });
+        state.ecosystem_registry.register(blocking.clone());
 
         let url = deps_core::test_util::test_uri("/test/Cargo.toml");
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
         let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
+        let manifest = blocking.manifest(&url);
         let doc = crate::document::DocumentState::new_from_parse_result(
             EcosystemId::Cargo,
             content,
-            parse_result,
+            manifest,
         );
         state.update_document(uri.clone(), doc);
 
@@ -292,7 +288,7 @@ serde = "1.0.0"
 "#
             .to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -344,7 +340,7 @@ serde = "1.0.0"
             let content =
                 "[dependencies]\nbypassed = \"1.0.0\"\nfailing = \"1.0.0\"\nmissing = \"1.0.0\"\n"
                     .to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -439,7 +435,7 @@ serde = "1.0.0"
 "#
             .to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -486,7 +482,7 @@ serde = "1.0.0"
                 .unwrap();
             let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -534,7 +530,7 @@ dependencies = ["requests>=2.0.0"]
 "#
             .to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");

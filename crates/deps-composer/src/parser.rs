@@ -124,9 +124,13 @@ impl deps_core::ParseResult for ComposerParseResult {
             MinimumStability::Absent | MinimumStability::Declared(_) => None,
         }
     }
+}
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+impl deps_core::TypedParseResult for ComposerParseResult {
+    type Dep = ComposerDependency;
+
+    fn own_dependencies(&self) -> &[ComposerDependency] {
+        &self.dependencies
     }
 }
 

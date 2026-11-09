@@ -3,6 +3,7 @@
 // `-D warnings` nightly build turns into a hard error (rust-lang/rust#159228). Same class of
 // fix as deps-cargo (#745), deps-nuget (#696), deps-swift (#673), deps-composer.
 #![recursion_limit = "256"]
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 //! Gemfile parsing and rubygems.org integration.
 //!

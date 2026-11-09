@@ -2,11 +2,11 @@
 //! parses of a manifest.
 
 use super::state::{DocumentState, ServerState};
-use deps_core::Dependency;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::FetchFailure;
 use deps_core::NormalizedName;
+use deps_core::ParsedManifest;
 use deps_core::ResolvedCandidatesMap;
 use deps_core::ResolvedVersionsMap;
 use deps_core::VersionReq;
@@ -229,36 +229,25 @@ impl DependencyDiff {
 /// [`super::state::PackageSignals::licenses`] (issue #1424): a dependency whose in-use version
 /// just moved can no longer vouch for its previously cached license.
 pub(crate) fn resolved_versions_changed(
-    deps: &[&dyn Dependency],
+    manifest: &dyn ParsedManifest,
     old_resolved: &ResolvedVersionsMap,
     old_candidates: &ResolvedCandidatesMap,
     new_resolved: &ResolvedVersionsMap,
     new_candidates: &ResolvedCandidatesMap,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem_id: EcosystemId,
 ) -> Vec<NormalizedName> {
-    deps.iter()
-        .filter_map(|dep| {
-            let key = deps_core::PackageKey::new(dep.name(), formatter);
-            let old = deps_core::lsp_helpers::resolve_in_use_version(
-                *dep,
-                &key,
-                old_resolved,
-                Some(old_candidates),
-                formatter,
-                ecosystem_id,
-            );
-            let new = deps_core::lsp_helpers::resolve_in_use_version(
-                *dep,
-                &key,
-                new_resolved,
-                Some(new_candidates),
-                formatter,
-                ecosystem_id,
-            );
-            (old != new).then(|| key.normalized().clone())
-        })
-        .collect()
+    let mut changed = Vec::new();
+    manifest.for_each_formatted_dependency(&mut |bound| {
+        let key = deps_core::PackageKey::new(bound.dependency().name(), bound.formatter());
+        let old =
+            bound.resolve_in_use_version(&key, old_resolved, Some(old_candidates), ecosystem_id);
+        let new =
+            bound.resolve_in_use_version(&key, new_resolved, Some(new_candidates), ecosystem_id);
+        if old != new {
+            changed.push(key.normalized().clone());
+        }
+    });
+    changed
 }
 
 /// Writes a freshly-reloaded `resolved_versions`/`resolved_version_candidates` pair into
@@ -296,7 +285,7 @@ pub(crate) fn resolved_versions_changed(
 ///
 /// Also evicts [`super::state::PackageSignals::licenses`] for every dependency whose in-use
 /// version moved, but only for an ecosystem whose
-/// <code>ecosystem.[license_source](deps_core::Ecosystem::license_source)().[requires_dedicated_fetch](deps_core::LicenseSource::requires_dedicated_fetch)()</code>
+/// <code>ecosystem.[license_source](deps_core::EcosystemBase::license_source)().[requires_dedicated_fetch](deps_core::LicenseSource::requires_dedicated_fetch)()</code>
 /// is `true` (issue #1424, resolving the prior `TODO(critic)` on
 /// [`super::state::DocumentState::merge_licenses`]) — done synchronously, in the same write
 /// that lands the fresh resolved-version maps, so a subsequent tier-3 re-fetch that fails
@@ -317,15 +306,13 @@ pub(crate) fn reload_resolved_versions(
 ) -> bool {
     let changed_names: Vec<NormalizedName> = state
         .with_document(uri, |doc| {
-            doc.parse_result().map(|parse_result| {
-                let deps = parse_result.dependencies();
+            doc.manifest().map(|manifest| {
                 resolved_versions_changed(
-                    &deps,
+                    manifest,
                     &doc.signals.resolved_versions,
                     &doc.signals.resolved_version_candidates,
                     resolved_versions,
                     resolved_version_candidates,
-                    ecosystem.formatter(),
                     ecosystem.ecosystem_id(),
                 )
             })
@@ -386,7 +373,10 @@ tokio = "1.0"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -423,7 +413,10 @@ serde = "1.0.210"
 tokio = "1.0"
 "#;
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content2, &url)
+                .await
+                .unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -489,7 +482,10 @@ serde_old = { package = "serde", version = "0.9" }
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -515,7 +511,10 @@ serde = "1.0"
 serde_old = { package = "serde", version = "0.9" }
 
 "#;
-            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content2, &url)
+                .await
+                .unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -560,7 +559,10 @@ serde = "1.0"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -590,7 +592,10 @@ serde = "1.0"
 serde = "1.0"
 
 "#;
-            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content2, &url)
+                .await
+                .unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -625,7 +630,10 @@ time = "0.1.43"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -647,7 +655,10 @@ time = "0.1.43"
 time = "0.1.43"
 
 "#;
-            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content2, &url)
+                .await
+                .unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -683,7 +694,10 @@ time = "0.1.43"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -706,7 +720,10 @@ time = "0.1.43"
 time = "0.1.43"
 
 "#;
-            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content2, &url)
+                .await
+                .unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -742,7 +759,10 @@ time = "0.1.43"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -768,7 +788,10 @@ time = "0.1.43"
 time = "0.1.43"
 
 "#;
-            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content2, &url)
+                .await
+                .unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -808,7 +831,10 @@ time = "0.1.43"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -840,7 +866,10 @@ serde = "1.0"
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
             assert_eq!(diff.removed.as_slice(), [NormalizedName::for_test("time")]);
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content2, &url)
+                .await
+                .unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -887,7 +916,10 @@ serde_old = { package = "serde", version = "0.9" }
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -915,7 +947,10 @@ serde_old = { package = "serde", version = "0.9" }
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
             assert_eq!(diff.removed.as_slice(), [NormalizedName::for_test("serde")]);
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content2, &url)
+                .await
+                .unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -962,7 +997,10 @@ time = "0.1.44"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -994,7 +1032,10 @@ time = "0.1.44"
             let content2 = r#"[dependencies]
 time = "0.1.43"
 "#;
-            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content2, &url)
+                .await
+                .unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -1052,7 +1093,10 @@ time = "0.1.44"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -1086,7 +1130,7 @@ time = "0.1.44"
 time = "0.1.43"
 "#;
             let old_deps = dependency_version_map(
-                ecosystem
+                Arc::clone(&ecosystem)
                     .parse_manifest(content1, &url)
                     .await
                     .unwrap()
@@ -1094,7 +1138,7 @@ time = "0.1.43"
                 ecosystem.formatter(),
             );
             let new_deps = dependency_version_map(
-                ecosystem
+                Arc::clone(&ecosystem)
                     .parse_manifest(content2, &url)
                     .await
                     .unwrap()
@@ -1104,7 +1148,10 @@ time = "0.1.43"
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
             assert_eq!(diff.version_changed, vec![NormalizedName::for_test("time")]);
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content2, &url)
+                .await
+                .unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -1165,7 +1212,10 @@ time = "0.1.43"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -1194,7 +1244,10 @@ serde = "1.0"
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
             assert_eq!(diff.removed.as_slice(), [NormalizedName::for_test("time")]);
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content2, &url)
+                .await
+                .unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -1243,7 +1296,10 @@ time = "=0.1.43"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -1265,7 +1321,7 @@ time = "=0.1.43"
 time = "=0.1.44"
 "#;
             let old_deps = dependency_version_map(
-                ecosystem
+                Arc::clone(&ecosystem)
                     .parse_manifest(content1, &url)
                     .await
                     .unwrap()
@@ -1273,7 +1329,7 @@ time = "=0.1.44"
                 ecosystem.formatter(),
             );
             let new_deps = dependency_version_map(
-                ecosystem
+                Arc::clone(&ecosystem)
                     .parse_manifest(content2, &url)
                     .await
                     .unwrap()
@@ -1285,7 +1341,10 @@ time = "=0.1.44"
             assert!(diff.removed.is_empty());
             assert_eq!(diff.version_changed, vec![NormalizedName::for_test("time")]);
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content2, &url)
+                .await
+                .unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -1331,7 +1390,10 @@ time = "0.1.43"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -1360,7 +1422,10 @@ serde = "1.0"
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
             assert_eq!(diff.removed.as_slice(), [NormalizedName::for_test("time")]);
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content2, &url)
+                .await
+                .unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -1451,7 +1516,10 @@ time = "0.1.43"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content.to_string(),
@@ -1473,7 +1541,10 @@ time = "0.1.43"
             // manifest text) — no dependency added or removed, so the real
             // handler would skip the registry fetch and never re-run the
             // yanked probe.
-            let parse_result2 = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content.to_string(),
@@ -1512,7 +1583,10 @@ serde = "1.0"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
             let doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content.to_string(),
@@ -1544,7 +1618,10 @@ serde = "1.0"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -1564,7 +1641,10 @@ serde = "1.0"
 serde = "1.0"
 "#;
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.ok();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content2, &url)
+                .await
+                .ok();
             assert!(
                 parse_result2.is_none(),
                 "Parse should fail for invalid TOML"
@@ -1716,7 +1796,10 @@ time = "0.1.43"
 [dev-dependencies]
 time = "0.1.44"
 "#;
-            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
             assert_eq!(
                 parse_result.dependencies().len(),
                 2,
@@ -1762,7 +1845,7 @@ time = "0.1.43"
 time = "0.1.44"
 "#;
             let old_deps = dependency_version_map(
-                ecosystem
+                Arc::clone(&ecosystem)
                     .parse_manifest(content1, &url)
                     .await
                     .unwrap()
@@ -1777,7 +1860,7 @@ time = "0.1.50"
 time = "0.1.44"
 "#;
             let new_deps = dependency_version_map(
-                ecosystem
+                Arc::clone(&ecosystem)
                     .parse_manifest(content2, &url)
                     .await
                     .unwrap()
@@ -1819,7 +1902,7 @@ time = "0.1.43"
 time = "0.1.44"
 "#;
             let old_deps = dependency_version_map(
-                ecosystem
+                Arc::clone(&ecosystem)
                     .parse_manifest(content1, &url)
                     .await
                     .unwrap()
@@ -1834,7 +1917,7 @@ time = "0.1.43"
 time = "0.1.60"
 "#;
             let new_deps = dependency_version_map(
-                ecosystem
+                Arc::clone(&ecosystem)
                     .parse_manifest(content2, &url)
                     .await
                     .unwrap()
@@ -1880,7 +1963,10 @@ time = "0.1.44"
 [target.'cfg(unix)'.dependencies]
 time = "0.1.43"
 "#;
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             assert_eq!(
                 parse_result1.dependencies().len(),
                 2,
@@ -1904,7 +1990,7 @@ time = "0.1.44"
 time = "0.1.50"
 "#;
             let new_deps = dependency_version_map(
-                ecosystem
+                Arc::clone(&ecosystem)
                     .parse_manifest(content2, &url)
                     .await
                     .unwrap()
@@ -1944,7 +2030,10 @@ anyhow = "1.0"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content1, &url)
+                .await
+                .unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content1.to_string(),
@@ -1984,7 +2073,10 @@ tokio = "1.0"
                 .collect();
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
 
-            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content2, &url)
+                .await
+                .unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content2.to_string(),
@@ -2042,7 +2134,10 @@ time = "0.1"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
             let doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content.to_string(),
@@ -2110,7 +2205,10 @@ time = "0.1"
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Dart)
                 .unwrap();
-            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
             let doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Dart,
                 content.to_string(),
@@ -2165,7 +2263,7 @@ time = "0.1"
             name: PackageName,
             version_req: Option<VersionReq>,
         }
-        impl Dependency for StubDependency {
+        impl deps_core::Dependency for StubDependency {
             fn name(&self) -> &PackageName {
                 &self.name
             }
@@ -2181,20 +2279,54 @@ time = "0.1"
             fn source(&self) -> deps_core::parser::DependencySource {
                 deps_core::parser::DependencySource::Registry
             }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
+        }
+
+        struct StubDocument {
+            uri: url::Url,
+            deps: Vec<StubDependency>,
+        }
+        impl deps_core::ParseResult for StubDocument {
+            fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
+                self.deps
+                    .iter()
+                    .map(|dep| dep as &dyn deps_core::Dependency)
+                    .collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+        }
+        impl deps_core::TypedParseResult for StubDocument {
+            type Dep = StubDependency;
+            fn own_dependencies(&self) -> &[StubDependency] {
+                &self.deps
             }
         }
 
-        const IDENTITY_FORMATTER: deps_core::test_util::StubFormatter =
-            deps_core::test_util::StubFormatter::new().with_package_url_prefix("");
+        fn document(
+            deps: Vec<StubDependency>,
+            formatter: deps_core::test_util::StubFormatter<StubDependency>,
+            id: EcosystemId,
+        ) -> Box<dyn ParsedManifest> {
+            let uri = deps_core::test_util::test_uri("/test/manifest.toml");
+            deps_core::test_util::stub_document_with(StubDocument { uri, deps }, formatter, id)
+        }
+
+        const IDENTITY_FORMATTER: deps_core::test_util::StubFormatter<StubDependency> =
+            deps_core::test_util::StubFormatter::new()
+                .with_package_url_prefix("")
+                .for_dependency();
 
         /// Mimics a PEP 503-normalizing ecosystem (PyPI/Poetry, Composer): lowercases the
         /// manifest-declared name the way the real lock-file key is produced.
-        const LOWERCASE_FORMATTER: deps_core::test_util::StubFormatter =
+        const LOWERCASE_FORMATTER: deps_core::test_util::StubFormatter<StubDependency> =
             deps_core::test_util::StubFormatter::new()
                 .with_package_url_prefix("")
-                .with_lowercase_names();
+                .with_lowercase_names()
+                .for_dependency();
 
         /// Regression guard for issue #1395: `handle_lockfile_change` has no
         /// `DependencyDiff` to consult (the manifest text is untouched), so it must detect
@@ -2209,8 +2341,7 @@ time = "0.1"
                 name: PackageName::new("serde"),
                 version_req: None,
             };
-            let deps: Vec<&dyn Dependency> = vec![&time, &serde];
-            let formatter = IDENTITY_FORMATTER;
+            let manifest = document(vec![time, serde], IDENTITY_FORMATTER, EcosystemId::Cargo);
             let no_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
 
             // `time` newly resolved (no lock file entry before `cargo generate-lockfile`).
@@ -2227,12 +2358,11 @@ time = "0.1"
             .collect();
             assert!(
                 !resolved_versions_changed(
-                    &deps,
+                    &*manifest,
                     &old,
                     &no_candidates,
                     &new,
                     &no_candidates,
-                    &formatter,
                     EcosystemId::Cargo,
                 )
                 .is_empty(),
@@ -2254,12 +2384,11 @@ time = "0.1"
             .collect();
             assert!(
                 !resolved_versions_changed(
-                    &deps,
+                    &*manifest,
                     &old,
                     &no_candidates,
                     &new,
                     &no_candidates,
-                    &formatter,
                     EcosystemId::Cargo,
                 )
                 .is_empty(),
@@ -2269,12 +2398,11 @@ time = "0.1"
             // Identical resolutions for every one of this document's own dependencies.
             assert!(
                 resolved_versions_changed(
-                    &deps,
+                    &*manifest,
                     &new,
                     &no_candidates,
                     &new.clone(),
                     &no_candidates,
-                    &formatter,
                     EcosystemId::Cargo,
                 )
                 .is_empty(),
@@ -2299,12 +2427,11 @@ time = "0.1"
             .collect();
             assert!(
                 resolved_versions_changed(
-                    &deps,
+                    &*manifest,
                     &old,
                     &no_candidates,
                     &new,
                     &no_candidates,
-                    &formatter,
                     EcosystemId::Cargo,
                 )
                 .is_empty(),
@@ -2322,8 +2449,7 @@ time = "0.1"
                 name: PackageName::new("time"),
                 version_req: None,
             };
-            let deps: Vec<&dyn Dependency> = vec![&time];
-            let formatter = IDENTITY_FORMATTER;
+            let manifest = document(vec![time], IDENTITY_FORMATTER, EcosystemId::Cargo);
             let no_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
 
             let old: HashMap<NormalizedName, ConcreteVersion> = std::iter::once((
@@ -2335,12 +2461,11 @@ time = "0.1"
 
             assert!(
                 !resolved_versions_changed(
-                    &deps,
+                    &*manifest,
                     &old,
                     &no_candidates,
                     &new,
                     &no_candidates,
-                    &formatter,
                     EcosystemId::Cargo,
                 )
                 .is_empty(),
@@ -2360,8 +2485,7 @@ time = "0.1"
                 name: PackageName::new("Django"),
                 version_req: None,
             };
-            let deps: Vec<&dyn Dependency> = vec![&django];
-            let formatter = LOWERCASE_FORMATTER;
+            let manifest = document(vec![django], LOWERCASE_FORMATTER, EcosystemId::Pypi);
             let no_candidates: HashMap<NormalizedName, Vec<ConcreteVersion>> = HashMap::new();
 
             // The lock file resolves under the normalized key, never the raw manifest
@@ -2376,12 +2500,11 @@ time = "0.1"
 
             assert!(
                 !resolved_versions_changed(
-                    &deps,
+                    &*manifest,
                     &old,
                     &no_candidates,
                     &new,
                     &no_candidates,
-                    &formatter,
                     EcosystemId::Pypi,
                 )
                 .is_empty(),
@@ -2403,8 +2526,7 @@ time = "0.1"
                 name: PackageName::new("time"),
                 version_req: Some(VersionReq::new("0.1")),
             };
-            let deps: Vec<&dyn Dependency> = vec![&time];
-            let formatter = IDENTITY_FORMATTER;
+            let manifest = document(vec![time], IDENTITY_FORMATTER, EcosystemId::Cargo);
 
             // The collapsed value is always the highest retained entry (0.3.36, a
             // transitive dependency's pin) and never changes across the update below.
@@ -2434,12 +2556,11 @@ time = "0.1"
 
             assert!(
                 !resolved_versions_changed(
-                    &deps,
+                    &*manifest,
                     &resolved,
                     &old_candidates,
                     &resolved,
                     &new_candidates,
-                    &formatter,
                     EcosystemId::Cargo,
                 )
                 .is_empty(),

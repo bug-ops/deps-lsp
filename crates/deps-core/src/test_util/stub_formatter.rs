@@ -1,8 +1,11 @@
 //! [`StubFormatter`]: a const-constructible `EcosystemFormatter` test double.
 
+use std::marker::PhantomData;
+
+use super::StubDependency;
 use crate::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    PinResolution, RequirementResolution, SourcePolicy,
+    DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, PinResolution, RequirementResolution, SourcePolicy,
 };
 use crate::{ConcreteVersion, Dependency, PackageName};
 
@@ -26,6 +29,10 @@ use crate::{ConcreteVersion, Dependency, PackageName};
 ///   [`OsvNaming::osv_version_to_native`] adds back a `v` prefix, mirroring `GoFormatter`'s
 ///   override — a non-identity `OsvNaming` double for tests that must fail if OSV's wire
 ///   spelling leaks into a native-namespace rendering unconverted.
+///
+/// `D` is the dependency type the stub reads as a
+/// [`DependencyFormatter`]; it defaults to [`StubDependency`]. Pair the stub with a parse result
+/// of another dependency type through [`Self::for_dependency`].
 ///
 /// Public-API `///` doctests that illustrate implementing [`EcosystemFormatter`](crate::lsp_helpers::EcosystemFormatter)
 /// from scratch (e.g. `deps_engine::classify::resolved::collect_in_use_versions`'s example)
@@ -76,8 +83,7 @@ use crate::{ConcreteVersion, Dependency, PackageName};
     reason = "each field is an independent, non-exclusive knob, not overlapping state a \
               two-variant enum could express more clearly"
 )]
-#[derive(Debug, Clone, Copy)]
-pub struct StubFormatter {
+pub struct StubFormatter<D = StubDependency> {
     quoted_text_edit: bool,
     lowercase_names: bool,
     package_url_prefix: &'static str,
@@ -85,6 +91,45 @@ pub struct StubFormatter {
     alternate_registry_resolution: bool,
     go_style_osv_version_to_native: bool,
     unpublished_pin_resolution: bool,
+    dependency: PhantomData<fn() -> D>,
+}
+
+impl<D> Clone for StubFormatter<D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<D> Copy for StubFormatter<D> {}
+
+impl<D> std::fmt::Debug for StubFormatter<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StubFormatter")
+            .field("quoted_text_edit", &self.quoted_text_edit)
+            .field("lowercase_names", &self.lowercase_names)
+            .field("package_url_prefix", &self.package_url_prefix)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<D> StubFormatter<D> {
+    /// The same stub reading dependencies of type `E`.
+    ///
+    /// Call it last in a builder chain: the builders live on the default-typed stub so that
+    /// `StubFormatter::new()` and [`StubFormatter::DEFAULT`] infer without annotations.
+    #[must_use]
+    pub const fn for_dependency<E>(self) -> StubFormatter<E> {
+        StubFormatter {
+            quoted_text_edit: self.quoted_text_edit,
+            lowercase_names: self.lowercase_names,
+            package_url_prefix: self.package_url_prefix,
+            manifest_requirement_as_resolved_version: self.manifest_requirement_as_resolved_version,
+            alternate_registry_resolution: self.alternate_registry_resolution,
+            go_style_osv_version_to_native: self.go_style_osv_version_to_native,
+            unpublished_pin_resolution: self.unpublished_pin_resolution,
+            dependency: PhantomData,
+        }
+    }
 }
 
 impl StubFormatter {
@@ -104,6 +149,7 @@ impl StubFormatter {
             alternate_registry_resolution: false,
             go_style_osv_version_to_native: false,
             unpublished_pin_resolution: false,
+            dependency: PhantomData,
         }
     }
 
@@ -130,7 +176,7 @@ impl StubFormatter {
         self
     }
 
-    /// [`RequirementResolution::manifest_requirement_is_resolved_version`] returns `true`,
+    /// [`DependencyFormatter::manifest_requirement_is_resolved_version`] returns `true`,
     /// mirroring `GoFormatter`'s override.
     #[must_use]
     pub const fn with_manifest_requirement_as_resolved_version(mut self) -> Self {
@@ -157,7 +203,7 @@ impl StubFormatter {
 }
 
 impl StubFormatter {
-    /// [`RequirementResolution::resolved_pin_version`] reports
+    /// [`DependencyFormatter::resolved_pin_version`] reports
     /// [`PinResolution::Unpublished`] for every dependency, as a git-tag ecosystem does for a
     /// full-release-shaped tag the registry never published.
     #[must_use]
@@ -173,7 +219,7 @@ impl Default for StubFormatter {
     }
 }
 
-impl PackageNaming for StubFormatter {
+impl<D: 'static> PackageNaming for StubFormatter<D> {
     fn normalized_spelling(&self, name: &PackageName) -> String {
         if self.lowercase_names {
             name.as_str().to_lowercase()
@@ -183,7 +229,7 @@ impl PackageNaming for StubFormatter {
     }
 }
 
-impl PackageRendering for StubFormatter {
+impl<D: 'static> PackageRendering for StubFormatter<D> {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         if self.quoted_text_edit {
             format!("\"{version}\"")
@@ -197,33 +243,19 @@ impl PackageRendering for StubFormatter {
     }
 }
 
-impl RequirementResolution for StubFormatter {
-    fn manifest_requirement_is_resolved_version(&self, dep: &dyn Dependency) -> bool {
-        let _ = dep;
-        self.manifest_requirement_as_resolved_version
-    }
+impl<D: 'static> RequirementResolution for StubFormatter<D> {}
 
-    fn resolved_pin_version(&self, dep: &dyn Dependency) -> PinResolution {
-        let _ = dep;
-        if self.unpublished_pin_resolution {
-            PinResolution::Unpublished
-        } else {
-            PinResolution::Unresolved
-        }
-    }
-}
+impl<D: 'static> DiagnosticMessages for StubFormatter<D> {}
 
-impl DiagnosticMessages for StubFormatter {}
+impl<D: 'static> DiagnosticPolicy for StubFormatter<D> {}
 
-impl DiagnosticPolicy for StubFormatter {}
-
-impl SourcePolicy for StubFormatter {
+impl<D: 'static> SourcePolicy for StubFormatter<D> {
     fn resolves_alternate_registry(&self) -> bool {
         self.alternate_registry_resolution
     }
 }
 
-impl OsvNaming for StubFormatter {
+impl<D: 'static> OsvNaming for StubFormatter<D> {
     fn osv_version_to_native(&self, version: &crate::osv::OsvVersion) -> ConcreteVersion {
         let version = version.as_str();
         if self.go_style_osv_version_to_native {
@@ -238,9 +270,28 @@ impl OsvNaming for StubFormatter {
     }
 }
 
+impl<D: Dependency + 'static> DependencyFormatter for StubFormatter<D> {
+    type Dep = D;
+
+    fn manifest_requirement_is_resolved_version(&self, dep: &D) -> bool {
+        let _ = dep;
+        self.manifest_requirement_as_resolved_version
+    }
+
+    fn resolved_pin_version(&self, dep: &D) -> PinResolution {
+        let _ = dep;
+        if self.unpublished_pin_resolution {
+            PinResolution::Unpublished
+        } else {
+            PinResolution::Unresolved
+        }
+    }
+}
+
 #[cfg(all(test, feature = "test-util"))]
 mod tests {
     use super::StubFormatter;
+    use crate::lsp_helpers::DependencyFormatter;
     use crate::lsp_helpers::{
         NormalizeName, PackageNaming, PackageRendering, RequirementResolution, SourcePolicy,
     };
@@ -265,9 +316,6 @@ mod tests {
         fn source(&self) -> DependencySource {
             DependencySource::Registry
         }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
     }
 
     /// Locally re-implements every `EcosystemFormatter` default so a drift in the trait's own
@@ -288,10 +336,13 @@ mod tests {
     impl crate::lsp_helpers::DiagnosticPolicy for DefaultInheriting {}
     impl SourcePolicy for DefaultInheriting {}
     impl crate::lsp_helpers::OsvNaming for DefaultInheriting {}
+    impl DependencyFormatter for DefaultInheriting {
+        type Dep = StubDep;
+    }
 
     #[test]
     fn default_matches_trait_defaults() {
-        let stub = StubFormatter::DEFAULT;
+        let stub = StubFormatter::DEFAULT.for_dependency::<StubDep>();
         let baseline = DefaultInheriting;
         let dep = StubDep;
 
@@ -327,7 +378,7 @@ mod tests {
 
     #[test]
     fn default_is_unquoted_identity_example_com() {
-        let stub = StubFormatter::DEFAULT;
+        let stub = StubFormatter::DEFAULT.for_dependency::<StubDep>();
         let name = PackageName::new("serde");
         assert_eq!(
             stub.format_version_for_text_edit(&ConcreteVersion::new("1.2.3")),
@@ -370,8 +421,9 @@ mod tests {
 
     #[test]
     fn with_manifest_requirement_as_resolved_version_reports_true() {
-        const F: StubFormatter =
-            StubFormatter::new().with_manifest_requirement_as_resolved_version();
+        const F: StubFormatter<StubDep> = StubFormatter::new()
+            .with_manifest_requirement_as_resolved_version()
+            .for_dependency();
         assert!(F.manifest_requirement_is_resolved_version(&StubDep));
     }
 

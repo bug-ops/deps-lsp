@@ -77,7 +77,6 @@ mod tests {
             Some("3.2.0")
         );
         assert!(dep.features().is_empty());
-        assert!(dep.as_any().is::<GradleDependency>());
         assert_matches!(dep.source(), deps_core::parser::DependencySource::Registry);
     }
 

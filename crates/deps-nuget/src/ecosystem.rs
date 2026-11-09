@@ -29,9 +29,10 @@ use deps_core::lsp_helpers::{
 };
 #[cfg(feature = "lsp-responses")]
 use deps_core::parser::DependencySource;
-use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
-};
+#[cfg(feature = "lsp-responses")]
+use deps_core::{Dependency, ParsedView};
+use deps_core::{EcosystemBase, Registry, Result, TypedEcosystem};
+#[cfg(test)]
 use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
@@ -98,7 +99,7 @@ impl NuGetEcosystem {
     /// typed into the name field, not a resolved private dependency name, so it is safe to
     /// send to api.nuget.org unconditionally — unlike version completion, which gates on
     /// `can_resolve_source` before ever reaching the registry (see
-    /// [`Ecosystem::complete_version`]'s default implementation).
+    /// [`TypedEcosystem::complete_version`]'s default implementation).
     #[cfg(feature = "lsp-responses")]
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
         deps_core::completion::complete_package_names_generic(
@@ -162,7 +163,7 @@ impl NuGetManifestKind {
 
 impl deps_core::ecosystem::private::Sealed for NuGetEcosystem {}
 
-impl Ecosystem for NuGetEcosystem {
+impl EcosystemBase for NuGetEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::NuGet
     }
@@ -188,11 +189,66 @@ impl Ecosystem for NuGetEcosystem {
         &["packages.lock.json", "packages.*.lock.json"]
     }
 
-    fn parse_manifest<'a>(
+    fn registry(&self) -> Arc<dyn Registry> {
+        self.registry.clone() as Arc<dyn Registry>
+    }
+
+    fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
+        Some(self.lockfile_provider.clone() as Arc<dyn deps_core::lockfile::LockFileProvider>)
+    }
+
+    fn fallback_completion_prefix<'a>(
+        &self,
+        content: &'a str,
+        position: deps_core::position::Position,
+    ) -> Option<&'a str> {
+        let line = deps_core::fallback_completion::line_at(content, position)?;
+        if !is_in_dependencies_section(content, position.line as usize) {
+            return None;
+        }
+        Some(extract_prefix(line, position.character))
+    }
+
+    fn fallback_completion_is_bare(
+        &self,
+        _content: &str,
+        _position: deps_core::position::Position,
+    ) -> bool {
+        // `extract_prefix` (`strip_open_xml_attribute_value`) only ever produces a
+        // non-empty prefix when the cursor is already inside an open `Include="`/`id="`
+        // attribute value — the caller's empty-prefix guard rejects every other case
+        // before this method is reached, so whenever `fallback_completion_prefix`
+        // returned a completable prefix at all, the surrounding `<PackageReference
+        // .../>` markup is already open around the cursor. Inserting the full tag there
+        // would nest a second copy of it inside the attribute value it was typed into
+        // (#724/#728) — the default `fallback_bare_insert_text` (the bare package name)
+        // is always the safe insert here.
+        true
+    }
+
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        Some(format!(
+            "<PackageReference Include=\"{}\" Version=\"{latest}\" />",
+            name.as_str()
+        ))
+    }
+}
+
+impl TypedEcosystem for NuGetEcosystem {
+    type Parsed = NuGetParseResult;
+    type Formatter = NuGetFormatter;
+
+    fn own_formatter(&self) -> &NuGetFormatter {
+        &self.formatter
+    }
+
+    fn parse<'a>(
         &'a self,
         content: &'a str,
         uri: &'a Url,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<NuGetParseResult>> {
         Box::pin(async move {
             let mut result = Self::parse_by_filename(content, uri)?;
 
@@ -241,26 +297,14 @@ impl Ecosystem for NuGetEcosystem {
                 NuGetRegistry::register_alternate(&self.registry, chain, &self.context.policy);
             }
 
-            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
+            Ok(result)
         })
-    }
-
-    fn registry(&self) -> Arc<dyn Registry> {
-        self.registry.clone() as Arc<dyn Registry>
-    }
-
-    fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
-        Some(self.lockfile_provider.clone() as Arc<dyn deps_core::lockfile::LockFileProvider>)
-    }
-
-    fn formatter(&self) -> &dyn EcosystemFormatter {
-        &self.formatter
     }
 
     #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
-        _request: deps_core::completion::CompletionRequest<'a>,
+        _request: deps_core::completion::CompletionRequest<'a, NuGetParseResult>,
         prefix: String,
         range: Range,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
@@ -303,20 +347,20 @@ impl Ecosystem for NuGetEcosystem {
     /// method's own tier gate), so this loses nothing a private-feed hover would have shown
     /// anyway.
     #[cfg(feature = "lsp-responses")]
-    fn generate_hover<'a>(
+    fn hover<'a>(
         &'a self,
-        parse_result: &'a dyn ParseResultTrait,
+        parsed: ParsedView<'a, NuGetParseResult>,
         position: Position,
         versions: deps_core::VersionData<'a>,
         freshness: deps_core::FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Option<Hover>> {
         Box::pin(async move {
             let base_hover = deps_core::lsp_generate_hover(
-                parse_result,
+                &parsed,
                 position,
                 versions,
                 self.registry.as_ref(),
-                self.formatter(),
+                self.own_formatter(),
                 freshness,
                 deps_core::PublishTime::now(),
             );
@@ -324,7 +368,7 @@ impl Ecosystem for NuGetEcosystem {
             // Same predicate `lsp_generate_hover` uses internally to pick a dependency: if
             // it finds none, the render above resolves to `None` too, so the unlisted fetch
             // is skipped rather than issued for a hover that will be empty anyway.
-            let dep = parse_result.dependencies().into_iter().find(|d| {
+            let dep = parsed.dependencies_slice().iter().find(|d| {
                 deps_core::position_in_range(position.into(), d.name_range())
                     || d.version_range()
                         .is_some_and(|r| deps_core::position_in_range(position.into(), r))
@@ -361,9 +405,9 @@ impl Ecosystem for NuGetEcosystem {
                 unlisted_client.unlisted_versions(dep.name().as_str()),
                 InteractiveFetchRequest::for_dependency(
                     versions,
-                    parse_result.uri(),
+                    &parsed.typed().uri,
                     dep,
-                    self.formatter(),
+                    self.own_formatter(),
                     FetchContext::Hover,
                 ),
                 AuxiliaryLookup::Decoration,
@@ -383,48 +427,6 @@ impl Ecosystem for NuGetEcosystem {
 
             Some(hover)
         })
-    }
-
-    fn fallback_completion_prefix<'a>(
-        &self,
-        content: &'a str,
-        position: deps_core::position::Position,
-    ) -> Option<&'a str> {
-        let line = deps_core::fallback_completion::line_at(content, position)?;
-        if !is_in_dependencies_section(content, position.line as usize) {
-            return None;
-        }
-        Some(extract_prefix(line, position.character))
-    }
-
-    fn fallback_completion_is_bare(
-        &self,
-        _content: &str,
-        _position: deps_core::position::Position,
-    ) -> bool {
-        // `extract_prefix` (`strip_open_xml_attribute_value`) only ever produces a
-        // non-empty prefix when the cursor is already inside an open `Include="`/`id="`
-        // attribute value — the caller's empty-prefix guard rejects every other case
-        // before this method is reached, so whenever `fallback_completion_prefix`
-        // returned a completable prefix at all, the surrounding `<PackageReference
-        // .../>` markup is already open around the cursor. Inserting the full tag there
-        // would nest a second copy of it inside the attribute value it was typed into
-        // (#724/#728) — the default `fallback_bare_insert_text` (the bare package name)
-        // is always the safe insert here.
-        true
-    }
-
-    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
-        let name = metadata.name();
-        let latest = metadata.latest_version().as_str();
-        Some(format!(
-            "<PackageReference Include=\"{}\" Version=\"{latest}\" />",
-            name.as_str()
-        ))
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -459,6 +461,7 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 mod tests {
     use super::*;
     use deps_core::NormalizedName;
+    use deps_core::{ParseResult as _, ParsedView};
 
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
     // test_ecosystem_id/test_ecosystem_display_name/test_lockfile_filenames/test_as_any
@@ -518,7 +521,7 @@ mod tests {
     ) -> deps_core::lsp_helpers::FallbackEditVerdict {
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NuGetEcosystem::new(cache);
+        let ecosystem: Arc<dyn deps_core::Ecosystem> = Arc::new(NuGetEcosystem::new(cache));
         let content = format!(
             r#"<Project><ItemGroup><PackageReference Include="pkg" Version="{req}" /></ItemGroup></Project>"#
         );
@@ -570,7 +573,7 @@ mod tests {
     async fn test_fallback_edit_excludes_newer_pins_sc017_version_before_include_lookup() {
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NuGetEcosystem::new(cache);
+        let ecosystem: Arc<dyn deps_core::Ecosystem> = Arc::new(NuGetEcosystem::new(cache));
         let content = r#"<Project><ItemGroup><PackageReference Version="1.0.0" Include="pkg" /></ItemGroup></Project>"#;
         let uri = deps_core::test_util::test_uri("/test/App.csproj");
         let verdict = deps_core::test_util::fallback_edit_outcome(
@@ -599,7 +602,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/test/App.csproj");
         let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
 
-        let result = eco.parse_manifest(content, &uri).await.unwrap();
+        let result = eco.parse(content, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
     }
 
@@ -613,7 +616,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/test/App.fsproj");
         let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
 
-        let result = eco.parse_manifest(content, &uri).await.unwrap();
+        let result = eco.parse(content, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
     }
 
@@ -627,7 +630,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/test/Directory.Packages.props");
         let content = r#"<Project><ItemGroup><PackageVersion Include="Serilog" Version="3.1.1" /></ItemGroup></Project>"#;
 
-        let result = eco.parse_manifest(content, &uri).await.unwrap();
+        let result = eco.parse(content, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
     }
 
@@ -641,7 +644,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/test/packages.config");
         let content = r#"<packages><package id="Newtonsoft.Json" version="13.0.3" targetFramework="net48" /></packages>"#;
 
-        let result = eco.parse_manifest(content, &uri).await.unwrap();
+        let result = eco.parse(content, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
     }
 
@@ -655,7 +658,7 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/test/App.csproj");
         let content = r#"<Project attr="unclosed></Project>"#;
 
-        let result = eco.parse_manifest(content, &uri).await;
+        let result = eco.parse(content, &uri).await;
         assert!(result.is_err());
     }
 
@@ -677,7 +680,7 @@ mod tests {
         // this guard is needed here — held for this shared helper's `parse_manifest` call so
         // every one of its callers is covered without repeating the guard per-caller.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let parse_result = eco.parse_manifest(content, uri).await.unwrap();
+        let parse_result = eco.parse(content, uri).await.unwrap();
         let mut cached = std::collections::HashMap::new();
         cached.insert(
             NormalizedName::for_test("newtonsoft.json"),
@@ -685,8 +688,8 @@ mod tests {
         );
         let resolved = std::collections::HashMap::new();
 
-        eco.generate_diagnostics(
-            parse_result.as_ref(),
+        eco.diagnostics(
+            ParsedView::new(&parse_result),
             VersionData::new(&cached, &resolved),
             uri,
             deps_core::FreshnessSettings::default(),
@@ -967,14 +970,11 @@ mod tests {
             let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Foo\" Version=\"1.0.0\" />\n  </ItemGroup>\n</Project>";
             let uri = deps_core::test_util::test_uri("/test/App.csproj");
 
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let position = Position::new(2, 33); // cursor after "Fo" in "Foo"
 
-            let context = deps_core::completion::detect_completion_context(
-                parse_result.as_ref(),
-                position,
-                content,
-            );
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
 
             match context {
                 deps_core::completion::CompletionContext::PackageName { prefix, range } => {
@@ -1414,7 +1414,7 @@ mod tests {
             // this guard is needed here — held for this shared helper's `parse_manifest` call so
             // every one of its five callers is covered without repeating the guard per-caller.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-            let parse_result = eco.parse_manifest(content, uri).await.unwrap();
+            let parse_result = eco.parse(content, uri).await.unwrap();
             let mut cached = std::collections::HashMap::new();
             cached.insert(
                 NormalizedName::for_test("newtonsoft.json"),
@@ -1423,8 +1423,8 @@ mod tests {
             let resolved = std::collections::HashMap::new();
 
             let hints = eco
-                .generate_inlay_hints(
-                    parse_result.as_ref(),
+                .inlay_hints(
+                    ParsedView::new(&parse_result),
                     VersionData::new(&cached, &resolved),
                     LoadingState::Idle,
                     &EcosystemConfig::default(),
@@ -1585,7 +1585,7 @@ mod tests {
 
             let uri = deps_core::test_util::test_uri("/test/App.csproj");
             let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
 
             let cached = std::collections::HashMap::new();
             let resolved = std::collections::HashMap::new();
@@ -1595,8 +1595,8 @@ mod tests {
             let freshness = deps_core::FreshnessSettings::Disabled;
 
             let hover = eco
-                .generate_hover(
-                    parse_result.as_ref(),
+                .hover(
+                    ParsedView::new(&parse_result),
                     Position::new(0, 49), // inside "Newtonsoft.Json"
                     deps_core::VersionData::new(&cached, &resolved),
                     freshness,
@@ -1651,14 +1651,14 @@ mod tests {
 
             let uri = deps_core::test_util::test_uri("/test/App.csproj");
             let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
 
             let cached = std::collections::HashMap::new();
             let resolved = std::collections::HashMap::new();
 
             let hover = eco
-                .generate_hover(
-                    parse_result.as_ref(),
+                .hover(
+                    ParsedView::new(&parse_result),
                     Position::new(0, 49),
                     deps_core::VersionData::new(&cached, &resolved),
                     deps_core::FreshnessSettings::Disabled,
@@ -1710,15 +1710,15 @@ mod tests {
             let eco = NuGetEcosystem::with_registry(registry);
             let uri = deps_core::test_util::test_uri("/test/App.csproj");
             let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let (cached, resolved) = (
                 std::collections::HashMap::new(),
                 std::collections::HashMap::new(),
             );
             let gate = interactive_gate();
             let hover = || async {
-                eco.generate_hover(
-                    parse_result.as_ref(),
+                eco.hover(
+                    ParsedView::new(&parse_result),
                     Position::new(0, 49),
                     gated_versions(&cached, &resolved, &gate),
                     deps_core::FreshnessSettings::Disabled,
@@ -1786,7 +1786,7 @@ mod tests {
             let eco = NuGetEcosystem::with_registry(registry);
             let uri = deps_core::test_util::test_uri("/test/App.csproj");
             let content = r#"<Project><ItemGroup><PackageReference Include="Pkg.A" Version="1.0.0" /><PackageReference Include="Pkg.B" Version="1.0.0" /><PackageReference Include="Pkg.C" Version="1.0.0" /></ItemGroup></Project>"#;
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let (cached, resolved) = (
                 std::collections::HashMap::new(),
                 std::collections::HashMap::new(),
@@ -1797,8 +1797,8 @@ mod tests {
                 let (eco, parse_result, gate) = (&eco, &parse_result, &gate);
                 let (cached, resolved) = (&cached, &resolved);
                 async move {
-                    eco.generate_hover(
-                        parse_result.as_ref(),
+                    eco.hover(
+                        ParsedView::new(parse_result),
                         Position::new(0, column),
                         gated_versions(cached, resolved, gate),
                         deps_core::FreshnessSettings::Disabled,
@@ -1847,14 +1847,14 @@ mod tests {
 
             let uri = deps_core::test_util::test_uri("/test/App.csproj");
             let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
 
             let cached = std::collections::HashMap::new();
             let resolved = std::collections::HashMap::new();
 
             let hover = eco
-                .generate_hover(
-                    parse_result.as_ref(),
+                .hover(
+                    ParsedView::new(&parse_result),
                     Position::new(0, 0), // outside any dependency's name/version range
                     deps_core::VersionData::new(&cached, &resolved),
                     deps_core::FreshnessSettings::Disabled,
@@ -1931,7 +1931,7 @@ mod tests {
             };
             let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
 
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let dep = parse_result
                 .dependencies()
                 .into_iter()
@@ -1996,7 +1996,7 @@ mod tests {
                 context,
             );
 
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let dep = parse_result
                 .dependencies()
                 .into_iter()
@@ -2063,7 +2063,7 @@ mod tests {
                 context,
             );
 
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let dep = parse_result
                 .dependencies()
                 .into_iter()
@@ -2150,7 +2150,7 @@ mod tests {
                     context,
                 );
 
-                let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+                let parse_result = eco.parse(content, &uri).await.unwrap();
                 let dep = parse_result
                     .dependencies()
                     .into_iter()
@@ -2241,15 +2241,15 @@ mod tests {
             };
             let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
 
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             // Position inside "MyCompany.Internal" in the Include attribute.
             let position = Position::new(0, 49);
 
             let cached = std::collections::HashMap::new();
             let resolved = std::collections::HashMap::new();
             let hover = eco
-                .generate_hover(
-                    parse_result.as_ref(),
+                .hover(
+                    ParsedView::new(&parse_result),
                     position,
                     deps_core::VersionData::new(&cached, &resolved),
                     deps_core::FreshnessSettings::Disabled,
@@ -2329,14 +2329,14 @@ mod tests {
             };
             let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
 
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = eco.parse(content, &uri).await.unwrap();
             let position = Position::new(0, 49); // inside "MyCompany.Internal"
 
             let cached = std::collections::HashMap::new();
             let resolved = std::collections::HashMap::new();
             let hover = eco
-                .generate_hover(
-                    parse_result.as_ref(),
+                .hover(
+                    ParsedView::new(&parse_result),
                     position,
                     deps_core::VersionData::new(&cached, &resolved),
                     deps_core::FreshnessSettings::Disabled,
@@ -2478,7 +2478,7 @@ mod tests {
             };
             let direct = eco.complete_package_names(&prefix, range).await;
             let via_dispatch = eco
-                .generate_completions(&parse_result, position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             assert_eq!(via_dispatch.items, direct);
             assert!(direct.is_empty());
@@ -2538,7 +2538,7 @@ mod tests {
                 .complete_versions(&parse_result, position, &prefix, freshness)
                 .await;
             let via_dispatch = eco
-                .generate_completions(&parse_result, position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             assert_eq!(via_dispatch.items, direct);
             assert!(direct.is_empty());

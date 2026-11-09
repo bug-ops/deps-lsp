@@ -41,10 +41,9 @@ pub async fn handle_code_actions(
     // Release the DashMap shard `Ref` before awaiting `generate_code_actions`'s registry
     // fetch — holding it across the await would block a concurrent `documents.get_mut` on
     // the same shard (#319); `with_document` makes this structural rather than a convention (#333).
-    let Some((ecosystem, ecosystem_id, parse_result, content, snapshot)) = state
+    let Some((ecosystem_id, manifest, content, snapshot)) = state
         .with_document(uri, |doc| {
-            let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
-            let parse_result = doc.parse_result_arc()?;
+            let manifest = doc.manifest_arc()?;
             let snapshot = doc
                 .signals
                 .snapshot()
@@ -54,13 +53,7 @@ pub async fn handle_code_actions(
                 .with_candidate_status(osv_checks)
                 .with_outcomes()
                 .finish();
-            Some((
-                ecosystem,
-                doc.ecosystem,
-                parse_result,
-                doc.content.clone(),
-                snapshot,
-            ))
+            Some((doc.ecosystem, manifest, doc.content.clone(), snapshot))
         })
         .flatten()
     else {
@@ -80,14 +73,8 @@ pub async fn handle_code_actions(
         .with_ecosystem(ecosystem_id)
         .with_network(network)
         .with_interactive_fetch_gate(&state.interactive_fetch);
-    let mut actions = ecosystem
-        .generate_code_actions(
-            parse_result.as_ref(),
-            position,
-            &domain_uri,
-            version_data,
-            &content,
-        )
+    let mut actions = manifest
+        .generate_code_actions(position, &domain_uri, version_data, &content)
         .await;
 
     bind_diagnostics(&mut actions, &params.context.diagnostics);
@@ -563,7 +550,7 @@ serde = "1.0.0"
 "#
             .to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -612,7 +599,7 @@ serde = "0.9.0"
 "#
             .to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -712,7 +699,7 @@ serde = "1.0.0"
 "#
             .to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -803,7 +790,7 @@ serde = "0.9.0"
 "#
             .to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -912,7 +899,7 @@ serde = "0.9.0"
 "#
             .to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -1082,7 +1069,7 @@ serde = "0.9.0"
                     .get(deps_core::EcosystemId::Cargo)
                     .unwrap();
                 let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-                let parse_result = ecosystem
+                let parse_result = Arc::clone(&ecosystem)
                     .parse_manifest(&content, &url)
                     .await
                     .unwrap_or_else(|e| panic!("{raw:?}: failed to parse manifest: {e}"));
@@ -1162,7 +1149,7 @@ serde = "0.9.0"
                     .ecosystem_registry
                     .get(deps_core::EcosystemId::Cargo)
                     .unwrap();
-                let parse_result = ecosystem
+                let parse_result = Arc::clone(&ecosystem)
                     .parse_manifest(content, &url)
                     .await
                     .expect("Failed to parse manifest");
@@ -1273,7 +1260,7 @@ serde = "0.9.0"
                 .unwrap();
             let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -1323,7 +1310,7 @@ serde = "0.9.0"
                 r#".package(url: "https://github.com/vapor/vapor", .exact("4.50.0"))"#.to_string();
             let version_col = content.find("4.50.0").unwrap() as u32;
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");

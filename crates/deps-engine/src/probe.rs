@@ -1,7 +1,7 @@
 //! The background-probe sequence shared by `deps-cli` and `deps-lsp`.
 //!
 //! Probes gather evidence that synchronous, network-free diagnostics cannot (see
-//! [`deps_core::Ecosystem::background_probes`]). The CLI runs them in a fixed order so its
+//! [`deps_core::ParsedManifest::background_probes`]). The CLI runs them in a fixed order so its
 //! findings equal the server's for the same registry answers:
 //!
 //! 1. parse the manifest;
@@ -18,10 +18,10 @@
 use std::sync::Arc;
 
 use deps_core::lsp_helpers::{ProbeEffect, ProbePhase, ProbeReport};
-use deps_core::{Ecosystem, NetworkMode, ParseResult};
+use deps_core::{Ecosystem, NetworkMode, ParsedManifest};
 use url::Url;
 
-/// Runs `ecosystem`'s probes for `phase` over `parse_result`.
+/// Runs the probes of the ecosystem that parsed `document` for `phase`.
 ///
 /// Offline runs issue nothing: a probe is an optional request, never a reason to leave the
 /// cache.
@@ -30,27 +30,25 @@ use url::Url;
 ///
 /// ```no_run
 /// # async fn run(
-/// #     ecosystem: &dyn deps_core::Ecosystem,
-/// #     parsed: &dyn deps_core::ParseResult,
+/// #     parsed: &dyn deps_core::ParsedManifest,
 /// # ) {
 /// use deps_core::NetworkMode;
 /// use deps_core::lsp_helpers::ProbePhase;
 /// use deps_engine::probe::run_background_probes;
 ///
-/// let report = run_background_probes(ecosystem, parsed, ProbePhase::PostFetch, NetworkMode::Online).await;
+/// let report = run_background_probes(parsed, ProbePhase::PostFetch, NetworkMode::Online).await;
 /// println!("{} probes unanswered", report.unanswered());
 /// # }
 /// ```
 pub async fn run_background_probes(
-    ecosystem: &dyn Ecosystem,
-    parse_result: &dyn ParseResult,
+    document: &dyn ParsedManifest,
     phase: ProbePhase,
     network: NetworkMode,
 ) -> ProbeReport {
     if network.is_offline() {
         return ProbeReport::default();
     }
-    ecosystem.background_probes(parse_result, phase).await
+    document.background_probes(phase).await
 }
 
 /// What the [`ProbePhase::PreFetch`] probes decided about a parse result.
@@ -68,36 +66,32 @@ pub enum PreFetchDecision {
     Reparse(ProbeReport),
 }
 
-/// Runs `ecosystem`'s [`ProbePhase::PreFetch`] probes over `parse_result` and reports whether the
-/// caller must parse again.
+/// Runs the [`ProbePhase::PreFetch`] probes of the ecosystem that parsed `document` and reports
+/// whether the caller must parse again.
 ///
 /// # Examples
 ///
 /// ```no_run
 /// # async fn run(
-/// #     ecosystem: &dyn deps_core::Ecosystem,
-/// #     parsed: &dyn deps_core::ParseResult,
+/// #     parsed: &dyn deps_core::ParsedManifest,
 /// # ) {
 /// use deps_core::NetworkMode;
 /// use deps_engine::probe::{PreFetchDecision, pre_fetch_decision};
 ///
-/// match pre_fetch_decision(ecosystem, parsed, NetworkMode::Online).await {
+/// match pre_fetch_decision(parsed, NetworkMode::Online).await {
 ///     PreFetchDecision::Reparse(_) => println!("parse again, without probing"),
 ///     PreFetchDecision::Keep(_) | PreFetchDecision::Skipped => {}
 /// }
 /// # }
 /// ```
 pub async fn pre_fetch_decision(
-    ecosystem: &dyn Ecosystem,
-    parse_result: &dyn ParseResult,
+    document: &dyn ParsedManifest,
     network: NetworkMode,
 ) -> PreFetchDecision {
     if network.is_offline() {
         return PreFetchDecision::Skipped;
     }
-    let report = ecosystem
-        .background_probes(parse_result, ProbePhase::PreFetch)
-        .await;
+    let report = document.background_probes(ProbePhase::PreFetch).await;
     match report.effect {
         ProbeEffect::Reparse => PreFetchDecision::Reparse(report),
         ProbeEffect::Unchanged | ProbeEffect::Republish => PreFetchDecision::Keep(report),
@@ -118,9 +112,9 @@ pub async fn parse_with_pre_fetch_probes(
     content: &str,
     uri: &Url,
     network: NetworkMode,
-) -> deps_core::error::Result<(Box<dyn ParseResult>, ProbeReport)> {
+) -> deps_core::error::Result<(Box<dyn ParsedManifest>, ProbeReport)> {
     let parsed = deps_core::parse_manifest_blocking(ecosystem, content, uri).await?;
-    match pre_fetch_decision(ecosystem.as_ref(), parsed.as_ref(), network).await {
+    match pre_fetch_decision(parsed.as_ref(), network).await {
         PreFetchDecision::Skipped => Ok((parsed, ProbeReport::default())),
         PreFetchDecision::Keep(report) => Ok((parsed, report)),
         PreFetchDecision::Reparse(report) => {
@@ -259,13 +253,9 @@ mod tests {
         let parsed = deps_core::parse_manifest_blocking(&dynamic, "", &uri())
             .await
             .unwrap();
-        let report = run_background_probes(
-            eco.as_ref(),
-            parsed.as_ref(),
-            ProbePhase::PostFetch,
-            NetworkMode::Offline,
-        )
-        .await;
+        let report =
+            run_background_probes(parsed.as_ref(), ProbePhase::PostFetch, NetworkMode::Offline)
+                .await;
         assert_eq!(report, ProbeReport::default());
         assert!(eco.probe_calls().is_empty());
     }
@@ -317,8 +307,7 @@ mod tests {
             .await
             .unwrap();
 
-        let decision =
-            pre_fetch_decision(eco.as_ref(), parsed.as_ref(), NetworkMode::Offline).await;
+        let decision = pre_fetch_decision(parsed.as_ref(), NetworkMode::Offline).await;
 
         assert_eq!(decision, PreFetchDecision::Skipped);
         assert!(eco.probe_calls().is_empty());
@@ -337,8 +326,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let decision =
-                pre_fetch_decision(eco.as_ref(), parsed.as_ref(), NetworkMode::Online).await;
+            let decision = pre_fetch_decision(parsed.as_ref(), NetworkMode::Online).await;
 
             assert_eq!(
                 matches!(decision, PreFetchDecision::Reparse(_)),
@@ -356,13 +344,9 @@ mod tests {
             .await
             .unwrap();
 
-        let report = run_background_probes(
-            eco.as_ref(),
-            parsed.as_ref(),
-            ProbePhase::PostFetch,
-            NetworkMode::Online,
-        )
-        .await;
+        let report =
+            run_background_probes(parsed.as_ref(), ProbePhase::PostFetch, NetworkMode::Online)
+                .await;
 
         assert_eq!(report.effect, ProbeEffect::Republish);
         assert_eq!(eco.probe_calls(), [ProbePhase::PostFetch]);

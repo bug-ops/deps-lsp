@@ -1316,7 +1316,7 @@ require (
     fn test_parse_go_mod_env_goproxy_keeps_public_modules_public_content() {
         use crate::config::{GoEnvCache, GoProcessEnv};
         use crate::formatter::GoFormatter;
-        use deps_core::lsp_helpers::OsvNaming as _;
+        use deps_core::lsp_helpers::DependencyFormatter as _;
         use deps_core::net_policy::{MapEnv, RegistryAccessPolicy};
         use std::sync::Arc;
 

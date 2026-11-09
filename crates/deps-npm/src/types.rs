@@ -455,10 +455,6 @@ impl deps_core::Dependency for NpmDependency {
     fn source(&self) -> deps_core::parser::DependencySource {
         self.source.clone()
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 /// Section in package.json where a dependency is declared.

@@ -24,12 +24,12 @@ use super::state::{DocumentState, ServerState};
 pub(super) fn document_prefetch_snapshot<S>(
     state: &ServerState,
     uri: &Uri,
-    snapshot: impl FnOnce(&DocumentState, &Arc<dyn deps_core::ParseResult>) -> S,
-) -> Option<(S, Arc<dyn deps_core::ParseResult>)> {
+    snapshot: impl FnOnce(&DocumentState, &Arc<dyn deps_core::ParsedManifest>) -> S,
+) -> Option<(S, Arc<dyn deps_core::ParsedManifest>)> {
     state
         .with_document(uri, |doc| {
-            let parse_result = doc.parse_result_arc()?;
-            Some((snapshot(doc, &parse_result), parse_result))
+            let manifest = doc.manifest_arc()?;
+            Some((snapshot(doc, &manifest), manifest))
         })
         .flatten()
 }

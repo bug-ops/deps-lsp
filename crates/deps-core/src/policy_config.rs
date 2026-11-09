@@ -878,7 +878,7 @@ impl DiagnosticsConfig {
     }
 
     /// Converts this LSP-facing config into the `deps-core` DTO threaded
-    /// through `Ecosystem::generate_diagnostics`.
+    /// through `ParsedManifest::generate_diagnostics`.
     ///
     /// # Examples
     ///
@@ -1374,7 +1374,7 @@ impl FreshnessConfig {
     }
 
     /// Converts this LSP-facing config into the `deps-core` DTO threaded
-    /// through `Ecosystem::generate_hover`/`generate_diagnostics`.
+    /// through `ParsedManifest::generate_hover`/`generate_diagnostics`.
     ///
     /// # Examples
     ///

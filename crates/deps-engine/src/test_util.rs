@@ -1,19 +1,17 @@
-//! Minimal, network-free test doubles for [`deps_core::Ecosystem`].
+//! Minimal, network-free test doubles for [`deps_core::EcosystemBase`].
 //!
 //! Scoped to what this crate's own `classify::license` tests and downstream driving-adapter
 //! regression tests (`deps-cli`'s `check_integration.rs`, issue #1133) need: a tier-3
-//! ecosystem whose [`deps_core::Ecosystem::fetch_license`] is fully controllable (a canned
+//! ecosystem whose [`deps_core::EcosystemBase::fetch_license`] is fully controllable (a canned
 //! return value, or one that never resolves, to exercise
 //! [`crate::classify::license::fetch_tier3_licenses`]'s timeout/concurrency/filter logic)
 //! without ever touching a real registry.
 //!
 //! Mirrors `crates/deps-lsp/src/test_utils.rs`'s `BlockingEcosystem` precedent: only the
 //! trait methods with no default implementation are overridden (`ecosystem_id`,
-//! `display_name`, `manifest_filenames`, `parse_manifest`, `registry`, `formatter`,
-//! `completion_insert_text`, `as_any`, plus `complete_version` when the `lsp-responses`
-//! feature is active — see [`deps_core::ecosystem::Ecosystem`]'s trait doc for why that one
-//! is feature-gated but still required). Every other `generate_*`/`complete_*` method keeps
-//! the trait's own default.
+//! `display_name`, `manifest_filenames`, `registry`, `completion_insert_text`, `parse`,
+//! `own_formatter`), plus the license, probe and `complete_version` hooks the tests drive.
+//! Every other hook keeps the trait's own default.
 //!
 //! Exposed as `pub` (not `#[cfg(test)]`-only) behind the `test-util` feature so an external
 //! crate's own test binary — which cannot see another crate's `#[cfg(test)]` items — can
@@ -21,23 +19,27 @@
 //! this one was copied from.
 
 use deps_core::ConcreteVersion;
-use deps_core::Ecosystem;
+use deps_core::EcosystemBase;
 use deps_core::EcosystemId;
 use deps_core::LicenseSource;
 use deps_core::Metadata;
 use deps_core::PackageName;
 use deps_core::ParseResult;
+use deps_core::ParsedView;
 use deps_core::Registry;
+use deps_core::TypedEcosystem;
+use deps_core::TypedParseResult;
 use deps_core::VersionReq;
 use deps_core::ecosystem::BoxFuture;
 use deps_core::ecosystem::private::Sealed;
-use deps_core::lsp_helpers::{EcosystemFormatter, ProbeEffect, ProbePhase, ProbeReport};
+use deps_core::lsp_helpers::{ProbeEffect, ProbePhase, ProbeReport};
+use deps_core::test_util::StubFormatter;
 use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// No-op [`Registry`]: every method returns an empty/`None` success immediately, for an
-/// [`Ecosystem`] test double whose registry is never meant to be exercised.
+/// [`EcosystemBase`] test double whose registry is never meant to be exercised.
 pub struct StubRegistry;
 
 impl Registry for StubRegistry {
@@ -70,12 +72,14 @@ impl Registry for StubRegistry {
     }
 }
 
-/// The single dependency [`TestTier3Ecosystem::parse_manifest`] parses into: named
-/// `"dep-0"`, an explicit `=`-pinned requirement (concrete under every ecosystem's
+/// The single dependency [`TestTier3Ecosystem`] parses into.
+///
+/// Named `"dep-0"`, with an explicit `=`-pinned requirement (concrete under every ecosystem's
 /// `deps_core::lsp_helpers::in_use_version::concrete_pin_version` policy, so
 /// `resolve_in_use_version` succeeds with no lock file needed — see
 /// [`crate::classify::license::tier3_license_targets`]).
-struct StubDependency {
+#[derive(Debug)]
+pub struct StubDependency {
     name: PackageName,
     version_req: VersionReq,
 }
@@ -96,12 +100,11 @@ impl deps_core::Dependency for StubDependency {
     fn source(&self) -> deps_core::parser::DependencySource {
         deps_core::parser::DependencySource::Registry
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
-struct StubParseResult {
+/// The parse result of [`TestTier3Ecosystem`]: its single [`StubDependency`].
+#[derive(Debug)]
+pub struct StubParseResult {
     dep: StubDependency,
     uri: url::Url,
 }
@@ -116,18 +119,23 @@ impl ParseResult for StubParseResult {
     fn uri(&self) -> &url::Url {
         &self.uri
     }
-    fn as_any(&self) -> &dyn Any {
-        self
+}
+
+impl TypedParseResult for StubParseResult {
+    type Dep = StubDependency;
+
+    fn own_dependencies(&self) -> &[StubDependency] {
+        std::slice::from_ref(&self.dep)
     }
 }
 
-/// A tier-3 [`Ecosystem`] test double.
+/// A tier-3 [`EcosystemBase`] test double.
 ///
-/// [`Ecosystem::fetch_license`] is fully controlled by the closure supplied at construction
+/// [`EcosystemBase::fetch_license`] is fully controlled by the closure supplied at construction
 /// — canned data, an empty result, or a future that never resolves (to exercise a caller's
 /// own timeout).
 ///
-/// [`Ecosystem::license_source`] always returns [`LicenseSource::DetectedSpdx`] (arbitrary
+/// [`EcosystemBase::license_source`] always returns [`LicenseSource::DetectedSpdx`] (arbitrary
 /// among the three `requires_dedicated_fetch() == true` variants — nothing in
 /// `classify::license` branches on which one it is).
 ///
@@ -165,9 +173,10 @@ pub struct TestTier3Ecosystem {
     probe_script: ProbeScript,
     probe_calls: Mutex<Vec<ProbePhase>>,
     parses: AtomicUsize,
+    formatter: StubFormatter<StubDependency>,
 }
 
-/// The [`ProbeEffect`] [`TestTier3Ecosystem::background_probes`] reports per phase.
+/// The [`ProbeEffect`] [`TypedEcosystem::probes`] reports per phase.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProbeScript {
     /// Reported for [`ProbePhase::PreFetch`].
@@ -183,12 +192,12 @@ enum FetchLicenseBehavior {
     /// caller's empty-result filter).
     Returns(Vec<String>),
     /// Never resolves — the only way a caller's own `tokio::time::timeout` around
-    /// [`Ecosystem::fetch_license`] can complete is by firing.
+    /// [`EcosystemBase::fetch_license`] can complete is by firing.
     Pending,
 }
 
 impl TestTier3Ecosystem {
-    /// [`Ecosystem::fetch_license`] resolves immediately with `license` (an empty `Vec` is a
+    /// [`EcosystemBase::fetch_license`] resolves immediately with `license` (an empty `Vec` is a
     /// valid, meaningful input — it exercises a caller's "filter out empty results" logic).
     #[must_use]
     pub const fn returning(license: Vec<String>) -> Self {
@@ -200,17 +209,18 @@ impl TestTier3Ecosystem {
             },
             probe_calls: Mutex::new(Vec::new()),
             parses: AtomicUsize::new(0),
+            formatter: StubFormatter::new().for_dependency(),
         }
     }
 
-    /// Makes [`Ecosystem::background_probes`] report `script`'s effects and record each call.
+    /// Makes [`TypedEcosystem::probes`] report `script`'s effects and record each call.
     #[must_use]
     pub const fn with_probes(mut self, script: ProbeScript) -> Self {
         self.probe_script = script;
         self
     }
 
-    /// The phases [`Ecosystem::background_probes`] was called with, in order.
+    /// The phases [`TypedEcosystem::probes`] was called with, in order.
     ///
     /// # Panics
     ///
@@ -224,13 +234,13 @@ impl TestTier3Ecosystem {
         self.probe_calls.lock().expect("probe record lock").clone()
     }
 
-    /// How many times [`Ecosystem::parse_manifest`] ran.
+    /// How many times [`TypedEcosystem::parse`] ran.
     #[must_use]
     pub fn parse_count(&self) -> usize {
         self.parses.load(Ordering::Relaxed)
     }
 
-    /// [`Ecosystem::fetch_license`] never resolves, for exercising a caller's own
+    /// [`EcosystemBase::fetch_license`] never resolves, for exercising a caller's own
     /// `tokio::time::timeout` around it.
     #[must_use]
     pub const fn pending() -> Self {
@@ -242,13 +252,14 @@ impl TestTier3Ecosystem {
             },
             probe_calls: Mutex::new(Vec::new()),
             parses: AtomicUsize::new(0),
+            formatter: StubFormatter::new().for_dependency(),
         }
     }
 }
 
 impl Sealed for TestTier3Ecosystem {}
 
-impl Ecosystem for TestTier3Ecosystem {
+impl EcosystemBase for TestTier3Ecosystem {
     fn ecosystem_id(&self) -> EcosystemId {
         EcosystemId::Dart
     }
@@ -261,44 +272,12 @@ impl Ecosystem for TestTier3Ecosystem {
         &[]
     }
 
-    fn parse_manifest<'a>(
-        &'a self,
-        _content: &'a str,
-        uri: &'a url::Url,
-    ) -> BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>> {
-        let uri = uri.clone();
-        self.parses.fetch_add(1, Ordering::Relaxed);
-        Box::pin(async move {
-            Ok(Box::new(StubParseResult {
-                dep: StubDependency {
-                    name: PackageName::new("dep-0"),
-                    version_req: VersionReq::new("=1.0.0"),
-                },
-                uri,
-            }) as Box<dyn ParseResult>)
-        })
-    }
-
     fn registry(&self) -> Arc<dyn Registry> {
         Arc::new(StubRegistry)
     }
 
-    fn formatter(&self) -> &dyn EcosystemFormatter {
-        &deps_core::test_util::StubFormatter::DEFAULT
-    }
-
     fn completion_insert_text(&self, _metadata: &dyn Metadata) -> Option<String> {
         None
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    fn complete_version<'a>(
-        &'a self,
-        _request: deps_core::completion::CompletionRequest<'a>,
-        _package_name: PackageName,
-        _prefix: String,
-    ) -> BoxFuture<'a, deps_core::completion::Completions> {
-        Box::pin(async move { deps_core::completion::Completions::default() })
     }
 
     fn fetch_license<'a>(
@@ -318,10 +297,47 @@ impl Ecosystem for TestTier3Ecosystem {
     fn license_source(&self) -> LicenseSource {
         LicenseSource::DetectedSpdx
     }
+}
 
-    fn background_probes<'a>(
+impl TypedEcosystem for TestTier3Ecosystem {
+    type Parsed = StubParseResult;
+    type Formatter = StubFormatter<StubDependency>;
+
+    fn own_formatter(&self) -> &Self::Formatter {
+        &self.formatter
+    }
+
+    fn parse<'a>(
         &'a self,
-        _parse_result: &'a dyn ParseResult,
+        _content: &'a str,
+        uri: &'a url::Url,
+    ) -> BoxFuture<'a, deps_core::Result<StubParseResult>> {
+        let uri = uri.clone();
+        self.parses.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            Ok(StubParseResult {
+                dep: StubDependency {
+                    name: PackageName::new("dep-0"),
+                    version_req: VersionReq::new("=1.0.0"),
+                },
+                uri,
+            })
+        })
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    fn complete_version<'a>(
+        &'a self,
+        _request: deps_core::completion::CompletionRequest<'a, StubParseResult>,
+        _package_name: PackageName,
+        _prefix: String,
+    ) -> BoxFuture<'a, deps_core::completion::Completions> {
+        Box::pin(async move { deps_core::completion::Completions::default() })
+    }
+
+    fn probes<'a>(
+        &'a self,
+        _parsed: ParsedView<'a, StubParseResult>,
         phase: ProbePhase,
     ) -> BoxFuture<'a, ProbeReport> {
         #[expect(
@@ -340,9 +356,5 @@ impl Ecosystem for TestTier3Ecosystem {
             effect,
             ..ProbeReport::default()
         }))
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }

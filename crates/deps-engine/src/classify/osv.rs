@@ -13,7 +13,7 @@ use deps_core::EcosystemId;
 
 use deps_core::lsp_helpers::{
     CandidateSiblings, CandidateSiblingsUnknown, CandidateTagSource, OsvNameAvailability,
-    TaggedVersions, has_unqueryable_resolved_pin, resolve_in_use_versions,
+    TaggedVersions,
 };
 use std::collections::HashMap;
 
@@ -53,7 +53,7 @@ impl FixTargetRegistry {
     }
 }
 
-/// Snapshots the registry version data of every dependency in `parse_result` under the
+/// Snapshots the registry version data of every dependency in `document` under the
 /// [`deps_core::osv::VulnKey`] the scan files it under.
 ///
 /// Uses [`deps_core::lsp_helpers::cached_package_versions`], the lookup the vulnerability-fix
@@ -64,66 +64,32 @@ impl FixTargetRegistry {
 /// # Examples
 ///
 /// ```
-/// use deps_core::lsp_helpers::{
-///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-///     PackageVersions, RequirementResolution, SourcePolicy,
-/// };
-/// use deps_core::osv::vulnerability_keys;
-/// use deps_core::test_util::stub_parse_result_with_dependencies;
-/// use deps_core::{ConcreteVersion, EcosystemId, PackageName};
+/// use deps_core::test_util::{stub_document, stub_parse_result};
 /// use deps_engine::classify::osv::fix_target_registry;
 /// use std::collections::HashMap;
 ///
-/// struct SimpleFormatter;
-/// impl PackageNaming for SimpleFormatter {}
-/// impl PackageRendering for SimpleFormatter {
-///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-///         version.to_string()
-///     }
-///     fn package_url(&self, name: &PackageName) -> String {
-///         name.as_str().to_string()
-///     }
-/// }
-/// impl RequirementResolution for SimpleFormatter {}
-/// impl DiagnosticMessages for SimpleFormatter {}
-/// impl DiagnosticPolicy for SimpleFormatter {}
-/// impl SourcePolicy for SimpleFormatter {}
-/// impl OsvNaming for SimpleFormatter {}
-///
-/// let parsed = stub_parse_result_with_dependencies(1);
-/// let vuln_keys = vulnerability_keys(
-///     parsed.as_ref(),
-///     &HashMap::new(),
-///     None,
-///     &SimpleFormatter,
-///     EcosystemId::Cargo,
-/// );
+/// let parsed = stub_document(stub_parse_result(1));
+/// let vuln_keys = parsed.vulnerability_keys(&HashMap::new(), None);
 /// // Nothing cached: the snapshot is empty and no fix target is steered.
-/// let registry = fix_target_registry(
-///     parsed.as_ref(),
-///     &vuln_keys,
-///     &HashMap::new(),
-///     &SimpleFormatter,
-/// );
+/// let registry = fix_target_registry(parsed.as_ref(), &vuln_keys, &HashMap::new());
 /// assert!(registry.is_empty());
 /// ```
 #[must_use]
 pub fn fix_target_registry(
-    parse_result: &dyn deps_core::ParseResult,
+    document: &dyn deps_core::ParsedManifest,
     vuln_keys: &deps_core::osv::VulnKeys,
     cached_versions: &deps_core::CachedVersionsMap,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> FixTargetRegistry {
-    let snapshot = parse_result
-        .dependencies()
-        .into_iter()
-        .filter_map(|dep| {
-            let versions =
-                deps_core::lsp_helpers::cached_package_versions(cached_versions, dep, formatter)?;
+    let mut snapshot = HashMap::new();
+    document.for_each_formatted_dependency(&mut |bound| {
+        let (dep, formatter) = (bound.dependency(), bound.formatter());
+        if let Some(versions) =
+            deps_core::lsp_helpers::cached_package_versions(cached_versions, dep, formatter)
+        {
             let key = deps_core::osv::vuln_key_for(dep, Some(vuln_keys), formatter);
-            Some((key, versions.clone()))
-        })
-        .collect();
+            snapshot.insert(key, versions.clone());
+        }
+    });
     FixTargetRegistry(snapshot)
 }
 
@@ -153,42 +119,14 @@ impl CandidateTagSources {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::{
-    ///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    ///     RequirementResolution, SourcePolicy,
-    /// };
-    /// use deps_core::osv::vulnerability_keys;
-    /// use deps_core::test_util::{stub_parse_result_with_dependencies, vuln_key};
-    /// use deps_core::{ConcreteVersion, EcosystemId, PackageName};
+    /// use deps_core::test_util::{stub_document, stub_parse_result, vuln_key};
+    /// use deps_core::{ConcreteVersion, EcosystemId};
     /// use deps_engine::classify::osv::candidate_tag_sources;
     /// use std::collections::HashMap;
     ///
-    /// struct SimpleFormatter;
-    /// impl PackageNaming for SimpleFormatter {}
-    /// impl PackageRendering for SimpleFormatter {
-    ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-    ///         version.to_string()
-    ///     }
-    ///     fn package_url(&self, name: &PackageName) -> String {
-    ///         name.as_str().to_string()
-    ///     }
-    /// }
-    /// impl RequirementResolution for SimpleFormatter {}
-    /// impl DiagnosticMessages for SimpleFormatter {}
-    /// impl DiagnosticPolicy for SimpleFormatter {}
-    /// impl SourcePolicy for SimpleFormatter {}
-    /// impl OsvNaming for SimpleFormatter {}
-    ///
-    /// let parsed = stub_parse_result_with_dependencies(1);
-    /// let keys = vulnerability_keys(
-    ///     parsed.as_ref(),
-    ///     &HashMap::new(),
-    ///     None,
-    ///     &SimpleFormatter,
-    ///     EcosystemId::Cargo,
-    /// );
-    /// let sources =
-    ///     candidate_tag_sources(parsed.as_ref(), &keys, &SimpleFormatter, EcosystemId::Cargo);
+    /// let parsed = stub_document(stub_parse_result(1));
+    /// let keys = parsed.vulnerability_keys(&HashMap::new(), None);
+    /// let sources = candidate_tag_sources(parsed.as_ref(), &keys, EcosystemId::Cargo);
     /// let siblings = sources
     ///     .siblings_for(&vuln_key("dep-0"), &ConcreteVersion::new("2.0.0"))
     ///     .unwrap();
@@ -214,20 +152,20 @@ impl CandidateTagSources {
 /// Occurrences sharing a key are merged by [`CandidateTagSource::merge`].
 #[must_use]
 pub fn candidate_tag_sources(
-    parse_result: &dyn deps_core::ParseResult,
+    document: &dyn deps_core::ParsedManifest,
     vuln_keys: &deps_core::osv::VulnKeys,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem: EcosystemId,
 ) -> CandidateTagSources {
     let mut by_key: HashMap<deps_core::osv::VulnKey, CandidateTagSource> = HashMap::new();
-    for dep in parse_result.dependencies() {
-        let key = deps_core::osv::vuln_key_for(dep, Some(vuln_keys), formatter);
-        let source = formatter.candidate_tag_source(dep);
+    document.for_each_formatted_dependency(&mut |bound| {
+        let key =
+            deps_core::osv::vuln_key_for(bound.dependency(), Some(vuln_keys), bound.formatter());
+        let source = bound.candidate_tag_source();
         match by_key.remove(&key) {
             Some(existing) => by_key.insert(key, existing.merge(source)),
             None => by_key.insert(key, source),
         };
-    }
+    });
     CandidateTagSources { ecosystem, by_key }
 }
 
@@ -245,7 +183,7 @@ pub fn candidate_tag_sources(
 ///    negative, which is worse than not scanning at all.
 ///
 /// **Go exception** (#228 follow-up, unified with #235's
-/// [`deps_core::lsp_helpers::RequirementResolution::manifest_requirement_is_resolved_version`]):
+/// [`deps_core::lsp_helpers::DependencyFormatter::manifest_requirement_is_resolved_version`]):
 /// step 1 is skipped entirely for a dependency whose manifest requirement is
 /// itself the resolved version (a Go `require`-directive dependency), going
 /// straight to step 2. Go's `go.mod` `require` line is already an exact
@@ -279,34 +217,14 @@ pub fn candidate_tag_sources(
 /// # Examples
 ///
 /// ```
-/// use deps_core::lsp_helpers::{
-///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-///     RequirementResolution, SourcePolicy,
-/// };
-/// use deps_core::test_util::stub_parse_result_with_dependencies;
-/// use deps_core::{ConcreteVersion, EcosystemId, NormalizedName, PackageName};
+/// use deps_core::test_util::{stub_document, stub_parse_result};
+/// use deps_core::{ConcreteVersion, EcosystemId, NormalizedName};
 /// use deps_engine::classify::osv::build_scan_targets;
 /// use std::collections::HashMap;
 ///
-/// struct SimpleFormatter;
-/// impl PackageNaming for SimpleFormatter {}
-/// impl PackageRendering for SimpleFormatter {
-///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-///         version.to_string()
-///     }
-///     fn package_url(&self, name: &PackageName) -> String {
-///         name.as_str().to_string()
-///     }
-/// }
-/// impl RequirementResolution for SimpleFormatter {}
-/// impl DiagnosticMessages for SimpleFormatter {}
-/// impl DiagnosticPolicy for SimpleFormatter {}
-/// impl SourcePolicy for SimpleFormatter {}
-/// impl OsvNaming for SimpleFormatter {}
-///
 /// // A single registry-sourced dependency ("dep-0"), with a lock-file-resolved version —
 /// // step 1 of the ladder above.
-/// let parsed = stub_parse_result_with_dependencies(1);
+/// let parsed = stub_document(stub_parse_result(1));
 /// let mut resolved_versions = HashMap::new();
 /// resolved_versions.insert(NormalizedName::for_test("dep-0"), ConcreteVersion::from("1.0.0"));
 ///
@@ -314,7 +232,6 @@ pub fn candidate_tag_sources(
 ///     parsed.as_ref(),
 ///     &resolved_versions,
 ///     &HashMap::new(),
-///     &SimpleFormatter,
 ///     EcosystemId::Cargo,
 /// );
 ///
@@ -322,10 +239,9 @@ pub fn candidate_tag_sources(
 /// assert!(skipped.is_empty(), "the one dependency became a scan target, nothing to skip");
 /// ```
 pub fn build_scan_targets(
-    parse_result: &dyn deps_core::ParseResult,
+    document: &dyn deps_core::ParsedManifest,
     resolved_versions: &deps_core::ResolvedVersionsMap,
     resolved_version_candidates: &deps_core::ResolvedCandidatesMap,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem: EcosystemId,
 ) -> (
     Vec<deps_core::osv::ScanTarget>,
@@ -337,58 +253,51 @@ pub fn build_scan_targets(
     let mut targets: Vec<deps_core::osv::ScanTarget> = Vec::new();
     let mut target_index: HashMap<deps_core::osv::VulnKey, usize> = HashMap::new();
     let mut skipped = deps_core::osv::VulnerabilityMap::new();
-    let keys = deps_core::osv::vulnerability_keys(
-        parse_result,
-        resolved_versions,
-        Some(resolved_version_candidates),
-        formatter,
-        ecosystem,
-    );
+    let keys = document.vulnerability_keys(resolved_versions, Some(resolved_version_candidates));
 
-    for dep in parse_result.dependencies() {
+    document.for_each_formatted_dependency(&mut |bound| {
+        let (dep, formatter) = (bound.dependency(), bound.formatter());
         let package_key = deps_core::PackageKey::new(dep.name(), formatter);
         let key = deps_core::osv::vuln_key_for(dep, Some(&keys), formatter);
 
-        if formatter.public_content(dep).is_none() {
-            let reason = deps_core::osv::non_public_skip_reason(dep, formatter);
+        if bound.public_content().is_none() {
+            let reason = bound.non_public_skip_reason();
             skipped.insert(key, ScanOutcome::Skipped(reason.as_skip_reason()));
-            continue;
+            return;
         }
 
         // go.mod's `require` line, not go.sum, is authoritative for Go: go.sum is an
         // append-only ledger (only `go mod tidy` prunes it), so its last-occurrence-wins
         // parse can yield a stale, no-longer-selected version (see
         // `manifest_requirement_is_resolved_version`).
-        let versions = resolve_in_use_versions(
-            dep,
+        let versions = bound.resolve_in_use_versions(
             &package_key,
             resolved_versions,
             Some(resolved_version_candidates),
-            formatter,
             ecosystem,
         );
 
         let Some(versions) = versions else {
-            let reason = if has_unqueryable_resolved_pin(dep, formatter, ecosystem) {
+            let reason = if bound.has_unqueryable_resolved_pin(ecosystem) {
                 SkipReason::ResolvedTagNotFullVersion
             } else {
                 SkipReason::NoConcreteVersion
             };
             skipped.insert(key, ScanOutcome::Skipped(reason));
-            continue;
+            return;
         };
 
         if deps_core::interpolation::package_name_is_unexpanded_template(dep.name().as_str()) {
             skipped.insert(key, ScanOutcome::Skipped(SkipReason::TemplatedName));
-            continue;
+            return;
         }
 
-        let osv_name = match formatter.osv_name_availability(dep) {
-            OsvNameAvailability::Ready => match formatter.osv_package_name(dep) {
+        let osv_name = match bound.osv_name_availability() {
+            OsvNameAvailability::Ready => match bound.osv_package_name() {
                 Some(name) => OsvQueryName::Confirmed(name),
                 None => {
                     skipped.insert(key, ScanOutcome::Skipped(SkipReason::UnmappableName));
-                    continue;
+                    return;
                 }
             },
             OsvNameAvailability::AwaitingRegistryData {
@@ -401,7 +310,7 @@ pub fn build_scan_targets(
                     key,
                     ScanOutcome::Skipped(SkipReason::CanonicalNameUnconfirmed),
                 );
-                continue;
+                return;
             }
         };
 
@@ -426,7 +335,7 @@ pub fn build_scan_targets(
                 }
             }
         }
-    }
+    });
 
     (targets, skipped)
 }
@@ -473,14 +382,12 @@ enum DepCheckClassification<'a> {
 /// The shared classification steps behind [`DepCheckClassification`]'s variants — see that
 /// type's doc.
 fn classify_dep_for_check_targets<'a>(
-    dep: &dyn deps_core::Dependency,
+    bound: &dyn deps_core::FormattedDependency<'_>,
     cached_versions: &'a deps_core::CachedVersionsMap,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> DepCheckClassification<'a> {
-    if formatter.public_content(dep).is_none() {
-        return DepCheckClassification::NonPublicSource(deps_core::osv::non_public_skip_reason(
-            dep, formatter,
-        ));
+    let (dep, formatter) = (bound.dependency(), bound.formatter());
+    if bound.public_content().is_none() {
+        return DepCheckClassification::NonPublicSource(bound.non_public_skip_reason());
     }
 
     let Some(cached) =
@@ -494,13 +401,13 @@ fn classify_dep_for_check_targets<'a>(
     }
 
     if matches!(
-        formatter.osv_name_availability(dep),
+        bound.osv_name_availability(),
         OsvNameAvailability::AwaitingRegistryData { .. }
     ) {
         return DepCheckClassification::AwaitingOsvName { cached };
     }
 
-    match formatter.osv_package_name(dep) {
+    match bound.osv_package_name() {
         Some(osv_name) => DepCheckClassification::Target { osv_name, cached },
         None => DepCheckClassification::UnmappableName { cached },
     }
@@ -535,71 +442,34 @@ fn classify_dep_for_check_targets<'a>(
 /// # Examples
 ///
 /// ```
-/// use deps_core::lsp_helpers::{
-///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-///     PackageVersions, RequirementResolution, SourcePolicy,
-/// };
-/// use deps_core::osv::{UpgradeStatus, vulnerability_keys};
-/// use deps_core::test_util::stub_parse_result_with_dependencies;
-/// use deps_core::{ConcreteVersion, EcosystemId, NormalizedName, PackageName};
+/// use deps_core::lsp_helpers::PackageVersions;
+/// use deps_core::test_util::{stub_document, stub_parse_result};
+/// use deps_core::{EcosystemId, NormalizedName};
 /// use deps_engine::classify::osv::{build_latest_check_targets, candidate_tag_sources};
 /// use std::collections::HashMap;
 ///
-/// struct SimpleFormatter;
-/// impl PackageNaming for SimpleFormatter {}
-/// impl PackageRendering for SimpleFormatter {
-///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-///         version.to_string()
-///     }
-///     fn package_url(&self, name: &PackageName) -> String {
-///         name.as_str().to_string()
-///     }
-/// }
-/// impl RequirementResolution for SimpleFormatter {}
-/// impl DiagnosticMessages for SimpleFormatter {}
-/// impl DiagnosticPolicy for SimpleFormatter {}
-/// impl SourcePolicy for SimpleFormatter {}
-/// impl OsvNaming for SimpleFormatter {}
-///
-/// let parsed = stub_parse_result_with_dependencies(1);
+/// let parsed = stub_document(stub_parse_result(1));
 /// let mut cached_versions = HashMap::new();
 /// cached_versions.insert(
 ///     NormalizedName::for_test("dep-0"),
 ///     PackageVersions::latest_only("2.0.0"),
 /// );
-/// let vuln_keys = vulnerability_keys(
-///     parsed.as_ref(),
-///     &HashMap::new(),
-///     None,
-///     &SimpleFormatter,
-///     EcosystemId::Cargo,
-/// );
+/// let vuln_keys = parsed.vulnerability_keys(&HashMap::new(), None);
 ///
-/// let candidate_tags = candidate_tag_sources(
-///     parsed.as_ref(),
-///     &vuln_keys,
-///     &SimpleFormatter,
-///     EcosystemId::Cargo,
-/// );
+/// let candidate_tags = candidate_tag_sources(parsed.as_ref(), &vuln_keys, EcosystemId::Cargo);
 ///
-/// let (targets, structural) = build_latest_check_targets(
-///     parsed.as_ref(),
-///     &cached_versions,
-///     &vuln_keys,
-///     &candidate_tags,
-///     &SimpleFormatter,
-/// );
+/// let (targets, structural) =
+///     build_latest_check_targets(parsed.as_ref(), &cached_versions, &vuln_keys, &candidate_tags);
 ///
 /// assert_eq!(targets.len(), 1);
 /// assert_eq!(targets[0].display_version, "2.0.0");
 /// assert!(structural.is_empty(), "the one dependency became a real target, nothing structural");
 /// ```
 pub fn build_latest_check_targets(
-    parse_result: &dyn deps_core::ParseResult,
+    document: &dyn deps_core::ParsedManifest,
     cached_versions: &deps_core::CachedVersionsMap,
     vuln_keys: &deps_core::osv::VulnKeys,
     candidate_tags: &CandidateTagSources,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> (
     Vec<deps_core::osv::ScanTarget>,
     deps_core::osv::LatestStatusMap,
@@ -610,10 +480,11 @@ pub fn build_latest_check_targets(
     let mut structural = deps_core::osv::LatestStatusMap::new();
     let mut seen = std::collections::HashSet::new();
 
-    for dep in parse_result.dependencies() {
+    document.for_each_formatted_dependency(&mut |bound| {
+        let (dep, formatter) = (bound.dependency(), bound.formatter());
         let key = vuln_key_for(dep, Some(vuln_keys), formatter);
 
-        match classify_dep_for_check_targets(dep, cached_versions, formatter) {
+        match classify_dep_for_check_targets(bound, cached_versions) {
             DepCheckClassification::NonPublicSource(reason) => {
                 structural.insert(key, UpgradeStatus::StructurallyUnchecked(reason));
             }
@@ -649,7 +520,7 @@ pub fn build_latest_check_targets(
             DepCheckClassification::Target { osv_name, cached } => {
                 // Occurrences sharing a key share one result (see `build_scan_targets`).
                 if !seen.insert(key.clone()) {
-                    continue;
+                    return;
                 }
                 let Ok(siblings) = candidate_tags.siblings_for(&key, &cached.latest) else {
                     structural.insert(
@@ -659,7 +530,7 @@ pub fn build_latest_check_targets(
                             reason: SkipReason::SiblingTagsUnknown,
                         },
                     );
-                    continue;
+                    return;
                 };
                 tracing::debug!(
                     key = %key,
@@ -677,7 +548,7 @@ pub fn build_latest_check_targets(
                 );
             }
         }
-    }
+    });
 
     (targets, structural)
 }
@@ -717,11 +588,10 @@ const MAX_CANDIDATE_CHECK_VERSIONS: usize = 6;
 /// [`deps_core::lsp_helpers::LatestVerdict::Unverified`] and is excluded — over-conservative,
 /// never under-conservative.
 pub fn build_candidate_check_targets(
-    parse_result: &dyn deps_core::ParseResult,
+    document: &dyn deps_core::ParsedManifest,
     cached_versions: &deps_core::CachedVersionsMap,
     vuln_keys: &deps_core::osv::VulnKeys,
     candidate_tags: &CandidateTagSources,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> (
     Vec<Vec<deps_core::osv::ScanTarget>>,
     deps_core::osv::CandidateStatusMap,
@@ -733,39 +603,40 @@ pub fn build_candidate_check_targets(
     let mut structural = deps_core::osv::CandidateStatusMap::new();
     let mut seen = std::collections::HashSet::new();
 
-    for dep in parse_result.dependencies() {
+    document.for_each_formatted_dependency(&mut |bound| {
+        let (dep, formatter) = (bound.dependency(), bound.formatter());
         let key = vuln_key_for(dep, Some(vuln_keys), formatter);
 
         let (osv_name, package_versions) =
-            match classify_dep_for_check_targets(dep, cached_versions, formatter) {
+            match classify_dep_for_check_targets(bound, cached_versions) {
                 DepCheckClassification::NonPublicSource(reason) => {
                     structural.insert(key, CandidateStatuses::Structural(reason));
-                    continue;
+                    return;
                 }
                 // No registry-cached version list yet — absence, not a structural skip (see
                 // doc above), matching `build_latest_check_targets`'s identical treatment.
-                DepCheckClassification::NoCachedVersions => continue,
+                DepCheckClassification::NoCachedVersions => return,
                 // Transient, like an absent cache: never recorded as structural.
-                DepCheckClassification::AwaitingOsvName { .. } => continue,
+                DepCheckClassification::AwaitingOsvName { .. } => return,
                 DepCheckClassification::TemplatedName { .. } => {
                     structural.insert(
                         key,
                         CandidateStatuses::Structural(StructuralSkipReason::TemplatedName),
                     );
-                    continue;
+                    return;
                 }
                 DepCheckClassification::UnmappableName { .. } => {
                     structural.insert(
                         key,
                         CandidateStatuses::Structural(StructuralSkipReason::UnmappableName),
                     );
-                    continue;
+                    return;
                 }
                 DepCheckClassification::Target { osv_name, cached } => (osv_name, cached),
             };
 
         if !seen.insert(key.clone()) {
-            continue;
+            return;
         }
 
         let yanked: std::collections::HashSet<&ConcreteVersion> = package_versions
@@ -806,7 +677,7 @@ pub fn build_candidate_check_targets(
                 .with_siblings(&siblings, formatter),
             );
         }
-    }
+    });
 
     (rounds, structural)
 }
@@ -965,9 +836,9 @@ fn resolve_fix_target(
 /// };
 /// use deps_core::osv::{
 ///     Advisory, Capped, DependencyVulnerabilities, OsvVersion, ScanOutcome, UpgradeStatus,
-///     VulnSeverity, VulnerabilityMap, vulnerability_keys,
+///     VulnSeverity, VulnerabilityMap,
 /// };
-/// use deps_core::test_util::{stub_parse_result_with_dependencies, vuln_key};
+/// use deps_core::test_util::{stub_document, stub_parse_result, vuln_key};
 /// use deps_core::{ConcreteVersion, EcosystemId, PackageName};
 /// use deps_engine::classify::osv::{
 ///     FixTargetRegistry, candidate_tag_sources, collect_fix_target_resolutions,
@@ -1013,20 +884,9 @@ fn resolve_fix_target(
 ///
 /// // F (the fix, 1.2.0) equals the already-checked "latest" candidate — resolved without a
 /// // live network check.
-/// let parsed = stub_parse_result_with_dependencies(1);
-/// let vuln_keys = vulnerability_keys(
-///     parsed.as_ref(),
-///     &HashMap::new(),
-///     None,
-///     &SimpleFormatter,
-///     EcosystemId::Cargo,
-/// );
-/// let candidate_tags = candidate_tag_sources(
-///     parsed.as_ref(),
-///     &vuln_keys,
-///     &SimpleFormatter,
-///     EcosystemId::Cargo,
-/// );
+/// let parsed = stub_document(stub_parse_result(1));
+/// let vuln_keys = parsed.vulnerability_keys(&HashMap::new(), None);
+/// let candidate_tags = candidate_tag_sources(parsed.as_ref(), &vuln_keys, EcosystemId::Cargo);
 /// let (resolved, live_check_candidates) = collect_fix_target_resolutions(
 ///     &vulnerabilities,
 ///     &[vuln_key("pkg")],
@@ -1191,6 +1051,7 @@ mod tests {
 
     use crate::classify::resolved::collect_in_use_versions;
     use deps_core::VersionReq;
+    use deps_core::test_util::stub_document_with;
     use std::assert_matches;
 
     fn no_tags() -> CandidateTagSources {
@@ -1261,7 +1122,6 @@ mod tests {
         use deps_core::parser::DependencySource;
         use deps_core::position::{Position, Range};
         use deps_core::test_util::StubFormatter;
-        use std::any::Any;
 
         struct MockDep {
             name: PackageName,
@@ -1289,9 +1149,6 @@ mod tests {
             fn source(&self) -> DependencySource {
                 self.source.clone()
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         struct MockParseResult {
@@ -1309,8 +1166,13 @@ mod tests {
                 static URI: std::sync::OnceLock<url::Url> = std::sync::OnceLock::new();
                 URI.get_or_init(|| deps_core::test_util::test_uri("/test/Cargo.toml"))
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+
+        impl deps_core::TypedParseResult for MockParseResult {
+            type Dep = MockDep;
+
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.deps
             }
         }
 
@@ -1339,10 +1201,14 @@ mod tests {
             resolved.insert(NormalizedName::for_test("time"), "0.1.43".into());
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Cargo,
+                )
+                .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert!(targets.is_empty());
@@ -1365,15 +1231,40 @@ mod tests {
             resolved.insert(NormalizedName::for_test("serde"), "1.0.195".into());
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Cargo,
+                )
+                .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].version, "1.0.195");
             assert!(skipped.is_empty());
+        }
+
+        /// Parses `content` as `file` through the real ecosystem, so the document carries its own
+        /// formatter and ecosystem id.
+        #[cfg(any(
+            feature = "deno",
+            feature = "composer",
+            feature = "pypi",
+            feature = "dart"
+        ))]
+        fn parse_real(
+            ecosystem: impl deps_core::Ecosystem + 'static,
+            file: &str,
+            content: &str,
+        ) -> Box<dyn deps_core::ParsedManifest> {
+            let ecosystem: std::sync::Arc<dyn deps_core::Ecosystem> =
+                std::sync::Arc::new(ecosystem);
+            let uri = deps_core::test_util::test_uri(file);
+            ecosystem
+                .parse_manifest_sync(content, &uri)
+                .expect("fixture parses")
         }
 
         /// Formatter stub mirroring `GoFormatter`'s override: every
@@ -1411,6 +1302,10 @@ mod tests {
             }
         }
 
+        impl deps_core::lsp_helpers::DependencyFormatter for MockVPrefixFormatter {
+            type Dep = MockDep;
+        }
+
         #[test]
         fn build_scan_targets_normalizes_version_via_formatter_osv_version_hook() {
             // Go's mandatory "v" prefix isn't valid OSV SEMVER (#228) — must route through
@@ -1429,10 +1324,9 @@ mod tests {
             );
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                stub_document_with(parse_result, MockVPrefixFormatter, EcosystemId::Go).as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &MockVPrefixFormatter,
                 EcosystemId::Go,
             );
             assert_eq!(targets.len(), 1);
@@ -1459,10 +1353,14 @@ mod tests {
             resolved.insert(NormalizedName::for_test("serde"), "1.0.195".into());
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Cargo,
+                )
+                .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert_eq!(targets.len(), 1);
@@ -1495,10 +1393,14 @@ mod tests {
             );
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    MOCK_GO_FORMATTER.for_dependency::<MockDep>(),
+                    EcosystemId::Go,
+                )
+                .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &MOCK_GO_FORMATTER,
                 EcosystemId::Go,
             );
             assert_eq!(targets.len(), 1);
@@ -1526,10 +1428,14 @@ mod tests {
                 };
 
                 let (targets, skipped) = build_scan_targets(
-                    &parse_result,
+                    stub_document_with(
+                        parse_result,
+                        MOCK_GO_FORMATTER.for_dependency::<MockDep>(),
+                        EcosystemId::Go,
+                    )
+                    .as_ref(),
                     &HashMap::new(),
                     &HashMap::new(),
-                    &MOCK_GO_FORMATTER,
                     EcosystemId::Go,
                 );
 
@@ -1553,19 +1459,16 @@ mod tests {
         #[cfg(feature = "deno")]
         #[test]
         fn build_scan_targets_deno_bare_pinned_jsr_dep_is_unmappable_name_skip() {
-            let parse_result = MockParseResult {
-                deps: vec![MockDep {
-                    name: PackageName::new("jsr:@std/fs"),
-                    version_req: Some(VersionReq::new("1.0.0")),
-                    source: DependencySource::Registry,
-                }],
-            };
+            let document = parse_real(
+                deps_deno::DenoEcosystem::new(std::sync::Arc::new(deps_core::HttpCache::new())),
+                "/test/deno.json",
+                r#"{"imports": {"@std/fs": "jsr:@std/fs@1.0.0"}}"#,
+            );
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                document.as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &deps_deno::DenoFormatter,
                 EcosystemId::Deno,
             );
 
@@ -1591,19 +1494,18 @@ mod tests {
         #[cfg(feature = "composer")]
         #[test]
         fn build_scan_targets_composer_mixed_case_name_is_lowercased_for_osv() {
-            let parse_result = MockParseResult {
-                deps: vec![MockDep {
-                    name: PackageName::new("Symfony/Http-Kernel"),
-                    version_req: Some(VersionReq::new("4.4.0")),
-                    source: DependencySource::Registry,
-                }],
-            };
+            let document = parse_real(
+                deps_composer::ComposerEcosystem::new(std::sync::Arc::new(
+                    deps_core::HttpCache::new(),
+                )),
+                "/test/composer.json",
+                r#"{"require": {"Symfony/Http-Kernel": "4.4.0"}}"#,
+            );
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                document.as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &deps_composer::ComposerFormatter,
                 EcosystemId::Composer,
             );
 
@@ -1618,20 +1520,16 @@ mod tests {
         #[cfg(feature = "pypi")]
         #[test]
         fn build_scan_targets_pypi_separator_only_key_is_skipped_and_sibling_still_queried() {
-            let dep = |name: &str| MockDep {
-                name: PackageName::new(name),
-                version_req: Some(VersionReq::new("==1.0.0")),
-                source: DependencySource::Registry,
-            };
-            let parse_result = MockParseResult {
-                deps: vec![dep("Werkzeug"), dep("---")],
-            };
+            let document = parse_real(
+                deps_pypi::PypiEcosystem::new(std::sync::Arc::new(deps_core::HttpCache::new())),
+                "/test/pyproject.toml",
+                "[tool.poetry.dependencies]\nWerkzeug = \"==1.0.0\"\n\"---\" = \"==1.0.0\"\n",
+            );
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                document.as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &deps_pypi::PypiFormatter,
                 EcosystemId::Pypi,
             );
 
@@ -1649,23 +1547,16 @@ mod tests {
         #[cfg(feature = "dart")]
         #[test]
         fn build_scan_targets_dart_plus_build_number_pin_without_lockfile_is_queried() {
-            let dep = |name: &str, req: &str| MockDep {
-                name: PackageName::new(name),
-                version_req: Some(VersionReq::new(req)),
-                source: DependencySource::Registry,
-            };
-            let parse_result = MockParseResult {
-                deps: vec![
-                    dep("image_picker_android", "0.8.13+1"),
-                    dep("caret_pkg", "^0.8.13+1"),
-                ],
-            };
+            let document = parse_real(
+                deps_dart::DartEcosystem::new(std::sync::Arc::new(deps_core::HttpCache::new())),
+                "/test/pubspec.yaml",
+                "dependencies:\n  image_picker_android: 0.8.13+1\n  caret_pkg: ^0.8.13+1\n",
+            );
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                document.as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &deps_dart::DartFormatter,
                 EcosystemId::Dart,
             );
 
@@ -1694,7 +1585,7 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = format!("steps:\n  - uses: actions/checkout@{sha} # v1\n");
             let parse_result =
-                deps_github_actions::parse_workflow_yaml(&content, &uri).expect("valid yaml");
+                || deps_github_actions::parse_workflow_yaml(&content, &uri).expect("valid yaml");
 
             let cache = Arc::new(deps_core::HttpCache::new());
             let registry = GithubActionsRegistry::new(cache);
@@ -1710,10 +1601,9 @@ mod tests {
             let formatter = GithubActionsFormatter::new(tag_index);
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                stub_document_with(parse_result(), formatter, EcosystemId::GithubActions).as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &formatter,
                 EcosystemId::GithubActions,
             );
 
@@ -1742,7 +1632,7 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = format!("steps:\n  - uses: actions/checkout@{sha} # v2.9\n");
             let parse_result =
-                deps_github_actions::parse_workflow_yaml(&content, &uri).expect("valid yaml");
+                || deps_github_actions::parse_workflow_yaml(&content, &uri).expect("valid yaml");
             let commit = CommitSha::parse(&sha).unwrap();
 
             for (tags, expected) in [
@@ -1768,10 +1658,10 @@ mod tests {
                 let formatter = GithubActionsFormatter::new(tag_index);
 
                 let (targets, skipped) = build_scan_targets(
-                    &parse_result,
+                    stub_document_with(parse_result(), formatter, EcosystemId::GithubActions)
+                        .as_ref(),
                     &HashMap::new(),
                     &HashMap::new(),
-                    &formatter,
                     EcosystemId::GithubActions,
                 );
 
@@ -1811,7 +1701,7 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = format!("steps:\n  - uses: actions/checkout@{sha} # v1\n");
             let parse_result =
-                deps_github_actions::parse_workflow_yaml(&content, &uri).expect("valid yaml");
+                || deps_github_actions::parse_workflow_yaml(&content, &uri).expect("valid yaml");
 
             let cache = Arc::new(deps_core::HttpCache::new());
             let registry = GithubActionsRegistry::new(cache);
@@ -1832,10 +1722,9 @@ mod tests {
             let formatter = GithubActionsFormatter::new(tag_index);
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                stub_document_with(parse_result(), formatter, EcosystemId::GithubActions).as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &formatter,
                 EcosystemId::GithubActions,
             );
 
@@ -1864,7 +1753,7 @@ mod tests {
                 "steps:\n  - uses: actions/checkout@{sha}\n  - uses: other/action@v4.9.0\n"
             );
             let parse_result =
-                deps_github_actions::parse_workflow_yaml(&content, &uri).expect("valid yaml");
+                || deps_github_actions::parse_workflow_yaml(&content, &uri).expect("valid yaml");
 
             let registry = GithubActionsRegistry::new(Arc::new(deps_core::HttpCache::new()));
             let tag_index = registry.tag_index();
@@ -1890,10 +1779,9 @@ mod tests {
             let formatter = GithubActionsFormatter::new(tag_index);
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                stub_document_with(parse_result(), formatter, EcosystemId::GithubActions).as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &formatter,
                 EcosystemId::GithubActions,
             );
 
@@ -1939,7 +1827,7 @@ mod tests {
                 "steps:\n  - uses: actions/checkout@{sha}\n  - uses: other/action@v4.9.0\n"
             );
             let parse_result =
-                deps_github_actions::parse_workflow_yaml(&content, &uri).expect("valid yaml");
+                || deps_github_actions::parse_workflow_yaml(&content, &uri).expect("valid yaml");
 
             let registry = GithubActionsRegistry::new(Arc::new(deps_core::HttpCache::new()));
             let tag_index = registry.tag_index();
@@ -1961,10 +1849,9 @@ mod tests {
             let formatter = GithubActionsFormatter::new(tag_index);
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                stub_document_with(parse_result(), formatter, EcosystemId::GithubActions).as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &formatter,
                 EcosystemId::GithubActions,
             );
 
@@ -1988,10 +1875,14 @@ mod tests {
                 }],
             };
             let (targets, _) = build_scan_targets(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Maven,
+                )
+                .as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::Maven,
             );
             assert!(targets.iter().all(|t| t.siblings().is_empty()));
@@ -2009,10 +1900,14 @@ mod tests {
             let resolved = HashMap::new();
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Maven,
+                )
+                .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::Maven,
             );
             assert_eq!(targets.len(), 1);
@@ -2032,10 +1927,14 @@ mod tests {
                 }],
             };
             let (targets, skipped) = build_scan_targets(
-                &cargo_result,
+                stub_document_with(
+                    cargo_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Cargo,
+                )
+                .as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert_eq!(targets.len(), 1);
@@ -2050,10 +1949,14 @@ mod tests {
                 }],
             };
             let (targets, skipped) = build_scan_targets(
-                &nuget_result,
+                stub_document_with(
+                    nuget_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::NuGet,
+                )
+                .as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::NuGet,
             );
             assert_eq!(targets.len(), 1);
@@ -2073,10 +1976,14 @@ mod tests {
             let resolved = HashMap::new();
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Cargo,
+                )
+                .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert!(targets.is_empty());
@@ -2098,10 +2005,14 @@ mod tests {
             let resolved = HashMap::new();
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Cargo,
+                )
+                .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert!(targets.is_empty());
@@ -2141,10 +2052,14 @@ mod tests {
                 resolved.insert(NormalizedName::for_test("pkg"), "1.0.0".into());
 
                 let (targets, skipped) = build_scan_targets(
-                    &parse_result,
+                    stub_document_with(
+                        parse_result,
+                        StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                        EcosystemId::Cargo,
+                    )
+                    .as_ref(),
                     &resolved,
                     &HashMap::new(),
-                    &StubFormatter::DEFAULT,
                     EcosystemId::Cargo,
                 );
                 assert!(targets.is_empty(), "{source:?} must be skipped (step 0)");
@@ -2184,10 +2099,14 @@ mod tests {
             let resolved = HashMap::new();
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Maven,
+                )
+                .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::Maven,
             );
 
@@ -2221,10 +2140,14 @@ mod tests {
             resolved.insert(NormalizedName::for_test("serde"), "1.0.195".into());
 
             let in_use = collect_in_use_versions(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Cargo,
+                )
+                .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert_eq!(
@@ -2247,10 +2170,14 @@ mod tests {
             let resolved = HashMap::new();
 
             let in_use = collect_in_use_versions(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Maven,
+                )
+                .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::Maven,
             );
             assert_eq!(
@@ -2275,10 +2202,14 @@ mod tests {
             let resolved = HashMap::new();
 
             let in_use = collect_in_use_versions(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Pypi,
+                )
+                .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::Pypi,
             );
             assert_eq!(
@@ -2300,10 +2231,14 @@ mod tests {
             let resolved = HashMap::new();
 
             let in_use = collect_in_use_versions(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Cargo,
+                )
+                .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert!(in_use.is_empty());
@@ -2327,10 +2262,14 @@ mod tests {
             resolved.insert(NormalizedName::for_test("time"), "0.1.43".into());
 
             let in_use = collect_in_use_versions(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Cargo,
+                )
+                .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert!(in_use.is_empty());
@@ -2358,10 +2297,14 @@ mod tests {
             let resolved = HashMap::new();
 
             let in_use = collect_in_use_versions(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                    EcosystemId::Cargo,
+                )
+                .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert_eq!(
@@ -2390,7 +2333,6 @@ mod tests {
         use deps_core::parser::DependencySource;
         use deps_core::position::{Position, Range};
         use deps_core::test_util::StubFormatter;
-        use std::any::Any;
         use std::sync::Arc;
 
         struct MockDep {
@@ -2415,9 +2357,6 @@ mod tests {
             fn source(&self) -> DependencySource {
                 self.source.clone()
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         struct MockParseResult {
@@ -2435,8 +2374,13 @@ mod tests {
                 static URI: std::sync::OnceLock<url::Url> = std::sync::OnceLock::new();
                 URI.get_or_init(|| deps_core::test_util::test_uri("/test/Cargo.toml"))
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+
+        impl deps_core::TypedParseResult for MockParseResult {
+            type Dep = MockDep;
+
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.deps
             }
         }
 
@@ -2457,11 +2401,11 @@ mod tests {
         impl DiagnosticMessages for UnmappableNameFormatter {}
         impl DiagnosticPolicy for UnmappableNameFormatter {}
         impl SourcePolicy for UnmappableNameFormatter {}
-        impl OsvNaming for UnmappableNameFormatter {
-            fn osv_package_name(
-                &self,
-                _dep: &dyn Dependency,
-            ) -> Option<deps_core::osv::OsvPackageName> {
+        impl OsvNaming for UnmappableNameFormatter {}
+        impl deps_core::lsp_helpers::DependencyFormatter for UnmappableNameFormatter {
+            type Dep = MockDep;
+
+            fn osv_package_name(&self, _dep: &MockDep) -> Option<deps_core::osv::OsvPackageName> {
                 None
             }
         }
@@ -2485,10 +2429,13 @@ mod tests {
         impl DiagnosticMessages for AwaitingNameFormatter {}
         impl DiagnosticPolicy for AwaitingNameFormatter {}
         impl SourcePolicy for AwaitingNameFormatter {}
-        impl OsvNaming for AwaitingNameFormatter {
+        impl OsvNaming for AwaitingNameFormatter {}
+        impl deps_core::lsp_helpers::DependencyFormatter for AwaitingNameFormatter {
+            type Dep = MockDep;
+
             fn osv_name_availability(
                 &self,
-                dep: &dyn Dependency,
+                dep: &MockDep,
             ) -> deps_core::lsp_helpers::OsvNameAvailability {
                 deps_core::lsp_helpers::OsvNameAvailability::AwaitingRegistryData {
                     written_fallback: self
@@ -2500,7 +2447,7 @@ mod tests {
         }
 
         fn awaiting_name_fixture() -> (
-            MockParseResult,
+            Box<dyn deps_core::ParsedManifest>,
             deps_core::osv::VulnKeys,
             HashMap<NormalizedName, PackageVersions>,
         ) {
@@ -2510,25 +2457,29 @@ mod tests {
                     source: DependencySource::Registry,
                 }],
             };
-            let vuln_keys = vuln_keys_for(&parse_result, &AwaitingNameFormatter::default());
+            let document = stub_document_with(
+                parse_result,
+                AwaitingNameFormatter::default(),
+                EcosystemId::Cargo,
+            );
+            let vuln_keys = vuln_keys_for(document.as_ref());
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
                 NormalizedName::for_test("gha-action"),
                 PackageVersions::latest_only("1.0.0"),
             );
-            (parse_result, vuln_keys, cached_versions)
+            (document, vuln_keys, cached_versions)
         }
 
         #[test]
         fn build_latest_check_targets_awaiting_osv_name_is_unverified_not_structural() {
-            let (parse_result, vuln_keys, cached_versions) = awaiting_name_fixture();
+            let (document, vuln_keys, cached_versions) = awaiting_name_fixture();
 
             let (targets, statuses) = build_latest_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &cached_versions,
                 &vuln_keys,
                 &no_tags(),
-                &AwaitingNameFormatter::default(),
             );
 
             assert!(targets.is_empty());
@@ -2543,14 +2494,13 @@ mod tests {
 
         #[test]
         fn build_candidate_check_targets_awaiting_osv_name_records_no_entry() {
-            let (parse_result, vuln_keys, cached_versions) = awaiting_name_fixture();
+            let (document, vuln_keys, cached_versions) = awaiting_name_fixture();
 
             let (rounds, statuses) = build_candidate_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &cached_versions,
                 &vuln_keys,
                 &no_tags(),
-                &AwaitingNameFormatter::default(),
             );
 
             assert!(rounds.iter().all(Vec::is_empty));
@@ -2571,11 +2521,13 @@ mod tests {
             use std::sync::Arc;
 
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-            let parse_result = deps_github_actions::parse_workflow_yaml(
-                "steps:\n  - uses: azure/setup-kubectl@v4.1.2\n",
-                &uri,
-            )
-            .expect("valid yaml");
+            let parse_result = || {
+                deps_github_actions::parse_workflow_yaml(
+                    "steps:\n  - uses: azure/setup-kubectl@v4.1.2\n",
+                    &uri,
+                )
+                .expect("valid yaml")
+            };
             let registry = GithubActionsRegistry::new(Arc::new(deps_core::HttpCache::new()));
             let written = deps_core::osv::OsvPackageName::new("azure/setup-kubectl").unwrap();
             let canonical = deps_core::osv::OsvPackageName::new("Azure/setup-kubectl").unwrap();
@@ -2592,10 +2544,10 @@ mod tests {
                 let formatter = GithubActionsFormatter::new(tag_index);
 
                 let (targets, skipped) = build_scan_targets(
-                    &parse_result,
+                    stub_document_with(parse_result(), formatter, EcosystemId::GithubActions)
+                        .as_ref(),
                     &HashMap::new(),
                     &HashMap::new(),
-                    &formatter,
                     EcosystemId::GithubActions,
                 );
 
@@ -2619,10 +2571,9 @@ mod tests {
             );
             let formatter = GithubActionsFormatter::new(tag_index);
             let (targets, _) = build_scan_targets(
-                &parse_result,
+                stub_document_with(parse_result(), formatter, EcosystemId::GithubActions).as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &formatter,
                 EcosystemId::GithubActions,
             );
             assert_eq!(targets[0].osv_name, OsvQueryName::Confirmed(canonical));
@@ -2639,11 +2590,13 @@ mod tests {
             use std::sync::Arc;
 
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-            let parse_result = deps_github_actions::parse_workflow_yaml(
-                "steps:\n  - uses: actions/checkout@v4\n",
-                &uri,
-            )
-            .expect("valid yaml");
+            let parse_result = || {
+                deps_github_actions::parse_workflow_yaml(
+                    "steps:\n  - uses: actions/checkout@v4\n",
+                    &uri,
+                )
+                .expect("valid yaml")
+            };
             let registry = GithubActionsRegistry::new(Arc::new(deps_core::HttpCache::new()));
             let key = deps_core::test_util::vuln_key("actions/checkout");
             let commit = CommitSha::parse(&"a".repeat(40)).unwrap();
@@ -2660,10 +2613,14 @@ mod tests {
                     tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
                 }
                 build_scan_targets(
-                    &parse_result,
+                    stub_document_with(
+                        parse_result(),
+                        GithubActionsFormatter::new(tag_index),
+                        EcosystemId::GithubActions,
+                    )
+                    .as_ref(),
                     &HashMap::new(),
                     &HashMap::new(),
-                    &GithubActionsFormatter::new(tag_index),
                     EcosystemId::GithubActions,
                 )
             };
@@ -2701,11 +2658,12 @@ mod tests {
             use std::sync::Arc;
 
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-            let parse_result = deps_github_actions::parse_workflow_yaml(
+            let parse_result = || {
+                deps_github_actions::parse_workflow_yaml(
                 "steps:\n  - uses: actions/checkout@4.2.2\n  - uses: actions/checkout@v999.0.0\n",
                 &uri,
-            )
-            .expect("valid yaml");
+            ).expect("valid yaml")
+            };
             let registry = GithubActionsRegistry::new(Arc::new(deps_core::HttpCache::new()));
             let commit = CommitSha::parse(&"a".repeat(40)).unwrap();
             registry.tag_index().insert(
@@ -2720,10 +2678,14 @@ mod tests {
             );
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                stub_document_with(
+                    parse_result(),
+                    GithubActionsFormatter::new(registry.tag_index()),
+                    EcosystemId::GithubActions,
+                )
+                .as_ref(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &GithubActionsFormatter::new(registry.tag_index()),
                 EcosystemId::GithubActions,
             );
             assert!(targets.is_empty(), "{targets:?}");
@@ -2749,10 +2711,14 @@ mod tests {
             );
 
             let (targets, skipped) = build_scan_targets(
-                &parse_result,
+                stub_document_with(
+                    parse_result,
+                    AwaitingNameFormatter::default(),
+                    EcosystemId::Cargo,
+                )
+                .as_ref(),
                 &resolved,
                 &HashMap::new(),
-                &AwaitingNameFormatter::default(),
                 EcosystemId::Cargo,
             );
 
@@ -2783,10 +2749,13 @@ mod tests {
         impl DiagnosticMessages for SequencedNameFormatter {}
         impl DiagnosticPolicy for SequencedNameFormatter {}
         impl SourcePolicy for SequencedNameFormatter {}
-        impl OsvNaming for SequencedNameFormatter {
+        impl OsvNaming for SequencedNameFormatter {}
+        impl deps_core::lsp_helpers::DependencyFormatter for SequencedNameFormatter {
+            type Dep = MockDep;
+
             fn osv_name_availability(
                 &self,
-                dep: &dyn Dependency,
+                dep: &MockDep,
             ) -> deps_core::lsp_helpers::OsvNameAvailability {
                 let idx = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if self.ready[idx] {
@@ -2833,10 +2802,9 @@ mod tests {
                     calls: std::sync::atomic::AtomicUsize::new(0),
                 };
                 let (targets, _) = build_scan_targets(
-                    &parse_result,
+                    stub_document_with(parse_result, formatter, EcosystemId::Cargo).as_ref(),
                     &resolved,
                     &HashMap::new(),
-                    &formatter,
                     EcosystemId::Cargo,
                 );
                 assert_eq!(targets.len(), 1, "ready={ready:?}");
@@ -2844,17 +2812,8 @@ mod tests {
             }
         }
 
-        fn vuln_keys_for(
-            parse_result: &dyn deps_core::ParseResult,
-            formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
-        ) -> deps_core::osv::VulnKeys {
-            deps_core::osv::vulnerability_keys(
-                parse_result,
-                &HashMap::new(),
-                None,
-                formatter,
-                EcosystemId::Cargo,
-            )
+        fn vuln_keys_for(document: &dyn deps_core::ParsedManifest) -> deps_core::osv::VulnKeys {
+            document.vulnerability_keys(&HashMap::new(), None)
         }
 
         fn gha_like_fixture() -> (MockParseResult, HashMap<NormalizedName, PackageVersions>) {
@@ -2875,7 +2834,12 @@ mod tests {
         #[test]
         fn build_latest_check_targets_attaches_candidate_siblings_without_touching_the_version() {
             let (parse_result, cached_versions) = gha_like_fixture();
-            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let document = stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Cargo,
+            );
+            let vuln_keys = vuln_keys_for(document.as_ref());
             let sources = sources_with(
                 "gha-action",
                 tagged_source(
@@ -2885,11 +2849,10 @@ mod tests {
             );
 
             let (targets, structural) = build_latest_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &cached_versions,
                 &vuln_keys,
                 &sources,
-                &StubFormatter::DEFAULT,
             );
 
             assert!(structural.is_empty());
@@ -2909,7 +2872,12 @@ mod tests {
             use deps_core::pagination::ListCoverage;
 
             let (parse_result, cached_versions) = gha_like_fixture();
-            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let document = stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Cargo,
+            );
+            let vuln_keys = vuln_keys_for(document.as_ref());
             let sources = sources_with(
                 "gha-action",
                 tagged_source_with_coverage(
@@ -2920,11 +2888,10 @@ mod tests {
             );
 
             let (targets, _) = build_latest_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &cached_versions,
                 &vuln_keys,
                 &sources,
-                &StubFormatter::DEFAULT,
             );
 
             assert_eq!(
@@ -2936,7 +2903,12 @@ mod tests {
         #[test]
         fn build_latest_check_targets_whole_commit_scope_spans_majors() {
             let (parse_result, cached_versions) = gha_like_fixture();
-            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let document = stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Cargo,
+            );
+            let vuln_keys = vuln_keys_for(document.as_ref());
             let sources = sources_with(
                 "gha-action",
                 tagged_source(
@@ -2946,11 +2918,10 @@ mod tests {
             );
 
             let (targets, _) = build_latest_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &cached_versions,
                 &vuln_keys,
                 &sources,
-                &StubFormatter::DEFAULT,
             );
 
             assert_eq!(targets[0].siblings().len(), 1);
@@ -2959,15 +2930,19 @@ mod tests {
         #[test]
         fn build_latest_check_targets_cold_tag_index_is_unverified_not_clean() {
             let (parse_result, cached_versions) = gha_like_fixture();
-            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let document = stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Cargo,
+            );
+            let vuln_keys = vuln_keys_for(document.as_ref());
             let sources = sources_with("gha-action", CandidateTagSource::NotYetIndexed);
 
             let (targets, structural) = build_latest_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &cached_versions,
                 &vuln_keys,
                 &sources,
-                &StubFormatter::DEFAULT,
             );
 
             assert!(targets.is_empty());
@@ -2983,24 +2958,27 @@ mod tests {
         #[test]
         fn build_candidate_check_targets_omits_candidates_with_unknown_siblings() {
             let (parse_result, cached_versions) = gha_like_fixture();
-            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let document = stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Cargo,
+            );
+            let vuln_keys = vuln_keys_for(document.as_ref());
 
             let (control, _) = build_candidate_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &cached_versions,
                 &vuln_keys,
                 &no_tags(),
-                &StubFormatter::DEFAULT,
             );
             assert!(control.iter().any(|round| !round.is_empty()));
 
             let cold = sources_with("gha-action", CandidateTagSource::NotYetIndexed);
             let (rounds, _) = build_candidate_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &cached_versions,
                 &vuln_keys,
                 &cold,
-                &StubFormatter::DEFAULT,
             );
             assert!(rounds.iter().all(Vec::is_empty));
         }
@@ -3015,14 +2993,18 @@ mod tests {
                     },
                 }],
             };
-            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let document = stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Cargo,
+            );
+            let vuln_keys = vuln_keys_for(document.as_ref());
 
             let (targets, structural) = build_latest_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &HashMap::new(),
                 &vuln_keys,
                 &no_tags(),
-                &StubFormatter::DEFAULT,
             );
 
             assert!(targets.is_empty());
@@ -3044,14 +3026,18 @@ mod tests {
                     },
                 }],
             };
-            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let document = stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Cargo,
+            );
+            let vuln_keys = vuln_keys_for(document.as_ref());
 
             let (rounds, structural) = build_candidate_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &HashMap::new(),
                 &vuln_keys,
                 &no_tags(),
-                &StubFormatter::DEFAULT,
             );
 
             assert!(
@@ -3074,7 +3060,9 @@ mod tests {
                     source: DependencySource::Registry,
                 }],
             };
-            let vuln_keys = vuln_keys_for(&parse_result, &UnmappableNameFormatter);
+            let document =
+                stub_document_with(parse_result, UnmappableNameFormatter, EcosystemId::Cargo);
+            let vuln_keys = vuln_keys_for(document.as_ref());
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
                 NormalizedName::for_test("jsr-pinned"),
@@ -3082,11 +3070,10 @@ mod tests {
             );
 
             let (rounds, structural) = build_candidate_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &cached_versions,
                 &vuln_keys,
                 &no_tags(),
-                &UnmappableNameFormatter,
             );
 
             assert!(
@@ -3119,7 +3106,12 @@ mod tests {
         #[test]
         fn build_latest_check_targets_dedups_duplicate_key_occurrences() {
             let parse_result = duplicated_registry_dep();
-            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let document = stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Cargo,
+            );
+            let vuln_keys = vuln_keys_for(document.as_ref());
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
                 NormalizedName::for_test("lodash"),
@@ -3127,11 +3119,10 @@ mod tests {
             );
 
             let (targets, structural) = build_latest_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &cached_versions,
                 &vuln_keys,
                 &no_tags(),
-                &StubFormatter::DEFAULT,
             );
 
             assert_eq!(
@@ -3145,7 +3136,12 @@ mod tests {
         #[test]
         fn build_candidate_check_targets_dedups_duplicate_key_occurrences() {
             let parse_result = duplicated_registry_dep();
-            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let document = stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Cargo,
+            );
+            let vuln_keys = vuln_keys_for(document.as_ref());
             let mut cached_versions = HashMap::new();
             let available: Arc<[ConcreteVersion]> = Arc::from(vec![
                 ConcreteVersion::new("2.0.0"),
@@ -3157,11 +3153,10 @@ mod tests {
             );
 
             let (rounds, _) = build_candidate_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &cached_versions,
                 &vuln_keys,
                 &no_tags(),
-                &StubFormatter::DEFAULT,
             );
 
             assert_eq!(rounds[0].len(), 1);
@@ -3181,7 +3176,12 @@ mod tests {
         #[test]
         fn build_latest_check_targets_keeps_first_occurrence_order() {
             let parse_result = dup_other_dup();
-            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let document = stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Cargo,
+            );
+            let vuln_keys = vuln_keys_for(document.as_ref());
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
                 NormalizedName::for_test("dup"),
@@ -3193,11 +3193,10 @@ mod tests {
             );
 
             let (targets, _) = build_latest_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &cached_versions,
                 &vuln_keys,
                 &no_tags(),
-                &StubFormatter::DEFAULT,
             );
 
             let keys: Vec<_> = targets.iter().map(|t| t.key.clone()).collect();
@@ -3215,7 +3214,12 @@ mod tests {
         #[test]
         fn build_candidate_check_targets_keeps_first_occurrence_order() {
             let parse_result = dup_other_dup();
-            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let document = stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Cargo,
+            );
+            let vuln_keys = vuln_keys_for(document.as_ref());
             let mut cached_versions = HashMap::new();
             for (name, newest) in [("dup", "2.0.0"), ("other", "3.0.0")] {
                 let available: Arc<[ConcreteVersion]> =
@@ -3227,11 +3231,10 @@ mod tests {
             }
 
             let (rounds, _) = build_candidate_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &cached_versions,
                 &vuln_keys,
                 &no_tags(),
-                &StubFormatter::DEFAULT,
             );
 
             let keys: Vec<_> = rounds[0].iter().map(|t| t.key.clone()).collect();
@@ -3255,7 +3258,12 @@ mod tests {
                     source: DependencySource::Registry,
                 }],
             };
-            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let document = stub_document_with(
+                parse_result,
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Cargo,
+            );
+            let vuln_keys = vuln_keys_for(document.as_ref());
             let mut cached_versions = HashMap::new();
             let available: Arc<[ConcreteVersion]> = Arc::from(vec![
                 ConcreteVersion::new("3.0.0"),
@@ -3268,11 +3276,10 @@ mod tests {
             );
 
             let (rounds, structural) = build_candidate_check_targets(
-                &parse_result,
+                document.as_ref(),
                 &cached_versions,
                 &vuln_keys,
                 &no_tags(),
-                &StubFormatter::DEFAULT,
             );
 
             assert!(structural.is_empty());

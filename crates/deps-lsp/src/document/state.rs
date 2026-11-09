@@ -11,8 +11,8 @@ use deps_core::policy_config::{
 };
 use deps_core::{
     CachedVersionsMap, DependencyOutcomes, DepsDevClient, EcosystemId, EcosystemRegistry,
-    GossipFindings, LicensePolicy, NormalizedName, ParseResult, ResolvedCandidatesMap,
-    ResolvedVersionsMap, TyposquatSignal,
+    GossipFindings, LicensePolicy, NormalizedName, ParseResult, ParsedManifest,
+    ResolvedCandidatesMap, ResolvedVersionsMap, TyposquatSignal,
 };
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -213,7 +213,7 @@ impl ParseFailure {
 /// One enum rather than two `Option`s so "has a result and a failure" cannot be represented.
 #[derive(Clone)]
 enum ManifestParse {
-    Parsed(Arc<dyn ParseResult>),
+    Parsed(Arc<dyn ParsedManifest>),
     Failed(ParseFailure),
     Unparsed,
 }
@@ -268,7 +268,7 @@ pub struct DocumentState {
     /// Original document content
     pub content: String,
     /// Parsed result as trait object, wrapped in `Arc` (rather than `Box`) so
-    /// [`Self::parse_result_arc`] can hand a caller a cheap owned clone — letting it
+    /// [`Self::manifest_arc`] can hand a caller a cheap owned clone — letting it
     /// release the DashMap shard `Ref` before an `.await` on a registry-bound
     /// `generate_*` call without deep-cloning ecosystem-specific parse data (#319). This is
     /// also why `#[derive(Clone)]` on `DocumentState` itself stays cheap for this field — a
@@ -469,12 +469,12 @@ impl DocumentState {
     pub fn new_from_parse_result(
         ecosystem: EcosystemId,
         content: String,
-        parse_result: Box<dyn ParseResult>,
+        manifest: Box<dyn ParsedManifest>,
     ) -> Self {
         Self::new_inner(
             ecosystem,
             content,
-            ManifestParse::Parsed(Arc::from(parse_result)),
+            ManifestParse::Parsed(Arc::from(manifest)),
         )
     }
 
@@ -504,21 +504,26 @@ impl DocumentState {
         }
     }
 
-    /// Gets a reference to the parse result if available.
-    pub fn parse_result(&self) -> Option<&dyn ParseResult> {
+    /// Gets a reference to the parsed manifest (parse result paired with its ecosystem) if available.
+    pub fn manifest(&self) -> Option<&dyn ParsedManifest> {
         match &self.manifest {
             ManifestParse::Parsed(result) => Some(result.as_ref()),
             ManifestParse::Failed(_) | ManifestParse::Unparsed => None,
         }
     }
 
-    /// Returns a cheap `Arc` clone of the parse result, if available.
+    /// Gets a reference to the parse result if available.
+    pub fn parse_result(&self) -> Option<&dyn ParseResult> {
+        self.manifest().map(|manifest| manifest as &dyn ParseResult)
+    }
+
+    /// Returns a cheap `Arc` clone of the parsed manifest, if available.
     ///
     /// Lets a caller (e.g. a `handlers::{hover,completion,code_actions}` handler) own
-    /// the parse result and release the DashMap shard `Ref` before awaiting a
-    /// registry-bound `Ecosystem::generate_*` call, without deep-cloning
+    /// the manifest and release the DashMap shard `Ref` before awaiting a
+    /// registry-bound `ParsedManifest::generate_*` call, without deep-cloning
     /// ecosystem-specific parse data on every request (#319).
-    pub fn parse_result_arc(&self) -> Option<Arc<dyn ParseResult>> {
+    pub fn manifest_arc(&self) -> Option<Arc<dyn ParsedManifest>> {
         match &self.manifest {
             ManifestParse::Parsed(result) => Some(Arc::clone(result)),
             ManifestParse::Failed(_) | ManifestParse::Unparsed => None,
@@ -1755,7 +1760,7 @@ impl ServerState {
     /// to the caller.
     ///
     /// `extract` runs synchronously while the shard lock is held and must return only
-    /// owned or `Arc`-cloned data (e.g. via [`DocumentState::parse_result_arc`]); the
+    /// owned or `Arc`-cloned data (e.g. via [`DocumentState::manifest_arc`]); the
     /// `Ref` this method acquires is dropped before the call returns, so *that*
     /// particular guard can never leak across an `.await` through `T`. This does not by
     /// itself prevent `extract` from independently capturing and returning some other,
@@ -2110,6 +2115,97 @@ mod tests {
     // =========================================================================
     // Generic tests (no feature flag required)
     // =========================================================================
+
+    mod paired_manifest_tests {
+        use super::*;
+        use deps_core::EcosystemBase;
+        use deps_core::VersionData;
+        use deps_core::ecosystem::BoxFuture;
+        use deps_core::ecosystem::private::Sealed;
+        use deps_core::hover::Hover;
+
+        struct TaggedEcosystem {
+            id: EcosystemId,
+            tag: &'static str,
+        }
+        impl Sealed for TaggedEcosystem {}
+        impl EcosystemBase for TaggedEcosystem {
+            fn ecosystem_id(&self) -> EcosystemId {
+                self.id
+            }
+            fn display_name(&self) -> &'static str {
+                self.tag
+            }
+            fn manifest_filenames(&self) -> &[&'static str] {
+                &[]
+            }
+            fn registry(&self) -> Arc<dyn deps_core::Registry> {
+                Arc::new(crate::test_utils::blocking_ecosystem::NoopRegistry)
+            }
+            fn completion_insert_text(
+                &self,
+                _metadata: &dyn deps_core::Metadata,
+            ) -> Option<String> {
+                None
+            }
+        }
+        crate::test_utils::impl_parsing_stub_ecosystem!(TaggedEcosystem, {
+            fn hover<'a>(
+                &'a self,
+                _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
+                _position: tower_lsp_server::ls_types::Position,
+                _versions: VersionData<'a>,
+                _freshness: deps_core::FreshnessSettings,
+            ) -> BoxFuture<'a, Option<Hover>> {
+                Box::pin(async move { Some(Hover::new(format!("hover from {}", self.tag), None)) })
+            }
+        });
+
+        /// A document's manifest answers through the ecosystem that parsed it, not through
+        /// whichever ecosystem the registry holds for the same `EcosystemId`.
+        #[tokio::test]
+        async fn manifest_hooks_use_the_ecosystem_that_parsed_the_document() {
+            let url = deps_core::test_util::test_uri("/test/manifest.toml");
+            let first = Arc::new(TaggedEcosystem {
+                id: EcosystemId::Cargo,
+                tag: "first",
+            });
+            let second = Arc::new(TaggedEcosystem {
+                id: EcosystemId::Npm,
+                tag: "second",
+            });
+            let docs = [
+                DocumentState::new_from_parse_result(
+                    EcosystemId::Cargo,
+                    String::new(),
+                    crate::test_utils::manifest_of(&first, &url),
+                ),
+                DocumentState::new_from_parse_result(
+                    EcosystemId::Npm,
+                    String::new(),
+                    crate::test_utils::manifest_of(&second, &url),
+                ),
+            ];
+
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            let mut texts = Vec::new();
+            for doc in &docs {
+                let hover = doc
+                    .manifest()
+                    .expect("document carries its manifest")
+                    .generate_hover(
+                        tower_lsp_server::ls_types::Position::new(0, 0),
+                        VersionData::new(&cached, &resolved),
+                        deps_core::FreshnessSettings::default(),
+                    )
+                    .await
+                    .expect("the double always answers");
+                texts.push(hover.markdown().to_string());
+            }
+            assert_eq!(texts, ["hover from first", "hover from second"]);
+        }
+    }
 
     // =========================================================================
     // License race-safety tests (issue #660/#661, critic S4/M2)
@@ -3323,7 +3419,7 @@ mod tests {
 
         let parse_result = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(ecosystem.parse_manifest(&content, &uri))
+            .block_on(Arc::clone(&ecosystem).parse_manifest(&content, &uri))
             .unwrap();
 
         let ecosystem_id: EcosystemId = "maven"
@@ -3389,7 +3485,7 @@ mod tests {
 
             let parse_result = tokio::runtime::Runtime::new()
                 .unwrap()
-                .block_on(ecosystem.parse_manifest(&content, &uri))
+                .block_on(Arc::clone(&ecosystem).parse_manifest(&content, &uri))
                 .unwrap();
 
             let doc_state = DocumentState::new_from_parse_result(
@@ -3479,7 +3575,7 @@ mod tests {
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
             let parse_result = tokio::runtime::Runtime::new()
                 .unwrap()
-                .block_on(ecosystem.parse_manifest(&content, &uri))
+                .block_on(Arc::clone(&ecosystem).parse_manifest(&content, &uri))
                 .unwrap();
 
             let state =
@@ -3487,12 +3583,12 @@ mod tests {
             let cloned = state.clone();
 
             assert!(
-                cloned.parse_result_arc().is_some(),
+                cloned.manifest_arc().is_some(),
                 "clone must still carry the parse result"
             );
             assert!(std::sync::Arc::ptr_eq(
-                &state.parse_result_arc().unwrap(),
-                &cloned.parse_result_arc().unwrap()
+                &state.manifest_arc().unwrap(),
+                &cloned.manifest_arc().unwrap()
             ));
         }
 
@@ -3591,7 +3687,7 @@ mod tests {
 
             let parse_result = tokio::runtime::Runtime::new()
                 .unwrap()
-                .block_on(ecosystem.parse_manifest(&content, &uri))
+                .block_on(Arc::clone(&ecosystem).parse_manifest(&content, &uri))
                 .unwrap();
 
             let doc_state = DocumentState::new_from_parse_result(

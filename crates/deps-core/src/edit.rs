@@ -10,12 +10,15 @@
 //! and spec 063 applied to [`crate::Dependency`]/[`crate::lockfile::LockFileCache`].
 
 use crate::lsp_helpers::{
-    EcosystemFormatter, LineOffsetTable, PackageVersions, RequirementGate, RequirementStatus,
-    VersionData, is_safe_version_string, literal_span_matches, requirement_is_oversized,
-    requirement_len_exceeds_cap, resolve_in_use_version, slice_for_range, strip_whitespace,
-    warn_rejected_value,
+    DependencyFormatter, DependencyGate, EcosystemFormatter, LineOffsetTable, PackageVersions,
+    RequirementGate, RequirementStatus, VersionData, is_safe_version_string, literal_span_matches,
+    requirement_is_oversized, requirement_len_exceeds_cap, resolve_in_use_version, slice_for_range,
+    strip_whitespace, warn_rejected_value,
 };
-use crate::{ConcreteVersion, Dependency, PackageKey, ParseResult, RemovalStatus, VersionReq};
+use crate::{
+    ConcreteVersion, Dependency, PackageKey, ParseResult, RemovalStatus, TypedParseResult,
+    VersionReq,
+};
 
 /// Whether `current` — or `dep`'s own literal version span — is an unexpanded placeholder.
 ///
@@ -73,9 +76,6 @@ use crate::{ConcreteVersion, Dependency, PackageKey, ParseResult, RemovalStatus,
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
 ///     }
-///     fn as_any(&self) -> &dyn std::any::Any {
-///         self
-///     }
 /// }
 ///
 /// let dep = PlainDependency(PackageName::new("example"));
@@ -102,7 +102,7 @@ pub fn requirement_is_placeholder_for(
 ///
 /// Centralizing the placeholder gate here — rather than leaving it to each ecosystem's
 /// [`PackageRendering::format_version_replacing`](crate::lsp_helpers::PackageRendering::format_version_replacing)/
-/// [`format_version_replacing_for`](crate::lsp_helpers::PackageRendering::format_version_replacing_for)
+/// [`format_version_replacing_for`](crate::lsp_helpers::DependencyFormatter::format_version_replacing_for)
 /// override to re-check — means a formatter implementation can never destructively rewrite a
 /// placeholder no matter how it is reached: the 14 previously hand-rolled per-crate guards
 /// inside those methods are gone (#1391), and this free function is the sole call site that
@@ -119,7 +119,7 @@ pub fn requirement_is_placeholder_for(
 ///
 /// ```
 /// use deps_core::edit::replacement_text;
-/// use deps_core::lsp_helpers::{DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering, RequirementResolution, SourcePolicy};
+/// use deps_core::lsp_helpers::{DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering, RequirementResolution, SourcePolicy};
 /// use deps_core::{ConcreteVersion, Dependency, PackageName, VersionReq};
 ///
 /// struct PlainFormatter;
@@ -137,6 +137,9 @@ pub fn requirement_is_placeholder_for(
 /// impl DiagnosticPolicy for PlainFormatter {}
 /// impl SourcePolicy for PlainFormatter {}
 /// impl OsvNaming for PlainFormatter {}
+/// impl DependencyFormatter for PlainFormatter {
+///     type Dep = PlainDependency;
+/// }
 ///
 /// struct PlainDependency(PackageName);
 /// impl Dependency for PlainDependency {
@@ -155,9 +158,6 @@ pub fn requirement_is_placeholder_for(
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
 ///     }
-///     fn as_any(&self) -> &dyn std::any::Any {
-///         self
-///     }
 /// }
 ///
 /// let dep = PlainDependency(PackageName::new("example"));
@@ -171,9 +171,9 @@ pub fn requirement_is_placeholder_for(
 /// );
 /// ```
 #[must_use]
-pub fn replacement_text(
-    formatter: &dyn EcosystemFormatter,
-    dep: &dyn Dependency,
+pub fn replacement_text<F: DependencyFormatter>(
+    formatter: &F,
+    dep: &F::Dep,
     version: &ConcreteVersion,
     current: &str,
 ) -> Option<String> {
@@ -183,15 +183,16 @@ pub fn replacement_text(
     Some(formatter.format_version_replacing_for(dep, version, current))
 }
 
-/// [`replacement_text`] for a security-fix or cooldown-fallback target: the rendering keeps the
-/// requirement's floor at `version` (see
-/// [`PackageRendering::format_version_replacing_floor_for`](crate::lsp_helpers::PackageRendering::format_version_replacing_floor_for)).
+/// [`replacement_text`] for a security-fix or cooldown-fallback target.
+///
+/// The rendering keeps the requirement's floor at `version` (see
+/// [`crate::lsp_helpers::DependencyFormatter::format_version_replacing_floor_for`]).
 ///
 /// Returns `None` for an unexpanded placeholder, exactly like [`replacement_text`].
 #[must_use]
-pub fn floor_safe_replacement_text(
-    formatter: &dyn EcosystemFormatter,
-    dep: &dyn Dependency,
+pub fn floor_safe_replacement_text<F: DependencyFormatter>(
+    formatter: &F,
+    dep: &F::Dep,
     version: &ConcreteVersion,
     current: &str,
 ) -> Option<String> {
@@ -450,7 +451,7 @@ impl<F: Fn(&str) -> Option<Box<dyn ParseResult>>> ManifestReparse for F {
 /// use deps_core::Ecosystem;
 /// use url::Url;
 ///
-/// # fn example(ecosystem: &dyn Ecosystem, uri: Url) {
+/// # fn example(ecosystem: &std::sync::Arc<dyn Ecosystem>, uri: Url) {
 /// let reparse = EcosystemReparse {
 ///     ecosystem,
 ///     uri: &uri,
@@ -460,7 +461,7 @@ impl<F: Fn(&str) -> Option<Box<dyn ParseResult>>> ManifestReparse for F {
 /// ```
 pub struct EcosystemReparse<'a> {
     /// The ecosystem to re-parse through.
-    pub ecosystem: &'a dyn crate::Ecosystem,
+    pub ecosystem: &'a std::sync::Arc<dyn crate::Ecosystem>,
     /// The manifest document's URI, for position tracking.
     pub uri: &'a url::Url,
 }
@@ -468,6 +469,7 @@ pub struct EcosystemReparse<'a> {
 impl ManifestReparse for EcosystemReparse<'_> {
     fn reparse(&self, content: &str) -> Option<Box<dyn ParseResult>> {
         crate::ecosystem::parse_manifest_now(self.ecosystem, content, self.uri)
+            .map(|manifest| manifest as Box<dyn ParseResult>)
     }
 }
 
@@ -618,10 +620,13 @@ fn parse_leading_dotted_numeric(s: &str) -> Option<(u64, u64, u64)> {
 /// ```
 /// use deps_core::edit::collect_update_edits;
 /// use deps_core::lsp_helpers::{
-///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
 ///     PackageVersions, RequirementResolution, SourcePolicy, VersionData,
 /// };
-/// use deps_core::{ConcreteVersion, Dependency, NormalizedName, ParseResult, PackageName, VersionReq};
+/// use deps_core::{
+/// ConcreteVersion, Dependency, NormalizedName, PackageName, ParseResult, TypedParseResult,
+/// VersionReq,
+/// };
 /// use std::any::Any;
 /// use std::collections::HashMap;
 /// use deps_core::position::{Position, Range};
@@ -641,6 +646,9 @@ fn parse_leading_dotted_numeric(s: &str) -> Option<(u64, u64, u64)> {
 /// impl DiagnosticPolicy for MockFormatter {}
 /// impl SourcePolicy for MockFormatter {}
 /// impl OsvNaming for MockFormatter {}
+/// impl DependencyFormatter for MockFormatter {
+///     type Dep = MockDep;
+/// }
 ///
 /// struct MockDep {
 ///     name: PackageName,
@@ -656,7 +664,6 @@ fn parse_leading_dotted_numeric(s: &str) -> Option<(u64, u64, u64)> {
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
 ///     }
-///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
 /// struct MockParseResult { deps: Vec<MockDep>, uri: url::Url }
@@ -666,7 +673,10 @@ fn parse_leading_dotted_numeric(s: &str) -> Option<(u64, u64, u64)> {
 ///     }
 ///     fn workspace_root(&self) -> Option<&std::path::Path> { None }
 ///     fn uri(&self) -> &url::Url { &self.uri }
-///     fn as_any(&self) -> &dyn Any { self }
+/// }
+/// impl TypedParseResult for MockParseResult {
+///     type Dep = MockDep;
+///     fn own_dependencies(&self) -> &[MockDep] { &self.deps }
 /// }
 ///
 /// let content = r#"serde = "1.0.0""#;
@@ -696,12 +706,16 @@ fn parse_leading_dotted_numeric(s: &str) -> Option<(u64, u64, u64)> {
 /// assert_eq!(planned[0].key.declared().as_str(), "serde");
 /// ```
 #[must_use]
-pub fn collect_update_edits(
-    parse_result: &dyn ParseResult,
+pub fn collect_update_edits<P, F>(
+    parse_result: &P,
     content: &str,
     versions: VersionData<'_>,
-    formatter: &dyn EcosystemFormatter,
-) -> Vec<PlannedUpdate> {
+    formatter: &F,
+) -> Vec<PlannedUpdate>
+where
+    P: TypedParseResult,
+    F: DependencyFormatter<Dep = P::Dep>,
+{
     let planned: Vec<PlannedUpdate> =
         collect_update_candidates(parse_result, content, versions, formatter)
             .into_iter()
@@ -779,13 +793,17 @@ pub enum UpdateCandidate {
 /// own classification logic reports for it — this is one of the four central edit-planning
 /// gates that predicate consults.
 #[must_use]
-pub fn collect_update_candidates(
-    parse_result: &dyn ParseResult,
+pub fn collect_update_candidates<P, F>(
+    parse_result: &P,
     content: &str,
     versions: VersionData<'_>,
-    formatter: &dyn EcosystemFormatter,
-) -> Vec<UpdateCandidate> {
-    let deps = parse_result.dependencies();
+    formatter: &F,
+) -> Vec<UpdateCandidate>
+where
+    P: TypedParseResult,
+    F: DependencyFormatter<Dep = P::Dep>,
+{
+    let deps = parse_result.own_dependencies();
     let mut candidates: Vec<UpdateCandidate> = Vec::with_capacity(deps.len());
     // Built once and reused for every dependency below (matches the pre-extraction
     // `collect_update_all_edits`'s own rationale for doing so).
@@ -1392,8 +1410,8 @@ pub fn resolve_verified_fix(
 /// ```
 /// use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
 /// use deps_core::lsp_helpers::{
-///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-///     RequirementResolution, SourcePolicy,
+///     DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+///     PackageRendering, RequirementResolution, SourcePolicy,
 /// };
 /// use deps_core::osv::{
 ///     Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
@@ -1418,6 +1436,9 @@ pub fn resolve_verified_fix(
 /// impl DiagnosticPolicy for MockFormatter {}
 /// impl SourcePolicy for MockFormatter {}
 /// impl OsvNaming for MockFormatter {}
+/// impl DependencyFormatter for MockFormatter {
+///     type Dep = MockDep;
+/// }
 ///
 /// struct MockDep {
 ///     name: PackageName,
@@ -1433,7 +1454,6 @@ pub fn resolve_verified_fix(
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
 ///     }
-///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
 /// let dep = MockDep {
@@ -1471,13 +1491,13 @@ pub fn resolve_verified_fix(
 ///
 /// Returns [`VulnFixSkip`] for any of the six causes that make an edit impossible or
 /// unnecessary — see that type's variants.
-pub fn plan_vulnerability_fix(
-    dep: &dyn Dependency,
+pub fn plan_vulnerability_fix<F: DependencyFormatter>(
+    dep: &F::Dep,
     version_range: crate::position::Range,
     current: &str,
     dv: &crate::osv::DependencyVulnerabilities,
     ctx: FixTargetContext<'_>,
-    formatter: &dyn EcosystemFormatter,
+    formatter: &F,
 ) -> Result<PlannedUpdate, VulnFixSkip> {
     let (_fix, version_native) = resolve_verified_fix(dv, ctx, formatter)?;
     plan_verified_fix(dep, version_range, current, &version_native, formatter)
@@ -1501,12 +1521,12 @@ pub fn plan_vulnerability_fix(
 /// [`VulnFixSkip::UnverifiedTarget`] (a commit pin whose tag list is unavailable), or
 /// [`VulnFixSkip::NoOpRewrite`] — the causes that can still make an edit unnecessary or
 /// impossible once the fix is already known resolved and verified.
-pub fn plan_verified_fix(
-    dep: &dyn Dependency,
+pub fn plan_verified_fix<F: DependencyFormatter>(
+    dep: &F::Dep,
     version_range: crate::position::Range,
     current: &str,
     version_native: &str,
-    formatter: &dyn EcosystemFormatter,
+    formatter: &F,
 ) -> Result<PlannedUpdate, VulnFixSkip> {
     // Checked before the placeholder gate: that gate reports oversized text as a placeholder,
     // which would misattribute a size-based skip to `UnresolvedPlaceholder`.
@@ -1581,6 +1601,26 @@ mod tests {
     use super::*;
     use crate::NormalizedName;
     use crate::position::Position;
+
+    #[test]
+    fn replacement_text_declines_a_placeholder_requirement_and_renders_a_plain_one() {
+        use crate::lsp_helpers::test_support::{MOCK_FORMATTER, dep_at};
+
+        let dep = dep_at("serde");
+        let version = ConcreteVersion::new("1.2.3");
+
+        for placeholder in ["${serde.version}", "{{ version }}", "$VERSION"] {
+            assert_eq!(
+                replacement_text(&MOCK_FORMATTER, &dep, &version, placeholder),
+                None,
+                "{placeholder:?} must never be rewritten"
+            );
+        }
+        assert_eq!(
+            replacement_text(&MOCK_FORMATTER, &dep, &version, "1.0.0"),
+            Some("\"1.2.3\"".to_string())
+        );
+    }
 
     fn range(sl: u32, sc: u32, el: u32, ec: u32) -> crate::position::Range {
         crate::position::Range::new(Position::new(sl, sc), Position::new(el, ec))
@@ -2023,6 +2063,9 @@ mod tests {
             impl crate::lsp_helpers::DiagnosticPolicy for NoOpFormatter {}
             impl crate::lsp_helpers::SourcePolicy for NoOpFormatter {}
             impl crate::lsp_helpers::OsvNaming for NoOpFormatter {}
+            impl crate::lsp_helpers::DependencyFormatter for NoOpFormatter {
+                type Dep = MockDep;
+            }
 
             let content = "pkg = \"1.0.0\"\n";
             let pr = parse_result(vec![dep("pkg", "1.0.0", range(0, 7, 0, 12))]);
@@ -2116,9 +2159,17 @@ mod tests {
                 ) -> bool {
                     false
                 }
+            }
+            impl crate::lsp_helpers::DiagnosticMessages for ShaPinResolvedFormatter {}
+            impl crate::lsp_helpers::DiagnosticPolicy for ShaPinResolvedFormatter {}
+            impl crate::lsp_helpers::SourcePolicy for ShaPinResolvedFormatter {}
+            impl crate::lsp_helpers::OsvNaming for ShaPinResolvedFormatter {}
+            impl crate::lsp_helpers::DependencyFormatter for ShaPinResolvedFormatter {
+                type Dep = MockDep;
+
                 fn resolved_pin_version(
                     &self,
-                    _dep: &dyn Dependency,
+                    _dep: &MockDep,
                 ) -> crate::lsp_helpers::PinResolution {
                     crate::lsp_helpers::PinResolution::Resolved {
                         pin: crate::lsp_helpers::ResolvedPin::most_specific(ConcreteVersion::new(
@@ -2128,10 +2179,6 @@ mod tests {
                     }
                 }
             }
-            impl crate::lsp_helpers::DiagnosticMessages for ShaPinResolvedFormatter {}
-            impl crate::lsp_helpers::DiagnosticPolicy for ShaPinResolvedFormatter {}
-            impl crate::lsp_helpers::SourcePolicy for ShaPinResolvedFormatter {}
-            impl crate::lsp_helpers::OsvNaming for ShaPinResolvedFormatter {}
 
             let sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
             let content = format!("actions/checkout = \"{sha}\"\n");
@@ -2195,17 +2242,21 @@ mod tests {
                 ) -> bool {
                     false
                 }
-                fn resolved_pin_version(
-                    &self,
-                    _dep: &dyn Dependency,
-                ) -> crate::lsp_helpers::PinResolution {
-                    crate::lsp_helpers::PinResolution::Unpublished
-                }
             }
             impl crate::lsp_helpers::DiagnosticMessages for UnpublishedFormatter {}
             impl crate::lsp_helpers::DiagnosticPolicy for UnpublishedFormatter {}
             impl crate::lsp_helpers::SourcePolicy for UnpublishedFormatter {}
             impl crate::lsp_helpers::OsvNaming for UnpublishedFormatter {}
+            impl crate::lsp_helpers::DependencyFormatter for UnpublishedFormatter {
+                type Dep = MockDep;
+
+                fn resolved_pin_version(
+                    &self,
+                    _dep: &MockDep,
+                ) -> crate::lsp_helpers::PinResolution {
+                    crate::lsp_helpers::PinResolution::Unpublished
+                }
+            }
 
             let declared = |text: &str| PlannedCurrent::Declared(VersionReq::new(text));
             let cases = [
@@ -2581,6 +2632,9 @@ mod tests {
         impl DiagnosticPolicy for ShaPinFormatter {}
         impl SourcePolicy for ShaPinFormatter {}
         impl OsvNaming for ShaPinFormatter {}
+        impl crate::lsp_helpers::DependencyFormatter for ShaPinFormatter {
+            type Dep = MockDep;
+        }
 
         /// A caret range ("^1" is what Cargo/npm-shaped bare "1" compiles to) that already
         /// admits the fix target must suppress the edit — the declared requirement needs no
@@ -2615,14 +2669,6 @@ mod tests {
                 fn format_version_replacing(&self, v: &ConcreteVersion, _current: &str) -> String {
                     v.as_str().split('.').next().unwrap_or_default().to_owned()
                 }
-                fn format_version_replacing_floor_for(
-                    &self,
-                    _dep: &dyn Dependency,
-                    v: &ConcreteVersion,
-                    _current: &str,
-                ) -> String {
-                    v.to_string()
-                }
                 fn package_url(&self, name: &PackageName) -> String {
                     name.as_str().to_string()
                 }
@@ -2639,6 +2685,18 @@ mod tests {
             impl crate::lsp_helpers::DiagnosticPolicy for PartialMajorFormatter {}
             impl crate::lsp_helpers::SourcePolicy for PartialMajorFormatter {}
             impl crate::lsp_helpers::OsvNaming for PartialMajorFormatter {}
+            impl crate::lsp_helpers::DependencyFormatter for PartialMajorFormatter {
+                type Dep = MockDep;
+
+                fn format_version_replacing_floor_for(
+                    &self,
+                    _dep: &MockDep,
+                    v: &ConcreteVersion,
+                    _current: &str,
+                ) -> String {
+                    v.to_string()
+                }
+            }
 
             let d = dep("lodash", "3", range(0, 8, 0, 9));
             let planned =
@@ -2720,9 +2778,6 @@ mod tests {
                 fn source(&self) -> crate::parser::DependencySource {
                     self.inner.source()
                 }
-                fn as_any(&self) -> &dyn std::any::Any {
-                    self
-                }
             }
 
             let oversized = "1".repeat(MAX_REQUIREMENT_LEN + 1);
@@ -2749,7 +2804,7 @@ mod tests {
                     range(0, 8, 0, 9),
                     "1",
                     "2",
-                    &ExactMatchFormatter,
+                    &crate::lsp_helpers::test_support::MOCK_FORMATTER.for_dependency(),
                 ),
                 Err(VulnFixSkip::OversizedRequirement)
             );
@@ -2942,6 +2997,9 @@ mod tests {
         impl DiagnosticPolicy for FloorFormatter {}
         impl SourcePolicy for FloorFormatter {}
         impl OsvNaming for FloorFormatter {}
+        impl crate::lsp_helpers::DependencyFormatter for FloorFormatter {
+            type Dep = MockDep;
+        }
 
         /// #1344 C1 regression: a floor-shaped requirement must NOT be suppressed just
         /// because `compile_bounded_requirement`'s raw matcher admits the fix target — the resolver

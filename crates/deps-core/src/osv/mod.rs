@@ -55,11 +55,12 @@ use crate::cache::HttpCache;
 /// # Examples
 ///
 /// ```
+/// use deps_core::TypedParseResult;
 /// use deps_core::osv::{StructuralSkipReason, non_public_skip_reason};
-/// use deps_core::test_util::{StubFormatter, stub_parse_result_with_dependencies};
+/// use deps_core::test_util::{StubFormatter, stub_parse_result};
 ///
-/// let parse_result = stub_parse_result_with_dependencies(1);
-/// let dep = parse_result.dependencies()[0];
+/// let parse_result = stub_parse_result(1);
+/// let dep = &parse_result.own_dependencies()[0];
 /// // A formatter that does not opt in keeps the skip silent.
 /// assert_eq!(
 ///     non_public_skip_reason(dep, &StubFormatter::DEFAULT),
@@ -67,9 +68,9 @@ use crate::cache::HttpCache;
 /// );
 /// ```
 #[must_use]
-pub fn non_public_skip_reason(
-    dep: &dyn crate::Dependency,
-    formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
+pub fn non_public_skip_reason<F: crate::lsp_helpers::DependencyFormatter>(
+    dep: &F::Dep,
+    formatter: &F,
 ) -> StructuralSkipReason {
     match formatter.non_public_route(dep) {
         NonPublicRoute::UnverifiedMirror if formatter.osv_package_name(dep).is_some() => {

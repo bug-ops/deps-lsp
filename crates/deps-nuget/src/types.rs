@@ -215,7 +215,6 @@ mod tests {
             Some("13.0.3")
         );
         assert!(dep.features().is_empty());
-        assert!(dep.as_any().is::<NuGetDependency>());
         assert_matches!(dep.source(), deps_core::parser::DependencySource::Registry);
     }
 

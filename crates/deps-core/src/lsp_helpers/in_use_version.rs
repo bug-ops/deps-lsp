@@ -4,7 +4,9 @@
 
 use std::collections::HashMap;
 
-use crate::lsp_helpers::{BoundedVersionReq, EcosystemFormatter, PinResolution, ResolvedPin};
+use crate::lsp_helpers::{
+    BoundedVersionReq, DependencyFormatter, EcosystemFormatter, PinResolution, ResolvedPin,
+};
 use crate::osv::SiblingCoverage;
 use crate::{ConcreteVersion, Dependency, EcosystemId, NormalizedName, PackageKey};
 
@@ -457,7 +459,7 @@ pub(crate) fn resolve_occurrence_version<'a>(
 /// already concrete ([`concrete_pin_version`]). `None` when neither applies.
 ///
 /// A dependency whose manifest requirement is itself the resolved version
-/// ([`crate::lsp_helpers::RequirementResolution::manifest_requirement_is_resolved_version`] — a Go
+/// ([`crate::lsp_helpers::DependencyFormatter::manifest_requirement_is_resolved_version`] — a Go
 /// `require`-directive dependency) skips the lockfile step entirely, going
 /// straight to the declared requirement (go.sum is unreliable there — a
 /// checksum ledger that `go get`/`go build` only ever append to, so its
@@ -478,7 +480,7 @@ pub(crate) fn resolve_occurrence_version<'a>(
 ///
 /// ```
 /// use deps_core::lsp_helpers::{
-///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
 ///     RequirementResolution, SourcePolicy, resolve_in_use_version,
 /// };
 /// use deps_core::{ConcreteVersion, Dependency, EcosystemId, NormalizedName, PackageKey, PackageName, VersionReq};
@@ -507,9 +509,6 @@ pub(crate) fn resolve_occurrence_version<'a>(
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
 ///     }
-///     fn as_any(&self) -> &dyn Any {
-///         self
-///     }
 /// }
 ///
 /// struct SimpleFormatter;
@@ -527,6 +526,9 @@ pub(crate) fn resolve_occurrence_version<'a>(
 /// impl DiagnosticPolicy for SimpleFormatter {}
 /// impl SourcePolicy for SimpleFormatter {}
 /// impl OsvNaming for SimpleFormatter {}
+/// impl DependencyFormatter for SimpleFormatter {
+///     type Dep = SimpleDep;
+/// }
 ///
 /// let dep = SimpleDep {
 ///     name: PackageName::new("time"),
@@ -548,12 +550,12 @@ pub(crate) fn resolve_occurrence_version<'a>(
 ///     Some(ConcreteVersion::new("0.1.43"))
 /// );
 /// ```
-pub fn resolve_in_use_version(
-    dep: &dyn Dependency,
+pub fn resolve_in_use_version<F: DependencyFormatter>(
+    dep: &F::Dep,
     key: &PackageKey,
     resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
     resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
-    formatter: &dyn EcosystemFormatter,
+    formatter: &F,
     ecosystem: EcosystemId,
 ) -> Option<ConcreteVersion> {
     resolve_in_use_versions(
@@ -675,7 +677,7 @@ impl InUseVersions {
 ///
 /// ```
 /// use deps_core::lsp_helpers::{
-///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
 ///     RequirementResolution, SourcePolicy, resolve_in_use_versions,
 /// };
 /// use deps_core::position::Range;
@@ -704,9 +706,6 @@ impl InUseVersions {
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
 ///     }
-///     fn as_any(&self) -> &dyn Any {
-///         self
-///     }
 /// }
 ///
 /// struct SimpleFormatter;
@@ -724,6 +723,9 @@ impl InUseVersions {
 /// impl DiagnosticPolicy for SimpleFormatter {}
 /// impl SourcePolicy for SimpleFormatter {}
 /// impl OsvNaming for SimpleFormatter {}
+/// impl DependencyFormatter for SimpleFormatter {
+///     type Dep = SimpleDep;
+/// }
 ///
 /// let dep = SimpleDep {
 ///     name: PackageName::new("time"),
@@ -741,12 +743,12 @@ impl InUseVersions {
 /// assert_eq!(versions.primary().as_str(), "0.1.43");
 /// assert!(versions.siblings().is_empty());
 /// ```
-pub fn resolve_in_use_versions(
-    dep: &dyn Dependency,
+pub fn resolve_in_use_versions<F: DependencyFormatter>(
+    dep: &F::Dep,
     key: &PackageKey,
     resolved_versions: &HashMap<NormalizedName, ConcreteVersion>,
     resolved_version_candidates: Option<&HashMap<NormalizedName, Vec<ConcreteVersion>>>,
-    formatter: &dyn EcosystemFormatter,
+    formatter: &F,
     ecosystem: EcosystemId,
 ) -> Option<InUseVersions> {
     if formatter.manifest_requirement_is_resolved_version(dep) {
@@ -837,15 +839,15 @@ fn is_major_minor_shape(s: &str) -> bool {
 /// Whether `dep` resolved to a tag too imprecise to query with (a moving alias or a
 /// non-version name).
 ///
-/// "Resolved" means [`RequirementResolution::resolved_pin_version`](crate::lsp_helpers::RequirementResolution::resolved_pin_version)
+/// "Resolved" means [`crate::lsp_helpers::DependencyFormatter::resolved_pin_version`]
 /// returned [`PinResolution::Resolved`].
 ///
 /// Lets a caller that got `None` from [`resolve_in_use_version`] tell "a tag was resolved but
 /// is not a full version" apart from "nothing was resolved at all" (#1668).
 #[must_use]
-pub fn has_unqueryable_resolved_pin(
-    dep: &dyn Dependency,
-    formatter: &dyn EcosystemFormatter,
+pub fn has_unqueryable_resolved_pin<F: DependencyFormatter>(
+    dep: &F::Dep,
+    formatter: &F,
     ecosystem: EcosystemId,
 ) -> bool {
     matches!(
@@ -891,6 +893,9 @@ mod tests {
     impl crate::lsp_helpers::DiagnosticPolicy for CaretFormatter {}
     impl crate::lsp_helpers::SourcePolicy for CaretFormatter {}
     impl crate::lsp_helpers::OsvNaming for CaretFormatter {}
+    impl DependencyFormatter for CaretFormatter {
+        type Dep = crate::lsp_helpers::test_support::MockDep;
+    }
 
     /// A formatter whose `resolved_pin_version` always returns a fixed value regardless of
     /// `dep` — exercises `resolve_in_use_version`'s own full-semver-shape gate on the hook's
@@ -932,15 +937,21 @@ mod tests {
             name.as_str().to_string()
         }
     }
-    impl crate::lsp_helpers::RequirementResolution for FixedResolvedPinFormatter {
-        fn resolved_pin_version(&self, _dep: &dyn Dependency) -> PinResolution {
-            self.0.clone()
-        }
-    }
+    impl crate::lsp_helpers::RequirementResolution for FixedResolvedPinFormatter {}
     impl crate::lsp_helpers::DiagnosticMessages for FixedResolvedPinFormatter {}
     impl crate::lsp_helpers::DiagnosticPolicy for FixedResolvedPinFormatter {}
     impl crate::lsp_helpers::SourcePolicy for FixedResolvedPinFormatter {}
     impl crate::lsp_helpers::OsvNaming for FixedResolvedPinFormatter {}
+    impl DependencyFormatter for FixedResolvedPinFormatter {
+        type Dep = crate::lsp_helpers::test_support::MockDep;
+
+        fn resolved_pin_version(
+            &self,
+            _dep: &crate::lsp_helpers::test_support::MockDep,
+        ) -> PinResolution {
+            self.0.clone()
+        }
+    }
 
     /// #1556 impl-critic S1: `resolved_pin_version`'s raw output (e.g. GitHub Actions'
     /// `TagIndex`-resolved tag) must not bypass the same full-semver-shape check manifest
@@ -1770,7 +1781,7 @@ mod tests {
             &crate::test_util::package_key("serde"),
             &resolved_versions,
             Some(&candidates),
-            &crate::lsp_helpers::test_support::MOCK_FORMATTER,
+            &crate::lsp_helpers::test_support::MOCK_FORMATTER.for_dependency(),
             EcosystemId::Cargo,
         );
 

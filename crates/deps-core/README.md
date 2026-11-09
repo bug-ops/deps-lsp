@@ -53,21 +53,30 @@ deps-core = "4.0"
 ## Implementing a new ecosystem
 
 ```rust
-use deps_core::{Ecosystem, Registry, ParseResult};
+use deps_core::{EcosystemBase, Registry, TypedEcosystem};
 
 pub struct MyEcosystem {
     registry: Arc<MyRegistry>,
+    formatter: MyFormatter,
 }
 
-impl Ecosystem for MyEcosystem {
+impl EcosystemBase for MyEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId { deps_core::EcosystemId::Cargo }
     fn display_name(&self) -> &'static str { "My Ecosystem" }
+    fn manifest_filenames(&self) -> &[&'static str] { &["my-manifest.json"] }
+    fn registry(&self) -> Arc<dyn Registry> { self.registry.clone() }
+    // ... completion_insert_text and the other required methods
+}
 
-    fn matches_uri(&self, uri: &Uri) -> bool {
-        uri.path().ends_with("my-manifest.json")
-    }
+impl TypedEcosystem for MyEcosystem {
+    type Parsed = MyParseResult;
+    type Formatter = MyFormatter; // MyFormatter::Dep must be MyParseResult's dependency type
 
-    async fn parse_manifest(&self, content: &str, uri: &Uri) -> Result<ParseResult> {
+    fn own_formatter(&self) -> &MyFormatter { &self.formatter }
+
+    fn parse<'a>(&'a self, content: &'a str, uri: &'a Url)
+        -> BoxFuture<'a, Result<MyParseResult>>
+    {
         // Parse the manifest and return dependencies with source positions
         todo!()
     }
@@ -76,7 +85,7 @@ impl Ecosystem for MyEcosystem {
 
 ## Versioning
 
-`deps-core`'s public trait signatures (`Ecosystem`, `Dependency`, `ParseResult`,
+`deps-core`'s public trait signatures (`EcosystemBase`, `TypedEcosystem`, `Dependency`, `ParseResult`,
 `EcosystemFormatter`) — and its public `lsp_helpers` / `completion` helper functions —
 are typed directly against `tower_lsp_server::ls_types` types. `tower-lsp-server` is pinned
 pre-1.0, so a `tower-lsp-server` minor bump (e.g. 0.23 → 0.24) is not an implementation
@@ -84,7 +93,7 @@ detail `deps-core` can absorb silently — it forces a breaking release of `deps
 minor version bump while `deps-core` itself remains pre-1.0, a major version bump once
 `deps-core` reaches 1.0.
 
-If you implement `Ecosystem` outside this workspace, depend on the exact matching
+If you implement `EcosystemBase`/`TypedEcosystem` outside this workspace, depend on the exact matching
 `tower-lsp-server` version via `deps_core::tower_lsp_server` rather than adding your own
 separate direct dependency on `tower-lsp-server`, to avoid it drifting out of sync with the
 version `deps-core` was built against.

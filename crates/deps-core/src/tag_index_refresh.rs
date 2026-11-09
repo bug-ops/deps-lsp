@@ -1,7 +1,7 @@
 //! Typed refresh broadcasts of ecosystems backed by a shared git tags datasource.
 //!
 //! [`RefreshSender`] owns the broadcast channel behind
-//! [`Ecosystem::refresh_events`](crate::Ecosystem::refresh_events) and the rule for when a
+//! [`EcosystemBase::refresh_events`](crate::EcosystemBase::refresh_events) and the rule for when a
 //! refetched [`TagIndex`] counts as a refresh, so GitHub Actions and GitLab CI cannot diverge
 //! on it. The same channel carries the follow-up events of background probes
 //! ([`RefreshEvent::ProbeEvidence`]) and of identity changes that require re-parsing
@@ -50,7 +50,7 @@ pub enum RefreshEvent {
         /// The monotonically increasing generation of the changed decisions.
         generation: u64,
         /// The parse input whose decision changed; a document is re-parsed only when
-        /// [`Ecosystem::parse_depends_on`](crate::Ecosystem::parse_depends_on) holds for it.
+        /// [`TypedEcosystem::depends_on`](crate::TypedEcosystem::depends_on) holds for it.
         input: ParseInputKey,
     },
 }
@@ -61,7 +61,7 @@ pub enum RefreshEvent {
 /// Opaque to everything but the ecosystem: only the ecosystem that sends
 /// [`RefreshEvent::ReparseOpenDocuments`] mints a key, from its own canonical form of the input
 /// (Swift: a canonicalized repository URL), and only its own
-/// [`Ecosystem::parse_depends_on`](crate::Ecosystem::parse_depends_on) interprets it.
+/// [`TypedEcosystem::depends_on`](crate::TypedEcosystem::depends_on) interprets it.
 ///
 /// # Examples
 ///
@@ -91,7 +91,7 @@ impl ParseInputKey {
 }
 
 /// Receiver of an ecosystem's [`RefreshEvent`]s, see
-/// [`Ecosystem::refresh_events`](crate::Ecosystem::refresh_events).
+/// [`EcosystemBase::refresh_events`](crate::EcosystemBase::refresh_events).
 pub type RefreshEvents = broadcast::Receiver<RefreshEvent>;
 
 /// Stores a fetched [`TagIndex`] and announces refreshes of an ecosystem.

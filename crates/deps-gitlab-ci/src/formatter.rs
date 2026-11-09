@@ -3,18 +3,15 @@
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
     AheadProof, BoundedVersionReq, BranchEvidence, CandidateTagSource, CommentCheck, CommentSlot,
-    CommitRewrite, CommitSha, DiagnosticMessages, DiagnosticPolicy, GitPinView, NormalizeName,
-    OsvNaming, PackageNaming, PackageRendering, PartialTagPolicy, PinResolution, ProbeRef,
-    ProbeStores, RequirementResolution, RequirementStatus, ShaPinComment, ShaPinLookup, ShaPinTail,
-    SourcePolicy, TagIndex, git_candidate_tag_source, git_commit_rewrite, git_tag_replacement,
-    requirement_contains_template_placeholder, resolve_git_pin, sha_pin_rewrite,
-    tag_pin_is_up_to_date, warn_rejected_value,
+    CommitRewrite, CommitSha, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+    GitPinView, NormalizeName, OsvNaming, PackageNaming, PackageRendering, PartialTagPolicy,
+    PinResolution, ProbeRef, ProbeStores, RequirementResolution, RequirementStatus, ShaPinComment,
+    ShaPinLookup, ShaPinTail, SourcePolicy, TagIndex, git_candidate_tag_source, git_commit_rewrite,
+    git_tag_replacement, requirement_contains_template_placeholder, resolve_git_pin,
+    sha_pin_rewrite, tag_pin_is_up_to_date, warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
-use deps_core::{
-    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, NarrowDependency, OwnDependency,
-    PackageName,
-};
+use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName};
 use std::sync::Arc;
 
 use crate::host::is_valid_gitlab_coordinate;
@@ -121,7 +118,7 @@ impl GitlabCiFormatter {
     /// [`CommentSlot::Appendable`] and `tag` is a valid comment tag, the bare SHA otherwise (a
     /// quoted, flow-style or aliased ref cannot take a comment). This backs the "Pin to commit
     /// SHA" quickfix, which turns a tag pin into a SHA pin; rewriting an existing SHA pin (and
-    /// its comment) goes through [`PackageRendering::format_version_replacing_for`] instead.
+    /// its comment) goes through [`DependencyFormatter::format_version_replacing_for`] instead.
     ///
     /// # Examples
     ///
@@ -342,60 +339,9 @@ impl PackageNaming for GitlabCiFormatter {
     }
 }
 
-impl OwnDependency for GitlabCiFormatter {
-    type Dep = GitlabCiDependency;
-}
-
 impl PackageRendering for GitlabCiFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.as_str().to_string()
-    }
-
-    /// "Commit N ahead of latest release" for a commentless SHA pin that probes proved ahead of
-    /// the latest release and on the default branch (GitLab reports no count).
-    fn hover_provenance(
-        &self,
-        dep: &dyn Dependency,
-    ) -> Option<deps_core::lsp_helpers::HoverProvenance> {
-        let gl_dep = self.own_dependency(dep)?;
-        self.commit_proof(gl_dep)
-            .map(|proof| proof.hover_provenance())
-    }
-
-    /// Preserves `current`'s `v`-prefix style for a normal (Tag/unpinned) update;
-    /// `Partial`/`Latest`/`Branch` pins are returned unchanged — bumping `1.2` to `1.3.0`,
-    /// or `main` to a version, changes the pin's *kind*, not just its value, so the shared
-    /// no-op guard correctly suppresses the code action instead of writing a
-    /// value-changing-but-kind-wrong edit (#1729).
-    ///
-    /// Since #1391, `current` is never an unresolved `$VAR`/`${VAR}`/`%VAR%` GitLab CI
-    /// variable reference here — the sole production caller,
-    /// [`deps_core::edit::replacement_text`], gates on
-    /// [`RequirementResolution::bounded_requirement_is_placeholder`] first (backed by
-    /// `contains_unresolved_gitlab_variable`, which also catches a variable reference
-    /// embedded inside an otherwise `Tag`-shaped ref, e.g. `v1.2-$BUILD`).
-    fn format_version_replacing_for(
-        &self,
-        dep: &dyn Dependency,
-        version: &ConcreteVersion,
-        current: &str,
-    ) -> String {
-        let Some(gl_dep) = self.own_dependency(dep) else {
-            return self.format_version_for_text_edit(version);
-        };
-        match &gl_dep.pin {
-            Some(PinStyle::Partial | PinStyle::Latest | PinStyle::Branch) => current.to_string(),
-            Some(PinStyle::Sha { tail, .. }) => self
-                .release_commit_for(gl_dep.kind.endpoint(), &gl_dep.name, version.as_str())
-                .map_or_else(
-                    || gl_dep.version_literal().unwrap_or(current).to_string(),
-                    |(tag, sha)| sha_pin_rewrite(tail, &sha, &tag),
-                ),
-            Some(PinStyle::Tag) | None => {
-                let index = self.endpoint_index(gl_dep);
-                git_tag_replacement(current, version, index.as_deref())
-            }
-        }
     }
 
     fn package_url(&self, name: &PackageName) -> String {
@@ -485,6 +431,67 @@ impl RequirementResolution for GitlabCiFormatter {
         )
     }
 
+    /// `tag_index` is populated as a side effect of [`GitlabCiRegistry`]'s own tags fetch,
+    /// not before — see [`RequirementResolution::resolved_pin_version_depends_on_registry_fetch`].
+    ///
+    /// [`GitlabCiRegistry`]: crate::registry::GitlabCiRegistry
+    fn resolved_pin_version_depends_on_registry_fetch(&self) -> bool {
+        true
+    }
+}
+
+impl DependencyFormatter for GitlabCiFormatter {
+    type Dep = GitlabCiDependency;
+
+    /// Preserves `current`'s `v`-prefix style for a normal (Tag/unpinned) update;
+    /// `Partial`/`Latest`/`Branch` pins are returned unchanged — bumping `1.2` to `1.3.0`,
+    /// or `main` to a version, changes the pin's *kind*, not just its value, so the shared
+    /// no-op guard correctly suppresses the code action instead of writing a
+    /// value-changing-but-kind-wrong edit (#1729).
+    ///
+    /// Since #1391, `current` is never an unresolved `$VAR`/`${VAR}`/`%VAR%` GitLab CI
+    /// variable reference here — the sole production caller,
+    /// [`deps_core::edit::replacement_text`], gates on
+    /// [`RequirementResolution::bounded_requirement_is_placeholder`] first (backed by
+    /// `contains_unresolved_gitlab_variable`, which also catches a variable reference
+    /// embedded inside an otherwise `Tag`-shaped ref, e.g. `v1.2-$BUILD`).
+    fn format_version_replacing_for(
+        &self,
+        gl_dep: &GitlabCiDependency,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        match &gl_dep.pin {
+            Some(PinStyle::Partial | PinStyle::Latest | PinStyle::Branch) => current.to_string(),
+            Some(PinStyle::Sha { tail, .. }) => self
+                .release_commit_for(gl_dep.kind.endpoint(), &gl_dep.name, version.as_str())
+                .map_or_else(
+                    || {
+                        gl_dep
+                            .version_literal
+                            .as_deref()
+                            .unwrap_or(current)
+                            .to_string()
+                    },
+                    |(tag, sha)| sha_pin_rewrite(tail, &sha, &tag),
+                ),
+            Some(PinStyle::Tag) | None => {
+                let index = self.endpoint_index(gl_dep);
+                git_tag_replacement(current, version, index.as_deref())
+            }
+        }
+    }
+
+    /// "Commit N ahead of latest release" for a commentless SHA pin that probes proved ahead of
+    /// the latest release and on the default branch (GitLab reports no count).
+    fn hover_provenance(
+        &self,
+        gl_dep: &GitlabCiDependency,
+    ) -> Option<deps_core::lsp_helpers::HoverProvenance> {
+        self.commit_proof(gl_dep)
+            .map(|proof| proof.hover_provenance())
+    }
+
     /// #466 review M-c: consults `dep`'s own parse-time [`PinStyle`] (authoritative — set
     /// once, at parse time, from the correct project-vs-component grammar) instead of
     /// re-classifying `requirement`'s raw text, which is ambiguous between the two:
@@ -492,7 +499,7 @@ impl RequirementResolution for GitlabCiFormatter {
     /// ([`crate::component::classify_component_pin_style`]) but [`PinStyle::Branch`] under
     /// the simpler `project:` ref grammar (`crate::parser`'s `classify_project_pin`) —
     /// indistinguishable from the text alone. This is the same source of truth
-    /// [`PackageRendering::format_version_replacing_for`] already consults, so the two can
+    /// [`Self::format_version_replacing_for`] already consults, so the two can
     /// no longer disagree about the same dependency (previously: the outdated diagnostic
     /// text-reclassified a `project:` `ref: "1.2"` as `Partial` and silently suppressed
     /// itself, while the code action offered by `format_version_replacing_for`'s correct
@@ -500,18 +507,15 @@ impl RequirementResolution for GitlabCiFormatter {
     ///
     /// #1648: this override bypasses [`RequirementResolution::classify_requirement_status`]'s
     /// shared default entirely, but no longer needs its own `requirement_is_oversized` gate —
-    /// [`RequirementGate::requirement_status_for`](deps_core::lsp_helpers::RequirementGate::requirement_status_for),
+    /// [`DependencyGate::requirement_status_for`](deps_core::lsp_helpers::DependencyGate::requirement_status_for),
     /// the only production entry point, already rejects an oversized requirement via
     /// [`BoundedVersionReq`] before this override is ever called.
     fn classify_requirement_status_for(
         &self,
-        dep: &dyn Dependency,
+        gl_dep: &GitlabCiDependency,
         requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> RequirementStatus {
-        let Some(gl_dep) = self.own_dependency(dep) else {
-            return self.classify_requirement_status(requirement, latest);
-        };
         let Some(pin) = gl_dep.pin.as_ref() else {
             return self.classify_requirement_status(requirement, latest);
         };
@@ -536,10 +540,11 @@ impl RequirementResolution for GitlabCiFormatter {
         }
     }
 
-    fn commit_rewrite_for(&self, dep: &dyn Dependency, version: &ConcreteVersion) -> CommitRewrite {
-        let Some(gl_dep) = self.own_dependency(dep) else {
-            return CommitRewrite::NotACommitPin;
-        };
+    fn commit_rewrite_for(
+        &self,
+        gl_dep: &GitlabCiDependency,
+        version: &ConcreteVersion,
+    ) -> CommitRewrite {
         let index = self.endpoint_index(gl_dep);
         git_commit_rewrite(Self::pin_view(gl_dep), index.as_deref(), version)
     }
@@ -551,10 +556,7 @@ impl RequirementResolution for GitlabCiFormatter {
     /// Keyed by `(endpoint, name)`, not `name` alone (validation finding S2) — same
     /// disambiguation `Self::resolved_tag_for_sha` applies, since a `project:` and
     /// `component:` include can textually collide on name across endpoints.
-    fn resolved_pin_version(&self, dep: &dyn Dependency) -> PinResolution {
-        let Some(gl_dep) = self.own_dependency(dep) else {
-            return PinResolution::Unresolved;
-        };
+    fn resolved_pin_version(&self, gl_dep: &GitlabCiDependency) -> PinResolution {
         let index = self.endpoint_index(gl_dep);
         resolve_git_pin(
             Self::pin_view(gl_dep),
@@ -563,21 +565,10 @@ impl RequirementResolution for GitlabCiFormatter {
         )
     }
 
-    /// `tag_index` is populated as a side effect of [`GitlabCiRegistry`]'s own tags fetch,
-    /// not before — see [`RequirementResolution::resolved_pin_version_depends_on_registry_fetch`].
-    ///
-    /// [`GitlabCiRegistry`]: crate::registry::GitlabCiRegistry
-    fn resolved_pin_version_depends_on_registry_fetch(&self) -> bool {
-        true
-    }
-
     /// Same rule as GitHub Actions' override. GitLab CI maps to no OSV ecosystem today, so this
     /// is not consulted yet; stating it keeps the default `NotTagBased` from silently failing
     /// open once GitLab CI gains OSV coverage.
-    fn candidate_tag_source(&self, dep: &dyn Dependency) -> CandidateTagSource {
-        let Some(gl_dep) = self.own_dependency(dep) else {
-            return CandidateTagSource::NotTagBased;
-        };
+    fn candidate_tag_source(&self, gl_dep: &GitlabCiDependency) -> CandidateTagSource {
         git_candidate_tag_source(Self::pin_view(gl_dep), self.endpoint_index(gl_dep))
     }
 }
@@ -698,7 +689,7 @@ mod tests {
     use super::*;
     use deps_core::NormalizedName;
     use deps_core::VersionReq;
-    use deps_core::lsp_helpers::RequirementGate;
+    use deps_core::lsp_helpers::{DependencyGate, RequirementGate};
     use deps_core::lsp_helpers::{ResolvedPin, SiblingScope};
     use deps_core::position::{Position, Range};
     use std::assert_matches;
@@ -1034,7 +1025,7 @@ mod tests {
     /// #1631/#1648 regression: `requirement_status_for` must report `Unresolved` for an
     /// oversized requirement before ever consulting `dep.pin` — this override no longer needs
     /// its own gate for that (see [`GitlabCiFormatter::classify_requirement_status_for`]'s doc):
-    /// [`RequirementGate::requirement_status_for`] rejects it structurally via
+    /// [`DependencyGate::requirement_status_for`] rejects it structurally via
     /// [`BoundedVersionReq`] first. A `Tag` pin whose requirement text differs from `latest`
     /// would otherwise reach `status_for_pin`'s `normalize_tag` comparison and report
     /// `Outdated` — the sanity assertion below proves that is what `status_for_pin` (the
@@ -1330,39 +1321,6 @@ mod tests {
             );
             assert_eq!(fmt.resolved_pin_version(&d), expected, "{pin:?}");
         }
-    }
-
-    #[test]
-    fn test_requirement_status_for_non_gitlab_dependency_falls_back_to_text() {
-        // A `dep` this formatter can't downcast (or whose `pin` is `None`) must fall back
-        // to the ordinary text-based `requirement_status`, not panic or misbehave.
-        struct OtherDep;
-        impl Dependency for OtherDep {
-            fn name(&self) -> &PackageName {
-                unimplemented!()
-            }
-            fn name_range(&self) -> Range {
-                Range::default()
-            }
-            fn version_requirement(&self) -> Option<&VersionReq> {
-                None
-            }
-            fn version_range(&self) -> Option<Range> {
-                None
-            }
-            fn source(&self) -> DependencySource {
-                DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-        let fmt = formatter();
-        let requirement = VersionReq::new("^1.0");
-        assert_eq!(
-            fmt.requirement_status_for(&OtherDep, &requirement, &ConcreteVersion::new("1.5.0")),
-            fmt.requirement_status(&requirement, &ConcreteVersion::new("1.5.0"))
-        );
     }
 
     // --- #1723: SHA pins classified through the tag index ---
@@ -2278,7 +2236,6 @@ mod tests {
     /// says `true`.
     #[test]
     fn test_plan_vulnerability_fix_var_placeholder_skips_via_no_op_rewrite() {
-        use deps_core::ParseResult;
         use deps_core::edit::{FixTargetContext, VulnFixSkip, plan_vulnerability_fix};
         use deps_core::net_policy::RegistryAccessPolicy;
         use deps_core::osv::{
@@ -2295,10 +2252,10 @@ mod tests {
         let policy = RegistryAccessPolicy::default();
         let result = crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host)
             .expect("valid gitlab-ci.yml");
-        let deps = result.dependencies();
-        let dep = deps.first().expect("one dependency parsed");
+        let dep = result.dependencies.first().expect("one dependency parsed");
         let current = dep
-            .version_requirement()
+            .version_req
+            .as_ref()
             .expect("parser preserves the raw $VAR ref text")
             .as_str();
         assert_eq!(current, "$DEPLOY_VERSION");
@@ -2318,8 +2275,8 @@ mod tests {
             });
 
         let planned = plan_vulnerability_fix(
-            *dep,
-            dep.version_range().expect("ref has a version range"),
+            dep,
+            dep.version_range.expect("ref has a version range"),
             current,
             &dv,
             FixTargetContext::default(),
@@ -2353,7 +2310,7 @@ mod tests {
     fn test_collect_update_candidates_var_placeholder_in_tag_shaped_ref_produces_no_candidate() {
         use deps_core::edit::collect_update_candidates;
         use deps_core::net_policy::RegistryAccessPolicy;
-        use deps_core::{PackageVersions, ParseResult, VersionData};
+        use deps_core::{PackageVersions, VersionData};
         use std::collections::HashMap;
         use std::sync::{Arc, RwLock};
 
@@ -2366,17 +2323,16 @@ mod tests {
         let policy = RegistryAccessPolicy::default();
         let result = crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host)
             .expect("valid gitlab-ci.yml");
-        let deps = result.dependencies();
-        let dep = deps.first().expect("one dependency parsed");
+        let dep = result.dependencies.first().expect("one dependency parsed");
         assert_eq!(
-            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
             Some("v16.0-$BUILD"),
             "parser preserves the raw $VAR-embedded tag-shaped ref text"
         );
         assert_eq!(
             formatter().requirement_status_for(
-                *dep,
-                dep.version_requirement().expect("checked above"),
+                dep,
+                dep.version_req.as_ref().expect("checked above"),
                 &ConcreteVersion::new("16.0.1")
             ),
             RequirementStatus::Unresolved,
@@ -2387,7 +2343,7 @@ mod tests {
         let fmt = formatter();
         let mut cached = HashMap::new();
         cached.insert(
-            NormalizedName::for_test(dep.name().as_str()),
+            NormalizedName::for_test(dep.name.as_str()),
             PackageVersions::latest_only("16.0.1"),
         );
         let resolved = HashMap::new();

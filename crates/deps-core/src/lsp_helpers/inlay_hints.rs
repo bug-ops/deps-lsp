@@ -1,12 +1,12 @@
 use tower_lsp_server::ls_types::{InlayHint, InlayHintKind, InlayHintLabel, InlayHintTooltip};
 
 use crate::error::FetchFailure;
-use crate::{ConcreteVersion, EcosystemConfig, PackageKey, ParseResult};
+use crate::{ConcreteVersion, Dependency, EcosystemConfig, PackageKey, TypedParseResult};
 
 use super::diagnostics::{MAX_VERSION_DIAGNOSTIC_CHARS, flagged_detail};
 use super::{
-    EcosystemFormatter, LatestVerdict, LookupMiss, RequirementGate, RequirementStatus,
-    SiblingMatchNote, VersionData, in_use_version, latest_verdict,
+    DependencyFormatter, DependencyGate, EcosystemFormatter, LatestVerdict, LookupMiss,
+    RequirementStatus, SiblingMatchNote, VersionData, in_use_version, latest_verdict,
     sanitize_and_truncate_for_diagnostic,
 };
 
@@ -119,7 +119,7 @@ fn lookup_miss_marker(
 /// Builds inlay hints showing the latest/in-use version next to each dependency's declaration.
 ///
 /// Shared by every ecosystem's default
-/// [`crate::ecosystem::Ecosystem::generate_inlay_hints`] implementation: one hint is
+/// [`crate::TypedEcosystem::inlay_hints`] implementation: one hint is
 /// emitted per dependency that has a version range, using `versions` and
 /// `loading_state` to decide whether cached data is ready to render yet.
 ///
@@ -130,14 +130,18 @@ fn lookup_miss_marker(
 /// is the `ℹ {resolved}` for a `CustomRegistry` dependency the registry never queried
 /// (#1949) or an `AlternateRegistry` dependency with a suppressed lookup miss (#1957): it
 /// replaces the up-to-date check mark, so it renders only when `show_up_to_date_hints` is on.
-pub fn generate_inlay_hints(
-    parse_result: &dyn ParseResult,
+pub fn generate_inlay_hints<P, F>(
+    parse_result: &P,
     versions: VersionData<'_>,
     loading_state: crate::LoadingState,
     config: &EcosystemConfig,
-    formatter: &dyn EcosystemFormatter,
-) -> Vec<InlayHint> {
-    let deps = parse_result.dependencies();
+    formatter: &F,
+) -> Vec<InlayHint>
+where
+    P: TypedParseResult,
+    F: DependencyFormatter<Dep = P::Dep>,
+{
+    let deps = parse_result.own_dependencies();
     // Issue #1517: shared per-occurrence OSV lookup keys, mirroring every other renderer's
     // identical pattern — needed so `latest_verdict` can tell one duplicated-name occurrence's
     // latest-check result apart from another's.
@@ -149,16 +153,16 @@ pub fn generate_inlay_hints(
         vuln_keys: super::hover::vuln_keys_for(parse_result, &versions, formatter),
     };
     let mut hints = Vec::with_capacity(deps.len());
-    hints.extend(deps.into_iter().filter_map(|dep| inlay_hint_for(dep, &ctx)));
+    hints.extend(deps.iter().filter_map(|dep| inlay_hint_for(dep, &ctx)));
     hints
 }
 
 /// What every dependency's hint is rendered against.
-struct HintContext<'a> {
+struct HintContext<'a, F> {
     versions: VersionData<'a>,
     loading_state: crate::LoadingState,
     config: &'a EcosystemConfig,
-    formatter: &'a dyn EcosystemFormatter,
+    formatter: &'a F,
     vuln_keys: Option<crate::osv::VulnKeys>,
 }
 
@@ -181,9 +185,9 @@ fn type_hint(
 }
 
 /// The hint for one dependency, or `None` when it shows nothing.
-fn inlay_hint_for(
-    dep: &dyn crate::ecosystem::Dependency,
-    ctx: &HintContext<'_>,
+fn inlay_hint_for<F: DependencyFormatter>(
+    dep: &F::Dep,
+    ctx: &HintContext<'_, F>,
 ) -> Option<InlayHint> {
     let HintContext {
         versions,
@@ -197,7 +201,7 @@ fn inlay_hint_for(
     let key = PackageKey::new(dep.name(), *formatter);
     let latest_version = versions.cached_for(&key).map(|v| &v.latest);
     let resolved_version: Option<ConcreteVersion> =
-        if formatter.manifest_requirement_is_resolved_version(dep) {
+        if (*formatter).manifest_requirement_is_resolved_version(dep) {
             dep.version_requirement()
                 .map(|r| ConcreteVersion::new(r.as_str()))
         } else {
@@ -263,7 +267,7 @@ fn inlay_hint_for(
             // `requirement_status_for`, matching `diagnostics.rs`'s `apply_outdated_rule`
             // (#907): lets e.g. `GithubActionsFormatter` prefer a SHA pin's
             // registry-confirmed tag over trusting its own comment text.
-            Some(version_req) => formatter.requirement_status_for(dep, version_req, latest),
+            Some(version_req) => (*formatter).requirement_status_for(dep, version_req, latest),
             // No declared requirement at all (e.g. a dangling alias/reference the
             // parser couldn't resolve to any string) — nothing was verified.
             None => RequirementStatus::Unresolved,
@@ -287,12 +291,12 @@ fn inlay_hint_for(
 
 /// The hint for a dependency with no cached latest version: an offline or failed-lookup marker
 /// over its locally known version, the up-to-date text, or nothing.
-fn hint_without_latest(
-    dep: &dyn crate::ecosystem::Dependency,
+fn hint_without_latest<F: DependencyFormatter>(
+    dep: &F::Dep,
     key: &PackageKey,
     resolved_version: Option<&ConcreteVersion>,
     position: tower_lsp_server::ls_types::Position,
-    ctx: &HintContext<'_>,
+    ctx: &HintContext<'_, F>,
 ) -> Option<InlayHint> {
     let HintContext {
         versions,
@@ -369,13 +373,13 @@ fn hint_without_latest(
 
 /// The label of a hint whose latest version is known, with the tooltip of a flagged one, or
 /// `None` when the status shows nothing.
-fn hint_label(
+fn hint_label<F: DependencyFormatter>(
     status: RequirementStatus,
-    dep: &dyn crate::ecosystem::Dependency,
+    dep: &F::Dep,
     key: &PackageKey,
     latest: &ConcreteVersion,
     resolved_version: Option<&ConcreteVersion>,
-    ctx: &HintContext<'_>,
+    ctx: &HintContext<'_, F>,
 ) -> Option<(String, Option<String>)> {
     let HintContext {
         versions,
@@ -525,7 +529,7 @@ mod tests {
             VersionData::new(&HashMap::new(), &HashMap::new()),
             crate::LoadingState::Loading,
             &config,
-            &formatter,
+            &formatter.for_dependency(),
         );
         assert!(
             hints_while_loading.is_empty(),
@@ -537,7 +541,7 @@ mod tests {
             VersionData::new(&HashMap::new(), &HashMap::new()),
             crate::LoadingState::Loaded,
             &config,
-            &formatter,
+            &formatter.for_dependency(),
         );
         assert!(hints_loaded.is_empty());
     }
@@ -580,7 +584,7 @@ mod tests {
             VersionData::new(&HashMap::new(), &resolved_versions),
             crate::LoadingState::Loaded,
             &config,
-            &formatter,
+            &formatter.for_dependency(),
         );
 
         assert_eq!(
@@ -630,7 +634,7 @@ mod tests {
             VersionData::new(&HashMap::new(), &HashMap::new()),
             crate::LoadingState::Loading,
             &config,
-            &formatter,
+            &formatter.for_dependency(),
         );
 
         assert_eq!(
@@ -695,8 +699,8 @@ mod tests {
         }
     }
 
-    fn resolved_vs_latest_label(
-        formatter: &dyn EcosystemFormatter,
+    fn resolved_vs_latest_label<F: DependencyFormatter<Dep = MockDep>>(
+        formatter: &F,
         resolved: &str,
         latest: &str,
     ) -> String {
@@ -1834,7 +1838,7 @@ mod tests {
                 .with_network(network),
             crate::LoadingState::Loaded,
             &config,
-            &MOCK_FORMATTER,
+            &MOCK_FORMATTER.for_dependency(),
         )
     }
 

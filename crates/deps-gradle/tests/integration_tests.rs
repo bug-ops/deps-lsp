@@ -8,7 +8,7 @@ use deps_core::lsp_helpers::{generate_diagnostics_from_cache, generate_inlay_hin
 use deps_core::{EcosystemConfig, LoadingState, PackageVersions, VersionData};
 #[cfg(feature = "lsp-responses")]
 use deps_gradle::GradleFormatter;
-use deps_gradle::parser::{GradleParseResult, parse_gradle};
+use deps_gradle::parser::parse_gradle;
 #[cfg(feature = "lsp-responses")]
 use std::collections::HashMap;
 use url::Url;
@@ -272,5 +272,4 @@ fn test_parse_result_trait() {
     assert_eq!(result.dependencies().len(), 1);
     assert!(result.workspace_root().is_none());
     assert_eq!(result.uri(), &uri);
-    assert!(result.as_any().is::<GradleParseResult>());
 }

@@ -24,7 +24,7 @@ pub struct NpmParseResult {
     pub uri: Url,
     /// Every `.npmrc`-resolved alternate registry this parse's dependencies reference,
     /// deduplicated (spec FR-002–004) — fed to `NpmRegistry::register_alternate` by
-    /// `NpmEcosystem::parse_manifest`, the one place a per-document `.npmrc` resolution and
+    /// `NpmEcosystem::parse`, the one place a per-document `.npmrc` resolution and
     /// the long-lived shared router meet. Empty for a workspace declaring no `.npmrc`
     /// (NFR-005: zero regression).
     pub resolved_registries: Vec<DeclaredNpmRegistry>,

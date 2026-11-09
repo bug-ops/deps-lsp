@@ -46,7 +46,7 @@ pub(super) enum MavenNameField {
 ///
 /// A crate-local, non-`&'static str` replacement for the hand-rolled tag-name return of
 /// [`super::MavenEcosystem::detect_xml_context`] (issue #819, same bug class as #793/#118): the
-/// dispatch match in [`deps_core::Ecosystem::generate_completions`]'s override for this crate
+/// dispatch match in [`deps_core::TypedEcosystem::completions`]'s override for this crate
 /// must be exhaustive over this enum, so adding a new completable tag forces a compile error at
 /// the match instead of silently falling through a `_ => vec![]` wildcard. `Version` does map
 /// conceptually to [`deps_core::completion::CompletionContext::Version`] — the reason this

@@ -257,7 +257,10 @@ mod tests {
         let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
 
         let ecosystem = state.ecosystem_registry.get(EcosystemId::Cargo).unwrap();
-        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let parse_result = Arc::clone(&ecosystem)
+            .parse_manifest(&content, &url)
+            .await
+            .unwrap();
         let mut doc_state =
             DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
         doc_state.set_version(Some(1));

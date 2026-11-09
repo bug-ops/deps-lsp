@@ -515,7 +515,10 @@ mod tests {
                 .ecosystem_registry
                 .for_uri(&url)
                 .expect("npm ecosystem not found");
-            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
             let doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Npm,
                 content.to_string(),

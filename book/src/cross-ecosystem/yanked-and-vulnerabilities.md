@@ -226,7 +226,7 @@ explanatory `detail` text) but not tagged `DEPRECATED` (no strikethrough), since
 otherwise read as "OSV actively flagged this" rather than "not independently checked."
 
 Completion's own gate for whether to run this check *at all* is `CompletionOrigin::Version` —
-the typed signal `Ecosystem::generate_completions` already resolved — not a position-based
+the typed signal `TypedEcosystem::completions` already resolved — not a position-based
 heuristic. PyPI's and Composer's `is_position_on_dependency` overrides widen the span they
 consider "on this dependency" to include the package-name position too (PyPI extras
 completion, Composer's alias forms), so using it as the sole gate would also reach

@@ -13,9 +13,10 @@ use tower_lsp_server::ls_types::{CompletionItem, Range};
 use deps_core::Version;
 use deps_core::completion::Completions;
 use deps_core::parser::DependencySource;
-use deps_core::{ParseResult as ParseResultTrait, Registry, Result};
+use deps_core::{Registry, Result, TypedParseResult};
 
 use super::CargoEcosystem;
+use crate::types::CargoDependency;
 
 /// Leading version-constraint operators `semver::VersionReq` (Cargo's own requirement
 /// grammar) accepts, stripped from a completion prefix before matching it against
@@ -50,14 +51,14 @@ enum CompletionSource {
 }
 
 /// Joins `package_name` back to `parse_result.dependencies()` by name (spec FR-012).
-fn resolve_completion_source(
-    parse_result: &dyn ParseResultTrait,
+fn resolve_completion_source<P: TypedParseResult<Dep = CargoDependency>>(
+    parse_result: &P,
     package_name: &deps_core::PackageName,
 ) -> CompletionSource {
     let mut sources = parse_result
-        .dependencies()
-        .into_iter()
-        .filter(|d| d.name() == package_name)
+        .own_dependencies()
+        .iter()
+        .filter(|d| deps_core::Dependency::name(*d) == package_name)
         .map(deps_core::Dependency::source);
 
     let Some(first) = sources.next() else {
@@ -96,15 +97,15 @@ impl CargoEcosystem {
     ///
     /// Fetches features from the latest stable version, routed by the source `package_name`
     /// resolves to in `parse_result` by name (spec FR-012) — unlike version completion
-    /// (issue #593, position-based; see [`deps_core::Ecosystem::complete_version`]'s default
+    /// (issue #593, position-based; see [`deps_core::TypedEcosystem::complete_version`]'s default
     /// implementation), this still joins by name via
     /// [`resolve_completion_source`]/[`CompletionSource`], so it keeps the same residual
     /// same-name-different-source `Ambiguous` gap #593 fixed for versions (not itself in
     /// #593's scope: `features_range`-based position routing for this method is a follow-up,
     /// not done here).
-    pub(super) async fn complete_features(
+    pub(super) async fn complete_features<P: TypedParseResult<Dep = CargoDependency>>(
         &self,
-        parse_result: &dyn ParseResultTrait,
+        parse_result: &P,
         package_name: &deps_core::PackageName,
         prefix: &str,
     ) -> Completions {

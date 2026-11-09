@@ -74,7 +74,7 @@ async fn real_typosquat_signal() -> TyposquatSignal {
     let state = ServerState::new();
     let url = deps_core::test_util::test_uri("/test/pyproject.toml");
     let ecosystem = state.ecosystem_registry.for_uri(&url).expect("pypi");
-    let parse = ecosystem
+    let parse = Arc::clone(&ecosystem)
         .parse_manifest(&manifest(&[("djang0", "==1.0.0")]), &url)
         .await
         .unwrap();
@@ -103,7 +103,10 @@ async fn open_fully_seeded(content: &str) -> (Arc<ServerState>, Uri, Arc<dyn Eco
     let url = deps_core::test_util::test_uri("/test/pyproject.toml");
     let uri = crate::lsp_types_interop::to_lsp_uri(&url);
     let ecosystem = state.ecosystem_registry.for_uri(&url).expect("pypi");
-    let parse = ecosystem.parse_manifest(content, &url).await.unwrap();
+    let parse = Arc::clone(&ecosystem)
+        .parse_manifest(content, &url)
+        .await
+        .unwrap();
     let mut doc =
         DocumentState::new_from_parse_result(EcosystemId::Pypi, content.to_string(), parse);
     doc.update_cached_versions(HashMap::from([(

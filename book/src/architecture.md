@@ -11,12 +11,22 @@ running LSP server via `tower-lsp-server` and does not itself know anything ecos
 parsing, registry access, and LSP response formatting are all delegated through the traits
 described below, so `deps-lsp` itself is only a request-dispatch and document-lifecycle layer.
 
-## The `Ecosystem` trait
+## The `EcosystemBase` / `TypedEcosystem` traits
 
-`Ecosystem` (`crates/deps-core/src/ecosystem.rs`) is the extension point every ecosystem crate
-implements — see `crates/deps-cargo/src/ecosystem.rs` for a concrete example. It is a sealed
-trait (requires `Self: ecosystem::private::Sealed`), so it can only be implemented from inside
-this workspace: `private::Sealed` lives in a `pub` (but `#[doc(hidden)]`) module, because Rust
+Every ecosystem crate implements two traits (`crates/deps-core/src/ecosystem.rs` and
+`ecosystem/typed.rs`) — see `crates/deps-cargo/src/ecosystem.rs` for a concrete example.
+`EcosystemBase` carries identity, routing, registry, lock-file and fallback-completion methods;
+`TypedEcosystem` adds the associated `Parsed` result and `Formatter` (whose
+`DependencyFormatter::Dep` must equal the parse result's `TypedParseResult::Dep`, checked at
+compile time) and the typed hooks (`parse`, `hover`, `diagnostics`, `completions`, ...), which
+receive a `ParsedView` of the concrete parse result. A blanket impl turns every
+`TypedEcosystem` into the erased, object-safe `Ecosystem` that `EcosystemRegistry` stores, and
+`parse_manifest` returns a `ParsedManifest`: the parse result paired with its ecosystem, whose
+`generate_*`, `vulnerability_keys`, `collect_update_*` and `for_each_formatted_dependency`
+methods let `deps-lsp`, `deps-engine` and `deps-cli` stay ecosystem-agnostic without any
+downcast. `Ecosystem` itself cannot be implemented directly (a blanket-only supertrait seals
+it), and the base traits are sealed too (requires `Self: ecosystem::private::Sealed`), so they
+can only be implemented from inside this workspace: `private::Sealed` lives in a `pub` (but `#[doc(hidden)]`) module, because Rust
 has no visibility level meaning "this workspace's crates, but no others" — sealing here is a
 documented contract enforced by code review, not a compiler-enforced wall.
 
@@ -33,7 +43,9 @@ documented contract enforced by code review, not a compiler-enforced wall.
   workspace — including `EcosystemId::osv_ecosystem()`'s OSV.dev name mapping and
   `deps-core::deps_dev`'s deps.dev `system` mapping — to be updated at compile time.
 - **`ParseResult` / `Dependency`** — trait-object interfaces a parser returns; ecosystem-specific
-  dependency types are exposed generically but remain downcastable via `as_any()`.
+  dependency types are exposed generically and are never downcast (`as_any` is gone from
+  `Ecosystem`, `ParseResult` and `Dependency`; clippy's `disallowed-methods` also bans the
+  remaining test-only `Registry`/`Version`/`Metadata::as_any` in production code).
   `ParseResult::blocked_registries()` additionally reports any dependency line whose
   registry-index resolution was blocked by the workspace-registry reachability policy (see
   [Network security](#network-security-ssrf-host-classification) below), so a blocked custom
@@ -62,15 +74,15 @@ documented contract enforced by code review, not a compiler-enforced wall.
 
 ### LSP response generation
 
-`generate_hover` / `generate_diagnostics` / `generate_code_actions` / `generate_code_lenses` /
-`generate_inlay_hints` all have default implementations delegating to shared logic in
-`deps-core::lsp_helpers`, driven by the ecosystem's own `formatter()` (an `EcosystemFormatter`
+`hover` / `diagnostics` / `code_actions` / `code_lenses` /
+`inlay_hints` (the `TypedEcosystem` hooks behind the erased `ParsedManifest::generate_*`) all have default implementations delegating to shared logic in
+`deps-core::lsp_helpers`, driven by the ecosystem's own `own_formatter()` (a `DependencyFormatter`
 implementation, see below) and `registry()` (a `Registry` implementation) — most ecosystem
 crates only need to supply parsing plus a formatter and a registry client, not reimplement LSP
-response generation. Override a `generate_*` method only for genuine ecosystem-specific
+response generation. Override a hook only for genuine ecosystem-specific
 behavior.
 
-`generate_completions` has **no default that every ecosystem inherits for free** in the way the
+`completions` has **no default that every ecosystem inherits for free** in the way the
 other `generate_*` methods do — the trait provides a default dispatch, but every ecosystem is
 expected to reason about it explicitly. That default detects the
 `deps_core::completion::CompletionContext` at the cursor position (`PackageName`, `Version`, or
@@ -85,7 +97,7 @@ expected to reason about it explicitly. That default detects the
 - `complete_feature` — feature-flag array entries; only Cargo and Go override this (most
   ecosystems have no feature-flag concept).
 
-`deps-maven` and `deps-gradle` override `generate_completions` wholesale instead, because they
+`deps-maven` and `deps-gradle` override `completions` wholesale instead, because they
 route on their own XML/Groovy-DSL cursor context rather than `CompletionContext`. When the
 manifest fails to parse entirely (typically mid-edit), `deps-lsp` falls back to
 `fallback_completion_prefix`/`completion_insert_text`/`fallback_bare_insert_text` — a raw-text,
@@ -213,7 +225,7 @@ added to any policy section without an explicit reparse-impact decision fails to
 `crates/deps-lsp/src/handlers/` is a thin dispatch layer, one file per LSP capability
 (`hover.rs`, `completion.rs`, `diagnostics.rs`, `code_actions.rs`, `code_lens.rs`,
 `inlay_hints.rs`, `document_link.rs`) — each resolves the request's `Ecosystem` via
-`EcosystemRegistry`, then calls that ecosystem's `generate_*` method against already-cached
+`EcosystemRegistry`, then calls the document's `ParsedManifest::generate_*` method against already-cached
 `DocumentState`. Every handler method is non-blocking by design: heavy work (registry fetches)
 is always spawned via `tokio::spawn` ahead of time and cached, never awaited inline inside a
 handler — a large minified manifest is even parsed on the blocking-thread pool
@@ -412,7 +424,7 @@ crates/deps-{ecosystem}/
 ├── Cargo.toml
 └── src/
     ├── lib.rs          # Re-exports and module declarations
-    ├── ecosystem.rs    # Ecosystem trait implementation
+    ├── ecosystem.rs    # EcosystemBase + TypedEcosystem implementation
     ├── error.rs        # Ecosystem-specific error types
     ├── formatter.rs    # Version display formatting
     ├── lockfile.rs     # Lock file parsing
@@ -483,7 +495,7 @@ View the HTML report at `target/criterion/report/index.html`.
 
 ## Versioning policy
 
-`deps-core`'s public trait signatures (`Ecosystem`, `Dependency`, `ParseResult`,
+`deps-core`'s public trait signatures (`EcosystemBase`, `TypedEcosystem`, `Dependency`, `ParseResult`,
 `EcosystemFormatter`) — and its public `lsp_helpers` / `completion` helper functions — are typed
 directly against `tower_lsp_server::ls_types` types. `tower-lsp-server` is pinned pre-1.0, so a
 `tower-lsp-server` minor bump (e.g. 0.23 → 0.24) is not an implementation detail `deps-core` can

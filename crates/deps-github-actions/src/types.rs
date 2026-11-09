@@ -240,10 +240,6 @@ impl deps_core::Dependency for GithubActionsDependency {
     fn version_literal(&self) -> Option<&str> {
         self.sha_comment().map(ShaComment::literal)
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 /// Version information for a GitHub Actions dependency (a repository tag).

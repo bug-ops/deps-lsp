@@ -1,9 +1,10 @@
 //! Version formatting for Gradle ecosystem.
 
+use crate::types::GradleDependency;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget, SourcePolicy,
-    bare_meaning, compile_requirement_unless, format_version_replacing_by_shape,
+    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
+    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget,
+    SourcePolicy, bare_meaning, compile_requirement_unless, format_version_replacing_by_shape,
     requirement_contains_template_placeholder,
 };
 use deps_core::{
@@ -331,6 +332,10 @@ impl DiagnosticPolicy for GradleFormatter {}
 impl SourcePolicy for GradleFormatter {}
 
 impl OsvNaming for GradleFormatter {}
+
+impl DependencyFormatter for GradleFormatter {
+    type Dep = GradleDependency;
+}
 
 #[cfg(test)]
 mod tests {
@@ -1080,14 +1085,14 @@ mod tests {
     /// parser itself.
     #[test]
     fn test_plan_vulnerability_fix_generic_placeholder_through_real_parser_is_not_rewritten() {
-        use deps_core::ParseResult;
+        use deps_core::Dependency;
         use deps_core::edit::{FixTargetContext, VulnFixSkip, plan_vulnerability_fix};
 
         let content = "dependencies {\n    implementation \"com.google.guava:guava:{{ guava_version }}\"\n}\n";
         let uri = deps_core::test_util::test_uri("/test/build.gradle");
         let result = crate::parser::parse_gradle(content, &uri).expect("valid build.gradle");
-        let deps = result.dependencies();
-        let dep = deps
+        let dep = result
+            .dependencies
             .iter()
             .find(|d| d.name().as_str() == "com.google.guava:guava")
             .expect("guava dependency parsed");
@@ -1100,7 +1105,7 @@ mod tests {
 
         let dv = vuln_fix_dv("33.0.0-jre");
         let planned = plan_vulnerability_fix(
-            *dep,
+            dep,
             version_range,
             current,
             &dv,

@@ -5,15 +5,13 @@
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
-use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
-};
-use std::any::Any;
+use deps_core::{EcosystemBase, Registry, Result, TypedEcosystem};
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, Range};
 
 use crate::formatter::ComposerFormatter;
+use crate::parser::ComposerParseResult;
 use crate::registry::PackagistRegistry;
 
 /// Leading version-constraint operators stripped from a completion prefix before
@@ -92,7 +90,7 @@ impl ComposerEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for ComposerEcosystem {}
 
-impl Ecosystem for ComposerEcosystem {
+impl EcosystemBase for ComposerEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::Composer
     }
@@ -109,64 +107,12 @@ impl Ecosystem for ComposerEcosystem {
         &["composer.lock"]
     }
 
-    fn parse_manifest<'a>(
-        &'a self,
-        content: &'a str,
-        uri: &'a url::Url,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
-        Box::pin(async move {
-            let result = crate::parser::parse_composer_json_with_lockfile(
-                content,
-                uri,
-                &self.lockfile_cache,
-            )
-            .await?;
-            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
-        })
-    }
-
-    /// Issue #1570: overrides the default `now_or_never()`-driven implementation, which races
-    /// [`Self::parse_manifest`]'s genuine `composer.lock` await (bare vcs/path/artifact
-    /// repository plus a lockfile) and non-deterministically saw `Pending` or `Ready` depending
-    /// on scheduler timing. FR-024's fallback-edit guard only needs the re-parsed requirement's
-    /// text/shape, never the lockfile-derived source classification
-    /// [`crate::parser::parse_composer_json_with_lockfile`] adds on top of
-    /// [`crate::parser::parse_composer_json`] — so this calls the latter directly, synchronously,
-    /// with no lockfile I/O at all.
-    fn parse_manifest_sync(
-        &self,
-        content: &str,
-        uri: &url::Url,
-    ) -> Option<Box<dyn ParseResultTrait>> {
-        let result = crate::parser::parse_composer_json(content, uri).ok()?;
-        Some(Box::new(result) as Box<dyn ParseResultTrait>)
-    }
-
     fn registry(&self) -> Arc<dyn Registry> {
         self.registry.clone() as Arc<dyn Registry>
     }
 
     fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
         Some(Arc::new(crate::lockfile::ComposerLockParser))
-    }
-
-    fn formatter(&self) -> &dyn EcosystemFormatter {
-        &self.formatter
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    fn complete_package_name<'a>(
-        &'a self,
-        _request: deps_core::completion::CompletionRequest<'a>,
-        prefix: String,
-        range: Range,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    fn version_operator_chars(&self) -> &'static [char] {
-        VERSION_OPERATOR_CHARS
     }
 
     fn fallback_completion_prefix<'a>(
@@ -203,9 +149,52 @@ impl Ecosystem for ComposerEcosystem {
         let latest = metadata.latest_version().as_str();
         Some(format!("\"{}\": \"^{latest}\"", name.as_str()))
     }
+}
 
-    fn as_any(&self) -> &dyn Any {
-        self
+impl TypedEcosystem for ComposerEcosystem {
+    type Parsed = ComposerParseResult;
+    type Formatter = ComposerFormatter;
+
+    fn own_formatter(&self) -> &ComposerFormatter {
+        &self.formatter
+    }
+
+    fn parse<'a>(
+        &'a self,
+        content: &'a str,
+        uri: &'a url::Url,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<ComposerParseResult>> {
+        Box::pin(async move {
+            crate::parser::parse_composer_json_with_lockfile(content, uri, &self.lockfile_cache)
+                .await
+        })
+    }
+
+    /// Issue #1570: overrides the default `now_or_never()`-driven implementation, which races
+    /// [`Self::parse`]'s genuine `composer.lock` await (bare vcs/path/artifact
+    /// repository plus a lockfile) and non-deterministically saw `Pending` or `Ready` depending
+    /// on scheduler timing. FR-024's fallback-edit guard only needs the re-parsed requirement's
+    /// text/shape, never the lockfile-derived source classification
+    /// [`crate::parser::parse_composer_json_with_lockfile`] adds on top of
+    /// [`crate::parser::parse_composer_json`] — so this calls the latter directly, synchronously,
+    /// with no lockfile I/O at all.
+    fn parse_sync(&self, content: &str, uri: &url::Url) -> Option<ComposerParseResult> {
+        crate::parser::parse_composer_json(content, uri).ok()
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    fn complete_package_name<'a>(
+        &'a self,
+        _request: deps_core::completion::CompletionRequest<'a, ComposerParseResult>,
+        prefix: String,
+        range: Range,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+        Box::pin(async move { self.complete_package_names(&prefix, range).await.into() })
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    fn version_operator_chars(&self) -> &'static [char] {
+        VERSION_OPERATOR_CHARS
     }
 }
 
@@ -243,6 +232,7 @@ fn extract_prefix(line: &str, character: u32) -> (&str, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::any::Any;
 
     /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against Composer's REAL
     /// formatter and a real `EcosystemReparse` for the ORDINARY (no bare vcs/path/artifact
@@ -250,7 +240,9 @@ mod tests {
     /// rule is unconditional, one assertion suffices.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_pins_writable_bare_exact_rendering() {
-        let ecosystem = ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem: Arc<dyn deps_core::Ecosystem> = Arc::new(ComposerEcosystem::new(Arc::new(
+            deps_core::HttpCache::new(),
+        )));
         let content = r#"{"require": {"acme/pkg": "1.0.0"}}"#.to_string();
         let uri = deps_core::test_util::test_uri("/test/composer.json");
         let verdict = deps_core::test_util::fallback_edit_outcome(
@@ -276,7 +268,9 @@ mod tests {
     /// `fallback` = 1.5.0.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback() {
-        let ecosystem = ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem: Arc<dyn deps_core::Ecosystem> = Arc::new(ComposerEcosystem::new(Arc::new(
+            deps_core::HttpCache::new(),
+        )));
         let content = r#"{"require": {"acme/pkg": ">=1.0 !=1.5.0 <2.0"}}"#.to_string();
         let uri = deps_core::test_util::test_uri("/test/composer.json");
         let verdict = deps_core::test_util::fallback_edit_outcome(
@@ -306,7 +300,9 @@ mod tests {
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback_spaced_operator()
     {
-        let ecosystem = ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem: Arc<dyn deps_core::Ecosystem> = Arc::new(ComposerEcosystem::new(Arc::new(
+            deps_core::HttpCache::new(),
+        )));
         let content = r#"{"require": {"acme/pkg": ">=1.0 != 1.5.0 <2.0"}}"#.to_string();
         let uri = deps_core::test_util::test_uri("/test/composer.json");
         let verdict = deps_core::test_util::fallback_edit_outcome(
@@ -333,7 +329,9 @@ mod tests {
     /// `ComposerMatcher::explicitly_excludes` asks the `!=` clause directly.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback_vacuous_case() {
-        let ecosystem = ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem: Arc<dyn deps_core::Ecosystem> = Arc::new(ComposerEcosystem::new(Arc::new(
+            deps_core::HttpCache::new(),
+        )));
         let content = r#"{"require": {"acme/pkg": ">=1.0 !=1.5.0 <2.0"}}"#.to_string();
         let uri = deps_core::test_util::test_uri("/test/composer.json");
         let verdict = deps_core::test_util::fallback_edit_outcome(
@@ -361,7 +359,9 @@ mod tests {
     /// `ComposerMatcher::explicitly_excludes`) catches this.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_rejects_or_alternation_gap_vacuous_case() {
-        let ecosystem = ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem: Arc<dyn deps_core::Ecosystem> = Arc::new(ComposerEcosystem::new(Arc::new(
+            deps_core::HttpCache::new(),
+        )));
         let content = r#"{"require": {"acme/pkg": ">=1.0 <1.5 || >1.5 <2.0"}}"#.to_string();
         let uri = deps_core::test_util::test_uri("/test/composer.json");
         let verdict = deps_core::test_util::fallback_edit_outcome(
@@ -389,7 +389,9 @@ mod tests {
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback_across_or_branches()
      {
-        let ecosystem = ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem: Arc<dyn deps_core::Ecosystem> = Arc::new(ComposerEcosystem::new(Arc::new(
+            deps_core::HttpCache::new(),
+        )));
         let content = r#"{"require": {"acme/pkg": "^0.9 || >=1.0 !=1.5.0 <2.0"}}"#.to_string();
         let uri = deps_core::test_util::test_uri("/test/composer.json");
         let verdict = deps_core::test_util::fallback_edit_outcome(
@@ -412,11 +414,11 @@ mod tests {
 
     /// Issue #1570 fix (was: spec 076 FR-024 known limitation, architect handoff
     /// `2026-09-27T17-56-09`, §3 amendment callout): a bare vcs/path/artifact repository plus a
-    /// real `composer.lock` on disk makes [`Ecosystem::parse_manifest`] genuinely await
+    /// real `composer.lock` on disk makes [`deps_core::Ecosystem::parse_manifest`] genuinely await
     /// (`LockFileCache::get_or_parse` -> `tokio::fs::metadata`), which used to make
     /// `parse_manifest_now`'s single `now_or_never()` poll a genuine scheduler race between
     /// `Pending` (`ReparseFailed`) and a completed read (`Writable`) — both safe, but
-    /// non-deterministic. [`ComposerEcosystem::parse_manifest_sync`] now overrides the default
+    /// non-deterministic. [`ComposerEcosystem::parse_sync`](TypedEcosystem::parse_sync) now overrides the default
     /// `now_or_never()`-driven re-parse to call [`crate::parser::parse_composer_json`] directly
     /// instead, with no lockfile I/O at all — the guard only needs `acme/pkg`'s re-parsed
     /// requirement text, never its lockfile-derived source classification — so this is
@@ -440,8 +442,10 @@ mod tests {
             .unwrap();
         let uri = url::Url::from_file_path(&manifest_path).unwrap();
 
-        let ecosystem = ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
-        let parsed = ecosystem
+        let ecosystem: Arc<dyn deps_core::Ecosystem> = Arc::new(ComposerEcosystem::new(Arc::new(
+            deps_core::HttpCache::new(),
+        )));
+        let parsed = Arc::clone(&ecosystem)
             .parse_manifest(content, &uri)
             .await
             .expect("manifest must parse");
@@ -477,7 +481,7 @@ mod tests {
         assert_eq!(
             verdict,
             deps_core::lsp_helpers::FallbackEditVerdict::Writable,
-            "parse_manifest_sync must skip lockfile classification deterministically, never \
+            "parse_sync must skip lockfile classification deterministically, never \
              race now_or_never() against it"
         );
     }
@@ -537,11 +541,11 @@ mod tests {
         let uri = deps_core::test_util::test_uri("/test/composer.json");
 
         let content = r#"{"require": {"symfony/console": "^6.0"}}"#;
-        let result = ecosystem.parse_manifest(content, &uri).await;
+        let result = ecosystem.parse(content, &uri).await;
         assert!(result.is_ok());
 
         let parse_result = result.unwrap();
-        assert_eq!(parse_result.dependencies().len(), 1);
+        assert_eq!(parse_result.dependencies.len(), 1);
     }
 
     #[tokio::test]
@@ -550,7 +554,7 @@ mod tests {
         let ecosystem = ComposerEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/test/composer.json");
 
-        let result = ecosystem.parse_manifest("{invalid json}", &uri).await;
+        let result = ecosystem.parse("{invalid json}", &uri).await;
         assert!(result.is_err());
     }
 
@@ -637,7 +641,7 @@ mod tests {
     mod lsp_tests {
         use super::*;
 
-        use deps_core::{EcosystemConfig, VersionData};
+        use deps_core::{EcosystemConfig, ParsedView, VersionData};
 
         use std::collections::HashMap;
 
@@ -684,14 +688,11 @@ mod tests {
             let content = "{\n  \"require\": {\n    \"symfony/console\": \"^6.0\"\n  }\n}";
             let uri = deps_core::test_util::test_uri("/test/composer.json");
 
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
             let position = Position::new(2, 9); // cursor after "symf" in "symfony/console"
 
-            let context = deps_core::completion::detect_completion_context(
-                parse_result.as_ref(),
-                position,
-                content,
-            );
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
 
             match context {
                 deps_core::completion::CompletionContext::PackageName { prefix, range } => {
@@ -710,11 +711,11 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/composer.json");
 
             let content = r#"{"require": {}}"#;
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
 
             let hints = ecosystem
-                .generate_inlay_hints(
-                    parse_result.as_ref(),
+                .inlay_hints(
+                    ParsedView::new(&parse_result),
                     VersionData::new(&HashMap::new(), &HashMap::new()),
                     deps_core::LoadingState::Loaded,
                     &EcosystemConfig::default(),
@@ -731,15 +732,15 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/composer.json");
 
             let content = r#"{"name": "test/project"}"#;
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
             let position = Position {
                 line: 0,
                 character: 0,
             };
 
             let completions = ecosystem
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     position,
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -753,7 +754,7 @@ mod tests {
         /// proves the shared helper strips a `!=` prefix against a hard-coded *copy* of
         /// Composer's operator array (`deps-core` cannot depend on `deps-composer` to reference
         /// the real one). This drives the same scenario through the real
-        /// `ComposerEcosystem::generate_completions` against a mocked Packagist response,
+        /// `ComposerEcosystem::completions` against a mocked Packagist response,
         /// proving the actual shipped `VERSION_OPERATOR_CHARS` constant above.
         #[tokio::test]
         async fn test_generate_completions_strips_not_equal_operator_against_real_registry() {
@@ -783,13 +784,13 @@ mod tests {
             };
             let uri = deps_core::test_util::test_uri("/test/composer.json");
             let content = r#"{"require": {"monolog/monolog": "!=2.0"}}"#;
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-            let dep = &parse_result.dependencies()[0];
-            let position = dep.version_range().unwrap().end.into();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
+            let dep = &parse_result.dependencies[0];
+            let position = dep.version_range.unwrap().end.into();
 
             let completions = ecosystem
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     position,
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -847,13 +848,13 @@ mod tests {
                 let mut server = mockito::Server::new_async().await;
                 let ecosystem = composer_ecosystem_with_alpha_and_stable(&mut server).await;
                 let uri = deps_core::test_util::test_uri("/test/composer.json");
-                let parse_result = ecosystem.parse_manifest(MANIFEST, &uri).await.unwrap();
-                let dep = &parse_result.dependencies()[0];
-                let position = dep.version_range().unwrap().start.into();
+                let parse_result = ecosystem.parse(MANIFEST, &uri).await.unwrap();
+                let dep = &parse_result.dependencies[0];
+                let position = dep.version_range.unwrap().start.into();
 
                 let hover = ecosystem
-                    .generate_hover(
-                        parse_result.as_ref(),
+                    .hover(
+                        ParsedView::new(&parse_result),
                         position,
                         VersionData::new(&HashMap::new(), &HashMap::new()),
                         deps_core::FreshnessSettings::default(),
@@ -878,13 +879,13 @@ mod tests {
                 let mut server = mockito::Server::new_async().await;
                 let ecosystem = composer_ecosystem_with_alpha_and_stable(&mut server).await;
                 let uri = deps_core::test_util::test_uri("/test/composer.json");
-                let parse_result = ecosystem.parse_manifest(MANIFEST, &uri).await.unwrap();
-                let dep = &parse_result.dependencies()[0];
-                let position = dep.version_range().unwrap().end.into();
+                let parse_result = ecosystem.parse(MANIFEST, &uri).await.unwrap();
+                let dep = &parse_result.dependencies[0];
+                let position = dep.version_range.unwrap().end.into();
 
                 let completions = ecosystem
-                    .generate_completions(
-                        parse_result.as_ref(),
+                    .completions(
+                        ParsedView::new(&parse_result),
                         position,
                         MANIFEST,
                         deps_core::FreshnessSettings::default(),
@@ -920,13 +921,13 @@ mod tests {
                 let mut server = mockito::Server::new_async().await;
                 let ecosystem = composer_ecosystem_with_alpha_and_stable(&mut server).await;
                 let uri = deps_core::test_util::test_uri("/test/composer.json");
-                let parse_result = ecosystem.parse_manifest(MANIFEST, &uri).await.unwrap();
-                let dep = &parse_result.dependencies()[0];
-                let position = dep.version_range().unwrap().start.into();
+                let parse_result = ecosystem.parse(MANIFEST, &uri).await.unwrap();
+                let dep = &parse_result.dependencies[0];
+                let position = dep.version_range.unwrap().start.into();
 
                 let actions = ecosystem
-                    .generate_code_actions(
-                        parse_result.as_ref(),
+                    .code_actions(
+                        ParsedView::new(&parse_result),
                         position,
                         &uri,
                         VersionData::new(&HashMap::new(), &HashMap::new()),
@@ -956,7 +957,7 @@ mod tests {
             }
 
             /// #1444 end-to-end: a real `composer.json` with an unrecognized `minimum-stability`
-            /// value produces a WARNING diagnostic through the full `Ecosystem::generate_diagnostics`
+            /// value produces a WARNING diagnostic through the full `TypedEcosystem::diagnostics`
             /// path — parse -> `ParseResult::invalid_minimum_stability` ->
             /// `invalid_minimum_stability_notice`. No mock registry needed:
             /// `generate_diagnostics_from_cache` never performs network I/O.
@@ -971,11 +972,11 @@ mod tests {
                 let cache = Arc::new(deps_core::HttpCache::new());
                 let ecosystem = ComposerEcosystem::new(cache);
                 let uri = deps_core::test_util::test_uri("/test/composer.json");
-                let parse_result = ecosystem.parse_manifest(manifest, &uri).await.unwrap();
+                let parse_result = ecosystem.parse(manifest, &uri).await.unwrap();
 
                 let diagnostics = ecosystem
-                    .generate_diagnostics(
-                        parse_result.as_ref(),
+                    .diagnostics(
+                        ParsedView::new(&parse_result),
                         VersionData::new(&HashMap::new(), &HashMap::new()),
                         &uri,
                         deps_core::FreshnessSettings::default(),

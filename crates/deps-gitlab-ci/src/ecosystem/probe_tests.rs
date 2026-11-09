@@ -4,12 +4,14 @@ use std::sync::{Arc, RwLock};
 
 use deps_core::diagnostic::Severity;
 use deps_core::lsp_helpers::{
-    CommitSha, LatestRelease, NormalizeName, PackageRendering, ProbeEffect, ProbePhase,
-    ProbeReport, RequirementGate, RequirementStatus,
+    CommitSha, DependencyFormatter, DependencyGate, LatestRelease, NormalizeName, ProbeEffect,
+    ProbePhase, ProbeReport, RequirementStatus,
 };
 use deps_core::pagination::ListCoverage;
 use deps_core::parser::DependencySource;
-use deps_core::{ConcreteVersion, Ecosystem, HttpCache, PackageName, VersionReq};
+use deps_core::{
+    ConcreteVersion, EcosystemBase, HttpCache, PackageName, ParsedView, TypedEcosystem, VersionReq,
+};
 
 use super::{GitlabCiEcosystem, unknown_ref_target};
 use crate::host::{GitlabHost, GitlabInstanceHost};
@@ -88,7 +90,7 @@ fn on_mock(fx: &Fixture, mut parsed: GitlabCiParseResult) -> GitlabCiParseResult
 
 async fn probe(fx: &Fixture, parsed: &GitlabCiParseResult) -> ProbeReport {
     fx.eco
-        .background_probes(parsed, ProbePhase::PostFetch)
+        .probes(ParsedView::new(parsed), ProbePhase::PostFetch)
         .await
 }
 
@@ -340,7 +342,7 @@ async fn pre_fetch_phase_does_nothing_and_evidence_is_announced() {
 
     let pre = fx
         .eco
-        .background_probes(&parsed, ProbePhase::PreFetch)
+        .probes(ParsedView::new(&parsed), ProbePhase::PreFetch)
         .await;
     assert_eq!(pre, ProbeReport::default());
     probe(&fx, &parsed).await;

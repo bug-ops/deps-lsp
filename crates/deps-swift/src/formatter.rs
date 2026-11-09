@@ -1,19 +1,17 @@
 //! Swift ecosystem formatter.
 
 use deps_core::ConcreteVersion;
-use deps_core::Dependency;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::is_dot_segment;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, HoverProvenance, OsvNaming,
-    PackageNaming, PackageRendering, PublicContent, RequirementMatcher, RequirementResolution,
-    SourcePolicy, compile_semver_requirement, requirement_contains_template_placeholder,
-    warn_rejected_value,
+    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, HoverProvenance,
+    OsvNaming, PackageNaming, PackageRendering, PublicContent, RequirementMatcher,
+    RequirementResolution, SourcePolicy, compile_semver_requirement,
+    requirement_contains_template_placeholder, warn_rejected_value,
 };
 use deps_core::osv::OsvPackageName;
 use deps_core::redact::RedactedUrl;
-use deps_core::{NarrowDependency, OwnDependency};
 use std::borrow::Cow;
 
 use crate::scm::SwiftOrigin;
@@ -61,10 +59,6 @@ fn is_non_github_registry_url(name: &str) -> bool {
 
 /// Formatter for Swift/SPM ecosystem LSP responses.
 pub struct SwiftFormatter;
-
-impl OwnDependency for SwiftFormatter {
-    type Dep = SwiftDependency;
-}
 
 impl PackageNaming for SwiftFormatter {
     fn normalized_spelling(&self, name: &PackageName) -> String {
@@ -128,21 +122,6 @@ impl PackageRendering for SwiftFormatter {
                 name.as_str(),
             );
             String::new()
-        }
-    }
-
-    /// A swizzled dependency (spec 088) says which registry identity it was swapped to and from
-    /// which repository.
-    fn hover_provenance(&self, dep: &dyn Dependency) -> Option<HoverProvenance> {
-        let swift_dep = self.own_dependency(dep)?;
-        match &swift_dep.origin {
-            SwiftOrigin::Swizzled { scm, .. } => {
-                Some(HoverProvenance::ResolvedViaRegistryIdentity {
-                    identity: swift_dep.name.clone(),
-                    scm: RedactedUrl::new(scm.wire()),
-                })
-            }
-            SwiftOrigin::Declared => None,
         }
     }
 
@@ -239,7 +218,25 @@ impl SourcePolicy for SwiftFormatter {
     }
 }
 
-impl OsvNaming for SwiftFormatter {
+impl OsvNaming for SwiftFormatter {}
+
+impl DependencyFormatter for SwiftFormatter {
+    type Dep = SwiftDependency;
+
+    /// A swizzled dependency (spec 088) says which registry identity it was swapped to and from
+    /// which repository.
+    fn hover_provenance(&self, dep: &SwiftDependency) -> Option<HoverProvenance> {
+        match &dep.origin {
+            SwiftOrigin::Swizzled { scm, .. } => {
+                Some(HoverProvenance::ResolvedViaRegistryIdentity {
+                    identity: dep.name.clone(),
+                    scm: RedactedUrl::new(scm.wire()),
+                })
+            }
+            SwiftOrigin::Declared => None,
+        }
+    }
+
     /// Raw `dep.name()`, NOT [`deps_core::lsp_helpers::NormalizeName::normalize_package_name`]: that
     /// lowercases, and OSV's `SwiftURL` matching is case-sensitive, so
     /// lowercasing would mangle mixed-case repos. Gated on the dependency's
@@ -251,18 +248,17 @@ impl OsvNaming for SwiftFormatter {
     ///
     /// A swizzled dependency (spec 088) is described by its source repository instead:
     /// `dep.name()` is then the registry identity, which OSV has never heard of.
-    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<OsvPackageName> {
-        let swift_dep = self.own_dependency(dep)?;
-        match &swift_dep.origin {
+    fn osv_package_name(&self, dep: &SwiftDependency) -> Option<OsvPackageName> {
+        match &dep.origin {
             SwiftOrigin::Swizzled { .. } => self
                 .public_content(dep)
                 .map(|content| format!("github.com/{}", content.name.as_str()))
                 .and_then(OsvPackageName::new_or_skip),
             SwiftOrigin::Declared => {
-                let host = reqwest::Url::parse(&swift_dep.url).ok()?;
+                let host = reqwest::Url::parse(&dep.url).ok()?;
                 host.host_str()
                     .is_some_and(crate::is_github_host)
-                    .then(|| format!("github.com/{}", dep.name().as_str()))
+                    .then(|| format!("github.com/{}", dep.name.as_str()))
                     .and_then(OsvPackageName::new_or_skip)
             }
         }
@@ -272,17 +268,17 @@ impl OsvNaming for SwiftFormatter {
     /// `SwiftURL` matching is case-sensitive); a swizzled dependency on any other host has no
     /// public content OSV or license data could describe. Every other dependency follows the
     /// source gate.
-    fn public_content<'d>(&self, dep: &'d dyn Dependency) -> Option<PublicContent<'d>> {
-        match self.own_dependency(dep).map(|swift_dep| &swift_dep.origin) {
-            Some(SwiftOrigin::Swizzled { scm, .. }) => crate::parser::url_to_identity(scm.wire())
+    fn public_content<'d>(&self, dep: &'d SwiftDependency) -> Option<PublicContent<'d>> {
+        match &dep.origin {
+            SwiftOrigin::Swizzled { scm, .. } => crate::parser::url_to_identity(scm.wire())
                 .filter(|repository| is_valid_owner_repo(repository))
                 .map(|repository| PublicContent {
                     name: Cow::Owned(PackageName::new(repository)),
                 }),
-            Some(SwiftOrigin::Declared) | None => self
-                .source_is_public_registry_content(&dep.source())
-                .then(|| PublicContent {
-                    name: Cow::Borrowed(dep.name()),
+            SwiftOrigin::Declared => self
+                .source_is_public_registry_content(&dep.source)
+                .then_some(PublicContent {
+                    name: Cow::Borrowed(&dep.name),
                 }),
         }
     }
@@ -292,6 +288,7 @@ impl OsvNaming for SwiftFormatter {
 mod tests {
     use super::*;
     use crate::scm::SwiftRequirementForm;
+    use deps_core::Dependency;
     use deps_core::NormalizeName;
     use deps_core::VersionReq;
     use deps_core::lsp_helpers::RequirementGate;
@@ -604,7 +601,7 @@ mod tests {
         };
         assert_eq!(
             fmt.public_content(&pinned).is_some(),
-            fmt.source_is_public_registry_content(&pinned.source())
+            fmt.source_is_public_registry_content(&pinned.source)
         );
     }
 
@@ -888,7 +885,6 @@ mod tests {
     /// literal) would pass this test despite still corrupting the manifest on the real path.
     #[test]
     fn test_plan_vulnerability_fix_unresolved_interpolation_is_not_rewritten() {
-        use deps_core::ParseResult;
         use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
@@ -897,8 +893,7 @@ mod tests {
         let manifest = r#".package(url: "https://github.com/apple/swift-nio", from: "\(v)")"#;
         let uri = deps_core::test_util::test_uri("/test/Package.swift");
         let result = crate::parser::parse_package_swift(manifest, &uri).expect("valid manifest");
-        let deps = result.dependencies();
-        let dep = deps.first().expect("one dependency parsed");
+        let dep = result.dependencies.first().expect("one dependency parsed");
         let current = dep
             .version_requirement()
             .expect("from: synthesizes a version requirement")
@@ -921,7 +916,7 @@ mod tests {
             });
 
         let planned = plan_vulnerability_fix(
-            *dep,
+            dep,
             deps_core::position::Range::default(),
             current,
             &dv,
@@ -951,7 +946,6 @@ mod tests {
     /// covers the shared generic-template detector rather than Swift's native `\(...)` form.
     #[test]
     fn test_plan_vulnerability_fix_generic_placeholder_through_real_parser_is_not_rewritten() {
-        use deps_core::ParseResult;
         use deps_core::edit::{FixTargetContext, VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
@@ -960,8 +954,7 @@ mod tests {
         let manifest = r#".package(url: "https://github.com/apple/swift-argument-parser", from: "{{ ap_version }}")"#;
         let uri = deps_core::test_util::test_uri("/test/Package.swift");
         let result = crate::parser::parse_package_swift(manifest, &uri).expect("valid manifest");
-        let deps = result.dependencies();
-        let dep = deps.first().expect("one dependency parsed");
+        let dep = result.dependencies.first().expect("one dependency parsed");
         let current = dep
             .version_requirement()
             .expect("from: synthesizes a version requirement")
@@ -983,7 +976,7 @@ mod tests {
             });
 
         let planned = plan_vulnerability_fix(
-            *dep,
+            dep,
             deps_core::position::Range::default(),
             current,
             &dv,

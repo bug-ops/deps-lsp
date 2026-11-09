@@ -451,14 +451,15 @@ fn seed_cached_versions_from_lockfile(
     // `resolved` value during the cold-open window before the
     // registry fetch completes (critique S1).
     let formatter = ecosystem.formatter();
-    let instant_resolved: ResolvedVersionsMap = match doc.parse_result() {
-        Some(parse_result) => {
-            let pinned_by_manifest: HashSet<NormalizedName> = parse_result
-                .dependencies()
-                .into_iter()
-                .filter(|d| formatter.manifest_requirement_is_resolved_version(*d))
-                .map(|d| formatter.normalize_package_name(d.name()))
-                .collect();
+    let instant_resolved: ResolvedVersionsMap = match doc.manifest() {
+        Some(manifest) => {
+            let mut pinned_by_manifest = HashSet::<NormalizedName>::new();
+            manifest.for_each_formatted_dependency(&mut |bound| {
+                if bound.manifest_requirement_is_resolved_version() {
+                    pinned_by_manifest
+                        .insert(formatter.normalize_package_name(bound.dependency().name()));
+                }
+            });
             resolved_versions
                 .iter()
                 .filter(|(name, _)| !pinned_by_manifest.contains(*name))
@@ -491,12 +492,12 @@ fn prepare_open_fetch(
         tracing::warn!("document not found, aborting fetch");
         return None;
     };
-    let Some(parse_result) = doc.parse_result() else {
+    let Some(manifest) = doc.manifest() else {
         tracing::warn!("no parse result, aborting fetch");
         return None;
     };
     Some(prepare_fetch(
-        parse_result,
+        manifest,
         ecosystem.formatter(),
         ecosystem.ecosystem_id(),
         resolved_versions,
@@ -665,7 +666,7 @@ async fn publish_after_prefetches(tail: FetchTail<'_>) {
     diagnostics::publish_document_diagnostics(state, client, uri, config, dep_count).await;
 
     // Any fetch that ran populated the tag index the probes need.
-    spawn_background_probes(state, uri, ecosystem);
+    spawn_background_probes(state, uri);
 }
 
 /// What caused a parse, which decides whether the pre-fetch probes run before it is committed.
@@ -708,9 +709,8 @@ async fn apply_pre_fetch_reparse(
 ) -> Option<PreFetchReparse> {
     let (parsed, version) = state
         .get_document(uri)
-        .and_then(|doc| Some((doc.parse_result_arc()?, doc.version)))?;
-    let decision =
-        pre_fetch_decision(ecosystem.as_ref(), parsed.as_ref(), state.network_mode()).await;
+        .and_then(|doc| Some((doc.manifest_arc()?, doc.version)))?;
+    let decision = pre_fetch_decision(parsed.as_ref(), state.network_mode()).await;
     let report = match decision {
         PreFetchDecision::Skipped => return None,
         PreFetchDecision::Keep(report) | PreFetchDecision::Reparse(report) => report,
@@ -841,7 +841,7 @@ async fn parse_and_diff_manifest(
 }
 
 /// A manifest parse: the result, or why the parser rejected the content.
-type ParseOutcome = std::result::Result<Box<dyn deps_core::ParseResult>, ParseFailure>;
+type ParseOutcome = std::result::Result<Box<dyn deps_core::ParsedManifest>, ParseFailure>;
 
 /// Whether [`commit_parsed_document`] should verify the document's current version before
 /// committing — see that function's doc for why this exists.
@@ -2199,7 +2199,7 @@ mod tests {
         ] {
             let url = deps_core::test_util::test_uri(path);
             let ecosystem = state.ecosystem_registry.for_uri(&url).expect("ecosystem");
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(content, &url)
                 .await
                 .expect("parse");
@@ -2325,7 +2325,10 @@ mod tests {
             .expect("composer ecosystem registered under the composer feature");
 
         let content1 = r#"{"require": {"symfony/console": "^6.0"}}"#;
-        let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+        let parse_result1 = Arc::clone(&ecosystem)
+            .parse_manifest(content1, &url)
+            .await
+            .unwrap();
         let doc_state1 = DocumentState::new_from_parse_result(
             EcosystemId::Composer,
             content1.to_string(),
@@ -2363,7 +2366,10 @@ mod tests {
             .expect("composer ecosystem registered under the composer feature");
 
         let content1 = r#"{"name": "acme/app", "require": {"symfony/console": "^6.0"}}"#;
-        let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+        let parse_result1 = Arc::clone(&ecosystem)
+            .parse_manifest(content1, &url)
+            .await
+            .unwrap();
         let doc_state1 = DocumentState::new_from_parse_result(
             EcosystemId::Composer,
             content1.to_string(),
@@ -2756,7 +2762,10 @@ mod tests {
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(&content, &url)
+                .await
+                .unwrap();
             let mut doc_state =
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             doc_state.set_version(Some(1));
@@ -2861,7 +2870,10 @@ mod tests {
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
-            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(&content, &url)
+                .await
+                .unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content.clone(),
@@ -2943,8 +2955,8 @@ mod tests {
         use deps_core::ecosystem::BoxFuture;
         use deps_core::ecosystem::private::Sealed;
         use deps_core::{
-            Dependency, DiagnosticSeverities, EcosystemConfig, EcosystemFormatter,
-            FreshnessSettings, Metadata, Version, VersionData, completion::Completions,
+            Dependency, DiagnosticSeverities, EcosystemConfig, FreshnessSettings, Metadata,
+            Version, VersionData, completion::Completions,
         };
         use std::any::Any;
         use std::path::Path;
@@ -2975,9 +2987,6 @@ mod tests {
             fn source(&self) -> deps_core::parser::DependencySource {
                 deps_core::parser::DependencySource::Registry
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
         struct FakeParseResult {
@@ -2994,10 +3003,16 @@ mod tests {
             fn uri(&self) -> &url::Url {
                 &self.uri
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+        impl deps_core::TypedParseResult for FakeParseResult {
+            type Dep = FakeDependency;
+            fn own_dependencies(&self) -> &[FakeDependency] {
+                std::slice::from_ref(&self.dep)
             }
         }
+
+        const FAKE_FORMATTER: deps_core::test_util::StubFormatter<FakeDependency> =
+            deps_core::test_util::StubFormatter::new().for_dependency();
 
         /// Tracks concurrent holders and sleeps `delay` per call, standing in for a slow
         /// (but never-failing) registry — mirrors `ConcurrencyTrackingRegistry` above, but
@@ -3052,7 +3067,7 @@ mod tests {
             registry: Arc<dyn Registry>,
         }
         impl Sealed for SlowFetchEcosystem {}
-        impl Ecosystem for SlowFetchEcosystem {
+        impl deps_core::EcosystemBase for SlowFetchEcosystem {
             fn ecosystem_id(&self) -> deps_core::EcosystemId {
                 deps_core::EcosystemId::Cargo
             }
@@ -3062,74 +3077,8 @@ mod tests {
             fn manifest_filenames(&self) -> &[&'static str] {
                 &["Cargo.toml"]
             }
-            fn parse_manifest<'a>(
-                &'a self,
-                _content: &'a str,
-                uri: &'a url::Url,
-            ) -> BoxFuture<'a, deps_core::Result<Box<dyn deps_core::ParseResult>>> {
-                let uri = uri.clone();
-                Box::pin(async move {
-                    let parse_result: Box<dyn deps_core::ParseResult> = Box::new(FakeParseResult {
-                        uri: uri.clone(),
-                        dep: FakeDependency {
-                            name: PackageName::new("pkg"),
-                            version_requirement: VersionReq::new("*"),
-                        },
-                    });
-                    Ok(parse_result)
-                })
-            }
             fn registry(&self) -> Arc<dyn Registry> {
                 Arc::clone(&self.registry) as Arc<dyn Registry>
-            }
-            fn formatter(&self) -> &dyn EcosystemFormatter {
-                &deps_core::test_util::StubFormatter::DEFAULT
-            }
-            fn generate_inlay_hints<'a>(
-                &'a self,
-                _parse_result: &'a dyn deps_core::ParseResult,
-                _versions: VersionData<'a>,
-                _loading_state: deps_core::LoadingState,
-                _config: &'a EcosystemConfig,
-            ) -> BoxFuture<'a, Vec<InlayHint>> {
-                Box::pin(async move { vec![] })
-            }
-            fn generate_diagnostics<'a>(
-                &'a self,
-                _parse_result: &'a dyn deps_core::ParseResult,
-                _versions: VersionData<'a>,
-                _uri: &'a url::Url,
-                _freshness: FreshnessSettings,
-                _severities: DiagnosticSeverities,
-            ) -> BoxFuture<'a, Vec<deps_core::diagnostic::Diagnostic>> {
-                Box::pin(async move { vec![] })
-            }
-            fn generate_code_lenses<'a>(
-                &'a self,
-                _parse_result: &'a dyn deps_core::ParseResult,
-                _content: &'a str,
-                _versions: VersionData<'a>,
-                _uri: &'a url::Url,
-                _command_id: &'a str,
-            ) -> BoxFuture<'a, Vec<CodeLens>> {
-                Box::pin(async move { vec![] })
-            }
-            fn generate_completions<'a>(
-                &'a self,
-                _parse_result: &'a dyn deps_core::ParseResult,
-                _position: Position,
-                _content: &'a str,
-                _freshness: FreshnessSettings,
-            ) -> BoxFuture<'a, Completions> {
-                Box::pin(async move { Completions::default() })
-            }
-            fn complete_version<'a>(
-                &'a self,
-                _request: deps_core::completion::CompletionRequest<'a>,
-                _package_name: deps_core::PackageName,
-                _prefix: String,
-            ) -> BoxFuture<'a, Completions> {
-                unimplemented!()
             }
             fn completion_insert_text(
                 &self,
@@ -3137,8 +3086,70 @@ mod tests {
             ) -> Option<String> {
                 unimplemented!()
             }
-            fn as_any(&self) -> &dyn Any {
-                self
+        }
+
+        impl deps_core::TypedEcosystem for SlowFetchEcosystem {
+            type Parsed = FakeParseResult;
+            type Formatter = deps_core::test_util::StubFormatter<FakeDependency>;
+
+            fn own_formatter(&self) -> &Self::Formatter {
+                &FAKE_FORMATTER
+            }
+
+            fn parse<'a>(
+                &'a self,
+                _content: &'a str,
+                uri: &'a url::Url,
+            ) -> BoxFuture<'a, deps_core::Result<FakeParseResult>> {
+                let uri = uri.clone();
+                Box::pin(async move {
+                    Ok(FakeParseResult {
+                        uri,
+                        dep: FakeDependency {
+                            name: PackageName::new("pkg"),
+                            version_requirement: VersionReq::new("*"),
+                        },
+                    })
+                })
+            }
+
+            fn inlay_hints<'a>(
+                &'a self,
+                _parsed: deps_core::ParsedView<'a, FakeParseResult>,
+                _versions: VersionData<'a>,
+                _loading_state: deps_core::LoadingState,
+                _config: &'a EcosystemConfig,
+            ) -> BoxFuture<'a, Vec<InlayHint>> {
+                Box::pin(async move { vec![] })
+            }
+            fn diagnostics<'a>(
+                &'a self,
+                _parsed: deps_core::ParsedView<'a, FakeParseResult>,
+                _versions: VersionData<'a>,
+                _uri: &'a url::Url,
+                _freshness: FreshnessSettings,
+                _severities: DiagnosticSeverities,
+            ) -> BoxFuture<'a, Vec<deps_core::diagnostic::Diagnostic>> {
+                Box::pin(async move { vec![] })
+            }
+            fn code_lenses<'a>(
+                &'a self,
+                _parsed: deps_core::ParsedView<'a, FakeParseResult>,
+                _content: &'a str,
+                _versions: VersionData<'a>,
+                _uri: &'a url::Url,
+                _command_id: &'a str,
+            ) -> BoxFuture<'a, Vec<CodeLens>> {
+                Box::pin(async move { vec![] })
+            }
+            fn completions<'a>(
+                &'a self,
+                _parsed: deps_core::ParsedView<'a, FakeParseResult>,
+                _position: Position,
+                _content: &'a str,
+                _freshness: FreshnessSettings,
+            ) -> BoxFuture<'a, Completions> {
+                Box::pin(async move { Completions::default() })
             }
         }
 
@@ -3309,19 +3320,23 @@ mod tests {
                 crate::test_utils::test_helpers::create_test_client_and_config();
             let url = deps_core::test_util::test_uri("/test/stalled-change/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let parse_result: Box<dyn deps_core::ParseResult> = Box::new(FakeParseResult {
-                uri: url,
-                dep: FakeDependency {
-                    name: PackageName::new("pkg"),
-                    version_requirement: VersionReq::new("*"),
+            let manifest = deps_core::test_util::stub_document_with(
+                FakeParseResult {
+                    uri: url,
+                    dep: FakeDependency {
+                        name: PackageName::new("pkg"),
+                        version_requirement: VersionReq::new("*"),
+                    },
                 },
-            });
+                FAKE_FORMATTER,
+                deps_core::EcosystemId::Cargo,
+            );
             state.update_document(
                 uri.clone(),
                 DocumentState::new_from_parse_result(
                     deps_core::EcosystemId::Cargo,
                     "x".to_string(),
-                    parse_result,
+                    manifest,
                 ),
             );
 
@@ -3406,7 +3421,10 @@ anyhow = "1.0"
             .ecosystem_registry
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
-        let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+        let parse_result1 = Arc::clone(&ecosystem)
+            .parse_manifest(content1, &url)
+            .await
+            .unwrap();
         let doc_state1 = DocumentState::new_from_parse_result(
             EcosystemId::Cargo,
             content1.to_string(),
@@ -3440,7 +3458,10 @@ anyhow = "1.0"
             [NormalizedName::for_test("anyhow")]
         );
 
-        let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+        let parse_result2 = Arc::clone(&ecosystem)
+            .parse_manifest(content2, &url)
+            .await
+            .unwrap();
         let committed = commit_parsed_document(
             &uri,
             ecosystem.as_ref(),
@@ -3527,7 +3548,7 @@ serde = "1.0"
                 .for_uri(&url)
                 .expect("Cargo ecosystem not found");
 
-            let parse_result = ecosystem.parse_manifest(content, &url).await;
+            let parse_result = Arc::clone(&ecosystem).parse_manifest(content, &url).await;
             assert!(parse_result.is_ok());
 
             let doc_state = DocumentState::new_from_parse_result(
@@ -3558,7 +3579,10 @@ serde = "1.0"
                 .for_uri(&url)
                 .expect("Cargo ecosystem not found");
 
-            let parse_result = ecosystem.parse_manifest(content, &url).await.ok();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .ok();
             assert!(
                 parse_result.is_none(),
                 "Parsing should fail for invalid TOML"
@@ -3601,7 +3625,10 @@ serde = "1.0""#;
                 .ecosystem_registry
                 .for_uri(&url)
                 .expect("Cargo ecosystem");
-            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
             let doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
                 content.to_string(),
@@ -3651,7 +3678,9 @@ serde = "1.0"
                 .ecosystem_registry
                 .for_uri(&url)
                 .expect("Cargo ecosystem");
-            let parse_result = ecosystem.parse_manifest(&loaded_content, &url).await;
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(&loaded_content, &url)
+                .await;
             assert!(parse_result.is_ok(), "Should parse successfully");
 
             // These are the same building blocks ensure_document_loaded's disk path uses.
@@ -3672,8 +3701,14 @@ serde = "1.0""#;
                 .for_uri(&url)
                 .expect("Cargo ecosystem");
 
-            let parse_result1 = ecosystem.parse_manifest(content, &url).await.unwrap();
-            let parse_result2 = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse_result1 = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
+            let parse_result2 = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
 
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -4693,7 +4728,10 @@ tokio = "1.0"
             let url = deps_core::test_util::test_uri("/test/pyproject.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let ecosystem = state.ecosystem_registry.for_uri(&url).expect("pypi");
-            let parse = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let parse = Arc::clone(&ecosystem)
+                .parse_manifest(content, &url)
+                .await
+                .unwrap();
             let mut doc =
                 DocumentState::new_from_parse_result(EcosystemId::Pypi, content.to_string(), parse);
             doc.update_cached_versions(HashMap::from([(
@@ -4838,7 +4876,7 @@ tokio = "1.0"
                 .for_uri(&url)
                 .expect("npm ecosystem not found");
 
-            let parse_result = ecosystem.parse_manifest(content, &url).await;
+            let parse_result = Arc::clone(&ecosystem).parse_manifest(content, &url).await;
             assert!(parse_result.is_ok());
 
             let doc_state = DocumentState::new_from_parse_result(
@@ -5076,7 +5114,7 @@ require github.com/gorilla/mux v1.8.0
                 .for_uri(&url)
                 .expect("go ecosystem not found");
 
-            let parse_result = ecosystem.parse_manifest(content, &url).await;
+            let parse_result = Arc::clone(&ecosystem).parse_manifest(content, &url).await;
             assert!(parse_result.is_ok());
 
             let doc_state = DocumentState::new_from_parse_result(

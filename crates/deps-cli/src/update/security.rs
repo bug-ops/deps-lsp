@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use deps_core::Ecosystem;
 use deps_core::edit::{
-    FixTargetContext, VulnFixSkip, plan_verified_fix, resolve_recommended_fix, resolve_verified_fix,
+    FixTargetContext, VulnFixSkip, resolve_recommended_fix, resolve_verified_fix,
 };
 use deps_core::lsp_helpers::CommitRewrite;
-use deps_core::lsp_helpers::{RequirementGate, resolve_in_use_version, resolve_scan_outcome};
+use deps_core::lsp_helpers::{FormattedDependency, RequirementGate, resolve_scan_outcome};
 use deps_core::osv::{OsvClient, OsvId, ScanOutcome};
 
 use crate::analyze::ManifestAnalysis;
@@ -59,7 +59,7 @@ const OSV_CHECK_TIMEOUT_CEILING_SECS: u64 = 30;
 /// let osv = OsvClient::new(Arc::new(HttpCache::new()));
 ///
 /// let analysis = ManifestAnalysis {
-///     parse_result: deps_core::test_util::stub_parse_result_with_dependencies(0),
+///     parse_result: deps_core::test_util::stub_document(deps_core::test_util::stub_parse_result(0)),
 ///     uri: deps_core::test_util::test_uri("/test/pubspec.yaml"),
 ///     now: deps_core::PublishTime::now(),
 ///     ecosystem_id: EcosystemId::Dart,
@@ -123,7 +123,6 @@ pub async fn plan_security_updates(
         analysis.parse_result.as_ref(),
         &analysis.resolved_versions,
         &analysis.resolved_version_candidates,
-        formatter,
         ecosystem_id,
     );
     let osv_name_by_key = deps_engine::classify::osv::osv_name_by_key(&targets);
@@ -135,18 +134,14 @@ pub async fn plan_security_updates(
     // (vulnerabilities checking disabled, or offline) degrades to an empty map, which
     // `collect_fix_target_resolutions` already treats as "nothing to reuse, always live-check"
     // — never a silently-suppressed fix.
-    let vuln_key_by_range = deps_core::osv::vulnerability_keys(
-        analysis.parse_result.as_ref(),
+    let vuln_key_by_range = analysis.parse_result.vulnerability_keys(
         &analysis.resolved_versions,
         Some(&analysis.resolved_version_candidates),
-        formatter,
-        ecosystem_id,
     );
 
     let candidate_tags = deps_engine::classify::osv::candidate_tag_sources(
         analysis.parse_result.as_ref(),
         &vuln_key_by_range,
-        formatter,
         ecosystem_id,
     );
 
@@ -154,7 +149,6 @@ pub async fn plan_security_updates(
         analysis.parse_result.as_ref(),
         &vuln_key_by_range,
         &analysis.cached_versions,
-        formatter,
     );
 
     static EMPTY_LATEST_STATUS: std::sync::LazyLock<deps_core::osv::LatestStatusMap> =
@@ -190,40 +184,40 @@ pub async fn plan_security_updates(
     }
 
     let mut items = Vec::new();
-    for dep in analysis.parse_result.dependencies() {
-        let key = PackageKey::new(dep.name(), formatter);
-        let Some(ScanOutcome::Vulnerable(dv)) =
-            resolve_scan_outcome(&vulnerabilities, dep, Some(&vuln_key_by_range), &key)
-        else {
-            continue;
-        };
+    analysis
+        .parse_result
+        .for_each_formatted_dependency(&mut |bound| {
+            let dep = bound.dependency();
+            let key = PackageKey::new(dep.name(), formatter);
+            let Some(ScanOutcome::Vulnerable(dv)) =
+                resolve_scan_outcome(&vulnerabilities, dep, Some(&vuln_key_by_range), &key)
+            else {
+                return;
+            };
+            if !is_requested(package_filter, key.normalized(), formatter) {
+                items.push(skipped_not_requested(bound, &key, ecosystem_id, analysis));
+                return;
+            }
 
-        if !is_requested(package_filter, key.normalized(), formatter) {
-            items.push(skipped_not_requested(
-                dep,
+            let latest = analysis.latest_status.as_ref().and_then(|map| {
+                deps_core::lsp_helpers::resolve_latest_status(
+                    map,
+                    dep,
+                    Some(&vuln_key_by_range),
+                    &key,
+                )
+            });
+
+            items.push(classify_vulnerable_dependency(
+                bound,
+                dv,
+                latest,
                 &key,
-                ecosystem_id,
                 analysis,
-                formatter,
+                ecosystem_id,
+                ignore_rules,
             ));
-            continue;
-        }
-
-        let latest = analysis.latest_status.as_ref().and_then(|map| {
-            deps_core::lsp_helpers::resolve_latest_status(map, dep, Some(&vuln_key_by_range), &key)
         });
-
-        items.push(classify_vulnerable_dependency(
-            dep,
-            dv,
-            latest,
-            &key,
-            analysis,
-            formatter,
-            ecosystem_id,
-            ignore_rules,
-        ));
-    }
 
     UpdatePlan { items }
 }
@@ -235,22 +229,15 @@ pub async fn plan_security_updates(
 /// unit-testable without an `OsvClient`/network dependency (spec 068 S5) — `dv` is taken
 /// pre-resolved rather than re-deriving its `fix_target_status` here.
 #[expect(
-    clippy::too_many_arguments,
-    reason = "issue #1517 added `latest` alongside seven pre-existing parameters; mirrors \
-              `deps-lsp::document::osv_scan::run_osv_fix_target_verification`'s identical \
-              precedent for the same OSV-plumbing reason"
-)]
-#[expect(
     clippy::too_many_lines,
     reason = "one verdict decision tree over advisory and upgrade status"
 )]
 fn classify_vulnerable_dependency(
-    dep: &dyn deps_core::Dependency,
+    bound: &dyn FormattedDependency<'_>,
     dv: &deps_core::osv::DependencyVulnerabilities,
     latest: Option<&deps_core::osv::UpgradeStatus>,
     key: &PackageKey,
     analysis: &ManifestAnalysis,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem_id: deps_core::EcosystemId,
     ignore_rules: &IgnoreRules,
 ) -> PlannedUpdateItem {
@@ -273,7 +260,9 @@ fn classify_vulnerable_dependency(
     // strictly more useful here than it would be worth changing default mode's shared,
     // LSP-facing `current` semantics to match (which FR-001's byte-identical-`deps-lsp`
     // constraint rules out doing casually anyway).
-    let current = security_current(dep, key, analysis, formatter, ecosystem_id);
+    let dep = bound.dependency();
+    let formatter = bound.formatter();
+    let current = security_current(bound, key, analysis, ecosystem_id);
     let ignore_rule_overridden = ignore_override(ignore_rules, key.normalized());
 
     // FR-011: the two-signal, load-bearing `Unfixable` rule — `fetch_and_classify_package`
@@ -319,7 +308,7 @@ fn classify_vulnerable_dependency(
                 formatter,
             ) {
                 let target = deps_core::ConcreteVersion::new(version_native);
-                if formatter.commit_rewrite_for(dep, &target) == CommitRewrite::NoReleaseTag {
+                if bound.commit_rewrite_for(&target) == CommitRewrite::NoReleaseTag {
                     return unfixable_item(
                         dep,
                         current,
@@ -392,13 +381,7 @@ fn classify_vulnerable_dependency(
     // already resolved and verified the fix above via `resolve_verified_fix`, so calling the
     // higher-level `plan_vulnerability_fix` here would re-run that same resolve-and-verify
     // chain a second time per dependency for no reason.
-    match plan_verified_fix(
-        dep,
-        version_range,
-        version_req.as_str(),
-        &version_native,
-        formatter,
-    ) {
+    match bound.plan_verified_fix(version_range, version_req.as_str(), &version_native) {
         // FR-014: `--security-only`'s fix target comes from the advisory, never a
         // GOSSIP-filtered registry `latest` (issue #1521 item 1) — `gossip_excluded_version`
         // and `cooldown_fallback` both stay `None` (PlannedUpdateItem::new's defaults).
@@ -535,27 +518,27 @@ fn sibling_match_note(
 /// — see [`classify_vulnerable_dependency`]'s doc for why this differs from default mode's
 /// [`deps_core::edit::collect_update_candidates`], which never falls back to the declared text.
 fn security_current(
-    dep: &dyn deps_core::Dependency,
+    bound: &dyn FormattedDependency<'_>,
     key: &PackageKey,
     analysis: &ManifestAnalysis,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem_id: deps_core::EcosystemId,
 ) -> CurrentVersion {
-    resolve_in_use_version(
-        dep,
-        key,
-        &analysis.resolved_versions,
-        Some(&analysis.resolved_version_candidates),
-        formatter,
-        ecosystem_id,
-    )
-    .map(CurrentVersion::Resolved)
-    .or_else(|| {
-        dep.version_requirement()
-            .cloned()
-            .map(CurrentVersion::Declared)
-    })
-    .unwrap_or(CurrentVersion::Unknown)
+    bound
+        .resolve_in_use_version(
+            key,
+            &analysis.resolved_versions,
+            Some(&analysis.resolved_version_candidates),
+            ecosystem_id,
+        )
+        .map(CurrentVersion::Resolved)
+        .or_else(|| {
+            bound
+                .dependency()
+                .version_requirement()
+                .cloned()
+                .map(CurrentVersion::Declared)
+        })
+        .unwrap_or(CurrentVersion::Unknown)
 }
 
 /// Whether a `[update].ignore` rule matches this dependency, purely for the FR-008 override
@@ -568,15 +551,14 @@ fn ignore_override(
 }
 
 fn skipped_not_requested(
-    dep: &dyn deps_core::Dependency,
+    bound: &dyn FormattedDependency<'_>,
     key: &PackageKey,
     ecosystem_id: deps_core::EcosystemId,
     analysis: &ManifestAnalysis,
-    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> PlannedUpdateItem {
-    let current = security_current(dep, key, analysis, formatter, ecosystem_id);
+    let current = security_current(bound, key, analysis, ecosystem_id);
     PlannedUpdateItem::new(
-        dep.name().as_str().to_string(),
+        bound.dependency().name().as_str().to_string(),
         current,
         Outcome::Skipped {
             reason: crate::update::SkipReason::NotRequested,
@@ -631,17 +613,17 @@ mod tests {
     use crate::config::IgnoreRule;
     use deps_core::licenses::LicensePolicy;
     use deps_core::lsp_helpers::{
-        DiagnosticMessages, DiagnosticPolicy, MAX_REQUIREMENT_LEN, OsvNaming, PackageNaming,
-        PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
+        DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, MAX_REQUIREMENT_LEN, OsvNaming,
+        PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
     };
     use deps_core::osv::{Advisory, Capped, OsvVersion, UpgradeStatus, VulnSeverity};
     use deps_core::parser::DependencySource;
     use deps_core::position::{Position, Range};
+    use deps_core::test_util::stub_document_with;
     use deps_core::{
         CachedVersionsMap, ConcreteVersion, Dependency, EcosystemId, NormalizedName, PackageName,
-        PackageVersions, RemovalStatus, VersionReq,
+        PackageVersions, ParseResult, RemovalStatus, TypedParseResult, VersionReq,
     };
-    use std::any::Any;
     use std::assert_matches;
     use std::collections::{HashMap, HashSet};
 
@@ -667,9 +649,106 @@ mod tests {
         fn source(&self) -> DependencySource {
             DependencySource::Registry
         }
-        fn as_any(&self) -> &dyn Any {
-            self
+    }
+
+    struct MockParseResult {
+        deps: Vec<MockDep>,
+        uri: url::Url,
+    }
+    impl ParseResult for MockParseResult {
+        fn dependencies(&self) -> Vec<&dyn Dependency> {
+            self.deps.iter().map(|d| d as &dyn Dependency).collect()
         }
+        fn workspace_root(&self) -> Option<&std::path::Path> {
+            None
+        }
+        fn uri(&self) -> &url::Url {
+            &self.uri
+        }
+    }
+    impl TypedParseResult for MockParseResult {
+        type Dep = MockDep;
+
+        fn own_dependencies(&self) -> &[MockDep] {
+            &self.deps
+        }
+    }
+
+    fn mock_parse(dep: MockDep) -> MockParseResult {
+        MockParseResult {
+            deps: vec![dep],
+            uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
+        }
+    }
+
+    /// Runs [`classify_vulnerable_dependency`] over the single dependency of `parse`, bound to
+    /// `formatter` through a stub document (the dependency is only valid inside the visitor).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the argument list of the production function it wraps"
+    )]
+    fn classify<P, F>(
+        parse: P,
+        dv: &deps_core::osv::DependencyVulnerabilities,
+        latest: Option<&deps_core::osv::UpgradeStatus>,
+        key: &PackageKey,
+        analysis: &ManifestAnalysis,
+        formatter: F,
+        ecosystem_id: EcosystemId,
+        ignore_rules: &IgnoreRules,
+    ) -> PlannedUpdateItem
+    where
+        P: TypedParseResult + 'static,
+        F: DependencyFormatter<Dep = P::Dep>,
+    {
+        let document = stub_document_with(parse, formatter, ecosystem_id);
+        let mut item = None;
+        document.for_each_formatted_dependency(&mut |bound| {
+            item = Some(classify_vulnerable_dependency(
+                bound,
+                dv,
+                latest,
+                key,
+                analysis,
+                ecosystem_id,
+                ignore_rules,
+            ));
+        });
+        item.expect("the fixture holds exactly one dependency")
+    }
+
+    /// [`classify`] over an already-built single-dependency document, with no `latest` verdict
+    /// and no ignore rules.
+    fn classify_bound(
+        document: &dyn deps_core::ParsedManifest,
+        dv: &deps_core::osv::DependencyVulnerabilities,
+        analysis: &ManifestAnalysis,
+        package: &str,
+        ecosystem_id: EcosystemId,
+    ) -> PlannedUpdateItem {
+        let key = deps_core::test_util::package_key(package);
+        let mut item = None;
+        document.for_each_formatted_dependency(&mut |bound| {
+            item = Some(classify_vulnerable_dependency(
+                bound,
+                dv,
+                None,
+                &key,
+                analysis,
+                ecosystem_id,
+                &IgnoreRules::empty(),
+            ));
+        });
+        item.expect("the fixture holds exactly one dependency")
+    }
+
+    fn real_cargo_parse(name: &str, req: &str) -> deps_engine::setup::CargoParseResult {
+        let manifest = format!("[dependencies]\n{name} = \"{req}\"\n");
+        deps_engine::setup::parse_cargo_toml(
+            &manifest,
+            &deps_core::test_util::test_uri("/test/Cargo.toml"),
+        )
+        .expect("valid manifest")
     }
 
     fn dep(name: &str, req: &str) -> MockDep {
@@ -724,6 +803,9 @@ mod tests {
     impl DiagnosticMessages for TestFormatter {}
     impl DiagnosticPolicy for TestFormatter {}
     impl SourcePolicy for TestFormatter {}
+    impl DependencyFormatter for TestFormatter {
+        type Dep = MockDep;
+    }
     impl OsvNaming for TestFormatter {
         fn osv_version_to_native(
             &self,
@@ -775,6 +857,9 @@ mod tests {
     impl DiagnosticPolicy for UnsupportedShapeFormatter {}
     impl SourcePolicy for UnsupportedShapeFormatter {}
     impl OsvNaming for UnsupportedShapeFormatter {}
+    impl DependencyFormatter for UnsupportedShapeFormatter {
+        type Dep = MockDep;
+    }
 
     /// A commit-pin formatter (like GitHub Actions/GitLab CI SHA pins): echoes the declared
     /// literal back, has no requirement matcher, and reports a fixed [`CommitRewrite`] verdict.
@@ -802,18 +887,22 @@ mod tests {
         ) -> Option<Box<dyn RequirementMatcher>> {
             None
         }
-        fn commit_rewrite_for(
-            &self,
-            _dep: &dyn deps_core::Dependency,
-            _version: &deps_core::ConcreteVersion,
-        ) -> deps_core::lsp_helpers::CommitRewrite {
-            self.0
-        }
     }
     impl DiagnosticMessages for CommitPinFormatter {}
     impl DiagnosticPolicy for CommitPinFormatter {}
     impl SourcePolicy for CommitPinFormatter {}
     impl OsvNaming for CommitPinFormatter {}
+    impl DependencyFormatter for CommitPinFormatter {
+        type Dep = MockDep;
+
+        fn commit_rewrite_for(
+            &self,
+            _dep: &MockDep,
+            _version: &deps_core::ConcreteVersion,
+        ) -> deps_core::lsp_helpers::CommitRewrite {
+            self.0
+        }
+    }
 
     /// Code review regression (S1 fix): mirrors `NuGetFormatter::bounded_requirement_already_resolves_to`'s
     /// real bare-floor override — the raw matcher mathematically admits the fix (`Some(true)`),
@@ -858,6 +947,9 @@ mod tests {
     impl DiagnosticPolicy for FloorLikeFormatter {}
     impl SourcePolicy for FloorLikeFormatter {}
     impl OsvNaming for FloorLikeFormatter {}
+    impl DependencyFormatter for FloorLikeFormatter {
+        type Dep = MockDep;
+    }
 
     /// A matcher that cannot decide — mirrors `Pep440Matcher::matches` returning `None` when
     /// the compared version fails to parse, rather than a confirmed `Some(false)`.
@@ -904,6 +996,9 @@ mod tests {
     impl DiagnosticPolicy for IndeterminateFormatter {}
     impl SourcePolicy for IndeterminateFormatter {}
     impl OsvNaming for IndeterminateFormatter {}
+    impl DependencyFormatter for IndeterminateFormatter {
+        type Dep = MockDep;
+    }
 
     /// Issue #1578: echoes `current` back unchanged but panics if `compile_bounded_requirement`
     /// is ever called — proves `plan_verified_fix`'s `OversizedRequirement` skip
@@ -940,6 +1035,9 @@ mod tests {
     impl DiagnosticPolicy for PanicsIfCompiledFormatter {}
     impl SourcePolicy for PanicsIfCompiledFormatter {}
     impl OsvNaming for PanicsIfCompiledFormatter {}
+    impl DependencyFormatter for PanicsIfCompiledFormatter {
+        type Dep = MockDep;
+    }
 
     /// A formatter with no `compile_bounded_requirement` override (like GitHub Actions/GitLab CI) —
     /// `plan_vulnerability_fix`'s own textual no-op guard is the only available signal.
@@ -973,7 +1071,9 @@ mod tests {
         fetch_failed: HashSet<NormalizedName>,
     ) -> ManifestAnalysis {
         ManifestAnalysis {
-            parse_result: deps_core::test_util::stub_parse_result_with_dependencies(0),
+            parse_result: deps_core::test_util::stub_document(
+                deps_core::test_util::stub_parse_result(0),
+            ),
             uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
             now: deps_core::PublishTime::now(),
             ecosystem_id: EcosystemId::Cargo,
@@ -1015,13 +1115,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: false,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1062,13 +1162,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: false,
         };
-        classify_vulnerable_dependency(
-            &dep,
+        classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         )
@@ -1111,13 +1211,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: false,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1137,13 +1237,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: false,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1161,13 +1261,13 @@ mod tests {
             requirement_already_admits_fix: true,
             osv_native_differs: false,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1186,13 +1286,13 @@ mod tests {
         let dep = dep("serde", "1.0.2");
         let dv = verified_dv("1.0.2");
         let analysis = test_analysis(cached_with("serde", "1.0.2"), HashSet::new());
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &NO_COMPILE_REQUIREMENT_FORMATTER,
+            NO_COMPILE_REQUIREMENT_FORMATTER.for_dependency::<MockDep>(),
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1209,13 +1309,13 @@ mod tests {
         let dep = dep("foo", ">=1.2, <1.5");
         let dv = verified_dv("1.5.2");
         let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("foo"),
             &analysis,
-            &UnsupportedShapeFormatter,
+            UnsupportedShapeFormatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1254,13 +1354,13 @@ mod tests {
         let dep = dep("foo", "1.5.2");
         let dv = verified_dv("1.5.2");
         let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("foo"),
             &analysis,
-            &FloorLikeFormatter,
+            FloorLikeFormatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1281,13 +1381,13 @@ mod tests {
         let dep = dep("foo", "1.5.2");
         let dv = verified_dv("1.5.2");
         let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("foo"),
             &analysis,
-            &IndeterminateFormatter,
+            IndeterminateFormatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1317,13 +1417,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: false,
         };
-        let rewrite_item = classify_vulnerable_dependency(
-            &rewrite_dep,
+        let rewrite_item = classify(
+            mock_parse(rewrite_dep),
             &rewrite_dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &rewrite_analysis,
-            &rewrite_formatter,
+            rewrite_formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1335,13 +1435,13 @@ mod tests {
             requirement_already_admits_fix: true,
             osv_native_differs: false,
         };
-        let lockfile_item = classify_vulnerable_dependency(
-            &lockfile_dep,
+        let lockfile_item = classify(
+            mock_parse(lockfile_dep),
             &lockfile_dv,
             None,
             &deps_core::test_util::package_key("tokio"),
             &lockfile_analysis,
-            &lockfile_formatter,
+            lockfile_formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1379,13 +1479,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: false,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1406,13 +1506,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: false,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1441,13 +1541,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: false,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1470,13 +1570,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: false,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1496,17 +1596,16 @@ mod tests {
             1,
         ));
         let analysis = test_analysis(cached_with("serde", "1.0.2"), HashSet::new());
-        let formatter = TestFormatter {
-            requirement_already_admits_fix: false,
-            osv_native_differs: false,
-        };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            TestFormatter {
+                requirement_already_admits_fix: false,
+                osv_native_differs: false,
+            },
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1515,7 +1614,7 @@ mod tests {
             Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
         );
         assert!(item.osv_sibling_match.is_none());
-        assert!(sibling_match_note(&dv, &formatter).is_none());
+        assert!(sibling_match_note(&dv, &deps_core::test_util::StubFormatter::DEFAULT).is_none());
     }
 
     /// #1782: a `NoVerifiedFix` row whose verdict holds through sibling tags alone names them.
@@ -1541,13 +1640,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: false,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1581,13 +1680,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: false,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1623,13 +1722,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: false,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1659,13 +1758,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: false,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1709,13 +1808,13 @@ mod tests {
             requirement_already_admits_fix: true,
             osv_native_differs: false,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1753,13 +1852,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: true,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1783,13 +1882,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: false,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1813,13 +1912,13 @@ mod tests {
             }],
             &formatter,
         );
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &ignore_rules,
         );
@@ -1841,13 +1940,13 @@ mod tests {
             requirement_already_admits_fix: false,
             osv_native_differs: false,
         };
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("serde"),
             &analysis,
-            &formatter,
+            formatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1872,16 +1971,15 @@ mod tests {
     /// `1.5.2` is excluded by `">=1.2, <1.5"`.
     #[test]
     fn test_classify_real_cargo_formatter_compound_requirement_confirms_exclusion() {
-        let dep = dep("foo", ">=1.2, <1.5");
         let dv = verified_dv("1.5.2");
         let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            real_cargo_parse("foo", ">=1.2, <1.5"),
             &dv,
             None,
             &deps_core::test_util::package_key("foo"),
             &analysis,
-            &deps_engine::setup::CargoFormatter,
+            deps_engine::setup::CargoFormatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1901,13 +1999,13 @@ mod tests {
         let dep = dep("foo", "0.9");
         let dv = verified_dv("1.5.2");
         let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("foo"),
             &analysis,
-            &CommitPinFormatter(deps_core::lsp_helpers::CommitRewrite::NoReleaseTag),
+            CommitPinFormatter(deps_core::lsp_helpers::CommitRewrite::NoReleaseTag),
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1929,13 +2027,13 @@ mod tests {
         let dep = dep("foo", "0.9");
         let dv = verified_dv("1.5.2");
         let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("foo"),
             &analysis,
-            &CommitPinFormatter(deps_core::lsp_helpers::CommitRewrite::IndexUnavailable),
+            CommitPinFormatter(deps_core::lsp_helpers::CommitRewrite::IndexUnavailable),
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -1969,18 +2067,23 @@ mod tests {
         if let Some(index) = index {
             tag_index.insert(PackageName::new("owner/action"), std::sync::Arc::new(index));
         }
-        let formatter = GithubActionsFormatter::new(tag_index);
-
-        let dependencies = deps_core::ParseResult::dependencies(&parse_result);
-        let dep = *dependencies.first().expect("one dependency");
-        let vuln_keys = deps_core::osv::vulnerability_keys(
-            &parse_result,
-            &HashMap::new(),
-            None,
-            &formatter,
+        let formatter = GithubActionsFormatter::new(std::sync::Arc::clone(&tag_index));
+        let document = stub_document_with(
+            parse_result,
+            GithubActionsFormatter::new(tag_index),
             EcosystemId::GithubActions,
         );
-        let key = deps_core::osv::vuln_key_for(dep, Some(&vuln_keys), &formatter);
+
+        let vuln_keys = document.vulnerability_keys(&HashMap::new(), None);
+        let mut key = None;
+        document.for_each_formatted_dependency(&mut |bound| {
+            key = Some(deps_core::osv::vuln_key_for(
+                bound.dependency(),
+                Some(&vuln_keys),
+                bound.formatter(),
+            ));
+        });
+        let key = key.expect("one dependency");
         let dv = deps_core::osv::DependencyVulnerabilities::new(Capped::new(
             vec![advisory("GHSA-aaaa-bbbb-cccc", fix)],
             1,
@@ -1989,17 +2092,15 @@ mod tests {
         vulnerabilities.insert(key.clone(), ScanOutcome::Vulnerable(dv.clone()));
 
         let (targets, _skipped) = deps_engine::classify::osv::build_scan_targets(
-            &parse_result,
+            document.as_ref(),
             &HashMap::new(),
             &HashMap::new(),
-            &formatter,
             EcosystemId::GithubActions,
         );
         let osv_name_by_key = deps_engine::classify::osv::osv_name_by_key(&targets);
         let candidate_tags = deps_engine::classify::osv::candidate_tag_sources(
-            &parse_result,
+            document.as_ref(),
             &vuln_keys,
-            &formatter,
             EcosystemId::GithubActions,
         );
         let (resolved, _live) = deps_engine::classify::osv::collect_fix_target_resolutions(
@@ -2017,15 +2118,12 @@ mod tests {
         );
 
         let analysis = test_analysis(cached_with("owner/action", "v1.2.0"), HashSet::new());
-        classify_vulnerable_dependency(
-            dep,
+        classify_bound(
+            document.as_ref(),
             &dv,
-            None,
-            &deps_core::test_util::package_key("owner/action"),
             &analysis,
-            &formatter,
+            "owner/action",
             EcosystemId::GithubActions,
-            &IgnoreRules::empty(),
         )
     }
 
@@ -2092,21 +2190,19 @@ mod tests {
         ]);
         let tag_index = std::sync::Arc::new(deps_engine::setup::RepositoryIndexes::default());
         tag_index.insert(PackageName::new("owner/action"), std::sync::Arc::new(index));
-        let formatter = GithubActionsFormatter::new(tag_index);
-
-        let dependencies = deps_core::ParseResult::dependencies(&parse_result);
-        let dep = *dependencies.first().expect("one dependency");
+        let document = stub_document_with(
+            parse_result,
+            GithubActionsFormatter::new(tag_index),
+            EcosystemId::GithubActions,
+        );
         let dv = verified_dv("v1.2.0");
         let analysis = test_analysis(cached_with("owner/action", "v1.2.0"), HashSet::new());
-        let item = classify_vulnerable_dependency(
-            dep,
+        let item = classify_bound(
+            document.as_ref(),
             &dv,
-            None,
-            &deps_core::test_util::package_key("owner/action"),
             &analysis,
-            &formatter,
+            "owner/action",
             EcosystemId::GithubActions,
-            &IgnoreRules::empty(),
         );
         assert_matches!(
                 &item.outcome,
@@ -2127,13 +2223,13 @@ mod tests {
         let dep = dep("foo", &oversized_req);
         let dv = verified_dv("1.5.2");
         let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            mock_parse(dep),
             &dv,
             None,
             &deps_core::test_util::package_key("foo"),
             &analysis,
-            &PanicsIfCompiledFormatter,
+            PanicsIfCompiledFormatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
@@ -2170,16 +2266,15 @@ mod tests {
         let requirement = format!("{head}{padding}{tail}");
         assert_eq!(requirement.len(), MAX_REQUIREMENT_LEN);
 
-        let dep = dep("foo", &requirement);
         let dv = verified_dv("1.5.2");
         let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
-        let item = classify_vulnerable_dependency(
-            &dep,
+        let item = classify(
+            real_cargo_parse("foo", &requirement),
             &dv,
             None,
             &deps_core::test_util::package_key("foo"),
             &analysis,
-            &deps_engine::setup::CargoFormatter,
+            deps_engine::setup::CargoFormatter,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );

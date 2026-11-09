@@ -2,16 +2,14 @@
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
-use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
-};
-use std::any::Any;
+use deps_core::{EcosystemBase, Registry, Result, TypedEcosystem};
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, Range};
 use url::Url;
 
 use crate::formatter::BundlerFormatter;
+use crate::parser::BundlerParseResult;
 use crate::registry::RubyGemsRegistry;
 
 /// Leading version-constraint operators stripped from a completion prefix before matching
@@ -74,7 +72,7 @@ impl BundlerEcosystem {
 
 impl deps_core::ecosystem::private::Sealed for BundlerEcosystem {}
 
-impl Ecosystem for BundlerEcosystem {
+impl EcosystemBase for BundlerEcosystem {
     fn ecosystem_id(&self) -> deps_core::EcosystemId {
         deps_core::EcosystemId::Bundler
     }
@@ -91,17 +89,6 @@ impl Ecosystem for BundlerEcosystem {
         &["Gemfile.lock"]
     }
 
-    fn parse_manifest<'a>(
-        &'a self,
-        content: &'a str,
-        uri: &'a Url,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
-        Box::pin(async move {
-            let result = crate::parser::parse_gemfile(content, uri)?;
-            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
-        })
-    }
-
     fn registry(&self) -> Arc<dyn Registry> {
         self.registry.clone() as Arc<dyn Registry>
     }
@@ -110,14 +97,33 @@ impl Ecosystem for BundlerEcosystem {
         Some(Arc::new(crate::lockfile::GemfileLockParser))
     }
 
-    fn formatter(&self) -> &dyn EcosystemFormatter {
+    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+        let name = metadata.name();
+        let latest = metadata.latest_version().as_str();
+        Some(format!("gem \"{}\", \"~> {latest}\"", name.as_str()))
+    }
+}
+
+impl TypedEcosystem for BundlerEcosystem {
+    type Parsed = BundlerParseResult;
+    type Formatter = BundlerFormatter;
+
+    fn own_formatter(&self) -> &BundlerFormatter {
         &self.formatter
+    }
+
+    fn parse<'a>(
+        &'a self,
+        content: &'a str,
+        uri: &'a Url,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<BundlerParseResult>> {
+        Box::pin(async move { crate::parser::parse_gemfile(content, uri) })
     }
 
     #[cfg(feature = "lsp-responses")]
     fn complete_package_name<'a>(
         &'a self,
-        _request: deps_core::completion::CompletionRequest<'a>,
+        _request: deps_core::completion::CompletionRequest<'a, BundlerParseResult>,
         prefix: String,
         range: Range,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
@@ -128,21 +134,12 @@ impl Ecosystem for BundlerEcosystem {
     fn version_operator_chars(&self) -> &'static [char] {
         VERSION_OPERATOR_CHARS
     }
-
-    fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
-        let name = metadata.name();
-        let latest = metadata.latest_version().as_str();
-        Some(format!("gem \"{}\", \"~> {latest}\"", name.as_str()))
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::any::Any;
 
     /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against Bundler's REAL
     /// formatter and a real `EcosystemReparse`. `format_version_for_text_edit` writes a bare
@@ -150,7 +147,8 @@ mod tests {
     /// auto-following range — FR-025's rule is unconditional, one assertion suffices.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_pins_writable_bare_exact_rendering() {
-        let ecosystem = BundlerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem: Arc<dyn deps_core::Ecosystem> =
+            Arc::new(BundlerEcosystem::new(Arc::new(deps_core::HttpCache::new())));
         let content = "gem \"pkg\", \"1.0.0\"\n".to_string();
         let uri = deps_core::test_util::test_uri("/test/Gemfile");
         let verdict = deps_core::test_util::fallback_edit_outcome(
@@ -176,7 +174,8 @@ mod tests {
     /// 1.5.0.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback() {
-        let ecosystem = BundlerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem: Arc<dyn deps_core::Ecosystem> =
+            Arc::new(BundlerEcosystem::new(Arc::new(deps_core::HttpCache::new())));
         let content = "gem \"pkg\", \">= 1.0\", \"!= 1.5.0\", \"< 2.0\"\n".to_string();
         let uri = deps_core::test_util::test_uri("/test/Gemfile");
         let verdict = deps_core::test_util::fallback_edit_outcome(
@@ -203,7 +202,8 @@ mod tests {
     /// `RubygemsMatcher::explicitly_excludes` asks the `!=` constraint directly.
     #[tokio::test]
     async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback_vacuous_case() {
-        let ecosystem = BundlerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let ecosystem: Arc<dyn deps_core::Ecosystem> =
+            Arc::new(BundlerEcosystem::new(Arc::new(deps_core::HttpCache::new())));
         let content = "gem \"pkg\", \">= 1.0\", \"!= 1.5.0\", \"< 2.0\"\n".to_string();
         let uri = deps_core::test_util::test_uri("/test/Gemfile");
         let verdict = deps_core::test_util::fallback_edit_outcome(
@@ -272,8 +272,8 @@ gem 'rails', '~> 7.0'";
         let path = "/test/Gemfile";
         let uri = Url::from_file_path(path).unwrap();
 
-        let result = ecosystem.parse_manifest(gemfile, &uri).await.unwrap();
-        assert_eq!(result.dependencies().len(), 1);
+        let result = ecosystem.parse(gemfile, &uri).await.unwrap();
+        assert_eq!(result.dependencies.len(), 1);
     }
 
     /// A Gemfile has no delimited dependencies section — `gem "name"` calls are valid
@@ -333,6 +333,7 @@ gem 'rails', '~> 7.0'";
     #[cfg(feature = "lsp-responses")]
     mod lsp_tests {
         use super::*;
+        use deps_core::{Dependency, ParsedView};
         use std::assert_matches;
 
         use tower_lsp_server::ls_types::Position;
@@ -398,14 +399,11 @@ gem 'rails', '~> 7.0'";
             let content = "source 'https://rubygems.org'\ngem 'rails', '~> 7.0'";
             let uri = deps_core::test_util::test_uri("/test/Gemfile");
 
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
             let position = Position::new(1, 7); // cursor after "ra" in "rails"
 
-            let context = deps_core::completion::detect_completion_context(
-                parse_result.as_ref(),
-                position,
-                content,
-            );
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
 
             match context {
                 deps_core::completion::CompletionContext::PackageName { prefix, range } => {
@@ -426,22 +424,19 @@ gem 'rails', '~> 7.0'";
             let ecosystem = BundlerEcosystem::new(cache);
             let content = "gem 'r'";
             let uri = deps_core::test_util::test_uri("/test/Gemfile");
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-            let position: Position = parse_result.dependencies()[0].name_range().end.into();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
+            let position: Position = parse_result.dependencies[0].name_range.end.into();
             let freshness = deps_core::FreshnessSettings::default();
 
-            let context = deps_core::completion::detect_completion_context(
-                parse_result.as_ref(),
-                position,
-                content,
-            );
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
             let deps_core::completion::CompletionContext::PackageName { prefix, range } = context
             else {
                 panic!("expected PackageName context, got {context:?}");
             };
             let direct = ecosystem.complete_package_names(&prefix, range).await;
             let via_dispatch = ecosystem
-                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             assert_eq!(via_dispatch.items, direct);
             assert!(direct.is_empty());
@@ -453,10 +448,10 @@ gem 'rails', '~> 7.0'";
             let ecosystem = BundlerEcosystem::new(cache);
             let content = "source \"https://rubygems.org\"\n";
             let uri = deps_core::test_util::test_uri("/test/Gemfile");
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
             let result = ecosystem
-                .generate_completions(
-                    parse_result.as_ref(),
+                .completions(
+                    ParsedView::new(&parse_result),
                     Position::new(0, 0),
                     content,
                     deps_core::FreshnessSettings::default(),
@@ -493,27 +488,24 @@ gem 'rails', '~> 7.0'";
             let ecosystem = BundlerEcosystem::with_registry_for_test(registry);
             let content = "gem \"this-gem-does-not-exist-12345\", \"~> 1.0\"";
             let uri = deps_core::test_util::test_uri("/test/Gemfile");
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-            let position: Position = parse_result.dependencies()[0]
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
+            let position: Position = parse_result.dependencies[0]
                 .version_range()
                 .unwrap()
                 .start
                 .into();
             let freshness = deps_core::FreshnessSettings::default();
 
-            let context = deps_core::completion::detect_completion_context(
-                parse_result.as_ref(),
-                position,
-                content,
-            );
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
             let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
                 panic!("expected Version context, got {context:?}");
             };
             let direct = ecosystem
-                .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
+                .complete_versions(&parse_result, position, &prefix, freshness)
                 .await;
             let via_dispatch = ecosystem
-                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             mock.assert_async().await;
             assert_eq!(via_dispatch.items, direct);
@@ -532,27 +524,24 @@ gem 'rails', '~> 7.0'";
             let ecosystem = BundlerEcosystem::new(cache);
             let content = "gem \"rails\", \"~> 7.0\"";
             let uri = deps_core::test_util::test_uri("/test/Gemfile");
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-            let position: Position = parse_result.dependencies()[0]
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
+            let position: Position = parse_result.dependencies[0]
                 .version_range()
                 .unwrap()
                 .start
                 .into();
             let freshness = deps_core::FreshnessSettings::default();
 
-            let context = deps_core::completion::detect_completion_context(
-                parse_result.as_ref(),
-                position,
-                content,
-            );
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
             let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
                 panic!("expected Version context, got {context:?}");
             };
             let direct = ecosystem
-                .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
+                .complete_versions(&parse_result, position, &prefix, freshness)
                 .await;
             let via_dispatch = ecosystem
-                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
             assert_eq!(via_dispatch.items, direct);
             assert!(!direct.is_empty());
@@ -584,8 +573,8 @@ gem 'rails', '~> 7.0'";
             let ecosystem = BundlerEcosystem::with_registry_for_test(registry);
             let content = "gem \"rails\", \">= 5.0\", \"< 6.0\"";
             let uri = deps_core::test_util::test_uri("/test/Gemfile");
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-            let dep = &parse_result.dependencies()[0];
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
+            let dep = &parse_result.dependencies[0];
             assert_eq!(
                 dep.version_requirement().map(deps_core::VersionReq::as_str),
                 Some(">= 5.0, < 6.0"),
@@ -597,7 +586,13 @@ gem 'rails', '~> 7.0'";
             let versions = deps_core::VersionData::new(&cached_versions, &resolved_versions);
 
             let actions = ecosystem
-                .generate_code_actions(parse_result.as_ref(), position, &uri, versions, content)
+                .code_actions(
+                    ParsedView::new(&parse_result),
+                    position,
+                    &uri,
+                    versions,
+                    content,
+                )
                 .await;
 
             mock.assert_async().await;
@@ -630,8 +625,8 @@ gem 'rails', '~> 7.0'";
             let ecosystem = BundlerEcosystem::with_registry_for_test(registry);
             let content = "gem \"rails\", '>= 5.0', \"< 6.0\"";
             let uri = deps_core::test_util::test_uri("/test/Gemfile");
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-            let dep = &parse_result.dependencies()[0];
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
+            let dep = &parse_result.dependencies[0];
             assert_eq!(
                 dep.version_requirement().map(deps_core::VersionReq::as_str),
                 Some(">= 5.0, < 6.0"),
@@ -643,7 +638,13 @@ gem 'rails', '~> 7.0'";
             let versions = deps_core::VersionData::new(&cached_versions, &resolved_versions);
 
             let actions = ecosystem
-                .generate_code_actions(parse_result.as_ref(), position, &uri, versions, content)
+                .code_actions(
+                    ParsedView::new(&parse_result),
+                    position,
+                    &uri,
+                    versions,
+                    content,
+                )
                 .await;
 
             mock.assert_async().await;
@@ -682,19 +683,16 @@ gem 'rails', '~> 7.0'";
             let ecosystem = BundlerEcosystem::with_registry_for_test(registry);
             let content = "gem \"rails\", \">= 5.0\", \"< 6.0\"";
             let uri = deps_core::test_util::test_uri("/test/Gemfile");
-            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-            let dep = &parse_result.dependencies()[0];
+            let parse_result = ecosystem.parse(content, &uri).await.unwrap();
+            let dep = &parse_result.dependencies[0];
             // Cursor at the very start of the multi-literal span (empty prefix — no candidate
             // filtered out), the same span
             // `test_parse_multi_constraint_version_range_collapses_to_single_pin` (parser.rs)
             // proves covers the raw `>= 5.0', '< 6.0` text.
             let position: Position = dep.version_range().unwrap().start.into();
 
-            let context = deps_core::completion::detect_completion_context(
-                parse_result.as_ref(),
-                position,
-                content,
-            );
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
             assert_matches!(
                 context,
                 deps_core::completion::CompletionContext::Version { .. },
@@ -704,7 +702,7 @@ gem 'rails', '~> 7.0'";
 
             let freshness = deps_core::FreshnessSettings::default();
             let completions = ecosystem
-                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .completions(ParsedView::new(&parse_result), position, content, freshness)
                 .await;
 
             mock.assert_async().await;

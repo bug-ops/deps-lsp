@@ -1677,28 +1677,19 @@ impl Backend {
             return;
         }
 
-        let Some(ecosystem) = self.state.ecosystem_registry.get(doc.ecosystem) else {
-            tracing::warn!("Unknown ecosystem for {:?}", uri);
-            drop(doc);
-            self.warn_update_all_outdated_not_ready().await;
-            return;
-        };
-
-        let Some(parse_result) = doc.parse_result() else {
+        let Some(manifest) = doc.manifest() else {
             tracing::warn!("No parse result for {:?}", uri);
             drop(doc);
             self.warn_update_all_outdated_not_ready().await;
             return;
         };
 
-        let edits = deps_core::collect_update_all_edits(
-            parse_result,
+        let edits = manifest.collect_update_all_edits(
             &doc.content,
             deps_core::VersionData::new(
                 &doc.signals.cached_versions,
                 &doc.signals.resolved_versions,
             ),
-            ecosystem.formatter(),
         );
         let version = doc.version;
         drop(doc);
@@ -1786,7 +1777,7 @@ impl Backend {
     /// `deps-lsp.pinAllToSha` (issue #633, generalized cross-ecosystem in #640) — the
     /// bulk counterpart of [`Self::execute_update_all_outdated`], sharing its readiness
     /// contract (see that method's doc comment) but sourcing edits from
-    /// [`deps_core::Ecosystem::collect_pin_all_to_sha_edits`] instead of
+    /// [`deps_core::ParsedManifest::collect_pin_all_to_sha_edits`] instead of
     /// `deps_core::collect_update_all_edits`. Dispatched through the resolved
     /// `Arc<dyn Ecosystem>` for every document's own ecosystem — an ecosystem with no
     /// mutable-ref pin concept simply returns no edits from the trait default, taking
@@ -1811,7 +1802,7 @@ impl Backend {
             return;
         };
 
-        let Some(parse_result) = doc.parse_result() else {
+        let Some(manifest) = doc.manifest() else {
             tracing::warn!("No parse result for {:?}", uri);
             drop(doc);
             self.warn_update_all_outdated_not_ready().await;
@@ -1822,7 +1813,7 @@ impl Backend {
             &doc.signals.cached_versions,
             &doc.signals.resolved_versions,
         );
-        let edits = ecosystem.collect_pin_all_to_sha_edits(parse_result, versions);
+        let edits = manifest.collect_pin_all_to_sha_edits(versions);
         let version = doc.version;
         drop(doc);
 
@@ -2562,7 +2553,10 @@ mod tests {
             .get(EcosystemId::Npm)
             .unwrap();
         let content = r#"{"dependencies": {"@acme-corp/secretpkg": "^1.0.0"}}"#.to_string();
-        let parse = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let parse = Arc::clone(&ecosystem)
+            .parse_manifest(&content, &url)
+            .await
+            .unwrap();
         let mut doc = DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse);
         doc.set_version(Some(1));
         doc.update_cached_versions(HashMap::from([(
@@ -2639,7 +2633,7 @@ let package = Package(
 )
 "#
         .to_string();
-        let parse = ecosystem
+        let parse = Arc::clone(&ecosystem)
             .parse_manifest(&content, &manifest_url)
             .await
             .unwrap();
@@ -2720,7 +2714,10 @@ let package = Package(
         let open = async |path: &str| {
             let url = deps_core::test_util::test_uri(path);
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let parse = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let parse = Arc::clone(&ecosystem)
+                .parse_manifest(&content, &url)
+                .await
+                .unwrap();
             let mut doc =
                 DocumentState::new_from_parse_result(EcosystemId::Swift, content.clone(), parse);
             doc.set_version(Some(1));
@@ -3139,7 +3136,7 @@ let package = Package(
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
         for (uri, content) in [(&small_uri, &small_content), (&large_uri, &large_content)] {
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(
                     content,
                     &crate::lsp_types_interop::from_lsp_uri(uri).unwrap(),
@@ -3240,7 +3237,7 @@ let package = Package(
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
         for (uri, content) in [(&alpha_uri, &alpha_content), (&beta_uri, &beta_content)] {
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(
                     content,
                     &crate::lsp_types_interop::from_lsp_uri(uri).unwrap(),
@@ -3346,7 +3343,7 @@ let package = Package(
             .ecosystem_registry
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
-        let parse_result = ecosystem
+        let parse_result = Arc::clone(&ecosystem)
             .parse_manifest(
                 &content,
                 &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
@@ -3427,7 +3424,7 @@ let package = Package(
             .ecosystem_registry
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
-        let parse_result = ecosystem
+        let parse_result = Arc::clone(&ecosystem)
             .parse_manifest(
                 &content,
                 &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
@@ -3519,7 +3516,7 @@ let package = Package(
             .ecosystem_registry
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
-        let parse_result = ecosystem
+        let parse_result = Arc::clone(&ecosystem)
             .parse_manifest(
                 &content,
                 &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
@@ -3606,7 +3603,7 @@ let package = Package(
             .ecosystem_registry
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
-        let parse_result = ecosystem
+        let parse_result = Arc::clone(&ecosystem)
             .parse_manifest(
                 &content,
                 &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
@@ -3691,7 +3688,7 @@ let package = Package(
             .ecosystem_registry
             .get(EcosystemId::Dart)
             .unwrap();
-        let parse_result = ecosystem
+        let parse_result = Arc::clone(&ecosystem)
             .parse_manifest(
                 &content,
                 &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
@@ -3979,14 +3976,14 @@ let package = Package(
                 "999 must clamp to the least-severe defined variant"
             );
 
-            let parse_result = deps_core::test_util::stub_parse_result_with_dependencies(1);
+            let parse_result = deps_core::test_util::stub_parse_result(1);
             let cached_versions = std::collections::HashMap::new();
             let resolved_versions = std::collections::HashMap::new();
             let diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
-                parse_result.as_ref(),
+                &parse_result,
                 deps_core::VersionData::new(&cached_versions, &resolved_versions),
                 &deps_core::test_util::StubFormatter::DEFAULT,
-                parse_result.uri(),
+                deps_core::ParseResult::uri(&parse_result),
                 deps_core::FreshnessSettings::default(),
                 config.policy.diagnostics.to_severities(),
                 deps_core::PublishTime::now(),
@@ -5034,7 +5031,10 @@ let package = Package(
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let parse_result = Arc::clone(&ecosystem)
+                .parse_manifest(&content, &url)
+                .await
+                .unwrap();
             let doc_state =
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             backend.state.update_document(uri.clone(), doc_state);
@@ -5320,7 +5320,7 @@ let package = Package(
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(
                     &content,
                     &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
@@ -5368,7 +5368,7 @@ let package = Package(
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(
                     &content,
                     &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
@@ -5405,7 +5405,7 @@ let package = Package(
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(
                     &content,
                     &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
@@ -5476,7 +5476,7 @@ let package = Package(
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &canonical_url)
                 .await
                 .unwrap();
@@ -5491,13 +5491,12 @@ let package = Package(
             // `assert_eq!` on the message text, just with a less informative diff).
             let empty_resolved = HashMap::new();
             assert_eq!(
-                deps_core::collect_update_all_edits(
-                    parse_result.as_ref(),
-                    &content,
-                    deps_core::VersionData::new(&cached, &empty_resolved),
-                    ecosystem.formatter(),
-                )
-                .len(),
+                parse_result
+                    .collect_update_all_edits(
+                        &content,
+                        deps_core::VersionData::new(&cached, &empty_resolved),
+                    )
+                    .len(),
                 1,
                 "fixture must have exactly one outdated, safely-editable dependency for \
                  this to test the apply-edit path, not the no-outdated-dependencies refusal"
@@ -5582,7 +5581,7 @@ let package = Package(
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(
                     &content,
                     &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
@@ -5709,19 +5708,13 @@ let package = Package(
         /// discriminating precondition (issue #633 critic S2: `execute_command` returns
         /// `Ok(None)` on every path, including every refusal branch, so asserting only
         /// `result.is_ok()` cannot tell "applied N edits" apart from "silently refused").
-        /// Calls the trait method directly on `&dyn Ecosystem` (#640) — no downcast, since
+        /// Calls the trait method directly on `&dyn ParsedManifest` (#640) — no downcast, since
         /// `collect_pin_all_to_sha_edits` is generic across every ecosystem now.
-        fn gha_edit_count(
-            ecosystem: &dyn deps_core::Ecosystem,
-            parse_result: &dyn deps_core::ParseResult,
-        ) -> usize {
+        fn gha_edit_count(manifest: &dyn deps_core::ParsedManifest) -> usize {
             let cached = std::collections::HashMap::new();
             let resolved = std::collections::HashMap::new();
-            ecosystem
-                .collect_pin_all_to_sha_edits(
-                    parse_result,
-                    deps_core::VersionData::new(&cached, &resolved),
-                )
+            manifest
+                .collect_pin_all_to_sha_edits(deps_core::VersionData::new(&cached, &resolved))
                 .len()
         }
 
@@ -5761,7 +5754,7 @@ let package = Package(
                 .get(deps_core::EcosystemId::GithubActions)
                 .unwrap();
             let content = "steps:\n  - uses: actions/checkout@v4\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(
                     &content,
                     &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
@@ -5808,7 +5801,7 @@ let package = Package(
                 .get(deps_core::EcosystemId::GithubActions)
                 .unwrap();
             let content = "steps:\n  - uses: actions/checkout@v4\n";
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(
                     content,
                     &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
@@ -5846,7 +5839,7 @@ let package = Package(
                 .ecosystem_registry
                 .get(deps_core::EcosystemId::GithubActions)
                 .unwrap();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(
                     content,
                     &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
@@ -5856,7 +5849,7 @@ let package = Package(
             // Pin the precondition the refusal actually depends on: a genuine `TagIndex`
             // cache miss, not e.g. a wrong downcast or an empty method body.
             assert_eq!(
-                gha_edit_count(ecosystem.as_ref(), parse_result.as_ref()),
+                gha_edit_count(parse_result.as_ref()),
                 0,
                 "fixture must have zero resolvable edits for this to test the no-op path"
             );
@@ -5895,7 +5888,7 @@ let package = Package(
                 "v4",
                 &"a".repeat(40),
             );
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(
                     content,
                     &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
@@ -5907,7 +5900,7 @@ let package = Package(
             // this, the test below cannot distinguish "applied 1 edit" from "refused,
             // showed an info message" (both return `Ok(None)`, critic S2).
             assert_eq!(
-                gha_edit_count(ecosystem.as_ref(), parse_result.as_ref()),
+                gha_edit_count(parse_result.as_ref()),
                 1,
                 "fixture must have exactly one resolvable edit for this to test the \
                  apply-edit path, not the no-resolvable-step refusal"
@@ -5976,12 +5969,12 @@ let package = Package(
                 "v4",
                 &"a".repeat(40),
             );
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(content, &canonical_url)
                 .await
                 .unwrap();
             assert_eq!(
-                gha_edit_count(ecosystem.as_ref(), parse_result.as_ref()),
+                gha_edit_count(parse_result.as_ref()),
                 1,
                 "fixture must have exactly one resolvable edit for this to test the \
                  apply-edit path, not the no-resolvable-step refusal"
@@ -6052,7 +6045,7 @@ let package = Package(
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
         let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-        let parse_result = ecosystem
+        let parse_result = Arc::clone(&ecosystem)
             .parse_manifest(
                 &content,
                 &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
@@ -6120,7 +6113,7 @@ let package = Package(
             .as_any()
             .downcast_ref::<deps_gitlab_ci::GitlabCiRegistry>()
             .expect("gitlab-ci ecosystem must back onto a GitlabCiRegistry");
-        let parse_result = ecosystem
+        let parse_result = Arc::clone(&ecosystem)
             .parse_manifest(
                 content,
                 &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
@@ -6146,9 +6139,7 @@ let package = Package(
         let empty_resolved = std::collections::HashMap::new();
         let versions = deps_core::VersionData::new(&empty_cached, &empty_resolved);
         assert_eq!(
-            ecosystem
-                .collect_pin_all_to_sha_edits(parse_result.as_ref(), versions)
-                .len(),
+            parse_result.collect_pin_all_to_sha_edits(versions).len(),
             1,
             "fixture must have exactly one resolvable edit for this to test the \
              apply-edit path, not an empty-edits no-op"

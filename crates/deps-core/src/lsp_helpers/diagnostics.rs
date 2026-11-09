@@ -17,13 +17,14 @@ use crate::{
     BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, DepsDevClient,
     EcosystemId, FetchCompleteness, FetchFailure, NormalizedName, PackageKey, PackageName,
     ParseResult, PublishTime, RegistryOccurrence, RejectedRegistryOccurrence, RemovalStatus,
-    TyposquatSignal, VersionReq, format_relative_age,
+    TypedParseResult, TyposquatSignal, VersionReq, format_relative_age,
 };
 
 use super::{
-    CooldownBlocker, CooldownDisposition, DiagnosticMessages, EcosystemFormatter, LatestVerdict,
-    LookupMiss, PackageVersions, RequirementGate, RequirementMatcher, RequirementStatus,
-    VersionData, cooldown_disposition, resolve_scan_outcome, version_range_is_synthetic_empty,
+    CooldownBlocker, CooldownDisposition, DependencyFormatter, DependencyGate, DiagnosticMessages,
+    EcosystemFormatter, LatestVerdict, LookupMiss, PackageVersions, RequirementMatcher,
+    RequirementStatus, VersionData, cooldown_disposition, resolve_scan_outcome,
+    version_range_is_synthetic_empty,
 };
 
 /// Stable [`Diagnostic::code`] set on the unsatisfiable-requirement diagnostic.
@@ -410,7 +411,7 @@ pub const DEPRECATED_DIAGNOSTIC_CODE: &str = "deprecated-package";
 /// Diagnostic severity levels for the four per-dependency issue categories.
 ///
 /// Threaded from `DiagnosticsConfig` (`deps-lsp`) through
-/// [`crate::Ecosystem::generate_diagnostics`] into [`generate_diagnostics_from_cache`].
+/// [`crate::ParsedManifest::generate_diagnostics`] into [`generate_diagnostics_from_cache`].
 ///
 /// Since this type is `#[non_exhaustive]`, `deps_lsp::config::DiagnosticsConfig::to_severities`
 /// builds one via [`Self::new`] plus a `with_*` chain rather than a struct literal — adding a
@@ -1131,16 +1132,20 @@ fn requirement_matches_only_yanked(
 ///   parameter rather than read internally via `PublishTime::now()` (issue #227 M4) so
 ///   callers can pin an exact cooldown-boundary instant deterministically in tests, and
 ///   so every dependency in one document is aged against the same instant.
-pub fn generate_diagnostics_from_cache(
-    parse_result: &dyn ParseResult,
+pub fn generate_diagnostics_from_cache<P, F>(
+    parse_result: &P,
     versions: VersionData<'_>,
-    formatter: &dyn EcosystemFormatter,
+    formatter: &F,
     uri: &url::Url,
     freshness: crate::freshness::FreshnessSettings,
     severities: DiagnosticSeverities,
     now: PublishTime,
-) -> Vec<Diagnostic> {
-    let deps = parse_result.dependencies();
+) -> Vec<Diagnostic>
+where
+    P: TypedParseResult,
+    F: DependencyFormatter<Dep = P::Dep>,
+{
+    let deps = parse_result.own_dependencies();
     let mut diagnostics = Vec::with_capacity(deps.len());
     // Buffered separately (#479) so 2+ near-identical fetch failures collapse into one
     // diagnostic while still naming every dependency and keeping any `Actionable` hint (#478/#485).
@@ -1163,15 +1168,15 @@ pub fn generate_diagnostics_from_cache(
     // twice for the same dependency (#1392 code-review finding 4). A synthetic `name_range()`
     // has no real document position and every rule anchors on it (critic S1, #905), so those
     // dependencies are dropped here rather than skipped in each consumer.
-    let keyed_deps: Vec<(&dyn Dependency, PackageKey)> = deps
+    let keyed_deps: Vec<(&P::Dep, PackageKey)> = deps
         .iter()
         .filter(|dep| !dep.name_range_is_synthetic())
-        .map(|dep| (*dep, PackageKey::new(dep.name(), formatter)))
+        .map(|dep| (dep, PackageKey::new(dep.name(), formatter)))
         .collect();
 
     dependency_ceiling_notice(&mut diagnostics, parse_result);
     invalid_minimum_stability_notice(&mut diagnostics, parse_result);
-    offline_notice(&mut diagnostics, versions, &deps);
+    offline_notice(&mut diagnostics, versions, deps);
     skip_reason_notice(
         &mut diagnostics,
         &keyed_deps,
@@ -1179,7 +1184,7 @@ pub fn generate_diagnostics_from_cache(
         uri,
         vuln_keys.as_ref(),
     );
-    blocked_and_rejected_registry_diagnostics(&mut diagnostics, parse_result, &deps);
+    blocked_and_rejected_registry_diagnostics(&mut diagnostics, parse_result, deps);
 
     let suppression = versions
         .suppression
@@ -1222,10 +1227,10 @@ pub fn generate_diagnostics_from_cache(
 ///
 /// Returns the dependency's resolved OSV finding (`None` when clean/skipped/unchecked) so the
 /// caller can classify advisory diagnostics when applying user suppression rules.
-fn apply_dependency_rules<'a>(
+fn apply_dependency_rules<'a, F: DependencyFormatter>(
     diagnostics: &mut Vec<Diagnostic>,
     fetch_failed: &mut Vec<FetchFailureEntry>,
-    ctx: &RuleContext<'a>,
+    ctx: &RuleContext<'a, F>,
     vuln_keys: Option<&crate::osv::VulnKeys>,
 ) -> Option<&'a crate::osv::DependencyVulnerabilities> {
     let dep = ctx.dep;
@@ -1277,13 +1282,13 @@ fn apply_dependency_rules<'a>(
 /// no rule can read state a later refactor forgot to pass it). `VersionData<'a>`,
 /// [`crate::freshness::FreshnessSettings`], and [`PublishTime`] are all `Copy`, so
 /// `RuleContext` is held by value.
-struct RuleContext<'a> {
-    dep: &'a dyn Dependency,
+struct RuleContext<'a, F: DependencyFormatter> {
+    dep: &'a F::Dep,
     /// Both spellings of `dep`'s name, computed once per dependency because five rules key
     /// their lookups on it.
     key: &'a PackageKey,
     versions: VersionData<'a>,
-    formatter: &'a dyn EcosystemFormatter,
+    formatter: &'a F,
     severities: DiagnosticSeverities,
     /// Whether an "outdated" diagnostic's message should differentiate a release
     /// still within its cooldown window (issue #227 §4.3). Read only by
@@ -1294,7 +1299,7 @@ struct RuleContext<'a> {
     now: PublishTime,
 }
 
-impl<'a> RuleContext<'a> {
+impl<'a, F: DependencyFormatter> RuleContext<'a, F> {
     /// The registry cache entry for this dependency, tried under the normalized name
     /// first and the declared name second. `None` routes the dependency into the
     /// unknown-package family (R5) and ends its evaluation.
@@ -1442,10 +1447,10 @@ fn invalid_minimum_stability_notice(
 /// Emits: at most one [`Severity::Information`] at `Position(0,0)`, appended
 /// first so it always precedes every other diagnostic in the returned `Vec`.
 /// Suppressed by: nothing. Suppresses: R5b (see [`apply_unknown_package_rule`]).
-fn offline_notice(
+fn offline_notice<D: Dependency>(
     diagnostics: &mut Vec<Diagnostic>,
     versions: VersionData<'_>,
-    deps: &[&dyn Dependency],
+    deps: &[D],
 ) {
     if versions.network.is_offline() && !deps.is_empty() {
         diagnostics.push(
@@ -1535,9 +1540,9 @@ const fn should_notify_in_diagnostics(reason: SkipReason) -> bool {
 /// (an allocating call) never runs twice for the same dependency.
 /// Emits: at most one [`Severity::Information`] at `Position(0,0)`, appended right after
 /// [`offline_notice`] so both file-level R0 notices stay adjacent.
-fn skip_reason_notice(
+fn skip_reason_notice<D: Dependency>(
     diagnostics: &mut Vec<Diagnostic>,
-    keyed_deps: &[(&dyn Dependency, PackageKey)],
+    keyed_deps: &[(&D, PackageKey)],
     versions: VersionData<'_>,
     uri: &url::Url,
     vuln_keys: Option<&crate::osv::VulnKeys>,
@@ -1670,10 +1675,10 @@ fn skip_reason_notice(
 /// would silently collapse to one diagnostic, leaving every dependency routed through the
 /// second declaration with no diagnostic at all — see [`ParseResult::blocked_registries`]'s
 /// own doc for why the key must identify the declaration, never the value.
-fn blocked_and_rejected_registry_diagnostics(
+fn blocked_and_rejected_registry_diagnostics<D: Dependency>(
     diagnostics: &mut Vec<Diagnostic>,
     parse_result: &dyn ParseResult,
-    deps: &[&dyn Dependency],
+    deps: &[D],
 ) {
     let blocked = parse_result.blocked_registries();
     let rejected = parse_result.rejected_registries();
@@ -1903,9 +1908,9 @@ fn push_collapsed_registry_diagnostics<O: RegistryOccurrence>(
 /// dependency is clean/skipped/unchecked) so the orchestrator can thread it into R7's
 /// [`flagged_latest_duplicates_vulnerability_finding`] (issue #1532 code-review finding 3)
 /// instead of that function re-running the identical [`resolve_scan_outcome`] lookup.
-fn apply_vulnerability_rule<'a>(
+fn apply_vulnerability_rule<'a, F: DependencyFormatter>(
     diagnostics: &mut Vec<Diagnostic>,
-    ctx: &RuleContext<'a>,
+    ctx: &RuleContext<'a, F>,
     vuln_keys: Option<&crate::osv::VulnKeys>,
 ) -> Option<&'a crate::osv::DependencyVulnerabilities> {
     let vulnerabilities = ctx.versions.vulnerabilities?;
@@ -1955,7 +1960,10 @@ fn apply_vulnerability_rule<'a>(
 /// what else on the POM wasn't recognized — dropping entries can only ever *miss* a
 /// denial, never fabricate one.
 /// Suppresses: nothing.
-fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'_>) {
+fn apply_license_policy_rule<F: DependencyFormatter>(
+    diagnostics: &mut Vec<Diagnostic>,
+    ctx: &RuleContext<'_, F>,
+) {
     let Some(policy) = ctx.versions.license_policy else {
         return;
     };
@@ -2003,7 +2011,7 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
 /// Reads `ctx.versions.typosquat_prefetch`, a background pre-fetch
 /// (`deps-lsp::document::typosquat::run_typosquat_prefetch`) merged into `VersionData`
 /// before this pipeline runs — see that field's doc for why this lives directly inside
-/// [`generate_diagnostics_from_cache`] rather than behind `Ecosystem::generate_diagnostics`'s
+/// [`generate_diagnostics_from_cache`] rather than behind `ParsedManifest::generate_diagnostics`'s
 /// default impl (issue #1437 security-review finding: an ecosystem override that calls
 /// this function directly, as `deps-npm`'s catalog-diagnostics override does, must not be
 /// able to bypass the typosquat signal, exactly the same "picked up automatically by every
@@ -2022,7 +2030,10 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
 /// rendering that now-stale hint for a since-privatized dependency; this check is free (no
 /// network call, just re-derives from the dependency's current, already-parsed source).
 /// Suppresses: nothing.
-fn apply_typosquat_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'_>) {
+fn apply_typosquat_rule<F: DependencyFormatter>(
+    diagnostics: &mut Vec<Diagnostic>,
+    ctx: &RuleContext<'_, F>,
+) {
     let Some(signal) = ctx
         .versions
         .typosquat_prefetch
@@ -2091,7 +2102,7 @@ pub struct TyposquatFetchOutcome {
 /// task that merges the result into `deps-lsp`'s own `DocumentState::signals.typosquats` map,
 /// from which [`VersionData::typosquat_prefetch`] is populated synchronously before
 /// [`generate_diagnostics_from_cache`] runs — see that field's doc for the full picture and
-/// why this design (not an inline await behind `Ecosystem::generate_diagnostics`) is also
+/// why this design (not an inline await behind `ParsedManifest::generate_diagnostics`) is also
 /// what makes the signal automatically reach every ecosystem's `generate_diagnostics`
 /// override, not just ecosystems that remember to opt in. `pub`, not `pub(crate)`: called
 /// from outside this crate (`deps-lsp`).
@@ -2253,7 +2264,10 @@ pub async fn force_refresh_gossip_findings(
 /// Suppresses: R4 conditionally (D5, see [`apply_in_use_yanked_rule`]), R6b
 /// conditionally (#437, see [`apply_yanked_only_rule`]) — both read only this rule's
 /// return value (presence), never its content.
-fn apply_deprecation_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'_>) -> bool {
+fn apply_deprecation_rule<F: DependencyFormatter>(
+    diagnostics: &mut Vec<Diagnostic>,
+    ctx: &RuleContext<'_, F>,
+) -> bool {
     let deprecation = ctx
         .formatter
         .can_resolve_source(&ctx.dep.source())
@@ -2330,9 +2344,9 @@ fn apply_deprecation_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'
 /// Returns whether a diagnostic was actually **pushed** — never `true` for a
 /// D5-suppressed finding, and never merely "a #263 entry existed". [`apply_yanked_only_rule`]
 /// reads this as its dedup gate.
-fn apply_in_use_yanked_rule(
+fn apply_in_use_yanked_rule<F: DependencyFormatter>(
     diagnostics: &mut Vec<Diagnostic>,
-    ctx: &RuleContext<'_>,
+    ctx: &RuleContext<'_, F>,
     deprecation_found: bool,
 ) -> bool {
     let deprecation_suppresses_yanked = deprecation_found
@@ -2427,10 +2441,10 @@ fn apply_in_use_yanked_rule(
 /// 7. `Ok(())` + `can_resolve_source` -> R5d `Unknown package '{name}'`.
 /// 8. `Ok(())` -> nothing (#248: unresolvable source, absent cache entry means "never
 ///    fetched").
-fn apply_unknown_package_rule(
+fn apply_unknown_package_rule<F: DependencyFormatter>(
     diagnostics: &mut Vec<Diagnostic>,
     fetch_failed: &mut Vec<FetchFailureEntry>,
-    ctx: &RuleContext<'_>,
+    ctx: &RuleContext<'_, F>,
 ) {
     let dep = ctx.dep;
     let in_lockfile = ctx.versions.is_resolved(ctx.key);
@@ -2547,9 +2561,9 @@ fn apply_unknown_package_rule(
 /// the orchestrator's `version_range` guard *before* this rule runs, not an effect of
 /// this rule running — so it is `RuleFlow::Stop` alone, not `version_range`'s
 /// existence, that skips R6b and R7 here.
-fn apply_unsatisfiable_rule(
+fn apply_unsatisfiable_rule<F: DependencyFormatter>(
     diagnostics: &mut Vec<Diagnostic>,
-    ctx: &RuleContext<'_>,
+    ctx: &RuleContext<'_, F>,
     resolved: &ResolvedData<'_>,
 ) -> RuleFlow {
     let dep = ctx.dep;
@@ -2636,9 +2650,9 @@ fn apply_unsatisfiable_rule(
 /// Suppressed by: the three gates above.
 /// Suppresses: R7 (`RuleFlow::Stop`) — the deliberate asymmetry with R4, which never
 /// stops the pipeline (see `test_yanked_only_match_suppresses_outdated_diagnostic`).
-fn apply_yanked_only_rule(
+fn apply_yanked_only_rule<F: DependencyFormatter>(
     diagnostics: &mut Vec<Diagnostic>,
-    ctx: &RuleContext<'_>,
+    ctx: &RuleContext<'_, F>,
     resolved: &ResolvedData<'_>,
     prior: YankedOnlyPrior,
 ) -> RuleFlow {
@@ -2719,9 +2733,9 @@ fn apply_yanked_only_rule(
 /// wording of a diagnostic that was already firing regardless. See
 /// [`push_flagged_latest_admitted_by_requirement`]'s own doc for the narrower,
 /// persistent-check-failure case it still surfaces (issue #1533).
-fn push_flagged_latest_admitted_by_requirement(
+fn push_flagged_latest_admitted_by_requirement<F: DependencyFormatter>(
     diagnostics: &mut Vec<Diagnostic>,
-    ctx: &RuleContext<'_>,
+    ctx: &RuleContext<'_, F>,
     resolved: &ResolvedData<'_>,
     vuln_keys: Option<&crate::osv::VulnKeys>,
     latest: &str,
@@ -2806,8 +2820,8 @@ fn push_flagged_latest_admitted_by_requirement(
 /// severity against, this returns `false` — the diagnostic still fires, matching this rule's
 /// pre-#1532 behavior, rather than risk hiding or downgrading a real finding on an unprovable
 /// guess.
-fn flagged_latest_duplicates_vulnerability_finding(
-    ctx: &RuleContext<'_>,
+fn flagged_latest_duplicates_vulnerability_finding<F: DependencyFormatter>(
+    ctx: &RuleContext<'_, F>,
     latest: &str,
     would_be_severity: Severity,
     vulnerable_in_use: Option<&crate::osv::DependencyVulnerabilities>,
@@ -2897,9 +2911,9 @@ fn push_unverified_latest_check_failed(
     );
 }
 
-fn apply_outdated_rule(
+fn apply_outdated_rule<F: DependencyFormatter>(
     diagnostics: &mut Vec<Diagnostic>,
-    ctx: &RuleContext<'_>,
+    ctx: &RuleContext<'_, F>,
     resolved: &ResolvedData<'_>,
     vuln_keys: Option<&crate::osv::VulnKeys>,
     vulnerable_in_use: Option<&crate::osv::DependencyVulnerabilities>,
@@ -3690,7 +3704,7 @@ mod tests {
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
-            &formatter,
+            &formatter.for_dependency(),
             parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -3708,32 +3722,31 @@ mod tests {
     }
 
     /// #796: a manifest whose dependency count was truncated by
-    /// `deps_core::dependency_cap::cap_dependencies` gets one file-level informational
+    /// `deps_core::ParsedManifest` gets one file-level informational
     /// diagnostic naming the ceiling, and `generate_diagnostics_from_cache` only ever
     /// evaluates the retained (capped) subset.
     #[test]
     fn test_generate_diagnostics_from_cache_reports_dependency_ceiling_truncation() {
-        let formatter = MOCK_FORMATTER;
-        let inner = crate::test_util::stub_parse_result_with_dependencies(12);
-        let parse_result = crate::dependency_cap::cap_dependencies(inner, 10);
+        use crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT as CAP;
+
+        let parse_result =
+            crate::test_util::stub_document(crate::test_util::stub_parse_result(CAP + 2));
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
 
-        let diagnostics = generate_diagnostics_from_cache(
-            parse_result.as_ref(),
+        let diagnostics = futures::FutureExt::now_or_never(parse_result.generate_diagnostics(
             VersionData::new(&cached_versions, &resolved_versions),
-            &formatter,
             parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
-            PublishTime::now(),
-        );
+        ))
+        .expect("stub diagnostics are ready immediately");
 
         assert_eq!(
             parse_result.dependencies().len(),
-            10,
-            "generate_diagnostics_from_cache must only ever see the capped 10 dependencies"
+            CAP,
+            "generate_diagnostics_from_cache must only ever see the capped dependencies"
         );
 
         let ceiling_diagnostics: Vec<_> = diagnostics
@@ -3749,29 +3762,29 @@ mod tests {
             1,
             "expected exactly one dependency-ceiling diagnostic, got: {diagnostics:?}"
         );
-        assert!(ceiling_diagnostics[0].message().contains("12"));
-        assert!(ceiling_diagnostics[0].message().contains("10"));
+        assert!(
+            ceiling_diagnostics[0]
+                .message()
+                .contains(&(CAP + 2).to_string())
+        );
+        assert!(ceiling_diagnostics[0].message().contains(&CAP.to_string()));
     }
 
     /// A document under the ceiling must never get a ceiling notice.
     #[test]
     fn test_generate_diagnostics_from_cache_no_ceiling_notice_under_the_limit() {
-        let formatter = MOCK_FORMATTER;
-        let inner = crate::test_util::stub_parse_result_with_dependencies(3);
-        let parse_result = crate::dependency_cap::cap_dependencies(inner, 10);
+        let parse_result = crate::test_util::stub_document(crate::test_util::stub_parse_result(3));
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
 
-        let diagnostics = generate_diagnostics_from_cache(
-            parse_result.as_ref(),
+        let diagnostics = futures::FutureExt::now_or_never(parse_result.generate_diagnostics(
             VersionData::new(&cached_versions, &resolved_versions),
-            &formatter,
             parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
-            PublishTime::now(),
-        );
+        ))
+        .expect("stub diagnostics are ready immediately");
 
         assert!(
             !diagnostics.iter().any(|d| d
@@ -3807,8 +3820,12 @@ mod tests {
             fn invalid_minimum_stability(&self) -> Option<InvalidStabilityOccurrence> {
                 Some(self.invalid.clone())
             }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
+        }
+
+        impl crate::TypedParseResult for InvalidStabilityParseResult {
+            type Dep = MockDep;
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.deps
             }
         }
 
@@ -3886,8 +3903,12 @@ mod tests {
             fn invalid_minimum_stability(&self) -> Option<InvalidStabilityOccurrence> {
                 Some(self.invalid.clone())
             }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
+        }
+
+        impl crate::TypedParseResult for InvalidStabilityParseResult {
+            type Dep = MockDep;
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.deps
             }
         }
 
@@ -4003,7 +4024,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_outcomes(&outcomes)
                 .with_network(network),
-            &MOCK_FORMATTER,
+            &MOCK_FORMATTER.for_dependency(),
             parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities {
@@ -4178,8 +4199,12 @@ mod tests {
             fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
                 self.blocked.clone()
             }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
+        }
+
+        impl crate::TypedParseResult for BlockedRegistryParseResult {
+            type Dep = MockDep;
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.deps
             }
         }
 
@@ -4532,8 +4557,12 @@ mod tests {
             fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
                 self.blocked.clone()
             }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
+        }
+
+        impl crate::TypedParseResult for BlockedRegistryParseResult {
+            type Dep = MockDep;
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.deps
             }
         }
 
@@ -4686,8 +4715,12 @@ mod tests {
             fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
                 self.blocked.clone()
             }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
+        }
+
+        impl crate::TypedParseResult for BlockedRegistryParseResult {
+            type Dep = MockDep;
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.deps
             }
         }
 
@@ -4782,8 +4815,12 @@ mod tests {
             fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
                 self.blocked.clone()
             }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
+        }
+
+        impl crate::TypedParseResult for BlockedRegistryParseResult {
+            type Dep = MockDep;
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.deps
             }
         }
 
@@ -4922,8 +4959,12 @@ mod tests {
             fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
                 self.blocked.clone()
             }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
+        }
+
+        impl crate::TypedParseResult for BlockedRegistryParseResult {
+            type Dep = MockDep;
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.deps
             }
         }
 
@@ -5014,8 +5055,12 @@ mod tests {
             fn rejected_registries(&self) -> Vec<RejectedRegistryOccurrence> {
                 self.rejected.clone()
             }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
+        }
+
+        impl crate::TypedParseResult for RejectedRegistryParseResult {
+            type Dep = MockDep;
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.deps
             }
         }
 
@@ -5178,8 +5223,12 @@ mod tests {
             fn rejected_registries(&self) -> Vec<RejectedRegistryOccurrence> {
                 self.rejected.clone()
             }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
+        }
+
+        impl crate::TypedParseResult for RejectedRegistryParseResult {
+            type Dep = MockDep;
+            fn own_dependencies(&self) -> &[MockDep] {
+                &self.deps
             }
         }
 
@@ -5285,6 +5334,10 @@ mod tests {
         impl DiagnosticPolicy for AlwaysUnsatisfiable {}
         impl SourcePolicy for AlwaysUnsatisfiable {}
         impl OsvNaming for AlwaysUnsatisfiable {}
+
+        impl DependencyFormatter for AlwaysUnsatisfiable {
+            type Dep = MockDep;
+        }
 
         let mut cached_versions = HashMap::new();
         cached_versions.insert(
@@ -6782,7 +6835,7 @@ mod tests {
     /// #1884: diagnostics for one lock-file-resolved dependency whose registry fetch ended in
     /// `failure` (or had no recorded outcome), rendered with `formatter`.
     fn lockfile_dep_diagnostics(
-        formatter: &dyn EcosystemFormatter,
+        formatter: &impl DependencyFormatter<Dep = MockDep>,
         failure: Option<FetchFailure>,
     ) -> Vec<Diagnostic> {
         use crate::position::{Position, Range};
@@ -8980,7 +9033,7 @@ mod tests {
             let diagnostics = generate_diagnostics_from_cache(
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
-                &MOCK_FORMATTER,
+                &MOCK_FORMATTER.for_dependency(),
                 parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
@@ -9045,7 +9098,7 @@ mod tests {
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
-            &formatter,
+            &formatter.for_dependency(),
             parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -9089,7 +9142,7 @@ mod tests {
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
-            &formatter,
+            &formatter.for_dependency(),
             parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -9463,6 +9516,10 @@ mod tests {
         impl SourcePolicy for CountingFormatter {}
         impl OsvNaming for CountingFormatter {}
 
+        impl DependencyFormatter for CountingFormatter {
+            type Dep = MockDep;
+        }
+
         let cached_versions = {
             let mut m = HashMap::new();
             m.insert(
@@ -9561,7 +9618,7 @@ mod tests {
             let diagnostics = generate_diagnostics_from_cache(
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions),
-                &ExactMatchFormatter,
+                &NonRegistryExactFormatter,
                 parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
@@ -9621,7 +9678,7 @@ mod tests {
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
-            &MOCK_FORMATTER,
+            &MOCK_FORMATTER.for_dependency(),
             parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -9680,7 +9737,7 @@ mod tests {
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
-            &RejectingFormatter,
+            &NonRegistryRejectingFormatter,
             parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -9720,7 +9777,7 @@ mod tests {
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
-            &MOCK_FORMATTER,
+            &MOCK_FORMATTER.for_dependency(),
             parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -11131,21 +11188,32 @@ mod tests {
 
         /// Same shape as `requirement_is_unsatisfiable_tests::TableFormatter`:
         /// `compile_bounded_requirement` only opts in for the literal requirement string `"modelled"`.
-        struct TableFormatter {
+        struct TableFormatter<D = MockDep> {
             decide: Decide,
+            dependency: std::marker::PhantomData<fn() -> D>,
         }
 
         impl TableFormatter {
             fn new(decide: impl Fn(&str) -> Option<bool> + Send + Sync + 'static) -> Self {
                 Self {
                     decide: Arc::new(decide),
+                    dependency: std::marker::PhantomData,
                 }
             }
         }
 
-        impl PackageNaming for TableFormatter {}
+        impl<D> TableFormatter<D> {
+            fn retyped<E>(self) -> TableFormatter<E> {
+                TableFormatter {
+                    decide: self.decide,
+                    dependency: std::marker::PhantomData,
+                }
+            }
+        }
 
-        impl PackageRendering for TableFormatter {
+        impl<D> PackageNaming for TableFormatter<D> {}
+
+        impl<D> PackageRendering for TableFormatter<D> {
             fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
@@ -11155,7 +11223,7 @@ mod tests {
             }
         }
 
-        impl RequirementResolution for TableFormatter {
+        impl<D> RequirementResolution for TableFormatter<D> {
             fn bounded_requirement_is_unresolved(
                 &self,
                 requirement: BoundedVersionReq<'_>,
@@ -11175,13 +11243,17 @@ mod tests {
             }
         }
 
-        impl DiagnosticMessages for TableFormatter {}
+        impl<D> DiagnosticMessages for TableFormatter<D> {}
 
-        impl DiagnosticPolicy for TableFormatter {}
+        impl<D> DiagnosticPolicy for TableFormatter<D> {}
 
-        impl SourcePolicy for TableFormatter {}
+        impl<D> SourcePolicy for TableFormatter<D> {}
 
-        impl OsvNaming for TableFormatter {}
+        impl<D> OsvNaming for TableFormatter<D> {}
+
+        impl<D: Dependency + 'static> DependencyFormatter for TableFormatter<D> {
+            type Dep = D;
+        }
 
         fn versions(strs: &[&str]) -> Vec<ConcreteVersion> {
             strs.iter().map(|s| (*s).into()).collect()
@@ -11869,7 +11941,7 @@ mod tests {
         /// `test_generate_diagnostics_unsatisfiable_skipped_for_non_registry_sources`).
         #[test]
         fn test_yanked_only_match_skipped_for_non_registry_sources() {
-            let formatter = TableFormatter::new(|v| Some(v == "1.2.1"));
+            let formatter = TableFormatter::new(|v| Some(v == "1.2.1")).retyped::<NonRegistryDep>();
             let uri = crate::test_util::test_uri("/test/Cargo.toml");
 
             let mut cached_versions = HashMap::new();
@@ -12739,9 +12811,6 @@ mod tests {
                     rev: None,
                 }
             }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
         }
 
         #[test]
@@ -12854,7 +12923,7 @@ mod tests {
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions)
                     .with_typosquat_prefetch(&typosquat),
-                &formatter,
+                &formatter.for_dependency(),
                 parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),

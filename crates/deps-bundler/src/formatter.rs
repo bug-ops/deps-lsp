@@ -1,15 +1,15 @@
 //! Version formatting for Bundler ecosystem.
 
+use crate::types::BundlerDependency;
 use crate::version::{compare_versions, is_valid_rubygems_version, version_matches_requirement};
 use deps_core::ConcreteVersion;
-use deps_core::Dependency;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OperatorGrammar, OsvNaming,
-    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget,
-    SourcePolicy, compile_requirement_unless, requirement_contains_template_placeholder,
-    requirement_is_compound,
+    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OperatorGrammar,
+    OsvNaming, PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution,
+    RewriteTarget, SourcePolicy, compile_requirement_unless,
+    requirement_contains_template_placeholder, requirement_is_compound,
 };
 
 /// Whether every character of `name` is in RubyGems' gem-name charset
@@ -268,9 +268,19 @@ impl PackageRendering for BundlerFormatter {
         crate::registry::gem_url(name.as_str())
     }
 
+    /// A bare version is an exact pin in RubyGems, the narrowest rendering for the fallback
+    /// retry (#1892).
+    fn format_version_exact_pin(&self, version: &ConcreteVersion) -> Option<String> {
+        Some(self.format_version_for_text_edit(version))
+    }
+}
+
+impl DependencyFormatter for BundlerFormatter {
+    type Dep = BundlerDependency;
+
     /// #1366 impl-critic S2: a multi-constraint requirement whose constraints were written
     /// with inconsistent quote characters (see `literal_span_has_mixed_quote_styles`) echoes
-    /// [`Dependency::version_literal`] back unchanged instead of collapsing to a bare
+    /// [`BundlerDependency::version_literal`] back unchanged instead of collapsing to a bare
     /// replacement version — this is a genuine text-shape concern (which quote characters
     /// bound the replaced span), not a placeholder-safety one, so it stays here rather than
     /// moving to [`RequirementResolution::bounded_requirement_is_placeholder`] (#1391: the former
@@ -287,11 +297,11 @@ impl PackageRendering for BundlerFormatter {
     /// produce a corrupting replacement despite the mixed-quote guard firing.
     fn format_version_replacing_for(
         &self,
-        dep: &dyn Dependency,
+        dep: &BundlerDependency,
         version: &ConcreteVersion,
         current: &str,
     ) -> String {
-        let literal_target = dep.version_literal().unwrap_or(current);
+        let literal_target = dep.version_literal.as_deref().unwrap_or(current);
         if literal_span_has_mixed_quote_styles(literal_target) {
             return literal_target.to_string();
         }
@@ -302,21 +312,15 @@ impl PackageRendering for BundlerFormatter {
     /// (`~> 2.0` -> `~> 2.9.1`), so the rewritten range never admits releases below the target.
     fn format_version_replacing_floor_for(
         &self,
-        dep: &dyn Dependency,
+        dep: &BundlerDependency,
         version: &ConcreteVersion,
         current: &str,
     ) -> String {
-        let literal_target = dep.version_literal().unwrap_or(current);
+        let literal_target = dep.version_literal.as_deref().unwrap_or(current);
         if literal_span_has_mixed_quote_styles(literal_target) {
             return literal_target.to_string();
         }
         render_bundler_requirement(version, current, RewriteTarget::Floor)
-    }
-
-    /// A bare version is an exact pin in RubyGems, the narrowest rendering for the fallback
-    /// retry (#1892).
-    fn format_version_exact_pin(&self, version: &ConcreteVersion) -> Option<String> {
-        Some(self.format_version_for_text_edit(version))
     }
 }
 
@@ -955,7 +959,7 @@ mod tests {
     /// `generate_code_actions`/`deps-cli` call graph, not defense-in-depth only.
     #[test]
     fn test_plan_vulnerability_fix_unresolved_interpolation_is_not_rewritten() {
-        use deps_core::ParseResult;
+        use deps_core::Dependency;
         use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
@@ -964,8 +968,7 @@ mod tests {
         let gemfile = r#"gem "rails", "~> #{RAILS_VERSION}""#;
         let uri = deps_core::test_util::test_uri("/test/Gemfile");
         let result = crate::parser::parse_gemfile(gemfile, &uri).expect("valid gemfile");
-        let deps = result.dependencies();
-        let dep = deps.first().expect("one dependency parsed");
+        let dep = result.dependencies.first().expect("one dependency parsed");
         let current = dep
             .version_requirement()
             .expect("parser preserves the raw interpolated requirement text")
@@ -987,7 +990,7 @@ mod tests {
             });
 
         let planned = plan_vulnerability_fix(
-            *dep,
+            dep,
             deps_core::position::Range::default(),
             current,
             &dv,
@@ -1016,7 +1019,7 @@ mod tests {
     /// syntactically valid, single-argument `gem` call behind (not a stray second literal).
     #[test]
     fn test_plan_vulnerability_fix_multi_constraint_collapses_to_single_pin() {
-        use deps_core::ParseResult;
+        use deps_core::Dependency;
         use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
@@ -1025,8 +1028,7 @@ mod tests {
         let gemfile = "gem \"rails\", \">= 5.0\", \"< 6.0\"";
         let uri = deps_core::test_util::test_uri("/test/Gemfile");
         let result = crate::parser::parse_gemfile(gemfile, &uri).expect("valid gemfile");
-        let deps = result.dependencies();
-        let dep = deps.first().expect("one dependency parsed");
+        let dep = result.dependencies.first().expect("one dependency parsed");
         let current = dep
             .version_requirement()
             .expect("multi-constraint requirement preserved")
@@ -1049,7 +1051,7 @@ mod tests {
             });
 
         let planned = plan_vulnerability_fix(
-            *dep,
+            dep,
             version_range,
             current,
             &dv,
@@ -1074,7 +1076,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_multi_constraint_later_unresolved_interpolation_is_not_rewritten()
      {
-        use deps_core::ParseResult;
+        use deps_core::Dependency;
         use deps_core::edit::{FixTargetContext, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
@@ -1083,8 +1085,7 @@ mod tests {
         let gemfile = "gem \"rails\", \"~> 1.0\", \"< #{RAILS_MAX}\"";
         let uri = deps_core::test_util::test_uri("/test/Gemfile");
         let result = crate::parser::parse_gemfile(gemfile, &uri).expect("valid gemfile");
-        let deps = result.dependencies();
-        let dep = deps.first().expect("one dependency parsed");
+        let dep = result.dependencies.first().expect("one dependency parsed");
         let current = dep
             .version_requirement()
             .expect("multi-constraint requirement preserved, interpolation included")
@@ -1106,7 +1107,7 @@ mod tests {
             });
 
         let planned = plan_vulnerability_fix(
-            *dep,
+            dep,
             deps_core::position::Range::default(),
             current,
             &dv,
@@ -1145,7 +1146,7 @@ mod tests {
     /// above, which only exercises Ruby's native `#{...}` interpolation.
     #[test]
     fn test_plan_vulnerability_fix_generic_placeholder_through_real_parser_is_not_rewritten() {
-        use deps_core::ParseResult;
+        use deps_core::Dependency;
         use deps_core::edit::{FixTargetContext, VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
@@ -1154,8 +1155,7 @@ mod tests {
         let gemfile = r#"gem "sinatra", "1.0.0.<%= s %>""#;
         let uri = deps_core::test_util::test_uri("/test/Gemfile");
         let result = crate::parser::parse_gemfile(gemfile, &uri).expect("valid gemfile");
-        let deps = result.dependencies();
-        let dep = deps.first().expect("one dependency parsed");
+        let dep = result.dependencies.first().expect("one dependency parsed");
         let current = dep
             .version_requirement()
             .expect("parser preserves the raw templated requirement text")
@@ -1177,7 +1177,7 @@ mod tests {
             });
 
         let planned = plan_vulnerability_fix(
-            *dep,
+            dep,
             deps_core::position::Range::default(),
             current,
             &dv,

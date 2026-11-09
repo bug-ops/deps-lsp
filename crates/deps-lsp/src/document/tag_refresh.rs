@@ -2,7 +2,7 @@
 //!
 //! A floating tag pin (`@v4`) is rescanned after a registry fetch only for the document whose
 //! fetch refreshed the tag index. An ecosystem that exposes
-//! [`Ecosystem::refresh_events`] emits the repository name on every refresh, from any
+//! [`deps_core::EcosystemBase::refresh_events`] emits the repository name on every refresh, from any
 //! source (lifecycle fetch, completion), and the listener here, for every other open document
 //! that uses that repository, re-evaluates the OSV scan-plan predicate
 //! ([`rescan_osv_if_tag_index_now_warm`], which applies the vulnerability/offline gate itself)
@@ -466,11 +466,24 @@ mod tests {
     }
 
     async fn open_document(state: &ServerState, path: &str, content: &str) -> Uri {
+        let ecosystem: Arc<dyn Ecosystem> = Arc::new(
+            deps_github_actions::GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new())),
+        );
+        open_document_with(state, &ecosystem, path, content).await
+    }
+
+    async fn open_document_with(
+        state: &ServerState,
+        ecosystem: &Arc<dyn Ecosystem>,
+        path: &str,
+        content: &str,
+    ) -> Uri {
         let url = deps_core::test_util::test_uri(path);
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-        let ecosystem =
-            deps_github_actions::GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));
-        let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+        let parse_result = Arc::clone(ecosystem)
+            .parse_manifest(content, &url)
+            .await
+            .unwrap();
         state.update_document(
             uri.clone(),
             DocumentState::new_from_parse_result(
@@ -551,7 +564,10 @@ mod tests {
         let ecosystem =
             deps_gitlab_ci::GitlabCiEcosystem::new(Arc::new(deps_core::HttpCache::new()));
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n    file: a.yml\n";
-        let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+        let parse_result = Arc::new(ecosystem)
+            .parse_manifest(content, &url)
+            .await
+            .unwrap();
         let project = parse_result.dependencies()[0].name().clone();
         state.update_document(
             uri.clone(),
@@ -875,8 +891,9 @@ mod tests {
         );
 
         let sha = "f".repeat(40);
-        let uri = open_document(
+        let uri = open_document_with(
             &state,
+            &ecosystem,
             "/repo/.github/workflows/ci.yml",
             &format!("steps:\n  - uses: actions/checkout@{sha} # v1\n"),
         )

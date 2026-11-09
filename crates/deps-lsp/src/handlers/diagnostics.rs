@@ -505,7 +505,7 @@ pub(crate) async fn generate_diagnostics_internal(
             return None;
         }
 
-        let parse_result = doc.parse_result_arc()?;
+        let manifest = doc.manifest_arc()?;
         // Issue #1437 security review N1 (impl-critic extended scope) / issue #1456 spec
         // 072's identical rationale for GOSSIP: a live `did_change_configuration` disabling
         // either feature, or a transition to offline, must stop rendering a previously-
@@ -531,13 +531,13 @@ pub(crate) async fn generate_diagnostics_internal(
             .with_typosquat_prefetch(typosquat_visibility)
             .with_gossip_prefetch(gossip_visibility)
             .finish();
-        Some((ecosystem, doc.ecosystem, parse_result, signals))
+        Some((ecosystem, doc.ecosystem, manifest, signals))
     }) else {
         tracing::warn!("Document not found for diagnostics: {:?}", uri);
         return vec![];
     };
 
-    let Some((ecosystem, ecosystem_id, parse_result, signals)) = extracted else {
+    let Some((ecosystem, ecosystem_id, manifest, signals)) = extracted else {
         return vec![];
     };
 
@@ -559,14 +559,8 @@ pub(crate) async fn generate_diagnostics_internal(
         .with_license_policy(&snapshot.license_policy)
         .with_suppression(&snapshot.suppression);
 
-    let domain_diagnostics = ecosystem
-        .generate_diagnostics(
-            parse_result.as_ref(),
-            version_data,
-            &domain_uri,
-            freshness,
-            severities,
-        )
+    let domain_diagnostics = manifest
+        .generate_diagnostics(version_data, &domain_uri, freshness, severities)
         .await;
     domain_diagnostics
         .into_iter()
@@ -794,7 +788,7 @@ mod tests {
             .get(deps_core::EcosystemId::Npm)
             .unwrap();
         let content = r#"{"dependencies": {"crossenv": "1.0.0"}}"#.to_string();
-        let parse_result = ecosystem
+        let parse_result = Arc::clone(&ecosystem)
             .parse_manifest(&content, &url)
             .await
             .expect("Failed to parse manifest");
@@ -872,7 +866,7 @@ mod tests {
             .get(deps_core::EcosystemId::Npm)
             .unwrap();
         let content = r#"{"dependencies": {"crossenv": "1.0.0"}}"#.to_string();
-        let parse_result = ecosystem
+        let parse_result = Arc::clone(&ecosystem)
             .parse_manifest(&content, &url)
             .await
             .expect("Failed to parse manifest");
@@ -936,7 +930,7 @@ mod tests {
             .get(deps_core::EcosystemId::Npm)
             .unwrap();
         let content = r#"{"dependencies": {"crossenv": "1.0.0"}}"#.to_string();
-        let parse_result = ecosystem
+        let parse_result = Arc::clone(&ecosystem)
             .parse_manifest(&content, &url)
             .await
             .expect("Failed to parse manifest");
@@ -1004,7 +998,7 @@ mod tests {
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
             let content = "[dependencies]\nserde = \"0.9.0\"\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("failed to parse manifest");
@@ -1433,7 +1427,7 @@ mod tests {
     /// concurrent `documents.get_mut` on the same URI (e.g. a `didChange`) is never
     /// blocked behind an in-flight (or stuck) diagnostics generation.
     ///
-    /// `BlockingEcosystem::generate_diagnostics` waits on a `Barrier` before blocking
+    /// `BlockingEcosystem::diagnostics` waits on a `Barrier` before blocking
     /// forever (`std::future::pending`), standing in for an override that performs real
     /// I/O — the worst case for a shard `Ref` held across the call. The test only
     /// proceeds to race the writer once that future has demonstrably started executing
@@ -1442,27 +1436,24 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_document_write_not_blocked_by_in_flight_diagnostics() {
         use crate::document::DocumentState;
-        use crate::test_utils::blocking_ecosystem::{
-            BlockingEcosystem, BlockingHook, MockParseResult,
-        };
-        use deps_core::ParseResult;
+        use crate::test_utils::blocking_ecosystem::{BlockingEcosystem, BlockingHook};
+
         use tokio::sync::Barrier;
 
         let state = Arc::new(ServerState::new());
         let started = Arc::new(Barrier::new(2));
-        state
-            .ecosystem_registry
-            .register(Arc::new(BlockingEcosystem {
-                started: Arc::clone(&started),
-                hook: BlockingHook::Diagnostics,
-            }));
+        let blocking = Arc::new(BlockingEcosystem {
+            started: Arc::clone(&started),
+            hook: BlockingHook::Diagnostics,
+        });
+        state.ecosystem_registry.register(blocking.clone());
 
         let url = deps_core::test_util::test_uri("/test/Cargo.toml");
 
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
         let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url.clone() });
-        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+        let manifest = blocking.manifest(&url);
+        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, manifest);
         state.update_document(uri.clone(), doc);
 
         let (client, full_config) = create_test_client_and_config();
@@ -1530,7 +1521,7 @@ mod tests {
 serde = "1.0.0"
 "#
             .to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -1563,7 +1554,7 @@ serde = "1.0.0"
 serde = "1.0.0"
 "#
             .to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -1596,7 +1587,7 @@ serde = "1.0.0"
 serde = "1.0.0"
 "#
             .to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -1641,7 +1632,7 @@ serde = "1.0.0"
 serde = "1.0.0"
 "#
             .to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -1682,7 +1673,7 @@ serde = "1.0.0"
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
             let content = "[dependencies]\nserde = \"99\"\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -1731,7 +1722,7 @@ serde = "1.0.0"
                 .unwrap();
             let content =
                 "[dependencies]\nserde = \"1.0\"\ntokio = \"1.0\"\nanyhow = \"1.0\"\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -1779,7 +1770,7 @@ serde = "1.0.0"
 "#
             .to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -1824,7 +1815,7 @@ serde = "1.0.0"
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -1893,7 +1884,7 @@ serde = "1.0.0"
             // No cached_versions/resolved_versions seeded for "serde" at all — the exact
             // "never actually fetched" shape S2 covers.
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -1954,7 +1945,7 @@ serde = "1.0.0"
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -2000,7 +1991,7 @@ serde = "1.0.0"
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
             let content = "[dependencies]\nserde = \"99\"\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -2052,7 +2043,7 @@ serde = "1.0.0"
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
             let content = "[dependencies]\nserde = \"99\"\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -2092,7 +2083,7 @@ serde = "1.0.0"
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
             let content = "[dependencies]\nserde = \"99\"\ntokio = \"1.0\"\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -2154,7 +2145,7 @@ serde = "1.0.0"
                 .get(deps_core::EcosystemId::Cargo)
                 .unwrap();
             let content = "[dependencies]\nserde = \"=1.0.213\"\n".to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -2211,7 +2202,7 @@ serde = "1.0.0"
                 .unwrap();
             let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -2250,7 +2241,7 @@ serde = "1.0.0"
                 .get(deps_core::EcosystemId::Npm)
                 .unwrap();
             let content = r#"{"dependencies": {"left-pad": "^1.0.0"}}"#.to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -2324,7 +2315,7 @@ serde = "1.0.0"
             // Bare exact pin (npm's ordinary package.json style, no `=` marker) — the
             // shape `yanked_diagnostic_applies_to` still allowed through pre-#436.
             let content = r#"{"dependencies": {"old-pkg": "1.0.1"}}"#.to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -2387,7 +2378,7 @@ serde = "1.0.0"
                 .get(deps_core::EcosystemId::Deno)
                 .unwrap();
             let content = r#"{"imports": {"lodash": "npm:lodash@4.17.20"}}"#.to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -2440,7 +2431,7 @@ serde = "1.0.0"
                 .get(deps_core::EcosystemId::Deno)
                 .unwrap();
             let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@1.0.0"}}"#.to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -2499,7 +2490,7 @@ serde = "1.0.0"
                 .get(deps_core::EcosystemId::Deno)
                 .unwrap();
             let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@^1.0.0"}}"#.to_string();
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -2565,7 +2556,7 @@ dependencies = ["requests>=2.0.0"]
 "#
             .to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -2585,7 +2576,7 @@ dependencies = ["requests>=2.0.0"]
         use super::*;
         use crate::config::LicensePolicyConfig;
         use crate::document::DocumentState;
-        use deps_core::{EcosystemId, ParseResult};
+        use deps_core::EcosystemId;
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{DiagnosticSeverity, NumberOrString};
 
@@ -2593,7 +2584,7 @@ dependencies = ["requests>=2.0.0"]
             state: &ServerState,
             uri: &url::Url,
             content: &str,
-        ) -> Box<dyn ParseResult> {
+        ) -> Box<dyn deps_core::ParsedManifest> {
             // See the comment in `test_unknown_package_uses_configured_severity` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             state
@@ -2811,7 +2802,7 @@ dependencies = ["requests>=2.0.0"]
                 .ecosystem_registry
                 .get(ecosystem_id)
                 .expect("ecosystem registered under its feature");
-            let error = ecosystem
+            let error = Arc::clone(&ecosystem)
                 .parse_manifest(content, &url)
                 .await
                 .err()

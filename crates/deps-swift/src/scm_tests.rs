@@ -3,12 +3,12 @@
 use std::assert_matches;
 use std::sync::Arc;
 
-use deps_core::Ecosystem;
 use deps_core::config_trust::OperatorPath;
 use deps_core::lsp_helpers::{ProbeEffect, ProbePhase, ProbeReport};
 use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
 use deps_core::parser::DependencySource;
 use deps_core::policy_config::ScmToRegistry;
+use deps_core::{EcosystemBase, ParsedView, TypedEcosystem};
 use mockito::{Matcher, Mock, ServerGuard};
 use url::Url;
 
@@ -106,26 +106,12 @@ impl Fixture {
     }
 
     pub(crate) async fn parse(&self, manifest: &str) -> SwiftParseResult {
-        let parsed = self
-            .ecosystem
-            .parse_manifest(manifest, &self.uri)
-            .await
-            .unwrap();
-        let any = parsed.as_any();
-        let parsed = any.downcast_ref::<SwiftParseResult>().unwrap();
-        SwiftParseResult {
-            dependencies: parsed.dependencies.clone(),
-            uri: parsed.uri.clone(),
-            dependency_truncation: parsed.dependency_truncation,
-            resolved_registries: parsed.resolved_registries.clone(),
-            blocked_registries: parsed.blocked_registries.clone(),
-            rejected_registries: parsed.rejected_registries.clone(),
-        }
+        self.ecosystem.parse(manifest, &self.uri).await.unwrap()
     }
 
     pub(crate) async fn prefetch(&self, parsed: &SwiftParseResult) -> ProbeReport {
         self.ecosystem
-            .background_probes(parsed, ProbePhase::PreFetch)
+            .probes(ParsedView::new(parsed), ProbePhase::PreFetch)
             .await
     }
 }
@@ -440,17 +426,12 @@ async fn test_removing_the_trusted_default_converges_without_reparse_or_events()
     let without_default = SwiftEcosystem::with_context(Arc::clone(&warm.registry), context);
     let mut events = warm.registry.identity_memo().subscribe();
     for _ in 0..3 {
-        let parsed = without_default
-            .parse_manifest(NIO, &warm.uri)
-            .await
-            .unwrap();
+        let parsed = without_default.parse(NIO, &warm.uri).await.unwrap();
         let report = without_default
-            .background_probes(parsed.as_ref(), ProbePhase::PreFetch)
+            .probes(ParsedView::new(&parsed), ProbePhase::PreFetch)
             .await;
         assert_eq!(report.effect, ProbeEffect::Unchanged);
-        let any = parsed.as_any();
-        let parsed = any.downcast_ref::<SwiftParseResult>().unwrap();
-        assert_eq!(dependency(parsed).source, DependencySource::Registry);
+        assert_eq!(dependency(&parsed).source, DependencySource::Registry);
     }
     assert!(events.try_recv().is_err());
 }

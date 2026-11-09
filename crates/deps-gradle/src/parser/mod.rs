@@ -1066,7 +1066,6 @@ mod tests {
         let result = parse_gradle("", &uri).unwrap();
         assert!(result.dependencies().is_empty());
         assert!(result.workspace_root().is_none());
-        assert!(result.as_any().is::<GradleParseResult>());
     }
 
     #[test]

@@ -152,7 +152,7 @@ pub fn to_lsp_related_information(
 /// Converts a domain [`deps_core::hover::Hover`] into the LSP-protocol `Hover`
 /// [`crate::handlers::hover::handle_hover`] returns to the client.
 ///
-/// The domain type is what [`deps_core::ecosystem::Ecosystem::generate_hover`] returns.
+/// The domain type is what [`deps_core::ParsedManifest::generate_hover`] returns.
 /// `MarkupKind::Markdown` is always the wire encoding: `deps-lsp` never produces any other
 /// `HoverContents` variant, so attaching the constant kind here (rather than carrying it
 /// through the domain type) is the same simplification [`to_lsp_diagnostic`]'s constant
@@ -171,7 +171,7 @@ pub fn to_lsp_hover(hover: deps_core::hover::Hover) -> ls_types::Hover {
 /// Converts a domain [`deps_core::diagnostic::Diagnostic`] into the LSP-protocol `Diagnostic`
 /// [`crate::handlers::diagnostics`] publishes to the client.
 ///
-/// The domain type is what [`deps_core::ecosystem::Ecosystem::generate_diagnostics`] returns.
+/// The domain type is what [`deps_core::ParsedManifest::generate_diagnostics`] returns.
 ///
 /// `source` is always `"deps-lsp"`: every diagnostic this server emits carries the same
 /// constant value, so the domain type (shared with `deps-cli`, which has no use for an

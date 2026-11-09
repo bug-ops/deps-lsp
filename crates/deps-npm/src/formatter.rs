@@ -1,15 +1,13 @@
 use crate::types::{NpmDependency, NpmDependencyOrigin, NpmDependencySection, NpmRegistryEntry};
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, MAX_REQUIREMENT_LEN, OsvNaming,
-    PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, RewriteTarget,
-    SourcePolicy, bare_meaning, format_version_replacing_by_shape, requirement_len_exceeds_cap,
+    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy,
+    MAX_REQUIREMENT_LEN, OsvNaming, PackageNaming, PackageRendering, RequirementMatcher,
+    RequirementResolution, RewriteTarget, SourcePolicy, bare_meaning,
+    format_version_replacing_by_shape, requirement_len_exceeds_cap,
     up_to_date_via_compiled_matcher,
 };
 use deps_core::osv::{LockResolution, NonPublicRoute};
-use deps_core::{
-    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, NarrowDependency, OwnDependency,
-    PackageName, VersionReq,
-};
+use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName, VersionReq};
 use std::borrow::Cow;
 
 /// Failure from [`parse_range_safe`]: either `node_semver`'s own parse rejection, or the
@@ -556,10 +554,6 @@ fn is_url_friendly_segment(segment: &str) -> bool {
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for npm.
 pub struct NpmFormatter;
 
-impl OwnDependency for NpmFormatter {
-    type Dep = NpmDependency;
-}
-
 impl PackageNaming for NpmFormatter {
     /// Lints `name` against npm's own `validate-npm-package-name` rules.
     ///
@@ -721,15 +715,6 @@ impl PackageRendering for NpmFormatter {
         format_node_semver_replacing(version, current)
     }
 
-    fn format_version_replacing_floor_for(
-        &self,
-        _dep: &dyn Dependency,
-        version: &ConcreteVersion,
-        current: &str,
-    ) -> String {
-        format_node_semver_replacing_floor(version, current)
-    }
-
     /// A bare version is an exact pin for node-semver, so it is the narrowest rendering that
     /// excludes a newer withheld version from a caret/tilde range (#1892).
     fn format_version_exact_pin(&self, version: &ConcreteVersion) -> Option<String> {
@@ -781,7 +766,33 @@ impl DiagnosticMessages for NpmFormatter {
     }
 }
 
-impl DiagnosticPolicy for NpmFormatter {
+impl SourcePolicy for NpmFormatter {
+    /// FR-009: widens [`SourcePolicy::can_resolve_source`] so a `.npmrc`-resolved
+    /// `AlternateRegistry` is resolvable alongside the default public `Registry` — gates
+    /// hover/diagnostics/code-actions onto the router's per-source dispatch
+    /// (`NpmRegistry::get_versions_from`) instead of the source-blind path. `CustomRegistry`
+    /// (FR-006's fail-closed state) keeps the default's `false`.
+    fn resolves_alternate_registry(&self) -> bool {
+        true
+    }
+}
+
+impl DiagnosticPolicy for NpmFormatter {}
+
+impl OsvNaming for NpmFormatter {}
+
+impl DependencyFormatter for NpmFormatter {
+    type Dep = NpmDependency;
+
+    fn format_version_replacing_floor_for(
+        &self,
+        _dep: &NpmDependency,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        format_node_semver_replacing_floor(version, current)
+    }
+
     /// Disables the manifest-requirement-level "requirement satisfiable only by a yanked
     /// version" diagnostic entirely (#436, follow-up to #205's plan.md §6): unconditionally
     /// `false`, for every requirement shape, not only ranges.
@@ -800,46 +811,30 @@ impl DiagnosticPolicy for NpmFormatter {
     /// while `latest` is clean still surfaces its own "yanked" diagnostic.
     fn yanked_diagnostic_applies_to(
         &self,
-        _dep: &dyn Dependency,
+        _dep: &NpmDependency,
         _requirement: &VersionReq,
     ) -> bool {
         false
     }
-}
 
-impl SourcePolicy for NpmFormatter {
-    /// FR-009: widens [`SourcePolicy::can_resolve_source`] so a `.npmrc`-resolved
-    /// `AlternateRegistry` is resolvable alongside the default public `Registry` — gates
-    /// hover/diagnostics/code-actions onto the router's per-source dispatch
-    /// (`NpmRegistry::get_versions_from`) instead of the source-blind path. `CustomRegistry`
-    /// (FR-006's fail-closed state) keeps the default's `false`.
-    fn resolves_alternate_registry(&self) -> bool {
-        true
-    }
-}
-
-impl OsvNaming for NpmFormatter {
     /// A dependency routed by the top-level `registry=` entry is an unverified mirror of npmjs
-    /// (an Artifactory/Nexus/Verdaccio proxy); a scope entry, a failed downcast and every
-    /// non-registry specifier stay private and silent (#1917).
-    fn non_public_route(&self, dep: &dyn Dependency) -> NonPublicRoute {
-        self.own_dependency(dep)
-            .and_then(NpmDependency::registry_entry)
+    /// (an Artifactory/Nexus/Verdaccio proxy); a scope entry and every non-registry specifier
+    /// stay private and silent (#1917).
+    fn non_public_route(&self, dep: &NpmDependency) -> NonPublicRoute {
+        dep.registry_entry()
             .map_or(NonPublicRoute::Private, NpmRegistryEntry::non_public_route)
     }
 
     /// A `peerDependencies` entry is never written to a lock file, so its missing resolved
     /// version is not a coverage gap (#1946).
-    fn lock_resolution(&self, dep: &dyn Dependency) -> LockResolution {
-        let is_peer = self.own_dependency(dep).is_some_and(|dep| {
-            matches!(
-                dep.origin,
-                NpmDependencyOrigin::Manifest {
-                    section: NpmDependencySection::PeerDependencies,
-                    ..
-                }
-            )
-        });
+    fn lock_resolution(&self, dep: &NpmDependency) -> LockResolution {
+        let is_peer = matches!(
+            dep.origin,
+            NpmDependencyOrigin::Manifest {
+                section: NpmDependencySection::PeerDependencies,
+                ..
+            }
+        );
         if is_peer {
             LockResolution::NotLocked
         } else {

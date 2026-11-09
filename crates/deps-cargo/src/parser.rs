@@ -64,7 +64,7 @@ pub struct CargoParseResult {
     /// Every alternate-registry index this parse resolved (spec FR-002). An index carries its
     /// own credential, if it has one.
     ///
-    /// `crate::ecosystem::CargoEcosystem::parse_manifest` registers each of these into the
+    /// `crate::ecosystem::CargoEcosystem::parse` registers each of these into the
     /// shared `CargoRegistry` router immediately after parsing, so a later
     /// `Registry::get_versions_from` call for the matching
     /// `DependencySource::AlternateRegistry` source can find its (possibly authenticated)
@@ -305,7 +305,7 @@ type AlternateRegistryResolution = (
 /// plain `DependencySource::Registry` entry into a resolved `AlternateRegistry {
 /// mirrors_public_registry: true, .. }` when a `[source.crates-io] replace-with` chain resolves to
 /// a sparse mirror (spec FR-005/006/007, plan-1b §1.4). Returns the newly-resolved indexes
-/// for `crate::ecosystem::CargoEcosystem::parse_manifest` to register into the shared
+/// for `crate::ecosystem::CargoEcosystem::parse` to register into the shared
 /// `CargoRegistry` router.
 ///
 /// Two distinct forms of `CustomRegistry` reach the alias-resolution half of this function:

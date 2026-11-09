@@ -9,8 +9,8 @@
 
 use deps_core::licenses::LicensePolicy;
 use deps_core::lsp_helpers::{
-    CachedVersionsMap, CooldownDisposition, DependencyOutcomes, LatestVerdict, RequirementGate,
-    ResolvedCandidatesMap, ResolvedVersionsMap, cooldown_disposition, latest_verdict,
+    CachedVersionsMap, CooldownDisposition, DependencyOutcomes, FormattedDependency, LatestVerdict,
+    ResolvedCandidatesMap, ResolvedVersionsMap, cooldown_disposition,
 };
 use deps_core::osv::{LatestStatusMap, VulnerabilityMap};
 use deps_core::{
@@ -154,12 +154,12 @@ impl AnalysisScope {
 /// need for their own exit-code decisions.
 ///
 /// Built by [`analyze_manifest`]; call [`Self::version_data`] to get the borrowed
-/// [`VersionData`] view [`deps_core::Ecosystem::generate_diagnostics`] and
+/// [`VersionData`] view [`deps_core::ParsedManifest::generate_diagnostics`] and
 /// [`deps_core::edit::collect_update_edits`]/[`deps_core::edit::plan_vulnerability_fix`] all
 /// take.
 pub struct ManifestAnalysis {
     /// The parsed manifest.
-    pub parse_result: Box<dyn deps_core::ParseResult>,
+    pub parse_result: Box<dyn deps_core::ParsedManifest>,
     /// The manifest's file URI (derived from the path `analyze_manifest` was given).
     pub uri: url::Url,
     /// The instant this analysis ran, captured once (fix-cycle item 9/security L3).
@@ -274,7 +274,7 @@ impl ManifestAnalysis {
     /// runs before any concrete `current`/target pair exists to classify an [`UpdateKind`] from).
     /// A dependency this widens past scope (a kind-scoped ignore rule that would not actually
     /// have matched this update) is not a regression: `deps_core::edit::collect_update_candidates`
-    /// applies the exact same [`latest_verdict`] gate per-candidate independently, so an
+    /// applies the exact same [`FormattedDependency::latest_verdict`] gate per-candidate independently, so an
     /// unverified `latest` for it still surfaces as `Skipped(NotSafelyEditable(LatestUnverified))`
     /// in the final plan (a nonzero exit) rather than silently vanishing — this check only
     /// controls whether the *whole run* aborts early with a clearer message, not whether the
@@ -288,47 +288,64 @@ impl ManifestAnalysis {
         package_filter: &[String],
         ignore_rules: &crate::update::ignore::IgnoreRules,
     ) -> bool {
-        let vuln_keys = deps_core::osv::vulnerability_keys(
-            self.parse_result.as_ref(),
+        let vuln_keys = self.parse_result.vulnerability_keys(
             &self.resolved_versions,
             Some(&self.resolved_version_candidates),
-            formatter,
-            self.ecosystem_id,
         );
-        self.parse_result.dependencies().into_iter().any(|dep| {
-            let key = deps_core::PackageKey::new(dep.name(), formatter);
-            if !crate::update::is_requested(package_filter, key.normalized(), formatter)
-                || ignore_rules.matches_name(key.normalized())
-            {
-                return false;
-            }
-            let Some(latest) = self
-                .cached_versions
-                .get(key.normalized())
-                .map(|v| &v.latest)
-            else {
-                return false;
-            };
-            let Some(version_req) = dep.version_requirement() else {
-                return false;
-            };
-            if formatter.requirement_status_for(dep, version_req, latest)
-                != deps_core::lsp_helpers::RequirementStatus::Outdated
-            {
-                return false;
-            }
-            matches!(
-                latest_verdict(
-                    self.latest_status.as_ref(),
-                    dep,
-                    Some(&vuln_keys),
-                    &key,
-                    latest.as_str(),
-                    formatter,
-                ),
-                LatestVerdict::Unverified
-            )
-        })
+        let mut unverified = false;
+        self.parse_result
+            .for_each_formatted_dependency(&mut |bound| {
+                unverified = unverified
+                    || self.is_unverified_in_scope(
+                        bound,
+                        &vuln_keys,
+                        formatter,
+                        package_filter,
+                        ignore_rules,
+                    );
+            });
+        unverified
+    }
+
+    fn is_unverified_in_scope(
+        &self,
+        bound: &dyn FormattedDependency<'_>,
+        vuln_keys: &deps_core::osv::VulnKeys,
+        formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+        package_filter: &[String],
+        ignore_rules: &crate::update::ignore::IgnoreRules,
+    ) -> bool {
+        let dep = bound.dependency();
+        let key = deps_core::PackageKey::new(dep.name(), formatter);
+        if !crate::update::is_requested(package_filter, key.normalized(), formatter)
+            || ignore_rules.matches_name(key.normalized())
+        {
+            return false;
+        }
+        let Some(latest) = self
+            .cached_versions
+            .get(key.normalized())
+            .map(|v| &v.latest)
+        else {
+            return false;
+        };
+        let Some(version_req) = dep.version_requirement() else {
+            return false;
+        };
+        if bound.requirement_status_for(version_req, latest)
+            != deps_core::lsp_helpers::RequirementStatus::Outdated
+        {
+            return false;
+        }
+        matches!(
+            bound.latest_verdict(
+                self.latest_status.as_ref(),
+                Some(vuln_keys),
+                &key,
+                latest.as_str(),
+            ),
+            LatestVerdict::Unverified
+        )
     }
 }
 
@@ -468,7 +485,6 @@ pub async fn analyze_manifest(
     )
     .await;
     let post_fetch_report = deps_engine::probe::run_background_probes(
-        ecosystem.as_ref(),
         parse_result.as_ref(),
         deps_core::lsp_helpers::ProbePhase::PostFetch,
         network,
@@ -544,7 +560,6 @@ pub async fn analyze_manifest(
                 parse_result.as_ref(),
                 &resolved_versions,
                 &resolved_version_candidates,
-                formatter,
                 ecosystem_id,
             );
             let mut vulns = skipped;
@@ -597,22 +612,11 @@ pub async fn analyze_manifest(
     // FR-010: computed once and shared between the latest-status and fallback-status futures
     // below, instead of each independently re-deriving the same map.
     let vuln_keys = (run_latest_check || run_fallback_check).then(|| {
-        deps_core::osv::vulnerability_keys(
-            parse_result.as_ref(),
-            &resolved_versions,
-            Some(&resolved_version_candidates),
-            formatter,
-            ecosystem_id,
-        )
+        parse_result.vulnerability_keys(&resolved_versions, Some(&resolved_version_candidates))
     });
 
     let candidate_tags = vuln_keys.as_ref().map(|keys| {
-        deps_engine::classify::osv::candidate_tag_sources(
-            parse_result.as_ref(),
-            keys,
-            formatter,
-            ecosystem_id,
-        )
+        deps_engine::classify::osv::candidate_tag_sources(parse_result.as_ref(), keys, ecosystem_id)
     });
 
     let latest_check = async {
@@ -628,7 +632,6 @@ pub async fn analyze_manifest(
             &cached_versions,
             vuln_keys,
             candidate_tags,
-            formatter,
         );
         if !targets.is_empty() {
             let timeout = Duration::from_secs(
@@ -660,13 +663,8 @@ pub async fn analyze_manifest(
         ) else {
             return None;
         };
-        let (targets, mut fallback_status) = build_latest_check_targets(
-            parse_result.as_ref(),
-            view,
-            vuln_keys,
-            candidate_tags,
-            formatter,
-        );
+        let (targets, mut fallback_status) =
+            build_latest_check_targets(parse_result.as_ref(), view, vuln_keys, candidate_tags);
         if !targets.is_empty() {
             let timeout = Duration::from_secs(
                 ctx.policy
@@ -743,10 +741,11 @@ mod has_unverified_latest_check_tests {
     use deps_core::parser::DependencySource;
     use deps_core::position::{Position, Range};
     use deps_core::test_util::StubFormatter;
+    use deps_core::test_util::stub_document_with;
     use deps_core::{
-        Dependency, EcosystemId, NormalizedName, PackageName, ParseResult, VersionReq,
+        Dependency, EcosystemId, NormalizedName, PackageName, ParseResult, TypedParseResult,
+        VersionReq,
     };
-    use std::any::Any;
     use std::collections::{HashMap, HashSet};
 
     struct MockDep {
@@ -770,9 +769,6 @@ mod has_unverified_latest_check_tests {
         fn source(&self) -> DependencySource {
             DependencySource::Registry
         }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
 
     struct MockParseResult {
@@ -789,8 +785,13 @@ mod has_unverified_latest_check_tests {
         fn uri(&self) -> &url::Url {
             &self.uri
         }
-        fn as_any(&self) -> &dyn Any {
-            self
+    }
+
+    impl TypedParseResult for MockParseResult {
+        type Dep = MockDep;
+
+        fn own_dependencies(&self) -> &[MockDep] {
+            &self.deps
         }
     }
 
@@ -806,14 +807,18 @@ mod has_unverified_latest_check_tests {
         );
 
         ManifestAnalysis {
-            parse_result: Box::new(MockParseResult {
-                deps: vec![MockDep {
-                    name: PackageName::new("serde"),
-                    version_req: VersionReq::new("1.0.0"),
-                    version_range: Range::new(Position::new(0, 9), Position::new(0, 14)),
-                }],
-                uri: uri.clone(),
-            }),
+            parse_result: stub_document_with(
+                MockParseResult {
+                    deps: vec![MockDep {
+                        name: PackageName::new("serde"),
+                        version_req: VersionReq::new("1.0.0"),
+                        version_range: Range::new(Position::new(0, 9), Position::new(0, 14)),
+                    }],
+                    uri: uri.clone(),
+                },
+                StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+                EcosystemId::Cargo,
+            ),
             uri,
             now: deps_core::PublishTime::now(),
             ecosystem_id: EcosystemId::Cargo,

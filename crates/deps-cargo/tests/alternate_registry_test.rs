@@ -226,7 +226,7 @@ async fn test_authenticated_alternate_registry_sends_authorization_header() {
 
 /// The full pipeline, end to end: a real `.cargo/config.toml` + `Cargo.toml` fixture on
 /// disk, parsed via the public `parse_cargo_toml`, registered into a `CargoRegistry`
-/// exactly the way `CargoEcosystem::parse_manifest` does, then fetched — proving the
+/// exactly the way `CargoEcosystem::parse` does, then fetched — proving the
 /// parser's alias resolution and the router's registration agree on the same index.
 #[tokio::test]
 async fn test_end_to_end_parse_register_and_fetch() {

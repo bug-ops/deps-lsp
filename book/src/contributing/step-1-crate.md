@@ -44,7 +44,7 @@ url = { workspace = true }
 ```
 
 > **Note:** every `#[cfg(feature = "lsp-responses")]`-gated item in this crate (LSP
-> `CompletionItem`/`Range`/`Position` construction, `generate_completions`, etc.) needs this
+> `CompletionItem`/`Range`/`Position` construction, `completions`, etc.) needs this
 > feature enabled to compile and to be exercised by tests — see the `lsp-responses`
 > feature comment above and [Step 6](step-6-ecosystem-trait.md) for what it gates in practice.
 

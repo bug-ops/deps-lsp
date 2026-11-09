@@ -1,3 +1,4 @@
+use crate::types::ComposerDependency;
 use deps_core::ConcreteVersion;
 use deps_core::Dependency;
 use deps_core::InvalidPackageName;
@@ -6,10 +7,10 @@ use deps_core::PackageName;
 use deps_core::StabilityFloor;
 use deps_core::interval::{VersionRange, range_from_edges, tighter_lower, tighter_upper};
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OperatorGrammar, OsvNaming,
-    PackageNaming, PackageRendering, RequirementGate, RequirementMatcher, RequirementResolution,
-    RewriteTarget, SourcePolicy, compile_requirement_unless, match_v_prefix_style,
-    requirement_contains_template_placeholder,
+    BoundedVersionReq, DependencyFormatter, DiagnosticMessages, DiagnosticPolicy, OperatorGrammar,
+    OsvNaming, PackageNaming, PackageRendering, RequirementGate, RequirementMatcher,
+    RequirementResolution, RewriteTarget, SourcePolicy, compile_requirement_unless,
+    match_v_prefix_style, requirement_contains_template_placeholder,
 };
 use deps_core::normalize_operator_spacing;
 use deps_core::osv::OsvPackageName;
@@ -903,17 +904,6 @@ impl PackageRendering for ComposerFormatter {
         render_composer_requirement(self, version, current, RewriteTarget::Update)
     }
 
-    /// Security-fix and fallback targets keep the operator but write the full version
-    /// (`^2.0` -> `^2.9.1`), so the rewritten range never admits releases below the target.
-    fn format_version_replacing_floor_for(
-        &self,
-        _dep: &dyn Dependency,
-        version: &ConcreteVersion,
-        current: &str,
-    ) -> String {
-        render_composer_requirement(self, version, current, RewriteTarget::Floor)
-    }
-
     /// Exact pin that keeps `current`'s `v` style and `@stability` flag (#1892).
     fn format_version_exact_pin_replacing(
         &self,
@@ -936,44 +926,6 @@ impl PackageRendering for ComposerFormatter {
 
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
-    }
-
-    /// Widens the rename quickfix's discoverability: without this, only a cursor on
-    /// `version_range` (the default) reaches `generate_code_actions`, so a user reading
-    /// "this package is abandoned" and clicking the package *name* — the very token the
-    /// rename rewrites — would find no action offered.
-    ///
-    /// Rejects a degenerate (zero-width) `name_range` rather than reusing the default's
-    /// `version_range`-only check plus this: `find_positions` (`parser.rs`) falls back to
-    /// `Range::default()` — `(0,0)-(0,0)` — when its name-literal search misses (e.g. a
-    /// legal escaped-solidus `"vendor\/package"` key), and `position_in_range` is
-    /// inclusive on both ends, so an unguarded widen would make that sentinel
-    /// *selectable* by a cursor resting on the file's opening `{` — reopening the exact
-    /// `Range::default()` hazard `build_replacement_action`'s literal-span guard exists
-    /// to prevent, just through the position check instead of the edit itself.
-    ///
-    /// This is the shared entry point [`generate_code_actions`](deps_core::lsp_helpers::generate_code_actions)
-    /// uses to find "the dependency at this position" for *every* action kind, not only
-    /// the rename — a cursor on the package name in `composer.json` now also surfaces
-    /// the version-bump/vulnerability-fix actions it previously didn't (their edits still
-    /// target `version_range` regardless of where the cursor landed, so this only widens
-    /// where the actions are *offered from*, never what they write). Accepted, not scoped
-    /// narrower to the rename alone: a single shared boolean gate has no per-action-kind
-    /// dial, and a cursor on the name is exactly where a user reading "this package is
-    /// abandoned" is likely to click for *any* fix, not just the rename.
-    fn is_position_on_dependency(
-        &self,
-        dep: &dyn Dependency,
-        position: deps_core::position::Position,
-    ) -> bool {
-        let name_range = dep.name_range();
-        if name_range.start != name_range.end
-            && deps_core::lsp_helpers::position_in_range(position, name_range)
-        {
-            return true;
-        }
-        dep.version_range()
-            .is_some_and(|r| deps_core::lsp_helpers::position_in_range(position, r))
     }
 }
 
@@ -1003,6 +955,70 @@ fn composer_requirement_opts_into_prereleases(requirement: &str) -> bool {
                 composer_version_stability(version) < StabilityFloor::Stable
             })
     })
+}
+
+impl DependencyFormatter for ComposerFormatter {
+    type Dep = ComposerDependency;
+
+    /// Security-fix and fallback targets keep the operator but write the full version
+    /// (`^2.0` -> `^2.9.1`), so the rewritten range never admits releases below the target.
+    fn format_version_replacing_floor_for(
+        &self,
+        _dep: &ComposerDependency,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        render_composer_requirement(self, version, current, RewriteTarget::Floor)
+    }
+
+    /// Widens the rename quickfix's discoverability: without this, only a cursor on
+    /// `version_range` (the default) reaches `generate_code_actions`, so a user reading
+    /// "this package is abandoned" and clicking the package *name* — the very token the
+    /// rename rewrites — would find no action offered.
+    ///
+    /// Rejects a degenerate (zero-width) `name_range` rather than reusing the default's
+    /// `version_range`-only check plus this: `find_positions` (`parser.rs`) falls back to
+    /// `Range::default()` — `(0,0)-(0,0)` — when its name-literal search misses (e.g. a
+    /// legal escaped-solidus `"vendor\/package"` key), and `position_in_range` is
+    /// inclusive on both ends, so an unguarded widen would make that sentinel
+    /// *selectable* by a cursor resting on the file's opening `{` — reopening the exact
+    /// `Range::default()` hazard `build_replacement_action`'s literal-span guard exists
+    /// to prevent, just through the position check instead of the edit itself.
+    ///
+    /// This is the shared entry point [`generate_code_actions`](deps_core::lsp_helpers::generate_code_actions)
+    /// uses to find "the dependency at this position" for *every* action kind, not only
+    /// the rename — a cursor on the package name in `composer.json` now also surfaces
+    /// the version-bump/vulnerability-fix actions it previously didn't (their edits still
+    /// target `version_range` regardless of where the cursor landed, so this only widens
+    /// where the actions are *offered from*, never what they write). Accepted, not scoped
+    /// narrower to the rename alone: a single shared boolean gate has no per-action-kind
+    /// dial, and a cursor on the name is exactly where a user reading "this package is
+    /// abandoned" is likely to click for *any* fix, not just the rename.
+    fn is_position_on_dependency(
+        &self,
+        dep: &ComposerDependency,
+        position: deps_core::position::Position,
+    ) -> bool {
+        let name_range = dep.name_range();
+        if name_range.start != name_range.end
+            && deps_core::lsp_helpers::position_in_range(position, name_range)
+        {
+            return true;
+        }
+        dep.version_range()
+            .is_some_and(|r| deps_core::lsp_helpers::position_in_range(position, r))
+    }
+
+    /// Packagist's canonical form is lowercase, and `composer.json` files
+    /// legitimately carry mixed case (Composer resolves case-insensitively).
+    /// This is the mirror image of NuGet: there, lowercasing kills the
+    /// ecosystem; here, *not* lowercasing does (OSV is case-sensitive for
+    /// every ecosystem except PyPI).
+    ///
+    /// Must stay ungated: this is plain OSV-classification logic reachable from `deps-cli`, not LSP-response code (#1545).
+    fn osv_package_name(&self, dep: &ComposerDependency) -> Option<OsvPackageName> {
+        OsvPackageName::new_or_skip(self.normalize_package_name(dep.name()).into_string())
+    }
 }
 
 impl RequirementResolution for ComposerFormatter {
@@ -1113,18 +1129,7 @@ impl DiagnosticPolicy for ComposerFormatter {
 
 impl SourcePolicy for ComposerFormatter {}
 
-impl OsvNaming for ComposerFormatter {
-    /// Packagist's canonical form is lowercase, and `composer.json` files
-    /// legitimately carry mixed case (Composer resolves case-insensitively).
-    /// This is the mirror image of NuGet: there, lowercasing kills the
-    /// ecosystem; here, *not* lowercasing does (OSV is case-sensitive for
-    /// every ecosystem except PyPI).
-    ///
-    /// Must stay ungated: this is plain OSV-classification logic reachable from `deps-cli`, not LSP-response code (#1545).
-    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<OsvPackageName> {
-        OsvPackageName::new_or_skip(self.normalize_package_name(dep.name()).into_string())
-    }
-}
+impl OsvNaming for ComposerFormatter {}
 
 /// Composer tilde semantics.
 ///

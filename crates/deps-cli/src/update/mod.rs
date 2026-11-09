@@ -11,13 +11,12 @@ use deps_core::NormalizeName;
 use deps_core::VersionReq;
 use deps_core::edit::{
     EditSpan, ManifestEdit, ManifestReparse, PlannedCurrent, PlannedUpdate, UnplannableReason,
-    UpdateCandidate, UpdateKind, apply_edits, classify_update, collect_update_candidates,
-    dedup_overlapping_edits,
+    UpdateCandidate, UpdateKind, apply_edits, classify_update, dedup_overlapping_edits,
 };
 use deps_core::lsp_helpers::{
     CachedVersionsMap, CooldownDisposition, EcosystemFormatter, FallbackEditRejection,
-    FallbackEditVerdict, LatestVerdict, cooldown_disposition, fallback_edit_excludes_newer,
-    latest_verdict,
+    FallbackEditVerdict, FormattedDependency, LatestVerdict, cooldown_disposition,
+    fallback_edit_excludes_newer,
 };
 use deps_core::{NormalizedName, PackageKey, PackageName};
 use std::collections::HashMap;
@@ -593,7 +592,7 @@ fn gossip_excluded_version(
 }
 
 /// Spec 075 FR-007/FR-008/FR-010: the fallback-substituted view [`plan_updates`] feeds through
-/// [`collect_update_candidates`] alongside the real `latest` view — only `latest` swapped for
+/// [`deps_core::ParsedManifest::collect_update_candidates`] alongside the real `latest` view — only `latest` swapped for
 /// each dependency's stored cooldown-fallback candidate, when one exists.
 ///
 /// Reuses [`ManifestAnalysis::cooldown_fallback_view`] when `analyze_manifest` already built it
@@ -603,7 +602,7 @@ fn gossip_excluded_version(
 /// cooldown-blocked with a usable fallback). When the field was never populated (a caller that
 /// built [`ManifestAnalysis`] directly, e.g. this module's own tests), the identical gate is
 /// applied here instead of computing the view unconditionally — `None` either way means
-/// `plan_updates` skips [`collect_update_candidates`]'s full-manifest pass over the fallback
+/// `plan_updates` skips [`deps_core::ParsedManifest::collect_update_candidates`]'s full-manifest pass over the fallback
 /// view entirely, since [`resolve_occurrence`] only ever consults it when a dependency's own
 /// [`cooldown_disposition`] is `Blocked { fallback: Some(_), .. }`.
 ///
@@ -650,33 +649,23 @@ fn resolve_cooldown_fallback_view(
 /// explicit `--config <path>` (FR-007) — callers pass [`IgnoreRules::empty`] otherwise, never
 /// an auto-discovered config's rules.
 ///
+/// `formatter` must be the document's own formatter (the one of the ecosystem that parsed it).
+///
 /// # Examples
 ///
 /// ```
 /// use deps_cli::analyze::ManifestAnalysis;
 /// use deps_cli::update::ignore::IgnoreRules;
 /// use deps_cli::update::{Outcome, plan_updates};
-/// use deps_core::lsp_helpers::{
-///     DiagnosticMessages, DiagnosticPolicy, DependencyOutcomes, OsvNaming, PackageNaming,
-///     PackageRendering, PackageVersions, RequirementResolution, SourcePolicy,
-/// };
+/// use deps_core::lsp_helpers::{DependencyOutcomes, PackageVersions};
 /// use deps_core::parser::DependencySource;
 /// use deps_core::position::{Position, Range};
-/// use deps_core::{ConcreteVersion, Dependency, EcosystemId, ParseResult, PackageName, VersionReq};
-/// use std::any::Any;
+/// use deps_core::test_util::{StubFormatter, stub_document_with};
+/// use deps_core::{
+///     ConcreteVersion, Dependency, EcosystemId, PackageName, ParseResult, TypedParseResult,
+///     VersionReq,
+/// };
 /// use std::collections::{HashMap, HashSet};
-///
-/// struct MockFormatter;
-/// impl PackageNaming for MockFormatter {}
-/// impl PackageRendering for MockFormatter {
-///     fn format_version_for_text_edit(&self, v: &ConcreteVersion) -> String { v.to_string() }
-///     fn package_url(&self, name: &PackageName) -> String { name.as_str().to_string() }
-/// }
-/// impl RequirementResolution for MockFormatter {}
-/// impl DiagnosticMessages for MockFormatter {}
-/// impl DiagnosticPolicy for MockFormatter {}
-/// impl SourcePolicy for MockFormatter {}
-/// impl OsvNaming for MockFormatter {}
 ///
 /// struct MockDep { name: PackageName, version_req: VersionReq, version_range: Range }
 /// impl Dependency for MockDep {
@@ -685,7 +674,6 @@ fn resolve_cooldown_fallback_view(
 ///     fn version_requirement(&self) -> Option<&VersionReq> { Some(&self.version_req) }
 ///     fn version_range(&self) -> Option<Range> { Some(self.version_range) }
 ///     fn source(&self) -> DependencySource { DependencySource::Registry }
-///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
 /// struct MockParseResult { deps: Vec<MockDep>, uri: url::Url }
@@ -695,7 +683,10 @@ fn resolve_cooldown_fallback_view(
 ///     }
 ///     fn workspace_root(&self) -> Option<&std::path::Path> { None }
 ///     fn uri(&self) -> &url::Url { &self.uri }
-///     fn as_any(&self) -> &dyn Any { self }
+/// }
+/// impl TypedParseResult for MockParseResult {
+///     type Dep = MockDep;
+///     fn own_dependencies(&self) -> &[MockDep] { &self.deps }
 /// }
 ///
 /// let content = r#"serde = "1.0.0""#;
@@ -703,14 +694,18 @@ fn resolve_cooldown_fallback_view(
 /// cached_versions.insert(deps_core::NormalizedName::for_test("serde"), PackageVersions::latest_only("1.2.0"));
 ///
 /// let analysis = ManifestAnalysis {
-///     parse_result: Box::new(MockParseResult {
-///         deps: vec![MockDep {
-///             name: PackageName::new("serde"),
-///             version_req: VersionReq::new("1.0.0"),
-///             version_range: Range::new(Position::new(0, 9), Position::new(0, 14)),
-///         }],
-///         uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
-///     }),
+///     parse_result: stub_document_with(
+///         MockParseResult {
+///             deps: vec![MockDep {
+///                 name: PackageName::new("serde"),
+///                 version_req: VersionReq::new("1.0.0"),
+///                 version_range: Range::new(Position::new(0, 9), Position::new(0, 14)),
+///             }],
+///             uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
+///         },
+///         StubFormatter::DEFAULT.for_dependency::<MockDep>(),
+///         EcosystemId::Cargo,
+///     ),
 ///     uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
 ///     now: deps_core::PublishTime::now(),
 ///     ecosystem_id: EcosystemId::Cargo,
@@ -740,7 +735,7 @@ fn resolve_cooldown_fallback_view(
 /// let plan = plan_updates(
 ///     &analysis,
 ///     content,
-///     &MockFormatter,
+///     &StubFormatter::DEFAULT,
 ///     &reparse,
 ///     &[],
 ///     &IgnoreRules::empty(),
@@ -769,12 +764,9 @@ pub fn plan_updates(
     freshness: deps_core::FreshnessSettings,
     now: deps_core::PublishTime,
 ) -> UpdatePlan {
-    let latest_candidates = collect_update_candidates(
-        analysis.parse_result.as_ref(),
-        content,
-        analysis.version_data(),
-        formatter,
-    );
+    let latest_candidates = analysis
+        .parse_result
+        .collect_update_candidates(content, analysis.version_data());
 
     // Spec 075 FR-007/FR-008: a fallback view of the registry data (only `latest` swapped for
     // each dependency's stored cooldown-fallback candidate, when one exists) fed through the
@@ -806,12 +798,9 @@ pub fn plan_updates(
                 }
                 None => fallback_version_data,
             };
-            collect_update_candidates(
-                analysis.parse_result.as_ref(),
-                content,
-                fallback_version_data,
-                formatter,
-            )
+            analysis
+                .parse_result
+                .collect_update_candidates(content, fallback_version_data)
         }
         None => Vec::new(),
     };
@@ -852,7 +841,7 @@ pub fn plan_updates(
         (normalized_name.clone(), name_range, version_range)
     };
 
-    // Same collision guard as `dep_by_key` below: a colliding occurrence's fallback candidate is
+    // Same collision guard as the unique-dependency check in the visitor below: a colliding occurrence's fallback candidate is
     // excluded rather than collapsed with the other's, so both occurrences fall through to the
     // same "fallback absent" (row 6) handling instead of one silently stealing the other's
     // `SkipReason`/attribution in the `Unplannable` branch (impl-critic, rows 8/10/11).
@@ -870,34 +859,41 @@ pub fn plan_updates(
         })
         .collect();
 
-    let dep_by_key: HashMap<OccurrenceKey, &dyn deps_core::Dependency> = deps_by_name_range
-        .iter()
-        .filter_map(
-            |(&(ref normalized_name, name_range), deps)| match deps.as_slice() {
-                [dep] => Some((occurrence_key(normalized_name, name_range), *dep)),
-                _ => None,
-            },
-        )
-        .collect();
-
-    let vuln_keys = deps_core::osv::vulnerability_keys(
-        analysis.parse_result.as_ref(),
+    let vuln_keys = analysis.parse_result.vulnerability_keys(
         &analysis.resolved_versions,
         Some(&analysis.resolved_version_candidates),
-        formatter,
-        analysis.ecosystem_id,
     );
 
-    let mut items: Vec<PlannedUpdateItem> = latest_candidates
+    // `FormattedDependency` is valid only inside the visitor callback, so every occurrence whose
+    // dependency is unambiguous is resolved there; the rest (collisions) resolve without one.
+    let mut occurrences: Vec<Occurrence> = latest_candidates
         .into_iter()
-        .map(|latest_candidate| {
-            let (normalized_name, name_range) = candidate_identity(&latest_candidate);
-            let key = occurrence_key(&normalized_name, name_range);
+        .map(|candidate| {
+            let (normalized_name, name_range) = candidate_identity(&candidate);
+            Occurrence {
+                key: occurrence_key(&normalized_name, name_range),
+                candidate: Some(candidate),
+                item: None,
+            }
+        })
+        .collect();
+    let mut pending: HashMap<OccurrenceKey, Vec<usize>> = HashMap::new();
+    for (index, occurrence) in occurrences.iter().enumerate() {
+        pending
+            .entry(occurrence.key.clone())
+            .or_default()
+            .push(index);
+    }
+    let resolve =
+        |candidate: UpdateCandidate,
+         key: OccurrenceKey,
+         dep: Option<&dyn FormattedDependency<'_>>,
+         fallback_by_key: &mut HashMap<OccurrenceKey, UpdateCandidate>| {
             resolve_occurrence(
-                latest_candidate,
+                candidate,
                 key,
-                &mut fallback_by_key,
-                &dep_by_key,
+                fallback_by_key,
+                dep,
                 analysis,
                 content,
                 formatter,
@@ -908,6 +904,44 @@ pub fn plan_updates(
                 &vuln_keys,
                 now,
             )
+        };
+    analysis
+        .parse_result
+        .for_each_formatted_dependency(&mut |bound| {
+            let dep = bound.dependency();
+            let identity = (
+                formatter.normalize_package_name(dep.name()),
+                dep.name_range(),
+            );
+            if deps_by_name_range
+                .get(&identity)
+                .is_none_or(|deps| deps.len() != 1)
+            {
+                return;
+            }
+            let key = occurrence_key(&identity.0, identity.1);
+            for index in pending.remove(&key).unwrap_or_default() {
+                let Some(occurrence) = occurrences.get_mut(index) else {
+                    continue;
+                };
+                if let Some(candidate) = occurrence.candidate.take() {
+                    occurrence.item = Some(resolve(
+                        candidate,
+                        key.clone(),
+                        Some(bound),
+                        &mut fallback_by_key,
+                    ));
+                }
+            }
+        });
+    let mut items: Vec<PlannedUpdateItem> = occurrences
+        .into_iter()
+        .filter_map(|occurrence| {
+            occurrence.item.or_else(|| {
+                occurrence
+                    .candidate
+                    .map(|candidate| resolve(candidate, occurrence.key, None, &mut fallback_by_key))
+            })
         })
         .collect();
 
@@ -920,6 +954,14 @@ pub fn plan_updates(
     dedup_applied_items(&mut items);
 
     UpdatePlan { items }
+}
+
+/// One latest-view candidate on its way to a [`PlannedUpdateItem`]: resolved inside the
+/// dependency visitor when its dependency is unambiguous, afterwards (without one) otherwise.
+struct Occurrence {
+    key: OccurrenceKey,
+    candidate: Option<UpdateCandidate>,
+    item: Option<PlannedUpdateItem>,
 }
 
 /// Spec 075 FR-007: one manifest occurrence's join key between the latest and fallback views —
@@ -1036,7 +1078,7 @@ type OsvVerdictDetails = (
 /// below never reach this helper for a `Verified`/`NotApplicable` version).
 fn osv_verdict_details(
     status: Option<&deps_core::osv::LatestStatusMap>,
-    dep: Option<&dyn deps_core::Dependency>,
+    dep: Option<&dyn FormattedDependency<'_>>,
     vuln_keys: &deps_core::osv::VulnKeys,
     key: &PackageKey,
     version: &str,
@@ -1045,7 +1087,7 @@ fn osv_verdict_details(
     let Some(dep) = dep else {
         return (Vec::new(), None);
     };
-    match latest_verdict(status, dep, Some(vuln_keys), key, version, formatter) {
+    match dep.latest_verdict(status, Some(vuln_keys), key, version) {
         LatestVerdict::Flagged {
             advisory_ids,
             via_sibling_tags,
@@ -1066,14 +1108,12 @@ fn osv_verdict_details(
 /// (a bare partial such as `5` must not become `6`, which admits older `6.x`); `None` for an
 /// unexpanded placeholder.
 fn floor_safe_candidate(
-    formatter: &dyn EcosystemFormatter,
-    dep: &dyn deps_core::Dependency,
+    dep: &dyn FormattedDependency<'_>,
     candidate: &ManifestEdit,
     target: &ConcreteVersion,
 ) -> Option<ManifestEdit> {
-    let current = dep.version_requirement()?;
-    let new_text =
-        deps_core::edit::floor_safe_replacement_text(formatter, dep, target, current.as_str())?;
+    let current = dep.dependency().version_requirement()?;
+    let new_text = dep.floor_safe_replacement_text(target, current.as_str())?;
     Some(ManifestEdit {
         range: candidate.range,
         new_text,
@@ -1087,21 +1127,18 @@ fn floor_safe_candidate(
 /// an `EditedAdmitsNewer` rejection (a caret range that would admit the withheld newer version)
 /// triggers one retry with the ecosystem's exact-pin rendering
 /// (`PackageRendering::format_version_exact_pin`), re-validated by the same guard (#1892).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors fallback_edit_excludes_newer's own parameter list plus the log key"
-)]
 fn writable_fallback_edit(
-    formatter: &dyn EcosystemFormatter,
     reparse: &dyn ManifestReparse,
     content: &str,
-    dep: &dyn deps_core::Dependency,
+    bound: &dyn FormattedDependency<'_>,
     candidate: &ManifestEdit,
     target: &ConcreteVersion,
     available: &[ConcreteVersion],
     package_key: &PackageKey,
 ) -> Option<ManifestEdit> {
-    let candidate = &floor_safe_candidate(formatter, dep, candidate, target)?;
+    let formatter = bound.formatter();
+    let dep = bound.dependency();
+    let candidate = &floor_safe_candidate(bound, candidate, target)?;
     let verdict = fallback_edit_excludes_newer(
         formatter, reparse, content, dep, candidate, target, available,
     );
@@ -1150,7 +1187,7 @@ fn resolve_occurrence(
     latest_candidate: UpdateCandidate,
     key: OccurrenceKey,
     fallback_by_key: &mut HashMap<OccurrenceKey, UpdateCandidate>,
-    dep_by_key: &HashMap<OccurrenceKey, &dyn deps_core::Dependency>,
+    dep: Option<&dyn FormattedDependency<'_>>,
     analysis: &ManifestAnalysis,
     content: &str,
     formatter: &dyn EcosystemFormatter,
@@ -1224,7 +1261,7 @@ fn resolve_occurrence(
                 package_versions.and_then(|versions| {
                     osv_verdict_details(
                         analysis.latest_status.as_ref(),
-                        dep_by_key.get(&key).copied(),
+                        dep,
                         vuln_keys,
                         &package_key,
                         versions.latest.as_str(),
@@ -1308,9 +1345,8 @@ fn resolve_occurrence(
                     // in-use version) and `Absent` (spec 076's no-lockfile) paths — no per-
                     // ecosystem override, no Go exception (removed, FR-022: `ExactMatcher`
                     // alone is sufficient once this guard ships).
-                    let writable_edit = dep_by_key.get(&key).copied().and_then(|dep| {
+                    let writable_edit = dep.and_then(|dep| {
                         writable_fallback_edit(
-                            formatter,
                             reparse,
                             content,
                             dep,
@@ -1346,7 +1382,7 @@ fn resolve_occurrence(
                                     |latest| {
                                         osv_verdict_details(
                                             analysis.latest_status.as_ref(),
-                                            dep_by_key.get(&key).copied(),
+                                            dep,
                                             vuln_keys,
                                             &package_key,
                                             latest.as_str(),
@@ -1421,7 +1457,7 @@ fn resolve_occurrence(
                         // the fallback version, never a silent cooldown skip.
                         let (advisory_ids, sibling_match) = osv_verdict_details(
                             analysis.fallback_status.as_ref(),
-                            dep_by_key.get(&key).copied(),
+                            dep,
                             vuln_keys,
                             &package_key,
                             fallback.version.as_str(),
@@ -1590,10 +1626,11 @@ pub fn apply_plan(
 mod tests {
     use super::*;
     use deps_core::licenses::LicensePolicy;
+    use deps_core::lsp_helpers::DependencyFormatter;
     use deps_core::parser::DependencySource;
     use deps_core::position::{Position, Range};
-    use deps_core::{Dependency, EcosystemId, PackageVersions, ParseResult};
-    use std::any::Any;
+    use deps_core::test_util::stub_document_with;
+    use deps_core::{Dependency, EcosystemId, PackageVersions, ParseResult, TypedParseResult};
     use std::assert_matches;
     use std::collections::{HashMap, HashSet};
 
@@ -1658,13 +1695,14 @@ mod tests {
                 .with_unpublished_pin_resolution();
         let content = "actions/checkout = \"4.2.2\"\n";
         let make_analysis = || {
-            let mut analysis = test_analysis(
+            let mut analysis = test_analysis_with(
                 vec![test_dep(
                     "actions/checkout",
                     "4.2.2",
                     Range::new(Position::new(0, 20), Position::new(0, 25)),
                 )],
                 cached("actions/checkout", "7.0.1"),
+                UNPUBLISHED.for_dependency::<TestDep>(),
             );
             analysis.ecosystem_id = EcosystemId::GithubActions;
             analysis
@@ -1721,9 +1759,6 @@ mod tests {
         fn source(&self) -> DependencySource {
             DependencySource::Registry
         }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
 
     struct TestParseResult {
@@ -1740,8 +1775,12 @@ mod tests {
         fn uri(&self) -> &url::Url {
             &self.uri
         }
-        fn as_any(&self) -> &dyn Any {
-            self
+    }
+    impl TypedParseResult for TestParseResult {
+        type Dep = TestDep;
+
+        fn own_dependencies(&self) -> &[TestDep] {
+            &self.deps
         }
     }
 
@@ -1824,11 +1863,25 @@ mod tests {
     }
 
     fn test_analysis(deps: Vec<TestDep>, cached: CachedVersionsMap) -> ManifestAnalysis {
+        test_analysis_with(deps, cached, STUB_FORMATTER.for_dependency::<TestDep>())
+    }
+
+    /// [`test_analysis`] whose document is bound to `formatter`, which must be the formatter the
+    /// test also hands to [`plan_updates`].
+    fn test_analysis_with<F: DependencyFormatter<Dep = TestDep>>(
+        deps: Vec<TestDep>,
+        cached: CachedVersionsMap,
+        formatter: F,
+    ) -> ManifestAnalysis {
         ManifestAnalysis {
-            parse_result: Box::new(TestParseResult {
-                deps,
-                uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
-            }),
+            parse_result: stub_document_with(
+                TestParseResult {
+                    deps,
+                    uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
+                },
+                formatter,
+                EcosystemId::Cargo,
+            ),
             uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
             now: deps_core::PublishTime::now(),
             ecosystem_id: EcosystemId::Cargo,
@@ -2922,6 +2975,9 @@ mod tests {
     impl deps_core::lsp_helpers::DiagnosticPolicy for RealSemverFormatter {}
     impl deps_core::lsp_helpers::SourcePolicy for RealSemverFormatter {}
     impl deps_core::lsp_helpers::OsvNaming for RealSemverFormatter {}
+    impl DependencyFormatter for RealSemverFormatter {
+        type Dep = TestDep;
+    }
 
     /// Spec 076 FR-022/FR-023 (A1 repro, phase-1 d0), corrected for #1564/#1561: rejects a
     /// fallback whose UNEDITED requirement's own floor (the oldest `available` entry it still
@@ -3036,6 +3092,9 @@ mod tests {
     impl deps_core::lsp_helpers::DiagnosticPolicy for ExactPinSemverFormatter {}
     impl deps_core::lsp_helpers::SourcePolicy for ExactPinSemverFormatter {}
     impl deps_core::lsp_helpers::OsvNaming for ExactPinSemverFormatter {}
+    impl DependencyFormatter for ExactPinSemverFormatter {
+        type Dep = TestDep;
+    }
 
     /// npm-style partial-precision plain rewrite, floor-safe rendering for fix targets.
     struct PartialSemverFormatter;
@@ -3046,14 +3105,6 @@ mod tests {
         }
         fn format_version_replacing(&self, v: &deps_core::ConcreteVersion, _: &str) -> String {
             v.as_str().split('.').next().unwrap_or_default().to_owned()
-        }
-        fn format_version_replacing_floor_for(
-            &self,
-            _dep: &dyn deps_core::Dependency,
-            v: &deps_core::ConcreteVersion,
-            _current: &str,
-        ) -> String {
-            v.to_string()
         }
         fn package_url(&self, name: &PackageName) -> String {
             name.as_str().to_string()
@@ -3071,6 +3122,18 @@ mod tests {
     impl deps_core::lsp_helpers::DiagnosticPolicy for PartialSemverFormatter {}
     impl deps_core::lsp_helpers::SourcePolicy for PartialSemverFormatter {}
     impl deps_core::lsp_helpers::OsvNaming for PartialSemverFormatter {}
+    impl DependencyFormatter for PartialSemverFormatter {
+        type Dep = TestDep;
+
+        fn format_version_replacing_floor_for(
+            &self,
+            _dep: &TestDep,
+            v: &deps_core::ConcreteVersion,
+            _current: &str,
+        ) -> String {
+            v.to_string()
+        }
+    }
 
     #[test]
     fn test_writable_fallback_edit_never_lowers_floor_with_partial_rendering() {
@@ -3087,16 +3150,14 @@ mod tests {
             "5.0.0".into(),
         ];
         let reparse = reparse_quoted_deps(vec![("pkg", Position::new(0, 7))]);
-        let formatter = PartialSemverFormatter;
-        let edit = writable_fallback_edit(
-            &formatter,
+        let edit = writable_edit_via_document(
+            PartialSemverFormatter,
             &reparse,
             "pkg = \"5\"\n",
-            &dep,
+            dep,
             &partial_candidate,
             &deps_core::ConcreteVersion::new("6.2.1"),
             &available,
-            &PackageKey::new(&PackageName::new("pkg"), &formatter),
         )
         .expect("floor-safe fallback is writable");
         assert_eq!(edit.new_text, "6.2.1");
@@ -3128,13 +3189,52 @@ mod tests {
     impl deps_core::lsp_helpers::DiagnosticPolicy for LeakyPinSemverFormatter {}
     impl deps_core::lsp_helpers::SourcePolicy for LeakyPinSemverFormatter {}
     impl deps_core::lsp_helpers::OsvNaming for LeakyPinSemverFormatter {}
+    impl DependencyFormatter for LeakyPinSemverFormatter {
+        type Dep = TestDep;
+    }
 
     #[test]
     fn test_writable_fallback_edit_retry_that_still_admits_newer_is_not_written_1892() {
-        assert_eq!(writable_edit_for(&LeakyPinSemverFormatter), None);
+        assert_eq!(writable_edit_for(LeakyPinSemverFormatter), None);
     }
 
-    fn writable_edit_for(formatter: &dyn EcosystemFormatter) -> Option<ManifestEdit> {
+    /// [`writable_fallback_edit`] over `dep`, bound to `formatter` through a stub document (the
+    /// bound dependency is only valid inside the visitor).
+    fn writable_edit_via_document<F: DependencyFormatter<Dep = TestDep>>(
+        formatter: F,
+        reparse: &dyn ManifestReparse,
+        content: &str,
+        dep: TestDep,
+        candidate: &ManifestEdit,
+        target: &ConcreteVersion,
+        available: &[ConcreteVersion],
+    ) -> Option<ManifestEdit> {
+        let document = stub_document_with(
+            TestParseResult {
+                deps: vec![dep],
+                uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
+            },
+            formatter,
+            EcosystemId::Cargo,
+        );
+        let mut edit = None;
+        document.for_each_formatted_dependency(&mut |bound| {
+            edit = writable_fallback_edit(
+                reparse,
+                content,
+                bound,
+                candidate,
+                target,
+                available,
+                &deps_core::test_util::package_key("pkg"),
+            );
+        });
+        edit
+    }
+
+    fn writable_edit_for<F: DependencyFormatter<Dep = TestDep>>(
+        formatter: F,
+    ) -> Option<ManifestEdit> {
         let range = Range::new(Position::new(0, 7), Position::new(0, 14));
         let dep = test_dep("pkg", "^0.21.0", range);
         let candidate = ManifestEdit {
@@ -3148,28 +3248,26 @@ mod tests {
             "0.21.0".into(),
         ];
         let reparse = reparse_quoted_deps(vec![("pkg", Position::new(0, 7))]);
-        writable_fallback_edit(
+        writable_edit_via_document(
             formatter,
             &reparse,
             "pkg = \"^0.21.0\"\n",
-            &dep,
+            dep,
             &candidate,
             &deps_core::ConcreteVersion::new("0.22.7"),
             &available,
-            &PackageKey::new(&PackageName::new("pkg"), formatter),
         )
     }
 
     #[test]
     fn test_writable_fallback_edit_retries_caret_as_exact_pin_1892() {
-        let edit =
-            writable_edit_for(&ExactPinSemverFormatter).expect("exact-pin retry is writable");
+        let edit = writable_edit_for(ExactPinSemverFormatter).expect("exact-pin retry is writable");
         assert_eq!(edit.new_text, "=0.22.7");
     }
 
     #[test]
     fn test_writable_fallback_edit_without_exact_pin_hook_stays_rejected_1892() {
-        assert_eq!(writable_edit_for(&RealSemverFormatter), None);
+        assert_eq!(writable_edit_for(RealSemverFormatter), None);
     }
 
     /// Issue #1561 repro (CWE-1284), adapted: the declared exact pin (`=1.5.0`) is absent from
@@ -3263,6 +3361,22 @@ mod tests {
         deps_core::FreshnessSettings,
         deps_core::PublishTime,
     ) {
+        fallback_scenario_analysis_with(
+            fallback_version,
+            FALLBACK_FORMATTER.for_dependency::<TestDep>(),
+        )
+    }
+
+    /// [`fallback_scenario_analysis`] whose document is bound to `formatter`, which must be the
+    /// formatter the test also hands to [`plan_updates`].
+    fn fallback_scenario_analysis_with<F: DependencyFormatter<Dep = TestDep>>(
+        fallback_version: &str,
+        formatter: F,
+    ) -> (
+        ManifestAnalysis,
+        deps_core::FreshnessSettings,
+        deps_core::PublishTime,
+    ) {
         let now = deps_core::PublishTime::from_unix_secs(10_000);
         let published_at = deps_core::PublishTime::from_unix_secs(9_900); // 100s old, within cooldown
         let mut versions = cached("pkg", "2.0.0");
@@ -3287,7 +3401,7 @@ mod tests {
                 deps_core::PublishTime::from_unix_secs(1_000),
             )),
         );
-        let analysis = test_analysis(
+        let analysis = test_analysis_with(
             vec![test_dep(
                 "pkg",
                 "=1.0.0",
@@ -3298,6 +3412,7 @@ mod tests {
                 Range::new(Position::new(0, 7), Position::new(0, 13)),
             )],
             versions,
+            formatter,
         );
         let freshness = deps_core::FreshnessSettings::Enabled {
             cooldown: deps_core::CooldownWindow::from_secs(1_000),
@@ -3334,13 +3449,14 @@ mod tests {
                 )),
         );
         let end = 7 + u32::try_from(req.len()).expect("short test literal");
-        let analysis = test_analysis(
+        let analysis = test_analysis_with(
             vec![test_dep(
                 "pkg",
                 req,
                 Range::new(Position::new(0, 7), Position::new(0, end)),
             )],
             versions,
+            RealSemverFormatter,
         );
         let freshness = deps_core::FreshnessSettings::Enabled {
             cooldown: deps_core::CooldownWindow::from_secs(1_000),
@@ -3553,7 +3669,8 @@ mod tests {
         use deps_core::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
 
         let content = "pkg = \"=1.0.0\"\n";
-        let (mut analysis, freshness, now) = fallback_scenario_analysis("1.1.0");
+        let (mut analysis, freshness, now) =
+            fallback_scenario_analysis_with("1.1.0", RealSemverFormatter);
         let mut latest_status = LatestStatusMap::new();
         latest_status.insert(
             deps_core::test_util::vuln_key("pkg"),
@@ -3950,7 +4067,8 @@ mod tests {
         use deps_core::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
 
         let content = "pkg = \"=1.0.0\"\n";
-        let (mut analysis, freshness, now) = fallback_scenario_analysis("1.1.0");
+        let (mut analysis, freshness, now) =
+            fallback_scenario_analysis_with("1.1.0", RealSemverFormatter);
         let mut latest_status = LatestStatusMap::new();
         latest_status.insert(
             deps_core::test_util::vuln_key("pkg"),
@@ -4005,7 +4123,8 @@ mod tests {
     #[tokio::test]
     async fn test_plan_updates_row9_honors_ignore_rule_instead_of_applying() {
         let content = "pkg = \"=1.0.0\"\n";
-        let (analysis, freshness, now) = fallback_scenario_analysis("1.1.0");
+        let (analysis, freshness, now) =
+            fallback_scenario_analysis_with("1.1.0", RealSemverFormatter);
         let ignore_pkg = IgnoreRules::new(
             vec![crate::config::IgnoreRule {
                 name: "pkg".to_string(),
@@ -4119,13 +4238,14 @@ mod tests {
             NormalizedName::for_test("django"),
             PackageVersions::latest_only("2.0.0").with_published_at(old_published_at),
         );
-        let mut analysis = test_analysis(
+        let mut analysis = test_analysis_with(
             vec![test_dep(
                 "Django",
                 "1.0.0",
                 Range::new(Position::new(0, 10), Position::new(0, 15)),
             )],
             versions,
+            lowercase_formatter.for_dependency::<TestDep>(),
         );
         let mut gossip = HashMap::new();
         gossip.insert(
@@ -4217,7 +4337,7 @@ mod tests {
             )),
         );
 
-        let analysis = test_analysis(
+        let analysis = test_analysis_with(
             vec![
                 test_dep(
                     "alpha",
@@ -4231,6 +4351,7 @@ mod tests {
                 ),
             ],
             versions,
+            RealSemverFormatter,
         );
         let reparse = reparse_quoted_deps(vec![
             ("alpha", Position::new(0, 9)),
@@ -4300,7 +4421,7 @@ mod tests {
                 )),
         );
 
-        let analysis = test_analysis(
+        let analysis = test_analysis_with(
             vec![
                 test_dep(
                     "pkg",
@@ -4314,6 +4435,7 @@ mod tests {
                 ),
             ],
             versions,
+            FALLBACK_FORMATTER.for_dependency::<TestDep>(),
         );
 
         let plan = plan_updates(
@@ -4350,7 +4472,7 @@ mod tests {
     }
 
     /// Team-lead/impl-critic follow-up: `fallback_by_key` used to build its map the same
-    /// "collapse-then-key" way `dep_by_key` did, so on a collision `.collect()` kept only the
+    /// "collapse-then-key" way the old `dep_by_key` did, so on a collision `.collect()` kept only the
     /// last occurrence's fallback candidate — the other occurrence could then be resolved
     /// against a stolen `UpdateCandidate` in the `Unplannable` branch (rows 8/10/11), a
     /// mismatched `SkipReason`/attribution even though (per impl-critic's trace) it never
@@ -4378,7 +4500,7 @@ mod tests {
                 )),
         );
 
-        let analysis = test_analysis(
+        let analysis = test_analysis_with(
             vec![
                 // occ1: requirement matches the manifest text — a genuinely valid,
                 // independently-Applicable fallback candidate in isolation.
@@ -4397,6 +4519,7 @@ mod tests {
                 ),
             ],
             versions,
+            FALLBACK_FORMATTER.for_dependency::<TestDep>(),
         );
 
         let plan = plan_updates(
@@ -4449,9 +4572,13 @@ mod tests {
                 ("v7.0.1", &commit),
             ])),
         );
-        let formatter = GithubActionsFormatter::new(tag_index);
+        let formatter = GithubActionsFormatter::new(std::sync::Arc::clone(&tag_index));
         let mut analysis = test_analysis(vec![], cached("actions/checkout", "v7.0.1"));
-        analysis.parse_result = Box::new(parse_result);
+        analysis.parse_result = stub_document_with(
+            parse_result,
+            GithubActionsFormatter::new(tag_index),
+            EcosystemId::GithubActions,
+        );
         analysis.uri = uri;
         analysis.ecosystem_id = EcosystemId::GithubActions;
 

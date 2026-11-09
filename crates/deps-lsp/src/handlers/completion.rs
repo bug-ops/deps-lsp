@@ -106,8 +106,8 @@ pub async fn handle_completion(
     // a concurrent `didChange` between them could pair a `parse_result` with `content` from
     // a different revision, and `generate_completions` correlates the two (#319 review).
     // `with_document` makes releasing the guard structural, not a convention (#333).
-    let Some((ecosystem_id, content, parse_result)) = state.with_document(uri, |doc| {
-        (doc.ecosystem, doc.content.clone(), doc.parse_result_arc())
+    let Some((ecosystem_id, content, manifest)) = state.with_document(uri, |doc| {
+        (doc.ecosystem, doc.content.clone(), doc.manifest_arc())
     }) else {
         tracing::warn!("completion: document not found: {:?}", uri);
         return context_less_response();
@@ -118,7 +118,7 @@ pub async fn handle_completion(
     tracing::info!(
         "completion: ecosystem={}, has_parse_result={}",
         ecosystem_id,
-        parse_result.is_some()
+        manifest.is_some()
     );
 
     // Try parse_result first, fall back to text-based detection. `is_incomplete` (#427) is
@@ -131,7 +131,7 @@ pub async fn handle_completion(
     // `Version`, so it's hardcoded to `PackageName` rather than inheriting whatever origin the
     // ecosystem itself returned (which could be `Version` on the "ecosystem returned empty,
     // trying fallback" branch).
-    let (mut items, is_incomplete, origin) = if let Some(parse_result) = parse_result {
+    let (mut items, is_incomplete, origin) = if let Some(manifest) = manifest {
         match state.ecosystem_registry.get(ecosystem_id) {
             Some(ecosystem) => {
                 // The DashMap shard `Ref` was already dropped above: holding it across
@@ -139,12 +139,7 @@ pub async fn handle_completion(
                 // `documents.get_mut` on the same shard for the duration (#319).
                 let completion_result = tokio::time::timeout(
                     COMPLETION_SEARCH_TIMEOUT,
-                    ecosystem.generate_completions(
-                        parse_result.as_ref(),
-                        position,
-                        &content,
-                        freshness,
-                    ),
+                    manifest.generate_completions(position, &content, freshness),
                 )
                 .await;
 
@@ -220,6 +215,20 @@ pub async fn handle_completion(
     } else {
         Some(CompletionResponse::Array(items))
     }
+}
+
+/// Whether `candidate` is the declaration `target` names: same package at the same source
+/// ranges.
+///
+/// The two come from independently produced views of one document, so storage identity cannot
+/// be relied on; ranges identify a declaration within a document.
+fn same_declaration(
+    candidate: &dyn deps_core::Dependency,
+    target: &dyn deps_core::Dependency,
+) -> bool {
+    candidate.name() == target.name()
+        && candidate.name_range() == target.name_range()
+        && candidate.version_range() == target.version_range()
 }
 
 /// Demotes/flags every entry in `items` unless its own [`LatestVerdict`] is `Verified` or
@@ -329,9 +338,7 @@ fn apply_osv_latest_verdict_to_completions(
 
     let verdicts: Option<Vec<LatestVerdict>> = state
         .with_document(uri, |doc| {
-            let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
-            let formatter = ecosystem.formatter();
-            let parse_result = doc.parse_result()?;
+            let manifest = doc.manifest()?;
             // Impl-critic S5 (#1524): the same two-pass lookup
             // `literal_version_dependency_in_scope` applies before its own literal-value check
             // — pass 1 by `version_range`, pass 2 a same-line fallback using `name_range` when
@@ -341,18 +348,14 @@ fn apply_osv_latest_verdict_to_completions(
             // even though the ecosystem's own completion dispatch found the dependency fine via
             // this same lookup to produce the very items being gated here.
             let dep = deps_core::completion::version_dependency_at_position(
-                parse_result,
+                manifest,
                 position,
                 deps_core::completion::DeclarationScope::Unchecked,
             )?;
-            let vuln_keys = deps_core::osv::vulnerability_keys(
-                parse_result,
+            let vuln_keys = manifest.vulnerability_keys(
                 &doc.signals.resolved_versions,
                 Some(&doc.signals.resolved_version_candidates),
-                formatter,
-                doc.ecosystem,
             );
-            let key = deps_core::PackageKey::new(dep.name(), formatter);
             let (latest_status, candidate_status) = match osv_checks.state() {
                 CheckState::Active => (
                     Some(&doc.signals.latest_status),
@@ -366,33 +369,39 @@ fn apply_osv_latest_verdict_to_completions(
             // phase B's separate multi-candidate check) — the two are deliberately different maps
             // (see each field's own doc), so an item must be routed to the one that actually
             // covers it, not merged into a single lookup.
-            Some(
-                versions
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, version)| {
-                        if Some(idx) == latest_idx {
-                            deps_core::lsp_helpers::latest_verdict(
-                                latest_status,
-                                dep,
-                                Some(&vuln_keys),
-                                &key,
-                                version,
-                                formatter,
-                            )
-                        } else {
-                            deps_core::lsp_helpers::candidate_verdict(
-                                candidate_status,
-                                dep,
-                                Some(&vuln_keys),
-                                &key,
-                                version,
-                                formatter,
-                            )
-                        }
-                    })
-                    .collect(),
-            )
+            let mut verdicts = None;
+            manifest.for_each_formatted_dependency(&mut |bound| {
+                if verdicts.is_some() || !same_declaration(bound.dependency(), dep) {
+                    return;
+                }
+                let key = deps_core::PackageKey::new(dep.name(), bound.formatter());
+                verdicts = Some(
+                    versions
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, version)| {
+                            if Some(idx) == latest_idx {
+                                bound.latest_verdict(latest_status, Some(&vuln_keys), &key, version)
+                            } else {
+                                bound.candidate_verdict(
+                                    candidate_status,
+                                    Some(&vuln_keys),
+                                    &key,
+                                    version,
+                                )
+                            }
+                        })
+                        .collect::<Vec<LatestVerdict>>(),
+                );
+            });
+            if verdicts.is_none() {
+                tracing::warn!(
+                    dependency = dep.name().as_str(),
+                    "completion: no formatted dependency matches the dependency at the cursor; \
+                     failing closed"
+                );
+            }
+            verdicts
         })
         .flatten();
 
@@ -447,7 +456,7 @@ fn apply_osv_latest_verdict_to_completions(
 /// Fallback completion when document parsing fails.
 ///
 /// Delegates the raw-text section/prefix detection entirely to the resolved
-/// ecosystem's [`deps_core::Ecosystem::fallback_completion_prefix`] (issue #722) — the
+/// ecosystem's [`deps_core::EcosystemBase::fallback_completion_prefix`] (issue #722) — the
 /// per-ecosystem section-boundary and manifest-syntax-stripping heuristics that used to
 /// live here now live with each ecosystem crate. This function only owns the two
 /// ecosystem-agnostic pieces: resolving the ecosystem, and the length (2-200 chars,
@@ -571,7 +580,7 @@ async fn search_packages(
 /// #1284: this fallback path and the primary completion path must reject the same unsafe
 /// metadata and render the same fields the same way, not diverge silently) — then builds
 /// `insert_text` itself, via the ecosystem's own manifest syntax
-/// ([`deps_core::Ecosystem::completion_insert_text`] — required, no default, so a new
+/// ([`deps_core::EcosystemBase::completion_insert_text`] — required, no default, so a new
 /// ecosystem must supply its own snippet instead of silently inheriting another ecosystem's
 /// syntax, see issue #118). `text_edit` is left as the base builder leaves it (`None`) — this
 /// path has no known insert range, so the client falls back to inserting `insert_text` at the
@@ -658,7 +667,7 @@ mod tests {
         bare_insert_text: fn(&dyn deps_core::Metadata) -> Option<String>,
     }
     impl deps_core::ecosystem::private::Sealed for MockEcosystem {}
-    impl deps_core::Ecosystem for MockEcosystem {
+    impl deps_core::EcosystemBase for MockEcosystem {
         fn ecosystem_id(&self) -> deps_core::EcosystemId {
             self.ecosystem_id
         }
@@ -668,36 +677,8 @@ mod tests {
         fn manifest_filenames(&self) -> &[&'static str] {
             &["Cargo.toml"]
         }
-        fn parse_manifest<'a>(
-            &'a self,
-            _content: &'a str,
-            _uri: &'a url::Url,
-        ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn deps_core::ParseResult>>>
-        {
-            Box::pin(async move { unimplemented!() })
-        }
         fn registry(&self) -> Arc<dyn deps_core::Registry> {
             Arc::clone(&self.registry)
-        }
-        fn formatter(&self) -> &dyn deps_core::lsp_helpers::EcosystemFormatter {
-            &deps_core::test_util::StubFormatter::DEFAULT
-        }
-        fn generate_completions<'a>(
-            &'a self,
-            _parse_result: &'a dyn deps_core::ParseResult,
-            _position: tower_lsp_server::ls_types::Position,
-            _content: &'a str,
-            _freshness: deps_core::FreshnessSettings,
-        ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions> {
-            Box::pin(async move { unimplemented!() })
-        }
-        fn complete_version<'a>(
-            &'a self,
-            _request: deps_core::completion::CompletionRequest<'a>,
-            _package_name: deps_core::PackageName,
-            _prefix: String,
-        ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions> {
-            unimplemented!()
         }
         fn fallback_completion_prefix<'a>(
             &self,
@@ -719,10 +700,19 @@ mod tests {
         fn fallback_bare_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
             (self.bare_insert_text)(metadata)
         }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
     }
+
+    crate::test_utils::impl_parsing_stub_ecosystem!(MockEcosystem, {
+        fn completions<'a>(
+            &'a self,
+            _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
+            _position: tower_lsp_server::ls_types::Position,
+            _content: &'a str,
+            _freshness: deps_core::FreshnessSettings,
+        ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions> {
+            Box::pin(async move { unimplemented!() })
+        }
+    });
 
     /// Default `completion_insert_text`/`fallback_bare_insert_text` for
     /// [`MockEcosystem`]: the bare package name, sufficient whenever a test only
@@ -802,17 +792,16 @@ mod tests {
     /// nothing to invalidate on the next keystroke.
     #[tokio::test]
     async fn test_completion_missing_document_reports_incomplete_for_flagged_ecosystem() {
+        use deps_core::Registry;
         use deps_core::completion::Completions;
         use deps_core::ecosystem::private::Sealed;
-        use deps_core::{Ecosystem, EcosystemFormatter, ParseResult, Registry};
-        use std::any::Any;
 
         /// Stands in for `PypiEcosystem`: overrides `package_search_is_incomplete`
         /// the same way, and `generate_completions` is deliberately `unimplemented!()`
         /// since this test never lets it run.
         struct IncompleteEcosystem;
         impl Sealed for IncompleteEcosystem {}
-        impl Ecosystem for IncompleteEcosystem {
+        impl deps_core::EcosystemBase for IncompleteEcosystem {
             fn ecosystem_id(&self) -> deps_core::EcosystemId {
                 deps_core::EcosystemId::Cargo
             }
@@ -822,39 +811,11 @@ mod tests {
             fn manifest_filenames(&self) -> &[&'static str] {
                 &["Cargo.toml"]
             }
-            fn parse_manifest<'a>(
-                &'a self,
-                _content: &'a str,
-                _uri: &'a url::Url,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
-            {
-                Box::pin(async move { unimplemented!() })
-            }
             fn registry(&self) -> Arc<dyn Registry> {
                 Arc::new(deps_core::test_util::MockRegistry::new())
             }
-            fn formatter(&self) -> &dyn EcosystemFormatter {
-                &deps_core::test_util::StubFormatter::DEFAULT
-            }
             fn package_search_is_incomplete(&self) -> bool {
                 true
-            }
-            fn generate_completions<'a>(
-                &'a self,
-                _parse_result: &'a dyn ParseResult,
-                _position: tower_lsp_server::ls_types::Position,
-                _content: &'a str,
-                _freshness: deps_core::FreshnessSettings,
-            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-                Box::pin(async move { unimplemented!() })
-            }
-            fn complete_version<'a>(
-                &'a self,
-                _request: deps_core::completion::CompletionRequest<'a>,
-                _package_name: deps_core::PackageName,
-                _prefix: String,
-            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-                unimplemented!()
             }
             fn completion_insert_text(
                 &self,
@@ -862,10 +823,19 @@ mod tests {
             ) -> Option<String> {
                 unimplemented!()
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
+
+        crate::test_utils::impl_parsing_stub_ecosystem!(IncompleteEcosystem, {
+            fn completions<'a>(
+                &'a self,
+                _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
+                _position: tower_lsp_server::ls_types::Position,
+                _content: &'a str,
+                _freshness: deps_core::FreshnessSettings,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+                Box::pin(async move { unimplemented!() })
+            }
+        });
 
         let state = Arc::new(ServerState::new());
         state
@@ -914,7 +884,10 @@ mod tests {
             .ecosystem_registry
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
-        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let parse_result = Arc::clone(&ecosystem)
+            .parse_manifest(&content, &url)
+            .await
+            .unwrap();
 
         let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
         state.update_document(uri.clone(), doc);
@@ -961,7 +934,10 @@ mod tests {
             .ecosystem_registry
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
-        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let parse_result = Arc::clone(&ecosystem)
+            .parse_manifest(&content, &url)
+            .await
+            .unwrap();
         let mut doc =
             DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
 
@@ -1081,7 +1057,10 @@ mod tests {
             .ecosystem_registry
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
-        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let parse_result = Arc::clone(&ecosystem)
+            .parse_manifest(&content, &url)
+            .await
+            .unwrap();
         // Deliberately never calls `update_latest_status`: `doc.signals.latest_status`
         // stays at its default, empty `LatestStatusMap` — the exact pre-phase-B state.
         let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
@@ -1119,6 +1098,126 @@ mod tests {
         );
     }
 
+    /// The OSV gate must find the cursor's dependency in the formatted view by declaration, not
+    /// by storage: here `dependencies()` and `own_dependencies()` are separate allocations.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_apply_osv_latest_verdict_to_completions_matches_dependency_across_storage() {
+        use deps_core::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
+        use deps_core::position::{Position as DepPosition, Range};
+
+        #[derive(Clone)]
+        struct Dep {
+            name: deps_core::PackageName,
+            req: deps_core::VersionReq,
+        }
+        fn name_range() -> Range {
+            Range::new(DepPosition::new(1, 0), DepPosition::new(1, 5))
+        }
+        fn version_range() -> Range {
+            Range::new(DepPosition::new(1, 8), DepPosition::new(1, 15))
+        }
+        impl deps_core::Dependency for Dep {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                name_range()
+            }
+            fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+                Some(&self.req)
+            }
+            fn version_range(&self) -> Option<Range> {
+                Some(version_range())
+            }
+            fn source(&self) -> deps_core::parser::DependencySource {
+                deps_core::parser::DependencySource::Registry
+            }
+        }
+        struct TwoStorages {
+            uri: url::Url,
+            own: Vec<Dep>,
+            shadow: Vec<Dep>,
+        }
+        impl deps_core::ParseResult for TwoStorages {
+            fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
+                self.shadow
+                    .iter()
+                    .map(|dep| dep as &dyn deps_core::Dependency)
+                    .collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+        }
+        impl deps_core::TypedParseResult for TwoStorages {
+            type Dep = Dep;
+            fn own_dependencies(&self) -> &[Dep] {
+                &self.own
+            }
+        }
+
+        let state = Arc::new(ServerState::new());
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+        let dep = Dep {
+            name: deps_core::PackageName::new("serde"),
+            req: deps_core::VersionReq::new("=1.0.0"),
+        };
+        let manifest = deps_core::test_util::stub_document_with(
+            TwoStorages {
+                uri: url,
+                own: vec![dep.clone()],
+                shadow: vec![dep],
+            },
+            deps_core::test_util::StubFormatter::new().for_dependency::<Dep>(),
+            EcosystemId::Cargo,
+        );
+        let mut doc =
+            DocumentState::new_from_parse_result(EcosystemId::Cargo, String::new(), manifest);
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            deps_core::test_util::vuln_key("serde"),
+            UpgradeStatus::CandidateVulnerable {
+                version: ConcreteVersion::new("1.2.0"),
+                advisory_ids: Capped::new(vec![deps_core::test_util::osv_id("MAL-2026-00001")], 1),
+                worst_severity: Some(VulnSeverity::Malicious),
+                via_sibling_tags: None,
+            },
+        );
+        doc.update_latest_status(latest_status);
+        state.update_document(uri.clone(), doc);
+
+        let mut items = vec![CompletionItem {
+            label: "1.2.0 (latest)".to_string(),
+            insert_text: Some("1.2.0".to_string()),
+            sort_text: Some("00000".to_string()),
+            preselect: Some(true),
+            ..Default::default()
+        }];
+        apply_osv_latest_verdict_to_completions(
+            &state,
+            &uri,
+            Position::new(1, 10),
+            test_osv_checks(true),
+            CompletionOrigin::Version,
+            &mut items,
+        );
+
+        assert!(
+            items[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("flagged by OSV")),
+            "the dependency must be matched, giving a flagged verdict rather than the \
+             fail-closed unverified one: {:?}",
+            items[0].detail
+        );
+    }
+
     /// Issue #1517 critique S1 (fail-open #2): before this fix, an item was only demoted when
     /// its version *equaled* the map entry's own recorded version — a live "latest" that had
     /// since diverged from a stale `CandidateClean` entry (e.g. the registry published a new
@@ -1140,7 +1239,10 @@ mod tests {
             .ecosystem_registry
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
-        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let parse_result = Arc::clone(&ecosystem)
+            .parse_manifest(&content, &url)
+            .await
+            .unwrap();
         let mut doc =
             DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
 
@@ -1205,7 +1307,10 @@ mod tests {
             .ecosystem_registry
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
-        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let parse_result = Arc::clone(&ecosystem)
+            .parse_manifest(&content, &url)
+            .await
+            .unwrap();
         let mut doc =
             DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
 
@@ -1300,7 +1405,10 @@ mod tests {
             .ecosystem_registry
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
-        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let parse_result = Arc::clone(&ecosystem)
+            .parse_manifest(&content, &url)
+            .await
+            .unwrap();
         let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
         state.update_document(uri.clone(), doc);
 
@@ -1350,7 +1458,10 @@ mod tests {
             .ecosystem_registry
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
-        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let parse_result = Arc::clone(&ecosystem)
+            .parse_manifest(&content, &url)
+            .await
+            .unwrap();
         assert!(
             parse_result.dependencies().is_empty(),
             "fixture must have no dependency to guarantee a lookup miss"
@@ -1411,7 +1522,10 @@ mod tests {
             .ecosystem_registry
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
-        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let parse_result = Arc::clone(&ecosystem)
+            .parse_manifest(&content, &url)
+            .await
+            .unwrap();
         let mut doc =
             DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
 
@@ -1536,7 +1650,10 @@ mod tests {
             .ecosystem_registry
             .get(deps_core::EcosystemId::Pypi)
             .unwrap();
-        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let parse_result = Arc::clone(&ecosystem)
+            .parse_manifest(&content, &url)
+            .await
+            .unwrap();
         let mut doc =
             DocumentState::new_from_parse_result(EcosystemId::Pypi, content, parse_result);
 
@@ -1627,7 +1744,10 @@ mod tests {
             .ecosystem_registry
             .get(deps_core::EcosystemId::Maven)
             .unwrap();
-        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let parse_result = Arc::clone(&ecosystem)
+            .parse_manifest(&content, &url)
+            .await
+            .unwrap();
         let dep = &parse_result.dependencies()[0];
         assert_eq!(dep.name().as_str(), "org.example:evil-lib");
         let version_range = dep
@@ -1751,7 +1871,10 @@ mod tests {
             .ecosystem_registry
             .get(deps_core::EcosystemId::Composer)
             .unwrap();
-        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let parse_result = Arc::clone(&ecosystem)
+            .parse_manifest(&content, &url)
+            .await
+            .unwrap();
         let dep = &parse_result.dependencies()[0];
         let position: Position = dep.version_range().unwrap().end.into();
         let mut doc = DocumentState::new_from_parse_result(
@@ -1834,7 +1957,10 @@ mod tests {
             .ecosystem_registry
             .get(deps_core::EcosystemId::Cargo)
             .unwrap();
-        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let parse_result = Arc::clone(&ecosystem)
+            .parse_manifest(&content, &url)
+            .await
+            .unwrap();
         let dep = &parse_result.dependencies()[0];
         let version_range: Range = dep
             .version_range()
@@ -1912,7 +2038,7 @@ mod tests {
     /// await, so a concurrent `documents.get_mut` on the same URI (e.g. a `didChange`)
     /// is never blocked behind an in-flight (or stuck) registry-backed search.
     ///
-    /// `BlockingEcosystem::generate_completions` waits on a `Barrier` before blocking
+    /// `BlockingEcosystem::completions` waits on a `Barrier` before blocking
     /// forever (`std::future::pending`), standing in for a registry call that never
     /// returns — the worst case for a shard `Ref` held across the search. The test
     /// only proceeds to race the writer once that future has demonstrably started
@@ -1925,26 +2051,23 @@ mod tests {
     /// search was ever awaited.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_document_write_not_blocked_by_in_flight_completion_search() {
-        use crate::test_utils::blocking_ecosystem::{
-            BlockingEcosystem, BlockingHook, MockParseResult,
-        };
-        use deps_core::ParseResult;
+        use crate::test_utils::blocking_ecosystem::{BlockingEcosystem, BlockingHook};
+
         use tokio::sync::Barrier;
 
         let state = Arc::new(ServerState::new());
         let started = Arc::new(Barrier::new(2));
-        state
-            .ecosystem_registry
-            .register(Arc::new(BlockingEcosystem {
-                started: Arc::clone(&started),
-                hook: BlockingHook::Completions,
-            }));
+        let blocking = Arc::new(BlockingEcosystem {
+            started: Arc::clone(&started),
+            hook: BlockingHook::Completions,
+        });
+        state.ecosystem_registry.register(blocking.clone());
 
         let url = deps_core::test_util::test_uri("/test/Cargo.toml");
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
         let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
-        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+        let manifest = blocking.manifest(&url);
+        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, manifest);
         state.update_document(uri.clone(), doc);
 
         let (client, config) = create_test_client_and_config();
@@ -2005,10 +2128,9 @@ mod tests {
     /// on the very next request, with no server restart and no re-opening the document.
     #[tokio::test]
     async fn test_completion_freshness_enabled_live_reload_changes_label_details_on_next_request() {
+        use deps_core::Registry;
         use deps_core::ecosystem::private::Sealed;
-        use deps_core::{Dependency, Ecosystem, EcosystemFormatter, ParseResult, Registry};
-        use std::any::Any;
-        use std::path::Path;
+
         use tower_lsp_server::ls_types::CompletionItemLabelDetails;
 
         /// Stands in for a real ecosystem's `generate_completions`, echoing whatever
@@ -2017,7 +2139,7 @@ mod tests {
         /// needing a real registry fetch or parsed manifest.
         struct FreshnessEchoEcosystem;
         impl Sealed for FreshnessEchoEcosystem {}
-        impl Ecosystem for FreshnessEchoEcosystem {
+        impl deps_core::EcosystemBase for FreshnessEchoEcosystem {
             fn ecosystem_id(&self) -> deps_core::EcosystemId {
                 deps_core::EcosystemId::Cargo
             }
@@ -2027,23 +2149,21 @@ mod tests {
             fn manifest_filenames(&self) -> &[&'static str] {
                 &["Cargo.toml"]
             }
-            fn parse_manifest<'a>(
-                &'a self,
-                _content: &'a str,
-                _uri: &'a url::Url,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
-            {
-                Box::pin(async move { unimplemented!() })
-            }
             fn registry(&self) -> Arc<dyn Registry> {
                 Arc::new(deps_core::test_util::MockRegistry::new())
             }
-            fn formatter(&self) -> &dyn EcosystemFormatter {
-                &deps_core::test_util::StubFormatter::DEFAULT
+            fn completion_insert_text(
+                &self,
+                _metadata: &dyn deps_core::Metadata,
+            ) -> Option<String> {
+                unimplemented!()
             }
-            fn generate_completions<'a>(
+        }
+
+        crate::test_utils::impl_parsing_stub_ecosystem!(FreshnessEchoEcosystem, {
+            fn completions<'a>(
                 &'a self,
-                _parse_result: &'a dyn ParseResult,
+                _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
                 _position: tower_lsp_server::ls_types::Position,
                 _content: &'a str,
                 freshness: deps_core::FreshnessSettings,
@@ -2062,55 +2182,18 @@ mod tests {
                     .into()
                 })
             }
-            fn complete_version<'a>(
-                &'a self,
-                _request: deps_core::completion::CompletionRequest<'a>,
-                _package_name: deps_core::PackageName,
-                _prefix: String,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions>
-            {
-                unimplemented!()
-            }
-            fn completion_insert_text(
-                &self,
-                _metadata: &dyn deps_core::Metadata,
-            ) -> Option<String> {
-                unimplemented!()
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockParseResult {
-            uri: url::Url,
-        }
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                vec![]
-            }
-            fn workspace_root(&self) -> Option<&Path> {
-                None
-            }
-            fn uri(&self) -> &url::Url {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
+        });
 
         let state = Arc::new(ServerState::new());
         // Overwrites the real Cargo ecosystem for this state instance only.
-        state
-            .ecosystem_registry
-            .register(Arc::new(FreshnessEchoEcosystem));
+        let ecosystem = Arc::new(FreshnessEchoEcosystem);
+        state.ecosystem_registry.register(ecosystem.clone());
         let url = deps_core::test_util::test_uri("/test/Cargo.toml");
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
         let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
-        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+        let manifest = crate::test_utils::manifest_of(&ecosystem, &url);
+        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, manifest);
         state.update_document(uri.clone(), doc);
 
         let params = || CompletionParams {
@@ -2770,9 +2853,6 @@ ser"
 
     #[tokio::test(start_paused = true)]
     async fn test_handle_completion_primary_path_times_out_and_skips_fallback() {
-        use deps_core::{Dependency, Ecosystem, EcosystemFormatter, ParseResult};
-        use std::any::Any;
-        use std::path::Path;
         use std::time::Duration;
 
         // Deliberately `unimplemented!()`: if a primary-path timeout ever falls through
@@ -2780,7 +2860,7 @@ ser"
         // `registry()` and this test panics instead of just running slow.
         struct SlowEcosystem;
         impl deps_core::ecosystem::private::Sealed for SlowEcosystem {}
-        impl Ecosystem for SlowEcosystem {
+        impl deps_core::EcosystemBase for SlowEcosystem {
             fn ecosystem_id(&self) -> deps_core::EcosystemId {
                 deps_core::EcosystemId::Cargo
             }
@@ -2790,23 +2870,21 @@ ser"
             fn manifest_filenames(&self) -> &[&'static str] {
                 &["Cargo.toml"]
             }
-            fn parse_manifest<'a>(
-                &'a self,
-                _content: &'a str,
-                _uri: &'a url::Url,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
-            {
-                Box::pin(async move { unimplemented!() })
-            }
             fn registry(&self) -> Arc<dyn deps_core::Registry> {
                 unimplemented!()
             }
-            fn formatter(&self) -> &dyn EcosystemFormatter {
-                &deps_core::test_util::StubFormatter::DEFAULT
+            fn completion_insert_text(
+                &self,
+                _metadata: &dyn deps_core::Metadata,
+            ) -> Option<String> {
+                unimplemented!()
             }
-            fn generate_completions<'a>(
+        }
+
+        crate::test_utils::impl_parsing_stub_ecosystem!(SlowEcosystem, {
+            fn completions<'a>(
                 &'a self,
-                _parse_result: &'a dyn ParseResult,
+                _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
                 _position: tower_lsp_server::ls_types::Position,
                 _content: &'a str,
                 _freshness: deps_core::FreshnessSettings,
@@ -2819,54 +2897,19 @@ ser"
                     deps_core::completion::Completions::default()
                 })
             }
-            fn complete_version<'a>(
-                &'a self,
-                _request: deps_core::completion::CompletionRequest<'a>,
-                _package_name: deps_core::PackageName,
-                _prefix: String,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions>
-            {
-                unimplemented!()
-            }
-            fn completion_insert_text(
-                &self,
-                _metadata: &dyn deps_core::Metadata,
-            ) -> Option<String> {
-                unimplemented!()
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockParseResult {
-            uri: url::Url,
-        }
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                vec![]
-            }
-            fn workspace_root(&self) -> Option<&Path> {
-                None
-            }
-            fn uri(&self) -> &url::Url {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
+        });
 
         let state = Arc::new(ServerState::new());
         let url = deps_core::test_util::test_uri("/test/Cargo.toml");
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
         // Overwrites the real Cargo ecosystem for this state instance only.
-        state.ecosystem_registry.register(Arc::new(SlowEcosystem));
+        let ecosystem = Arc::new(SlowEcosystem);
+        state.ecosystem_registry.register(ecosystem.clone());
 
         let content = "[dependencies]\nserde = \"1\"\n".to_string();
-        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
-        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+        let manifest = crate::test_utils::manifest_of(&ecosystem, &url);
+        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, manifest);
         state.update_document(uri.clone(), doc);
 
         let params = CompletionParams {
@@ -2892,15 +2935,11 @@ ser"
     /// ecosystem, and the shared version-completion helper, which scopes the endpoint.
     #[tokio::test(start_paused = true)]
     async fn test_handle_completion_feeds_the_endpoint_breaker() {
-        use deps_core::{Dependency, Ecosystem, EcosystemFormatter, ParseResult};
-        use std::any::Any;
-        use std::path::Path;
-
         struct StalledCompletionEcosystem {
             registry: Arc<deps_core::test_util::StalledCoalescingRegistry>,
         }
         impl deps_core::ecosystem::private::Sealed for StalledCompletionEcosystem {}
-        impl Ecosystem for StalledCompletionEcosystem {
+        impl deps_core::EcosystemBase for StalledCompletionEcosystem {
             fn ecosystem_id(&self) -> deps_core::EcosystemId {
                 deps_core::EcosystemId::Cargo
             }
@@ -2910,23 +2949,21 @@ ser"
             fn manifest_filenames(&self) -> &[&'static str] {
                 &["Cargo.toml"]
             }
-            fn parse_manifest<'a>(
-                &'a self,
-                _content: &'a str,
-                _uri: &'a url::Url,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
-            {
-                Box::pin(async move { unimplemented!() })
-            }
             fn registry(&self) -> Arc<dyn deps_core::Registry> {
                 Arc::clone(&self.registry) as Arc<dyn deps_core::Registry>
             }
-            fn formatter(&self) -> &dyn EcosystemFormatter {
-                &deps_core::test_util::StubFormatter::DEFAULT
+            fn completion_insert_text(
+                &self,
+                _metadata: &dyn deps_core::Metadata,
+            ) -> Option<String> {
+                unimplemented!()
             }
-            fn generate_completions<'a>(
+        }
+
+        crate::test_utils::impl_parsing_stub_ecosystem!(StalledCompletionEcosystem, {
+            fn completions<'a>(
                 &'a self,
-                _parse_result: &'a dyn ParseResult,
+                _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
                 _position: tower_lsp_server::ls_types::Position,
                 _content: &'a str,
                 freshness: deps_core::FreshnessSettings,
@@ -2951,58 +2988,21 @@ ser"
                     completions
                 })
             }
-            fn complete_version<'a>(
-                &'a self,
-                _request: deps_core::completion::CompletionRequest<'a>,
-                _package_name: deps_core::PackageName,
-                _prefix: String,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions>
-            {
-                unimplemented!()
-            }
-            fn completion_insert_text(
-                &self,
-                _metadata: &dyn deps_core::Metadata,
-            ) -> Option<String> {
-                unimplemented!()
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockParseResult {
-            uri: url::Url,
-        }
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                vec![]
-            }
-            fn workspace_root(&self) -> Option<&Path> {
-                None
-            }
-            fn uri(&self) -> &url::Url {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
+        });
 
         let state = Arc::new(ServerState::new());
         let stalled = Arc::new(deps_core::test_util::StalledCoalescingRegistry::new());
-        state
-            .ecosystem_registry
-            .register(Arc::new(StalledCompletionEcosystem {
-                registry: Arc::clone(&stalled),
-            }));
+        let ecosystem = Arc::new(StalledCompletionEcosystem {
+            registry: Arc::clone(&stalled),
+        });
+        state.ecosystem_registry.register(ecosystem.clone());
         let url = deps_core::test_util::test_uri("/test/stalled-completion/Cargo.toml");
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
+        let manifest = crate::test_utils::manifest_of(&ecosystem, &url);
         let doc = DocumentState::new_from_parse_result(
             EcosystemId::Cargo,
             "[dependencies]\nserde = \"1\"\n".to_string(),
-            parse_result,
+            manifest,
         );
         state.update_document(uri.clone(), doc);
         let params = CompletionParams {
@@ -3040,10 +3040,9 @@ ser"
     /// unchanged.
     #[tokio::test]
     async fn test_generate_completions_is_incomplete_flows_into_response_both_branches() {
+        use deps_core::Registry;
         use deps_core::completion::Completions;
         use deps_core::ecosystem::private::Sealed;
-        use deps_core::{Dependency, Ecosystem, EcosystemFormatter, ParseResult, Registry};
-        use std::any::Any;
 
         /// Stands in for `PypiEcosystem`: always reports incomplete results, and
         /// returns either zero or one completion item depending on `has_item`.
@@ -3051,7 +3050,7 @@ ser"
             has_item: bool,
         }
         impl Sealed for IncompleteEcosystem {}
-        impl Ecosystem for IncompleteEcosystem {
+        impl deps_core::EcosystemBase for IncompleteEcosystem {
             fn ecosystem_id(&self) -> deps_core::EcosystemId {
                 deps_core::EcosystemId::Cargo
             }
@@ -3061,23 +3060,21 @@ ser"
             fn manifest_filenames(&self) -> &[&'static str] {
                 &["Cargo.toml"]
             }
-            fn parse_manifest<'a>(
-                &'a self,
-                _content: &'a str,
-                _uri: &'a url::Url,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
-            {
-                Box::pin(async move { unimplemented!() })
-            }
             fn registry(&self) -> Arc<dyn Registry> {
                 Arc::new(deps_core::test_util::MockRegistry::new())
             }
-            fn formatter(&self) -> &dyn EcosystemFormatter {
-                &deps_core::test_util::StubFormatter::DEFAULT
+            fn completion_insert_text(
+                &self,
+                _metadata: &dyn deps_core::Metadata,
+            ) -> Option<String> {
+                unimplemented!()
             }
-            fn generate_completions<'a>(
+        }
+
+        crate::test_utils::impl_parsing_stub_ecosystem!(IncompleteEcosystem, {
+            fn completions<'a>(
                 &'a self,
-                _parse_result: &'a dyn ParseResult,
+                _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
                 _position: tower_lsp_server::ls_types::Position,
                 _content: &'a str,
                 _freshness: deps_core::FreshnessSettings,
@@ -3092,55 +3089,18 @@ ser"
                 };
                 Box::pin(async move { Completions::new(items).with_incomplete(true) })
             }
-            fn complete_version<'a>(
-                &'a self,
-                _request: deps_core::completion::CompletionRequest<'a>,
-                _package_name: deps_core::PackageName,
-                _prefix: String,
-            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-                unimplemented!()
-            }
-            fn completion_insert_text(
-                &self,
-                _metadata: &dyn deps_core::Metadata,
-            ) -> Option<String> {
-                unimplemented!()
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockParseResult {
-            uri: url::Url,
-        }
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                vec![]
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &url::Url {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
+        });
 
         async fn run(has_item: bool) -> Option<CompletionResponse> {
             let state = Arc::new(ServerState::new());
-            state
-                .ecosystem_registry
-                .register(Arc::new(IncompleteEcosystem { has_item }));
+            let ecosystem = Arc::new(IncompleteEcosystem { has_item });
+            state.ecosystem_registry.register(ecosystem.clone());
 
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-            let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
-            let doc =
-                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            let manifest = crate::test_utils::manifest_of(&ecosystem, &url);
+            let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, manifest);
             state.update_document(uri.clone(), doc);
 
             let params = CompletionParams {
@@ -3189,13 +3149,10 @@ ser"
     async fn test_origin_version_skips_fallback_search() {
         use deps_core::completion::Completions;
         use deps_core::ecosystem::private::Sealed;
-        use deps_core::{Dependency, Ecosystem, EcosystemFormatter, ParseResult};
-        use std::any::Any;
-        use std::path::Path;
 
         struct SuppressFallbackEcosystem;
         impl Sealed for SuppressFallbackEcosystem {}
-        impl Ecosystem for SuppressFallbackEcosystem {
+        impl deps_core::EcosystemBase for SuppressFallbackEcosystem {
             fn ecosystem_id(&self) -> deps_core::EcosystemId {
                 deps_core::EcosystemId::Cargo
             }
@@ -3205,41 +3162,10 @@ ser"
             fn manifest_filenames(&self) -> &[&'static str] {
                 &["Cargo.toml"]
             }
-            fn parse_manifest<'a>(
-                &'a self,
-                _content: &'a str,
-                _uri: &'a url::Url,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
-            {
-                Box::pin(async move { unimplemented!() })
-            }
             fn registry(&self) -> Arc<dyn deps_core::Registry> {
                 unimplemented!(
                     "fallback_completion must not resolve a registry when origin blocks fallback"
                 )
-            }
-            fn formatter(&self) -> &dyn EcosystemFormatter {
-                &deps_core::test_util::StubFormatter::DEFAULT
-            }
-            fn generate_completions<'a>(
-                &'a self,
-                _parse_result: &'a dyn ParseResult,
-                _position: tower_lsp_server::ls_types::Position,
-                _content: &'a str,
-                _freshness: deps_core::FreshnessSettings,
-            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-                Box::pin(async move {
-                    Completions::default()
-                        .with_origin(deps_core::completion::CompletionOrigin::Version)
-                })
-            }
-            fn complete_version<'a>(
-                &'a self,
-                _request: deps_core::completion::CompletionRequest<'a>,
-                _package_name: deps_core::PackageName,
-                _prefix: String,
-            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-                unimplemented!()
             }
             fn fallback_completion_prefix<'a>(
                 &self,
@@ -3254,39 +3180,32 @@ ser"
             ) -> Option<String> {
                 unimplemented!()
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
-        struct MockParseResult {
-            uri: url::Url,
-        }
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                vec![]
+        crate::test_utils::impl_parsing_stub_ecosystem!(SuppressFallbackEcosystem, {
+            fn completions<'a>(
+                &'a self,
+                _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
+                _position: tower_lsp_server::ls_types::Position,
+                _content: &'a str,
+                _freshness: deps_core::FreshnessSettings,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+                Box::pin(async move {
+                    Completions::default()
+                        .with_origin(deps_core::completion::CompletionOrigin::Version)
+                })
             }
-            fn workspace_root(&self) -> Option<&Path> {
-                None
-            }
-            fn uri(&self) -> &url::Url {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
+        });
 
         let state = Arc::new(ServerState::new());
-        state
-            .ecosystem_registry
-            .register(Arc::new(SuppressFallbackEcosystem));
+        let ecosystem = Arc::new(SuppressFallbackEcosystem);
+        state.ecosystem_registry.register(ecosystem.clone());
 
         let url = deps_core::test_util::test_uri("/test/Cargo.toml");
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
         let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
-        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+        let manifest = crate::test_utils::manifest_of(&ecosystem, &url);
+        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, manifest);
         state.update_document(uri.clone(), doc);
 
         let params = CompletionParams {
@@ -3319,15 +3238,13 @@ ser"
     /// than by type/grep reasoning alone.
     #[tokio::test]
     async fn test_handle_completion_falls_back_when_origin_unresolved() {
+        use deps_core::Registry;
         use deps_core::completion::Completions;
         use deps_core::ecosystem::private::Sealed;
-        use deps_core::{Dependency, Ecosystem, EcosystemFormatter, ParseResult, Registry};
-        use std::any::Any;
-        use std::path::Path;
 
         struct NotSuppressingEcosystem;
         impl Sealed for NotSuppressingEcosystem {}
-        impl Ecosystem for NotSuppressingEcosystem {
+        impl deps_core::EcosystemBase for NotSuppressingEcosystem {
             fn ecosystem_id(&self) -> deps_core::EcosystemId {
                 deps_core::EcosystemId::Cargo
             }
@@ -3337,42 +3254,12 @@ ser"
             fn manifest_filenames(&self) -> &[&'static str] {
                 &["Cargo.toml"]
             }
-            fn parse_manifest<'a>(
-                &'a self,
-                _content: &'a str,
-                _uri: &'a url::Url,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
-            {
-                Box::pin(async move { unimplemented!() })
-            }
             fn registry(&self) -> Arc<dyn Registry> {
                 Arc::new(deps_core::test_util::MockRegistry::new().with_search(
                     deps_core::test_util::SearchBehavior::Results(vec![
                         deps_core::test_util::MockMetadata::new("requests", "2.31.0"),
                     ]),
                 ))
-            }
-            fn formatter(&self) -> &dyn EcosystemFormatter {
-                &deps_core::test_util::StubFormatter::DEFAULT
-            }
-            fn generate_completions<'a>(
-                &'a self,
-                _parse_result: &'a dyn ParseResult,
-                _position: tower_lsp_server::ls_types::Position,
-                _content: &'a str,
-                _freshness: deps_core::FreshnessSettings,
-            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-                // `origin` defaults to `Unresolved` — this is the common case every
-                // ecosystem except a positively-resolved `Version`/`Feature` context takes.
-                Box::pin(async move { Completions::default() })
-            }
-            fn complete_version<'a>(
-                &'a self,
-                _request: deps_core::completion::CompletionRequest<'a>,
-                _package_name: deps_core::PackageName,
-                _prefix: String,
-            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-                unimplemented!()
             }
             fn fallback_completion_prefix<'a>(
                 &self,
@@ -3384,39 +3271,31 @@ ser"
             fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
                 Some(metadata.name().as_str().to_string())
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
-        struct MockParseResult {
-            uri: url::Url,
-        }
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                vec![]
+        crate::test_utils::impl_parsing_stub_ecosystem!(NotSuppressingEcosystem, {
+            fn completions<'a>(
+                &'a self,
+                _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
+                _position: tower_lsp_server::ls_types::Position,
+                _content: &'a str,
+                _freshness: deps_core::FreshnessSettings,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+                // `origin` defaults to `Unresolved` — this is the common case every
+                // ecosystem except a positively-resolved `Version`/`Feature` context takes.
+                Box::pin(async move { Completions::default() })
             }
-            fn workspace_root(&self) -> Option<&Path> {
-                None
-            }
-            fn uri(&self) -> &url::Url {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
+        });
 
         let state = Arc::new(ServerState::new());
-        state
-            .ecosystem_registry
-            .register(Arc::new(NotSuppressingEcosystem));
+        let ecosystem = Arc::new(NotSuppressingEcosystem);
+        state.ecosystem_registry.register(ecosystem.clone());
 
         let url = deps_core::test_util::test_uri("/test/Cargo.toml");
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
         let content = "[dependencies]\nreq = \"1.0\"\n".to_string();
-        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
-        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+        let manifest = crate::test_utils::manifest_of(&ecosystem, &url);
+        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, manifest);
         state.update_document(uri.clone(), doc);
 
         let params = CompletionParams {
@@ -3449,17 +3328,15 @@ ser"
     /// user actually hits, and the one row that fails if the gate is ever written inverted.
     #[tokio::test]
     async fn test_fallback_gate_across_all_origins() {
+        use deps_core::Registry;
         use deps_core::completion::{CompletionOrigin, Completions};
         use deps_core::ecosystem::private::Sealed;
-        use deps_core::{Dependency, Ecosystem, EcosystemFormatter, ParseResult, Registry};
-        use std::any::Any;
-        use std::path::Path;
 
         struct OriginProbeEcosystem {
             origin: CompletionOrigin,
         }
         impl Sealed for OriginProbeEcosystem {}
-        impl Ecosystem for OriginProbeEcosystem {
+        impl deps_core::EcosystemBase for OriginProbeEcosystem {
             fn ecosystem_id(&self) -> deps_core::EcosystemId {
                 deps_core::EcosystemId::Cargo
             }
@@ -3469,41 +3346,12 @@ ser"
             fn manifest_filenames(&self) -> &[&'static str] {
                 &["Cargo.toml"]
             }
-            fn parse_manifest<'a>(
-                &'a self,
-                _content: &'a str,
-                _uri: &'a url::Url,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
-            {
-                Box::pin(async move { unimplemented!() })
-            }
             fn registry(&self) -> Arc<dyn Registry> {
                 Arc::new(deps_core::test_util::MockRegistry::new().with_search(
                     deps_core::test_util::SearchBehavior::Results(vec![
                         deps_core::test_util::MockMetadata::new("requests", "2.31.0"),
                     ]),
                 ))
-            }
-            fn formatter(&self) -> &dyn EcosystemFormatter {
-                &deps_core::test_util::StubFormatter::DEFAULT
-            }
-            fn generate_completions<'a>(
-                &'a self,
-                _parse_result: &'a dyn ParseResult,
-                _position: tower_lsp_server::ls_types::Position,
-                _content: &'a str,
-                _freshness: deps_core::FreshnessSettings,
-            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-                let origin = self.origin;
-                Box::pin(async move { Completions::default().with_origin(origin) })
-            }
-            fn complete_version<'a>(
-                &'a self,
-                _request: deps_core::completion::CompletionRequest<'a>,
-                _package_name: deps_core::PackageName,
-                _prefix: String,
-            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-                unimplemented!()
             }
             fn fallback_completion_prefix<'a>(
                 &self,
@@ -3520,28 +3368,20 @@ ser"
             fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
                 Some(metadata.name().as_str().to_string())
             }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
         }
 
-        struct MockParseResult {
-            uri: url::Url,
-        }
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                vec![]
+        crate::test_utils::impl_parsing_stub_ecosystem!(OriginProbeEcosystem, {
+            fn completions<'a>(
+                &'a self,
+                _parsed: deps_core::ParsedView<'a, deps_core::test_util::StubParseResult>,
+                _position: tower_lsp_server::ls_types::Position,
+                _content: &'a str,
+                _freshness: deps_core::FreshnessSettings,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+                let origin = self.origin;
+                Box::pin(async move { Completions::default().with_origin(origin) })
             }
-            fn workspace_root(&self) -> Option<&Path> {
-                None
-            }
-            fn uri(&self) -> &url::Url {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
+        });
 
         for (origin, should_fall_back) in [
             (CompletionOrigin::Unresolved, true),
@@ -3550,16 +3390,14 @@ ser"
             (CompletionOrigin::Feature, false),
         ] {
             let state = Arc::new(ServerState::new());
-            state
-                .ecosystem_registry
-                .register(Arc::new(OriginProbeEcosystem { origin }));
+            let ecosystem = Arc::new(OriginProbeEcosystem { origin });
+            state.ecosystem_registry.register(ecosystem.clone());
 
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "[dependencies]\nreq = \"1.0\"\n".to_string();
-            let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
-            let doc =
-                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            let manifest = crate::test_utils::manifest_of(&ecosystem, &url);
+            let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, manifest);
             state.update_document(uri.clone(), doc);
 
             let params = CompletionParams {

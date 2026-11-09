@@ -57,10 +57,10 @@ pub async fn handle_hover(
     } else {
         PrefetchVisibility::Suppress
     };
-    let (ecosystem, ecosystem_id, parse_result, snapshot) = state
+    let (ecosystem, ecosystem_id, manifest, snapshot) = state
         .with_document(uri, |doc| {
             let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
-            let parse_result = doc.parse_result_arc()?;
+            let manifest = doc.manifest_arc()?;
             let snapshot = doc
                 .signals
                 .snapshot()
@@ -71,7 +71,7 @@ pub async fn handle_hover(
                 .with_license_prefetch()
                 .with_gossip_prefetch(gossip_visibility)
                 .finish();
-            Some((ecosystem, doc.ecosystem, parse_result, snapshot))
+            Some((ecosystem, doc.ecosystem, manifest, snapshot))
         })
         .flatten()?;
 
@@ -94,8 +94,8 @@ pub async fn handle_hover(
         versions = versions.with_gossip_client(&state.deps_dev);
     }
 
-    ecosystem
-        .generate_hover(parse_result.as_ref(), position, versions, freshness)
+    manifest
+        .generate_hover(position, versions, freshness)
         .await
         .map(crate::lsp_types_interop::to_lsp_hover)
 }
@@ -205,7 +205,7 @@ serde = "1.0.0"
 "#
             .to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
@@ -270,7 +270,7 @@ serde = "1.0.0"
                 .unwrap();
             let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
 
-            let parse_result = ecosystem
+            let parse_result = Arc::clone(&ecosystem)
                 .parse_manifest(&content, &url)
                 .await
                 .expect("Failed to parse manifest");
